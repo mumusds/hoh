@@ -285,6 +285,7 @@ impl hoh_app::host::Executor for Agents {
             gate,
             ended: reaping(child),
             prompt: None,
+            ran: None,
         })
     }
 
@@ -2391,6 +2392,7 @@ impl hoh_app::host::Executor for LeavesItsGroup {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }

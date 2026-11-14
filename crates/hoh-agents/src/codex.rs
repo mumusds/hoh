@@ -324,7 +324,8 @@ pub fn failure_of(error: Option<&Value>, auth_hint: bool) -> String {
         Some("unauthorized") => "BLOCKED_AUTH".to_owned(),
         Some("rateLimitExceeded" | "serverOverloaded") => "TRANSIENT_EXTERNAL".to_owned(),
         _ if auth_hint || message.contains("unexpected status 401") => "BLOCKED_AUTH".to_owned(),
-        Some(other) => other.to_owned(),
+        // Codex's own text: never one of HoH's reason codes (docs/adr/ADR-030.md decision 6).
+        Some(other) => crate::adapter::native_code(other),
         None => "turn failed".to_owned(),
     }
 }

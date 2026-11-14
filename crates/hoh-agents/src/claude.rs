@@ -9,7 +9,8 @@
 //! An attempt SETTLES only on a `result` frame with `subtype=success` and `is_error=false` and exit code 0, with its
 //! prompt delivered whole and both raw logs complete; a stream that ends before its `result` frame is FAILED
 //! (PROTOCOL_INCOMPLETE) even with exit code 0; any other result is FAILED with its subtype kept (also in the
-//! `adapter.result` event), or BLOCKED_AUTH when an assistant frame carried Claude's `authentication_failed` error
+//! `adapter.result` event; `native:<subtype>` when it names one of HoH's reason codes, `adapter::native_code`), or
+//! BLOCKED_AUTH when an assistant frame carried Claude's `authentication_failed` error
 //! (recorded case `unauthenticated`). A cancel requested before the end is recorded makes the attempt CANCELLED
 //! whatever follows (Claude still prints `result(error_during_execution)` and exits 0 after SIGINT, CR-003): every end
 //! is committed through the attempt's [`CancelLatch`], so a cancel accepted before that commit wins; a refused
@@ -234,7 +235,11 @@ pub fn verdict(e: &Ending<'_>) -> (AttemptState, Option<String>) {
 fn judge(result: &ResultFrame, exit: Option<Termination>) -> (AttemptState, Option<String>) {
     let subtype = result.subtype.as_deref().unwrap_or("unknown");
     if subtype != "success" {
-        return (AttemptState::Failed, Some(subtype.to_owned()));
+        // Claude's own text: never one of HoH's reason codes (docs/adr/ADR-030.md decision 6).
+        return (
+            AttemptState::Failed,
+            Some(crate::adapter::native_code(subtype)),
+        );
     }
     if result.is_error != Some(false) {
         return (AttemptState::Failed, Some("is_error".to_owned()));

@@ -885,3 +885,36 @@ async fn a_judgment_whose_evidence_cannot_be_kept_writes_nothing() -> R {
 fn judge(staffed: &Staffed, snapshot: &Snapshot) -> Judgment {
     hoh_core::staffing::judge(staffed, &snapshot.facts, &staffed.excluded)
 }
+
+#[test]
+fn a_prepared_turn_runs_as_the_current_identity_at_the_current_generation() -> R {
+    // Decision 2 (M2T15D-07): what a turn prepared now runs as is the identity of the agent's current look and the
+    // registry's generation (host_epoch, n) of the agent now, as the snapshot's observation names it; a login look
+    // after it moves the generation on, so a turn prepared before a visible recovery is older than it.
+    let bin = tempfile::tempdir()?;
+    claude(bin.path(), "A")?;
+    let project = tempfile::tempdir()?;
+    let registry =
+        Registry::new(path_of(bin.path())).with_timings(Duration::from_secs(20), Duration::ZERO);
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["claude"]));
+    assert!(
+        registry.prepared(Agent::Claude).is_none(),
+        "not looked at yet"
+    );
+    registry.refresh();
+    // The tick's snapshot names the host's epoch before any dispatch (runner.rs), as `ran` takes it.
+    let seen = self::ran(&registry)?;
+    let (ready, ran) = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    assert_eq!(ran, seen);
+    assert_eq!(ran.identity, ready.entry.identity());
+    assert_eq!(Some(ready), registry.seen(Agent::Claude).transpose()?);
+    login(bin.path(), "out")?;
+    registry.refresh();
+    login(bin.path(), "in")?;
+    registry.refresh();
+    let (_, later) = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    assert!(later.generation > ran.generation, "{later:?} {ran:?}");
+    assert_eq!(later.identity, ran.identity);
+    Ok(())
+}

@@ -71,7 +71,7 @@ pub use snapshot::{
 };
 pub use staffing::{
     BINDING_BLOCKED, BINDING_EXCLUDED, BINDING_FALLBACK, BINDING_UNBLOCKED, CHANGE_PENDING,
-    CHANGE_WITHDRAWN, Evidence, StaffChange, StaffWrite,
+    CHANGE_WITHDRAWN, EXCLUSION_SKIPPED, Evidence, StaffChange, StaffWrite, TASK_UNBLOCKED,
 };
 pub use suites::{
     ABANDONED, Admission, DISCARDED, Publication, Published, SUITE_COMPLETED, SUITE_DEFERRED,

@@ -57,6 +57,10 @@ const CHILD_OLD_COMMANDER: &str = "HOH_TEST_RECOVERY_OLD_COMMANDER";
 /// `<dir>/release` exists (docs/adr/ADR-030.md decision 10).
 const CHILD_HOLD_SUITE: &str = "HOH_TEST_RECOVERY_HOLD_SUITE";
 
+/// A directory of fake agent CLIs: the child is the product's host (its executor the product's, its registry over that
+/// directory and the system's tools alone, pi's settings in `<dir>/pi-agent`; docs/adr/ADR-030.md decision 6's recovery).
+const CHILD_PRODUCT: &str = "HOH_TEST_RECOVERY_PRODUCT";
+
 /// The child's exit code when it submitted its decision and was not killed.
 const NOT_KILLED: i32 = 77;
 
@@ -223,6 +227,7 @@ impl hoh_app::host::Executor for FakeExecutor {
                 gate,
                 ended,
                 prompt: None,
+                ran: None,
             });
         }
         let lines = vec![incomplete(work)];
@@ -247,6 +252,7 @@ impl hoh_app::host::Executor for FakeExecutor {
             gate,
             ended: carried,
             prompt: None,
+            ran: None,
         })
     }
 }
@@ -341,6 +347,7 @@ impl hoh_app::host::Executor for FailingExecutor {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }
@@ -419,6 +426,7 @@ fn runner_point(name: &str) -> Option<hoh_app::host::RunnerPoint> {
         "AfterSend" => RunnerPoint::AfterSend,
         "AfterAck" => RunnerPoint::AfterAck,
         "AfterEffectStarted" => RunnerPoint::AfterEffectStarted,
+        "AfterEffectObserved" => RunnerPoint::AfterEffectObserved,
         "AfterEffectCommitted" => RunnerPoint::AfterEffectCommitted,
         _ => return None,
     })
@@ -552,6 +560,28 @@ fn recovery_host() {
         return;
     };
     let mut config = config(Path::new(&project));
+    if let Some(bin) = std::env::var_os(CHILD_PRODUCT) {
+        let bin = PathBuf::from(bin);
+        let registry = Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            format!("{}:/usr/bin:/bin", bin.display()).into(),
+            Some(bin.join("pi-agent")),
+        ));
+        let mut product = HostConfig::product_with(
+            Path::new(&project),
+            hoh_core::config::Config::default(),
+            env!("CARGO_BIN_EXE_hoh").into(),
+            registry,
+        );
+        product.port = 0;
+        product.store.wal_probe = Some(probe());
+        // Commander sessions' directories beside the project, never the user's state directory.
+        if let Some(runner) = product.runner.as_mut() {
+            runner.context.commander_dir = Path::new(&project)
+                .parent()
+                .map(|d| d.join("state/hoh/commander"));
+        }
+        config = product;
+    }
     if let Ok(kill) = std::env::var(CHILD_KILL) {
         let (job, point) = kill.split_once(':').expect("<job>:<point>");
         config.store.faults = Arc::new(KillAt {
@@ -1765,6 +1795,7 @@ impl hoh_app::host::Executor for StuckExecutor {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 
@@ -3110,6 +3141,7 @@ impl hoh_app::host::Executor for LeavesAMember {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }
@@ -3638,6 +3670,7 @@ impl hoh_app::host::Executor for Faulty {
                 }),
                 ended,
                 prompt: None,
+                ran: None,
             });
         }
         let started = self.inner.start(work)?;
@@ -3739,6 +3772,7 @@ impl hoh_app::host::Executor for Cancellable {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 
@@ -3840,6 +3874,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 
@@ -4985,4 +5020,257 @@ fn a_crash_during_the_suite_reopens_the_writer_slot() -> R {
     );
     drop(second);
     Ok(())
+}
+
+/// The fake pi of a product child: the unmodified recorded 1.5.0 help; a turn replays the recorded `rpc-no-provider`
+/// with its prompt refused `Model not found: x/y` (pi.rs's MODEL_UNAVAILABLE). And a fake claude 2.1.318 that only
+/// answers its probe. The registry's PATH is `bin` and the system's tools.
+fn model_failing_pi(bin: &Path) -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+    let pi_rpc = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../hoh-agents/tests/fakes/pi_rpc.py"
+    );
+    let d = bin.join("pi.d");
+    std::fs::create_dir_all(&d)?;
+    let case = format!("{fixtures}/pi/1.5.0/rpc-no-provider");
+    let mut frames = Vec::new();
+    for line in std::fs::read_to_string(format!("{case}/stdout.jsonl"))?.lines() {
+        let mut frame: Value = serde_json::from_str(line)?;
+        if frame["id"] == "p1" && frame["command"] == "prompt" {
+            frame["error"] = json!("Model not found: x/y");
+        }
+        frames.push(format!("{frame}\n"));
+    }
+    std::fs::write(d.join("frames.jsonl"), frames.concat())?;
+    let mut commands = serde_json::Map::new();
+    for line in std::fs::read_to_string(format!("{case}/stdin.txt"))?.lines() {
+        let c: Value = serde_json::from_str(line)?;
+        if let (Some(id), Some(kind)) = (c["id"].as_str(), c["type"].as_str()) {
+            commands.insert(id.to_owned(), json!(kind));
+        }
+    }
+    std::fs::write(d.join("commands.json"), Value::Object(commands).to_string())?;
+    let scripts = [
+        (
+            "pi",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat '{fixtures}/pi/1.5.0/help.txt'; \
+                 exit 0;; esac\nexec timeout 60 python3 '{pi_rpc}' '{d}/frames.jsonl' '{d}/commands.json' \"{d}/log.$$\" \
+                 -- \"$@\"\n",
+                d = d.display()
+            ),
+        ),
+        (
+            "claude",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.318 (Claude Code)';; --help) cat \
+                 '{fixtures}/claude/2.1.318/help.txt';; *) exit 2;;\nesac\n"
+            ),
+        ),
+    ];
+    for (name, text) in scripts {
+        std::fs::write(bin.join(name), text)?;
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// The team of decision 6's recovery test: the developer pi falling back to claude, every other role claude.
+const MODEL_TEAM: &str = "config_version = \"1.0\"\n\
+[team.commander]\nagent = \"claude\"\n[team.cto]\nagent = \"claude\"\n[team.developer]\nagent = \"pi\"\n\
+fallback = [\"claude\"]\n[team.qa]\nagent = \"claude\"\n[team.researcher]\nagent = \"claude\"\n\
+[team.reviewer]\nagent = \"claude\"\n";
+
+/// The exclusion records, fallbacks and developer binding of the project's run.
+fn exclusions(project: &Path) -> R<(Vec<Value>, String, String)> {
+    let records: Vec<Value> = serde_json::from_str(&query(
+        &db(project),
+        "SELECT json_group_array(json(payload_json)) FROM events WHERE kind = 'team.binding_excluded'",
+    )?)?;
+    let fallbacks = query(
+        &db(project),
+        "SELECT count(*) FROM events WHERE kind = 'team.binding_fallback'",
+    )?;
+    let binding = query(
+        &db(project),
+        "SELECT agent || '/' || role_epoch FROM role_bindings WHERE role = 'developer'",
+    )?;
+    Ok((records, fallbacks, binding))
+}
+
+#[test]
+fn a_model_failure_recovered_after_observed_falls_back_like_a_settled_one() -> R {
+    // M2T15D-103 (docs/adr/ADR-030.md decision 6, K8): the developer pi (its prompt refused "Model not found", the
+    // Model class) falling back to claude, both registered by the product's compat suite. The product's host is killed
+    // at RunnerPoint::AfterEffectObserved (the class persisted with the OBSERVED work, its end not settled); the next
+    // host's reconcile writes team.binding_excluded with the identity of pi's session's team.session_bound, and staffing
+    // switches the developer to claude at epoch 2 with one team.binding_fallback; a host started again writes no other
+    // exclusion or fallback. The same world not killed: the runner's own settle writes the same record.
+    let mut kept = serde_json::Map::new();
+    for killed in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(project.join(".hoh"))?;
+        std::fs::create_dir_all(&bin)?;
+        model_failing_pi(&bin)?;
+        std::fs::write(project.join(".hoh/config.toml"), MODEL_TEAM)?;
+        // The file becomes the project's team revision at a host's start.
+        let (code, stderr) = serve_and_stop(&project)?;
+        assert_eq!(code, 0, "{stderr}");
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        for agent in [
+            hoh_agents::compat::Agent::Pi,
+            hoh_agents::compat::Agent::Claude,
+        ] {
+            let registered =
+                hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&path))?;
+            assert_eq!(format!("{:?}", registered.entry.suite.status), "Pass");
+        }
+        let mut env: Vec<(&str, &std::ffi::OsStr)> = vec![(CHILD_PRODUCT, bin.as_os_str())];
+        if killed {
+            env.push((
+                CHILD_RUNNER_KILL,
+                std::ffi::OsStr::new("AfterEffectObserved"),
+            ));
+        }
+        let host = start_child(&project, &env)?;
+        let info: Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+        let start = json!({
+            "schema_version": "1.0", "command_id": "c-start", "idempotency_key": "start", "expected_revision": 0,
+            "kind": "StartRun", "run_id": null,
+            "payload": {"goal": "Ship the parser", "mode": "AUTO", "interactive": false},
+        });
+        let (status, body) = http(&info, "POST", "/v1/commands", Some(&start.to_string()))?;
+        assert_eq!(status, 202, "{body}");
+        let run_id = serde_json::from_str::<Value>(&body)?["run_id"]
+            .as_str()
+            .ok_or("no run_id")?
+            .to_owned();
+        assert!(
+            wait_for(
+                &db(&project),
+                &format!(
+                    "SELECT session_id IS NOT NULL FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer'"
+                ),
+                "1",
+                Duration::from_secs(60),
+            )?,
+            "pi's session was not granted"
+        );
+        seed(
+            &project,
+            &format!(
+                "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+                 UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';
+                 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+                   VALUES ('T1', '{run_id}', 's1', 'READY', 1, 'developer', 0, 1, 1);"
+            ),
+        )?;
+        let first = "T1/attempt-1";
+        if killed {
+            let (status, stderr) = wait(host, Duration::from_secs(60))?;
+            assert_eq!(status.signal(), Some(9), "{stderr}");
+            assert_eq!(
+                query(
+                    &db(&project),
+                    &format!("SELECT state FROM attempts WHERE attempt_id = '{first}'")
+                )?,
+                "RUNNING",
+                "settled before the kill"
+            );
+            assert_eq!(
+                query(
+                    &db(&project),
+                    &format!(
+                        "SELECT json_extract(payload_json, '$.detail.class') FROM events WHERE kind = 'effect.observed' \
+                         AND json_extract(payload_json, '$.effect_key') = '{}'",
+                        hoh_core::reconcile::work_key(first)
+                    )
+                )?,
+                "model"
+            );
+            assert!(exclusions(&project)?.0.is_empty());
+            let restarted = start_child(&project, &[(CHILD_PRODUCT, bin.as_os_str())])?;
+            assert!(
+                wait_for(
+                    &db(&project),
+                    "SELECT count(*) FROM events WHERE kind = 'team.binding_fallback'",
+                    "1",
+                    Duration::from_secs(60),
+                )?,
+                "no fallback after the reconcile"
+            );
+            drop(restarted);
+        } else {
+            assert!(
+                wait_for(
+                    &db(&project),
+                    "SELECT count(*) FROM events WHERE kind = 'team.binding_fallback'",
+                    "1",
+                    Duration::from_secs(60),
+                )?,
+                "no fallback after the settle"
+            );
+            drop(host);
+        }
+        let (records, fallbacks, binding) = exclusions(&project)?;
+        let session = query(
+            &db(&project),
+            &format!("SELECT session_id FROM attempts WHERE attempt_id = '{first}'"),
+        )?;
+        let identity: Value = serde_json::from_str(&query(
+            &db(&project),
+            &format!(
+                "SELECT json_extract(payload_json, '$.identity') FROM events WHERE kind = 'team.session_bound' \
+                 AND json_extract(payload_json, '$.session_id') = '{session}'"
+            ),
+        )?)?;
+        assert_eq!(
+            identity["implementation_sha256"].as_str().map(str::len),
+            Some(64),
+            "{identity}"
+        );
+        let config_revision: i64 = query(
+            &db(&project),
+            &format!("SELECT config_revision FROM attempts WHERE attempt_id = '{first}'"),
+        )?
+        .parse()?;
+        assert_eq!(
+            records,
+            [
+                json!({"run_id": run_id, "role": "developer", "config_revision": config_revision, "agent": "pi",
+                    "agent_version": "1.5.0", "identity": identity, "reason": "MODEL_UNAVAILABLE",
+                    "attempt_id": first})
+            ],
+            "killed: {killed}"
+        );
+        assert_eq!((fallbacks.as_str(), binding.as_str()), ("1", "claude/2"));
+        assert_eq!(
+            query(
+                &db(&project),
+                "SELECT json_extract(payload_json, '$.cause') FROM events WHERE kind = 'team.binding_blocked' \
+                 AND json_extract(payload_json, '$.attempt_id') = 'T1/attempt-1'"
+            )?,
+            "turn"
+        );
+        if killed {
+            // Once more: nothing new is excluded or switched.
+            let again = start_child(&project, &[(CHILD_PRODUCT, bin.as_os_str())])?;
+            std::thread::sleep(Duration::from_secs(2));
+            drop(again);
+            assert_eq!(
+                exclusions(&project)?,
+                (records.clone(), fallbacks.clone(), binding.clone())
+            );
+        }
+        kept.insert(
+            if killed { "recovered" } else { "settled" }.to_owned(),
+            json!({"exclusions": records, "fallbacks": fallbacks, "binding": binding}),
+        );
+    }
+    keep("model-failure-recovered.json", &Value::Object(kept))
 }

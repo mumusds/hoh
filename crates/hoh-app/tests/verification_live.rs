@@ -655,6 +655,7 @@ impl Live {
             gate,
             ended,
             prompt: None,
+            ran: None,
         })
     }
 }

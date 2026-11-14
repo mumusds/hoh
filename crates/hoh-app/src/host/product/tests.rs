@@ -406,20 +406,25 @@ fn a_kept_first_input_is_read_for_its_session_and_none_is_none()
 
 #[test]
 fn an_adapters_failure_code_fails_its_attempt_by_its_class() {
-    // Decision 16 (ADR-020 decision 1).
+    // Decision 16 (ADR-020 decision 1); docs/adr/ADR-030.md decision 6: MODEL_UNAVAILABLE is its own class, and only
+    // the codes the adapters themselves recognise give a class: a bare COMPAT_UNVERIFIED string (no typed source) and
+    // an agent's own text marked native are transient.
     assert_eq!(class_of(Some("BLOCKED_AUTH")), FailureClass::Auth);
     assert_eq!(
         class_of(Some("BLOCKED_CAPABILITY")),
         FailureClass::Capability
     );
-    assert_eq!(
-        class_of(Some("MODEL_UNAVAILABLE")),
-        FailureClass::Capability
-    );
+    assert_eq!(class_of(Some("MODEL_UNAVAILABLE")), FailureClass::Model);
     for code in [
         Some("PROTOCOL_FRAME_TOO_LARGE"),
         Some("CAPABILITY_UNSUPPORTED"),
         Some("TRANSIENT_EXTERNAL"),
+        Some("COMPAT_UNVERIFIED"),
+        Some("AGENT_UNAVAILABLE"),
+        Some("native:BLOCKED_AUTH"),
+        Some("native:MODEL_UNAVAILABLE"),
+        Some("native:BLOCKED_CAPABILITY"),
+        Some("native:COMPAT_UNVERIFIED"),
         None,
     ] {
         assert_eq!(
@@ -777,6 +782,40 @@ fn a_verifiers_confirm_ids_are_recorded_in_its_context_packed_and_its_entries_ar
             .event
             .get("confirm_ids")
             .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_prepare_without_its_agent_is_refused_as_unavailable() -> Result<(), Box<dyn std::error::Error>>
+{
+    // docs/adr/ADR-030.md decision 6: prepare's "the binding names no agent" and an agent whose last look found it
+    // unusable (`Some(Err)`) are refused AGENT_UNAVAILABLE in the Unavailable class (the task BLOCKED(AGENT_UNAVAILABLE),
+    // decision 7's vacancy, no longer BLOCKED_CAPABILITY); an agent not looked at yet stays transient.
+    let project = tempfile::tempdir()?;
+    let executor = executor(project.path());
+    let mut unnamed = work(None);
+    unnamed.assignment.agent = None;
+    let refusal = executor.prepare(&unnamed).err().ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("AGENT_UNAVAILABLE", FailureClass::Unavailable)
+    );
+    let refusal = executor.prepare(&work(None)).err().ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        (
+            "AGENT_UNAVAILABLE",
+            FailureClass::Transient { retry_after: None }
+        ),
+        "not looked at yet"
+    );
+    // The registry's PATH is empty: its look finds no claude.
+    assert!(executor.registry.look(Agent::Claude).is_err());
+    let refusal = executor.prepare(&work(None)).err().ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("AGENT_UNAVAILABLE", FailureClass::Unavailable)
     );
     Ok(())
 }

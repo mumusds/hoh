@@ -238,6 +238,17 @@ fn reviewer_report(
     session: &str,
     candidate: &str,
 ) -> R<(ReportIntake, String)> {
+    verifier_report(project, "reviewer", attempt, session, candidate)
+}
+
+/// [`reviewer_report`] of a verifier of `role`.
+fn verifier_report(
+    project: &Path,
+    role: &str,
+    attempt: &str,
+    session: &str,
+    candidate: &str,
+) -> R<(ReportIntake, String)> {
     let block = json!({"status": "PASS", "scope": ["AC-1-01"], "findings": []});
     let raw = format!(
         "{}\n",
@@ -246,7 +257,7 @@ fn reviewer_report(
     let mut raw_session = kept(project, raw.as_bytes(), "raw_log", "stdout.jsonl")?;
     raw_session.mime = "application/x-ndjson".to_owned();
     let native = serde_json::to_vec(&report::native_attempt(
-        "reviewer",
+        role,
         "COMPLETED",
         &[session.to_owned()],
         candidate,
@@ -259,7 +270,7 @@ fn reviewer_report(
     };
     let built = report::build(
         &block,
-        "reviewer",
+        role,
         session,
         (candidate, &spec_sha256()),
         &reference(&raw_session),
@@ -422,5 +433,123 @@ async fn test_054_01_reports_in_conflicting_sessions_are_rejected() -> R {
             .contains(&accepted[0]["session_id"].as_str().unwrap_or_default())
     );
     assert_eq!(rows(&db, "SELECT issue_id FROM issues")?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_020_04_a_developer_sessions_qa_report_is_rejected_while_qa_is_blocked() -> R {
+    // AC-020-04 (REQ-020 failure mode 1, behaviour 6; docs/adr/ADR-030.md decision 8): test_054_01's world, the qa
+    // binding BLOCKED(BLOCKED_AUTH) by staffing. The product takes reports only from verification attempts, so a qa
+    // verification attempt in the developer's session S_dev is seeded, and a role=qa, session S_dev, PASS report under
+    // the locked schema is taken in: REJECTED for SESSION_ROLE_MISMATCH (its report.rejected says the same), no
+    // acceptance row, C has no PASS row and is not ACCEPTED.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(dir.path())?;
+    seed(&db, &world())?;
+    assert!(
+        store
+            .staff(hoh_core::persistence::StaffChange {
+                run_id: "R".to_owned(),
+                role: "qa".to_owned(),
+                role_epoch: 1,
+                agent: "pi".to_owned(),
+                write: hoh_core::persistence::StaffWrite::Block {
+                    reason: hoh_core::protocol::BlockedReason::BlockedAuth,
+                    missing: vec!["pi:BLOCKED_AUTH".to_owned()],
+                    evidence: hoh_core::persistence::Evidence {
+                        sha256: "e".repeat(64),
+                        bytes: 10,
+                    },
+                },
+            })
+            .await?
+    );
+    let (candidate, done) = completion()?;
+    store.complete_writer_attempt(done).await?;
+    let opened = rows(
+        &db,
+        "SELECT json_extract(payload_json, '$.tasks.qa') AS qa FROM events WHERE kind = 'verification.round_opened'",
+    )?;
+    let qa = opened
+        .first()
+        .and_then(|o| o["qa"].as_str())
+        .ok_or("no qa task")?
+        .to_owned();
+    let acceptance = "SELECT count(*) AS n FROM acceptance_results";
+    let before = rows(&db, acceptance)?;
+    let attempt = hoh_core::ids::child_id(&qa, "attempt-S_dev");
+    seed(
+        &db,
+        &format!(
+            "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision) \
+             VALUES ('{attempt}', '{qa}', 'S_dev', 'SETTLED', 1, 1, 1);"
+        ),
+    )?;
+    let (intake, text) = verifier_report(dir.path(), "qa", &attempt, "S_dev", &candidate)?;
+    let report_sha256 = intake.report_artifact.sha256.clone();
+    let state = store.record_report(intake).await?;
+    let reports = rows(
+        &db,
+        "SELECT report_id, role, session_id, status, state, reject_reason FROM independent_reports",
+    )?;
+    let rejections: Vec<Value> = rows(
+        &db,
+        "SELECT payload_json FROM events WHERE kind = 'report.rejected' ORDER BY seq",
+    )?
+    .iter()
+    .map(|r| serde_json::from_str(r["payload_json"].as_str().unwrap_or("null")))
+    .collect::<Result<_, _>>()?;
+    let observed = json!({
+        "candidate_id": candidate, "report": {"text": text, "sha256": report_sha256},
+        "state": state.state.as_str(), "reasons": state.reasons, "independent_reports": reports,
+        "report.rejected": rejections,
+        "qa_binding": rows(&db, "SELECT state, blocked_reason, missing_json FROM role_bindings WHERE role = 'qa'")?,
+        "acceptance_results": rows(&db, "SELECT * FROM acceptance_results")?,
+        "candidates": rows(&db, "SELECT candidate_id, state FROM candidates")?,
+    });
+    println!("{observed}");
+    keep("test-020-04.json", &observed)?;
+    let mismatch =
+        "SESSION_ROLE_MISMATCH: session conflict: session S_dev is a developer's, not a qa's";
+    assert_eq!(state.state, ReportState::Rejected, "{state:?}");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["state"], "REJECTED");
+    assert!(
+        reports[0]["reject_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains(mismatch)),
+        "{reports:?}"
+    );
+    assert_eq!(rejections.len(), 1);
+    assert!(
+        rejections[0]["reasons"].as_array().is_some_and(|r| r
+            .iter()
+            .any(|r| r.as_str().is_some_and(|r| r.contains(mismatch)))),
+        "{rejections:?}"
+    );
+    assert_eq!(rows(&db, acceptance)?, before);
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM acceptance_results WHERE candidate_id = '{candidate}' AND status = 'PASS'"
+            ),
+        )?,
+        [json!({"n": 0})]
+    );
+    assert_ne!(
+        rows(
+            &db,
+            &format!("SELECT state FROM candidates WHERE candidate_id = '{candidate}'")
+        )?,
+        [json!({"state": "ACCEPTED"})]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, blocked_reason FROM role_bindings WHERE role = 'qa'"
+        )?,
+        [json!({"state": "BLOCKED", "blocked_reason": "BLOCKED_AUTH"})]
+    );
     Ok(())
 }

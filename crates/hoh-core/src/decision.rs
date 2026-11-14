@@ -153,6 +153,9 @@ pub struct Context {
     /// The registry's last actual look at each agent it looked at (docs/adr/ADR-025.md decision 5); `None`: the caller
     /// gives none (a run's Commander is then judged without them).
     pub observations: Option<BTreeMap<String, Observation>>,
+    /// The registry's one snapshot of the tick (docs/adr/ADR-030.md decision 1): what the pace judges whether a vacant
+    /// role's tasks are dispatchable again by (decision 7); `None`: a host without a registry.
+    pub staffing: Option<std::sync::Arc<crate::staffing::Snapshot>>,
     /// Where Commander sessions get their own working directories, outside every project
     /// (`$XDG_STATE_HOME/hoh/commander`; docs/adr/ADR-025.md decision 3); `None`: none recorded.
     pub commander_dir: Option<std::path::PathBuf>,

@@ -11,8 +11,10 @@ use super::writer::{self, Commit, Ctx, NewEvent, NewOutbox};
 use super::{PersistError, sqlite_error};
 use crate::ids::{child_id, member, series};
 use crate::protocol::BlockedReason;
+use crate::retry::FailureClass;
 use crate::staffing::{
-    AgentIdentity, BindingState, Cause, Excluded, PendingChange, Session, Staffed,
+    AgentIdentity, BindingState, Cause, Excluded, Exclusion as Excludes, PendingChange, Session,
+    Staffed,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -30,6 +32,10 @@ pub const CHANGE_WITHDRAWN: &str = "team.binding_change_withdrawn";
 pub const BINDING_FALLBACK: &str = "team.binding_fallback";
 /// A turn's failure excluded an agent's version and identity from a role (decision 6; written by the settle).
 pub const BINDING_EXCLUDED: &str = "team.binding_excluded";
+/// A turn's Capability or Model failure excluded nothing: its session has no identity (decision 6, M2T15D-103).
+pub const EXCLUSION_SKIPPED: &str = "team.exclusion_skipped";
+/// A task of a vacant role back to READY (decision 7).
+pub const TASK_UNBLOCKED: &str = "task.unblocked";
 
 /// The evidence object of a Block or a Switch (decision 5): what the host wrote with `objects::put` before, by its
 /// digest and size; the transaction registers it as an artifact and the events name it.
@@ -609,6 +615,248 @@ pub(super) fn staff(
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)?;
     Ok(true)
+}
+
+/// What a settle reads of a failed attempt: its task's role, its epoch, agent and session, and its configuration
+/// revision.
+struct TurnRow {
+    role: String,
+    role_epoch: i64,
+    agent: Option<String>,
+    session_id: Option<String>,
+    config_revision: i64,
+}
+
+/// What a turn's failure of `class` writes for its binding (decision 6), in the transaction that settles its attempt
+/// `attempt_id` of task `task_id` (the runner's settle or a reconcile, the same input: both read it here). For the
+/// Auth, Capability and Model classes, a supervision turn's too (M2T15D-05): the binding of the task's role at the
+/// attempt's epoch to the attempt's agent BLOCKED for the class's reason, missing `["<agent>:<CODE>"]`, and its
+/// `team.binding_blocked{cause: "turn", attempt_id}` in the epoch's staffing series (on entering BLOCKED or when its
+/// reason or missing changes); a binding that is no longer that one is left alone. Capability and Model also write
+/// the exclusion record `team.binding_excluded`, its version and identity the attempt's session's (`sessions` and its
+/// `team.session_bound`, never the runner's memory, M2T15D-103), once per attempt; a session without an identity writes
+/// `team.exclusion_skipped` instead. The binding's columns are written here; the events are for the caller's commit.
+pub(super) fn turn_failed(
+    tx: &Connection,
+    project_id: &str,
+    run_id: &str,
+    attempt_id: &str,
+    class: FailureClass,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let (reason, excludes) = match class {
+        FailureClass::Auth => (BlockedReason::BlockedAuth, None),
+        FailureClass::Capability => (
+            BlockedReason::BlockedCapability,
+            Some(Excludes::BlockedCapability),
+        ),
+        FailureClass::Model => (
+            BlockedReason::ModelUnavailable,
+            Some(Excludes::ModelUnavailable),
+        ),
+        _ => return Ok(Vec::new()),
+    };
+    let attempt: Option<TurnRow> = tx
+        .query_row(
+            "SELECT t.role, a.role_epoch, a.agent, a.session_id, a.config_revision FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE a.attempt_id = ?1",
+            params![attempt_id],
+            |r| {
+                Ok(TurnRow {
+                    role: r.get(0)?,
+                    role_epoch: r.get(1)?,
+                    agent: r.get(2)?,
+                    session_id: r.get(3)?,
+                    config_revision: r.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(TurnRow {
+        role,
+        role_epoch,
+        agent: Some(agent),
+        session_id,
+        config_revision,
+    }) = attempt
+    else {
+        return Ok(Vec::new());
+    };
+    let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        project_id: project_id.to_owned(),
+        event_id,
+        run_id: Some(run_id.to_owned()),
+        kind: kind.to_owned(),
+        payload,
+    };
+    let mut events = Vec::new();
+    let missing = vec![format!("{agent}:{}", reason.as_str())];
+    let bound: Option<(String, Option<String>, String)> = tx
+        .query_row(
+            "SELECT state, blocked_reason, missing_json FROM role_bindings \
+             WHERE run_id = ?1 AND role = ?2 AND role_epoch = ?3 AND agent = ?4",
+            params![run_id, role, role_epoch, agent],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some((state, blocked, held)) = bound {
+        let blocked = (state == "BLOCKED").then_some(blocked).flatten();
+        let held: Vec<String> = serde_json::from_str(&held).unwrap_or_default();
+        if blocked.as_deref() != Some(reason.as_str()) || held != missing {
+            tx.execute(
+                "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = ?5, missing_json = ?6 \
+                 WHERE run_id = ?1 AND role = ?2 AND role_epoch = ?3 AND agent = ?4",
+                params![
+                    run_id,
+                    role,
+                    role_epoch,
+                    agent,
+                    reason.as_str(),
+                    json!(missing).to_string()
+                ],
+            )
+            .map_err(sqlite_error)?;
+            let stem = stem(run_id, &role, role_epoch);
+            let n = super::series::count(tx, &stem)? + 1;
+            events.push(event(
+                member(&stem, n),
+                BINDING_BLOCKED,
+                json!({"run_id": run_id, "role": role, "role_epoch": role_epoch, "agent": agent,
+                       "reason": reason.as_str(), "missing": missing, "evaluated": missing, "cause": "turn",
+                       "attempt_id": attempt_id}),
+            ));
+        }
+    }
+    let Some(excludes) = excludes else {
+        return Ok(events);
+    };
+    let exists = |id: &str| -> Result<bool, PersistError> {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)
+    };
+    let (excluded, skipped) = (
+        child_id(attempt_id, "excluded"),
+        child_id(attempt_id, "exclusion_skipped"),
+    );
+    if exists(&excluded)? || exists(&skipped)? {
+        return Ok(events);
+    }
+    let session = match &session_id {
+        Some(id) => {
+            let version: Option<String> = tx
+                .query_row(
+                    "SELECT agent_version FROM sessions WHERE session_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            version.zip(super::team::session_identity(tx, id)?)
+        }
+        None => None,
+    };
+    events.push(match session {
+        Some((agent_version, identity)) => event(
+            excluded,
+            BINDING_EXCLUDED,
+            json!({"run_id": run_id, "role": role, "config_revision": config_revision, "agent": agent,
+                   "agent_version": agent_version, "identity": identity, "reason": excludes,
+                   "attempt_id": attempt_id}),
+        ),
+        None => event(
+            skipped,
+            EXCLUSION_SKIPPED,
+            json!({"attempt_id": attempt_id, "session_id": session_id,
+                   "reason": "the session has no identity"}),
+        ),
+    });
+    Ok(events)
+}
+
+/// The reason and missing lines of run `run_id`'s binding of `role` while it is BLOCKED for a reason of the vacancy set
+/// V (decision 7); none otherwise.
+pub(super) fn vacancy(
+    tx: &Connection,
+    run_id: &str,
+    role: &str,
+) -> Result<Option<(BlockedReason, Vec<String>)>, PersistError> {
+    let row: Option<(Option<String>, String)> = tx
+        .query_row(
+            "SELECT blocked_reason, missing_json FROM role_bindings \
+             WHERE run_id = ?1 AND role = ?2 AND state = 'BLOCKED'",
+            params![run_id, role],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(row.and_then(|(reason, missing)| {
+        let reason = reason
+            .as_deref()
+            .and_then(BlockedReason::parse)
+            .filter(|r| crate::staffing::VACANCY.contains(r))?;
+        Some((reason, serde_json::from_str(&missing).unwrap_or_default()))
+    }))
+}
+
+/// Whether a task of run `run_id`'s `role` blocked for `reason` (of V) is dispatchable again (decision 7): the binding
+/// active as `decide::load_binding` says (ACTIVE, its session, nothing pending, its first input delivered), its session
+/// granting what the role requires, and, with the tick's snapshot, the bound agent's fact usable and verified with the
+/// session fresh for it (an agent the snapshot lacks is not verified, M2T15D-51); without one (a host with no
+/// registry, and so no gate), never for COMPAT_UNVERIFIED. The binding's epoch when it is.
+pub(super) fn dispatchable(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    role: &str,
+    context: &crate::decision::Context,
+    reason: BlockedReason,
+) -> Result<Option<i64>, PersistError> {
+    use crate::staffing::{Compat, Fact};
+    let Some(binding) = super::decide::load_binding(tx, run_id, role)? else {
+        return Ok(None);
+    };
+    if !binding.active
+        || context
+            .required_capabilities
+            .get(role)
+            .is_some_and(|required| !required.is_subset(&binding.capabilities))
+    {
+        return Ok(None);
+    }
+    let epoch = i64::try_from(binding.role_epoch).map_err(|_| {
+        PersistError::IntegrityViolation(format!("role epoch {}", binding.role_epoch))
+    })?;
+    let Some(snapshot) = &context.staffing else {
+        return Ok((reason != BlockedReason::CompatUnverified).then_some(epoch));
+    };
+    let bound: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT b.agent, b.session_id, s.agent_version, s.capabilities_json FROM role_bindings b \
+             JOIN sessions s ON s.session_id = b.session_id WHERE b.run_id = ?1 AND b.role = ?2",
+            params![run_id, role],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((agent, session_id, agent_version, capabilities)) = bound else {
+        return Ok(None);
+    };
+    let Some(fact @ Fact::Usable(usable)) = snapshot.facts.get(&agent) else {
+        return Ok(None);
+    };
+    let session = Session {
+        agent_version,
+        capabilities: serde_json::from_str(&capabilities).unwrap_or(Value::Null),
+        identity: super::team::session_identity(tx, &session_id)?,
+    };
+    Ok(
+        (usable.compat == Compat::Verified && crate::staffing::fresh(&session, fact))
+            .then_some(epoch),
+    )
 }
 
 /// The binding as `team.binding_applied` records it on either side of a change.

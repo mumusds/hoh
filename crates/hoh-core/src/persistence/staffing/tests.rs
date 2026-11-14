@@ -1321,3 +1321,1310 @@ async fn an_assignment_carries_its_sessions_capabilities_and_identity() -> R {
     );
     Ok(())
 }
+
+// ---- Turn failures (docs/adr/ADR-030.md decision 6, slice S4) ----
+
+use crate::decision::Context;
+use crate::persistence::Ending;
+use crate::retry::FailureClass;
+use crate::staffing::{Compat, Fact, Facts, FileStamp, Judgment, Snapshot, Stamp, Usable};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// The session capabilities every grant of these tests records.
+fn caps() -> Value {
+    json!({"structured_events": true, "resume": true})
+}
+
+/// A usable, verified fact of an agent at `version` with `identity` whose session would record [`caps`].
+fn usable(version: &str, identity: AgentIdentity) -> Fact {
+    let stamp = FileStamp {
+        dev: 1,
+        ino: 1,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+    };
+    Fact::Usable(Box::new(Usable {
+        version: version.to_owned(),
+        identity,
+        stamp: Stamp {
+            launcher: stamp,
+            implementation: stamp,
+        },
+        generation: (1, 1),
+        session: caps(),
+        granted: crate::decision::granted_capabilities(&caps()),
+        compat: Compat::Verified,
+    }))
+}
+
+fn facts(items: &[(&str, Fact)]) -> Facts {
+    items
+        .iter()
+        .map(|(agent, fact)| ((*agent).to_owned(), fact.clone()))
+        .collect()
+}
+
+/// The team at revision 1: the developer `agent` falling back to `fallback`; run R1 RUNNING under it on spec s1.
+async fn developer_team(store: &Store, path: &PathBuf, agent: &str, fallback: &[&str]) -> R {
+    store
+        .submit_command(team_change(
+            "developer",
+            0,
+            json!({"developer": {"agent": agent, "fallback": fallback}}),
+        ))
+        .await?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
+    )
+}
+
+/// Task `task` of `role` RUNNING with attempt `attempt` RUNNING in `session` of `agent` at `epoch` (revision 1).
+fn running(path: &PathBuf, task: &str, attempt: &str, role: &str, agent: &str, epoch: i64) -> R {
+    let session = crate::persistence::session_id("R1", role, epoch);
+    exec(
+        path,
+        &format!(
+            "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+               ('{task}', 'R1', 's1', 'RUNNING', 2, '{role}', 0, (SELECT count(*) + 1 FROM tasks), 1);
+             INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision, agent,
+               started_at) VALUES ('{attempt}', '{task}', '{session}', 'RUNNING', {epoch}, 1, 1, '{agent}',
+               '2026-11-14T00:00:00Z');"
+        ),
+    )
+}
+
+/// A failed ending of `class` at `at`.
+fn failed(class: FailureClass, at: SystemTime) -> Ending {
+    Ending {
+        success: false,
+        detail: format!("{class:?}"),
+        class,
+        at,
+        draw: 0,
+        observed: crate::persistence::Observed::default(),
+        unknown_effect: false,
+    }
+}
+
+fn t0() -> R<SystemTime> {
+    crate::time::parse_rfc3339("2026-11-14T00:00:00Z").ok_or_else(|| "a time".into())
+}
+
+/// What `judgment` of `staffed` under `facts` writes, as the host's staffing writes it (docs/adr/ADR-030.md decision
+/// 5; `host::agents::staff`): the evidence object is the store test's own.
+fn write_of(staffed: &Staffed, judgment: Judgment, facts: &Facts, n: u8) -> Option<StaffWrite> {
+    Some(match judgment {
+        Judgment::Nothing => return None,
+        Judgment::Grant => match facts.get(&staffed.agent) {
+            Some(Fact::Usable(u)) => StaffWrite::Grant {
+                agent_version: u.version.clone(),
+                capabilities: u.session.clone(),
+                identity: u.identity.clone(),
+            },
+            _ => return None,
+        },
+        Judgment::Unblock => StaffWrite::Unblock,
+        Judgment::Rebind { .. } => StaffWrite::Rebind,
+        Judgment::Block { reason, missing } => StaffWrite::Block {
+            reason,
+            missing,
+            evidence: evidence(n),
+        },
+        Judgment::Switch {
+            to,
+            model,
+            evaluated,
+        } => {
+            let v = crate::staffing::verdict(
+                &staffed.agent,
+                &staffed.required,
+                facts,
+                &staffed.excluded,
+            );
+            StaffWrite::Switch {
+                to,
+                model,
+                reason: v.reason()?,
+                line: v.line(&staffed.agent),
+                evaluated,
+                evidence: evidence(n),
+            }
+        }
+    })
+}
+
+/// Staffing's judgment of run R1's `role` under `facts`, written: the judgment, and whether anything was written.
+async fn judge_and_write(store: &Store, role: &str, facts: &Facts, n: u8) -> R<(Judgment, bool)> {
+    let staffed = staffed(store, role).await?;
+    let judgment = crate::staffing::judge(&staffed, facts, &staffed.excluded);
+    let wrote = match write_of(&staffed, judgment.clone(), facts, n) {
+        Some(write) => {
+            store
+                .staff(change(
+                    "R1",
+                    role,
+                    staffed.role_epoch,
+                    &staffed.agent,
+                    write,
+                ))
+                .await?
+        }
+        None => false,
+    };
+    Ok((judgment, wrote))
+}
+
+/// The developer's context of these tests at `now`: what its role requires, and the tick's snapshot `snapshot`.
+fn developer_context(now: SystemTime, snapshot: Option<Snapshot>) -> Context {
+    Context {
+        required_capabilities: [(
+            "developer".to_owned(),
+            ["structured_events".to_owned()].into_iter().collect(),
+        )]
+        .into(),
+        now: Some(now),
+        staffing: snapshot.map(Arc::new),
+        ..Context::default()
+    }
+}
+
+fn snapshot(facts: Facts) -> Snapshot {
+    Snapshot {
+        facts,
+        ..Snapshot::default()
+    }
+}
+
+/// Dispatch run R1's due tasks at `now` (the pace, then the rounds), each attempt taken by the runner (STARTING); the
+/// attempts dispatched with their agents.
+async fn dispatch(store: &Store, context: Context) -> R<Vec<(String, Option<String>)>> {
+    store.pace_run("R1", context.clone()).await?;
+    let mut dispatched = Vec::new();
+    while let Some(d) = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+    {
+        let notice = store
+            .runner_waiting("p1")
+            .await?
+            .dispatches
+            .into_iter()
+            .find(|n| n.attempt_id == d.attempt_id)
+            .ok_or("no dispatch notice")?;
+        let agent = notice.assignment.agent.clone();
+        assert!(store.runner_received(notice, context.now()).await?);
+        dispatched.push((d.attempt_id, agent));
+    }
+    Ok(dispatched)
+}
+
+/// Save `value` as `name` in the check's evidence directory, when there is one.
+fn keep(name: &str, value: &Value) -> R {
+    if let Some(dir) = std::env::var_os("HOH_EVIDENCE_DIR") {
+        std::fs::write(
+            std::path::Path::new(&dir).join(name),
+            serde_json::to_vec_pretty(value)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_020_05_a_503_waits_and_a_lost_login_falls_back_to_codex() -> R {
+    // AC-020-05 (decision 6, REQ-020 behaviour 7): two stores, a FakeClock from t0. (a) A 503 with Retry-After 30 s
+    // waits (READY at t0+30 s, the run WAITING_EXTERNAL) and staffing changes nothing under a snapshot with both agents
+    // usable and verified: codex is chosen 0 times. (b) A turn's BLOCKED_AUTH blocks the task at once (no retry) and
+    // the binding (cause turn); under a snapshot where claude's login is missing, staffing falls back to codex (epoch
+    // 2, model NULL, evaluated [claude:BLOCKED_AUTH, codex:usable]); once codex has its session and its first input, the
+    // pace puts the task back READY and a round dispatches it to codex.
+    let t0 = t0()?;
+    let mut kept = serde_json::Map::new();
+    for part in ["a", "b"] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        developer_team(&store, &path, "claude", &["codex"]).await?;
+        assert!(
+            store
+                .staff(change(
+                    "R1",
+                    "developer",
+                    1,
+                    "claude",
+                    StaffWrite::Grant {
+                        agent_version: "2.1.318".to_owned(),
+                        capabilities: caps(),
+                        identity: identity("claude"),
+                    }
+                ))
+                .await?
+        );
+        exec(
+            &path,
+            "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+             VALUES ('T1', 'R1', 's1', 'READY', 1, 'developer', 0, 1, 1);",
+        )?;
+        let both = facts(&[
+            ("claude", usable("2.1.318", identity("claude"))),
+            ("codex", usable("codex-cli 0.166.0", identity("codex"))),
+        ]);
+        let dispatched =
+            dispatch(&store, developer_context(t0, Some(snapshot(both.clone())))).await?;
+        let [(attempt, agent)] = dispatched.as_slice() else {
+            return Err(format!("{part}: dispatched {dispatched:?}").into());
+        };
+        assert_eq!(agent.as_deref(), Some("claude"));
+        if part == "a" {
+            let class = FailureClass::Transient {
+                retry_after: Some(Duration::from_secs(30)),
+            };
+            assert!(store.runner_finished(attempt, failed(class, t0)).await?);
+            assert_eq!(
+                value(
+                    &path,
+                    "SELECT state || ' ' || next_retry_at FROM tasks WHERE task_id = 'T1'"
+                )?,
+                json!("READY 2026-11-14T00:00:30Z")
+            );
+            store
+                .pace_run("R1", developer_context(t0, Some(snapshot(both.clone()))))
+                .await?;
+            assert_eq!(
+                value(&path, "SELECT state FROM runs WHERE run_id = 'R1'")?,
+                json!("WAITING_EXTERNAL")
+            );
+            let (judgment, wrote) = judge_and_write(&store, "developer", &both, 1).await?;
+            assert_eq!((judgment, wrote), (Judgment::Nothing, false));
+            assert!(events(&path, "R1", &["team.binding_fallback"])?.is_empty());
+            assert_eq!(
+                value(&path, "SELECT count(*) FROM attempts WHERE agent = 'codex'")?,
+                json!(0),
+                "codex chosen"
+            );
+            kept.insert(
+                "a".to_owned(),
+                json!({
+                    "retry": events(&path, "R1", &["task.retry_scheduled"])?.pop().map(|e| e.2),
+                    "binding": binding(&path, "R1", "developer")?,
+                    "staffing_events": events(&path, "R1", &STAFFING)?.len(),
+                }),
+            );
+            continue;
+        }
+        assert!(
+            store
+                .runner_finished(attempt, failed(FailureClass::Auth, t0))
+                .await?
+        );
+        assert_eq!(
+            values(
+                &path,
+                "SELECT state, blocked_reason, next_retry_at FROM tasks WHERE task_id = 'T1'"
+            )?,
+            [vec![json!("BLOCKED"), json!("BLOCKED_AUTH"), Value::Null]]
+        );
+        assert!(events(&path, "R1", &["task.retry_scheduled"])?.is_empty());
+        assert_eq!(
+            binding(&path, "R1", "developer")?[2..8],
+            [
+                json!(1),
+                json!(1),
+                json!(crate::persistence::session_id("R1", "developer", 1)),
+                json!("BLOCKED"),
+                json!("BLOCKED_AUTH"),
+                json!("[\"claude:BLOCKED_AUTH\"]")
+            ]
+        );
+        let blocked = events(&path, "R1", &["team.binding_blocked"])?;
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].0,
+            crate::ids::member(&crate::ids::series("R1", "staffing/developer/1"), 1)
+        );
+        assert_eq!(
+            blocked[0].2,
+            json!({"run_id": "R1", "role": "developer", "role_epoch": 1, "agent": "claude",
+                   "reason": "BLOCKED_AUTH", "missing": ["claude:BLOCKED_AUTH"],
+                   "evaluated": ["claude:BLOCKED_AUTH"], "cause": "turn", "attempt_id": attempt})
+        );
+        let lost = facts(&[
+            (
+                "claude",
+                Fact::LoginMissing(format!("turn {attempt} failed BLOCKED_AUTH")),
+            ),
+            ("codex", usable("codex-cli 0.166.0", identity("codex"))),
+        ]);
+        let (judgment, wrote) = judge_and_write(&store, "developer", &lost, 2).await?;
+        assert!(wrote);
+        assert_eq!(
+            judgment,
+            Judgment::Switch {
+                to: "codex".to_owned(),
+                model: None,
+                evaluated: vec!["claude:BLOCKED_AUTH".to_owned(), "codex:usable".to_owned()],
+            }
+        );
+        assert_eq!(
+            binding(&path, "R1", "developer")?[0..3],
+            [json!("codex"), Value::Null, json!(2)]
+        );
+        let fallback = events(&path, "R1", &["team.binding_fallback"])?;
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(
+            (
+                fallback[0].2["evaluated"].clone(),
+                fallback[0].2["chosen"].clone()
+            ),
+            (
+                json!(["claude:BLOCKED_AUTH", "codex:usable"]),
+                json!("codex")
+            )
+        );
+        // Grant, then the first input delivered: the pace puts T1 back READY, a round dispatches it to codex.
+        let (judgment, wrote) = judge_and_write(&store, "developer", &lost, 3).await?;
+        assert_eq!((judgment, wrote), (Judgment::Grant, true));
+        let session = crate::persistence::session_id("R1", "developer", 2);
+        let starts = store.session_starts("p1").await?;
+        let start = starts
+            .iter()
+            .find(|s| s.role == "developer" && s.role_epoch == 2)
+            .ok_or("no session.start of epoch 2")?;
+        assert!(
+            store
+                .deliver_session_start(&start.message_id, &session)
+                .await?
+        );
+        let later = t0 + Duration::from_secs(1);
+        let dispatched = dispatch(
+            &store,
+            developer_context(later, Some(snapshot(lost.clone()))),
+        )
+        .await?;
+        assert_eq!(
+            events(&path, "R1", &["task.unblocked"])?
+                .iter()
+                .map(|e| e.2.clone())
+                .collect::<Vec<_>>(),
+            [
+                json!({"task_id": "T1", "reason": "BLOCKED_AUTH", "role": "developer", "role_epoch": 2})
+            ]
+        );
+        let [(second, agent)] = dispatched.as_slice() else {
+            return Err(format!("dispatched {dispatched:?}").into());
+        };
+        assert_eq!(agent.as_deref(), Some("codex"));
+        assert_eq!(
+            value(
+                &path,
+                &format!("SELECT session_id FROM attempts WHERE attempt_id = '{second}'")
+            )?,
+            json!(session)
+        );
+        kept.insert(
+            "b".to_owned(),
+            json!({
+                "selection": fallback[0].2,
+                "task": values(&path, "SELECT state, blocked_reason, attempt_count, next_retry_at FROM tasks")?,
+                "events": events(&path, "R1", &["task.blocked", "team.binding_blocked", "team.binding_fallback",
+                    "team.binding_applied", "team.session_bound", "task.unblocked"])?
+                    .into_iter().map(|e| json!([e.0, e.1, e.2])).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    keep("test_020_05.json", &Value::Object(kept))
+}
+
+#[tokio::test]
+async fn two_candidates_excluded_by_model_failures_switch_twice_then_block() -> R {
+    // Decision 6 (K5): each switch needs a failed turn first; the developer claude falling back to codex then pi, each
+    // agent's turn failing MODEL_UNAVAILABLE: two switches, then BLOCKED(MODEL_UNAVAILABLE) with every agent's line,
+    // and no further switch however often it is judged again.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    developer_team(&store, &path, "claude", &["codex", "pi"]).await?;
+    let all = facts(&[
+        ("claude", usable("2.1.318", identity("claude"))),
+        ("codex", usable("codex-cli 0.166.0", identity("codex"))),
+        ("pi", usable("1.5.0", identity("pi"))),
+    ]);
+    let t0 = t0()?;
+    for (n, agent) in ["claude", "codex", "pi"].into_iter().enumerate() {
+        let epoch = i64::try_from(n)? + 1;
+        let (judgment, wrote) = judge_and_write(&store, "developer", &all, 10).await?;
+        assert_eq!((judgment, wrote), (Judgment::Grant, true), "{agent}");
+        let (task, attempt) = (format!("T{n}"), format!("A{n}"));
+        running(&path, &task, &attempt, "developer", agent, epoch)?;
+        assert!(
+            store
+                .runner_finished(&attempt, failed(FailureClass::Model, t0))
+                .await?
+        );
+        assert_eq!(
+            binding(&path, "R1", "developer")?[5..8],
+            [
+                json!("BLOCKED"),
+                json!("MODEL_UNAVAILABLE"),
+                json!(format!("[\"{agent}:MODEL_UNAVAILABLE\"]"))
+            ],
+            "{agent}"
+        );
+        let (judgment, _) = judge_and_write(&store, "developer", &all, 11).await?;
+        match agent {
+            "claude" => {
+                assert!(matches!(judgment, Judgment::Switch { ref to, .. } if to == "codex"))
+            }
+            "codex" => assert!(matches!(judgment, Judgment::Switch { ref to, .. } if to == "pi")),
+            _ => assert_eq!(
+                judgment,
+                Judgment::Block {
+                    reason: BlockedReason::ModelUnavailable,
+                    missing: vec![
+                        "claude:MODEL_UNAVAILABLE".to_owned(),
+                        "codex:MODEL_UNAVAILABLE".to_owned(),
+                        "pi:MODEL_UNAVAILABLE".to_owned()
+                    ],
+                }
+            ),
+        }
+    }
+    assert_eq!(events(&path, "R1", &["team.binding_fallback"])?.len(), 2);
+    assert_eq!(
+        binding(&path, "R1", "developer")?[..8],
+        [
+            json!("pi"),
+            Value::Null,
+            json!(3),
+            json!(1),
+            json!(crate::persistence::session_id("R1", "developer", 3)),
+            json!("BLOCKED"),
+            json!("MODEL_UNAVAILABLE"),
+            json!(
+                "[\"claude:MODEL_UNAVAILABLE\",\"codex:MODEL_UNAVAILABLE\",\"pi:MODEL_UNAVAILABLE\"]"
+            )
+        ]
+    );
+    for n in 0..3 {
+        let (_, wrote) = judge_and_write(&store, "developer", &all, 20 + n).await?;
+        assert!(!wrote, "judged again {n}");
+    }
+    assert_eq!(events(&path, "R1", &["team.binding_fallback"])?.len(), 2);
+    assert_eq!(events(&path, "R1", &["team.binding_excluded"])?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_exclusion_does_not_apply_to_an_identity_of_the_same_version_and_another_hash() -> R {
+    // Decision 6 (K8): an exclusion record applies only to its version and whole identity; claude at the same version
+    // with another implementation hash is usable: its binding is rebound (its session was another identity's), not
+    // switched.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    developer_team(&store, &path, "claude", &["codex"]).await?;
+    let first = facts(&[
+        ("claude", usable("2.1.318", identity("claude"))),
+        ("codex", usable("codex-cli 0.166.0", identity("codex"))),
+    ]);
+    judge_and_write(&store, "developer", &first, 1).await?;
+    running(&path, "T0", "A0", "developer", "claude", 1)?;
+    assert!(
+        store
+            .runner_finished("A0", failed(FailureClass::Capability, t0()?))
+            .await?
+    );
+    let excluded = events(&path, "R1", &["team.binding_excluded"])?;
+    assert_eq!(excluded.len(), 1);
+    assert_eq!(excluded[0].2["reason"], json!("BLOCKED_CAPABILITY"));
+    let rebuilt = AgentIdentity {
+        implementation_sha256: "3".repeat(64),
+        ..identity("claude")
+    };
+    let second = facts(&[
+        ("claude", usable("2.1.318", rebuilt.clone())),
+        ("codex", usable("codex-cli 0.166.0", identity("codex"))),
+    ]);
+    let staffed = staffed(&store, "developer").await?;
+    assert_eq!(staffed.excluded.len(), 1);
+    assert_eq!(
+        crate::staffing::verdict("claude", &staffed.required, &second, &staffed.excluded),
+        crate::staffing::Verdict::Usable
+    );
+    assert_eq!(
+        crate::staffing::verdict("claude", &staffed.required, &first, &staffed.excluded),
+        crate::staffing::Verdict::Excluded(crate::staffing::Exclusion::BlockedCapability)
+    );
+    let (judgment, wrote) = judge_and_write(&store, "developer", &second, 2).await?;
+    assert_eq!((judgment, wrote), (Judgment::Rebind { model: None }, true));
+    assert_eq!(
+        binding(&path, "R1", "developer")?[0..3],
+        [json!("claude"), Value::Null, json!(2)]
+    );
+    assert!(events(&path, "R1", &["team.binding_fallback"])?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_supervisor_attempts_capability_or_model_failure_blocks_the_commander_and_is_excluded()
+-> R {
+    // M2T15D-05 (decision 6): a supervision turn's Capability or Model failure blocks the commander binding (cause
+    // turn) and writes its exclusion record in the transaction that cancels the supervision task and records
+    // supervisor.turn_failed.
+    for (class, reason) in [
+        (FailureClass::Model, "MODEL_UNAVAILABLE"),
+        (FailureClass::Capability, "BLOCKED_CAPABILITY"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        store
+            .submit_command(team_change(
+                "commander",
+                0,
+                json!({"commander": {"agent": "pi", "fallback": ["claude"]}}),
+            ))
+            .await?;
+        store
+            .submit_command(start("R1", Config::default().budget))
+            .await?;
+        exec(
+            &path,
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+             UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
+        )?;
+        assert!(
+            store
+                .staff(change(
+                    "R1",
+                    "commander",
+                    1,
+                    "pi",
+                    StaffWrite::Grant {
+                        agent_version: "1.5.0".to_owned(),
+                        capabilities: caps(),
+                        identity: identity("pi"),
+                    }
+                ))
+                .await?
+        );
+        running(&path, "S1", "SA1", "commander", "pi", 1)?;
+        assert!(store.runner_finished("SA1", failed(class, t0()?)).await?);
+        assert_eq!(
+            value(&path, "SELECT state FROM tasks WHERE task_id = 'S1'")?,
+            json!("CANCELLED")
+        );
+        assert_eq!(events(&path, "R1", &["supervisor.turn_failed"])?.len(), 1);
+        assert_eq!(
+            binding(&path, "R1", "commander")?[5..8],
+            [
+                json!("BLOCKED"),
+                json!(reason),
+                json!(format!("[\"pi:{reason}\"]"))
+            ]
+        );
+        let blocked = events(&path, "R1", &["team.binding_blocked"])?;
+        assert_eq!(
+            (blocked.len(), blocked[0].2["cause"].clone()),
+            (1, json!("turn"))
+        );
+        let excluded = events(&path, "R1", &["team.binding_excluded"])?;
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].0, crate::ids::child_id("SA1", "excluded"));
+        assert_eq!(
+            excluded[0].2,
+            json!({"run_id": "R1", "role": "commander", "config_revision": 1, "agent": "pi",
+                   "agent_version": "1.5.0", "identity": identity("pi"), "reason": reason, "attempt_id": "SA1"})
+        );
+        // The commander's fallback is evaluated with it: staffing switches to claude.
+        let both = facts(&[
+            ("pi", usable("1.5.0", identity("pi"))),
+            ("claude", usable("2.1.318", identity("claude"))),
+        ]);
+        let (judgment, wrote) = judge_and_write(&store, "commander", &both, 1).await?;
+        assert!(wrote);
+        assert!(
+            matches!(judgment, Judgment::Switch { ref to, .. } if to == "claude"),
+            "{judgment:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Run R1's developer pi falling back to claude, its session granted under `identity` (none: a team.session_bound
+/// written before identities, M2T15D-103), attempt A1 of task T1 RUNNING with its work OBSERVED as failed by `class`.
+async fn observed_failure(
+    store: &Store,
+    path: &PathBuf,
+    identity: Option<AgentIdentity>,
+    class: FailureClass,
+) -> R {
+    developer_team(store, path, "pi", &["claude"]).await?;
+    assert!(
+        store
+            .staff(change(
+                "R1",
+                "developer",
+                1,
+                "pi",
+                StaffWrite::Grant {
+                    agent_version: "1.5.0".to_owned(),
+                    capabilities: caps(),
+                    identity: self::identity("pi"),
+                }
+            ))
+            .await?
+    );
+    if identity.is_none() {
+        exec(
+            path,
+            "UPDATE events SET payload_json = json_remove(payload_json, '$.identity') WHERE kind = 'team.session_bound';",
+        )?;
+    }
+    running(path, "T1", "A1", "developer", "pi", 1)?;
+    let key = crate::reconcile::work_key("A1");
+    let class = class.to_json();
+    exec(
+        path,
+        &format!(
+            "INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'OBSERVED');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', '{key}/effect.observed', 'R1', 'effect.observed',
+                json_object('effect_key', '{key}', 'detail', json_object('success', json('false'), 'detail',
+                  'Model not found', 'class', '{}', 'retry_after_ms', NULL, 'ended_at', '2026-11-14T00:00:05Z')),
+                '2026-11-14T00:00:05Z');",
+            class["class"].as_str().unwrap_or_default()
+        ),
+    )
+}
+
+/// The reconcile of a new host (decision 6's crash recovery): A1's process gone, disposed of by its recorded class.
+async fn reconcile_a1(store: &Store) -> R<usize> {
+    use crate::reconcile::{Effect, Process, Unfinished, dispose};
+    let at = t0()? + Duration::from_secs(60);
+    let rows = store.reconcile_scan("p1", at).await?;
+    for row in &rows {
+        let process = Process::Gone {
+            basis: "no_process".to_owned(),
+        };
+        let disposition = dispose(&Unfinished {
+            attempt_id: row.attempt_id.clone(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects: row
+                .effects
+                .iter()
+                .map(|e| Effect {
+                    key: e.key.clone(),
+                    state: e.state,
+                    observation: None,
+                })
+                .collect(),
+            lease_expired: row.lease_expired,
+            work_outcome: row.work_outcome,
+            writer: row.writer,
+            verifier: row.verifier,
+        });
+        store
+            .reconcile_apply(row.clone(), disposition, process, "reconcile", at, 0)
+            .await?;
+    }
+    Ok(rows.len())
+}
+
+/// Every event's id, kind and payload text of run R1, in seq order.
+fn all_events(path: &PathBuf) -> R<Vec<Vec<Value>>> {
+    values(
+        path,
+        "SELECT event_id, kind, payload_json FROM events WHERE run_id = 'R1' ORDER BY seq",
+    )
+}
+
+#[tokio::test]
+async fn a_failure_recovered_after_observed_is_excluded_like_a_settled_one() -> R {
+    // M2T15D-103 (decision 6, K8): the same prefix in two stores, A1's Model failure OBSERVED. Store 1 is recovered by
+    // a new host's reconcile (fail_task with the recorded class), store 2 settled by its own host (runner_finished):
+    // both block the binding (cause turn) and write the same exclusion record, byte for byte, its version and identity
+    // the session's; under the same snapshot both switch to claude once. A second reconcile of store 1 writes nothing.
+    let mut stores = Vec::new();
+    for recovered in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        observed_failure(&store, &path, Some(identity("pi")), FailureClass::Model).await?;
+        if recovered {
+            assert_eq!(reconcile_a1(&store).await?, 1);
+        } else {
+            assert!(
+                store
+                    .runner_finished(
+                        "A1",
+                        failed(FailureClass::Model, t0()? + Duration::from_secs(5))
+                    )
+                    .await?
+            );
+        }
+        assert_eq!(
+            binding(&path, "R1", "developer")?[5..8],
+            [
+                json!("BLOCKED"),
+                json!("MODEL_UNAVAILABLE"),
+                json!("[\"pi:MODEL_UNAVAILABLE\"]")
+            ]
+        );
+        assert_eq!(
+            events(&path, "R1", &["team.binding_blocked"])?[0].2["cause"],
+            json!("turn")
+        );
+        let excluded = values(
+            &path,
+            "SELECT event_id, payload_json FROM events WHERE kind = 'team.binding_excluded'",
+        )?;
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(
+            excluded[0][0],
+            json!(crate::ids::child_id("A1", "excluded"))
+        );
+        let payload: Value = serde_json::from_str(excluded[0][1].as_str().ok_or("text")?)?;
+        assert_eq!(
+            (
+                payload["agent_version"].clone(),
+                payload["identity"].clone()
+            ),
+            (json!("1.5.0"), serde_json::to_value(identity("pi"))?)
+        );
+        let both = facts(&[
+            ("pi", usable("1.5.0", identity("pi"))),
+            ("claude", usable("2.1.318", identity("claude"))),
+        ]);
+        let (judgment, wrote) = judge_and_write(&store, "developer", &both, 1).await?;
+        assert!(wrote);
+        assert!(matches!(judgment, Judgment::Switch { ref to, .. } if to == "claude"));
+        assert_eq!(
+            binding(&path, "R1", "developer")?[0..3],
+            [json!("claude"), Value::Null, json!(2)]
+        );
+        assert_eq!(events(&path, "R1", &["team.binding_fallback"])?.len(), 1);
+        stores.push((dir, store, path, excluded[0][1].clone()));
+    }
+    assert_eq!(stores[0].3, stores[1].3, "the two records differ");
+    let (_, store, path, _) = &stores[0];
+    let before = all_events(path)?;
+    assert_eq!(reconcile_a1(store).await?, 0, "a second reconcile found A1");
+    assert_eq!(all_events(path)?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_recovered_failure_of_a_session_without_identity_blocks_and_rebinds() -> R {
+    // M2T15D-103: a session granted before identities were recorded: the recovered Model failure blocks the binding,
+    // writes team.exclusion_skipped instead of an exclusion record; staffing then rebinds pi (its session stale), no
+    // fallback, and the new session carries its identity.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    observed_failure(&store, &path, None, FailureClass::Model).await?;
+    assert_eq!(reconcile_a1(&store).await?, 1);
+    assert_eq!(
+        binding(&path, "R1", "developer")?[5..7],
+        [json!("BLOCKED"), json!("MODEL_UNAVAILABLE")]
+    );
+    assert!(events(&path, "R1", &["team.binding_excluded"])?.is_empty());
+    let skipped = events(&path, "R1", &["team.exclusion_skipped"])?;
+    assert_eq!(
+        skipped
+            .iter()
+            .map(|e| (e.0.clone(), e.2.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            crate::ids::child_id("A1", "exclusion_skipped"),
+            json!({"attempt_id": "A1", "session_id": crate::persistence::session_id("R1", "developer", 1),
+                   "reason": "the session has no identity"})
+        )]
+    );
+    let both = facts(&[
+        ("pi", usable("1.5.0", identity("pi"))),
+        ("claude", usable("2.1.318", identity("claude"))),
+    ]);
+    let (judgment, wrote) = judge_and_write(&store, "developer", &both, 1).await?;
+    assert_eq!((judgment, wrote), (Judgment::Rebind { model: None }, true));
+    assert!(events(&path, "R1", &["team.binding_fallback"])?.is_empty());
+    let (judgment, wrote) = judge_and_write(&store, "developer", &both, 2).await?;
+    assert_eq!((judgment, wrote), (Judgment::Grant, true));
+    let bound = events(&path, "R1", &["team.session_bound"])?;
+    assert_eq!(
+        bound.last().map(|e| e.2["identity"].clone()),
+        Some(serde_json::to_value(identity("pi"))?)
+    );
+    Ok(())
+}
+
+// ---- A vacant role's tasks: marking and recovery in the pace (docs/adr/ADR-030.md decision 7, slice S5) ----
+
+/// The context of the pace and the rounds at `now`: every role of [`team_and_run`]'s team requiring structured events
+/// (the reviewer resume too), and the tick's snapshot `snapshot`.
+fn team_context(now: SystemTime, snapshot: Option<Snapshot>) -> Context {
+    let needs = |extra: &[&str]| {
+        std::iter::once("structured_events")
+            .chain(extra.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    Context {
+        required_capabilities: [
+            ("developer".to_owned(), needs(&[])),
+            ("qa".to_owned(), needs(&[])),
+            ("reviewer".to_owned(), needs(&["resume"])),
+        ]
+        .into(),
+        now: Some(now),
+        staffing: snapshot.map(Arc::new),
+        ..Context::default()
+    }
+}
+
+/// Task `task` of `role` in `state` (BLOCKED for `reason`, if any), never attempted.
+fn task(path: &PathBuf, task: &str, role: &str, state: &str, reason: Option<&str>) -> R {
+    let reason = reason.map_or("NULL".to_owned(), |r| format!("'{r}'"));
+    exec(
+        path,
+        &format!(
+            "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate, \
+               blocked_reason) VALUES ('{task}', 'R1', 's1', '{state}', 1, '{role}', 0, \
+               (SELECT count(*) + 1 FROM tasks), 1, {reason});"
+        ),
+    )
+}
+
+/// Task `task`'s state, blocked reason, attempt count and next retry, and its attempts.
+fn task_row(path: &PathBuf, task: &str) -> R<Vec<Value>> {
+    let mut row = values(
+        path,
+        &format!(
+            "SELECT state, blocked_reason, attempt_count, next_retry_at, \
+             (SELECT count(*) FROM attempts WHERE task_id = '{task}') FROM tasks WHERE task_id = '{task}'"
+        ),
+    )?;
+    row.pop().ok_or_else(|| format!("no task {task}").into())
+}
+
+#[tokio::test]
+async fn every_vacancy_reason_marks_a_due_task_and_recovers_it_once_dispatchable() -> R {
+    // Decision 7 (K4): for each reason of V, a due task of a role whose binding is BLOCKED for it is marked BLOCKED
+    // for it (task.blocked{cause: vacancy, missing}, R2's id), with no attempt, its attempt_count and next_retry_at
+    // untouched and cleared; the run, with nothing else to move on, is BLOCKED for it. Once the binding is ACTIVE with
+    // its session fresh and verified in the snapshot, the pace puts the task back READY (task.unblocked{task_id,
+    // reason, role, role_epoch}, blocked_reason and next_retry_at cleared before the CAS) and the run works again; a
+    // NEED_DECISION task beside it is never recovered.
+    let t0 = t0()?;
+    for reason in crate::staffing::VACANCY {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        team_and_run(&store, &path).await?;
+        store
+            .staff(change(
+                "R1",
+                "developer",
+                1,
+                "claude",
+                grant("2.1.318", "claude"),
+            ))
+            .await?;
+        let line = format!("claude:{}", reason.as_str());
+        store
+            .staff(change(
+                "R1",
+                "developer",
+                1,
+                "claude",
+                StaffWrite::Block {
+                    reason,
+                    missing: vec![line.clone()],
+                    evidence: evidence(1),
+                },
+            ))
+            .await?;
+        task(&path, "T1", "developer", "READY", None)?;
+        task(&path, "N1", "developer", "BLOCKED", Some("NEED_DECISION"))?;
+        exec(
+            &path,
+            "UPDATE tasks SET attempt_count = 2, next_retry_at = '2026-11-13T00:00:00Z' WHERE task_id = 'T1';",
+        )?;
+        let verified = facts(&[("claude", usable("2.1.318", identity("claude")))]);
+        let paced = store
+            .pace_run("R1", team_context(t0, Some(snapshot(verified.clone()))))
+            .await?;
+        assert_eq!(paced.vacant, ["T1"], "{reason:?}");
+        assert_eq!(
+            task_row(&path, "T1")?,
+            [
+                json!("BLOCKED"),
+                json!(reason.as_str()),
+                json!(2),
+                Value::Null,
+                json!(0)
+            ],
+            "{reason:?}"
+        );
+        let blocked = events(&path, "R1", &["task.blocked"])?;
+        assert_eq!(
+            blocked
+                .iter()
+                .map(|e| (e.0.clone(), e.2.clone()))
+                .collect::<Vec<_>>(),
+            [(
+                crate::ids::child_id("T1", "blocked/1"),
+                json!({"task_id": "T1", "reason": reason.as_str(), "missing": [line], "cause": "vacancy"})
+            )],
+            "{reason:?}"
+        );
+        assert_eq!(
+            value(&path, "SELECT state FROM runs WHERE run_id = 'R1'")?,
+            json!("BLOCKED"),
+            "{reason:?}"
+        );
+        // Still vacant: nothing is recovered.
+        let again = store
+            .pace_run("R1", team_context(t0, Some(snapshot(verified.clone()))))
+            .await?;
+        assert!(again.recovered.is_empty(), "{reason:?}");
+        assert!(
+            store
+                .staff(change("R1", "developer", 1, "claude", StaffWrite::Unblock))
+                .await?
+        );
+        let paced = store
+            .pace_run("R1", team_context(t0, Some(snapshot(verified.clone()))))
+            .await?;
+        assert_eq!(paced.recovered, ["T1"], "{reason:?}");
+        assert_eq!(
+            task_row(&path, "T1")?,
+            [json!("READY"), Value::Null, json!(2), Value::Null, json!(0)],
+            "{reason:?}"
+        );
+        let unblocked = events(&path, "R1", &["task.unblocked"])?;
+        assert_eq!(
+            unblocked
+                .iter()
+                .map(|e| (e.0.clone(), e.2.clone()))
+                .collect::<Vec<_>>(),
+            [(
+                crate::ids::child_id("T1", "unblocked/2"),
+                json!({"task_id": "T1", "reason": reason.as_str(), "role": "developer", "role_epoch": 1})
+            )],
+            "{reason:?}"
+        );
+        assert_eq!(
+            task_row(&path, "N1")?[0..2],
+            [json!("BLOCKED"), json!("NEED_DECISION")],
+            "{reason:?}"
+        );
+        assert_ne!(
+            value(&path, "SELECT state FROM runs WHERE run_id = 'R1'")?,
+            json!("BLOCKED"),
+            "{reason:?}"
+        );
+        let dispatched = dispatch_r1(&store, team_context(t0, Some(snapshot(verified)))).await?;
+        assert_eq!(dispatched.len(), 1, "{reason:?}");
+    }
+    Ok(())
+}
+
+/// Run R1's rounds at `context` until nothing more is dispatched: the attempts dispatched.
+async fn dispatch_r1(store: &Store, context: Context) -> R<Vec<String>> {
+    let mut dispatched = Vec::new();
+    while let Some(d) = store
+        .schedule_round("R1", context.clone())
+        .await?
+        .dispatched
+    {
+        dispatched.push(d.attempt_id);
+    }
+    Ok(dispatched)
+}
+
+#[tokio::test]
+async fn a_waiting_runs_verifier_is_unblocked_in_the_same_pace() -> R {
+    // M2T15D-54 (decision 7's position): run R1 WAITING_EXTERNAL (another task's retry in the future), its qa task
+    // BLOCKED_AUTH; qa's binding recovered, its session fresh and verified in the snapshot: the one pace writes
+    // task.unblocked, the task READY and due, and the run works again.
+    let t0 = t0()?;
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    team_and_run(&store, &path).await?;
+    store
+        .staff(change("R1", "qa", 1, "pi", grant("1.5.0", "pi")))
+        .await?;
+    task(&path, "V1", "qa", "BLOCKED", Some("BLOCKED_AUTH"))?;
+    task(&path, "T2", "developer", "READY", None)?;
+    exec(
+        &path,
+        "UPDATE tasks SET next_retry_at = '2026-11-14T01:00:00Z', attempt_count = 1 WHERE task_id = 'T2';
+         UPDATE runs SET state = 'WAITING_EXTERNAL', resume_state = 'RUNNING' WHERE run_id = 'R1';",
+    )?;
+    let verified = facts(&[("pi", usable("1.5.0", identity("pi")))]);
+    let paced = store
+        .pace_run("R1", team_context(t0, Some(snapshot(verified))))
+        .await?;
+    assert_eq!(paced.recovered, ["V1"]);
+    assert!(paced.woke, "{paced:?}");
+    assert_eq!(
+        task_row(&path, "V1")?,
+        [json!("READY"), Value::Null, json!(0), Value::Null, json!(0)]
+    );
+    assert_eq!(
+        events(&path, "R1", &["task.unblocked"])?[0].2,
+        json!({"task_id": "V1", "reason": "BLOCKED_AUTH", "role": "qa", "role_epoch": 1})
+    );
+    assert_eq!(
+        value(&path, "SELECT state FROM runs WHERE run_id = 'R1'")?,
+        json!("RUNNING")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compat_unverified_is_recovered_only_by_a_verified_fresh_session_in_the_snapshot() -> R {
+    // M2T15D-51 (decision 7): a task BLOCKED(COMPAT_UNVERIFIED) of a role whose binding is ACTIVE with its session stays
+    // BLOCKED while the snapshot lacks the agent, its fact is not verified, the session's version or identity is not
+    // the fact's, or there is no snapshot at all (no registry, no gate); a verified fact the session is fresh for
+    // recovers it.
+    let t0 = t0()?;
+    let pending = match usable("2.1.318", identity("claude")) {
+        Fact::Usable(mut u) => {
+            u.compat = Compat::Pending("not run".to_owned());
+            Fact::Usable(u)
+        }
+        other => other,
+    };
+    let cases: [(&str, Option<Snapshot>, bool); 6] = [
+        (
+            "the snapshot lacks claude",
+            Some(snapshot(Facts::new())),
+            false,
+        ),
+        (
+            "claude is not verified",
+            Some(snapshot(facts(&[("claude", pending)]))),
+            false,
+        ),
+        (
+            "another version",
+            Some(snapshot(facts(&[(
+                "claude",
+                usable("2.1.325", identity("claude")),
+            )]))),
+            false,
+        ),
+        (
+            "another identity",
+            Some(snapshot(facts(&[(
+                "claude",
+                usable(
+                    "2.1.318",
+                    AgentIdentity {
+                        implementation_path: "/opt/claude/versions/B".to_owned(),
+                        ..identity("claude")
+                    },
+                ),
+            )]))),
+            false,
+        ),
+        ("no snapshot", None, false),
+        (
+            "verified and fresh",
+            Some(snapshot(facts(&[(
+                "claude",
+                usable("2.1.318", identity("claude")),
+            )]))),
+            true,
+        ),
+    ];
+    for (case, snapshot, recovered) in cases {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        team_and_run(&store, &path).await?;
+        store
+            .staff(change(
+                "R1",
+                "developer",
+                1,
+                "claude",
+                grant("2.1.318", "claude"),
+            ))
+            .await?;
+        task(
+            &path,
+            "T1",
+            "developer",
+            "BLOCKED",
+            Some("COMPAT_UNVERIFIED"),
+        )?;
+        let paced = store.pace_run("R1", team_context(t0, snapshot)).await?;
+        assert_eq!(paced.recovered.len(), usize::from(recovered), "{case}");
+        assert_eq!(
+            task_row(&path, "T1")?[0],
+            json!(if recovered { "READY" } else { "BLOCKED" }),
+            "{case}"
+        );
+        assert_eq!(
+            events(&path, "R1", &["task.unblocked"])?.len(),
+            usize::from(recovered),
+            "{case}"
+        );
+    }
+    // Without a snapshot the other reasons of V are judged by the binding and the session's capabilities alone.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    team_and_run(&store, &path).await?;
+    store
+        .staff(change(
+            "R1",
+            "developer",
+            1,
+            "claude",
+            grant("2.1.318", "claude"),
+        ))
+        .await?;
+    task(&path, "T1", "developer", "BLOCKED", Some("BLOCKED_AUTH"))?;
+    let paced = store.pace_run("R1", team_context(t0, None)).await?;
+    assert_eq!(paced.recovered, ["T1"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_blocked_capability_verifier_is_dispatched_once_its_rebound_session_has_the_capability()
+-> R {
+    // CR-018 (docs/cr/CR-018-verification-hand-overs.md:30; decisions 4 and 7): the reviewer's session lacks resume:
+    // staffing blocks the binding BLOCKED_CAPABILITY and the pace marks its due verification task. codex upgraded (its
+    // session capabilities with resume, another version and identity, verified): Rebind at epoch 2, Grant, the first
+    // input delivered, and the pace puts the task back READY for a round to dispatch; a NEED_DECISION task stays BLOCKED
+    // and the failure items attached to the reworked task are still its rework context after the recovery.
+    let t0 = t0()?;
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    team_and_run(&store, &path).await?;
+    let old = json!({"structured_events": true});
+    let codex = |version: &str, tag: &str, session: &Value| match usable(version, identity(tag)) {
+        Fact::Usable(mut u) => {
+            u.session = session.clone();
+            u.granted = crate::decision::granted_capabilities(session);
+            Fact::Usable(u)
+        }
+        other => other,
+    };
+    let before = facts(&[("codex", codex("codex-cli 0.166.0", "codex-a", &old))]);
+    // A session granted before (its capabilities what codex's session said then).
+    assert!(
+        store
+            .staff(change(
+                "R1",
+                "reviewer",
+                1,
+                "codex",
+                StaffWrite::Grant {
+                    agent_version: "codex-cli 0.166.0".to_owned(),
+                    capabilities: old.clone(),
+                    identity: identity("codex-a"),
+                }
+            ))
+            .await?
+    );
+    let (judgment, wrote) = judge_and_write(&store, "reviewer", &before, 2).await?;
+    assert_eq!(
+        (judgment, wrote),
+        (
+            Judgment::Block {
+                reason: BlockedReason::BlockedCapability,
+                missing: vec!["codex:CAPABILITY_UNSUPPORTED:resume".to_owned()],
+            },
+            true
+        )
+    );
+    task(&path, "V1", "reviewer", "READY", None)?;
+    task(&path, "N1", "reviewer", "BLOCKED", Some("NEED_DECISION"))?;
+    // V1's rework context: the failure items a rework took from a round on candidate C1.
+    exec(
+        &path,
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, created_at) VALUES ('C1', 'R1', printf('%040d', 1), printf('%040d', 2),
+           printf('%064d', 1), printf('%064d', 2), printf('%064d', 3), '/repo', '2026-11-14T00:00:00Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'round-1/opened', 'R1', 'verification.round_opened',
+            '{\"round_id\": \"round-1\", \"candidate_id\": \"C1\", \"source_task_ids\": [\"V1\"]}', '2026-11-14T00:00:00Z'),
+           ('p1', 'round-1/consumed', 'R1', 'verification.failures_consumed',
+            '{\"round_id\": \"round-1\", \"task_id\": \"V1\", \"by\": \"rework\", \"items\": [\"check:unit\"]}',
+            '2026-11-14T00:00:00Z');",
+    )?;
+    let rework = |path: &PathBuf| -> R<Option<crate::persistence::ReworkContext>> {
+        let conn = Connection::open(path)?;
+        Ok(crate::persistence::context::rework(&conn, "V1")?)
+    };
+    let attached = rework(&path)?;
+    assert!(attached.is_some(), "no rework context seeded");
+    let paced = store
+        .pace_run("R1", team_context(t0, Some(snapshot(before.clone()))))
+        .await?;
+    assert_eq!(paced.vacant, ["V1"]);
+    assert_eq!(
+        task_row(&path, "V1")?[0..2],
+        [json!("BLOCKED"), json!("BLOCKED_CAPABILITY")]
+    );
+    let upgraded = facts(&[("codex", usable("codex-cli 0.167.0", identity("codex-b")))]);
+    let (judgment, wrote) = judge_and_write(&store, "reviewer", &upgraded, 3).await?;
+    assert_eq!((judgment, wrote), (Judgment::Rebind { model: None }, true));
+    let paced = store
+        .pace_run("R1", team_context(t0, Some(snapshot(upgraded.clone()))))
+        .await?;
+    assert!(
+        paced.recovered.is_empty(),
+        "recovered before its new session"
+    );
+    let (judgment, wrote) = judge_and_write(&store, "reviewer", &upgraded, 4).await?;
+    assert_eq!((judgment, wrote), (Judgment::Grant, true));
+    let paced = store
+        .pace_run("R1", team_context(t0, Some(snapshot(upgraded.clone()))))
+        .await?;
+    assert!(
+        paced.recovered.is_empty(),
+        "recovered before its first input"
+    );
+    let session = crate::persistence::session_id("R1", "reviewer", 2);
+    let starts = store.session_starts("p1").await?;
+    let start = starts
+        .iter()
+        .find(|s| s.role == "reviewer" && s.role_epoch == 2)
+        .ok_or("no session.start of epoch 2")?;
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    let paced = store
+        .pace_run("R1", team_context(t0, Some(snapshot(upgraded.clone()))))
+        .await?;
+    assert_eq!(paced.recovered, ["V1"]);
+    assert_eq!(
+        events(&path, "R1", &["task.unblocked"])?[0].2,
+        json!({"task_id": "V1", "reason": "BLOCKED_CAPABILITY", "role": "reviewer", "role_epoch": 2})
+    );
+    assert_eq!(
+        task_row(&path, "N1")?[0..2],
+        [json!("BLOCKED"), json!("NEED_DECISION")]
+    );
+    assert_eq!(rework(&path)?, attached);
+    let dispatched = dispatch_r1(&store, team_context(t0, Some(snapshot(upgraded)))).await?;
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        value(
+            &path,
+            &format!(
+                "SELECT task_id || ' ' || session_id FROM attempts WHERE attempt_id = '{}'",
+                dispatched[0]
+            )
+        )?,
+        json!(format!("V1 {session}"))
+    );
+    Ok(())
+}
