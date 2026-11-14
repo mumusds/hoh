@@ -1,0 +1,9 @@
+{"id":0,"result":{"userAgent":"hoh-suite/0.0.0","codexHome":"/hoh-suite/.codex","platformFamily":"unix","platformOs":"linux"}}
+{"id":1,"result":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]},"model":"codex-suite-model","modelProvider":"openai","cwd":"/hoh-suite","approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"},"reasoningEffort":null}}
+{"method":"thread/started","params":{"thread":{"id":"hoh-suite-session","preview":"","ephemeral":false,"turns":[]}}}
+{"id":2,"result":{"turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"turn/started","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"inProgress","error":null}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","startedAtMs":1}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"item-user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}]},"threadId":"hoh-suite-session","turnId":"hoh-suite-turn","completedAtMs":1}}
+{"method":"error","params":{"error":{"message":"unexpected status 401 Unauthorized","codexErrorInfo":"unauthorized"},"willRetry":false,"threadId":"hoh-suite-session","turnId":"hoh-suite-turn"}}
+{"method":"turn/completed","params":{"threadId":"hoh-suite-session","turn":{"id":"hoh-suite-turn","items":[],"status":"failed","error":{"message":"unexpected status 401 Unauthorized","codexErrorInfo":"unauthorized"}}}}

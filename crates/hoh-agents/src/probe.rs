@@ -2397,15 +2397,6 @@ fn exec_runs_commands(exec_help: &str) -> Option<bool> {
     Some(crate::adapter::offers(exec_help, crate::codex::YOLO_FLAG))
 }
 
-/// The `thread/start` request of HoH's YOLO profile, as the App Server adapter builds it (codex/app_server.rs).
-fn yolo_thread_start() -> serde_json::Value {
-    serde_json::json!({
-        "id": 0,
-        "method": "thread/start",
-        "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"},
-    })
-}
-
 /// An `item/started` notification of a command the App Server runs: the least the recorded 0.166.0 schema asks of one.
 fn command_started() -> serde_json::Value {
     serde_json::json!({
@@ -2442,15 +2433,21 @@ fn frame_valid(file: Option<&serde_json::Value>, frame: &serde_json::Value, work
 
 /// Whether the App Server runs commands under HoH's YOLO profile (docs/adr/ADR-030.md decision 12), from its
 /// `ClientRequest.json` and `ServerNotification.json` as written, `params` not opened (`None` where the export lacks
-/// one): the YOLO `thread/start` ([`yolo_thread_start`]) is a valid request and an `item/started` of a command
-/// ([`command_started`]) a valid notification. Both valid: true; either invalid: false; else it cannot be told.
+/// one): the YOLO `thread/start` of a new thread, as the adapter's own builder gives it
+/// ([`crate::codex::app_server::requests::thread_start`], docs/adr/ADR-030.md decision 10), is a valid request and an
+/// `item/started` of a command ([`command_started`]) a valid notification. Both valid: true; either invalid: false;
+/// else it cannot be told.
 fn app_server_runs_commands(
     client_requests: Option<&serde_json::Value>,
     server_notifications: Option<&serde_json::Value>,
     work: &Work,
 ) -> Option<bool> {
     let both = Truth::all([
-        frame_valid(client_requests, &yolo_thread_start(), work),
+        frame_valid(
+            client_requests,
+            &crate::codex::app_server::requests::thread_start(0, true, None),
+            work,
+        ),
         frame_valid(server_notifications, &command_started(), work),
     ]);
     match both {
@@ -2722,7 +2719,7 @@ fn tree_sha256_of(root: &Path, files: &[(PathBuf, Vec<u8>)], work: &Work) -> io:
 
 /// sha256 over the sorted lines `<path relative to root> <digest>\n`.
 fn tree_sha256_from(root: &Path, digests: &[(PathBuf, String)]) -> io::Result<String> {
-    let mut lines = Vec::new();
+    let mut members = Vec::new();
     for (file, digest) in digests {
         let rel = file.strip_prefix(root).map_err(io::Error::other)?;
         let rel = rel
@@ -2730,10 +2727,21 @@ fn tree_sha256_from(root: &Path, digests: &[(PathBuf, String)]) -> io::Result<St
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        lines.push(format!("{rel} {digest}\n"));
+        members.push((rel, digest.clone()));
     }
+    Ok(members_sha256(members))
+}
+
+/// The tree digest of named members: sha256 over the sorted lines `<name> <digest>\n`, so the members count in
+/// (name, digest) order (the compat suite set uses it too, docs/adr/ADR-030.md decision 10; crates/hoh-agents/build.rs
+/// computes the definition digest the same way).
+pub(crate) fn members_sha256(members: Vec<(String, String)>) -> String {
+    let mut lines: Vec<String> = members
+        .into_iter()
+        .map(|(name, digest)| format!("{name} {digest}\n"))
+        .collect();
     lines.sort();
-    Ok(hex(&Sha256::digest(lines.concat().as_bytes())))
+    hex(&Sha256::digest(lines.concat().as_bytes()))
 }
 
 /// The adapters' streaming hash, one helper for both (M1R-10).
@@ -3094,6 +3102,9 @@ fn wait_for_output(outputs: &[Output], wait: Duration) -> io::Result<()> {
 
 #[cfg(test)]
 mod capability_tests;
+
+#[cfg(test)]
+mod compat_tests;
 
 #[cfg(test)]
 mod tests {

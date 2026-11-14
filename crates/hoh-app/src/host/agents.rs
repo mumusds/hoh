@@ -320,7 +320,7 @@ impl Registry {
             pi_dir,
             probe_timeout: PROBE_TIMEOUT,
             every: AUTH_EVERY,
-            suite_set: compat::SUITE_SET_SHA256.to_owned(),
+            suite_set: compat::SUITE_SET_SHA256.as_str().to_owned(),
         }
     }
 
@@ -332,8 +332,7 @@ impl Registry {
         self
     }
 
-    /// The registry verifying against a test's suite set: until the build's digest arrives, [`compat::SUITE_SET_SHA256`]
-    /// matches no schema-valid manifest.
+    /// The registry verifying against a test's suite set instead of this build's ([`compat::SUITE_SET_SHA256`]).
     #[cfg(test)]
     fn with_suite_set(mut self, suite_set: &str) -> Registry {
         self.suite_set = suite_set.to_owned();

@@ -1,0 +1,126 @@
+{
+  "variants": {
+    "new": {
+      "resume": false,
+      "model": false
+    },
+    "new-model": {
+      "resume": false,
+      "model": true
+    },
+    "resumed": {
+      "resume": true,
+      "model": false
+    },
+    "resumed-model": {
+      "resume": true,
+      "model": true
+    }
+  },
+  "suites": {
+    "claude": {
+      "success": [
+        "new",
+        "new-model"
+      ],
+      "failure": [
+        "new",
+        "new-model"
+      ],
+      "cancel": [
+        "new",
+        "new-model"
+      ],
+      "compaction": [
+        "resumed",
+        "resumed-model"
+      ],
+      "tool": [
+        "new",
+        "new-model"
+      ],
+      "unknown_fields": [
+        "new",
+        "new-model"
+      ]
+    },
+    "codex": {
+      "success": [
+        "new",
+        "new-model"
+      ],
+      "failure": [
+        "new",
+        "new-model"
+      ],
+      "cancel": [
+        "new",
+        "new-model"
+      ],
+      "compaction": [
+        "resumed",
+        "resumed-model"
+      ],
+      "tool": [
+        "new",
+        "new-model"
+      ],
+      "unknown_fields": [
+        "new",
+        "new-model"
+      ]
+    },
+    "codex-exec": {
+      "success": [
+        "new",
+        "new-model"
+      ],
+      "failure": [
+        "new",
+        "new-model"
+      ],
+      "cancel": [
+        "new",
+        "new-model"
+      ],
+      "compaction": [
+        "resumed",
+        "resumed-model"
+      ],
+      "tool": [
+        "new",
+        "new-model"
+      ],
+      "unknown_fields": [
+        "new",
+        "new-model"
+      ]
+    },
+    "pi": {
+      "success": [
+        "new",
+        "new-model"
+      ],
+      "failure": [
+        "new",
+        "new-model"
+      ],
+      "cancel": [
+        "new",
+        "new-model"
+      ],
+      "compaction": [
+        "resumed",
+        "resumed-model"
+      ],
+      "tool": [
+        "new",
+        "new-model"
+      ],
+      "unknown_fields": [
+        "new",
+        "new-model"
+      ]
+    }
+  }
+}

@@ -286,6 +286,102 @@ impl Recorder<'_> {
     }
 }
 
+/// What an adapter's own judging makes of frames replayed through it, no process started (docs/adr/ADR-030.md
+/// decision 10, the compat suite's replay): the end it judges, its failure code and how many `adapter.unknown_event`s
+/// it records. A replay runs a turn of the runner's mode (a cancel is the agent's own only) that the host started with
+/// the product's YOLO launch, a new session, no model, the suite's prompt and session id
+/// ([`crate::compat::SUITE_PROMPT`], [`crate::compat::SUITE_SESSION`]), its prompt written whole, its process exiting
+/// with code 0 after the last frame with both streams read to their end.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Replayed {
+    pub state: AttemptState,
+    pub failure: Option<String>,
+    pub unknown_events: usize,
+}
+
+/// One step of a replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// A line of the agent's stdout (framed as [`crate::frame::FrameReader`] frames it: on LF only, one CR before it
+    /// dropped, bytes after the last LF a frame cut short).
+    Frame(Vec<u8>),
+    /// The host's cancel at this point: the line [`REPLAY_CANCEL`], which is no frame of the agent's.
+    Cancel,
+}
+
+/// The line of a replayed stream that stands for the host's cancel (docs/adr/ADR-030.md decision 10).
+pub const REPLAY_CANCEL: &str = r#"{"hoh_replay":"cancel"}"#;
+
+/// The steps of a replayed stream. No frame is refused as too large: the replay judges the frames, not the reader.
+pub(crate) fn replay_steps(bytes: &[u8]) -> Vec<Replay> {
+    let mut steps = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (line, after) = match rest.iter().position(|b| *b == b'\n') {
+            Some(at) => {
+                let line = &rest[..at];
+                (line.strip_suffix(b"\r").unwrap_or(line), &rest[at + 1..])
+            }
+            None => (rest, &rest[rest.len()..]),
+        };
+        steps.push(if line == REPLAY_CANCEL.as_bytes() {
+            Replay::Cancel
+        } else {
+            Replay::Frame(line.to_vec())
+        });
+        rest = after;
+    }
+    steps
+}
+
+/// The output of a future that is ready at its first poll, with no runtime: an adapter's judging with nothing to wait
+/// for (a replay writes to no store and no process). `None` if it would wait.
+pub(crate) fn at_once<F: std::future::Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// How a replayed turn's process ended: by itself with code 0 after its last frame, both streams read to their end.
+pub(crate) fn replayed_exit() -> crate::process::ExitReport {
+    let complete = crate::process::StreamReport {
+        eof: true,
+        ..crate::process::StreamReport::default()
+    };
+    crate::process::ExitReport {
+        pid: 0,
+        status: Some(crate::process::Termination::Code(0)),
+        cause: crate::process::Cause::Exited,
+        steps: Vec::new(),
+        orphans: Some(0),
+        group_reaped: true,
+        stdout: complete.clone(),
+        stderr: complete,
+        stderr_tail: Vec::new(),
+    }
+}
+
+/// How many `adapter.unknown_event`s a turn recorded.
+pub(crate) fn unknown_events(recorded: &[Recorded]) -> usize {
+    recorded
+        .iter()
+        .filter(|r| matches!(r, Recorded::Event { kind, .. } if kind == "adapter.unknown_event"))
+        .count()
+}
+
+/// The replay of a turn whose judging could not finish at once or could not record (neither happens without a store
+/// or a process): FAILED with why, so it never passes for an expected end.
+pub(crate) fn unreplayable(why: &str) -> Replayed {
+    Replayed {
+        state: AttemptState::Failed,
+        failure: Some(format!("REPLAY_INCOMPLETE: {why}")),
+        unknown_events: 0,
+    }
+}
+
 /// Why a turn could not be recorded or run.
 #[derive(Debug)]
 pub enum AdapterError {

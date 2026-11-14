@@ -15,7 +15,9 @@ use super::{
     Ending, METHOD_NOT_FOUND, Mode, Outcome, Steer, SteerReceipt, Turn, app_server_args,
     failure_of, hard_stop, hashes, is_text_item, verdict,
 };
-use crate::adapter::{AdapterError, AttemptRef, Recorded, Stop, finish, now, soft_move, step};
+use crate::adapter::{
+    AdapterError, AttemptRef, Recorded, Replay, Replayed, Stop, finish, now, soft_move, step,
+};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Config, Event, Process};
@@ -28,6 +30,8 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+
+pub mod requests;
 
 /// How the App Server part ended.
 pub(super) enum End {
@@ -70,11 +74,12 @@ impl Conn {
         }
     }
 
-    fn request(&mut self, method: &str, params: Value, what: Pending) {
+    /// Send the request `build` gives for the next id ([`requests`]), remembering what it was.
+    fn request(&mut self, what: Pending, build: impl FnOnce(i64) -> Value) {
         let id = self.next_id;
         self.next_id += 1;
         self.pending.insert(id, what);
-        self.send(&json!({"method": method, "id": id, "params": params}));
+        self.send(&build(id));
     }
 
     fn open(&self) -> bool {
@@ -205,25 +210,26 @@ impl State<'_> {
             .await
     }
 
-    /// End the process now: close stdin, then SIGTERM and SIGKILL to the group.
-    fn hard_stop(&mut self, process: &Process) {
+    /// End the process now: close stdin, then SIGTERM and SIGKILL to the group (`None`: a replay, no process).
+    fn hard_stop(&mut self, process: Option<&Process>) {
         self.conn.close();
         if !self.stopped {
-            process.cancel(hard_stop(self.turn.escalation));
+            if let Some(process) = process {
+                process.cancel(hard_stop(self.turn.escalation));
+            }
             self.stopped = true;
         }
     }
 
     /// Stop the turn: interrupt the active turn and give it the native grace; before a turn is active, end the
     /// process.
-    fn begin_stop(&mut self, process: &Process) {
+    fn begin_stop(&mut self, process: Option<&Process>) {
         if self.native_only {
             // Only the agent's own cancel: interrupt an active turn, or close stdin before one is; nothing more.
             if self.phase == Phase::Active && self.conn.open() && !self.interrupted {
                 if let (Some(t), Some(u)) = (&self.thread_id, &self.turn_id) {
-                    let params = json!({"threadId": t, "turnId": u});
                     self.conn
-                        .request("turn/interrupt", params, Pending::Interrupt);
+                        .request(Pending::Interrupt, |id| requests::turn_interrupt(id, t, u));
                 }
             } else {
                 self.conn.close();
@@ -233,9 +239,8 @@ impl State<'_> {
         }
         if self.phase == Phase::Active && self.conn.open() && !self.interrupted {
             if let (Some(t), Some(u)) = (&self.thread_id, &self.turn_id) {
-                let params = json!({"threadId": t, "turnId": u});
                 self.conn
-                    .request("turn/interrupt", params, Pending::Interrupt);
+                    .request(Pending::Interrupt, |id| requests::turn_interrupt(id, t, u));
             }
             self.interrupted = true;
             self.stop_at = Some(Instant::now() + self.turn.escalation.native_grace);
@@ -267,10 +272,10 @@ impl State<'_> {
             item: None,
             acked: false,
         });
-        let params = json!({"threadId": self.thread_id, "expectedTurnId": expected,
-                            "input": [{"type": "text", "text": s.text}]});
-        self.conn
-            .request(super::STEER_REQUEST, params, Pending::Steer(s));
+        let (thread, text) = (self.thread_id.clone(), s.text.clone());
+        self.conn.request(Pending::Steer(s), |id| {
+            requests::turn_steer(id, thread.as_deref(), expected.as_deref(), &text)
+        });
     }
 
     async fn apply(&self, input_id: String) -> Result<(), PersistError> {
@@ -438,7 +443,7 @@ impl State<'_> {
     /// The answer to one of our requests.
     async fn on_response(
         &mut self,
-        process: &Process,
+        process: Option<&Process>,
         held: &mut Vec<Steer>,
         frame: &Value,
     ) -> Result<(), PersistError> {
@@ -474,7 +479,7 @@ impl State<'_> {
                     self.begin_stop(process);
                 }
                 None => {
-                    self.conn.send(&json!({"method": "initialized"}));
+                    self.conn.send(&requests::initialized());
                     // In the runner's mode the runner recorded RUNNING before the gate opened.
                     if let Some(store) = self.store {
                         step(
@@ -489,21 +494,14 @@ impl State<'_> {
                     self.running = true;
                     self.phase = Phase::Thread;
                     let launch = &self.turn.launch;
-                    let mut params = if launch.yolo {
-                        json!({"approvalPolicy": "never", "sandbox": "danger-full-access"})
-                    } else {
-                        json!({})
-                    };
-                    if let Some(m) = &launch.model {
-                        params["model"] = json!(m);
-                    }
+                    let (yolo, model) = (launch.yolo, launch.model.as_deref());
                     match &launch.resume {
-                        Some(thread) => {
-                            params["threadId"] = json!(thread);
-                            self.conn
-                                .request(super::RESUME_REQUEST, params, Pending::Thread);
-                        }
-                        None => self.conn.request("thread/start", params, Pending::Thread),
+                        Some(thread) => self.conn.request(Pending::Thread, |id| {
+                            requests::thread_resume(id, yolo, model, thread)
+                        }),
+                        None => self.conn.request(Pending::Thread, |id| {
+                            requests::thread_start(id, yolo, model)
+                        }),
                     }
                 }
             },
@@ -540,9 +538,10 @@ impl State<'_> {
                         (None, None) => {}
                     }
                     self.phase = Phase::TurnStart;
-                    let params = json!({"threadId": self.thread_id,
-                                        "input": [{"type": "text", "text": self.turn.prompt}]});
-                    self.conn.request("turn/start", params, Pending::TurnStart);
+                    let (thread, prompt) = (self.thread_id.as_deref(), &self.turn.prompt);
+                    self.conn.request(Pending::TurnStart, |id| {
+                        requests::turn_start(id, thread, prompt)
+                    });
                 }
             },
             Pending::TurnStart => match refused {
@@ -622,6 +621,190 @@ impl State<'_> {
             },
         }
         Ok(())
+    }
+}
+
+impl<'a> State<'a> {
+    /// A turn about to send initialize on `lines`: `native_only` in the runner's mode, `cancelled` if a cancel came
+    /// before it started.
+    fn new(
+        store: Option<&'a Store>,
+        attempt: &'a AttemptRef,
+        turn: &'a Turn,
+        lines: mpsc::UnboundedSender<Vec<u8>>,
+        pid: u32,
+        native_only: bool,
+        cancelled: bool,
+    ) -> State<'a> {
+        State {
+            store,
+            recorded: std::sync::Mutex::new(Vec::new()),
+            native_only,
+            attempt,
+            turn,
+            conn: Conn {
+                lines: Some(lines),
+                next_id: 0,
+                pending: HashMap::new(),
+            },
+            pid,
+            phase: Phase::Init,
+            running: false,
+            thread_id: None,
+            turn_id: None,
+            model: None,
+            usage: None,
+            status: None,
+            error: None,
+            reply: None,
+            cancelled,
+            deadline: false,
+            too_large: false,
+            tool_started: false,
+            failure: None,
+            degrade: None,
+            stop_at: None,
+            stopped: false,
+            interrupted: false,
+            counters: HashMap::new(),
+            sent: Vec::new(),
+            seen_items: HashSet::new(),
+            prompt_seen: false,
+            early: Vec::new(),
+        }
+    }
+
+    /// Judge one stdout line: a request, a notification or the answer to one of ours (`process`: `None` in a replay).
+    async fn on_line(
+        &mut self,
+        process: Option<&Process>,
+        held: &mut Vec<Steer>,
+        line: &[u8],
+    ) -> Result<(), PersistError> {
+        let Ok(frame) = serde_json::from_slice::<Value>(line) else {
+            return self
+                .diagnostic(
+                    json!({"reason": "stdout line is not JSON", "bytes": line.len(),
+                           "head": String::from_utf8_lossy(&line[..line.len().min(256)])}),
+                )
+                .await;
+        };
+        match (frame["method"].as_str(), frame.get("id").cloned()) {
+            (Some(method), Some(id)) => self.on_request(method, id, &frame, line).await,
+            (Some(method), None) => self.on_notification(method, &frame, line).await,
+            (None, _) => self.on_response(process, held, &frame).await,
+        }
+    }
+
+    /// The end of a turn whose process ended (`report`; `None`: it was not seen to end) and whose stdin is closed:
+    /// moved to exec, or its verdict with what it records.
+    async fn conclude(
+        mut self,
+        report: Option<crate::process::ExitReport>,
+        held: &mut Vec<Steer>,
+    ) -> Result<Drove, PersistError> {
+        // Steers nobody answered stay QUEUED.
+        for (_, what) in self.conn.pending.drain() {
+            if let Pending::Steer(st) = what {
+                let _ = st.reply.send(SteerReceipt::NotNow);
+            }
+        }
+        let logs_incomplete = report.as_ref().is_none_or(|r| {
+            r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
+        });
+        // A refused handshake moves the turn to exec only when nothing ranked above a refused request in ADR-012 §3
+        // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02).
+        if let Some(reason) = self
+            .degrade
+            .clone()
+            .filter(|_| !self.cancelled && !self.too_large && !self.deadline && !logs_incomplete)
+        {
+            return Ok(Drove::Degrade(reason, report.map(Box::new)));
+        }
+        for st in held.drain(..) {
+            let _ = st.reply.send(SteerReceipt::NotNow);
+        }
+        // This thread's notifications still waiting for a turn that was never confirmed: a tool among them may have
+        // acted.
+        if !self.early.is_empty() {
+            let early = std::mem::take(&mut self.early);
+            let started: Vec<Value> = early
+                .iter()
+                .filter(|(m, _, _)| m == "item/started")
+                .map(|(_, f, _)| f["params"]["item"].clone())
+                .collect();
+            if started
+                .iter()
+                .any(|i| !is_text_item(i["type"].as_str().unwrap_or_default()))
+            {
+                self.tool_started = true;
+            }
+            self.event(
+                "unconfirmed-turn",
+                "adapter.diagnostic",
+                json!({"reason": "notifications of this thread for a turn never confirmed",
+                       "methods": early.iter().map(|(m, _, _)| m.clone()).collect::<Vec<_>>(),
+                       "items_started": started.iter().map(|i| json!({"id": i["id"], "type": i["type"]})).collect::<Vec<_>>()}),
+            )
+            .await?;
+        }
+        if logs_incomplete && let Some(r) = &report {
+            self.event(
+                "raw-log-incomplete",
+                "adapter.diagnostic",
+                json!({"reason": "RAW_LOG_INCOMPLETE",
+                       "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
+                       "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
+            )
+            .await?;
+        }
+        let exit = report.as_ref().and_then(|r| r.status);
+        let (state, failure) = verdict(&Ending {
+            cancelled: self.cancelled,
+            too_large: self.too_large,
+            deadline: self.deadline,
+            logs_incomplete,
+            failure: self.failure.as_deref(),
+            status: self.status.as_deref(),
+            error: self.error.as_ref(),
+            auth_hint: false,
+            tool_started: self.tool_started,
+            exit_matters: false,
+            exit,
+        });
+        if self.status.as_deref() == Some("failed") {
+            let reason = failure_of(self.error.as_ref(), false);
+            self.event(
+                "turn-failed",
+                "adapter.turn_failed",
+                json!({"status": self.status, "error": self.error,
+                       "blocked_reason": (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH"),
+                       "retry": if reason == "TRANSIENT_EXTERNAL" { "transient" } else { "none" }}),
+            )
+            .await?;
+        }
+        let recorded = self
+            .recorded
+            .lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default();
+        Ok(Drove::Ended(Box::new(Driven {
+            state,
+            failure,
+            running: self.running,
+            cancelled: self.cancelled,
+            items: self.counters.get("item").copied().unwrap_or(0),
+            unknown_events: self.counters.get("unknown").copied().unwrap_or(0),
+            thread_id: self.thread_id,
+            turn_id: self.turn_id,
+            model: self.model,
+            usage: self.usage,
+            status: self.status,
+            reply: self.reply,
+            pid: self.pid,
+            report,
+            recorded,
+        })))
     }
 }
 
@@ -796,64 +979,33 @@ pub(super) async fn drive(
         }
         input.shutdown().await
     });
-    let mut s = State {
+    let mut s = State::new(
         store,
-        recorded: std::sync::Mutex::new(Vec::new()),
-        native_only: stop.is_native(),
         attempt,
         turn,
-        conn: Conn {
-            lines: Some(lines),
-            next_id: 0,
-            pending: HashMap::new(),
-        },
-        pid: process.pid(),
-        phase: Phase::Init,
-        running: false,
-        thread_id: None,
-        turn_id: None,
-        model: None,
-        usage: None,
-        status: None,
-        error: None,
-        reply: None,
-        cancelled: stop.requested_now(),
-        deadline: false,
-        too_large: false,
-        tool_started: false,
-        failure: None,
-        degrade: None,
-        stop_at: None,
-        stopped: false,
-        interrupted: false,
-        counters: HashMap::new(),
-        sent: Vec::new(),
-        seen_items: HashSet::new(),
-        prompt_seen: false,
-        early: Vec::new(),
-    };
-    s.conn.request(
-        "initialize",
-        json!({"clientInfo": {"name": "hoh", "version": crate::VERSION}}),
-        Pending::Initialize,
+        lines,
+        process.pid(),
+        stop.is_native(),
+        stop.requested_now(),
     );
+    s.conn.request(Pending::Initialize, requests::initialize);
     let handshake_until = Instant::now() + turn.handshake_timeout;
     let deadline_at = turn.deadline.map(|d| Instant::now() + d);
     let (mut steers_open, mut written) = (true, false);
     if s.cancelled {
-        s.begin_stop(process);
+        s.begin_stop(Some(process));
     }
     let report = loop {
         let event = tokio::select! {
             biased;
             () = stop.requested(), if !s.cancelled => {
                 s.cancelled = true;
-                s.begin_stop(process);
+                s.begin_stop(Some(process));
                 continue;
             }
             _ = tokio::time::sleep_until(at(deadline_at)), if deadline_at.is_some() && !s.deadline => {
                 s.deadline = true;
-                s.begin_stop(process);
+                s.begin_stop(Some(process));
                 continue;
             }
             _ = tokio::time::sleep_until(handshake_until),
@@ -863,7 +1015,7 @@ pub(super) async fn drive(
                 continue;
             }
             _ = tokio::time::sleep_until(at(s.stop_at)), if s.stop_at.is_some() && !s.stopped => {
-                s.hard_stop(process);
+                s.hard_stop(Some(process));
                 continue;
             }
             result = &mut writer, if !written => {
@@ -878,7 +1030,7 @@ pub(super) async fn drive(
                 // the outcome, so a tool that had started still makes it UNKNOWN_EFFECT.
                 if let Some(e) = failed.filter(|_| s.conn.open()) {
                     s.diagnostic(json!({"reason": "stdin failed", "error": e})).await?;
-                    s.hard_stop(process);
+                    s.hard_stop(Some(process));
                 }
                 continue;
             }
@@ -899,7 +1051,7 @@ pub(super) async fn drive(
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 s.too_large = true;
-                s.hard_stop(process);
+                s.hard_stop(Some(process));
                 s.event(
                     "frame-too-large",
                     "adapter.diagnostic",
@@ -913,124 +1065,60 @@ pub(super) async fn drive(
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };
-        let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
-            s.diagnostic(
-                json!({"reason": "stdout line is not JSON", "bytes": line.len(),
-                                "head": String::from_utf8_lossy(&line[..line.len().min(256)])}),
-            )
-            .await?;
-            continue;
-        };
-        match (frame["method"].as_str(), frame.get("id").cloned()) {
-            (Some(method), Some(id)) => s.on_request(method, id, &frame, &line).await?,
-            (Some(method), None) => s.on_notification(method, &frame, &line).await?,
-            (None, _) => s.on_response(process, held, &frame).await?,
-        }
+        s.on_line(Some(process), held, &line).await?;
     };
     s.conn.close();
     // The process has exited: whatever is left to write goes nowhere, so the writer is not waited for.
     if !written {
         writer.abort();
     }
-    // Steers nobody answered stay QUEUED.
-    for (_, what) in s.conn.pending.drain() {
-        if let Pending::Steer(st) = what {
-            let _ = st.reply.send(SteerReceipt::NotNow);
+    Ok(s.conclude(report, held).await?)
+}
+
+/// Replay `bytes` (the App Server's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands)
+/// through this transport's own judging as the runner's mode drives `turn`, no process started (docs/adr/ADR-030.md
+/// decision 10): see [`Replayed`]. What the turn writes goes nowhere; an initialize the App Server refuses as unknown
+/// ends it as the runner's mode does (FAILED, CAPABILITY_UNSUPPORTED).
+pub(super) fn replay(bytes: &[u8], turn: &Turn) -> Replayed {
+    let attempt = AttemptRef {
+        attempt_id: "replay".to_owned(),
+        session_id: "replay".to_owned(),
+        role: String::new(),
+        agent_version: String::new(),
+    };
+    let (lines, _written) = mpsc::unbounded_channel::<Vec<u8>>();
+    let mut s = State::new(None, &attempt, turn, lines, 0, true, false);
+    s.conn.request(Pending::Initialize, requests::initialize);
+    let mut held = Vec::new();
+    for step in crate::adapter::replay_steps(bytes) {
+        match step {
+            Replay::Cancel if !s.cancelled => {
+                s.cancelled = true;
+                s.begin_stop(None);
+            }
+            Replay::Cancel => {}
+            Replay::Frame(line) => {
+                match crate::adapter::at_once(s.on_line(None, &mut held, &line)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return crate::adapter::unreplayable(&e.to_string()),
+                    None => return crate::adapter::unreplayable("the judging waited"),
+                }
+            }
         }
     }
-    let logs_incomplete = report.as_ref().is_none_or(|r| {
-        r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
-    });
-    // A refused handshake moves the turn to exec only when nothing ranked above a refused request in ADR-012 §3
-    // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02).
-    if let Some(reason) = s
-        .degrade
-        .clone()
-        .filter(|_| !s.cancelled && !s.too_large && !s.deadline && !logs_incomplete)
-    {
-        return Ok(Drove::Degrade(reason, report.map(Box::new)));
+    s.conn.close();
+    match crate::adapter::at_once(s.conclude(Some(crate::adapter::replayed_exit()), &mut held)) {
+        Some(Ok(Drove::Ended(driven))) => Replayed {
+            state: driven.state,
+            failure: driven.failure,
+            unknown_events: driven.unknown_events,
+        },
+        Some(Ok(Drove::Degrade(..))) => Replayed {
+            state: AttemptState::Failed,
+            failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
+            unknown_events: 0,
+        },
+        Some(Err(e)) => crate::adapter::unreplayable(&e.to_string()),
+        None => crate::adapter::unreplayable("the judging waited"),
     }
-    for st in held.drain(..) {
-        let _ = st.reply.send(SteerReceipt::NotNow);
-    }
-    // This thread's notifications still waiting for a turn that was never confirmed: a tool among them may have acted.
-    if !s.early.is_empty() {
-        let early = std::mem::take(&mut s.early);
-        let started: Vec<Value> = early
-            .iter()
-            .filter(|(m, _, _)| m == "item/started")
-            .map(|(_, f, _)| f["params"]["item"].clone())
-            .collect();
-        if started
-            .iter()
-            .any(|i| !is_text_item(i["type"].as_str().unwrap_or_default()))
-        {
-            s.tool_started = true;
-        }
-        s.event(
-            "unconfirmed-turn",
-            "adapter.diagnostic",
-            json!({"reason": "notifications of this thread for a turn never confirmed",
-                   "methods": early.iter().map(|(m, _, _)| m.clone()).collect::<Vec<_>>(),
-                   "items_started": started.iter().map(|i| json!({"id": i["id"], "type": i["type"]})).collect::<Vec<_>>()}),
-        )
-        .await?;
-    }
-    if logs_incomplete && let Some(r) = &report {
-        s.event(
-            "raw-log-incomplete",
-            "adapter.diagnostic",
-            json!({"reason": "RAW_LOG_INCOMPLETE",
-                   "stdout": {"eof": r.stdout.eof, "error": r.stdout.error},
-                   "stderr": {"eof": r.stderr.eof, "error": r.stderr.error}}),
-        )
-        .await?;
-    }
-    let exit = report.as_ref().and_then(|r| r.status);
-    let (state, failure) = verdict(&Ending {
-        cancelled: s.cancelled,
-        too_large: s.too_large,
-        deadline: s.deadline,
-        logs_incomplete,
-        failure: s.failure.as_deref(),
-        status: s.status.as_deref(),
-        error: s.error.as_ref(),
-        auth_hint: false,
-        tool_started: s.tool_started,
-        exit_matters: false,
-        exit,
-    });
-    if s.status.as_deref() == Some("failed") {
-        let reason = failure_of(s.error.as_ref(), false);
-        s.event(
-            "turn-failed",
-            "adapter.turn_failed",
-            json!({"status": s.status, "error": s.error,
-                   "blocked_reason": (reason == "BLOCKED_AUTH").then_some("BLOCKED_AUTH"),
-                   "retry": if reason == "TRANSIENT_EXTERNAL" { "transient" } else { "none" }}),
-        )
-        .await?;
-    }
-    let recorded = s
-        .recorded
-        .lock()
-        .map(|mut r| std::mem::take(&mut *r))
-        .unwrap_or_default();
-    Ok(Drove::Ended(Box::new(Driven {
-        state,
-        failure,
-        running: s.running,
-        cancelled: s.cancelled,
-        items: s.counters.get("item").copied().unwrap_or(0),
-        unknown_events: s.counters.get("unknown").copied().unwrap_or(0),
-        thread_id: s.thread_id,
-        turn_id: s.turn_id,
-        model: s.model,
-        usage: s.usage,
-        status: s.status,
-        reply: s.reply,
-        pid: s.pid,
-        report,
-        recorded,
-    })))
 }

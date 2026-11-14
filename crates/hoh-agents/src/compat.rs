@@ -2,19 +2,228 @@
 //! by [`crate::probe::probe`]. A version is usable for a new attempt only while its implementation, help and schema
 //! hashes match the entry and `suite.status` is `PASS`.
 
+use crate::codex::app_server::requests;
 use hoh_core::nullable;
 use hoh_core::staffing::{AgentIdentity, Compat};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
+pub mod fixtures;
 
 #[cfg(test)]
 mod tests;
 
-/// This build's suite-set digest, recorded as a PASS entry's `suite.fixture_set_sha256` (docs/adr/ADR-030.md decisions
-/// 9 and 10, M2T15D-102). The build's real digest (embedded fixtures, the request builders' output, the suite's
-/// definition) arrives in slice S6a; until then it is empty, which matches no manifest the locked schema accepts (64
-/// hex), so every agent is `Compat::Pending`: the conservative direction.
-pub const SUITE_SET_SHA256: &str = "";
+/// This build's suite set, recorded as a PASS entry's `suite.fixture_set_sha256` (docs/adr/ADR-030.md decisions 9 and
+/// 10, "套件集摘要", M2T15D-52, -102): [`suite_set`] of the embedded fixtures ([`fixture_members`]), what the request
+/// builders give for every launch variant ([`request_members`]) and the suite's definition ([`DEFINITION_SHA256`]),
+/// computed once on first use. A PASS recorded under any other is pending for this build.
+pub static SUITE_SET_SHA256: LazyLock<String> =
+    LazyLock::new(|| suite_set(&fixture_members(), &request_members(), DEFINITION_SHA256));
+
+/// The suite's definition digest, computed by build.rs when this crate is compiled (docs/adr/ADR-030.md decision 10):
+/// the tree digest of [`DEFINITION_FILES`] (this crate's sources, the builders, the validator, the replays and the
+/// embedded fixtures among them; its Cargo.toml; the workspace's Cargo.lock; the frame registries the replays judge
+/// by), so changing how requests are built, checked or replayed changes the key.
+pub const DEFINITION_SHA256: &str = env!("HOH_AGENTS_DEFINITION_SHA256");
+
+/// The files [`DEFINITION_SHA256`] covers, by their path in the workspace.
+pub static DEFINITION_FILES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| env!("HOH_AGENTS_DEFINITION_FILES").split(';').collect());
+
+/// The fixed inputs the request builders are given for the suite set, and the launch a replay judges
+/// (docs/adr/ADR-030.md decision 10): the working directory, the prompt, the model, the session (claude's session,
+/// codex's thread, pi's session id), the turn, a steer's text and pi's session directory.
+pub const SUITE_CWD: &str = "/hoh-suite";
+pub const SUITE_PROMPT: &str = "Reply with exactly HOH_SUITE_OK and nothing else.";
+pub const SUITE_MODEL: &str = "hoh-suite-model";
+pub const SUITE_SESSION: &str = "hoh-suite-session";
+pub const SUITE_TURN: &str = "hoh-suite-turn";
+pub const SUITE_STEER: &str = "Also say HOH_SUITE_STEER.";
+pub const SUITE_PI_SESSION_DIR: &str = "/hoh-suite/pi-session";
+
+/// The server requests of codex's `tool` case, which the adapter answers headless ([`crate::codex::headless_answer`]).
+pub const TOOL_SERVER_REQUESTS: [&str; 2] = [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+];
+
+/// The help texts the argv builders are given for the suite set: each declares every option its builder may pass, so
+/// the argv is the one the product builds wherever the tested help declares them (the suite checks the tested help).
+const CLAUDE_HELP: &str = "Usage: claude [options]\n  -p, --print\n  --output-format <format>  text, json, stream-json\n  --verbose\n  --include-partial-messages\n  --resume [sessionId]\n  --model <model>\n  --dangerously-skip-permissions\n";
+const CODEX_EXEC_HELP: &str = "Usage: codex exec [OPTIONS] [PROMPT]\n      --json\n      --dangerously-bypass-approvals-and-sandbox\n  -m, --model <MODEL>\n";
+const PI_HELP: &str = "Usage: pi [options]\n  --mode <mode>  text, json, rpc\n  --session-dir <dir>\n  --session-id <id>\n  --provider <name>\n  --model <id>\n";
+
+/// Every embedded fixture file as a member of the suite set: `fixtures/<path>` with its bytes.
+pub fn fixture_members() -> Vec<(String, Vec<u8>)> {
+    fixtures::FILES
+        .iter()
+        .map(|(name, bytes)| (format!("fixtures/{name}"), bytes.to_vec()))
+        .collect()
+}
+
+/// What the request builders give for every launch variant of every suite's cases, as members of the suite set:
+/// `requests/<suite>/<case>/<variant>` with the canonical JSON ([`canonical`]) of the App Server's messages and
+/// headless answers (codex), or the argv (claude, codex exec, pi), built from the fixed inputs (docs/adr/ADR-030.md
+/// decision 10). A builder refusing a variant gives `{"refused": why}`.
+pub fn request_members() -> Vec<(String, Vec<u8>)> {
+    let table = fixtures::variants();
+    let mut members = Vec::new();
+    for suite in fixtures::SUITES {
+        for case in fixtures::CASES {
+            for name in table.of(suite, case) {
+                let Some(variant) = table.variant(name) else {
+                    continue;
+                };
+                let built = built(suite, case, variant);
+                members.push((format!("requests/{suite}/{case}/{name}"), canonical(&built)));
+            }
+        }
+    }
+    members
+}
+
+/// What `suite`'s builders give for `case` launched as `variant`.
+fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
+    let model = variant.model.then_some(SUITE_MODEL);
+    let resume = variant.resume.then(|| SUITE_SESSION.to_owned());
+    let argv = |built: Result<Vec<String>, String>| match built {
+        Ok(argv) => json!({"argv": argv}),
+        Err(why) => json!({"refused": why}),
+    };
+    match suite {
+        "codex" => {
+            let thread = if variant.resume {
+                requests::thread_resume(1, true, model, SUITE_SESSION)
+            } else {
+                requests::thread_start(1, true, model)
+            };
+            let mut messages = vec![
+                requests::initialize(0),
+                requests::initialized(),
+                thread,
+                requests::turn_start(2, Some(SUITE_SESSION), SUITE_PROMPT),
+            ];
+            let mut answers = serde_json::Map::new();
+            match case {
+                "cancel" => messages.push(requests::turn_interrupt(3, SUITE_SESSION, SUITE_TURN)),
+                "tool" => {
+                    messages.push(requests::turn_steer(
+                        3,
+                        Some(SUITE_SESSION),
+                        Some(SUITE_TURN),
+                        SUITE_STEER,
+                    ));
+                    for method in TOOL_SERVER_REQUESTS {
+                        let answer = match crate::codex::headless_answer(method) {
+                            Ok(result) => json!({"result": result}),
+                            Err((code, message)) => {
+                                json!({"error": {"code": code, "message": message}})
+                            }
+                        };
+                        answers.insert(method.to_owned(), answer);
+                    }
+                }
+                _ => {}
+            }
+            json!({"messages": messages, "answers": answers})
+        }
+        "codex-exec" => argv(
+            crate::codex::exec_args(&crate::codex::Launch {
+                program: PathBuf::from("codex"),
+                app_server_help: None,
+                exec_help: CODEX_EXEC_HELP.to_owned(),
+                exec_resume_help: Some(CODEX_EXEC_HELP.to_owned()),
+                cwd: PathBuf::from(SUITE_CWD),
+                yolo: true,
+                resume,
+                model: model.map(str::to_owned),
+                known: Default::default(),
+                requests: Default::default(),
+                client_notifications: Default::default(),
+                capabilities: crate::capabilities::Probed::new(),
+            })
+            .map_err(|crate::codex::Blocked(why)| why),
+        ),
+        "claude" => argv(
+            crate::claude::argv(&crate::claude::Launch {
+                program: PathBuf::from("claude"),
+                help: CLAUDE_HELP.to_owned(),
+                cwd: PathBuf::from(SUITE_CWD),
+                yolo: true,
+                partial: false,
+                resume,
+                model: model.map(str::to_owned),
+                root: false,
+                capabilities: crate::capabilities::Probed::new(),
+            })
+            .map(|argv| argv.args)
+            .map_err(|crate::claude::Blocked(why)| why),
+        ),
+        "pi" => argv(
+            crate::pi::args(&crate::pi::Launch {
+                program: PathBuf::from("pi"),
+                help: PI_HELP.to_owned(),
+                cwd: PathBuf::from(SUITE_CWD),
+                session_dir: PathBuf::from(SUITE_PI_SESSION_DIR),
+                session_id: SUITE_SESSION.to_owned(),
+                resume: variant.resume,
+                provider: None,
+                model: model.map(str::to_owned),
+                settled_event: true,
+                capabilities: crate::capabilities::Probed::new(),
+            })
+            .map_err(|crate::pi::Blocked(why)| why),
+        ),
+        other => json!({"refused": format!("no suite {other}")}),
+    }
+}
+
+/// The canonical JSON of `value`: compact, every object's keys in sorted order.
+pub fn canonical(value: &Value) -> Vec<u8> {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let ordered: BTreeMap<&String, Value> =
+                    map.iter().map(|(k, v)| (k, sorted(v))).collect();
+                let mut out = serde_json::Map::new();
+                for (k, v) in ordered {
+                    out.insert(k.clone(), v);
+                }
+                Value::Object(out)
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_vec(&sorted(value)).unwrap_or_default()
+}
+
+/// The suite set of `fixtures` and `requests` (members by name, with their bytes) under the suite's `definition`
+/// digest (docs/adr/ADR-030.md decision 10): the tree digest ([`crate::probe::members_sha256`], the probe's algorithm)
+/// of every member by (name, sha256 of its bytes) and the member `definition` with `definition` as its digest. Pure.
+pub fn suite_set(
+    fixtures: &[(String, Vec<u8>)],
+    requests: &[(String, Vec<u8>)],
+    definition: &str,
+) -> String {
+    let hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let members = fixtures
+        .iter()
+        .chain(requests)
+        .map(|(name, bytes)| (name.clone(), hex(bytes)))
+        .chain([("definition".to_owned(), definition.to_owned())])
+        .collect();
+    crate::probe::members_sha256(members)
+}
 
 /// The native agents HoH drives (the product configuration's, REQ-018).
 pub use hoh_core::config::Agent;

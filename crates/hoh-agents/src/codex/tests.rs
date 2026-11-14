@@ -363,3 +363,108 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
         }
     }
 }
+
+/// The recorded App Server case `name`: its server frames as recorded and its client lines (stdin.txt).
+fn recorded_app_server(name: &str) -> (String, Vec<Value>) {
+    let frames = std::fs::read_to_string(format!("{FIXTURES}/{name}/stdout.jsonl"))
+        .expect("recorded frames");
+    let client = std::fs::read_to_string(format!("{FIXTURES}/{name}/stdin.txt"))
+        .expect("recorded client lines")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON client line"))
+        .collect();
+    (frames, client)
+}
+
+#[tokio::test]
+async fn the_driver_writes_what_the_request_builders_give() {
+    // docs/adr/ADR-030.md decision 10, "同一构建函数": the recorded `app-server-turn` replayed by the fake App Server; every
+    // line the driver writes to its stdin equals, one by one, what `app_server::requests` gives for the same start
+    // (YOLO, no model, a new thread), so what the compat suite checks is what the driver sends.
+    use app_server::requests;
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (frames, client) = recorded_app_server("app-server-turn");
+    let frames_file = dir.path().join("frames.jsonl");
+    std::fs::write(&frames_file, &frames).expect("frames");
+    let methods: BTreeMap<String, String> = client
+        .iter()
+        .filter_map(|m| {
+            Some((
+                m["id"].as_i64()?.to_string(),
+                m["method"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let requests_file = dir.path().join("requests.json");
+    std::fs::write(&requests_file, json!(methods).to_string()).expect("requests");
+    let fake_logs = dir.path().join("fake");
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/app_server.py");
+    let mut command = std::process::Command::new("python3");
+    command
+        .arg(fake)
+        .arg(&frames_file)
+        .arg(&requests_file)
+        .arg(&fake_logs);
+    let mut process =
+        crate::process::Process::spawn(command, crate::process::Config::default()).expect("fake");
+    let prompt = client[3]["params"]["input"][0]["text"]
+        .as_str()
+        .expect("the recorded prompt")
+        .to_owned();
+    let thread = client[3]["params"]["threadId"]
+        .as_str()
+        .expect("the recorded thread")
+        .to_owned();
+    let turn = Turn {
+        launch: launch(),
+        prompt: prompt.clone(),
+        logs: dir.path().join("logs"),
+        escalation: Turn::default_escalation(),
+        handshake_timeout: Duration::from_secs(20),
+        deadline: None,
+    };
+    let attempt = AttemptRef {
+        attempt_id: "attempt-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        role: "builder".to_owned(),
+        agent_version: "codex-cli 0.166.0".to_owned(),
+    };
+    let notify = tokio::sync::Notify::new();
+    let (_steer, mut steers) = mpsc::channel::<Steer>(1);
+    let drove = app_server::drive(
+        None,
+        &attempt,
+        &turn,
+        &mut process,
+        Stop::Native(&notify),
+        &mut steers,
+        &mut Vec::new(),
+        None,
+    )
+    .await
+    .expect("driven");
+    let app_server::Drove::Ended(driven) = drove else {
+        panic!("the recorded turn did not degrade");
+    };
+    assert_eq!(driven.state, AttemptState::Settled);
+    let written: Vec<Value> = std::fs::read_to_string(fake_logs.join("received.jsonl"))
+        .expect("what the driver wrote")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let built = vec![
+        requests::initialize(0),
+        requests::initialized(),
+        requests::thread_start(1, true, None),
+        requests::turn_start(2, Some(&thread), &prompt),
+    ];
+    assert_eq!(written.len(), built.len(), "{written:#?}");
+    for (n, (written, built)) in written.iter().zip(&built).enumerate() {
+        assert_eq!(written, built, "line {n} the driver wrote");
+    }
+    // The same start as recorded: the thread and turn requests are the recorder's own; only initialize's clientInfo
+    // names another client.
+    assert_eq!(built[1..], client[1..]);
+    assert_eq!(built[0]["method"], client[0]["method"]);
+}

@@ -26,7 +26,7 @@
 use crate::adapter::{
     AdapterError, AttemptRef, Recorder, Stop, finish, now, offers, sha256_file, step,
 };
-pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused};
+pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused, Replayed};
 use crate::process::{Escalation, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-mod app_server;
+pub mod app_server;
 mod exec;
 
 /// exec's YOLO flag; used only when `codex exec --help` offers it.
@@ -584,6 +584,58 @@ pub async fn run(
         }
     };
     exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
+}
+
+/// Replay `bytes` (the App Server's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands)
+/// through the App Server adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see
+/// [`Replayed`]. Every codex version is judged alike: its notifications are those of the frame registry built in
+/// ([`crate::known::codex_app_server`]); `_version` is the tested one's.
+pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
+    app_server::replay(bytes, &replay_turn())
+}
+
+/// Replay `bytes` (`codex exec --json`'s stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands)
+/// through the exec transport's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`].
+/// Every codex version is judged alike (the exec registry built in, [`crate::known::codex_exec`]); `_version` is the
+/// tested one's.
+pub fn replay_exec(bytes: &[u8], _version: &str) -> Replayed {
+    exec::replay(bytes)
+}
+
+/// The turn a replay judges: the product's YOLO launch of a new thread with codex's own model and the suite's prompt;
+/// the App Server serves every request the adapter sends.
+fn replay_turn() -> Turn {
+    let known = crate::known::codex_app_server().keys().cloned().collect();
+    let requests = APP_SERVER_REQUESTS
+        .iter()
+        .chain(APP_SERVER_GATED.iter().map(|(method, _)| method))
+        .map(|m| (*m).to_owned())
+        .collect();
+    let client_notifications = APP_SERVER_CLIENT_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    Turn {
+        launch: Launch {
+            program: PathBuf::from("codex"),
+            app_server_help: None,
+            exec_help: String::new(),
+            exec_resume_help: None,
+            cwd: PathBuf::from(crate::compat::SUITE_CWD),
+            yolo: true,
+            resume: None,
+            model: None,
+            known,
+            requests,
+            client_notifications,
+            capabilities: crate::capabilities::Probed::new(),
+        },
+        prompt: crate::compat::SUITE_PROMPT.to_owned(),
+        logs: PathBuf::from(crate::compat::SUITE_CWD),
+        escalation: Turn::default_escalation(),
+        handshake_timeout: Duration::from_secs(60),
+        deadline: None,
+    }
 }
 
 /// The capabilities a session of this turn's launch has (docs/adr/ADR-022.md decision 9): those of the transport

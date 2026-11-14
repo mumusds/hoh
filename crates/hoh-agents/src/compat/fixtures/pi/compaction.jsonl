@@ -1,0 +1,13 @@
+{"id":"hoh-state-1","type":"response","command":"get_state","success":true,"data":{"model":{"id":"pi-suite-model","name":"Suite","provider":"suite"},"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"sessionFile":"/hoh-suite/pi-session/hoh-suite-session.jsonl","sessionId":"hoh-suite-session","autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}}
+{"id":"hoh-prompt-2","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}],"timestamp":1}}
+{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}],"timestamp":1}}
+{"type":"message_start","message":{"role":"assistant","content":[],"provider":"suite","model":"pi-suite-model","usage":{"input":20,"output":10,"totalTokens":30},"stopReason":"stop","timestamp":2}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"HOH_SUITE_OK"}],"provider":"suite","model":"pi-suite-model","usage":{"input":20,"output":10,"totalTokens":30},"stopReason":"stop","timestamp":2}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"HOH_SUITE_OK"}],"provider":"suite","model":"pi-suite-model","usage":{"input":20,"output":10,"totalTokens":30},"stopReason":"stop","timestamp":2}}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"Reply with exactly HOH_SUITE_OK and nothing else."}],"timestamp":1},{"role":"assistant","content":[{"type":"text","text":"HOH_SUITE_OK"}],"provider":"suite","model":"pi-suite-model","usage":{"input":20,"output":10,"totalTokens":30},"stopReason":"stop","timestamp":2}]}
+{"type":"compaction_start","reason":"threshold"}
+{"type":"compaction_end","reason":"threshold","aborted":false,"willRetry":false}
+{"type":"agent_settled","aborted":false}
