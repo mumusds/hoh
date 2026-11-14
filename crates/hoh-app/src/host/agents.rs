@@ -1,6 +1,7 @@
-//! The product's agents (docs/adr/ADR-022.md decisions 9 and 10, docs/adr/ADR-030.md decision 2): the registry that
-//! finds and probes each agent CLI outside the writer and keeps what staffing knows of each, and the binder that gives
-//! each binding its session with what its agent's probe found, or blocks it when its agent is unavailable.
+//! The product's agents (docs/adr/ADR-022.md decisions 9 and 10, docs/adr/ADR-030.md decisions 1 to 5): the registry
+//! that finds and probes each agent CLI outside the writer and keeps what staffing knows of each, and staffing, which
+//! judges each binding against one snapshot of it and has the store write the judgment: a session granted, a binding
+//! blocked or unblocked, a fallback or a rebind.
 
 use hoh_agents::capabilities::Probed;
 use hoh_agents::compat::{self, Agent, AgentEntry, CompatManifest};
@@ -8,8 +9,11 @@ use hoh_agents::launch;
 use hoh_agents::login::{self, Login};
 use hoh_agents::probe::{self, ProbeEnv, ProbeError};
 use hoh_core::decision::Observation;
-use hoh_core::persistence::{PersistError, SessionGrant, Store, Unbound};
-use hoh_core::staffing::{AgentIdentity, Compat, Fact, FileStamp, Snapshot, Stamp, Usable};
+use hoh_core::persistence::{Evidence, PersistError, StaffChange, StaffWrite, Store};
+use hoh_core::staffing::{
+    AgentIdentity, BindingState, Cause, Compat, Fact, FileStamp, Judgment, Kind, Snapshot, Staffed,
+    Stamp, Usable,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -68,6 +72,18 @@ impl ProbeClass {
             ProbeError::NotStarted { .. } => ProbeClass::NotStarted,
             ProbeError::Failed { .. } => ProbeClass::Failed,
             ProbeError::Io(_) => ProbeClass::Io,
+        }
+    }
+
+    /// Its name, as a staffing evidence object records it (docs/adr/ADR-030.md decision 5).
+    pub fn name(self) -> &'static str {
+        match self {
+            ProbeClass::NotFound => "NotFound",
+            ProbeClass::Unsupported => "Unsupported",
+            ProbeClass::TimedOut => "TimedOut",
+            ProbeClass::NotStarted => "NotStarted",
+            ProbeClass::Failed => "Failed",
+            ProbeClass::Io => "Io",
         }
     }
 
@@ -247,6 +263,38 @@ impl State {
                 verified: matches!(&fact, Some(Fact::Usable(u)) if u.compat == Compat::Verified),
             });
         (fact, observation)
+    }
+
+    /// What `agent`'s last look found, as the evidence of a staffing Block or Switch records it (docs/adr/ADR-030.md
+    /// decision 5): its probe's class and detail (a ready agent's: none, or why its fact is not usable), its entry's
+    /// version, launcher, hashes and capabilities, its compat verdict and the look's identity `(host_epoch, n)`; `None`
+    /// while it was not looked at. Read under the same lock as its fact.
+    fn probe(&self, agent: Agent, suite_set: &str) -> Option<serde_json::Value> {
+        let known = self.agents.get(&agent)?;
+        let seen = known.seen.as_ref()?;
+        let observation = serde_json::json!({"host_epoch": self.host_epoch, "n": known.looks});
+        Some(match &seen.outcome {
+            Err(probe) => serde_json::json!({
+                "class": probe.class.name(), "detail": probe.detail, "cli_version": null, "launcher_path": null,
+                "implementation_sha256": null, "help_sha256": null, "schema_sha256": null, "capabilities": null,
+                "compat": null, "observation": observation,
+            }),
+            Ok(ready) => {
+                let detail = match self.fact(agent, known, suite_set) {
+                    Some(Fact::LoginMissing(why) | Fact::Unsupported(why)) => Some(why),
+                    _ => None,
+                };
+                let entry = &ready.entry;
+                serde_json::json!({
+                    "class": null, "detail": detail, "cli_version": entry.cli_version,
+                    "launcher_path": entry.launcher_path, "implementation_sha256": entry.implementation_sha256,
+                    "help_sha256": entry.help_sha256, "schema_sha256": entry.schema_sha256,
+                    "capabilities": entry.capabilities,
+                    "compat": compat::verdict(self.manifest.as_ref(), agent.as_str(), entry, suite_set),
+                    "observation": observation,
+                })
+            }
+        })
     }
 
     /// Decision 2's fact of `agent`; `None` while it was not looked at, or while the registry has no project to say
@@ -709,6 +757,9 @@ impl Registry {
             if let Some(fact) = fact {
                 snapshot.facts.insert(name.clone(), fact);
             }
+            if let Some(probe) = state.probe(*agent, &self.suite_set) {
+                snapshot.probes.insert(name.clone(), probe);
+            }
             if let Some(observation) = observation {
                 snapshot.observations.insert(name, observation);
             }
@@ -845,14 +896,9 @@ pub(crate) fn read_manifest(path: &Path) -> Result<Option<CompatManifest>, Strin
 
 /// The capabilities every role needs, and those a role following `contract`'s role contract needs too (REQ-020
 /// decision 1, the part that has names; decision 10): structured events always, resume for the commander and the
-/// reviewer.
-pub fn required(contract: Option<&str>) -> BTreeSet<String> {
-    let mut needs: BTreeSet<String> = ["structured_events".to_owned()].into();
-    if matches!(contract, Some("commander" | "reviewer")) {
-        needs.insert("resume".to_owned());
-    }
-    needs
-}
+/// reviewer. One function for the dispatch and for staffing's judgment (docs/adr/ADR-030.md decisions 3 and 12), kept
+/// in `hoh_core::staffing` so the store's staffing read gives each binding its role's.
+pub use hoh_core::staffing::required;
 
 /// What a turn of an agent is given besides what its registry entry says (decisions 11, 12 and 15).
 #[derive(Debug, Clone)]
@@ -1005,45 +1051,141 @@ impl Ready {
     }
 }
 
-/// The binder (decision 9): each binding waiting for its session gets one if its agent is available (its version and
-/// the capabilities a turn will have), is blocked (AGENT_UNAVAILABLE) with why if not, or waits while its agent was not
-/// looked at yet. It reads what the registry last saw: no probe runs in a tick or a writer job.
-pub(super) async fn bind(
+/// Staffing (docs/adr/ADR-030.md decisions 1, 4 and 5): each binding of `staffing` judged against `snapshot`, the
+/// registry's one snapshot of this tick, and what the judgment writes handed to the store, which writes it only while
+/// the binding is still the one judged. A Block or a Switch first keeps its evidence, every candidate evaluated with
+/// what its look found, as an object of the project at `root`; when it cannot be written the judgment is not written
+/// this tick (no evidence, no switch and no block; the next tick judges again). A judgment the binding already holds
+/// (the same block, the same change pending) writes nothing. It reads what the registry last saw: no probe runs in a
+/// tick or a writer job. Whether anything was written.
+pub(super) async fn staff(
     store: &Store,
-    registry: &Arc<Registry>,
-    unbound: Vec<Unbound>,
-    cwd: &Path,
-) -> Result<(), PersistError> {
-    for waiting in unbound {
-        let Some(agent) = Agent::named(&waiting.agent) else {
+    root: &Path,
+    snapshot: &Snapshot,
+    staffing: Vec<Staffed>,
+) -> Result<bool, PersistError> {
+    let mut wrote = false;
+    for staffed in staffing {
+        let judgment = hoh_core::staffing::judge(&staffed, &snapshot.facts, &staffed.excluded);
+        let Some(write) = write_of(&staffed, judgment, snapshot, root).await else {
             continue;
         };
-        let Some(looked) = registry.seen(agent) else {
-            continue;
-        };
-        let granted = looked.and_then(|ready| {
-            let capabilities = ready.session_capabilities(agent, cwd)?;
-            Ok((ready.version, capabilities))
-        });
-        match granted {
-            Ok((agent_version, capabilities)) => {
-                store
-                    .bind_session(SessionGrant {
-                        run_id: waiting.run_id,
-                        role: waiting.role,
-                        role_epoch: waiting.role_epoch,
-                        agent: waiting.agent,
-                        agent_version,
-                        capabilities,
-                    })
-                    .await?;
+        wrote |= store
+            .staff(StaffChange {
+                run_id: staffed.run_id,
+                role: staffed.role,
+                role_epoch: staffed.role_epoch,
+                agent: staffed.agent,
+                write,
+            })
+            .await?;
+    }
+    Ok(wrote)
+}
+
+/// What `judgment` of `staffed` writes, if anything: none when the binding already holds it, or when the evidence of a
+/// Block or a Switch could not be kept.
+async fn write_of(
+    staffed: &Staffed,
+    judgment: Judgment,
+    snapshot: &Snapshot,
+    root: &Path,
+) -> Option<StaffWrite> {
+    let c = &staffed.agent;
+    let verdict =
+        hoh_core::staffing::verdict(c, &staffed.required, &snapshot.facts, &staffed.excluded);
+    let pending = |cause: Cause, to: &str| {
+        staffed
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.cause == cause && p.to == to)
+    };
+    let blocked_for = |reason: hoh_core::protocol::BlockedReason| {
+        staffed.state == BindingState::Blocked && staffed.blocked_reason == Some(reason)
+    };
+    match judgment {
+        // The bound agent usable and its session fresh: a change still pending is withdrawn (decision 5).
+        Judgment::Nothing => (verdict.kind() == Kind::Usable && staffed.pending.is_some())
+            .then_some(StaffWrite::Unblock),
+        Judgment::Grant => match snapshot.facts.get(c) {
+            Some(Fact::Usable(usable)) => Some(StaffWrite::Grant {
+                agent_version: usable.version.clone(),
+                capabilities: usable.session.clone(),
+                identity: usable.identity.clone(),
+            }),
+            _ => None,
+        },
+        Judgment::Unblock => Some(StaffWrite::Unblock),
+        Judgment::Rebind { .. } => {
+            (!(staffed.live && pending(Cause::Rebind, c))).then_some(StaffWrite::Rebind)
+        }
+        Judgment::Block { reason, missing } => {
+            if blocked_for(reason) && staffed.missing == missing && staffed.pending.is_none() {
+                return None;
             }
-            Err(why) => {
-                store.block_binding(waiting, why).await?;
+            let evidence = evidence(root, snapshot, &missing).await?;
+            Some(StaffWrite::Block {
+                reason,
+                missing,
+                evidence,
+            })
+        }
+        Judgment::Switch {
+            to,
+            model,
+            evaluated,
+        } => {
+            let reason = verdict.reason()?;
+            if staffed.live && blocked_for(reason) && pending(Cause::Fallback, &to) {
+                return None;
             }
+            let line = verdict.line(c);
+            let mut lines = evaluated.clone();
+            if !lines.iter().any(|l| agent_of(l) == c.as_str()) {
+                lines.insert(0, line.clone());
+            }
+            let evidence = evidence(root, snapshot, &lines).await?;
+            Some(StaffWrite::Switch {
+                to,
+                model,
+                reason,
+                line,
+                evaluated,
+                evidence,
+            })
         }
     }
-    Ok(())
+}
+
+/// The agent a verdict's line `<agent>:<code>` names.
+fn agent_of(line: &str) -> &str {
+    line.split_once(':').map_or(line, |(agent, _)| agent)
+}
+
+/// The evidence of a judgment (decision 5): `{agent, line, probe}` of each candidate `lines` evaluated, in order, as
+/// canonical JSON kept as an object of the project at `root`; `None` when it could not be written.
+async fn evidence(root: &Path, snapshot: &Snapshot, lines: &[String]) -> Option<Evidence> {
+    let items: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            let agent = agent_of(line);
+            serde_json::json!({
+                "agent": agent, "line": line,
+                "probe": snapshot.probes.get(agent).cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    let bytes = compat::canonical(&serde_json::Value::Array(items));
+    let root = root.to_path_buf();
+    let size = bytes.len() as u64;
+    let sha256 = tokio::task::spawn_blocking(move || hoh_core::objects::put(&root, &bytes))
+        .await
+        .ok()?
+        .ok()?;
+    Some(Evidence {
+        sha256,
+        bytes: size,
+    })
 }
 
 #[cfg(test)]

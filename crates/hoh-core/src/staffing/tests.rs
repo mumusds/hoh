@@ -772,16 +772,22 @@ fn judge_follows_decision_four() {
                         let mut judged = Vec::new();
                         for live in [false, true] {
                             let staffed = Staffed {
+                                run_id: "R".to_owned(),
+                                role: "developer".to_owned(),
+                                role_epoch: 1,
                                 agent: "a".to_owned(),
                                 model: Some("bound-model".to_owned()),
                                 preferred: preferred.clone(),
                                 preferred_model: Some("configured-model".to_owned()),
                                 state,
                                 blocked_reason,
+                                missing: Vec::new(),
                                 session: held.session(bound),
                                 live,
                                 order: order.clone(),
                                 required: required_set(ALL_CAPS),
+                                excluded: excluded.clone(),
+                                pending: None,
                             };
                             let judgment = judge(&staffed, &facts, &excluded);
                             assert_eq!(

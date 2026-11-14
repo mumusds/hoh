@@ -313,7 +313,7 @@ pub(super) fn file_source(
 }
 
 /// The configuration of revision `revision`, if it is recorded.
-fn at_revision(
+pub(super) fn at_revision(
     conn: &Connection,
     project_id: &str,
     revision: i64,
@@ -764,18 +764,9 @@ pub(super) fn checkpoint(
     Ok(true)
 }
 
-/// A binding that needs its agent looked at by the binder (decision 9): ACTIVE with no session yet, or BLOCKED because
-/// its agent was unavailable (not a removed role).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Unbound {
-    pub run_id: String,
-    pub role: String,
-    pub role_epoch: i64,
-    pub agent: String,
-}
-
-/// A session the binder grants: for run `run_id`'s `role` at `role_epoch`, with its agent's version and the
-/// capabilities a turn of it will have (decision 9).
+/// A session staffing grants: for run `run_id`'s `role` at `role_epoch`, with its agent's version, the capabilities a
+/// turn of it will have (decision 9) and the identity it is granted under (docs/adr/ADR-030.md decision 4: a session
+/// is fresh only while its agent is still that identity).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionGrant {
     pub run_id: String,
@@ -784,6 +775,7 @@ pub struct SessionGrant {
     pub agent: String,
     pub agent_version: String,
     pub capabilities: serde_json::Value,
+    pub identity: crate::staffing::AgentIdentity,
 }
 
 /// What a dispatched attempt runs as (docs/adr/ADR-022.md decisions 9, 11 and 12): its agent, model and session as
@@ -806,6 +798,11 @@ pub struct Assignment {
     /// next turn then starts a new one of its own (docs/adr/ADR-024.md decision 4, M2T17R-450, -451, -600, -601).
     pub native_session: Option<String>,
     pub agent_version: Option<String>,
+    /// The session's capabilities (`sessions.capabilities_json`) and the identity it was granted under
+    /// (`team.session_bound.identity`; none when its record has no whole one): prepare checks the session is fresh for
+    /// the agent's fact (docs/adr/ADR-030.md decision 9 (d)).
+    pub session_capabilities: Option<serde_json::Value>,
+    pub session_identity: Option<crate::staffing::AgentIdentity>,
     /// A prompt override file (relative to the project) or `builtin:<role>`; none: the role's own built-in contract.
     pub prompt: Option<String>,
     pub goal: Option<String>,
@@ -854,7 +851,7 @@ pub(super) fn assignment(
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
               WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
               ORDER BY e.seq DESC LIMIT 1), \
-             (SELECT t.writer FROM tasks t WHERE t.task_id = ?3) \
+             (SELECT t.writer FROM tasks t WHERE t.task_id = ?3), s.capabilities_json \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
@@ -868,6 +865,10 @@ pub(super) fn assignment(
                     session_id: r.get(4)?,
                     native_session: r.get(5)?,
                     agent_version: r.get(6)?,
+                    session_capabilities: r
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
+                    session_identity: None,
                     prompt: None,
                     goal: r.get(7)?,
                     title: r.get(8)?,
@@ -892,6 +893,7 @@ pub(super) fn assignment(
     if let Some(session) = &assignment.session_id {
         assignment.first_input =
             super::handover::first_input_owed(conn, run_id, role, assignment.role_epoch, session)?;
+        assignment.session_identity = session_identity(conn, session)?;
     }
     if role == super::wakes::COMMANDER {
         assignment.supervision = super::wakes::supervision_input(conn, run_id, attempt_id)?;
@@ -983,6 +985,27 @@ fn handoff(conn: &Connection, attempt_id: &str) -> Result<Option<Handoff>, Persi
     }))
 }
 
+/// The identity session `session_id` was granted under, as its `team.session_bound` records it (looked up by the event's
+/// id, docs/adr/ADR-030.md decision 4); none when it has no record or the record has no whole identity (granted before
+/// identities were recorded: the session is stale).
+pub(super) fn session_identity(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<crate::staffing::AgentIdentity>, PersistError> {
+    let identity: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(payload_json, '$.identity') FROM events WHERE event_id = ?1",
+            params![crate::ids::child_id(session_id, "bound")],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(identity
+        .flatten()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|value| crate::staffing::AgentIdentity::from_json(&value)))
+}
+
 /// The id of the session of `role` at `role_epoch` in run `run_id`: one per run, role and epoch.
 pub fn session_id(run_id: &str, role: &str, role_epoch: i64) -> String {
     crate::ids::child_id(run_id, &format!("session/{role}/{role_epoch}"))
@@ -1062,57 +1085,9 @@ pub(super) fn agents(
     Ok(agents)
 }
 
-/// The project's bindings the binder looks at, in runs not ended.
-pub(super) fn unbound(conn: &Connection, project_id: &str) -> Result<Vec<Unbound>, PersistError> {
-    let mut statement = conn
-        .prepare(
-            "SELECT b.run_id, b.role, b.role_epoch, b.agent, b.config_revision, b.session_id FROM role_bindings b \
-             JOIN runs r ON r.run_id = b.run_id WHERE r.project_id = ?1 \
-             AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') \
-             AND ((b.state = 'ACTIVE' AND b.session_id IS NULL) OR (b.state = 'BLOCKED' AND b.blocked_reason = ?2)) \
-             ORDER BY r.created_at, b.run_id, b.role",
-        )
-        .map_err(sqlite_error)?;
-    let rows: Vec<(String, String, i64, String, i64, Option<String>)> = statement
-        .query_map(params![project_id, AGENT_UNAVAILABLE], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        })
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
-        .map_err(sqlite_error)?;
-    let mut found = Vec::new();
-    for (run_id, role, role_epoch, agent, config_revision, session_id) in rows {
-        let binding = Bound {
-            role: role.clone(),
-            agent: agent.clone(),
-            model: None,
-            role_epoch,
-            config_revision,
-            session_id,
-        };
-        // A removed role stays BLOCKED: it is not the binder's.
-        if matches!(before(conn, project_id, &binding)?, Before::Absent) {
-            continue;
-        }
-        found.push(Unbound {
-            run_id,
-            role,
-            role_epoch,
-            agent,
-        });
-    }
-    Ok(found)
-}
-
-/// In one transaction: the session of `grant`, and the binding at its epoch bound to it (ACTIVE again if its agent was
-/// unavailable before), with a team.session_bound event; whether the binding was still the one granted.
+/// In one transaction: the session of `grant`, and the binding at its epoch bound to it (ACTIVE again if it was BLOCKED
+/// for a vacancy, docs/adr/ADR-030.md decision 7's set), with a team.session_bound event carrying the whole identity
+/// it is granted under (decision 4); whether the binding was still the one granted, with no session yet.
 pub(super) fn bind_session(
     conn: &mut Connection,
     grant: &SessionGrant,
@@ -1132,12 +1107,19 @@ pub(super) fn bind_session(
         ],
     )
     .map_err(sqlite_error)?;
+    let vacancy = serde_json::Value::from(
+        crate::staffing::VACANCY
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .to_string();
     let bound = tx
         .execute(
             "UPDATE role_bindings SET session_id = ?1, state = 'ACTIVE', blocked_reason = NULL, missing_json = '[]' \
-             WHERE run_id = ?2 AND role = ?3 AND role_epoch = ?4 AND agent = ?5 \
-             AND ((state = 'ACTIVE' AND session_id IS NULL) OR (state = 'BLOCKED' AND blocked_reason = ?6))",
-            params![id, grant.run_id, grant.role, grant.role_epoch, grant.agent, AGENT_UNAVAILABLE],
+             WHERE run_id = ?2 AND role = ?3 AND role_epoch = ?4 AND agent = ?5 AND session_id IS NULL \
+             AND (state = 'ACTIVE' OR (state = 'BLOCKED' AND blocked_reason IN (SELECT value FROM json_each(?6))))",
+            params![id, grant.run_id, grant.role, grant.role_epoch, grant.agent, vacancy],
         )
         .map_err(sqlite_error)?;
     if bound == 0 {
@@ -1161,59 +1143,7 @@ pub(super) fn bind_session(
                 payload: serde_json::json!({
                     "run_id": grant.run_id, "role": grant.role, "role_epoch": grant.role_epoch,
                     "session_id": id, "agent": grant.agent, "agent_version": grant.agent_version,
-                }),
-            }],
-            ..super::writer::Commit::default()
-        },
-        ctx,
-    )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
-    Ok(true)
-}
-
-/// In one transaction: run `run_id`'s binding of `role` at `role_epoch`, still waiting for a session, BLOCKED because
-/// its agent is unavailable (`$defs.BlockedReason` AGENT_UNAVAILABLE, the agent in missing_json), with a
-/// team.binding_blocked event; whether it was still waiting.
-pub(super) fn block_binding(
-    conn: &mut Connection,
-    unbound: &Unbound,
-    detail: &str,
-    ctx: &super::writer::Ctx<'_>,
-) -> Result<bool, PersistError> {
-    let tx = super::writer::begin(conn, ctx)?;
-    let blocked = tx
-        .execute(
-            "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = ?5, missing_json = json_array(?4) \
-             WHERE run_id = ?1 AND role = ?2 AND role_epoch = ?3 AND agent = ?4 AND state = 'ACTIVE' \
-             AND session_id IS NULL",
-            params![unbound.run_id, unbound.role, unbound.role_epoch, unbound.agent, AGENT_UNAVAILABLE],
-        )
-        .map_err(sqlite_error)?;
-    if blocked == 0 {
-        return Ok(false);
-    }
-    let project_id: String = tx
-        .query_row(
-            "SELECT project_id FROM runs WHERE run_id = ?1",
-            params![unbound.run_id],
-            |r| r.get(0),
-        )
-        .map_err(sqlite_error)?;
-    super::writer::write(
-        &tx,
-        &super::writer::Commit {
-            events: vec![super::writer::NewEvent {
-                project_id,
-                event_id: crate::ids::child_id(
-                    &unbound.run_id,
-                    &format!("blocked/{}/{}", unbound.role, unbound.role_epoch),
-                ),
-                run_id: Some(unbound.run_id.clone()),
-                kind: "team.binding_blocked".to_owned(),
-                payload: serde_json::json!({
-                    "run_id": unbound.run_id, "role": unbound.role, "role_epoch": unbound.role_epoch,
-                    "agent": unbound.agent, "reason": AGENT_UNAVAILABLE, "detail": detail,
+                    "identity": grant.identity,
                 }),
             }],
             ..super::writer::Commit::default()
@@ -1237,9 +1167,14 @@ pub struct TeamMember {
     pub session_id: Option<String>,
     pub state: String,
     pub blocked_reason: Option<String>,
-    /// What the project's current revision changes for this role, applied at its next checkpoint (decision 8):
-    /// `{"agent", "model", "config_revision", "refused"}`, `agent` null when the role is removed, `refused` the reason
-    /// while the change is refused (the old binding works on), else null.
+    /// The lines of its last block (`role_bindings.missing_json`, docs/adr/ADR-030.md decision 5): which agents were
+    /// evaluated and why none could fill the role.
+    pub missing: Vec<String>,
+    /// A change waiting for this role, with its `cause`: `"config"`, what the project's current revision changes for
+    /// it, applied at its next checkpoint (decision 8), `agent` null when the role is removed, `refused` the reason while
+    /// the change is refused (the old binding works on), else null; or `"fallback"` or `"rebind"`, a change staffing
+    /// holds pending while the role's attempt is in flight (docs/adr/ADR-030.md decision 5). `{"cause", "agent",
+    /// "model", "config_revision", "refused"}`.
     pub pending: Option<serde_json::Value>,
     /// The role was removed from the team (its row stays, BLOCKED, so an old epoch stays fenced): not an availability
     /// block.
@@ -1294,7 +1229,7 @@ pub(super) fn view(
     };
     let mut statement = conn
         .prepare(
-            "SELECT role, agent, model, role_epoch, config_revision, session_id, state, blocked_reason \
+            "SELECT role, agent, model, role_epoch, config_revision, session_id, state, blocked_reason, missing_json \
              FROM role_bindings WHERE run_id = ?1",
         )
         .map_err(sqlite_error)?;
@@ -1309,6 +1244,7 @@ pub(super) fn view(
                 session_id: r.get(5)?,
                 state: r.get(6)?,
                 blocked_reason: r.get(7)?,
+                missing: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
                 pending: None,
                 removed: false,
                 first_input_pending: false,
@@ -1329,18 +1265,26 @@ pub(super) fn view(
         member.removed = matches!(before(conn, project_id, &binding)?, Before::Absent);
         member.first_input_pending =
             super::handover::first_input_pending(conn, run_id, &member.role, member.role_epoch)?;
-        if member.config_revision >= team_revision {
-            continue;
-        }
-        let wanted = config.team.get(&member.role);
-        if changes(conn, project_id, &binding, &config)? {
+        if member.config_revision < team_revision && changes(conn, project_id, &binding, &config)? {
+            let wanted = config.team.get(&member.role);
             let refused = verdicts(conn, run_id, &member.role, team_revision)?.1;
             member.pending = Some(serde_json::json!({
+                "cause": "config",
                 "agent": wanted.map(|role| role.agent.as_str()),
                 "model": wanted.and_then(|role| role.model.clone()),
                 "config_revision": team_revision,
                 // Why it is refused, as its last refusal said (not always AGENT_UNAVAILABLE: M2T17R-51).
                 "refused": refused.map(|(reason, _)| reason),
+            }));
+        } else if let Some((change, model)) =
+            super::staffing::pending_change(conn, run_id, &member.role, member.role_epoch)?
+        {
+            member.pending = Some(serde_json::json!({
+                "cause": change.cause.as_str(),
+                "agent": change.to,
+                "model": model,
+                "config_revision": member.config_revision,
+                "refused": null,
             }));
         }
     }
@@ -1355,9 +1299,11 @@ pub(super) fn view(
                 session_id: None,
                 state: "UNBOUND".to_owned(),
                 blocked_reason: None,
+                missing: Vec::new(),
                 removed: false,
                 first_input_pending: false,
                 pending: Some(serde_json::json!({
+                    "cause": "config",
                     "agent": role.agent.as_str(),
                     "model": role.model,
                     "config_revision": team_revision,

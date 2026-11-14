@@ -690,3 +690,198 @@ fn a_manifest_missing_unreadable_or_not_schema_valid_is_empty_and_leftovers_go()
     assert!(matches!(compat(&registry)?, Compat::Pending(_)));
     Ok(())
 }
+
+#[test]
+fn a_snapshot_has_each_looked_at_agents_probe_for_the_evidence() -> R {
+    // docs/adr/ADR-030.md decision 5: the evidence of a Block or a Switch names, for each candidate, what its look found;
+    // the snapshot carries it beside the fact, read under the same lock: a failed look's class and detail, a ready
+    // agent's version, launcher, hashes, capabilities and compat verdict, with the look's identity (host_epoch, n).
+    let bin = tempfile::tempdir()?;
+    claude(bin.path(), "A")?;
+    let project = tempfile::tempdir()?;
+    let registry = Registry::new(path_of(bin.path())).with_suite_set(&suite_set());
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["claude", "pi"]));
+    registry.refresh();
+    let snapshot = registry.snapshot(EPOCH);
+    let pi = snapshot.probes.get("pi").ok_or("no probe of pi")?;
+    assert_eq!(pi["class"], "NotFound", "{pi}");
+    assert!(
+        pi["detail"].as_str().is_some_and(|d| d.contains("PATH")),
+        "{pi}"
+    );
+    assert_eq!(
+        pi["observation"],
+        serde_json::json!({"host_epoch": EPOCH, "n": snapshot.observations["pi"].n})
+    );
+    let claude = snapshot.probes.get("claude").ok_or("no probe of claude")?;
+    let ready = registry.seen(Agent::Claude).ok_or("not seen")??;
+    assert_eq!(claude["class"], serde_json::Value::Null, "{claude}");
+    assert_eq!(claude["cli_version"], ready.entry.cli_version.as_str());
+    assert_eq!(claude["launcher_path"], ready.entry.launcher_path.as_str());
+    assert_eq!(
+        claude["implementation_sha256"],
+        ready.entry.implementation_sha256.as_str()
+    );
+    assert_eq!(claude["help_sha256"], ready.entry.help_sha256.as_str());
+    assert_eq!(
+        claude["capabilities"],
+        serde_json::to_value(&ready.entry.capabilities)?
+    );
+    assert!(claude["compat"].get("pending").is_some(), "{claude}");
+    assert_eq!(
+        claude["observation"],
+        serde_json::json!({"host_epoch": EPOCH, "n": snapshot.observations["claude"].n})
+    );
+    registry.want(&wanted(&["claude"]));
+    assert!(
+        !registry.snapshot(EPOCH).probes.contains_key("pi"),
+        "not wanted"
+    );
+    Ok(())
+}
+
+/// Run R's qa as the store reads it: bound to pi at epoch 1, ACTIVE with no session, `order` its order.
+fn qa(order: &[&str]) -> Staffed {
+    Staffed {
+        run_id: "R".to_owned(),
+        role: "qa".to_owned(),
+        role_epoch: 1,
+        agent: "pi".to_owned(),
+        model: None,
+        preferred: "pi".to_owned(),
+        preferred_model: None,
+        state: BindingState::Active,
+        blocked_reason: None,
+        missing: Vec::new(),
+        session: None,
+        live: false,
+        order: order.iter().map(|a| (*a).to_owned()).collect(),
+        required: required(Some("qa")),
+        excluded: Vec::new(),
+        pending: None,
+    }
+}
+
+/// pi not installed, claude usable and verified, with what their looks found.
+fn pi_gone_claude_verified() -> Snapshot {
+    let launcher = FileStamp {
+        dev: 1,
+        ino: 2,
+        ctime_sec: 3,
+        ctime_nsec: 4,
+    };
+    let session = serde_json::json!({"structured_events": true, "resume": true});
+    let mut snapshot = Snapshot::default();
+    snapshot.facts.insert(
+        "pi".to_owned(),
+        Fact::NotInstalled("pi is not on PATH".to_owned()),
+    );
+    snapshot.facts.insert(
+        "claude".to_owned(),
+        Fact::Usable(Box::new(Usable {
+            version: "2.1.318 (Claude Code)".to_owned(),
+            identity: AgentIdentity {
+                launcher_path: "/bin/claude".to_owned(),
+                launcher_sha256: "1".repeat(64),
+                implementation_path: "/bin/claude".to_owned(),
+                implementation_sha256: "1".repeat(64),
+            },
+            stamp: Stamp {
+                launcher,
+                implementation: launcher,
+            },
+            generation: (EPOCH, 1),
+            granted: hoh_core::decision::granted_capabilities(&session),
+            session,
+            compat: Compat::Verified,
+        })),
+    );
+    snapshot.probes.insert(
+        "pi".to_owned(),
+        serde_json::json!({"class": "NotFound", "detail": "pi is not on PATH"}),
+    );
+    snapshot.probes.insert(
+        "claude".to_owned(),
+        serde_json::json!({"class": null, "cli_version": "2.1.318 (Claude Code)"}),
+    );
+    snapshot
+}
+
+#[tokio::test]
+async fn a_judgment_whose_evidence_cannot_be_kept_writes_nothing() -> R {
+    // docs/adr/ADR-030.md decision 5: a Block or a Switch keeps its evidence first, each evaluated candidate with what
+    // its look found, as an object of the project; when the object cannot be written the judgment is not written this
+    // tick (no evidence, no switch and no block).
+    let snapshot = pi_gone_claude_verified();
+    let project = tempfile::tempdir()?;
+    let Some(StaffWrite::Block {
+        reason,
+        missing,
+        evidence,
+    }) = write_of(
+        &qa(&["pi"]),
+        judge(&qa(&["pi"]), &snapshot),
+        &snapshot,
+        project.path(),
+    )
+    .await
+    else {
+        return Err("no block".into());
+    };
+    assert_eq!(
+        (reason, missing),
+        (
+            hoh_core::protocol::BlockedReason::AgentUnavailable,
+            vec!["pi:not_installed".to_owned()]
+        )
+    );
+    let kept: serde_json::Value =
+        serde_json::from_slice(&hoh_core::objects::get(project.path(), &evidence.sha256)?)?;
+    assert_eq!(
+        kept,
+        serde_json::json!([{"agent": "pi", "line": "pi:not_installed",
+                             "probe": {"class": "NotFound", "detail": "pi is not on PATH"}}])
+    );
+    let Some(StaffWrite::Switch { to, evidence, .. }) = write_of(
+        &qa(&["pi", "claude"]),
+        judge(&qa(&["pi", "claude"]), &snapshot),
+        &snapshot,
+        project.path(),
+    )
+    .await
+    else {
+        return Err("no switch".into());
+    };
+    assert_eq!(to, "claude");
+    let kept: serde_json::Value =
+        serde_json::from_slice(&hoh_core::objects::get(project.path(), &evidence.sha256)?)?;
+    assert_eq!(
+        kept.as_array()
+            .map(|items| items.iter().map(|i| i["line"].clone()).collect::<Vec<_>>()),
+        Some(vec![
+            serde_json::json!("pi:not_installed"),
+            serde_json::json!("claude:usable")
+        ])
+    );
+    // The objects cannot be written where `.hoh/objects` is a file.
+    let broken = tempfile::tempdir()?;
+    std::fs::create_dir_all(broken.path().join(".hoh"))?;
+    std::fs::write(broken.path().join(".hoh/objects"), "not a directory")?;
+    for order in [&["pi"][..], &["pi", "claude"][..]] {
+        let written = write_of(
+            &qa(order),
+            judge(&qa(order), &snapshot),
+            &snapshot,
+            broken.path(),
+        )
+        .await;
+        assert_eq!(written, None, "{order:?}");
+    }
+    Ok(())
+}
+
+/// Decision 4's judgment of `staffed` under `snapshot`.
+fn judge(staffed: &Staffed, snapshot: &Snapshot) -> Judgment {
+    hoh_core::staffing::judge(staffed, &snapshot.facts, &staffed.excluded)
+}

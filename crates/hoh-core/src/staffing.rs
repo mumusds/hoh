@@ -101,6 +101,22 @@ pub type Facts = BTreeMap<String, Fact>;
 pub struct Snapshot {
     pub facts: Facts,
     pub observations: BTreeMap<String, crate::decision::Observation>,
+    /// What each agent's last look found, as the evidence of a Block or a Switch records it (decision 5): `{class,
+    /// detail, cli_version, launcher_path, implementation_sha256, help_sha256, schema_sha256, capabilities, compat,
+    /// observation: {host_epoch, n}}`; an agent not looked at has none.
+    pub probes: BTreeMap<String, Value>,
+}
+
+/// The capabilities every role needs, and those a role following `contract`'s role contract needs too (REQ-020
+/// decision 1, the part that has names; docs/adr/ADR-022.md decision 10): structured events always, resume for the
+/// commander and the reviewer. Staffing judges a binding by them (decision 3) and the host's dispatch asks them of a
+/// session (`host::agents::required`).
+pub fn required(contract: Option<&str>) -> BTreeSet<String> {
+    let mut needs: BTreeSet<String> = ["structured_events".to_owned()].into();
+    if matches!(contract, Some("commander" | "reviewer")) {
+        needs.insert("resume".to_owned());
+    }
+    needs
 }
 
 /// What a turn's failure excludes (decision 6).
@@ -305,6 +321,16 @@ pub fn fresh(session: &Session, fact: &Fact) -> bool {
     }
 }
 
+/// The vacancy set V (decision 7): the reasons a binding is BLOCKED for while its role waits for an agent; a session
+/// granted ends them.
+pub const VACANCY: [BlockedReason; 5] = [
+    BlockedReason::AgentUnavailable,
+    BlockedReason::BlockedAuth,
+    BlockedReason::BlockedCapability,
+    BlockedReason::ModelUnavailable,
+    BlockedReason::CompatUnverified,
+];
+
 /// `role_bindings.state`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingState {
@@ -312,9 +338,39 @@ pub enum BindingState {
     Blocked,
 }
 
+/// Why a change staffing wrote waits (decision 5): another agent of the order, or a new session of the same agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    Fallback,
+    Rebind,
+}
+
+impl Cause {
+    /// As `team.binding_change_pending.cause` and `team.binding_applied.cause` say it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cause::Fallback => "fallback",
+            Cause::Rebind => "rebind",
+        }
+    }
+}
+
+/// A switch or a rebind staffing wrote as pending while the role had an attempt in flight (decision 5): the epoch's
+/// latest staffing event is its `team.binding_change_pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChange {
+    pub cause: Cause,
+    /// The agent the change binds.
+    pub to: String,
+}
+
 /// One binding as staffing judges it (decision 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staffed {
+    pub run_id: String,
+    pub role: String,
+    pub role_epoch: i64,
     /// The bound agent.
     pub agent: String,
     /// The bound model; `None`: the agent's own default.
@@ -324,6 +380,8 @@ pub struct Staffed {
     pub preferred_model: Option<String>,
     pub state: BindingState,
     pub blocked_reason: Option<BlockedReason>,
+    /// `role_bindings.missing_json`: the lines its last block named.
+    pub missing: Vec<String>,
     pub session: Option<Session>,
     /// The role has an attempt in flight (PREPARED, STARTING or RUNNING). It does not change the judgment; the store
     /// turns a switch or rebind into a pending change while it holds (decision 5).
@@ -332,6 +390,10 @@ pub struct Staffed {
     pub order: Vec<String>,
     /// The capabilities the role requires.
     pub required: BTreeSet<String>,
+    /// The exclusion records of the binding's run, role and revision (decision 6).
+    pub excluded: Vec<Excluded>,
+    /// The change the epoch's latest staffing event holds pending, if it is one (decision 5).
+    pub pending: Option<PendingChange>,
 }
 
 /// What a binding should become (decision 4).

@@ -84,6 +84,16 @@ fn rows<T: rusqlite::types::FromSql>(path: &PathBuf, sql: &str) -> R<Vec<Vec<T>>
     Ok(rows)
 }
 
+/// The identity the tests' grants record (docs/adr/ADR-030.md decision 4: every session is granted under one).
+fn granted_identity() -> crate::staffing::AgentIdentity {
+    crate::staffing::AgentIdentity {
+        launcher_path: "/opt/agent/bin/agent".to_owned(),
+        launcher_sha256: "1".repeat(64),
+        implementation_path: "/opt/agent/lib/agent".to_owned(),
+        implementation_sha256: "2".repeat(64),
+    }
+}
+
 #[tokio::test]
 async fn a_started_run_binds_the_team_of_the_current_revision_at_epoch_1() -> R {
     // ADR-022 decisions 3 and 7: the first team transaction writes revision 0 (the built-in defaults, applied); StartRun
@@ -861,7 +871,7 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
         ))
         .await?;
     let codex: std::collections::BTreeSet<String> = ["codex".to_owned()].into();
-    let refused = json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}]);
+    let refused = json!(["claude", 1, {"cause": "config", "agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}]);
     // Refused while A0 runs too: the old binding is not held back for a change that cannot be applied.
     store.team_checkpoint("R1", codex.clone()).await?;
     assert_eq!(shown_developer(&path)?, refused);
@@ -873,7 +883,7 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
     );
     assert_eq!(
         shown_developer(&path)?,
-        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}])
+        json!(["claude", 1, {"cause": "config", "agent": "codex", "model": null, "config_revision": 1, "refused": "AGENT_UNAVAILABLE"}])
     );
     store.pace_run("R1", context.clone()).await?;
     let round = store.schedule_round("R1", context.clone()).await?;
@@ -903,7 +913,7 @@ async fn a_refused_change_leaves_the_old_binding_working_until_its_agent_is_ther
     );
     assert_eq!(
         shown_developer(&path)?,
-        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": null}])
+        json!(["claude", 1, {"cause": "config", "agent": "codex", "model": null, "config_revision": 1, "refused": null}])
     );
     let round = store.schedule_round("R1", context.clone()).await?;
     assert!(round.dispatched.is_none(), "{round:?}");
@@ -970,7 +980,7 @@ async fn a_change_to_an_agent_not_looked_at_yet_waits_without_a_verdict() -> R {
     );
     assert_eq!(
         shown_developer(&path)?,
-        json!(["claude", 1, {"agent": "codex", "model": null, "config_revision": 1, "refused": null}])
+        json!(["claude", 1, {"cause": "config", "agent": "codex", "model": null, "config_revision": 1, "refused": null}])
     );
     store
         .team_checkpoint("R1", crate::persistence::Availability::default())
@@ -1005,7 +1015,7 @@ async fn a_refusal_holds_for_its_revision_only() -> R {
         .await?;
     assert_eq!(
         shown_developer(&path)?,
-        json!(["claude", 1, {"agent": "pi", "model": null, "config_revision": 2, "refused": null}])
+        json!(["claude", 1, {"cause": "config", "agent": "pi", "model": null, "config_revision": 2, "refused": null}])
     );
     store.team_checkpoint("R1", codex).await?;
     assert_eq!(
@@ -1126,7 +1136,7 @@ async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_
     store
         .team_checkpoint("R1", crate::persistence::Availability::default())
         .await?;
-    let waiting = store.runner_waiting("p1").await?.unbound;
+    let waiting = store.runner_waiting("p1").await?.staffing;
     let roles: Vec<&str> = waiting.iter().map(|u| u.role.as_str()).collect();
     assert_eq!(roles, ["commander", "cto", "developer", "qa", "reviewer"]);
     let developer = waiting
@@ -1141,14 +1151,29 @@ async fn the_binder_binds_a_session_per_role_and_epoch_or_blocks_an_unavailable_
         agent: "claude".to_owned(),
         agent_version: "2.1.318 (Claude Code)".to_owned(),
         capabilities: json!({"structured_events": true, "resume": true}),
+        identity: granted_identity(),
     };
     assert!(
         !store.bind_session(grant(2)).await?,
         "another epoch is not granted"
     );
+    // Blocked by staffing (docs/adr/ADR-030.md decision 5) where the binder blocked it before.
     assert!(
         store
-            .block_binding(developer.clone(), "claude is not on PATH".to_owned())
+            .staff(crate::persistence::StaffChange {
+                run_id: developer.run_id.clone(),
+                role: developer.role.clone(),
+                role_epoch: developer.role_epoch,
+                agent: developer.agent.clone(),
+                write: crate::persistence::StaffWrite::Block {
+                    reason: crate::protocol::BlockedReason::AgentUnavailable,
+                    missing: vec!["claude:not_installed".to_owned()],
+                    evidence: crate::persistence::Evidence {
+                        sha256: "1".repeat(64),
+                        bytes: 2,
+                    },
+                },
+            })
             .await?
     );
     assert_eq!(
@@ -1610,6 +1635,7 @@ async fn a_session_start_goes_once_to_its_epochs_session_and_a_superseded_one_ne
             agent: "pi".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({}),
+            identity: granted_identity(),
         })
         .await?;
     let start = store
@@ -1690,6 +1716,7 @@ async fn a_session_start_goes_once_to_its_epochs_session_and_a_superseded_one_ne
             agent: "codex".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({}),
+            identity: granted_identity(),
         })
         .await?;
     let current = store
@@ -1849,6 +1876,7 @@ async fn handed_over_developer(store: &Store, path: &PathBuf) -> R<crate::decisi
             agent: "codex".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({"structured_events": true, "resume": true}),
+            identity: granted_identity(),
         })
         .await?;
     let start = store
@@ -2278,6 +2306,7 @@ async fn a_session_resumes_only_its_own_latest_completed_turn() -> R {
             agent: "claude".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({"structured_events": true, "resume": true}),
+            identity: granted_identity(),
         })
         .await?;
     let start = store
@@ -2650,6 +2679,7 @@ async fn a_new_holder_is_dispatched_nothing_before_it_has_its_first_input() -> R
             agent: "codex".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({"structured_events": true}),
+            identity: granted_identity(),
         })
         .await?;
     store.pace_run("R1", context.clone()).await?;
@@ -2737,6 +2767,7 @@ async fn a_first_input_the_executor_did_not_take_is_recorded_once_and_shown_pend
             agent: "codex".to_owned(),
             agent_version: "1".to_owned(),
             capabilities: json!({}),
+            identity: granted_identity(),
         })
         .await?;
     let session = store

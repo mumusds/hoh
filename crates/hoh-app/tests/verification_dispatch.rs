@@ -263,6 +263,9 @@ struct Team {
     self_test: AtomicBool,
     /// Each FakeAgent started: its process group (its leader's pid) and its leader's start time.
     agents: std::sync::Mutex<Vec<(u32, Option<String>)>>,
+    /// The product's agent registry, when set: the runner then staffs the bindings by it (docs/adr/ADR-030.md decision
+    /// 1), and the Team takes each new holder's first input (its session.start) as delivered.
+    registry: std::sync::Mutex<Option<Arc<hoh_app::host::agents::Registry>>>,
 }
 
 /// The Developer FakeAgent's self-test record: it claims every TEST of TEST-053-01's specification passed.
@@ -294,6 +297,7 @@ impl Team {
             review_findings: std::sync::Mutex::default(),
             self_test: AtomicBool::new(false),
             agents: std::sync::Mutex::default(),
+            registry: std::sync::Mutex::default(),
         }
     }
 
@@ -339,6 +343,24 @@ fn refusal(reason: &str, class: hoh_core::retry::FailureClass) -> hoh_app::host:
 }
 
 impl hoh_app::host::Executor for Team {
+    fn registry(&self) -> Option<Arc<hoh_app::host::agents::Registry>> {
+        self.registry.lock().ok().and_then(|r| r.clone())
+    }
+
+    fn open_session(
+        &self,
+        _start: &hoh_core::persistence::SessionStart,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (sent, answer) = tokio::sync::oneshot::channel();
+        let taken = if self.registry().is_some() {
+            Ok(())
+        } else {
+            Err("this executor opens no sessions".to_owned())
+        };
+        let _ = sent.send(taken);
+        answer
+    }
+
     fn deliver(
         &self,
         work: &hoh_app::host::Work,
@@ -3126,4 +3148,214 @@ async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
     host.shutdown().await;
     team.end_agents();
     outcome
+}
+
+/// TEST-020-02's team (docs/adr/ADR-030.md, its test plan): every role claude but qa, which is pi falling back to claude.
+const FALLBACK_TEAM: &str = "config_version = \"1.0\"\n\
+[team.commander]\nagent = \"claude\"\n[team.cto]\nagent = \"claude\"\n[team.developer]\nagent = \"claude\"\n\
+[team.qa]\nagent = \"pi\"\nfallback = [\"claude\"]\n[team.researcher]\nagent = \"claude\"\n[team.reviewer]\nagent = \"claude\"\n";
+
+/// [`world`] with every role bound as StartRun binds it: at epoch 1 of the project's current team revision with no
+/// session yet (staffing grants them), claude for every role but qa (pi).
+fn world_unbound(spec: &str) -> String {
+    format!(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, '{spec}', 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, config_revision, created_at) VALUES
+  ('R', :p, 's1', 'RUNNING', 'AUTO', 7, (SELECT max(revision) FROM team_revisions WHERE state = 'APPLIED'),
+   '2026-11-12T00:00:00Z');
+INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-035', 's1', 'r', 1);
+INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+  ('AC-035-03', 'REQ-035', 's1', 'handoffs without the Commander', 'integration');
+INSERT INTO role_bindings(run_id, role, agent, role_epoch, config_revision, bound_at)
+  SELECT 'R', role, agent, 1, (SELECT max(revision) FROM team_revisions WHERE state = 'APPLIED'), '2026-11-12T00:00:00Z'
+  FROM (SELECT 'commander' AS role, 'claude' AS agent UNION ALL SELECT 'cto', 'claude' UNION ALL
+        SELECT 'developer', 'claude' UNION ALL SELECT 'qa', 'pi' UNION ALL SELECT 'researcher', 'claude' UNION ALL
+        SELECT 'reviewer', 'claude');
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
+  ('D', 'R', 's1', 'READY', 1, 'developer', 1, 1, 1);
+INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('D', 'REQ-035', 's1');"
+    )
+}
+
+/// A fake `claude` in `bin` answering `--version` and `--help` with the unmodified recorded 2.1.318 help.
+fn fake_claude(bin: &Path) -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/claude/2.1.318/help.txt"
+    );
+    std::fs::create_dir_all(bin)?;
+    std::fs::write(
+        bin.join("claude"),
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '2.1.318 (Claude Code)';;\n --help) cat '{help}';;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_020_02_qa_falls_back_to_claude_in_a_session_of_its_own() -> R {
+    // AC-020-02 (docs/adr/ADR-030.md decisions 3 to 5, its test plan's TEST-020-02): no pi on the host's PATH, qa
+    // configured pi falling back to claude, claude (answering the unmodified recorded 2.1.318 help) registered by the
+    // product's compat suite. Staffing switches qa to claude at epoch 2 with its evidence; D (claude) completes into a
+    // candidate and the QA attempt runs as claude in a session that is not the Developer's, with command execution.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    let bin = dir.path().join("bin");
+    fake_claude(&bin)?;
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    std::fs::write(project.join(".hoh/config.toml"), FALLBACK_TEAM)?;
+    // The file becomes the project's team revision at a host's start.
+    Host::start(config(&project)).await?.shutdown().await;
+    let registered = hoh_app::compat::register(
+        &project,
+        hoh_agents::compat::Agent::Claude,
+        std::ffi::OsStr::new(&path),
+    )?;
+    assert_eq!(
+        format!("{:?}", registered.entry.suite.status),
+        "Pass",
+        "{registered:?}"
+    );
+    seed(&project, &world_unbound(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    if let Ok(mut registry) = team.registry.lock() {
+        *registry = Some(Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            path.clone().into(),
+            Some(dir.path().join("pi-agent")),
+        )));
+    }
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let qa = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT a.attempt_id, a.agent, a.session_id, a.role_epoch FROM attempts a JOIN tasks t \
+             ON t.task_id = a.task_id WHERE t.role = 'qa'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let qa = &qa[0];
+        assert_eq!(qa["agent"], "claude", "{qa}");
+        assert_eq!(qa["role_epoch"], 2, "{qa}");
+        let developer = rows(
+            &project,
+            "SELECT session_id FROM attempts WHERE task_id = 'D'",
+        )?;
+        let s_dev = developer[0]["session_id"].clone();
+        assert!(s_dev.is_string(), "{developer}");
+        assert_ne!(qa["session_id"], s_dev, "QA ran in the Developer's session");
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT agent, role_epoch FROM role_bindings WHERE run_id = 'R' AND role = 'qa'"
+            )?,
+            json!([{"agent": "claude", "role_epoch": 2}])
+        );
+        let session = rows(
+            &project,
+            &format!(
+                "SELECT agent, role, json_extract(capabilities_json, '$.command_execution') AS command_execution \
+                 FROM sessions WHERE session_id = '{}'",
+                qa["session_id"].as_str().unwrap_or_default()
+            ),
+        )?;
+        assert_eq!(
+            session,
+            json!([{"agent": "claude", "role": "qa", "command_execution": 1}])
+        );
+        let fallback = rows(
+            &project,
+            "SELECT payload_json FROM events WHERE run_id = 'R' AND kind = 'team.binding_fallback'",
+        )?;
+        assert_eq!(fallback.as_array().map(Vec::len), Some(1), "{fallback}");
+        let fallback: Value =
+            serde_json::from_str(fallback[0]["payload_json"].as_str().unwrap_or("null"))?;
+        assert_eq!(
+            (&fallback["role"], &fallback["from"], &fallback["chosen"]),
+            (&json!("qa"), &json!("pi"), &json!("claude")),
+            "{fallback}"
+        );
+        assert!(
+            fallback["evaluated"]
+                .as_array()
+                .is_some_and(|e| e.contains(&json!("pi:not_installed"))),
+            "{fallback}"
+        );
+        let sha256 = fallback["probe_sha256"].as_str().ok_or("no probe sha256")?;
+        assert!(
+            fallback["probe_artifact_id"]
+                .as_str()
+                .is_some_and(|a| a.starts_with(sha256)),
+            "{fallback}"
+        );
+        // The object's bytes match its name (get recomputes the digest).
+        let probe: Value = serde_json::from_slice(&hoh_core::objects::get(&project, sha256)?)?;
+        let pi = probe
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["agent"] == "pi"))
+            .ok_or("no pi in the evidence")?;
+        assert_eq!(pi["probe"]["class"], "NotFound", "{probe}");
+        let registered_artifact = rows(
+            &project,
+            &format!(
+                "SELECT count(*) AS n FROM artifacts WHERE artifact_id = '{}'",
+                fallback["probe_artifact_id"].as_str().unwrap_or_default()
+            ),
+        )?;
+        assert_eq!(registered_artifact, json!([{"n": 1}]));
+        let qa_events = rows(
+            &project,
+            "SELECT kind, json_extract(payload_json, '$.role_epoch') AS role_epoch, \
+             json_extract(payload_json, '$.reason') AS reason, json_extract(payload_json, '$.cause') AS cause \
+             FROM events WHERE run_id = 'R' AND kind IN ('team.binding_blocked', 'team.binding_applied') \
+             AND json_extract(payload_json, '$.role') = 'qa' ORDER BY seq",
+        )?;
+        assert_eq!(
+            qa_events,
+            json!([
+                {"kind": "team.binding_blocked", "role_epoch": 1, "reason": "AGENT_UNAVAILABLE", "cause": "staffing"},
+                {"kind": "team.binding_applied", "role_epoch": null, "reason": null, "cause": "fallback"},
+            ])
+        );
+        keep_s3("test-020-02-probe", &probe)?;
+        keep_s3(
+            "test-020-02-attempts",
+            &rows(
+                &project,
+                "SELECT a.attempt_id, t.role, a.state, a.agent, a.session_id, a.role_epoch, a.config_revision \
+                 FROM attempts a JOIN tasks t ON t.task_id = a.task_id ORDER BY a.rowid",
+            )?,
+        )?;
+        keep_s3("test-020-02-sessions", &rows(&project, "SELECT * FROM sessions ORDER BY session_id")?)?;
+        keep_s3(
+            "test-020-02-events",
+            &rows(
+                &project,
+                "SELECT seq, event_id, kind, payload_json FROM events WHERE kind LIKE 'team.%' \
+                 OR kind = 'handoff.prepared' ORDER BY seq",
+            )?,
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome
+}
+
+/// Keep `value` as `<name>.json` in `$HOH_S3_EVIDENCE` when it is set (the slice's evidence directory).
+fn keep_s3(name: &str, value: &Value) -> R {
+    if let Ok(dir) = std::env::var("HOH_S3_EVIDENCE") {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            Path::new(&dir).join(format!("{name}.json")),
+            serde_json::to_vec_pretty(value)?,
+        )?;
+    }
+    keep(name, value)
 }

@@ -47,8 +47,9 @@ pub struct Waiting {
     /// The runs, not ended, behind the project's current team revision: their checkpoint comes first
     /// (docs/adr/ADR-022.md decision 8).
     pub team_behind: Vec<String>,
-    /// The bindings the binder looks at (decision 9).
-    pub unbound: Vec<super::team::Unbound>,
+    /// Every binding of every run not ended that staffing judges (docs/adr/ADR-030.md decision 1): a removed role, and a
+    /// role whose configuration change waits for its checkpoint, left out.
+    pub staffing: Vec<crate::staffing::Staffed>,
     /// The project's current team: each role and the built-in role whose contract it follows (its own, a custom role's
     /// `builtin:<role>`, or none), for the capabilities it needs (decision 10).
     pub roles: Vec<(String, Option<String>)>,
@@ -68,7 +69,7 @@ pub struct Waiting {
 pub(super) enum RunnerJob {
     Waiting(String),
     /// Only the session.start notices waiting in a project (docs/adr/ADR-024.md decision 4), its runner's second look
-    /// after a checkpoint or the binder (M2T17R-156).
+    /// after a checkpoint or a staffing write (M2T17R-156).
     SessionStarts(String),
     /// A dispatch taken at this time (the runner's clock: its attempt's start, M2T19R-53).
     Received(Box<DispatchNotice>, std::time::SystemTime),
@@ -129,10 +130,10 @@ pub(super) enum RunnerJob {
     SessionStart(String, Option<String>),
     /// A session.start notice the executor did not take, with what it said (decision 4, M2T17R-150).
     SessionStartUndelivered(String, String),
-    /// A session the binder grants (docs/adr/ADR-022.md decision 9).
+    /// A session granted to a binding (docs/adr/ADR-022.md decision 9).
     BindSession(Box<super::team::SessionGrant>),
-    /// A binding the binder blocks because its agent is unavailable, and why.
-    BlockBinding(Box<super::team::Unbound>, String),
+    /// A staffing judgment's write (docs/adr/ADR-030.md decision 5).
+    Staff(Box<super::staffing::StaffChange>),
     /// A run's team checkpoint (docs/adr/ADR-022.md decision 8), with the agents the registry found unavailable.
     Checkpoint(String, super::team::Availability),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
@@ -381,8 +382,8 @@ pub(super) fn run(
         RunnerJob::BindSession(grant) => {
             super::team::bind_session(conn, &grant, ctx).map(RunnerDone::Applied)
         }
-        RunnerJob::BlockBinding(unbound, detail) => {
-            super::team::block_binding(conn, &unbound, &detail, ctx).map(RunnerDone::Applied)
+        RunnerJob::Staff(change) => {
+            super::staffing::staff(conn, &change, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Checkpoint(run_id, availability) => {
             super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
@@ -544,7 +545,7 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
                 .collect::<Result<_, _>>()
                 .map_err(sqlite_error)?
         },
-        unbound: super::team::unbound(conn, project_id)?,
+        staffing: super::staffing::staffed(conn, project_id)?,
         roles: super::team::roles(conn, project_id)?,
         agents: super::team::agents(conn, project_id)?,
     })

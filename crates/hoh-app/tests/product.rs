@@ -1070,8 +1070,10 @@ async fn a_change_to_an_agent_not_installed_is_refused_until_it_is_and_the_old_b
 #[tokio::test]
 async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R {
     // ADR-022 decisions 11 and 12: a prompt override gone at the start fails the attempt PROMPT_UNAVAILABLE (transient:
-    // its task waits for a retry), never another contract in its place; an agent gone from the host since its binding
-    // fails it AGENT_UNAVAILABLE (capability: its task is blocked); each with an attempt.start_refused event saying why.
+    // its task waits for a retry), never another contract in its place, with an attempt.start_refused event saying why.
+    // An agent gone from the host since its binding: staffing blocks the bindings to it at its next look
+    // (docs/adr/ADR-030.md decisions 4 and 5: no fallback, AGENT_UNAVAILABLE with the line that says why), so a task of
+    // its role due then starts no attempt (the task's own vacancy mark is decision 7's, S5).
     let world = World::new()?;
     world.claude(None)?;
     let project = world.project();
@@ -1119,17 +1121,60 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
             "no contract was sent in its place"
         );
         std::fs::remove_file(world.bin().join("claude"))?;
-        // A tick looks at the team's agents: claude is gone.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // The registry looks at the team's agents: claude is gone, and staffing blocks the developer's binding.
+        until(
+            &project,
+            &format!(
+                "SELECT state || '/' || blocked_reason || '/' || missing_json FROM role_bindings \
+                 WHERE run_id = '{run_id}' AND role = 'developer'"
+            ),
+            "BLOCKED/AGENT_UNAVAILABLE/[\"claude:not_installed\"]",
+            limit,
+        )
+        .await?;
+        // Exactly one block of the developer, by staffing, whose evidence object names claude's look: not found.
+        let blocked: Vec<String> = serde_json::from_str(&query(
+            &project,
+            &format!(
+                "SELECT json_group_array(payload_json) FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'team.binding_blocked' AND json_extract(payload_json, '$.role') = 'developer'"
+            ),
+        )?)?;
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        let blocked: Value = serde_json::from_str(&blocked[0])?;
+        assert_eq!(
+            (&blocked["cause"], &blocked["reason"], &blocked["missing"]),
+            (
+                &json!("staffing"),
+                &json!("AGENT_UNAVAILABLE"),
+                &json!(["claude:not_installed"])
+            ),
+            "{blocked}"
+        );
+        let sha256 = blocked["probe_sha256"].as_str().ok_or("no probe_sha256")?;
+        assert!(
+            blocked["probe_artifact_id"]
+                .as_str()
+                .is_some_and(|a| a.starts_with(sha256)),
+            "{blocked}"
+        );
+        let evidence: Value = serde_json::from_slice(&hoh_core::objects::get(&project, sha256)?)?;
+        let claude = evidence
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["agent"] == "claude"))
+            .ok_or("no claude in the evidence")?;
+        assert_eq!(claude["probe"]["class"], "NotFound", "{evidence}");
         ready(&project, &run_id, &[("T-d", "developer")])?;
-        until(&project, &ended("T-d/attempt-1"), "FAILED/AGENT_UNAVAILABLE", limit).await?;
-        assert!(!refused("T-d/attempt-1")?.is_empty());
+        // Ticks go on (200 ms each): the blocked role is dispatched nothing, and its task waits READY (the vacancy mark
+        // of decision 7 is S5's).
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(
             query(
                 &project,
-                "SELECT state || '/' || blocked_reason FROM tasks WHERE task_id = 'T-d'"
+                "SELECT state || '/' || attempt_count || '/' || \
+                 (SELECT count(*) FROM attempts WHERE task_id = 'T-d') FROM tasks WHERE task_id = 'T-d'"
             )?,
-            "BLOCKED/BLOCKED_CAPABILITY"
+            "READY/0/0"
         );
         R::Ok(())
     }
@@ -3374,14 +3419,28 @@ fn kinds(events: &[(i64, String, Value)]) -> Vec<&str> {
 
 #[tokio::test]
 async fn a_writer_waits_for_a_running_suite() -> R {
-    // docs/adr/ADR-030.md decision 10 (M2T15D-04, K7): the host runs the compat suite of claude, which nothing
-    // registered, once it looked at it; while the suite is open (held here after its run, before its publication) a
-    // writer task due stays READY with no attempt and the writer slot is granted to no one, while a reader task is
-    // dispatched; once the suite published, the next round grants the writer.
+    // docs/adr/ADR-030.md decision 10 (M2T15D-04, K7): the host runs the compat suite of pi, which nothing registered,
+    // once it looked at it; while the suite is open (held here after its run, before its publication) a writer task
+    // due stays READY with no attempt and the writer slot is granted to no one, while a reader task is dispatched;
+    // once the suite published, the next round grants the writer. The tasks are the developer's, bound to claude,
+    // registered before the host starts: a session is granted only for a verified agent (decisions 4 and 9), so a
+    // reader runs while a suite is open only on an agent verified already.
     let world = World::new()?;
     world.claude(None)?;
+    world.pi()?;
+    // qa and researcher stay pi's, so the registry wants pi and its suite is admitted.
     world.bind_installed()?;
     let project = world.project();
+    let path = format!(
+        "{}:{}",
+        world.bin().display(),
+        world.dir.path().join("tools").display()
+    );
+    hoh_app::compat::register(
+        &project,
+        hoh_agents::compat::Agent::Claude,
+        std::ffi::OsStr::new(&path),
+    )?;
     let hold = world.dir.path().join("hold");
     std::fs::create_dir_all(&hold)?;
     let mut config = world.config();
@@ -3389,6 +3448,17 @@ async fn a_writer_waits_for_a_running_suite() -> R {
     let host = start_when_free(config).await?;
     let outcome = async {
         let run_id = started(&host, "s1").await?;
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT group_concat(role, ',') FROM (SELECT role FROM role_bindings WHERE run_id = '{run_id}' \
+                     AND agent = 'pi' ORDER BY role)"
+                )
+            )?,
+            "qa,researcher",
+            "pi is bound, so wanted"
+        );
         ready(&project, &run_id, &[])?;
         exists(&hold.join("held"), Duration::from_secs(60)).await?;
         let events = suite_events(&project)?;
@@ -3397,7 +3467,7 @@ async fn a_writer_waits_for_a_running_suite() -> R {
             ["compat.suite_opened", "compat.suite_started"],
             "{events:?}"
         );
-        assert_eq!(events[0].2["agent"], "claude");
+        assert_eq!(events[0].2["agent"], "pi");
         let suite = events[0].2["suite_id"].clone();
         exec(
             &project,
@@ -3428,7 +3498,12 @@ async fn a_writer_waits_for_a_running_suite() -> R {
             query(&project, "SELECT count(*) FROM leases WHERE kind = 'writer'")?,
             "0"
         );
-        assert!(!project.join(".hoh/compat-manifest.json").exists());
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(project.join(".hoh/compat-manifest.json"))?)?;
+        assert!(
+            manifest["agents"].get("pi").is_none(),
+            "pi's suite is not published yet: {manifest}"
+        );
         std::fs::write(hold.join("release"), "")?;
         until(
             &project,
@@ -3462,9 +3537,9 @@ async fn a_writer_waits_for_a_running_suite() -> R {
         );
         let manifest: Value =
             serde_json::from_slice(&std::fs::read(project.join(".hoh/compat-manifest.json"))?)?;
-        assert_eq!(manifest["agents"]["claude"]["suite"]["status"], "PASS");
+        assert_eq!(manifest["agents"]["pi"]["suite"]["status"], "PASS");
         assert_eq!(
-            manifest["agents"]["claude"]["suite"]["fixture_set_sha256"],
+            manifest["agents"]["pi"]["suite"]["fixture_set_sha256"],
             json!(hoh_agents::compat::SUITE_SET_SHA256.as_str())
         );
         R::Ok(())
