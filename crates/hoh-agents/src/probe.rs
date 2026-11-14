@@ -32,6 +32,7 @@ pub const CAPABILITIES: &[&str] = &[
     "browser",
     "ui_dialogs",
     "token_usage",
+    "command_execution",
 ];
 
 /// Where and how to probe.
@@ -443,6 +444,7 @@ fn probe_codex(
                     "token_usage",
                     schema.notifications.contains("thread/tokenUsage/updated"),
                 );
+                caps.insert("command_execution".to_owned(), schema.command_execution);
                 return Ok((Transport::AppServer, help, Some(schema.hash)));
             }
             Err(why) => no_app_server = why,
@@ -467,6 +469,10 @@ fn probe_codex(
     );
     set(caps, "mid_turn_steer", false);
     set(caps, "partial_messages", false);
+    caps.insert(
+        "command_execution".to_owned(),
+        exec_runs_commands(&exec_text),
+    );
     Ok((Transport::Exec, help, None))
 }
 
@@ -478,6 +484,9 @@ pub struct CodexSchema {
     pub requests: std::collections::BTreeSet<String>,
     pub client_notifications: std::collections::BTreeSet<String>,
     pub notifications: std::collections::BTreeSet<String>,
+    /// Whether the App Server runs commands under HoH's YOLO profile, judged on the schema as written
+    /// ([`app_server_runs_commands`]); `None` when it cannot be told.
+    pub command_execution: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1594,8 +1603,9 @@ fn read_and_remove(
 }
 
 /// The three protocol schemas of a schema output (`dir`, its files read): the methods each lists in the known form
-/// whose message can be valid, and the tree hash. Every other `.json` file must parse too, and is not kept. Work the
-/// budget or the deadline cut short is a failure, never fewer methods (M1T07R-40).
+/// whose message can be valid, whether the App Server runs commands ([`app_server_runs_commands`]), and the tree hash.
+/// Every other `.json` file must parse too, and is not kept. Work the budget or the deadline cut short is a failure,
+/// never fewer methods (M1T07R-40).
 fn read_schema(
     dir: &Path,
     files: &[(PathBuf, Vec<u8>)],
@@ -1645,14 +1655,12 @@ fn read_schema(
             }
         }
     }
-    // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a method,
-    // checked against the file with the params left to the compat suite (M1T07R-33).
-    // Each file's value is taken, opened in place and dropped once its methods are read, never copied.
-    let mut methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
-        let (mut value, text) = parsed
-            .remove(name)
+    // Each protocol file is a well-formed schema whose numbers read exactly, before any is validated against.
+    for name in PROTOCOL {
+        let (value, text) = parsed
+            .get(name)
             .ok_or_else(|| format!("{name} is missing"))?;
-        draft7_well_formed(&value, checks)
+        draft7_well_formed(value, checks)
             .map_err(|e| format!("{name} is not a well-formed schema: {e}"))?;
         match inexact_number(text, checks) {
             Ok(Some(number)) => {
@@ -1663,6 +1671,22 @@ fn read_schema(
             Err(()) => return Err(format!("{name} was not read within the time limit")),
             Ok(None) => {}
         }
+    }
+    // Whole frames, judged on the files as written, before their params are opened (docs/adr/ADR-030.md decision 12).
+    let command_execution = app_server_runs_commands(
+        parsed.get("ClientRequest.json").map(|(value, _)| value),
+        parsed
+            .get("ServerNotification.json")
+            .map(|(value, _)| value),
+        work,
+    );
+    // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a method,
+    // checked against the file with the params left to the compat suite (M1T07R-33).
+    // Each file's value is taken, opened in place and dropped once its methods are read, never copied.
+    let mut methods = |name: &str, sent: bool, envelope: &dyn Fn(&str) -> serde_json::Value| {
+        let (mut value, _) = parsed
+            .remove(name)
+            .ok_or_else(|| format!("{name} is missing"))?;
         let listed = schema_methods(&value, sent, checks)
             .map_err(|()| format!("{name} was not read within the time limit"))?
             .ok_or_else(|| format!("{name} does not list its methods in the known form"))?;
@@ -1696,6 +1720,7 @@ fn read_schema(
     between("validate", dir);
     let requests = methods("ClientRequest.json", true, &request)?;
     let schema = CodexSchema {
+        command_execution,
         requests,
         client_notifications: methods(
             "ClientNotification.json",
@@ -2337,7 +2362,102 @@ fn probe_claude(
         "resume",
         crate::adapter::offers(&String::from_utf8_lossy(&help), "--resume"),
     );
+    caps.insert(
+        "command_execution".to_owned(),
+        claude_runs_commands(&String::from_utf8_lossy(&help)),
+    );
     Ok((Transport::StreamJson, help, None))
+}
+
+/// Whether claude runs commands under HoH's YOLO profile (docs/adr/ADR-030.md decision 12): its help declares the YOLO
+/// flag (the adapter's own check, [`crate::claude::argv`]) and the text of `--tools` lists `Bash`
+/// ([`crate::adapter::lists_name`]); that text alone is the ground, not `--restricted`'s. Without the YOLO flag it does
+/// not; without `--tools` it cannot be told.
+fn claude_runs_commands(help: &str) -> Option<bool> {
+    if !crate::adapter::offers(help, crate::claude::YOLO_FLAG) {
+        return Some(false);
+    }
+    crate::adapter::option_text(help, "--tools")
+        .map(|tools| crate::adapter::lists_name(&tools, "Bash"))
+}
+
+/// Whether pi runs commands (docs/adr/ADR-030.md decision 12): its built-in tools ([`crate::pi::builtin_tools`]) have
+/// `bash`, not `off by default`; without that list it cannot be told.
+fn pi_runs_commands(help: &str) -> Option<bool> {
+    crate::pi::builtin_tools(help).map(|tools| {
+        tools
+            .get("bash")
+            .is_some_and(|about| !about.contains("off by default"))
+    })
+}
+
+/// Whether `codex exec` runs commands under HoH's YOLO profile (docs/adr/ADR-030.md decision 12): its help declares the
+/// flag that executes commands without a sandbox, the adapter's own check ([`crate::codex::exec_args`]).
+fn exec_runs_commands(exec_help: &str) -> Option<bool> {
+    Some(crate::adapter::offers(exec_help, crate::codex::YOLO_FLAG))
+}
+
+/// The `thread/start` request of HoH's YOLO profile, as the App Server adapter builds it (codex/app_server.rs).
+fn yolo_thread_start() -> serde_json::Value {
+    serde_json::json!({
+        "id": 0,
+        "method": "thread/start",
+        "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+    })
+}
+
+/// An `item/started` notification of a command the App Server runs: the least the recorded 0.166.0 schema asks of one.
+fn command_started() -> serde_json::Value {
+    serde_json::json!({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "type": "commandExecution",
+                "id": "item-1",
+                "command": "true",
+                "commandActions": [],
+                "cwd": "/",
+                "status": "inProgress",
+            },
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "startedAtMs": 0,
+        },
+    })
+}
+
+/// Whether the whole `frame`, its `params` included, is valid under the protocol schema `file` as the CLI wrote it,
+/// never opened; a file the export lacks cannot tell.
+fn frame_valid(file: Option<&serde_json::Value>, frame: &serde_json::Value, work: &Work) -> Truth {
+    let Some(file) = file else {
+        return Truth::Unknown;
+    };
+    let empty = serde_json::Map::new();
+    let defs = file
+        .get("definitions")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(&empty);
+    valid(file, frame, defs, 0, work)
+}
+
+/// Whether the App Server runs commands under HoH's YOLO profile (docs/adr/ADR-030.md decision 12), from its
+/// `ClientRequest.json` and `ServerNotification.json` as written, `params` not opened (`None` where the export lacks
+/// one): the YOLO `thread/start` ([`yolo_thread_start`]) is a valid request and an `item/started` of a command
+/// ([`command_started`]) a valid notification. Both valid: true; either invalid: false; else it cannot be told.
+fn app_server_runs_commands(
+    client_requests: Option<&serde_json::Value>,
+    server_notifications: Option<&serde_json::Value>,
+    work: &Work,
+) -> Option<bool> {
+    let both = Truth::all([
+        frame_valid(client_requests, &yolo_thread_start(), work),
+        frame_valid(server_notifications, &command_started(), work),
+    ]);
+    match both {
+        Truth::Yes => Some(true),
+        Truth::No => Some(false),
+        Truth::Unknown => None,
+    }
 }
 
 /// Pi: `--mode rpc`; resume from the session options in `--help`.
@@ -2360,6 +2480,10 @@ fn probe_pi(
         "resume",
         crate::adapter::offers(&String::from_utf8_lossy(&help), "--session-id")
             || crate::adapter::offers(&String::from_utf8_lossy(&help), "--resume"),
+    );
+    caps.insert(
+        "command_execution".to_owned(),
+        pi_runs_commands(&String::from_utf8_lossy(&help)),
     );
     Ok((Transport::Rpc, help, None))
 }
@@ -2967,6 +3091,9 @@ fn wait_for_output(outputs: &[Output], wait: Duration) -> io::Result<()> {
         Err(e) => Err(e.into()),
     }
 }
+
+#[cfg(test)]
+mod capability_tests;
 
 #[cfg(test)]
 mod tests {

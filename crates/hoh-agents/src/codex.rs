@@ -774,8 +774,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
 /// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn
 /// used (M1R-01, M1T04R-15). On App Server: events, resume (`thread/resume`), steer, deltas and token usage; on exec:
 /// events, token usage (`turn.completed`), and resume if a resumed exec turn can do whatever a new one can
-/// (M1T04R-11, -14, -17). Server requests are
-/// answered headless (no dialogs, no custom tools), prompts are text only, there is no browser.
+/// (M1T04R-11, -14, -17); on both, commands under the YOLO profile (docs/adr/ADR-030.md decision 12). Server requests
+/// are answered headless (no dialogs, no custom tools), prompts are text only, there is no browser.
 fn session(
     attempt: &AttemptRef,
     turn: &Turn,
@@ -792,6 +792,7 @@ fn session(
             ),
             ("partial_messages", true),
             ("token_usage", true),
+            ("command_execution", turn.launch.yolo),
         ]
     } else {
         vec![
@@ -802,6 +803,7 @@ fn session(
                 crate::adapter::lists_command(&turn.launch.exec_help, "resume")
                     && exec_resumable(&turn.launch),
             ),
+            ("command_execution", turn.launch.yolo),
         ]
     };
     Session {
