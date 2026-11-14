@@ -1,10 +1,10 @@
 # CR-021 · 命令执行能力进入能力列表；兼容套件的 fixture 集 hash 覆盖的范围
 
 ID：CR-021
-状态：PROPOSED
-批准人：（待：ADR-030 的设计审查判定可批准后，由 CTO 依 CR-003 D1 预授权批准）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（ADR-030 设计审查第 5 轮 Codex 01a1d9d8-a595-7d93-9cee-2fc8c1225271 与 Grok 01a1d9d8-af1f-7da2-96cb-f3c8ae926797 都判 PASS，并都判 CR-021 属 CR-003 D1 的细化、可由 CTO 批准；草案在第 5 轮审查的冻结提交 86b44ea 中，批准时文字未改）
 日期：2026-11-14
-基线：改受锁的 `contracts/requirements.json`（REQ-027 行为 2、行为 3）；批准后 `python3 tools/gen_spec_views.py`，`python3 tools/baseline.py relock --cr docs/cr/CR-021-command-execution-capability.md`
+基线：修改受锁文件 `contracts/requirements.json`（REQ-027 行为 2、行为 3），重新生成视图，重新上锁
 
 ## 背景
 
