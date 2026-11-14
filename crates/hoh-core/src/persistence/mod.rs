@@ -40,6 +40,7 @@ mod rounds;
 mod runner;
 mod series;
 mod snapshot;
+mod staffing;
 mod suites;
 mod supervise;
 mod team;
@@ -68,6 +69,10 @@ pub use snapshot::{
     AcShown, AcceptanceItem, AcceptancePage, AcceptanceView, CandidateShown, CheckShown, IssueItem,
     IssuesPage, RowShown,
 };
+pub use staffing::{
+    BINDING_BLOCKED, BINDING_EXCLUDED, BINDING_FALLBACK, BINDING_UNBLOCKED, CHANGE_PENDING,
+    CHANGE_WITHDRAWN, Evidence, StaffChange, StaffWrite,
+};
 pub use suites::{
     ABANDONED, Admission, DISCARDED, Publication, Published, SUITE_COMPLETED, SUITE_DEFERRED,
     SUITE_ENDED, SUITE_OPENED, SUITE_STARTED, SuiteSubject, TIMED_OUT, UNPUBLISHED, WITHDRAWN,
@@ -75,7 +80,7 @@ pub use suites::{
 pub use supervise::{Fired, Supervised};
 pub use team::{
     Assignment, Availability, FileTeam, Handoff, SessionGrant, TeamChange, TeamConfig, TeamMember,
-    TeamView, Unbound, session_id,
+    TeamView, session_id,
 };
 pub use verification::{ChangeRequest, Deferred, VerifierRequest};
 pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
@@ -951,7 +956,7 @@ impl Store {
     }
 
     /// The session.start notices PENDING in project `project_id`'s runs not ended, with their bindings now (the
-    /// runner's look after its checkpoints and binder, docs/adr/ADR-024.md decision 4).
+    /// runner's look after its checkpoints and staffing, docs/adr/ADR-024.md decision 4).
     pub async fn session_starts(
         &self,
         project_id: &str,
@@ -1216,13 +1221,10 @@ impl Store {
             .await
     }
 
-    /// Block a binding whose agent is unavailable (decision 9), saying why; whether it was still waiting.
-    pub async fn block_binding(
-        &self,
-        unbound: Unbound,
-        detail: String,
-    ) -> Result<bool, PersistError> {
-        self.runner_step(runner::RunnerJob::BlockBinding(Box::new(unbound), detail))
+    /// Write a staffing judgment of a binding (docs/adr/ADR-030.md decision 5) in one transaction, only while the
+    /// binding is still the one judged (its run, role, epoch and agent); whether anything was written.
+    pub async fn staff(&self, change: StaffChange) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Staff(Box::new(change)))
             .await
     }
 

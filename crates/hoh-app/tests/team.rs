@@ -390,7 +390,7 @@ async fn an_accepted_team_change_is_the_next_revision_pending_in_running_runs_an
     assert_eq!(developer["role_epoch"], 1);
     assert_eq!(
         developer["pending"],
-        json!({"agent": "codex", "model": "m-test", "config_revision": 1, "refused": null})
+        json!({"cause": "config", "agent": "codex", "model": "m-test", "config_revision": 1, "refused": null})
     );
     let auditor = member("auditor").ok_or("no auditor")?;
     assert_eq!(auditor["state"], "UNBOUND", "{auditor}");

@@ -250,7 +250,7 @@ pub struct SessionStart {
     pub package: crate::protocol::ContextHandoff,
     /// The binding's epoch now: past the notice's, the notice is superseded.
     pub current_epoch: i64,
-    /// The binding's session, none until the binder grants one.
+    /// The binding's session, none until staffing grants one.
     pub session_id: Option<String>,
     pub agent: String,
 }

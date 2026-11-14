@@ -588,8 +588,8 @@ async fn tick(
         *renewed = Instant::now();
     }
     let waiting = store.runner_waiting(&project_id).await?;
-    // The product's agents as the registry last saw them: it looks at the ones the team and the unbound bindings name
-    // in its own task (registry_watch), so no probe holds up a tick (docs/adr/ADR-022.md decision 10).
+    // The product's agents as the registry last saw them: it looks at the ones the team, the bindings and their
+    // fallbacks name in its own task (registry_watch), so no probe holds up a tick (docs/adr/ADR-022.md decision 10).
     let registry = common.executor.registry();
     let availability = match &registry {
         Some(registry) => {
@@ -597,7 +597,7 @@ async fn tick(
                 .agents
                 .iter()
                 .cloned()
-                .chain(waiting.unbound.iter().map(|u| u.agent.clone()))
+                .chain(waiting.staffing.iter().map(|s| s.agent.clone()))
                 .collect();
             registry.want(&named);
             registry.availability()
@@ -610,14 +610,18 @@ async fn tick(
     for run in &waiting.team_behind {
         store.team_checkpoint(run, availability.clone()).await?;
     }
-    // Sessions for the bindings waiting for one, and what each role of the team needs (decisions 9 and 10).
+    // Staffing (docs/adr/ADR-030.md decision 1), where the binder was: after the checkpoints, before the first inputs,
+    // the reconcile, the paces and the rounds, so they read the bindings it wrote; every binding judged against one
+    // snapshot of the registry, taken now. And what each role of the team needs (ADR-022 decisions 9 and 10).
     let mut context = context.clone();
+    let mut staffed = false;
     if let Some(registry) = &registry {
-        super::agents::bind(
+        let snapshot = registry.snapshot(common.host_epoch);
+        staffed = super::agents::staff(
             store,
-            registry,
-            waiting.unbound.clone(),
             &common.shared.root,
+            &snapshot,
+            waiting.staffing.clone(),
         )
         .await?;
         context.required_capabilities = waiting
@@ -627,11 +631,12 @@ async fn tick(
             .collect();
     }
     // The new holders' first inputs (docs/adr/ADR-024.md decision 4): a notice its binding has passed is superseded,
-    // never delivered; one of the binding's own epoch goes to its session once the binder granted it, and is settled
+    // never delivered; one of the binding's own epoch goes to its session once staffing granted it, and is settled
     // when the executor has it (at least once: a crash before the settle gives it again). Seen as the bindings are
-    // after this tick's checkpoints and binder, the only writers of a run's bindings once it is started: a notice
-    // taken from the look before them could be one a checkpoint just passed (M2T17R-01).
-    let session_starts = if waiting.team_behind.is_empty() && waiting.unbound.is_empty() {
+    // after this tick's checkpoints and staffing, the writers of a run's bindings once it is started: a notice taken
+    // from the look before them could be one a checkpoint or a switch just passed (M2T17R-01); with no checkpoint due
+    // and no staffing write this tick, the look before them is the bindings as they are.
+    let session_starts = if waiting.team_behind.is_empty() && !staffed {
         waiting.session_starts.clone()
     } else {
         store.session_starts(&project_id).await?

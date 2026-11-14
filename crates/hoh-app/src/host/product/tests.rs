@@ -20,6 +20,8 @@ fn work(prompt: Option<&str>) -> Work {
             session_id: Some("R1/session/developer/1".to_owned()),
             native_session: None,
             agent_version: Some("2.1.318".to_owned()),
+            session_capabilities: None,
+            session_identity: None,
             prompt: prompt.map(str::to_owned),
             goal: Some("Ship it".to_owned()),
             title: Some("Write the parser".to_owned()),
