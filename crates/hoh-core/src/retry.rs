@@ -1,8 +1,8 @@
 //! The retry policy of REQ-042 (docs/adr/ADR-020.md decisions 1 and 2): what a failed attempt means for its task.
 //! A transient failure waits for its Retry-After, else for a full-jitter delay `uniform(0, min(cap, base·2^n))` for
-//! the task's n-th failure (n from 0), at most [`MAX_RETRIES`] times after the first; a missing authentication or an
-//! incompatible CLI blocks at once, with no backoff. Pure: the caller gives the failure time (the store's whole
-//! seconds) and a uniform 32-bit draw, so a fixed seed replays the same delays.
+//! the task's n-th failure (n from 0), at most [`MAX_RETRIES`] times after the first; a missing authentication, model
+//! or agent, or an incompatible or unverified CLI blocks at once, with no backoff. Pure: the caller gives the failure
+//! time (the store's whole seconds) and a uniform 32-bit draw, so a fixed seed replays the same delays.
 
 use crate::protocol::BlockedReason;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,20 +24,29 @@ pub enum FailureClass {
     Auth,
     /// An incompatible CLI found at run time (BLOCKED_CAPABILITY).
     Capability,
+    /// The bound model is not available to the agent (MODEL_UNAVAILABLE; docs/adr/ADR-030.md decision 6).
+    Model,
+    /// The bound agent is not there to run (AGENT_UNAVAILABLE).
+    Unavailable,
+    /// The agent's version is not the verified one (COMPAT_UNVERIFIED), as HoH itself found before it ran.
+    Compat,
     /// A refusal before anything ran that the same input would meet again, such as CONTEXT_BUDGET_TOO_SMALL
     /// (docs/adr/ADR-026.md decision 9): no retry, a decision at once (NEED_DECISION).
     Decision,
 }
 
 impl FailureClass {
-    /// As an OBSERVED effect and the retry events record it: `{"class": "transient"|"auth"|"capability"|"decision",
-    /// "retry_after_ms": n|null}`, so a host that crashes after OBSERVED disposes of it by its class (ADR-020
-    /// decision 1).
+    /// As an OBSERVED effect and the retry events record it: `{"class": "transient"|"auth"|"capability"|"model"|
+    /// "unavailable"|"compat"|"decision", "retry_after_ms": n|null}`, so a host that crashes after OBSERVED disposes of
+    /// it by its class (ADR-020 decision 1).
     pub fn to_json(self) -> serde_json::Value {
         let (class, retry_after) = match self {
             FailureClass::Transient { retry_after } => ("transient", retry_after),
             FailureClass::Auth => ("auth", None),
             FailureClass::Capability => ("capability", None),
+            FailureClass::Model => ("model", None),
+            FailureClass::Unavailable => ("unavailable", None),
+            FailureClass::Compat => ("compat", None),
             FailureClass::Decision => ("decision", None),
         };
         serde_json::json!({
@@ -57,6 +66,9 @@ impl FailureClass {
             }),
             "auth" => Some(FailureClass::Auth),
             "capability" => Some(FailureClass::Capability),
+            "model" => Some(FailureClass::Model),
+            "unavailable" => Some(FailureClass::Unavailable),
+            "compat" => Some(FailureClass::Compat),
             "decision" => Some(FailureClass::Decision),
             _ => None,
         }
@@ -92,6 +104,9 @@ pub fn after_failure(
     let retry_after = match class {
         FailureClass::Auth => return AfterFailure::Blocked(BlockedReason::BlockedAuth),
         FailureClass::Capability => return AfterFailure::Blocked(BlockedReason::BlockedCapability),
+        FailureClass::Model => return AfterFailure::Blocked(BlockedReason::ModelUnavailable),
+        FailureClass::Unavailable => return AfterFailure::Blocked(BlockedReason::AgentUnavailable),
+        FailureClass::Compat => return AfterFailure::Blocked(BlockedReason::CompatUnverified),
         FailureClass::Decision => return AfterFailure::Decide,
         FailureClass::Transient { retry_after } => retry_after,
     };
@@ -312,6 +327,41 @@ mod tests {
                 after_failure(FailureClass::Capability, failures, at(0, 0), 0),
                 AfterFailure::Blocked(BlockedReason::BlockedCapability)
             );
+        }
+    }
+
+    #[test]
+    fn a_missing_model_agent_or_verified_version_blocks_at_once_and_survives_its_record() {
+        // docs/adr/ADR-030.md decision 6: a vacancy of the role, no backoff; the class reads back from its record.
+        for (class, name, reason) in [
+            (
+                FailureClass::Model,
+                "model",
+                BlockedReason::ModelUnavailable,
+            ),
+            (
+                FailureClass::Unavailable,
+                "unavailable",
+                BlockedReason::AgentUnavailable,
+            ),
+            (
+                FailureClass::Compat,
+                "compat",
+                BlockedReason::CompatUnverified,
+            ),
+        ] {
+            for failures in [1, 5, MAX_RETRIES + 1] {
+                assert_eq!(
+                    after_failure(class, failures, at(0, 0), 0),
+                    AfterFailure::Blocked(reason)
+                );
+            }
+            let json = class.to_json();
+            assert_eq!(
+                json,
+                serde_json::json!({"class": name, "retry_after_ms": null})
+            );
+            assert_eq!(FailureClass::from_json(&json), Some(class));
         }
     }
 
