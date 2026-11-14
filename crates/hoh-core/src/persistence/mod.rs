@@ -38,7 +38,9 @@ mod results;
 mod retry;
 mod rounds;
 mod runner;
+mod series;
 mod snapshot;
+mod suites;
 mod supervise;
 mod team;
 mod verification;
@@ -65,6 +67,10 @@ pub use runner::{
 pub use snapshot::{
     AcShown, AcceptanceItem, AcceptancePage, AcceptanceView, CandidateShown, CheckShown, IssueItem,
     IssuesPage, RowShown,
+};
+pub use suites::{
+    ABANDONED, Admission, DISCARDED, Publication, Published, SUITE_COMPLETED, SUITE_DEFERRED,
+    SUITE_ENDED, SUITE_OPENED, SUITE_STARTED, SuiteSubject, TIMED_OUT, UNPUBLISHED, WITHDRAWN,
 };
 pub use supervise::{Fired, Supervised};
 pub use team::{
@@ -790,6 +796,70 @@ impl Store {
     /// Commit `commit` in one IMMEDIATE transaction on the writer: all of it or nothing.
     pub async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
         self.writer.commit(commit).await
+    }
+
+    /// Admit `subject`'s compat suite in project `project_id` at `now` (docs/adr/ADR-030.md decision 10): `Busy` while
+    /// another identity's suite is open, `Deferred` (and the suite open) while the writer slot is held, else `Started`.
+    pub async fn begin_suite(
+        &self,
+        project_id: &str,
+        subject: SuiteSubject,
+        now: std::time::SystemTime,
+    ) -> Result<Admission, PersistError> {
+        match self
+            .writer
+            .suite(suites::SuiteJob::Begin {
+                project_id: project_id.to_owned(),
+                subject,
+                now,
+            })
+            .await?
+        {
+            suites::SuiteDone::Admitted(admission) => Ok(admission),
+            _ => Err(PersistError::IntegrityViolation(
+                "a suite's admission answered with something else".to_owned(),
+            )),
+        }
+    }
+
+    /// Publish a started suite's result over the manifest (decision 10 "发布"), only while it is still open.
+    pub async fn publish_suite(&self, publication: Publication) -> Result<Published, PersistError> {
+        match self
+            .writer
+            .suite(suites::SuiteJob::Publish(publication))
+            .await?
+        {
+            suites::SuiteDone::Published(published) => Ok(published),
+            _ => Err(PersistError::IntegrityViolation(
+                "a suite's publication answered with something else".to_owned(),
+            )),
+        }
+    }
+
+    /// End compat suite `suite_id` of project `project_id` with `status` (and why), if it is the one open; false when it
+    /// is not.
+    pub async fn end_suite(
+        &self,
+        project_id: &str,
+        suite_id: &str,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<bool, PersistError> {
+        match self
+            .writer
+            .suite(suites::SuiteJob::End {
+                project_id: project_id.to_owned(),
+                suite_id: suite_id.to_owned(),
+                status: status.to_owned(),
+                error,
+            })
+            .await?
+        {
+            suites::SuiteDone::Ended(ended) => Ok(ended),
+            _ => Err(PersistError::IntegrityViolation(
+                "a suite's end answered with something else".to_owned(),
+            )),
+        }
     }
 
     /// The project's unfinished attempts (PREPARED, STARTING, RUNNING) with their tasks, process records and

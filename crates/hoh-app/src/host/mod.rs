@@ -22,6 +22,7 @@ mod processes;
 pub mod product;
 mod reconcile;
 mod runner;
+mod suites;
 pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, Started, Work};
@@ -198,6 +199,10 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
 
     /// Just after the host announced itself (host.json written), before it returns from its start.
     fn announced(&self) {}
+
+    /// A compat suite's run on `agent` ended and its result is not yet published, on the suite's own thread
+    /// (docs/adr/ADR-030.md decision 10): a test's implementation holds the suite open here.
+    fn suite_ran(&self, _agent: &str) {}
 
     /// Between reading the team's revision and submitting the configuration file's revision over it (a test's
     /// implementation moves the team on here, M2T07R-454).

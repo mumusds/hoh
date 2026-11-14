@@ -315,9 +315,15 @@ pub(super) async fn run(
         runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
     });
     let registry = config.executor.registry();
-    let watch = registry
-        .clone()
-        .map(|registry| tokio::spawn(registry_watch(registry, stop.clone())));
+    // The project's compat manifest into the registry, the leftovers of a publication that crashed deleted, before the
+    // registry's first look (docs/adr/ADR-030.md decision 10, "清单只由 host 写，放在注册表里").
+    if let Some(registry) = &registry {
+        open_manifest(&common, registry).await;
+    }
+    let watch = registry.clone().map(|registry| {
+        let suites = super::suites::Suites::new(common.shared.clone(), common.clock.clone());
+        tokio::spawn(registry_watch(registry, suites, stop.clone()))
+    });
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
     // Before the first tick: the candidates' records recovered, what no live attempt uses removed, one round sweep
@@ -469,13 +475,62 @@ async fn verified_runs(
     Ok(runs)
 }
 
+/// Read the project's compat manifest into `registry` (deleting what a publication that crashed left beside it); one
+/// that cannot be read or is not schema-valid is held as empty and recorded as a `compat.manifest_unreadable` event of
+/// this host epoch (docs/adr/ADR-030.md decision 10).
+async fn open_manifest(common: &Common, registry: &Arc<super::agents::Registry>) {
+    let (opening, root) = (registry.clone(), common.shared.root.clone());
+    let said = tokio::task::spawn_blocking(move || opening.open_manifest(&root))
+        .await
+        .ok()
+        .flatten();
+    let Some(said) = said else {
+        return;
+    };
+    let project_id = &common.shared.project_id;
+    let recorded = common
+        .shared
+        .store
+        .commit(Commit {
+            events: vec![NewEvent {
+                project_id: project_id.clone(),
+                event_id: hoh_core::ids::child_id(
+                    project_id,
+                    &format!("compat-manifest-unreadable/{}", common.host_epoch),
+                ),
+                run_id: None,
+                kind: said.kind.to_owned(),
+                payload: json!({"host_epoch": common.host_epoch, "detail": said.detail}),
+            }],
+            ..Commit::default()
+        })
+        .await;
+    if let Err(e) = recorded {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "hoh host: the compat manifest is not used ({}): {e}",
+            said.detail
+        );
+    }
+}
+
 /// The registry's own loop (docs/adr/ADR-022.md decision 10): every tick it looks at the agents the runner wants, off
-/// the async workers; a probe may take its while, but neither a tick nor the host's stop waits for it.
-async fn registry_watch(registry: Arc<super::agents::Registry>, mut stop: watch::Receiver<bool>) {
+/// the async workers; a probe may take its while, but neither a tick nor the host's stop waits for it. After each look
+/// it drives the compat suites (docs/adr/ADR-030.md decision 10), one at a time; at the stop the one open is abandoned.
+async fn registry_watch(
+    registry: Arc<super::agents::Registry>,
+    mut suites: super::suites::Suites,
+    mut stop: watch::Receiver<bool>,
+) {
     loop {
         let looking = registry.clone();
         // Not left behind on a stop: the registry's stop ends the probe, and the host waits for it (M2T07R-202).
         let _ = tokio::task::spawn_blocking(move || looking.refresh()).await;
+        if *stop.borrow() {
+            break;
+        }
+        suites.step(&registry).await;
         if *stop.borrow() {
             break;
         }
@@ -484,6 +539,7 @@ async fn registry_watch(registry: Arc<super::agents::Registry>, mut stop: watch:
             _ = stop.changed() => break,
         }
     }
+    suites.abandon().await;
 }
 
 async fn tick(

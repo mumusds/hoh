@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long one probe command may take.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How often a wanted agent's login is looked at again (its status command, docs/adr/ADR-024.md decision 7), and how
 /// soon a temporary probe failure is probed again though its files did not change (docs/adr/ADR-030.md decision 2).
@@ -302,6 +302,9 @@ pub struct Registry {
     every: Duration,
     /// This build's suite set ([`compat::SUITE_SET_SHA256`]); the tests verify against one of their own.
     suite_set: String,
+    /// The stop of the compat suite running, if one is: stopped with the registry's (docs/adr/ADR-030.md decision 10,
+    /// "有界、停止与崩溃"), and on its own when the suite runs past its limit.
+    suite_stop: Mutex<Option<probe::ProbeStop>>,
 }
 
 impl Registry {
@@ -321,6 +324,7 @@ impl Registry {
             probe_timeout: PROBE_TIMEOUT,
             every: AUTH_EVERY,
             suite_set: compat::SUITE_SET_SHA256.as_str().to_owned(),
+            suite_stop: Mutex::new(None),
         }
     }
 
@@ -350,6 +354,82 @@ impl Registry {
     /// residual of decision 10 v6 (M2T07R-300, -450, -500, -700, -853).
     pub fn stop(&self) {
         self.stopping.stop();
+        let running = self
+            .suite_stop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(suite) = running {
+            suite.stop();
+        }
+    }
+
+    /// The stop of a compat suite about to run (docs/adr/ADR-030.md decision 10): its own, so the host can end it past
+    /// its limit, and registered here, so the host's stop ends it too (already stopped if the host is stopping).
+    pub(super) fn suite_stop(&self) -> probe::ProbeStop {
+        let stop = probe::ProbeStop::default();
+        *self
+            .suite_stop
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stop.clone());
+        if self.stopping.is_stopped() {
+            stop.stop();
+        }
+        stop
+    }
+
+    /// What a compat suite runs with: the probe's PATH and per-command limit (decision 10: each command 20 s); its
+    /// own stop is set by the suite ([`compat::suite::run`]).
+    pub(super) fn suite_env(&self) -> ProbeEnv {
+        ProbeEnv {
+            cancel: None,
+            ..self.env()
+        }
+    }
+
+    /// The wanted agents whose last look found them ready and whose verdict is `Pending`, in name order, with that look:
+    /// the ones a compat suite is due for (decision 10, "何时运行与互斥"). `Failed` and `Undecided` are not run again for
+    /// the same identity; another identity or this build's suite set makes them pending again.
+    pub(super) fn pending_suites(&self) -> Vec<(Agent, Ready)> {
+        let state = self.state();
+        state
+            .wanted
+            .iter()
+            .filter_map(|agent| {
+                let ready = state
+                    .agents
+                    .get(agent)?
+                    .seen
+                    .as_ref()?
+                    .outcome
+                    .as_ref()
+                    .ok()?;
+                let verdict = compat::verdict(
+                    state.manifest.as_ref(),
+                    agent.as_str(),
+                    &ready.entry,
+                    &self.suite_set,
+                );
+                matches!(verdict, Compat::Pending(_)).then(|| (*agent, ready.clone()))
+            })
+            .collect()
+    }
+
+    /// The manifest the registry holds, as JSON (none: empty): the base a publication replaces one entry of.
+    pub(super) fn manifest(&self) -> Option<serde_json::Value> {
+        self.state()
+            .manifest
+            .as_ref()
+            .and_then(|m| serde_json::to_value(m).ok())
+    }
+
+    /// Hold `manifest`, which a publication just put in place (decision 10: only after it committed), as the one the
+    /// facts are verified against; one that is not a manifest is refused and the one held is kept.
+    pub(super) fn adopt(&self, manifest: serde_json::Value) -> Result<(), String> {
+        let manifest: CompatManifest =
+            serde_json::from_value(manifest).map_err(|e| e.to_string())?;
+        self.state().manifest = Some(manifest);
+        Ok(())
     }
 
     /// The agents named `names` are the ones to look at from now on (names that are not agents are left out).
@@ -701,6 +781,24 @@ impl Registry {
     }
 }
 
+/// The stamps of `launcher` and `implementation` now (`stat`, following links), if both can be read: what a compat
+/// suite's end compares with the look it ran for (decision 10, "结束时另重读身份戳").
+pub(crate) fn stamp_now(launcher: &Path, implementation: &Path) -> Option<Stamp> {
+    key(launcher, implementation).ok().map(|key| stamp_of(&key))
+}
+
+/// `agent` found on `env`'s PATH and probed as a look does, without its login check: its entry and the stamps read
+/// before the probe ([`crate::compat::register`]).
+pub(crate) fn probed_entry(agent: Agent, env: &ProbeEnv) -> Result<(AgentEntry, Stamp), String> {
+    let launcher = probe::find_on_path(agent.command(), &env.path)
+        .ok_or_else(|| ProbeError::NotFound { agent }.to_string())?;
+    let implementation =
+        probe::resolve_implementation(agent, &launcher).map_err(|e| e.to_string())?;
+    let key = key(&launcher, &implementation).map_err(|e| e.to_string())?;
+    let entry = probe::probe(agent, env).map_err(|e| e.to_string())?;
+    Ok((entry, stamp_of(&key)))
+}
+
 /// Probe `agent` at `launcher`, its files' stamps being `key`: its entry and launch facts.
 fn probed(agent: Agent, launcher: &Path, key: &Key, env: &ProbeEnv) -> Result<Ready, Probe> {
     let entry = probe::probe(agent, env).map_err(|e| Probe::of(&e))?;
@@ -722,7 +820,7 @@ fn probed(agent: Agent, launcher: &Path, key: &Key, env: &ProbeEnv) -> Result<Re
 
 /// The compat manifest at `path`: `None` when there is none; why when it cannot be read or is not valid against the
 /// locked schema.
-fn read_manifest(path: &Path) -> Result<Option<CompatManifest>, String> {
+pub(crate) fn read_manifest(path: &Path) -> Result<Option<CompatManifest>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
