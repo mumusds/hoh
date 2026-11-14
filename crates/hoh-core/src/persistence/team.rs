@@ -1013,7 +1013,9 @@ pub(super) fn roles(
 }
 
 /// The agents the runner needs looked at (decision 10): the project's current team's, and those of every binding in a
-/// run not ended, so an agent kept by a refused change or bound before a restart is looked at too (M2T07R-250).
+/// run not ended, so an agent kept by a refused change or bound before a restart is looked at too (M2T07R-250); with
+/// each of those roles' fallbacks, the binding's as the revision it was made at configured its role, so staffing finds
+/// its candidates looked at (docs/adr/ADR-030.md decision 2).
 pub(super) fn agents(
     conn: &Connection,
     project_id: &str,
@@ -1023,19 +1025,39 @@ pub(super) fn agents(
         .unwrap_or_else(|| TeamConfig::builtin().team);
     let mut agents: std::collections::BTreeSet<String> = team
         .values()
-        .map(|role| role.agent.as_str().to_owned())
+        .flat_map(|role| std::iter::once(&role.agent).chain(&role.fallback))
+        .map(|agent| agent.as_str().to_owned())
         .collect();
     let mut statement = conn
         .prepare(
-            "SELECT DISTINCT b.agent FROM role_bindings b JOIN runs r ON r.run_id = b.run_id WHERE r.project_id = ?1 \
-             AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE')",
+            "SELECT DISTINCT b.agent, b.role, b.config_revision FROM role_bindings b JOIN runs r ON r.run_id = b.run_id \
+             WHERE r.project_id = ?1 AND r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE')",
         )
         .map_err(sqlite_error)?;
-    for agent in statement
-        .query_map(params![project_id], |r| r.get::<_, String>(0))
+    let bindings = statement
+        .query_map(params![project_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
         .map_err(sqlite_error)?
-    {
-        agents.insert(agent.map_err(sqlite_error)?);
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    let mut revisions: BTreeMap<i64, Option<TeamConfig>> = BTreeMap::new();
+    for (agent, role, revision) in bindings {
+        agents.insert(agent);
+        let config = match revisions.entry(revision) {
+            std::collections::btree_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::btree_map::Entry::Vacant(new) => {
+                new.insert(at_revision(conn, project_id, revision)?)
+            }
+        };
+        // A revision not recorded (a binding written by hand) has no fallbacks (decision 3's order).
+        if let Some(role) = config.as_ref().and_then(|c| c.team.get(&role)) {
+            agents.extend(role.fallback.iter().map(|a| a.as_str().to_owned()));
+        }
     }
     Ok(agents)
 }

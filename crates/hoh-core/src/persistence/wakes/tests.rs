@@ -2254,6 +2254,7 @@ async fn a_commander_whose_agent_the_registry_finds_unavailable_waits_for_a_newe
         n,
         available,
         logged_in,
+        verified: false,
     };
     store
         .supervise("R", seen(3000, vec![("codex", look(1, 4, true, false))]))
@@ -2434,6 +2435,7 @@ async fn an_unavailable_commander_is_not_preempted_for() -> R {
         n: 1,
         available: false,
         logged_in: false,
+        verified: false,
     };
     store
         .supervise(
@@ -2847,6 +2849,7 @@ fn agent_gone(clock: &TestClock, ms: u64) -> Context {
                     n: 1,
                     available: false,
                     logged_in: true,
+                    verified: false,
                 },
             )]
             .into_iter()
@@ -2935,6 +2938,7 @@ async fn a_registry_fault_of_the_old_agent_does_not_hold_a_commander_handed_to_a
                     n,
                     available,
                     logged_in: true,
+                    verified: false,
                 },
             )]
             .into_iter()
@@ -3470,6 +3474,7 @@ async fn a_registry_fault_recorded_follows_its_agent_through_a_handover_under_th
                     n,
                     available: false,
                     logged_in: true,
+                    verified: false,
                 },
             )]
             .into_iter()
@@ -3638,6 +3643,7 @@ async fn a_probe_settled_while_its_commander_is_unavailable_otherwise_is_owed_un
                     n: 2,
                     available: true,
                     logged_in: true,
+                    verified: false,
                 },
             )]
             .into_iter()
