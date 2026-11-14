@@ -288,7 +288,9 @@ fn exec(path: &PathBuf, sql: &str) -> R {
 }
 
 /// R1 started (team revision 0), RUNNING on spec s1, with developer task T0 RUNNING (attempt A0 RUNNING) and T1 READY,
-/// both readers; the developer bound to session sd.
+/// both readers; the developer bound to session sd. A0 starts now by the system clock (SQLite's `'now'`), the clock a
+/// round's `Context::default()` judges the budget by: a fixed start would use up the run's `max_duration_hours` once
+/// that long had passed since it, and the rounds would stop dispatching for that.
 async fn working(store: &Store, path: &PathBuf) -> R {
     store
         .submit_command(start("R1", Config::default().budget))
@@ -304,7 +306,7 @@ async fn working(store: &Store, path: &PathBuf) -> R {
            ('T0', 'R1', 's1', 'RUNNING', 2, 'developer', 0, 1, 1),
            ('T1', 'R1', 's1', 'READY', 1, 'developer', 0, 2, 1);
          INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, agent, started_at)
-           VALUES ('A0', 'T0', 'RUNNING', 1, 1, 0, 'claude', '2026-11-09T00:00:00Z');",
+           VALUES ('A0', 'T0', 'RUNNING', 1, 1, 0, 'claude', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
     )
 }
 
