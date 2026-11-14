@@ -1852,7 +1852,9 @@ impl FaultHooks for GrantProbe {
 }
 
 /// AC-041-02's world: run R RUNNING with two writer tasks READY after T0, whose attempt A0 settled holding the
-/// writer lease at epoch 3 (so T1's attempt gets epoch 4, the next grant 5).
+/// writer lease at epoch 3 (so T1's attempt gets epoch 4, the next grant 5). The lease expired a day before the seed
+/// by the system clock (SQLite's `'now'`), the clock the host judges leases by: a fixed date would hold it unexpired
+/// on a clock before that date.
 const WRITERS: &str = "
 INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s2', :p, printf('%064d', 2), 2);
 INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES ('R', :p, 's2', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
@@ -1865,7 +1867,7 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, creat
   ('T2', 'R', 's2', 'READY', 1, 'developer', 1, 3, 1);
 INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, ended_at) VALUES
   ('A0', 'T0', 'SETTLED', 2, 1, 1, '2026-11-07T00:00:00Z');
-INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 'writer', 'A0', 3, '2026-11-07T00:00:00Z');
+INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES (:p, 'writer', 'A0', 3, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day'));
 ";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
