@@ -252,3 +252,26 @@ fn a_sessions_capabilities_are_those_its_argv_gives() {
     blocked.help = HELP.replace("stream-json", "text, json");
     assert!(session_capabilities(&blocked).is_err());
 }
+
+#[test]
+fn a_yolo_session_runs_commands_where_the_probe_found_it() {
+    // docs/adr/ADR-030.md decision 12: the adapter runs commands under the YOLO profile only, and the session has
+    // what the probe found (left out where it could not tell).
+    for (probed, yolo, expected) in [
+        (Some(true), true, Some(true)),
+        (Some(false), true, Some(false)),
+        (None, true, None),
+        (Some(true), false, Some(false)),
+    ] {
+        let mut l = launch();
+        l.capabilities
+            .insert("command_execution".to_owned(), probed);
+        l.yolo = yolo;
+        let caps = session_capabilities(&l).expect("capabilities");
+        assert_eq!(
+            caps.get("command_execution").and_then(Value::as_bool),
+            expected,
+            "probed {probed:?}, yolo {yolo}: {caps}"
+        );
+    }
+}

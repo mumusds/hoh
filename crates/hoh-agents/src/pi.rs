@@ -85,6 +85,38 @@ pub fn interface_missing(help: &str) -> Option<String> {
     .then(|| "pi --help offers no --mode rpc".to_owned())
 }
 
+/// The built-in tools `help` lists, by name with their description, or `None` when it has no such list: the lines
+/// after the one that is `Built-in Tool Names:` once trimmed, up to an empty line or the first line not indented, each
+/// split at its first ` - ` into a name and a description, both trimmed (the recorded help pads the names:
+/// `bash       - Execute bash commands`, M2T15D-200). A line without ` - ` continues the description before it, and a
+/// name listed again adds its description to the first, so a note such as `off by default` is never dropped
+/// (docs/adr/ADR-030.md decision 12).
+pub fn builtin_tools(help: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut lines = help
+        .lines()
+        .skip_while(|line| line.trim() != "Built-in Tool Names:");
+    lines.next()?;
+    let mut tools = std::collections::BTreeMap::<String, String>::new();
+    let mut last: Option<String> = None;
+    for line in lines.take_while(|line| !line.trim().is_empty() && line.starts_with([' ', '\t'])) {
+        let (name, about) = match (line.split_once(" - "), &last) {
+            (Some((name, about)), _) => (name.trim(), about.trim()),
+            (None, Some(previous)) => (previous.as_str(), line.trim()),
+            (None, None) => (line.trim(), ""),
+        };
+        let name = name.to_owned();
+        tools
+            .entry(name.clone())
+            .and_modify(|before| {
+                before.push(' ');
+                before.push_str(about);
+            })
+            .or_insert_with(|| about.to_owned());
+        last = Some(name);
+    }
+    Some(tools)
+}
+
 /// The arguments of `pi --mode rpc` on the session (never `--no-session`).
 pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
     if let Some(why) = interface_missing(&launch.help) {
@@ -393,12 +425,16 @@ pub async fn run(
             native_id: Some(launch.session_id.clone()),
             native_path: Some(launch.session_dir.to_string_lossy().into_owned()),
             agent_version: attempt.agent_version.clone(),
-            // The probed capabilities this adapter implements: events and resume (M1R-01). It takes no steer, answers
-            // no dialog and records no token usage (M1T04R-16); whether pi emits agent_settled is the adapter's
-            // setting, not a capability of the session (M1T04R-13).
+            // The probed capabilities this adapter implements: events, resume and commands (M1R-01, docs/adr/ADR-030.md
+            // decision 12). It takes no steer, answers no dialog and records no token usage (M1T04R-16); whether pi
+            // emits agent_settled is the adapter's setting, not a capability of the session (M1T04R-13).
             capabilities: crate::capabilities::of_session(
                 &launch.capabilities,
-                &[("structured_events", true), ("resume", true)],
+                &[
+                    ("structured_events", true),
+                    ("resume", true),
+                    ("command_execution", true),
+                ],
             ),
         })
         .await?;
@@ -513,13 +549,17 @@ pub async fn run(
     })
 }
 
-/// The capabilities a session of this launch has (docs/adr/ADR-022.md decision 9), as [`run`] records them: events and
-/// resume (no steer, no dialog, no token usage); or why no turn can start.
+/// The capabilities a session of this launch has (docs/adr/ADR-022.md decision 9), as [`run`] records them: events,
+/// resume and commands (no steer, no dialog, no token usage); or why no turn can start.
 pub fn session_capabilities(launch: &Launch) -> Result<Value, Blocked> {
     args(launch)?;
     Ok(crate::capabilities::of_session(
         &launch.capabilities,
-        &[("structured_events", true), ("resume", true)],
+        &[
+            ("structured_events", true),
+            ("resume", true),
+            ("command_execution", true),
+        ],
     ))
 }
 

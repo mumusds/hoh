@@ -307,3 +307,59 @@ fn a_sessions_capabilities_are_those_of_the_transport_a_turn_would_take() {
     nothing.exec_help = String::new();
     assert!(session_capabilities(&turn(nothing)).is_err());
 }
+
+#[test]
+fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
+    // docs/adr/ADR-030.md decision 12: on the App Server and on exec the adapter runs commands under the YOLO profile
+    // only, and the session has what the probe found (left out where it could not tell).
+    let served = |mut l: Launch| {
+        l.requests = APP_SERVER_REQUESTS
+            .iter()
+            .map(|m| (*m).to_owned())
+            .collect();
+        l.client_notifications = APP_SERVER_CLIENT_NOTIFICATIONS
+            .iter()
+            .map(|m| (*m).to_owned())
+            .collect();
+        l.known = APP_SERVER_NOTIFICATIONS
+            .iter()
+            .map(|m| (*m).to_owned())
+            .collect();
+        l
+    };
+    for app_server in [true, false] {
+        for (probed, yolo, expected) in [
+            (Some(true), true, Some(true)),
+            (Some(false), true, Some(false)),
+            (None, true, None),
+            (Some(true), false, Some(false)),
+        ] {
+            let mut l = if app_server {
+                served(launch())
+            } else {
+                launch()
+            };
+            l.capabilities
+                .insert("command_execution".to_owned(), probed);
+            l.capabilities
+                .insert("partial_messages".to_owned(), Some(true));
+            l.yolo = yolo;
+            let turn = Turn {
+                launch: l,
+                prompt: String::new(),
+                logs: PathBuf::from("/tmp"),
+                escalation: Turn::default_escalation(),
+                handshake_timeout: Duration::from_secs(1),
+                deadline: None,
+            };
+            let caps = session_capabilities(&turn).expect("capabilities");
+            // The transport is the one meant: only the App Server streams deltas.
+            assert_eq!(caps["partial_messages"], json!(app_server), "{caps}");
+            assert_eq!(
+                caps.get("command_execution").and_then(Value::as_bool),
+                expected,
+                "app server {app_server}, probed {probed:?}, yolo {yolo}: {caps}"
+            );
+        }
+    }
+}

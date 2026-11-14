@@ -131,8 +131,9 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     }
     Ok(Argv {
         args,
-        // What this adapter implements: events, the result's token usage, and resume and deltas where the help offers
-        // them. One prompt on stdin, then stdin closes, so no steer and no dialog (M1T04R-12, -15, -17).
+        // What this adapter implements: events, the result's token usage, resume and deltas where the help offers
+        // them, and commands under the YOLO profile (docs/adr/ADR-030.md decision 12). One prompt on stdin, then
+        // stdin closes, so no steer and no dialog (M1T04R-12, -15, -17).
         capabilities: crate::capabilities::of_session(
             &launch.capabilities,
             &[
@@ -140,6 +141,7 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
                 ("token_usage", true),
                 ("resume", resume),
                 ("partial_messages", partial),
+                ("command_execution", launch.yolo),
             ],
         ),
     })

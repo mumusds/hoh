@@ -280,3 +280,24 @@ fn a_sessions_capabilities_are_events_and_resume() {
     assert_eq!(caps["resume"], true);
     assert_ne!(caps["mid_turn_steer"], true, "pi takes no steer here");
 }
+
+#[test]
+fn a_session_runs_commands_where_the_probe_found_it() {
+    // docs/adr/ADR-030.md decision 12: pi runs commands on every turn, so the session has what the probe found (left
+    // out where it could not tell).
+    for (probed, expected) in [
+        (Some(true), Some(true)),
+        (Some(false), Some(false)),
+        (None, None),
+    ] {
+        let mut l = launch();
+        l.capabilities
+            .insert("command_execution".to_owned(), probed);
+        let caps = session_capabilities(&l).expect("capabilities");
+        assert_eq!(
+            caps.get("command_execution").and_then(Value::as_bool),
+            expected,
+            "probed {probed:?}: {caps}"
+        );
+    }
+}

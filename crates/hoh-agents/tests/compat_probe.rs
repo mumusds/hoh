@@ -206,6 +206,69 @@ fn test_027_01_probe_three_fake_binaries_into_a_valid_manifest() -> R {
     Ok(())
 }
 
+/// The probe records `command_execution` for each recorded CLI by its own transport's rule, from the unmodified
+/// recorded help and schema: claude 2.1.317 and 2.1.318, pi 1.5.0, and codex 0.166.0 on the App Server and, with no
+/// App Server listed, on exec (docs/adr/ADR-030.md decision 12, M2T15D-06).
+#[test]
+fn the_probe_measures_command_execution_on_each_recorded_cli() -> R {
+    let tmp = tempfile::tempdir()?;
+    let help_only = |version: &str, help: &str| {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '{version}';;\n --help) cat '{}';;\n *) exit 2;;\nesac\n",
+            fixtures().join(help).display()
+        )
+    };
+    let codex = fixtures().join("codex/0.166.0");
+    let app_server = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+         app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{f}/app-server-schema/.' \"$4/\";;\n  \
+         *) exit 2;;\n esac;;\n *) echo \"unknown command $1\" >&2; exit 2;;\nesac\n",
+        f = codex.display()
+    );
+    let exec = format!(
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) grep -v '^  app-server ' '{f}/help.txt';;\n exec) [ \"$2\" = --help ] && cat '{f}/help-exec.txt';;\n \
+         *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+        f = codex.display()
+    );
+    for (group, agent, script, transport) in [
+        (
+            "claude-2.1.317",
+            Agent::Claude,
+            help_only("2.1.317 (Claude Code)", "claude/2.1.317/help.txt"),
+            Transport::StreamJson,
+        ),
+        (
+            "claude-2.1.318",
+            Agent::Claude,
+            help_only("2.1.318 (Claude Code)", "claude/2.1.318/help.txt"),
+            Transport::StreamJson,
+        ),
+        (
+            "pi-1.5.0",
+            Agent::Pi,
+            help_only("1.5.0", "pi/1.5.0/help.txt"),
+            Transport::Rpc,
+        ),
+        (
+            "codex-app-server",
+            Agent::Codex,
+            app_server,
+            Transport::AppServer,
+        ),
+        ("codex-exec", Agent::Codex, exec, Transport::Exec),
+    ] {
+        let (dir, _) = fake(tmp.path(), group, agent.command(), &script)?;
+        let entry = probe(agent, &env_for(&dir))?;
+        assert_eq!(entry.transport, transport, "{group}");
+        assert_eq!(
+            entry.capabilities.get("command_execution"),
+            Some(&Some(true)),
+            "{group}"
+        );
+    }
+    Ok(())
+}
+
 /// The recorded help without the declaration of `flag` (the option line naming it, indented as declarations are);
 /// other options' text that mentions the flag stays.
 fn without_declaration(help: &str, flag: &str) -> String {

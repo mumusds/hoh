@@ -507,6 +507,19 @@ pub fn has_word(text: &str, word: &str) -> bool {
             .any(|token| listed_value(token) == word)
 }
 
+/// Whether `text` lists `name` as an item of a comma-separated list: each token between white space, taken off as a
+/// value ([`listed_value`]), is split at `,`, and each piece taken off once more; a piece equal to `name` lists it. So
+/// claude's `--tools` example `"Bash,Edit,Read").` lists `Bash`, while `BashOutput` and the `"Bash` of `"Bash Edit"`
+/// do not (docs/adr/ADR-030.md decision 12, M2T15D-150).
+pub fn lists_name(text: &str, name: &str) -> bool {
+    !name.is_empty()
+        && text.split_whitespace().any(|token| {
+            listed_value(token)
+                .split(',')
+                .any(|piece| listed_value(piece) == name)
+        })
+}
+
 /// A token without what only wraps or follows a whole value: openers `( [ {` before it; one sentence-final `.`, then
 /// closers `) ] }` and list punctuation `,` `;` after it; then one pair of quotes around it (`"x"`, `'x'`, `` `x` ``).
 /// Brackets, quotes or a `.` inside a value are part of it, and so is a second `.` (`stdio://..`; M1T07R-27).
@@ -813,6 +826,27 @@ mod help_tests {
         assert!(!has_word("Output format: stream-json..", "stream-json"));
         assert!(!has_word("Output mode: rpc...", "rpc"));
         assert!(has_word("Supported values: (stdio://).", "stdio://"));
+    }
+
+    /// A name is listed as a piece of a comma-separated token, each piece taken off as a value: what wraps or follows
+    /// the whole token and what wraps or follows the piece (docs/adr/ADR-030.md decision 12, M2T15D-150).
+    #[test]
+    fn a_name_is_a_piece_of_a_listed_token() {
+        for token in [
+            "\"a,b\").",
+            "(a,",
+            "'a'",
+            "a;",
+            "a",
+            "b,a",
+            "[\"x\", \"a\"]",
+        ] {
+            assert!(lists_name(token, "a"), "{token}");
+        }
+        for token in ["\"a", "ab", "ab,c", "b.a", "a(x)", "\"a b\"", ""] {
+            assert!(!lists_name(token, "a"), "{token}");
+        }
+        assert!(!lists_name("a,b", ""), "an empty name is never listed");
     }
 
     /// A subcommand is a name in the command column of the `Commands:` section, not a wrapped description and not a
