@@ -20,11 +20,11 @@ pub fn register(project: &Path, agent: Agent, path: &OsStr) -> Result<SuiteResul
     let state = project.join(".hoh");
     hoh_core::state_dir::ensure(&state)
         .map_err(|e| format!("cannot make {}: {e}", state.display()))?;
-    // Held for the whole registration: a host does not start meanwhile, nor is one running.
-    let lock =
-        std::fs::File::open(&state).map_err(|e| format!("cannot open {}: {e}", state.display()))?;
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| format!("a host holds {}", state.display()))?;
+    // Held for the whole registration: a host does not start meanwhile, nor is one running. Released explicitly, so
+    // a child another thread forked meanwhile does not keep it held for the next registration or the host's start.
+    let lock = crate::host::DirLock::try_take(&state)
+        .map_err(|e| format!("cannot open {}: {e}", state.display()))?
+        .ok_or_else(|| format!("a host holds {}", state.display()))?;
     let stop = ProbeStop::default();
     let env = ProbeEnv {
         path: path.to_os_string(),
