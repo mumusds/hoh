@@ -338,3 +338,638 @@ async fn test_021_04_a_stale_answer_is_rejected_and_its_retrigger_answered_at_th
     host.shutdown().await;
     Ok(())
 }
+
+// The Commander on the product's path (docs/adr/ADR-030.md decision 11, its test plan's "Commander", M2T15D-05): the
+// product's host over fake agent CLIs. Staffing treats the commander binding as any role's (fallback), a supervision
+// turn's permanent failure reaches staffing through the binding it blocks, and an owed wake waits, uncounted, while the
+// Commander's agent is not verified.
+
+const PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+const PI_RPC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../hoh-agents/tests/fakes/pi_rpc.py"
+);
+
+/// A project whose agents are fake CLIs of its own, found only on its own PATH (never an agent installed on this
+/// machine), under a temporary root.
+struct Fakes {
+    dir: tempfile::TempDir,
+}
+
+impl Fakes {
+    fn new() -> R<Fakes> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join("project"))?;
+        std::fs::create_dir_all(dir.path().join("bin"))?;
+        let tools = dir.path().join("tools");
+        std::fs::create_dir_all(&tools)?;
+        for tool in ["cat", "python3", "timeout"] {
+            let found = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool))
+                .find(|p| p.exists())
+                .ok_or(format!("no {tool}"))?;
+            std::os::unix::fs::symlink(found, tools.join(tool))?;
+        }
+        Ok(Fakes { dir })
+    }
+
+    fn project(&self) -> PathBuf {
+        self.dir.path().join("project")
+    }
+
+    fn bin(&self) -> PathBuf {
+        self.dir.path().join("bin")
+    }
+
+    /// The registry's PATH: the fakes, then the tools they use.
+    fn path(&self) -> String {
+        format!(
+            "{}:{}",
+            self.bin().display(),
+            self.dir.path().join("tools").display()
+        )
+    }
+
+    /// The executable `name` running `body` (bash), written beside it and renamed over it: the registry sees another
+    /// file, never a half-written one.
+    fn script(&self, name: &str, body: &str) -> R {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(self.bin().join(format!("{name}.d")))?;
+        let staged = self.bin().join(format!(".{name}.new"));
+        std::fs::write(&staged, format!("#!/bin/bash\n{body}\n"))?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&staged, self.bin().join(name))?;
+        Ok(())
+    }
+
+    /// A fake `claude` 2.1.318 (`note` a comment line of its own: another note, another implementation): the probe's
+    /// answers from the recording; a turn reads its prompt and replays the recorded `success` turn.
+    fn claude(&self, note: &str) -> R {
+        let d = self.bin().join("claude.d");
+        self.script(
+            "claude",
+            &format!(
+                "# {note}\nf='{PROTOCOL}/claude/2.1.318'; d='{d}'\n\
+                 case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+                 echo $$ > \"$d/pid.$$\"; cat > /dev/null\ncat \"$f/success/stdout.jsonl\"\n",
+                d = d.display()
+            ),
+        )
+    }
+
+    /// A fake `pi` 1.5.0 whose model is not there: the probe's answers from the recording; a turn's get_state is
+    /// answered as recorded and its prompt refused `Model not found: …` (pi.rs's MODEL_UNAVAILABLE).
+    fn pi_without_its_model(&self) -> R {
+        let d = self.bin().join("pi.d");
+        std::fs::create_dir_all(&d)?;
+        let state =
+            std::fs::read_to_string(format!("{PROTOCOL}/pi/1.5.0/rpc-prompt/stdout.jsonl"))?
+                .lines()
+                .next()
+                .ok_or("no get_state answer")?
+                .to_owned();
+        let refused = json!({"id": "p1", "type": "response", "command": "prompt", "success": false,
+            "error": "Model not found: zai-coding-cn/glm-5.3"});
+        std::fs::write(d.join("frames.jsonl"), format!("{state}\n{refused}\n"))?;
+        std::fs::write(
+            d.join("commands.json"),
+            json!({"s1": "get_state", "p1": "prompt"}).to_string(),
+        )?;
+        self.script(
+            "pi",
+            &format!(
+                "f='{PROTOCOL}/pi/1.5.0'; d='{d}'\n\
+                 case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+                 echo $$ > \"$d/pid.$$\"\n\
+                 exec timeout 60 python3 '{PI_RPC}' \"$d/frames.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
+                d = d.display()
+            ),
+        )
+    }
+
+    /// The project's own `.hoh/config.toml` (its team revision once a host starts).
+    fn team(&self, toml: &str) -> R {
+        std::fs::create_dir_all(self.project().join(".hoh"))?;
+        std::fs::write(self.project().join(".hoh/config.toml"), toml)?;
+        Ok(())
+    }
+
+    /// `agent` registered by the product's compat suite (before a host starts), which must pass.
+    fn register(&self, agent: hoh_agents::compat::Agent) -> R {
+        let registered =
+            hoh_app::compat::register(&self.project(), agent, std::ffi::OsStr::new(&self.path()))?;
+        assert_eq!(
+            format!("{:?}", registered.entry.suite.status),
+            "Pass",
+            "{registered:?}"
+        );
+        Ok(())
+    }
+
+    /// The product's host of the project, its agents found only among the fakes, pi's settings in a directory of the
+    /// world's own and Commander sessions' directories in the world's.
+    fn config(&self) -> HostConfig {
+        let registry = hoh_app::host::agents::Registry::with_pi_dir(
+            self.path().into(),
+            Some(self.dir.path().join("pi-agent")),
+        );
+        let mut config = HostConfig::product_with(
+            &self.project(),
+            hoh_core::config::Config::default(),
+            env!("CARGO_BIN_EXE_hoh").into(),
+            Arc::new(registry),
+        );
+        config.port = 0;
+        config.store.wal_probe = Some(probe());
+        if let Some(runner) = config.runner.as_mut() {
+            runner.context.commander_dir = Some(self.dir.path().join("state/hoh/commander"));
+        }
+        config
+    }
+
+    /// Every fake turn process gone: one still there is killed only while its command line names this world's fakes.
+    fn stop_fakes(&self) {
+        let bin = self.bin().display().to_string();
+        for name in ["claude", "pi"] {
+            let Ok(entries) = std::fs::read_dir(self.bin().join(format!("{name}.d"))) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                if let Some(pid) = file.strip_prefix("pid.")
+                    && std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&bin))
+                {
+                    let _ = Command::new("kill").args(["-KILL", pid]).status();
+                }
+            }
+        }
+    }
+}
+
+/// Holds each compat suite after its run, before its publication, until `<dir>/release` exists (or `dir` is gone).
+#[derive(Debug)]
+struct HoldSuite(PathBuf);
+
+impl hoh_app::host::HostHooks for HoldSuite {
+    fn suite_ran(&self, _agent: &str) {
+        let _ = std::fs::write(self.0.join("held"), "");
+        let end = Instant::now() + Duration::from_secs(120);
+        while self.0.exists() && !self.0.join("release").exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+async fn start_when_free(config: HostConfig) -> Result<Host, hoh_app::host::StartError> {
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Host::start(config.clone()).await {
+            Err(e) if e.exit_code == 69 && Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A run started over the host's HTTP API: its id.
+async fn started(host: &Host) -> R<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let body = json!({
+        "schema_version": "1.0", "command_id": "c-start", "idempotency_key": "start",
+        "expected_revision": 0, "kind": "StartRun", "run_id": null,
+        "payload": {"goal": "Ship the parser", "mode": "AUTO", "interactive": false},
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n{body}",
+        port = host.port,
+        token = host.token,
+        length = body.len(),
+    );
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8(raw)?;
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    assert!(head.starts_with("HTTP/1.1 202"), "{text}");
+    let accepted: Value = serde_json::from_str(body)?;
+    Ok(accepted["run_id"].as_str().ok_or("no run_id")?.to_owned())
+}
+
+/// Wait until `sql`'s rows satisfy `done`, for at most `limit`; the rows.
+async fn until(
+    project: &Path,
+    sql: &str,
+    limit: Duration,
+    done: &dyn Fn(&Value) -> bool,
+) -> R<Value> {
+    let end = Instant::now() + limit;
+    loop {
+        let found = rows(&db(project), sql)?;
+        if done(&found) {
+            return Ok(found);
+        }
+        if Instant::now() > end {
+            return Err(format!("not reached: {sql}: {found}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn some(rows: &Value) -> bool {
+    rows.as_array().is_some_and(|a| !a.is_empty())
+}
+
+/// Run `run_id` RUNNING on a spec (a run needs one to be supervised, docs/adr/ADR-025.md decision 4), once its
+/// commander binding has a session, and a need_decision of fingerprint `fp` about it.
+async fn supervised(project: &Path, run_id: &str, fp: &str) -> R {
+    until(
+        project,
+        &format!(
+            "SELECT 1 FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander' AND session_id IS NOT NULL"
+        ),
+        Duration::from_secs(60),
+        &some,
+    )
+    .await?;
+    seed(
+        project,
+        &format!(
+            "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+             UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    need_decision(project, run_id, fp)
+}
+
+/// A need_decision of fingerprint `fp` in run `run_id`.
+fn need_decision(project: &Path, run_id: &str, fp: &str) -> R {
+    seed(
+        project,
+        &format!(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+               (:p, 'nd-{fp}', '{run_id}', 'need_decision', '{{\"fingerprint\": \"{fp}\"}}', '2026-11-14T00:00:00Z');"
+        ),
+    )
+}
+
+/// The query of run `run_id`'s supervision turns: wake, attempt, agent, epoch and state, in allocation order.
+fn turns(run_id: &str) -> String {
+    format!(
+        "SELECT json_extract(e.payload_json, '$.wake') AS wake, a.attempt_id, a.agent, a.role_epoch, a.state, \
+         a.failure_reason FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, '$.attempt_id') \
+         WHERE e.run_id = '{run_id}' AND e.kind = 'supervisor.allocated' ORDER BY e.seq"
+    )
+}
+
+/// How many of run `run_id`'s blocker claims are COMMANDER_UNAVAILABLE.
+fn commander_claims(project: &Path, run_id: &str) -> R<Value> {
+    Ok(rows(
+        &db(project),
+        &format!(
+            "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'run.blocker_claimed' \
+             AND json_extract(payload_json, '$.reason') = 'COMMANDER_UNAVAILABLE'"
+        ),
+    )?[0]["n"]
+        .clone())
+}
+
+/// docs/adr/ADR-030.md decision 11 (its test plan's "Commander"): a world with only claude installed, the commander
+/// configured codex falling back to claude: staffing switches the commander to claude at epoch 2 (the other roles'
+/// blocks wake it), its turns answer, and the run is never claimed COMMANDER_UNAVAILABLE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commander_not_installed_falls_back_and_its_run_is_not_blocked_for_it() -> R {
+    let fakes = Fakes::new()?;
+    fakes.claude("A")?;
+    fakes.team(
+        "config_version = \"1.0\"\n[team.commander]\nagent = \"codex\"\nfallback = [\"claude\"]\n",
+    )?;
+    fakes.register(hoh_agents::compat::Agent::Claude)?;
+    let host = start_when_free(fakes.config()).await?;
+    let project = fakes.project();
+    let outcome = async {
+        let run_id = started(&host).await?;
+        supervised(&project, &run_id, "fp-1").await?;
+        let commander = rows(
+            &db(&project),
+            &format!(
+                "SELECT agent, role_epoch, state FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"
+            ),
+        )?;
+        assert_eq!(
+            commander,
+            json!([{"agent": "claude", "role_epoch": 2, "state": "ACTIVE"}])
+        );
+        let fallback = rows(
+            &db(&project),
+            &format!(
+                "SELECT json_extract(payload_json, '$.from') AS \"from\", json_extract(payload_json, '$.chosen') AS chosen, \
+                 json_extract(payload_json, '$.evaluated') AS evaluated FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'team.binding_fallback' AND json_extract(payload_json, '$.role') = 'commander'"
+            ),
+        )?;
+        assert_eq!(
+            fallback,
+            json!([{"from": "codex", "chosen": "claude", "evaluated": "[\"codex:not_installed\",\"claude:usable\"]"}])
+        );
+        let answered = until(
+            &project,
+            &turns(&run_id),
+            Duration::from_secs(60),
+            &|r: &Value| {
+                r.as_array()
+                    .is_some_and(|a| a.iter().any(|t| t["state"] == "SETTLED"))
+            },
+        )
+        .await?;
+        assert!(
+            answered
+                .as_array()
+                .is_some_and(|a| a.iter().all(|t| t["agent"] == "claude" && t["role_epoch"] == 2)),
+            "{answered}"
+        );
+        assert_eq!(commander_claims(&project, &run_id)?, json!(0));
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    fakes.stop_fakes();
+    outcome
+}
+
+/// docs/adr/ADR-030.md decision 11 with docs/adr/ADR-025.md decision 5 (its implementation note on the worlds with only
+/// claude installed): with no fallback, the commander bound to codex, not installed, is BLOCKED, and the run, owing
+/// it the decisions the other roles' blocks wake, is BLOCKED(COMMANDER_UNAVAILABLE).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_fallback_a_commander_not_installed_blocks_its_run() -> R {
+    let fakes = Fakes::new()?;
+    fakes.claude("A")?;
+    fakes.register(hoh_agents::compat::Agent::Claude)?;
+    let host = start_when_free(fakes.config()).await?;
+    let project = fakes.project();
+    let outcome = async {
+        let run_id = started(&host).await?;
+        until(
+            &project,
+            &format!(
+                "SELECT 1 FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander' AND state = 'BLOCKED' \
+                 AND blocked_reason = 'AGENT_UNAVAILABLE'"
+            ),
+            Duration::from_secs(60),
+            &some,
+        )
+        .await?;
+        seed(
+            &project,
+            &format!(
+                "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+                 UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        let run = until(
+            &project,
+            &format!("SELECT state, blocked_reasons_json AS reasons FROM runs WHERE run_id = '{run_id}'"),
+            Duration::from_secs(60),
+            &|r: &Value| r[0]["state"] == "BLOCKED",
+        )
+        .await?;
+        assert!(
+            run[0]["reasons"]
+                .as_str()
+                .is_some_and(|r| r.contains("COMMANDER_UNAVAILABLE")),
+            "{run}"
+        );
+        assert_eq!(
+            rows(
+                &db(&project),
+                &format!(
+                    "SELECT agent, role_epoch FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"
+                ),
+            )?,
+            json!([{"agent": "codex", "role_epoch": 1}])
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    fakes.stop_fakes();
+    outcome
+}
+
+/// docs/adr/ADR-030.md decision 11 (M2T15D-05, its test plan's "Commander"): the commander is a pi whose prompt is
+/// refused `Model not found` (MODEL_UNAVAILABLE), falling back to claude. Its first supervision turn fails; the commander
+/// binding is BLOCKED(MODEL_UNAVAILABLE, cause turn) with pi's exclusion recorded, and staffing switches it to claude at
+/// epoch 2, whose turn answers the wake: the Commander did not back off on pi up to its cap (no failures_capped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commanders_unavailable_model_falls_back() -> R {
+    let fakes = Fakes::new()?;
+    fakes.claude("A")?;
+    fakes.pi_without_its_model()?;
+    fakes.team(
+        "config_version = \"1.0\"\n[team.commander]\nagent = \"pi\"\nfallback = [\"claude\"]\n\
+         [team.reviewer]\nagent = \"claude\"\n",
+    )?;
+    fakes.register(hoh_agents::compat::Agent::Claude)?;
+    fakes.register(hoh_agents::compat::Agent::Pi)?;
+    let host = start_when_free(fakes.config()).await?;
+    let project = fakes.project();
+    let outcome = async {
+        let run_id = started(&host).await?;
+        supervised(&project, &run_id, "fp-1").await?;
+        // The wake of the need_decision is the first one given a turn; it is answered once a turn of it settles.
+        let answered = until(
+            &project,
+            &turns(&run_id),
+            Duration::from_secs(60),
+            &|r: &Value| {
+                r.as_array().is_some_and(|a| {
+                    a.iter()
+                        .any(|t| t["wake"] == a[0]["wake"] && t["state"] == "SETTLED")
+                })
+            },
+        )
+        .await?;
+        let turns = answered.as_array().ok_or("no turns")?;
+        let first = &turns[0];
+        assert_eq!(
+            (&first["agent"], &first["role_epoch"], &first["state"], &first["failure_reason"]),
+            (&json!("pi"), &json!(1), &json!("FAILED"), &json!("MODEL_UNAVAILABLE")),
+            "{answered}"
+        );
+        let of_wake: Vec<(&Value, &Value, &Value)> = turns
+            .iter()
+            .filter(|t| t["wake"] == first["wake"])
+            .map(|t| (&t["agent"], &t["role_epoch"], &t["state"]))
+            .collect();
+        assert_eq!(
+            of_wake,
+            [
+                (&json!("pi"), &json!(1), &json!("FAILED")),
+                (&json!("claude"), &json!(2), &json!("SETTLED"))
+            ],
+            "one failure on pi, then the wake answered by claude: {answered}"
+        );
+        // The later wakes (the commander's own block wakes it) are claude's at epoch 2 too.
+        assert!(
+            turns[1..]
+                .iter()
+                .all(|t| t["agent"] == "claude" && t["role_epoch"] == 2),
+            "{answered}"
+        );
+        let failed = first["attempt_id"].as_str().ok_or("no attempt")?;
+        let blocked = rows(
+            &db(&project),
+            &format!(
+                "SELECT json_extract(payload_json, '$.role_epoch') AS role_epoch, json_extract(payload_json, '$.agent') AS agent, \
+                 json_extract(payload_json, '$.reason') AS reason, json_extract(payload_json, '$.cause') AS cause, \
+                 json_extract(payload_json, '$.attempt_id') AS attempt_id FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'team.binding_blocked' AND json_extract(payload_json, '$.role') = 'commander'"
+            ),
+        )?;
+        assert_eq!(
+            blocked,
+            json!([{"role_epoch": 1, "agent": "pi", "reason": "MODEL_UNAVAILABLE", "cause": "turn", "attempt_id": failed}])
+        );
+        let excluded = rows(
+            &db(&project),
+            &format!(
+                "SELECT json_extract(payload_json, '$.role') AS role, json_extract(payload_json, '$.agent') AS agent, \
+                 json_extract(payload_json, '$.reason') AS reason, json_extract(payload_json, '$.attempt_id') AS attempt_id \
+                 FROM events WHERE run_id = '{run_id}' AND kind = 'team.binding_excluded'"
+            ),
+        )?;
+        assert_eq!(
+            excluded,
+            json!([{"role": "commander", "agent": "pi", "reason": "MODEL_UNAVAILABLE", "attempt_id": failed}])
+        );
+        let fallback = rows(
+            &db(&project),
+            &format!(
+                "SELECT json_extract(payload_json, '$.from') AS \"from\", json_extract(payload_json, '$.chosen') AS chosen \
+                 FROM events WHERE run_id = '{run_id}' AND kind = 'team.binding_fallback'"
+            ),
+        )?;
+        assert_eq!(fallback, json!([{"from": "pi", "chosen": "claude"}]));
+        let capped = rows(
+            &db(&project),
+            &format!(
+                "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'supervisor.unavailable' \
+                 AND payload_json LIKE '%failures_capped%'"
+            ),
+        )?;
+        assert_eq!(capped, json!([{"n": 0}]));
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    fakes.stop_fakes();
+    outcome
+}
+
+/// docs/adr/ADR-030.md decision 11 (-53, its test plan's "Commander"): the Commander's agent (claude) changes after its
+/// session was granted, and the new implementation's suite is held: staffing keeps the binding (compat pending), and the
+/// allocation writes supervisor.deferred{COMPAT_UNVERIFIED} for the owed wake instead of a turn, its failures not
+/// growing; once the suite published PASS the Commander is bound again and the wake answered, never failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification() -> R {
+    let fakes = Fakes::new()?;
+    fakes.claude("A")?;
+    fakes.team(
+        "config_version = \"1.0\"\n[team.commander]\nagent = \"claude\"\n[team.qa]\nagent = \"claude\"\n\
+         [team.researcher]\nagent = \"claude\"\n[team.reviewer]\nagent = \"claude\"\n",
+    )?;
+    fakes.register(hoh_agents::compat::Agent::Claude)?;
+    let hold = fakes.dir.path().join("hold");
+    std::fs::create_dir_all(&hold)?;
+    let mut config = fakes.config();
+    config.hooks = Arc::new(HoldSuite(hold.clone()));
+    let host = start_when_free(config).await?;
+    let project = fakes.project();
+    let outcome = async {
+        let run_id = started(&host).await?;
+        supervised(&project, &run_id, "fp-1").await?;
+        let settled = |r: &Value| {
+            r.as_array()
+                .is_some_and(|a| a.iter().filter(|t| t["state"] == "SETTLED").count() >= 1)
+        };
+        until(&project, &turns(&run_id), Duration::from_secs(60), &settled).await?;
+        // Another implementation of claude: not verified until its suite, held here, publishes.
+        fakes.claude("B")?;
+        let limit = Duration::from_secs(60);
+        let end = Instant::now() + limit;
+        while !hold.join("held").exists() {
+            if Instant::now() > end {
+                return Err("claude's suite never ran".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let before = rows(&db(&project), &turns(&run_id))?;
+        need_decision(&project, &run_id, "fp-2")?;
+        let deferred = until(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.wakes') AS wakes FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'supervisor.deferred' AND json_extract(payload_json, '$.reason') = 'COMPAT_UNVERIFIED'"
+            ),
+            limit,
+            &some,
+        )
+        .await?;
+        // Ticks go on meanwhile (one each 200 ms): no turn, no other deferral, no failure.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(rows(&db(&project), &turns(&run_id))?, before, "no turn while unverified");
+        let again = rows(
+            &db(&project),
+            &format!(
+                "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'supervisor.deferred' \
+                 AND json_extract(payload_json, '$.reason') = 'COMPAT_UNVERIFIED'"
+            ),
+        )?;
+        assert_eq!(again, json!([{"n": 1}]), "{deferred}");
+        let wake: Vec<Value> = serde_json::from_str(deferred[0]["wakes"].as_str().unwrap_or("[]"))?;
+        let [wake] = wake.as_slice() else {
+            return Err(format!("one owed wake: {deferred}").into());
+        };
+        std::fs::write(hold.join("release"), "")?;
+        let answered = until(
+            &project,
+            &turns(&run_id),
+            limit,
+            &|r: &Value| {
+                r.as_array().is_some_and(|a| {
+                    a.iter().any(|t| t["wake"] == *wake && t["state"] == "SETTLED")
+                })
+            },
+        )
+        .await?;
+        let of_wake: Vec<&Value> = answered
+            .as_array()
+            .map(|a| a.iter().filter(|t| t["wake"] == *wake).collect())
+            .unwrap_or_default();
+        assert_eq!(of_wake.len(), 1, "answered at its first turn: {answered}");
+        assert_eq!(
+            (&of_wake[0]["agent"], &of_wake[0]["role_epoch"]),
+            (&json!("claude"), &json!(2)),
+            "bound again to the verified implementation: {answered}"
+        );
+        let failures = rows(
+            &db(&project),
+            &format!(
+                "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'supervisor.rearmed' \
+                 AND json_extract(payload_json, '$.reason') = 'failure'"
+            ),
+        )?;
+        assert_eq!(failures, json!([{"n": 0}]));
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(hold.join("release"), "");
+    host.shutdown().await;
+    fakes.stop_fakes();
+    outcome
+}
