@@ -4643,3 +4643,62 @@ async fn an_unverified_commander_is_not_preempted_for() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_judge_that_blocks_before_the_horizon_moves_still_ends_its_step_with_the_run_result() -> R
+{
+    // docs/adr/ADR-031.md decision 3 (M2T13D-201): the run.result is the last event of its transaction whatever writes
+    // after the move into E. Three wakes answered and closed, the horizon not yet past them; a fourth owed while the
+    // Commander's agent is gone: one step's transaction judges the run BLOCKED (COMMANDER_UNAVAILABLE) and then moves
+    // the horizon (BLOCKED holds nothing back), and its run.result comes last, after supervisor.horizon.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let mut ms = 0;
+    for n in 0..3 {
+        wake(&store, &clock, "R", "D", &format!("fp{n}"), ms).await?;
+        let a = store
+            .allocate_supervision("p1", context(&clock, ms + 2100))
+            .await?
+            .ok_or("allocated")?;
+        run_turn(&store, &clock, &a.attempt_id, ms + 2200, true, TRANSIENT).await?;
+        ms += 10_000;
+    }
+    clock.set(ms);
+    event(
+        &store,
+        "R",
+        "R/fp3",
+        "need_decision",
+        json!({"task_id": "D", "fingerprint": "fp3"}),
+    )
+    .await?;
+    let before = value(&path, "SELECT max(seq) FROM events")?;
+    store.supervise("R", agent_gone(&clock, ms + 2000)).await?;
+    let conn = Connection::open(&path)?;
+    let mut statement = conn.prepare("SELECT kind FROM events WHERE seq > ?1 ORDER BY seq")?;
+    let kinds: Vec<String> = statement
+        .query_map([before.as_i64().unwrap_or(0)], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let at = |kind: &str| kinds.iter().position(|k| k == kind);
+    let (blocked, judged, horizon, result) = (
+        at("run.blocked"),
+        at("supervisor.blocked"),
+        at("supervisor.horizon"),
+        at("run.result"),
+    );
+    assert!(
+        blocked.is_some() && judged.is_some() && blocked.max(judged) < horizon && horizon < result,
+        "{kinds:?}"
+    );
+    assert_eq!(result, Some(kinds.len() - 1), "{kinds:?}");
+    let state: String = conn.query_row(
+        "SELECT json_extract(payload_json, '$.state') || '/' || json_extract(payload_json, '$.blocked_reason') \
+         FROM events WHERE kind = 'run.result'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(state, "BLOCKED/COMMANDER_UNAVAILABLE");
+    Ok(())
+}

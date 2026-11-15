@@ -1155,3 +1155,37 @@ async fn a_rounds_verifier_task_is_refused_to_every_commander_decision() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_commanders_move_into_a_stopping_state_ends_its_commit_with_a_run_result() -> R {
+    // docs/adr/ADR-031.md decision 3, the decision path: the Commander's transition_run to FAILED is applied with its
+    // events, and the run's run.result ends the transaction.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    let before = rows(&path, "SELECT coalesce(max(seq), 0) FROM events")?[0][0]
+        .as_i64()
+        .unwrap_or(0);
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let decided = store
+        .decide(
+            commander.decide(
+                3,
+                7,
+                json!({"kind": "transition_run", "to_state": "FAILED"}),
+            ),
+            context(),
+        )
+        .await?;
+    assert!(matches!(decided, Decided::Applied { .. }), "{decided:?}");
+    let failed =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "FAILED")?;
+    assert_eq!(
+        (&failed["exit_code"], &failed["spec_revision"]),
+        (&json!(1), &json!(2))
+    );
+    Ok(())
+}

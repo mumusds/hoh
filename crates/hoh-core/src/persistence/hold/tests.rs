@@ -642,3 +642,106 @@ fn every_read_of_a_record_kind_by_run_goes_through_of_run() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn a_failure_is_never_a_stopped_runs_held_or_run_stopped() {
+    // Rule 2 (c): the recorders of failures take only a Failure, which neither form of a stopped run's refusal makes.
+    for stopped in [
+        PersistError::Held {
+            run: "R".to_owned(),
+            state: RunState::Completed,
+        },
+        PersistError::RunStopped {
+            run: "R".to_owned(),
+            state: RunState::Incomplete,
+        },
+    ] {
+        assert!(
+            matches!(
+                super::Failure::try_from(stopped),
+                Err(PersistError::Held { .. } | PersistError::RunStopped { .. })
+            ),
+            "a stopped run's refusal is no failure"
+        );
+    }
+    let failure = super::Failure::try_from(PersistError::Storage("disk".to_owned()));
+    assert_eq!(
+        failure.map(|f| f.to_string()).ok().as_deref(),
+        Some("storage error: disk")
+    );
+}
+
+/// R's candidates: C1 superseded by C2's freeze (history), C3 VERIFYING under an open round (a live obligation).
+const CANDIDATES: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256,
+  source_path, state, created_at) VALUES
+  ('C1', 'R', printf('%040d', 1), printf('%040d', 1), printf('%064d', 1), printf('%064d', 2), printf('%064d', 3),
+   '/repo', 'VERIFYING', '2026-11-15T00:00:00Z'),
+  ('C2', 'R', printf('%040d', 2), printf('%040d', 2), printf('%064d', 1), printf('%064d', 2), printf('%064d', 3),
+   '/repo', 'FROZEN', '2026-11-15T00:00:00Z'),
+  ('C3', 'R', printf('%040d', 3), printf('%040d', 3), printf('%064d', 1), printf('%064d', 2), printf('%064d', 3),
+   '/repo', 'VERIFYING', '2026-11-15T00:00:00Z');
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+  ('p1', 'C1/round', 'R', 'verification.round_opened', '{\"round_id\": \"rd1\", \"candidate_id\": \"C1\"}',
+   '2026-11-15T00:00:00Z'),
+  ('p1', 'C2/frozen', 'R', 'candidate.frozen', '{\"candidate_id\": \"C2\", \"superseded\": [\"C1\"]}',
+   '2026-11-15T00:00:00Z'),
+  ('p1', 'C3/round', 'R', 'verification.round_opened', '{\"round_id\": \"rd3\", \"candidate_id\": \"C3\"}',
+   '2026-11-15T00:00:00Z');
+";
+
+#[tokio::test]
+async fn a_stopped_runs_history_is_recovered_as_records_and_its_live_obligation_waits() -> R {
+    // (5)–(7) of the test plan, as far as the two predicates go: on a stopped run, a superseded candidate's recovery is
+    // history — wanted at the host's start, written as Records (project-scoped), its failure only
+    // candidate.reconcile_failed — while a live obligation is neither due nor wanted, and its write would be Held.
+    for state in [RunState::Completed, RunState::Incomplete] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        let (from, through) = path_to(state);
+        world(&path, from)?;
+        Connection::open(&path)?.execute_batch(CANDIDATES)?;
+        for (n, to) in through.into_iter().enumerate() {
+            enter(&store, &path, to, &format!("move-{n}")).await?;
+        }
+        let reader = store.reader()?;
+        assert!(reader.start_recovery_wanted("C1")?, "{state:?}");
+        assert!(!reader.start_recovery_wanted("C3")?, "{state:?}");
+        assert!(!reader.recovery_due("C1")?);
+        assert!(!reader.recovery_due("C3")?);
+        let now = std::time::SystemTime::now();
+        store
+            .record_start_recovery("C1", Err((true, "lost".to_owned())), now)
+            .await?;
+        store.record_recovery("C1", Ok(1), now).await?;
+        let written: Vec<(Option<String>, String, Value)> = events(&path)?
+            .into_iter()
+            .filter(|e| e.4["candidate_id"] == "C1" && e.3 != "verification.round_opened")
+            .map(|e| (e.2, e.3, e.4["run_id"].clone()))
+            .collect();
+        assert_eq!(
+            written,
+            [
+                (None, "candidate.reconcile_failed".to_owned(), json!("R")),
+                (None, "candidate.reconcile_recovered".to_owned(), json!("R"))
+            ],
+            "{state:?}"
+        );
+        assert_eq!(stopped(&path)?, Some(state));
+        // The live obligation's recovery, were it tried, is the run's progress: Held.
+        let refused = store
+            .record_recovery("C3", Err((false, "x".to_owned())), now)
+            .await;
+        assert!(
+            matches!(refused, Err(PersistError::Held { .. })),
+            "{state:?}: {refused:?}"
+        );
+        // It is due again once the run leaves its stop (INCOMPLETE takes a CancelRun).
+        if state == RunState::Incomplete {
+            store.submit_command(cancel(revision(&path)?)).await?;
+            assert!(store.reader()?.recovery_due("C3")?);
+        }
+    }
+    Ok(())
+}
