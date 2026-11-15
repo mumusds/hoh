@@ -1,8 +1,8 @@
 # CR-023 · ResumeRun 从停止状态恢复的例外边界与它的承接
 
 ID：CR-023
-状态：草案，待独立审查
-批准人：（待：独立审查判定属 CR-003 D1 的细化后，由 CTO 依 CR-003 D1 预授权批准）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立审查 Codex 01a1e0d2-85e3-7641-aa3c-1f83b3fef04d，attempt c6366033-ce8a-4c13-9472-a7c0e75d938f，判 PASS：CR-022 与 CR-023 均属 CR-003 D1 的细化、可按现稿批准；审查的冻结提交 f3d9985 与受锁修改补丁 sha256 5b7692be…f0be；批准时只按审查的 low 建议 CR22R-01 收窄了 CR-022 一句兼容性说明，决定与修改未变）
 日期：2026-11-15
 基线：改受锁文件 `contracts/requirements.json`（REQ-036 的行为 3、失败模式、第 2 条决定）与不在锁内的 `contracts/development-tasks.json`（M2-T13、M2-T11 的 done_when）；`python3 tools/gen_spec_views.py` 重新生成视图；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-023-resume-from-stop-states.md`
 

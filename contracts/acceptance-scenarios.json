@@ -126,7 +126,7 @@
     "PTY 输出不含 `ESC[?1049h`",
     "所有 commands/input_queue payload 不含由 stdin 写入的 `y`",
     "每次执行 runs 新增恰1行",
-    "每个 run 的 decisions 至少1行 payload 含 assumption=true 与依据引用",
+    "每个 run 的 decisions 至少1行 state=APPLIED 的 assumption 记录，其 basis 非空（依据引用）",
     "管道方式未关闭 stdin 仍在超时内退出"
    ],
    "observables": [
