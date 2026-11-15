@@ -142,6 +142,132 @@ fn test_020_01_the_same_probe_table_selects_claude_every_time() {
 }
 
 #[test]
+fn developer_and_qa_require_command_execution() {
+    // docs/adr/ADR-030.md decision 12 (REQ-020 decision 1, M2T15D-06): every role needs structured events, the
+    // commander and the reviewer resume as well, the developer and qa command execution as well.
+    for contract in ["developer", "qa"] {
+        assert_eq!(
+            required(Some(contract)),
+            set(&["command_execution", "structured_events"]),
+            "{contract}"
+        );
+    }
+    for contract in ["commander", "reviewer"] {
+        assert_eq!(
+            required(Some(contract)),
+            set(&["resume", "structured_events"]),
+            "{contract}"
+        );
+    }
+    for contract in [Some("cto"), Some("researcher"), None] {
+        assert_eq!(
+            required(contract),
+            set(&["structured_events"]),
+            "{contract:?}"
+        );
+    }
+}
+
+/// An agent at `identity()`, verified, whose session records `session`.
+fn verified(session: Value) -> Fact {
+    let granted = crate::decision::granted_capabilities(&session);
+    Fact::Usable(Box::new(Usable {
+        version: VERSION.to_owned(),
+        identity: identity(),
+        stamp: stamp(),
+        generation: (1, 1),
+        session,
+        granted,
+        compat: Compat::Verified,
+    }))
+}
+
+#[test]
+fn a_developer_fallback_without_command_execution_is_not_selected() {
+    // docs/adr/ADR-030.md decision 12 and its test plan ("能力"): the developer's order [claude, X], claude not
+    // installed, X usable and verified with structured events and resume but no command execution. X is not selected:
+    // its line is `X:CAPABILITY_UNSUPPORTED:command_execution`, and the binding is blocked with both lines. The same X
+    // with command execution (one fact changed) is selected.
+    let order = strings(&["claude", "X"]);
+    let lacking = json!({"structured_events": true, "resume": true, "command_execution": false});
+    let mut facts = Facts::new();
+    facts.insert(
+        "claude".to_owned(),
+        Fact::NotInstalled("claude: command not found".to_owned()),
+    );
+    facts.insert("X".to_owned(), verified(lacking));
+    for role in ["developer", "qa"] {
+        let required = required(Some(role));
+        assert_eq!(
+            verdict("X", &required, &facts, &[]),
+            Verdict::CapabilityUnsupported(strings(&["command_execution"]))
+        );
+        let selection = select(&order, &required, &facts, &[]);
+        assert_eq!(selection.chosen, None, "{role}");
+        assert_eq!(selection.waiting_on, None, "{role}");
+        assert_eq!(
+            selection.evaluated,
+            [
+                "claude:not_installed",
+                "X:CAPABILITY_UNSUPPORTED:command_execution"
+            ],
+            "{role}"
+        );
+        let staffed = Staffed {
+            run_id: "R".to_owned(),
+            role: role.to_owned(),
+            role_epoch: 1,
+            agent: "claude".to_owned(),
+            model: None,
+            preferred: "claude".to_owned(),
+            preferred_model: None,
+            state: BindingState::Active,
+            blocked_reason: None,
+            missing: Vec::new(),
+            session: None,
+            live: false,
+            order: order.clone(),
+            required,
+            excluded: Vec::new(),
+            pending: None,
+        };
+        assert_eq!(
+            judge(&staffed, &facts, &[]),
+            Judgment::Block {
+                reason: BlockedReason::AgentUnavailable,
+                missing: strings(&[
+                    "claude:not_installed",
+                    "X:CAPABILITY_UNSUPPORTED:command_execution"
+                ]),
+            },
+            "{role}"
+        );
+
+        // The positive control: X with command execution is chosen.
+        let mut capable = facts.clone();
+        capable.insert(
+            "X".to_owned(),
+            verified(json!({"structured_events": true, "resume": true, "command_execution": true})),
+        );
+        assert_eq!(
+            judge(&staffed, &capable, &[]),
+            Judgment::Switch {
+                to: "X".to_owned(),
+                model: None,
+                evaluated: strings(&["claude:not_installed", "X:usable"]),
+            },
+            "{role}"
+        );
+    }
+
+    // The commander and the reviewer do not need it: the same X fills them.
+    for role in ["commander", "reviewer"] {
+        let selection = select(&order, &required(Some(role)), &facts, &[]);
+        assert_eq!(selection.chosen.as_deref(), Some("X"), "{role}");
+    }
+}
+
+#[test]
 fn fresh_compares_the_whole_identity() {
     // M2T15D-104: a session is the agent's only under the same version, capabilities and whole identity.
     let fact = usable(VERSION, identity(), &CAPS, Compat::Verified);

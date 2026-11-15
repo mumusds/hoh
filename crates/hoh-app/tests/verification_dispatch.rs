@@ -3406,15 +3406,22 @@ const PI_QA_TEAM: &str = "config_version = \"1.0\"\n\
 [team.commander]\nagent = \"claude\"\n[team.cto]\nagent = \"claude\"\n[team.developer]\nagent = \"claude\"\n\
 [team.qa]\nagent = \"pi\"\n[team.researcher]\nagent = \"claude\"\n[team.reviewer]\nagent = \"claude\"\n";
 
+/// The recorded pi 1.5.0 help.
+const PI_HELP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+);
+
 /// A fake `pi` 1.5.0 in `bin` (`note` a comment line of its own: another implementation): the unmodified recorded
 /// help; its status command (`auth check`) says not logged in (credentials not configured) until `<bin>/pi.d/logged-in`
 /// exists. pi's settings in `pi_dir` name a default provider, so the registry runs that command (ADR-024 decision 7).
 fn fake_pi(bin: &Path, pi_dir: &Path, note: &str) -> R {
+    fake_pi_answering(bin, pi_dir, note, Path::new(PI_HELP))
+}
+
+/// [`fake_pi`] answering `--help` with the file `help`.
+fn fake_pi_answering(bin: &Path, pi_dir: &Path, note: &str, help: &Path) -> R {
     use std::os::unix::fs::PermissionsExt as _;
-    let help = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
-    );
     let d = bin.join("pi.d");
     std::fs::create_dir_all(&d)?;
     std::fs::create_dir_all(pi_dir)?;
@@ -3431,7 +3438,8 @@ fn fake_pi(bin: &Path, pi_dir: &Path, note: &str) -> R {
              'auth check') if [ -e '{d}/logged-in' ]; then echo '{{\"status\": \"ready\"}}'; else \
              echo '{{\"status\": \"not_ready\", \"reason\": \"credentials_not_configured\"}}'; exit 1; fi;;\n \
              *) exit 2;;\nesac\n",
-            d = d.display()
+            d = d.display(),
+            help = help.display()
         ),
     )?;
     std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
@@ -3824,6 +3832,163 @@ async fn a_late_auth_failure_of_a_replaced_pi_does_not_block_qa() -> R {
             "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'task.unblocked'",
         )?;
         assert_eq!(unblocked, json!([{"reason": "BLOCKED_AUTH"}]));
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome
+}
+
+/// The capability product path's team (docs/adr/ADR-030.md, its test plan "能力的产品路径"): every role claude but the
+/// developer, which is codex falling back to pi.
+const PI_DEVELOPER_TEAM: &str = "config_version = \"1.0\"\n\
+[team.commander]\nagent = \"claude\"\n[team.cto]\nagent = \"claude\"\n[team.developer]\nagent = \"codex\"\n\
+fallback = [\"pi\"]\n[team.qa]\nagent = \"claude\"\n[team.researcher]\nagent = \"claude\"\n[team.reviewer]\n\
+agent = \"claude\"\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_developer_fallback_whose_help_turns_bash_off_is_not_selected() -> R {
+    // docs/adr/ADR-030.md decision 12 and its test plan ("能力的产品路径", M2T15D-06, -150): the developer is codex,
+    // not on the host's PATH, falling back to pi. pi is logged in and registered by the product's compat suite, but its
+    // help is the recorded 1.5.0 help with one fact changed: `bash` is `(off by default)`. Staffing does not select pi:
+    // the developer binding stays codex's at epoch 1, BLOCKED with the missing line
+    // `pi:CAPABILITY_UNSUPPORTED:command_execution`, the evidence of the block shows pi's probe found no command
+    // execution, and D has no attempt. The positive control on the product path is TEST-020-02.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    let bin = dir.path().join("bin");
+    fake_claude(&bin)?;
+    let recorded = std::fs::read_to_string(PI_HELP)?;
+    let bash = "  bash       - Execute bash commands\n";
+    assert_eq!(
+        recorded.matches(bash).count(),
+        1,
+        "the recorded help's bash line"
+    );
+    let help = dir.path().join("pi-help.txt");
+    std::fs::write(
+        &help,
+        recorded.replace(
+            bash,
+            "  bash       - Execute bash commands (off by default)\n",
+        ),
+    )?;
+    let pi_dir = dir.path().join("pi-agent");
+    fake_pi_answering(&bin, &pi_dir, "A", &help)?;
+    std::fs::write(bin.join("pi.d/logged-in"), "")?;
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    std::fs::write(project.join(".hoh/config.toml"), PI_DEVELOPER_TEAM)?;
+    // The file becomes the project's team revision at a host's start.
+    Host::start(config(&project)).await?.shutdown().await;
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Pi,
+    ] {
+        let registered = hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&path))?;
+        assert_eq!(
+            format!("{:?}", registered.entry.suite.status),
+            "Pass",
+            "{registered:?}"
+        );
+    }
+    // Run R bound as StartRun binds this team: the developer codex, every other role claude.
+    seed(
+        &project,
+        &format!(
+            "{}\nUPDATE role_bindings SET agent = 'codex' WHERE run_id = 'R' AND role = 'developer';\n\
+             UPDATE role_bindings SET agent = 'claude' WHERE run_id = 'R' AND role = 'qa';",
+            world_unbound(&spec)
+        ),
+    )?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    if let Ok(mut registry) = team.registry.lock() {
+        *registry = Some(Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            path.clone().into(),
+            Some(pi_dir.clone()),
+        )));
+    }
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        // Whichever comes first: the developer blocked, or pi selected (the binding moved on from codex).
+        let developer = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT agent, role_epoch, state, blocked_reason, missing_json FROM role_bindings \
+             WHERE run_id = 'R' AND role = 'developer'",
+            &|r| r[0]["state"] == "BLOCKED" || r[0]["agent"] != "codex",
+        )?;
+        let developer = &developer[0];
+        let missing: Value =
+            serde_json::from_str(developer["missing_json"].as_str().unwrap_or("null"))?;
+        assert_eq!(
+            (
+                &developer["agent"],
+                &developer["role_epoch"],
+                &developer["state"],
+                &developer["blocked_reason"],
+                &missing
+            ),
+            (
+                &json!("codex"),
+                &json!(1),
+                &json!("BLOCKED"),
+                &json!("AGENT_UNAVAILABLE"),
+                &json!(["codex:not_installed", "pi:CAPABILITY_UNSUPPORTED:command_execution"])
+            ),
+            "{developer}"
+        );
+        let blocked = rows(
+            &project,
+            "SELECT payload_json FROM events WHERE run_id = 'R' AND kind = 'team.binding_blocked' \
+             AND json_extract(payload_json, '$.role') = 'developer'",
+        )?;
+        assert_eq!(blocked.as_array().map(Vec::len), Some(1), "{blocked}");
+        let blocked: Value =
+            serde_json::from_str(blocked[0]["payload_json"].as_str().unwrap_or("null"))?;
+        assert_eq!(blocked["missing"], missing, "{blocked}");
+        let sha256 = blocked["probe_sha256"].as_str().ok_or("no probe sha256")?;
+        let probe: Value = serde_json::from_slice(&hoh_core::objects::get(&project, sha256)?)?;
+        let pi = probe
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["agent"] == "pi"))
+            .ok_or("no pi in the evidence")?;
+        assert_eq!(
+            pi["line"], "pi:CAPABILITY_UNSUPPORTED:command_execution",
+            "{probe}"
+        );
+        assert_eq!(
+            (
+                &pi["probe"]["capabilities"]["command_execution"],
+                &pi["probe"]["capabilities"]["structured_events"]
+            ),
+            (&json!(false), &json!(true)),
+            "{probe}"
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM events WHERE run_id = 'R' \
+                 AND kind IN ('team.binding_fallback', 'team.binding_applied') \
+                 AND json_extract(payload_json, '$.role') = 'developer'"
+            )?,
+            json!([{"n": 0}])
+        );
+        assert_eq!(
+            rows(&project, "SELECT count(*) AS n FROM attempts WHERE task_id = 'D'")?,
+            json!([{"n": 0}])
+        );
+        keep(
+            "capability-product-path",
+            &json!({
+                "role_bindings": rows(&project, "SELECT role, agent, role_epoch, session_id, state, blocked_reason, missing_json FROM role_bindings ORDER BY role")?,
+                "probe": probe,
+                "events": rows(&project, "SELECT seq, kind, payload_json FROM events WHERE kind LIKE 'team.%' OR kind LIKE 'task.%' ORDER BY seq")?,
+            }),
+        )?;
         R::Ok(())
     }
     .await;

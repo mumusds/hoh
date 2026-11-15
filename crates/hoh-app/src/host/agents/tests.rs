@@ -88,14 +88,21 @@ fn an_agent_is_probed_once_until_its_files_change_and_a_missing_one_is_unavailab
 
 #[test]
 fn a_roles_needs_follow_its_contract() {
-    // Decision 10 (REQ-020 decision 1, the named part).
+    // Decision 10 (REQ-020 decision 1); docs/adr/ADR-030.md decision 12: the developer and qa need command execution.
     let set = |items: &[&str]| {
         items
             .iter()
             .map(|s| (*s).to_owned())
             .collect::<BTreeSet<_>>()
     };
-    assert_eq!(required(Some("developer")), set(&["structured_events"]));
+    assert_eq!(
+        required(Some("developer")),
+        set(&["command_execution", "structured_events"])
+    );
+    assert_eq!(
+        required(Some("qa")),
+        set(&["command_execution", "structured_events"])
+    );
     assert_eq!(
         required(Some("reviewer")),
         set(&["resume", "structured_events"])
@@ -771,7 +778,9 @@ fn pi_gone_claude_verified() -> Snapshot {
         ctime_sec: 3,
         ctime_nsec: 4,
     };
-    let session = serde_json::json!({"structured_events": true, "resume": true});
+    // Command execution as claude 2.1.318's probe measures it from the recorded help (ADR-030 decision 12): qa needs it.
+    let session =
+        serde_json::json!({"structured_events": true, "resume": true, "command_execution": true});
     let mut snapshot = Snapshot::default();
     snapshot.facts.insert(
         "pi".to_owned(),
