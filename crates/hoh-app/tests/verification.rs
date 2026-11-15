@@ -1753,6 +1753,9 @@ async fn a_record_another_holds_is_left_and_one_it_left_is_recorded() -> R {
         })?;
     rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
     assert_eq!(super_reconcile(&f, &c).await?, 0);
+    // Let go explicitly: a drop alone leaves the lock with any child another test thread forked meanwhile, until it
+    // execs (ADR-022 decision 10, convention v2).
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock)?;
     drop(lock);
     assert_eq!(super_reconcile(&f, &c).await?, 1);
     assert_eq!(f.query("SELECT outcome FROM evidence")?, ["PASS"]);

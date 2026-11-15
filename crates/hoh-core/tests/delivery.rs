@@ -2166,13 +2166,81 @@ async fn a_returned_claim_does_not_make_other_writes_wait_longer_for_a_busy_data
     Ok(())
 }
 
+/// Holds the writer at the answer of each outbox request while armed (after its commit, before the answer is sent),
+/// so a tick polled once meanwhile has sent its claim and cannot have read its answer.
+#[derive(Debug, Default)]
+struct HeldAnswers {
+    /// Armed, and how many answers are held now.
+    state: Mutex<(bool, usize)>,
+    changed: std::sync::Condvar,
+}
+
+impl HeldAnswers {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (bool, usize)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn arm(&self) {
+        self.lock().0 = true;
+    }
+
+    /// Wait until an answer is held, for at most 10 s.
+    fn held(&self) -> R {
+        let state = self.lock();
+        let (state, waited) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(10), |s| s.1 == 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if waited.timed_out() && state.1 == 0 {
+            return Err("the writer never answered an outbox request".into());
+        }
+        Ok(())
+    }
+
+    fn release(&self) {
+        self.lock().0 = false;
+        self.changed.notify_all();
+    }
+}
+
+impl hoh_core::persistence::FaultHooks for HeldAnswers {
+    fn at(&self, job: &'static str, point: hoh_core::persistence::WritePoint) {
+        if job != "Outbox" || point != hoh_core::persistence::WritePoint::Committed {
+            return;
+        }
+        let mut state = self.lock();
+        if !state.0 {
+            return;
+        }
+        state.1 += 1;
+        self.changed.notify_all();
+        let mut state = self
+            .changed
+            .wait_while(state, |s| s.0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 -= 1;
+    }
+}
+
 #[tokio::test]
 async fn claims_left_unread_across_their_backoff_do_not_stack() -> R {
     // M2T04R-400: three ticks each take the claim and are never polled again while the clock passes the backoff;
-    // a message with a live guard is not claimed again, so one delivery at most is pending, and none counts.
+    // a message with a live guard is not claimed again, so one delivery at most is pending, and none counts. Each
+    // tick's one poll is made while the writer holds the answers back, so it has sent its claim and has not read the
+    // answer whatever the scheduling: under load the answer could come within that poll, the first tick then went on
+    // to deliver (ACKED) and a later one completed in it.
     use std::task::{Context, Waker};
     let dir = tempfile::tempdir()?;
-    let (store, db) = open(&dir)?;
+    let held = std::sync::Arc::new(HeldAnswers::default());
+    let (store, db) = open_with(
+        &dir,
+        Options {
+            faults: held.clone(),
+            ..Options::default()
+        },
+    )?;
     seed(&db, WORLD)?;
     enqueue(&store, "k", &[to_qa("k", 3, 2, &sha(2), None)?]).await?;
     let clock = FakeClock::new();
@@ -2189,8 +2257,15 @@ async fn claims_left_unread_across_their_backoff_do_not_stack() -> R {
     let mut ticks = Vec::new();
     for _ in 0..3 {
         let mut tick = Box::pin(dispatcher.tick());
-        let _ = tick.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        // Let the claim be answered, unread.
+        held.arm();
+        assert!(
+            tick.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        // The writer has the claim and holds its answer; let it be answered, unread.
+        held.held()?;
+        held.release();
         store.writer_pragmas().await?;
         ticks.push(tick);
         clock.set(clock.now() + Duration::from_secs(120));

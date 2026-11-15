@@ -331,7 +331,8 @@ impl World {
 
     /// The body of [`World::codex`]'s script, which appends `<name> <marker> <argv>` to `codex.d/calls` at each run;
     /// for an attempt whose marker names SIXTYFIVE it writes the gate's refusal line on stderr and exits 65 with no
-    /// frame; FORGE, the same after `codex.d/forge.py` (when there) forged records in its gate's log; NATIVE, the
+    /// frame; FORGE, the same, its first attempt only after `codex.d/forge.py` (when there) forged records in its
+    /// gate's log (a retry forging again would add a `forged.<pid>` of its own and append to that log); NATIVE, the
     /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`. An App Server run writes
     /// its marker to `codex.d/marker.<pid>` (its log is `codex.d/log.<pid>`); for an attempt whose marker names
     /// HOLD-INIT it waits for `codex.d/release` before it answers anything, HOLD-TURN, the first attempt's turn writes its
@@ -440,8 +441,9 @@ impl World {
                     *DEGRADE*) frames=\"$d/degrade.jsonl\"; opt=;;\n\
                     *INCOMPLETE/attempt-1) frames=\"$d/incomplete.jsonl\"; opt=--exit-when-done;;\n\
                     *SIXTYFIVE*) echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
-                    *FORGE*) [ -f \"$d/forge.py\" ] && python3 \"$d/forge.py\" \"$d/forged.$$\" \"$@\"\n\
+                    *FORGE/attempt-1) [ -f \"$d/forge.py\" ] && python3 \"$d/forge.py\" \"$d/forged.$$\" \"$@\"\n\
                      echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
+                    *FORGE*) echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
                     *NATIVE*) frames=\"$d/native.jsonl\"; opt=;;\n\
                     *HOLD-INIT*) while [ ! -e \"$d/release\" ]; do sleep 0.05; done; frames=\"$d/frames.jsonl\"; opt=;;\n\
                     *HOLD-TURN/attempt-1) frames=\"$d/hold-turn.jsonl\"; opt=;;\n\
@@ -464,7 +466,8 @@ impl World {
     /// The body of [`World::pi`]'s script, which appends `<name> <marker> <argv>` to `pi.d/calls` at each run and, for a
     /// turn, its marker to `pi.d/marker.<pid>` (its log is `pi.d/log.<pid>`). For an attempt whose marker names
     /// HOLD-ANSWER its turn waits for `pi.d/release` before it answers anything; CHMOD, it first changes its own mode to
-    /// the one it has (docs/adr/ADR-030.md decision 9's re-check before the first input).
+    /// the one it has (docs/adr/ADR-030.md decision 9's re-check before the first input), then makes
+    /// `pi.d/chmodded.<attempt-n>` and waits for `pi.d/chmod-go.<attempt-n>` (`<attempt-n>` its attempt id's last part).
     fn pi_body(&self, name: &str) -> R<String> {
         let d = self.bin().join("pi.d");
         std::fs::create_dir_all(&d)?;
@@ -512,7 +515,8 @@ impl World {
              case \"$HOH_ATTEMPT_ID\" in\n\
               *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
               *EARLY-EXIT/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/early-exit.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
-              *CHMOD*) python3 -c 'import os, sys; os.chmod(sys.argv[1], os.stat(sys.argv[1]).st_mode & 0o7777)' \"$0\";;\n\
+              *CHMOD*) python3 -c 'import os, sys; os.chmod(sys.argv[1], os.stat(sys.argv[1]).st_mode & 0o7777)' \"$0\"\n\
+               n=\"${{HOH_ATTEMPT_ID##*/}}\"; : > \"$d/chmodded.$n\"; while [ ! -e \"$d/chmod-go.$n\" ]; do sleep 0.05; done;;\n\
              esac\n\
              frames=\"$d/frames.jsonl\"; case \"$HOH_ATTEMPT_ID\" in *HOLD-ANSWER*) frames=\"$d/hold.jsonl\";; esac\n\
              exec timeout 60 python3 '{PI_RPC}' \"$frames\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
@@ -929,11 +933,27 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
             ),
             (&json!("codex"), &json!("m-test"), &json!(2), &json!(r + 1))
         );
-        // codex was asked for the binding's model, and reported it.
-        let asked: Vec<Value> = std::fs::read_dir(world.bin().join("codex.d"))?
+        // codex was asked for the binding's model, and reported it: every thread/start of the developer's attempts
+        // (the binding this test changes), found by their App Server runs' markers. The run's Commander is codex too,
+        // and a supervision turn of its asks for the Commander's binding (no model) when a wake starts one meanwhile:
+        // the world has no pi, so the qa and researcher bindings are blocked and their team.binding_blocked wakes it
+        // (docs/adr/ADR-025.md).
+        let developers: Vec<String> = serde_json::from_str(&query(
+            &project,
+            "SELECT json_group_array(attempt_id) FROM attempts JOIN tasks USING (task_id) WHERE tasks.role = 'developer'",
+        )?)?;
+        let d = world.bin().join("codex.d");
+        let asked: Vec<Value> = std::fs::read_dir(&d)?
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
+            .filter_map(|e| {
+                let pid = e.file_name().to_string_lossy().strip_prefix("marker.")?.to_owned();
+                let marker = std::fs::read_to_string(e.path()).ok()?;
+                developers
+                    .iter()
+                    .any(|a| marker.trim().ends_with(&format!("/{a}")))
+                    .then(|| d.join(format!("log.{pid}/received.jsonl")))
+            })
+            .filter_map(|log| std::fs::read_to_string(log).ok())
             .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .filter(|m| m["method"] == "thread/start")
@@ -2345,6 +2365,21 @@ fn a_hosts_stop_kills_the_schema_command_however_late_its_reader_runs() -> R {
             started.push((pid, start));
         }
         let reader = thread_named(host_pid, "hoh-schema").ok_or("no schema reader thread")?;
+        // Held only once it waits in the probe's loop for its command (blocked in the poll of its outputs, after the
+        // spawn returned and the command was put in its slot): what this test claims is that the stop kills a command
+        // in its slot however late the thread's own looks come. Its pid files exist as soon as the command runs, while
+        // the thread that spawned it may not have returned from the spawn yet (under load it was held in clone3): a
+        // thread held there is ADR-022 decision 10 v6's residual (a), the pid known to its starter alone, which this
+        // test does not claim.
+        let waiting = format!("{} ", nix::libc::SYS_ppoll);
+        while !std::fs::read_to_string(format!("/proc/{host_pid}/task/{reader}/syscall"))
+            .is_ok_and(|now| now.starts_with(&waiting))
+        {
+            if Instant::now() > end {
+                return Err("the schema reader never waited for its command".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let tid = Pid::from_raw(reader);
         ptrace::seize(tid, ptrace::Options::empty())?;
         traced = Some(tid);
@@ -4999,9 +5034,10 @@ async fn pi_held_before_its_first_answer(
         ..Points::default()
     });
     let (observed, hook) = observed();
+    let registry = world.registry();
     let mut config = world.config_with(
         hoh_core::config::Config::default(),
-        world.registry(),
+        registry.clone(),
         None,
         Some(hook),
     );
@@ -5040,6 +5076,30 @@ async fn pi_held_before_its_first_answer(
             BeforeAnswer::SameMode => {
                 let mode = std::fs::metadata(&pi)?.permissions().mode();
                 std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(mode))?;
+                // Released only once the registry looked at pi again (its fact verified with the new stamps), so the
+                // retry this variant claims comes due after that look. A retry due before it (its backoff drawn short,
+                // the look slow under load) is refused by prepare ("files changed since the last look") and its task
+                // waits for the look: the one refused attempt docs/adr/ADR-030.md allows there (decision 13 (b) and
+                // its S6c correction, the registry's facts rereading the stamps), a path of the look's timing that
+                // this test does not claim. The turn held here keeps the stamps of the look before the change
+                // (`Expect.stamp`).
+                let changed = std::fs::metadata(&pi)?;
+                let end = Instant::now() + limit;
+                loop {
+                    use std::os::unix::fs::MetadataExt as _;
+                    if let Some(hoh_core::staffing::Fact::Usable(u)) =
+                        registry.fact(hoh_agents::compat::Agent::Pi)
+                        && u.compat == hoh_core::staffing::Compat::Verified
+                        && (u.stamp.implementation.ctime_sec, u.stamp.implementation.ctime_nsec)
+                            == (changed.ctime(), changed.ctime_nsec())
+                    {
+                        break;
+                    }
+                    if Instant::now() > end {
+                        return Err("the registry never looked at pi again".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
             BeforeAnswer::GateRewritten => {
                 let gate = project.join(".hoh/attempts/T-HOLD-ANSWER%2Fattempt-1/gate.jsonl");
@@ -5245,6 +5305,17 @@ async fn codex_app_server_sends_no_thread_start_when_its_implementation_changed(
         ready(&project, &run_id, &[("T-HOLD-INIT", "developer")])?;
         let attempt = "T-HOLD-INIT/attempt-1";
         gate_verified(&project, attempt).await?;
+        // Replaced only once A runs (its call is written as its script starts): the fake is a script, executed by its
+        // interpreter, which opens it by its path after the gate's check (plan E2), so a rename before that open
+        // would run B in the attempt (docs/adr/ADR-030.md decision 9's R2, accepted), not the change before the first
+        // input this test claims.
+        let end = Instant::now() + limit;
+        while codex_calls(&world, attempt).is_empty() {
+            if Instant::now() > end {
+                return Err(format!("{attempt}: its codex never ran").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         std::fs::rename(stage_codex_b(&world)?, world.bin().join("codex"))?;
         std::fs::write(world.bin().join("codex.d/release"), "")?;
         until(&project, &ended(attempt), "FAILED/COMPAT_UNVERIFIED", limit).await?;
@@ -5546,9 +5617,11 @@ async fn a_metadata_only_change_before_the_first_input_is_retried_to_the_cap() -
     // own implementation to the mode it has before it answers get_state, in every attempt: no prompt, FAILED
     // COMPAT_UNVERIFIED with stamp_only, transient: READY with a task.retry_scheduled; the store's clock moved to each
     // next_retry_at (once the registry looked at pi's changed stamps again, as it does within a tick or two of a real
-    // backoff of seconds), the ninth failed attempt (MAX_RETRIES = 8) leaves the task BLOCKED(NEED_DECISION) with one
-    // need_decision{reason: retries_exhausted} and no next_retry_at (ADR-020, TEST-042-03's exit); moving the clock on,
-    // nothing more is dispatched: exactly nine attempts, all FAILED.
+    // backoff of seconds; each attempt's pi answers only after that look, so a backoff drawn shorter than the look
+    // under load does not bring its retry due before it: that retry would be refused by prepare, "files changed since
+    // the last look", a path of the look's timing this test does not claim), the ninth failed attempt (MAX_RETRIES =
+    // 8) leaves the task BLOCKED(NEED_DECISION) with one need_decision{reason: retries_exhausted} and no next_retry_at
+    // (ADR-020, TEST-042-03's exit); moving the clock on, nothing more is dispatched: exactly nine attempts, all FAILED.
     let world = World::new()?;
     world.claude(None)?;
     world.pi()?;
@@ -5585,11 +5658,31 @@ async fn a_metadata_only_change_before_the_first_input_is_retried_to_the_cap() -
             matches!(registry.fact(hoh_agents::compat::Agent::Pi), Some(hoh_core::staffing::Fact::Usable(u))
                 if u.compat == hoh_core::staffing::Compat::Verified)
         };
+        // The registry's fact of pi verified with the stamps pi has now: it looked at pi since its last change.
+        let looked = || -> R<bool> {
+            use std::os::unix::fs::MetadataExt as _;
+            let now = std::fs::metadata(world.bin().join("pi"))?;
+            Ok(matches!(registry.fact(hoh_agents::compat::Agent::Pi), Some(hoh_core::staffing::Fact::Usable(u))
+                if u.compat == hoh_core::staffing::Compat::Verified
+                    && (u.stamp.implementation.ctime_sec, u.stamp.implementation.ctime_nsec)
+                        == (now.ctime(), now.ctime_nsec())))
+        };
+        let d = world.bin().join("pi.d");
         let mut moves = Vec::new();
         let end = Instant::now() + Duration::from_secs(240);
         while query(&project, task)? != "BLOCKED/NEED_DECISION/" {
             if Instant::now() > end {
                 return Err(format!("not capped: {}; moves {moves:?}", query(&project, task)?).into());
+            }
+            // An attempt's pi that changed its mode answers once the registry looked at it again.
+            for entry in std::fs::read_dir(&d)?.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(n) = name.strip_prefix("chmodded.") {
+                    let go = d.join(format!("chmod-go.{n}"));
+                    if !go.exists() && looked()? {
+                        std::fs::write(go, "")?;
+                    }
+                }
             }
             let busy = query(
                 &project,

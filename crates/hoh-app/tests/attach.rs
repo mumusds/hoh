@@ -311,15 +311,42 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         )
     };
     let before = rows()?;
+    // Each client's lines are read as they come, so what the three received can be compared while all are attached.
+    type Lines = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
     let mut clients = Vec::new();
     for _ in 0..3 {
-        clients.push(
-            env.command(&["attach", &run_id, "--output", "stream-json"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?,
-        );
+        let mut client = env
+            .command(&["attach", &run_id, "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdout = client.stdout.take().ok_or("no stdout")?;
+        let lines = Lines::default();
+        let reader = {
+            let lines = lines.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    lines
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(line);
+                }
+            })
+        };
+        clients.push((client, lines, reader));
     }
+    let seqs = |lines: &Lines| -> R<Vec<i64>> {
+        Ok(lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).map(|e| e["seq"].as_i64().unwrap_or(-1)))
+            .collect::<Result<_, _>>()?)
+    };
     // From the first ready on, exactly one host the whole time.
     let end = Instant::now() + Duration::from_secs(10);
     while query(&env.project(), "SELECT host_epoch FROM projects")? == epoch.to_string() {
@@ -337,8 +364,31 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(seen.len(), 1, "{seen:?}");
+    // The same events while all three are attached: a moment when each has received the same sequence. The host's
+    // events keep coming meanwhile (its looks at the agents on PATH commit team events some 10 s after its start under
+    // load), so the clients, stopped one after another below, may each end at another event of the same stream.
+    // The clients are stopped whatever this finds.
+    let end = Instant::now() + LIMIT;
+    let agreed = loop {
+        let now = clients
+            .iter()
+            .map(|(_, lines, _)| seqs(lines))
+            .collect::<R<Vec<_>>>();
+        match now {
+            Ok(now) if !now[0].is_empty() && now.iter().all(|s| s == &now[0]) => {
+                break Ok(now[0].clone());
+            }
+            Ok(now) if Instant::now() > end => {
+                break Err(format!(
+                    "the attaches never received the same events: {now:?}"
+                ));
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
     let mut sequences = Vec::new();
-    for client in clients {
+    for (client, lines, reader) in clients {
         if let Some(pid) = i32::try_from(client.id())
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -352,20 +402,27 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let seqs: Vec<i64> = String::from_utf8(out.stdout)?
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).map(|e| e["seq"].as_i64().unwrap_or(-1)))
-            .collect::<Result<_, _>>()?;
-        sequences.push(seqs);
+        reader.join().map_err(|_| "a client's reader panicked")?;
+        sequences.push(seqs(&lines)?);
     }
+    let agreed = agreed?;
     assert!(!sequences[0].is_empty());
     // Each in strictly increasing order: no event twice, none out of order (M2T06R-52).
     for seqs in &sequences {
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
     }
+    // Each began with what all had received together and went on in the same stream until its own stop: a prefix of
+    // the longest, none missing an event another got before a later one.
+    let longest = sequences
+        .iter()
+        .max_by_key(|s| s.len())
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        sequences.iter().all(|s| s == &sequences[0]),
-        "{sequences:?}"
+        sequences
+            .iter()
+            .all(|s| s.starts_with(&agreed) && longest.starts_with(s)),
+        "{agreed:?} {sequences:?}"
     );
     assert_eq!(
         query(&env.project(), "SELECT host_epoch FROM projects")?,
