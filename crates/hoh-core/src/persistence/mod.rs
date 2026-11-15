@@ -61,7 +61,7 @@ pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
 pub use plan::Imported;
 pub use reconcile::{EffectRow, UnfinishedRow};
 pub use reports::{IntakeState, ReportIntake, ReportState};
-pub use results::{TaskResultOutcome, VERIFIERS};
+pub use results::{ResultView, TaskResultOutcome, VERIFIERS};
 pub use retry::{Failure, Paced, Repair, RepairRequest, RepairVerdict};
 pub use rounds::{Dispatched, RoundOutcome};
 pub use runner::{
@@ -95,7 +95,7 @@ pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
 pub use commands::{
-    CommandOutcome, EventRow, HostStart, RunRow, RunTarget, RunsPage, SubmitCommand,
+    CommandOutcome, EventRow, HostStart, RunProjection, RunRow, RunTarget, RunsPage, SubmitCommand,
 };
 pub use decide::{Decided, Fenced};
 pub use inputs::{InputMove, InputRow, NewInput};
@@ -2294,12 +2294,9 @@ impl Reader {
         commands::run_view(&self.conn, run_id)
     }
 
-    /// [`Reader::run_view`] with the run's acceptance snapshot (getRun's projection, docs/adr/ADR-029.md decision 5),
-    /// read together.
-    pub fn run_projection(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<(RunRow, TeamView, AcceptanceView, i64)>, PersistError> {
+    /// [`Reader::run_view`] with the run's acceptance snapshot (getRun's projection, docs/adr/ADR-029.md decision 5)
+    /// and its result as of the watermark (docs/adr/ADR-031.md decision 12), read together.
+    pub fn run_projection(&self, run_id: &str) -> Result<Option<RunProjection>, PersistError> {
         commands::run_projection(&self.conn, run_id)
     }
 

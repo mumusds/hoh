@@ -568,11 +568,20 @@ pub(super) fn run_view(
     read
 }
 
+/// A run as getRun shows it: its row, its team, its acceptance summary, its result as of the watermark, and the
+/// watermark it was read at.
+pub type RunProjection = (
+    RunRow,
+    super::team::TeamView,
+    super::AcceptanceView,
+    super::results::ResultView,
+    i64,
+);
 /// [`run_view`] with the run's acceptance snapshot (docs/adr/ADR-029.md decision 5), in one read transaction.
 pub(super) fn run_projection(
     conn: &Connection,
     run_id: &str,
-) -> Result<Option<(RunRow, super::team::TeamView, super::AcceptanceView, i64)>, PersistError> {
+) -> Result<Option<RunProjection>, PersistError> {
     conn.execute_batch("BEGIN").map_err(sqlite_error)?;
     let read = (|| {
         let Some((run, _)) = snapshot_rows(conn, run_id)? else {
@@ -583,7 +592,9 @@ pub(super) fn run_projection(
         let Some(acceptance) = super::snapshot::view_in(conn, run_id, watermark)? else {
             return Ok(None);
         };
-        Ok::<_, PersistError>(Some((run, team, acceptance, watermark)))
+        // The run's result as of the watermark (docs/adr/ADR-031.md decision 12): in the same read.
+        let result = super::results::view(conn, run_id, watermark)?;
+        Ok::<_, PersistError>(Some((run, team, acceptance, result, watermark)))
     })();
     // Ends the read transaction either way; nothing was written.
     let _ = conn.execute_batch("COMMIT");
