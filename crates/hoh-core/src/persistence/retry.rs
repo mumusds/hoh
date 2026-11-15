@@ -547,14 +547,7 @@ pub(super) fn pace(
     let stop = budget::stop(&budget, context.wall());
     // Two counts of the attempts not ended (docs/adr/ADR-025.md decision 3): every one, supervision turns too, for a
     // budget stop, which waits for them; the work attempts only for whether the run can move on or only waits.
-    let (unfinished, unfinished_work): (i64, i64) = tx
-        .query_row(
-            "SELECT count(*), count(*) FILTER (WHERE t.role <> 'commander') FROM attempts a \
-             JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
-            params![run_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(sqlite_error)?;
+    let (unfinished, unfinished_work) = unfinished_attempts(&tx, run_id)?;
     let back = |resume: &Option<String>| -> Result<RunState, PersistError> {
         Ok(resume
             .as_deref()
@@ -1026,6 +1019,22 @@ pub(super) fn repair_in(
 /// The cost of run `run_id` (CR-009, ADR-020 decision 9): known only when its price is known (its run-scope usd row
 /// says so) and every attempt has a billed cost, then their sum (0 with no attempt); otherwise unknown and null,
 /// never an estimate.
+/// Run `run_id`'s attempts not ended (PREPARED, STARTING, RUNNING): all of them, its supervision turns too, and its
+/// work's alone (docs/adr/ADR-025.md decision 3). The budget stop and an end of the run wait for all of them
+/// (docs/adr/ADR-031.md decision 4).
+pub(super) fn unfinished_attempts(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(i64, i64), PersistError> {
+    conn.query_row(
+        "SELECT count(*), count(*) FILTER (WHERE t.role <> 'commander') FROM attempts a \
+         JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = ?1 AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')",
+        params![run_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(sqlite_error)
+}
+
 pub(super) fn run_cost(
     conn: &Connection,
     run_id: &str,

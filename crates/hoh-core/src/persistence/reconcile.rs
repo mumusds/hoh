@@ -292,7 +292,7 @@ fn host_event(
         },
         ctx,
     )?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
     ))
@@ -545,7 +545,7 @@ fn apply(
         },
         ctx,
     )?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
     ))

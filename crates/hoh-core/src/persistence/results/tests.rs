@@ -463,7 +463,7 @@ fn every_commit_of_the_writer_is_its_commit_function() -> R {
             {
                 assert_eq!(inside.matches(".commit()").count(), 1, "{function}");
                 assert!(
-                    function.contains("begin_host") || inside.contains("finish(&tx)?;"),
+                    function.contains("begin_host") || inside.contains("finish(&tx, ctx)?;"),
                     "{function}"
                 );
                 rest = rest.replacen(inside, "", 1);

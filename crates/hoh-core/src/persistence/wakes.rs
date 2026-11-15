@@ -1611,6 +1611,27 @@ pub(super) fn advance_horizon(
     project_id: &str,
     run_id: &str,
 ) -> Result<Option<NewEvent>, PersistError> {
+    // A run held (PAUSE_REQUESTED, PAUSED, INCOMPLETE) or ended keeps its horizon: Hold leaves what is owed as it is,
+    // and an ended run's close-out is in its end commit (docs/adr/ADR-031.md decision 4, M2T13D-04). Judged here, in the
+    // transaction that would write it, whichever path calls.
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if matches!(
+        writer::parse::<RunState>(&state)?,
+        RunState::PauseRequested
+            | RunState::Paused
+            | RunState::Incomplete
+            | RunState::Completed
+            | RunState::Failed
+            | RunState::Cancelled
+    ) {
+        return Ok(None);
+    }
     // The readers table (v20): kept are the open wakes, every wake with an unterminated output on any of its turns
     // (a superseded one too, M2T08R-401), and the wake of the current Commander epoch's last SETTLED turn (the Auth
     // and Capability recovery, the probe's cooldown, M2T08R-400).

@@ -2577,8 +2577,9 @@ async fn a_failure_rearmed_after_a_handover_counts_under_its_turns_epoch() -> R 
 
 #[tokio::test]
 async fn an_ended_runs_owed_wake_is_stepped_superseded_and_closed() -> R {
-    // M2T08R-06, -54 (decision 3, v13): a run that ended with a wake owed is still stepped: its wake is superseded,
-    // supervisor.closed written once nothing is left, and the run is no longer stepped.
+    // M2T08R-06, -54 (decision 3, v13): a run that ended with a wake owed has its wake superseded, supervisor.closed
+    // written once nothing is left, and the run is no longer stepped. docs/adr/ADR-031.md decision 4 ("实施时受影响的既有
+    // 测试"): that is folded into the commit that ends it, before its run.result, no longer a later step's.
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
@@ -2586,24 +2587,30 @@ async fn an_ended_runs_owed_wake_is_stepped_superseded_and_closed() -> R {
     let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
     exec(
         &path,
-        "UPDATE runs SET state = 'COMPLETED' WHERE run_id = 'R';",
+        "UPDATE runs SET state = 'VERIFYING' WHERE run_id = 'R';",
     )?;
-    assert!(
-        store
-            .runner_waiting("p1")
-            .await?
-            .supervised
-            .contains(&"R".to_owned()),
-        "an ended run with a wake owed is stepped"
-    );
-    store.supervise("R", context(&clock, 3000)).await?;
+    let revision = run_state(&path, "R")?.1;
+    store
+        .commit(Commit {
+            cas: vec![crate::persistence::StateCas {
+                id: "R".to_owned(),
+                expected_revision: revision,
+                change: crate::persistence::Change::Run(crate::protocol::RunState::Completed),
+            }],
+            ..Commit::default()
+        })
+        .await?;
     assert_eq!(
         value(
             &path,
             "SELECT json_group_array(kind || ' ' || coalesce(json_extract(payload_json, '$.wake'), '-')) FROM events \
-             WHERE kind IN ('supervisor.superseded', 'supervisor.closed') ORDER BY seq"
+             WHERE kind IN ('supervisor.superseded', 'supervisor.closed', 'run.result') ORDER BY seq"
         )?,
-        json!([format!("supervisor.superseded {w}"), "supervisor.closed -"])
+        json!([
+            format!("supervisor.superseded {w}"),
+            "supervisor.closed -",
+            "run.result -"
+        ])
     );
     assert!(
         !store
@@ -4700,5 +4707,582 @@ async fn a_judge_that_blocks_before_the_horizon_moves_still_ends_its_step_with_t
         |r| r.get(0),
     )?;
     assert_eq!(state, "BLOCKED/COMMANDER_UNAVAILABLE");
+    Ok(())
+}
+
+/// R's two generations of wakes (docs/adr/ADR-031.md M2T13D-04): W1 answered, its output disposed of; W2's turn SETTLED
+/// with two outputs still to dispose of; no step since, so the horizon is not past W1. The output ids of W2.
+async fn two_generations(store: &Store, clock: &TestClock, path: &PathBuf) -> R<Vec<String>> {
+    let w1 = wake(store, clock, "R", "D", "fp1", 0).await?;
+    let a1 = store
+        .allocate_supervision("p1", context(clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(path, &a1.attempt_id)?;
+    bridged_turn(
+        store,
+        clock,
+        &a1.attempt_id,
+        3200,
+        true,
+        &[line(
+            &nonce,
+            output("m1", "decision", &w1, &a1.attempt_id, 1, assumption()),
+        )],
+    )
+    .await?;
+    store.supervise("R", context(clock, 4000)).await?;
+    let w2 = wake(store, clock, "R", "D", "fp2", 10_000).await?;
+    let a2 = store
+        .allocate_supervision("p1", context(clock, 13_000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(path, &a2.attempt_id)?;
+    bridged_turn(
+        store,
+        clock,
+        &a2.attempt_id,
+        13_200,
+        true,
+        &[
+            line(
+                &nonce,
+                output("m2", "decision", &w2, &a2.attempt_id, 1, assumption()),
+            ),
+            line(
+                &nonce,
+                output("m3", "decision", &w2, &a2.attempt_id, 1, assumption()),
+            ),
+        ],
+    )
+    .await?;
+    Ok(vec![
+        format!("{}/output/0", a2.attempt_id),
+        format!("{}/output/1", a2.attempt_id),
+    ])
+}
+
+#[tokio::test]
+async fn a_held_runs_steps_never_move_its_horizon_past_an_answered_wake() -> R {
+    // docs/adr/ADR-031.md decision 4 (M2T13D-04), the test plan's guard (e): with two generations of wakes, a run that
+    // goes INCOMPLETE (its result published), PAUSE_REQUESTED or PAUSED has steps and disposals that write nothing of
+    // supervision: no supervisor.horizon past W1, W2's outputs still to dispose of, over this and three more ticks.
+    use crate::persistence::{Change, StateCas};
+    use crate::protocol::RunState;
+    for through in [
+        vec![RunState::Incomplete],
+        vec![RunState::PauseRequested],
+        vec![RunState::PauseRequested, RunState::Paused],
+    ] {
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        exec(&path, WORLD)?;
+        exec(
+            &path,
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+        )?;
+        let waiting = two_generations(&store, &clock, &path).await?;
+        let horizons = value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.horizon'",
+        )?;
+        for to in &through {
+            let revision = run_state(&path, "R")?.1;
+            store
+                .commit(Commit {
+                    cas: vec![StateCas {
+                        id: "R".to_owned(),
+                        expected_revision: revision,
+                        change: Change::Run(*to),
+                    }],
+                    ..Commit::default()
+                })
+                .await?;
+        }
+        let stopped = value(&path, "SELECT max(seq) FROM events")?;
+        for tick in 0..4 {
+            let stepped = store
+                .supervise("R", context(&clock, 20_000 + tick * 1000))
+                .await;
+            assert!(stepped.is_ok(), "{through:?}: {stepped:?}");
+        }
+        assert_eq!(
+            value(
+                &path,
+                &format!(
+                    "SELECT json_group_array(kind) FROM events WHERE run_id = 'R' AND seq > {stopped} \
+                     AND kind LIKE 'supervisor.%'"
+                )
+            )?,
+            json!([]),
+            "{through:?}"
+        );
+        assert_eq!(
+            value(
+                &path,
+                "SELECT count(*) FROM events WHERE kind = 'supervisor.horizon'"
+            )?,
+            horizons,
+            "{through:?}"
+        );
+        let conn = Connection::open(&path)?;
+        let still: Vec<String> = crate::persistence::outputs::waiting(&conn, "R")?
+            .into_iter()
+            .map(|w| w.output_id)
+            .collect();
+        assert_eq!(still, waiting, "{through:?}");
+    }
+    Ok(())
+}
+
+/// R's run state moved by the store's writer through `through`, each move a commit of its own.
+async fn move_run(store: &Store, path: &PathBuf, through: &[crate::protocol::RunState]) -> R {
+    for to in through {
+        let revision = run_state(path, "R")?.1;
+        store
+            .commit(Commit {
+                cas: vec![crate::persistence::StateCas {
+                    id: "R".to_owned(),
+                    expected_revision: revision,
+                    change: crate::persistence::Change::Run(*to),
+                }],
+                ..Commit::default()
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_end_folds_the_runs_supervision_into_its_commit_and_nothing_follows() -> R {
+    // docs/adr/ADR-031.md decision 4 ("尾部并入终态的提交"; the test plan's guard): a run with Commander turns, a PENDING
+    // trigger and outputs of its last turn still waiting ends COMPLETED, FAILED or CANCELLED: the end commit holds, in
+    // order, its own events, supervisor.superseded, the outputs' output_disposed{superseded}, supervisor.closed and its
+    // run.result last; then no step picks it, nothing more of it is written, and its close is no longer due. A run never
+    // supervised ends with no supervisor.closed.
+    use crate::protocol::RunState;
+    for (from, through) in [
+        ("VERIFYING", vec![RunState::Completed]),
+        ("RUNNING", vec![RunState::Failed]),
+        (
+            "RUNNING",
+            vec![RunState::CancelRequested, RunState::Cancelled],
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        exec(&path, WORLD)?;
+        exec(
+            &path,
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+        )?;
+        let waiting = two_generations(&store, &clock, &path).await?;
+        // A wake taken in by a step, not due yet: a PENDING trigger, the cursor past it (no disposal since).
+        clock.set(30_000);
+        event(
+            &store,
+            "R",
+            "R/fp3",
+            "need_decision",
+            json!({"task_id": "D", "fingerprint": "fp3"}),
+        )
+        .await?;
+        exec(
+            &path,
+            "INSERT INTO supervisor_triggers(trigger_id, run_id, fingerprint, spec_id, severity, event_seqs_json, \
+             first_seq, last_seq, due_at, state, created_at) SELECT 'R/trigger/fp3', 'R', 'fp3', 's3', 'normal', \
+             json_array(seq), seq, seq, '2100-01-01T00:00:00.000Z', 'PENDING', '2027-01-15T08:00:30.000Z' \
+             FROM events WHERE event_id = 'R/fp3';
+             INSERT INTO supervisor_cursor(run_id, last_handled_seq) SELECT 'R', seq FROM events WHERE event_id = 'R/fp3'
+               ON CONFLICT(run_id) DO UPDATE SET last_handled_seq = excluded.last_handled_seq;",
+        )?;
+        assert_eq!(
+            value(
+                &path,
+                "SELECT count(*) FROM supervisor_triggers WHERE state = 'PENDING'"
+            )?,
+            json!(1)
+        );
+        exec(
+            &path,
+            &format!("UPDATE runs SET state = '{from}' WHERE run_id = 'R';"),
+        )?;
+        let (last, ending) = through.split_last().ok_or("a move")?;
+        move_run(&store, &path, ending).await?;
+        let before = value(&path, "SELECT max(seq) FROM events")?;
+        move_run(&store, &path, std::slice::from_ref(last)).await?;
+        let commit = value(
+            &path,
+            &format!(
+                "SELECT json_group_array(kind || coalesce(':' || json_extract(payload_json, '$.outcome'), '')) \
+                 FROM (SELECT * FROM events WHERE seq > {before} ORDER BY seq)"
+            ),
+        )?;
+        assert_eq!(
+            commit,
+            json!([
+                "supervisor.superseded",
+                "supervisor.output_disposed:superseded",
+                "supervisor.output_disposed:superseded",
+                "supervisor.closed",
+                "run.result"
+            ]),
+            "{last:?}"
+        );
+        let disposed: Vec<String> = Connection::open(&path)?
+            .prepare(&format!(
+                "SELECT json_extract(payload_json, '$.output_id') FROM events WHERE seq > {before} \
+                 AND kind = 'supervisor.output_disposed' ORDER BY seq"
+            ))?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(disposed, waiting, "{last:?}");
+        let after = value(&path, "SELECT max(seq) FROM events")?;
+        for tick in 0..3 {
+            let supervised = store.runner_waiting("p1").await?.supervised;
+            assert!(!supervised.contains(&"R".to_owned()), "{last:?}");
+            for run in supervised {
+                store
+                    .supervise(&run, context(&clock, 40_000 + tick * 1000))
+                    .await?;
+            }
+            store
+                .allocate_supervision("p1", context(&clock, 40_000 + tick * 1000))
+                .await?;
+        }
+        assert_eq!(
+            value(&path, "SELECT max(seq) FROM events")?,
+            after,
+            "{last:?}"
+        );
+        let mut conn = Connection::open(&path)?;
+        let tx = conn.transaction()?;
+        assert_eq!(crate::persistence::supervise::close_due(&tx, "R")?, None);
+    }
+    // Never supervised: no close.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    move_run(&store, &path, &[RunState::Failed]).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(kind) FROM events WHERE run_id = 'R'"
+        )?,
+        json!(["run.result"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_disposal_batch_stops_after_the_commit_that_ends_its_run() -> R {
+    // docs/adr/ADR-031.md decision 4 (M2T13D-06; the test plan's guard (f)): a turn's three outputs in one batch, the
+    // first the Commander's transition_run to FAILED while the run is quiet: the disposal returns Ok; the end commit
+    // supersedes the other two and closes the supervision, its run.result last; nothing of the run follows, no Held,
+    // no event id twice. The first an INCOMPLETE instead: the other two stay to dispose of (Hold), and no horizon.
+    for to in ["FAILED", "INCOMPLETE"] {
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        exec(&path, WORLD)?;
+        exec(
+            &path,
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+        )?;
+        let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+        let a = store
+            .allocate_supervision("p1", context(&clock, 3000))
+            .await?
+            .ok_or("allocated")?;
+        let nonce = nonce_of(&path, &a.attempt_id)?;
+        bridged_turn(
+            &store,
+            &clock,
+            &a.attempt_id,
+            3200,
+            true,
+            &[
+                line(
+                    &nonce,
+                    output(
+                        "m1",
+                        "decision",
+                        &w,
+                        &a.attempt_id,
+                        1,
+                        json!({"kind": "transition_run", "to_state": to}),
+                    ),
+                ),
+                line(
+                    &nonce,
+                    output("m2", "decision", &w, &a.attempt_id, 1, assumption()),
+                ),
+                line(
+                    &nonce,
+                    output("m3", "decision", &w, &a.attempt_id, 1, assumption()),
+                ),
+            ],
+        )
+        .await?;
+        let horizons = value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.horizon'",
+        )?;
+        let disposed = store.supervise("R", context(&clock, 4000)).await;
+        assert!(disposed.is_ok(), "{to}: {disposed:?}");
+        assert_eq!(run_state(&path, "R")?.0, to);
+        let tail = value(
+            &path,
+            "SELECT json_group_array(kind || coalesce(':' || json_extract(payload_json, '$.outcome'), '')) \
+             FROM (SELECT * FROM events WHERE seq >= (SELECT seq FROM events WHERE kind = 'decision.applied') ORDER BY seq)",
+        )?;
+        let tail: Vec<String> = serde_json::from_value(tail)?;
+        if to == "FAILED" {
+            assert_eq!(
+                tail.iter().rev().take(4).rev().cloned().collect::<Vec<_>>(),
+                [
+                    "supervisor.output_disposed:superseded",
+                    "supervisor.output_disposed:superseded",
+                    "supervisor.closed",
+                    "run.result"
+                ],
+                "{tail:?}"
+            );
+            assert_eq!(
+                ends(&path)?,
+                [
+                    (
+                        format!("{}/output/0", a.attempt_id),
+                        "decision.applied".to_owned()
+                    ),
+                    (
+                        format!("{}/output/1", a.attempt_id),
+                        "superseded".to_owned()
+                    ),
+                    (
+                        format!("{}/output/2", a.attempt_id),
+                        "superseded".to_owned()
+                    )
+                ]
+            );
+        } else {
+            assert_eq!(
+                tail.last().map(String::as_str),
+                Some("run.result"),
+                "{tail:?}"
+            );
+            let conn = Connection::open(&path)?;
+            assert_eq!(crate::persistence::outputs::waiting(&conn, "R")?.len(), 2);
+        }
+        let after = value(&path, "SELECT max(seq) FROM events")?;
+        store.supervise("R", context(&clock, 5000)).await?;
+        assert_eq!(value(&path, "SELECT max(seq) FROM events")?, after, "{to}");
+        assert_eq!(
+            value(
+                &path,
+                "SELECT count(*) FROM events WHERE kind = 'supervisor.horizon'"
+            )?,
+            horizons,
+            "{to}"
+        );
+    }
+    Ok(())
+}
+
+/// The store's hook that lowers how many unread wake events an end takes in (docs/adr/ADR-031.md decision 4's bound).
+#[derive(Debug)]
+struct UnreadLimit(i64);
+
+impl crate::persistence::FaultHooks for UnreadLimit {
+    fn unread_limit(&self) -> Option<i64> {
+        Some(self.0)
+    }
+}
+
+/// R's end (its run.result's seq) and the triggers whose seqs hold `seq`: (state, superseded before the result).
+fn ended_with(path: &PathBuf, seq: i64) -> R<(i64, Value, Value)> {
+    let result = value(
+        &path.clone(),
+        "SELECT max(seq) FROM events WHERE run_id = 'R' AND kind = 'run.result'",
+    )?;
+    let result = result.as_i64().ok_or("no run.result")?;
+    let triggers = value(
+        path,
+        &format!(
+            "SELECT json_group_array(json_array(t.state, (SELECT e.seq < {result} FROM events e \
+             WHERE e.event_id = t.trigger_id || '/superseded'))) FROM supervisor_triggers t, json_each(t.event_seqs_json) s \
+             WHERE s.value = {seq}"
+        ),
+    )?;
+    let cursor = value(
+        path,
+        "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'",
+    )?;
+    Ok((result, triggers, cursor))
+}
+
+#[tokio::test]
+async fn an_end_takes_in_what_its_supervisor_had_not_and_sets_the_cursor_to_its_result() -> R {
+    // docs/adr/ADR-031.md decision 4's (0) and (4) (M2T13D-603, -652; the test plan's 停住之后的写入口 (9)): a wake event
+    // the supervisor has not taken in when the run ends — written while it was PAUSED, or in the end commit itself —
+    // lands in a trigger SUPERSEDED in the end commit, before its run.result, with no supervisor.woken; the cursor is
+    // exactly the run.result's seq; a restart and more steps change nothing.
+    use crate::protocol::RunState;
+    for paused in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        exec(&path, WORLD)?;
+        exec(
+            &path,
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+        )?;
+        store.supervise("R", context(&clock, 0)).await?;
+        let seq = if paused {
+            move_run(&store, &path, &[RunState::PauseRequested, RunState::Paused]).await?;
+            event(
+                &store,
+                "R",
+                "R/answered",
+                "need_decision",
+                json!({"task_id": "D", "fingerprint": "answered"}),
+            )
+            .await?;
+            move_run(&store, &path, &[RunState::CancelRequested]).await?;
+            let finished = store
+                .finish_cancel("R", json!({}), Default::default(), t(1000))
+                .await?;
+            assert_eq!(finished, crate::persistence::Finished::Cancelled);
+            value(
+                &path,
+                "SELECT seq FROM events WHERE event_id = 'R/answered'",
+            )?
+        } else {
+            // The end commit's own wake event.
+            exec(
+                &path,
+                "UPDATE runs SET state = 'VERIFYING' WHERE run_id = 'R';",
+            )?;
+            let revision = run_state(&path, "R")?.1;
+            store
+                .commit(Commit {
+                    cas: vec![crate::persistence::StateCas {
+                        id: "R".to_owned(),
+                        expected_revision: revision,
+                        change: crate::persistence::Change::Run(RunState::Failed),
+                    }],
+                    events: vec![NewEvent {
+                        intent: Intent::Progress,
+                        project_id: "p1".to_owned(),
+                        event_id: "R/own".to_owned(),
+                        run_id: Some("R".to_owned()),
+                        kind: "need_decision".to_owned(),
+                        payload: json!({"task_id": "D", "fingerprint": "own"}),
+                    }],
+                    ..Commit::default()
+                })
+                .await?;
+            value(&path, "SELECT seq FROM events WHERE event_id = 'R/own'")?
+        };
+        let seq = seq.as_i64().ok_or("no seq")?;
+        let (result, triggers, cursor) = ended_with(&path, seq)?;
+        assert_eq!(triggers, json!([["SUPERSEDED", 1]]), "paused {paused}");
+        assert_eq!(cursor, json!(result), "paused {paused}");
+        assert_eq!(
+            value(
+                &path,
+                &format!(
+                    "SELECT count(*) FROM events WHERE kind = 'supervisor.woken' AND seq > {seq}"
+                )
+            )?,
+            json!(0)
+        );
+        let after = value(&path, "SELECT max(seq) FROM events")?;
+        let triggers_after = value(&path, "SELECT count(*) FROM supervisor_triggers")?;
+        drop(store);
+        let (store, _) = open(&dir, &clock)?;
+        for tick in 0..3 {
+            for run in store.runner_waiting("p1").await?.supervised {
+                store
+                    .supervise(&run, context(&clock, 5000 + tick * 1000))
+                    .await?;
+            }
+        }
+        assert_eq!(value(&path, "SELECT max(seq) FROM events")?, after);
+        assert_eq!(
+            value(&path, "SELECT count(*) FROM supervisor_triggers")?,
+            triggers_after
+        );
+        assert_eq!(
+            value(
+                &path,
+                "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'"
+            )?,
+            json!(result)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancel_with_more_unread_wake_events_than_its_commit_takes_in_waits_for_the_steps() -> R {
+    // docs/adr/ADR-031.md decision 4 (M2T13D-700; (9)'s last case, the bound lowered to 1 by the store's hook): two
+    // wake events unread, the cancel's last step answers Recovering, writes nothing and leaves the run CANCEL_REQUESTED;
+    // once a step has taken them in, the next one ends it, the cursor its run.result's seq.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            clock: Some(StoreClock(clock.clone())),
+            faults: std::sync::Arc::new(UnreadLimit(1)),
+            ..Options::default()
+        },
+    )?;
+    exec(&path, WORLD)?;
+    exec(
+        &path,
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+    )?;
+    store.supervise("R", context(&clock, 0)).await?;
+    for fp in ["x", "y"] {
+        event(
+            &store,
+            "R",
+            &format!("R/{fp}"),
+            "need_decision",
+            json!({"task_id": "D", "fingerprint": fp}),
+        )
+        .await?;
+    }
+    move_run(&store, &path, &[crate::protocol::RunState::CancelRequested]).await?;
+    let before = value(&path, "SELECT max(seq) FROM events")?;
+    let waiting = store
+        .finish_cancel("R", json!({}), Default::default(), t(1000))
+        .await?;
+    assert_eq!(waiting, crate::persistence::Finished::Recovering);
+    assert_eq!(value(&path, "SELECT max(seq) FROM events")?, before);
+    assert_eq!(run_state(&path, "R")?.0, "CANCEL_REQUESTED");
+    store.supervise("R", context(&clock, 2000)).await?;
+    let finished = store
+        .finish_cancel("R", json!({}), Default::default(), t(3000))
+        .await?;
+    assert_eq!(finished, crate::persistence::Finished::Cancelled);
+    let result = value(
+        &path,
+        "SELECT max(seq) FROM events WHERE kind = 'run.result'",
+    )?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = 'R'"
+        )?,
+        result
+    );
     Ok(())
 }

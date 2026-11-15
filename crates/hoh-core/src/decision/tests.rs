@@ -51,6 +51,7 @@ fn snapshot() -> Snapshot {
             live: caps(&["C1"]),
             ..Evidence::default()
         },
+        quiet: crate::decision::Quiet::default(),
     }
 }
 

@@ -70,7 +70,7 @@ pub(super) fn decide(
         return Err(PersistError::Unsupported(kind));
     }
     if !matches!(decided, Decided::Replayed { .. } | Decided::KeyReuse) {
-        super::writer::commit_unhooked(tx)?;
+        super::writer::commit_unhooked(tx, ctx)?;
     }
     Ok(decided)
 }
@@ -211,7 +211,7 @@ pub(super) fn decide_in(
         ],
     )
     .map_err(sqlite_error)?;
-    let snapshot = load_snapshot(tx, &project_id, proposal, context, run)?;
+    let snapshot = load_snapshot(tx, &project_id, proposal, context, run, ctx)?;
     let turn = match allocation.filter(|a| a["wake"].as_str() == proposal.causation_id.as_deref()) {
         Some(allocation) => Some(answered_by(allocation)?),
         None => answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?,
@@ -658,6 +658,7 @@ fn load_snapshot(
     proposal: &Proposal,
     context: &Context,
     run: RunView,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Snapshot, PersistError> {
     let run_id = proposal.run_id.as_str();
     let commander_epoch = load_binding(tx, run_id, COMMANDER)?.map(|b| b.role_epoch);
@@ -694,6 +695,20 @@ fn load_snapshot(
     } else {
         Evidence::default()
     };
+    let quiet = if proposal.kind() == "transition_run" {
+        let count = |n: i64| u64::try_from(n).unwrap_or(0);
+        let limit = ctx.unread_limit();
+        crate::decision::Quiet {
+            attempts_unfinished: count(super::retry::unfinished_attempts(tx, run_id)?.0),
+            open_rounds: count(
+                i64::try_from(super::closing::open_rounds(tx, run_id)?).unwrap_or(i64::MAX),
+            ),
+            unread_wakes: count(super::supervise::unread_wakes(tx, run_id, limit)?),
+            unread_limit: count(limit),
+        }
+    } else {
+        crate::decision::Quiet::default()
+    };
     Ok(Snapshot {
         run,
         commander_epoch,
@@ -704,6 +719,7 @@ fn load_snapshot(
         budget_stop,
         free_slot,
         evidence,
+        quiet,
     })
 }
 
