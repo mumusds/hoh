@@ -318,7 +318,7 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// The effective configuration of the project at `root`: its `.hoh/config.toml` over the defaults, or the defaults
-/// when there is none.
+/// when there is none (no such path, or a `.hoh` that is not a directory).
 pub fn load(root: &Path) -> Result<Config, ConfigError> {
     load_file(root).map(|(config, _)| config)
 }
@@ -335,7 +335,15 @@ pub fn load_file(root: &Path) -> Result<(Config, Option<String>), ConfigError> {
     };
     let meta = match std::fs::metadata(&file) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), None)),
+        // No file there: none, or a `.hoh` that is not a directory (docs/adr/ADR-031.md decision 9).
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok((Config::default(), None));
+        }
         Err(e) => return Err(failed(e.to_string())),
     };
     if !meta.is_file() {
