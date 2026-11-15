@@ -37,23 +37,8 @@ pub enum Ending {
 /// Only COMPLETED is 0.
 pub fn exit_code(ending: Ending) -> Option<u8> {
     match ending {
-        Ending::Run(state) => match state {
-            RunState::Completed => Some(0),
-            RunState::Failed => Some(1),
-            RunState::Blocked => Some(3),
-            RunState::Incomplete => Some(4),
-            RunState::Cancelled => Some(5),
-            RunState::Paused => Some(6),
-            RunState::Created
-            | RunState::Discovering
-            | RunState::Specifying
-            | RunState::Ready
-            | RunState::Running
-            | RunState::Verifying
-            | RunState::PauseRequested
-            | RunState::WaitingExternal
-            | RunState::CancelRequested => None,
-        },
+        // The run states' codes live with the run results that carry them (docs/adr/ADR-031.md decision 3).
+        Ending::Run(state) => hoh_core::exit::run_code(state),
         Ending::Client(event) => Some(match event {
             ClientEvent::Usage => 64,
             ClientEvent::HostUnavailable => 69,
