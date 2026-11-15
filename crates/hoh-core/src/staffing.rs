@@ -108,13 +108,20 @@ pub struct Snapshot {
 }
 
 /// The capabilities every role needs, and those a role following `contract`'s role contract needs too (REQ-020
-/// decision 1, the part that has names; docs/adr/ADR-022.md decision 10): structured events always, resume for the
-/// commander and the reviewer. Staffing judges a binding by them (decision 3) and the host's dispatch asks them of a
-/// session (`host::agents::required`).
+/// decision 1; docs/adr/ADR-022.md decision 10, docs/adr/ADR-030.md decision 12): structured events always, resume
+/// for the commander and the reviewer, command execution (as the probe measures it) for the developer and qa.
+/// Staffing judges a binding by them (decision 3) and the host's dispatch asks them of a session
+/// (`host::agents::required`).
 pub fn required(contract: Option<&str>) -> BTreeSet<String> {
     let mut needs: BTreeSet<String> = ["structured_events".to_owned()].into();
-    if matches!(contract, Some("commander" | "reviewer")) {
-        needs.insert("resume".to_owned());
+    match contract {
+        Some("commander" | "reviewer") => {
+            needs.insert("resume".to_owned());
+        }
+        Some("developer" | "qa") => {
+            needs.insert("command_execution".to_owned());
+        }
+        _ => {}
     }
     needs
 }

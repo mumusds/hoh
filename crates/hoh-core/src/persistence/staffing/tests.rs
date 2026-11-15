@@ -193,10 +193,11 @@ fn change(run_id: &str, role: &str, epoch: i64, agent: &str, write: StaffWrite) 
     }
 }
 
+/// A grant of a session recording [`caps`].
 fn grant(agent_version: &str, tag: &str) -> StaffWrite {
     StaffWrite::Grant {
         agent_version: agent_version.to_owned(),
-        capabilities: json!({"structured_events": true, "resume": true}),
+        capabilities: caps(),
         identity: identity(tag),
     }
 }
@@ -308,7 +309,11 @@ async fn the_staffing_read_has_every_binding_with_its_order_session_identity_and
             session: None,
             live: false,
             order: vec!["pi".to_owned(), "claude".to_owned()],
-            required: ["structured_events".to_owned()].into(),
+            required: [
+                "command_execution".to_owned(),
+                "structured_events".to_owned()
+            ]
+            .into(),
             excluded: Vec::new(),
             pending: None,
         }
@@ -344,7 +349,7 @@ async fn the_staffing_read_has_every_binding_with_its_order_session_identity_and
         developer.session,
         Some(Session {
             agent_version: "2.1.318".to_owned(),
-            capabilities: json!({"structured_events": true, "resume": true}),
+            capabilities: caps(),
             identity: Some(identity("a")),
         })
     );
@@ -1268,7 +1273,7 @@ async fn a_rebind_with_no_attempt_in_flight_is_the_next_epoch_of_the_same_agent_
         staffed(&store, "developer").await?.session,
         Some(Session {
             agent_version: "2.1.325".to_owned(),
-            capabilities: json!({"structured_events": true, "resume": true}),
+            capabilities: caps(),
             identity: Some(identity("b")),
         })
     );
@@ -1309,10 +1314,7 @@ async fn an_assignment_carries_its_sessions_capabilities_and_identity() -> R {
     let a0 = crate::persistence::team::assignment(&conn, "p1", "R1", "T0", "A0", "developer")?;
     assert_eq!(
         (a0.session_capabilities, a0.session_identity),
-        (
-            Some(json!({"structured_events": true, "resume": true})),
-            Some(identity("a"))
-        )
+        (Some(caps()), Some(identity("a")))
     );
     let a1 = crate::persistence::team::assignment(&conn, "p1", "R1", "T1", "A1", "developer")?;
     assert_eq!(
@@ -1331,9 +1333,11 @@ use crate::staffing::{Compat, Fact, Facts, FileStamp, Judgment, Snapshot, Stamp,
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-/// The session capabilities every grant of these tests records.
+/// The session capabilities every grant of these tests records. Command execution is among them: claude 2.1.318,
+/// codex 0.166.0 and pi 1.5.0 each have it under HoH's options as their probes measure it from the recorded help and
+/// schema, and the developer and qa require it (docs/adr/ADR-030.md decision 12).
 fn caps() -> Value {
-    json!({"structured_events": true, "resume": true})
+    json!({"structured_events": true, "resume": true, "command_execution": true})
 }
 
 /// A usable, verified fact of an agent at `version` with `identity` whose session would record [`caps`].
