@@ -668,8 +668,8 @@ pub(crate) async fn drive_watched(
 }
 
 /// A codex App Server turn of the runner's mode driven on `process` (its gate `gate` open) with `watch` and the
-/// handshake timeout `handshake`, its diagnostics shown to `observer`, for the adapters' unit tests: its facts as
-/// [`start`] gives them.
+/// handshake timeout `handshake`, its diagnostics shown to `observer` and its native cancel `native`, for the adapters'
+/// unit tests: its facts as [`start`] gives them.
 #[cfg(test)]
 pub(crate) async fn app_server_facts_watched(
     process: &mut crate::process::Process,
@@ -677,6 +677,7 @@ pub(crate) async fn app_server_facts_watched(
     observer: Observer,
     gate: &GateCommand,
     handshake: Duration,
+    native: &tokio::sync::Notify,
 ) -> Facts {
     let attempt = AttemptRef {
         attempt_id: "attempt".to_owned(),
@@ -688,14 +689,13 @@ pub(crate) async fn app_server_facts_watched(
         handshake_timeout: handshake,
         ..replay_turn()
     };
-    let native = tokio::sync::Notify::new();
     let (_, mut steers) = mpsc::channel::<Steer>(1);
     let drove = app_server::drive(
         None,
         &attempt,
         &turn,
         process,
-        Stop::Native(&native),
+        Stop::Native(native),
         &mut steers,
         &mut Vec::new(),
         Some(gate.go()),
