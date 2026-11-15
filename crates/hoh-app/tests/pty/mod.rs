@@ -326,6 +326,81 @@ pub fn squash(bytes: &[u8]) -> String {
     out
 }
 
+/// A snapshot helper: the screen a terminal of the given rows and columns shows after the bytes.
+pub type Screen = dyn Fn(&[u8], u16, u16) -> R<String>;
+
+/// What a terminal of `rows` x `cols` shows after `bytes`, as [`screen`] gives it, once [`erase_check`] found that
+/// [`screen`] shows nothing that was erased or overwritten (docs/adr/ADR-031.md decision 14): a snapshot helper that
+/// fails its counter-example is refused, never used, and there is no fallback to [`squash`].
+pub fn snapshot(bytes: &[u8], rows: u16, cols: u16) -> R<String> {
+    erase_check(&screen)?;
+    screen(bytes, rows, cols)
+}
+
+/// The screen a terminal of `rows` x `cols` shows after `bytes`: each row's text without its trailing blanks, the rows
+/// joined by LF, trailing empty rows dropped.
+pub fn screen(bytes: &[u8], rows: u16, cols: u16) -> R<String> {
+    let size = |n: u16| {
+        std::num::NonZeroU16::new(n).ok_or("a terminal has at least one row and one column")
+    };
+    let mut parser = vt100::Parser::new(size(rows)?, size(cols)?, 0);
+    parser.process(bytes);
+    let rows: Vec<String> = parser
+        .screen()
+        .contents()
+        .split('\n')
+        .map(|row| row.trim_end().to_owned())
+        .collect();
+    let used = rows
+        .iter()
+        .rposition(|r| !r.is_empty())
+        .map_or(0, |i| i + 1);
+    Ok(rows[..used].join("\n"))
+}
+
+/// The erase counter-examples (docs/adr/ADR-031.md decision 14) `screen` must pass: a project name written and the
+/// screen then cleared (`ESC[2J`), a line written and then erased (`ESC[2K`), a word overwritten in place after a
+/// carriage return and the rest of its line erased (`ESC[K`), and a run id drawn on the alternate screen that was
+/// left. None of what was erased may show, and what was written after it must.
+pub fn erase_check(screen: &Screen) -> R {
+    let cases: [(&[u8], &[&str], &[&str]); 4] = [
+        (
+            b"project-erased\r\n\x1b[2J\x1b[Hshown",
+            &["project-erased"],
+            &["shown"],
+        ),
+        (b"line-erased\x1b[2K\rkept", &["line-erased"], &["kept"]),
+        (
+            b"PAUSED-overwritten\rRUNNING\x1b[K",
+            &["PAUSED", "overwritten"],
+            &["RUNNING"],
+        ),
+        (
+            b"main\x1b[?1049h\x1b[Hrun-on-alternate\x1b[?1049l",
+            &["run-on-alternate"],
+            &["main"],
+        ),
+    ];
+    for (bytes, gone, shown) in cases {
+        let text = screen(bytes, 24, 80)?;
+        if let Some(left) = gone.iter().find(|g| text.contains(**g)) {
+            return Err(format!(
+                "the snapshot helper shows {left:?}, which {:?} erased or overwrote: {text:?}",
+                String::from_utf8_lossy(bytes)
+            )
+            .into());
+        }
+        if let Some(missing) = shown.iter().find(|s| !text.contains(**s)) {
+            return Err(format!(
+                "the snapshot helper does not show {missing:?}, which {:?} left on the screen: {text:?}",
+                String::from_utf8_lossy(bytes)
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// `hoh args…` in `project` with the PTY as its controlling terminal and stdio, in a clean environment.
 pub fn spawn_in(
     pty: &Pty,
