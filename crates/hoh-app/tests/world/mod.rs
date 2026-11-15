@@ -876,6 +876,18 @@ impl World {
         Ok(())
     }
 
+    /// An in-process host of the project without a runner: it takes commands and serves clients; nothing wakes or
+    /// works. Its clock is `clock` when given.
+    pub async fn start_plain_host(&self, clock: Option<std::sync::Arc<FakeClock>>) -> R<Host> {
+        let mut config = HostConfig::new(&self.project());
+        config.port = 0;
+        config.store.wal_probe = Some(probe());
+        if let Some(clock) = clock {
+            config.clock = hoh_app::host::HostClock(clock);
+        }
+        Ok(Host::start(config).await?)
+    }
+
     /// The product's host of the project in this process (docs/adr/ADR-022.md decision 17): the effective
     /// configuration from the project's file, the product executor on the world's PATH, pi's settings and the
     /// Commander sessions' directories the world's own, any free port.
@@ -1246,6 +1258,24 @@ pub fn finish(mut child: Child, limit: Duration) -> R<Output> {
         stdout: pipe(stdout)?,
         stderr: pipe(stderr)?,
     })
+}
+
+/// The system time plus what the test adds: a host's clock (`HostConfig::clock`) for deadlines and retry waits.
+#[derive(Debug, Default)]
+pub struct FakeClock(std::sync::Mutex<Duration>);
+
+impl FakeClock {
+    pub fn advance(&self, by: Duration) {
+        if let Ok(mut ahead) = self.0.lock() {
+            *ahead += by;
+        }
+    }
+}
+
+impl hoh_core::delivery::Clock for FakeClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + self.0.lock().map(|d| *d).unwrap_or_default()
+    }
 }
 
 /// The session id and the controlling terminal (0: none) of process `pid` (`/proc/<pid>/stat` fields 6 and 7).
