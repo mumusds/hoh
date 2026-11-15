@@ -33,11 +33,17 @@ pub struct ProductExecutor {
     exec_only: Arc<Mutex<BTreeSet<(PathBuf, String)>>>,
     /// A test's look at each attempt's gate key as it is drawn; the product has none.
     keys: Option<KeyHook>,
+    /// A test's look at each diagnostic a turn collects as it collects it; the product has none.
+    observe: Option<hoh_agents::adapter::Observe>,
 }
 
 /// Called with (attempt id, key) for each gate key an executor draws (a test's: the key is in no file, event or
 /// argv).
 pub type KeySeen = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// Called with (attempt id, diagnostic) for each diagnostic a turn collects, as it collects it (a test's: a turn's
+/// diagnostics are in memory until it ends, docs/adr/ADR-030.md decision 9, M2T15D-401).
+pub type DiagnosticSeen = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
 
 /// A [`KeySeen`] the executor holds.
 #[derive(Clone)]
@@ -64,6 +70,7 @@ impl ProductExecutor {
             cancels: Arc::default(),
             exec_only: Arc::default(),
             keys: None,
+            observe: None,
         }
     }
 
@@ -72,6 +79,14 @@ impl ProductExecutor {
     #[doc(hidden)]
     pub fn with_keys(mut self, hook: KeySeen) -> ProductExecutor {
         self.keys = Some(KeyHook(hook));
+        self
+    }
+
+    /// The executor calling `hook` with (attempt id, diagnostic) for each diagnostic its turns collect, as the adapter
+    /// collects it: a test's way to wait for one before the turn ends (docs/adr/ADR-030.md decision 9, M2T15D-401).
+    #[doc(hidden)]
+    pub fn with_observe(mut self, hook: DiagnosticSeen) -> ProductExecutor {
+        self.observe = Some(hoh_agents::adapter::Observe(hook));
         self
     }
 }
@@ -790,9 +805,14 @@ impl Executor for ProductExecutor {
             ready,
             ran,
             usable,
-            prepared,
+            mut prepared,
             record,
         } = self.prepare(work)?;
+        match &mut prepared {
+            Prepared::Claude(turn) => turn.observe = self.observe.clone(),
+            Prepared::Codex(turn) => turn.observe = self.observe.clone(),
+            Prepared::Pi(turn) => turn.observe = self.observe.clone(),
+        }
         let gate = self.gate(work, agent, &usable)?;
         let attempt = AttemptRef {
             attempt_id: work.attempt_id.clone(),

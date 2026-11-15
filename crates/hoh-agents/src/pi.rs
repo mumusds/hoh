@@ -25,9 +25,10 @@
 //! a tool had started. Every end is committed through the attempt's cancel latch.
 
 use crate::adapter::{
-    AdapterError, AttemptRef, Replay, Replayed, Sink, Stop, finish, now, offers, sha256_file, step,
+    AdapterError, AttemptRef, Changed, Expect, Observer, Replay, Replayed, Sink, Stop, Watch,
+    finish, now, offers, sha256_file, step,
 };
-pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused};
+pub use crate::adapter::{Facts, GateCommand, Held, Observe, Recorded, Refused};
 use crate::clock::{Clock, Timer};
 use crate::frame::Frame;
 use crate::known;
@@ -188,6 +189,8 @@ pub struct Turn {
     pub clock: Arc<dyn Clock>,
     /// Every record Pi writes, in order (the adapter's subscribe()).
     pub events: Option<mpsc::UnboundedSender<Value>>,
+    /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
+    pub observe: Option<Observe>,
 }
 
 impl Turn {
@@ -496,6 +499,7 @@ pub async fn run(
     let mut sink = Sink {
         store: Some(store),
         recorded: Vec::new(),
+        observer: Observer::default(),
     };
     let driven = drive(
         &mut sink,
@@ -505,6 +509,7 @@ pub async fn run(
         Stop::Latch(cancel),
         None,
         &noted,
+        &mut Watch::new(None),
     )
     .await?;
     let state = finish(
@@ -634,7 +639,10 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         let mut sink = Sink {
             store: None,
             recorded: Vec::new(),
+            observer: Observer::new(&attempt.attempt_id, turn.observe.clone()),
         };
+        // The agent's files are re-checked before the prompt, the first input, and while the turn runs, from the
+        // gate's opening (docs/adr/ADR-030.md decision 9).
         let driven = drive(
             &mut sink,
             &attempt,
@@ -643,6 +651,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             Stop::Native(&native),
             Some(gate.go()),
             &noted,
+            &mut Watch::new(gate.expect.clone()),
         )
         .await;
         match driven {
@@ -656,7 +665,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                         &sink.recorded,
                     ) =>
             {
-                refused
+                sink.observer.refused(refused)
             }
             Ok(driven) => Facts {
                 state: driven.state,
@@ -671,7 +680,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 degraded: None,
                 final_text: driven.reply,
                 compat: None,
-            },
+            }
+            .before_input(driven.changed.as_ref()),
             Err(_) => Facts::incomplete(raw_log_path, sink.recorded),
         }
     });
@@ -696,6 +706,8 @@ struct Driven {
     parse_errors: usize,
     state_queries: usize,
     report: Option<crate::process::ExitReport>,
+    /// What its re-check before the prompt found changed (docs/adr/ADR-030.md decision 9).
+    changed: Option<Changed>,
 }
 
 /// What a cancel or the deadline asks of the driver once [`Rpc::abort`] has done its part.
@@ -751,6 +763,11 @@ struct Rpc<'a> {
     provider_error: Option<String>,
     /// stdin was closed since the driver last looked: Pi is given the term grace to exit.
     closed: bool,
+    /// What the gate verified (the runner's mode): re-checked before the prompt, the first input (docs/adr/ADR-030.md
+    /// decision 9).
+    expect: Option<Expect>,
+    /// What that re-check found changed: no prompt was sent.
+    changed: Option<Changed>,
 }
 
 impl<'a> Rpc<'a> {
@@ -798,6 +815,8 @@ impl<'a> Rpc<'a> {
             ended_since_query: false,
             provider_error: None,
             closed: false,
+            expect: None,
+            changed: None,
         }
     }
 
@@ -955,6 +974,21 @@ impl<'a> Rpc<'a> {
                                                       "noted": self.noted.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
                                                       "opened": record["data"]["sessionFile"]}))
                                 .await?;
+                            self.close();
+                        } else if let Some(changed) = self
+                            .expect
+                            .as_ref()
+                            .and_then(|e| crate::adapter::recheck(e).changed())
+                        {
+                            // Before the first input, the agent's files are still the ones its gate verified
+                            // (docs/adr/ADR-030.md decision 9, "首个输入之前的再核对"): else no prompt is sent and stdin
+                            // is closed, as for a session mismatch.
+                            self.failure = Some(crate::adapter::COMPAT_UNVERIFIED.to_owned());
+                            let (key, mut payload) = changed.event();
+                            payload["attempt_id"] = json!(id);
+                            sink.attempt_event(id, &key, "adapter.diagnostic", payload)
+                                .await?;
+                            self.changed = Some(changed);
                             self.close();
                         } else if self.lines.is_some() {
                             let prompt_id = self.command_id("prompt");
@@ -1170,13 +1204,16 @@ impl<'a> Rpc<'a> {
             parse_errors: self.parse_errors,
             state_queries: self.state_queries,
             report,
+            changed: self.changed,
         })
     }
 }
 
 /// Drive one Pi turn on `process` until it ended: the session query, the prompt, its records, dialogs answered
 /// headless, a cancel from `stop` (an abort; in the direct mode then SIGTERM and SIGKILL after their graces).
-/// `preamble` is written first (the runner's mode: the gate's `go`).
+/// `preamble` is written first (the runner's mode: the gate's `go`). `watch`'s expectation is re-checked before the
+/// prompt, and while the turn runs as it is due.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     sink: &mut Sink<'_>,
     attempt: &AttemptRef,
@@ -1185,6 +1222,7 @@ async fn drive(
     stop: Stop<'_>,
     preamble: Option<Vec<u8>>,
     noted: &[SessionFile],
+    watch: &mut Watch,
 ) -> Result<Driven, AdapterError> {
     let id = &attempt.attempt_id;
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -1208,6 +1246,7 @@ async fn drive(
         stop.is_native(),
         stop.requested_now(),
     );
+    r.expect = watch.expect().cloned();
     r.open();
     let mut written = false;
     let mut deadline_timer: Option<Timer> = turn.deadline.map(|d| turn.clock.sleep(d));
@@ -1236,6 +1275,14 @@ async fn drive(
             () = stop.requested(), if !r.cancelled => {
                 r.cancelled = true;
                 abort(&mut r, process, &mut abort_timer);
+                continue;
+            }
+            // A re-check that is due comes before output (the same branch wakes an idle loop for it).
+            () = watch.due(), if watch.on() => {
+                for (key, mut payload) in watch.check() {
+                    payload["attempt_id"] = json!(id);
+                    sink.attempt_event(id, &key, "adapter.diagnostic", payload).await?;
+                }
                 continue;
             }
             () = fire(&mut deadline_timer), if deadline_timer.is_some() && !r.deadline => {
@@ -1313,11 +1360,45 @@ async fn drive(
     Ok(r.conclude(sink, report).await?)
 }
 
-/// Replay `bytes` (pi's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
-/// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. `version` (pi's
-/// `--version`) decides whether the turn waits for `agent_settled` or checks for idle ([`emits_settled`]).
-pub fn replay(bytes: &[u8], version: &str) -> Replayed {
-    let turn = Turn {
+/// A pi turn of the runner's mode driven on `process` (its gate open) with `watch`, its diagnostics shown to
+/// `observer`, for the adapters' unit tests: its verdict and what it recorded.
+#[cfg(test)]
+pub(crate) async fn drive_watched(
+    process: &mut Process,
+    watch: &mut Watch,
+    observer: Observer,
+) -> Result<(AttemptState, Option<String>, Vec<Recorded>), AdapterError> {
+    let attempt = AttemptRef {
+        attempt_id: "attempt".to_owned(),
+        session_id: "session".to_owned(),
+        role: "developer".to_owned(),
+        agent_version: String::new(),
+    };
+    let turn = replay_turn("1.5.0");
+    let native = tokio::sync::Notify::new();
+    let mut sink = Sink {
+        store: None,
+        recorded: Vec::new(),
+        observer,
+    };
+    let driven = drive(
+        &mut sink,
+        &attempt,
+        &turn,
+        process,
+        Stop::Native(&native),
+        None,
+        &[],
+        watch,
+    )
+    .await?;
+    Ok((driven.state, driven.failure, sink.recorded))
+}
+
+/// The turn a replay judges: the suite's launch, prompt and session; `version` (pi's `--version`) decides whether the
+/// turn waits for `agent_settled` or checks for idle ([`emits_settled`]).
+fn replay_turn(version: &str) -> Turn {
+    Turn {
         launch: Launch {
             program: PathBuf::from("pi"),
             help: String::new(),
@@ -1337,10 +1418,19 @@ pub fn replay(bytes: &[u8], version: &str) -> Replayed {
         deadline: None,
         clock: Arc::new(crate::clock::SystemClock),
         events: None,
-    };
+        observe: None,
+    }
+}
+
+/// Replay `bytes` (pi's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
+/// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. `version` (pi's
+/// `--version`) decides whether the turn waits for `agent_settled` or checks for idle ([`emits_settled`]).
+pub fn replay(bytes: &[u8], version: &str) -> Replayed {
+    let turn = replay_turn(version);
     let mut sink = Sink {
         store: None,
         recorded: Vec::new(),
+        observer: Observer::default(),
     };
     let (lines, _written) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut r = Rpc::new(&turn, "replay", &[], lines, true, false);

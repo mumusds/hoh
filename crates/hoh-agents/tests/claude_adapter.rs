@@ -105,6 +105,7 @@ impl Fakes for World {
             logs: self.dir.path().join(logs),
             escalation: Turn::default_escalation(),
             deadline: Some(Duration::from_secs(60)),
+            observe: None,
         })
     }
 

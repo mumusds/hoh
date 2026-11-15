@@ -112,6 +112,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             deadline: Some(Duration::from_secs(600)),
             clock: Arc::new(SystemClock),
             events: None,
+            observe: None,
         }
     };
     let session_of = |o: &Outcome| {

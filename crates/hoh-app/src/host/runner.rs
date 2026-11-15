@@ -236,6 +236,9 @@ pub struct RunnerConfig {
 /// How often the runner looks again when nothing woke it.
 const TICK: Duration = Duration::from_millis(200);
 
+// A running turn's agent files are re-checked every tick (docs/adr/ADR-030.md decision 9, "turn 中的再核对").
+const _: () = assert!(TICK.as_nanos() == hoh_agents::adapter::RECHECK_EVERY.as_nanos());
+
 /// How long a tick waits for the executor to take a new holder's first input; past it the notice waits for the next.
 const OPEN_SESSION: Duration = Duration::from_secs(10);
 

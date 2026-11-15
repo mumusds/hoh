@@ -200,8 +200,9 @@ pub enum Origin {
 }
 
 /// HoH's own finding that a turn's agent is not the one verified (docs/adr/ADR-030.md decision 6, K9): made only in
-/// this module, from its gate's keyed refusal ([`Facts::gate_refused`]), so no failure text of an agent's is ever
-/// taken for one. `stamp_only`: only the files' stamps differed, the identity did not (a transient failure).
+/// this module, from its gate's keyed refusal ([`Facts::gate_refused`]) or its re-check before the first input
+/// ([`Facts::before_input`]), so no failure text of an agent's is ever taken for one. `stamp_only`: only the files'
+/// stamps differed, the identity did not (a transient failure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatRefusal {
     origin: Origin,
@@ -235,6 +236,308 @@ pub(crate) fn refused_at_gate(
     all.append(&mut facts.recorded);
     facts.recorded = all;
     Some(facts)
+}
+
+/// How often a running turn's agent files are looked at again (docs/adr/ADR-030.md decision 9, "turn 中的再核对"): the
+/// runner's tick.
+pub const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The failure of a turn whose re-check before its first input found its agent's files changed: it sends no input and
+/// closes; [`Facts::before_input`] types it.
+pub(crate) const COMPAT_UNVERIFIED: &str = "COMPAT_UNVERIFIED";
+
+/// The diagnostic of a re-check before the first input that found the agent's files changed: no input was sent.
+pub const CHANGED_BEFORE_INPUT: &str = "IMPLEMENTATION_CHANGED_BEFORE_INPUT";
+
+/// The diagnostic of a re-check while the turn ran that found the agent's files changed: recorded only.
+pub const CHANGED_IN_TURN: &str = "IMPLEMENTATION_CHANGED_IN_TURN";
+
+/// One of an agent's two files a re-check stats: its launcher or its implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentFile {
+    Launcher,
+    Implementation,
+}
+
+impl AgentFile {
+    /// Its name in a diagnostic (`file`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentFile::Launcher => "launcher",
+            AgentFile::Implementation => "implementation",
+        }
+    }
+}
+
+/// What a re-check found changed (docs/adr/ADR-030.md decision 9, "首个输入之前的再核对"): the first of the agent's
+/// files, the implementation first, whose stamp is not the expected one, that stamp, the one seen now (`None`: the file
+/// cannot be read), and whether the agent's identity, derived again the gate's way, is still the expected one (only
+/// the stamps changed: a transient failure).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    file: AgentFile,
+    expected: FileStamp,
+    seen: Option<FileStamp>,
+    stamp_only: bool,
+}
+
+impl Changed {
+    pub fn file(&self) -> AgentFile {
+        self.file
+    }
+
+    pub fn expected(&self) -> FileStamp {
+        self.expected
+    }
+
+    pub fn seen(&self) -> Option<FileStamp> {
+        self.seen
+    }
+
+    pub fn stamp_only(&self) -> bool {
+        self.stamp_only
+    }
+
+    /// The `adapter.diagnostic` of a re-check before the first input that found it (key, payload): no input was sent.
+    pub(crate) fn event(&self) -> (String, serde_json::Value) {
+        (
+            "implementation-changed-before-input".to_owned(),
+            json!({"reason": CHANGED_BEFORE_INPUT, "file": self.file.as_str(), "expected": self.expected,
+                   "seen": seen_json(self.seen), "stamp_only": self.stamp_only}),
+        )
+    }
+}
+
+/// A stamp seen now as a diagnostic gives it: `missing` when the file cannot be read.
+fn seen_json(seen: Option<FileStamp>) -> serde_json::Value {
+    seen.map_or_else(|| json!("missing"), |s| json!(s))
+}
+
+/// What [`recheck`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recheck {
+    /// Both files' stamps are the expected ones.
+    Same,
+    Changed(Changed),
+}
+
+impl Recheck {
+    /// What changed, if anything did.
+    pub fn changed(self) -> Option<Changed> {
+        match self {
+            Recheck::Same => None,
+            Recheck::Changed(changed) => Some(changed),
+        }
+    }
+}
+
+/// Whether the launcher and the implementation `expect` names are still the files its gate verified
+/// (docs/adr/ADR-030.md decision 9, "首个输入之前的再核对", M2T15D-201): each path `stat`ed (following links) and its
+/// (dev, ino, ctime) compared with `expect.stamp`, in memory; no record of any file's is read. On a difference the
+/// agent's identity is derived again as its gate derives it ([`identity_now`]): the same as `expect.identity` → only
+/// the stamps changed (`stamp_only`); another one, or none that can be derived → not.
+pub fn recheck(expect: &Expect) -> Recheck {
+    let [launcher, implementation] = stamps_now(expect);
+    let differs = [
+        (
+            AgentFile::Implementation,
+            expect.stamp.implementation,
+            implementation,
+        ),
+        (AgentFile::Launcher, expect.stamp.launcher, launcher),
+    ]
+    .into_iter()
+    .find(|(_, expected, seen)| *seen != Some(*expected));
+    match differs {
+        None => Recheck::Same,
+        Some((file, expected, seen)) => Recheck::Changed(Changed {
+            file,
+            expected,
+            seen,
+            stamp_only: identity_now(expect).as_ref() == Some(&expect.identity),
+        }),
+    }
+}
+
+/// The stamps of the launcher and the implementation `expect` names, as their paths are now (`stat`, following links;
+/// metadata only): `None` for one that cannot be read.
+pub fn stamps_now(expect: &Expect) -> [Option<FileStamp>; 2] {
+    let stat = |path: &str| std::fs::metadata(path).ok().map(|m| file_stamp(&m));
+    [
+        stat(&expect.identity.launcher_path),
+        stat(&expect.identity.implementation_path),
+    ]
+}
+
+/// A file's stamp from its metadata: (dev, ino, ctime).
+fn file_stamp(m: &std::fs::Metadata) -> FileStamp {
+    use std::os::unix::fs::MetadataExt as _;
+    FileStamp {
+        dev: m.dev(),
+        ino: m.ino(),
+        ctime_sec: m.ctime(),
+        ctime_nsec: m.ctime_nsec(),
+    }
+}
+
+/// The identity of the agent `expect` names as its files are now, derived the gate's way: the implementation resolved
+/// again from the launcher as the probe resolves it ([`crate::probe::resolve_implementation`]), the launcher and the
+/// implementation each opened and hashed through its descriptor, its stamp (`fstat`) the same before and after; `None`
+/// when any of that fails or a file changed while it was hashed.
+pub fn identity_now(expect: &Expect) -> Option<AgentIdentity> {
+    let launcher = Path::new(&expect.identity.launcher_path);
+    let implementation = crate::probe::resolve_implementation(expect.agent, launcher).ok()?;
+    // Hashed through the descriptor it was opened as, which is the file whose stamp is read before and after.
+    let hashed = |path: &Path| -> Option<String> {
+        let file = std::fs::File::open(path).ok()?;
+        let before = file.metadata().ok().map(|m| file_stamp(&m))?;
+        let sha256 = sha256_read(&file).ok()?;
+        let after = file.metadata().ok().map(|m| file_stamp(&m))?;
+        (before == after).then_some(sha256)
+    };
+    Some(AgentIdentity {
+        launcher_path: expect.identity.launcher_path.clone(),
+        launcher_sha256: hashed(launcher)?,
+        implementation_path: implementation.to_str()?.to_owned(),
+        implementation_sha256: hashed(&implementation)?,
+    })
+}
+
+/// A test's look at each diagnostic a turn of the runner's mode collects, called with the attempt's id and the
+/// diagnostic's payload as it is collected, before the turn ends (docs/adr/ADR-030.md decision 9, M2T15D-401: a
+/// turn's diagnostics are in memory until then); the product has none.
+#[derive(Clone)]
+pub struct Observe(pub Seen);
+
+/// Called with an attempt's id and a diagnostic of its turn's.
+pub type Seen = std::sync::Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
+
+impl std::fmt::Debug for Observe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Observe")
+    }
+}
+
+/// Who is shown a turn's diagnostics as they are collected: the attempt and its test's [`Observe`], if any.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Observer {
+    attempt_id: String,
+    observe: Option<Observe>,
+}
+
+impl Observer {
+    pub(crate) fn new(attempt_id: &str, observe: Option<Observe>) -> Observer {
+        Observer {
+            attempt_id: attempt_id.to_owned(),
+            observe,
+        }
+    }
+
+    /// Show an event a turn collects to the observer if it is a diagnostic.
+    pub(crate) fn collected(&self, kind: &str, payload: &serde_json::Value) {
+        if kind == "adapter.diagnostic"
+            && let Some(Observe(observe)) = &self.observe
+        {
+            observe(&self.attempt_id, payload);
+        }
+    }
+
+    /// The facts of a turn its gate refused ([`refused_at_gate`]), their GATE_REFUSED diagnostic, collected as the
+    /// turn's end is judged, shown to the observer.
+    pub(crate) fn refused(&self, facts: Facts) -> Facts {
+        for recorded in &facts.recorded {
+            if let Recorded::Event { key, kind, payload } = recorded
+                && key == "gate-refused"
+            {
+                self.collected(kind, payload);
+            }
+        }
+        facts
+    }
+}
+
+/// A turn's watch over its agent's files (docs/adr/ADR-030.md decision 9): the gate's expectation, re-checked before
+/// the first input where the protocol has HoH speak first ([`recheck`] of [`Watch::expect`]) and every
+/// [`RECHECK_EVERY`] while the turn runs, from its gate's opening to its process's end ([`Watch::due`],
+/// [`Watch::check`]). The re-check while it runs only records: a file seen changed is an
+/// `adapter.diagnostic{IMPLEMENTATION_CHANGED_IN_TURN}`, once per new stamp it is seen with; the turn, its outcome and
+/// its class are left as they are (REQ-027 behaviour 4, AC-027-04).
+#[derive(Debug)]
+pub(crate) struct Watch {
+    expect: Option<Expect>,
+    /// What the launcher and the implementation were last seen as: `expect`'s stamps at first.
+    seen: [Option<FileStamp>; 2],
+    due: tokio::time::Instant,
+    recorded: usize,
+}
+
+impl Watch {
+    /// The watch of a turn whose gate expects `expect` (none: nothing is re-checked); its first re-check due
+    /// [`RECHECK_EVERY`] from now.
+    pub(crate) fn new(expect: Option<Expect>) -> Watch {
+        let seen = expect.as_ref().map_or([None, None], |e| {
+            [Some(e.stamp.launcher), Some(e.stamp.implementation)]
+        });
+        Watch {
+            expect,
+            seen,
+            due: tokio::time::Instant::now() + RECHECK_EVERY,
+            recorded: 0,
+        }
+    }
+
+    /// Whether it re-checks: its turn has an expectation.
+    pub(crate) fn on(&self) -> bool {
+        self.expect.is_some()
+    }
+
+    /// Ready once a re-check is due: at its first poll when it is due already, so an event loop that polls it before
+    /// its next event re-checks on time however long events stay ready (M2T15D-400); else when it comes, so an idle
+    /// loop wakes for it.
+    pub(crate) async fn due(&self) {
+        if tokio::time::Instant::now() < self.due {
+            tokio::time::sleep_until(self.due).await;
+        }
+    }
+
+    /// The re-check while the turn runs, the next one due [`RECHECK_EVERY`] from now: each file whose stamp is not the
+    /// expected one and not the one it was last seen with is an `IMPLEMENTATION_CHANGED_IN_TURN` diagnostic (the
+    /// launcher only when it is not the same file as the implementation seen changed with it); the events to record
+    /// (key, payload).
+    pub(crate) fn check(&mut self) -> Vec<(String, serde_json::Value)> {
+        self.due = tokio::time::Instant::now() + RECHECK_EVERY;
+        let Some(expect) = &self.expect else {
+            return Vec::new();
+        };
+        let now = stamps_now(expect);
+        let expected = [expect.stamp.launcher, expect.stamp.implementation];
+        // A file is recorded when its stamp is not the expected one and it was not seen with it already.
+        let new = |i: usize| now[i] != Some(expected[i]) && now[i] != self.seen[i];
+        let implementation = new(1);
+        // The launcher seen as the same file as the implementation recorded with it is that one change.
+        let launcher = new(0) && !(implementation && now[0] == now[1]);
+        let mut events = Vec::new();
+        for (i, file, recorded) in [
+            (1, AgentFile::Implementation, implementation),
+            (0, AgentFile::Launcher, launcher),
+        ] {
+            if recorded {
+                self.recorded += 1;
+                events.push((
+                    format!("implementation-changed-in-turn-{}", self.recorded),
+                    json!({"reason": CHANGED_IN_TURN, "file": file.as_str(), "expected": expected[i],
+                           "seen": seen_json(now[i])}),
+                ));
+            }
+        }
+        self.seen = now;
+        events
+    }
+
+    /// The expectation its re-checks compare with: the re-check before the first input uses it too ([`recheck`]).
+    pub(crate) fn expect(&self) -> Option<&Expect> {
+        self.expect.as_ref()
+    }
 }
 
 /// One thing a turn recorded for its attempt: an event (key, kind, payload, as the direct mode writes them), or the
@@ -325,6 +628,28 @@ impl Facts {
         }
     }
 
+    /// The facts `self` of a turn whose re-check before its first input found `changed` (docs/adr/ADR-030.md decision 9,
+    /// "首个输入之前的再核对"): it sent no input and closed, and its adapter judged it FAILED COMPAT_UNVERIFIED; typed as
+    /// that re-check's (Compat, or transient when only the stamps changed), as only this module types one. Another
+    /// verdict (a cancel, a raw log cut short) stays as it was judged.
+    pub(crate) fn before_input(self, changed: Option<&Changed>) -> Facts {
+        match changed {
+            Some(changed)
+                if self.state == AttemptState::Failed
+                    && self.failure.as_deref() == Some(COMPAT_UNVERIFIED) =>
+            {
+                Facts {
+                    compat: Some(CompatRefusal {
+                        origin: Origin::BeforeInput,
+                        stamp_only: changed.stamp_only,
+                    }),
+                    ..self
+                }
+            }
+            _ => self,
+        }
+    }
+
     /// A turn whose drive failed before it had a verdict.
     pub(crate) fn incomplete(raw_log_path: String, recorded: Vec<Recorded>) -> Facts {
         Facts {
@@ -391,6 +716,8 @@ impl std::error::Error for Refused {}
 pub(crate) struct Sink<'a> {
     pub(crate) store: Option<&'a Store>,
     pub(crate) recorded: Vec<Recorded>,
+    /// Shown each diagnostic the list collects (the runner's mode).
+    pub(crate) observer: Observer,
 }
 
 impl Sink<'_> {
@@ -404,6 +731,7 @@ impl Sink<'_> {
         match self.store {
             Some(store) => store.attempt_event(attempt_id, key, kind, payload).await,
             None => {
+                self.observer.collected(kind, &payload);
                 self.recorded.push(Recorded::Event {
                     key: key.to_owned(),
                     kind: kind.to_owned(),
@@ -457,7 +785,8 @@ impl Stop<'_> {
     }
 }
 
-/// Where a turn records what it sees: the store, at once (the direct mode), or a list the runner records.
+/// Where a turn records what it sees: the store, at once (the direct mode), or a list the runner records, each
+/// diagnostic shown to its observer as it is collected.
 pub(crate) enum Recorder<'a> {
     Store {
         store: &'a Store,
@@ -465,7 +794,7 @@ pub(crate) enum Recorder<'a> {
         agent: &'static str,
         capabilities: &'a serde_json::Value,
     },
-    Collect(Vec<Recorded>),
+    Collect(Vec<Recorded>, Observer),
 }
 
 impl Recorder<'_> {
@@ -481,7 +810,8 @@ impl Recorder<'_> {
                     .attempt_event(&attempt.attempt_id, key, kind, payload)
                     .await
             }
-            Recorder::Collect(recorded) => {
+            Recorder::Collect(recorded, observer) => {
+                observer.collected(kind, &payload);
                 recorded.push(Recorded::Event {
                     key: key.to_owned(),
                     kind: kind.to_owned(),
@@ -513,7 +843,7 @@ impl Recorder<'_> {
                     })
                     .await
             }
-            Recorder::Collect(recorded) => {
+            Recorder::Collect(recorded, _) => {
                 recorded.push(Recorded::NativeSession(native.to_owned()));
                 Ok(())
             }
@@ -650,8 +980,13 @@ impl std::error::Error for AdapterError {}
 /// The sha256 of a raw log, read in fixed-size pieces: a turn's logs are not bounded by the frame limit or the stderr
 /// tail, so the whole file is never held in memory (M1R-05).
 pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
+    sha256_read(&std::fs::File::open(path)?)
+}
+
+/// The sha256 of what is read from the open file `file` from where it is (just opened: its start), in fixed-size
+/// pieces.
+fn sha256_read(mut file: &std::fs::File) -> std::io::Result<String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut piece = vec![0u8; 1 << 16];
     loop {

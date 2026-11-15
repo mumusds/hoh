@@ -67,6 +67,7 @@ pub(super) fn prepare(
             logs,
             escalation: claude::Turn::default_escalation(),
             deadline: Some(DEADLINE),
+            observe: None,
         }),
         Agent::Codex => {
             let launch::Facts::Codex {
@@ -100,6 +101,7 @@ pub(super) fn prepare(
                 escalation: codex::Turn::default_escalation(),
                 handshake_timeout: Duration::from_secs(60),
                 deadline: Some(DEADLINE),
+                observe: None,
             })
         }
         Agent::Pi => Prepared::Pi(pi::Turn {
@@ -124,6 +126,7 @@ pub(super) fn prepare(
             deadline: Some(DEADLINE),
             clock: Arc::new(SystemClock),
             events: None,
+            observe: None,
         }),
     })
 }

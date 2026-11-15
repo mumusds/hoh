@@ -278,6 +278,7 @@ fn a_sessions_capabilities_are_those_of_the_transport_a_turn_would_take() {
         escalation: Turn::default_escalation(),
         handshake_timeout: Duration::from_secs(1),
         deadline: None,
+        observe: None,
     };
     let exec_only = turn(launch());
     assert_eq!(
@@ -351,6 +352,7 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
                 escalation: Turn::default_escalation(),
                 handshake_timeout: Duration::from_secs(1),
                 deadline: None,
+                observe: None,
             };
             let caps = session_capabilities(&turn).expect("capabilities");
             // The transport is the one meant: only the App Server streams deltas.
@@ -423,6 +425,7 @@ async fn the_driver_writes_what_the_request_builders_give() {
         escalation: Turn::default_escalation(),
         handshake_timeout: Duration::from_secs(20),
         deadline: None,
+        observe: None,
     };
     let attempt = AttemptRef {
         attempt_id: "attempt-1".to_owned(),
@@ -441,6 +444,8 @@ async fn the_driver_writes_what_the_request_builders_give() {
         &mut steers,
         &mut Vec::new(),
         None,
+        &mut crate::adapter::Watch::new(None),
+        crate::adapter::Observer::default(),
     )
     .await
     .expect("driven");

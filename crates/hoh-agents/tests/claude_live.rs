@@ -133,6 +133,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         logs: out.join(logs),
         escalation: Turn::default_escalation(),
         deadline: Some(Duration::from_secs(600)),
+        observe: None,
     };
     let mut sessions = Vec::new();
     let session_of = |o: &Outcome| {

@@ -147,6 +147,7 @@ async fn codex_live_turn_and_cancel() -> R {
         escalation: Turn::default_escalation(),
         handshake_timeout: Duration::from_secs(60),
         deadline: Some(Duration::from_secs(600)),
+        observe: None,
     };
     let session_of = |o: &Outcome| {
         json!({

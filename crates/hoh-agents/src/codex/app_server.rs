@@ -16,7 +16,8 @@ use super::{
     failure_of, hard_stop, hashes, is_text_item, verdict,
 };
 use crate::adapter::{
-    AdapterError, AttemptRef, Recorded, Replay, Replayed, Stop, finish, now, soft_move, step,
+    AdapterError, AttemptRef, Changed, Expect, Observer, Recorded, Replay, Replayed, Stop, Watch,
+    finish, now, soft_move, step,
 };
 use crate::frame::Frame;
 use crate::known;
@@ -140,6 +141,13 @@ struct State<'a> {
     /// decision 12).
     store: Option<&'a Store>,
     recorded: std::sync::Mutex<Vec<Recorded>>,
+    /// Shown each diagnostic the runner's mode collects.
+    observer: Observer,
+    /// What the gate verified (the runner's mode): re-checked before thread/start, the first input (docs/adr/ADR-030.md
+    /// decision 9).
+    expect: Option<Expect>,
+    /// What that re-check found changed: no input was sent.
+    changed: Option<Changed>,
     /// A cancel only interrupts the turn: the host's ladder ends the process (the runner's mode, decision 14).
     native_only: bool,
     attempt: &'a AttemptRef,
@@ -192,6 +200,7 @@ impl State<'_> {
                     .await
             }
             None => {
+                self.observer.collected(kind, &payload);
                 if let Ok(mut recorded) = self.recorded.lock() {
                     recorded.push(Recorded::Event {
                         key: name.to_owned(),
@@ -478,6 +487,19 @@ impl State<'_> {
                     self.failure = Some(format!("initialize: {message}"));
                     self.begin_stop(process);
                 }
+                // Before the first input, the agent's files are still the ones its gate verified (docs/adr/ADR-030.md
+                // decision 9, "首个输入之前的再核对"): else nothing more is sent and stdin is closed.
+                None if let Some(changed) = self
+                    .expect
+                    .as_ref()
+                    .and_then(|e| crate::adapter::recheck(e).changed()) =>
+                {
+                    self.failure = Some(crate::adapter::COMPAT_UNVERIFIED.to_owned());
+                    let (key, payload) = changed.event();
+                    self.event(&key, "adapter.diagnostic", payload).await?;
+                    self.changed = Some(changed);
+                    self.close_gently();
+                }
                 None => {
                     self.conn.send(&requests::initialized());
                     // In the runner's mode the runner recorded RUNNING before the gate opened.
@@ -639,6 +661,9 @@ impl<'a> State<'a> {
         State {
             store,
             recorded: std::sync::Mutex::new(Vec::new()),
+            observer: Observer::default(),
+            expect: None,
+            changed: None,
             native_only,
             attempt,
             turn,
@@ -804,6 +829,7 @@ impl<'a> State<'a> {
             pid: self.pid,
             report,
             recorded,
+            changed: self.changed,
         })))
     }
 }
@@ -873,6 +899,8 @@ pub(super) async fn run(
         steers,
         held,
         None,
+        &mut Watch::new(None),
+        Observer::default(),
     )
     .await?
     {
@@ -951,11 +979,15 @@ pub(super) struct Driven {
     pub(super) report: Option<crate::process::ExitReport>,
     /// What the turn saw, in the runner's mode (the direct mode wrote it to the store).
     pub(super) recorded: Vec<Recorded>,
+    /// What its re-check before the first input found changed (docs/adr/ADR-030.md decision 9).
+    pub(super) changed: Option<Changed>,
 }
 
 /// Drive one App Server turn on `process` until it ended: the handshake, the thread, the turn, its notifications and
 /// requests, a cancel from `stop`. `preamble` is written first (the runner's mode: the gate's `go`). With no store
-/// (the runner's mode) nothing is written and the turn's events come back with it.
+/// (the runner's mode) nothing is written and the turn's events come back with it, each diagnostic shown to
+/// `observer` as it is collected. `watch`'s expectation is re-checked before thread/start, and while the turn runs as
+/// it is due.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn drive(
     store: Option<&Store>,
@@ -966,6 +998,8 @@ pub(super) async fn drive(
     steers: &mut mpsc::Receiver<Steer>,
     held: &mut Vec<Steer>,
     preamble: Option<Vec<u8>>,
+    watch: &mut Watch,
+    observer: Observer,
 ) -> Result<Drove, AdapterError> {
     let (lines, mut queue) = mpsc::unbounded_channel::<Vec<u8>>();
     if let Some(preamble) = preamble {
@@ -988,6 +1022,8 @@ pub(super) async fn drive(
         stop.is_native(),
         stop.requested_now(),
     );
+    s.observer = observer;
+    s.expect = watch.expect().cloned();
     s.conn.request(Pending::Initialize, requests::initialize);
     let handshake_until = Instant::now() + turn.handshake_timeout;
     let deadline_at = turn.deadline.map(|d| Instant::now() + d);
@@ -1001,6 +1037,13 @@ pub(super) async fn drive(
             () = stop.requested(), if !s.cancelled => {
                 s.cancelled = true;
                 s.begin_stop(Some(process));
+                continue;
+            }
+            // A re-check that is due comes before output (the same branch wakes an idle loop for it).
+            () = watch.due(), if watch.on() => {
+                for (key, payload) in watch.check() {
+                    s.event(&key, "adapter.diagnostic", payload).await?;
+                }
                 continue;
             }
             _ = tokio::time::sleep_until(at(deadline_at)), if deadline_at.is_some() && !s.deadline => {

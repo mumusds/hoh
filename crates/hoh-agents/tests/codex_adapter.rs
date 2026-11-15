@@ -194,6 +194,7 @@ impl Fakes for World {
             },
             handshake_timeout: Duration::from_secs(10),
             deadline: Some(Duration::from_secs(60)),
+            observe: None,
         })
     }
 

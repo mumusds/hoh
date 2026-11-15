@@ -69,6 +69,7 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
         escalation: Turn::default_escalation(),
         handshake_timeout: Duration::from_secs(10),
         deadline: Some(Duration::from_secs(60)),
+        observe: None,
     };
     // app-server.stderr.log stops at 4 MiB of the 8 MiB written; nothing else this process writes comes near it.
     let before = getrlimit(Resource::Fsize);
