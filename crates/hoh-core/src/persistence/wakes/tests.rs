@@ -2439,7 +2439,9 @@ async fn an_overdue_routine_trigger_is_superseded_not_woken_while_the_commander_
 async fn an_unavailable_commander_is_not_preempted_for() -> R {
     // M2T08R-08 (decision 3, v13): the preempt's condition is the replacement's allocation as the verdict judges it:
     // with the registry finding the Commander's agent unavailable, an integrity wake does not preempt the turn in
-    // flight (its replacement could not be given a turn).
+    // flight (its replacement could not be given a turn). The look finds the agent verified, so only its
+    // unavailability can stop the preempt (an unverified agent is docs/adr/ADR-030.md decision 11's own cause,
+    // `an_unverified_commander_is_not_preempted_for`).
     use crate::decision::Observation;
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
@@ -2464,7 +2466,7 @@ async fn an_unavailable_commander_is_not_preempted_for() -> R {
         n: 1,
         available: false,
         logged_in: false,
-        verified: false,
+        verified: true,
     };
     store
         .supervise(
