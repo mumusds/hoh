@@ -1189,3 +1189,94 @@ async fn a_commanders_move_into_a_stopping_state_ends_its_commit_with_a_run_resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn an_end_decided_while_the_run_is_not_quiet_is_rejected_with_nothing_else_written() -> R {
+    // docs/adr/ADR-031.md decision 4 (the test plan's 结束的安静条件, without the stall detector): while T3's attempt
+    // runs, the Commander's transition_run to FAILED, INCOMPLETE and COMPLETED are each REJECTED ILLEGAL_TRANSITION, the
+    // commit holding only its decision.rejected, the run unchanged. FAILED is refused too while a verification round is
+    // open, or while more wake events than an end takes in are unread (the bound lowered by the store's hook).
+    #[derive(Debug)]
+    struct Limit;
+    impl crate::persistence::FaultHooks for Limit {
+        fn unread_limit(&self) -> Option<i64> {
+            Some(1)
+        }
+    }
+    let worlds = [
+        "INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES \
+         ('A3', 'T3', 'RUNNING', 2, 1, 1);",
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', 'rd/opened', 'R', 'verification.round_opened', '{\"round_id\": \"rd\", \"candidate_id\": \"C\"}', \
+          '2026-11-04T00:00:00Z');",
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', 'nd1', 'R', 'need_decision', '{\"task_id\": \"T1\", \"fingerprint\": \"a\"}', '2026-11-04T00:00:00Z'), \
+         ('p1', 'nd2', 'R', 'need_decision', '{\"task_id\": \"T1\", \"fingerprint\": \"b\"}', '2026-11-04T00:00:00Z');",
+    ];
+    for (n, extra) in worlds.into_iter().enumerate() {
+        let targets: &[&str] = if n == 0 {
+            &["FAILED", "INCOMPLETE", "COMPLETED"]
+        } else {
+            &["FAILED"]
+        };
+        for to in targets {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join(".hoh/state.db");
+            let store = Store::open(
+                &path,
+                Options {
+                    wal_probe: Some(selftest::test_probe(None)),
+                    faults: std::sync::Arc::new(Limit),
+                    ..Options::default()
+                },
+            )?;
+            seed(&path, WORLD)?;
+            seed(&path, extra)?;
+            let before = rows(&path, "SELECT coalesce(max(seq), 0) FROM events")?[0][0]
+                .as_i64()
+                .unwrap_or(0);
+            let mut commander = FakeCommander {
+                sent: 0,
+                candidate: None,
+            };
+            let decided = store
+                .decide(
+                    commander.decide(
+                        3,
+                        7,
+                        if *to == "COMPLETED" {
+                            json!({"kind": "transition_run", "to_state": to, "accepted_requirements": ["REQ-1"]})
+                        } else {
+                            json!({"kind": "transition_run", "to_state": to})
+                        },
+                    ),
+                    context(),
+                )
+                .await?;
+            assert!(
+                matches!(
+                    decided,
+                    Decided::Rejected {
+                        reason: RejectionReason::IllegalTransition,
+                        ..
+                    }
+                ),
+                "{n} {to}: {decided:?}"
+            );
+            assert_eq!(
+                rows(
+                    &path,
+                    &format!("SELECT kind FROM events WHERE seq > {before} ORDER BY seq")
+                )?,
+                [[json!("decision.rejected")]],
+                "{n} {to}"
+            );
+            assert_eq!(
+                rows(&path, "SELECT state, revision FROM runs WHERE run_id = 'R'")?,
+                [[json!("RUNNING"), json!(7)]],
+                "{n} {to}"
+            );
+        }
+    }
+    Ok(())
+}

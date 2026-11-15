@@ -105,7 +105,7 @@ pub(super) fn claim_next(
             .optional()
             .map_err(sqlite_error)?;
         let Some((message_id, run_id, recipient_role, role_epoch, payload, count)) = due else {
-            super::writer::commit_unhooked(tx)?;
+            super::writer::commit_unhooked(tx, ctx)?;
             return Ok(None);
         };
         if count >= max_attempts {
@@ -130,7 +130,7 @@ pub(super) fn claim_next(
         .map_err(sqlite_error)?;
         let payload = serde_json::from_str(&payload)
             .map_err(|e| PersistError::IntegrityViolation(format!("outbox {message_id}: {e}")))?;
-        super::writer::commit_unhooked(tx)?;
+        super::writer::commit_unhooked(tx, ctx)?;
         return Ok(Some(OutboxRow {
             message_id,
             run_id,
@@ -172,7 +172,7 @@ pub(super) fn unclaim_all(
     for row in rows {
         undo(&tx, row)?;
     }
-    super::writer::commit_unhooked(tx)
+    super::writer::commit_unhooked(tx, ctx)
 }
 
 /// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
@@ -288,7 +288,7 @@ pub(super) fn settle(
         // Settled already, or a late answer of an earlier delivery: the settlement that came first stands.
         _ => {}
     }
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(())
 }
 
@@ -668,7 +668,7 @@ pub(super) fn consume(
         params![consumer, message.message_id, rfc3339_utc(now), result_json],
     )
     .map_err(sqlite_error)?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(Consumed {
         result_json,
         replayed: false,
@@ -739,7 +739,7 @@ pub(super) fn invalid(
         },
         ctx,
     )?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(done.event_seqs[0])
 }
 

@@ -54,7 +54,7 @@ pub(super) fn accept(
     let tx = super::writer::begin(conn, ctx)?;
     let outcome = accept_in(&tx, result, false, ctx)?;
     if !matches!(outcome, TaskResultOutcome::Replayed { .. }) {
-        super::writer::commit_unhooked(tx)?;
+        super::writer::commit_unhooked(tx, ctx)?;
     }
     Ok(outcome)
 }

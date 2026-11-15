@@ -275,11 +275,19 @@ pub(super) fn dispose(
             )
             .map_err(sqlite_error)?;
         let state = writer::parse::<RunState>(&state)?;
+        // Held: none for now. Ended, by a disposal of this batch or another writer: its end commit superseded what was
+        // waiting and closed its supervision, so the batch ends with nothing written (docs/adr/ADR-031.md decision 4,
+        // M2T13D-06).
         if matches!(
             state,
             RunState::PauseRequested | RunState::Paused | RunState::Incomplete
-        ) {
+        ) || state.is_terminal()
+        {
             return Ok(false);
+        }
+        // Ended since the batch's list was read: passed over.
+        if ended(&tx, run_id, &output_id)? {
+            continue;
         }
         let text: String = tx
             .query_row(
@@ -367,6 +375,37 @@ pub(super) fn dispose(
         }
     }
     Ok(total > processed)
+}
+
+/// Whether output `output_id` of run `run_id` has its end (an `output_disposed`, or the decision that disposed of it).
+fn ended(tx: &Transaction<'_>, run_id: &str, output_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind IN (?2, 'decision.applied', 'decision.rejected') \
+         AND json_extract(payload_json, '$.output_id') = ?3)",
+        params![run_id, DISPOSED, output_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The `output_disposed{superseded}` of each output of run `run_id` still waiting, to write in `tx`: the outputs of a
+/// run that ends (docs/adr/ADR-031.md decision 4's tail, (2)).
+pub(super) fn supersede_in(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+) -> Result<Vec<NewEvent>, PersistError> {
+    Ok(waiting(tx, run_id)?
+        .into_iter()
+        .map(|w| NewEvent {
+            intent: Intent::Progress,
+            project_id: project_id.to_owned(),
+            event_id: child_id(&w.output_id, "disposed"),
+            run_id: Some(run_id.to_owned()),
+            kind: DISPOSED.to_owned(),
+            payload: json!({"output_id": w.output_id, "attempt_id": w.attempt_id, "outcome": "superseded"}),
+        })
+        .collect())
 }
 
 /// Turn `attempt_id`'s `supervisor.allocated` (null when there is none).

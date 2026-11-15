@@ -164,7 +164,7 @@ pub(super) fn round(
                 verification = Some((round_id, handoff));
             }
             Some(super::verification::Admission::Refused) => {
-                super::writer::commit_unhooked(tx)?;
+                super::writer::commit_unhooked(tx, ctx)?;
                 return Ok(RoundOutcome::default());
             }
             None => {}
@@ -273,7 +273,7 @@ pub(super) fn round(
         )
         .map_err(sqlite_error)?;
     }
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(RoundOutcome {
         dispatched: Some(Dispatched {
             task_id: selected.task_id,

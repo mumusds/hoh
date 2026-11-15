@@ -405,7 +405,7 @@ pub(super) fn run(
                     )
                     .map_err(sqlite_error)?;
             }
-            super::writer::commit_unhooked(tx)?;
+            super::writer::commit_unhooked(tx, ctx)?;
             Ok(RunnerDone::Renewed(renewed))
         }
         RunnerJob::Ack(message_id) => {
@@ -417,7 +417,7 @@ pub(super) fn run(
                     params![message_id],
                 )
                 .map_err(sqlite_error)?;
-            super::writer::commit_unhooked(tx)?;
+            super::writer::commit_unhooked(tx, ctx)?;
             Ok(RunnerDone::Applied(changed == 1))
         }
     }

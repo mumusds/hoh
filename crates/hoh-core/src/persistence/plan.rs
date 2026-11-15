@@ -227,7 +227,7 @@ pub(super) fn import(
         outbox: Vec::new(),
     };
     let done = writer::write(&tx, &commit, ctx)?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(Imported {
         task_ids,
         run_revision: done.revisions[0],

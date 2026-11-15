@@ -62,7 +62,7 @@ impl CommitTimes {
 /// How many events one batch of a step looks at at most (a window of the global seq after the run's cursor, v20), in
 /// one transaction and one writer job; the step goes on from the batch's cursor, a job each, until it has caught up
 /// (docs/adr/ADR-025.md decision 2, v13).
-const STEP: i64 = 10_000;
+pub(super) const STEP: i64 = 10_000;
 
 /// A trigger fired by a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +150,19 @@ pub(super) fn dispose(
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     let more = super::outputs::dispose(conn, run_id, upto, context, ctx)?;
+    // A run that ended has had its supervision closed by its end commit, and a held one keeps what it owes and its
+    // horizon: no close, no horizon for either (docs/adr/ADR-031.md decision 4, M2T13D-06).
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let state = writer::parse::<RunState>(&state)?;
+    if state.is_terminal() || matches!(admission(state), Admission::Hold) {
+        return Ok(more);
+    }
     if !more {
         close(conn, run_id, context, ctx)?;
         // The outputs disposed of may have closed wakes: the horizon moves now, not at the next step (v19).
@@ -197,6 +210,24 @@ fn close(
     if !matches!(admission(state), Admission::Supersede) {
         return Ok(());
     }
+    let Some(last) = close_due(&tx, run_id)? else {
+        return Ok(());
+    };
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![closed(&project_id, run_id, state, last, context.now())],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    super::writer::commit(tx, ctx)
+}
+
+/// Whether run `run_id`'s supervision is to be closed now (v13, M2T08R-06; docs/adr/ADR-031.md decision 4's (3)): no
+/// PENDING trigger, no wake neither answered nor superseded, no output pending, and a woken or an output since the
+/// last close — that last one's seq, which names the close.
+pub(super) fn close_due(tx: &Transaction<'_>, run_id: &str) -> Result<Option<i64>, PersistError> {
     let last: Option<i64> = tx
         .query_row(
             "SELECT max(seq) FROM events WHERE run_id = ?1 AND kind IN (?2, ?3) AND seq > \
@@ -206,7 +237,7 @@ fn close(
         )
         .map_err(sqlite_error)?;
     let Some(last) = last else {
-        return Ok(());
+        return Ok(None);
     };
     let pending: bool = tx
         .query_row(
@@ -216,29 +247,155 @@ fn close(
         )
         .map_err(sqlite_error)?;
     if pending
-        || wakes::of_run(&tx, run_id)?
+        || wakes::of_run(tx, run_id)?
             .iter()
             .any(|w| !w.superseded && !w.settled())
-        || !super::outputs::waiting(&tx, run_id)?.is_empty()
+        || !super::outputs::waiting(tx, run_id)?.is_empty()
     {
-        return Ok(());
+        return Ok(None);
     }
-    writer::write(
-        &tx,
-        &Commit {
-            events: vec![NewEvent {
-                intent: Intent::Progress,
-                project_id,
-                event_id: child_id(run_id, &format!("supervisor/closed/{last}")),
-                run_id: Some(run_id.to_owned()),
-                kind: CLOSED.to_owned(),
-                payload: json!({"state": state.as_str(), "at": rfc3339_millis_utc(context.now())}),
-            }],
-            ..Commit::default()
-        },
-        ctx,
-    )?;
-    super::writer::commit(tx, ctx)
+    Ok(Some(last))
+}
+
+/// The `supervisor.closed` of run `run_id` in `state`, named by `last` (its woken or output since the last close).
+fn closed(project_id: &str, run_id: &str, state: RunState, last: i64, at: SystemTime) -> NewEvent {
+    NewEvent {
+        intent: Intent::Progress,
+        project_id: project_id.to_owned(),
+        event_id: child_id(run_id, &format!("supervisor/closed/{last}")),
+        run_id: Some(run_id.to_owned()),
+        kind: CLOSED.to_owned(),
+        payload: json!({"state": state.as_str(), "at": rfc3339_millis_utc(at)}),
+    }
+}
+
+/// Run `run_id`'s cursor: where its supervisor's next step starts (before its first event when it has none yet,
+/// M2T08R-552).
+fn cursor(tx: &Connection, run_id: &str) -> Result<i64, PersistError> {
+    let cursor: Option<i64> = tx
+        .query_row(
+            "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    match cursor {
+        Some(cursor) => Ok(cursor),
+        None => tx
+            .query_row(
+                "SELECT coalesce(min(seq), 1) - 1 FROM events WHERE run_id = ?1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error),
+    }
+}
+
+/// The kinds of [`KINDS`] as an SQL list.
+fn kinds_sql() -> String {
+    KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// How many of run `run_id`'s wake-kind events its supervisor has not taken in yet (after its cursor), counted up to
+/// `limit + 1` at most: a saturating count whose reading does not grow with a backlog (docs/adr/ADR-031.md decision 4,
+/// M2T13D-700). An end of the run is put off while it is above `limit`.
+pub(super) fn unread_wakes(tx: &Connection, run_id: &str, limit: i64) -> Result<i64, PersistError> {
+    let cursor = cursor(tx, run_id)?;
+    tx.query_row(
+        &format!(
+            "SELECT count(*) FROM (SELECT 1 FROM events WHERE run_id = ?1 AND kind IN ({}) AND seq > ?2 LIMIT ?3)",
+            kinds_sql()
+        ),
+        params![run_id, cursor, limit.saturating_add(1)],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The supervision of run `run_id` folded into the commit that ends it in `state` (COMPLETED, FAILED or CANCELLED;
+/// docs/adr/ADR-031.md decision 4, "尾部并入终态的提交"), before its run.result: (0) its wake-kind events after its
+/// cursor, this transaction's included, taken in as the step takes them in; (1) its PENDING triggers and owed wakes
+/// superseded; (2) its outputs waiting superseded; (3) `supervisor.closed` when the close is due. Its cursor is then set
+/// to the run.result's seq by the writer (4). The ends bound what (0) reads ([`unread_wakes`]).
+pub(super) fn tail(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    state: RunState,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let (project_id, revision, policy): (String, Option<i64>, Option<String>) = tx
+        .query_row(
+            "SELECT r.project_id, s.revision, json_extract(r.config_snapshot_json, '$.supervision.policy') FROM runs r \
+             LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sqlite_error)?;
+    let policy = policy
+        .as_deref()
+        .and_then(Policy::named)
+        .unwrap_or(Policy::Balanced);
+    let now = ctx.now();
+    let after = cursor(tx, run_id)?;
+    let waking: Vec<(i64, String, String)> = {
+        let mut statement = tx
+            .prepare(&format!(
+                "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN ({}) AND seq > ?2 \
+                 ORDER BY seq",
+                kinds_sql()
+            ))
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id, after], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    for j in join_wakes(tx, &project_id, policy, revision, &waking, now, ctx)? {
+        take_in(tx, run_id, &j)?;
+    }
+    let mut events = supersede_in(tx, &project_id, run_id, state, now, ctx)?;
+    events.extend(super::outputs::supersede_in(tx, &project_id, run_id)?);
+    if !events.is_empty() {
+        writer::write(
+            tx,
+            &Commit {
+                events,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
+    if let Some(last) = close_due(tx, run_id)? {
+        writer::write(
+            tx,
+            &Commit {
+                events: vec![closed(&project_id, run_id, state, last, now)],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
+    Ok(())
+}
+
+/// Run `run_id`'s cursor set to `seq`, its end's run.result (docs/adr/ADR-031.md decision 4's (4)): its supervisor has
+/// taken in every event of it.
+pub(super) fn set_cursor(tx: &Transaction<'_>, run_id: &str, seq: i64) -> Result<(), PersistError> {
+    tx.execute(
+        "INSERT INTO supervisor_cursor(run_id, last_handled_seq) VALUES (?1, ?2) \
+         ON CONFLICT(run_id) DO UPDATE SET last_handled_seq = excluded.last_handled_seq",
+        params![run_id, seq],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// Run `run_id`'s supervisor step failed with `error`: `supervisor.step_failed{error}` in a transaction of its own,
@@ -323,25 +480,8 @@ fn take_in_batch(
         .and_then(Policy::named)
         .unwrap_or(Policy::Balanced);
     let now = context.now();
-    let cursor: Option<i64> = tx
-        .query_row(
-            "SELECT last_handled_seq FROM supervisor_cursor WHERE run_id = ?1",
-            params![run_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
     // A run with no cursor yet starts just before its own first event, not at the store's beginning (M2T08R-552).
-    let cursor = match cursor {
-        Some(cursor) => cursor,
-        None => tx
-            .query_row(
-                "SELECT coalesce(min(seq), 1) - 1 FROM events WHERE run_id = ?1",
-                params![run_id],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?,
-    };
+    let cursor = cursor(tx, run_id)?;
     // A batch is a window of the global seq after the cursor, at most STEP long, read by its rowid range: at most STEP
     // events looked at, and the cursor moves to the window's end even when none of them is this run's (v20,
     // M2T08R-451: by the run's index each step scanned all of the run's events).
@@ -349,11 +489,7 @@ fn take_in_batch(
         .query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))
         .map_err(sqlite_error)?;
     let high = last.min(cursor.saturating_add(STEP)).max(cursor);
-    let kinds = KINDS
-        .iter()
-        .map(|k| format!("'{k}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let kinds = kinds_sql();
     let waking: Vec<(i64, String, String)> = {
         let mut statement = tx
             .prepare(&format!(
@@ -369,6 +505,33 @@ fn take_in_batch(
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
     };
+    let joined = join_wakes(tx, &project_id, policy, revision, &waking, now, ctx)?;
+    for j in &joined {
+        take_in(tx, run_id, j)?;
+    }
+    if high > cursor {
+        tx.execute(
+            "INSERT INTO supervisor_cursor(run_id, last_handled_seq) VALUES (?1, ?2) \
+             ON CONFLICT(run_id) DO UPDATE SET last_handled_seq = max(last_handled_seq, excluded.last_handled_seq)",
+            params![run_id, high],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok((project_id, high, high >= last))
+}
+
+/// Waking events `waking` (seq, kind, payload) of run `run_id` joined by key in memory, in the order of each key's
+/// first, classified under `policy` and its spec `revision`, each timed from its commit (else `now`): what
+/// [`take_in`] writes, one read and one write per key.
+fn join_wakes(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    policy: Policy,
+    revision: Option<i64>,
+    waking: &[(i64, String, String)],
+    now: SystemTime,
+    ctx: &Ctx<'_>,
+) -> Result<Vec<Joined>, PersistError> {
     // The batch's waking events joined by key in memory, in the order of each key's first: then one read and one
     // write per key (v13, M2T08R-03; once per event rewrote the whole seq array each time).
     let mut joined: Vec<Joined> = Vec::new();
@@ -376,7 +539,7 @@ fn take_in_batch(
         std::collections::BTreeMap::new();
     let mut specs: std::collections::BTreeMap<i64, Option<String>> =
         std::collections::BTreeMap::new();
-    for (seq, kind, payload) in &waking {
+    for (seq, kind, payload) in waking {
         let payload: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
         let Some(wake) = supervise::classify(policy, kind, &payload, revision) else {
             continue;
@@ -431,18 +594,7 @@ fn take_in_batch(
             }
         }
     }
-    for j in &joined {
-        take_in(tx, run_id, j)?;
-    }
-    if high > cursor {
-        tx.execute(
-            "INSERT INTO supervisor_cursor(run_id, last_handled_seq) VALUES (?1, ?2) \
-             ON CONFLICT(run_id) DO UPDATE SET last_handled_seq = max(last_handled_seq, excluded.last_handled_seq)",
-            params![run_id, high],
-        )
-        .map_err(sqlite_error)?;
-    }
-    Ok((project_id, high, high >= last))
+    Ok(joined)
 }
 
 /// A batch's events of one key, joined in memory: their highest severity, their seqs, and when the first and the last
@@ -576,6 +728,104 @@ fn record(run_id: &str, t: &Pending, now: SystemTime, ctx: &Ctx<'_>) -> Value {
     })
 }
 
+/// Run `run_id`'s PENDING triggers (`due_by`: only those due by then), in due order. `lenient`: a trigger whose seqs
+/// cannot be read is taken with none, for superseding (v17, M2T08R-256).
+fn pending_triggers(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    due_by: Option<SystemTime>,
+    lenient: bool,
+) -> Result<Vec<Pending>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at, first_seq \
+             FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING' AND (?2 OR due_at <= ?3) \
+             ORDER BY due_at, first_seq",
+        )
+        .map_err(sqlite_error)?;
+    let at = due_by.map_or_else(String::new, rfc3339_millis_utc);
+    let rows = statement
+        .query_map(params![run_id, due_by.is_none(), at], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, String>(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    rows.into_iter()
+        .map(
+            |(trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq)| {
+                let seqs = match serde_json::from_str(&seqs) {
+                    Ok(seqs) => seqs,
+                    Err(_) if lenient => Vec::new(),
+                    Err(e) => {
+                        return Err(PersistError::IntegrityViolation(format!(
+                            "trigger {trigger_id}: event_seqs_json: {e}"
+                        )));
+                    }
+                };
+                Ok(Pending {
+                    trigger_id,
+                    fingerprint,
+                    spec_id,
+                    severity,
+                    seqs,
+                    created_at,
+                    first_seq,
+                })
+            },
+        )
+        .collect()
+}
+
+/// Nothing more is owed to run `run_id`, cancelled or ended in `state` (decision 3): its PENDING triggers SUPERSEDED,
+/// and the `supervisor.superseded` events of those and of its owed wakes, to write in `tx`.
+pub(super) fn supersede_in(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    state: RunState,
+    now: SystemTime,
+    ctx: &Ctx<'_>,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let event = |id: String, payload: Value| NewEvent {
+        intent: Intent::Progress,
+        project_id: project_id.to_owned(),
+        event_id: id,
+        run_id: Some(run_id.to_owned()),
+        kind: wakes::SUPERSEDED.to_owned(),
+        payload,
+    };
+    let mut events = Vec::new();
+    for t in pending_triggers(tx, run_id, None, true)? {
+        tx.execute(
+            "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
+            params![t.trigger_id],
+        )
+        .map_err(sqlite_error)?;
+        let mut payload = record(run_id, &t, now, ctx);
+        payload["reason"] = json!(state.as_str());
+        events.push(event(child_id(&t.trigger_id, "superseded"), payload));
+    }
+    for wake in wakes::of_run(tx, run_id)?
+        .into_iter()
+        .filter(wakes::Wake::owed)
+    {
+        events.push(event(
+            child_id(&wake.id, "superseded"),
+            json!({"wake": wake.id, "reason": state.as_str()}),
+        ));
+    }
+    Ok(events)
+}
+
 /// Fire run `run_id`'s triggers due at `now`, as its state allows and by the step's one verdict on its Commander
 /// (v13): the fired ones, the events to write, and the verdict when the step is to judge the Commander by it (a run
 /// with a binding and a spec, in a state that fires).
@@ -617,88 +867,15 @@ fn fire(
         kind: kind.to_owned(),
         payload,
     };
-    // `lenient`: a trigger whose seqs cannot be read is taken with none, for superseding (v17, M2T08R-256).
-    let pending = |due_only: bool, lenient: bool| -> Result<Vec<Pending>, PersistError> {
-        let mut statement = tx
-            .prepare(
-                "SELECT trigger_id, fingerprint, spec_id, severity, event_seqs_json, created_at, first_seq \
-                 FROM supervisor_triggers WHERE run_id = ?1 AND state = 'PENDING' AND (?2 OR due_at <= ?3) \
-                 ORDER BY due_at, first_seq",
-            )
-            .map_err(sqlite_error)?;
-        let rows = statement
-            .query_map(params![run_id, !due_only, rfc3339_millis_utc(now)], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                ))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sqlite_error)?;
-        rows.into_iter()
-            .map(
-                |(trigger_id, fingerprint, spec_id, severity, seqs, created_at, first_seq)| {
-                    let seqs = match serde_json::from_str(&seqs) {
-                        Ok(seqs) => seqs,
-                        Err(_) if lenient => Vec::new(),
-                        Err(e) => {
-                            return Err(PersistError::IntegrityViolation(format!(
-                                "trigger {trigger_id}: event_seqs_json: {e}"
-                            )));
-                        }
-                    };
-                    Ok(Pending {
-                        trigger_id,
-                        fingerprint,
-                        spec_id,
-                        severity,
-                        seqs,
-                        created_at,
-                        first_seq,
-                    })
-                },
-            )
-            .collect()
-    };
     match admission(state) {
         Admission::Hold => return Ok((fired, events, None)),
         Admission::Supersede => {
-            // Nothing more is owed to a run that is cancelled or ended: its PENDING triggers and its owed wakes.
-            for t in pending(false, true)? {
-                tx.execute(
-                    "UPDATE supervisor_triggers SET state = 'SUPERSEDED' WHERE trigger_id = ?1 AND state = 'PENDING'",
-                    params![t.trigger_id],
-                )
-                .map_err(sqlite_error)?;
-                let mut payload = record(run_id, &t, now, ctx);
-                payload["reason"] = json!(state.as_str());
-                events.push(event(
-                    child_id(&t.trigger_id, "superseded"),
-                    wakes::SUPERSEDED,
-                    payload,
-                ));
-            }
-            for wake in wakes::of_run(tx, run_id)?
-                .into_iter()
-                .filter(wakes::Wake::owed)
-            {
-                events.push(event(
-                    child_id(&wake.id, "superseded"),
-                    wakes::SUPERSEDED,
-                    json!({"wake": wake.id, "reason": state.as_str()}),
-                ));
-            }
+            events.extend(supersede_in(tx, project_id, run_id, state, now, ctx)?);
             return Ok((fired, events, None));
         }
         Admission::Fire => {}
     }
-    let due = pending(true, false)?;
+    let due = pending_triggers(tx, run_id, Some(now), false)?;
     if run_spec.is_none() {
         // No supervision task without a spec (decision 4): each due trigger waits, deferred once; the Commander is not
         // judged (decision 4 before 5, v13, M2T08R-04).

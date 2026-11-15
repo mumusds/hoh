@@ -174,6 +174,12 @@ pub trait FaultHooks: Send + Sync + std::fmt::Debug {
     /// A request of the writer named `job` was answered Held for run `run`: the insert function refused its progress
     /// because the run has stopped (docs/adr/ADR-031.md correction D, rule 2). A test's hook records when.
     fn held(&self, _job: &'static str, _run: &str) {}
+
+    /// How many unread wake events an end of a run allows (docs/adr/ADR-031.md decision 4's bound): a test's hook
+    /// lowers it; `None`, the supervisor's batch.
+    fn unread_limit(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// A point of a write request (REQ-036, ADR-019 decision 1), in order: the transaction began (its host fence
