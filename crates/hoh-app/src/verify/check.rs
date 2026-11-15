@@ -4,7 +4,7 @@
 
 use crate::host::control::git;
 use hoh_core::persistence::{
-    AcceptanceRow, ArtifactRow, EvidenceHandle, PersistError, Reader, Recording,
+    AcceptanceRow, ArtifactRow, EvidenceHandle, PersistError, Reader, Recording, RecordingSource,
 };
 use hoh_core::verification::{
     AcSpec, Evidence, FileRef, Manifest, NamedRef, Planned, Record, Runner, Sealed, outcome,
@@ -954,6 +954,7 @@ async fn finish(
                     sealed: &ready.sealed,
                     run_id: &ready.run_id,
                     record_dir: &record_dir,
+                    source: RecordingSource::Run,
                 },
                 &facts,
             )?;
@@ -1121,6 +1122,7 @@ pub async fn record_attempt_change(
                 sealed: &sealed,
                 run_id: &row.run_id,
                 record_dir: &record_dir,
+                source: RecordingSource::Run,
             },
             &facts,
         )?;
@@ -1332,6 +1334,8 @@ struct Judged<'a> {
     sealed: &'a Sealed,
     run_id: &'a str,
     record_dir: &'a Path,
+    /// The check's own run, or a recovery of its pending record (docs/adr/ADR-031.md correction D's write intents).
+    source: RecordingSource,
 }
 
 /// The judgement of a run's facts on its files as they are now (principle one; decisions 8 and 9): its observations
@@ -1487,6 +1491,7 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
             observations: e.observations.clone(),
             rows: rows_out,
             integrity: facts.integrity.clone(),
+            source: at.source,
         },
         ran,
     ))
@@ -1705,6 +1710,7 @@ fn pending(
                     sealed,
                     run_id,
                     record_dir: &record_dir,
+                    source: RecordingSource::Recovery,
                 },
                 &facts,
             )?;

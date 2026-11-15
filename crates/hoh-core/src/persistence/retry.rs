@@ -8,7 +8,7 @@
 
 use super::blockers;
 use super::decide::{child_id, load_binding};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::budget::{self, Budget, Ledger};
 use crate::decision::Context;
@@ -47,6 +47,7 @@ pub(super) struct Failed {
 
 fn event(project_id: &str, run_id: &str, id: String, kind: &str, payload: Value) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),
@@ -800,8 +801,7 @@ pub(super) fn pace(
         return Ok(paced);
     }
     writer::write(&tx, &commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(paced)
 }
 
@@ -905,8 +905,7 @@ pub(super) fn request_repair(
     let tx = writer::begin(conn, ctx)?;
     let (verdict, commit) = repair_in(&tx, request)?;
     writer::write(&tx, &commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(verdict)
 }
 

@@ -82,6 +82,21 @@ pub struct NewEvent {
     pub run_id: Option<String>,
     pub kind: String,
     pub payload: serde_json::Value,
+    /// What it is written as once its run has stopped ([`insert_event`]).
+    pub intent: Intent,
+}
+
+/// An event's write intent (docs/adr/ADR-031.md correction D, rule 1, E17), judged by [`insert_event`] only for an
+/// event of a stopped run (in G, its stop published by its `run.result`). A command accepted for that run makes every
+/// event of the run in its transaction the command's, whatever the intent (`temp.command_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// The run's progress, what every writer writes unless it says otherwise: refused on a stopped run
+    /// (`RunStopped`, answered as Held).
+    Progress,
+    /// Audit, history, delivery bookkeeping or a diagnostic, of a kind in `hold::RECORD_KINDS` (any other kind is an
+    /// IntegrityViolation): on a stopped run written project-scoped — `run_id` null, the run in the payload.
+    Record,
 }
 
 /// An outbox message for the event at index `event` of the same commit.
@@ -318,6 +333,22 @@ pub(super) fn begin<'c>(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
+    // What a transaction registers is gone by its end, by its commit (`commit`) or its rollback: a row left here is a
+    // commit that went around `commit` (docs/adr/ADR-031.md decision 3).
+    temp_tables(&tx)?;
+    let left: Option<String> = tx
+        .query_row(
+            "SELECT run_id FROM temp.results_due UNION ALL SELECT run_id FROM temp.command_run LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(run) = left {
+        return Err(PersistError::IntegrityViolation(format!(
+            "a transaction committed without writer::commit: what it registered for run {run} is left"
+        )));
+    }
     if let Some(fence) = ctx.fence {
         let current: Option<i64> = tx
             .query_row(
@@ -345,11 +376,21 @@ pub(super) fn begin<'c>(
 /// decision 2): a caller that moves the clock once answered cannot move that instant.
 type Reply = Box<dyn FnOnce()>;
 
+/// A job refused by the insert function because its run has stopped (`RunStopped`) has had that transaction rolled
+/// back with it; the caller gets Held, the only form of it outside the writer (docs/adr/ADR-031.md correction D,
+/// rule 2): no failure, nothing written, its obligation kept.
 fn answer<T: 'static>(
     ctx: &Ctx<'_>,
     reply: oneshot::Sender<Result<T, PersistError>>,
     result: Result<T, PersistError>,
 ) -> Reply {
+    let result = result.map_err(|e| match e {
+        PersistError::RunStopped { run, state } => {
+            ctx.hooks.held(ctx.job, &run);
+            PersistError::Held { run, state }
+        }
+        e => e,
+    });
     if result.is_ok() {
         ctx.at(WritePoint::Committed);
     }
@@ -1084,7 +1125,7 @@ fn scratch_task(
         params![task_id, run_id, spec_id],
     )
     .map_err(sqlite_error)?;
-    tx.commit().map_err(sqlite_error)
+    commit_unhooked(tx)
 }
 
 fn ensure_project(
@@ -1099,15 +1140,14 @@ fn ensure_project(
         params![project_id, repo_path, crate::time::now_rfc3339()],
     )
     .map_err(sqlite_error)?;
-    tx.commit().map_err(sqlite_error)
+    commit_unhooked(tx)
 }
 
 /// One commit as one IMMEDIATE transaction; any error drops (rolls back) the transaction.
-fn apply(conn: &mut Connection, commit: &Commit, ctx: &Ctx<'_>) -> Result<Committed, PersistError> {
+fn apply(conn: &mut Connection, writes: &Commit, ctx: &Ctx<'_>) -> Result<Committed, PersistError> {
     let tx = begin(conn, ctx)?;
-    let done = write(&tx, commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    let done = write(&tx, writes, ctx)?;
+    commit(tx, ctx)?;
     Ok(done)
 }
 
@@ -1126,18 +1166,17 @@ pub(super) fn write_session_native(
     session_id: &str,
     native: &str,
 ) -> Result<(), PersistError> {
-    tx.execute(
-        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            project_id,
-            crate::ids::child_id(attempt_id, SESSION_NATIVE),
-            run_id,
-            SESSION_NATIVE,
-            serde_json::json!({"session_id": session_id, "native_id": native, "attempt_id": attempt_id}).to_string(),
-            crate::time::now_rfc3339()
-        ],
-    )
-    .map_err(sqlite_error)?;
+    insert_event(
+        tx,
+        &NewEvent {
+            project_id: project_id.to_owned(),
+            event_id: crate::ids::child_id(attempt_id, SESSION_NATIVE),
+            run_id: Some(run_id.to_owned()),
+            kind: SESSION_NATIVE.to_owned(),
+            payload: serde_json::json!({"session_id": session_id, "native_id": native, "attempt_id": attempt_id}),
+            intent: Intent::Progress,
+        },
+    )?;
     Ok(())
 }
 
@@ -1150,9 +1189,19 @@ pub(super) fn write(
     let mut revisions = Vec::with_capacity(commit.cas.len());
     for cas in &commit.cas {
         revisions.push(compare_and_set(tx, cas)?);
+        // A run that enters a stopping state gets its run.result at the end of the transaction, if it is still in one
+        // then (docs/adr/ADR-031.md decision 3).
+        if let Change::Run(to) = cas.change
+            && crate::exit::run_code(to).is_some()
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO temp.results_due(run_id) VALUES (?1)",
+                params![cas.id],
+            )
+            .map_err(sqlite_error)?;
+        }
     }
     ctx.at(WritePoint::StateWritten);
-    let now = crate::time::now_rfc3339();
     let mut event_seqs = Vec::with_capacity(commit.events.len());
     for event in &commit.events {
         if event.kind == SESSION_NATIVE {
@@ -1161,19 +1210,7 @@ pub(super) fn write(
                 event.event_id
             )));
         }
-        tx.execute(
-            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                event.project_id,
-                event.event_id,
-                event.run_id,
-                event.kind,
-                event.payload.to_string(),
-                now
-            ],
-        )
-        .map_err(sqlite_error)?;
-        event_seqs.push(tx.last_insert_rowid());
+        event_seqs.push(insert_event(tx, event)?);
     }
     // A run leaves BLOCKED only with every blocker claim released, this commit's releases counted
     // (docs/adr/ADR-025.md decision 5).
@@ -1226,6 +1263,189 @@ pub(super) fn write(
         revisions,
         event_seqs,
     })
+}
+
+/// The writer connection's TEMP tables (docs/adr/ADR-031.md decision 3 and correction D), only on that connection and
+/// rolled back with a transaction: `results_due`, the runs whose `run.result` this transaction's [`commit`] judges, and
+/// `command_run`, the run of the command it accepts.
+pub(super) fn temp_tables(conn: &Connection) -> Result<(), PersistError> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS results_due(run_id TEXT PRIMARY KEY); \
+         CREATE TEMP TABLE IF NOT EXISTS command_run(run_id TEXT PRIMARY KEY);",
+    )
+    .map_err(sqlite_error)
+}
+
+/// The end of a write transaction of the writer (docs/adr/ADR-031.md decision 3): [`finish`], then the fault hooks'
+/// word (an error fails the commit and the transaction rolls back), then the commit.
+pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
+    finish(&tx)?;
+    ctx.before_commit()?;
+    tx.commit().map_err(sqlite_error)
+}
+
+/// [`commit`] for the transactions that never were a point of the fault hooks (CR-006): their behaviour unchanged.
+pub(super) fn commit_unhooked(tx: Transaction<'_>) -> Result<(), PersistError> {
+    finish(&tx)?;
+    tx.commit().map_err(sqlite_error)
+}
+
+/// What every write transaction of the writer does last (docs/adr/ADR-031.md decision 3): each run registered in it that
+/// is in a stopping state E now gets its `run.result`, in run id order, the last events of the transaction; what it
+/// registered is emptied. A command's run in a terminal state now is an IntegrityViolation: no command is accepted on a
+/// terminal run (correction D).
+fn finish(tx: &Transaction<'_>) -> Result<(), PersistError> {
+    let ended: Option<String> = tx
+        .query_row(
+            "SELECT c.run_id FROM temp.command_run c JOIN main.runs r ON r.run_id = c.run_id \
+             WHERE r.state IN ('COMPLETED', 'FAILED', 'CANCELLED') ORDER BY c.run_id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(run) = ended {
+        return Err(PersistError::IntegrityViolation(format!(
+            "a command was accepted for run {run}, which has ended"
+        )));
+    }
+    let due: Vec<String> = {
+        let mut statement = tx
+            .prepare("SELECT run_id FROM temp.results_due ORDER BY run_id")
+            .map_err(sqlite_error)?;
+        let rows = statement
+            .query_map([], |r| r.get(0))
+            .map_err(sqlite_error)?;
+        rows.collect::<Result<_, _>>().map_err(sqlite_error)?
+    };
+    for run in &due {
+        append_result(tx, run)?;
+    }
+    tx.execute_batch("DELETE FROM temp.results_due; DELETE FROM temp.command_run;")
+        .map_err(sqlite_error)
+}
+
+/// Run `run`'s `run.result` if it is in a stopping state now (E1): `$defs.RunResult` with its own seq — the next
+/// AUTOINCREMENT value of events, predicted from `sqlite_sequence` and checked against the insert — and the id of the
+/// run's revision now (every transaction that writes one moves it).
+fn append_result(tx: &Transaction<'_>, run: &str) -> Result<(), PersistError> {
+    let (project_id, state, revision): (String, String, i64) = tx
+        .query_row(
+            "SELECT project_id, state, revision FROM runs WHERE run_id = ?1",
+            params![run],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sqlite_error)?;
+    if crate::exit::run_code(parse::<RunState>(&state)?).is_none() {
+        return Ok(());
+    }
+    let seq: i64 = tx
+        .query_row(
+            "SELECT coalesce((SELECT seq FROM main.sqlite_sequence WHERE name = 'events'), 0) + 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let result = super::results::compute(tx, run, seq)?;
+    let event = NewEvent {
+        project_id,
+        event_id: crate::ids::child_id(run, &format!("result/{revision}")),
+        run_id: Some(run.to_owned()),
+        kind: crate::protocol::RunResult::EVENT_KIND.to_owned(),
+        payload: serde_json::to_value(&result).map_err(|e| {
+            PersistError::IntegrityViolation(format!("the run.result of {run}: {e}"))
+        })?,
+        intent: Intent::Progress,
+    };
+    let written = insert(tx, &event)?;
+    if written != seq {
+        return Err(PersistError::IntegrityViolation(format!(
+            "the run.result of {run} was predicted at seq {seq} and written at {written}"
+        )));
+    }
+    Ok(())
+}
+
+/// The only `INSERT INTO events` of the product (docs/adr/ADR-031.md correction D, rule 1, E17); every writer's events
+/// come through it. An event of run R is written as it is unless R has stopped (`hold::stopped`); then it is written
+/// as it is when R is the run of the command this transaction accepts, project-scoped when it is a Record (its
+/// `run_id` null and R in its payload, its id kept), and refused with `RunStopped` when it is Progress. `run.result` is
+/// written only by [`commit`]. Returns the event's seq.
+pub(super) fn insert_event(tx: &Connection, event: &NewEvent) -> Result<i64, PersistError> {
+    if event.kind == crate::protocol::RunResult::EVENT_KIND {
+        return Err(PersistError::IntegrityViolation(format!(
+            "event {}: run.result is written only at the end of its transaction",
+            event.event_id
+        )));
+    }
+    insert(tx, event)
+}
+
+/// [`insert_event`] for every kind, `run.result` included.
+fn insert(tx: &Connection, event: &NewEvent) -> Result<i64, PersistError> {
+    if event.intent == Intent::Record && !super::hold::RECORD_KINDS.contains(&event.kind.as_str()) {
+        return Err(PersistError::IntegrityViolation(format!(
+            "event {}: {} is not a kind written as a record",
+            event.event_id, event.kind
+        )));
+    }
+    let mut run_id = event.run_id.as_deref();
+    let mut payload = std::borrow::Cow::Borrowed(&event.payload);
+    if let Some(run) = run_id
+        && event.kind != crate::protocol::RunResult::EVENT_KIND
+        && let Some(state) = super::hold::stopped(tx, run)?
+        && !super::hold::commanded(tx, run)?
+    {
+        match event.intent {
+            Intent::Progress => {
+                return Err(PersistError::RunStopped {
+                    run: run.to_owned(),
+                    state,
+                });
+            }
+            Intent::Record => {
+                payload = std::borrow::Cow::Owned(project_scoped(event, run)?);
+                run_id = None;
+            }
+        }
+    }
+    tx.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event.project_id,
+            event.event_id,
+            run_id,
+            event.kind,
+            payload.to_string(),
+            crate::time::now_rfc3339()
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// The payload of Record `event` of stopped run `run`, written project-scoped: the run named in it (`run_id`).
+fn project_scoped(event: &NewEvent, run: &str) -> Result<serde_json::Value, PersistError> {
+    let mut payload = event.payload.clone();
+    let object = payload.as_object_mut().ok_or_else(|| {
+        PersistError::IntegrityViolation(format!(
+            "record {} of run {run}: its payload is not an object",
+            event.event_id
+        ))
+    })?;
+    match object.get("run_id") {
+        None => {
+            object.insert("run_id".to_owned(), serde_json::Value::from(run));
+        }
+        Some(named) if named.as_str() == Some(run) => {}
+        Some(named) => {
+            return Err(PersistError::IntegrityViolation(format!(
+                "record {} of run {run} names run {named} in its payload",
+                event.event_id
+            )));
+        }
+    }
+    Ok(payload)
 }
 
 /// One compare-and-set inside `tx`: read the row, check the revision and the move, then write it guarded by the

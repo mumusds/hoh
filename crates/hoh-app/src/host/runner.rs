@@ -21,7 +21,7 @@ use hoh_agents::identity;
 use hoh_core::decision::Context;
 use hoh_core::delivery::Clock;
 use hoh_core::persistence::{
-    AttemptFacts, Commit, DispatchNotice, Ending, NewEvent, PersistError, SessionStart,
+    AttemptFacts, Commit, DispatchNotice, Ending, Intent, NewEvent, PersistError, SessionStart,
     UnfinishedRow,
 };
 use hoh_core::reconcile::{
@@ -385,15 +385,37 @@ pub(super) async fn run(
 }
 
 /// A recovery's outcome as decision 11 records it: what trying again cannot make good (damaged facts, a record that
-/// is not the candidate's) is permanent.
+/// is not the candidate's) is permanent. None when its run has stopped (Held, docs/adr/ADR-031.md correction D rule 2
+/// (c)): no failure, nothing to record; its records stay pending for when the run leaves its stop.
 fn recovery_outcome(
     recovered: Result<usize, crate::verify::check::CheckError>,
-) -> hoh_core::persistence::RecoveryOutcome {
+) -> Option<hoh_core::persistence::RecoveryOutcome> {
     use crate::verify::check::CheckError;
-    recovered.map_err(|e| {
-        let permanent = matches!(e, CheckError::Damaged(_) | CheckError::Refused(_));
-        (permanent, crate::verify::check::described(&e))
-    })
+    match recovered {
+        Ok(recorded) => Some(Ok(recorded)),
+        Err(CheckError::Store(PersistError::Held { .. })) => None,
+        Err(e) => {
+            let permanent = matches!(e, CheckError::Damaged(_) | CheckError::Refused(_));
+            Some(Err((permanent, crate::verify::check::described(&e))))
+        }
+    }
+}
+
+/// A store call's answer for one item of a tick (docs/adr/ADR-031.md correction D, rule 2 (b)): a stopped run's Held
+/// is no failure — the item is skipped and its run noted in `held`, so the tick's later steps of that run skip it too;
+/// nothing is said on stderr and the tick goes on. Any other error is its caller's, as before.
+fn unless_held<T>(
+    result: Result<T, PersistError>,
+    held: &mut std::collections::BTreeSet<String>,
+) -> Result<Option<T>, PersistError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(PersistError::Held { run, .. }) => {
+            held.insert(run);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The host's start for verification (docs/adr/ADR-028.md decision 16), before the first tick: every candidate with a
@@ -425,11 +447,17 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
         if !wanted {
             continue;
         }
-        let outcome =
-            recovery_outcome(crate::verify::check::reconcile(&handle, &state, candidate).await);
-        store
-            .record_start_recovery(candidate, outcome, common.clock.now())
-            .await?;
+        let Some(outcome) =
+            recovery_outcome(crate::verify::check::reconcile(&handle, &state, candidate).await)
+        else {
+            continue;
+        };
+        unless_held(
+            store
+                .record_start_recovery(candidate, outcome, common.clock.now())
+                .await,
+            &mut std::collections::BTreeSet::new(),
+        )?;
     }
     remove_unused(common).await?;
     let waiting = store.runner_waiting(&common.shared.project_id).await?;
@@ -439,7 +467,10 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
             .await
             .unwrap_or_default();
     for run in verified_runs(common, &waiting).await? {
-        store.reconcile_verification(&run, pending.clone()).await?;
+        unless_held(
+            store.reconcile_verification(&run, pending.clone()).await,
+            &mut std::collections::BTreeSet::new(),
+        )?;
     }
     Ok(())
 }
@@ -507,6 +538,7 @@ async fn open_manifest(common: &Common, registry: &Arc<super::agents::Registry>)
         .store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: project_id.clone(),
                 event_id: hoh_core::ids::child_id(
                     project_id,
@@ -565,6 +597,8 @@ async fn tick(
     let store = &common.shared.store;
     let project_id = common.shared.project_id.clone();
     let now = common.clock.now();
+    // The runs a store call of this tick found stopped (Held): their later steps of this tick are skipped.
+    let mut held = std::collections::BTreeSet::new();
     // Expired leases first, so the rounds below can grant their slots again (ADR-019 decision 7).
     for row in store.reconcile_scan(&project_id, now).await? {
         let waiting = held_back
@@ -577,7 +611,8 @@ async fn tick(
         let id = row.attempt_id.clone();
         let entry = common.inflight.lock().ok().and_then(|mut f| f.remove(&id));
         let last = held_back.get(&id).map(|(_, seen)| seen.clone());
-        match settle(common, &id, entry, "lease_expired", last.as_deref()).await? {
+        let settled = settle(common, &id, entry, "lease_expired", last.as_deref()).await;
+        match unless_held(settled, &mut held)?.flatten() {
             Some((Disposition::Unreaped, seen)) => {
                 held_back.insert(id, (Instant::now(), seen));
             }
@@ -622,7 +657,10 @@ async fn tick(
     // (decision 8), before any pace or round: a change to an agent unavailable is refused, one to an agent not looked
     // at yet waits.
     for run in &waiting.team_behind {
-        store.team_checkpoint(run, availability.clone()).await?;
+        unless_held(
+            store.team_checkpoint(run, availability.clone()).await,
+            &mut held,
+        )?;
     }
     // Staffing (docs/adr/ADR-030.md decision 1), where the binder was: after the checkpoints, before the first inputs,
     // the reconcile, the paces and the rounds, so they read the bindings it wrote; every binding judged against one
@@ -662,7 +700,10 @@ async fn tick(
     };
     for start in &session_starts {
         if start.current_epoch > start.role_epoch {
-            store.supersede_session_start(&start.message_id).await?;
+            unless_held(
+                store.supersede_session_start(&start.message_id).await,
+                &mut held,
+            )?;
             continue;
         }
         let Some(session) = &start.session_id else {
@@ -671,9 +712,12 @@ async fn tick(
         let answer = tokio::time::timeout(OPEN_SESSION, common.executor.open_session(start)).await;
         let failure = match answer {
             Ok(Ok(Ok(()))) => {
-                store
-                    .deliver_session_start(&start.message_id, session)
-                    .await?;
+                unless_held(
+                    store
+                        .deliver_session_start(&start.message_id, session)
+                        .await,
+                    &mut held,
+                )?;
                 continue;
             }
             Ok(Ok(Err(e))) => e,
@@ -681,9 +725,16 @@ async fn tick(
             Err(_) => format!("no answer within {OPEN_SESSION:?}"),
         };
         // Seen in the run's events, once, not only on stderr: the role waits for its first input (M2T17R-150).
-        store
-            .session_start_undelivered(&start.message_id, &failure)
-            .await?;
+        if unless_held(
+            store
+                .session_start_undelivered(&start.message_id, &failure)
+                .await,
+            &mut held,
+        )?
+        .is_none()
+        {
+            continue;
+        }
         if common
             .undelivered
             .lock()
@@ -733,39 +784,63 @@ async fn tick(
         if !due || not_before.is_some_and(|t| common.clock.now() < t) {
             continue;
         }
-        let outcome = recovery_outcome(
+        let Some(outcome) = recovery_outcome(
             crate::verify::check::reconcile(&handle, &common.shared.root.join(".hoh"), candidate)
                 .await,
-        );
-        store
-            .record_recovery(candidate, outcome, common.clock.now())
-            .await?;
+        ) else {
+            continue;
+        };
+        unless_held(
+            store
+                .record_recovery(candidate, outcome, common.clock.now())
+                .await,
+            &mut held,
+        )?;
     }
     for run in verified_runs(common, &waiting).await? {
-        store.reconcile_verification(&run, pending.clone()).await?;
+        if held.contains(&run) {
+            continue;
+        }
+        unless_held(
+            store.reconcile_verification(&run, pending.clone()).await,
+            &mut held,
+        )?;
     }
     // Run directories and request directories no live attempt uses, whichever path ended theirs (a cancel's included,
     // M2T16R-54): removed, off the async threads.
     remove_unused(common).await?;
     for run in &waiting.runs {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
-        store.pace_run(run, at()).await?;
-        while store.schedule_round(run, at()).await?.dispatched.is_some() {}
+        if held.contains(run) || unless_held(store.pace_run(run, at()).await, &mut held)?.is_none()
+        {
+            continue;
+        }
+        while let Some(round) = unless_held(store.schedule_round(run, at()).await, &mut held)?
+            && round.dispatched.is_some()
+        {}
     }
     // The supervisor (docs/adr/ADR-025.md decisions 2, 3, 5 and 8): each run's step (its triggers, its Commander's
     // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now. The registry's
     // looks, by their identity, judge whether a Commander's agent is there (decision 5): the tick's snapshot's
     // (docs/adr/ADR-030.md decision 1), in `at()`.
     for run in &waiting.supervised {
+        if held.contains(run) {
+            continue;
+        }
         let stepped = store.supervise(run, at()).await;
         // A run's failing step is its own: said once, and the tick goes on with the other runs, the allocation and
-        // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51).
-        match stepped {
+        // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51). A stopped run's step is
+        // no failure (Held, docs/adr/ADR-031.md correction D): not recorded, not said.
+        match unless_held(stepped, &mut held) {
             Ok(_) => {}
             Err(
                 e @ (PersistError::WriterStopped | PersistError::Busy(_) | PersistError::Full(_)),
             ) => return Err(e),
             Err(e) => {
+                let Ok(failure) = hoh_core::persistence::hold::Failure::try_from(e) else {
+                    continue;
+                };
+                let e = failure;
                 // Seen in the run's events too, once per error (v15, M2T08R-152); its own failure only said.
                 if let Err(failed) = store.supervision_failed(run, &e.to_string()).await {
                     use std::io::Write as _;
@@ -790,12 +865,18 @@ async fn tick(
         }
     }
     // The allocation judges by the same looks (docs/adr/ADR-025.md v14 decision 5).
-    store.allocate_supervision(&project_id, at()).await?;
+    unless_held(
+        store.allocate_supervision(&project_id, at()).await,
+        &mut held,
+    )?;
     for stop in store.supervision_stops(&project_id, at()).await? {
         if stop.state == "PREPARED" {
-            store
-                .withdraw_turn(&stop.attempt_id, common.clock.now())
-                .await?;
+            unless_held(
+                store
+                    .withdraw_turn(&stop.attempt_id, common.clock.now())
+                    .await,
+                &mut held,
+            )?;
             continue;
         }
         let waiting_out = held_back
@@ -812,15 +893,15 @@ async fn tick(
         let last = held_back
             .get(&stop.attempt_id)
             .map(|(_, seen)| seen.clone());
-        match settle(
+        let settled = settle(
             common,
             &stop.attempt_id,
             entry,
             stop.reason,
             last.as_deref(),
         )
-        .await?
-        {
+        .await;
+        match unless_held(settled, &mut held)?.flatten() {
             Some((Disposition::Unreaped, seen)) => {
                 held_back.insert(stop.attempt_id.clone(), (Instant::now(), seen));
             }
@@ -830,7 +911,7 @@ async fn tick(
         }
     }
     for (message_id, _) in &waiting.started {
-        store.ack_notice(message_id).await?;
+        unless_held(store.ack_notice(message_id).await, &mut held)?;
     }
     // Dispatches made by these rounds are taken on the next tick (their commit wakes the loop).
     for notice in waiting.dispatches {
@@ -861,7 +942,11 @@ async fn tick(
                 // An error is settled at once, its entry still there so no tick takes it meanwhile (M2T05R-260);
                 // however it ends, its entry then goes (no lease is renewed for it any more; a settle that failed is
                 // left to its lease's expiry, M2T05R-102, -150).
-                if let Err(e) = result {
+                // A stopped run's write is no failure of the attempt (Held, docs/adr/ADR-031.md correction D): no
+                // runner_error settle.
+                if let Err(e) = result.or_else(|e| {
+                    hoh_core::persistence::hold::Failure::try_from(e).map_or(Ok(()), Err)
+                }) {
                     use std::io::Write as _;
                     let _ = writeln!(std::io::stderr(), "hoh host: an attempt of the runner: {e}");
                     let entry = Entry { work, task: None };
@@ -1155,6 +1240,7 @@ async fn attempt(
         store
             .commit(Commit {
                 events: vec![NewEvent {
+                    intent: Intent::Record,
                     project_id: common.shared.project_id.clone(),
                     event_id: hoh_core::ids::child_id(&id, "runner/unreaped"),
                     run_id: Some(work.run_id.clone()),
@@ -1204,6 +1290,7 @@ async fn attempt(
         store
             .commit(Commit {
                 events: vec![NewEvent {
+                    intent: Intent::Record,
                     project_id: common.shared.project_id.clone(),
                     event_id: hoh_core::ids::child_id(&id, name),
                     run_id: Some(work.run_id.clone()),
@@ -1407,6 +1494,7 @@ async fn run_check(
         store
             .commit(Commit {
                 events: vec![NewEvent {
+                    intent: Intent::Progress,
                     project_id: common.shared.project_id.clone(),
                     event_id: hoh_core::ids::child_id(&work.attempt_id, &format!("check_refused/{n}")),
                     run_id: Some(work.run_id.clone()),
@@ -1530,6 +1618,7 @@ fn identity_of(work: &Work) -> Result<hoh_core::bridge::Identity, PersistError> 
 /// collide with it (M2T05R-06).
 fn step(row: &UnfinishedRow, prefix: &str, pass: &str, name: &str, payload: Value) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: row.project_id.clone(),
         event_id: hoh_core::ids::child_id(&row.attempt_id, &format!("{pass}/{name}")),
         run_id: Some(row.run_id.clone()),

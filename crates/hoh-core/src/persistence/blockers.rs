@@ -4,7 +4,7 @@
 //! transaction; each source releases only its own claims. The sources: `pace` (what blocks the tasks of a run none of
 //! whose tasks can move on), `budget` (a cost limit it cannot enforce), `supervisor` and `commander:<decision_id>`.
 
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
@@ -186,6 +186,7 @@ impl Claims {
             payload["migrated"] = json!(true);
         }
         self.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: self.project_id.clone(),
             event_id: child_id(&self.run_id, &format!("blocker/{}", self.next)),
             run_id: Some(self.run_id.clone()),
@@ -276,6 +277,7 @@ pub(super) fn follow(
         .map_err(sqlite_error)?;
     let state = writer::parse::<RunState>(&state)?;
     let event = |id: String, kind: &str, payload: serde_json::Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),

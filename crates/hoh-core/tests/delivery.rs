@@ -10,8 +10,8 @@
 use hoh_core::delivery::{Clock, Consumer, DeliveryError, Dispatcher, LocalTransport, Transport};
 use hoh_core::persistence::selftest::{self, ProbeCommand};
 use hoh_core::persistence::{
-    Change, Commit, ConsumeEffect, Entity, NewAttempt, NewEvent, NewOutbox, Options, OutboxRow,
-    PersistError, StateCas, Store, TaskResultOutcome,
+    Change, Commit, ConsumeEffect, Entity, Intent, NewAttempt, NewEvent, NewOutbox, Options,
+    OutboxRow, PersistError, StateCas, Store, TaskResultOutcome,
 };
 use hoh_core::protocol::{self, ContextHandoff, Message, RejectionReason, TaskResult};
 use serde_json::{Value, json};
@@ -167,6 +167,7 @@ async fn enqueue(store: &Store, tag: &str, messages: &[Message]) -> R {
     store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: format!("enqueue/{tag}"),
                 run_id: Some("R".to_owned()),
@@ -228,6 +229,7 @@ impl Consumer for Touch {
                 change: Change::Touch(Entity::Task),
             }],
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: format!("{}/touched", message.message_id),
                 run_id: Some(message.run_id.clone()),
@@ -808,6 +810,7 @@ async fn test_062_03_redelivery_applies_once_and_a_bad_foreign_key_rolls_back_it
     // One transaction: a valid event, then an attempt of a task that does not exist.
     let effect = ConsumeEffect {
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: "bad/valid-event".to_owned(),
             run_id: Some("R".to_owned()),
@@ -1199,6 +1202,7 @@ async fn runtime_notices_in_the_outbox_are_left_for_their_own_consumer() -> R {
     store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "notice".to_owned(),
                 run_id: Some("R".to_owned()),
@@ -2143,6 +2147,7 @@ async fn a_returned_claim_does_not_make_other_writes_wait_longer_for_a_busy_data
         let started = std::time::Instant::now();
         let commit = Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "w/event".to_owned(),
                 run_id: Some("R".to_owned()),
@@ -2327,6 +2332,7 @@ async fn a_claim_held_when_the_writer_panics_cannot_start() -> R {
     let _ = store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "boom".to_owned(),
                 run_id: Some("R".to_owned()),

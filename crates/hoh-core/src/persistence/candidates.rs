@@ -42,8 +42,7 @@ pub(super) fn freeze(
 ) -> Result<Frozen, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
     let frozen = freeze_in(&tx, job)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(frozen)
 }
 
@@ -131,18 +130,17 @@ pub(super) fn freeze_in(tx: &Transaction<'_>, job: &Freeze) -> Result<Frozen, Pe
         ],
     )
     .map_err(sqlite_error)?;
-    tx.execute(
-        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            project_id,
-            crate::ids::child_id(id, "frozen"),
-            job.run_id,
-            "candidate.frozen",
-            json!({"candidate_id": id, "superseded": superseded, "source_path": job.export.path}).to_string(),
-            now
-        ],
-    )
-    .map_err(sqlite_error)?;
+    super::writer::insert_event(
+        tx,
+        &super::writer::NewEvent {
+            project_id: project_id.clone(),
+            event_id: crate::ids::child_id(id, "frozen"),
+            run_id: Some(job.run_id.clone()),
+            kind: "candidate.frozen".to_owned(),
+            payload: json!({"candidate_id": id, "superseded": superseded, "source_path": job.export.path}),
+            intent: super::writer::Intent::Progress,
+        },
+    )?;
     // Every other candidate of the run is now superseded for its reports (docs/adr/ADR-029.md decision 8): their
     // CURRENT reports STALE in this transaction.
     let others: Vec<String> = {

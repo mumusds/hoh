@@ -6,7 +6,7 @@
 //! its event and outbox message, and the exact accepted result is stored with the command. Only accepted commands get
 //! a row (`accepted_at` is required): a rejected command is decided again when it is retried.
 
-use super::writer::{self, Change, Commit, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Change, Commit, Intent, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::lifecycle::Lifecycle as _;
 use crate::protocol::RunState;
@@ -201,6 +201,9 @@ pub(super) fn submit(
             (revision, done.event_seqs[0])
         }
         target => {
+            // A run command: every event of its run in this transaction is the command's, written even while the run
+            // is stopped (docs/adr/ADR-031.md correction D: an INCOMPLETE run takes commands).
+            super::hold::command(&tx, &command.run_id)?;
             let run: Option<(String, Option<String>, String)> = tx
                 .query_row(
                     "SELECT state, resume_state, project_id FROM runs WHERE run_id = ?1",
@@ -264,6 +267,7 @@ pub(super) fn submit(
                     cas.extend(moves);
                     events.extend(withdrawn);
                     events.push(NewEvent {
+                        intent: Intent::Progress,
                         project_id: project_id.clone(),
                         event_id: crate::ids::child_id(&command.run_id, &format!("resumed-blocked/{}", command.command_id)),
                         run_id: Some(command.run_id.clone()),
@@ -348,8 +352,7 @@ pub(super) fn submit(
     if let Some(made) = &team_revision {
         super::team::record(&tx, &command.event.project_id, &command.command_id, made)?;
     }
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(CommandOutcome::Accepted {
         result_json,
         revision,
@@ -395,6 +398,7 @@ fn resume_reconcile(
         });
     }
     Ok(NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: crate::ids::child_id(&command.run_id, &format!("resume/{}", command.command_id)),
         run_id: Some(command.run_id.clone()),

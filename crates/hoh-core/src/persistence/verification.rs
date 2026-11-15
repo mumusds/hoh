@@ -4,7 +4,7 @@
 //! transaction.
 
 use super::decide::load_binding;
-use super::writer::{NewEvent, NewOutbox};
+use super::writer::{Intent, NewEvent, NewOutbox};
 use super::{PersistError, sqlite_error};
 use crate::handoff::{self, Recipient, Verification};
 use crate::ids::child_id;
@@ -17,6 +17,36 @@ pub(super) const ROUND_OPENED: &str = "verification.round_opened";
 
 /// The kind of the event that closes a round (decision 11).
 pub(super) const ROUND_CLOSED: &str = "verification.round_closed";
+
+/// Whether candidate `candidate` is a live verification obligation (docs/adr/ADR-031.md correction D, its two
+/// predicates): it is VERIFYING, REJECTED or INVALID, has a round not closed, and no persistent fact says it was
+/// superseded (`candidate.stale`, a Record of a stopped run included, or a later freeze that listed it). No stop
+/// condition: it is the same before and after its run stops, and decides only whether its recovery's writes are the
+/// run's progress (live) or history (Records); whether that work is done now is [`super::Reader::recovery_due`].
+pub(super) fn live_obligation(
+    conn: &rusqlite::Connection,
+    candidate: &str,
+) -> Result<bool, PersistError> {
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.candidate_id = ?1 \
+               AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
+             AND EXISTS(SELECT 1 FROM events o WHERE o.kind = 'verification.round_opened' \
+               AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM events x \
+                 WHERE x.kind = 'verification.round_closed' \
+                 AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
+             AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
+               AND {} AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
+             AND NOT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
+               WHERE f.kind = 'candidate.frozen' AND f.run_id = (SELECT run_id FROM candidates \
+               WHERE candidate_id = ?1) AND v.value = ?1)",
+            super::hold::of_run("s", "(SELECT run_id FROM candidates WHERE candidate_id = ?1)")
+        ),
+        params![candidate],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
 
 /// The writer tasks of run `run_id` an open round holds (decision 13, REQ-037 decision 1): a round not closed whose
 /// candidate has an Issue not closed (OPEN or REOPENED), and the task has a requirement with a criterion in that
@@ -163,6 +193,7 @@ pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, P
         .map(|m| NewOutbox::hcp(o.outbox_event, m))
         .collect::<Result<Vec<_>, _>>()?;
     let event = NewEvent {
+        intent: Intent::Progress,
         project_id: o.project_id.to_owned(),
         event_id: child_id(&round_id, "opened"),
         run_id: Some(o.run_id.to_owned()),
@@ -339,6 +370,7 @@ pub(super) fn unknown_effect(
             change: super::writer::Change::Task(crate::protocol::TaskState::Blocked),
         },
         NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(attempt_id, "need_decision"),
             run_id: Some(run_id.to_owned()),
@@ -575,6 +607,7 @@ pub(super) fn admit(
         .payload
         .insert("role_epoch".to_owned(), json!(role_epoch));
     let mut events = vec![NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(&again.message_id, "issued"),
         run_id: Some(run_id.to_owned()),
@@ -585,6 +618,7 @@ pub(super) fn admit(
     }];
     if matches!(state.as_str(), "PENDING" | "DELIVERING") {
         events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(&handoff, "dead_letter"),
             run_id: Some(run_id.to_owned()),
@@ -672,6 +706,7 @@ pub(super) fn refuse(
     .map_err(sqlite_error)?;
     let key = |what: &str| child_id(r.task_id, &format!("{}/{}/{what}", r.cause, r.revision));
     let event = |event_id: String, kind: &str, payload: serde_json::Value| NewEvent {
+        intent: Intent::Progress,
         project_id: r.project_id.to_owned(),
         event_id,
         run_id: Some(r.run_id.to_owned()),
@@ -770,6 +805,7 @@ pub(super) fn request(
         .map_err(sqlite_error)?;
     let key = child_id(attempt_id, &format!("request/{message_id}"));
     let event = |event_id: String, kind: &str, payload: serde_json::Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.clone(),
         event_id,
         run_id: Some(run_id.clone()),
@@ -837,8 +873,7 @@ pub(super) fn request(
         ctx,
     )?;
     // A change request's Issue is a present fact of its fingerprint (docs/adr/ADR-029.md decision 10, M2T18D-701).
-    super::issues::settle_all(&tx, run_id)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::issues::settle_all(&tx, run_id, Intent::Progress)?;
+    super::writer::commit(tx, ctx)?;
     Ok(issue)
 }

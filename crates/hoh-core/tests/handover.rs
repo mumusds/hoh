@@ -10,8 +10,8 @@ use hoh_core::config::Config;
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{self, ProbeCommand};
 use hoh_core::persistence::{
-    Availability, Commit, ConsumeEffect, Decided, Fenced, NewEvent, NewOutbox, Options, RunTarget,
-    Store, SubmitCommand, TeamChange,
+    Availability, Commit, ConsumeEffect, Decided, Fenced, Intent, NewEvent, NewOutbox, Options,
+    RunTarget, Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::Message;
 use serde_json::{Value, json};
@@ -123,6 +123,7 @@ async fn world(store: &Store, path: &Path) -> R {
                 policy: "balanced".to_owned(),
             },
             event: NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "e-start".to_owned(),
                 run_id: Some("R".to_owned()),
@@ -170,6 +171,7 @@ async fn hand_over(store: &Store, path: &Path) -> R {
                 file: None,
             }),
             event: NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "e-pi".to_owned(),
                 run_id: None,
@@ -461,6 +463,7 @@ async fn queue(store: &Store, message: &Message) -> R {
     store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: format!("queued/{}", message.message_id),
                 run_id: Some("R".to_owned()),
@@ -478,6 +481,7 @@ async fn queue(store: &Store, message: &Message) -> R {
 fn applied(message: &Message) -> ConsumeEffect {
     ConsumeEffect {
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: format!("effect/{}", message.message_id),
             run_id: Some("R".to_owned()),

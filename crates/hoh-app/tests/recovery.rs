@@ -9,7 +9,7 @@
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::{Context, Proposal};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
-use hoh_core::persistence::{Commit, FaultHooks, NewEvent, WritePoint};
+use hoh_core::persistence::{Commit, FaultHooks, Intent, NewEvent, WritePoint};
 use hoh_core::protocol::Message;
 use serde_json::{Value, json};
 use std::os::unix::process::ExitStatusExt;
@@ -2190,6 +2190,7 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
         .store()
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: host.project_id.clone(),
                 event_id: "old-host-write".to_owned(),
                 run_id: Some("R".to_owned()),

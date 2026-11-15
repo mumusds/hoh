@@ -5,7 +5,7 @@
 //! `supervisor.allocated` until its attempt ends.
 
 use super::decide::{self, LeaseRequest, Leased};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, leases, sqlite_error};
 use crate::decision::Context;
 use crate::ids::child_id;
@@ -391,6 +391,7 @@ pub(super) fn rearm(
             });
         }
         events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(&turn.attempt_id, "rearmed"),
             run_id: Some(run_id.to_owned()),
@@ -944,8 +945,7 @@ pub(super) fn allocate(
         }
         if !rearmed.events.is_empty() {
             writer::write(&tx, &rearmed, ctx)?;
-            ctx.before_commit()?;
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit(tx, ctx)?;
         }
         return Ok(None);
     };
@@ -959,8 +959,7 @@ pub(super) fn allocate(
     }) else {
         if !rearmed.events.is_empty() {
             writer::write(&tx, &rearmed, ctx)?;
-            ctx.before_commit()?;
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit(tx, ctx)?;
         }
         return Ok(None);
     };
@@ -1031,6 +1030,7 @@ pub(super) fn allocate(
                     .join(&digest[..16])
                     .join(session.replace('%', "%25").replace('/', "%2F"));
                 rearmed.events.push(NewEvent {
+                    intent: Intent::Progress,
                     project_id: chosen.project_id.clone(),
                     event_id: child_id(&task_id, "workdir"),
                     run_id: Some(chosen.run_id.clone()),
@@ -1042,6 +1042,7 @@ pub(super) fn allocate(
     }
     if chosen.probe {
         rearmed.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: chosen.project_id.clone(),
             event_id: child_id(&task_id, "probe"),
             run_id: Some(chosen.run_id.clone()),
@@ -1057,6 +1058,7 @@ pub(super) fn allocate(
             .events
             .into_iter()
             .chain([NewEvent {
+                intent: Intent::Progress,
             project_id: chosen.project_id.clone(),
             event_id: child_id(&task_id, "allocated"),
             run_id: Some(chosen.run_id.clone()),
@@ -1096,8 +1098,7 @@ pub(super) fn allocate(
         }],
     };
     writer::write(&tx, &commit, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(Some(Allocated {
         run_id: chosen.run_id,
         wake: chosen.wake.id,
@@ -1417,6 +1418,7 @@ pub(super) fn judge(
     let (reasons, observation) = (&verdict.reasons, &verdict.observation);
     let last = recorded(tx, run_id)?;
     let event = |id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),
@@ -1661,6 +1663,7 @@ pub(super) fn advance_horizon(
         return Ok(None);
     }
     Ok(Some(NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(run_id, &format!("supervisor/horizon/{next}")),
         run_id: Some(run_id.to_owned()),
@@ -1815,6 +1818,7 @@ fn defer_once(
         .map(|w| w.id.as_str())
         .collect();
     Ok(Some(NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(run_id, &format!("deferred/{n}")),
         run_id: Some(run_id.to_owned()),
@@ -1917,6 +1921,7 @@ pub(super) fn stops(
                 let recorded = has_event(&tx, &child_id(&turn.attempt_id, "turn_limit"))?;
                 if !recorded {
                     events.push(NewEvent {
+                        intent: Intent::Progress,
                         project_id: project_id.to_owned(),
                         event_id: child_id(&turn.attempt_id, "turn_limit"),
                         run_id: Some(run_id.clone()),
@@ -1954,8 +1959,7 @@ pub(super) fn stops(
             },
             ctx,
         )?;
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit(tx, ctx)?;
     }
     Ok(found)
 }
@@ -2016,6 +2020,7 @@ pub(super) fn withdraw_turn(
         &Commit {
             cas,
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id,
                 event_id: child_id(attempt_id, "withdrawn"),
                 run_id: Some(run_id),
@@ -2026,8 +2031,7 @@ pub(super) fn withdraw_turn(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 

@@ -205,6 +205,7 @@ pub(super) fn prepare(
     let package = crate::protocol::encode(&package)
         .map_err(|e| PersistError::IntegrityViolation(format!("the handover package: {e}")))?;
     let event = super::writer::NewEvent {
+        intent: super::writer::Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: crate::ids::child_id(run_id, &format!("handoff/{role}/{epoch}")),
         run_id: Some(run_id.to_owned()),
@@ -350,6 +351,7 @@ pub(super) fn undelivered(
         &tx,
         &super::writer::Commit {
             events: vec![super::writer::NewEvent {
+                intent: super::writer::Intent::Progress,
                 project_id,
                 event_id,
                 run_id: Some(run_id.clone()),
@@ -362,8 +364,7 @@ pub(super) fn undelivered(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -434,6 +435,7 @@ pub(super) fn settle(
         &tx,
         &super::writer::Commit {
             events: vec![super::writer::NewEvent {
+                intent: super::writer::Intent::Progress,
                 project_id,
                 event_id: crate::ids::child_id(message_id, kind),
                 run_id: Some(run_id),
@@ -444,7 +446,6 @@ pub(super) fn settle(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }

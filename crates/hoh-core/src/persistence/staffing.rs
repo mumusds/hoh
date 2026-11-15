@@ -7,7 +7,7 @@
 //! staffing state.
 
 use super::team::TeamConfig;
-use super::writer::{self, Commit, Ctx, NewEvent, NewOutbox};
+use super::writer::{self, Commit, Ctx, Intent, NewEvent, NewOutbox};
 use super::{PersistError, sqlite_error};
 use crate::ids::{child_id, member, series};
 use crate::protocol::BlockedReason;
@@ -345,6 +345,7 @@ impl Writes<'_> {
             body.extend(more);
         }
         self.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: self.project_id.clone(),
             event_id: member(&self.stem, self.next),
             run_id: Some(self.change.run_id.clone()),
@@ -357,6 +358,7 @@ impl Writes<'_> {
     /// Another event of the write.
     fn event(&mut self, event_id: String, kind: &str, payload: Value) {
         self.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: self.project_id.clone(),
             event_id,
             run_id: Some(self.change.run_id.clone()),
@@ -612,8 +614,7 @@ pub(super) fn staff(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -683,6 +684,7 @@ pub(super) fn turn_failed(
         return Ok(Vec::new());
     };
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id,
         run_id: Some(run_id.to_owned()),

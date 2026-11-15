@@ -3879,6 +3879,7 @@ pub(in crate::persistence) fn pass_recording(
             failing: Vec::new(),
         }],
         integrity: Vec::new(),
+        source: crate::persistence::RecordingSource::Run,
     }
 }
 

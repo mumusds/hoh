@@ -3,6 +3,7 @@
 //! the integrity event when the source changed, and the candidate's veto.
 
 use super::runner::{ArtifactRow, artifact_id, register};
+use super::writer::{Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::verification::{Outcome, Record, Status};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -77,6 +78,18 @@ pub struct Recording {
     pub rows: Vec<AcceptanceRow>,
     /// The post-check's reasons when the source or the candidate changed during the check (decision 7).
     pub integrity: Vec<String>,
+    /// Who hands it over: the attempt's own check run, or the recovery of a pending record.
+    pub source: RecordingSource,
+}
+
+/// Who hands a [`Recording`] to the store (docs/adr/ADR-031.md correction D, its write intents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingSource {
+    /// The check's own run, while its attempt has not ended: always the run's progress.
+    Run,
+    /// The recovery of a record a crash left pending: the run's progress while its candidate is a live obligation,
+    /// else history (Records, project-scoped on a stopped run).
+    Recovery,
 }
 
 /// Record `job` in one transaction; refused with nothing written when its candidate is unknown or its producer is not
@@ -121,6 +134,15 @@ pub(super) fn record(
         }
         Some(_) => {}
     }
+    let intent = match job.source {
+        RecordingSource::Run => Intent::Progress,
+        RecordingSource::Recovery
+            if super::verification::live_obligation(&tx, &r.candidate_id)? =>
+        {
+            Intent::Progress
+        }
+        RecordingSource::Recovery => Intent::Record,
+    };
     // Recorded already (docs/adr/ADR-027.md decision 8, recovery protocol; M2T10R-101, -150): the same record again is
     // nothing to do, whoever commits it second; another record under its id is refused.
     let recorded: Option<String> = tx
@@ -250,13 +272,18 @@ pub(super) fn record(
         .map_err(sqlite_error)?;
     }
     let event = |id: String, kind: &str, payload: Value| {
-        tx.execute(
-            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![project_id, id, run_id, kind, payload.to_string(), now],
+        super::writer::insert_event(
+            &tx,
+            &NewEvent {
+                project_id: project_id.clone(),
+                event_id: id,
+                run_id: Some(run_id.clone()),
+                kind: kind.to_owned(),
+                payload,
+                intent,
+            },
         )
         .map(|_| ())
-        .map_err(sqlite_error)
     };
     event(
         crate::ids::child_id(&r.record_id, "evidence"),
@@ -284,9 +311,8 @@ pub(super) fn record(
     }
     // Its rows and its veto change what resolves an Issue (docs/adr/ADR-029.md decision 10): materialised before the
     // commit.
-    super::issues::settle_all(&tx, &run_id)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)
+    super::issues::settle_all(&tx, &run_id, intent)?;
+    super::writer::commit(tx, ctx)
 }
 
 #[cfg(test)]

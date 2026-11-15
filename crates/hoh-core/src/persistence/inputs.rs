@@ -4,7 +4,7 @@
 //! `lifecycle::InputState` (`ILLEGAL_TRANSITION` otherwise). Each write appends its event in the same transaction.
 
 use super::decide::child_id;
-use super::writer::{self, Commit, Entity, NewEvent};
+use super::writer::{self, Commit, Entity, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::lifecycle::{self, InputState, Lifecycle};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -60,6 +60,7 @@ fn event(
         .ok_or_else(|| PersistError::IntegrityViolation(format!("no run {run_id}")))?;
     let commit = Commit {
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id,
             event_id,
             run_id: Some(run_id.to_owned()),

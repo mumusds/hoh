@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream::{self, Stream};
 use hoh_core::persistence::{
-    CommandOutcome, EventRow, FileTeam, NewEvent, NewOutbox, PersistError, Reader, RunTarget,
-    Store, SubmitCommand, TeamChange,
+    CommandOutcome, EventRow, FileTeam, Intent, NewEvent, NewOutbox, PersistError, Reader,
+    RunTarget, Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::{self, Command, CommandBody, RunState};
 use serde_json::{Value, json};
@@ -424,6 +424,7 @@ pub(super) async fn sync_config(
             if !seen {
                 let commit = hoh_core::persistence::Commit {
                     events: vec![NewEvent {
+                        intent: Intent::Progress,
                         project_id: shared.project_id.clone(),
                         event_id,
                         run_id: None,
@@ -487,6 +488,7 @@ pub(super) async fn sync_config(
                 }),
             }),
             event: NewEvent {
+                intent: Intent::Progress,
                 project_id: shared.project_id.clone(),
                 event_id: command_id.clone(),
                 run_id: None,
@@ -785,10 +787,13 @@ async fn submit_command(
             }),
             "team.configured",
             None,
+            // The project's event whether or not a run is named (ADR-022 decision 4; docs/adr/ADR-031.md correction
+            // D, -501): the named run, if any, only in its payload.
             json!({
                 "revision": command.expected_revision.saturating_add(1),
                 "bindings": team.bindings,
                 "scheduler": team.scheduler,
+                "run_id": command.run_id,
             }),
         ),
         // No notice: nothing waits for a resume but the rounds, which follow the run's state.
@@ -851,6 +856,7 @@ async fn submit_command(
         .map(|b| format!("{b:02x}"))
         .collect();
     let event_id = super::new_id();
+    let project_scoped = matches!(target, RunTarget::Team(_));
     let mut payload = json!({"command_id": command.command_id});
     if let (Some(all), Some(more)) = (payload.as_object_mut(), details.as_object()) {
         all.extend(more.clone());
@@ -865,9 +871,10 @@ async fn submit_command(
         payload_sha256,
         target,
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: shared.project_id.clone(),
             event_id: event_id.clone(),
-            run_id: (!run_id.is_empty()).then(|| run_id.clone()),
+            run_id: (!run_id.is_empty() && !project_scoped).then(|| run_id.clone()),
             kind: event_kind.to_owned(),
             payload,
         },

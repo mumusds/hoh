@@ -574,6 +574,7 @@ pub(super) fn checkpoint(
     let mut behind = false;
     let applied = |role: &str, epoch: i64, from: serde_json::Value, to: serde_json::Value| {
         super::writer::NewEvent {
+            intent: super::writer::Intent::Progress,
             project_id: project_id.clone(),
             event_id: crate::ids::child_id(run_id, &format!("team/{role}/{epoch}")),
             run_id: Some(run_id.to_owned()),
@@ -595,6 +596,7 @@ pub(super) fn checkpoint(
         }
         let (written, refused) = verdicts(&tx, run_id, &binding.role, revision)?;
         let verdict = |kind: &str, payload: serde_json::Value| super::writer::NewEvent {
+            intent: super::writer::Intent::Progress,
             project_id: project_id.clone(),
             event_id: crate::ids::child_id(
                 run_id,
@@ -759,8 +761,7 @@ pub(super) fn checkpoint(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -1136,6 +1137,7 @@ pub(super) fn bind_session(
         &tx,
         &super::writer::Commit {
             events: vec![super::writer::NewEvent {
+                intent: super::writer::Intent::Progress,
                 project_id,
                 event_id: crate::ids::child_id(&id, "bound"),
                 run_id: Some(grant.run_id.clone()),
@@ -1150,8 +1152,7 @@ pub(super) fn bind_session(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 

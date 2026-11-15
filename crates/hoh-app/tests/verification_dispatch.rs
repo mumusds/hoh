@@ -2467,6 +2467,89 @@ async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejec
     outcome
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_cut_short_after_its_attempts_ended_closes_the_round_when_the_host_starts_again()
+-> R {
+    // docs/adr/ADR-031.md decision 4's crash safety (M2T13D-302; test plan "取消的验证收尾"): the host died while the run
+    // was cancelling, its verifiers' attempts ended and their round still open, before the cancel's last step. After the
+    // restart the run is still CANCEL_REQUESTED, and the first cancel step closes the round superseded, rejects its
+    // handoffs and ends the run, in one transaction whose last event is the run's run.result.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    let first = host(&project, team.clone(), clock.clone()).await?;
+    let running = wait_for(
+        &project,
+        &clock,
+        Duration::from_millis(100),
+        "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+         WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
+        &|r| r[0]["n"] == json!(2),
+    );
+    first.shutdown().await;
+    team.end_agents();
+    running?;
+    // What the host left had it died after the cancel ended the attempts, before the cancel's last transaction.
+    seed(
+        &project,
+        "UPDATE runs SET state = 'CANCEL_REQUESTED', resume_state = state, revision = revision + 1 WHERE run_id = 'R';
+         DELETE FROM leases WHERE attempt_id IN (SELECT attempt_id FROM attempts WHERE state IN ('PREPARED', 'STARTING', 'RUNNING'));
+         UPDATE attempts SET state = 'CANCELLED', cancel_requested = 1, ended_at = '2026-11-12T00:00:30Z'
+           WHERE state IN ('PREPARED', 'STARTING', 'RUNNING');",
+    )?;
+    assert_eq!(
+        rows(
+            &project,
+            "SELECT count(*) AS n FROM events WHERE kind = 'verification.round_closed'"
+        )?,
+        json!([{"n": 0}])
+    );
+    let second = host(&project, team.clone(), clock.clone()).await?;
+    let ended = wait_for(
+        &project,
+        &clock,
+        Duration::from_millis(100),
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        &|r| r[0]["state"] == "CANCELLED",
+    );
+    second.shutdown().await;
+    team.end_agents();
+    ended?;
+    let events = rows(
+        &project,
+        "SELECT kind, json_extract(payload_json, '$.verdict') AS verdict FROM events WHERE run_id = 'R' \
+         AND seq >= (SELECT min(seq) FROM events WHERE kind = 'verification.round_closed') ORDER BY seq",
+    )?;
+    let kinds: Vec<&str> = events
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds.first(),
+        Some(&"verification.round_closed"),
+        "{events}"
+    );
+    assert_eq!(events[0]["verdict"], "superseded", "{events}");
+    assert_eq!(kinds.last(), Some(&"run.result"), "{events}");
+    assert!(kinds.contains(&"run.cancelled"), "{events}");
+    assert_eq!(
+        rows(
+            &project,
+            "SELECT DISTINCT state FROM tasks WHERE role IN ('qa', 'reviewer')"
+        )?,
+        json!([{"state": "CANCELLED"}])
+    );
+    assert_eq!(
+        rows(&project, "SELECT DISTINCT state FROM handoffs")?,
+        json!([{"state": "REJECTED"}])
+    );
+    Ok(())
+}
+
 /// TEST-053-01's specification: REQ-090 with AC-090-01 (feature a, which the project has) and AC-090-02 (feature b,
 /// which it lacks), each with its TEST.
 const SPEC_AB: &str = "{\"requirements\": [{\"id\": \"REQ-090\", \"acceptance\": [{\"id\": \"AC-090-01\", \"test_id\": \"TEST-090-01\"}, {\"id\": \"AC-090-02\", \"test_id\": \"TEST-090-02\"}]}]}\n";

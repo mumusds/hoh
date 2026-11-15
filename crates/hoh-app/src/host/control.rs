@@ -176,7 +176,9 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
                 .await
         };
         match step.await {
-            Ok(Finished::Running(_)) => tokio::time::sleep(STEP_AGAIN).await,
+            // A round waiting for its candidate's pending records: the runner's recovery settles them, the next step
+            // finishes (docs/adr/ADR-031.md decision 4).
+            Ok(Finished::Running(_) | Finished::Recovering) => tokio::time::sleep(STEP_AGAIN).await,
             Ok(Finished::Cancelled | Finished::NotCancelling) => return,
             Err(e) => {
                 use std::io::Write as _;
@@ -286,6 +288,10 @@ impl Processes for HostProcesses {
 
     fn workspace(&self) -> Value {
         workspace(&self.project)
+    }
+
+    fn pending_candidates(&self) -> std::collections::BTreeSet<String> {
+        crate::verify::check::pending_candidates(&self.project.join(".hoh"))
     }
 }
 

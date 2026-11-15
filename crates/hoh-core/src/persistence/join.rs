@@ -10,7 +10,7 @@ use super::closing::{
     run_of, task_criteria, task_state,
 };
 use super::verification::Source;
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::protocol::TaskState;
@@ -64,7 +64,7 @@ pub(super) fn join(
     let spec_id = spec_id.unwrap_or_default();
     // The Issues as the facts say before they are read (decision 10's materialisation; the unconfirmed set below is
     // evaluated directly all the same).
-    super::issues::settle_all(tx, run_id)?;
+    super::issues::settle_all(tx, run_id, Intent::Progress)?;
     let mut participants = Vec::new();
     let sources: BTreeSet<&str> = on
         .iter()
@@ -205,6 +205,7 @@ struct Joining<'a> {
 impl Joining<'_> {
     fn event(&self, event_id: String, kind: &str, payload: Value) -> NewEvent {
         NewEvent {
+            intent: Intent::Progress,
             project_id: self.project_id.to_owned(),
             event_id,
             run_id: Some(self.run_id.to_owned()),

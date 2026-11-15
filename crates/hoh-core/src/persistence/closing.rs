@@ -11,7 +11,7 @@
 
 use super::retry::{Repair, RepairRequest, RepairVerdict};
 use super::verification::{ROUND_CLOSED, ROUND_OPENED, Source};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
@@ -146,10 +146,13 @@ pub(super) fn candidate_state(
 /// `candidate.stale` names it (a specification change, evidence found unrecoverable); later vetoes do not change it.
 fn superseded(tx: &Transaction<'_>, run_id: &str, candidate: &str) -> Result<bool, PersistError> {
     tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = 'candidate.stale' \
-           AND json_extract(payload_json, '$.candidate_id') = ?2) \
-         OR EXISTS(SELECT 1 FROM events e, json_each(e.payload_json, '$.superseded') s \
-           WHERE e.kind = 'candidate.frozen' AND e.run_id = ?1 AND s.value = ?2)",
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM events t WHERE {} AND t.kind = 'candidate.stale' \
+               AND json_extract(t.payload_json, '$.candidate_id') = ?2) \
+             OR EXISTS(SELECT 1 FROM events e, json_each(e.payload_json, '$.superseded') s \
+               WHERE e.kind = 'candidate.frozen' AND e.run_id = ?1 AND s.value = ?2)",
+            super::hold::of_run("t", "?1")
+        ),
         params![run_id, candidate],
         |r| r.get(0),
     )
@@ -374,31 +377,48 @@ pub(super) fn reconcile(
     ctx: &Ctx<'_>,
 ) -> Result<Reconciled, PersistError> {
     let tx = writer::begin(conn, ctx)?;
+    // A stopped run's reconcile would write its progress: answered Held at once, without the work (docs/adr/ADR-031.md
+    // correction D, rule 2 (d)).
+    super::hold::writable(&tx, run_id)?;
+    let done = reconcile_in(&tx, run_id, pending, ctx)?;
+    super::writer::commit(tx, ctx)?;
+    Ok(done)
+}
+
+/// [`reconcile`] inside the caller's transaction: a cancel's last transaction closes its run's rounds in it, the run
+/// still cancelling (docs/adr/ADR-031.md decision 4, M2T13D-302).
+pub(super) fn reconcile_in(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    pending: &BTreeSet<String>,
+    ctx: &Ctx<'_>,
+) -> Result<Reconciled, PersistError> {
     let mut done = Reconciled::default();
-    let (project_id, spec_id, run_state) = run_of(&tx, run_id)?;
+    let (project_id, spec_id, run_state) = run_of(tx, run_id)?;
     // Reports whose candidate no longer stands, made STALE whoever superseded it (docs/adr/ADR-029.md decision 8).
-    super::reports::sweep(&tx, run_id)?;
+    super::reports::sweep(tx, run_id)?;
     // The Issues' states as the facts say, whatever wrote them before (a store older than ADR-029 decision 10's
     // materialisation included).
-    super::issues::settle_all(&tx, run_id)?;
+    super::issues::settle_all(tx, run_id, Intent::Progress)?;
     let cancelling = matches!(run_state.as_str(), "CANCEL_REQUESTED" | "CANCELLED");
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.clone(),
         event_id,
         run_id: Some(run_id.to_owned()),
         kind: kind.to_owned(),
         payload,
     };
-    let all = rounds(&tx, run_id)?;
-    let mut verdicts = closed(&tx, run_id)?;
+    let all = rounds(tx, run_id)?;
+    let mut verdicts = closed(tx, run_id)?;
     // (1) A round whose candidate is no longer under verification: its unsettled verifier tasks cancelled.
     for round in all.iter().filter(|r| !verdicts.contains_key(&r.id)) {
-        let state = candidate_state(&tx, &round.candidate)?;
+        let state = candidate_state(tx, &round.candidate)?;
         if state.as_deref() == Some("VERIFYING") && !cancelling {
             continue;
         }
         for (role, task) in [("qa", &round.qa), ("reviewer", &round.reviewer)] {
-            let Some((state, revision, _)) = task_state(&tx, task)? else {
+            let Some((state, revision, _)) = task_state(tx, task)? else {
                 continue;
             };
             if !matches!(
@@ -451,7 +471,7 @@ pub(super) fn reconcile(
                 ));
             }
             writer::write(
-                &tx,
+                tx,
                 &Commit {
                     cas: vec![StateCas {
                         id: task.clone(),
@@ -472,20 +492,20 @@ pub(super) fn reconcile(
             continue;
         }
         let settled = |task: &str| -> Result<bool, PersistError> {
-            Ok(task_state(&tx, task)?.is_some_and(|(s, _, _)| {
+            Ok(task_state(tx, task)?.is_some_and(|(s, _, _)| {
                 matches!(s, TaskState::Implemented | TaskState::Cancelled)
             }))
         };
         if !settled(&round.qa)? || !settled(&round.reviewer)? {
             continue;
         }
-        let was_superseded = superseded(&tx, run_id, &round.candidate)?;
+        let was_superseded = superseded(tx, run_id, &round.candidate)?;
         if pending.contains(&round.candidate) && !was_superseded {
             continue;
         }
-        let candidate = candidate_state(&tx, &round.candidate)?.unwrap_or_default();
-        let attempts = attempts(&tx, round)?;
-        let evidence = evidence(&tx, &attempts)?;
+        let candidate = candidate_state(tx, &round.candidate)?.unwrap_or_default();
+        let attempts = attempts(tx, round)?;
+        let evidence = evidence(tx, &attempts)?;
         let vetoed: Vec<&Evidence> = evidence.iter().filter(|e| e.outcome == "INVALID").collect();
         let verdict =
             if was_superseded || cancelling || (candidate == "INVALID" && vetoed.is_empty()) {
@@ -520,15 +540,15 @@ pub(super) fn reconcile(
                 }
             }
         }
-        let issues = round_issues(&tx, round)?;
+        let issues = round_issues(tx, round)?;
         // What the round's verifiers were delivered to confirm and what they said of it (docs/adr/ADR-029.md decision
         // 10): its absent facts are written whatever the verdict; its critical and high entries classify it.
         let sides = [
-            super::issues::side(&tx, &attempts, "qa")?,
-            super::issues::side(&tx, &attempts, "reviewer")?,
+            super::issues::side(tx, &attempts, "qa")?,
+            super::issues::side(tx, &attempts, "reviewer")?,
         ];
-        let entries = super::issues::entries(&tx, run_id, &round.candidate, &sides)?;
-        super::issues::observe_absent(&tx, run_id, &round.id, &round.candidate, &sides, &entries)?;
+        let entries = super::issues::entries(tx, run_id, &round.candidate, &sides)?;
+        super::issues::observe_absent(tx, run_id, &round.id, &round.candidate, &sides, &entries)?;
         let mut items: BTreeSet<Item> = BTreeSet::new();
         let to_all = |items: &mut BTreeSet<Item>, item: String| {
             for task in &round.sources {
@@ -544,7 +564,7 @@ pub(super) fn reconcile(
         }
         let (verdict, class, inputs) = if verdict.is_empty() {
             let (input, failed) = classify_round(
-                &tx,
+                tx,
                 round,
                 spec_id.as_deref(),
                 &attempts,
@@ -555,7 +575,7 @@ pub(super) fn reconcile(
             if class == Class::Failed {
                 // Each acceptance failure an Issue on the candidate, in this close (docs/adr/ADR-029.md decision 9).
                 super::issues::open_acceptance(
-                    &tx,
+                    tx,
                     run_id,
                     &round.candidate,
                     &super::issues::ac_failures(failed.iter().map(|(_, item)| item.as_str())),
@@ -565,7 +585,7 @@ pub(super) fn reconcile(
                         (Some(ac), text) => {
                             // An in-scope AC's FAIL belongs to the sources whose scope holds it.
                             for task in &round.sources {
-                                if task_criteria(&tx, task, spec_id.as_deref())?.contains(&ac) {
+                                if task_criteria(tx, task, spec_id.as_deref())?.contains(&ac) {
                                     items.insert(Item {
                                         task_id: task.clone(),
                                         item: text.clone(),
@@ -648,7 +668,7 @@ pub(super) fn reconcile(
         // Its settled verifier tasks end: IMPLEMENTED -> VERIFYING -> ACCEPTED (their work done; no requirement of theirs).
         let mut cas = Vec::new();
         for task in [&round.qa, &round.reviewer] {
-            if let Some((TaskState::Implemented, revision, _)) = task_state(&tx, task)? {
+            if let Some((TaskState::Implemented, revision, _)) = task_state(tx, task)? {
                 cas.push(StateCas {
                     id: task.clone(),
                     expected_revision: revision,
@@ -698,7 +718,7 @@ pub(super) fn reconcile(
         for (role, task) in [("qa", &round.qa), ("reviewer", &round.reviewer)] {
             let completed = verdict != "superseded"
                 && matches!(
-                    task_state(&tx, task)?,
+                    task_state(tx, task)?,
                     Some((
                         TaskState::Implemented | TaskState::Verifying | TaskState::Accepted,
                         _,
@@ -719,7 +739,7 @@ pub(super) fn reconcile(
             .map_err(sqlite_error)?;
         }
         writer::write(
-            &tx,
+            tx,
             &Commit {
                 cas,
                 events,
@@ -728,20 +748,20 @@ pub(super) fn reconcile(
             ctx,
         )?;
         if matches!(verdict.as_str(), "repair" | "invalidated") {
-            iteration(&tx, (&project_id, run_id), &round.candidate, &verdict, ctx)?;
+            iteration(tx, (&project_id, run_id), &round.candidate, &verdict, ctx)?;
         }
         // Its rows, its absent facts and its Issues materialised before the next round is judged (decision 10).
-        super::issues::settle_all(&tx, run_id)?;
+        super::issues::settle_all(tx, run_id, Intent::Progress)?;
         verdicts.insert(round.id.clone(), verdict.clone());
         done.closed.push((round.id.clone(), verdict));
     }
     // (2a) Failure items not yet consumed, by their owner's state.
-    consume(&tx, run_id, &project_id, cancelling, ctx, &mut done)?;
+    consume(tx, run_id, &project_id, cancelling, ctx, &mut done)?;
     // A refusal not cleared is a standing condition: a task that could be dispatched waits for its decision
     // (decision 12, M2T16D-853).
-    for task in super::verification::refused(&tx, run_id)? {
+    for task in super::verification::refused(tx, run_id)? {
         let Some((state @ (TaskState::Ready | TaskState::Pending), revision, _)) =
-            task_state(&tx, &task)?
+            task_state(tx, &task)?
         else {
             continue;
         };
@@ -751,7 +771,7 @@ pub(super) fn reconcile(
         )
         .map_err(sqlite_error)?;
         writer::write(
-            &tx,
+            tx,
             &Commit {
                 cas: vec![StateCas {
                     id: task.clone(),
@@ -771,7 +791,7 @@ pub(super) fn reconcile(
     }
     // (3) and (4): the source tasks' exits and the candidates' barriers.
     exits(
-        &tx,
+        tx,
         run_id,
         &project_id,
         &all,
@@ -780,10 +800,17 @@ pub(super) fn reconcile(
         ctx,
         &mut done,
     )?;
-    super::issues::settle_all(&tx, run_id)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::issues::settle_all(tx, run_id, Intent::Progress)?;
     Ok(done)
+}
+
+/// How many of run `run_id`'s verification rounds are not closed.
+pub(super) fn open_rounds(tx: &Connection, run_id: &str) -> Result<usize, PersistError> {
+    let closed = closed(tx, run_id)?;
+    Ok(rounds(tx, run_id)?
+        .iter()
+        .filter(|r| !closed.contains_key(&r.id))
+        .count())
 }
 
 /// Task `task_id`'s acceptance criteria under specification `spec_id`.
@@ -1145,6 +1172,7 @@ pub(super) fn consume(
             .push((item, fingerprint));
     }
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id,
         run_id: Some(run_id.to_owned()),
@@ -1380,6 +1408,7 @@ fn exits(
         return Ok(());
     }
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id,
         run_id: Some(run_id.to_owned()),
@@ -1642,6 +1671,7 @@ pub(super) fn reverify_source(
             payload["join_id"] = json!(join);
         }
         commit.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(how.action, &format!("reverify_exhausted/{task}")),
             run_id: Some(run_id.to_owned()),
@@ -1687,6 +1717,7 @@ pub(super) fn block_flaky(
                 change: Change::Task(TaskState::Blocked),
             }],
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: project_id.to_owned(),
                 event_id: child_id(at, &format!("flaky/{task}")),
                 run_id: Some(run_id.to_owned()),
@@ -1748,6 +1779,7 @@ pub(super) fn iteration(
         tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: project_id.to_owned(),
                 event_id: id,
                 run_id: Some(run_id.to_owned()),
@@ -1815,6 +1847,13 @@ pub(super) fn record_recovery(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
+    // A live obligation's recovery is the run's progress; a superseded candidate's or one whose rounds are closed is
+    // history, written as Records (docs/adr/ADR-031.md correction D, A1 to A3).
+    let intent = if super::verification::live_obligation(&tx, candidate)? {
+        Intent::Progress
+    } else {
+        Intent::Record
+    };
     let of = |kind: &str| -> Result<Vec<(i64, Value)>, PersistError> {
         let mut statement = tx
             .prepare(
@@ -1842,6 +1881,7 @@ pub(super) fn record_recovery(
             .map_or(0, |d| d.as_millis())
     };
     let event = |event_id: String, kind: &str, payload: Value| NewEvent {
+        intent,
         project_id: project_id.clone(),
         event_id,
         run_id: Some(run_id.clone()),
@@ -1877,8 +1917,11 @@ pub(super) fn record_recovery(
                     && millis(now).saturating_sub(first) >= TRANSIENT_SPAN_MS);
             let stale: bool = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?2 AND kind = 'candidate.stale' \
-                     AND json_extract(payload_json, '$.candidate_id') = ?1)",
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM events s WHERE {} AND s.kind = 'candidate.stale' \
+                         AND json_extract(s.payload_json, '$.candidate_id') = ?1)",
+                        super::hold::of_run("s", "?2")
+                    ),
                     params![candidate, run_id],
                     |r| r.get(0),
                 )
@@ -1927,6 +1970,5 @@ pub(super) fn record_recovery(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)
+    super::writer::commit(tx, ctx)
 }

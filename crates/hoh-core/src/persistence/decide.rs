@@ -5,7 +5,7 @@
 
 use super::attempts::{self, NewAttempt};
 use super::leases;
-use super::writer::{self, Change, Commit, Entity, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Change, Commit, Entity, Intent, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::decision::{
     self, BindingView, COMMANDER, Context, Effect, Evidence, Proposal, Rejection, RunView,
@@ -70,7 +70,7 @@ pub(super) fn decide(
         return Err(PersistError::Unsupported(kind));
     }
     if !matches!(decided, Decided::Replayed { .. } | Decided::KeyReuse) {
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit_unhooked(tx)?;
     }
     Ok(decided)
 }
@@ -350,6 +350,7 @@ fn retrigger(
         None => None,
     };
     Ok(NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(&proposal.decision_id, "retrigger"),
         run_id: Some(proposal.run_id.clone()),
@@ -497,6 +498,7 @@ fn applied(
     Ok(Commit {
         cas,
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(&proposal.decision_id, "applied"),
             run_id: Some(proposal.run_id.clone()),
@@ -594,6 +596,7 @@ fn rejected(
     rejection: &Rejection,
 ) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(&proposal.decision_id, "rejected"),
         run_id: Some(proposal.run_id.clone()),
@@ -1088,6 +1091,7 @@ pub(super) fn commander_message(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id,
                 event_id: child_id(&message.message_id, "rejected"),
                 run_id: Some(message.run_id.clone()),
@@ -1105,8 +1109,7 @@ pub(super) fn commander_message(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(Fenced::Rejected {
         reason,
         detail,
