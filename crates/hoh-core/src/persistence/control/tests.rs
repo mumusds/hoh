@@ -1268,6 +1268,72 @@ async fn a_run_record_is_taken_again_when_a_pass_came_after_the_writers() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_pause_a_cancel_and_a_resume_into_blocked_each_end_their_commit_with_a_run_result() -> R {
+    // docs/adr/ADR-031.md decision 3, the control paths: pause_step to PAUSED, finish_cancel to CANCELLED, and a
+    // ResumeRun with blockers claimed to BLOCKED each end their transaction with the run's run.result.
+    let ended = "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-07T00:00:05Z' WHERE attempt_id = 'A1';";
+    let max = |path: &Path| count(path, "SELECT coalesce(max(seq), 0) FROM events");
+    // PAUSED.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!("{WORLD}{ended}"))?;
+    store
+        .submit_command(command(
+            "PauseRun",
+            "pause",
+            1,
+            RunTarget::To(RunState::PauseRequested),
+        ))
+        .await?;
+    let before = max(&path)?;
+    let at = parse_rfc3339("2026-11-07T00:00:10Z").ok_or("time")?;
+    assert_eq!(
+        store.pause_step("R", at).await?,
+        crate::persistence::PauseStep::Paused
+    );
+    let paused =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "PAUSED")?;
+    assert_eq!(paused["exit_code"], 6);
+    // CANCELLED.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!("{WORLD}{ended}"))?;
+    store.submit_command(cancel_run(1)).await?;
+    let before = max(&path)?;
+    let finished = store
+        .finish_cancel(
+            "R",
+            json!({"workspace_sha256": "fake"}),
+            std::collections::BTreeSet::new(),
+            SystemTime::now(),
+        )
+        .await?;
+    assert_eq!(finished, Finished::Cancelled);
+    let cancelled =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "CANCELLED")?;
+    assert_eq!(cancelled["exit_code"], 5);
+    // A resume with blockers claimed: BLOCKED.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}{ended}
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'NEED_DECISION',
+           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';"
+    ))?;
+    let before = max(&path)?;
+    store
+        .submit_command(command("ResumeRun", "resume", 4, RunTarget::Resume))
+        .await?;
+    let blocked =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "BLOCKED")?;
+    assert_eq!(
+        (&blocked["exit_code"], &blocked["blocked_reason"]),
+        (&json!(3), &json!("NEED_DECISION"))
+    );
+    Ok(())
+}
+
 /// R cancelling with nothing running: T1's A1 ended; round rd1 open on C1 with its verifier tasks Q and V, whose
 /// attempts ended CANCELLED, and their handoffs DELIVERED.
 const OPEN_ROUND: &str = "

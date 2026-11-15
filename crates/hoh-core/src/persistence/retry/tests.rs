@@ -1726,3 +1726,61 @@ async fn a_raw_log_that_could_not_be_kept_is_recorded_as_a_failure_with_its_prod
     assert_eq!(produced["items"], json!([]));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_paces_stop_into_incomplete_or_blocked_ends_its_commit_with_a_run_result() -> R {
+    // docs/adr/ADR-031.md decision 3, the pace's paths: its budget stop to INCOMPLETE (run.incomplete) and its blocker
+    // claims to BLOCKED each end their transaction with the run's run.result.
+    let max = |path: &Path| count(path, "SELECT coalesce(max(seq), 0) FROM events");
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE runs SET deadline_at = '2026-11-07T00:05:00Z' WHERE run_id = 'R';"
+    ))?;
+    let before = max(&path)?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:05:00Z")?))
+        .await?;
+    let incomplete =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "INCOMPLETE")?;
+    assert_eq!(
+        (&incomplete["exit_code"], &incomplete["blocked_reason"]),
+        (&json!(4), &Value::Null)
+    );
+    // Parked for T1's retry, then T1 blocked for a decision: the pace blocks the run by its claims.
+    use crate::persistence::{Repair, RepairRequest};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET attempt_count = 1, next_retry_at = '2026-11-07T00:01:00Z' WHERE task_id = 'T1';"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    store
+        .request_repair(RepairRequest {
+            run_id: "R".to_owned(),
+            task_id: "T1".to_owned(),
+            repair: Repair::Local {
+                fingerprint: "F".to_owned(),
+            },
+            limit: 0,
+            detail: "refused".to_owned(),
+            action_id: None,
+            hold: false,
+        })
+        .await?;
+    let before = max(&path)?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:20Z")?))
+        .await?;
+    let blocked =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "BLOCKED")?;
+    assert_eq!(
+        (&blocked["exit_code"], &blocked["blocked_reason"]),
+        (&json!(3), &json!("NEED_DECISION"))
+    );
+    Ok(())
+}

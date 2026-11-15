@@ -1750,3 +1750,64 @@ async fn a_session_start_passed_by_the_checkpoint_of_the_same_tick_is_never_offe
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_team_change_naming_a_run_is_the_projects_event_and_leaves_a_stopped_run_stopped() -> R {
+    // docs/adr/ADR-031.md correction D (-501), ADR-022 decision 4: ConfigureTeam naming a run writes team.configured
+    // with a null run_id and the run in its payload, whether the run works or has stopped (a published COMPLETED or
+    // INCOMPLETE); the team's revision moves, the run's revision and latest event do not.
+    let dir = tempfile::tempdir()?;
+    let host = start_when_free(config(dir.path())).await?;
+    let mut expected = 0;
+    for (n, state) in ["RUNNING", "COMPLETED", "INCOMPLETE"]
+        .into_iter()
+        .enumerate()
+    {
+        let run_id = started(&host, &format!("s{n}")).await?;
+        if state != "RUNNING" {
+            exec(
+                dir.path(),
+                &format!(
+                    "UPDATE runs SET state = '{state}' WHERE run_id = '{run_id}';
+                     INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                       SELECT project_id, '{run_id}/result', run_id, 'run.result',
+                         json_object('run_id', run_id, 'state', state), '2026-11-15T00:00:00Z'
+                       FROM runs WHERE run_id = '{run_id}';"
+                ),
+            )?;
+        }
+        let latest = format!(
+            "SELECT kind || '/' || seq FROM events WHERE run_id = '{run_id}' ORDER BY seq DESC LIMIT 1"
+        );
+        let revision = format!("SELECT revision FROM runs WHERE run_id = '{run_id}'");
+        let before = (query(dir.path(), &latest)?, query(dir.path(), &revision)?);
+        let body = configure(
+            &format!("team-{n}"),
+            Some(&run_id),
+            expected,
+            json!({"bindings": {"developer": {"agent": "codex", "model": "m-test"}}, "apply_at": "checkpoint"}),
+        );
+        let (status, accepted) = exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{state}: {accepted}");
+        expected += 1;
+        assert_eq!(accepted["revision"], expected, "{state}");
+        assert_eq!(
+            query(
+                dir.path(),
+                &format!(
+                    "SELECT coalesce(run_id, 'null') || ' ' || json_extract(payload_json, '$.run_id') FROM events \
+                     WHERE kind = 'team.configured' AND json_extract(payload_json, '$.revision') = {expected}"
+                )
+            )?,
+            format!("null {run_id}"),
+            "{state}"
+        );
+        assert_eq!(
+            (query(dir.path(), &latest)?, query(dir.path(), &revision)?),
+            before,
+            "{state}"
+        );
+    }
+    host.shutdown().await;
+    Ok(())
+}

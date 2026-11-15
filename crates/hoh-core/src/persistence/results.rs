@@ -554,5 +554,59 @@ pub(super) fn compute(
     })
 }
 
+/// Test-only: the events of the database at `path` after seq `after` end with run `run`'s one `run.result` in `state`,
+/// a valid `$defs.RunResultEvent` at its own seq, its id from the run's revision (docs/adr/ADR-031.md E1). Its
+/// payload.
+#[cfg(test)]
+pub(super) fn assert_ends_with_result(
+    path: &std::path::Path,
+    after: i64,
+    run: &str,
+    state: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(
+        "SELECT seq, project_id, event_id, run_id, kind, payload_json, created_at FROM events WHERE seq > ?1 \
+         ORDER BY seq",
+    )?;
+    let events: Vec<Value> = statement
+        .query_map([after], |r| {
+            Ok(json!({
+                "schema_version": "1.0", "seq": r.get::<_, i64>(0)?, "project_id": r.get::<_, String>(1)?,
+                "event_id": r.get::<_, String>(2)?, "run_id": r.get::<_, Option<String>>(3)?, "attempt_id": null,
+                "kind": r.get::<_, String>(4)?,
+                "payload": serde_json::from_str::<Value>(&r.get::<_, String>(5)?).unwrap_or(Value::Null),
+                "at": r.get::<_, String>(6)?,
+            }))
+        })?
+        .collect::<Result<_, _>>()?;
+    let results: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "run.result")
+        .collect();
+    let [result] = results.as_slice() else {
+        return Err(format!("not one run.result after seq {after}: {events:?}").into());
+    };
+    if events.last() != Some(*result) {
+        return Err(format!("the run.result is not the last event: {events:?}").into());
+    }
+    crate::schema::protocol()
+        .validate_def("RunResultEvent", result)?
+        .map_err(|v| format!("{v:?}: {result}"))?;
+    let revision: i64 =
+        conn.query_row("SELECT revision FROM runs WHERE run_id = ?1", [run], |r| {
+            r.get(0)
+        })?;
+    let id = crate::ids::child_id(run, &format!("result/{revision}"));
+    if result["run_id"] != run
+        || result["payload"]["state"] != state
+        || result["payload"]["last_event_seq"] != result["seq"]
+        || result["event_id"] != id.as_str()
+    {
+        return Err(format!("not {run}'s {state} result at its own seq, id {id}: {result}").into());
+    }
+    Ok(result["payload"].clone())
+}
+
 #[cfg(test)]
 mod tests;
