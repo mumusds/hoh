@@ -73,7 +73,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - **AC-002-01**（TEST-002-01 · 检查 `integration`）Given mock 项目 + FakeAgent 脚本：Commander 在规格阶段产生1个 requires_user=true 的决策请求；stdin=/dev/null，无 TTY；When 执行 `hoh -p '实现登录功能' --output json`；Then 退出码3；stdout 唯一 JSON 对象 state=BLOCKED、blocked_reason=NEED_DECISION、含 run_id；DB 恰新增1个 run 且 state=BLOCKED；StartRun.payload.goal 与 argv 文本逐字节相同、interactive=false
   - 判定：退出码=3；stdout 整体 json.loads 成功，state=BLOCKED，blocked_reason=NEED_DECISION；runs 新增恰1行，state=BLOCKED；commands 新增恰1行 kind=StartRun，goal 字节=`实现登录功能`，interactive=false；events 含该决策问题原文，且无客户端产生的其它命令；stdout 与 stderr 均不含 `ESC[?1049h`
 - **AC-002-02**（TEST-002-02 · 检查 `integration`）Given FakeAgent 脚本：所有决定可由已授权默认值得出；配置 max_iterations=1 使 run 以 INCOMPLETE 结束；When (a) 在 PTY 中执行 `hoh -p 'fix bug'` 并在启动后向 PTY 写入 `y` 回车；(b) stdin 为保持打开、从不写入的管道执行同一命令；Then 两次退出码均为4；PTY 输出不含 `ESC[?1049h`；`y` 未出现在任何 command/input_queue payload；各自只新增1个 run；decisions 中至少1条 assumption 记录
-  - 判定：两次退出码均=4，run state=INCOMPLETE；PTY 输出不含 `ESC[?1049h`；所有 commands/input_queue payload 不含由 stdin 写入的 `y`；每次执行 runs 新增恰1行；每个 run 的 decisions 至少1行 payload 含 assumption=true 与依据引用；管道方式未关闭 stdin 仍在超时内退出
+  - 判定：两次退出码均=4，run state=INCOMPLETE；PTY 输出不含 `ESC[?1049h`；所有 commands/input_queue payload 不含由 stdin 写入的 `y`；每次执行 runs 新增恰1行；每个 run 的 decisions 至少1行 state=APPLIED 的 assumption 记录，其 basis 非空（依据引用）；管道方式未关闭 stdin 仍在超时内退出
 - **AC-002-03**（TEST-002-03 · 检查 `integration`）Given fixture 项目含 run C=COMPLETED（revision=5）与 run K=BLOCKED（NEED_DECISION）；FakeAgent 在收到答复后以 INCOMPLETE 结束；When 依次执行 `hoh -p`、`hoh -p ''`、`hoh -p '  '`、`hoh -p x --resume NOPE`、`hoh -p x --resume <C>`、`hoh -p '采用方案A' --resume <K>`；Then 前5项退出码64、stdout 0字节、runs 行数不变且 C 仍 COMPLETED/revision=5；第6项不新建 run，commands 新增1行 SendInput(run_id=K)，退出码=4
   - 判定：前5条退出码均=64，stdout 大小=0，stderr 非空；前5条后 runs 行数不变，run C state=COMPLETED 且 revision=5；第6条后 runs 行数不变，commands 新增恰1行 kind=SendInput 且 run_id=K；第6条退出码=4，run K 终态=INCOMPLETE
 
@@ -133,7 +133,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 
 - json 模式 stdout 必须恰为1个 JSON 对象并以单个 LF 结尾，至少含 run_id、state、exit_code、blocked_reason、spec_revision、accepted、total、last_event_seq。
 - stream-json 模式 stdout 每行1个符合 protocol.schema.json#/$defs/Event 的对象并以单个 0x0A 结束，seq 严格递增，最后一行为持久化终态事件 kind=`run.result`（含 state、exit_code）。
-- stream-json 必须输出该 run 全部已持久化事件，与 DB events 的 seq 集合一致；慢消费者不得造成缺口或重排。
+- stream-json 必须输出该 run 截至客户端据以退出的那条 run.result（含）的全部已持久化事件，与 DB 中该 run seq ≤ 该 run.result 的 last_event_seq 的 events 的 seq 集合一致；慢消费者不得造成缺口或重排（CR-022）。
 - 所有模式下进度、日志、警告与原生 Agent stderr 只写 stderr；text 模式 stdout 只含最终可读结果；stdout 非 TTY 或设 NO_COLOR 时不含 ANSI 转义。
 - 输出 JSON 时 U+2028/U+2029 必须转义为 `\u2028`/`\u2029`，记录内不出现原始 LF；读取方只按 0x0A 分帧。
 - run 终态退出码：COMPLETED=0，FAILED=1，BLOCKED=3（含 BLOCKED_AUTH、BLOCKED_CAPABILITY、NEED_DECISION），INCOMPLETE=4，CANCELLED=5，PAUSED=6；只有 COMPLETED 为0。
@@ -918,7 +918,7 @@ Run/Iteration/Task/Attempt/Session以独立全局ID持久化，按单源迁移�
 
 - Run/Iteration/Task/Attempt/Session必须使用互不复用的UUID类全局ID；排序与回放只依据events.seq，不依据ID或时间戳。
 - Run、Task、Attempt迁移必须对照hoh-core单一迁移表校验，状态名集合与001_initial.sql CHECK枚举一致；非法迁移返回DomainConflict（ILLEGAL_TRANSITION）且不写事件。
-- Run终态为COMPLETED/CANCELLED/FAILED且无出边；COMPLETED只能来自VERIFYING；PAUSED只来自PAUSE_REQUESTED；CANCELLED只来自CANCEL_REQUESTED；恢复回到resume_state并先reconcile。
+- Run终态为COMPLETED/CANCELLED/FAILED且无出边；COMPLETED只能来自VERIFYING；PAUSED只来自PAUSE_REQUESTED；CANCELLED只来自CANCEL_REQUESTED；恢复（ResumeRun）先reconcile，该停止状态自己的停止条件不再成立时回到resume_state，阻塞集合非空时回到BLOCKED（CR-023）。
 - 每次迁移必须在一个BEGIN IMMEDIATE事务内：UPDATE…WHERE id=? AND revision=expected（rowcount=1）、revision+1、events追加、所需outbox插入；rowcount=0则回滚并返回409与current_revision。
 - 命令ACK、SSE广播与投影更新只能在COMMIT成功之后发生；日志文本可异步写，关键事件不得因内存队列满被丢弃。
 - 重试只能新增Attempt行；旧Attempt保留原终态与raw_log_path，失败历史只追加。
@@ -931,6 +931,7 @@ Run/Iteration/Task/Attempt/Session以独立全局ID持久化，按单源迁移�
 - 当请求COMPLETED→RUNNING或FAILED Attempt→RUNNING等终态出边时，返回ILLEGAL_TRANSITION，状态不变。
 - 当COMMIT失败（如SQLITE_FULL）时，客户端收到错误而非202，订阅者未收到该事件，投影不变。
 - 当QA Attempt试图复用产出该candidate的开发session_id时，不创建Attempt并返回SESSION_NOT_INDEPENDENT。
+- 当ResumeRun时该停止状态自己的停止条件仍成立（INCOMPLETE的预算或期限仍耗尽、WAITING_EXTERNAL没有到期的Task且仍有Task在等待next_retry_at、BLOCKED的阻塞集合非空）时，返回409 ILLEGAL_TRANSITION并在details写明是哪一项，不写任何行，state/revision不变（CR-023）。
 
 **验收**
 
@@ -946,7 +947,7 @@ Run/Iteration/Task/Attempt/Session以独立全局ID持久化，按单源迁移�
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - VERIFYING→RUNNING（候选失败后修复/下一增量）文档未显式列出，按工程循环选择为合法。
-- INCOMPLETE是否终态未定；本选择终态仅COMPLETED/CANCELLED/FAILED，INCOMPLETE/BLOCKED/WAITING_EXTERNAL/PAUSED可经ResumeRun回到resume_state。
+- INCOMPLETE是否终态未定；本选择终态仅COMPLETED/CANCELLED/FAILED，INCOMPLETE/BLOCKED/WAITING_EXTERNAL/PAUSED可经ResumeRun回到resume_state：先reconcile；该停止状态自己的停止条件仍成立时拒绝（ILLEGAL_TRANSITION，说明是哪一项），不写任何行——INCOMPLETE为使它停下的预算或期限仍耗尽，WAITING_EXTERNAL为没有到期的Task且仍有Task在等待next_retry_at，BLOCKED为阻塞集合非空，PAUSED没有停止条件；否则回到resume_state，阻塞集合非空时回到BLOCKED（CR-023）。
 - attempts 已含 config_revision 列（CR-001 SQL）；SESSION_NOT_INDEPENDENT 为确认的错误码。
 - 故障注入点是产品代码中的空操作钩子（CR-006，项目所有者批准）：产品对每个钩子的实现什么也不做，制造故障的实现只在测试目标中，由测试在同一进程内传入；产品入口（main 及其调用的一切）只使用空实现，没有环境变量、命令行参数或配置文件能换掉它。产品二进制中没有能产生故障的代码；全部代码都在 AC-062-05 的受检构建中（成员不声明 Cargo 特性）。
 

@@ -1,8 +1,8 @@
 # CR-022 · stream-json 的回放标记、集合相等的边界与 TEST-002-02 的 assumption 措辞
 
 ID：CR-022
-状态：草案，待独立审查
-批准人：（待：独立审查判定属 CR-003 D1 的细化后，由 CTO 依 CR-003 D1 预授权批准）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立审查 Codex 01a1e0d2-85e3-7641-aa3c-1f83b3fef04d，attempt c6366033-ce8a-4c13-9472-a7c0e75d938f，判 PASS：CR-022 与 CR-023 均属 CR-003 D1 的细化、可按现稿批准；审查的冻结提交 f3d9985 与受锁修改补丁 sha256 5b7692be…f0be；批准时只按审查的 low 建议 CR22R-01 收窄了 CR-022 一句兼容性说明，决定与修改未变）
 日期：2026-11-15
 基线：改受锁文件 `contracts/protocol.schema.json`（`$defs.Event`）、`contracts/requirements.json`（REQ-004 行为 3）、`contracts/acceptance-scenarios.json`（TEST-002-02 的 pass_criteria 第 5 条）；`python3 tools/gen_spec_views.py` 重新生成视图；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-022-stream-json-replay-and-result-bound.md`
 
@@ -42,7 +42,7 @@ ID：CR-022
 ## 不变的部分
 
 - 不删除任何需求或 AC，不改 required/degradable，不缩小 release_targets。
-- `$defs.Event` 只多一个可选键，现有事件与现有的有效、无效实例的判定都不变。
+- `$defs.Event` 只多一个可选键：不使用 `replay` 的实例的有效、无效判定都不变；带 `replay: true`、其余字段合法的实例由原来的拒绝变为接受，这是本 CR 的目的（CR22R-01）。
 - TEST-002-02 的第 5 条与原意等价且可判定：受锁 DecisionPayload 唯一能表达“假设与依据”的就是 record_assumption 分支与非空的 `basis`；另要求 state=APPLIED，比原文更严；AC-002-02 的文本不变。场景的检查方式（integration）、其余通过条件与观察量不变。
 - REQ-004 行为 3 只给集合相等补上时间边界：AC-004-02（TEST-004-02）的结局是 INCOMPLETE，之后没有该 run 的事件，它仍要求与 DB 中该 run 的全部事件相等；AC 的条数与文本不变。
 - 不改任何场景的断言强度（TEST-001-01 的终端模拟快照照原文，不提供退回：ADR-031 第二版草案曾有的“vt100 不可得时退回 `pty::squash`”已删去，M2T13D-05、-57）。

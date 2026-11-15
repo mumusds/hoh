@@ -493,6 +493,10 @@
         },
         "payload": {
           "type": "object"
+        },
+        "replay": {
+          "const": true,
+          "description": "Present only on a line of a client's stream-json output that replays an event committed before the client's own command was accepted (or before an attach began); never stored, never sent by the host (REQ-002, CR-022)."
         }
       },
       "required": [

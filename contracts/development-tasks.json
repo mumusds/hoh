@@ -739,7 +739,7 @@
     "AC-005-01",
     "AC-042-04"
    ],
-   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。AnswerQuestion 解除时对带修复拒绝的 Task 同一事务调用 M2-T16 的 Store::clear_repair_refusal；解除 BLOCKED(NEED_DECISION) 的路径覆盖 Runtime 的验证 Task（含验证 Attempt 的 UNKNOWN_EFFECT 经决策确认后的解除）与因验证而 BLOCKED 的源 Task（ADR-028 出口表的该行）；AC-042-04 的“QA FAIL”为 COMPLETED 的验证结果配 FAIL 的证据或报告（CR-018）。受锁 RunResult 的 accepted 与 remaining_requirements 用 ADR-029 决定 12 的 `requirements_passed` 求（按需求计，不用快照按 AC 的计数）；解除汇合级 NEED_DECISION 的出口：join_gate_refused 与 reverify_exhausted 为重新验证（开下一轮）或返工，flaky 为要求新提交的返工（同内容守卫也看汇合的 flaky；REQ-055 的 flaky 处置属 M5-T02），每种出口都产生新的栅栏编号（ADR-029 J9）（CR-020）。"
+   "done_when": "AC-001-01/02、REQ-002 全部 AC、AC-003-03、AC-004-02/03/04、AC-042-04 通过；AC-005-01 通过（CR-010：由 `hoh -p --detach` 拉起的 host 经 FakeAgent 运行）。AnswerQuestion 解除时对带修复拒绝的 Task 同一事务调用 M2-T16 的 Store::clear_repair_refusal；解除 BLOCKED(NEED_DECISION) 的路径覆盖 Runtime 的验证 Task（含验证 Attempt 的 UNKNOWN_EFFECT 经决策确认后的解除）与因验证而 BLOCKED 的源 Task（ADR-028 出口表的该行）；AC-042-04 的“QA FAIL”为 COMPLETED 的验证结果配 FAIL 的证据或报告（CR-018）。受锁 RunResult 的 accepted 与 remaining_requirements 用 ADR-029 决定 12 的 `requirements_passed` 求（按需求计，不用快照按 AC 的计数）；解除汇合级 NEED_DECISION 的出口：join_gate_refused 与 reverify_exhausted 为重新验证（开下一轮）或返工，flaky 为要求新提交的返工（同内容守卫也看汇合的 flaky；REQ-055 的 flaky 处置属 M5-T02），每种出口都产生新的栅栏编号（ADR-029 J9）（CR-020）。ResumeRun 从 PAUSED、INCOMPLETE、WAITING_EXTERNAL、BLOCKED 按 REQ-036 第 2 条决定恢复（ADR-031 决定 16）；回到工作态之后的继续由停滞探测保证（ADR-031 更正 C）；`hoh -p … --resume` 到 INCOMPLETE 的 Run 在 SendInput 之后提交 ResumeRun（CR-023）。"
   },
   {
    "id": "M2-T11",
@@ -782,7 +782,7 @@
     "REQ-054",
     "REQ-062"
    ],
-   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），含 mock 故障矩阵与 recovery 检查；对 M1/M2 每条 AC 给出 PASS/FAIL/BLOCKED/NOT_RUN 及原始证据；critical/high 问题为零或已开修复任务。"
+   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），含 mock 故障矩阵与 recovery 检查；对 M1/M2 每条 AC 给出 PASS/FAIL/BLOCKED/NOT_RUN 及原始证据；critical/high 问题为零或已开修复任务。对 CR-023 给 M2-T13 加的 ResumeRun 条款给出 PASS/FAIL/BLOCKED/NOT_RUN 与原始证据（它没有 AC：证据是 M2-T13 的支撑测试在同一冻结候选上的结果，由独立会话复核）（CR-023）。"
   },
   {
    "id": "V01-T01",
