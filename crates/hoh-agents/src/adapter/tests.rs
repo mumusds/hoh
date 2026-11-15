@@ -228,3 +228,593 @@ fn a_gate_refusal_is_a_typed_compat_failure_with_its_diagnostic() -> R {
     assert_eq!(refused_at_gate(&other, "/logs", Some(&report), &[]), None);
     Ok(())
 }
+
+/// An installation like claude's in `dir`: `versions/A` and `versions/B` (another content), the launcher `bin/agent` a
+/// link to `versions/A`, and a `gate.jsonl` beside them; the expectation of its look now.
+fn installed(dir: &std::path::Path) -> R<Expect> {
+    std::fs::create_dir_all(dir.join("versions"))?;
+    std::fs::create_dir_all(dir.join("bin"))?;
+    std::fs::write(dir.join("versions/A"), "#!/bin/sh\necho A\n")?;
+    std::fs::write(dir.join("versions/B"), "#!/bin/sh\necho B\n")?;
+    std::os::unix::fs::symlink(dir.join("versions/A"), dir.join("bin/agent"))?;
+    std::fs::write(
+        dir.join("gate.jsonl"),
+        serde_json::json!({"outcome": "verified", "plan": "E2"}).to_string() + "\n",
+    )?;
+    let launcher = dir.join("bin/agent");
+    let implementation = std::fs::canonicalize(dir.join("versions/A"))?;
+    let sha = |path: &std::path::Path| crate::adapter::sha256_file(path);
+    let stat = |path: &std::path::Path| -> R<FileStamp> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok(FileStamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime_sec: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        })
+    };
+    Ok(Expect {
+        agent: Agent::Claude,
+        identity: AgentIdentity {
+            launcher_path: launcher.display().to_string(),
+            launcher_sha256: sha(&launcher)?,
+            implementation_path: implementation.display().to_string(),
+            implementation_sha256: sha(&implementation)?,
+        },
+        stamp: Stamp {
+            launcher: stat(&launcher)?,
+            implementation: stat(&implementation)?,
+        },
+        plan: Exec::Path,
+    })
+}
+
+/// Replace `path` by a new file of `bytes` (a new inode, renamed into place).
+fn replace(path: &std::path::Path, bytes: &[u8]) -> R {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(&staged, path)?;
+    Ok(())
+}
+
+#[test]
+fn the_recheck_compares_the_files_stamps_and_derives_the_identity_again_on_a_difference() -> R {
+    // Decision 9 ("首个输入之前的再核对", -201) and the test plan's table: both files' (dev, ino, ctime) equal to
+    // Expect.stamp → Same; the implementation replaced by another inode, only its ctime changed (chmod to the same
+    // mode), appended to in place, deleted, the launcher's link retargeted to another file → each Changed, naming the
+    // file (the implementation first); gate.jsonl deleted or rewritten changes nothing (it is not read). After a
+    // difference the identity derived again decides: the same → stamp_only, another or none → not.
+    use std::os::unix::fs::PermissionsExt as _;
+    struct Case {
+        name: &'static str,
+        change: fn(&std::path::Path) -> R,
+        file: Option<AgentFile>,
+        same_ino: bool,
+        missing: bool,
+        stamp_only: bool,
+    }
+    let cases = [
+        Case {
+            name: "nothing changed",
+            change: |_| Ok(()),
+            file: None,
+            same_ino: true,
+            missing: false,
+            stamp_only: false,
+        },
+        Case {
+            name: "gate.jsonl deleted and rewritten",
+            change: |dir| {
+                std::fs::remove_file(dir.join("gate.jsonl"))?;
+                std::fs::write(
+                    dir.join("gate.jsonl"),
+                    serde_json::json!({"outcome": "refused", "key": KEY, "code": "COMPAT_UNVERIFIED",
+                                       "item": "stamp", "stamp_only": false})
+                    .to_string()
+                        + "\n",
+                )?;
+                Ok(())
+            },
+            file: None,
+            same_ino: true,
+            missing: false,
+            stamp_only: false,
+        },
+        Case {
+            name: "the implementation replaced by another content",
+            change: |dir| replace(&dir.join("versions/A"), b"#!/bin/sh\necho other\n"),
+            file: Some(AgentFile::Implementation),
+            same_ino: false,
+            missing: false,
+            stamp_only: false,
+        },
+        Case {
+            name: "the implementation replaced by the same content",
+            change: |dir| replace(&dir.join("versions/A"), b"#!/bin/sh\necho A\n"),
+            file: Some(AgentFile::Implementation),
+            same_ino: false,
+            missing: false,
+            stamp_only: true,
+        },
+        Case {
+            name: "chmod to the same mode",
+            change: |dir| {
+                let path = dir.join("versions/A");
+                let mode = std::fs::metadata(&path)?.permissions().mode();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+                Ok(())
+            },
+            file: Some(AgentFile::Implementation),
+            same_ino: true,
+            missing: false,
+            stamp_only: true,
+        },
+        Case {
+            name: "appended to in place",
+            change: |dir| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.join("versions/A"))?
+                    .write_all(b"#\n")?;
+                Ok(())
+            },
+            file: Some(AgentFile::Implementation),
+            same_ino: true,
+            missing: false,
+            stamp_only: false,
+        },
+        Case {
+            name: "the implementation deleted",
+            change: |dir| Ok(std::fs::remove_file(dir.join("versions/A"))?),
+            file: Some(AgentFile::Implementation),
+            same_ino: false,
+            missing: true,
+            stamp_only: false,
+        },
+        Case {
+            name: "the launcher's link retargeted",
+            change: |dir| {
+                std::os::unix::fs::symlink(dir.join("versions/B"), dir.join("bin/agent.new"))?;
+                std::fs::rename(dir.join("bin/agent.new"), dir.join("bin/agent"))?;
+                Ok(())
+            },
+            file: Some(AgentFile::Launcher),
+            same_ino: false,
+            missing: false,
+            stamp_only: false,
+        },
+    ];
+    for case in cases {
+        let dir = tempfile::tempdir()?;
+        let expect = installed(dir.path())?;
+        assert_eq!(recheck(&expect), Recheck::Same, "{}: before", case.name);
+        (case.change)(dir.path())?;
+        let found = recheck(&expect).changed();
+        assert_eq!(
+            found.as_ref().map(Changed::file),
+            case.file,
+            "{}: {found:?}",
+            case.name
+        );
+        let Some(changed) = found else {
+            continue;
+        };
+        let expected = match changed.file() {
+            AgentFile::Launcher => expect.stamp.launcher,
+            AgentFile::Implementation => expect.stamp.implementation,
+        };
+        assert_eq!(changed.expected(), expected, "{}", case.name);
+        assert_eq!(changed.seen().is_none(), case.missing, "{}", case.name);
+        if let Some(seen) = changed.seen() {
+            assert_eq!(seen.ino == expected.ino, case.same_ino, "{}", case.name);
+            assert_ne!(seen, expected, "{}", case.name);
+        }
+        assert_eq!(changed.stamp_only(), case.stamp_only, "{}", case.name);
+        let (key, payload) = changed.event();
+        assert_eq!(key, "implementation-changed-before-input");
+        assert_eq!(payload["reason"], "IMPLEMENTATION_CHANGED_BEFORE_INPUT");
+        assert_eq!(payload["file"], changed.file().as_str());
+        assert_eq!(payload["expected"], serde_json::json!(expected));
+        if case.missing {
+            assert_eq!(payload["seen"], "missing", "{}", case.name);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_identity_derived_again_is_the_gates() -> R {
+    // Decision 9 ("身份是否也变了"): the implementation resolved again the probe's way and both files hashed through
+    // their descriptors: the expectation's identity while nothing changed, the other version's once the link names it,
+    // none once the implementation it names is gone.
+    let dir = tempfile::tempdir()?;
+    let expect = installed(dir.path())?;
+    assert_eq!(identity_now(&expect), Some(expect.identity.clone()));
+    std::os::unix::fs::symlink(
+        dir.path().join("versions/B"),
+        dir.path().join("bin/agent.new"),
+    )?;
+    std::fs::rename(
+        dir.path().join("bin/agent.new"),
+        dir.path().join("bin/agent"),
+    )?;
+    let other = identity_now(&expect).ok_or("no identity")?;
+    assert_eq!(
+        other.implementation_path,
+        std::fs::canonicalize(dir.path().join("versions/B"))?
+            .display()
+            .to_string()
+    );
+    assert_ne!(other, expect.identity);
+    std::fs::remove_file(dir.path().join("versions/B"))?;
+    assert_eq!(identity_now(&expect), None);
+    Ok(())
+}
+
+#[test]
+fn a_refusal_before_the_first_input_is_typed_as_that_rechecks() -> R {
+    // Decisions 6 and 9 (K9): the facts of a turn its re-check before the first input refused, judged FAILED
+    // COMPAT_UNVERIFIED by its adapter, are typed BeforeInput, stamp_only as the re-check found it; another verdict, or
+    // no re-check that found a change, stays untyped.
+    let dir = tempfile::tempdir()?;
+    let expect = installed(dir.path())?;
+    std::fs::set_permissions(
+        dir.path().join("versions/A"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )?;
+    let stamp_only = recheck(&expect).changed().ok_or("no change")?;
+    replace(&dir.path().join("versions/A"), b"other")?;
+    let other = recheck(&expect).changed().ok_or("no change")?;
+    assert!(stamp_only.stamp_only() && !other.stamp_only());
+    let failed = || Facts {
+        state: AttemptState::Failed,
+        failure: Some("COMPAT_UNVERIFIED".to_owned()),
+        ..Facts::incomplete("/logs".to_owned(), Vec::new())
+    };
+    for (changed, want) in [(&stamp_only, true), (&other, false)] {
+        let compat = failed()
+            .before_input(Some(changed))
+            .compat
+            .ok_or("untyped")?;
+        assert_eq!(
+            (compat.origin(), compat.stamp_only()),
+            (Origin::BeforeInput, want)
+        );
+    }
+    assert_eq!(failed().before_input(None).compat, None);
+    let cancelled = Facts {
+        state: AttemptState::Cancelled,
+        failure: None,
+        ..failed()
+    };
+    assert_eq!(cancelled.before_input(Some(&other)).compat, None);
+    let other_failure = Facts {
+        failure: Some("RAW_LOG_INCOMPLETE".to_owned()),
+        ..failed()
+    };
+    assert_eq!(other_failure.before_input(Some(&other)).compat, None);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_in_turn_recheck_records_each_new_stamp_once() -> R {
+    // Decision 9 ("turn 中的再核对（只记录）"): every re-check compares each file with what it was last seen as; a new
+    // stamp is one IMPLEMENTATION_CHANGED_IN_TURN, the same one is not recorded again. The launcher's link retargeted
+    // (its version kept) names the launcher; that version deleted names the implementation, seen missing. A launcher
+    // that is the implementation's file seen changed with it is not named again (one change, one diagnostic).
+    let dir = tempfile::tempdir()?;
+    let expect = installed(dir.path())?;
+    let mut watch = Watch::new(Some(expect.clone()));
+    assert!(watch.check().is_empty());
+    std::os::unix::fs::symlink(
+        dir.path().join("versions/B"),
+        dir.path().join("bin/agent.new"),
+    )?;
+    std::fs::rename(
+        dir.path().join("bin/agent.new"),
+        dir.path().join("bin/agent"),
+    )?;
+    let first = watch.check();
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(first[0].1["reason"], "IMPLEMENTATION_CHANGED_IN_TURN");
+    assert_eq!(first[0].1["file"], "launcher");
+    assert_eq!(
+        first[0].1["expected"],
+        serde_json::json!(expect.stamp.launcher)
+    );
+    assert!(watch.check().is_empty(), "the same change recorded again");
+    std::fs::remove_file(dir.path().join("versions/A"))?;
+    let second = watch.check();
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(
+        (&second[0].1["file"], &second[0].1["seen"]),
+        (
+            &serde_json::json!("implementation"),
+            &serde_json::json!("missing")
+        )
+    );
+    assert_ne!(
+        first[0].0, second[0].0,
+        "two events of one attempt share a key"
+    );
+    assert!(watch.check().is_empty());
+    // One file as launcher and implementation (a launcher that is its own implementation): replaced, one diagnostic.
+    let single = tempfile::tempdir()?;
+    installed(single.path())?;
+    let mut alone = expect.clone();
+    let path = std::fs::canonicalize(single.path().join("versions/A"))?;
+    alone.identity.launcher_path = path.display().to_string();
+    alone.identity.implementation_path = path.display().to_string();
+    let stamp = {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(&path)?;
+        FileStamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            ctime_sec: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    };
+    alone.stamp = Stamp {
+        launcher: stamp,
+        implementation: stamp,
+    };
+    let mut watch = Watch::new(Some(alone));
+    replace(&path, b"other")?;
+    let replaced = watch.check();
+    assert_eq!(replaced.len(), 1, "{replaced:?}");
+    assert_eq!(replaced[0].1["file"], "implementation");
+    Ok(())
+}
+
+/// Which adapter event loop a test drives.
+#[derive(Debug, Clone, Copy)]
+enum Loop {
+    Claude,
+    CodexAppServer,
+    CodexExec,
+    Pi,
+}
+
+/// The test's look at the diagnostics a loop collects: each with the number of frames handed out when it was
+/// collected.
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(usize, serde_json::Value)>>>;
+
+/// A process whose every event is ready at its first poll, never pending (M2T15D-500): `total` frames, then its exit.
+/// At frame `change_at` it moves the paused clock past [`RECHECK_EVERY`] and runs `change`; at frame `again_at` it moves
+/// the clock again and changes nothing; at its last frame, it moves the clock and runs `last`.
+struct AlwaysReady {
+    handed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+    change_at: usize,
+    again_at: usize,
+    change: Box<dyn Fn() + Send + Sync>,
+    last: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for AlwaysReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AlwaysReady")
+    }
+}
+
+impl AlwaysReady {
+    /// Move the paused clock past the next re-check now, without waiting: `advance` moves it before its first await.
+    fn past_the_next_recheck() {
+        let _ = at_once(tokio::time::advance(
+            RECHECK_EVERY + std::time::Duration::from_millis(1),
+        ));
+    }
+}
+
+impl crate::process::FakeEvents for AlwaysReady {
+    fn next(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<crate::process::Event>> + Send + '_>,
+    > {
+        let n = self
+            .handed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if n == self.change_at {
+            AlwaysReady::past_the_next_recheck();
+            (self.change)();
+        }
+        if n == self.again_at {
+            AlwaysReady::past_the_next_recheck();
+        }
+        if n == self.total {
+            AlwaysReady::past_the_next_recheck();
+            (self.last)();
+        }
+        let event = match n {
+            n if n <= self.total => Some(crate::process::Event::Frame(crate::frame::Frame::Line(
+                br#"{"type":"hoh_test_frame"}"#.to_vec(),
+            ))),
+            n if n == self.total + 1 => {
+                Some(crate::process::Event::Exit(Box::new(replayed_exit())))
+            }
+            _ => None,
+        };
+        Box::pin(std::future::ready(event))
+    }
+}
+
+/// Drive `which`'s loop on an [`AlwaysReady`] process watching `expect` (none: no watch), `changes` making the
+/// changes; its verdict and the IMPLEMENTATION_CHANGED_IN_TURN diagnostics it collected, each with the frames handed
+/// out by then, and what the turn recorded of them.
+async fn drive_always_ready(
+    which: Loop,
+    expect: Option<Expect>,
+    change: Box<dyn Fn() + Send + Sync>,
+    last: Box<dyn Fn() + Send + Sync>,
+) -> R<(
+    (AttemptState, Option<String>),
+    Vec<(usize, serde_json::Value)>,
+    Vec<serde_json::Value>,
+)> {
+    let handed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let events = AlwaysReady {
+        handed: handed.clone(),
+        total: 40,
+        change_at: 10,
+        again_at: 30,
+        change,
+        last,
+    };
+    let seen: Seen = std::sync::Arc::default();
+    let into = seen.clone();
+    let observer = Observer::new(
+        "attempt",
+        Some(Observe(std::sync::Arc::new(
+            move |_: &str, d: &serde_json::Value| {
+                if d["reason"] == CHANGED_IN_TURN
+                    && let Ok(mut seen) = into.lock()
+                {
+                    seen.push((handed.load(std::sync::atomic::Ordering::SeqCst), d.clone()));
+                }
+            },
+        ))),
+    );
+    let mut process = crate::process::Process::fake(4242, None, Box::new(events));
+    let mut watch = Watch::new(expect);
+    let (state, failure, recorded) = match which {
+        Loop::Claude => crate::claude::drive_watched(&mut process, &mut watch, observer).await?,
+        Loop::CodexAppServer => {
+            crate::codex::drive_watched(false, &mut process, &mut watch, observer).await?
+        }
+        Loop::CodexExec => {
+            crate::codex::drive_watched(true, &mut process, &mut watch, observer).await?
+        }
+        Loop::Pi => crate::pi::drive_watched(&mut process, &mut watch, observer).await?,
+    };
+    let kept = recorded
+        .into_iter()
+        .filter_map(|r| match r {
+            Recorded::Event { payload, .. } if payload["reason"] == CHANGED_IN_TURN => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    let seen = seen.lock().map(|s| s.clone()).unwrap_or_default();
+    Ok(((state, failure), seen, kept))
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_loop_whose_frames_are_always_ready_still_rechecks_on_time() -> R {
+    // M2T15D-400, -500 (decision 9, "turn 中的再核对"): each adapter's loop driven on a paused clock by a process whose
+    // every frame is ready at once. The clock moved past RECHECK_EVERY and the implementation replaced at frame 10: the
+    // diagnostic is collected before frame 11 is read; the clock moved again at frame 30 with nothing changed: nothing
+    // is recorded again; at the last frame the clock moved and the launcher's link retargeted: its diagnostic is
+    // collected before the exit event is read. The verdict is the one of the same loop with nothing changed, and what
+    // the turn recorded is what was collected. Red by the mutation "the re-check moved back to a timer branch after the
+    // frames": no diagnostic at all.
+    for which in [
+        Loop::Claude,
+        Loop::CodexAppServer,
+        Loop::CodexExec,
+        Loop::Pi,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let expect = installed(dir.path())?;
+        let root = dir.path().to_path_buf();
+        let at = root.clone();
+        let (verdict, seen, kept) = drive_always_ready(
+            which,
+            Some(expect.clone()),
+            Box::new(move || {
+                let _ = replace(&at.join("versions/A"), b"#!/bin/sh\necho C\n");
+            }),
+            Box::new(move || {
+                let _ =
+                    std::os::unix::fs::symlink(root.join("versions/B"), root.join("bin/agent.new"));
+                let _ = std::fs::rename(root.join("bin/agent.new"), root.join("bin/agent"));
+            }),
+        )
+        .await?;
+        let files: Vec<(usize, &serde_json::Value)> =
+            seen.iter().map(|(n, d)| (*n, &d["file"])).collect();
+        assert_eq!(
+            files,
+            [
+                (10, &serde_json::json!("implementation")),
+                (40, &serde_json::json!("launcher"))
+            ],
+            "{which:?}: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].1["seen"]["ino"], seen[0].1["expected"]["ino"],
+            "{which:?}"
+        );
+        assert_eq!(
+            kept,
+            seen.iter().map(|(_, d)| d.clone()).collect::<Vec<_>>(),
+            "{which:?}"
+        );
+        let unchanged = tempfile::tempdir()?;
+        let control = installed(unchanged.path())?;
+        let (control_verdict, control_seen, _) =
+            drive_always_ready(which, Some(control), Box::new(|| {}), Box::new(|| {})).await?;
+        assert_eq!(control_seen, Vec::new(), "{which:?}");
+        assert_eq!(verdict, control_verdict, "{which:?}: the outcome changed");
+        let (unwatched, _, _) =
+            drive_always_ready(which, None, Box::new(|| {}), Box::new(|| {})).await?;
+        assert_eq!(verdict, unwatched, "{which:?}: the outcome changed");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_gate_refusal_is_shown_to_the_observer_as_its_diagnostic_is_collected() -> R {
+    // Decision 9 (M2T15D-401): the executor's test hook sees each diagnostic a turn collects; a gate's refusal is judged
+    // once the turn ended, and its GATE_REFUSED is shown then; diagnostics the loop collected were shown already and are
+    // not shown again, and a turn of no observer shows nothing.
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("gate.jsonl"),
+        serde_json::json!({"outcome": "refused", "key": KEY, "code": "COMPAT_UNVERIFIED",
+                           "item": "stamp", "stamp_only": true, "expected": "e", "seen": "s"})
+        .to_string()
+            + "\n",
+    )?;
+    let gate = GateCommand {
+        program: "/hoh".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        expect: Some(expect()),
+        status: Some(status(dir.path(), KEY)),
+    };
+    let mut report = crate::adapter::replayed_exit();
+    report.stdout.bytes = 0;
+    let earlier = vec![Recorded::Event {
+        key: "stdin-failed".to_owned(),
+        kind: "adapter.diagnostic".to_owned(),
+        payload: serde_json::json!({"reason": "stdin failed"}),
+    }];
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        std::sync::Arc::default();
+    let into = seen.clone();
+    let observer = Observer::new(
+        "attempt-1",
+        Some(Observe(std::sync::Arc::new(
+            move |a: &str, d: &serde_json::Value| {
+                if let Ok(mut seen) = into.lock() {
+                    seen.push((a.to_owned(), d.clone()));
+                }
+            },
+        ))),
+    );
+    let facts = refused_at_gate(&gate, "/logs", Some(&report), &earlier).ok_or("not refused")?;
+    let shown = observer.refused(facts.clone());
+    assert_eq!(shown, facts);
+    let seen = seen.lock().map(|s| s.clone()).unwrap_or_default();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].0, "attempt-1");
+    assert_eq!(seen[0].1["reason"], "GATE_REFUSED");
+    assert_eq!(Observer::default().refused(facts.clone()), facts);
+    Ok(())
+}

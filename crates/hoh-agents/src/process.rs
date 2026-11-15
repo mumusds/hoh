@@ -222,8 +222,24 @@ impl Control {
 pub struct Process {
     pid: u32,
     stdin: Option<pipe::Sender>,
-    events: mpsc::Receiver<Event>,
+    events: Events,
     control: Control,
+}
+
+/// Where a [`Process`]'s events come from: its supervisor, or a unit test's stand-in.
+#[derive(Debug)]
+enum Events {
+    Supervised(mpsc::Receiver<Event>),
+    #[cfg(test)]
+    Fake(Box<dyn FakeEvents>),
+}
+
+/// A unit test's stand-in for a process's events: an adapter's event loop driven with no process
+/// ([`Process::fake`]).
+#[cfg(test)]
+pub(crate) trait FakeEvents: Send + Sync + std::fmt::Debug {
+    /// The next event, as [`Process::next`] gives it.
+    fn next(&mut self) -> Pin<Box<dyn std::future::Future<Output = Option<Event>> + Send + '_>>;
 }
 
 impl Process {
@@ -304,7 +320,7 @@ impl Process {
         Ok(Process {
             pid: pid.as_raw_pid() as u32,
             stdin: Some(stdin),
-            events,
+            events: Events::Supervised(events),
             control: Control {
                 slot: std::sync::Arc::new(cancel_tx),
                 leader: leader_tx,
@@ -322,9 +338,34 @@ impl Process {
         self.stdin.take()
     }
 
+    /// A process with no child for a unit test: `pid`, its stdin `stdin` and its events `events`; a cancel or a
+    /// signal goes nowhere.
+    #[cfg(test)]
+    pub(crate) fn fake(
+        pid: u32,
+        stdin: Option<pipe::Sender>,
+        events: Box<dyn FakeEvents>,
+    ) -> Process {
+        let (slot, _) = watch::channel(None);
+        let (leader, _) = mpsc::unbounded_channel();
+        Process {
+            pid,
+            stdin,
+            events: Events::Fake(events),
+            control: Control {
+                slot: std::sync::Arc::new(slot),
+                leader,
+            },
+        }
+    }
+
     /// The next frame, then the exit report; `None` after that.
     pub async fn next(&mut self) -> Option<Event> {
-        self.events.recv().await
+        match &mut self.events {
+            Events::Supervised(events) => events.recv().await,
+            #[cfg(test)]
+            Events::Fake(events) => events.next().await,
+        }
     }
 
     pub fn control(&self) -> Control {

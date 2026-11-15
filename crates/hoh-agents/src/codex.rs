@@ -24,9 +24,10 @@
 //! an earlier `error` event says `unexpected status 401` (CR-003).
 
 use crate::adapter::{
-    AdapterError, AttemptRef, Recorder, Stop, finish, now, offers, sha256_file, step,
+    AdapterError, AttemptRef, Observer, Recorder, Stop, Watch, finish, now, offers, sha256_file,
+    step,
 };
-pub use crate::adapter::{Facts, GateCommand, Held, Recorded, Refused, Replayed};
+pub use crate::adapter::{Facts, GateCommand, Held, Observe, Recorded, Refused, Replayed};
 use crate::process::{Escalation, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{AttemptFacts, CancelLatch, Session, Store};
@@ -249,6 +250,8 @@ pub struct Turn {
     /// How long initialize may take before exec is used instead.
     pub handshake_timeout: Duration,
     pub deadline: Option<Duration>,
+    /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
+    pub observe: Option<Observe>,
 }
 
 impl Turn {
@@ -603,6 +606,67 @@ pub fn replay_exec(bytes: &[u8], _version: &str) -> Replayed {
     exec::replay(bytes)
 }
 
+/// A codex turn of the runner's mode driven on `process` (its gate open) with `watch`, its diagnostics shown to
+/// `observer`, for the adapters' unit tests: over the App Server (`exec` false) or exec; its verdict and what it
+/// recorded.
+#[cfg(test)]
+pub(crate) async fn drive_watched(
+    exec: bool,
+    process: &mut crate::process::Process,
+    watch: &mut Watch,
+    observer: Observer,
+) -> Result<(AttemptState, Option<String>, Vec<Recorded>), AdapterError> {
+    let attempt = AttemptRef {
+        attempt_id: "attempt".to_owned(),
+        session_id: "session".to_owned(),
+        role: "developer".to_owned(),
+        agent_version: String::new(),
+    };
+    let turn = replay_turn();
+    let native = tokio::sync::Notify::new();
+    let (_, mut steers) = mpsc::channel::<Steer>(1);
+    if exec {
+        let mut recorder = Recorder::Collect(Vec::new(), observer);
+        let driven = exec::drive(
+            &mut recorder,
+            &attempt,
+            &turn,
+            process,
+            b"prompt".to_vec(),
+            Stop::Native(&native),
+            &mut steers,
+            watch,
+        )
+        .await?;
+        let recorded = match recorder {
+            Recorder::Collect(recorded, _) => recorded,
+            Recorder::Store { .. } => Vec::new(),
+        };
+        return Ok((driven.state, driven.failure, recorded));
+    }
+    match app_server::drive(
+        None,
+        &attempt,
+        &turn,
+        process,
+        Stop::Native(&native),
+        &mut steers,
+        &mut Vec::new(),
+        None,
+        watch,
+        observer,
+    )
+    .await?
+    {
+        app_server::Drove::Ended(driven) => Ok((driven.state, driven.failure, driven.recorded)),
+        app_server::Drove::Degrade(reason, _) => Ok((
+            AttemptState::Failed,
+            Some(format!("degraded: {reason}")),
+            Vec::new(),
+        )),
+    }
+}
+
 /// The turn a replay judges: the product's YOLO launch of a new thread with codex's own model and the suite's prompt;
 /// the App Server serves every request the adapter sends.
 fn replay_turn() -> Turn {
@@ -636,6 +700,7 @@ fn replay_turn() -> Turn {
         escalation: Turn::default_escalation(),
         handshake_timeout: Duration::from_secs(60),
         deadline: None,
+        observe: None,
     }
 }
 
@@ -734,6 +799,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let native = cancel.clone();
     let (attempt, turn) = (attempt.clone(), turn.clone());
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let observer = Observer::new(&attempt.attempt_id, turn.observe.clone());
     let gate = gate.clone();
     let ended = tokio::spawn(async move {
         if opened.await.is_err() {
@@ -742,6 +808,9 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         }
         // No steering in the runner's mode yet: the channel is closed.
         let (_, mut steers) = mpsc::channel::<Steer>(1);
+        // The agent's files are re-checked while the turn runs, from the gate's opening, and on the App Server before
+        // its first input (docs/adr/ADR-030.md decision 9); exec's prompt goes with the go line.
+        let mut watch = Watch::new(gate.expect.clone());
         if app_server.is_some() {
             let mut held = Vec::new();
             let drove = app_server::drive(
@@ -753,6 +822,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 &mut steers,
                 &mut held,
                 Some(gate.go()),
+                &mut watch,
+                observer.clone(),
             )
             .await;
             return match drove {
@@ -766,7 +837,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                             &driven.recorded,
                         ) =>
                 {
-                    refused
+                    observer.refused(refused)
                 }
                 Ok(app_server::Drove::Ended(driven)) => Facts {
                     state: driven.state,
@@ -781,7 +852,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                     degraded: None,
                     final_text: driven.reply,
                     compat: None,
-                },
+                }
+                .before_input(driven.changed.as_ref()),
                 Ok(app_server::Drove::Degrade(reason, report)) => Facts {
                     failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
                     recorded: vec![Recorded::Event {
@@ -798,7 +870,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         }
         let mut input = gate.go();
         input.extend_from_slice(turn.prompt.as_bytes());
-        let mut recorder = Recorder::Collect(Vec::new());
+        let mut recorder = Recorder::Collect(Vec::new(), observer);
         let driven = exec::drive(
             &mut recorder,
             &attempt,
@@ -807,11 +879,12 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             input,
             Stop::Native(&native),
             &mut steers,
+            &mut watch,
         )
         .await;
-        let recorded = match recorder {
-            Recorder::Collect(recorded) => recorded,
-            Recorder::Store { .. } => Vec::new(),
+        let (recorded, observer) = match recorder {
+            Recorder::Collect(recorded, observer) => (recorded, observer),
+            Recorder::Store { .. } => (Vec::new(), Observer::default()),
         };
         match driven {
             // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
@@ -824,7 +897,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                         &recorded,
                     ) =>
             {
-                refused
+                observer.refused(refused)
             }
             Ok(driven) => Facts {
                 state: driven.state,

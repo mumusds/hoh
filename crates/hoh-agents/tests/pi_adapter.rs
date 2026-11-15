@@ -171,6 +171,7 @@ impl Fakes for World {
             deadline: None,
             clock: Arc::new(SystemClock),
             events: None,
+            observe: None,
         })
     }
 

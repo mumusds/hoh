@@ -1029,6 +1029,7 @@ impl Ready {
                     logs: spec.logs.clone(),
                     escalation: graced(hoh_agents::claude::Turn::default_escalation()),
                     deadline: None,
+                    observe: None,
                 })
             }
             (
@@ -1061,6 +1062,7 @@ impl Ready {
                 escalation: graced(hoh_agents::codex::Turn::default_escalation()),
                 handshake_timeout: Duration::from_secs(60),
                 deadline: None,
+                observe: None,
             }),
             (Agent::Pi, launch::Facts::Pi { help }) => Prepared::Pi(hoh_agents::pi::Turn {
                 launch: hoh_agents::pi::Launch {
@@ -1085,6 +1087,7 @@ impl Ready {
                 deadline: None,
                 clock: Arc::new(hoh_agents::clock::SystemClock),
                 events: None,
+                observe: None,
             }),
             _ => {
                 return Err(format!(

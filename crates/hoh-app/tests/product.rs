@@ -134,7 +134,7 @@ impl World {
 
     /// The product's host as [`World::config`], with the effective configuration `effective`.
     fn config_of(&self, effective: hoh_core::config::Config) -> HostConfig {
-        self.config_with(effective, self.registry(), None)
+        self.config_with(effective, self.registry(), None, None)
     }
 
     /// The PATH the world's agents are found on: the fakes, then the tools they use.
@@ -155,13 +155,15 @@ impl World {
         ))
     }
 
-    /// The product's host as [`World::config_of`], its agents those of `registry`, and with `keys` called with each
-    /// attempt's gate key as its executor draws it (docs/adr/ADR-030.md decision 9).
+    /// The product's host as [`World::config_of`], its agents those of `registry`, with `keys` called with each
+    /// attempt's gate key as its executor draws it and `observe` with each diagnostic its turns collect as they do
+    /// (docs/adr/ADR-030.md decision 9).
     fn config_with(
         &self,
         effective: hoh_core::config::Config,
         registry: std::sync::Arc<hoh_app::host::agents::Registry>,
         keys: Option<hoh_app::host::product::KeySeen>,
+        observe: Option<hoh_app::host::product::DiagnosticSeen>,
     ) -> HostConfig {
         let graces = (
             Duration::from_secs(u64::from(effective.execution.cancel_native_grace_seconds)),
@@ -173,16 +175,22 @@ impl World {
             env!("CARGO_BIN_EXE_hoh").into(),
             registry.clone(),
         );
-        if let (Some(keys), Some(runner)) = (keys, config.runner.as_mut()) {
-            runner.executor = std::sync::Arc::new(
-                hoh_app::host::product::ProductExecutor::new(
-                    registry,
-                    self.project(),
-                    env!("CARGO_BIN_EXE_hoh").into(),
-                    graces,
-                )
-                .with_keys(keys),
+        if let Some(runner) = config.runner.as_mut()
+            && (keys.is_some() || observe.is_some())
+        {
+            let mut executor = hoh_app::host::product::ProductExecutor::new(
+                registry,
+                self.project(),
+                env!("CARGO_BIN_EXE_hoh").into(),
+                graces,
             );
+            if let Some(keys) = keys {
+                executor = executor.with_keys(keys);
+            }
+            if let Some(observe) = observe {
+                executor = executor.with_observe(observe);
+            }
+            runner.executor = std::sync::Arc::new(executor);
         }
         config.port = 0;
         config.store.wal_probe = Some(probe());
@@ -249,6 +257,30 @@ impl World {
     /// `claude.d/big-log` while it exists (its raw log's extra lines); one whose marker names NATIVE-<code> replays the
     /// recorded turn with its `result` frame's subtype `<code>` (COMPAT_UNVERIFIED, MODEL_UNAVAILABLE, BLOCKED_AUTH).
     fn claude(&self, hold: Option<&Path>) -> R {
+        let body = self.claude_body(hold)?;
+        self.script("claude", &body)
+    }
+
+    /// [`World::claude`] installed as claude's own installer does: the launcher `bin/claude` a link to the version
+    /// file `claude-versions/A`, beside it `claude-versions/B`, the same script with one more line (another identity,
+    /// the same version); a turn waits for `hold` as [`World::claude`]'s does.
+    fn claude_versions(&self, hold: Option<&Path>) -> R {
+        let body = self.claude_body(hold)?;
+        let versions = self.dir.path().join("claude-versions");
+        std::fs::create_dir_all(&versions)?;
+        for (name, text) in [
+            ("A", format!("#!/bin/bash\n{body}\n")),
+            ("B", format!("#!/bin/bash\n{body}\n# B\n")),
+        ] {
+            std::fs::write(versions.join(name), text)?;
+            std::fs::set_permissions(versions.join(name), std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::os::unix::fs::symlink(versions.join("A"), self.bin().join("claude"))?;
+        Ok(())
+    }
+
+    /// The body of [`World::claude`]'s script.
+    fn claude_body(&self, hold: Option<&Path>) -> R<String> {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
         });
@@ -272,10 +304,8 @@ impl World {
                 text,
             )?;
         }
-        self.script(
-            "claude",
-            &format!(
-                "f='{PROTOCOL}/claude/2.1.318'; d='{bin}/claude.d'\n\
+        Ok(format!(
+            "f='{PROTOCOL}/claude/2.1.318'; d='{bin}/claude.d'\n\
                  case \"$1\" in --version) [ -e \"$d/hang\" ] && {{ echo $$ > \"$d/probe-pid\"; sleep 120; }}; [ -e \"$d/slow\" ] && sleep 3; echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
                  echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; env > \"$d/env.$$\"; cat > \"$d/stdin.$$\"\n\
                  case \"$HOH_ATTEMPT_ID\" in\n\
@@ -284,9 +314,8 @@ impl World {
                   *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED \"$d/self-test\" || exit 1; [ -f \"$d/big-log\" ] && cat \"$d/big-log\";;\n\
                   *NATIVE-*) code=${{HOH_ATTEMPT_ID#*NATIVE-}}; cat \"$d/native-${{code%%/*}}.jsonl\"; exit 0;;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
-                bin = self.bin().display()
-            ),
-        )
+            bin = self.bin().display()
+        ))
     }
 
     /// A fake `codex` 0.166.0: the probe's answers (helps, App Server schema) from the recording (while
@@ -303,7 +332,12 @@ impl World {
     /// The body of [`World::codex`]'s script, which appends `<name> <marker> <argv>` to `codex.d/calls` at each run;
     /// for an attempt whose marker names SIXTYFIVE it writes the gate's refusal line on stderr and exits 65 with no
     /// frame; FORGE, the same after `codex.d/forge.py` (when there) forged records in its gate's log; NATIVE, the
-    /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`.
+    /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`. An App Server run writes
+    /// its marker to `codex.d/marker.<pid>` (its log is `codex.d/log.<pid>`); for an attempt whose marker names
+    /// HOLD-INIT it waits for `codex.d/release` before it answers anything, HOLD-TURN, the first attempt's turn writes its
+    /// first frame and then waits for `codex.d/release` (docs/adr/ADR-030.md decision 9's re-checks) and a later
+    /// attempt's ends at once with no frame (a writer's turn that wrote no TaskResult is corrected by another attempt,
+    /// which then never resumes the thread the fake cannot answer for).
     fn codex_body(&self, model: &str, name: &str) -> R<String> {
         let d = self.bin().join("codex.d");
         std::fs::create_dir_all(&d)?;
@@ -367,6 +401,22 @@ impl World {
         native[end]["params"]["turn"]["error"] =
             json!({"codexErrorInfo": "COMPAT_UNVERIFIED", "message": "codex's own text"});
         std::fs::write(d.join("native.jsonl"), lines(&native))?;
+        // A turn that writes its first frame and waits for the test's release before the rest.
+        let turn_start = requests
+            .iter()
+            .find(|(_, method)| method.as_str() == Some("turn/start"))
+            .and_then(|(id, _)| id.parse::<i64>().ok())
+            .ok_or("no turn/start request")?;
+        let begun = frames
+            .iter()
+            .position(|f| f["id"].as_i64() == Some(turn_start) && f.get("result").is_some())
+            .ok_or("no turn/start answer")?;
+        let mut held = frames.clone();
+        held.insert(
+            begun + 1,
+            json!({"hoh_hold": d.join("release").display().to_string()}),
+        );
+        std::fs::write(d.join("hold-turn.jsonl"), lines(&held))?;
         std::fs::write(d.join("requests.json"), Value::Object(requests).to_string())?;
         Ok(format!(
             "f='{PROTOCOL}/codex/0.166.0'; d='{d}'\n\
@@ -383,7 +433,7 @@ impl World {
                     generate-json-schema) [ -e \"$d/hang-schema\" ] && {{ sleep 120 & echo $! > \"$d/schema-member\"; echo $$ > \"$d/schema-pid\"; wait; }}\n\
                      [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
                    esac\n\
-                   echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
+                   echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; echo \"$HOH_ATTEMPT_ID\" > \"$d/marker.$$\"\n\
                    case \"$HOH_ATTEMPT_ID\" in\n\
                     *HUGE*) frames=\"$d/huge.jsonl\"; opt=;;\n\
                     *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
@@ -393,6 +443,9 @@ impl World {
                     *FORGE*) [ -f \"$d/forge.py\" ] && python3 \"$d/forge.py\" \"$d/forged.$$\" \"$@\"\n\
                      echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
                     *NATIVE*) frames=\"$d/native.jsonl\"; opt=;;\n\
+                    *HOLD-INIT*) while [ ! -e \"$d/release\" ]; do sleep 0.05; done; frames=\"$d/frames.jsonl\"; opt=;;\n\
+                    *HOLD-TURN/attempt-1) frames=\"$d/hold-turn.jsonl\"; opt=;;\n\
+                    *HOLD-TURN/*) exit 3;;\n\
                     *) frames=\"$d/frames.jsonl\"; opt=;;\n\
                    esac\n\
                    exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\" $opt;;\n\
@@ -404,6 +457,15 @@ impl World {
     /// A fake `pi` 1.5.0: the probe's answers from the recording; a turn replays the recorded `rpc-prompt`, or, for an
     /// attempt whose marker names HUGE, one record and then 8 MiB with no LF.
     fn pi(&self) -> R {
+        let body = self.pi_body("A")?;
+        self.script("pi", &body)
+    }
+
+    /// The body of [`World::pi`]'s script, which appends `<name> <marker> <argv>` to `pi.d/calls` at each run and, for a
+    /// turn, its marker to `pi.d/marker.<pid>` (its log is `pi.d/log.<pid>`). For an attempt whose marker names
+    /// HOLD-ANSWER its turn waits for `pi.d/release` before it answers anything; CHMOD, it first changes its own mode to
+    /// the one it has (docs/adr/ADR-030.md decision 9's re-check before the first input).
+    fn pi_body(&self, name: &str) -> R<String> {
         let d = self.bin().join("pi.d");
         std::fs::create_dir_all(&d)?;
         let case = format!("{PROTOCOL}/pi/1.5.0/rpc-prompt");
@@ -433,20 +495,29 @@ impl World {
                 json!({"hoh_exit": 1})
             ),
         )?;
-        self.script(
-            "pi",
-            &format!(
-                "f='{PROTOCOL}/pi/1.5.0'; d='{d}'\n\
-                 case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
-                 echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"\n\
-                 case \"$HOH_ATTEMPT_ID\" in\n\
-                  *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
-                  *EARLY-EXIT/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/early-exit.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
-                 esac\n\
-                 exec timeout 60 python3 '{PI_RPC}' \"$d/frames.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
-                d = d.display()
+        // A turn that waits for the test's release before it answers anything.
+        std::fs::write(
+            d.join("hold.jsonl"),
+            format!(
+                "{}\n{}",
+                json!({"hoh_hold": d.join("release").display().to_string()}),
+                std::fs::read_to_string(d.join("frames.jsonl"))?
             ),
-        )
+        )?;
+        Ok(format!(
+            "f='{PROTOCOL}/pi/1.5.0'; d='{d}'\n\
+             echo \"{name} $HOH_ATTEMPT_ID $*\" >> \"$d/calls\"\n\
+             case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+             echo $$ > \"$d/pid.$$\"; pwd -P > \"$d/cwd.$$\"; printf '%s\\n' \"$@\" > \"$d/argv.$$\"; echo \"$HOH_ATTEMPT_ID\" > \"$d/marker.$$\"\n\
+             case \"$HOH_ATTEMPT_ID\" in\n\
+              *HUGE*) printf '%s\\n' '{{\"type\":\"agent_start\"}}'; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
+              *EARLY-EXIT/attempt-1) exec timeout 60 python3 '{PI_RPC}' \"$d/early-exit.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\";;\n\
+              *CHMOD*) python3 -c 'import os, sys; os.chmod(sys.argv[1], os.stat(sys.argv[1]).st_mode & 0o7777)' \"$0\";;\n\
+             esac\n\
+             frames=\"$d/frames.jsonl\"; case \"$HOH_ATTEMPT_ID\" in *HOLD-ANSWER*) frames=\"$d/hold.jsonl\";; esac\n\
+             exec timeout 60 python3 '{PI_RPC}' \"$frames\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
+            d = d.display()
+        ))
     }
 
     /// Every fake turn process gone: the ones still there are killed (nothing a test started outlives it). A number is
@@ -3843,7 +3914,12 @@ async fn a_turn_whose_agent_went_after_staffing_is_refused_before_it_starts() ->
     }
     let registry = world.registry();
     let points = std::sync::Arc::new(Points::default());
-    let mut config = world.config_with(hoh_core::config::Config::default(), registry.clone(), None);
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        registry.clone(),
+        None,
+        None,
+    );
     config.hooks = points.clone();
     let host = start_when_free(config).await?;
     let outcome = async {
@@ -3932,6 +4008,14 @@ type Registry = std::sync::Arc<hoh_app::host::agents::Registry>;
 /// A world whose every role is the fake codex A, registered (verified) before its host starts, with the hooks of
 /// `points` and the keys of its gates recorded; its host's registry.
 async fn codex_world(points: &std::sync::Arc<Points>) -> R<(World, Host, Keys, Registry)> {
+    codex_world_with(points, None).await
+}
+
+/// [`codex_world`], `observe` called with each diagnostic its turns collect as they do.
+async fn codex_world_with(
+    points: &std::sync::Arc<Points>,
+    observe: Option<hoh_app::host::product::DiagnosticSeen>,
+) -> R<(World, Host, Keys, Registry)> {
     let world = World::new()?;
     world.codex("gpt-6-astra")?;
     world.bind_installed()?;
@@ -3946,6 +4030,7 @@ async fn codex_world(points: &std::sync::Arc<Points>) -> R<(World, Host, Keys, R
         hoh_core::config::Config::default(),
         registry.clone(),
         Some(hook),
+        observe,
     );
     config.hooks = points.clone();
     let host = start_when_free(config).await?;
@@ -4497,6 +4582,1121 @@ async fn a_suite_passing_after_the_snapshot_does_not_start_the_new_codex_in_the_
     }
     .await;
     let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// The diagnostics a host's turns collected, as they collected them: (attempt id, diagnostic) in order
+/// (docs/adr/ADR-030.md decision 9, M2T15D-401: until a turn ends they are in memory only).
+type Observed = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+/// A recorder of the diagnostics an executor's turns collect, and the hook that records them.
+fn observed() -> (Observed, hoh_app::host::product::DiagnosticSeen) {
+    let seen: Observed = std::sync::Arc::default();
+    let into = seen.clone();
+    let hook: hoh_app::host::product::DiagnosticSeen =
+        std::sync::Arc::new(move |attempt: &str, diagnostic: &Value| {
+            if let Ok(mut seen) = into.lock() {
+                seen.push((attempt.to_owned(), diagnostic.clone()));
+            }
+        });
+    (seen, hook)
+}
+
+/// The diagnostics of `reason` attempt `attempt_id`'s turn collected so far.
+fn observed_of(observed: &Observed, attempt_id: &str, reason: &str) -> Vec<Value> {
+    observed
+        .lock()
+        .map(|seen| {
+            seen.iter()
+                .filter(|(attempt, d)| attempt == attempt_id && d["reason"] == reason)
+                .map(|(_, d)| d.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wait until attempt `attempt_id`'s turn collected `count` diagnostics of `reason`, for at most 60 s; them.
+async fn observed_count(
+    observed: &Observed,
+    attempt_id: &str,
+    reason: &str,
+    count: usize,
+) -> R<Vec<Value>> {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        let found = observed_of(observed, attempt_id, reason);
+        if found.len() >= count {
+            return Ok(found);
+        }
+        if Instant::now() > end {
+            return Err(
+                format!("{attempt_id}: {count} {reason} never collected: {found:?}").into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// What attempt `attempt_id`'s turn sent its fake `agent` (`<agent>.d/log.<pid>/received.jsonl`, its process found by
+/// its `marker.<pid>`): each line's `field` (`type` for pi's commands, `method` for codex's).
+fn received(world: &World, agent: &str, attempt_id: &str, field: &str) -> R<Vec<String>> {
+    let d = world.bin().join(format!("{agent}.d"));
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir(&d)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("marker.") else {
+            continue;
+        };
+        if !std::fs::read_to_string(entry.path())?
+            .trim()
+            .ends_with(&format!("/{attempt_id}"))
+        {
+            continue;
+        }
+        let log = d.join(format!("log.{pid}/received.jsonl"));
+        for line in std::fs::read_to_string(log).unwrap_or_default().lines() {
+            let message: Value = serde_json::from_str(line)?;
+            lines.push(message[field].as_str().unwrap_or_default().to_owned());
+        }
+    }
+    Ok(lines)
+}
+
+/// Wait until attempt `attempt_id`'s gate recorded that it verified its agent and execed it, for at most 60 s.
+async fn gate_verified(project: &Path, attempt_id: &str) -> R {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        if gate_records(project, attempt_id)
+            .is_ok_and(|records| records.iter().any(|r| r["outcome"] == "verified"))
+        {
+            return Ok(());
+        }
+        if Instant::now() > end {
+            return Err(format!("{attempt_id}: its gate never verified").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Lower-case hex of the sha256 of the file at `path`.
+fn file_sha256(path: &Path) -> R<String> {
+    use sha2::Digest as _;
+    Ok(sha2::Sha256::digest(std::fs::read(path)?)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+/// The fake pi B staged beside the world's pi: the same script naming itself B (another identity, the same version).
+fn stage_pi_b(world: &World) -> R<PathBuf> {
+    let staged = world.bin().join(".pi-B");
+    std::fs::write(&staged, format!("#!/bin/bash\n{}\n", world.pi_body("B")?))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    Ok(staged)
+}
+
+/// Whether HoH session `session_id` of run `run_id`'s `role` at `epoch` still owes its first input (ADR-024 decision
+/// 4, as the store judges it): its session.start was delivered to it and no attempt of it SETTLED.
+fn first_input_owed(
+    project: &Path,
+    run_id: &str,
+    role: &str,
+    epoch: i64,
+    session_id: &str,
+) -> R<bool> {
+    Ok(query(
+        project,
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM outbox o JOIN receipts r ON r.message_id = o.message_id \
+             WHERE o.message_id = '{run_id}/session-start/{role}/{epoch}' AND o.state = 'ACKED' \
+             AND json_extract(r.result_json, '$.session_id') = '{session_id}') \
+             AND NOT EXISTS(SELECT 1 FROM attempts WHERE session_id = '{session_id}' AND state = 'SETTLED')"
+        ),
+    )? == "1")
+}
+
+/// What a test does to pi's installation while its turn waits before its first answer (docs/adr/ADR-030.md decision
+/// 9, "首个输入之前的再核对").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeforeAnswer {
+    /// Another script renamed to pi's implementation path.
+    Replaced,
+    /// One byte appended to pi's implementation in place: its ctime and hash change, not its inode.
+    Appended,
+    /// pi's implementation set to the mode it has: only its ctime changes.
+    SameMode,
+    /// The attempt's gate.jsonl deleted and written anew: no file of pi's changes.
+    GateRewritten,
+    Unchanged,
+}
+
+/// The new developer pi's (claude, then pi at epoch 2 with its handover package) first turn T-HOLD-ANSWER waits before
+/// its first answer, after its gate verified it; `change` is made then, and the turn released. Suites are held before
+/// their publication, so a new identity of pi stays unverified. Returns what the test asserts on: the world, the suites'
+/// hold directory, the host (still running), the run and the diagnostics observed.
+async fn pi_held_before_its_first_answer(
+    change: BeforeAnswer,
+) -> R<(World, tempfile::TempDir, Host, String, Observed)> {
+    let world = World::new()?;
+    world.claude(None)?;
+    world.pi()?;
+    world.bind_installed()?;
+    let project = world.project();
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Pi,
+    ] {
+        hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&world.path()))?;
+    }
+    let hold = tempfile::tempdir()?;
+    let points = std::sync::Arc::new(Points {
+        hold: Some(hold.path().to_path_buf()),
+        ..Points::default()
+    });
+    let (observed, hook) = observed();
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        world.registry(),
+        None,
+        Some(hook),
+    );
+    config.hooks = points;
+    let host = start_when_free(config).await?;
+    let run = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        ready(&project, &run_id, &[])?;
+        let developer = format!(
+            "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
+             WHERE run_id = '{run_id}' AND role = 'developer'"
+        );
+        until(&project, &developer, &format!("claude/1/{run_id}/session/developer/1"), limit).await?;
+        configure(&host, "to-pi", team_revision(&project)?, json!({"developer": {"agent": "pi"}})).await?;
+        until(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{run_id}/session-start/developer/2'"),
+            "ACKED",
+            limit,
+        )
+        .await?;
+        ready(&project, &run_id, &[("T-HOLD-ANSWER", "developer")])?;
+        let attempt = "T-HOLD-ANSWER/attempt-1";
+        gate_verified(&project, attempt).await?;
+        let pi = world.bin().join("pi");
+        match change {
+            BeforeAnswer::Replaced => std::fs::rename(stage_pi_b(&world)?, &pi)?,
+            BeforeAnswer::Appended => {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&pi)?
+                    .write_all(b"#")?;
+            }
+            BeforeAnswer::SameMode => {
+                let mode = std::fs::metadata(&pi)?.permissions().mode();
+                std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(mode))?;
+            }
+            BeforeAnswer::GateRewritten => {
+                let gate = project.join(".hoh/attempts/T-HOLD-ANSWER%2Fattempt-1/gate.jsonl");
+                std::fs::remove_file(&gate)?;
+                std::fs::write(
+                    &gate,
+                    json!({"outcome": "refused", "code": "COMPAT_UNVERIFIED", "item": "stamp"}).to_string()
+                        + "\n",
+                )?;
+            }
+            BeforeAnswer::Unchanged => {}
+        }
+        std::fs::write(world.bin().join("pi.d/release"), "")?;
+        R::Ok(run_id)
+    }
+    .await;
+    match run {
+        Ok(run_id) => Ok((world, hold, host, run_id, observed)),
+        Err(e) => {
+            let _ = std::fs::write(hold.path().join("release"), "");
+            host.shutdown().await;
+            world.stop_fakes()?;
+            Err(e)
+        }
+    }
+}
+
+/// The checks of [`pi_held_before_its_first_answer`]'s turn for `change`, then the world's end.
+async fn pi_sends_no_prompt_when(change: BeforeAnswer) -> R {
+    let (world, hold, host, run_id, observed) = pi_held_before_its_first_answer(change).await?;
+    let project = world.project();
+    let attempt = "T-HOLD-ANSWER/attempt-1";
+    let outcome = async {
+        let limit = Duration::from_secs(60);
+        let refused = matches!(
+            change,
+            BeforeAnswer::Replaced | BeforeAnswer::Appended | BeforeAnswer::SameMode
+        );
+        if !refused {
+            until(&project, &ended(attempt), "SETTLED/", limit).await?;
+            let sent = received(&world, "pi", attempt, "type")?;
+            assert!(sent.iter().any(|t| t == "prompt"), "{change:?}: {sent:?}");
+            let diagnostics = attempt_events(&project, attempt, "adapter.diagnostic")?;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d["reason"] == "IMPLEMENTATION_CHANGED_BEFORE_INPUT"
+                        || d["reason"] == "IMPLEMENTATION_CHANGED_IN_TURN"),
+                "{change:?}: {diagnostics:?}"
+            );
+            return R::Ok(json!({"change": format!("{change:?}"), "sent": sent,
+                                "attempt": attempt_row(&project, attempt)?}));
+        }
+        until(&project, &ended(attempt), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        // Only get_state reached pi: no prompt.
+        let sent = received(&world, "pi", attempt, "type")?;
+        assert_eq!(sent, ["get_state"], "{change:?}");
+        let diagnostics: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_BEFORE_INPUT")
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{change:?}: {diagnostics:?}");
+        let d = &diagnostics[0];
+        assert_eq!(d["file"], "implementation", "{d}");
+        assert_eq!(
+            d["seen"]["ino"] == d["expected"]["ino"],
+            change != BeforeAnswer::Replaced,
+            "{change:?}: {d}"
+        );
+        assert_ne!(d["seen"], d["expected"], "{d}");
+        assert_eq!(d["stamp_only"], json!(change == BeforeAnswer::SameMode), "{d}");
+        // Collected in the turn's memory first, shown to the test's hook as it was.
+        assert_eq!(
+            observed_of(&observed, attempt, "IMPLEMENTATION_CHANGED_BEFORE_INPUT").len(),
+            1
+        );
+        let blocked = query(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'task.blocked' \
+             AND json_extract(payload_json, '$.task_id') = 'T-HOLD-ANSWER' \
+             AND json_extract(payload_json, '$.reason') = 'COMPAT_UNVERIFIED'",
+        )?;
+        let scheduled = query(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'task.retry_scheduled' \
+             AND json_extract(payload_json, '$.task_id') = 'T-HOLD-ANSWER'",
+        )?;
+        let session = query(
+            &project,
+            &format!("SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"),
+        )?;
+        let owed = first_input_owed(&project, &run_id, "developer", 2, &session)?;
+        if change == BeforeAnswer::SameMode {
+            // Only the stamps changed: transient, retried; the retry sends its prompt.
+            assert_eq!((blocked.as_str(), scheduled.as_str()), ("0", "1"));
+            until(&project, &ended("T-HOLD-ANSWER/attempt-2"), "SETTLED/", limit).await?;
+            let retried = received(&world, "pi", "T-HOLD-ANSWER/attempt-2", "type")?;
+            assert!(retried.iter().any(|t| t == "prompt"), "{retried:?}");
+        } else {
+            // Another identity: the task waits for its suite (held here) and rebind; the first input is still owed.
+            assert_eq!((blocked.as_str(), scheduled.as_str()), ("1", "0"));
+            assert_eq!(
+                query(
+                    &project,
+                    "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') \
+                     FROM tasks WHERE task_id = 'T-HOLD-ANSWER'"
+                )?,
+                "BLOCKED/COMPAT_UNVERIFIED/"
+            );
+            assert!(owed, "{change:?}: the first input of {session} is not owed");
+        }
+        R::Ok(json!({"change": format!("{change:?}"), "sent": sent, "diagnostic": d,
+                     "attempt": attempt_row(&project, attempt)?, "first_input_owed": owed}))
+    }
+    .await;
+    let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    keep(&format!("pi-before-input-{change:?}"), &outcome?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_sends_no_prompt_when_its_script_changed_before_the_first_input() -> R {
+    // docs/adr/ADR-030.md decision 9 ("首个输入之前的再核对", the owner's decision of 2026-11-13): the new developer pi's
+    // turn waits before it answers get_state; once its gate's `verified` record is there (the test's sync point only),
+    // another script is renamed to pi's implementation path and the turn released: pi received get_state only, no
+    // prompt; an adapter.diagnostic{IMPLEMENTATION_CHANGED_BEFORE_INPUT} whose expected and seen inodes differ, the
+    // attempt FAILED COMPAT_UNVERIFIED, the task BLOCKED(COMPAT_UNVERIFIED), the session's first input still owed.
+    pi_sends_no_prompt_when(BeforeAnswer::Replaced).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_sends_no_prompt_when_its_script_changed_before_the_first_input_appended_in_place() -> R
+{
+    // The variant of an in-place append of one byte (its ctime changes, its inode does not, its hash does): the same.
+    pi_sends_no_prompt_when(BeforeAnswer::Appended).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_sends_no_prompt_when_its_script_changed_before_the_first_input_same_mode_is_transient()
+-> R {
+    // The variant of a chmod to the same mode (only its ctime changes, its identity does not): no prompt, FAILED
+    // COMPAT_UNVERIFIED with stamp_only, the task READY with a retry scheduled (transient), and the retry runs.
+    pi_sends_no_prompt_when(BeforeAnswer::SameMode).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_sends_no_prompt_when_its_script_changed_before_the_first_input_not_by_its_gate_record()
+-> R {
+    // The variant of the attempt's gate.jsonl deleted and written anew before pi answers: the re-check reads no record,
+    // so the prompt is sent and the turn SETTLED.
+    pi_sends_no_prompt_when(BeforeAnswer::GateRewritten).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_sends_no_prompt_when_its_script_changed_before_the_first_input_control() -> R {
+    // The control: nothing changed, the prompt is sent and the turn SETTLED, no re-check diagnostic.
+    pi_sends_no_prompt_when(BeforeAnswer::Unchanged).await
+}
+
+/// Wait until the developer of run `run_id` has a session, for at most 60 s; its session and epoch.
+async fn developer_session(project: &Path, run_id: &str) -> R<(String, i64)> {
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        let row = query(
+            project,
+            &format!(
+                "SELECT coalesce(session_id, '') || ' ' || role_epoch FROM role_bindings WHERE run_id = '{run_id}' \
+                 AND role = 'developer'"
+            ),
+        )?;
+        if let Some((session, epoch)) = row.split_once(' ')
+            && !session.is_empty()
+        {
+            return Ok((session.to_owned(), epoch.parse()?));
+        }
+        if Instant::now() > end {
+            return Err(format!("the developer of {run_id} has no session: {row:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_app_server_sends_no_thread_start_when_its_implementation_changed() -> R {
+    // docs/adr/ADR-030.md decision 9 ("首个输入之前的再核对"): codex's App Server answers initialize before HoH sends its
+    // first input, thread/start. The fake App Server waits before it answers anything; once the attempt's gate verified
+    // A, B is renamed to codex's path and the turn released: stdin held initialize only, no thread/start; an
+    // adapter.diagnostic{IMPLEMENTATION_CHANGED_BEFORE_INPUT} whose expected and seen inodes differ; the attempt FAILED
+    // COMPAT_UNVERIFIED; the task BLOCKED(COMPAT_UNVERIFIED) while B's suite (held here) has not published.
+    let hold = tempfile::tempdir()?;
+    let points = std::sync::Arc::new(Points {
+        hold: Some(hold.path().to_path_buf()),
+        ..Points::default()
+    });
+    let (observed, hook) = observed();
+    let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        developer_session(&project, &run_id).await?;
+        ready(&project, &run_id, &[("T-HOLD-INIT", "developer")])?;
+        let attempt = "T-HOLD-INIT/attempt-1";
+        gate_verified(&project, attempt).await?;
+        std::fs::rename(stage_codex_b(&world)?, world.bin().join("codex"))?;
+        std::fs::write(world.bin().join("codex.d/release"), "")?;
+        until(&project, &ended(attempt), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        let sent = received(&world, "codex", attempt, "method")?;
+        assert!(
+            sent == ["initialize"] || sent == ["initialize", "initialized"],
+            "{sent:?}"
+        );
+        let diagnostics: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_BEFORE_INPUT")
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let d = &diagnostics[0];
+        assert_ne!(d["seen"]["ino"], d["expected"]["ino"], "{d}");
+        assert_eq!(d["stamp_only"], false, "{d}");
+        assert_eq!(
+            observed_of(&observed, attempt, "IMPLEMENTATION_CHANGED_BEFORE_INPUT").len(),
+            1
+        );
+        // The turn ran as A (its gate verified A); B was never run for it.
+        let calls = codex_calls(&world, attempt);
+        assert!(
+            calls.len() == 1 && calls[0].starts_with("A "),
+            "{calls:?}"
+        );
+        assert_eq!(
+            query(
+                &project,
+                "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') \
+                 FROM tasks WHERE task_id = 'T-HOLD-INIT'"
+            )?,
+            "BLOCKED/COMPAT_UNVERIFIED/"
+        );
+        keep(
+            "codex-before-input",
+            &json!({"sent": sent, "diagnostic": d, "attempt": attempt_row(&project, attempt)?}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_codex_replaced_during_its_turn_is_recorded_and_settles() -> R {
+    // docs/adr/ADR-030.md decision 9 ("turn 中的再核对（只记录）", the owner's decision of 2026-11-14, M2T15D-401): the
+    // fake codex's turn writes its first frame and waits; B (another content) is renamed to the implementation path and
+    // the test waits for the executor's hook to report the attempt's IMPLEMENTATION_CHANGED_IN_TURN (a turn's
+    // diagnostics are in memory until it ends), then releases it: the turn SETTLED, the task done as usual; once
+    // settled, the attempt's events hold exactly one adapter.diagnostic{IMPLEMENTATION_CHANGED_IN_TURN, file:
+    // implementation} whose expected and seen inodes differ, kept in its diagnostics.jsonl too; the next task imported
+    // has its first attempt refused (COMPAT_UNVERIFIED).
+    let hold = tempfile::tempdir()?;
+    let points = std::sync::Arc::new(Points {
+        hold: Some(hold.path().to_path_buf()),
+        ..Points::default()
+    });
+    let (observed, hook) = observed();
+    let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        developer_session(&project, &run_id).await?;
+        ready(&project, &run_id, &[("T-HOLD-TURN", "developer")])?;
+        let attempt = "T-HOLD-TURN/attempt-1";
+        // The turn is under way: turn/start reached the fake, which wrote its first frame and waits.
+        let end = Instant::now() + limit;
+        while !received(&world, "codex", attempt, "method")?
+            .iter()
+            .any(|m| m == "turn/start")
+        {
+            if Instant::now() > end {
+                return Err("the turn never started".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::rename(stage_codex_b(&world)?, world.bin().join("codex"))?;
+        let seen = observed_count(&observed, attempt, "IMPLEMENTATION_CHANGED_IN_TURN", 1).await?;
+        // Re-checks go on meanwhile (every 200 ms): the same change is not recorded again.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        std::fs::write(world.bin().join("codex.d/release"), "")?;
+        until(&project, &ended(attempt), "SETTLED/", limit).await?;
+        until(
+            &project,
+            "SELECT state FROM tasks WHERE task_id = 'T-HOLD-TURN'",
+            "IMPLEMENTED",
+            limit,
+        )
+        .await?;
+        let diagnostics: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_IN_TURN")
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let d = &diagnostics[0];
+        assert_eq!(d["file"], "implementation", "{d}");
+        assert_ne!(d["seen"]["ino"], d["expected"]["ino"], "{d}");
+        assert_eq!(
+            seen,
+            std::slice::from_ref(d),
+            "what the hook saw is what was recorded"
+        );
+        let kept = std::fs::read_to_string(
+            project.join(".hoh/attempts/T-HOLD-TURN%2Fattempt-1/diagnostics.jsonl"),
+        )?;
+        assert_eq!(
+            kept.lines()
+                .filter(|l| l.contains("IMPLEMENTATION_CHANGED_IN_TURN"))
+                .count(),
+            1,
+            "{kept}"
+        );
+        let calls = codex_calls(&world, attempt);
+        assert!(calls.len() == 1 && calls[0].starts_with("A "), "{calls:?}");
+        // A new attempt is refused before B runs.
+        ready(&project, &run_id, &[("T-NEXT", "developer")])?;
+        until(
+            &project,
+            &ended("T-NEXT/attempt-1"),
+            "FAILED/COMPAT_UNVERIFIED",
+            limit,
+        )
+        .await?;
+        assert_eq!(
+            codex_calls(&world, "T-NEXT/attempt-1"),
+            Vec::<String>::new()
+        );
+        keep(
+            "codex-in-turn",
+            &json!({"diagnostic": d, "observed": seen, "attempt": attempt_row(&project, attempt)?,
+                    "next": attempt_row(&project, "T-NEXT/attempt-1")?}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(world.bin().join("codex.d/release"), "");
+    let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// A world of claude installed as its installer does ([`World::claude_versions`], its turns waiting for `hold`) as the
+/// developer and codex, both registered, its diagnostics observed, suites held in `suites`; its host.
+async fn claude_versions_world(hold: &Path, suites: &Path) -> R<(World, Host, Observed)> {
+    let world = World::new()?;
+    world.claude_versions(Some(hold))?;
+    world.codex("gpt-6-astra")?;
+    world.bind_installed()?;
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Codex,
+    ] {
+        hoh_app::compat::register(&world.project(), agent, std::ffi::OsStr::new(&world.path()))?;
+    }
+    let (observed, hook) = observed();
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        world.registry(),
+        None,
+        Some(hook),
+    );
+    config.hooks = std::sync::Arc::new(Points {
+        hold: Some(suites.to_path_buf()),
+        ..Points::default()
+    });
+    let host = start_when_free(config).await?;
+    Ok((world, host, observed))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claude_launcher_retargeted_during_its_turn_is_recorded() -> R {
+    // docs/adr/ADR-030.md decision 9 ("turn 中的再核对", "记录到什么"): claude's launcher links to versions/A. While its
+    // turn runs, the link is retargeted to versions/B (A kept): one diagnostic, file launcher; then A is deleted: a
+    // second one, file implementation, seen missing; the same change is never recorded twice, and the turn SETTLED.
+    let dir = tempfile::tempdir()?;
+    let (hold, suites) = (dir.path().join("hold"), dir.path().join("suites"));
+    std::fs::create_dir_all(&suites)?;
+    let (world, host, observed) = claude_versions_world(&hold, &suites).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        developer_session(&project, &run_id).await?;
+        ready(&project, &run_id, &[("T-RETARGET", "developer")])?;
+        let attempt = "T-RETARGET/attempt-1";
+        gate_verified(&project, attempt).await?;
+        let versions = world.dir.path().join("claude-versions");
+        let link = world.bin().join("claude");
+        std::os::unix::fs::symlink(versions.join("B"), world.bin().join(".claude-new"))?;
+        std::fs::rename(world.bin().join(".claude-new"), &link)?;
+        let first = observed_count(&observed, attempt, "IMPLEMENTATION_CHANGED_IN_TURN", 1).await?;
+        assert_eq!(first[0]["file"], "launcher", "{first:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::remove_file(versions.join("A"))?;
+        let both = observed_count(&observed, attempt, "IMPLEMENTATION_CHANGED_IN_TURN", 2).await?;
+        assert_eq!(
+            (&both[1]["file"], &both[1]["seen"]),
+            (&json!("implementation"), &json!("missing")),
+            "{both:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        std::fs::write(&hold, "")?;
+        until(&project, &ended(attempt), "SETTLED/", limit).await?;
+        let diagnostics: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_IN_TURN")
+            .collect();
+        assert_eq!(diagnostics, both, "each change once");
+        keep(
+            "claude-in-turn",
+            &json!({"diagnostics": diagnostics, "attempt": attempt_row(&project, attempt)?}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(&hold, "");
+    let _ = std::fs::write(suites.join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_whose_agent_files_did_not_change_records_no_change() -> R {
+    // docs/adr/ADR-030.md decision 9's controls ("不记录的"): while a claude turn runs (held for more than a second, so
+    // several re-checks ran), a file of its install directory that is in no identity is written (claude-versions/C),
+    // and in another turn nothing changes: both SETTLED, neither has an IMPLEMENTATION_CHANGED_IN_TURN.
+    let dir = tempfile::tempdir()?;
+    let (hold, suites) = (dir.path().join("hold"), dir.path().join("suites"));
+    std::fs::create_dir_all(&suites)?;
+    let (world, host, observed) = claude_versions_world(&hold, &suites).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        developer_session(&project, &run_id).await?;
+        ready(
+            &project,
+            &run_id,
+            &[("T-OTHER-FILE", "developer"), ("T-NOTHING", "developer")],
+        )?;
+        for attempt in ["T-OTHER-FILE/attempt-1", "T-NOTHING/attempt-1"] {
+            gate_verified(&project, attempt).await?;
+        }
+        std::fs::write(world.dir.path().join("claude-versions/C"), "#!/bin/sh\n")?;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        std::fs::write(&hold, "")?;
+        for attempt in ["T-OTHER-FILE/attempt-1", "T-NOTHING/attempt-1"] {
+            until(&project, &ended(attempt), "SETTLED/", limit).await?;
+            assert_eq!(
+                observed_of(&observed, attempt, "IMPLEMENTATION_CHANGED_IN_TURN"),
+                Vec::<Value>::new()
+            );
+            let recorded = attempt_events(&project, attempt, "adapter.diagnostic")?;
+            assert!(
+                !recorded
+                    .iter()
+                    .any(|d| d["reason"] == "IMPLEMENTATION_CHANGED_IN_TURN"),
+                "{attempt}: {recorded:?}"
+            );
+        }
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(&hold, "");
+    let _ = std::fs::write(suites.join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// The store's clock moved on by a test (ADR-020's backoffs reached without waiting them out).
+#[derive(Debug, Default)]
+struct FakeClock(std::sync::Mutex<Duration>);
+
+impl FakeClock {
+    fn advance(&self, by: Duration) {
+        if let Ok(mut ahead) = self.0.lock() {
+            *ahead += by;
+        }
+    }
+}
+
+impl hoh_core::delivery::Clock for FakeClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + self.0.lock().map(|d| *d).unwrap_or_default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_metadata_only_change_before_the_first_input_is_retried_to_the_cap() -> R {
+    // docs/adr/ADR-030.md decision 9 ("只有身份戳不符时是瞬时类", "再核对的界限", M2T15D-302): the developer pi sets its
+    // own implementation to the mode it has before it answers get_state, in every attempt: no prompt, FAILED
+    // COMPAT_UNVERIFIED with stamp_only, transient: READY with a task.retry_scheduled; the store's clock moved to each
+    // next_retry_at (once the registry looked at pi's changed stamps again, as it does within a tick or two of a real
+    // backoff of seconds), the ninth failed attempt (MAX_RETRIES = 8) leaves the task BLOCKED(NEED_DECISION) with one
+    // need_decision{reason: retries_exhausted} and no next_retry_at (ADR-020, TEST-042-03's exit); moving the clock on,
+    // nothing more is dispatched: exactly nine attempts, all FAILED.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.pi()?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"pi\"\n",
+    )?;
+    world.bind_installed()?;
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Pi,
+    ] {
+        hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&world.path()))?;
+    }
+    let clock = std::sync::Arc::new(FakeClock::default());
+    let registry = world.registry();
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        registry.clone(),
+        None,
+        None,
+    );
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    let host = start_when_free(config).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        developer_session(&project, &run_id).await?;
+        ready(&project, &run_id, &[("T-CHMOD", "developer")])?;
+        let task = "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') FROM tasks \
+                    WHERE task_id = 'T-CHMOD'";
+        let verified = || {
+            matches!(registry.fact(hoh_agents::compat::Agent::Pi), Some(hoh_core::staffing::Fact::Usable(u))
+                if u.compat == hoh_core::staffing::Compat::Verified)
+        };
+        let mut moves = Vec::new();
+        let end = Instant::now() + Duration::from_secs(240);
+        while query(&project, task)? != "BLOCKED/NEED_DECISION/" {
+            if Instant::now() > end {
+                return Err(format!("not capped: {}; moves {moves:?}", query(&project, task)?).into());
+            }
+            let busy = query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-CHMOD' \
+                 AND state IN ('PREPARED', 'STARTING', 'RUNNING')",
+            )?;
+            let next = query(
+                &project,
+                "SELECT coalesce(next_retry_at, '') FROM tasks WHERE task_id = 'T-CHMOD' AND state = 'READY'",
+            )?;
+            if busy == "0"
+                && verified()
+                && let Some(next) = hoh_core::time::parse_rfc3339(&next)
+                && let Ok(ahead) =
+                    next.duration_since(hoh_core::delivery::Clock::now(clock.as_ref()))
+            {
+                clock.advance(ahead + Duration::from_secs(1));
+                moves.push(json!({"to": hoh_core::time::rfc3339_utc(next), "by_s": ahead.as_secs() + 1}));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        clock.advance(Duration::from_secs(3_600));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(query(&project, task)?, "BLOCKED/NEED_DECISION/");
+        let attempts: Vec<(String, String)> = serde_json::from_str::<Vec<Vec<String>>>(&query(
+            &project,
+            "SELECT json_group_array(json_array(attempt_id, state || '/' || coalesce(failure_reason, ''))) \
+             FROM (SELECT * FROM attempts WHERE task_id = 'T-CHMOD' ORDER BY rowid)",
+        )?)?
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone()))
+        .collect();
+        assert_eq!(attempts.len(), 9, "{attempts:?}");
+        for (attempt, end) in &attempts {
+            assert_eq!(end, "FAILED/COMPAT_UNVERIFIED", "{attempt}");
+            assert_eq!(received(&world, "pi", attempt, "type")?, ["get_state"], "{attempt}");
+            let refused: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+                .into_iter()
+                .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_BEFORE_INPUT")
+                .collect();
+            assert!(
+                refused.len() == 1 && refused[0]["stamp_only"] == true,
+                "{attempt}: {refused:?}"
+            );
+        }
+        let count = |kind: &str, reason: Option<&str>| {
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM events WHERE kind = '{kind}' \
+                     AND json_extract(payload_json, '$.task_id') = 'T-CHMOD'{}",
+                    reason.map_or(String::new(), |r| format!(
+                        " AND json_extract(payload_json, '$.reason') = '{r}'"
+                    ))
+                ),
+            )
+        };
+        assert_eq!(count("task.retry_scheduled", None)?, "8");
+        assert_eq!(count("need_decision", Some("retries_exhausted"))?, "1");
+        assert_eq!(count("task.blocked", Some("COMPAT_UNVERIFIED"))?, "0");
+        keep(
+            "metadata-only-cap",
+            &json!({"attempts": attempts, "clock_moves": moves,
+                    "task": query(&project, "SELECT json_object('state', state, 'blocked_reason', blocked_reason, \
+                                   'attempt_count', attempt_count, 'next_retry_at', next_retry_at) FROM tasks \
+                                   WHERE task_id = 'T-CHMOD'")?}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// `hoh doctor --output json` in the world's project, its agents those on the world's PATH, its home the world's own.
+fn doctor_json(world: &World) -> R<Value> {
+    let home = world.dir.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let out = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(world.project())
+        .env_clear()
+        .env("HOME", &home)
+        .env("TMPDIR", world.dir.path())
+        .env("PATH", world.path())
+        .env("NO_COLOR", "1")
+        .output()?;
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("{e}: {}", String::from_utf8_lossy(&out.stdout)).into())
+}
+
+/// The project's writer lease row, as JSON (`null` for none).
+fn writer_lease(project: &Path) -> R<Value> {
+    Ok(serde_json::from_str(&query(
+        project,
+        "SELECT coalesce((SELECT json_object('attempt_id', attempt_id, 'epoch', epoch, 'expires_at', expires_at) \
+         FROM leases WHERE kind = 'writer'), 'null')",
+    )?)?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -> R {
+    // AC-027-04 (docs/adr/ADR-030.md decisions 9, 10 and the test plan's TEST-027-04): the developer is bound to codex A,
+    // registered. The writer task T1 (here T1-HOLD-TURN: its turn writes its first frame and waits) RUNNING, codex on
+    // the PATH is replaced by B (the same script with one more line: another identity, the same version) by a rename, and
+    // the reader task T2 imported. T2's first attempt is refused before B runs (FAILED COMPAT_UNVERIFIED,
+    // attempt.start_refused), T2 BLOCKED(COMPAT_UNVERIFIED); doctor says codex's protocol is unknown; B's suite is
+    // deferred while T1 holds the writer lease (compat.suite_deferred naming T1's attempt, compat.suite_opened, no
+    // compat.suite_started), the manifest still A's. T1's turn, A, recorded B's arrival (IMPLEMENTATION_CHANGED_IN_TURN,
+    // the re-check only records) and, released, SETTLED: its writer lease row stays, of the epoch it was granted at,
+    // expiring at T1's end (released by the settle, not deleted, -01); B's suite starts after T1's settle, no writer is
+    // granted from its opening to its PASS, and the manifest's codex is B's, PASS, of this build's suite set and
+    // schema-valid. Then (-51) the developer is rebound (epoch + 1), T2 unblocked, and its next attempt runs B in a new
+    // session whose granted identity is B's.
+    let points = std::sync::Arc::new(Points::default());
+    let (observed, hook) = observed();
+    let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        let (s1, e1) = developer_session(&project, &run_id).await?;
+        let manifest_path = project.join(".hoh/compat-manifest.json");
+        let manifest_before: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let sha_a = file_sha256(&world.bin().join("codex"))?;
+        assert_eq!(manifest_before["agents"]["codex"]["implementation_sha256"], json!(sha_a));
+        ready(&project, &run_id, &[])?;
+        exec(
+            &project,
+            &format!(
+                "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
+                 VALUES ('T1-HOLD-TURN', '{run_id}', 's1', 'READY', 1, 'developer', 1, 1, 1);"
+            ),
+        )?;
+        let t1 = "T1-HOLD-TURN/attempt-1";
+        let end = Instant::now() + limit;
+        while !received(&world, "codex", t1, "method")?
+            .iter()
+            .any(|m| m == "turn/start")
+        {
+            if Instant::now() > end {
+                return Err("T1's turn never started".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lease_granted = writer_lease(&project)?;
+        assert_eq!(lease_granted["attempt_id"], t1, "{lease_granted}");
+        let staged = stage_codex_b(&world)?;
+        let sha_b = file_sha256(&staged)?;
+        std::fs::rename(&staged, world.bin().join("codex"))?;
+        observed_count(&observed, t1, "IMPLEMENTATION_CHANGED_IN_TURN", 1).await?;
+        ready(&project, &run_id, &[("T2", "developer")])?;
+        until(&project, &ended("T2/attempt-1"), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        assert_eq!(
+            attempt_events(&project, "T2/attempt-1", "attempt.start_refused")?.len(),
+            1
+        );
+        assert_eq!(
+            query(
+                &project,
+                "SELECT state || '/' || coalesce(blocked_reason, '') FROM tasks WHERE task_id = 'T2'"
+            )?,
+            "BLOCKED/COMPAT_UNVERIFIED"
+        );
+        let doctor = doctor_json(&world)?;
+        assert_eq!(doctor["agents"]["codex"]["protocol"], "unknown", "{doctor}");
+        // B's suite deferred while T1 holds the writer lease.
+        let end = Instant::now() + limit;
+        let deferred = loop {
+            let events = suite_events(&project)?;
+            if let Some((_, _, payload)) = events.iter().find(|(_, kind, payload)| {
+                kind == "compat.suite_deferred" && payload["implementation_sha256"] == json!(sha_b)
+            }) {
+                break payload.clone();
+            }
+            if Instant::now() > end {
+                return Err(format!("B's suite was never deferred: {events:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            (&deferred["agent"], &deferred["lease_attempt_id"]),
+            (&json!("codex"), &json!(t1)),
+            "{deferred}"
+        );
+        let events = suite_events(&project)?;
+        assert!(kinds(&events).contains(&"compat.suite_opened"), "{events:?}");
+        assert!(!kinds(&events).contains(&"compat.suite_started"), "{events:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&manifest_path)?)?,
+            manifest_before
+        );
+        // B ran no turn: only the looks' and the suite's commands (`--version`, a `--help`, the App Server's schema, the
+        // login check), with no attempt's marker.
+        let b_calls = || -> R<Vec<String>> {
+            Ok(std::fs::read_to_string(world.bin().join("codex.d/calls"))?
+                .lines()
+                .filter(|l| l.starts_with("B "))
+                .map(str::to_owned)
+                .collect())
+        };
+        for call in b_calls()? {
+            let args = call.strip_prefix("B  ").ok_or_else(|| format!("a turn of B's: {call}"))?;
+            assert!(
+                args == "--version"
+                    || args == "login status"
+                    || args.ends_with("--help")
+                    || args.starts_with("app-server generate-json-schema"),
+                "{call}"
+            );
+        }
+        // T1 released: it SETTLED as A, having recorded B's arrival once.
+        std::fs::write(world.bin().join("codex.d/release"), "")?;
+        until(&project, &ended(t1), "SETTLED/", limit).await?;
+        let t1_calls = codex_calls(&world, t1);
+        assert!(t1_calls.len() == 1 && t1_calls[0].starts_with("A "), "{t1_calls:?}");
+        let in_turn: Vec<Value> = attempt_events(&project, t1, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_IN_TURN")
+            .collect();
+        assert_eq!(in_turn.len(), 1, "{in_turn:?}");
+        assert_eq!(in_turn[0]["file"], "implementation");
+        let lease_released = writer_lease(&project)?;
+        let t1_ended = query(&project, &format!("SELECT ended_at FROM attempts WHERE attempt_id = '{t1}'"))?;
+        assert_eq!(
+            (&lease_released["attempt_id"], &lease_released["epoch"], &lease_released["expires_at"]),
+            (&json!(t1), &lease_granted["epoch"], &json!(t1_ended)),
+            "{lease_released}"
+        );
+        // B's suite runs after T1's settle, with no writer granted until its PASS.
+        until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'compat.suite_completed'",
+            "1",
+            limit,
+        )
+        .await?;
+        let events = suite_events(&project)?;
+        let seq_of = |kind: &str| {
+            events
+                .iter()
+                .find(|(_, k, payload)| k == kind && (kind != "compat.suite_ended" || payload["status"] == "PASS"))
+                .map(|(seq, _, _)| *seq)
+                .ok_or_else(|| format!("no {kind}: {events:?}"))
+        };
+        let settled: i64 = query(
+            &project,
+            &format!("SELECT seq FROM events WHERE event_id = '{t1}/SETTLED'"),
+        )?
+        .parse()?;
+        let (opened, started_at, passed) = (
+            seq_of("compat.suite_opened")?,
+            seq_of("compat.suite_started")?,
+            seq_of("compat.suite_ended")?,
+        );
+        assert!(started_at > settled, "the suite started (seq {started_at}) before T1 settled ({settled})");
+        let writer_grants = |within: &str| {
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch' \
+                     AND json_extract(payload_json, '$.lease.kind') = 'writer' AND {within}"
+                ),
+            )
+        };
+        assert_eq!(
+            writer_grants(&format!("json_extract(payload_json, '$.attempt_id') = '{t1}'"))?,
+            "1",
+            "T1's own grant is a writer dispatch"
+        );
+        assert_eq!(
+            writer_grants(&format!("event_seq > {opened} AND event_seq < {passed}"))?,
+            "0",
+            "a writer was granted while the suite was open"
+        );
+        // The writer row now: still T1's released one, or a writer granted after the suite's PASS.
+        let lease_after_suite = writer_lease(&project)?;
+        if lease_after_suite != lease_released {
+            let holder = lease_after_suite["attempt_id"].as_str().unwrap_or_default();
+            let granted: i64 = query(
+                &project,
+                &format!(
+                    "SELECT min(event_seq) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch'                      AND json_extract(payload_json, '$.attempt_id') = '{holder}'"
+                ),
+            )?
+            .parse()?;
+            assert!(granted > passed, "{lease_after_suite} granted at seq {granted}, the suite passed at {passed}");
+        }
+        let manifest_after: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let codex = &manifest_after["agents"]["codex"];
+        assert_eq!(codex["implementation_sha256"], json!(sha_b));
+        assert_eq!(codex["suite"]["status"], "PASS");
+        assert_eq!(
+            codex["suite"]["fixture_set_sha256"],
+            json!(hoh_agents::compat::SUITE_SET_SHA256.as_str())
+        );
+        if let Err(errors) = hoh_core::schema::compat_manifest().validate(&manifest_after) {
+            return Err(format!("the manifest is not schema-valid: {errors:?}").into());
+        }
+        // -51: rebound, T2 unblocked, its next attempt B's in a new session of B's identity.
+        until(&project, &ended("T2/attempt-2"), "SETTLED/", limit).await?;
+        let rebound = query(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.cause') || '/' || json_extract(payload_json, '$.to.role_epoch') \
+                 FROM events WHERE kind = 'team.binding_applied' AND event_id = '{run_id}/team/developer/{}'",
+                e1 + 1
+            ),
+        )?;
+        assert_eq!(rebound, format!("rebind/{}", e1 + 1));
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM events WHERE kind = 'task.unblocked' \
+                 AND json_extract(payload_json, '$.task_id') = 'T2'"
+            )?,
+            "1"
+        );
+        let t2 = attempt_row(&project, "T2/attempt-2")?;
+        assert_ne!(t2["session_id"], json!(s1));
+        assert_eq!(t2["role_epoch"], json!(e1 + 1));
+        let session = t2["session_id"].as_str().unwrap_or_default();
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.identity.implementation_sha256') FROM events \
+                     WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.session_id') = '{session}'"
+                )
+            )?,
+            sha_b
+        );
+        let t2_calls = codex_calls(&world, "T2/attempt-2");
+        assert!(t2_calls.len() == 1 && t2_calls[0].starts_with("B "), "{t2_calls:?}");
+        keep(
+            "test-027-04",
+            &json!({
+                "manifest_before": manifest_before, "manifest_after": manifest_after,
+                "attempts": [attempt_row(&project, t1)?, attempt_row(&project, "T2/attempt-1")?, t2],
+                "leases": {"granted": lease_granted, "released": lease_released, "after_suite": lease_after_suite},
+                "doctor": doctor, "suite_events": events.iter().map(|(seq, kind, payload)| json!([seq, kind, payload]))
+                    .collect::<Vec<_>>(),
+                "t1_in_turn": in_turn, "b_calls": b_calls()?,
+            }),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(world.bin().join("codex.d/release"), "");
     host.shutdown().await;
     world.stop_fakes()?;
     outcome

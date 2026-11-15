@@ -18,8 +18,12 @@
 //! prints after. Stopping sends SIGINT, then SIGTERM and SIGKILL to the process group with graces between. Stdin,
 //! stdout and the cancel are driven together, so a child that never reads its prompt cannot hold up a cancel.
 
-pub use crate::adapter::{AdapterError, AttemptRef, Facts, GateCommand, Held, Recorded, Refused};
-use crate::adapter::{Recorder, Replay, Replayed, Stop, finish, now, offers, sha256_file, step};
+pub use crate::adapter::{
+    AdapterError, AttemptRef, Facts, GateCommand, Held, Observe, Recorded, Refused,
+};
+use crate::adapter::{
+    Observer, Recorder, Replay, Replayed, Stop, Watch, finish, now, offers, sha256_file, step,
+};
 use crate::frame::Frame;
 use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
@@ -164,6 +168,8 @@ pub struct Turn {
     /// native: SIGINT, then SIGTERM and SIGKILL to the group (docs/13: 10 s / 5 s initially).
     pub escalation: Escalation,
     pub deadline: Option<Duration>,
+    /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
+    pub observe: Option<Observe>,
 }
 
 impl Turn {
@@ -420,6 +426,7 @@ pub async fn run(
         turn.prompt.clone(),
         turn.escalation,
         Stop::Latch(cancel),
+        &mut Watch::new(None),
     )
     .await?;
     // A cancel accepted from here on still wins: the store commits the end through the latch (M1T03R-03, M1T03R-10).
@@ -510,6 +517,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let escalation = turn.escalation;
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
     let attempt_id = attempt.attempt_id.clone();
+    let observer = Observer::new(&attempt_id, turn.observe.clone());
     let gate = gate.clone();
     let ended = tokio::spawn(async move {
         // Nothing reaches the gate before it is opened; unopened, its input ends and the agent never runs.
@@ -519,7 +527,9 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         }
         let mut input = gate.go();
         input.extend_from_slice(&prompt);
-        let mut recorder = Recorder::Collect(Vec::new());
+        let mut recorder = Recorder::Collect(Vec::new(), observer);
+        // The agent's files are re-checked while the turn runs, from the gate's opening (docs/adr/ADR-030.md decision
+        // 9): its prompt goes with the go line, so there is no re-check before it.
         let driven = drive(
             &mut recorder,
             &attempt_id,
@@ -527,11 +537,12 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             input,
             escalation,
             Stop::Native(&native),
+            &mut Watch::new(gate.expect.clone()),
         )
         .await;
-        let recorded = match recorder {
-            Recorder::Collect(recorded) => recorded,
-            Recorder::Store { .. } => Vec::new(),
+        let (recorded, observer) = match recorder {
+            Recorder::Collect(recorded, observer) => (recorded, observer),
+            Recorder::Store { .. } => (Vec::new(), Observer::default()),
         };
         let Ok(driven) = driven else {
             return Facts::incomplete(raw_log_path, recorded);
@@ -546,7 +557,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 &recorded,
             )
         {
-            return refused;
+            return observer.refused(refused);
         }
         // Claude's own cost estimate goes with the usage, never as the run's cost (ADR-020, M2T07R-256).
         let usage = match (driven.usage, driven.cost) {
@@ -717,7 +728,7 @@ impl Driven {
 }
 
 /// Write `input` and read the turn's output until its process ended, recording what it shows; a cancel from `stop`
-/// is acted on as it comes.
+/// is acted on as it comes, and `watch`'s re-checks of the agent's files are recorded as they are due.
 async fn drive(
     recorder: &mut Recorder<'_>,
     attempt_id: &str,
@@ -725,6 +736,7 @@ async fn drive(
     input: Vec<u8>,
     escalation: Escalation,
     stop: Stop<'_>,
+    watch: &mut Watch,
 ) -> Result<Driven, AdapterError> {
     // The input is written while the output and the cancel are watched; the pipe closes when it is written.
     let pipe = process.take_stdin();
@@ -738,12 +750,19 @@ async fn drive(
         act(&stop, process, escalation);
     }
     driven.report = loop {
-        // A cancel is seen before output that is ready at the same time.
+        // A cancel is seen before output that is ready at the same time, and a re-check that is due before output too
+        // (the same branch wakes an idle loop for it).
         let event = tokio::select! {
             biased;
             () = stop.requested(), if !driven.cancelled => {
                 driven.cancelled = true;
                 act(&stop, process, escalation);
+                continue;
+            }
+            () = watch.due(), if watch.on() => {
+                for (key, payload) in watch.check() {
+                    recorder.event(&key, "adapter.diagnostic", payload).await?;
+                }
                 continue;
             }
             written = &mut feed, if driven.fed.is_none() => {
@@ -795,11 +814,39 @@ async fn drive(
     Ok(driven)
 }
 
+/// A claude turn of the runner's mode driven on `process` (its gate open, a prompt written) with `watch`, its
+/// diagnostics shown to `observer`, for the adapters' unit tests: its verdict and what it recorded.
+#[cfg(test)]
+pub(crate) async fn drive_watched(
+    process: &mut Process,
+    watch: &mut Watch,
+    observer: Observer,
+) -> Result<(AttemptState, Option<String>, Vec<Recorded>), AdapterError> {
+    let native = tokio::sync::Notify::new();
+    let mut recorder = Recorder::Collect(Vec::new(), observer);
+    let driven = drive(
+        &mut recorder,
+        "attempt",
+        process,
+        b"prompt\n".to_vec(),
+        Turn::default_escalation(),
+        Stop::Native(&native),
+        watch,
+    )
+    .await?;
+    let (state, failure) = driven.verdict();
+    let recorded = match recorder {
+        Recorder::Collect(recorded, _) => recorded,
+        Recorder::Store { .. } => Vec::new(),
+    };
+    Ok((state, failure, recorded))
+}
+
 /// Replay `bytes` (claude's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
 /// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. Every claude version
 /// is judged alike (the frame registry built in, [`known::claude`]); `_version` is the tested one's.
 pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
-    let mut recorder = Recorder::Collect(Vec::new());
+    let mut recorder = Recorder::Collect(Vec::new(), Observer::default());
     let mut driven = Driven::new(false);
     driven.fed = Some(Ok(()));
     for step in crate::adapter::replay_steps(bytes) {
@@ -818,7 +865,7 @@ pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
     driven.report = Some(crate::adapter::replayed_exit());
     let (state, failure) = driven.verdict();
     let recorded = match recorder {
-        Recorder::Collect(recorded) => recorded,
+        Recorder::Collect(recorded, _) => recorded,
         Recorder::Store { .. } => Vec::new(),
     };
     Replayed {

@@ -7,8 +7,8 @@ id to its method ({"0": "initialize", ...}). Frames are sent in order. A respons
 method waits until the client has sent its k-th request of that method, and goes out with the client's id; notifications and server
 requests go out as soon as everything before them has. When every frame is out the fake waits for stdin to close
 (or exits at once with --exit-when-done, a stream cut short). A frame {"hoh_sleep": SECONDS} is not sent: the fake
-pauses there; {"hoh_wait": {"method": M, "count": N}} is not sent either: the fake waits there until the client
-has sent N requests of method M; {"hoh_close_stdin": true} closes the fake's stdin (it sends what follows, then
+pauses there; {"hoh_hold": PATH} is not sent: the fake waits there until PATH exists; {"hoh_wait": {"method": M,
+"count": N}} is not sent either: the fake waits there until the client has sent N requests of method M; {"hoh_close_stdin": true} closes the fake's stdin (it sends what follows, then
 exits); {"hoh_batch": [FRAME, ...]} sends those frames in one write; {"hoh_raw": {"byte": B, "count": N}} writes N
 bytes B with no LF (a line that never ends, AC-027-03). In LOGDIR it keeps received.jsonl (every client line),
 sent.jsonl (the exact bytes sent) and trace.jsonl (both directions in order).
@@ -65,6 +65,11 @@ def main() -> int:
             if 'hoh_sleep' in frame:  # not sent: a pause before what follows
                 frames.pop(0)
                 time.sleep(float(frame['hoh_sleep']))
+                continue
+            if 'hoh_hold' in frame:  # not sent: wait until the file exists
+                frames.pop(0)
+                while not Path(frame['hoh_hold']).exists():
+                    time.sleep(0.01)
                 continue
             if 'hoh_close_stdin' in frame:  # not sent: close stdin, so the client's next write fails
                 frames.pop(0)

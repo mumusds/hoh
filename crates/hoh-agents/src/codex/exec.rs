@@ -6,7 +6,7 @@ use super::{
     interrupt_first, is_text_item, verdict,
 };
 use crate::adapter::{
-    AdapterError, AttemptRef, Recorder, Replay, Replayed, Stop, finish, now, step,
+    AdapterError, AttemptRef, Observer, Recorder, Replay, Replayed, Stop, Watch, finish, now, step,
 };
 use crate::frame::Frame;
 use crate::known;
@@ -94,6 +94,7 @@ pub(super) async fn run(
         turn.prompt.as_bytes().to_vec(),
         Stop::Latch(cancel),
         steers,
+        &mut Watch::new(None),
     )
     .await?;
     let state = finish(
@@ -333,7 +334,9 @@ impl Seen {
 }
 
 /// Write `input` and read one exec turn's output until its process ended, recording what it shows; a cancel from
-/// `stop` interrupts it (the direct mode then escalates as the turn's plan says; the runner's sends SIGINT only).
+/// `stop` interrupts it (the direct mode then escalates as the turn's plan says; the runner's sends SIGINT only), and
+/// `watch`'s re-checks of the agent's files are recorded as they are due.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drive(
     recorder: &mut Recorder<'_>,
     attempt: &AttemptRef,
@@ -342,6 +345,7 @@ pub(super) async fn drive(
     input: Vec<u8>,
     stop: Stop<'_>,
     steers: &mut mpsc::Receiver<Steer>,
+    watch: &mut Watch,
 ) -> Result<Driven, AdapterError> {
     let id = &attempt.attempt_id;
     let cancel_now = |process: &Process| {
@@ -370,6 +374,13 @@ pub(super) async fn drive(
             () = stop.requested(), if !cancelled => {
                 cancelled = true;
                 cancel_now(process);
+                continue;
+            }
+            // A re-check that is due comes before output (the same branch wakes an idle loop for it).
+            () = watch.due(), if watch.on() => {
+                for (key, payload) in watch.check() {
+                    recorder.event(&format!("exec-{key}"), "adapter.diagnostic", payload).await?;
+                }
                 continue;
             }
             written = &mut feed, if fed.is_none() => {
@@ -415,7 +426,7 @@ pub(super) async fn drive(
 /// Replay `bytes` (exec's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands) through this
 /// transport's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`].
 pub(super) fn replay(bytes: &[u8]) -> Replayed {
-    let mut recorder = Recorder::Collect(Vec::new());
+    let mut recorder = Recorder::Collect(Vec::new(), Observer::default());
     let mut seen = Seen::default();
     let mut cancelled = false;
     for step in crate::adapter::replay_steps(bytes) {
@@ -445,7 +456,7 @@ pub(super) fn replay(bytes: &[u8]) -> Replayed {
         None => return crate::adapter::unreplayable("the judging waited"),
     };
     let recorded = match recorder {
-        Recorder::Collect(recorded) => recorded,
+        Recorder::Collect(recorded, _) => recorded,
         Recorder::Store { .. } => Vec::new(),
     };
     Replayed {
