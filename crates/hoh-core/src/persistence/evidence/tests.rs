@@ -455,3 +455,70 @@ async fn test_053_02_a_fail_row_is_not_updated_to_pass() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_stopped_runs_history_backfill_is_written_as_records_and_its_live_recording_is_held() -> R
+{
+    // docs/adr/ADR-031.md correction D (-401, -502; the test plan's 停住之后的写入口 (7), at the store): candidate C,
+    // superseded by a later freeze, is no live obligation; its run R has ended (its COMPLETED published). A recovered
+    // record of C carrying SOURCE_CHANGED is history: its evidence row is written and its evidence.recorded and
+    // integrity_violation are Records, project-scoped (run_id null, R in the payload, ids kept); R stays stopped. The
+    // same record handed over by a check's own run is R's progress: Held, nothing written.
+    for source in [RecordingSource::Recovery, RecordingSource::Run] {
+        let dir = tempfile::tempdir()?;
+        let (store, path, c) = world(dir.path()).await?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-11T00:00:05Z';
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', 'later/frozen', 'R', 'candidate.frozen', json_object('candidate_id', 'C9', 'superseded',
+                json_array('{c}')), '2026-11-11T00:00:06Z');
+             UPDATE runs SET state = 'VERIFYING' WHERE run_id = 'R';"
+        ))?;
+        let revision: i64 = Connection::open(&path)?.query_row(
+            "SELECT revision FROM runs WHERE run_id = 'R'",
+            [],
+            |r| r.get(0),
+        )?;
+        store
+            .commit(crate::persistence::Commit {
+                cas: vec![crate::persistence::StateCas {
+                    id: "R".to_owned(),
+                    expected_revision: revision,
+                    change: crate::persistence::Change::Run(crate::protocol::RunState::Completed),
+                }],
+                ..crate::persistence::Commit::default()
+            })
+            .await?;
+        let mut job = recording("rec-1", &c, "Q/attempt-1");
+        job.integrity = vec!["SOURCE_CHANGED: src/lib.rs".to_owned()];
+        job.source = source;
+        let recorded = store.record_evidence(job).await;
+        let events = texts(
+            &path,
+            "SELECT kind || ' ' || coalesce(run_id, 'null') || ' ' || coalesce(json_extract(payload_json, '$.run_id'), '-') \
+             FROM events WHERE kind IN ('evidence.recorded', 'integrity_violation') ORDER BY seq",
+        )?;
+        let latest = texts(
+            &path,
+            "SELECT kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1",
+        )?;
+        let rows = texts(&path, "SELECT evidence_id FROM evidence")?;
+        if source == RecordingSource::Recovery {
+            recorded?;
+            assert_eq!(
+                events,
+                ["evidence.recorded null R", "integrity_violation null R"]
+            );
+            assert_eq!(rows, ["rec-1"]);
+        } else {
+            assert!(
+                matches!(recorded, Err(PersistError::Held { .. })),
+                "{recorded:?}"
+            );
+            assert!(events.is_empty(), "{events:?}");
+            assert!(rows.is_empty(), "{rows:?}");
+        }
+        assert_eq!(latest, ["run.result"], "{source:?}");
+    }
+    Ok(())
+}
