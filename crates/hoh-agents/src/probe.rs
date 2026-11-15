@@ -2657,6 +2657,127 @@ pub fn resolve_implementation(agent: Agent, launcher: &Path) -> Result<PathBuf, 
     })
 }
 
+/// How the start gate runs an agent's verified implementation (docs/adr/ADR-030.md decision 9, "执行计划"): the gate's
+/// `--plan` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exec {
+    /// E1, the implementation is an ELF: the inode the gate hashed is executed through its descriptor, its path as
+    /// `argv[0]`.
+    Fd,
+    /// E2, the implementation is a script: its interpreter (the shebang read through the descriptor the gate hashed)
+    /// is executed with the implementation's path as its argument.
+    Path,
+}
+
+impl Exec {
+    /// Its name on the gate's command line (`--plan fd|path`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Exec::Fd => "fd",
+            Exec::Path => "path",
+        }
+    }
+
+    /// The plan named `name` on the gate's command line.
+    pub fn named(name: &str) -> Option<Exec> {
+        match name {
+            "fd" => Some(Exec::Fd),
+            "path" => Some(Exec::Path),
+            _ => None,
+        }
+    }
+
+    /// Its name in the gate's `verified` record.
+    pub fn record(self) -> &'static str {
+        match self {
+            Exec::Fd => "E1",
+            Exec::Path => "E2",
+        }
+    }
+}
+
+/// What the start gate executes for an agent once it verified it (docs/adr/ADR-030.md decision 9, "执行计划"): always the
+/// resolved implementation, never a wrapper that would resolve it again at run time, with what the agent's own launcher
+/// would have set for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub exec: Exec,
+    /// The resolved implementation: E1's `argv[0]`, E2's script argument.
+    pub implementation: PathBuf,
+    /// Set in the agent's environment: codex's npm wrapper's `CODEX_MANAGED_PACKAGE_ROOT` and `CODEX_MANAGED_BY_NPM`,
+    /// pi's `PI_MANAGED_INSTALL_ROOT`.
+    pub env: Vec<(OsString, OsString)>,
+    /// Put before the agent's `PATH`: pi's own node (`<data home>/pi-node/current/bin`), as its launcher puts it.
+    pub path_prefix: Option<PathBuf>,
+}
+
+/// The plan of `agent`'s `implementation` resolved from `launcher` ([`resolve_implementation`]), its layout one of those
+/// that function knows; pi's node looked for under `${XDG_DATA_HOME:-$HOME/.local/share}` of this process.
+pub fn exec_plan(agent: Agent, launcher: &Path, implementation: &Path) -> Plan {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    exec_plan_in(agent, launcher, implementation, data_home.as_deref())
+}
+
+/// [`exec_plan`] with pi's data home `data_home`. E1 when the implementation starts with the ELF magic, else E2 (a
+/// file that cannot be read is no ELF). A layout is recognised when the implementation is not the launcher's own real
+/// path: codex's npm wrapper (`bin/codex.js` running its vendored binary) adds the two variables `codex.js` sets for an
+/// npm install; pi's launcher (`<agent dir>/bin/pi` running `install/releases/<version>`) adds `PI_MANAGED_INSTALL_ROOT`
+/// and, where `<data home>/pi-node/current/bin/node` is executable, that directory before `PATH`. Claude's link to its
+/// versioned binary and a launcher that is its own implementation add nothing.
+pub fn exec_plan_in(
+    agent: Agent,
+    launcher: &Path,
+    implementation: &Path,
+    data_home: Option<&Path>,
+) -> Plan {
+    let elf = std::fs::File::open(implementation).is_ok_and(|mut file| {
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+    });
+    let mut plan = Plan {
+        exec: if elf { Exec::Fd } else { Exec::Path },
+        implementation: implementation.to_path_buf(),
+        env: Vec::new(),
+        path_prefix: None,
+    };
+    let Some(real) = std::fs::canonicalize(launcher)
+        .ok()
+        .filter(|real| real != implementation)
+    else {
+        return plan;
+    };
+    match agent {
+        Agent::Codex if is_codex_npm_wrapper(&real) => {
+            if let Some(package) = real.parent().and_then(Path::parent) {
+                plan.env.push((
+                    "CODEX_MANAGED_PACKAGE_ROOT".into(),
+                    package.as_os_str().to_owned(),
+                ));
+                plan.env.push(("CODEX_MANAGED_BY_NPM".into(), "1".into()));
+            }
+        }
+        Agent::Pi => {
+            if let Some(agent_dir) = real.parent().and_then(Path::parent) {
+                plan.env.push((
+                    "PI_MANAGED_INSTALL_ROOT".into(),
+                    agent_dir.join("install").into_os_string(),
+                ));
+            }
+            plan.path_prefix = data_home
+                .map(|home| home.join("pi-node/current/bin"))
+                .filter(|bin| {
+                    std::fs::metadata(bin.join("node"))
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                });
+        }
+        _ => {}
+    }
+    plan
+}
+
 /// The target triple and platform package `codex.js` selects for this host (its `PLATFORM_PACKAGE_BY_TARGET`).
 fn codex_target() -> Option<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {

@@ -489,7 +489,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
     let mut command = Command::new(&gate.program);
     command
-        .args(&gate.args)
+        .args(gate.argv())
         .arg(&turn.launch.program)
         .args(argv.args.iter().map(OsString::from))
         .envs(gate.env.iter().map(|(k, v)| (k, v)))
@@ -510,13 +510,14 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let escalation = turn.escalation;
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
     let attempt_id = attempt.attempt_id.clone();
+    let gate = gate.clone();
     let ended = tokio::spawn(async move {
         // Nothing reaches the gate before it is opened; unopened, its input ends and the agent never runs.
         if opened.await.is_err() {
             let report = crate::adapter::close_gate(&mut process).await;
             return Facts::gate_closed(raw_log_path, report.as_ref());
         }
-        let mut input = b"go\n".to_vec();
+        let mut input = gate.go();
         input.extend_from_slice(&prompt);
         let mut recorder = Recorder::Collect(Vec::new());
         let driven = drive(
@@ -536,6 +537,17 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             return Facts::incomplete(raw_log_path, recorded);
         };
         let (state, failure) = driven.verdict();
+        // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
+        if state != AttemptState::Cancelled
+            && let Some(refused) = crate::adapter::refused_at_gate(
+                &gate,
+                &raw_log_path,
+                driven.report.as_ref(),
+                &recorded,
+            )
+        {
+            return refused;
+        }
         // Claude's own cost estimate goes with the usage, never as the run's cost (ADR-020, M2T07R-256).
         let usage = match (driven.usage, driven.cost) {
             (Some(Value::Object(mut usage)), Some(cost)) => {
@@ -557,6 +569,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             recorded,
             degraded: None,
             final_text: driven.result.and_then(|r| r.text),
+            compat: None,
         }
     });
     Ok(Held {

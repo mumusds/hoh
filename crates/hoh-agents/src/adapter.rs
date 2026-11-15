@@ -5,6 +5,7 @@ use hoh_core::lifecycle::{AttemptState, InputState, Lifecycle};
 use hoh_core::persistence::{
     AttemptFacts, AttemptMove, CancelLatch, InputMove, PersistError, Store,
 };
+use hoh_core::staffing::{AgentIdentity, FileStamp, Stamp};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -24,11 +25,216 @@ pub struct AttemptRef {
 /// agent's own program and argv. It reads one line from stdin and, if the line is `go`, execs the agent in its place
 /// (same pid, group, environment and cgroup); otherwise it exits and the agent never runs. `env` is added to the
 /// agent's environment (its attempt's marker).
+///
+/// With `expect` and `status` (the product's every turn, docs/adr/ADR-030.md decision 9) the gate is opened by
+/// `go <key>` and, before it execs, verifies that the implementation it is about to run is the one `expect` names,
+/// recording its decision in `status.path`; without them (a gate tests drive directly) it opens on `go` unchecked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCommand {
     pub program: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub expect: Option<Expect>,
+    pub status: Option<GateStatus>,
+}
+
+impl GateCommand {
+    /// The gate's arguments before the agent's program and argv: `args`, then, with `expect` and `status`,
+    /// `--expect <agent> <launcher_path> <launcher_sha256> <implementation_path> <implementation_sha256> --stamp
+    /// <launcher's dev:ino:ctime_sec:ctime_nsec> <the implementation's> --plan <fd|path> --status <path> --`
+    /// (docs/adr/ADR-030.md decision 9); the key is never among them.
+    pub fn argv(&self) -> Vec<std::ffi::OsString> {
+        let mut argv = self.args.clone();
+        if let Some(expect) = &self.expect {
+            let identity = &expect.identity;
+            argv.push("--expect".into());
+            argv.push(expect.agent.as_str().into());
+            for part in [
+                &identity.launcher_path,
+                &identity.launcher_sha256,
+                &identity.implementation_path,
+                &identity.implementation_sha256,
+            ] {
+                argv.push(part.into());
+            }
+            argv.push("--stamp".into());
+            argv.push(stamp_text(&expect.stamp.launcher).into());
+            argv.push(stamp_text(&expect.stamp.implementation).into());
+            argv.push("--plan".into());
+            argv.push(expect.plan.as_str().into());
+        }
+        if let Some(status) = &self.status {
+            argv.push("--status".into());
+            argv.push(status.path.clone().into_os_string());
+        }
+        if self.expect.is_some() || self.status.is_some() {
+            argv.push("--".into());
+        }
+        argv
+    }
+
+    /// The line that opens the gate: `go`, or `go <key>` when it records to `status` (docs/adr/ADR-030.md decision 9:
+    /// the key reaches the gate only through it, on the stdin it reads one byte at a time).
+    pub(crate) fn go(&self) -> Vec<u8> {
+        match &self.status {
+            Some(status) => format!("go {}\n", status.key).into_bytes(),
+            None => b"go\n".to_vec(),
+        }
+    }
+}
+
+/// A file's stamp as the gate's command line gives it: `dev:ino:ctime_sec:ctime_nsec`.
+pub fn stamp_text(stamp: &FileStamp) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        stamp.dev, stamp.ino, stamp.ctime_sec, stamp.ctime_nsec
+    )
+}
+
+/// The stamp `text` gives as [`stamp_text`] writes it.
+pub fn stamp_of_text(text: &str) -> Option<FileStamp> {
+    let mut parts = text.split(':');
+    let stamp = FileStamp {
+        dev: parts.next()?.parse().ok()?,
+        ino: parts.next()?.parse().ok()?,
+        ctime_sec: parts.next()?.parse().ok()?,
+        ctime_nsec: parts.next()?.parse().ok()?,
+    };
+    parts.next().is_none().then_some(stamp)
+}
+
+/// What a turn's gate verifies before it execs, all from the fact F its prepare used (docs/adr/ADR-030.md decision 9):
+/// the agent, its identity, the stamps of its launcher and implementation as F's look read them, and how the
+/// implementation is to be executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expect {
+    pub agent: crate::compat::Agent,
+    pub identity: AgentIdentity,
+    pub stamp: Stamp,
+    pub plan: crate::probe::Exec,
+}
+
+/// Where a turn's gate records its decision (`gate.jsonl` in the attempt's log directory) and the key, drawn for the
+/// attempt and kept in HoH's memory only, that marks a refusal there as the gate's own (docs/adr/ADR-030.md decision
+/// 9, "闸门的结果通道"). Its `Debug` never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GateStatus {
+    pub path: std::path::PathBuf,
+    pub key: String,
+}
+
+impl std::fmt::Debug for GateStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GateStatus")
+            .field("path", &self.path)
+            .field("key", &"<withheld>")
+            .finish()
+    }
+}
+
+/// The most of a turn's `gate.jsonl` that is read for its gate's refusal: the gate writes one line before it exits or
+/// execs; whatever an agent that ran appends after it is no refusal of its gate's (it has no key).
+const GATE_RECORD_LIMIT: u64 = 1 << 20;
+
+/// A refusal its gate recorded with the attempt's key (docs/adr/ADR-030.md decision 9): what did not match, whether
+/// only the stamps did not, what was expected and what was seen. Made only by [`gate_refusal`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    item: String,
+    stamp_only: bool,
+    expected: serde_json::Value,
+    seen: serde_json::Value,
+}
+
+impl Refusal {
+    pub fn item(&self) -> &str {
+        &self.item
+    }
+
+    pub fn stamp_only(&self) -> bool {
+        self.stamp_only
+    }
+
+    pub fn expected(&self) -> &serde_json::Value {
+        &self.expected
+    }
+
+    pub fn seen(&self) -> &serde_json::Value {
+        &self.seen
+    }
+}
+
+/// The refusal the gate recorded in `status.path` with `status.key` (docs/adr/ADR-030.md decision 9, "适配器读"): the
+/// last line whose `outcome` is `refused` and whose `key` equals the attempt's; every other line (`verified`,
+/// `exec_failed`, another key, none, one that does not parse) is ignored, and so is anything past the first
+/// [`GATE_RECORD_LIMIT`] bytes. `None` when there is no such line or no file.
+pub fn gate_refusal(status: &GateStatus) -> Option<Refusal> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&status.path)
+        .ok()?
+        .take(GATE_RECORD_LIMIT)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    bytes
+        .split(|b| *b == b'\n')
+        .rev()
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|record| {
+            record["outcome"] == "refused" && record["key"].as_str() == Some(status.key.as_str())
+        })
+        .map(|record| Refusal {
+            item: record["item"].as_str().unwrap_or_default().to_owned(),
+            stamp_only: record["stamp_only"].as_bool().unwrap_or(false),
+            expected: record["expected"].clone(),
+            seen: record["seen"].clone(),
+        })
+}
+
+/// Where a typed COMPAT_UNVERIFIED of a turn came from (docs/adr/ADR-030.md decision 6): its gate's keyed refusal, or
+/// the re-check before its first input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Gate,
+    BeforeInput,
+}
+
+/// HoH's own finding that a turn's agent is not the one verified (docs/adr/ADR-030.md decision 6, K9): made only in
+/// this module, from its gate's keyed refusal ([`Facts::gate_refused`]), so no failure text of an agent's is ever
+/// taken for one. `stamp_only`: only the files' stamps differed, the identity did not (a transient failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompatRefusal {
+    origin: Origin,
+    stamp_only: bool,
+}
+
+impl CompatRefusal {
+    pub fn origin(&self) -> Origin {
+        self.origin
+    }
+
+    pub fn stamp_only(&self) -> bool {
+        self.stamp_only
+    }
+}
+
+/// The facts of a turn whose agent ended without any frame and whose gate recorded a refusal with this turn's key
+/// ([`gate_refusal`]); `None` for a gate without a status, a turn not seen to end, one that wrote anything on stdout,
+/// or no such refusal: its end is then judged by the adapter's own rules. `recorded` is what the turn recorded so far.
+pub(crate) fn refused_at_gate(
+    gate: &GateCommand,
+    raw_log_path: &str,
+    report: Option<&crate::process::ExitReport>,
+    recorded: &[Recorded],
+) -> Option<Facts> {
+    let status = gate.status.as_ref()?;
+    let report = report.filter(|r| r.stdout.bytes == 0)?;
+    let refusal = gate_refusal(status)?;
+    let mut facts = Facts::gate_refused(raw_log_path.to_owned(), Some(report), refusal);
+    let mut all = recorded.to_vec();
+    all.append(&mut facts.recorded);
+    facts.recorded = all;
+    Some(facts)
 }
 
 /// One thing a turn recorded for its attempt: an event (key, kind, payload, as the direct mode writes them), or the
@@ -68,6 +274,9 @@ pub struct Facts {
     /// The text of its final assistant message, where a verifier's report block is read (docs/adr/ADR-028.md
     /// decision 15); none when it gave none.
     pub final_text: Option<String>,
+    /// HoH's own finding that its agent was not the verified one (docs/adr/ADR-030.md decision 6): only this module
+    /// makes one, so its failure class never comes from a failure string.
+    pub compat: Option<CompatRefusal>,
 }
 
 impl Facts {
@@ -88,6 +297,31 @@ impl Facts {
             recorded: Vec::new(),
             degraded: None,
             final_text: None,
+            compat: None,
+        }
+    }
+
+    /// A turn whose gate refused to exec its agent (docs/adr/ADR-030.md decision 9, "适配器读"): FAILED
+    /// COMPAT_UNVERIFIED, typed as the gate's refusal (Compat, or transient when only the stamps differed), with an
+    /// `adapter.diagnostic{reason: GATE_REFUSED, item, expected, seen}`. The agent never ran.
+    pub fn gate_refused(
+        raw_log_path: String,
+        report: Option<&crate::process::ExitReport>,
+        refusal: Refusal,
+    ) -> Facts {
+        Facts {
+            failure: Some("COMPAT_UNVERIFIED".to_owned()),
+            recorded: vec![Recorded::Event {
+                key: "gate-refused".to_owned(),
+                kind: "adapter.diagnostic".to_owned(),
+                payload: json!({"reason": "GATE_REFUSED", "item": refusal.item,
+                                "expected": refusal.expected, "seen": refusal.seen}),
+            }],
+            compat: Some(CompatRefusal {
+                origin: Origin::Gate,
+                stamp_only: refusal.stamp_only,
+            }),
+            ..Facts::gate_closed(raw_log_path, report)
         }
     }
 
@@ -105,6 +339,7 @@ impl Facts {
             recorded,
             degraded: None,
             final_text: None,
+            compat: None,
         }
     }
 }
@@ -1180,3 +1415,6 @@ mod native_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

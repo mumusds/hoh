@@ -2,13 +2,14 @@
 //! the adapter's runner mode, its process started at the `hoh __gate` start gate, its prompt the role's contract with
 //! the task's header. The adapter moves no state; the turn's facts come back as the attempt's [`Outcome`].
 
-use super::agents::{Prepared, Ran, Ready, Registry, Spec};
+use super::agents::{Current, Prepared, Ran, Ready, Registry, Spec};
 use super::runner::{Executor, Gate, Outcome, Refusal, Started, Work};
-use hoh_agents::adapter::{AttemptRef, Facts, GateCommand, Recorded};
+use hoh_agents::adapter::{AttemptRef, Expect, Facts, GateCommand, GateStatus, Recorded};
 use hoh_agents::compat::Agent;
 use hoh_core::lifecycle::AttemptState;
 use hoh_core::persistence::{Observed, PromptRecord, SessionStart};
 use hoh_core::retry::FailureClass;
+use hoh_core::staffing::{Compat, Fact, Usable};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,22 @@ pub struct ProductExecutor {
     cancels: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
     /// Codex implementations (launcher, version) whose App Server degraded: their next turns use exec (decision 15).
     exec_only: Arc<Mutex<BTreeSet<(PathBuf, String)>>>,
+    /// A test's look at each attempt's gate key as it is drawn; the product has none.
+    keys: Option<KeyHook>,
+}
+
+/// Called with (attempt id, key) for each gate key an executor draws (a test's: the key is in no file, event or
+/// argv).
+pub type KeySeen = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// A [`KeySeen`] the executor holds.
+#[derive(Clone)]
+struct KeyHook(KeySeen);
+
+impl std::fmt::Debug for KeyHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyHook")
+    }
 }
 
 impl ProductExecutor {
@@ -46,8 +63,35 @@ impl ProductExecutor {
             graces,
             cancels: Arc::default(),
             exec_only: Arc::default(),
+            keys: None,
         }
     }
+
+    /// The executor calling `hook` with (attempt id, key) for each gate key it draws: a test's way to the key of an
+    /// attempt, which is otherwise only in HoH's memory and on its gate's go line (docs/adr/ADR-030.md decision 9).
+    #[doc(hidden)]
+    pub fn with_keys(mut self, hook: KeySeen) -> ProductExecutor {
+        self.keys = Some(KeyHook(hook));
+        self
+    }
+}
+
+/// The file in an attempt's log directory where its gate records its decision (docs/adr/ADR-030.md decision 9).
+const GATE_RECORD: &str = "gate.jsonl";
+
+/// A gate's key: 32 bytes from the kernel's random source as lower-case hex, drawn per attempt and kept only in
+/// memory (docs/adr/ADR-030.md decision 9, "位置与钥匙").
+fn gate_key() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty()) {
+            Ok(n) => filled += n,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// How long a delivery waits for the registry's first look at its agent (its probe's commands each have 20 s).
@@ -204,11 +248,21 @@ pub(super) fn read_bridge(path: &Path) -> (Vec<String>, bool) {
     (kept, truncated)
 }
 
-/// How an adapter's failure code fails its attempt (decision 16, ADR-020 decision 1; docs/adr/ADR-030.md decision 6):
-/// the codes the adapters themselves recognise, BLOCKED_AUTH, MODEL_UNAVAILABLE and BLOCKED_CAPABILITY, give their
-/// classes; anything else is transient, a bare COMPAT_UNVERIFIED string and an agent's own text marked `native:` too
-/// (only HoH's typed refusals are Compat).
-fn class_of(code: Option<&str>) -> FailureClass {
+/// How a turn's facts fail its attempt (decision 16, ADR-020 decision 1; docs/adr/ADR-030.md decision 6): a typed
+/// COMPAT_UNVERIFIED (its gate's keyed refusal) is Compat, or transient when only the files' stamps differed; anything
+/// else by its failure code ([`class_of_code`]), never by a COMPAT_UNVERIFIED string.
+fn class_of(facts: &Facts) -> FailureClass {
+    match facts.compat {
+        Some(compat) if compat.stamp_only() => FailureClass::Transient { retry_after: None },
+        Some(_) => FailureClass::Compat,
+        None => class_of_code(facts.failure.as_deref()),
+    }
+}
+
+/// How an adapter's failure code fails its attempt: the codes the adapters themselves recognise, BLOCKED_AUTH,
+/// MODEL_UNAVAILABLE and BLOCKED_CAPABILITY, give their classes; anything else is transient, a bare COMPAT_UNVERIFIED
+/// string and an agent's own text marked `native:` too (only HoH's typed refusals are Compat).
+fn class_of_code(code: Option<&str>) -> FailureClass {
     match code {
         Some("BLOCKED_AUTH") => FailureClass::Auth,
         Some("MODEL_UNAVAILABLE") => FailureClass::Model,
@@ -231,6 +285,7 @@ fn refused(reason: &str, class: FailureClass, detail: String) -> Refusal {
 /// decision 7).
 fn outcome(facts: Facts) -> Outcome {
     let success = facts.state == AttemptState::Settled;
+    let class = class_of(&facts);
     let mut native_session = facts.native_session.clone();
     let mut events = Vec::new();
     for recorded in facts.recorded {
@@ -267,7 +322,7 @@ fn outcome(facts: Facts) -> Outcome {
         success,
         detail,
         group_gone: facts.group_reaped,
-        class: class_of(facts.failure.as_deref()),
+        class,
         observed: Observed {
             resolved_model: facts.resolved_model,
             usage: facts.usage,
@@ -457,10 +512,11 @@ impl ProductExecutor {
         Ok((recorded.packed.prompt, record))
     }
 
-    /// The turn `work` runs, what it runs as and the record of its prompt, or why it cannot start: an agent the
-    /// binding does not name, or that its last look found unusable, is AGENT_UNAVAILABLE in the Unavailable class
-    /// (docs/adr/ADR-030.md decision 6; its task waits for its role's vacancy to end, decision 7).
-    fn prepare(&self, work: &Work) -> Result<(Agent, Ready, Ran, Prepared, PromptRecord), Refusal> {
+    /// The turn `work` runs, what it runs as, the fact it was checked against and the record of its prompt, or why it
+    /// cannot start: an agent the binding does not name, or that its last look found unusable, is AGENT_UNAVAILABLE in
+    /// the Unavailable class (docs/adr/ADR-030.md decision 6; its task waits for its role's vacancy to end, decision
+    /// 7); then [`check`] (decision 9's (a) to (d)) before anything else is prepared.
+    fn prepare(&self, work: &Work) -> Result<Turn, Refusal> {
         let a = &work.assignment;
         let agent = a.agent.as_deref().and_then(Agent::named).ok_or_else(|| {
             refused(
@@ -469,8 +525,9 @@ impl ProductExecutor {
                 format!("the binding of {} names no agent", work.role),
             )
         })?;
-        let (ready, ran) = match self.registry.prepared(agent) {
-            Some(Ok(prepared)) => prepared,
+        // One read of the registry: the agent's last look, what the turn runs as and its fact F (decision 1, -100).
+        let current = match self.registry.prepared(agent) {
+            Some(Ok(current)) => current,
             Some(Err(why)) => {
                 return Err(refused("AGENT_UNAVAILABLE", FailureClass::Unavailable, why));
             }
@@ -482,6 +539,8 @@ impl ProductExecutor {
                 ));
             }
         };
+        let usable = check(work, agent, &current)?;
+        let Current { ready, ran, .. } = current;
         let contract = hoh_core::config::contract(&self.project, &work.role, a.prompt.as_deref())
             .map_err(|why| {
             refused(
@@ -551,8 +610,138 @@ impl ProductExecutor {
         let prepared = ready
             .turn(agent, spec)
             .map_err(|why| refused("BLOCKED_CAPABILITY", FailureClass::Capability, why))?;
-        Ok((agent, ready, ran, prepared, record))
+        Ok(Turn {
+            agent,
+            ready,
+            ran,
+            usable,
+            prepared,
+            record,
+        })
     }
+
+    /// The start gate of `work`'s turn (docs/adr/ADR-030.md decision 9): checked, expecting the implementation of the
+    /// fact `usable` the turn's prepare used, recording to `gate.jsonl` in the attempt's log directory with a key drawn
+    /// for it now. A key that cannot be drawn fails the start as the adapters' own start failures do (`SPAWN`,
+    /// transient): no new reason code (docs/adr/ADR-030.md "未采用", new reason codes).
+    fn gate(&self, work: &Work, agent: Agent, usable: &Usable) -> Result<GateCommand, Refusal> {
+        let key = gate_key().map_err(|e| {
+            refused(
+                "SPAWN",
+                FailureClass::Transient { retry_after: None },
+                format!("the gate's key could not be drawn: {e}"),
+            )
+        })?;
+        if let Some(KeyHook(hook)) = &self.keys {
+            hook(&work.attempt_id, &key);
+        }
+        let identity = &usable.identity;
+        let plan = hoh_agents::probe::exec_plan(
+            agent,
+            Path::new(&identity.launcher_path),
+            Path::new(&identity.implementation_path),
+        );
+        Ok(GateCommand {
+            program: self.gate.clone(),
+            args: vec!["__gate".into()],
+            env: std::iter::once((super::ATTEMPT_ENV.into(), work.marker().into()))
+                .chain(work.helpers.iter().flat_map(|h| {
+                    [
+                        ("HOH_RUN_CHECK".into(), h.run_check.clone().into_os_string()),
+                        ("HOH_ASK".into(), h.ask.clone().into_os_string()),
+                    ]
+                }))
+                .collect(),
+            expect: Some(Expect {
+                agent,
+                identity: identity.clone(),
+                stamp: usable.stamp,
+                plan: plan.exec,
+            }),
+            status: Some(GateStatus {
+                path: attempt_logs(&self.project, &work.attempt_id).join(GATE_RECORD),
+                key,
+            }),
+        })
+    }
+}
+
+/// A turn prepared to start: its agent, the look and fact it was checked against, what it runs as, the adapter's
+/// turn and the record of its prompt.
+struct Turn {
+    agent: Agent,
+    ready: Ready,
+    ran: Ran,
+    usable: Box<Usable>,
+    prepared: Prepared,
+    record: PromptRecord,
+}
+
+/// Decision 9's checks of `work`'s turn of `agent` (docs/adr/ADR-030.md, "prepare 的核对", M2T15D-100), in order and
+/// all from the one fact F in `current`, before anything else of the turn is prepared: (a) the launcher's and the
+/// implementation's stamps read again (metadata only) are F's look's, (b) F's entry is verified against the manifest
+/// the registry holds, (c) F is not a missing login (BLOCKED_AUTH, Auth), (d) the turn's session is fresh for F
+/// (`staffing::fresh`, staffing's own function). (a), (b) and (d) refuse COMPAT_UNVERIFIED in the Compat class. A fact
+/// that is none of usable and logged out (its session capabilities could not be read) is AGENT_UNAVAILABLE in the
+/// Unavailable class, as a look that found the agent unusable. F's usable form when every check passed.
+fn check(work: &Work, agent: Agent, current: &Current) -> Result<Box<Usable>, Refusal> {
+    let a = &work.assignment;
+    let ready = &current.ready;
+    let compat = |detail: String| refused("COMPAT_UNVERIFIED", FailureClass::Compat, detail);
+    let name = agent.as_str();
+    let implementation = Path::new(&ready.entry.implementation_path);
+    let now = super::agents::stamp_now(&ready.launcher, implementation);
+    if now != Some(ready.stamp) {
+        return Err(compat(format!(
+            "{name}: files changed since the last look: {} and {} were {}, are {}",
+            ready.launcher.display(),
+            implementation.display(),
+            serde_json::json!(ready.stamp),
+            now.map_or_else(
+                || "unreadable".to_owned(),
+                |s| serde_json::json!(s).to_string()
+            ),
+        )));
+    }
+    if current.compat != Compat::Verified {
+        return Err(compat(format!(
+            "{name} {} is not verified: {}",
+            ready.version,
+            serde_json::json!(current.compat)
+        )));
+    }
+    let usable = match &current.fact {
+        Fact::Usable(usable) => usable.clone(),
+        Fact::LoginMissing(why) => {
+            return Err(refused("BLOCKED_AUTH", FailureClass::Auth, why.clone()));
+        }
+        other => {
+            return Err(refused(
+                "AGENT_UNAVAILABLE",
+                FailureClass::Unavailable,
+                format!("{name}: {}", serde_json::json!(other)),
+            ));
+        }
+    };
+    let session = hoh_core::staffing::Session {
+        agent_version: a.agent_version.clone().unwrap_or_default(),
+        capabilities: a
+            .session_capabilities
+            .clone()
+            .unwrap_or(serde_json::Value::Null),
+        identity: a.session_identity.clone(),
+    };
+    if !hoh_core::staffing::fresh(&session, &current.fact) {
+        return Err(compat(format!(
+            "session {} was granted for {}, the agent is now {}; it waits for its rebind",
+            a.session_id.as_deref().unwrap_or("(none)"),
+            serde_json::json!({"agent_version": session.agent_version, "identity": session.identity,
+                               "capabilities": session.capabilities}),
+            serde_json::json!({"agent_version": usable.version, "identity": usable.identity,
+                               "capabilities": usable.session}),
+        )));
+    }
+    Ok(usable)
 }
 
 impl Executor for ProductExecutor {
@@ -596,7 +785,15 @@ impl Executor for ProductExecutor {
     }
 
     fn start(&self, work: &Work) -> Result<Started, Refusal> {
-        let (agent, ready, ran, prepared, record) = self.prepare(work)?;
+        let Turn {
+            agent,
+            ready,
+            ran,
+            usable,
+            prepared,
+            record,
+        } = self.prepare(work)?;
+        let gate = self.gate(work, agent, &usable)?;
         let attempt = AttemptRef {
             attempt_id: work.attempt_id.clone(),
             session_id: work.assignment.session_id.clone().unwrap_or_default(),
@@ -607,25 +804,13 @@ impl Executor for ProductExecutor {
                 .clone()
                 .unwrap_or_else(|| ready.version.clone()),
         };
-        let gate = GateCommand {
-            program: self.gate.clone(),
-            args: vec!["__gate".into()],
-            env: std::iter::once((super::ATTEMPT_ENV.into(), work.marker().into()))
-                .chain(work.helpers.iter().flat_map(|h| {
-                    [
-                        ("HOH_RUN_CHECK".into(), h.run_check.clone().into_os_string()),
-                        ("HOH_ASK".into(), h.ask.clone().into_os_string()),
-                    ]
-                }))
-                .collect(),
-        };
         let held = match &prepared {
             Prepared::Claude(turn) => hoh_agents::claude::start(&attempt, turn, &gate),
             Prepared::Codex(turn) => hoh_agents::codex::start(&attempt, turn, &gate),
             Prepared::Pi(turn) => hoh_agents::pi::start(&attempt, turn, &gate),
         }
         .map_err(|r| {
-            let class = class_of(Some(&r.code));
+            let class = class_of_code(Some(&r.code));
             refused(&r.code, class, r.detail)
         })?;
         let id = work.attempt_id.clone();

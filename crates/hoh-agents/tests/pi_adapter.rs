@@ -1402,6 +1402,8 @@ fn gate(world: &World) -> R<pi::GateCommand> {
         program: "python3".into(),
         args: vec![script.into()],
         env: vec![("HOH_ATTEMPT_ID".into(), "p/A1".into())],
+        expect: None,
+        status: None,
     })
 }
 

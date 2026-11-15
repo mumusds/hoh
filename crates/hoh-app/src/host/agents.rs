@@ -121,6 +121,18 @@ impl Probe {
     }
 }
 
+/// An agent as a turn prepared now finds it ([`Registry::prepared`]): read together, under one lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Current {
+    pub ready: Ready,
+    pub ran: Ran,
+    /// The agent's fact F (docs/adr/ADR-030.md decision 1): prepare checks it and the gate's expectation is taken from it.
+    pub fact: Fact,
+    /// `compat::verdict` of `ready`'s entry against the manifest the registry holds, `Pending` when the files changed
+    /// since the look (F's own when it is usable).
+    pub compat: Compat,
+}
+
 /// What a turn ran as (docs/adr/ADR-030.md decision 2, M2T15D-07): its agent, the identity of the fact its prepare
 /// used and the registry's generation `(host_epoch, n)` of that agent then. A turn's BLOCKED_AUTH is latched as the
 /// agent's fact only by it ([`Registry::turn_auth_failed`]).
@@ -290,7 +302,7 @@ impl State {
                     "launcher_path": entry.launcher_path, "implementation_sha256": entry.implementation_sha256,
                     "help_sha256": entry.help_sha256, "schema_sha256": entry.schema_sha256,
                     "capabilities": entry.capabilities,
-                    "compat": compat::verdict(self.manifest.as_ref(), agent.as_str(), entry, suite_set),
+                    "compat": self.compat(agent, ready, suite_set),
                     "observation": observation,
                 })
             }
@@ -325,13 +337,36 @@ impl State {
             generation: (self.host_epoch, ready.look),
             session: session.clone(),
             granted: hoh_core::decision::granted_capabilities(session),
-            compat: compat::verdict(
+            compat: self.compat(agent, ready, suite_set),
+        })))
+    }
+
+    /// Whether `agent` as its look `ready` found it is verified (decision 9's `compat::verdict` of its entry against
+    /// the manifest held), but `Pending` once its launcher's or implementation's stamp read now (`stat`, following
+    /// links, metadata only: prepare's (a)) is not the look's, or cannot be read: its files changed since the last
+    /// look, which only the next look probes (docs/adr/ADR-030.md decision 1, its implementation correction in S6c).
+    /// Read under the registry's lock, so a snapshot, `fact` and `prepared` all see the change as soon as it is there,
+    /// and no task is put back for a version the registry has not looked at (decision 13 (b)).
+    fn compat(&self, agent: Agent, ready: &Ready, suite_set: &str) -> Compat {
+        let implementation = Path::new(&ready.entry.implementation_path);
+        match stamp_now(&ready.launcher, implementation) {
+            Some(now) if now == ready.stamp => compat::verdict(
                 self.manifest.as_ref(),
                 agent.as_str(),
                 &ready.entry,
                 suite_set,
             ),
-        })))
+            now => Compat::Pending(format!(
+                "files changed since the last look: {} and {} were {}, are {}",
+                ready.launcher.display(),
+                implementation.display(),
+                serde_json::json!(ready.stamp),
+                now.map_or_else(
+                    || "unreadable".to_owned(),
+                    |s| serde_json::json!(s).to_string()
+                ),
+            )),
+        }
     }
 }
 
@@ -353,6 +388,8 @@ pub struct Registry {
     /// The stop of the compat suite running, if one is: stopped with the registry's (docs/adr/ADR-030.md decision 10,
     /// "有界、停止与崩溃"), and on its own when the suite runs past its limit.
     suite_stop: Mutex<Option<probe::ProbeStop>>,
+    /// How many times [`Registry::state`] was taken (a prepare reads it once, decision 1 -100; tests count).
+    reads: std::sync::atomic::AtomicU64,
 }
 
 impl Registry {
@@ -373,6 +410,7 @@ impl Registry {
             every: AUTH_EVERY,
             suite_set: compat::SUITE_SET_SHA256.as_str().to_owned(),
             suite_stop: Mutex::new(None),
+            reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -392,6 +430,7 @@ impl Registry {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -821,24 +860,40 @@ impl Registry {
         }
     }
 
-    /// `agent` as it was last looked at, with what a turn prepared from it now runs as (docs/adr/ADR-030.md decision
-    /// 2, M2T15D-07): the identity of that look and the registry's generation `(host_epoch, n)` of the agent now, read
-    /// under one lock; `None` if it never was looked at.
-    pub fn prepared(&self, agent: Agent) -> Option<Result<(Ready, Ran), String>> {
+    /// `agent` as a turn prepared now finds it, read under the registry's lock in one go (docs/adr/ADR-030.md decisions
+    /// 1, 2 and 9, M2T15D-07, -100): its last look, what the turn runs as (that look's identity and the registry's
+    /// generation `(host_epoch, n)` of the agent now), its fact F (the constructor of [`Registry::fact`] and the
+    /// snapshot's) and the verdict of the look's entry against the manifest the registry holds. `None` if it never was
+    /// looked at (or the registry has no project yet); why its last look found it unusable.
+    pub fn prepared(&self, agent: Agent) -> Option<Result<Current, String>> {
         let state = self.state();
         let known = state.agents.get(&agent)?;
         let seen = known.seen.as_ref()?;
-        Some(match &seen.outcome {
-            Ok(ready) => Ok((
-                ready.clone(),
-                Ran {
-                    agent,
-                    identity: ready.entry.identity(),
-                    generation: (state.host_epoch, known.looks),
-                },
-            )),
-            Err(probe) => Err(probe.detail.clone()),
-        })
+        let ready = match &seen.outcome {
+            Ok(ready) => ready,
+            Err(probe) => return Some(Err(probe.detail.clone())),
+        };
+        let fact = state.item(agent, &self.suite_set).0?;
+        let compat = match &fact {
+            Fact::Usable(usable) => usable.compat.clone(),
+            _ => state.compat(agent, ready, &self.suite_set),
+        };
+        Some(Ok(Current {
+            ready: ready.clone(),
+            ran: Ran {
+                agent,
+                identity: ready.entry.identity(),
+                generation: (state.host_epoch, known.looks),
+            },
+            fact,
+            compat,
+        }))
+    }
+
+    /// How many times the registry's state was read (its lock taken): a test's count of a prepare's reads.
+    #[cfg(test)]
+    pub(super) fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `agent` as it was last looked at, without looking again; `None` if it never was.

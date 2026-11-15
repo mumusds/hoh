@@ -134,22 +134,56 @@ impl World {
 
     /// The product's host as [`World::config`], with the effective configuration `effective`.
     fn config_of(&self, effective: hoh_core::config::Config) -> HostConfig {
-        let path = format!(
+        self.config_with(effective, self.registry(), None)
+    }
+
+    /// The PATH the world's agents are found on: the fakes, then the tools they use.
+    fn path(&self) -> String {
+        format!(
             "{}:{}",
             self.bin().display(),
             self.dir.path().join("tools").display()
-        );
-        // pi's settings from a directory of the world's own, never the user's ~/.pi/agent (M2T17R-59).
-        let registry = hoh_app::host::agents::Registry::with_pi_dir(
-            path.into(),
+        )
+    }
+
+    /// A registry of the world's agents, pi's settings from a directory of the world's own, never the user's
+    /// ~/.pi/agent (M2T17R-59).
+    fn registry(&self) -> std::sync::Arc<hoh_app::host::agents::Registry> {
+        std::sync::Arc::new(hoh_app::host::agents::Registry::with_pi_dir(
+            self.path().into(),
             Some(self.dir.path().join("pi-agent")),
+        ))
+    }
+
+    /// The product's host as [`World::config_of`], its agents those of `registry`, and with `keys` called with each
+    /// attempt's gate key as its executor draws it (docs/adr/ADR-030.md decision 9).
+    fn config_with(
+        &self,
+        effective: hoh_core::config::Config,
+        registry: std::sync::Arc<hoh_app::host::agents::Registry>,
+        keys: Option<hoh_app::host::product::KeySeen>,
+    ) -> HostConfig {
+        let graces = (
+            Duration::from_secs(u64::from(effective.execution.cancel_native_grace_seconds)),
+            Duration::from_secs(u64::from(effective.execution.cancel_term_grace_seconds)),
         );
         let mut config = HostConfig::product_with(
             &self.project(),
             effective,
             env!("CARGO_BIN_EXE_hoh").into(),
-            std::sync::Arc::new(registry),
+            registry.clone(),
         );
+        if let (Some(keys), Some(runner)) = (keys, config.runner.as_mut()) {
+            runner.executor = std::sync::Arc::new(
+                hoh_app::host::product::ProductExecutor::new(
+                    registry,
+                    self.project(),
+                    env!("CARGO_BIN_EXE_hoh").into(),
+                    graces,
+                )
+                .with_keys(keys),
+            );
+        }
         config.port = 0;
         config.store.wal_probe = Some(probe());
         // Commander sessions' own directories in the world's, never the user's state directory (ADR-025 decision 3).
@@ -212,13 +246,32 @@ impl World {
     /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF, or, for one whose marker names
     /// CANCEL, [`CANCEL_STAND_IN`]; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
     /// identity header ([`RESULT_FAKE`]; with the self-test record `claude.d/self-test` while it exists), then prints
-    /// `claude.d/big-log` while it exists (its raw log's extra lines).
+    /// `claude.d/big-log` while it exists (its raw log's extra lines); one whose marker names NATIVE-<code> replays the
+    /// recorded turn with its `result` frame's subtype `<code>` (COMPAT_UNVERIFIED, MODEL_UNAVAILABLE, BLOCKED_AUTH).
     fn claude(&self, hold: Option<&Path>) -> R {
         let wait = hold.map_or(String::new(), |h| {
             format!("while [ ! -e '{}' ]; do sleep 0.05; done\n", h.display())
         });
         std::fs::create_dir_all(self.bin().join("claude.d"))?;
         std::fs::write(self.bin().join("claude.d/result.py"), RESULT_FAKE)?;
+        // Turns whose result is claude's own error named like a reserved code (docs/adr/ADR-030.md decision 6).
+        let recorded =
+            std::fs::read_to_string(format!("{PROTOCOL}/claude/2.1.318/success/stdout.jsonl"))?;
+        for code in ["COMPAT_UNVERIFIED", "MODEL_UNAVAILABLE", "BLOCKED_AUTH"] {
+            let mut text = String::new();
+            for line in recorded.lines() {
+                let mut frame: Value = serde_json::from_str(line)?;
+                if frame["type"] == "result" {
+                    frame["subtype"] = json!(code);
+                    frame["is_error"] = json!(true);
+                }
+                text.push_str(&format!("{frame}\n"));
+            }
+            std::fs::write(
+                self.bin().join(format!("claude.d/native-{code}.jsonl")),
+                text,
+            )?;
+        }
         self.script(
             "claude",
             &format!(
@@ -229,6 +282,7 @@ impl World {
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
                   *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED \"$d/self-test\" || exit 1; [ -f \"$d/big-log\" ] && cat \"$d/big-log\";;\n\
+                  *NATIVE-*) code=${{HOH_ATTEMPT_ID#*NATIVE-}}; cat \"$d/native-${{code%%/*}}.jsonl\"; exit 0;;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
                 bin = self.bin().display()
             ),
@@ -242,6 +296,15 @@ impl World {
     /// frames before `turn/completed` and then 8 MiB with no LF; for one whose marker names UNKNOWN, an effect (a line
     /// in `codex.d/effects`), the frames up to a started command, and its end.
     fn codex(&self, model: &str) -> R {
+        let body = self.codex_body(model, "A")?;
+        self.script("codex", &body)
+    }
+
+    /// The body of [`World::codex`]'s script, which appends `<name> <marker> <argv>` to `codex.d/calls` at each run;
+    /// for an attempt whose marker names SIXTYFIVE it writes the gate's refusal line on stderr and exits 65 with no
+    /// frame; FORGE, the same after `codex.d/forge.py` (when there) forged records in its gate's log; NATIVE, the
+    /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`.
+    fn codex_body(&self, model: &str, name: &str) -> R<String> {
         let d = self.bin().join("codex.d");
         std::fs::create_dir_all(&d)?;
         let case = format!("{PROTOCOL}/codex/0.166.0/app-server-turn");
@@ -298,11 +361,16 @@ impl World {
             d.join("degrade.jsonl"),
             lines(&[json!({"id": 0, "error": {"code": -32601, "message": "Method not found"}})]),
         )?;
+        // A turn that fails with codex's own error named like a reserved code (docs/adr/ADR-030.md decision 6).
+        let mut native = frames.clone();
+        native[end]["params"]["turn"]["status"] = json!("failed");
+        native[end]["params"]["turn"]["error"] =
+            json!({"codexErrorInfo": "COMPAT_UNVERIFIED", "message": "codex's own text"});
+        std::fs::write(d.join("native.jsonl"), lines(&native))?;
         std::fs::write(d.join("requests.json"), Value::Object(requests).to_string())?;
-        self.script(
-            "codex",
-            &format!(
-                "f='{PROTOCOL}/codex/0.166.0'; d='{d}'\n\
+        Ok(format!(
+            "f='{PROTOCOL}/codex/0.166.0'; d='{d}'\n\
+                 echo \"{name} $HOH_ATTEMPT_ID $*\" >> \"$d/calls\"\n\
                  case \"$1\" in\n\
                   --version) echo 'codex-cli 0.166.0'; exit 0;;\n\
                   --help) cat \"$f/help.txt\"; exit 0;;\n\
@@ -321,13 +389,16 @@ impl World {
                     *UNKNOWN*) frames=\"$d/unknown.jsonl\"; opt=--exit-when-done; echo \"$HOH_ATTEMPT_ID\" >> \"$d/effects\";;\n\
                     *DEGRADE*) frames=\"$d/degrade.jsonl\"; opt=;;\n\
                     *INCOMPLETE/attempt-1) frames=\"$d/incomplete.jsonl\"; opt=--exit-when-done;;\n\
+                    *SIXTYFIVE*) echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
+                    *FORGE*) [ -f \"$d/forge.py\" ] && python3 \"$d/forge.py\" \"$d/forged.$$\" \"$@\"\n\
+                     echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
+                    *NATIVE*) frames=\"$d/native.jsonl\"; opt=;;\n\
                     *) frames=\"$d/frames.jsonl\"; opt=;;\n\
                    esac\n\
                    exec timeout 60 python3 '{APP_SERVER}' \"$frames\" \"$d/requests.json\" \"$d/log.$$\" $opt;;\n\
                  esac\nexit 2\n",
-                d = d.display()
-            ),
-        )
+            d = d.display()
+        ))
     }
 
     /// A fake `pi` 1.5.0: the probe's answers from the recording; a turn replays the recorded `rpc-prompt`, or, for an
@@ -3648,6 +3719,784 @@ async fn a_hosts_start_holds_an_unreadable_manifest_as_empty_and_says_so() -> R 
         R::Ok(())
     }
     .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// An action armed at a runner point: called each time the point is reached until it says it is done.
+type Action = Box<dyn FnMut() -> bool + Send>;
+
+/// The runner's points with actions a test arms (CR-006 hooks), and the compat suites held as [`HoldSuite`] holds
+/// them when `hold` is set.
+#[derive(Default)]
+struct Points {
+    armed: std::sync::Mutex<Vec<(hoh_app::host::RunnerPoint, Action)>>,
+    hold: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Points {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Points")
+    }
+}
+
+impl Points {
+    /// Call `action` at each `point` from now on, until it returns true.
+    fn arm(
+        &self,
+        point: hoh_app::host::RunnerPoint,
+        action: impl FnMut() -> bool + Send + 'static,
+    ) {
+        if let Ok(mut armed) = self.armed.lock() {
+            armed.push((point, Box::new(action)));
+        }
+    }
+}
+
+impl hoh_app::host::HostHooks for Points {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        // Taken out while they run (an action may wait), put back unless done.
+        let due: Vec<(hoh_app::host::RunnerPoint, Action)> = match self.armed.lock() {
+            Ok(mut armed) => {
+                let (due, rest) = std::mem::take(&mut *armed)
+                    .into_iter()
+                    .partition(|(at, _)| *at == point);
+                *armed = rest;
+                due
+            }
+            Err(_) => return,
+        };
+        let kept: Vec<_> = due
+            .into_iter()
+            .filter_map(|(at, mut action)| (!action()).then_some((at, action)))
+            .collect();
+        if let Ok(mut armed) = self.armed.lock() {
+            armed.extend(kept);
+        }
+    }
+
+    fn suite_ran(&self, agent: &str) {
+        if let Some(hold) = &self.hold {
+            HoldSuite(hold.clone()).suite_ran(agent);
+        }
+    }
+}
+
+/// Wait on this thread (a hook's: the tick waits with it) until `done`, for at most 60 s; whether it came.
+fn waiting(done: impl Fn() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        if Instant::now() > end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// The events of `kind` of attempt `attempt_id` (by their id's prefix), their payloads in order.
+fn attempt_events(project: &Path, attempt_id: &str, kind: &str) -> R<Vec<Value>> {
+    let rows = query(
+        project,
+        &format!(
+            "SELECT json_group_array(json(payload_json)) FROM (SELECT payload_json FROM events WHERE kind = '{kind}' \
+             AND event_id LIKE '{attempt_id}/%' ORDER BY seq)"
+        ),
+    )?;
+    Ok(serde_json::from_str(&rows)?)
+}
+
+/// The lines of `codex.d/calls` (`<name> <marker> <argv>`) whose marker names `attempt_id`.
+fn codex_calls(world: &World, attempt_id: &str) -> Vec<String> {
+    std::fs::read_to_string(world.bin().join("codex.d/calls"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| {
+            l.split(' ')
+                .nth(1)
+                .is_some_and(|m| m.ends_with(&format!("/{attempt_id}")))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_whose_agent_went_after_staffing_is_refused_before_it_starts() -> R {
+    // docs/adr/ADR-030.md decision 6 (the half of a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class that
+    // staffing took over, restored deterministically, S3's obligation A1-2): claude is removed after the tick's
+    // staffing kept the developer's binding (its snapshot still had claude) and before the round dispatches T-v; the
+    // registry's look found it gone, so prepare refuses AGENT_UNAVAILABLE in the Unavailable class: the attempt FAILED
+    // with an attempt.start_refused, nothing started, the task BLOCKED(AGENT_UNAVAILABLE) for its role's vacancy (no
+    // longer BLOCKED_CAPABILITY). The Commander is codex's, there all along, so the run is not BLOCKED for it (which
+    // would withdraw the dispatch before it starts).
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("gpt-6-astra")?;
+    world.bind_installed()?;
+    let project = world.project();
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Codex,
+    ] {
+        hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&world.path()))?;
+    }
+    let registry = world.registry();
+    let points = std::sync::Arc::new(Points::default());
+    let mut config = world.config_with(hoh_core::config::Config::default(), registry.clone(), None);
+    config.hooks = points.clone();
+    let host = start_when_free(config).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(30);
+        until(
+            &project,
+            &format!(
+                "SELECT group_concat(role || ':' || agent, ',') FROM (SELECT role, agent FROM role_bindings \
+                 WHERE run_id = '{run_id}' AND role IN ('commander', 'developer') AND session_id IS NOT NULL \
+                 ORDER BY role)"
+            ),
+            "commander:codex,developer:claude",
+            limit,
+        )
+        .await?;
+        // The run is RUNNING before the tick (a tick paces and schedules the runs it read as it began).
+        ready(&project, &run_id, &[])?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, claude, at, run) = (gone.clone(), world.bin().join("claude"), project.clone(), run_id.clone());
+        points.arm(hoh_app::host::RunnerPoint::AfterStaffing, move || {
+            let _ = ready(&at, &run, &[("T-v", "developer")]);
+            let _ = std::fs::remove_file(&claude);
+            let found = waiting(|| matches!(registry.seen(hoh_agents::compat::Agent::Claude), Some(Err(_))));
+            seen.store(found, std::sync::atomic::Ordering::SeqCst);
+            true
+        });
+        until(&project, &ended("T-v/attempt-1"), "FAILED/AGENT_UNAVAILABLE", limit).await?;
+        assert!(gone.load(std::sync::atomic::Ordering::SeqCst), "the registry saw claude gone");
+        let refused = attempt_events(&project, "T-v/attempt-1", "attempt.start_refused")?;
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["reason"], "AGENT_UNAVAILABLE");
+        assert!(
+            refused[0]["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "{refused:?}"
+        );
+        until(
+            &project,
+            "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') FROM tasks \
+             WHERE task_id = 'T-v'",
+            "BLOCKED/AGENT_UNAVAILABLE/",
+            limit,
+        )
+        .await?;
+        // Blocked by its attempt's settle, in the Unavailable class (not by the pace's vacancy marking).
+        let blocked = attempt_events(&project, "T-v/attempt-1", "task.blocked")?;
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(
+            (&blocked[0]["reason"], &blocked[0]["failure"]["class"]),
+            (&json!("AGENT_UNAVAILABLE"), &json!("unavailable")),
+            "{blocked:?}"
+        );
+        // Nothing started: no gate record, no process of the turn.
+        assert!(
+            !project.join(".hoh/attempts/T-v%2Fattempt-1/gate.jsonl").exists(),
+            "a gate was spawned"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// The keys the world's executor drew, by attempt id.
+type Keys = std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
+
+/// A recorder of the keys an executor draws, and the hook that records them.
+fn key_recorder() -> (Keys, hoh_app::host::product::KeySeen) {
+    let keys: Keys = std::sync::Arc::default();
+    let into = keys.clone();
+    let hook: hoh_app::host::product::KeySeen =
+        std::sync::Arc::new(move |attempt: &str, key: &str| {
+            if let Ok(mut keys) = into.lock() {
+                keys.insert(attempt.to_owned(), key.to_owned());
+            }
+        });
+    (keys, hook)
+}
+
+/// The registry of a test's host.
+type Registry = std::sync::Arc<hoh_app::host::agents::Registry>;
+
+/// A world whose every role is the fake codex A, registered (verified) before its host starts, with the hooks of
+/// `points` and the keys of its gates recorded; its host's registry.
+async fn codex_world(points: &std::sync::Arc<Points>) -> R<(World, Host, Keys, Registry)> {
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    world.bind_installed()?;
+    hoh_app::compat::register(
+        &world.project(),
+        hoh_agents::compat::Agent::Codex,
+        std::ffi::OsStr::new(&world.path()),
+    )?;
+    let (keys, hook) = key_recorder();
+    let registry = world.registry();
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        registry.clone(),
+        Some(hook),
+    );
+    config.hooks = points.clone();
+    let host = start_when_free(config).await?;
+    Ok((world, host, keys, registry))
+}
+
+/// The fake codex B staged beside the world's codex: the same script naming itself B (so another identity, the same
+/// version); renamed to `bin/codex`, it replaces A on the PATH.
+fn stage_codex_b(world: &World) -> R<PathBuf> {
+    let staged = world.bin().join(".codex-B");
+    std::fs::write(
+        &staged,
+        format!("#!/bin/bash\n{}\n", world.codex_body("gpt-6-astra", "B")?),
+    )?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    Ok(staged)
+}
+
+/// The lines of an attempt's gate record.
+fn gate_records(project: &Path, attempt_id: &str) -> R<Vec<Value>> {
+    let path = project
+        .join(".hoh/attempts")
+        .join(attempt_id.replace('%', "%25").replace('/', "%2F"))
+        .join("gate.jsonl");
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_codex_replaced_while_held_at_the_gate_does_not_run() -> R {
+    // docs/adr/ADR-030.md decision 9 (-03, -101): A is replaced by B after the attempt's prepare passed and its gate
+    // was spawned (RunnerPoint::AfterSpawn), before the gate opens: the gate refuses. Its record has exactly one line,
+    // `refused` with the attempt's key, not stamp_only; the attempt FAILED COMPAT_UNVERIFIED with an
+    // adapter.diagnostic{GATE_REFUSED}; neither A nor B ran the turn; the task BLOCKED(COMPAT_UNVERIFIED), no retry.
+    // Decision 13 (b)'s bound: that is the only refused attempt of the task before B's suite publishes (held here
+    // after its run): the registry's facts say "files changed since the last look" until it looked at B, so the pace
+    // does not put the task back meanwhile; after the publication, the rebind and the grant, it runs B.
+    let hold = tempfile::tempdir()?;
+    let points = std::sync::Arc::new(Points {
+        hold: Some(hold.path().to_path_buf()),
+        ..Points::default()
+    });
+    let (world, host, keys, _) = codex_world(&points).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer' \
+                 AND session_id IS NOT NULL"
+            ),
+            "1",
+            limit,
+        )
+        .await?;
+        // At the spawn of T-GATE's attempt (its log directory made by its prepare), A is replaced by B.
+        let held = project.join(".hoh/attempts/T-GATE%2Fattempt-1");
+        let staged = stage_codex_b(&world)?;
+        let codex = world.bin().join("codex");
+        let replaced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = replaced.clone();
+        points.arm(hoh_app::host::RunnerPoint::AfterSpawn, move || {
+            if !held.exists() {
+                return false;
+            }
+            said.store(
+                std::fs::rename(&staged, &codex).is_ok(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            true
+        });
+        ready(&project, &run_id, &[("T-GATE", "developer")])?;
+        until(&project, &ended("T-GATE/attempt-1"), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        assert!(replaced.load(std::sync::atomic::Ordering::SeqCst));
+        let key = keys
+            .lock()
+            .ok()
+            .and_then(|k| k.get("T-GATE/attempt-1").cloned())
+            .ok_or("no key drawn")?;
+        let records = gate_records(&project, "T-GATE/attempt-1")?;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            (&records[0]["outcome"], &records[0]["key"], &records[0]["stamp_only"]),
+            (&json!("refused"), &json!(key), &json!(false)),
+            "{records:?}"
+        );
+        let diagnostics = attempt_events(&project, "T-GATE/attempt-1", "adapter.diagnostic")?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d["reason"] == "GATE_REFUSED" && d["item"] == records[0]["item"]),
+            "{diagnostics:?}"
+        );
+        // Only the gate ran: neither A nor B was called for the turn.
+        assert_eq!(codex_calls(&world, "T-GATE/attempt-1"), Vec::<String>::new());
+        let task = "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') || '/' || \
+                    (SELECT count(*) FROM attempts WHERE task_id = 'T-GATE') FROM tasks WHERE task_id = 'T-GATE'";
+        assert_eq!(query(&project, task)?, "BLOCKED/COMPAT_UNVERIFIED//1");
+        // B looked at and its suite admitted, held before its publication; ticks go on (200 ms each): the task waits,
+        // with its one refused attempt.
+        exists(&hold.path().join("held"), limit).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(query(&project, task)?, "BLOCKED/COMPAT_UNVERIFIED//1");
+        std::fs::write(hold.path().join("release"), "")?;
+        until(&project, &ended("T-GATE/attempt-2"), "SETTLED/", limit).await?;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-GATE' AND failure_reason = 'COMPAT_UNVERIFIED'"
+            )?,
+            "1"
+        );
+        assert_eq!(codex_calls(&world, "T-GATE/attempt-2").len(), 1);
+        keep(
+            "gate-replaced",
+            &json!({"records": records, "diagnostics": diagnostics,
+                    "attempts": [attempt_row(&project, "T-GATE/attempt-1")?,
+                                 attempt_row(&project, "T-GATE/attempt-2")?]}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// What a verified agent that ends without a frame forges (docs/adr/ADR-030.md decision 9, -201): every 64-hex string
+/// it can read (its argv, environment, descriptors' targets, its attempt's log directory `argv[2]`) as a refusal line
+/// in that directory's gate.jsonl, and each `verified` line there copied as `refused`; all it read in `argv[1]`.
+const FORGE: &str = r#"import json, os, re, sys
+out, logs = sys.argv[1], sys.argv[2]
+seen = [" ".join(sys.argv), json.dumps(dict(os.environ))]
+for fd in os.listdir("/proc/self/fd"):
+    try:
+        seen.append(os.readlink("/proc/self/fd/" + fd))
+    except OSError:
+        pass
+for name in sorted(os.listdir(logs)):
+    path = os.path.join(logs, name)
+    if os.path.isfile(path):
+        seen.append(open(path, encoding="utf-8", errors="replace").read())
+text = "\n".join(seen)
+open(out, "w").write(text)
+gate = os.path.join(logs, "gate.jsonl")
+lines = []
+for key in sorted(set(re.findall("[0-9a-f]{64}", text))):
+    lines.append(json.dumps({"outcome": "refused", "key": key, "code": "COMPAT_UNVERIFIED"}))
+for line in open(gate).read().splitlines():
+    if '"verified"' in line:
+        lines.append(line.replace('"verified"', '"refused"'))
+with open(gate, "a") as f:
+    for line in lines:
+        f.write(line + "\n")
+"#;
+
+/// Every file under `dir` (links not followed) whose bytes contain `needle`.
+fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file()
+                && std::fs::read(entry.path())
+                    .is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+            {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verified_cli_exiting_65_without_frames_is_retried_as_its_own_failure() -> R {
+    // docs/adr/ADR-030.md decision 9 (-101) and the exits table: a verified codex (its gate verified it and execed it)
+    // writes no frame, the gate's own refusal line on stderr and exits 65: its gate's record is `verified` only, so the
+    // attempt fails by the adapter's own rule for an agent that ended without frames, transient: retried with a
+    // backoff, never BLOCKED(COMPAT_UNVERIFIED); the registry's fact and the manifest are as they were. The forging
+    // variant (-201) appends a refusal for every 64-hex string it can read and a copy of the verified line as refused:
+    // the same outcome, and the attempt's key is nowhere it wrote, in its log directory or in the workspace.
+    let points = std::sync::Arc::new(Points::default());
+    let (world, host, keys, registry) = codex_world(&points).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer' \
+                 AND session_id IS NOT NULL"
+            ),
+            "1",
+            limit,
+        )
+        .await?;
+        let manifest = std::fs::read(project.join(".hoh/compat-manifest.json"))?;
+        let fact = registry.fact(hoh_agents::compat::Agent::Codex);
+        assert!(
+            matches!(&fact, Some(hoh_core::staffing::Fact::Usable(u))
+                if u.compat == hoh_core::staffing::Compat::Verified),
+            "{fact:?}"
+        );
+        // The forger is told its attempt's log directory (a fake cannot be given an environment variable of the
+        // test's: it gets it as an argument baked into its script).
+        let logs = project.join(".hoh/attempts/T-FORGE%2Fattempt-1");
+        let d = world.bin().join("codex.d");
+        std::fs::write(
+            d.join("forge.py"),
+            FORGE.replace(
+                "out, logs = sys.argv[1], sys.argv[2]",
+                &format!("out, logs = sys.argv[1], {:?}", logs.display().to_string()),
+            ),
+        )?;
+        ready(&project, &run_id, &[("T-SIXTYFIVE", "developer"), ("T-FORGE", "developer")])?;
+        let mut kept = serde_json::Map::new();
+        for task in ["T-SIXTYFIVE", "T-FORGE"] {
+            let attempt = format!("{task}/attempt-1");
+            until(
+                &project,
+                &format!(
+                    "SELECT state FROM attempts WHERE attempt_id = '{attempt}' \
+                     AND state IN ('SETTLED', 'FAILED', 'CANCELLED')"
+                ),
+                "FAILED",
+                limit,
+            )
+            .await?;
+            let failure = query(
+                &project,
+                &format!("SELECT failure_reason FROM attempts WHERE attempt_id = '{attempt}'"),
+            )?;
+            assert_ne!(failure, "COMPAT_UNVERIFIED", "{attempt}");
+            let records = gate_records(&project, &attempt)?;
+            assert_eq!(records[0]["outcome"], "verified", "{attempt}: {records:?}");
+            assert!(records[0].get("key").is_none(), "{records:?}");
+            assert_eq!(
+                records.iter().filter(|r| r["outcome"] == "verified").count(),
+                1,
+                "{attempt}: {records:?}"
+            );
+            let retried = attempt_events(&project, &attempt, "task.retry_scheduled")?;
+            assert_eq!(retried.len(), 1, "{attempt}: {retried:?}");
+            assert_eq!(retried[0]["failure"]["class"], "transient", "{retried:?}");
+            assert!(retried[0]["next_retry_at"].is_string(), "{retried:?}");
+            assert_eq!(
+                query(
+                    &project,
+                    &format!(
+                        "SELECT count(*) FROM events WHERE kind = 'task.blocked' \
+                         AND json_extract(payload_json, '$.task_id') = '{task}'"
+                    )
+                )?,
+                "0",
+                "{task} was blocked"
+            );
+            // It ran: the agent's own call is there (the gate let it through).
+            assert_eq!(codex_calls(&world, &attempt).len(), 1, "{attempt}");
+            kept.insert(attempt.clone(), json!({"failure": failure, "records": records, "retry": retried}));
+        }
+        // The forger forged: lines it appended are there, none with the attempt's key.
+        let records = gate_records(&project, "T-FORGE/attempt-1")?;
+        assert!(records.len() > 1, "nothing forged: {records:?}");
+        let key = keys
+            .lock()
+            .ok()
+            .and_then(|k| k.get("T-FORGE/attempt-1").cloned())
+            .ok_or("no key drawn")?;
+        assert!(!records.iter().any(|r| r["key"] == json!(key)), "{records:?}");
+        let forged: Vec<PathBuf> = std::fs::read_dir(&d)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("forged.")))
+            .collect();
+        assert_eq!(forged.len(), 1, "{forged:?}");
+        assert_eq!(files_containing(&world.bin(), key.as_bytes()), Vec::<PathBuf>::new());
+        assert_eq!(files_containing(&project, key.as_bytes()), Vec::<PathBuf>::new());
+        assert_eq!(std::fs::read(project.join(".hoh/compat-manifest.json"))?, manifest);
+        assert_eq!(registry.fact(hoh_agents::compat::Agent::Codex), fact);
+        keep("sixty-five", &Value::Object(kept))?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_error_named_like_a_reserved_code_is_its_own_failure() -> R {
+    // docs/adr/ADR-030.md decision 6 (-300): a verified claude's legal `result` frame whose subtype is
+    // COMPAT_UNVERIFIED fails its attempt native:COMPAT_UNVERIFIED, transient (retried with a backoff), never blocking
+    // the task; MODEL_UNAVAILABLE and BLOCKED_AUTH the same, the binding not blocked and nothing excluded; codex's
+    // turn/completed with codexErrorInfo COMPAT_UNVERIFIED the same.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.auditor]\nagent = \"codex\"\nprompt = \"builtin:developer\"\n",
+    )?;
+    world.bind_installed()?;
+    for agent in [
+        hoh_agents::compat::Agent::Claude,
+        hoh_agents::compat::Agent::Codex,
+    ] {
+        hoh_app::compat::register(&project, agent, std::ffi::OsStr::new(&world.path()))?;
+    }
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role IN ('developer', 'auditor') \
+                 AND session_id IS NOT NULL"
+            ),
+            "2",
+            limit,
+        )
+        .await?;
+        let cases = [
+            ("T-NATIVE-COMPAT_UNVERIFIED", "developer", "native:COMPAT_UNVERIFIED"),
+            ("T-NATIVE-MODEL_UNAVAILABLE", "developer", "native:MODEL_UNAVAILABLE"),
+            ("T-NATIVE-BLOCKED_AUTH", "developer", "native:BLOCKED_AUTH"),
+            ("T-CODEX-NATIVE", "auditor", "native:COMPAT_UNVERIFIED"),
+        ];
+        let tasks: Vec<(&str, &str)> = cases.iter().map(|(t, r, _)| (*t, *r)).collect();
+        ready(&project, &run_id, &tasks)?;
+        let mut kept = serde_json::Map::new();
+        for (task, role, failure) in cases {
+            let attempt = format!("{task}/attempt-1");
+            until(&project, &ended(&attempt), &format!("FAILED/{failure}"), limit).await?;
+            let retried = attempt_events(&project, &attempt, "task.retry_scheduled")?;
+            assert_eq!(retried.len(), 1, "{attempt}: {retried:?}");
+            assert_eq!(retried[0]["failure"]["class"], "transient", "{retried:?}");
+            assert!(retried[0]["next_retry_at"].is_string(), "{retried:?}");
+            assert_eq!(
+                query(
+                    &project,
+                    &format!(
+                        "SELECT count(*) FROM events WHERE kind = 'task.blocked' \
+                         AND json_extract(payload_json, '$.task_id') = '{task}'"
+                    )
+                )?,
+                "0",
+                "{task} was blocked"
+            );
+            assert_eq!(
+                query(
+                    &project,
+                    &format!(
+                        "SELECT state FROM role_bindings WHERE run_id = '{run_id}' AND role = '{role}'"
+                    )
+                )?,
+                "ACTIVE",
+                "{role}"
+            );
+            kept.insert(attempt, json!({"failure": failure, "retry": retried}));
+        }
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM events WHERE run_id = '{run_id}' AND kind IN \
+                     ('team.binding_excluded', 'team.binding_blocked')"
+                )
+            )?,
+            "0"
+        );
+        keep("native-errors", &Value::Object(kept))?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suite_passing_after_the_snapshot_does_not_start_the_new_codex_in_the_old_session() -> R {
+    // docs/adr/ADR-030.md decision 9 (d) (M2T15D-100): the developer is bound to codex A (session S_A); B replaces A on
+    // the PATH and its suite, admitted, is held before its publication. In the first tick after T2 (a reader task, never
+    // BLOCKED) is imported, whose snapshot has B pending, RunnerPoint::AfterStaffing lets the suite publish and waits
+    // until the registry's fact is B verified: the same tick's round grants T2's first attempt in S_A, and its prepare
+    // refuses it COMPAT_UNVERIFIED (S_A waits for its rebind): B never ran in S_A. Then the rebind, the grant and T2's
+    // unblocking: its next attempt runs B in a session whose identity is B's.
+    let hold = tempfile::tempdir()?;
+    let points = std::sync::Arc::new(Points {
+        hold: Some(hold.path().to_path_buf()),
+        ..Points::default()
+    });
+    let (world, host, _, registry) = codex_world(&points).await?;
+    let project = world.project();
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        let session_of = |role: &str| {
+            query(
+                &project,
+                &format!(
+                    "SELECT coalesce(session_id, '') FROM role_bindings WHERE run_id = '{run_id}' AND role = '{role}'"
+                ),
+            )
+        };
+        let end = Instant::now() + limit;
+        while session_of("developer")?.is_empty() && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let s_a = session_of("developer")?;
+        assert!(!s_a.is_empty(), "no session for A");
+        ready(&project, &run_id, &[])?;
+        let staged = stage_codex_b(&world)?;
+        let sha_b = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(std::fs::read(&staged)?)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        std::fs::rename(&staged, world.bin().join("codex"))?;
+        // B looked at, its suite admitted and held before its publication: B is pending.
+        exists(&hold.path().join("held"), limit).await?;
+        let codex = hoh_agents::compat::Agent::Codex;
+        let pending = registry.fact(codex);
+        assert!(
+            matches!(&pending, Some(hoh_core::staffing::Fact::Usable(u))
+                if u.identity.implementation_sha256 == sha_b
+                    && matches!(u.compat, hoh_core::staffing::Compat::Pending(_))),
+            "{pending:?}"
+        );
+        let watermark = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let (mark, at, run, release, facts) = (
+            watermark.clone(),
+            project.clone(),
+            run_id.clone(),
+            hold.path().join("release"),
+            registry.clone(),
+        );
+        let wanted = sha_b.clone();
+        points.arm(hoh_app::host::RunnerPoint::AfterStaffing, move || {
+            let seq = query(&at, "SELECT max(seq) FROM events").unwrap_or_default();
+            let snapshot = format!("{:?}", facts.fact(codex));
+            let _ = ready(&at, &run, &[("T2", "developer")]);
+            let _ = std::fs::write(&release, "");
+            let verified = waiting(|| {
+                matches!(facts.fact(codex), Some(hoh_core::staffing::Fact::Usable(u))
+                    if u.identity.implementation_sha256 == wanted
+                        && u.compat == hoh_core::staffing::Compat::Verified)
+            });
+            if let Ok(mut mark) = mark.lock() {
+                *mark = json!({"seq_at_the_hook": seq, "fact_before": snapshot, "verified_after": verified});
+            }
+            true
+        });
+        until(&project, &ended("T2/attempt-1"), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        let mark = watermark.lock().map(|m| m.clone()).unwrap_or_default();
+        assert_eq!(mark["verified_after"], true, "{mark}");
+        let first = attempt_row(&project, "T2/attempt-1")?;
+        assert_eq!(
+            query(&project, "SELECT session_id FROM attempts WHERE attempt_id = 'T2/attempt-1'")?,
+            s_a
+        );
+        let refused = attempt_events(&project, "T2/attempt-1", "attempt.start_refused")?;
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        let detail = refused[0]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&s_a) && detail.contains("waits for its rebind") && detail.contains(&sha_b),
+            "{detail}"
+        );
+        assert_eq!(codex_calls(&world, "T2/attempt-1"), Vec::<String>::new(), "B ran in S_A");
+        let dispatched: i64 = query(
+            &project,
+            "SELECT seq FROM events WHERE kind = 'schedule.round' AND event_id = 'T2/attempt-1/round'",
+        )?
+        .parse()?;
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM events WHERE kind = 'task.blocked' \
+                     AND json_extract(payload_json, '$.task_id') = 'T2' AND seq < {dispatched}"
+                )
+            )?,
+            "0",
+            "T2 was BLOCKED before its first attempt"
+        );
+        // Rebound, granted, unblocked: the next attempt runs B in a session of B's identity.
+        until(&project, &ended("T2/attempt-2"), "SETTLED/", limit).await?;
+        let rebound = query(
+            &project,
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id = '{run_id}' AND kind = 'team.binding_applied' \
+                 AND json_extract(payload_json, '$.role') = 'developer' \
+                 AND json_extract(payload_json, '$.cause') = 'rebind'"
+            ),
+        )?;
+        assert_eq!(rebound, "1");
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM events WHERE kind = 'task.unblocked' \
+                 AND json_extract(payload_json, '$.task_id') = 'T2'"
+            )?,
+            "1"
+        );
+        let s_b = query(&project, "SELECT session_id FROM attempts WHERE attempt_id = 'T2/attempt-2'")?;
+        assert_ne!(s_b, s_a);
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.identity.implementation_sha256') FROM events \
+                     WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.session_id') = '{s_b}'"
+                )
+            )?,
+            sha_b
+        );
+        let calls = codex_calls(&world, "T2/attempt-2");
+        assert!(
+            calls.len() == 1 && calls[0].starts_with("B "),
+            "{calls:?}"
+        );
+        keep(
+            "suite-after-snapshot",
+            &json!({"hook": mark, "attempts": [first, attempt_row(&project, "T2/attempt-2")?],
+                    "refused": refused,
+                    "b_calls": std::fs::read_to_string(world.bin().join("codex.d/calls"))?
+                        .lines().filter(|l| l.starts_with("B ")).collect::<Vec<_>>()}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(hold.path().join("release"), "");
     host.shutdown().await;
     world.stop_fakes()?;
     outcome

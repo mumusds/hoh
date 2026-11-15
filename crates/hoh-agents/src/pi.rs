@@ -601,7 +601,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let (stdout, stderr) = (turn.logs.join("stdout.jsonl"), turn.logs.join("stderr.log"));
     let mut command = Command::new(&gate.program);
     command
-        .args(&gate.args)
+        .args(gate.argv())
         .arg(&launch.program)
         .args(&args)
         .envs(gate.env.iter().map(|(k, v)| (k, v)))
@@ -625,6 +625,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let native = cancel.clone();
     let (attempt, turn) = (attempt.clone(), turn.clone());
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
+    let gate = gate.clone();
     let ended = tokio::spawn(async move {
         if opened.await.is_err() {
             let report = crate::adapter::close_gate(&mut process).await;
@@ -640,11 +641,23 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             &turn,
             &mut process,
             Stop::Native(&native),
-            Some(b"go\n".to_vec()),
+            Some(gate.go()),
             &noted,
         )
         .await;
         match driven {
+            // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
+            Ok(driven)
+                if driven.state != AttemptState::Cancelled
+                    && let Some(refused) = crate::adapter::refused_at_gate(
+                        &gate,
+                        &raw_log_path,
+                        driven.report.as_ref(),
+                        &sink.recorded,
+                    ) =>
+            {
+                refused
+            }
             Ok(driven) => Facts {
                 state: driven.state,
                 failure: driven.failure,
@@ -657,6 +670,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 recorded: sink.recorded,
                 degraded: None,
                 final_text: driven.reply,
+                compat: None,
             },
             Err(_) => Facts::incomplete(raw_log_path, sink.recorded),
         }

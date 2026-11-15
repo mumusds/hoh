@@ -905,7 +905,7 @@ fn a_prepared_turn_runs_as_the_current_identity_at_the_current_generation() -> R
     registry.refresh();
     // The tick's snapshot names the host's epoch before any dispatch (runner.rs), as `ran` takes it.
     let seen = self::ran(&registry)?;
-    let (ready, ran) = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    let Current { ready, ran, .. } = registry.prepared(Agent::Claude).ok_or("not looked at")??;
     assert_eq!(ran, seen);
     assert_eq!(ran.identity, ready.entry.identity());
     assert_eq!(Some(ready), registry.seen(Agent::Claude).transpose()?);
@@ -913,8 +913,89 @@ fn a_prepared_turn_runs_as_the_current_identity_at_the_current_generation() -> R
     registry.refresh();
     login(bin.path(), "in")?;
     registry.refresh();
-    let (_, later) = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    let later = registry
+        .prepared(Agent::Claude)
+        .ok_or("not looked at")??
+        .ran;
     assert!(later.generation > ran.generation, "{later:?} {ran:?}");
     assert_eq!(later.identity, ran.identity);
+    Ok(())
+}
+
+/// A registry for a fresh project whose claude (`note` its identity, the fake in the returned directory) was looked at
+/// and verified: its manifest entry is the look's, PASS under [`suite_set`].
+fn verified_claude(note: &str) -> R<(tempfile::TempDir, tempfile::TempDir, Registry)> {
+    let bin = tempfile::tempdir()?;
+    claude(bin.path(), note)?;
+    let project = tempfile::tempdir()?;
+    let registry = Registry::new(path_of(bin.path())).with_suite_set(&suite_set());
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["claude"]));
+    registry.refresh();
+    record(project.path(), &registry, SuiteStatus::Pass)?;
+    registry.open_manifest(project.path());
+    Ok((bin, project, registry))
+}
+
+/// The compat of claude's fact in a snapshot, in `fact` and in `prepared`, and the snapshot observation's `verified`.
+fn compats(registry: &Registry) -> R<(Compat, Compat, Compat, bool)> {
+    let snapshot = registry.snapshot(EPOCH);
+    let seen = usable(snapshot.facts.get("claude").cloned())?.compat;
+    let now = usable(registry.fact(Agent::Claude))?.compat;
+    let current = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    usable(Some(current.fact.clone()))?;
+    let verified = snapshot.observations["claude"].verified;
+    Ok((seen, now, current.compat, verified))
+}
+
+#[test]
+fn a_file_changed_since_the_last_look_makes_its_fact_pending() -> R {
+    // docs/adr/ADR-030.md decision 1 (implementation correction of S6c): the one fact constructor re-stats a ready
+    // agent's launcher and implementation under the registry's lock; once their (dev, ino, ctime) is not the look's (a
+    // file renamed onto the path, a chmod to the same mode, a file gone), the fact's compat is Pending ("files changed
+    // since the last look") in the snapshot, in `fact` and in `prepared`, and the observation is not verified, until
+    // the next look probes the files again; its identity and stamp stay the look's. Unchanged files: Verified.
+    let changed = |compat: &Compat| matches!(compat, Compat::Pending(why) if why.contains("files changed since the last look"));
+    for case in ["renamed", "chmod", "removed"] {
+        let (bin, _project, registry) = verified_claude(case)?;
+        assert_eq!(
+            compats(&registry)?,
+            (Compat::Verified, Compat::Verified, Compat::Verified, true),
+            "{case}: unchanged"
+        );
+        let looked = usable(registry.fact(Agent::Claude))?;
+        let launcher = bin.path().join("claude");
+        match case {
+            "renamed" => {
+                let other = bin.path().join(".claude-B");
+                let mut text = std::fs::read_to_string(&launcher)?;
+                text.push_str("# B\n");
+                std::fs::write(&other, text)?;
+                std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))?;
+                std::fs::rename(&other, &launcher)?;
+            }
+            "chmod" => {
+                let before = file_stamp(&launcher)?;
+                let end = std::time::Instant::now() + Duration::from_secs(5);
+                while file_stamp(&launcher)? == before {
+                    assert!(std::time::Instant::now() < end, "the ctime never moved");
+                    std::thread::sleep(Duration::from_millis(10));
+                    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+            _ => std::fs::remove_file(&launcher)?,
+        }
+        let (seen, now, current, verified) = compats(&registry)?;
+        assert!(
+            changed(&seen) && changed(&now) && changed(&current) && !verified,
+            "{case}: {seen:?} {now:?} {current:?} {verified}"
+        );
+        let after = usable(registry.fact(Agent::Claude))?;
+        assert_eq!(
+            (&after.identity, after.stamp, &after.version),
+            (&looked.identity, looked.stamp, &looked.version),
+            "{case}"
+        );
+    }
     Ok(())
 }
