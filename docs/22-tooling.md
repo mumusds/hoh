@@ -123,6 +123,26 @@ M2-T16 起，产品自己完成“开发者完成 → 冻结 → QA 与 Review �
   - 只追加的扫描（检查 7）覆盖 SQLite 常见的写法；引号内含双写引号的标识符（如别名 `"e""x"`）仍可漏过扫描，由写者连接的 TEMP 触发器拒绝（M2T18R-300，延后）。
   - 运行目录的位置：HoH 的状态与验证者的运行目录（XDG 状态目录下）不得位于系统临时目录（TMPDIR）之下：有的 Agent 插件（pi 的 pi-lens）在临时目录下的工作目录里写自己的状态，验证者的运行目录核对会把它判为改动并否决候选（ADR-029 实施中的更正 8）。
 
+## 产品中的能力匹配与兼容闸门（ADR-030）
+
+M2-T15 起，产品按探测与兼容套件为职位选 Agent，缺员时等待并自行恢复，并在启动 Agent 之前核对它的版本。用户可见的恢复动作见 docs/12“异常解释”，适配器、套件与闸门见 docs/13。下列事实与余项供运维与后续任务参考：
+
+- **兼容清单** `.hoh/compat-manifest.json` 只由 host 写（套件结束时原子替换本 Agent 一项），doctor 只读；产品没有运行套件的命令，host 在写租约空闲时自动运行。`suite.fixture_set_sha256` 是本构建的套件集摘要，所以每次 HoH 升级每个 Agent 都重跑一次套件。
+- **套件定义表的维护**（ADR-030“实施中的更正”）：定义摘要不用构建脚本（AC-062-05 的检查不允许），由 `crates/hoh-agents/src/compat/definition.rs` 以逐个字面路径的 `include_bytes!` 列出本 crate `src/**` 中嵌入 fixture 以外的文件、Cargo.toml 与帧注册表，嵌入 fixture 列在 `compat/fixtures.rs`，工作区 Cargo.lock 以 `src/compat/definition/cargo-lock.sha256` 计入。`crates/hoh-agents/tests/compat_definition.rs` 在 `src/` 下有未列出的文件、列出的内容与磁盘不同、或锁摘要不是当前 Cargo.lock 的时失败：给 hoh-agents 加源文件或更新依赖时同时更新这张表，锁摘要在工作区根目录以 `sha256sum Cargo.lock | cut -d' ' -f1 > crates/hoh-agents/src/compat/definition/cargo-lock.sha256` 刷新。
+- **离线判不了的**：套件的 PASS 只依据被测二进制可离线核对的事实，清单以 `live` 用例 NOT_RUN 标明；新版本在真实 turn 中的响应帧、claude 的 stdin 提示词与 pi 的 RPC 命令由 adapter-live 检查与 soak 的实跑记录（REQ-027 决定 2）。
+- **所有者接受的余项**（ADR-030 决定 9；批准人：所有者，R1、R2 于 2026-11-13，R3 于 2026-11-14）。对外表述为“除 R1、R2、R3 之外，新 Attempt 不使用未验证的版本”。
+  - R1（E1、E2 都有；执行计划 E1、E2 见 docs/13“检查的启动闸门”）：从闸门算完哈希到内核执行该文件（E1）或解释器打开脚本（E2）之间，有进程以写方式打开同一个 inode 就地改写。安装新版本（新文件再 rename、新的版本目录、删除重建、链接改指）不会造成 R1。
+  - R2（只 E2）：解释器在闸门核对之后按路径读脚本，这期间路径被换成别的文件；脚本之后按路径加载的包内其他文件与解释器本身不在身份里，只改它们不算版本变化。pi 的升级装入新的版本目录，只在有人就地改动已安装的版本目录时遇到；npm 安装的 claude 在 `npm i -g` 原地换包目录且与 node 启动重叠时遇到。
+  - R3：Agent 启动之后按路径执行的自身或包内辅助程序（codex 的 `apply_patch`、沙箱与 `rg` 等辅助程序，claude 在旧版本文件被删除后经启动器执行的 `rg` 等）执行的是那时路径上的文件；turn 进行中装入新版本时它们运行未经套件验证的代码，主进程仍是核对过的版本（证据与边界见 ADR-030 决定 9“R3”）。
+  - 首个输入之前的再核对（R1、R2 的同一决定）：pi 的 RPC 与 codex App Server 在发出工作输入之前比较启动器与实现路径的 (dev, ino, ctime)，变了即取消、不发输入。它收窄 E2 主脚本的替换、同一 inode 的就地改写（ctime 变）与启动后、首个输入之前的路径替换；不覆盖答复之后才加载的包内文件与解释器、首个输入之后的变化，以及没有先行答复的 claude stream-json 与 codex exec。
+  - turn 中的再核对（R3 的同一决定）：每 200 ms 同样比较，变了只记 `adapter.diagnostic{IMPLEMENTATION_CHANGED_IN_TURN}`，turn 照常结束。所有者先选了“变了即结束该 turn”，设计审查第 4 轮指出它与受锁的 REQ-027 行为 4、失败模式 5 与 AC-027-04 矛盾，所有者改选只记录（2026-11-14）。只就地替换包内辅助文件而启动器与实现都不变时没有记录。
+- **接受、有界的余项**（ADR-030 决定 13）：
+  - (a) 状态命令一直说“已登录”而令牌已失效时，同一身份的 turn 鉴权失败在本 host 生命周期内不清除；恢复靠重新登录后重启 host，每次重启至多再失败一个 turn（上一个生命周期的结算不进入新 host 的注册表）。
+  - (b) 每次身份变化，已有会话的职位上每个到期 Task 至多消耗一个被拒的 Attempt（`attempt_count` 加 1，prepare 拒绝），之后等待已验证且新鲜的会话，不再派发。
+  - (c) 跨 HoH 升级被对账的 Capability/Model 失败，若其会话没有身份（旧版本授予），不写排除记录而写 `team.exclusion_skipped`，该绑定至多多一次失败的 turn。
+  - (d) 每次 HoH 升级，每个 Agent 在写租约空闲时重跑一次套件，期间新 turn 等待。
+- **再核对的界限**：闸门与首个输入之前的再核对只发现身份戳不符而身份不变（chmod、xattr、同内容替换）时按瞬时类结算，受 ADR-020 的重试封顶约束（第 9 个失败的 Attempt 之后 NEED_DECISION）；turn 中的再核对每个新身份戳一条诊断。
+
 ## 工具退出语义
 
 - 包自测：0 表示启动包通过；product 缺实现或清单时返回 3。
