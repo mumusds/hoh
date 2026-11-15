@@ -680,7 +680,7 @@ struct Finish {
     record_id: String,
     record_dir: std::path::PathBuf,
     /// The record's lock, held from before the command to the commit.
-    lock: std::fs::File,
+    lock: RecordLock,
     /// Its checkout held as read until the finishing ends (M2T16R-150).
     _hold: CheckoutHold,
     timeout: f64,
@@ -1138,7 +1138,7 @@ pub async fn record_attempt_change(
 
 /// After record `record_id`'s commit: its pending facts and lock file are no longer kept (M2T10R-554). Safe for a
 /// reconciliation meanwhile, which passes over a recorded record before reading and again after locking.
-fn settle(state: &Path, record_id: &str, lock: std::fs::File) {
+fn settle(state: &Path, record_id: &str, lock: RecordLock) {
     let _ = std::fs::remove_file(pending_path(state, record_id));
     let _ = std::fs::remove_file(lock_path(state, record_id));
     drop(lock);
@@ -1497,6 +1497,19 @@ fn lock_path(state: &Path, record_id: &str) -> std::path::PathBuf {
     state.join("locks").join(format!("{record_id}.lock"))
 }
 
+/// A record's lock ([`lock_record`]), let go explicitly when dropped: the lock belongs to the open file description,
+/// which a child another thread forked holds a copy of until it execs, so closing this descriptor alone could leave
+/// the record locked meanwhile and a reconciliation would pass over it (docs/adr/ADR-022.md decision 10, convention
+/// v2; as `host::DirLock`).
+#[derive(Debug)]
+struct RecordLock(std::fs::File);
+
+impl Drop for RecordLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 /// The lock of record `record_id`, `.hoh/locks/<record_id>.lock`: its run holds it from before its command to its
 /// commit, so a reconciliation never takes a record a live run is still recording (M2T10R-150, -350, -400); the lock
 /// goes with its holder, also when the process dies. Without `wait`, `None` when another holds it.
@@ -1504,7 +1517,7 @@ fn lock_record(
     state: &Path,
     record_id: &str,
     wait: bool,
-) -> Result<Option<std::fs::File>, CheckError> {
+) -> Result<Option<RecordLock>, CheckError> {
     use rustix::fs::{FlockOperation, Mode, OFlags};
     // HoH's own state, outside the record directory the command writes beside: a command clearing what lies by its
     // artifacts cannot remove it (M2T10R-400).
@@ -1538,7 +1551,7 @@ fn lock_record(
         FlockOperation::NonBlockingLockExclusive
     };
     match rustix::fs::flock(&file, operation) {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(RecordLock(file))),
         Err(e) if !wait && e == rustix::io::Errno::WOULDBLOCK => Ok(None),
         Err(e) => Err(at(e.into())),
     }
@@ -1605,7 +1618,7 @@ fn pending(
     reader: &Reader,
     state: &Path,
     candidate_id: &str,
-) -> Result<Vec<(std::fs::File, Recording)>, CheckError> {
+) -> Result<Vec<(RecordLock, Recording)>, CheckError> {
     let project = state
         .parent()
         .ok_or_else(|| CheckError::Io(format!("{} has no parent", state.display())))?;
@@ -1809,6 +1822,24 @@ mod tests {
             .map(|e| e.map(|e| e.file_name()))
             .collect::<Result<_, _>>()?;
         assert_eq!(names, ["execution.json"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_records_lock_is_let_go_by_its_drop_whatever_copies_of_its_descriptor_live()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A child another thread forked holds a copy of each descriptor until it execs (docs/adr/ADR-022.md decision
+        // 10, convention v2): a lock only closed stays held meanwhile, and a reconciliation then passes over its record
+        // (seen under load: the reconciliation right after a failed commit recorded nothing). The copy kept here stands
+        // in for such a child's.
+        let state = tempfile::tempdir()?;
+        let take = |wait| lock_record(state.path(), "r1", wait).map_err(|e| format!("{e:?}"));
+        let lock = take(true)?.ok_or("not granted")?;
+        let copy = lock.0.try_clone()?;
+        assert!(take(false)?.is_none(), "held while its holder lives");
+        drop(lock);
+        assert!(take(false)?.is_some(), "let go by its holder's drop");
+        drop(copy);
         Ok(())
     }
 
