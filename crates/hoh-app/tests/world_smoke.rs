@@ -1,14 +1,24 @@
 //! The M2-T13 test world on its own (docs/adr/ADR-031.md decision 14, slice S5): the fixtures the eleven TESTs of
 //! M2-T13 share, checked before any TEST uses them. These are tests of the fixtures, not of an acceptance criterion:
-//! the vt100 screen snapshot and its erase counter-example.
+//! the vt100 screen snapshot and its erase counter-example, the PTY and plain-child helpers, the fake CLIs' compat
+//! suites, the pinned fake Commander on codex and on claude, the fake Developer and verifiers through the product
+//! executor, a codex turn that fails unauthorized, and a host the world's own `hoh` starts.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
 mod pty;
+mod world;
 
 use pty::R;
+use serde_json::{Value, json};
+use std::ffi::OsStr;
+use std::time::{Duration, Instant};
+use world::World;
+
+/// How long a smoke test waits for the product to get where it looks.
+const WAIT: Duration = Duration::from_secs(120);
 
 #[test]
 fn the_screen_snapshot_shows_only_what_erases_and_overwrites_left() -> R {
@@ -24,5 +34,502 @@ fn the_screen_snapshot_shows_only_what_erases_and_overwrites_left() -> R {
         pty::snapshot(drawn, 5, 40)?,
         "hoh  demo RUNNING\nrun 0123456789"
     );
+    Ok(())
+}
+
+#[test]
+fn the_pty_helper_runs_a_program_of_the_world_and_snapshots_its_screen() -> R {
+    let world = World::new()?;
+    let pty = pty::Pty::new(10, 60)?;
+    let mut child = world.spawn_pty(
+        &pty,
+        OsStr::new("sh"),
+        &[
+            "-c",
+            "printf 'erased\\033[2J\\033[1;1Hshown %s %s %s\\n' \"$HOME\" \"$TERM\" \"$(tty)\"",
+        ],
+        true,
+    )?;
+    let status = pty::exit_within(&mut child, Duration::from_secs(10))?;
+    assert_eq!(status.code(), Some(0));
+    pty.drained(Duration::from_secs(5))?;
+    let screen = pty::snapshot(&pty.output(), 10, 60)?;
+    assert!(!screen.contains("erased"), "{screen:?}");
+    let shown = screen.lines().next().ok_or("an empty screen")?;
+    let mut words = shown.split(' ');
+    assert_eq!(words.next(), Some("shown"));
+    assert_eq!(words.next(), Some(world.home().to_str().ok_or("home")?));
+    assert_eq!(words.next(), Some("xterm-256color"));
+    assert!(
+        words.next().is_some_and(|t| t.starts_with("/dev/pts/")),
+        "its controlling terminal is the PTY: {shown:?}"
+    );
+    // A shell in the terminal, its session's leader, runs the `hoh` the world's PATH has (TEST-005-01's way).
+    let mut pty = pty::Pty::new(10, 80)?;
+    let mut shell = world.spawn_pty(&pty, OsStr::new("bash"), &["--noprofile", "--norc"], true)?;
+    let (sid, tty) = world::session_and_tty(shell.0.id())?;
+    assert_eq!(sid, shell.0.id());
+    assert_ne!(tty, 0);
+    pty.send(b"hoh --version > version.txt; exit 7\n")?;
+    assert_eq!(
+        pty::exit_within(&mut shell, Duration::from_secs(10))?.code(),
+        Some(7)
+    );
+    assert!(std::fs::read_to_string(world.project().join("version.txt"))?.starts_with("hoh 0.0.0"));
+    // hoh itself, as the TUI tests start it.
+    let pty = pty::Pty::new(30, 100)?;
+    let mut hoh = world.hoh_pty(&pty, &["--version"])?;
+    assert_eq!(
+        pty::exit_within(&mut hoh, Duration::from_secs(10))?.code(),
+        Some(0)
+    );
+    pty.drained(Duration::from_secs(5))?;
+    assert!(pty::snapshot(&pty.output(), 30, 100)?.starts_with("hoh 0.0.0"));
+    Ok(())
+}
+
+#[test]
+fn a_plain_hoh_command_runs_in_the_project_with_its_output_captured() -> R {
+    let world = World::new()?;
+    let out = world.hoh(&["--version"])?;
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8(out.stdout)?.starts_with("hoh 0.0.0"));
+    let out = world.hoh(&["-p"])?;
+    assert_eq!(out.status.code(), Some(64), "a usage error");
+    assert!(out.stdout.is_empty() && !out.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_worlds_fake_agents_pass_the_compat_suite_and_are_the_only_agents_on_its_path() -> R {
+    let world = World::new()?;
+    let started = Instant::now();
+    world.register()?;
+    let manifest: Value = serde_json::from_slice(&std::fs::read(
+        world.project().join(".hoh/compat-manifest.json"),
+    )?)?;
+    for agent in ["codex", "claude", "pi"] {
+        assert!(
+            manifest.to_string().contains(&format!("\"{agent}\"")),
+            "{agent} is not in {manifest}"
+        );
+        assert!(world.bin().join(agent).is_file());
+        assert!(!world.tools().join(agent).exists());
+    }
+    eprintln!("registered in {:?}", started.elapsed());
+    Ok(())
+}
+
+/// `world`'s committed project, its agents registered, its in-process host started, a run started on it and its
+/// Commander's binding given a session: the run's id.
+async fn world_with_run(world: &World, key: &str) -> R<(hoh_app::host::Host, String)> {
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    let host = world.start_host().await?;
+    let run = match world::start_run(&host, key, "完成fixture目标").await {
+        Ok(run) => run,
+        Err(e) => {
+            host.shutdown().await;
+            return Err(e);
+        }
+    };
+    Ok((host, run))
+}
+
+/// The pinned fake Commander (M2T13D-52) on `agent`: a run with the committed specification and a wake moves to
+/// RUNNING by its decisions; its first batch is the whole script at consecutive revisions, every message valid; its
+/// record_assumption is applied with its statement byte for byte; no decision of it moves a run past RUNNING.
+async fn the_pinned_commander_moves_a_run_to_running_on(agent: &str) -> R {
+    let world = World::new()?;
+    let mut team = world::TEAM.to_vec();
+    team[0] = ("commander", agent);
+    world.configure(&team, "")?;
+    let statement = "默认采用 fixture 规格 👩\u{200d}👩\u{200d}👧\u{2028}第二段\u{2029}第三段\n第四行 \"引号\" \\ 反斜杠";
+    world.commander(&world::Commander {
+        statement: statement.to_owned(),
+        ..world::Commander::default()
+    })?;
+    let started = Instant::now();
+    let (host, run) = world_with_run(&world, "s1").await?;
+    let outcome = async {
+        world
+            .until(
+                &format!(
+                    "SELECT count(*) FROM role_bindings WHERE run_id = '{run}' AND role = 'commander' \
+                     AND agent = '{agent}' AND session_id IS NOT NULL"
+                ),
+                "1",
+                WAIT,
+            )
+            .await?;
+        let spec = world.seed_spec()?;
+        let sha = world.query(&format!("SELECT sha256 FROM specs WHERE spec_id = '{spec}'"))?;
+        // The wake a run that adopted the specification has (docs/adr/ADR-031.md decision 1), written here.
+        world.exec(&format!(
+            "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}';
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'adopted-{run}',
+               '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}', 'spec_revision', 1,
+               'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z');"
+        ))?;
+        world
+            .until(
+                &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+                "RUNNING",
+                WAIT,
+            )
+            .await?;
+        let batches = world.log("commander.jsonl")?;
+        let first = batches.first().ok_or("no batch")?;
+        assert_eq!(first["agent"].as_str().map(|a| a.starts_with(agent)), Some(true), "{first}");
+        assert_eq!(first["state"], "CREATED");
+        let revision = first["revision"].as_i64().ok_or("no revision")?;
+        let messages = first["messages"].as_array().ok_or("no messages")?;
+        let steps: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let p = &m["payload"];
+                match p["to_state"].as_str() {
+                    Some(to) => format!("{}:{to}", p["kind"].as_str().unwrap_or("?")),
+                    None => p["kind"].as_str().unwrap_or("?").to_owned(),
+                }
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                "record_assumption",
+                "transition_run:DISCOVERING",
+                "transition_run:SPECIFYING",
+                "create_tasks",
+                "transition_run:READY",
+                "transition_run:RUNNING"
+            ]
+        );
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(m["expected_revision"].as_i64(), Some(revision + i64::try_from(i)?));
+            assert_eq!(m["run_id"], json!(run));
+            assert_eq!(m["spec_sha256"], json!(sha));
+            let valid = hoh_core::schema::protocol().validate_def("Message", m)?;
+            assert!(valid.is_ok(), "{m}: {valid:?}");
+        }
+        let plan = &messages[3]["payload"]["plan"]["tasks"];
+        assert_eq!(plan[0]["task_id"], json!(format!("{run}-develop")));
+        assert_eq!(plan[0]["requirement_ids"], json!(["REQ-901"]));
+        // Applied as written: the assumption, and the first two steps (what follows depends on create_tasks).
+        let applied = world.rows(&format!(
+            "SELECT decision_id, json_extract(payload_json, '$.kind') AS kind, json_extract(payload_json, '$.statement') \
+             AS statement, json_extract(payload_json, '$.to_state') AS to_state, state FROM decisions \
+             WHERE run_id = '{run}' ORDER BY rowid"
+        ))?;
+        // A decision's id is its message's under the turn's attempt.
+        let state_of = |id: &Value| {
+            let id = id.as_str().unwrap_or_default();
+            applied
+                .iter()
+                .find(|d| {
+                    d["decision_id"]
+                        .as_str()
+                        .is_some_and(|d| d == id || d.ends_with(&format!("/{id}")))
+                })
+                .map(|d| d["state"].clone())
+        };
+        for m in &messages[..3] {
+            assert_eq!(state_of(&m["message_id"]), Some(json!("APPLIED")), "{applied:?}");
+        }
+        assert_eq!(
+            applied
+                .iter()
+                .filter(|d| d["kind"] == "record_assumption" && d["state"] == "APPLIED")
+                .map(|d| d["statement"].clone())
+                .collect::<Vec<_>>(),
+            [json!(statement)]
+        );
+        // Never past RUNNING, in any batch.
+        for batch in &batches {
+            for m in batch["messages"].as_array().into_iter().flatten() {
+                let to = m["payload"]["to_state"].as_str().unwrap_or("CREATED");
+                assert!(
+                    ["CREATED", "DISCOVERING", "SPECIFYING", "READY", "RUNNING"].contains(&to),
+                    "{m}"
+                );
+            }
+        }
+        let turns = world.log("turns.jsonl")?;
+        assert!(
+            turns
+                .iter()
+                .filter(|t| t["role"] == "commander" && t["event"] == "end")
+                .all(|t| t["failure"].is_null()),
+            "{turns:?}"
+        );
+        // Each codex App Server was asked for one turn on a new thread or its session's thread again.
+        let mut asked: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
+        for r in world.log("codex-requests.jsonl")? {
+            if !r["id"].is_null() {
+                asked
+                    .entry(r["pid"].as_i64().ok_or("no pid")?)
+                    .or_default()
+                    .push(r["method"].as_str().unwrap_or("?").to_owned());
+            }
+        }
+        for methods in asked.values() {
+            assert!(
+                methods == &["initialize", "thread/start", "turn/start"]
+                    || methods == &["initialize", "thread/resume", "turn/start"],
+                "{asked:?}"
+            );
+        }
+        if agent == "codex" {
+            assert!(!asked.is_empty());
+        }
+        eprintln!(
+            "{agent}: RUNNING after {:?}, codex App Servers {asked:?}, {} batches: {}",
+            started.elapsed(),
+            batches.len(),
+            batches
+                .iter()
+                .map(|b| format!("{}@{} x{}", b["state"], b["revision"], b["messages"].as_array().map_or(0, Vec::len)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pinned_commander_moves_a_run_to_running_on_codex() -> R {
+    the_pinned_commander_moves_a_run_to_running_on("codex").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pinned_commander_moves_a_run_to_running_on_claude() -> R {
+    the_pinned_commander_moves_a_run_to_running_on("claude").await
+}
+
+/// Run `run` RUNNING on the seeded specification with developer task `<run>-T` READY for every requirement: the task.
+fn ready_task(world: &World, run: &str) -> R<String> {
+    let spec = world.seed_spec()?;
+    let task = format!("{run}-T");
+    world.exec(&format!(
+        "UPDATE runs SET state = 'RUNNING', spec_id = '{spec}' WHERE run_id = '{run}';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+           VALUES ('{task}', '{run}', '{spec}', 'READY', 1, 'developer', 1,
+           (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id)
+           SELECT '{task}', requirement_id, '{spec}' FROM requirements WHERE spec_id = '{spec}';"
+    ))?;
+    Ok(task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fake_developer_and_verifiers_run_a_round_through_the_product_executor() -> R {
+    // The Developer works 2 s, writes 1 MiB of marked stderr noise and commits; QA runs every planned check and reports
+    // FAIL in a COMPLETED result (CR-018), the Reviewer PASS: both reports are taken in, CURRENT, with those statuses,
+    // in sessions of their own.
+    let world = World::new()?;
+    world.configure(&world::TEAM, "[budget]\nmax_iterations = 1\n")?;
+    let marker = "SMOKE-NOISE-7f3c";
+    world.developer(&world::Developer {
+        seconds: 2.0,
+        stderr_bytes: 1 << 20,
+        stderr_marker: marker.to_owned(),
+        ..world::Developer::default()
+    })?;
+    world.commit_project(&world::fixture_spec())?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            report: "FAIL".to_owned(),
+            checks: world.checks()?,
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    let started = Instant::now();
+    let host = world.start_host().await?;
+    let outcome = async {
+        let run = world::start_run(&host, "s1", "完成fixture目标").await?;
+        let task = ready_task(&world, &run)?;
+        let attempt = format!("{task}/attempt-1");
+        world
+            .until(
+                "SELECT group_concat(role || ':' || status || ':' || state, ',') FROM (SELECT role, status, state \
+                 FROM independent_reports ORDER BY role)",
+                "qa:FAIL:CURRENT,reviewer:PASS:CURRENT",
+                WAIT,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "{e}; attempts: {:?}; turns: {:?}",
+                    world.rows("SELECT attempt_id, state, failure_reason FROM attempts"),
+                    world.log("turns.jsonl")
+                )
+            })?;
+        let round = Instant::now();
+        assert_eq!(
+            world.query(&format!("SELECT state FROM attempts WHERE attempt_id = '{attempt}'"))?,
+            "SETTLED"
+        );
+        let calls = world.log("calls.jsonl")?;
+        assert_eq!(calls.first().map(|c| c["attempt_id"].clone()), Some(json!(attempt)), "{calls:?}");
+        let turns = world.log("turns.jsonl")?;
+        let at = |event: &str| -> Option<i64> {
+            turns
+                .iter()
+                .find(|t| t["attempt_id"] == json!(attempt) && t["event"] == event)
+                .and_then(|t| t["at_ns"].as_i64())
+        };
+        let worked = at("end").zip(at("start")).map(|(e, s)| e - s).ok_or("no turn")?;
+        assert!(worked >= 2_000_000_000, "{worked} ns");
+        let stderr = std::fs::read(world::attempt_dir(&world.project(), &attempt).join("stderr.log"))?;
+        assert!(stderr.len() >= 1 << 20, "{} bytes", stderr.len());
+        assert!(String::from_utf8_lossy(&stderr).starts_with(marker));
+        assert!(world.git(&["log", "--format=%s"])?.contains(&format!("fake work {attempt}")));
+        let checks = world.log("checks.jsonl")?;
+        assert_eq!(
+            checks.iter().map(|c| (c["check"].clone(), c["exit"].clone())).collect::<Vec<_>>(),
+            [(json!("check-ac-901-01"), json!(0))],
+            "{checks:?}"
+        );
+        // Each verifier in a session of its own role, none of them the Developer's.
+        let sessions = world.rows(
+            "SELECT r.role, s.role AS session_role, s.native_id FROM independent_reports r \
+             JOIN sessions s ON s.session_id = r.session_id ORDER BY r.role",
+        )?;
+        let developer = world.query(&format!(
+            "SELECT s.native_id FROM attempts a JOIN sessions s ON s.session_id = a.session_id \
+             WHERE a.attempt_id = '{attempt}'"
+        ))?;
+        for s in &sessions {
+            assert_eq!(s["role"], s["session_role"], "{sessions:?}");
+            assert_ne!(s["native_id"], json!(developer), "{sessions:?}");
+        }
+        eprintln!(
+            "the round's reports after {:?} ({:?} since)",
+            started.elapsed(),
+            round.elapsed()
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_codex_developers_turn_fails_unauthorized() -> R {
+    // The synthesis of hoh-agents' codex_adapter tests: turn/completed failed with codexErrorInfo unauthorized; the
+    // attempt ends FAILED for BLOCKED_AUTH, and the fake did no work.
+    let world = World::new()?;
+    let mut team = world::TEAM.to_vec();
+    team[0] = ("commander", "claude");
+    team[2] = ("developer", "codex");
+    world.configure(&team, "")?;
+    world.unauthorized("codex", &["developer"])?;
+    let (host, run) = world_with_run(&world, "s1").await?;
+    let outcome = async {
+        let task = ready_task(&world, &run)?;
+        world
+            .until(
+                &format!(
+                    "SELECT state || '/' || coalesce(failure_reason, '') FROM attempts \
+                     WHERE attempt_id = '{task}/attempt-1' AND state IN ('SETTLED', 'FAILED')"
+                ),
+                "FAILED/BLOCKED_AUTH",
+                WAIT,
+            )
+            .await?;
+        assert!(world.log("calls.jsonl")?.is_empty());
+        let turns = world.log("turns.jsonl")?;
+        assert!(
+            turns
+                .iter()
+                .any(|t| t["agent"] == "codex-app-server" && t["failure"] == "unauthorized"),
+            "{turns:?}"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_the_worlds_hoh_starts_has_the_worlds_environment_and_runs_its_fakes() -> R {
+    // `hoh -p --detach` with no host running starts one (CR-010) with the world's environment only; it found the
+    // registered fakes without a suite of its own, and its Commander turn is the fake's.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    world.init_store().await?;
+    let spec = world.seed_spec()?;
+    let started = Instant::now();
+    let out = world.hoh(&["-p", "完成fixture目标", "--detach", "--output", "json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let accepted: Value = serde_json::from_slice(&out.stdout)?;
+    let run = accepted["run_id"].as_str().ok_or("no run_id")?.to_owned();
+    let hosts = world.hosts()?;
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    let environ = std::fs::read(format!("/proc/{}/environ", hosts[0]))?;
+    // Besides what the client itself gives its host (`HOH_HOST_*`: why it was started without a scope of its own).
+    let mut env: Vec<String> = environ
+        .split(|b| *b == 0)
+        .filter(|v| !v.is_empty() && !v.starts_with(b"HOH_HOST_"))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .collect();
+    env.sort();
+    let mut want: Vec<String> = world
+        .env()
+        .iter()
+        .map(|(k, v)| format!("{k}={}", v.to_string_lossy()))
+        .collect();
+    want.sort();
+    assert_eq!(env, want, "the host has the world's environment only");
+    world.wait(
+        &format!(
+            "SELECT count(*) FROM role_bindings WHERE run_id = '{run}' AND role = 'commander' AND session_id IS NOT NULL"
+        ),
+        "1",
+        WAIT,
+    )?;
+    let sha = world.query(&format!(
+        "SELECT sha256 FROM specs WHERE spec_id = '{spec}'"
+    ))?;
+    world.exec(&format!(
+        "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'adopted-{run}',
+           '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}', 'spec_revision', 1,
+           'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z');"
+    ))?;
+    world.wait(
+        &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+        "RUNNING",
+        WAIT,
+    )?;
+    let turns = world.log("turns.jsonl")?;
+    assert!(
+        turns
+            .iter()
+            .any(|t| t["role"] == "commander" && t["agent"] == "codex-app-server"),
+        "{turns:?}"
+    );
+    assert_eq!(
+        world.query("SELECT count(*) FROM events WHERE kind LIKE 'compat.suite%'")?,
+        "0",
+        "the registered fakes needed no suite"
+    );
+    eprintln!("detached run RUNNING after {:?}", started.elapsed());
+    world.stop();
+    assert!(world.hosts()?.is_empty());
+    assert!(world.processes().is_empty(), "{:?}", world.processes());
     Ok(())
 }
