@@ -23,10 +23,11 @@ const HOH: &str = env!("CARGO_BIN_EXE_hoh");
 const LIMIT: Duration = Duration::from_secs(30);
 
 /// How long test_005_02 waits, after its 10 s, for staffing to have judged every binding of its run for good: the
-/// registry's looks at the agents on PATH and their compat suites, one after another, end 30 to 50 s after the host's
-/// start (60 s and more under load), and a probe that failed is looked at again 30 s after it (docs/adr/ADR-030.md
-/// decisions 2 and 10).
-const SETTLE: Duration = Duration::from_secs(180);
+/// registry's looks at the fake agents ([`FAKE_AGENT`]) and the judgments end within the host's first second unloaded,
+/// long before the 10 s end, so the wait ends at its first check; the margin is for load, and covers even a fake's
+/// first look that timed out (a probe command's limit is 20 s) and its look again 30 s after it (docs/adr/ADR-030.md
+/// decision 2).
+const SETTLE: Duration = Duration::from_secs(60);
 
 /// `child`'s output once it ends; past `limit` it is killed and this is an error, so a command that never ends (an
 /// attach that follows a run it should not have picked) fails its test instead of hanging it.
@@ -93,21 +94,52 @@ fn config(project: &Path) -> HostConfig {
     config
 }
 
-/// A project directory with a short path (a socket path has at most 107 bytes) and a home of its own.
+/// The agents of this file's hosts and doctors (TEST-005-02's fixture names a FakeAgent; M2T15R-200): a fake `codex`,
+/// `claude` and `pi` of each [`Env`]'s own, first on every PATH its commands set, so an agent installed on this machine
+/// is never the one looked at. Each answers every command at once with this one line and exit 0: a version, and a help
+/// that offers nothing HoH drives an agent by, so a look finds it Unsupported, a permanent failure (docs/adr/ADR-030.md
+/// decision 2): while its file does not change it is never probed again, and its login is never checked nor a compat
+/// suite run for it (both only for an agent whose probe succeeded), so every binding of it is judged once for good:
+/// BLOCKED, AGENT_UNAVAILABLE, `<agent>:unsupported` (decisions 3 and 4).
+const FAKE_AGENT: &str = "#!/bin/sh\necho 'fake agent 0.0.0 (hoh attach tests)'\n";
+
+/// A project directory with a short path (a socket path has at most 107 bytes), a home of its own and the fake agents.
 struct Env {
     dir: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> R<Env> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
         std::fs::create_dir_all(dir.path().join("p"))?;
         std::fs::create_dir_all(dir.path().join("home"))?;
+        std::fs::create_dir_all(dir.path().join("agents"))?;
+        // Written once, before any host: their files never change after (the stamps a look compares).
+        for agent in ["codex", "claude", "pi"] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(dir.path().join("agents").join(agent))?
+                .write_all(FAKE_AGENT.as_bytes())?;
+        }
         Ok(Env { dir })
     }
 
     fn project(&self) -> PathBuf {
         self.dir.path().join("p")
+    }
+
+    /// The PATH of this test's commands: its fake agents, then `rest`.
+    fn path(&self, rest: &std::ffi::OsStr) -> std::ffi::OsString {
+        let mut path = self.dir.path().join("agents").into_os_string();
+        if !rest.is_empty() {
+            path.push(":");
+            path.push(rest);
+        }
+        path
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -117,7 +149,10 @@ impl Env {
             .current_dir(self.project())
             .env_clear()
             .env("HOME", self.dir.path().join("home"))
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env(
+                "PATH",
+                self.path(&std::env::var_os("PATH").unwrap_or_default()),
+            )
             .stdin(Stdio::null());
         command
     }
@@ -289,8 +324,8 @@ fn detach_starts_a_host_of_its_own_session_and_prints_one_object_after_the_commi
 
 #[test]
 fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_events() -> R {
-    // AC-005-02: R PAUSED with nothing running, its host stopped normally (host_epoch N); three attaches without a TTY
-    // start within 50 ms and stay 10 s.
+    // AC-005-02: R PAUSED with nothing running, its host stopped normally (host_epoch N), the agents fakes (Env); three
+    // attaches without a TTY start within 50 ms and stay 10 s.
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
     let out = env.hoh(&["-p", "x", "--detach", "--output", "json"])?;
@@ -371,12 +406,14 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(seen.len(), 1, "{seen:?}");
-    // R's events go on after the 10 s: staffing's judgments of its bindings (docs/adr/ADR-030.md decisions 1 and 5).
-    // Each binding is judged once the registry's look at its agent on PATH has ended (codex's and claude's logins found
-    // missing some 6 and 16 s after the host's start: team.binding_blocked) and, for a usable agent, once its compat
-    // suite has passed (pi's, run after codex's and claude's: team.session_bound some 33 s after the host's start),
-    // the binding's state and its event committed in one transaction. A binding ACTIVE with a session, or BLOCKED by no verdict that waits
-    // (decision 3), is judged for good while the agents' files and logins do not change: its next looks write nothing.
+    // R's events after run.created: staffing's judgments of its bindings (docs/adr/ADR-030.md decisions 1 and 5), each
+    // committed with the binding's state in one transaction once the registry has looked at the binding's agent. The
+    // agents are this test's fakes (FAKE_AGENT), each found Unsupported at a host's first look, well within the 10 s:
+    // every binding BLOCKED with one team.binding_blocked, by this host or already by the one the detach started. A
+    // binding ACTIVE with a session, or BLOCKED by no verdict that waits (decision 3), is judged for good on the premise
+    // that its agent's answers are fixed, as the fakes' are (the same at every look, their files unchanged): its next
+    // looks write nothing. An agent whose answers change (a probe that keeps failing, a login check that times out
+    // after a clear "logged out") could leave a binding waiting or change a judgment after this wait (M2T15R-200).
     // Nothing else writes R's events while it is PAUSED with no attempt: its supervisor holds (ADR-025 decision 3) and
     // the paces and rounds take no PAUSED run. So the clients stay, the hosts still sampled, until every binding is
     // judged for good and each client has received every event of R in the database; they are disconnected then, and
@@ -489,6 +526,81 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
     );
     // And they are R's events: every one received, none committed after the clients had all of them.
     assert_eq!(sequences[0], run_now()?.1, "{sequences:?}");
+    // With the fake agents those events are known: run.created, then one team.binding_blocked of each binding of R's
+    // team, its agent unsupported, in the order the hosts judged them; and each binding is as its event left it.
+    let known: Value = serde_json::from_str(&query(
+        &env.project(),
+        &format!(
+            "SELECT json_object('events', (SELECT json_group_array(json_array(seq, kind, json(payload_json))) \
+             FROM events WHERE run_id = '{run_id}'), 'bindings', (SELECT json_group_array(json_array(role, agent, \
+             state, blocked_reason, json(missing_json), session_id)) FROM role_bindings WHERE run_id = '{run_id}'))"
+        ),
+    )?)?;
+    let mut events: Vec<&Value> = known["events"]
+        .as_array()
+        .ok_or("no events")?
+        .iter()
+        .collect();
+    events.sort_by_key(|e| e[0].as_i64());
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e[1].as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["run.created"]
+            .into_iter()
+            .chain(["team.binding_blocked"; 6])
+            .collect::<Vec<_>>(),
+        "{events:?}"
+    );
+    let team = [
+        ("commander", "codex"),
+        ("cto", "claude"),
+        ("developer", "claude"),
+        ("qa", "pi"),
+        ("researcher", "pi"),
+        ("reviewer", "codex"),
+    ];
+    let sorted = |mut items: Vec<Value>| {
+        items.sort_by_key(Value::to_string);
+        items
+    };
+    let blocked = sorted(
+        events[1..]
+            .iter()
+            .map(|e| {
+                let p = &e[2];
+                serde_json::json!([p["role"], p["agent"], p["reason"], p["missing"]])
+            })
+            .collect(),
+    );
+    let want = sorted(
+        team.iter()
+            .map(|(role, agent)| {
+                serde_json::json!([
+                    role,
+                    agent,
+                    "AGENT_UNAVAILABLE",
+                    [format!("{agent}:unsupported")]
+                ])
+            })
+            .collect(),
+    );
+    assert_eq!(blocked, want);
+    let bindings = sorted(known["bindings"].as_array().ok_or("no bindings")?.clone());
+    let want = sorted(
+        team.iter()
+            .map(|(role, agent)| {
+                serde_json::json!([
+                    role,
+                    agent,
+                    "BLOCKED",
+                    "AGENT_UNAVAILABLE",
+                    [format!("{agent}:unsupported")],
+                    null
+                ])
+            })
+            .collect(),
+    );
+    assert_eq!(bindings, want);
     assert_eq!(
         query(&env.project(), "SELECT host_epoch FROM projects")?,
         (epoch + 1).to_string()
@@ -772,7 +884,8 @@ fn scope_available() -> bool {
             .any(|d| d.join("systemd-run").is_file())
 }
 
-/// `env`'s `hoh` with the user's systemd manager reachable (XDG_RUNTIME_DIR, USER), PATH as given.
+/// `env`'s `hoh` with the user's systemd manager reachable (XDG_RUNTIME_DIR, USER), PATH `env`'s fake agents and then
+/// `path`.
 fn with_manager(env: &Env, args: &[&str], path: &std::ffi::OsStr) -> Command {
     let mut command = env.command(args);
     for name in ["XDG_RUNTIME_DIR", "USER"] {
@@ -780,7 +893,7 @@ fn with_manager(env: &Env, args: &[&str], path: &std::ffi::OsStr) -> Command {
             command.env(name, value);
         }
     }
-    command.env("PATH", path);
+    command.env("PATH", env.path(path));
     command
 }
 
