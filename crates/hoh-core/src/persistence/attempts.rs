@@ -248,7 +248,7 @@ pub(super) fn apply(
             )?
         }
     }
-    super::writer::commit_unhooked(tx)
+    super::writer::commit_unhooked(tx, ctx)
 }
 
 /// The terminal move `m`, or CANCELLED with its facts if a cancel was accepted first; the state written.
@@ -285,7 +285,7 @@ pub(super) fn end(
             )
             .map_err(sqlite_error)?;
         }
-        super::writer::commit_unhooked(tx)?;
+        super::writer::commit_unhooked(tx, ctx)?;
         Ok(m.to)
     })
 }

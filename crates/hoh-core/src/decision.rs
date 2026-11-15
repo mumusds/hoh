@@ -314,6 +314,22 @@ pub struct Snapshot {
     /// For a dispatch, the free slot the named task needs (`writer` or `reader-k`); `None` when it is held (CR-007).
     pub free_slot: Option<String>,
     pub evidence: Evidence,
+    /// For a move of the run, what an end of it waits for (docs/adr/ADR-031.md decision 4).
+    pub quiet: Quiet,
+}
+
+/// What an end of a run waits for (docs/adr/ADR-031.md decision 4): it is ended only when quiet, so nothing of it is
+/// written after its run.result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Quiet {
+    /// Its attempts not ended (PREPARED, STARTING, RUNNING), its work's and its supervision's.
+    pub attempts_unfinished: u64,
+    /// Its verification rounds not closed.
+    pub open_rounds: u64,
+    /// Its wake-kind events its supervisor has not taken in yet, counted up to `unread_limit + 1` at most.
+    pub unread_wakes: u64,
+    /// How many of those an end may take in in its own commit (one step's batch).
+    pub unread_limit: u64,
 }
 
 /// A refused proposal.
@@ -656,6 +672,39 @@ fn transition_run(
                 to.as_str()
             ),
         );
+    }
+    // An end only when quiet (docs/adr/ADR-031.md decision 4): nothing of the run still runs or is allocated, and a
+    // COMPLETED or FAILED one also has no round left open and no more unread wakes than its commit takes in.
+    let quiet = &snapshot.quiet;
+    let refusal = |why: String| {
+        reject(
+            RejectionReason::IllegalTransition,
+            format!("run {} -> {}: {why}", from.as_str(), to.as_str()),
+        )
+    };
+    if matches!(
+        to,
+        RunState::Incomplete | RunState::Failed | RunState::Completed
+    ) && quiet.attempts_unfinished > 0
+    {
+        return refusal(format!(
+            "{} of its attempts have not ended",
+            quiet.attempts_unfinished
+        ));
+    }
+    if matches!(to, RunState::Failed | RunState::Completed) {
+        if quiet.open_rounds > 0 {
+            return refusal(format!(
+                "{} of its verification rounds are open",
+                quiet.open_rounds
+            ));
+        }
+        if quiet.unread_wakes > quiet.unread_limit {
+            return refusal(format!(
+                "more than {} of its events are not taken in by its supervisor",
+                quiet.unread_limit
+            ));
+        }
     }
     let mut needed: BTreeSet<String> = accepted.iter().cloned().collect();
     if to == RunState::Completed {

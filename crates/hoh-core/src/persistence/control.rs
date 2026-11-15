@@ -36,9 +36,10 @@ pub enum Finished {
     Running(usize),
     /// The run is not cancelling (anymore).
     NotCancelling,
-    /// A round of the run cannot close yet: its candidate's check records are still pending and it was not superseded
-    /// (docs/adr/ADR-031.md decision 4). Nothing was written; the run stays CANCEL_REQUESTED until their recovery
-    /// settles it.
+    /// The run cannot end yet (docs/adr/ADR-031.md decision 4): a round of it cannot close, its candidate's check
+    /// records still pending and it not superseded, or its supervisor has more events to take in than the end commit
+    /// takes in. Nothing was written; the run stays CANCEL_REQUESTED until the recovery or the supervisor's steps catch
+    /// up.
     Recovering,
 }
 
@@ -297,7 +298,7 @@ fn pause_step(
             },
             ctx,
         )?;
-        super::writer::commit_unhooked(tx)?;
+        super::writer::commit_unhooked(tx, ctx)?;
     }
     Ok(step)
 }
@@ -407,7 +408,7 @@ fn record_pass(
         attempts::effects_unknown(&tx, &pass.attempt_id)?;
         super::retry::accrue_wall(&tx, &run_id, &pass.attempt_id, pass.at, None)?;
     }
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(done.event_seqs.last().copied().unwrap_or(0))
 }
 
@@ -439,6 +440,12 @@ fn finish_cancel(
     };
     if writer::parse::<RunState>(&state)? != RunState::CancelRequested {
         return Ok(Finished::NotCancelling);
+    }
+    // Its end commit takes in what its supervisor has not yet, at most one step's batch (docs/adr/ADR-031.md decision
+    // 4, M2T13D-700): more, and it waits for the steps to take it in.
+    let limit = ctx.unread_limit();
+    if super::supervise::unread_wakes(&tx, run_id, limit)? > limit {
+        return Ok(Finished::Recovering);
     }
     let running: i64 = tx
         .query_row(
@@ -575,7 +582,7 @@ fn finish_cancel(
         },
         ctx,
     )?;
-    super::writer::commit_unhooked(tx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
     Ok(Finished::Cancelled)
 }
 

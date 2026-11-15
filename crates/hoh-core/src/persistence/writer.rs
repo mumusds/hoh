@@ -273,6 +273,8 @@ pub(super) struct Ctx<'a> {
     after_events: &'a dyn Fn(),
     /// When each transaction of this writer's life committed (docs/adr/ADR-025.md decision 2).
     commits: &'a std::cell::RefCell<super::supervise::CommitTimes>,
+    /// The store's clock (the host's), the system clock when none.
+    clock: Option<&'a super::StoreClock>,
 }
 
 #[cfg(test)]
@@ -288,7 +290,20 @@ impl Ctx<'_> {
             fence: None,
             after_events: &nothing,
             commits: Box::leak(Box::default()),
+            clock: None,
         }
+    }
+
+    /// Now, by the store's clock.
+    pub(super) fn now(&self) -> std::time::SystemTime {
+        self.clock
+            .map_or_else(std::time::SystemTime::now, |c| c.0.now())
+    }
+
+    /// How many of a run's events not taken in by its supervisor an end of the run reads at most
+    /// (docs/adr/ADR-031.md decision 4: one step's batch, [`super::supervise::STEP`]; a test's hook may lower it).
+    pub(super) fn unread_limit(&self) -> i64 {
+        self.hooks.unread_limit().unwrap_or(super::supervise::STEP)
     }
 
     /// When the transaction that wrote event `seq` committed, by the store's clock, if this writer committed it.
@@ -568,6 +583,7 @@ impl Writer {
                         fence: fence.as_ref(),
                         after_events: &after_events,
                         commits: &commits,
+                        clock: clock.as_ref(),
                     };
                     let mut deferred: Option<Reply> = None;
                     match job {
@@ -790,6 +806,7 @@ impl Writer {
                     fence: fence.as_ref(),
                     after_events: &after_events,
                     commits: &commits,
+                    clock: clock.as_ref(),
                 };
                 let _ = super::outbox::unclaim_all(&mut conn, &left, &close);
                 drop(conn);
@@ -1125,7 +1142,7 @@ fn scratch_task(
         params![task_id, run_id, spec_id],
     )
     .map_err(sqlite_error)?;
-    commit_unhooked(tx)
+    commit_unhooked(tx, ctx)
 }
 
 fn ensure_project(
@@ -1140,7 +1157,7 @@ fn ensure_project(
         params![project_id, repo_path, crate::time::now_rfc3339()],
     )
     .map_err(sqlite_error)?;
-    commit_unhooked(tx)
+    commit_unhooked(tx, ctx)
 }
 
 /// One commit as one IMMEDIATE transaction; any error drops (rolls back) the transaction.
@@ -1279,22 +1296,24 @@ pub(super) fn temp_tables(conn: &Connection) -> Result<(), PersistError> {
 /// The end of a write transaction of the writer (docs/adr/ADR-031.md decision 3): [`finish`], then the fault hooks'
 /// word (an error fails the commit and the transaction rolls back), then the commit.
 pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
-    finish(&tx)?;
+    finish(&tx, ctx)?;
     ctx.before_commit()?;
     tx.commit().map_err(sqlite_error)
 }
 
 /// [`commit`] for the transactions that never were a point of the fault hooks (CR-006): their behaviour unchanged.
-pub(super) fn commit_unhooked(tx: Transaction<'_>) -> Result<(), PersistError> {
-    finish(&tx)?;
+pub(super) fn commit_unhooked(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
+    finish(&tx, ctx)?;
     tx.commit().map_err(sqlite_error)
 }
 
-/// What every write transaction of the writer does last (docs/adr/ADR-031.md decision 3): each run registered in it that
-/// is in a stopping state E now gets its `run.result`, in run id order, the last events of the transaction; what it
-/// registered is emptied. A command's run in a terminal state now is an IntegrityViolation: no command is accepted on a
-/// terminal run (correction D).
-fn finish(tx: &Transaction<'_>) -> Result<(), PersistError> {
+/// What every write transaction of the writer does last (docs/adr/ADR-031.md decisions 3 and 4): each run registered in
+/// it that ended (COMPLETED, FAILED, CANCELLED) has its supervision folded in first, in run id order
+/// ([`super::supervise::tail`]); then each run registered that is in a stopping state E now gets its `run.result`, in
+/// run id order, the last events of the transaction, an ended run's supervisor cursor set to it; what it registered is
+/// emptied. A command's run in a terminal state now is an IntegrityViolation: no command is accepted on a terminal run
+/// (correction D).
+fn finish(tx: &Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     let ended: Option<String> = tx
         .query_row(
             "SELECT c.run_id FROM temp.command_run c JOIN main.runs r ON r.run_id = c.run_id \
@@ -1318,17 +1337,41 @@ fn finish(tx: &Transaction<'_>) -> Result<(), PersistError> {
             .map_err(sqlite_error)?;
         rows.collect::<Result<_, _>>().map_err(sqlite_error)?
     };
+    let mut ended = Vec::new();
     for run in &due {
-        append_result(tx, run)?;
+        if let Some(state) = ended_state(tx, run)? {
+            super::supervise::tail(tx, run, state, ctx)?;
+            ended.push(run);
+        }
+    }
+    for run in &due {
+        if let Some(seq) = append_result(tx, run)?
+            && ended.contains(&run)
+        {
+            super::supervise::set_cursor(tx, run, seq)?;
+        }
     }
     tx.execute_batch("DELETE FROM temp.results_due; DELETE FROM temp.command_run;")
         .map_err(sqlite_error)
 }
 
+/// Run `run`'s state when it is COMPLETED, FAILED or CANCELLED.
+fn ended_state(tx: &Transaction<'_>, run: &str) -> Result<Option<RunState>, PersistError> {
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            params![run],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let state = parse::<RunState>(&state)?;
+    Ok(state.is_terminal().then_some(state))
+}
+
 /// Run `run`'s `run.result` if it is in a stopping state now (E1): `$defs.RunResult` with its own seq — the next
 /// AUTOINCREMENT value of events, predicted from `sqlite_sequence` and checked against the insert — and the id of the
-/// run's revision now (every transaction that writes one moves it).
-fn append_result(tx: &Transaction<'_>, run: &str) -> Result<(), PersistError> {
+/// run's revision now (every transaction that writes one moves it). Its seq, when written.
+fn append_result(tx: &Transaction<'_>, run: &str) -> Result<Option<i64>, PersistError> {
     let (project_id, state, revision): (String, String, i64) = tx
         .query_row(
             "SELECT project_id, state, revision FROM runs WHERE run_id = ?1",
@@ -1337,7 +1380,7 @@ fn append_result(tx: &Transaction<'_>, run: &str) -> Result<(), PersistError> {
         )
         .map_err(sqlite_error)?;
     if crate::exit::run_code(parse::<RunState>(&state)?).is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let seq: i64 = tx
         .query_row(
@@ -1363,7 +1406,7 @@ fn append_result(tx: &Transaction<'_>, run: &str) -> Result<(), PersistError> {
             "the run.result of {run} was predicted at seq {seq} and written at {written}"
         )));
     }
-    Ok(())
+    Ok(Some(seq))
 }
 
 /// The only `INSERT INTO events` of the product (docs/adr/ADR-031.md correction D, rule 1, E17); every writer's events
