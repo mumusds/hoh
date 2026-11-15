@@ -11,6 +11,7 @@
 mod pty;
 mod world;
 
+use hoh_app::host::Host;
 use pty::R;
 use serde_json::{Value, json};
 use std::ffi::OsStr;
@@ -100,6 +101,37 @@ fn a_plain_hoh_command_runs_in_the_project_with_its_output_captured() -> R {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_worlds_hoh_is_a_client_of_its_in_process_host() -> R {
+    // `hoh` with the world's environment only finds the host this process runs for the project (attach.rs's way): its
+    // detached run is the host's, and no host of its own is started.
+    let world = World::new()?;
+    let clock = std::sync::Arc::new(world::FakeClock::default());
+    let host = world.start_plain_host(Some(clock)).await?;
+    let outcome = async {
+        let out = tokio::task::block_in_place(|| {
+            world.hoh(&["-p", "x", "--detach", "--output", "json"])
+        })?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let accepted: Value = serde_json::from_slice(&out.stdout)?;
+        let run = accepted["run_id"].as_str().ok_or("no run_id")?;
+        assert_eq!(
+            world.query(&format!("SELECT count(*) FROM runs WHERE run_id = '{run}'"))?,
+            "1"
+        );
+        assert!(world.hosts()?.is_empty(), "the in-process host was used");
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
 #[test]
 fn the_worlds_fake_agents_pass_the_compat_suite_and_are_the_only_agents_on_its_path() -> R {
     let world = World::new()?;
@@ -120,20 +152,65 @@ fn the_worlds_fake_agents_pass_the_compat_suite_and_are_the_only_agents_on_its_p
     Ok(())
 }
 
-/// `world`'s committed project, its agents registered, its in-process host started, a run started on it and its
-/// Commander's binding given a session: the run's id.
-async fn world_with_run(world: &World, key: &str) -> R<(hoh_app::host::Host, String)> {
+/// `world`'s committed project with its specification's rows, its agents registered and its in-process product host
+/// started; a run started on it and adopted ([`adopt`]): the host and the run's id.
+async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     world.commit_project(&world::fixture_spec())?;
     world.register()?;
     let host = world.start_host().await?;
-    let run = match world::start_run(&host, key, "完成fixture目标").await {
-        Ok(run) => run,
+    let started = async {
+        let spec = world.seed_spec()?;
+        let run = world::start_run(&host, key, "完成fixture目标").await?;
+        adopt(world, &run, &spec)?;
+        R::Ok(run)
+    }
+    .await;
+    match started {
+        Ok(run) => Ok((host, run)),
         Err(e) => {
             host.shutdown().await;
-            return Err(e);
+            Err(e)
         }
-    };
-    Ok((host, run))
+    }
+}
+
+/// Run `run` on specification `spec` with the wake of its adoption, as StartRun gives a run the project's latest
+/// approved specification (docs/adr/ADR-031.md decision 1): written here only where the product has not (before
+/// slice S2 it does not), so the world's smoke tests hold before and after it.
+fn adopt(world: &World, run: &str, spec: &str) -> R {
+    let sha = world.query(&format!(
+        "SELECT sha256 FROM specs WHERE spec_id = '{spec}'"
+    ))?;
+    world.exec(&format!(
+        "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}' AND spec_id IS NULL;
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT :p, 'adopted-{run}', '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}',
+             'spec_revision', 1, 'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z'
+           WHERE NOT EXISTS (SELECT 1 FROM events WHERE run_id = '{run}' AND kind = 'spec.changed');"
+    ))
+}
+
+/// Once the pinned Commander moved `run` to RUNNING: the developer task its create_tasks plans (`<run>-develop`, every
+/// requirement), inserted here only where the product did not apply that create_tasks (before slice S2 it does not).
+async fn planned(world: &World, run: &str) -> R<String> {
+    world
+        .until(
+            &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+            "RUNNING",
+            WAIT,
+        )
+        .await?;
+    let task = format!("{run}-develop");
+    world.exec(&format!(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+           SELECT '{task}', run_id, spec_id, 'READY', 0, 'developer', 1,
+             (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks WHERE run_id = '{run}'), 1
+           FROM runs WHERE run_id = '{run}' AND NOT EXISTS (SELECT 1 FROM tasks WHERE task_id = '{task}');
+         INSERT INTO task_requirements(task_id, requirement_id, spec_id)
+           SELECT '{task}', q.requirement_id, q.spec_id FROM requirements q JOIN runs r ON r.spec_id = q.spec_id
+           WHERE r.run_id = '{run}' AND NOT EXISTS (SELECT 1 FROM task_requirements WHERE task_id = '{task}');"
+    ))?;
+    Ok(task)
 }
 
 /// The pinned fake Commander (M2T13D-52) on `agent`: a run with the committed specification and a wake moves to
@@ -150,27 +227,8 @@ async fn the_pinned_commander_moves_a_run_to_running_on(agent: &str) -> R {
         ..world::Commander::default()
     })?;
     let started = Instant::now();
-    let (host, run) = world_with_run(&world, "s1").await?;
+    let (host, run) = adopted_run(&world, "s1").await?;
     let outcome = async {
-        world
-            .until(
-                &format!(
-                    "SELECT count(*) FROM role_bindings WHERE run_id = '{run}' AND role = 'commander' \
-                     AND agent = '{agent}' AND session_id IS NOT NULL"
-                ),
-                "1",
-                WAIT,
-            )
-            .await?;
-        let spec = world.seed_spec()?;
-        let sha = world.query(&format!("SELECT sha256 FROM specs WHERE spec_id = '{spec}'"))?;
-        // The wake a run that adopted the specification has (docs/adr/ADR-031.md decision 1), written here.
-        world.exec(&format!(
-            "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}';
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'adopted-{run}',
-               '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}', 'spec_revision', 1,
-               'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z');"
-        ))?;
         world
             .until(
                 &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
@@ -178,6 +236,9 @@ async fn the_pinned_commander_moves_a_run_to_running_on(agent: &str) -> R {
                 WAIT,
             )
             .await?;
+        let sha = world.query(&format!(
+            "SELECT s.sha256 FROM specs s JOIN runs r ON r.spec_id = s.spec_id WHERE r.run_id = '{run}'"
+        ))?;
         let batches = world.log("commander.jsonl")?;
         let first = batches.first().ok_or("no batch")?;
         assert_eq!(first["agent"].as_str().map(|a| a.starts_with(agent)), Some(true), "{first}");
@@ -309,21 +370,6 @@ async fn the_pinned_commander_moves_a_run_to_running_on_claude() -> R {
     the_pinned_commander_moves_a_run_to_running_on("claude").await
 }
 
-/// Run `run` RUNNING on the seeded specification with developer task `<run>-T` READY for every requirement: the task.
-fn ready_task(world: &World, run: &str) -> R<String> {
-    let spec = world.seed_spec()?;
-    let task = format!("{run}-T");
-    world.exec(&format!(
-        "UPDATE runs SET state = 'RUNNING', spec_id = '{spec}' WHERE run_id = '{run}';
-         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
-           VALUES ('{task}', '{run}', '{spec}', 'READY', 1, 'developer', 1,
-           (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
-         INSERT INTO task_requirements(task_id, requirement_id, spec_id)
-           SELECT '{task}', requirement_id, '{spec}' FROM requirements WHERE spec_id = '{spec}';"
-    ))?;
-    Ok(task)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_fake_developer_and_verifiers_run_a_round_through_the_product_executor() -> R {
     // The Developer works 2 s, writes 1 MiB of marked stderr noise and commits; QA runs every planned check and reports
@@ -338,21 +384,18 @@ async fn the_fake_developer_and_verifiers_run_a_round_through_the_product_execut
         stderr_marker: marker.to_owned(),
         ..world::Developer::default()
     })?;
-    world.commit_project(&world::fixture_spec())?;
     world.verifier(
         "qa",
         &world::Verifier {
             report: "FAIL".to_owned(),
-            checks: world.checks()?,
+            checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
             ..world::Verifier::default()
         },
     )?;
-    world.register()?;
     let started = Instant::now();
-    let host = world.start_host().await?;
+    let (host, run) = adopted_run(&world, "s1").await?;
     let outcome = async {
-        let run = world::start_run(&host, "s1", "完成fixture目标").await?;
-        let task = ready_task(&world, &run)?;
+        let task = planned(&world, &run).await?;
         let attempt = format!("{task}/attempt-1");
         world
             .until(
@@ -395,6 +438,15 @@ async fn the_fake_developer_and_verifiers_run_a_round_through_the_product_execut
             [(json!("check-ac-901-01"), json!(0))],
             "{checks:?}"
         );
+        // Each report's scope is the in-scope criteria its prompt listed.
+        for path in world.rows(
+            "SELECT a.path FROM independent_reports r JOIN artifacts a ON a.artifact_id = r.report_artifact_id",
+        )? {
+            let report: Value = serde_json::from_slice(&std::fs::read(
+                world.project().join(path["path"].as_str().ok_or("no path")?),
+            )?)?;
+            assert_eq!(report["scope"], json!(["AC-901-01"]), "{report}");
+        }
         // Each verifier in a session of its own role, none of them the Developer's.
         let sessions = world.rows(
             "SELECT r.role, s.role AS session_role, s.native_id FROM independent_reports r \
@@ -430,9 +482,9 @@ async fn a_codex_developers_turn_fails_unauthorized() -> R {
     team[2] = ("developer", "codex");
     world.configure(&team, "")?;
     world.unauthorized("codex", &["developer"])?;
-    let (host, run) = world_with_run(&world, "s1").await?;
+    let (host, run) = adopted_run(&world, "s1").await?;
     let outcome = async {
-        let task = ready_task(&world, &run)?;
+        let task = planned(&world, &run).await?;
         world
             .until(
                 &format!(
@@ -494,22 +546,7 @@ async fn a_host_the_worlds_hoh_starts_has_the_worlds_environment_and_runs_its_fa
         .collect();
     want.sort();
     assert_eq!(env, want, "the host has the world's environment only");
-    world.wait(
-        &format!(
-            "SELECT count(*) FROM role_bindings WHERE run_id = '{run}' AND role = 'commander' AND session_id IS NOT NULL"
-        ),
-        "1",
-        WAIT,
-    )?;
-    let sha = world.query(&format!(
-        "SELECT sha256 FROM specs WHERE spec_id = '{spec}'"
-    ))?;
-    world.exec(&format!(
-        "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}';
-         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'adopted-{run}',
-           '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}', 'spec_revision', 1,
-           'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z');"
-    ))?;
+    adopt(&world, &run, &spec)?;
     world.wait(
         &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
         "RUNNING",
