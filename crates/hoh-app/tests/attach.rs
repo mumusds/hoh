@@ -9,6 +9,7 @@
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{FaultHooks, PersistError};
+use hoh_core::staffing::{Kind, Verdict};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -20,6 +21,12 @@ const HOH: &str = env!("CARGO_BIN_EXE_hoh");
 
 /// How long one `hoh` command of these tests may take: a host start is at most 10 s (ADR-021 decision 2).
 const LIMIT: Duration = Duration::from_secs(30);
+
+/// How long test_005_02 waits, after its 10 s, for staffing to have judged every binding of its run for good: the
+/// registry's looks at the agents on PATH and their compat suites, one after another, end 30 to 50 s after the host's
+/// start (60 s and more under load), and a probe that failed is looked at again 30 s after it (docs/adr/ADR-030.md
+/// decisions 2 and 10).
+const SETTLE: Duration = Duration::from_secs(180);
 
 /// `child`'s output once it ends; past `limit` it is killed and this is an error, so a command that never ends (an
 /// attach that follows a run it should not have picked) fails its test instead of hanging it.
@@ -364,37 +371,102 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(seen.len(), 1, "{seen:?}");
-    // The same events while all three are attached: a moment when each has received the same sequence. The host's
-    // events keep coming meanwhile (its looks at the agents on PATH commit team events some 10 s after its start under
-    // load), so the clients, stopped one after another below, may each end at another event of the same stream.
-    // The clients are stopped whatever this finds.
-    let end = Instant::now() + LIMIT;
-    let agreed = loop {
-        let now = clients
+    // R's events go on after the 10 s: staffing's judgments of its bindings (docs/adr/ADR-030.md decisions 1 and 5).
+    // Each binding is judged once the registry's look at its agent on PATH has ended (codex's and claude's logins found
+    // missing some 6 and 16 s after the host's start: team.binding_blocked) and, for a usable agent, once its compat
+    // suite has passed (pi's, run after codex's and claude's: team.session_bound some 33 s after the host's start),
+    // the binding's state and its event committed in one transaction. A binding ACTIVE with a session, or BLOCKED by no verdict that waits
+    // (decision 3), is judged for good while the agents' files and logins do not change: its next looks write nothing.
+    // Nothing else writes R's events while it is PAUSED with no attempt: its supervisor holds (ADR-025 decision 3) and
+    // the paces and rounds take no PAUSED run. So the clients stay, the hosts still sampled, until every binding is
+    // judged for good and each client has received every event of R in the database; they are disconnected then, and
+    // whatever this finds.
+    let waits: Vec<String> = [
+        Verdict::NotLookedAt,
+        Verdict::ProbeFailed,
+        Verdict::CompatPending,
+    ]
+    .iter()
+    .inspect(|v| assert_eq!(v.kind(), Kind::Waiting, "{v:?}"))
+    .map(Verdict::code)
+    .collect();
+    // R's bindings not judged for good, and R's events, read in one statement.
+    let run_now = || -> R<(Vec<String>, Vec<i64>)> {
+        let now: Value = serde_json::from_str(&query(
+            &env.project(),
+            &format!(
+                "SELECT json_object('bindings', (SELECT json_group_array(json_array(role, state, session_id, \
+                 json(missing_json))) FROM role_bindings WHERE run_id = '{run_id}'), \
+                 'seqs', (SELECT json_group_array(seq) FROM events WHERE run_id = '{run_id}'))"
+            ),
+        )?)?;
+        let unjudged = now["bindings"]
+            .as_array()
+            .ok_or("no bindings")?
             .iter()
-            .map(|(_, lines, _)| seqs(lines))
-            .collect::<R<Vec<_>>>();
-        match now {
-            Ok(now) if !now[0].is_empty() && now.iter().all(|s| s == &now[0]) => {
-                break Ok(now[0].clone());
-            }
-            Ok(now) if Instant::now() > end => {
-                break Err(format!(
-                    "the attaches never received the same events: {now:?}"
-                ));
-            }
-            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => break Err(e.to_string()),
-        }
+            .filter(|b| match b[1].as_str() {
+                Some("ACTIVE") => b[2].is_null(),
+                Some("BLOCKED") => b[3].as_array().is_none_or(|missing| {
+                    missing.iter().any(|line| {
+                        line.as_str()
+                            .and_then(|l| l.split_once(':'))
+                            .is_none_or(|(_, code)| waits.iter().any(|w| w == code))
+                    })
+                }),
+                _ => true,
+            })
+            .map(Value::to_string)
+            .collect();
+        let mut seqs: Vec<i64> = serde_json::from_value(now["seqs"].clone())?;
+        seqs.sort_unstable();
+        Ok((unjudged, seqs))
     };
-    let mut sequences = Vec::new();
-    for (client, lines, reader) in clients {
+    let settled = (|| -> R {
+        let end = Instant::now() + SETTLE;
+        loop {
+            let hosts = hosts_of(&env.project())?;
+            seen.extend(hosts.iter().copied());
+            if hosts.len() > 1 || seen.len() > 1 {
+                return Err(format!("not one host: {hosts:?}, {seen:?}").into());
+            }
+            // The clients' first, then the database's: what a client received was committed before, so it is the
+            // start of R's events read after it, unless the client missed one.
+            let received = clients
+                .iter()
+                .map(|(_, lines, _)| seqs(lines))
+                .collect::<R<Vec<_>>>()?;
+            let (unjudged, committed) = run_now()?;
+            if let Some(k) = received.iter().position(|r| !committed.starts_with(r)) {
+                return Err(format!(
+                    "client {k} received {:?}, not R's events in order: {committed:?}",
+                    received[k]
+                )
+                .into());
+            }
+            if unjudged.is_empty() && received.iter().all(|r| *r == committed) {
+                return Ok(());
+            }
+            if Instant::now() > end {
+                return Err(format!(
+                    "after {SETTLE:?}: bindings not judged for good {unjudged:?}, R's events {committed:?}, \
+                     received {received:?}"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })();
+    // The three disconnected together.
+    for (client, _, _) in &clients {
         if let Some(pid) = i32::try_from(client.id())
             .ok()
             .and_then(rustix::process::Pid::from_raw)
         {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
         }
+    }
+    let mut sequences = Vec::new();
+    for (client, lines, reader) in clients {
         let out = finish(client, LIMIT)?;
         assert_eq!(
             out.status.code(),
@@ -405,25 +477,18 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         reader.join().map_err(|_| "a client's reader panicked")?;
         sequences.push(seqs(&lines)?);
     }
-    let agreed = agreed?;
+    settled?;
     assert!(!sequences[0].is_empty());
     // Each in strictly increasing order: no event twice, none out of order (M2T06R-52).
     for seqs in &sequences {
         assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
     }
-    // Each began with what all had received together and went on in the same stream until its own stop: a prefix of
-    // the longest, none missing an event another got before a later one.
-    let longest = sequences
-        .iter()
-        .max_by_key(|s| s.len())
-        .cloned()
-        .unwrap_or_default();
     assert!(
-        sequences
-            .iter()
-            .all(|s| s.starts_with(&agreed) && longest.starts_with(s)),
-        "{agreed:?} {sequences:?}"
+        sequences.iter().all(|s| s == &sequences[0]),
+        "{sequences:?}"
     );
+    // And they are R's events: every one received, none committed after the clients had all of them.
+    assert_eq!(sequences[0], run_now()?.1, "{sequences:?}");
     assert_eq!(
         query(&env.project(), "SELECT host_epoch FROM projects")?,
         (epoch + 1).to_string()
