@@ -15,7 +15,7 @@ use hoh_core::staffing::{
     Stamp, Usable,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -131,6 +131,9 @@ pub struct Current {
     /// `compat::verdict` of `ready`'s entry against the manifest the registry holds, `Pending` when the files changed
     /// since the look (F's own when it is usable).
     pub compat: Compat,
+    /// Why the agent is not what its last look found (the registry's one predicate of that, which F's compat is
+    /// `Pending` by too), `None` while it is: prepare's (a) (docs/adr/ADR-030.md decision 9, M2T15R-01).
+    pub changed: Option<String>,
 }
 
 /// What a turn ran as (docs/adr/ADR-030.md decision 2, M2T15D-07): its agent, the identity of the fact its prepare
@@ -200,12 +203,121 @@ fn stamp_of(key: &Key) -> Stamp {
     }
 }
 
+/// An agent's files as a look finds them: its launcher (the first on the PATH), the implementation
+/// [`probe::resolve_implementation`] gives for it, and their stamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Files {
+    launcher: PathBuf,
+    implementation: PathBuf,
+    key: Key,
+}
+
+/// Why an agent is not what its last look found ([`since`]).
+#[derive(Debug)]
+struct Changed {
+    /// Its files now, or why none can be found or read.
+    now: Result<Files, ProbeError>,
+    /// What differs from the look's, as its fact's `Pending` and prepare's (a) say it.
+    detail: String,
+}
+
+/// Whether `agent` is still what the look that found `last` found (docs/adr/ADR-030.md decisions 1, 2 and 9, the
+/// implementation correction of M2T15R-01): the one predicate of a look's decision to probe again, of its fact's
+/// compat and of prepare's (a). Its files are found now as a look finds them, on `path` (the registry's PATH): the
+/// launcher first on it, the implementation resolved for that launcher, their stamps (`stat`, following links); and
+/// compared with `last`'s: the launcher's path, the implementation's path, the stamps. File-system reads only, never a
+/// process, so it is read under the registry's lock. Its files now when they are `last`'s; else what differs, and its
+/// files now or why none were found (with no `last` there is nothing to be current with).
+fn since(agent: Agent, path: &OsStr, last: Option<&Files>) -> Result<Files, Box<Changed>> {
+    let changed = |now, what: String| {
+        Box::new(Changed {
+            now,
+            detail: format!("files changed since the last look: {what}"),
+        })
+    };
+    let found = |of: fn(&Files) -> &PathBuf| {
+        last.map_or_else(
+            || "no look found one".to_owned(),
+            |last| format!("the look found {}", of(last).display()),
+        )
+    };
+    let Some(launcher) = probe::find_on_path(agent.command(), path) else {
+        let what = format!(
+            "no {} is found on the PATH ({})",
+            agent.command(),
+            found(|f| &f.launcher)
+        );
+        return Err(changed(Err(ProbeError::NotFound { agent }), what));
+    };
+    let implementation = match probe::resolve_implementation(agent, &launcher) {
+        Ok(implementation) => implementation,
+        Err(e) => {
+            let what = format!(
+                "the implementation of {} is not resolved: {e} ({})",
+                launcher.display(),
+                found(|f| &f.implementation)
+            );
+            return Err(changed(Err(e), what));
+        }
+    };
+    let key = match key(&launcher, &implementation) {
+        Ok(key) => key,
+        Err(e) => {
+            let what = format!(
+                "{} and {} cannot be read: {e}",
+                launcher.display(),
+                implementation.display()
+            );
+            return Err(changed(Err(ProbeError::Io(e)), what));
+        }
+    };
+    let now = Files {
+        launcher,
+        implementation,
+        key,
+    };
+    let what = match last {
+        None => "no look found its files".to_owned(),
+        Some(last) if now.launcher != last.launcher => format!(
+            "the launcher found on the PATH is {}, {}",
+            now.launcher.display(),
+            found(|f| &f.launcher)
+        ),
+        Some(last) if now.implementation != last.implementation => format!(
+            "{} resolves the implementation {}, {}",
+            now.launcher.display(),
+            now.implementation.display(),
+            found(|f| &f.implementation)
+        ),
+        Some(last) if now.key != last.key => format!(
+            "{} and {} were {}, are {}",
+            now.launcher.display(),
+            now.implementation.display(),
+            serde_json::json!(stamp_of(&last.key)),
+            serde_json::json!(stamp_of(&now.key)),
+        ),
+        Some(_) => return Ok(now),
+    };
+    Err(changed(Ok(now), what))
+}
+
+/// What a look at an agent does ([`Registry::cached`]).
+#[derive(Debug)]
+enum Look {
+    /// What was last seen of it: it is what that look found.
+    Cached(Box<Result<Ready, Probe>>),
+    /// Probe these files, found now.
+    Probe(Files),
+    /// None was found: why.
+    Missing(ProbeError),
+}
+
 /// What an actual look at an agent found.
 #[derive(Debug, Clone)]
 struct Seen {
-    /// The files' stamps it was found under; `None` when there were none to read (no launcher, or not readable): looked
-    /// at again each time.
-    key: Option<Key>,
+    /// The files it was found under; `None` when there were none to read (no launcher, or not readable): looked at again
+    /// each time. Its fact is current while the agent is what they are ([`since`]).
+    files: Option<Files>,
     /// When: a temporary failure is probed again [`AUTH_EVERY`] after it.
     at: Instant,
     outcome: Result<Ready, Probe>,
@@ -257,11 +369,11 @@ struct State {
 impl State {
     /// `agent`'s fact and observation as the registry knows them now: the one constructor of a snapshot's items and of
     /// [`Registry::fact`] (docs/adr/ADR-030.md decision 1, M2T15D-100).
-    fn item(&self, agent: Agent, suite_set: &str) -> (Option<Fact>, Option<Observation>) {
+    fn item(&self, agent: Agent, basis: Basis<'_>) -> (Option<Fact>, Option<Observation>) {
         let Some(known) = self.agents.get(&agent) else {
             return (None, None);
         };
-        let fact = self.fact(agent, known, suite_set);
+        let fact = self.fact(agent, known, basis);
         let observation = known
             .seen
             .as_ref()
@@ -281,7 +393,7 @@ impl State {
     /// decision 5): its probe's class and detail (a ready agent's: none, or why its fact is not usable), its entry's
     /// version, launcher, hashes and capabilities, its compat verdict and the look's identity `(host_epoch, n)`; `None`
     /// while it was not looked at. Read under the same lock as its fact.
-    fn probe(&self, agent: Agent, suite_set: &str) -> Option<serde_json::Value> {
+    fn probe(&self, agent: Agent, basis: Basis<'_>) -> Option<serde_json::Value> {
         let known = self.agents.get(&agent)?;
         let seen = known.seen.as_ref()?;
         let observation = serde_json::json!({"host_epoch": self.host_epoch, "n": known.looks});
@@ -292,7 +404,7 @@ impl State {
                 "compat": null, "observation": observation,
             }),
             Ok(ready) => {
-                let detail = match self.fact(agent, known, suite_set) {
+                let detail = match self.fact(agent, known, basis) {
                     Some(Fact::LoginMissing(why) | Fact::Unsupported(why)) => Some(why),
                     _ => None,
                 };
@@ -302,7 +414,7 @@ impl State {
                     "launcher_path": entry.launcher_path, "implementation_sha256": entry.implementation_sha256,
                     "help_sha256": entry.help_sha256, "schema_sha256": entry.schema_sha256,
                     "capabilities": entry.capabilities,
-                    "compat": self.compat(agent, ready, suite_set),
+                    "compat": self.compat(agent, seen, ready, basis),
                     "observation": observation,
                 })
             }
@@ -311,7 +423,7 @@ impl State {
 
     /// Decision 2's fact of `agent`; `None` while it was not looked at, or while the registry has no project to say
     /// what a session of it would have.
-    fn fact(&self, agent: Agent, known: &Known, suite_set: &str) -> Option<Fact> {
+    fn fact(&self, agent: Agent, known: &Known, basis: Basis<'_>) -> Option<Fact> {
         let seen = known.seen.as_ref()?;
         let ready = match &seen.outcome {
             Ok(ready) => ready,
@@ -337,37 +449,36 @@ impl State {
             generation: (self.host_epoch, ready.look),
             session: session.clone(),
             granted: hoh_core::decision::granted_capabilities(session),
-            compat: self.compat(agent, ready, suite_set),
+            compat: self.compat(agent, seen, ready, basis),
         })))
     }
 
-    /// Whether `agent` as its look `ready` found it is verified (decision 9's `compat::verdict` of its entry against
-    /// the manifest held), but `Pending` once its launcher's or implementation's stamp read now (`stat`, following
-    /// links, metadata only: prepare's (a)) is not the look's, or cannot be read: its files changed since the last
-    /// look, which only the next look probes (docs/adr/ADR-030.md decision 1, its implementation correction in S6c).
-    /// Read under the registry's lock, so a snapshot, `fact` and `prepared` all see the change as soon as it is there,
-    /// and no task is put back for a version the registry has not looked at (decision 13 (b)).
-    fn compat(&self, agent: Agent, ready: &Ready, suite_set: &str) -> Compat {
-        let implementation = Path::new(&ready.entry.implementation_path);
-        match stamp_now(&ready.launcher, implementation) {
-            Some(now) if now == ready.stamp => compat::verdict(
+    /// Whether `agent` as the look `seen` found it (`ready`) is verified: decision 9's `compat::verdict` of its entry
+    /// against the manifest held, but `Pending` while the agent is not what that look found ([`since`], the one
+    /// predicate a look's decision to probe again and prepare's (a) use too: the launcher on the PATH now, the
+    /// implementation resolved for it now and their stamps, against the look's; not found or not readable is not it):
+    /// only the next look probes what is there now (docs/adr/ADR-030.md decision 1, its implementation corrections in
+    /// S6c and M2T15R-01). Read under the registry's lock, so a snapshot, `fact` and `prepared` all see the change as
+    /// soon as it is there, and no task is put back for a version the registry has not looked at (decision 13 (b)).
+    fn compat(&self, agent: Agent, seen: &Seen, ready: &Ready, basis: Basis<'_>) -> Compat {
+        match since(agent, basis.path, seen.files.as_ref()) {
+            Ok(_) => compat::verdict(
                 self.manifest.as_ref(),
                 agent.as_str(),
                 &ready.entry,
-                suite_set,
+                basis.suite_set,
             ),
-            now => Compat::Pending(format!(
-                "files changed since the last look: {} and {} were {}, are {}",
-                ready.launcher.display(),
-                implementation.display(),
-                serde_json::json!(ready.stamp),
-                now.map_or_else(
-                    || "unreadable".to_owned(),
-                    |s| serde_json::json!(s).to_string()
-                ),
-            )),
+            Err(changed) => Compat::Pending(changed.detail),
         }
     }
+}
+
+/// What the registry's facts are judged by: the PATH its looks find the agents on and the suite set their entries are
+/// verified under.
+#[derive(Debug, Clone, Copy)]
+struct Basis<'a> {
+    path: &'a OsStr,
+    suite_set: &'a str,
 }
 
 /// The host's agents, found on its PATH and probed lazily (decision 10).
@@ -427,6 +538,14 @@ impl Registry {
     fn with_suite_set(mut self, suite_set: &str) -> Registry {
         self.suite_set = suite_set.to_owned();
         self
+    }
+
+    /// What its facts are judged by: its PATH, the one its looks find the agents on, and its suite set.
+    fn basis(&self) -> Basis<'_> {
+        Basis {
+            path: &self.path,
+            suite_set: &self.suite_set,
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -670,25 +789,18 @@ impl Registry {
         }
     }
 
-    /// `agent` as it is now: probed again when its launcher or implementation changed (their stamps, change time
-    /// included) or a temporary failure's [`AUTH_EVERY`] passed, else as last seen. Blocking: run it outside the writer
-    /// and off the async workers.
+    /// `agent` as it is now: probed again when it is not what its last look found ([`since`]: the launcher on the PATH,
+    /// the implementation resolved for it, their stamps, change time included) or a temporary failure's
+    /// [`AUTH_EVERY`] passed, else as last seen. Blocking: run it outside the writer and off the async workers.
     pub fn look(&self, agent: Agent) -> Result<Ready, String> {
         let env = self.env();
-        let found = (|| {
-            let launcher = probe::find_on_path(agent.command(), &env.path)
-                .ok_or_else(|| Probe::of(&ProbeError::NotFound { agent }))?;
-            let implementation =
-                probe::resolve_implementation(agent, &launcher).map_err(|e| Probe::of(&e))?;
-            let key = key(&launcher, &implementation).map_err(|e| Probe::of(&ProbeError::Io(e)))?;
-            Ok((launcher, key))
-        })();
-        let (key, outcome, looked) = match found {
-            Err(probe) => (None, Err(probe), true),
-            Ok((launcher, key)) => match self.cached(agent, &key) {
-                Some(outcome) => (Some(key), outcome, false),
-                None => (Some(key), probed(agent, &launcher, &key, &env), true),
-            },
+        let (files, outcome, looked) = match self.cached(agent, &env.path) {
+            Look::Cached(outcome) => (None, *outcome, false),
+            Look::Probe(files) => {
+                let outcome = probed(agent, &files, &env);
+                (Some(files), outcome, true)
+            }
+            Look::Missing(error) => (None, Err(Probe::of(&error)), true),
         };
         // A look the host's stop ended says nothing of the agent: not recorded, so it stays as last seen (or not looked
         // at), and no dispatch takes the stop for the agent being unavailable (M2T07R-352).
@@ -704,32 +816,47 @@ impl Registry {
             }
         }
         let outcome = if looked {
-            self.record(agent, key, outcome)
+            self.record(agent, files, outcome)
         } else {
             outcome
         };
         outcome.map_err(|probe| probe.detail)
     }
 
-    /// What was last seen of `agent` under the stamps `key`, unless it is to be probed again: another key, or a
-    /// temporary failure [`AUTH_EVERY`] old.
-    fn cached(&self, agent: Agent, key: &Key) -> Option<Result<Ready, Probe>> {
+    /// What a look at `agent` does now, on `path` (the registry's PATH): what was last seen of it while it is what that
+    /// look found ([`since`]) and that is no temporary failure [`AUTH_EVERY`] old; else probe its files found now, or
+    /// none were found. Read under the registry's lock (`since` runs no process).
+    fn cached(&self, agent: Agent, path: &OsStr) -> Look {
         let mut state = self.state();
         let root = state.root.clone();
-        let seen = state.agents.get_mut(&agent)?.seen.as_mut()?;
-        if seen.key.as_ref() != Some(key) {
-            return None;
-        }
+        let seen = state
+            .agents
+            .get_mut(&agent)
+            .and_then(|known| known.seen.as_mut());
+        let last = seen.as_ref().and_then(|seen| seen.files.as_ref());
+        let files = match since(agent, path, last) {
+            Ok(files) => files,
+            Err(changed) => {
+                return match changed.now {
+                    Ok(files) => Look::Probe(files),
+                    Err(error) => Look::Missing(error),
+                };
+            }
+        };
+        // Current only against a look's files, so there was one.
+        let Some(seen) = seen else {
+            return Look::Probe(files);
+        };
         if let Err(probe) = &seen.outcome
             && probe.class.temporary()
             && seen.at.elapsed() >= self.every
         {
-            return None;
+            return Look::Probe(files);
         }
         if let (Ok(ready), None, Some(root)) = (&seen.outcome, &seen.session, &root) {
             seen.session = Some(ready.session_capabilities(agent, root));
         }
-        Some(seen.outcome.clone())
+        Look::Cached(Box::new(seen.outcome.clone()))
     }
 
     /// Record an actual look at `agent`: its `n` moves; a ready agent gets its session capabilities in the project and,
@@ -737,7 +864,7 @@ impl Registry {
     fn record(
         &self,
         agent: Agent,
-        key: Option<Key>,
+        files: Option<Files>,
         mut outcome: Result<Ready, Probe>,
     ) -> Result<Ready, Probe> {
         let mut state = self.state();
@@ -760,7 +887,7 @@ impl Registry {
             session = root.map(|root| ready.session_capabilities(agent, &root));
         }
         known.seen = Some(Seen {
-            key,
+            files,
             at: Instant::now(),
             outcome: outcome.clone(),
             session,
@@ -778,7 +905,7 @@ impl Registry {
             .agents
             .keys()
             .filter_map(|agent| {
-                let observation = state.item(*agent, &self.suite_set).1?;
+                let observation = state.item(*agent, self.basis()).1?;
                 Some((agent.as_str().to_owned(), observation))
             })
             .collect()
@@ -791,12 +918,12 @@ impl Registry {
         state.host_epoch = host_epoch;
         let mut snapshot = Snapshot::default();
         for agent in &state.wanted {
-            let (fact, observation) = state.item(*agent, &self.suite_set);
+            let (fact, observation) = state.item(*agent, self.basis());
             let name = agent.as_str().to_owned();
             if let Some(fact) = fact {
                 snapshot.facts.insert(name.clone(), fact);
             }
-            if let Some(probe) = state.probe(*agent, &self.suite_set) {
+            if let Some(probe) = state.probe(*agent, self.basis()) {
                 snapshot.probes.insert(name.clone(), probe);
             }
             if let Some(observation) = observation {
@@ -809,7 +936,7 @@ impl Registry {
     /// `agent`'s fact now, as a snapshot taken now would have it (the same constructor, M2T15D-100); `None` while it
     /// was not looked at.
     pub fn fact(&self, agent: Agent) -> Option<Fact> {
-        self.state().item(agent, &self.suite_set).0
+        self.state().item(agent, self.basis()).0
     }
 
     /// A turn that `ran` as it says failed BLOCKED_AUTH (docs/adr/ADR-030.md decision 2, M2T15D-07): latched as the
@@ -873,11 +1000,15 @@ impl Registry {
             Ok(ready) => ready,
             Err(probe) => return Some(Err(probe.detail.clone())),
         };
-        let fact = state.item(agent, &self.suite_set).0?;
+        let basis = self.basis();
+        let fact = state.item(agent, basis).0?;
         let compat = match &fact {
             Fact::Usable(usable) => usable.compat.clone(),
-            _ => state.compat(agent, ready, &self.suite_set),
+            _ => state.compat(agent, seen, ready, basis),
         };
+        let changed = since(agent, basis.path, seen.files.as_ref())
+            .err()
+            .map(|changed| changed.detail);
         Some(Ok(Current {
             ready: ready.clone(),
             ran: Ran {
@@ -887,6 +1018,7 @@ impl Registry {
             },
             fact,
             compat,
+            changed,
         }))
     }
 
@@ -925,21 +1057,39 @@ pub(crate) fn probed_entry(agent: Agent, env: &ProbeEnv) -> Result<(AgentEntry, 
     Ok((entry, stamp_of(&key)))
 }
 
-/// Probe `agent` at `launcher`, its files' stamps being `key`: its entry and launch facts.
-fn probed(agent: Agent, launcher: &Path, key: &Key, env: &ProbeEnv) -> Result<Ready, Probe> {
+/// Probe `agent`, whose `files` a look just found: its entry and launch facts. The probe finds the agent again: an entry
+/// of other files than the look's (they changed in between, or their paths are not UTF-8 and the entry's are not
+/// theirs) is no fact of the look's, which [`since`] could ever call current; it is a temporary failure, probed again
+/// once the files are seen to change or [`AUTH_EVERY`] passed.
+fn probed(agent: Agent, files: &Files, env: &ProbeEnv) -> Result<Ready, Probe> {
     let entry = probe::probe(agent, env).map_err(|e| Probe::of(&e))?;
+    if Path::new(&entry.launcher_path) != files.launcher
+        || Path::new(&entry.implementation_path) != files.implementation
+    {
+        return Err(Probe {
+            class: ProbeClass::Failed,
+            detail: format!(
+                "{}'s files changed while it was probed: the look found {} and {}, the probe {} and {}",
+                agent.as_str(),
+                files.launcher.display(),
+                files.implementation.display(),
+                entry.launcher_path,
+                entry.implementation_path
+            ),
+        });
+    }
     // The same commands the probe just ran: their failure now is a temporary one.
-    let facts = launch::read(agent, launcher, env).map_err(|detail| Probe {
+    let facts = launch::read(agent, &files.launcher, env).map_err(|detail| Probe {
         class: ProbeClass::Failed,
         detail,
     })?;
     Ok(Ready {
-        launcher: launcher.to_path_buf(),
+        launcher: files.launcher.clone(),
         version: entry.cli_version.clone(),
         capabilities: entry.capabilities.clone(),
         facts,
         entry,
-        stamp: stamp_of(key),
+        stamp: stamp_of(&files.key),
         look: 0,
     })
 }
@@ -1267,4 +1417,4 @@ async fn evidence(root: &Path, snapshot: &Snapshot, lines: &[String]) -> Option<
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

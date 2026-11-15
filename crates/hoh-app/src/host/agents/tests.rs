@@ -948,13 +948,172 @@ fn verified_claude(note: &str) -> R<(tempfile::TempDir, tempfile::TempDir, Regis
 
 /// The compat of claude's fact in a snapshot, in `fact` and in `prepared`, and the snapshot observation's `verified`.
 fn compats(registry: &Registry) -> R<(Compat, Compat, Compat, bool)> {
+    compats_of(registry, Agent::Claude)
+}
+
+/// The compat of `agent`'s fact in a snapshot, in `fact` and in `prepared`, and the snapshot observation's `verified`.
+fn compats_of(registry: &Registry, agent: Agent) -> R<(Compat, Compat, Compat, bool)> {
     let snapshot = registry.snapshot(EPOCH);
-    let seen = usable(snapshot.facts.get("claude").cloned())?.compat;
-    let now = usable(registry.fact(Agent::Claude))?.compat;
-    let current = registry.prepared(Agent::Claude).ok_or("not looked at")??;
+    let seen = usable(snapshot.facts.get(agent.as_str()).cloned())?.compat;
+    let now = usable(registry.fact(agent))?.compat;
+    let current = registry.prepared(agent).ok_or("not looked at")??;
     usable(Some(current.fact.clone()))?;
-    let verified = snapshot.observations["claude"].verified;
+    let verified = snapshot.observations[agent.as_str()].verified;
     Ok((seen, now, current.compat, verified))
+}
+
+/// A fake pi laid out under `root` as pi's installer lays it out: the launcher `root/bin/pi` answering `--version` and
+/// `--help` (the recorded help), each of `versions` a release `install/releases/<version>` whose `node_modules/.bin/pi`
+/// links to its own script, and `install/current-version` naming `current`. The launcher.
+pub(in crate::host) fn pi_install(root: &Path, versions: &[&str], current: &str) -> R<PathBuf> {
+    for version in versions {
+        let release = root.join("install/releases").join(version);
+        let bundle = release.join("node_modules/pi-coding-agent/dist/bundle");
+        std::fs::create_dir_all(&bundle)?;
+        std::fs::write(bundle.join("cli.js"), format!("#!/bin/sh\n# {version}\n"))?;
+        std::fs::set_permissions(
+            bundle.join("cli.js"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+        std::fs::create_dir_all(release.join("node_modules/.bin"))?;
+        std::os::unix::fs::symlink(
+            "../pi-coding-agent/dist/bundle/cli.js",
+            release.join("node_modules/.bin/pi"),
+        )?;
+    }
+    std::fs::write(root.join("install/current-version"), format!("{current}\n"))?;
+    std::fs::create_dir_all(root.join("bin"))?;
+    let launcher = root.join("bin/pi");
+    let help = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/pi/1.5.0/help.txt"
+    );
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '1.5.0';;\n --help) cat '{help}';;\n *) exit 2;;\nesac\n"
+        ),
+    )?;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+    Ok(launcher)
+}
+
+/// A registry of the pi found on `path` (no pi settings, so no login check) for a fresh project, looked at and
+/// verified: its manifest entry is the look's, PASS under this build's suite set. The project and the registry.
+pub(in crate::host) fn verified_pi(path: OsString) -> R<(tempfile::TempDir, Arc<Registry>)> {
+    let project = tempfile::tempdir()?;
+    let registry = Registry::with_pi_dir(path, None);
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["pi"]));
+    registry.refresh();
+    let mut entry = registry.seen(Agent::Pi).ok_or("not seen")??.entry;
+    entry.suite = Suite {
+        status: SuiteStatus::Pass,
+        fixture_set_sha256: compat::SUITE_SET_SHA256.as_str().to_owned(),
+        run_at: Some(Some("2026-11-14T00:00:00Z".to_owned())),
+        cases: Some(Vec::new()),
+    };
+    std::fs::create_dir_all(project.path().join(".hoh"))?;
+    std::fs::write(
+        project.path().join(".hoh/compat-manifest.json"),
+        serde_json::to_vec_pretty(&CompatManifest::new([(Agent::Pi, entry)].into()))?,
+    )?;
+    registry.open_manifest(project.path());
+    Ok((project, Arc::new(registry)))
+}
+
+#[test]
+fn a_pi_whose_current_version_moved_is_pending_though_none_of_its_files_changed() -> R {
+    // M2T15R-01 (docs/adr/ADR-030.md decisions 1, 2 and 13 (b), the CTO's design correction): "this agent is still
+    // what its last look found" is one predicate, the look's own: the launcher found on the PATH now, the
+    // implementation resolved for it now and their stamps, against the look's. pi's install/current-version moved from
+    // A to B with A's files kept: no stamp of the look's files changed, yet the snapshot, `fact` and `prepared` say
+    // Pending naming both implementation paths and the observation is not verified, until a look probes B. Moved back
+    // to A: Verified again without a look. Another pi earlier on the PATH: Pending naming both launchers.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let launcher = pi_install(&root, &["A", "B"], "A")?;
+    let early = root.join("early");
+    std::fs::create_dir_all(&early)?;
+    let (_project, registry) = verified_pi(
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            early.display(),
+            root.join("bin").display()
+        )
+        .into(),
+    )?;
+    let verified = (Compat::Verified, Compat::Verified, Compat::Verified, true);
+    assert_eq!(compats_of(&registry, Agent::Pi)?, verified, "unchanged");
+    let looked = usable(registry.fact(Agent::Pi))?;
+    let a = looked.identity.implementation_path.clone();
+    assert!(
+        a.ends_with("/install/releases/A/node_modules/pi-coding-agent/dist/bundle/cli.js"),
+        "{a}"
+    );
+    let b = a.replace("/install/releases/A/", "/install/releases/B/");
+    std::fs::write(root.join("install/current-version"), "B\n")?;
+    // None of the look's files changed: their stamps alone would call A current.
+    assert_eq!(file_stamp(Path::new(&a))?, looked.stamp.implementation);
+    assert_eq!(file_stamp(&launcher)?, looked.stamp.launcher);
+    let names = |compat: &Compat, was: &str, is: &str| {
+        matches!(compat, Compat::Pending(why)
+            if why.contains("files changed since the last look") && why.contains(was) && why.contains(is))
+    };
+    let (seen, now, current, observed) = compats_of(&registry, Agent::Pi)?;
+    assert!(
+        names(&seen, &a, &b) && names(&now, &a, &b) && names(&current, &a, &b) && !observed,
+        "{seen:?} {now:?} {current:?} {observed}"
+    );
+    let after = usable(registry.fact(Agent::Pi))?;
+    assert_eq!(
+        (&after.identity, after.stamp),
+        (&looked.identity, looked.stamp),
+        "the fact is still the look's"
+    );
+    std::fs::write(root.join("install/current-version"), "A\n")?;
+    assert_eq!(compats_of(&registry, Agent::Pi)?, verified, "moved back");
+    // Another pi earlier on the PATH (resolving the same implementation).
+    std::fs::copy(&launcher, early.join("pi"))?;
+    let (was, is) = (
+        launcher.display().to_string(),
+        early.join("pi").display().to_string(),
+    );
+    let (seen, now, current, observed) = compats_of(&registry, Agent::Pi)?;
+    assert!(
+        names(&seen, &was, &is)
+            && names(&now, &was, &is)
+            && names(&current, &was, &is)
+            && !observed,
+        "{seen:?} {now:?} {current:?} {observed}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_probe_that_found_other_files_than_its_look_is_a_temporary_failure() -> R {
+    // M2T15R-01: a look's fact is current while the agent is what that look found, so what its probe identified must be
+    // the files the look found. A probe whose entry names other paths (here a launcher in a directory whose name is not
+    // UTF-8: the entry's paths are its lossy text, which no file found later has, nor the gate's re-resolution) is no
+    // fact of the look's but a temporary probe failure saying so.
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = tempfile::tempdir()?;
+    let bin = dir.path().join(std::ffi::OsStr::from_bytes(b"bin-\xff"));
+    std::fs::create_dir(&bin)?;
+    claude(&bin, "not UTF-8")?;
+    let project = tempfile::tempdir()?;
+    let mut path = bin.into_os_string();
+    path.push(":/usr/bin:/bin");
+    let registry = Registry::new(path);
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["claude"]));
+    registry.refresh();
+    let fact = registry.fact(Agent::Claude);
+    assert!(
+        matches!(&fact, Some(Fact::ProbeFailed(why)) if why.contains("files changed while it was probed")),
+        "{fact:?}"
+    );
+    Ok(())
 }
 
 #[test]

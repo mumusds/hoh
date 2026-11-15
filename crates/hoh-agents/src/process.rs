@@ -359,6 +359,12 @@ impl Process {
         }
     }
 
+    /// Whether a cancel asked to end it, for a unit test.
+    #[cfg(test)]
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.control.slot.borrow().is_some()
+    }
+
     /// The next frame, then the exit report; `None` after that.
     pub async fn next(&mut self) -> Option<Event> {
         match &mut self.events {

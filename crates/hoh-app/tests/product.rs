@@ -520,6 +520,41 @@ impl World {
         ))
     }
 
+    /// pi as its installer lays it out (docs/adr/ADR-030.md decision 9, pi's launcher): the launcher `bin/pi` runs the
+    /// release `install/current-version` names, each of `versions` a release `install/releases/<version>` whose
+    /// `node_modules/.bin/pi` links to [`World::pi_body`]'s script naming itself `<version>`. While `pi.d/hold-look`
+    /// exists the launcher's `--version` waits: a look at pi (a probe's first command) is held.
+    fn pi_releases(&self, versions: &[&str], current: &str) -> R {
+        let root = self.dir.path();
+        for version in versions {
+            let release = root.join("install/releases").join(version);
+            let bundle = release.join("node_modules/pi-coding-agent/dist/bundle");
+            std::fs::create_dir_all(&bundle)?;
+            let script = bundle.join("cli.js");
+            std::fs::write(
+                &script,
+                format!("#!/bin/bash\n{}\n", self.pi_body(version)?),
+            )?;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::create_dir_all(release.join("node_modules/.bin"))?;
+            std::os::unix::fs::symlink(
+                "../pi-coding-agent/dist/bundle/cli.js",
+                release.join("node_modules/.bin/pi"),
+            )?;
+        }
+        std::fs::write(root.join("install/current-version"), format!("{current}\n"))?;
+        self.script(
+            "pi",
+            &format!(
+                "root='{root}'\n\
+                 [ \"$1\" = --version ] && while [ -e '{hold}' ]; do sleep 0.05; done\n\
+                 exec \"$root/install/releases/$(cat \"$root/install/current-version\")/node_modules/.bin/pi\" \"$@\"",
+                root = root.display(),
+                hold = self.bin().join("pi.d/hold-look").display()
+            ),
+        )
+    }
+
     /// Every fake turn process gone: the ones still there are killed (nothing a test started outlives it). A number is
     /// killed only while its command line names this world's fakes (each fake's does, the ones that exec too), so a
     /// number another process took since is never killed (CIR-056's class).
@@ -3795,6 +3830,98 @@ async fn a_hosts_start_holds_an_unreadable_manifest_as_empty_and_says_so() -> R 
     outcome
 }
 
+/// The first replacement of the compat manifest that reaches its rename fails to sync the manifest's directory: the
+/// test's fault hook (CR-006; the product's does nothing).
+#[derive(Debug, Default)]
+struct UnsyncedOnce(std::sync::atomic::AtomicBool);
+
+impl hoh_core::persistence::FaultHooks for UnsyncedOnce {
+    fn manifest_at(&self, step: hoh_core::compat_manifest::Step) -> std::io::Result<()> {
+        if step == hoh_core::compat_manifest::Step::Renamed
+            && !self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            Err(std::io::Error::other("injected"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_manifest_renamed_but_not_synced_is_the_base_of_the_next_publication() -> R {
+    // M2T15R-04, docs/adr/ADR-030.md decision 10 "发布": the first suite's publication renames the new manifest into
+    // place and only the sync of its directory fails. The host holds what was renamed, so the second agent's
+    // publication, built on the manifest the host holds, keeps the first agent's entry instead of writing the second's
+    // over the manifest before it.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.pi()?;
+    world.bind_installed()?;
+    let project = world.project();
+    let mut config = world.config();
+    config.store.faults = std::sync::Arc::new(UnsyncedOnce::default());
+    let host = start_when_free(config).await?;
+    let outcome = async {
+        until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind = 'compat.suite_ended'",
+            "2",
+            Duration::from_secs(90),
+        )
+        .await?;
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(project.join(".hoh/compat-manifest.json"))?)?;
+        let events = suite_events(&project)?;
+        let first = events[0].2["agent"].as_str().unwrap_or_default();
+        assert!(
+            events[2].2["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("not synced")),
+            "{events:?}"
+        );
+        assert_eq!(
+            manifest["agents"][first]["suite"]["status"], "PASS",
+            "{first}'s entry was overwritten: {manifest}"
+        );
+        assert_eq!(
+            kinds(&events),
+            [
+                "compat.suite_opened",
+                "compat.suite_started",
+                "compat.suite_ended",
+                "compat.suite_completed",
+                "compat.suite_opened",
+                "compat.suite_started",
+                "compat.suite_ended",
+                "compat.suite_completed"
+            ],
+            "{events:?}"
+        );
+        assert_eq!(events[2].2["status"], "PASS", "{events:?}");
+        let second = events[4].2["agent"].as_str().unwrap_or_default();
+        assert_eq!(
+            [first, second]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["claude", "pi"].into_iter().collect(),
+            "{events:?}"
+        );
+        assert_eq!(
+            events[6].2,
+            json!({"suite_id": events[4].2["suite_id"], "status": "PASS"})
+        );
+        assert_eq!(
+            manifest["agents"][second]["suite"]["status"], "PASS",
+            "{manifest}"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
 /// An action armed at a runner point: called each time the point is reached until it says it is done.
 type Action = Box<dyn FnMut() -> bool + Send>;
 
@@ -4158,6 +4285,122 @@ async fn a_codex_replaced_while_held_at_the_gate_does_not_run() -> R {
     }
     .await;
     let _ = std::fs::write(hold.path().join("release"), "");
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pi_whose_current_version_moved_is_refused_once_until_its_look() -> R {
+    // M2T15R-01 (docs/adr/ADR-030.md decisions 1, 7 and 13 (b), the CTO's design correction): every role is pi,
+    // installed as its installer lays it out with releases A and B, registered (verified) under A. At the spawn of
+    // T-MOVED's attempt (RunnerPoint::AfterSpawn, its prepare passed) the registry's next look at pi is held and
+    // install/current-version moves to B, A's files kept, so none of the look's stamps changes: the gate resolves B and
+    // refuses implementation_path; the attempt FAILED COMPAT_UNVERIFIED, the task BLOCKED(COMPAT_UNVERIFIED) with no
+    // retry. While the look stays held (ticks go on, 200 ms each), the registry's facts say "files changed since the
+    // last look" (the look's own predicate: B is resolved now), so neither staffing's dispatchable predicate nor the
+    // pace puts the task back: still exactly one refused attempt. Once the look is let go, B is probed, its suite
+    // publishes, the developer rebinds and the task runs B.
+    let world = World::new()?;
+    world.pi_releases(&["A", "B"], "A")?;
+    world.bind_installed()?;
+    let project = world.project();
+    hoh_app::compat::register(
+        &project,
+        hoh_agents::compat::Agent::Pi,
+        std::ffi::OsStr::new(&world.path()),
+    )?;
+    let points = std::sync::Arc::new(Points::default());
+    let mut config = world.config_with(
+        hoh_core::config::Config::default(),
+        world.registry(),
+        None,
+        None,
+    );
+    config.hooks = points.clone();
+    let host = start_when_free(config).await?;
+    let hold = world.bin().join("pi.d/hold-look");
+    let calls = |attempt_id: &str| -> Vec<String> {
+        std::fs::read_to_string(world.bin().join("pi.d/calls"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| {
+                l.split(' ')
+                    .nth(1)
+                    .is_some_and(|m| m.ends_with(&format!("/{attempt_id}")))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let outcome = async {
+        let run_id = started(&host, "s1").await?;
+        let limit = Duration::from_secs(60);
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer' \
+                 AND session_id IS NOT NULL"
+            ),
+            "1",
+            limit,
+        )
+        .await?;
+        let held = project.join(".hoh/attempts/T-MOVED%2Fattempt-1");
+        let (looks, pointer) = (hold.clone(), world.dir.path().join("install/current-version"));
+        let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let said = moved.clone();
+        points.arm(hoh_app::host::RunnerPoint::AfterSpawn, move || {
+            if !held.exists() {
+                return false;
+            }
+            said.store(
+                std::fs::write(&looks, "").is_ok() && std::fs::write(&pointer, "B\n").is_ok(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            true
+        });
+        ready(&project, &run_id, &[("T-MOVED", "developer")])?;
+        until(&project, &ended("T-MOVED/attempt-1"), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+        assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
+        let records = gate_records(&project, "T-MOVED/attempt-1")?;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            (&records[0]["outcome"], &records[0]["item"]),
+            (&json!("refused"), &json!("implementation_path")),
+            "{records:?}"
+        );
+        // Only the gate ran: neither A nor B was called for the turn.
+        assert_eq!(calls("T-MOVED/attempt-1"), Vec::<String>::new());
+        let task = "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') || '/' || \
+                    (SELECT count(*) FROM attempts WHERE task_id = 'T-MOVED') FROM tasks WHERE task_id = 'T-MOVED'";
+        assert_eq!(query(&project, task)?, "BLOCKED/COMPAT_UNVERIFIED//1");
+        // The look at B held, ticks go on: the task waits with its one refused attempt.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(query(&project, task)?, "BLOCKED/COMPAT_UNVERIFIED//1");
+        std::fs::remove_file(&hold)?;
+        until(&project, &ended("T-MOVED/attempt-2"), "SETTLED/", limit).await?;
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-MOVED' AND failure_reason = 'COMPAT_UNVERIFIED'"
+            )?,
+            "1"
+        );
+        let ran = calls("T-MOVED/attempt-2");
+        assert!(
+            !ran.is_empty() && ran.iter().all(|l| l.starts_with("B ")),
+            "{ran:?}"
+        );
+        keep(
+            "pi-current-version-moved",
+            &json!({"records": records,
+                    "attempts": [attempt_row(&project, "T-MOVED/attempt-1")?,
+                                 attempt_row(&project, "T-MOVED/attempt-2")?]}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_file(&hold);
     host.shutdown().await;
     world.stop_fakes()?;
     outcome

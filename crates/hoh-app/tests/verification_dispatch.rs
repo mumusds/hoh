@@ -273,6 +273,8 @@ struct Team {
     /// How a verifier's turn fails once released, when it does (docs/adr/ADR-030.md decision 6): no report, its end of
     /// this class (`BLOCKED_AUTH` for Auth).
     verifier_fails: std::sync::Mutex<Option<hoh_core::retry::FailureClass>>,
+    /// Only a verifier's turn run as this agent fails (as `verifier_fails` says), when set; else every one does.
+    verifier_fails_as: std::sync::Mutex<Option<String>>,
 }
 
 /// The Developer FakeAgent's self-test record: it claims every TEST of TEST-053-01's specification passed.
@@ -308,6 +310,7 @@ impl Team {
             held_tasks: std::sync::Mutex::default(),
             task_release: Arc::default(),
             verifier_fails: std::sync::Mutex::default(),
+            verifier_fails_as: std::sync::Mutex::default(),
         }
     }
 
@@ -478,7 +481,18 @@ impl hoh_app::host::Executor for Team {
                 if let Ok(mut dirs) = self.run_dirs.lock() {
                     dirs.push((role.to_owned(), work.run_dir.clone()));
                 }
-                let fails = self.verifier_fails.lock().ok().and_then(|f| *f);
+                let fails = self
+                    .verifier_fails
+                    .lock()
+                    .ok()
+                    .and_then(|f| *f)
+                    .filter(|_| {
+                        self.verifier_fails_as
+                            .lock()
+                            .ok()
+                            .and_then(|a| a.clone())
+                            .is_none_or(|a| work.assignment.agent.as_deref() == Some(a.as_str()))
+                    });
                 if let (Some(class), true) = (fails, work.assignment.handoff.is_some()) {
                     failed = true;
                     verifier_class = Some(class);
@@ -3467,6 +3481,16 @@ async fn pi_qa_world(
     t3: bool,
     logged_in: bool,
 ) -> R<(PathBuf, String, PathBuf, String)> {
+    pi_qa_world_with(dir, t3, logged_in, PI_QA_TEAM).await
+}
+
+/// [`pi_qa_world`] with the team configuration `team` (qa pi in it, every other role claude).
+async fn pi_qa_world_with(
+    dir: &Path,
+    t3: bool,
+    logged_in: bool,
+    team: &str,
+) -> R<(PathBuf, String, PathBuf, String)> {
     let (project, spec) = project(dir).await?;
     let bin = dir.join("bin");
     fake_claude(&bin)?;
@@ -3475,7 +3499,7 @@ async fn pi_qa_world(
         std::fs::write(bin.join("pi.d/logged-in"), "")?;
     }
     let path = format!("{}:/usr/bin:/bin", bin.display());
-    std::fs::write(project.join(".hoh/config.toml"), PI_QA_TEAM)?;
+    std::fs::write(project.join(".hoh/config.toml"), team)?;
     Host::start(config(&project)).await?.shutdown().await;
     for agent in [
         hoh_agents::compat::Agent::Claude,
@@ -3832,6 +3856,223 @@ async fn a_late_auth_failure_of_a_replaced_pi_does_not_block_qa() -> R {
             "SELECT json_extract(payload_json, '$.reason') AS reason FROM events WHERE kind = 'task.unblocked'",
         )?;
         assert_eq!(unblocked, json!([{"reason": "BLOCKED_AUTH"}]));
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_auth_failure_while_pi_says_logged_in_switches_qa_to_its_fallback() -> R {
+    // AC-020-05's then-clause on the product path (docs/adr/ADR-030.md decisions 2 and 4 to 7, M2T15R-50):
+    // TEST-020-03's world with TEST-020-02's team (qa pi falling back to claude), pi logged in and registered. qa's
+    // turn runs as pi and fails BLOCKED_AUTH under pi's current identity while pi's status command keeps saying it is
+    // logged in. The host runner's end of the turn latches it as pi's fact: staffing switches qa to claude at epoch 2
+    // (its evidence shows pi's fact is the turn's failure), and the task is unblocked and dispatched to claude in a
+    // session of its own. pi is never unblocked: no team.binding_unblocked, and no other qa turn runs as pi.
+    let dir = tempfile::tempdir()?;
+    let (project, spec, bin, path) =
+        pi_qa_world_with(dir.path(), false, true, FALLBACK_TEAM).await?;
+    let clock = Arc::new(FakeClock::default());
+    let team = pi_qa_team(dir.path(), &project, &spec, &path);
+    if let Ok(mut fails) = team.verifier_fails.lock() {
+        *fails = Some(hoh_core::retry::FailureClass::Auth);
+    }
+    // Only pi's turn fails: the reviewer (claude) and qa's fallback (claude) report.
+    if let Ok(mut fails_as) = team.verifier_fails_as.lock() {
+        *fails_as = Some("pi".to_owned());
+    }
+    let registry = hoh_app::host::Executor::registry(&*team).ok_or("no registry")?;
+    let host = host(&project, team.clone(), clock.clone()).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        let first = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT a.attempt_id, a.agent, a.session_id, a.role_epoch FROM attempts a JOIN tasks t \
+             ON t.task_id = a.task_id WHERE t.role = 'qa' AND a.state = 'RUNNING'",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        let (a_attempt, a_session) = (
+            first[0]["attempt_id"].as_str().ok_or("no attempt")?.to_owned(),
+            first[0]["session_id"].as_str().ok_or("no session")?.to_owned(),
+        );
+        assert_eq!(
+            (&first[0]["agent"], &first[0]["role_epoch"]),
+            (&json!("pi"), &json!(1)),
+            "{first}"
+        );
+        // pi's status command says it is logged in: its fact is usable before the turn fails.
+        let before = registry.fact(hoh_agents::compat::Agent::Pi);
+        assert!(
+            matches!(before, Some(hoh_core::staffing::Fact::Usable(_))),
+            "{before:?}"
+        );
+        team.release.store(true, Ordering::SeqCst);
+        let a_end = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!("SELECT state, failure_reason FROM attempts WHERE attempt_id = '{a_attempt}'"),
+            &|r| r[0]["state"] == "FAILED",
+        )?;
+        assert_eq!(a_end[0]["failure_reason"], "BLOCKED_AUTH", "{a_end}");
+        // The turn blocked pi's binding, and its failure was latched (not only said, as an older identity's is).
+        assert_eq!(
+            rows(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.cause') AS cause, json_extract(payload_json, '$.reason') \
+                     AS reason, json_extract(payload_json, '$.agent') AS agent, json_extract(payload_json, \
+                     '$.role_epoch') AS role_epoch FROM events WHERE kind = 'team.binding_blocked' \
+                     AND json_extract(payload_json, '$.attempt_id') = '{a_attempt}'"
+                ),
+            )?,
+            json!([{"cause": "turn", "reason": "BLOCKED_AUTH", "agent": "pi", "role_epoch": 1}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                &format!(
+                    "SELECT count(*) AS n FROM events WHERE kind = 'registry.turn_auth_ignored' \
+                     AND json_extract(payload_json, '$.attempt_id') = '{a_attempt}'"
+                ),
+            )?,
+            json!([{"n": 0}])
+        );
+        // Whichever comes first: qa switched to its fallback, or pi's blocked binding unblocked.
+        let judged = wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT kind, payload_json FROM events WHERE run_id = 'R' \
+             AND kind IN ('team.binding_fallback', 'team.binding_unblocked') \
+             AND json_extract(payload_json, '$.role') = 'qa' ORDER BY seq",
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(
+            judged.as_array().map(|j| j.iter().map(|e| e["kind"].clone()).collect::<Vec<_>>()),
+            Some(vec![json!("team.binding_fallback")]),
+            "pi was not switched from: {judged}"
+        );
+        let fallback: Value =
+            serde_json::from_str(judged[0]["payload_json"].as_str().unwrap_or("null"))?;
+        assert_eq!(
+            (&fallback["from"], &fallback["chosen"], &fallback["evaluated"]),
+            (
+                &json!("pi"),
+                &json!("claude"),
+                &json!(["pi:BLOCKED_AUTH", "claude:usable"])
+            ),
+            "{fallback}"
+        );
+        // The switch's evidence: pi found ready, its fact the latched turn's failure, not its status command's answer.
+        let sha256 = fallback["probe_sha256"].as_str().ok_or("no probe sha256")?;
+        let probe: Value = serde_json::from_slice(&hoh_core::objects::get(&project, sha256)?)?;
+        let pi = probe
+            .as_array()
+            .and_then(|items| items.iter().find(|i| i["agent"] == "pi"))
+            .ok_or("no pi in the evidence")?;
+        assert_eq!(
+            (&pi["line"], &pi["probe"]["class"], &pi["probe"]["detail"]),
+            (
+                &json!("pi:BLOCKED_AUTH"),
+                &Value::Null,
+                &json!(format!("turn {a_attempt} failed BLOCKED_AUTH"))
+            ),
+            "{probe}"
+        );
+        // The task is unblocked and dispatched to claude at epoch 2, in a new session of claude's.
+        let second = wait_for(
+            &project,
+            &clock,
+            step,
+            &format!(
+                "SELECT a.attempt_id, a.agent, a.session_id, a.role_epoch FROM attempts a JOIN tasks t \
+                 ON t.task_id = a.task_id WHERE t.role = 'qa' AND a.attempt_id <> '{a_attempt}'"
+            ),
+            &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+        )?;
+        assert_eq!(second.as_array().map(Vec::len), Some(1), "{second}");
+        assert_eq!(
+            (&second[0]["agent"], &second[0]["role_epoch"]),
+            (&json!("claude"), &json!(2)),
+            "{second}"
+        );
+        let b_session = second[0]["session_id"].as_str().ok_or("no session")?;
+        assert_ne!(b_session, a_session);
+        assert_eq!(
+            rows(
+                &project,
+                &format!("SELECT agent, role FROM sessions WHERE session_id = '{b_session}'")
+            )?,
+            json!([{"agent": "claude", "role": "qa"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT agent, role_epoch, session_id FROM role_bindings WHERE run_id = 'R' AND role = 'qa'"
+            )?,
+            json!([{"agent": "claude", "role_epoch": 2, "session_id": b_session}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.cause') AS cause FROM events WHERE kind = 'team.binding_applied' \
+                 AND json_extract(payload_json, '$.role') = 'qa'"
+            )?,
+            json!([{"cause": "fallback"}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT json_extract(payload_json, '$.reason') AS reason, json_extract(payload_json, '$.role_epoch') \
+                 AS role_epoch FROM events WHERE kind = 'task.unblocked' \
+                 AND json_extract(payload_json, '$.role') = 'qa'"
+            )?,
+            json!([{"reason": "BLOCKED_AUTH", "role_epoch": 2}])
+        );
+        // pi was never unblocked, though its status command still says it is logged in: its fact stays the turn's.
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM events WHERE kind = 'team.binding_unblocked' \
+                 AND json_extract(payload_json, '$.role') = 'qa'"
+            )?,
+            json!([{"n": 0}])
+        );
+        assert_eq!(
+            rows(
+                &project,
+                "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.role = 'qa' AND a.agent = 'pi'"
+            )?,
+            json!([{"n": 1}])
+        );
+        let status = Command::new(bin.join("pi")).args(["auth", "check"]).output()?;
+        assert!(
+            status.status.success(),
+            "{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert_eq!(
+            registry.fact(hoh_agents::compat::Agent::Pi),
+            Some(hoh_core::staffing::Fact::LoginMissing(format!(
+                "turn {a_attempt} failed BLOCKED_AUTH"
+            )))
+        );
+        keep(
+            "auth-latch-product-path",
+            &json!({
+                "probe": probe,
+                "attempts": rows(&project, "SELECT a.attempt_id, t.role, a.state, a.agent, a.session_id, a.role_epoch, a.failure_reason FROM attempts a JOIN tasks t ON t.task_id = a.task_id ORDER BY a.rowid")?,
+                "role_bindings": rows(&project, "SELECT role, agent, role_epoch, session_id, state, blocked_reason, missing_json FROM role_bindings ORDER BY role")?,
+                "events": rows(&project, "SELECT seq, kind, payload_json FROM events WHERE kind LIKE 'team.%' OR kind LIKE 'task.%' OR kind LIKE 'registry.%' ORDER BY seq")?,
+            }),
+        )?;
         R::Ok(())
     }
     .await;

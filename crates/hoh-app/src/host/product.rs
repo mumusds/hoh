@@ -693,30 +693,21 @@ struct Turn {
 }
 
 /// Decision 9's checks of `work`'s turn of `agent` (docs/adr/ADR-030.md, "prepare 的核对", M2T15D-100), in order and
-/// all from the one fact F in `current`, before anything else of the turn is prepared: (a) the launcher's and the
-/// implementation's stamps read again (metadata only) are F's look's, (b) F's entry is verified against the manifest
-/// the registry holds, (c) F is not a missing login (BLOCKED_AUTH, Auth), (d) the turn's session is fresh for F
-/// (`staffing::fresh`, staffing's own function). (a), (b) and (d) refuse COMPAT_UNVERIFIED in the Compat class. A fact
-/// that is none of usable and logged out (its session capabilities could not be read) is AGENT_UNAVAILABLE in the
-/// Unavailable class, as a look that found the agent unusable. F's usable form when every check passed.
+/// all from the one fact F in `current`, before anything else of the turn is prepared: (a) the agent is still what F's
+/// look found ([`Current::changed`], the registry's one predicate of that: the launcher on the PATH now, the
+/// implementation resolved for it now and their stamps, metadata only, against the look's; M2T15R-01), (b) F's entry is
+/// verified against the manifest the registry holds, (c) F is not a missing login (BLOCKED_AUTH, Auth), (d) the turn's
+/// session is fresh for F (`staffing::fresh`, staffing's own function). (a), (b) and (d) refuse COMPAT_UNVERIFIED in the
+/// Compat class. A fact that is none of usable and logged out (its session capabilities could not be read) is
+/// AGENT_UNAVAILABLE in the Unavailable class, as a look that found the agent unusable. F's usable form when every
+/// check passed.
 fn check(work: &Work, agent: Agent, current: &Current) -> Result<Box<Usable>, Refusal> {
     let a = &work.assignment;
     let ready = &current.ready;
     let compat = |detail: String| refused("COMPAT_UNVERIFIED", FailureClass::Compat, detail);
     let name = agent.as_str();
-    let implementation = Path::new(&ready.entry.implementation_path);
-    let now = super::agents::stamp_now(&ready.launcher, implementation);
-    if now != Some(ready.stamp) {
-        return Err(compat(format!(
-            "{name}: files changed since the last look: {} and {} were {}, are {}",
-            ready.launcher.display(),
-            implementation.display(),
-            serde_json::json!(ready.stamp),
-            now.map_or_else(
-                || "unreadable".to_owned(),
-                |s| serde_json::json!(s).to_string()
-            ),
-        )));
+    if let Some(changed) = &current.changed {
+        return Err(compat(format!("{name}: {changed}")));
     }
     if current.compat != Compat::Verified {
         return Err(compat(format!(

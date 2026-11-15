@@ -659,12 +659,57 @@ pub(crate) async fn drive_watched(
     .await?
     {
         app_server::Drove::Ended(driven) => Ok((driven.state, driven.failure, driven.recorded)),
-        app_server::Drove::Degrade(reason, _) => Ok((
+        app_server::Drove::Degrade(degraded) => Ok((
             AttemptState::Failed,
-            Some(format!("degraded: {reason}")),
-            Vec::new(),
+            Some(format!("degraded: {}", degraded.reason)),
+            degraded.recorded,
         )),
     }
+}
+
+/// A codex App Server turn of the runner's mode driven on `process` (its gate `gate` open) with `watch` and the
+/// handshake timeout `handshake`, its diagnostics shown to `observer`, for the adapters' unit tests: its facts as
+/// [`start`] gives them.
+#[cfg(test)]
+pub(crate) async fn app_server_facts_watched(
+    process: &mut crate::process::Process,
+    watch: &mut Watch,
+    observer: Observer,
+    gate: &GateCommand,
+    handshake: Duration,
+) -> Facts {
+    let attempt = AttemptRef {
+        attempt_id: "attempt".to_owned(),
+        session_id: "session".to_owned(),
+        role: "developer".to_owned(),
+        agent_version: String::new(),
+    };
+    let turn = Turn {
+        handshake_timeout: handshake,
+        ..replay_turn()
+    };
+    let native = tokio::sync::Notify::new();
+    let (_, mut steers) = mpsc::channel::<Steer>(1);
+    let drove = app_server::drive(
+        None,
+        &attempt,
+        &turn,
+        process,
+        Stop::Native(&native),
+        &mut steers,
+        &mut Vec::new(),
+        Some(gate.go()),
+        watch,
+        observer.clone(),
+    )
+    .await;
+    app_server_facts(
+        drove,
+        &attempt.attempt_id,
+        gate,
+        "/logs".to_owned(),
+        &observer,
+    )
 }
 
 /// The turn a replay judges: the product's YOLO launch of a new thread with codex's own model and the suite's prompt;
@@ -826,47 +871,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 observer.clone(),
             )
             .await;
-            return match drove {
-                // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
-                Ok(app_server::Drove::Ended(driven))
-                    if driven.state != AttemptState::Cancelled
-                        && let Some(refused) = crate::adapter::refused_at_gate(
-                            &gate,
-                            &raw_log_path,
-                            driven.report.as_ref(),
-                            &driven.recorded,
-                        ) =>
-                {
-                    observer.refused(refused)
-                }
-                Ok(app_server::Drove::Ended(driven)) => Facts {
-                    state: driven.state,
-                    failure: driven.failure,
-                    native_session: driven.thread_id,
-                    resolved_model: driven.model,
-                    usage: driven.usage,
-                    raw_log_path,
-                    max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
-                    group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
-                    recorded: driven.recorded,
-                    degraded: None,
-                    final_text: driven.reply,
-                    compat: None,
-                }
-                .before_input(driven.changed.as_ref()),
-                Ok(app_server::Drove::Degrade(reason, report)) => Facts {
-                    failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
-                    recorded: vec![Recorded::Event {
-                        key: "degraded".to_owned(),
-                        kind: "adapter.degraded".to_owned(),
-                        payload: json!({"attempt_id": attempt.attempt_id, "reason": reason, "mode": "exec",
-                                            "next_attempt": true}),
-                    }],
-                    degraded: Some(reason),
-                    ..Facts::gate_closed(raw_log_path, report.as_deref())
-                },
-                Err(_) => Facts::incomplete(raw_log_path, Vec::new()),
-            };
+            return app_server_facts(drove, &attempt.attempt_id, &gate, raw_log_path, &observer);
         }
         let mut input = gate.go();
         input.extend_from_slice(turn.prompt.as_bytes());
@@ -922,6 +927,75 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         cancel,
         ended,
     })
+}
+
+/// The facts of an App Server turn of the runner's mode (`attempt_id`'s, its gate `gate`) from how its drive ended.
+fn app_server_facts(
+    drove: Result<app_server::Drove, AdapterError>,
+    attempt_id: &str,
+    gate: &GateCommand,
+    raw_log_path: String,
+    observer: &Observer,
+) -> Facts {
+    match drove {
+        // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
+        Ok(app_server::Drove::Ended(driven))
+            if driven.state != AttemptState::Cancelled
+                && let Some(refused) = crate::adapter::refused_at_gate(
+                    gate,
+                    &raw_log_path,
+                    driven.report.as_ref(),
+                    &driven.recorded,
+                ) =>
+        {
+            observer.refused(refused)
+        }
+        Ok(app_server::Drove::Ended(driven)) => Facts {
+            state: driven.state,
+            failure: driven.failure,
+            native_session: driven.thread_id,
+            resolved_model: driven.model,
+            usage: driven.usage,
+            raw_log_path,
+            max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
+            group_reaped: driven.report.as_ref().is_some_and(|r| r.group_reaped),
+            recorded: driven.recorded,
+            degraded: None,
+            final_text: driven.reply,
+            compat: None,
+        }
+        .before_input(driven.changed.as_ref()),
+        // Moved to exec before the agent wrote a frame: its gate, slower than the handshake timeout, may have refused it
+        // (M2T15R-02); its keyed refusal decides.
+        Ok(app_server::Drove::Degrade(degraded))
+            if let Some(refused) = crate::adapter::refused_at_gate(
+                gate,
+                &raw_log_path,
+                degraded.report.as_ref(),
+                &degraded.recorded,
+            ) =>
+        {
+            observer.refused(refused)
+        }
+        // What the turn recorded until it moved to exec is kept with its degraded record (an in-turn re-check's
+        // diagnostic among it: docs/adr/ADR-030.md decision 9, M2T15R-03).
+        Ok(app_server::Drove::Degrade(degraded)) => {
+            let mut recorded = degraded.recorded;
+            recorded.push(Recorded::Event {
+                key: "degraded".to_owned(),
+                kind: "adapter.degraded".to_owned(),
+                payload: json!({"attempt_id": attempt_id, "reason": degraded.reason, "mode": "exec",
+                                "next_attempt": true}),
+            });
+            Facts {
+                failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
+                recorded,
+                degraded: Some(degraded.reason),
+                ..Facts::gate_closed(raw_log_path, degraded.report.as_ref())
+            }
+        }
+        Err(_) => Facts::incomplete(raw_log_path, Vec::new()),
+    }
 }
 
 /// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn

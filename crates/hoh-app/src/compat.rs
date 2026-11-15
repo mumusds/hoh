@@ -61,10 +61,13 @@ pub fn register(project: &Path, agent: Agent, path: &OsStr) -> Result<SuiteResul
         &hoh_core::time::now_rfc3339(),
     )?;
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-    compat_manifest::replace(
+    let replaced = compat_manifest::replace(
         &Files::of(project, &format!("register.{}", std::process::id())),
         &bytes,
     )?;
     drop(lock);
+    if let compat_manifest::Replaced::Unsynced(why) = replaced {
+        return Err(why);
+    }
     Ok(result)
 }

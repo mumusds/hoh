@@ -1032,6 +1032,63 @@ async fn prepare_refuses_a_session_granted_for_another_identity()
 }
 
 #[test]
+fn prepare_refuses_a_pi_whose_current_version_moved_since_the_last_look()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M2T15R-01 (docs/adr/ADR-030.md decision 9's (a), the CTO's design correction): prepare's (a) is the registry's
+    // one predicate "the agent is still what its last look found". The fact F is pi A (verified, its session fresh);
+    // pi's install/current-version moves to B with A's files kept, so none of F's stamps changed: prepare refuses
+    // COMPAT_UNVERIFIED in the Compat class, "files changed since the last look" naming both implementation paths,
+    // from its one read of the registry. Unchanged, the same turn is prepared.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    crate::host::agents::tests::pi_install(&root, &["A", "B"], "A")?;
+    let (project, registry) = crate::host::agents::tests::verified_pi(
+        format!("{}:/usr/bin:/bin", root.join("bin").display()).into(),
+    )?;
+    let a = match registry.fact(Agent::Pi) {
+        Some(Fact::Usable(usable)) if usable.compat == Compat::Verified => *usable,
+        other => return Err(format!("not verified: {other:?}").into()),
+    };
+    let executor = ProductExecutor::new(
+        registry.clone(),
+        project.path().to_owned(),
+        PathBuf::from("hoh"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let mut w = work(None);
+    w.assignment.agent = Some("pi".to_owned());
+    w.assignment.agent_version = Some(a.version.clone());
+    w.assignment.session_capabilities = Some(a.session.clone());
+    w.assignment.session_identity = Some(a.identity.clone());
+    executor
+        .prepare(&w)
+        .map_err(|r| format!("unchanged: {r:?}"))?;
+    std::fs::write(root.join("install/current-version"), "B\n")?;
+    let reads = registry.reads();
+    let refusal = executor
+        .prepare(&w)
+        .err()
+        .ok_or("prepared after the move")?;
+    assert_eq!(registry.reads() - reads, 1, "F is read once");
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("COMPAT_UNVERIFIED", FailureClass::Compat)
+    );
+    let detail = refusal.detail.unwrap_or_default();
+    let b = a
+        .identity
+        .implementation_path
+        .replace("/install/releases/A/", "/install/releases/B/");
+    assert!(
+        detail.starts_with("pi: files changed since the last look")
+            && detail.contains(&a.identity.implementation_path)
+            && detail.contains(&b),
+        "{detail}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_typed_gate_refusal_is_compat_unless_only_its_stamps_differed()
 -> Result<(), Box<dyn std::error::Error>> {
     // docs/adr/ADR-030.md decisions 6 and 9 (-101, -201): class_of reads the facts' typed CompatRefusal, never the

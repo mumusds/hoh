@@ -160,6 +160,13 @@ pub trait FaultHooks: Send + Sync + std::fmt::Debug {
     /// At `point` of a request of the writer named `job` ("Decide", "Commit", …; ADR-019 decision 1): a test's hook
     /// may end the process here (AC-036-02).
     fn at(&self, _job: &'static str, _point: WritePoint) {}
+
+    /// After `step` of the compat manifest's replacement by a suite's publication (docs/adr/ADR-030.md decision 10
+    /// "发布"): an error fails that step as an I/O error would (after [`Step::Renamed`](crate::compat_manifest::Step),
+    /// the sync of the manifest's directory).
+    fn manifest_at(&self, _step: crate::compat_manifest::Step) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A point of a write request (REQ-036, ADR-019 decision 1), in order: the transaction began (its host fence

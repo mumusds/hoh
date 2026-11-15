@@ -818,3 +818,280 @@ fn a_gate_refusal_is_shown_to_the_observer_as_its_diagnostic_is_collected() -> R
     assert_eq!(Observer::default().refused(facts.clone()), facts);
     Ok(())
 }
+
+/// What a [`Timed`] process does as one of its events is handed out.
+type Then = Option<Box<dyn FnOnce() + Send + Sync>>;
+
+/// A process whose events come at set times of the paused clock, in order: each handed out once its time came, its
+/// [`Then`] run as it is; none after the last. A wait the event loop drops for another branch hands nothing out.
+struct Timed(std::collections::VecDeque<(tokio::time::Instant, crate::process::Event, Then)>);
+
+impl std::fmt::Debug for Timed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Timed")
+    }
+}
+
+impl crate::process::FakeEvents for Timed {
+    fn next(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<crate::process::Event>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let at = self.0.front()?.0;
+            tokio::time::sleep_until(at).await;
+            let (_, event, then) = self.0.pop_front()?;
+            if let Some(then) = then {
+                then();
+            }
+            Some(event)
+        })
+    }
+}
+
+/// The handshake timeout of a [`codex_facts_timed`] turn.
+const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A codex App Server frame handed out at `ms` milliseconds.
+fn frame_at(ms: u64, frame: serde_json::Value, then: Then) -> (u64, crate::process::Event, Then) {
+    (
+        ms,
+        crate::process::Event::Frame(crate::frame::Frame::Line(frame.to_string().into_bytes())),
+        then,
+    )
+}
+
+/// The process's exit at `ms` milliseconds, its streams complete, `stdout_bytes` read from its stdout.
+fn exit_at(ms: u64, stdout_bytes: u64) -> (u64, crate::process::Event, Then) {
+    let mut report = replayed_exit();
+    report.stdout.bytes = stdout_bytes;
+    (ms, crate::process::Event::Exit(Box::new(report)), None)
+}
+
+/// The facts of a codex App Server turn of the runner's mode (its handshake timeout [`HANDSHAKE`]) driven on a
+/// [`Timed`] process whose `script` gives each event's time in milliseconds from now, watching `expect`, its gate
+/// `gate`; its stdin a pipe nobody reads. With them, whether the adapter asked to end the process.
+async fn codex_facts_timed(
+    script: Vec<(u64, crate::process::Event, Then)>,
+    expect: Option<Expect>,
+    gate: &GateCommand,
+) -> R<(Facts, bool)> {
+    let start = tokio::time::Instant::now();
+    let events = Timed(
+        script
+            .into_iter()
+            .map(|(ms, event, then)| (start + std::time::Duration::from_millis(ms), event, then))
+            .collect(),
+    );
+    let (stdin, unread) = tokio::net::unix::pipe::pipe()?;
+    let mut process = crate::process::Process::fake(4242, Some(stdin), Box::new(events));
+    let mut watch = Watch::new(expect);
+    let facts = crate::codex::app_server_facts_watched(
+        &mut process,
+        &mut watch,
+        Observer::default(),
+        gate,
+        HANDSHAKE,
+    )
+    .await;
+    drop(unread);
+    Ok((facts, process.cancel_requested()))
+}
+
+/// A gate with no expectation and no status: today's `go`.
+fn plain_gate() -> GateCommand {
+    GateCommand {
+        program: "/hoh".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        expect: None,
+        status: None,
+    }
+}
+
+/// Each event a turn recorded as (kind, its payload's reason).
+fn kinds(recorded: &[Recorded]) -> Vec<(String, serde_json::Value)> {
+    recorded
+        .iter()
+        .filter_map(|r| match r {
+            Recorded::Event { kind, payload, .. } => {
+                Some((kind.clone(), payload["reason"].clone()))
+            }
+            Recorded::NativeSession(_) => None,
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_before_the_first_input_outlasts_the_handshake_deadline() -> R {
+    // M2T15R-02 (decision 9, "首个输入之前的再核对"; decision 15): initialize is answered just before the handshake
+    // deadline, the implementation replaced as the answer comes, so the re-check refuses and stdin is closed; the process
+    // exits only after the deadline. The deadline no longer applies once initialize was answered: the facts are the
+    // re-check's typed refusal, never a move to exec (no `degraded`, which marks the implementation exec_only). Red
+    // before the fix: the handshake timer set the degrade after the refusal and `conclude` preferred it.
+    let dir = tempfile::tempdir()?;
+    let expect = installed(dir.path())?;
+    let at = dir.path().join("versions/A");
+    let (facts, _) = codex_facts_timed(
+        vec![
+            frame_at(
+                900,
+                serde_json::json!({"id": 0, "result": {"userAgent": "codex"}}),
+                Some(Box::new(move || {
+                    let _ = replace(&at, b"#!/bin/sh\necho C\n");
+                })),
+            ),
+            exit_at(1500, 64),
+        ],
+        Some(expect),
+        &plain_gate(),
+    )
+    .await?;
+    assert_eq!(
+        (
+            facts.state,
+            facts.failure.as_deref(),
+            facts.degraded.as_deref()
+        ),
+        (AttemptState::Failed, Some(COMPAT_UNVERIFIED), None),
+        "{facts:?}"
+    );
+    let compat = facts.compat.ok_or("untyped")?;
+    assert_eq!(
+        (compat.origin(), compat.stamp_only()),
+        (Origin::BeforeInput, false)
+    );
+    let recorded = kinds(&facts.recorded);
+    assert!(
+        recorded.contains(&(
+            "adapter.diagnostic".to_owned(),
+            serde_json::json!(CHANGED_BEFORE_INPUT)
+        )),
+        "{recorded:?}"
+    );
+    assert!(
+        !recorded.iter().any(|(kind, _)| kind == "adapter.degraded"),
+        "{recorded:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_initialize_refused_in_the_runners_mode_outlasts_the_handshake_deadline() -> R {
+    // M2T15R-02, the same flaw on another path: initialize refused with an error other than "method not found" just
+    // before the handshake deadline; in the runner's mode that stop only closes stdin ("nothing more": the host's ladder
+    // ends the process), and the process exits after the deadline and after the term grace that a degrade would have
+    // armed. The refusal is the turn's failure, never a move to exec, and the adapter asks no end of the process. Red
+    // before the fix: the timer's degrade won; with only `conclude` fixed, the timer's degrade still escalated.
+    let (facts, cancelled) = codex_facts_timed(
+        vec![
+            frame_at(
+                900,
+                serde_json::json!({"id": 0, "error": {"code": -32000, "message": "boom"}}),
+                None,
+            ),
+            exit_at(7000, 64),
+        ],
+        None,
+        &plain_gate(),
+    )
+    .await?;
+    assert_eq!(
+        (
+            facts.state,
+            facts.failure.as_deref(),
+            facts.degraded.as_deref()
+        ),
+        (AttemptState::Failed, Some("initialize: boom"), None),
+        "{facts:?}"
+    );
+    assert!(
+        !cancelled,
+        "the adapter escalated a turn that was only closing"
+    );
+    Ok(())
+}
+
+/// M2T15R-03 (decision 9, "turn 中的再核对": its diagnostics are written with the turn's end): the implementation is
+/// replaced before the turn starts, so the re-check while it runs records IMPLEMENTATION_CHANGED_IN_TURN at its first
+/// tick; then initialize gets `answer` at 300 ms (none: no answer within the handshake timeout). The facts move the next
+/// attempt to exec and keep that diagnostic before the turn's adapter.degraded. Red before the fix: only
+/// adapter.degraded.
+async fn degraded_after_an_in_turn_change(answer: Option<serde_json::Value>) -> R {
+    let dir = tempfile::tempdir()?;
+    let expect = installed(dir.path())?;
+    replace(&dir.path().join("versions/A"), b"#!/bin/sh\necho C\n")?;
+    let mut script: Vec<_> = answer.map(|a| frame_at(300, a, None)).into_iter().collect();
+    script.push(exit_at(1500, 64));
+    let (facts, _) = codex_facts_timed(script, Some(expect), &plain_gate()).await?;
+    assert_eq!(
+        (facts.state, facts.failure.as_deref()),
+        (AttemptState::Failed, Some("CAPABILITY_UNSUPPORTED")),
+        "{facts:?}"
+    );
+    assert!(facts.degraded.is_some(), "{facts:?}");
+    assert_eq!(
+        kinds(&facts.recorded)
+            .into_iter()
+            .map(|(kind, reason)| (kind, reason.as_str().map(str::to_owned)))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "adapter.diagnostic".to_owned(),
+                Some(CHANGED_IN_TURN.to_owned())
+            ),
+            ("adapter.degraded".to_owned(), facts.degraded.clone()),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_degraded_by_method_not_found_keeps_what_it_recorded() -> R {
+    degraded_after_an_in_turn_change(Some(
+        serde_json::json!({"id": 0, "error": {"code": -32601, "message": "Method not found"}}),
+    ))
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_degraded_by_the_handshake_timeout_keeps_what_it_recorded() -> R {
+    degraded_after_an_in_turn_change(None).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gate_refusal_outranks_a_handshake_that_timed_out() -> R {
+    // M2T15R-02, the same flaw on the gate's side (decision 9, "适配器读"): the gate takes longer than the handshake
+    // timeout and refuses the agent, which never wrote a frame; the process exits after the deadline. Its keyed refusal
+    // decides (COMPAT_UNVERIFIED from the gate), not a move to exec. Red before the fix: CAPABILITY_UNSUPPORTED, degraded.
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("gate.jsonl"),
+        serde_json::json!({"outcome": "refused", "key": KEY, "code": "COMPAT_UNVERIFIED",
+                           "item": "implementation_sha256", "stamp_only": false, "expected": "e", "seen": "s"})
+        .to_string()
+            + "\n",
+    )?;
+    let gate = GateCommand {
+        expect: Some(expect()),
+        status: Some(status(dir.path(), KEY)),
+        ..plain_gate()
+    };
+    let (facts, _) = codex_facts_timed(vec![exit_at(1500, 0)], None, &gate).await?;
+    assert_eq!(
+        (
+            facts.state,
+            facts.failure.as_deref(),
+            facts.degraded.as_deref()
+        ),
+        (AttemptState::Failed, Some(COMPAT_UNVERIFIED), None),
+        "{facts:?}"
+    );
+    let compat = facts.compat.ok_or("untyped")?;
+    assert_eq!(
+        (compat.origin(), compat.stamp_only()),
+        (Origin::Gate, false)
+    );
+    Ok(())
+}
