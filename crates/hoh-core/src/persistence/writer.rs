@@ -293,6 +293,11 @@ impl Ctx<'_> {
     pub(super) fn before_commit(&self) -> Result<(), PersistError> {
         self.hooks.before_commit()
     }
+
+    /// After a step of the compat manifest's replacement: a fault hook's error fails it.
+    pub(super) fn manifest_at(&self, step: crate::compat_manifest::Step) -> std::io::Result<()> {
+        self.hooks.manifest_at(step)
+    }
 }
 
 /// The epoch of the host a writer serves (REQ-041, ADR-019 decision 2): set when that host began on the database.

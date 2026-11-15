@@ -1,6 +1,7 @@
 //! The project's compat manifest file, `.hoh/compat-manifest.json` (ADR-015 decision 2; docs/adr/ADR-030.md decision
 //! 10, K6): only the host writes it, by publishing a compat suite's entry over the manifest it holds; [`replaced`]
-//! builds the new whole manifest and checks it against the locked schema, [`replace`] puts it in place.
+//! builds the new whole manifest and checks it against the locked schema, [`replace`] puts it in place and says
+//! whether it did: an error only when the old manifest is still the one in place (M2T15R-04).
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -86,20 +87,33 @@ pub enum Step {
     Renamed,
 }
 
-/// Put `bytes` in place as the manifest of `files`.
-pub fn replace(files: &Files, bytes: &[u8]) -> Result<(), String> {
+/// A replacement done: the new manifest was renamed over the old one, so it is the one every reader of the file sees.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// Its directory synced too.
+    Synced,
+    /// Its directory not synced (why): the rename may not outlive a crash of the system, after which the old manifest
+    /// is back.
+    Unsynced(String),
+}
+
+/// Put `bytes` in place as the manifest of `files`: what was done once they are in place; an error (why) when they are
+/// not, the old manifest (or none) being in place as it was.
+pub fn replace(files: &Files, bytes: &[u8]) -> Result<Replaced, String> {
     replace_at(files, bytes, &|_| Ok(()))
 }
 
 /// [`replace`], `at` called after each [`Step`] (an error there fails it as an I/O error would). The bytes go to the
 /// temporary file in the manifest's own directory, which is synced, renamed over the manifest and its directory
 /// synced: until the rename the old manifest is whole, after it the new one is. A failure before the rename removes
-/// the temporary file; one after it (the directory's sync) leaves the new manifest in place and says so.
+/// the temporary file and is the error; one after it (the directory's sync) leaves the new manifest in place and is
+/// [`Replaced::Unsynced`].
 pub fn replace_at(
     files: &Files,
     bytes: &[u8],
     at: &dyn Fn(Step) -> std::io::Result<()>,
-) -> Result<(), String> {
+) -> Result<Replaced, String> {
     use std::io::Write as _;
     let written = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -122,11 +136,12 @@ pub fn replace_at(
         let dir = files.path.parent().unwrap_or(Path::new("/"));
         std::fs::File::open(dir)?.sync_all()
     })();
-    synced.map_err(|e| {
-        format!(
+    Ok(match synced {
+        Ok(()) => Replaced::Synced,
+        Err(e) => Replaced::Unsynced(format!(
             "{} was replaced but its directory was not synced: {e}",
             files.path.display()
-        )
+        )),
     })
 }
 

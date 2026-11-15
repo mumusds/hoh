@@ -87,6 +87,17 @@ impl Conn {
         self.lines.is_some()
     }
 
+    /// Whether initialize is still waiting for its answer on an open connection: only then does the handshake timeout
+    /// apply. Once initialize is answered, or the turn is closing for any reason (stdin closed: a refusal, the re-check
+    /// before the first input, a stop, a cancel), it no longer does (M2T15R-02).
+    fn awaiting_initialize(&self) -> bool {
+        self.open()
+            && self
+                .pending
+                .values()
+                .any(|what| matches!(what, Pending::Initialize))
+    }
+
     /// Close stdin (once the writer has written what is queued).
     fn close(&mut self) {
         self.lines = None;
@@ -721,6 +732,14 @@ impl<'a> State<'a> {
         }
     }
 
+    /// What the turn recorded so far (the runner's mode), taken.
+    fn take_recorded(&self) -> Vec<Recorded> {
+        self.recorded
+            .lock()
+            .map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default()
+    }
+
     /// The end of a turn whose process ended (`report`; `None`: it was not seen to end) and whose stdin is closed:
     /// moved to exec, or its verdict with what it records.
     async fn conclude(
@@ -738,13 +757,21 @@ impl<'a> State<'a> {
             r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
         });
         // A refused handshake moves the turn to exec only when nothing ranked above a refused request in ADR-012 §3
-        // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02).
-        if let Some(reason) = self
-            .degrade
-            .clone()
-            .filter(|_| !self.cancelled && !self.too_large && !self.deadline && !logs_incomplete)
-        {
-            return Ok(Drove::Degrade(reason, report.map(Box::new)));
+        // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02); and never once the
+        // handshake's answer decided the turn's failure (a refused initialize, the re-check before the first input:
+        // docs/adr/ADR-030.md decision 9, M2T15R-02).
+        if let Some(reason) = self.degrade.clone().filter(|_| {
+            !self.cancelled
+                && !self.too_large
+                && !self.deadline
+                && !logs_incomplete
+                && self.failure.is_none()
+        }) {
+            return Ok(Drove::Degrade(Box::new(Degraded {
+                reason,
+                report,
+                recorded: self.take_recorded(),
+            })));
         }
         for st in held.drain(..) {
             let _ = st.reply.send(SteerReceipt::NotNow);
@@ -808,11 +835,7 @@ impl<'a> State<'a> {
             )
             .await?;
         }
-        let recorded = self
-            .recorded
-            .lock()
-            .map(|mut r| std::mem::take(&mut *r))
-            .unwrap_or_default();
+        let recorded = self.take_recorded();
         Ok(Drove::Ended(Box::new(Driven {
             state,
             failure,
@@ -904,7 +927,7 @@ pub(super) async fn run(
     )
     .await?
     {
-        Drove::Degrade(reason, _) => return Ok(End::Degrade(reason)),
+        Drove::Degrade(degraded) => return Ok(End::Degrade(degraded.reason)),
         Drove::Ended(drove) => *drove,
     };
     let state = finish(
@@ -956,9 +979,17 @@ pub(super) async fn run(
 /// How an App Server turn's drive ended: moved to exec (the handshake refused, before anything ranked above it), or
 /// over with its verdict.
 pub(super) enum Drove {
-    /// The reason, and how the process ended (boxed: an exit report is large, clippy::large_enum_variant).
-    Degrade(String, Option<Box<crate::process::ExitReport>>),
+    /// Boxed: an exit report is large (clippy::large_enum_variant).
+    Degrade(Box<Degraded>),
     Ended(Box<Driven>),
+}
+
+/// An App Server turn moved to exec: why, how its process ended, and what it recorded until then.
+pub(super) struct Degraded {
+    pub(super) reason: String,
+    pub(super) report: Option<crate::process::ExitReport>,
+    /// What the turn saw, in the runner's mode (the direct mode wrote it to the store).
+    pub(super) recorded: Vec<Recorded>,
 }
 
 /// What an App Server turn showed, and the adapter's verdict.
@@ -1051,8 +1082,7 @@ pub(super) async fn drive(
                 s.begin_stop(Some(process));
                 continue;
             }
-            _ = tokio::time::sleep_until(handshake_until),
-                if s.phase == Phase::Init && s.degrade.is_none() && !s.stopped => {
+            _ = tokio::time::sleep_until(handshake_until), if s.conn.awaiting_initialize() => {
                 s.degrade = Some(format!("initialize did not answer within {:?}", turn.handshake_timeout));
                 s.close_gently();
                 continue;
@@ -1156,12 +1186,52 @@ pub(super) fn replay(bytes: &[u8], turn: &Turn) -> Replayed {
             failure: driven.failure,
             unknown_events: driven.unknown_events,
         },
-        Some(Ok(Drove::Degrade(..))) => Replayed {
+        Some(Ok(Drove::Degrade(_))) => Replayed {
             state: AttemptState::Failed,
             failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
             unknown_events: 0,
         },
         Some(Err(e)) => crate::adapter::unreplayable(&e.to_string()),
         None => crate::adapter::unreplayable("the judging waited"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failure_decided_on_the_handshakes_answer_is_no_degrade() {
+        // M2T15R-02 (docs/adr/ADR-030.md decision 9, "首个输入之前的再核对"): a turn whose handshake answer decided its
+        // failure (the re-check's COMPAT_UNVERIFIED, a refused initialize) ends with that verdict even if a degrade was
+        // also set; a degrade alone still moves the turn to exec. Red before the fix: Degrade.
+        let attempt = AttemptRef {
+            attempt_id: "attempt".to_owned(),
+            session_id: "session".to_owned(),
+            role: String::new(),
+            agent_version: String::new(),
+        };
+        let turn = super::super::replay_turn();
+        let concluded = |failure: Option<&str>| {
+            let (lines, _written) = mpsc::unbounded_channel::<Vec<u8>>();
+            let mut s = State::new(None, &attempt, &turn, lines, 0, true, false);
+            s.degrade = Some("initialize did not answer within 1s".to_owned());
+            s.failure = failure.map(str::to_owned);
+            s.conn.close();
+            crate::adapter::at_once(
+                s.conclude(Some(crate::adapter::replayed_exit()), &mut Vec::new()),
+            )
+        };
+        for failure in [crate::adapter::COMPAT_UNVERIFIED, "initialize: boom"] {
+            match concluded(Some(failure)) {
+                Some(Ok(Drove::Ended(driven))) => assert_eq!(
+                    (driven.state, driven.failure.as_deref()),
+                    (AttemptState::Failed, Some(failure))
+                ),
+                Some(Ok(Drove::Degrade(d))) => panic!("{failure}: degraded ({})", d.reason),
+                _ => panic!("{failure}: not concluded"),
+            }
+        }
+        assert!(matches!(concluded(None), Some(Ok(Drove::Degrade(_)))));
     }
 }

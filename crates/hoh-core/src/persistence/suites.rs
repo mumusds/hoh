@@ -34,7 +34,7 @@ pub const ABANDONED: &str = "abandoned";
 pub const WITHDRAWN: &str = "withdrawn";
 /// The run earned nothing to publish: its files changed while it ran, or its own probe differed or failed.
 pub const DISCARDED: &str = "discarded";
-/// The new manifest could not be built (schema) or written.
+/// The new manifest could not be built (schema) or put in place: the old one is in place.
 pub const UNPUBLISHED: &str = "unpublished";
 
 /// Why a deferred suite waits, for whoever reads the deferral (AC-027-04's maintenance window).
@@ -80,11 +80,13 @@ pub struct Publication {
 /// What a publication did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Published {
-    /// The manifest was replaced and the suite ended: this is the manifest now.
+    /// The manifest was replaced and the suite ended: this is the manifest now (also when only its directory's sync
+    /// failed, which the suite's end says).
     Replaced(Value),
     /// The suite was not open and started (ended by the host, or of an older host epoch): nothing was written.
     Closed,
-    /// The new manifest could not be built or written: the old one is in place and the suite ended `unpublished`.
+    /// The new manifest could not be built or put in place (not renamed over the old one): the old one is in place and
+    /// the suite ended `unpublished`.
     Unpublished(String),
     /// The manifest was replaced but the transaction did not commit: the suite is still open (the writer slot stays
     /// closed) until the host ends it.
@@ -275,8 +277,9 @@ pub(super) fn begin(
 /// started in the current host epoch, the new manifest (the host's with this agent's entry replaced, valid against the
 /// locked schema) is written to a temporary file, synced, renamed over the manifest and its directory synced; then the
 /// suite's `compat.suite_ended` and `compat.suite_completed`, and the commit. The replacement happens while the suite
-/// is open, so no writer's grant commits beside it. Not open → nothing written; not built or not written →
-/// `unpublished`.
+/// is open, so no writer's grant commits beside it. Not open → nothing written; not built or not renamed into place →
+/// `unpublished`, the old manifest in place; renamed but its directory not synced → published all the same, the end
+/// saying so (M2T15R-04: the file every reader sees is the new manifest, so the host must hold it).
 pub(super) fn publish(
     conn: &mut Connection,
     publication: &Publication,
@@ -292,11 +295,13 @@ pub(super) fn publish(
         crate::compat_manifest::replaced(p.base.as_ref(), &p.agent, &p.entry, &rfc3339_utc(p.now))
             .and_then(|manifest| {
                 let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-                crate::compat_manifest::replace(&p.files, &bytes)?;
-                Ok(manifest)
+                let replaced = crate::compat_manifest::replace_at(&p.files, &bytes, &|step| {
+                    ctx.manifest_at(step)
+                })?;
+                Ok((manifest, replaced))
             });
-    let manifest = match written {
-        Ok(manifest) => manifest,
+    let (manifest, replaced) = match written {
+        Ok(written) => written,
         Err(why) => {
             drop(tx);
             end(
@@ -312,13 +317,12 @@ pub(super) fn publish(
     };
     let suite = &p.entry["suite"];
     let status = suite["status"].clone();
+    let mut ended = json!({"suite_id": p.suite_id, "status": status});
+    if let crate::compat_manifest::Replaced::Unsynced(why) = replaced {
+        ended["error"] = Value::from(why);
+    }
     let events = vec![
-        event(
-            &p.project_id,
-            open.ended_id.clone(),
-            SUITE_ENDED,
-            json!({"suite_id": p.suite_id, "status": status}),
-        ),
+        event(&p.project_id, open.ended_id.clone(), SUITE_ENDED, ended),
         event(
             &p.project_id,
             child_id(&p.suite_id, "completed"),

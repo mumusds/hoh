@@ -1274,6 +1274,13 @@ fn the_product_hooks_do_nothing() {
     ] {
         assert_eq!(NoFaults.before_wal_step(step), Ok(()), "{step:?}");
     }
+    // The steps of a compat manifest's replacement (docs/adr/ADR-030.md decision 10, M2T15R-04): each goes ahead.
+    {
+        use hoh_core::compat_manifest::Step;
+        for step in [Step::Written, Step::Synced, Step::Renamed] {
+            assert!(NoFaults.manifest_at(step).is_ok(), "{step:?}");
+        }
+    }
     let answered = std::panic::catch_unwind(|| NoHostFaults.after_commit());
     assert!(answered.is_ok());
     // The points of M2-T05 (ADR-019 decisions 1, 8, 10): every one returns and does nothing (M2T05R-58).

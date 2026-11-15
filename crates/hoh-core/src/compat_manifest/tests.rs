@@ -66,7 +66,7 @@ fn a_failure_before_the_rename_leaves_the_old_manifest_whole() -> R {
 fn a_replacement_renames_its_temporary_file_over_the_manifest() -> R {
     let (dir, files) = project(b"OLD MANIFEST")?;
     let seen = std::cell::RefCell::new(Vec::new());
-    replace_at(&files, b"NEW MANIFEST", &|step| {
+    let replaced = replace_at(&files, b"NEW MANIFEST", &|step| {
         // Until the rename the manifest is the old one; the temporary file holds the new bytes.
         if step != Step::Renamed {
             assert_eq!(std::fs::read(&files.path)?, b"OLD MANIFEST");
@@ -75,12 +75,13 @@ fn a_replacement_renames_its_temporary_file_over_the_manifest() -> R {
         seen.borrow_mut().push(step);
         Ok(())
     })?;
+    assert_eq!(replaced, Replaced::Synced);
     assert_eq!(*seen.borrow(), [Step::Written, Step::Synced, Step::Renamed]);
     assert_eq!(std::fs::read(&files.path)?, b"NEW MANIFEST");
     assert_eq!(names(&dir)?, [FILE]);
     // No manifest yet: the same.
     std::fs::remove_file(&files.path)?;
-    replace(&files, b"FIRST")?;
+    assert_eq!(replace(&files, b"FIRST")?, Replaced::Synced);
     assert_eq!(std::fs::read(&files.path)?, b"FIRST");
     Ok(())
 }
@@ -123,4 +124,28 @@ fn temporary_files_are_named_apart() {
     assert!(is_temp(".compat-manifest.json.12.3.tmp"));
     assert!(!is_temp(".compat-manifest.json..tmp"));
     assert!(!is_temp("compat-manifest.json"));
+}
+
+#[test]
+fn a_failure_after_the_rename_leaves_the_new_manifest_and_says_it_is_not_synced() -> R {
+    // M2T15R-04: once renamed the new manifest is the one every reader sees; only its directory's sync failed. The
+    // replacement says it replaced the manifest and did not sync it, never that it did not replace it.
+    let (dir, files) = project(b"OLD MANIFEST")?;
+    let replaced = replace_at(&files, b"NEW MANIFEST", &|s| {
+        if s == Step::Renamed {
+            Err(std::io::Error::other("injected"))
+        } else {
+            Ok(())
+        }
+    })?;
+    assert!(
+        matches!(&replaced, Replaced::Unsynced(why) if why.contains("not synced") && why.contains("injected")),
+        "{replaced:?}"
+    );
+    assert_eq!(std::fs::read(&files.path)?, b"NEW MANIFEST");
+    assert_eq!(names(&dir)?, [FILE]);
+    // Synced, it says so.
+    assert_eq!(replace(&files, b"NEWER")?, Replaced::Synced);
+    assert_eq!(std::fs::read(&files.path)?, b"NEWER");
+    Ok(())
 }
