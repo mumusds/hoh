@@ -4373,3 +4373,264 @@ async fn a_probe_refused_again_is_the_turn_its_records_unavailability_names() ->
     assert_eq!(refused, probe.attempt_id);
     Ok(())
 }
+
+// docs/adr/ADR-030.md decision 11 (Commander, M2T15D-05, -51, -53): the supervision class table's `model`, and the
+// allocation deferred while the Commander's agent is not verified.
+
+/// Staffing unblocks run R's commander binding at its epoch (docs/adr/ADR-030.md decision 4): its agent usable again
+/// and its session fresh, as under a revision its exclusion record does not apply to (decision 6).
+async fn staffing_unblocks(store: &Store, path: &PathBuf) -> R {
+    let binding = value(
+        path,
+        "SELECT json_array(agent, role_epoch) FROM role_bindings WHERE run_id = 'R' AND role = 'commander'",
+    )?;
+    assert!(
+        store
+            .staff(crate::persistence::StaffChange {
+                run_id: "R".to_owned(),
+                role: "commander".to_owned(),
+                role_epoch: binding[1].as_i64().ok_or("an epoch")?,
+                agent: binding[0].as_str().ok_or("an agent")?.to_owned(),
+                write: crate::persistence::StaffWrite::Unblock,
+            })
+            .await?,
+        "the commander binding was not blocked"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_model_failure_holds_its_commander_unavailable_until_a_turn_of_its_epoch_settles() -> R {
+    // docs/adr/ADR-030.md decision 11 (the supervision class table): a supervision turn failing for its model holds
+    // `model` on the current epoch, as `capability` does. The failure blocks the binding too (decision 6, M2T15D-05),
+    // so both reasons stand; staffing unblocking the binding leaves `model`, the run BLOCKED and no ordinary turn;
+    // past the cooldown a probe is allowed, and its SETTLED turn recovers.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let model = crate::retry::FailureClass::Model;
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, model).await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    assert_eq!(
+        blocked(&path)?.1,
+        json!(["COMMANDER_UNAVAILABLE", "NEED_DECISION"])
+    );
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!([
+            "supervisor.unavailable",
+            ["binding_blocked", "model"]
+        ]))
+    );
+    staffing_unblocks(&store, &path).await?;
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.unavailable", ["model"]])),
+        "held on the epoch after its binding is unblocked"
+    );
+    assert_eq!(blocked(&path)?.0, "BLOCKED");
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 6000))
+            .await?
+            .is_none(),
+        "no turn within the cooldown"
+    );
+    let later = 5000 + crate::retry::CAP.as_millis() as u64 + 1000;
+    let probe = store
+        .allocate_supervision("p1", context(&clock, later))
+        .await?
+        .ok_or("a probe past the cooldown")?;
+    run_turn(&store, &clock, &probe.attempt_id, later, true, TRANSIENT).await?;
+    store.supervise("R", context(&clock, later + 1000)).await?;
+    assert_eq!(
+        blocked(&path)?,
+        ("RUNNING".to_owned(), json!([]), Vec::<String>::new())
+    );
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.available", null]))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_model_unavailability_ends_with_its_commanders_epoch() -> R {
+    // docs/adr/ADR-030.md decision 11: `model` is the current epoch's; a switch to another agent at the next epoch
+    // (staffing's fallback, decision 5) ends it, and the wake is given a turn at the new epoch.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let model = crate::retry::FailureClass::Model;
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, model).await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!([
+            "supervisor.unavailable",
+            ["binding_blocked", "model"]
+        ]))
+    );
+    exec(
+        &path,
+        // The switch: the next epoch bound to another agent, ACTIVE, with its own session (decisions 4 and 5).
+        "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc3', 'claude', 'commander', '1', '{}');
+         UPDATE role_bindings SET agent = 'claude', session_id = 'sc3', role_epoch = 2, state = 'ACTIVE',
+           blocked_reason = NULL, missing_json = '[]' WHERE run_id = 'R' AND role = 'commander';",
+    )?;
+    store.supervise("R", context(&clock, 5000)).await?;
+    assert_eq!(blocked(&path)?.0, "RUNNING");
+    assert_eq!(
+        unavailable(&path)?.last().cloned(),
+        Some(json!(["supervisor.available", null]))
+    );
+    let next = store
+        .allocate_supervision("p1", context(&clock, 6000))
+        .await?
+        .ok_or("allocated at the new epoch")?;
+    assert_eq!(next.wake, w);
+    Ok(())
+}
+
+/// A context at `ms` whose registry's look finds codex (the Commander's agent in [`WORLD`]) available and logged in,
+/// verified by its compat suite or not.
+fn codex_looked(clock: &TestClock, ms: u64, verified: bool) -> Context {
+    Context {
+        observations: Some(
+            [(
+                "codex".to_owned(),
+                crate::decision::Observation {
+                    host_epoch: 1,
+                    n: 1,
+                    available: true,
+                    logged_in: true,
+                    verified,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..context(clock, ms)
+    }
+}
+
+#[tokio::test]
+async fn compat_deferral_does_not_count_toward_the_limit() -> R {
+    // docs/adr/ADR-030.md decision 11 (-53, -51): with its agent not verified, an active Commander's owed wake is not
+    // allocated: one supervisor.deferred{COMPAT_UNVERIFIED} (once per reason and epoch since the last allocation). It
+    // waits for something that resolves itself, so it is not `inactive`: 31 minutes on, the Commander is still
+    // available and the run not BLOCKED for it; once verified, the wake is allocated.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    for ms in [3000, 4000] {
+        assert!(
+            store
+                .allocate_supervision("p1", codex_looked(&clock, ms, false))
+                .await?
+                .is_none()
+        );
+    }
+    assert_eq!(deferred(&path)?, ["COMPAT_UNVERIFIED"]);
+    let past = 3000 + 31 * 60_000;
+    store
+        .supervise("R", codex_looked(&clock, past, false))
+        .await?;
+    assert!(
+        store
+            .allocate_supervision("p1", codex_looked(&clock, past, false))
+            .await?
+            .is_none()
+    );
+    assert_eq!(deferred(&path)?, ["COMPAT_UNVERIFIED"], "exactly one");
+    assert_eq!(
+        blocked(&path)?,
+        ("RUNNING".to_owned(), json!([]), Vec::<String>::new())
+    );
+    assert!(
+        unavailable(&path)?.is_empty(),
+        "not inactive, nor unavailable otherwise"
+    );
+    let a = store
+        .allocate_supervision("p1", codex_looked(&clock, past + 1000, true))
+        .await?
+        .ok_or("allocated once verified")?;
+    assert_eq!(a.wake, w);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commander_whose_agent_the_looks_lack_is_deferred_and_one_without_looks_is_not() -> R {
+    // docs/adr/ADR-030.md decision 11 (-53): observations given without the Commander's agent (not looked at, so not
+    // known verified) defer its wake as an unverified one; a host with no registry (observations None, no gate) does
+    // not defer.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let unlooked = Context {
+        observations: Some(Default::default()),
+        ..context(&clock, 3000)
+    };
+    assert!(store.allocate_supervision("p1", unlooked).await?.is_none());
+    assert_eq!(deferred(&path)?, ["COMPAT_UNVERIFIED"]);
+    let a = store
+        .allocate_supervision("p1", context(&clock, 4000))
+        .await?
+        .ok_or("allocated without observations")?;
+    assert_eq!(a.wake, w);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unverified_commander_is_not_preempted_for() -> R {
+    // docs/adr/ADR-030.md decision 11 with docs/adr/ADR-025.md decision 3 (M2T08R-08: the preempt's condition is the
+    // replacement's allocation): while the Commander's agent is not verified the integrity wake could not be given a
+    // turn, so it does not preempt the turn in flight.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "w", 0).await?;
+    store
+        .allocate_supervision("p1", codex_looked(&clock, 3000, true))
+        .await?
+        .ok_or("allocated")?;
+    clock.set(4000);
+    event(
+        &store,
+        "R",
+        "R/integrity",
+        "integrity_violation",
+        json!({"task_id": "D", "reason": "x", "fingerprint": "iv/x"}),
+    )
+    .await?;
+    store
+        .supervise("R", codex_looked(&clock, 4000, false))
+        .await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'supervisor.preempt'"
+        )?,
+        json!(0)
+    );
+    Ok(())
+}

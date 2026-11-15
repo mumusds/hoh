@@ -754,9 +754,10 @@ struct Candidate {
 
 /// One owed wake of project `project_id` given a Commander turn at `context.now()`, in one transaction (decision 3):
 /// the supervisor slot (a reader slot when `reserve_supervisor_slot` is false) must be free; the wake's run must admit
-/// it (working, BLOCKED or WAITING_EXTERNAL, with a spec), have no turn in flight, an active Commander and a budget
-/// that does not stop it. The order: a wake waiting longer than a turn's limit, then integrity, then the rest, each
-/// by wake time, the runs taking turns within a level. Neither the run's state nor its revision moves.
+/// it (working, BLOCKED or WAITING_EXTERNAL, with a spec), have no turn in flight, an active Commander whose agent the
+/// looks find verified (docs/adr/ADR-030.md decision 11) and a budget that does not stop it. The order: a wake waiting
+/// longer than a turn's limit, then integrity, then the rest, each by wake time, the runs taking turns within a level.
+/// Neither the run's state nor its revision moves.
 pub(super) fn allocate(
     conn: &mut Connection,
     project_id: &str,
@@ -844,14 +845,31 @@ pub(super) fn allocate(
         if wakes.iter().any(Wake::in_flight) {
             continue;
         }
-        // An unavailable Commander gets no turn but a probe (decision 5).
-        let state: String = tx
+        let (state, agent): (String, String) = tx
             .query_row(
-                "SELECT state FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                "SELECT state, agent FROM role_bindings WHERE run_id = ?1 AND role = ?2",
                 params![run_id, COMMANDER],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(sqlite_error)?;
+        // Its agent not verified by the tick's looks: no turn, nor a probe, an owed wake told once. It waits for what
+        // resolves itself (the suite after the writer's lease), so it is not counted toward `inactive`
+        // (docs/adr/ADR-030.md decision 11, -51, -53).
+        if unverified(context, &agent) {
+            if wakes.iter().any(Wake::owed) {
+                rearmed.events.extend(defer_once(
+                    &tx,
+                    project_id,
+                    &run_id,
+                    "COMPAT_UNVERIFIED",
+                    epoch,
+                    &wakes,
+                    now,
+                )?);
+            }
+            continue;
+        }
+        // An unavailable Commander gets no turn but a probe (decision 5).
         let (reasons, _, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
         // Only on the verdict the step recorded, and only when this view agrees with it: available both, an ordinary
         // turn; unavailable both, a probe; else nothing until the next step records the change (v17, M2T08R-251).
@@ -1092,8 +1110,8 @@ pub(super) fn allocate(
 
 /// Whether run `run_id` could give a wake whose backoff ends at `not_before` a turn once its turn in flight stops
 /// (decision 3, the preempt's condition): its Commander available by the step's `verdict` (v13, M2T08R-08), its
-/// binding ACTIVE with a session, its budget not stopping it, the backoff over. The run's state is the caller's (it
-/// fires only in an admitting state).
+/// binding ACTIVE with a session and its agent verified by the looks (docs/adr/ADR-030.md decision 11), its budget not
+/// stopping it, the backoff over. The run's state is the caller's (it fires only in an admitting state).
 pub(super) fn could_allocate(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1104,17 +1122,28 @@ pub(super) fn could_allocate(
     if !verdict.available() {
         return Ok(false);
     }
-    let bound: bool = tx
+    let bound: Option<String> = tx
         .query_row(
-            "SELECT EXISTS (SELECT 1 FROM role_bindings WHERE run_id = ?1 AND role = ?2 AND state = 'ACTIVE' \
-             AND session_id IS NOT NULL)",
+            "SELECT agent FROM role_bindings WHERE run_id = ?1 AND role = ?2 AND state = 'ACTIVE' \
+             AND session_id IS NOT NULL",
             params![run_id, COMMANDER],
             |r| r.get(0),
         )
+        .optional()
         .map_err(sqlite_error)?;
-    Ok(bound
+    Ok(bound.is_some_and(|agent| !unverified(context, &agent))
         && super::retry::budget_stop(tx, run_id, context)?.is_none()
         && not_before.is_none_or(|t| t <= context.now()))
+}
+
+/// Whether the Commander's agent `agent` waits for its compat suite (docs/adr/ADR-030.md decision 11, -51, -53): the
+/// tick's looks are given and none finds it verified (they lack it, or its suite has not verified its identity). A
+/// host that gives no looks has no registry and no gate: it never waits.
+fn unverified(context: &Context, agent: &str) -> bool {
+    context
+        .observations
+        .as_ref()
+        .is_some_and(|looks| !looks.get(agent).is_some_and(|o| o.verified))
 }
 
 /// Whether the registry's looks keep run `run_id`'s Commander unavailable (decision 5, -306, -355): its last look at
@@ -1179,8 +1208,9 @@ fn registry_reason(
 /// Why run `run_id`'s Commander, at role epoch `epoch` and binding state `binding`, is unavailable now (empty:
 /// available; decision 5): its binding BLOCKED (`binding_blocked`); the registry's looks; inactive past its limit; a
 /// wake not answered (owed, or its probe in flight: v13, M2T08R-01) with MAX_RETRIES failures under the epoch
-/// (`failures_capped`); its last turn of the epoch that ended failed for authentication or capability (`auth`,
-/// `capability`). Every judgement of a step and of the allocation goes through it.
+/// (`failures_capped`); its last turn of the epoch that ended failed for authentication, capability or its model
+/// (`auth`, `capability`, `model`: docs/adr/ADR-030.md decision 11). Every judgement of a step and of the allocation
+/// goes through it.
 fn unavailability(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1205,9 +1235,11 @@ fn unavailability(
     {
         reasons.push("failures_capped");
     }
-    // Auth, Capability or a deterministic refusal (Decision, held as `context`: docs/adr/ADR-026.md decision 9): a turn
-    // of the epoch failed so and no turn of the epoch settled after it, in the turns' order; a turn that failed
-    // otherwise, was withdrawn or preempted recovers nothing (v14, M2T08R-100).
+    // Auth, Capability, Model (docs/adr/ADR-030.md decision 11) or a deterministic refusal (Decision, held as
+    // `context`: docs/adr/ADR-026.md decision 9): a turn of the epoch failed so and no turn of the epoch settled after
+    // it, in the turns' order; a turn that failed otherwise, was withdrawn or preempted recovers nothing (v14,
+    // M2T08R-100). An agent missing (Unavailable) is the registry's `agent_unavailable` to judge, and an unverified
+    // one (Compat) is deferred by the allocation: neither holds a reason (docs/adr/ADR-030.md decision 11).
     let classes: BTreeMap<String, String> = {
         let mut statement = tx
             .prepare(
@@ -1247,6 +1279,9 @@ fn unavailability(
             Some("capability") => {
                 held.insert("capability");
             }
+            Some("model") => {
+                held.insert("model");
+            }
             Some("decision") => {
                 held.insert("context");
                 refused = Some(turn.attempt_id.clone());
@@ -1255,7 +1290,7 @@ fn unavailability(
         }
     }
     reasons.extend(
-        ["auth", "capability", "context"]
+        ["auth", "capability", "model", "context"]
             .into_iter()
             .filter(|r| held.contains(r)),
     );
@@ -1651,8 +1686,9 @@ fn probe_attempts(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeSet<String>
 }
 
 /// Whether run `run_id`'s Commander, unavailable for `reasons`, may be probed at `now` (decision 5): only for capped
-/// failures or a failed turn's class, its binding active; one probe per cooldown from the unavailability (or from the
-/// last probe's failed end), the next at once after a probe that settled. The wake to probe: the oldest capped one.
+/// failures or a failed turn's class (`model` as `capability`: docs/adr/ADR-030.md decision 11), its binding active;
+/// one probe per cooldown from the unavailability (or from the last probe's failed end), the next at once after a
+/// probe that settled. The wake to probe: the oldest capped one.
 fn probe(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1662,9 +1698,12 @@ fn probe(
     now: std::time::SystemTime,
 ) -> Result<Option<Option<String>>, PersistError> {
     if reasons.is_empty()
-        || reasons
-            .iter()
-            .any(|r| !matches!(*r, "failures_capped" | "auth" | "capability" | "context"))
+        || reasons.iter().any(|r| {
+            !matches!(
+                *r,
+                "failures_capped" | "auth" | "capability" | "model" | "context"
+            )
+        })
     {
         return Ok(None);
     }
