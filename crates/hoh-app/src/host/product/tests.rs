@@ -1,7 +1,9 @@
 //! The product executor's pure parts: the prompt it sends, how a turn's facts become the attempt's outcome.
 
 use super::*;
+use hoh_agents::adapter::GateStatus;
 use hoh_core::persistence::Assignment;
+use hoh_core::staffing::AgentIdentity;
 
 fn work(prompt: Option<&str>) -> Work {
     Work {
@@ -404,17 +406,38 @@ fn a_kept_first_input_is_read_for_its_session_and_none_is_none()
     Ok(())
 }
 
+/// The facts of a turn that failed with `code` and no typed COMPAT_UNVERIFIED (`Facts.compat` none).
+fn failed(code: Option<&str>) -> Facts {
+    Facts {
+        state: AttemptState::Failed,
+        failure: code.map(str::to_owned),
+        native_session: None,
+        resolved_model: None,
+        usage: None,
+        raw_log_path: "/logs".to_owned(),
+        max_buffered: None,
+        group_reaped: true,
+        recorded: Vec::new(),
+        degraded: None,
+        final_text: None,
+        compat: None,
+    }
+}
+
 #[test]
 fn an_adapters_failure_code_fails_its_attempt_by_its_class() {
     // Decision 16 (ADR-020 decision 1); docs/adr/ADR-030.md decision 6: MODEL_UNAVAILABLE is its own class, and only
     // the codes the adapters themselves recognise give a class: a bare COMPAT_UNVERIFIED string (no typed source) and
     // an agent's own text marked native are transient.
-    assert_eq!(class_of(Some("BLOCKED_AUTH")), FailureClass::Auth);
+    assert_eq!(class_of(&failed(Some("BLOCKED_AUTH"))), FailureClass::Auth);
     assert_eq!(
-        class_of(Some("BLOCKED_CAPABILITY")),
+        class_of(&failed(Some("BLOCKED_CAPABILITY"))),
         FailureClass::Capability
     );
-    assert_eq!(class_of(Some("MODEL_UNAVAILABLE")), FailureClass::Model);
+    assert_eq!(
+        class_of(&failed(Some("MODEL_UNAVAILABLE"))),
+        FailureClass::Model
+    );
     for code in [
         Some("PROTOCOL_FRAME_TOO_LARGE"),
         Some("CAPABILITY_UNSUPPORTED"),
@@ -428,7 +451,7 @@ fn an_adapters_failure_code_fails_its_attempt_by_its_class() {
         None,
     ] {
         assert_eq!(
-            class_of(code),
+            class_of(&failed(code)),
             FailureClass::Transient { retry_after: None },
             "{code:?}"
         );
@@ -472,6 +495,7 @@ fn a_turns_facts_become_its_outcome() {
         ],
         degraded: Some("initialize timed out".to_owned()),
         final_text: Some("done\n```hoh-report\n{}\n```".to_owned()),
+        compat: None,
     };
     let o = outcome(facts);
     // Its final assistant message, where a verifier's report is read (docs/adr/ADR-028.md decision 15).
@@ -817,5 +841,228 @@ fn a_prepare_without_its_agent_is_refused_as_unavailable() -> Result<(), Box<dyn
         (refusal.reason.as_str(), refusal.class),
         ("AGENT_UNAVAILABLE", FailureClass::Unavailable)
     );
+    Ok(())
+}
+
+const PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+
+/// A fake codex 0.166.0 in `bin` answering the probe from its recording (`note` makes it another identity); a turn
+/// is never run through it here.
+fn fake_codex(bin: &Path, note: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = bin.join("codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\n# {note}\nf='{PROTOCOL}/codex/0.166.0'\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0'; exit 0;;\n \
+             --help) cat \"$f/help.txt\"; exit 0;;\n exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}; exit 2;;\n \
+             app-server) case \"$2\" in\n  --help) cat \"$f/help-app-server.txt\"; exit 0;;\n  generate-json-schema) \
+             [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n esac;;\nesac\nexit 2\n"
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// A registry for `project` whose codex is the fake in `bin`, looked at and verified: its manifest entry is the look's,
+/// PASS under this build's suite set.
+fn verified_codex(bin: &Path, project: &Path) -> Result<Arc<Registry>, Box<dyn std::error::Error>> {
+    use hoh_agents::compat::{CompatManifest, SUITE_SET_SHA256, Suite, SuiteStatus};
+    let registry = Registry::with_pi_dir(format!("{}:/usr/bin:/bin", bin.display()).into(), None);
+    registry.open_manifest(project);
+    registry.want(&["codex".to_owned()]);
+    registry.refresh();
+    let mut entry = registry.seen(Agent::Codex).ok_or("not seen")??.entry;
+    entry.suite = Suite {
+        status: SuiteStatus::Pass,
+        fixture_set_sha256: SUITE_SET_SHA256.as_str().to_owned(),
+        run_at: Some(Some("2026-11-14T00:00:00Z".to_owned())),
+        cases: Some(Vec::new()),
+    };
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/compat-manifest.json"),
+        serde_json::to_vec_pretty(&CompatManifest::new([(Agent::Codex, entry)].into()))?,
+    )?;
+    registry.open_manifest(project);
+    Ok(Arc::new(registry))
+}
+
+#[tokio::test]
+async fn prepare_refuses_a_session_granted_for_another_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-030.md decision 9 (d) (M2T15D-100): the registry's fact F is codex B (verified, logged in, its files
+    // as stamped); a turn whose session S was granted for A (same version and capabilities, another identity) is refused
+    // COMPAT_UNVERIFIED in the Compat class, its detail naming S and both identities, before its adapter starts (no
+    // gate is spawned); as is one whose S has another version, other capabilities or no identity. S granted for B
+    // passes, and its gate expects F's identity. F is read once each time (one read of the registry).
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = tempfile::tempdir()?;
+    fake_codex(bin.path(), "B")?;
+    let project = tempfile::tempdir()?;
+    let registry = verified_codex(bin.path(), project.path())?;
+    let b = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) if usable.compat == Compat::Verified => *usable,
+        other => return Err(format!("not verified: {other:?}").into()),
+    };
+    // The gate spawned for a turn records its argv in `runs` and waits for its input's end.
+    let gates = tempfile::tempdir()?;
+    let runs = gates.path().join("runs");
+    let gate = gates.path().join("gate");
+    std::fs::write(
+        &gate,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{runs}'\ncat > /dev/null\n: > '{runs}.ended'\n",
+            runs = runs.display()
+        ),
+    )?;
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755))?;
+    let executor = ProductExecutor::new(
+        registry.clone(),
+        project.path().to_owned(),
+        gate,
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let session =
+        |version: &str, capabilities: &serde_json::Value, identity: Option<&AgentIdentity>| {
+            let mut w = work(None);
+            w.assignment.agent = Some("codex".to_owned());
+            w.assignment.agent_version = Some(version.to_owned());
+            w.assignment.session_capabilities = Some(capabilities.clone());
+            w.assignment.session_identity = identity.cloned();
+            w
+        };
+    let a = AgentIdentity {
+        implementation_sha256: "a".repeat(64),
+        ..b.identity.clone()
+    };
+    let mut fewer = b.session.clone();
+    if let Some(caps) = fewer.as_object_mut() {
+        caps.insert("resume".to_owned(), serde_json::json!(false));
+    }
+    assert_ne!(fewer, b.session);
+    let other_version = "codex-cli 0.165.0";
+    for (case, w) in [
+        ("granted for A", session(&b.version, &b.session, Some(&a))),
+        (
+            "another version",
+            session(other_version, &b.session, Some(&b.identity)),
+        ),
+        (
+            "other capabilities",
+            session(&b.version, &fewer, Some(&b.identity)),
+        ),
+        ("no identity", session(&b.version, &b.session, None)),
+    ] {
+        let reads = registry.reads();
+        let refusal = executor.prepare(&w).err().ok_or(case)?;
+        assert_eq!(registry.reads() - reads, 1, "{case}: F is read once");
+        assert_eq!(
+            (refusal.reason.as_str(), refusal.class),
+            ("COMPAT_UNVERIFIED", FailureClass::Compat),
+            "{case}"
+        );
+        let detail = refusal.detail.unwrap_or_default();
+        assert!(
+            detail.contains("session R1/session/developer/1 was granted for")
+                && detail.contains("it waits for its rebind")
+                && detail.contains(&b.identity.implementation_sha256),
+            "{case}: {detail}"
+        );
+        let refused = executor.start(&w).err().ok_or(case)?;
+        assert_eq!(refused.reason, "COMPAT_UNVERIFIED", "{case}");
+        assert!(!runs.exists(), "{case}: an adapter started");
+        if case == "granted for A" {
+            assert!(detail.contains(&"a".repeat(64)), "{detail}");
+        }
+        if case == "another version" {
+            assert!(detail.contains(other_version), "{detail}");
+        }
+    }
+    // Granted for B: prepared, its gate expecting F's identity and stamps.
+    let w = session(&b.version, &b.session, Some(&b.identity));
+    let reads = registry.reads();
+    let turn = executor.prepare(&w).map_err(|r| format!("{r:?}"))?;
+    assert_eq!(registry.reads() - reads, 1, "F is read once");
+    assert_eq!(turn.ran.identity, b.identity);
+    let command = executor
+        .gate(&w, turn.agent, &turn.usable)
+        .map_err(|r| format!("{r:?}"))?;
+    let expect = command.expect.ok_or("no expect")?;
+    assert_eq!(
+        (expect.agent, &expect.identity, expect.stamp, expect.plan),
+        (
+            Agent::Codex,
+            &b.identity,
+            b.stamp,
+            hoh_agents::probe::Exec::Path
+        )
+    );
+    let status = command.status.ok_or("no status")?;
+    assert_eq!(
+        status.path,
+        attempt_logs(project.path(), &w.attempt_id).join("gate.jsonl")
+    );
+    assert!(
+        status.key.len() == 64
+            && status
+                .key
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+        "a key of 32 bytes in hex"
+    );
+    // Started: its adapter spawns the gate once, told that expectation.
+    let started = executor.start(&w).map_err(|r| format!("{r:?}"))?;
+    drop(started);
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while !runs.with_extension("ended").exists() && std::time::Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let argv = std::fs::read_to_string(&runs)?;
+    assert_eq!(argv.lines().count(), 1, "{argv}");
+    let id = &b.identity;
+    assert!(
+        argv.starts_with(&format!(
+            "__gate --expect codex {} {} {} {} --stamp ",
+            id.launcher_path, id.launcher_sha256, id.implementation_path, id.implementation_sha256
+        )),
+        "{argv}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_typed_gate_refusal_is_compat_unless_only_its_stamps_differed()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-030.md decisions 6 and 9 (-101, -201): class_of reads the facts' typed CompatRefusal, never the
+    // failure string: COMPAT_UNVERIFIED with none is transient; the gate's keyed refusal is Compat, and transient when
+    // only the stamps differed.
+    let key = "c".repeat(64);
+    let dir = tempfile::tempdir()?;
+    let status = GateStatus {
+        path: dir.path().join("gate.jsonl"),
+        key: key.clone(),
+    };
+    assert_eq!(
+        class_of(&failed(Some("COMPAT_UNVERIFIED"))),
+        FailureClass::Transient { retry_after: None }
+    );
+    for (stamp_only, class) in [
+        (false, FailureClass::Compat),
+        (true, FailureClass::Transient { retry_after: None }),
+    ] {
+        std::fs::write(
+            &status.path,
+            serde_json::json!({"outcome": "refused", "key": key, "code": "COMPAT_UNVERIFIED", "item": "stamp",
+                               "stamp_only": stamp_only, "expected": {}, "seen": {}})
+            .to_string()
+                + "\n",
+        )?;
+        let refusal = hoh_agents::adapter::gate_refusal(&status).ok_or("no refusal")?;
+        let facts = Facts::gate_refused("/logs".to_owned(), None, refusal);
+        assert_eq!(facts.failure.as_deref(), Some("COMPAT_UNVERIFIED"));
+        assert_eq!(class_of(&facts), class, "stamp_only {stamp_only}");
+        assert_eq!(outcome(facts).class, class);
+    }
     Ok(())
 }

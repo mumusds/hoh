@@ -204,9 +204,14 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
 /// The runner's fault injection points (CR-006): the product's hooks do nothing. In order, for one attempt: before
 /// its dispatch is handed over, handed over but not answered, answered but its receipt not written, its process
 /// started at its gate but its identity not recorded, its work effect STARTED and the process running (not yet
-/// OBSERVED), its work effect OBSERVED but not COMMITTED, its work effect COMMITTED but its task not yet moved.
+/// OBSERVED), its work effect OBSERVED but not COMMITTED, its work effect COMMITTED but its task not yet moved. And once
+/// per tick, [`RunnerPoint::AfterStaffing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerPoint {
+    /// A tick's staffing has written its judgments, against the tick's snapshot of the registry; the first inputs, the
+    /// paces and the rounds that read them come after (docs/adr/ADR-030.md decision 1; its test plan's -100: what
+    /// changes here is seen by the dispatch's prepare, not by the tick's snapshot).
+    AfterStaffing,
     BeforeSend,
     AfterSend,
     AfterAck,
@@ -640,6 +645,7 @@ async fn tick(
             .map(|(role, contract)| (role.clone(), super::agents::required(contract.as_deref())))
             .collect();
     }
+    common.shared.hooks.runner(RunnerPoint::AfterStaffing);
     // The new holders' first inputs (docs/adr/ADR-024.md decision 4): a notice its binding has passed is superseded,
     // never delivered; one of the binding's own epoch goes to its session once staffing granted it, and is settled
     // when the executor has it (at least once: a crash before the settle gives it again). Seen as the bindings are

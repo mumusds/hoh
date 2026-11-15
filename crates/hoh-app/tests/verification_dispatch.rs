@@ -630,7 +630,7 @@ impl hoh_app::host::Executor for Team {
                 .agent
                 .as_deref()
                 .and_then(hoh_agents::compat::Agent::named)?;
-            registry.prepared(agent)?.ok().map(|(_, ran)| ran)
+            registry.prepared(agent)?.ok().map(|current| current.ran)
         });
         Ok(hoh_app::host::Started {
             pid,

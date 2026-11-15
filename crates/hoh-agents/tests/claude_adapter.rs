@@ -1199,6 +1199,8 @@ fn gate(world: &World, marker: &str) -> R<claude::GateCommand> {
         program: "python3".into(),
         args: vec![script.into()],
         env: vec![("HOH_ATTEMPT_ID".into(), marker.into())],
+        expect: None,
+        status: None,
     })
 }
 

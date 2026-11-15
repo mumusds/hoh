@@ -19,6 +19,10 @@ pub(crate) const FILES: &[(&str, &[u8])] = &[
         include_bytes!("../adapter.rs") as &[u8],
     ),
     (
+        "crates/hoh-agents/src/adapter/tests.rs",
+        include_bytes!("../adapter/tests.rs") as &[u8],
+    ),
+    (
         "crates/hoh-agents/src/capabilities.rs",
         include_bytes!("../capabilities.rs") as &[u8],
     ),
