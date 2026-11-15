@@ -34,6 +34,9 @@ pub enum Settlement {
     Failed(String),
     /// The row holds no valid message: dead at once.
     Invalid(String),
+    /// Nothing was applied: the consume found the message's run stopped (Held, docs/adr/ADR-031.md correction D). The
+    /// generation is given back as a claim's undo does — no failure counted, no dead letter, a late answer's ACKED kept.
+    Unapplied,
 }
 
 /// What a consumer does with a message that passes its fences, in the same transaction as its receipt.
@@ -89,16 +92,20 @@ pub(super) fn claim_next(
     // A verification handoff is never claimed: its round's verifier task takes it at its dispatch (docs/adr/ADR-028.md
     // decision 9, M2T16D-255).
     loop {
+        // A published INCOMPLETE run's messages wait for it to leave its stop (rows, counts and retry times as they
+        // are); an ended run's are dead-lettered below (docs/adr/ADR-031.md correction D, -500).
         let due: Option<(String, Option<String>, String, i64, String, i64)> = tx
             .query_row(
-                "SELECT message_id, run_id, recipient_role, role_epoch, payload_json, attempt_count FROM outbox \
+                &format!("SELECT message_id, run_id, recipient_role, role_epoch, payload_json, attempt_count FROM outbox \
                  WHERE ((state = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= ?1)) \
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
                    AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
-                 ORDER BY event_seq, message_id LIMIT 1",
+                 AND (run_id IS NULL OR (SELECT r.state FROM runs r WHERE r.run_id = outbox.run_id) IS NOT 'INCOMPLETE' \
+                   OR {}) \
+                 ORDER BY event_seq, message_id LIMIT 1", super::hold::not_held("outbox.run_id")),
                 params![stamp, roles, live],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
@@ -108,6 +115,23 @@ pub(super) fn claim_next(
             super::writer::commit_unhooked(tx, ctx)?;
             return Ok(None);
         };
+        // Its run ended (its stop published): never delivered any more; dead-lettered, its record project-scoped
+        // (correction D, -500), and the claim goes on.
+        if let Some(run) = &run_id
+            && super::hold::stopped(&tx, run)?.is_some_and(crate::lifecycle::Lifecycle::is_terminal)
+        {
+            dead_letter(
+                &tx,
+                &message_id,
+                run_id.clone(),
+                &recipient_role,
+                count,
+                "run_ended",
+                Some("run_ended"),
+                ctx,
+            )?;
+            continue;
+        }
         if count >= max_attempts {
             // Its deliveries were taken and never settled (a crash, a cancelled tick): spent all the same.
             dead_letter(
@@ -117,6 +141,7 @@ pub(super) fn claim_next(
                 &recipient_role,
                 count,
                 "no answer to its last delivery",
+                None,
                 ctx,
             )?;
             continue;
@@ -148,12 +173,19 @@ pub(super) fn claim_next(
 /// the row is still at that generation and either DELIVERING or ACKED by a late answer of an earlier delivery, whose
 /// state stands (M2T04R-500; ADR-018 decision 4).
 fn undo(tx: &Transaction<'_>, row: &OutboxRow) -> Result<(), PersistError> {
+    give_back(tx, &row.message_id, row.attempt_count)
+}
+
+/// Message `message_id`'s delivery of `generation` given back: not counted, a row still DELIVERING due again at once,
+/// one ACKED by a late answer of an earlier delivery kept ACKED; a row no longer at that generation (claimed again,
+/// dead-lettered) is left as it is — the settlement that came first stands.
+fn give_back(tx: &Transaction<'_>, message_id: &str, generation: i64) -> Result<(), PersistError> {
     tx.execute(
         "UPDATE outbox SET attempt_count = attempt_count - 1, \
                 state = CASE state WHEN 'DELIVERING' THEN 'PENDING' ELSE state END, \
                 next_retry_at = NULL \
          WHERE message_id = ?1 AND state IN ('DELIVERING', 'ACKED') AND attempt_count = ?2",
-        params![row.message_id, row.attempt_count],
+        params![message_id, generation],
     )
     .map_err(sqlite_error)?;
     Ok(())
@@ -175,7 +207,9 @@ pub(super) fn unclaim_all(
     super::writer::commit_unhooked(tx, ctx)
 }
 
-/// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
+/// DEAD_LETTER and its `outbox.dead_letter` event (a Record), in the caller's transaction; `reason` named when it is
+/// not the deliveries' (`run_ended`).
+#[allow(clippy::too_many_arguments)]
 fn dead_letter(
     tx: &Transaction<'_>,
     message_id: &str,
@@ -183,6 +217,7 @@ fn dead_letter(
     recipient: &str,
     count: i64,
     error: &str,
+    reason: Option<&str>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
     tx.execute(
@@ -200,12 +235,18 @@ fn dead_letter(
                 event_id: child_id(message_id, "dead_letter"),
                 run_id,
                 kind: "outbox.dead_letter".to_owned(),
-                payload: json!({
-                    "message_id": message_id,
-                    "recipient_role": recipient,
-                    "attempt_count": count,
-                    "last_error": error,
-                }),
+                payload: {
+                    let mut payload = json!({
+                        "message_id": message_id,
+                        "recipient_role": recipient,
+                        "attempt_count": count,
+                        "last_error": error,
+                    });
+                    if let Some(reason) = reason {
+                        payload["reason"] = json!(reason);
+                    }
+                    payload
+                },
             }],
             ..Commit::default()
         },
@@ -283,8 +324,11 @@ pub(super) fn settle(
             .map_err(sqlite_error)?;
         }
         Settlement::Failed(error) | Settlement::Invalid(error) if current => {
-            dead_letter(&tx, message_id, run_id, &recipient, count, error, ctx)?;
+            dead_letter(&tx, message_id, run_id, &recipient, count, error, None, ctx)?;
         }
+        // Its run stopped before the consume applied anything (docs/adr/ADR-031.md correction D, -600): the delivery
+        // never happened, so its generation goes back, whatever the limit.
+        Settlement::Unapplied => give_back(&tx, message_id, generation)?,
         // Settled already, or a late answer of an earlier delivery: the settlement that came first stands.
         _ => {}
     }

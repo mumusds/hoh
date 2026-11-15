@@ -2475,3 +2475,380 @@ async fn a_returned_claim_is_uncounted_even_when_an_earlier_delivery_was_acked_f
     );
     Ok(())
 }
+
+/// Run `run`'s state moved by the store's writer to each of `through` (each a commit of its own; a stop's run.result
+/// published by its commit).
+async fn move_run(
+    store: &Store,
+    db: &Path,
+    run: &str,
+    through: &[hoh_core::protocol::RunState],
+) -> R {
+    for to in through {
+        let revision = one(
+            db,
+            &format!("SELECT revision FROM runs WHERE run_id = '{run}'"),
+        )?
+        .as_i64()
+        .ok_or("no revision")?;
+        store
+            .commit(Commit {
+                cas: vec![StateCas {
+                    id: run.to_owned(),
+                    expected_revision: revision,
+                    change: Change::Run(*to),
+                }],
+                ..Commit::default()
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// A steer to qa about run `run`'s task T.
+fn steer(id: &str, run: &str) -> R<Message> {
+    let mut m = to_qa(id, 3, 2, &sha(2), None)?;
+    m.run_id = run.to_owned();
+    Ok(m)
+}
+
+#[tokio::test]
+async fn a_stopped_runs_messages_wait_or_are_dead_lettered_and_cost_no_other_message() -> R {
+    // docs/adr/ADR-031.md correction D (-500; the test plan's 停住之后的写入口 (3)): M1, of run R, comes first by
+    // event_seq, its deliveries spent and due; M2 of working run R2 is due. R a published INCOMPLETE: one claim takes
+    // and delivers M2; M1's row, count and retry time stay, no event, over three more ticks and a restart. When R works
+    // again (a direct state change: ResumeRun from INCOMPLETE is slice S1d) the claim dead-letters M1 as R's. R a
+    // published COMPLETED instead: the same claim dead-letters M1 project-scoped (run_ended), then takes M2; M1's late
+    // answer makes it ACKED with a project-scoped outbox.delivered_late. R a published PAUSED: claimed and delivered
+    // as before (not in G).
+    use hoh_core::protocol::RunState;
+    for (variant, through) in [
+        ("INCOMPLETE", vec![RunState::Incomplete]),
+        ("COMPLETED", vec![RunState::Verifying, RunState::Completed]),
+        ("PAUSED", vec![RunState::PauseRequested, RunState::Paused]),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, db) = open(&dir)?;
+        seed(&db, WORLD)?;
+        seed(
+            &db,
+            "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('R2', 'p1', 's2', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:00Z');",
+        )?;
+        enqueue(&store, "m1", &[steer("M1", "R")?]).await?;
+        enqueue(&store, "m2", &[steer("M2", "R2")?]).await?;
+        move_run(&store, &db, "R", &through).await?;
+        if variant != "PAUSED" {
+            seed(
+                &db,
+                "UPDATE outbox SET attempt_count = 2 WHERE message_id = 'M1';",
+            )?;
+        }
+        let m1_row = || {
+            rows(
+                &db,
+                "SELECT state, attempt_count, next_retry_at FROM outbox WHERE message_id = 'M1'",
+            )
+        };
+        let before = m1_row()?;
+        let r_events = || {
+            rows(
+                &db,
+                "SELECT seq FROM events WHERE run_id = 'R' ORDER BY seq",
+            )
+        };
+        let r_before = r_events()?;
+        let clock = FakeClock::new();
+        let transport = LocalTransport::new(&store, &clock).with("qa", Noop);
+        let dispatcher = Dispatcher {
+            store: &store,
+            clock: &clock,
+            transport: &transport,
+            roles: vec!["qa".to_owned()],
+            max_attempts: 2,
+            batch: 1,
+        };
+        let tick = dispatcher.tick().await?;
+        match variant {
+            "INCOMPLETE" => {
+                assert_eq!(tick.delivered, ["M2"], "{variant}");
+                for _ in 0..3 {
+                    let again = dispatcher.tick().await?;
+                    assert!(
+                        again.delivered.is_empty() && again.held.is_empty(),
+                        "{again:?}"
+                    );
+                }
+                assert_eq!(m1_row()?, before, "{variant}");
+                assert_eq!(r_events()?, r_before, "{variant}");
+                drop(dispatcher);
+                drop(transport);
+                drop(store);
+                let (store, _) = open(&dir)?;
+                let transport = LocalTransport::new(&store, &clock).with("qa", Noop);
+                let dispatcher = Dispatcher {
+                    store: &store,
+                    clock: &clock,
+                    transport: &transport,
+                    roles: vec!["qa".to_owned()],
+                    max_attempts: 2,
+                    batch: 1,
+                };
+                assert_eq!(
+                    dispatcher.tick().await?,
+                    hoh_core::delivery::Tick::default()
+                );
+                assert_eq!(m1_row()?, before);
+                // R works again (as a ResumeRun would leave it): M1's spent deliveries dead-letter it, as R's.
+                seed(&db, "UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R';")?;
+                dispatcher.tick().await?;
+                assert_eq!(
+                    rows(
+                        &db,
+                        "SELECT o.state, e.run_id FROM outbox o, events e WHERE o.message_id = 'M1' \
+                               AND e.kind = 'outbox.dead_letter'"
+                    )?,
+                    [[json!("DEAD_LETTER"), json!("R")]]
+                );
+            }
+            "COMPLETED" => {
+                assert_eq!(tick.delivered, ["M2"], "{variant}");
+                assert_eq!(
+                    rows(
+                        &db,
+                        "SELECT o.state, e.run_id, json_extract(e.payload_json, '$.run_id'), \
+                               json_extract(e.payload_json, '$.reason') FROM outbox o, events e \
+                               WHERE o.message_id = 'M1' AND e.kind = 'outbox.dead_letter'"
+                    )?,
+                    [[
+                        json!("DEAD_LETTER"),
+                        Value::Null,
+                        json!("R"),
+                        json!("run_ended")
+                    ]]
+                );
+                store
+                    .settle_outbox("M1", 2, hoh_core::persistence::Settlement::Delivered, 2)
+                    .await?;
+                assert_eq!(
+                    rows(
+                        &db,
+                        "SELECT o.state, e.run_id, json_extract(e.payload_json, '$.run_id') FROM outbox o, \
+                               events e WHERE o.message_id = 'M1' AND e.kind = 'outbox.delivered_late'"
+                    )?,
+                    [[json!("ACKED"), Value::Null, json!("R")]]
+                );
+                assert_eq!(r_events()?, r_before, "{variant}");
+            }
+            _ => {
+                assert_eq!(tick.delivered, ["M1"], "{variant}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delivers through `inner`, committing run R's move to `stop` first (once): its run stops between the claim and the
+/// consume.
+struct StopFirst<'a, T: Transport> {
+    inner: &'a T,
+    store: &'a Store,
+    db: PathBuf,
+    stop: Vec<hoh_core::protocol::RunState>,
+    done: Mutex<bool>,
+}
+
+impl<T: Transport> Transport for StopFirst<'_, T> {
+    async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
+        let first = self
+            .done
+            .lock()
+            .map(|mut d| !std::mem::replace(&mut *d, true))
+            .unwrap_or(false);
+        if first {
+            move_run(self.store, &self.db, "R", &self.stop)
+                .await
+                .map_err(|e| DeliveryError::Lost(e.to_string()))?;
+        }
+        self.inner.deliver(row).await
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_whose_run_stops_before_its_consume_is_given_back_unapplied() -> R {
+    // docs/adr/ADR-031.md correction D (-600, -650; the test plan's 停住之后的写入口 (4)): M's claim committed (DELIVERING,
+    // generation g), then R's stop before the consume: the consume is refused, the transport answers DeliveryError::Held
+    // (typed), the dispatcher settles Unapplied: Tick.held has M, not failed; the row PENDING again, its count g - 1, no
+    // retry time, no receipt, no event of the consume or a dead letter, R's events as they were. The same at the last
+    // allowed delivery. Three more ticks and a restart: M not taken. R working again (a direct state change: ResumeRun is
+    // slice S1d): taken at g, applied, ACKED, one receipt. R CANCELLED instead: given back the same, then dead-lettered
+    // project-scoped (run_ended) by the next claim.
+    use hoh_core::protocol::RunState;
+    for (variant, stop, max) in [
+        ("INCOMPLETE", vec![RunState::Incomplete], 3),
+        (
+            "INCOMPLETE at the last delivery",
+            vec![RunState::Incomplete],
+            1,
+        ),
+        (
+            "CANCELLED",
+            vec![RunState::CancelRequested, RunState::Cancelled],
+            3,
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, db) = open(&dir)?;
+        seed(&db, WORLD)?;
+        seed(
+            &db,
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-07T00:00:01Z' WHERE attempt_id = 'A';",
+        )?;
+        enqueue(&store, "m", &[to_qa("M", 3, 2, &sha(2), None)?]).await?;
+        let clock = FakeClock::new();
+        let local = LocalTransport::new(&store, &clock).with("qa", Touch);
+        let transport = StopFirst {
+            inner: &local,
+            store: &store,
+            db: db.clone(),
+            stop,
+            done: Mutex::new(false),
+        };
+        let dispatcher = Dispatcher {
+            store: &store,
+            clock: &clock,
+            transport: &transport,
+            roles: vec!["qa".to_owned()],
+            max_attempts: max,
+            batch: 1,
+        };
+        let tick = dispatcher.tick().await?;
+        assert_eq!(
+            (tick.held.as_slice(), tick.failed.len()),
+            (["M".to_owned()].as_slice(), 0),
+            "{variant}"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT state, attempt_count, next_retry_at FROM outbox WHERE message_id = 'M'"
+            )?,
+            [[json!("PENDING"), json!(0), Value::Null]],
+            "{variant}"
+        );
+        assert_eq!(
+            one(
+                &db,
+                "SELECT (SELECT count(*) FROM receipts) || '/' || (SELECT count(*) FROM events WHERE kind IN \
+                       ('qa.touched', 'message.applied', 'message.rejected', 'outbox.dead_letter'))"
+            )?,
+            json!("0/0"),
+            "{variant}"
+        );
+        let r_after_stop = rows(
+            &db,
+            "SELECT seq FROM events WHERE run_id = 'R' ORDER BY seq",
+        )?;
+        assert_eq!(
+            one(
+                &db,
+                "SELECT kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1"
+            )?,
+            json!("run.result"),
+            "{variant}"
+        );
+        if variant.starts_with("CANCELLED") {
+            dispatcher.tick().await?;
+            assert_eq!(
+                rows(
+                    &db,
+                    "SELECT o.state, e.run_id, json_extract(e.payload_json, '$.reason') FROM outbox o, events e \
+                           WHERE o.message_id = 'M' AND e.kind = 'outbox.dead_letter'"
+                )?,
+                [[json!("DEAD_LETTER"), Value::Null, json!("run_ended")]]
+            );
+            continue;
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                dispatcher.tick().await?,
+                hoh_core::delivery::Tick::default(),
+                "{variant}"
+            );
+        }
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT state, attempt_count FROM outbox WHERE message_id = 'M'"
+            )?,
+            [[json!("PENDING"), json!(0)]]
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT seq FROM events WHERE run_id = 'R' ORDER BY seq"
+            )?,
+            r_after_stop
+        );
+        // R works again: M is taken at the same generation and applied once.
+        seed(&db, "UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R';")?;
+        let tick = dispatcher.tick().await?;
+        assert_eq!(tick.delivered, ["M"], "{variant}");
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT state, attempt_count FROM outbox WHERE message_id = 'M'"
+            )?,
+            [[json!("ACKED"), json!(1)]]
+        );
+        assert_eq!(
+            one(
+                &db,
+                "SELECT (SELECT count(*) FROM receipts) || '/' || (SELECT count(*) FROM events \
+                       WHERE kind = 'qa.touched' AND run_id = 'R')"
+            )?,
+            json!("1/1")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unapplied_settlement_gives_back_only_its_own_generation() -> R {
+    // -600's late answers: generation g - 1's answer made the row ACKED before g's Unapplied: ACKED it stays (its count
+    // g - 1, as the claim's undo writes it), nothing is delivered again; an Unapplied of a generation the row no longer
+    // has (claimed again since) changes nothing.
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    enqueue(&store, "m", &[to_qa("M", 3, 2, &sha(2), None)?]).await?;
+    seed(
+        &db,
+        "UPDATE outbox SET state = 'ACKED', attempt_count = 2 WHERE message_id = 'M';",
+    )?;
+    store
+        .settle_outbox("M", 2, hoh_core::persistence::Settlement::Unapplied, 3)
+        .await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'M'"
+        )?,
+        [[json!("ACKED"), json!(1)]]
+    );
+    seed(
+        &db,
+        "UPDATE outbox SET state = 'DELIVERING', attempt_count = 3 WHERE message_id = 'M';",
+    )?;
+    store
+        .settle_outbox("M", 2, hoh_core::persistence::Settlement::Unapplied, 3)
+        .await?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT state, attempt_count FROM outbox WHERE message_id = 'M'"
+        )?,
+        [[json!("DELIVERING"), json!(3)]]
+    );
+    Ok(())
+}

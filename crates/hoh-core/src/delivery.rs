@@ -87,6 +87,21 @@ pub enum DeliveryError {
     Lost(String),
     /// The row holds no valid message: it is recorded and dead at once.
     Invalid(String),
+    /// The message's run stopped (in G, its stop published) between the claim and the consume: the consume was rolled
+    /// back, nothing was applied; the delivery is given back, no failure (docs/adr/ADR-031.md correction D).
+    Held {
+        run: String,
+        state: protocol::RunState,
+    },
+}
+
+/// A store failure of a delivery: a stopped run's Held kept as such, typed (never through a string); any other is no
+/// answer.
+fn delivery_error(error: PersistError) -> DeliveryError {
+    match error {
+        PersistError::Held { run, state } => DeliveryError::Held { run, state },
+        error => DeliveryError::Lost(error.to_string()),
+    }
 }
 
 /// How a message reaches its consumer; the answer is the reply exactly as the consumer stored it.
@@ -160,7 +175,7 @@ impl<C: Clock> Transport for LocalTransport<'_, C> {
                         &violations,
                     )
                     .await
-                    .map_err(|e| DeliveryError::Lost(e.to_string()))?;
+                    .map_err(delivery_error)?;
                 return Err(DeliveryError::Invalid(violations));
             }
         };
@@ -175,7 +190,7 @@ impl<C: Clock> Transport for LocalTransport<'_, C> {
             .consume(&row.recipient_role, message, effect, self.clock.now())
             .await
             .map(|consumed| consumed.result_json)
-            .map_err(|e| DeliveryError::Lost(e.to_string()))
+            .map_err(delivery_error)
     }
 }
 
@@ -185,6 +200,8 @@ pub struct Tick {
     pub delivered: Vec<String>,
     pub failed: Vec<String>,
     pub invalid: Vec<String>,
+    /// Given back unapplied: their run stopped between the claim and the consume (docs/adr/ADR-031.md correction D).
+    pub held: Vec<String>,
 }
 
 /// Takes, delivers and settles outbox messages of `roles`, at most `batch` a tick, up to `max_attempts` deliveries
@@ -234,6 +251,10 @@ impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
                 Err(DeliveryError::Invalid(e)) => {
                     tick.invalid.push(row.message_id.clone());
                     Settlement::Invalid(e)
+                }
+                Err(DeliveryError::Held { .. }) => {
+                    tick.held.push(row.message_id.clone());
+                    Settlement::Unapplied
                 }
             };
             self.store
