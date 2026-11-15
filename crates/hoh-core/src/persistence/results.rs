@@ -474,6 +474,48 @@ pub(super) fn compute(
     seq: i64,
 ) -> Result<protocol::RunResult, PersistError> {
     use crate::lifecycle::Lifecycle as _;
+    let view = view(conn, run_id, seq)?;
+    let exit_code = view.exit_code.ok_or_else(|| {
+        PersistError::IntegrityViolation(format!(
+            "run {run_id}: {} is not a state with a result",
+            view.state.as_str()
+        ))
+    })?;
+    Ok(protocol::RunResult {
+        run_id: view.run_id,
+        state: view.state,
+        exit_code,
+        blocked_reason: view.blocked_reason,
+        spec_revision: view.spec_revision,
+        accepted: view.accepted,
+        total: view.total,
+        last_event_seq: view.last_event_seq,
+        cost_usd: view.cost_usd,
+        cost_status: view.cost_status,
+        remaining_requirements: view.remaining_requirements,
+    })
+}
+
+/// A run's result as of event `seq`, whatever its state (docs/adr/ADR-031.md decisions 3, 5 and 12): the fields of
+/// its `run.result`, with `exit_code` none for a state that ends no client. [`compute`] gives a stopped run's
+/// `run.result` from it; getRun shows it as the run's `projection.result`, at the watermark it reads the run at.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ResultView {
+    pub run_id: String,
+    pub state: protocol::RunState,
+    pub exit_code: Option<u8>,
+    pub blocked_reason: Option<protocol::BlockedReason>,
+    pub spec_revision: Option<u64>,
+    pub accepted: u64,
+    pub total: u64,
+    pub last_event_seq: u64,
+    pub cost_usd: Option<f64>,
+    pub cost_status: protocol::CostStatus,
+    pub remaining_requirements: Vec<String>,
+}
+
+/// [`ResultView`] of run `run_id` as of event `seq`.
+pub(super) fn view(conn: &Connection, run_id: &str, seq: i64) -> Result<ResultView, PersistError> {
     let (state, blocked, spec): (String, Option<String>, Option<(String, i64)>) = conn
         .query_row(
             "SELECT r.state, r.blocked_reason, r.spec_id, s.revision FROM runs r \
@@ -488,8 +530,7 @@ pub(super) fn compute(
         .map_err(sqlite_error)?;
     let state = writer::parse::<protocol::RunState>(&state)?;
     let integrity = |why: String| PersistError::IntegrityViolation(format!("run {run_id}: {why}"));
-    let exit_code = crate::exit::run_code(state)
-        .ok_or_else(|| integrity(format!("{} is not a state with a result", state.as_str())))?;
+    let exit_code = crate::exit::run_code(state);
     let blocked_reason = match (state, blocked) {
         (protocol::RunState::Blocked, Some(reason)) => Some(
             protocol::BlockedReason::parse(&reason)
@@ -539,7 +580,7 @@ pub(super) fn compute(
         .collect();
     let (cost_usd, cost_status) = super::retry::run_cost(conn, run_id)?;
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-    Ok(protocol::RunResult {
+    Ok(ResultView {
         run_id: run_id.to_owned(),
         state,
         exit_code,

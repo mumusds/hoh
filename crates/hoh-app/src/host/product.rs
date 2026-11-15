@@ -120,8 +120,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `id` as one path component: `%` and `/` escaped, so distinct ids stay distinct.
-pub(super) fn component(id: &str) -> String {
+/// `id` as one path component: `%` and `/` escaped, so distinct ids stay distinct. A client reads an attempt's
+/// native stderr where [`attempt_logs`] puts it (docs/adr/ADR-031.md decision 11).
+pub fn component(id: &str) -> String {
     id.replace('%', "%25").replace('/', "%2F")
 }
 
@@ -978,7 +979,8 @@ fn keep_logs(
     (rows, failed)
 }
 
-fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
+/// The directory of attempt `attempt_id`'s raw logs in the project at `project`: its agent's `*stderr.log` among them.
+pub fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
     project.join(".hoh/attempts").join(component(attempt_id))
 }
 

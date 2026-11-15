@@ -1856,6 +1856,163 @@ async fn events_follow_the_openapi_contract() -> R {
     Ok(())
 }
 
+/// An event's `attempt_id` is its payload's when that is a string, else null (docs/adr/ADR-031.md decision 10): what
+/// a client's stderr forwarding collects the attempts of a run by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_names_the_attempt_its_payload_names() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.readline().strip(); \
+                  c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit(); c.close()";
+    let sql = "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+                 ('ra', :p, 'RUNNING', 'AUTO', '2026-11-15T00:00:00Z');
+               INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                 (:p, 'ra/1', 'ra', 'attempt.started', '{\"attempt_id\": \"ra/a1\"}', '2026-11-15T00:00:00Z'),
+                 (:p, 'ra/2', 'ra', 'attempt.odd', '{\"attempt_id\": 7}', '2026-11-15T00:00:01Z'),
+                 (:p, 'ra/3', 'ra', 'run.noted', '{}', '2026-11-15T00:00:02Z');";
+    python(
+        &db(dir.path()),
+        script,
+        &format!("{}\n{sql}", host.project_id),
+    )?;
+    let subscriber = Subscriber::connect(
+        To::Unix(host.socket.clone()),
+        &host.token,
+        "/v1/events?run_id=ra",
+    )
+    .await?;
+    assert!(
+        until(Duration::from_secs(5), || subscriber.events().len() == 3).await,
+        "{:?}",
+        subscriber.events()
+    );
+    let protocol_event = {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts");
+        let protocol: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("protocol.schema.json"))?)?;
+        let mut document = json!({"$ref": "#/$defs/Event"});
+        document["$defs"] = protocol["$defs"].clone();
+        hoh_core::schema::Schema::new(document)?
+    };
+    let events = subscriber.events();
+    for (_, event) in &events {
+        conforms(&protocol_event, event)?;
+    }
+    let named: Vec<&Value> = events.iter().map(|(_, e)| &e["attempt_id"]).collect();
+    assert_eq!(named, vec![&json!("ra/a1"), &json!(null), &json!(null)]);
+    drop(subscriber);
+    host.shutdown().await;
+    Ok(())
+}
+
+/// getRun's `projection.result` is the run's result as of the watermark, from the same function as its `run.result`
+/// (docs/adr/ADR-031.md decision 12): with no event after a stopped run's result it is that result's payload, plus
+/// the run's label and revision; for a run still at work its `exit_code` is null and `last_event_seq` the watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_shows_its_result_as_of_the_watermark() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let to = To::Unix(host.socket.clone());
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.readline().strip(); \
+                  c.executescript(sys.stdin.read().replace(':p', repr(p))); c.commit(); c.close()";
+    let sql = "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 3);
+               INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES
+                 ('REQ-2', 's1', 'b', 1), ('REQ-1', 's1', 'a', 1);
+               INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES
+                 ('rp', :p, 's1', 'CREATED', 'AUTO', '2026-11-15T00:00:00Z'),
+                 ('rw', :p, 's1', 'RUNNING', 'AUTO', '2026-11-15T00:00:01Z');";
+    python(
+        &db(dir.path()),
+        script,
+        &format!("{}\n{sql}", host.project_id),
+    )?;
+    // rp has no attempt: its pause lands at once, with its run.result (ADR-031 decision 3).
+    let paused = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c1", "k1", "rp", 0, "snapshot"),
+    )
+    .await?;
+    assert_eq!(paused.status, 202, "{paused:?}");
+    assert!(
+        until(Duration::from_secs(10), || {
+            scalar(
+                dir.path(),
+                "SELECT count(*) FROM events WHERE run_id = 'rp' AND kind = 'run.result'",
+            )
+            .is_ok_and(|n| n == "1")
+        })
+        .await
+    );
+    let (result_seq, result): (i64, Value) = {
+        let text = scalar(
+            dir.path(),
+            "SELECT json_object('seq', seq, 'payload', json(payload_json)) FROM events WHERE kind = 'run.result'",
+        )?;
+        let row: Value = serde_json::from_str(&text)?;
+        (row["seq"].as_i64().ok_or("no seq")?, row["payload"].clone())
+    };
+    assert_eq!(
+        scalar(dir.path(), "SELECT max(seq) FROM events")?,
+        result_seq.to_string(),
+        "nothing after the result"
+    );
+    let got = call(&to, "GET", "/v1/runs/rp", &host.token, b"")
+        .await?
+        .json()?;
+    let mut shown = got["projection"]["result"].clone();
+    assert_eq!(
+        (shown["label"].take(), shown["revision"].take()),
+        (json!("PAUSED"), got["revision"].clone()),
+        "{got}"
+    );
+    let shown: serde_json::Map<String, Value> = shown
+        .as_object()
+        .ok_or("no result object")?
+        .iter()
+        .filter(|(k, _)| !["label", "revision"].contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    assert_eq!(Value::Object(shown), result, "{got}");
+    assert_eq!(result["remaining_requirements"], json!(["REQ-1", "REQ-2"]));
+    let working = call(&to, "GET", "/v1/runs/rw", &host.token, b"")
+        .await?
+        .json()?;
+    let shown = &working["projection"]["result"];
+    assert_eq!(
+        (
+            &shown["run_id"],
+            &shown["state"],
+            &shown["exit_code"],
+            &shown["blocked_reason"],
+            &shown["spec_revision"],
+            &shown["accepted"],
+            &shown["total"],
+            &shown["last_event_seq"],
+            &shown["label"],
+            &shown["revision"],
+        ),
+        (
+            &json!("rw"),
+            &json!("RUNNING"),
+            &json!(null),
+            &json!(null),
+            &json!(3),
+            &json!(0),
+            &json!(2),
+            &working["watermark"],
+            &json!("RUNNING"),
+            &json!(0),
+        ),
+        "{working}"
+    );
+    assert!(shown["cost_status"].is_string() && shown.get("cost_usd").is_some());
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A host stops with event streams open: they end with the stop itself, well before the grace; host.json and the
 /// socket go, and the lock is free again (M2T12R-01).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
