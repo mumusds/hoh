@@ -1224,7 +1224,18 @@ async fn get_run(
     };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.run_projection(&wanted)).await {
-        Ok(Some((run, team, acceptance, watermark))) => (
+        Ok(Some((run, team, acceptance, result, watermark))) => {
+            let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
+                |_| run.state.clone(),
+                |s| hoh_core::lifecycle::label(s).to_owned(),
+            );
+            // The run's result as of the watermark, what `hoh attach --output json` prints (docs/adr/ADR-031.md
+            // decision 12): the fields of its run.result, exit_code null while it ends no client, with its label and
+            // revision.
+            let mut shown = json!(result);
+            shown["label"] = json!(label);
+            shown["revision"] = json!(run.revision);
+            (
             StatusCode::OK,
             axum::Json(json!({
                 "run_id": run.run_id,
@@ -1247,12 +1258,13 @@ async fn get_run(
                     "resume_state": run.resume_state,
                     "blocked_reason": run.blocked_reason,
                     // CANCEL_REQUESTED is shown as CANCELLING (REQ-043 behaviour 3, ADR-021 decision 8h).
-                    "label": serde_json::from_value::<RunState>(json!(run.state))
-                        .map_or_else(|_| run.state.clone(), |s| hoh_core::lifecycle::label(s).to_owned()),
+                    "label": label,
+                    "result": shown,
                 },
             })),
         )
-            .into_response(),
+            .into_response()
+        }
         Ok(None) => error(
             StatusCode::NOT_FOUND,
             "RUN_NOT_FOUND",
@@ -1271,7 +1283,8 @@ struct EventsQuery {
     kinds: Option<String>,
 }
 
-/// The protocol `Event` of a stored one.
+/// The protocol `Event` of a stored one: its attempt is its payload's `attempt_id` when that is a string, else none
+/// (docs/adr/ADR-031.md decision 10).
 fn event_json(event: &EventRow) -> Value {
     json!({
         "schema_version": "1.0",
@@ -1279,7 +1292,7 @@ fn event_json(event: &EventRow) -> Value {
         "seq": event.seq,
         "event_id": event.event_id,
         "run_id": event.run_id,
-        "attempt_id": null,
+        "attempt_id": event.payload.get("attempt_id").and_then(Value::as_str),
         "at": event.created_at,
         "kind": event.kind,
         "payload": event.payload,
