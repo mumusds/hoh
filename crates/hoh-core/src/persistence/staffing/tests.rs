@@ -5,7 +5,8 @@
 
 use crate::config::{Budget, Config};
 use crate::persistence::{
-    Evidence, NewEvent, Options, RunTarget, StaffChange, StaffWrite, Store, SubmitCommand, selftest,
+    Evidence, Intent, NewEvent, Options, RunTarget, StaffChange, StaffWrite, Store, SubmitCommand,
+    selftest,
 };
 use crate::protocol::BlockedReason;
 use crate::staffing::{AgentIdentity, BindingState, Cause, PendingChange, Session, Staffed};
@@ -44,6 +45,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
             policy: "balanced".to_owned(),
         },
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: format!("e-{}", run_id.len()),
             run_id: Some(run_id.to_owned()),
@@ -71,6 +73,7 @@ fn team_change(key: &str, expected: i64, bindings: Value) -> SubmitCommand {
             file: None,
         }),
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: format!("e-{key}"),
             run_id: None,

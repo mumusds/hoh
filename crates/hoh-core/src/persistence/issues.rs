@@ -49,19 +49,31 @@ fn insert_event(
     event_id: &str,
     kind: &str,
     payload: &Value,
+    intent: super::writer::Intent,
 ) -> Result<(), PersistError> {
-    tx.execute(
-        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
-         SELECT project_id, ?1, run_id, ?2, ?3, ?4 FROM runs WHERE run_id = ?5",
-        params![
-            event_id,
-            kind,
-            payload.to_string(),
-            crate::time::now_rfc3339(),
-            run_id
-        ],
-    )
-    .map_err(sqlite_error)?;
+    let project_id: Option<String> = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    // An event of no run is none at all, as before.
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+    super::writer::insert_event(
+        tx,
+        &super::writer::NewEvent {
+            project_id,
+            event_id: event_id.to_owned(),
+            run_id: Some(run_id.to_owned()),
+            kind: kind.to_owned(),
+            payload: payload.clone(),
+            intent,
+        },
+    )?;
     Ok(())
 }
 
@@ -205,6 +217,7 @@ pub(super) fn take_report(
             "issue.opened",
             &json!({"issue_id": issue_id, "candidate_id": candidate, "report_id": report_id, "finding_id": id,
                 "severity": severity, "fingerprint": fingerprint, "attempt_id": attempt_id, "source": "finding"}),
+            super::writer::Intent::Progress,
         )?;
         registered.push(issue_id);
     }
@@ -259,7 +272,14 @@ fn observe(tx: &Transaction<'_>, run_id: &str, o: &Observed<'_>) -> Result<(), P
     let mut payload = json!({"observation_id": id, "fingerprint": o.fingerprint, "polarity": o.polarity.code(),
         "candidate_id": o.candidate, "issue_ids": o.issue_ids, "sources": o.sources});
     payload[if o.attempt { "attempt_id" } else { "round_id" }] = json!(o.at);
-    insert_event(tx, run_id, &id, OBSERVATION, &payload)
+    insert_event(
+        tx,
+        run_id,
+        &id,
+        OBSERVATION,
+        &payload,
+        super::writer::Intent::Progress,
+    )
 }
 
 /// An acceptance failure of a failed close: its AC and, when the item names one, its failing test.
@@ -317,6 +337,7 @@ pub(super) fn open_acceptance(
             "issue.opened",
             &json!({"issue_id": issue_id, "candidate_id": candidate, "severity": "high", "fingerprint": fingerprint,
                 "source": "acceptance", "ac_id": ac, "test": test, "evidence_id": evidence}),
+            super::writer::Intent::Progress,
         )?;
         opened.push(issue_id);
     }
@@ -769,17 +790,24 @@ pub(super) fn judged(conn: &Connection, run_id: &str) -> Result<Vec<(Row, Judged
 /// state differs from the function's changes, RESOLVED with `issue.resolved{issue_id, basis}` or REOPENED with
 /// `issue.reopened{issue_id, basis, undoes}`, each event's id from its Issue and basis. Called before the commit of
 /// every transaction that writes an observation fact, an acceptance row, an INVALID evidence or an Issue, and at the
-/// start of each verification reconcile, so a committed state agrees with the function. The changes, (Issue, state).
+/// start of each verification reconcile, so a committed state agrees with the function. Its events are written with
+/// its caller's `intent` (a history backfill's are Records, docs/adr/ADR-031.md correction D). The changes, (Issue,
+/// state).
 pub(super) fn settle_all(
     tx: &Transaction<'_>,
     run_id: &str,
+    intent: super::writer::Intent,
 ) -> Result<Vec<(String, &'static str)>, PersistError> {
     let mut changed = Vec::new();
     for (row, judged) in judged(tx, run_id)? {
         let last: Option<String> = if row.state == "RESOLVED" && !judged.resolved() {
             tx.query_row(
-                "SELECT json_extract(payload_json, '$.basis') FROM events WHERE run_id = ?1 AND kind = 'issue.resolved' \
-                 AND json_extract(payload_json, '$.issue_id') = ?2 ORDER BY seq DESC LIMIT 1",
+                &format!(
+                    "SELECT json_extract(e.payload_json, '$.basis') FROM events e WHERE {} \
+                     AND e.kind = 'issue.resolved' AND json_extract(e.payload_json, '$.issue_id') = ?2 \
+                     ORDER BY e.seq DESC LIMIT 1",
+                    super::hold::of_run("e", "?1")
+                ),
                 params![run_id, row.issue.id],
                 |r| r.get(0),
             )
@@ -806,6 +834,7 @@ pub(super) fn settle_all(
             &child_id(&row.issue.id, &t.key),
             t.kind,
             &payload,
+            intent,
         )?;
         changed.push((row.issue.id, t.to));
     }

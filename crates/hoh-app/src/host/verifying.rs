@@ -3,7 +3,7 @@
 //! removed once it is.
 
 use crate::verify::rundir::{self, Unprepared};
-use hoh_core::persistence::{Commit, Ending, NewEvent, PersistError, Store};
+use hoh_core::persistence::{Commit, Ending, Intent, NewEvent, PersistError, Store};
 use hoh_core::retry::FailureClass;
 use hoh_core::verification::Sealed;
 use serde_json::{Value, json};
@@ -206,6 +206,7 @@ pub(super) async fn check_at_reconcile(
     store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: project_id.to_owned(),
                 event_id: hoh_core::ids::child_id(attempt_id, &key),
                 run_id: Some(run_id.to_owned()),

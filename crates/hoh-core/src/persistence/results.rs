@@ -4,7 +4,7 @@
 //! qa and reviewer, all in one transaction; a stale or mismatched result is one `task_result.rejected` event.
 
 use super::decide::{child_id, load_binding};
-use super::writer::{self, Change, Commit, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::protocol::{self, Candidate, RejectionReason, TaskResult, TaskState, TaskStatus};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -54,7 +54,7 @@ pub(super) fn accept(
     let tx = super::writer::begin(conn, ctx)?;
     let outcome = accept_in(&tx, result, false, ctx)?;
     if !matches!(outcome, TaskResultOutcome::Replayed { .. }) {
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit_unhooked(tx)?;
     }
     Ok(outcome)
 }
@@ -238,6 +238,7 @@ pub(super) fn accept_in(
             tx,
             &Commit {
                 events: vec![NewEvent {
+                    intent: Intent::Progress,
                     project_id: run.project_id,
                     event_id: rejected_id,
                     run_id: Some(result.run_id.clone()),
@@ -318,6 +319,7 @@ pub(super) fn accept_in(
             ],
             events: vec![
                 NewEvent {
+                    intent: Intent::Progress,
                     project_id: run.project_id,
                     event_id: ready_id,
                     run_id: Some(result.run_id.clone()),
@@ -460,3 +462,97 @@ pub(super) fn goal(
     Ok(started_goal(tx, run_id)?
         .unwrap_or_else(|| format!("验证任务 {task_id} 的候选 {candidate} 是否满足其验收标准")))
 }
+
+/// Run `run_id`'s result as its `run.result` carries it (docs/adr/ADR-031.md decisions 3 and 5), read in the
+/// transaction that writes it, whose own seq is `seq`: its state and that state's exit code, its blocked reason when
+/// BLOCKED, its specification's revision; the requirements of that specification accepted under it — the union of what
+/// each ACCEPTED candidate of the run passed (`requirements_passed`, docs/adr/ADR-029.md decision 12; never the
+/// per-criterion acceptance view, CR-020) — the total and the rest in ascending order; its cost (CR-009).
+pub(super) fn compute(
+    conn: &Connection,
+    run_id: &str,
+    seq: i64,
+) -> Result<protocol::RunResult, PersistError> {
+    use crate::lifecycle::Lifecycle as _;
+    let (state, blocked, spec): (String, Option<String>, Option<(String, i64)>) = conn
+        .query_row(
+            "SELECT r.state, r.blocked_reason, r.spec_id, s.revision FROM runs r \
+             LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            params![run_id],
+            |r| {
+                let spec: Option<String> = r.get(2)?;
+                let revision: Option<i64> = r.get(3)?;
+                Ok((r.get(0)?, r.get(1)?, spec.zip(revision)))
+            },
+        )
+        .map_err(sqlite_error)?;
+    let state = writer::parse::<protocol::RunState>(&state)?;
+    let integrity = |why: String| PersistError::IntegrityViolation(format!("run {run_id}: {why}"));
+    let exit_code = crate::exit::run_code(state)
+        .ok_or_else(|| integrity(format!("{} is not a state with a result", state.as_str())))?;
+    let blocked_reason = match (state, blocked) {
+        (protocol::RunState::Blocked, Some(reason)) => Some(
+            protocol::BlockedReason::parse(&reason)
+                .ok_or_else(|| integrity(format!("unknown blocked reason {reason:?}")))?,
+        ),
+        (protocol::RunState::Blocked, None) => {
+            return Err(integrity("BLOCKED without a blocked reason".to_owned()));
+        }
+        _ => None,
+    };
+    let (spec_revision, accepted, required) = match &spec {
+        None => (None, Vec::new(), Vec::new()),
+        Some((spec_id, revision)) => {
+            let ids = |sql: &str, key: &str| -> Result<Vec<String>, PersistError> {
+                let mut statement = conn.prepare(sql).map_err(sqlite_error)?;
+                let rows = statement
+                    .query_map(params![key], |r| r.get(0))
+                    .map_err(sqlite_error)?;
+                rows.collect::<Result<_, _>>().map_err(sqlite_error)
+            };
+            let required = ids(
+                "SELECT requirement_id FROM requirements WHERE spec_id = ?1 ORDER BY requirement_id",
+                spec_id,
+            )?;
+            let mut passed = std::collections::BTreeSet::new();
+            for candidate in ids(
+                "SELECT candidate_id FROM candidates WHERE run_id = ?1 AND state = 'ACCEPTED' \
+                 ORDER BY candidate_id",
+                run_id,
+            )? {
+                passed.extend(super::decide::requirements_passed(
+                    conn, run_id, spec_id, &candidate,
+                )?);
+            }
+            let accepted = required
+                .iter()
+                .filter(|r| passed.contains(*r))
+                .cloned()
+                .collect();
+            (u64::try_from(*revision).ok(), accepted, required)
+        }
+    };
+    let remaining: Vec<String> = required
+        .iter()
+        .filter(|r| !accepted.contains(*r))
+        .cloned()
+        .collect();
+    let (cost_usd, cost_status) = super::retry::run_cost(conn, run_id)?;
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    Ok(protocol::RunResult {
+        run_id: run_id.to_owned(),
+        state,
+        exit_code,
+        blocked_reason,
+        spec_revision,
+        accepted: count(accepted.len()),
+        total: count(required.len()),
+        last_event_seq: u64::try_from(seq).map_err(|_| integrity(format!("seq {seq}")))?,
+        cost_usd,
+        cost_status,
+        remaining_requirements: remaining,
+    })
+}
+
+#[cfg(test)]
+mod tests;

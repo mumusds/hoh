@@ -3,7 +3,7 @@
 
 use super::attempts::{self, NewAttempt};
 use super::decide::child_id;
-use super::writer::{self, Commit, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Commit, Intent, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::protocol::{self, Candidate, Message, MessageKind, RejectionReason};
 use crate::time::rfc3339_utc;
@@ -105,7 +105,7 @@ pub(super) fn claim_next(
             .optional()
             .map_err(sqlite_error)?;
         let Some((message_id, run_id, recipient_role, role_epoch, payload, count)) = due else {
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit_unhooked(tx)?;
             return Ok(None);
         };
         if count >= max_attempts {
@@ -130,7 +130,7 @@ pub(super) fn claim_next(
         .map_err(sqlite_error)?;
         let payload = serde_json::from_str(&payload)
             .map_err(|e| PersistError::IntegrityViolation(format!("outbox {message_id}: {e}")))?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit_unhooked(tx)?;
         return Ok(Some(OutboxRow {
             message_id,
             run_id,
@@ -172,7 +172,7 @@ pub(super) fn unclaim_all(
     for row in rows {
         undo(&tx, row)?;
     }
-    tx.commit().map_err(sqlite_error)
+    super::writer::commit_unhooked(tx)
 }
 
 /// DEAD_LETTER and its `outbox.dead_letter` event, in the caller's transaction.
@@ -195,6 +195,7 @@ fn dead_letter(
         tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Record,
                 project_id,
                 event_id: child_id(message_id, "dead_letter"),
                 run_id,
@@ -262,6 +263,7 @@ pub(super) fn settle(
                 &tx,
                 &Commit {
                     events: vec![NewEvent {
+                        intent: Intent::Record,
                         project_id,
                         event_id: child_id(message_id, &format!("delivered-late/{generation}")),
                         run_id,
@@ -286,7 +288,7 @@ pub(super) fn settle(
         // Settled already, or a late answer of an earlier delivery: the settlement that came first stands.
         _ => {}
     }
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(())
 }
 
@@ -602,6 +604,7 @@ pub(super) fn consume(
                 &tx,
                 &Commit {
                     events: vec![NewEvent {
+                        intent: Intent::Progress,
                         project_id: found.project_id.clone(),
                         event_id: child_id(&message.message_id, &format!("{consumer}/rejected")),
                         run_id: Some(message.run_id.clone()),
@@ -623,6 +626,7 @@ pub(super) fn consume(
         None => {
             let mut events = effect.events.clone();
             events.push(NewEvent {
+                intent: Intent::Progress,
                 project_id: found.project_id.clone(),
                 event_id: child_id(&message.message_id, &format!("{consumer}/applied")),
                 run_id: Some(message.run_id.clone()),
@@ -664,7 +668,7 @@ pub(super) fn consume(
         params![consumer, message.message_id, rfc3339_utc(now), result_json],
     )
     .map_err(sqlite_error)?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(Consumed {
         result_json,
         replayed: false,
@@ -724,6 +728,7 @@ pub(super) fn invalid(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Record,
                 project_id,
                 event_id,
                 run_id: run_id.map(str::to_owned),
@@ -734,7 +739,7 @@ pub(super) fn invalid(
         },
         ctx,
     )?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(done.event_seqs[0])
 }
 

@@ -3,7 +3,7 @@
 //! index), moves the cursor past every event it looked at, and fires the triggers due. Times are the host clock's
 //! (`Context.now`), to the millisecond; an event's own `created_at` is the writer's wall clock and plays no part.
 
-use super::writer::{self, Commit, Ctx, NewEvent};
+use super::writer::{self, Commit, Ctx, Intent, NewEvent};
 use super::{PersistError, sqlite_error, wakes};
 use crate::decision::Context;
 use crate::ids::child_id;
@@ -98,8 +98,7 @@ pub(super) fn step(
     let tx = writer::begin(conn, ctx)?;
     let (project_id, high, caught_up) = take_in_batch(&tx, run_id, context, ctx)?;
     if !caught_up {
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit(tx, ctx)?;
         return Ok(None);
     }
     let (fired, events, verdict) = fire(&tx, &project_id, run_id, context, ctx)?;
@@ -130,8 +129,7 @@ pub(super) fn step(
             ctx,
         )?;
     }
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     // Then the outputs of its turns, in jobs of their own ([`dispose`]), after the judgement: a probe that settled
     // releases its claims before its answer is disposed of (decision 5, -454).
     Ok(Some(Supervised {
@@ -172,8 +170,7 @@ pub(super) fn dispose(
                 },
                 ctx,
             )?;
-            ctx.before_commit()?;
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit(tx, ctx)?;
         }
     }
     Ok(more)
@@ -230,6 +227,7 @@ fn close(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id,
                 event_id: child_id(run_id, &format!("supervisor/closed/{last}")),
                 run_id: Some(run_id.to_owned()),
@@ -240,8 +238,7 @@ fn close(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)
+    super::writer::commit(tx, ctx)
 }
 
 /// Run `run_id`'s supervisor step failed with `error`: `supervisor.step_failed{error}` in a transaction of its own,
@@ -279,6 +276,7 @@ pub(super) fn step_failed(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Record,
                 project_id,
                 event_id,
                 run_id: Some(run_id.to_owned()),
@@ -289,8 +287,7 @@ pub(super) fn step_failed(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -613,6 +610,7 @@ fn fire(
         return Ok((fired, events, None));
     }
     let event = |id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),

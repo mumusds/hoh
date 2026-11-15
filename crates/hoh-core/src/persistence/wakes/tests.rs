@@ -4,7 +4,9 @@
 
 use crate::decision::Context;
 use crate::delivery::Clock;
-use crate::persistence::{Allocated, Commit, NewEvent, Options, Store, StoreClock, selftest};
+use crate::persistence::{
+    Allocated, Commit, Intent, NewEvent, Options, Store, StoreClock, selftest,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -98,6 +100,7 @@ async fn event(store: &Store, run: &str, id: &str, kind: &str, payload: Value) -
     store
         .commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: id.to_owned(),
                 run_id: Some(run.to_owned()),
@@ -1997,6 +2000,7 @@ async fn a_turns_assignment_carries_its_wake_its_nonce_and_a_bounded_summary() -
         .commit(Commit {
             events: (0..60)
                 .map(|i| NewEvent {
+                    intent: Intent::Progress,
                     project_id: "p1".to_owned(),
                     event_id: format!("nd/{i}"),
                     run_id: Some("R".to_owned()),
@@ -2640,6 +2644,7 @@ async fn a_turns_summary_bounds_its_tasks_and_other_wakes_and_keeps_every_snapsh
         .commit(Commit {
             events: (0..60)
                 .map(|i| NewEvent {
+                    intent: Intent::Progress,
                     project_id: "p1".to_owned(),
                     event_id: format!("nd/{i}"),
                     run_id: Some("R".to_owned()),
@@ -2647,6 +2652,7 @@ async fn a_turns_summary_bounds_its_tasks_and_other_wakes_and_keeps_every_snapsh
                     payload: json!({"task_id": format!("T{i}"), "fingerprint": "many"}),
                 })
                 .chain((0..55).map(|i| NewEvent {
+                    intent: Intent::Progress,
                     project_id: "p1".to_owned(),
                     event_id: format!("other/{i}"),
                     run_id: Some("R".to_owned()),
@@ -3574,6 +3580,7 @@ async fn a_disposal_job_is_budgeted_by_the_snapshots_its_decisions_compare() -> 
             .commit(Commit {
                 events: (0..1000)
                     .map(|i| NewEvent {
+                        intent: Intent::Progress,
                         project_id: "p1".to_owned(),
                         event_id: format!("nd/{c}/{i}"),
                         run_id: Some("R".to_owned()),

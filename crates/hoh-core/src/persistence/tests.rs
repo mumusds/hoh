@@ -50,6 +50,7 @@ fn seed(path: &Path) -> R {
 
 fn event(id: &str) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: "p1".to_owned(),
         event_id: id.to_owned(),
         run_id: Some("r1".to_owned()),
@@ -608,6 +609,12 @@ async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
                 "UPDATE runs SET state = ?1, revision = 0, resume_state = ?2, blocked_reason = ?3 WHERE run_id = 'r1'",
                 rusqlite::params![from.as_str(), resume, blocked],
             )?;
+            // Revision 0 again: the run.result of an earlier pair, named by its revision (docs/adr/ADR-031.md decision
+            // 3), goes with the state it was placed in.
+            conn.execute(
+                "DELETE FROM events WHERE run_id = 'r1' AND kind = 'run.result'",
+                [],
+            )?;
             let result = store
                 .commit(Commit {
                     cas: vec![cas(0, to)],
@@ -668,6 +675,7 @@ async fn a_run_is_unblocked_only_from_blocked_with_every_claim_released() -> R {
         })
     };
     let release = || NewEvent {
+        intent: Intent::Progress,
         project_id: "p1".to_owned(),
         event_id: "release-1".to_owned(),
         run_id: Some("r1".to_owned()),

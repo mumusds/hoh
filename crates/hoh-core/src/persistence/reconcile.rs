@@ -3,7 +3,7 @@
 //! disposition, its effects, its task and its events, between a `reconcile.started` and a `reconcile.completed`.
 
 use super::attempts::{self, AttemptFacts, AttemptMove};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::{AttemptState, Lifecycle};
@@ -281,6 +281,7 @@ fn host_event(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: project_id.to_owned(),
                 event_id: child_id(&format!("host-epoch/{host_epoch}"), kind),
                 run_id: None,
@@ -291,7 +292,7 @@ fn host_event(
         },
         ctx,
     )?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
     ))
@@ -492,6 +493,7 @@ fn apply(
         task_events.push(decision);
     }
     let mut events = vec![NewEvent {
+        intent: Intent::Progress,
         project_id: row.project_id.clone(),
         event_id: child_id(&row.attempt_id, &format!("{cause}/{pass}/attempt")),
         run_id: Some(row.run_id.clone()),
@@ -525,6 +527,7 @@ fn apply(
     };
     if let Some(payload) = diagnostic {
         events.push(NewEvent {
+            intent: Intent::Record,
             project_id: row.project_id.clone(),
             event_id: child_id(&row.attempt_id, &format!("{cause}/{pass}/diagnostic")),
             run_id: Some(row.run_id.clone()),
@@ -542,7 +545,7 @@ fn apply(
         },
         ctx,
     )?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
     ))

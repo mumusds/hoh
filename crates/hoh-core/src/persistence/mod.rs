@@ -25,6 +25,7 @@ mod control;
 mod decide;
 mod evidence;
 mod handover;
+pub mod hold;
 mod inputs;
 mod issues;
 mod join;
@@ -52,7 +53,7 @@ pub use completion::{
     WriterCompleted, WriterCompletion, WriterOutcome,
 };
 pub use control::{CancelPass, Finished, PauseStep};
-pub use evidence::{AcceptanceKey, AcceptanceRow, Recording};
+pub use evidence::{AcceptanceKey, AcceptanceRow, Recording, RecordingSource};
 pub use handover::{SessionStart, package_bytes};
 pub use leases::{Grant, LEASE_TTL, LeaseView};
 pub use outbox::{ConsumeEffect, Consumed, OutboxRow, Settlement, backoff};
@@ -96,7 +97,9 @@ pub use commands::{
 };
 pub use decide::{Decided, Fenced};
 pub use inputs::{InputMove, InputRow, NewInput};
-pub use writer::{Change, Claimed, Commit, Committed, Entity, NewEvent, NewOutbox, StateCas};
+pub use writer::{
+    Change, Claimed, Commit, Committed, Entity, Intent, NewEvent, NewOutbox, StateCas,
+};
 
 use crate::protocol::{ErrorCode, RejectionReason};
 use rusqlite::{Connection, OpenFlags};
@@ -167,6 +170,10 @@ pub trait FaultHooks: Send + Sync + std::fmt::Debug {
     fn manifest_at(&self, _step: crate::compat_manifest::Step) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// A request of the writer named `job` was answered Held for run `run`: the insert function refused its progress
+    /// because the run has stopped (docs/adr/ADR-031.md correction D, rule 2). A test's hook records when.
+    fn held(&self, _job: &'static str, _run: &str) {}
 }
 
 /// A point of a write request (REQ-036, ADR-019 decision 1), in order: the transaction began (its host fence
@@ -285,6 +292,20 @@ pub enum PersistError {
     /// Evidence the store does not take: its candidate is not frozen here, or its producer is not a qa or reviewer
     /// attempt of the candidate's run (docs/adr/ADR-027.md principle two); nothing was written.
     EvidenceRefused(String),
+    /// An event of run `run`, stopped in `state`, that is neither its result, a command's nor a Record: refused by the
+    /// only events insert, and the transaction rolled back (docs/adr/ADR-031.md correction D, rule 1). It never leaves
+    /// the writer: its answer turns it into [`PersistError::Held`].
+    RunStopped {
+        run: String,
+        state: crate::protocol::RunState,
+    },
+    /// A write of the progress of run `run`, which stopped in `state` (published by its `run.result`), rolled back
+    /// (correction D, rule 2): no failure — nothing is counted and nothing was written; the obligation stays for when
+    /// the run leaves `state`, if it does. Recorders of failures refuse it ([`hold::Failure`]).
+    Held {
+        run: String,
+        state: crate::protocol::RunState,
+    },
     /// Any other SQLite or I/O failure.
     Storage(String),
 }
@@ -418,6 +439,16 @@ impl std::fmt::Display for PersistError {
             } => write!(
                 f,
                 "candidate {candidate_id} is content run {run_id} froze: make a new commit to freeze it for this run"
+            ),
+            PersistError::RunStopped { run, state } => write!(
+                f,
+                "RUN_STOPPED: run {run} stopped in {}: its progress is not written",
+                crate::lifecycle::Lifecycle::as_str(*state)
+            ),
+            PersistError::Held { run, state } => write!(
+                f,
+                "held: run {run} stopped in {}: nothing was written",
+                crate::lifecycle::Lifecycle::as_str(*state)
             ),
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
         }
@@ -795,6 +826,7 @@ impl Store {
         configure(&conn, &options, true)?;
         migrate(&conn, migrations)?;
         guard_append_only(&conn)?;
+        hold::install(&conn)?;
         let (committed, watermark) = tokio::sync::watch::channel(commands::max_seq(&conn)?);
         let writer = writer::Writer::spawn(conn, &options, committed)?;
         Ok(Store {
@@ -1357,11 +1389,13 @@ impl Store {
     }
 
     /// The run's last cancel transaction once none of its attempts starts or runs (ADR-021 decision 8f), with its
-    /// workspace record.
+    /// workspace record; its open rounds close in it unless their candidate is in `pending`, the candidates with check
+    /// records still to be recorded, and was not superseded ([`Finished::Recovering`], docs/adr/ADR-031.md decision 4).
     pub async fn finish_cancel(
         &self,
         run_id: &str,
         workspace: serde_json::Value,
+        pending: std::collections::BTreeSet<String>,
         at: std::time::SystemTime,
     ) -> Result<Finished, PersistError> {
         match self
@@ -1369,6 +1403,7 @@ impl Store {
             .control(control::ControlJob::FinishCancel {
                 run_id: run_id.to_owned(),
                 workspace,
+                pending,
                 at,
             })
             .await?
@@ -1459,6 +1494,7 @@ impl Store {
             .ok_or_else(|| PersistError::IntegrityViolation(format!("no task {task_id}")))?;
         self.commit(Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id,
                 event_id: crate::ids::child_id(task_id, &format!("refusal_cleared/{decision_id}")),
                 run_id: Some(run_id),
@@ -1935,15 +1971,19 @@ impl Reader {
     ) -> Result<std::collections::BTreeSet<String>, PersistError> {
         let mut statement = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
                  WHERE f.kind = 'candidate.reconcile_failed' \
                  AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
                    AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
-                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.run_id = f.run_id AND s.kind = 'candidate.stale' \
+                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
                    AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
                    AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
-            )
+                hold::of_run(
+                    "s",
+                    "(SELECT run_id FROM candidates WHERE candidate_id = json_extract(f.payload_json, '$.candidate_id'))"
+                )
+            ))
             .map_err(sqlite_error)?;
         let rows = statement
             .query_map([], |r| r.get(0))
@@ -1953,18 +1993,30 @@ impl Reader {
 
     /// Whether candidate `candidate_id`'s records are recovered at the host's start (docs/adr/ADR-028.md decision 16):
     /// it is frozen here and was not judged unrecoverable (its pending facts are kept for audit only, -1252).
+    ///
+    /// History is always recovered (a Record of a stopped run, project-scoped); a live obligation only while its run is
+    /// not stopped (docs/adr/ADR-031.md correction D, A2 and A3).
     pub fn start_recovery_wanted(&self, candidate_id: &str) -> Result<bool, PersistError> {
-        self.conn
+        let wanted: bool = self
+            .conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM candidates WHERE candidate_id = ?1) \
-                 AND NOT EXISTS(SELECT 1 FROM events WHERE kind = 'candidate.stale' \
-                   AND run_id = (SELECT run_id FROM candidates WHERE candidate_id = ?1) \
-                   AND json_extract(payload_json, '$.reason') = 'evidence_unrecoverable' \
-                   AND json_extract(payload_json, '$.candidate_id') = ?1)",
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM candidates WHERE candidate_id = ?1) \
+                     AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
+                       AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+                       AND json_extract(s.payload_json, '$.candidate_id') = ?1)",
+                    hold::of_run(
+                        "s",
+                        "(SELECT run_id FROM candidates WHERE candidate_id = ?1)"
+                    )
+                ),
                 rusqlite::params![candidate_id],
                 |r| r.get(0),
             )
-            .map_err(sqlite_error)
+            .map_err(sqlite_error)?;
+        Ok(wanted
+            && (!verification::live_obligation(&self.conn, candidate_id)?
+                || !self.candidate_held(candidate_id)?))
     }
 
     /// Run `run_id`'s wait-for view (docs/adr/ADR-028.md decision 13): one edge, sender role to recipient role, per
@@ -2052,15 +2104,18 @@ impl Reader {
         &self,
         project_id: &str,
     ) -> Result<Vec<String>, PersistError> {
+        // A stopped run is not picked (docs/adr/ADR-031.md correction D): its cancel closes its rounds in its own
+        // transaction; only a run cancelled before its result existed is left to this reconcile.
         let mut statement = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT DISTINCT r.run_id FROM runs r JOIN events o ON o.run_id = r.run_id \
                  AND o.kind = 'verification.round_opened' WHERE r.project_id = ?1 AND r.state = 'CANCELLED' \
                  AND NOT EXISTS(SELECT 1 FROM events c WHERE c.run_id = r.run_id AND c.kind = 'verification.round_closed' \
                    AND json_extract(c.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id')) \
-                 ORDER BY r.run_id",
-            )
+                 AND {} ORDER BY r.run_id",
+                hold::not_held("r.run_id")
+            ))
             .map_err(sqlite_error)?;
         let rows = statement
             .query_map(rusqlite::params![project_id], |r| r.get(0))
@@ -2083,21 +2138,21 @@ impl Reader {
     /// Whether candidate `candidate_id`'s pending check records are to be recovered now (docs/adr/ADR-028.md decision
     /// 11): it has a verification round not closed, it is VERIFYING, REJECTED or INVALID, and no persistent fact says it
     /// was superseded (a later freeze listed it, or `candidate.stale`, an unrecoverable one's included).
+    ///
+    /// A live obligation of a stopped run waits until the run leaves its stop (docs/adr/ADR-031.md correction D, A1).
     pub fn recovery_due(&self, candidate_id: &str) -> Result<bool, PersistError> {
+        Ok(verification::live_obligation(&self.conn, candidate_id)?
+            && !self.candidate_held(candidate_id)?)
+    }
+
+    /// Whether candidate `candidate_id`'s run is stopped (correction D).
+    fn candidate_held(&self, candidate_id: &str) -> Result<bool, PersistError> {
         self.conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.candidate_id = ?1 \
-                   AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
-                 AND EXISTS(SELECT 1 FROM events o WHERE o.kind = 'verification.round_opened' \
-                   AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM events x \
-                     WHERE x.kind = 'verification.round_closed' \
-                     AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
-                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
-                   AND s.run_id = (SELECT run_id FROM candidates WHERE candidate_id = ?1) \
-                   AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
-                 AND NOT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
-                   WHERE f.kind = 'candidate.frozen' AND f.run_id = (SELECT run_id FROM candidates \
-                   WHERE candidate_id = ?1) AND v.value = ?1)",
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.candidate_id = ?1 AND NOT ({}))",
+                    hold::not_held("c.run_id")
+                ),
                 rusqlite::params![candidate_id],
                 |r| r.get(0),
             )

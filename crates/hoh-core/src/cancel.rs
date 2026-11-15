@@ -196,6 +196,12 @@ pub trait Processes: Send + Sync {
     /// The workspace's record, taken before the run is CANCELLED (ADR-021 decision 8g), and before an interrupted
     /// writer's lease goes (docs/adr/ADR-024.md decision 9); called on a blocking thread.
     fn workspace(&self) -> serde_json::Value;
+    /// The candidates with check records still to be recorded (`.hoh/pending/`), whose rounds the cancel's last
+    /// transaction does not close (docs/adr/ADR-031.md decision 4); called on a blocking thread. None from processes of
+    /// no project (a test's).
+    fn pending_candidates(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
 }
 
 /// The cancels in progress: where each attempt's escalation stands between passes.
@@ -308,9 +314,18 @@ impl Canceller {
         }
         let workspace = match last_record {
             Some(record) => record,
-            None => workspace_of(processes).await?,
+            None => workspace_of(processes.clone()).await?,
         };
-        store.finish_cancel(run_id, workspace, clock.now()).await
+        let pending = tokio::task::spawn_blocking(move || processes.pending_candidates())
+            .await
+            .map_err(|e| {
+                crate::persistence::PersistError::IntegrityViolation(format!(
+                    "the pending records' look-up failed: {e}"
+                ))
+            })?;
+        store
+            .finish_cancel(run_id, workspace, pending, clock.now())
+            .await
     }
 }
 

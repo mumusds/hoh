@@ -3,7 +3,7 @@
 //! caller's transaction; a CURRENT row made STALE once its candidate is superseded.
 
 use super::runner::{ArtifactRow, artifact_id};
-use super::writer::{self, Commit, NewEvent};
+use super::writer::{self, Commit, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::verification::classify::Report;
@@ -135,6 +135,7 @@ pub(super) fn intake_in(
         },
     )?;
     let event = |name: &str, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.clone(),
         event_id: child_id(&report_id, name),
         run_id: Some(run_id.clone()),
@@ -458,12 +459,15 @@ fn stale_reason(
 ) -> Result<Option<&'static str>, PersistError> {
     let (superseded, stale): (bool, bool) = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM events f WHERE f.kind = 'candidate.frozen' AND f.run_id = ?1 \
-               AND json_extract(f.payload_json, '$.candidate_id') <> ?2 \
-               AND f.seq > coalesce((SELECT max(o.seq) FROM events o WHERE o.kind = 'candidate.frozen' \
-                 AND o.run_id = ?1 AND json_extract(o.payload_json, '$.candidate_id') = ?2), 0)), \
-             EXISTS(SELECT 1 FROM events s WHERE s.run_id = ?1 AND s.kind = 'candidate.stale' \
-               AND json_extract(s.payload_json, '$.candidate_id') = ?2)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM events f WHERE f.kind = 'candidate.frozen' AND f.run_id = ?1 \
+                   AND json_extract(f.payload_json, '$.candidate_id') <> ?2 \
+                   AND f.seq > coalesce((SELECT max(o.seq) FROM events o WHERE o.kind = 'candidate.frozen' \
+                     AND o.run_id = ?1 AND json_extract(o.payload_json, '$.candidate_id') = ?2), 0)), \
+                 EXISTS(SELECT 1 FROM events s WHERE {} AND s.kind = 'candidate.stale' \
+                   AND json_extract(s.payload_json, '$.candidate_id') = ?2)",
+                super::hold::of_run("s", "?1")
+            ),
             params![run_id, candidate],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -563,10 +567,9 @@ pub(super) fn record(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        super::issues::settle_all(&tx, &run_id)?;
+        super::issues::settle_all(&tx, &run_id, Intent::Progress)?;
     }
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(done)
 }
 
@@ -601,17 +604,24 @@ pub(super) fn stale_reports(
     )
     .map_err(sqlite_error)?;
     // Each report goes STALE once, so the first of those made STALE names the event.
-    tx.execute(
-        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
-         SELECT project_id, ?1, run_id, 'report.stale', ?2, ?3 FROM runs WHERE run_id = ?4",
-        params![
-            child_id(first, "made-stale"),
-            json!({"report_ids": flipped, "reason": reason, "by": by}).to_string(),
-            crate::time::now_rfc3339(),
-            run_id
-        ],
-    )
-    .map_err(sqlite_error)?;
+    let project_id: String = tx
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    writer::insert_event(
+        tx,
+        &NewEvent {
+            project_id,
+            event_id: child_id(first, "made-stale"),
+            run_id: Some(run_id.to_owned()),
+            kind: "report.stale".to_owned(),
+            payload: json!({"report_ids": flipped, "reason": reason, "by": by}),
+            intent: Intent::Progress,
+        },
+    )?;
     Ok(flipped)
 }
 

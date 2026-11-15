@@ -2,7 +2,7 @@
 //! transaction with one `plan.imported` event, or nothing at all (REQ-038, AC-038-03).
 
 use super::decide::child_id;
-use super::writer::{self, Change, Commit, Entity, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Entity, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::dag;
 use crate::schedule::DEFAULT_COST;
@@ -217,6 +217,7 @@ pub(super) fn import(
             change: Change::Touch(Entity::Run),
         }],
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id,
             event_id: child_id(run_id, &format!("plan/{}", base + 1)),
             run_id: Some(run_id.to_owned()),
@@ -226,7 +227,7 @@ pub(super) fn import(
         outbox: Vec::new(),
     };
     let done = writer::write(&tx, &commit, ctx)?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(Imported {
         task_ids,
         run_revision: done.revisions[0],

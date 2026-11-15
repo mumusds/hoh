@@ -8,7 +8,7 @@
 //! 4. finished: the attempt SETTLED (its task IMPLEMENTED) or FAILED (its task READY).
 
 use super::attempts::{self, AttemptFacts, AttemptMove};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::{AttemptState, Lifecycle};
@@ -405,7 +405,7 @@ pub(super) fn run(
                     )
                     .map_err(sqlite_error)?;
             }
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit_unhooked(tx)?;
             Ok(RunnerDone::Renewed(renewed))
         }
         RunnerJob::Ack(message_id) => {
@@ -417,7 +417,7 @@ pub(super) fn run(
                     params![message_id],
                 )
                 .map_err(sqlite_error)?;
-            tx.commit().map_err(sqlite_error)?;
+            super::writer::commit_unhooked(tx)?;
             Ok(RunnerDone::Applied(changed == 1))
         }
     }
@@ -498,15 +498,17 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)
     };
+    // A stopped run is not picked (docs/adr/ADR-031.md correction D): no step of the supervisor may write for it.
     let supervised = {
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT r.run_id FROM runs r WHERE r.project_id = ?1 AND (r.state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED') \
                  OR EXISTS (SELECT 1 FROM supervisor_triggers t WHERE t.run_id = r.run_id AND t.state = 'PENDING') \
                  OR EXISTS (SELECT 1 FROM events e WHERE e.run_id = r.run_id AND e.kind IN (?2, ?3) AND e.seq > \
                    (SELECT coalesce(max(c.seq), 0) FROM events c WHERE c.run_id = r.run_id AND c.kind = ?4))) \
-                 ORDER BY r.created_at, r.run_id",
-            )
+                 AND {} ORDER BY r.created_at, r.run_id",
+                super::hold::not_held("r.run_id")
+            ))
             .map_err(sqlite_error)?;
         statement
             .query_map(
@@ -578,6 +580,7 @@ fn task_of(
 
 fn event(project_id: &str, run_id: &str, id: String, kind: &str, payload: Value) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),
@@ -678,8 +681,7 @@ fn received(
             });
         }
         writer::write(&tx, &commit, ctx)?;
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit(tx, ctx)?;
         return Ok(false);
     }
     tx.execute(
@@ -727,8 +729,7 @@ fn received(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -842,8 +843,7 @@ fn effect(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -1054,8 +1054,7 @@ fn running(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 
@@ -1117,8 +1116,7 @@ fn finished(
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
     let applied = finished_in(&tx, attempt_id, ending, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(applied)
 }
 
@@ -1255,6 +1253,7 @@ pub(super) fn finished_in(
     }
     for (key, kind, payload) in &ending.observed.events {
         commit.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.clone(),
             event_id: crate::ids::child_id(attempt_id, key),
             run_id: Some(run_id.clone()),
@@ -1269,6 +1268,7 @@ pub(super) fn finished_in(
     }
     if !started.is_empty() && (unknown || cancelled) {
         commit.events.push(NewEvent {
+            intent: Intent::Record,
             project_id: project_id.clone(),
             event_id: crate::ids::child_id(attempt_id, "runner/unknown-effect"),
             run_id: Some(run_id.clone()),

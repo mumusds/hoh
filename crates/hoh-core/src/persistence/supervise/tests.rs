@@ -2,7 +2,7 @@
 
 use crate::decision::Context;
 use crate::delivery::Clock;
-use crate::persistence::{Commit, NewEvent, Options, Store, StoreClock, selftest};
+use crate::persistence::{Commit, Intent, NewEvent, Options, Store, StoreClock, selftest};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -118,6 +118,7 @@ async fn events(store: &Store, tag: &str, list: &[(&str, Value)]) -> R<Vec<i64>>
                 .iter()
                 .enumerate()
                 .map(|(i, (kind, payload))| NewEvent {
+                    intent: Intent::Progress,
                     project_id: "p1".to_owned(),
                     event_id: format!("{tag}/{i}"),
                     run_id: Some("R".to_owned()),
@@ -1209,6 +1210,7 @@ async fn a_run_with_no_cursor_starts_at_its_own_first_event() -> R {
             .commit(Commit {
                 events: (0..1000)
                     .map(|i| NewEvent {
+                        intent: Intent::Progress,
                         project_id: "p1".to_owned(),
                         event_id: format!("other/{n}/{i}"),
                         run_id: Some("O".to_owned()),
@@ -1281,6 +1283,7 @@ async fn evidence_whose_source_changed_wakes_the_commander_in_the_step_that_sees
             observations: Vec::new(),
             rows: Vec::new(),
             integrity: vec!["source changed: src/lib.rs".to_owned()],
+            source: crate::persistence::RecordingSource::Run,
         })
         .await?;
     let seq = count(

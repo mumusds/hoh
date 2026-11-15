@@ -7,7 +7,7 @@
 //! counting closes what a host that stopped or crashed left open.
 
 use super::leases::{self, OpenSuite};
-use super::writer::{self, Commit, Ctx, NewEvent};
+use super::writer::{self, Commit, Ctx, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::time::rfc3339_utc;
@@ -152,6 +152,7 @@ pub(super) fn run(
 
 fn event(project_id: &str, event_id: String, kind: &str, payload: Value) -> NewEvent {
     NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id,
         run_id: None,
@@ -265,8 +266,7 @@ pub(super) fn begin(
             ctx,
         )?;
     }
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(match holder {
         Some(_) => Admission::Deferred(suite_id),
         None => Admission::Started(suite_id),
@@ -347,8 +347,7 @@ pub(super) fn publish(
             },
             ctx,
         )?;
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)
+        super::writer::commit(tx, ctx)
     })();
     Ok(match committed {
         Ok(()) => Published::Replaced(manifest),
@@ -385,8 +384,7 @@ pub(super) fn end(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(true)
 }
 

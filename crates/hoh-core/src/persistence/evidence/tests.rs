@@ -153,6 +153,7 @@ fn recording(record_id: &str, candidate: &str, producer: &str) -> Recording {
             failing: Vec::new(),
         }],
         integrity: Vec::new(),
+        source: crate::persistence::RecordingSource::Run,
     }
 }
 

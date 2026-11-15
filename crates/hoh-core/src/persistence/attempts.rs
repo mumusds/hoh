@@ -11,7 +11,7 @@
 
 use super::decide::child_id;
 use super::leases;
-use super::writer::{self, Commit, Entity, NewEvent};
+use super::writer::{self, Commit, Entity, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::lifecycle::{self, AttemptState, Lifecycle};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -248,7 +248,7 @@ pub(super) fn apply(
             )?
         }
     }
-    tx.commit().map_err(sqlite_error)
+    super::writer::commit_unhooked(tx)
 }
 
 /// The terminal move `m`, or CANCELLED with its facts if a cancel was accepted first; the state written.
@@ -285,7 +285,7 @@ pub(super) fn end(
             )
             .map_err(sqlite_error)?;
         }
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit_unhooked(tx)?;
         Ok(m.to)
     })
 }
@@ -339,6 +339,7 @@ fn event(
     let (project_id, run_id) = owner(tx, task_id)?;
     let commit = Commit {
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id,
             event_id,
             run_id: Some(run_id),
@@ -518,6 +519,7 @@ pub(super) fn move_attempt(
                 tx,
                 &super::writer::Commit {
                     events: vec![super::writer::NewEvent {
+                        intent: super::writer::Intent::Progress,
                         project_id,
                         event_id: crate::ids::child_id(&m.attempt_id, "implemented"),
                         run_id: Some(run_id),

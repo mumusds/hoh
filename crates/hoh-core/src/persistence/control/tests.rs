@@ -4,7 +4,7 @@ use crate::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
 use crate::delivery::Clock;
 use crate::lifecycle;
 use crate::persistence::{
-    AttemptRow, CommandOutcome, Finished, NewEvent, NewOutbox, Options, RunTarget, Store,
+    AttemptRow, CommandOutcome, Finished, Intent, NewEvent, NewOutbox, Options, RunTarget, Store,
     SubmitCommand, selftest,
 };
 use crate::protocol::RunState;
@@ -56,6 +56,7 @@ fn cancel_run(revision: i64) -> SubmitCommand {
         payload_sha256: format!("{:064}", 9),
         target: RunTarget::To(RunState::CancelRequested),
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: "e-cancel".to_owned(),
             run_id: Some("R".to_owned()),
@@ -202,6 +203,7 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
             }
             Finished::Cancelled => break,
             Finished::NotCancelling => return Err("not cancelling".into()),
+            Finished::Recovering => return Err("no record is pending here".into()),
         }
         if samples.len() > 20 {
             return Err(format!("never ended: {samples:?}").into());
@@ -289,7 +291,12 @@ async fn a_cancel_is_not_finished_while_an_attempt_still_runs_however_it_is_aske
     store.submit_command(cancel_run(1)).await?;
     let before = count(&path, "SELECT count(*) FROM events")?;
     let finished = store
-        .finish_cancel("R", json!({"workspace_sha256": "fake"}), SystemTime::now())
+        .finish_cancel(
+            "R",
+            json!({"workspace_sha256": "fake"}),
+            std::collections::BTreeSet::new(),
+            SystemTime::now(),
+        )
         .await?;
     assert_eq!(finished, Finished::Running(1));
     let states: (String, String, String) = Connection::open(&path)?.query_row(
@@ -319,6 +326,7 @@ fn command(kind: &str, key: &str, revision: i64, target: RunTarget) -> SubmitCom
         payload_sha256: format!("{:064}", key.len()),
         target,
         event: NewEvent {
+            intent: Intent::Progress,
             event_id: format!("e-{key}"),
             kind: format!("run.{}", kind.to_lowercase()),
             ..cancel_run(revision).event
@@ -428,6 +436,7 @@ async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte
     let start = |key: &str, revision: i64| SubmitCommand {
         run_id: "R-new".to_owned(),
         event: NewEvent {
+            intent: Intent::Progress,
             run_id: Some("R-new".to_owned()),
             ..command("StartRun", key, revision, RunTarget::To(RunState::Created)).event
         },
@@ -866,7 +875,12 @@ async fn a_cancelled_attempt_whose_effect_is_unknown_ends_the_same_however_it_en
         )?;
         assert_eq!(keys, r#"["A1/work"]"#, "by the reconcile: {by_reconcile}");
         store
-            .finish_cancel("R", json!({"workspace_sha256": "fake"}), SystemTime::now())
+            .finish_cancel(
+                "R",
+                json!({"workspace_sha256": "fake"}),
+                std::collections::BTreeSet::new(),
+                SystemTime::now(),
+            )
             .await?;
         let ended: (String, String, String, String) = conn.query_row(
             "SELECT r.state, t.state, a.state, e.state FROM runs r, tasks t, attempts a, effects e \
@@ -1251,5 +1265,108 @@ async fn a_run_record_is_taken_again_when_a_pass_came_after_the_writers() -> R {
     )?)?;
     assert_eq!(run["workspace_sha256"], "record-2", "{run}");
     assert_eq!(records.lock().map(|n| *n).unwrap_or(0), 2);
+    Ok(())
+}
+
+/// R cancelling with nothing running: T1's A1 ended; round rd1 open on C1 with its verifier tasks Q and V, whose
+/// attempts ended CANCELLED, and their handoffs DELIVERED.
+const OPEN_ROUND: &str = "
+UPDATE attempts SET state = 'CANCELLED', ended_at = '2026-11-07T00:00:05Z' WHERE attempt_id = 'A1';
+UPDATE runs SET state = 'CANCEL_REQUESTED', revision = 2, resume_state = 'RUNNING' WHERE run_id = 'R';
+INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
+  ('Q', 'R', 's1', 'RUNNING', 2, 'qa', 3, 1), ('V', 'R', 's1', 'RUNNING', 2, 'reviewer', 4, 1);
+INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at, ended_at) VALUES
+  ('QA1', 'Q', 'CANCELLED', 1, 1, 1, '2026-11-07T00:00:01Z', '2026-11-07T00:00:05Z'),
+  ('RV1', 'V', 'CANCELLED', 1, 1, 1, '2026-11-07T00:00:01Z', '2026-11-07T00:00:05Z');
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+  ('p1', 'rd1/opened', 'R', 'verification.round_opened',
+   '{\"round_id\": \"rd1\", \"candidate_id\": \"C1\", \"tasks\": {\"qa\": \"Q\", \"reviewer\": \"V\"}, \"source_task_ids\": [\"T1\"]}',
+   '2026-11-07T00:00:00Z');
+INSERT INTO artifacts(artifact_id, sha256, path, bytes, mime) VALUES
+  ('pkg', printf('%064d', 9), 'package.json', 1, 'application/json');
+INSERT INTO handoffs(handoff_id, run_id, from_role, to_role, role_epoch, package_artifact_id, state, created_at) VALUES
+  ('rd1/verify/qa', 'R', 'runtime', 'qa', 1, 'pkg', 'DELIVERED', '2026-11-07T00:00:00Z'),
+  ('rd1/verify/reviewer', 'R', 'runtime', 'reviewer', 1, 'pkg', 'DELIVERED', '2026-11-07T00:00:00Z');
+";
+
+#[tokio::test]
+async fn a_cancel_closes_its_open_rounds_superseded_in_its_own_last_transaction() -> R {
+    // docs/adr/ADR-031.md decision 4 (M2T13D-302): the cancel's last transaction cancels the tasks, closes every open
+    // round as superseded and rejects its handoffs, then writes run.cancelled, and its run.result last; nothing of the
+    // run is written after it. A round whose candidate's records are still pending, not superseded, holds it back.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!("{WORLD}{OPEN_ROUND}"))?;
+    let before = count(&path, "SELECT max(seq) FROM events")?;
+    // C1's check records still pending and C1 not superseded: the round waits for them, so nothing is written and the
+    // run stays cancelling.
+    let waiting = store
+        .finish_cancel(
+            "R",
+            json!({"workspace_sha256": "fake"}),
+            ["C1".to_owned()].into(),
+            SystemTime::now(),
+        )
+        .await?;
+    assert_eq!(waiting, Finished::Recovering);
+    assert_eq!(count(&path, "SELECT max(seq) FROM events")?, before);
+    assert_eq!(run_state(&path)?.0, "CANCEL_REQUESTED");
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM tasks WHERE state = 'CANCELLED'"
+        )?,
+        0
+    );
+    // Recorded since: the next cancel step ends it.
+    let finished = store
+        .finish_cancel(
+            "R",
+            json!({"workspace_sha256": "fake"}),
+            std::collections::BTreeSet::new(),
+            SystemTime::now(),
+        )
+        .await?;
+    assert_eq!(finished, Finished::Cancelled);
+    let kinds: Vec<(i64, String, Option<String>)> = {
+        let conn = Connection::open(&path)?;
+        let mut statement = conn.prepare(
+            "SELECT seq, kind, json_extract(payload_json, '$.verdict') FROM events WHERE seq > ?1 ORDER BY seq",
+        )?;
+        statement
+            .query_map([before], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let at = |kind: &str| kinds.iter().position(|(_, k, _)| k == kind);
+    let (closed, cancelled, result) = (
+        at("verification.round_closed"),
+        at("run.cancelled"),
+        at("run.result"),
+    );
+    assert!(
+        closed.is_some() && closed < cancelled && cancelled < result,
+        "{kinds:?}"
+    );
+    assert_eq!(result, Some(kinds.len() - 1), "{kinds:?}");
+    assert_eq!(
+        closed.and_then(|i| kinds[i].2.clone()).as_deref(),
+        Some("superseded")
+    );
+    let states: (String, String, String, String) = Connection::open(&path)?.query_row(
+        "SELECT (SELECT group_concat(DISTINCT state) FROM tasks WHERE task_id IN ('Q', 'V')), \
+         (SELECT group_concat(DISTINCT state) FROM handoffs), (SELECT state FROM runs WHERE run_id = 'R'), \
+         (SELECT kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1)",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    assert_eq!(
+        states,
+        (
+            "CANCELLED".to_owned(),
+            "REJECTED".to_owned(),
+            "CANCELLED".to_owned(),
+            "run.result".to_owned()
+        )
+    );
     Ok(())
 }

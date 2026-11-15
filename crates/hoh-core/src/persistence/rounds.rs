@@ -7,7 +7,7 @@
 
 use super::decide::{self, LeaseRequest, Leased, child_id};
 use super::leases;
-use super::writer::{self, Change, Commit, Entity, NewEvent, NewOutbox, StateCas};
+use super::writer::{self, Change, Commit, Entity, Intent, NewEvent, NewOutbox, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::decision::Context;
 use crate::protocol::{RunState, SchedulerSettings, TaskState};
@@ -164,7 +164,7 @@ pub(super) fn round(
                 verification = Some((round_id, handoff));
             }
             Some(super::verification::Admission::Refused) => {
-                tx.commit().map_err(sqlite_error)?;
+                super::writer::commit_unhooked(tx)?;
                 return Ok(RoundOutcome::default());
             }
             None => {}
@@ -224,6 +224,7 @@ pub(super) fn round(
     let commit = Commit {
         cas,
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id,
             event_id: child_id(&attempt_id, "round"),
             run_id: Some(run_id.to_owned()),
@@ -272,7 +273,7 @@ pub(super) fn round(
         )
         .map_err(sqlite_error)?;
     }
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(RoundOutcome {
         dispatched: Some(Dispatched {
             task_id: selected.task_id,

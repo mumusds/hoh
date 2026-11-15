@@ -2,7 +2,7 @@
 //! cancel pass over an attempt's processes, and the run's last cancel transaction once nothing of it runs.
 
 use super::attempts::{self, AttemptFacts, AttemptMove};
-use super::writer::{self, Change, Commit, Ctx, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::cancel::{PassEnd, Signal};
 use crate::ids::child_id;
@@ -36,6 +36,10 @@ pub enum Finished {
     Running(usize),
     /// The run is not cancelling (anymore).
     NotCancelling,
+    /// A round of the run cannot close yet: its candidate's check records are still pending and it was not superseded
+    /// (docs/adr/ADR-031.md decision 4). Nothing was written; the run stays CANCEL_REQUESTED until their recovery
+    /// settles it.
+    Recovering,
 }
 
 /// What [`pause_step`] came to.
@@ -60,6 +64,8 @@ pub(super) enum ControlJob {
     FinishCancel {
         run_id: String,
         workspace: Value,
+        /// The candidates with check records still to be recorded (`.hoh/pending/`).
+        pending: std::collections::BTreeSet<String>,
         at: SystemTime,
     },
 }
@@ -85,8 +91,9 @@ pub(super) fn run(
         ControlJob::FinishCancel {
             run_id,
             workspace,
+            pending,
             at,
-        } => finish_cancel(conn, &run_id, &workspace, at, ctx).map(ControlDone::Finished),
+        } => finish_cancel(conn, &run_id, &workspace, &pending, at, ctx).map(ControlDone::Finished),
     }
 }
 
@@ -196,6 +203,7 @@ pub(super) fn withdraw(
             });
         }
         events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(&attempt_id, suffix),
             run_id: Some(run_id.to_owned()),
@@ -263,6 +271,7 @@ fn pause_step(
             )
             .map_err(sqlite_error)?;
         events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.clone(),
             event_id: child_id(run_id, &format!("paused/{number}")),
             run_id: Some(run_id.to_owned()),
@@ -288,7 +297,7 @@ fn pause_step(
             },
             ctx,
         )?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit_unhooked(tx)?;
     }
     Ok(step)
 }
@@ -326,6 +335,7 @@ fn record_pass(
         )
         .map_err(sqlite_error)?;
     let event = |kind: &str, at: SystemTime| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.clone(),
         event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/{kind}")),
         run_id: Some(run_id.clone()),
@@ -358,6 +368,7 @@ fn record_pass(
     };
     if !unknown.is_empty() {
         events.push(NewEvent {
+            intent: Intent::Record,
             project_id: project_id.clone(),
             event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/diagnostic")),
             run_id: Some(run_id.clone()),
@@ -396,17 +407,21 @@ fn record_pass(
         attempts::effects_unknown(&tx, &pass.attempt_id)?;
         super::retry::accrue_wall(&tx, &run_id, &pass.attempt_id, pass.at, None)?;
     }
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(done.event_seqs.last().copied().unwrap_or(0))
 }
 
 /// The run's last cancel transaction (ADR-021 decision 8f), once none of its attempts starts or runs: its workspace
 /// record, its attempts not yet started and its open tasks CANCELLED, its pending control notices acknowledged, then
-/// the run CANCELLED. No candidate is touched, so an unfinished one is never marked verified (REQ-043 behaviour 4).
+/// its verification reconciled while it is still cancelling — every open round closed superseded, its handoffs
+/// rejected (docs/adr/ADR-031.md decision 4, M2T13D-302) — and only then the run CANCELLED, its run.result last. A
+/// round whose candidate is in `pending` and was not superseded cannot close yet: then nothing is committed and the
+/// run stays CANCEL_REQUESTED ([`Finished::Recovering`]). No candidate is marked verified (REQ-043 behaviour 4).
 fn finish_cancel(
     conn: &mut Connection,
     run_id: &str,
     workspace: &Value,
+    pending: &std::collections::BTreeSet<String>,
     at: SystemTime,
     ctx: &Ctx<'_>,
 ) -> Result<Finished, PersistError> {
@@ -419,7 +434,7 @@ fn finish_cancel(
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, revision, project_id)) = run else {
+    let Some((state, _, project_id)) = run else {
         return Err(PersistError::RunNotFound(run_id.to_owned()));
     };
     if writer::parse::<RunState>(&state)? != RunState::CancelRequested {
@@ -485,19 +500,38 @@ fn finish_cancel(
         params![run_id],
     )
     .map_err(sqlite_error)?;
-    let mut cas: Vec<StateCas> = tasks
-        .into_iter()
-        .map(|(id, expected_revision)| StateCas {
-            id,
-            expected_revision,
-            change: Change::Task(TaskState::Cancelled),
-        })
-        .collect();
-    cas.push(StateCas {
+    writer::write(
+        &tx,
+        &Commit {
+            cas: tasks
+                .into_iter()
+                .map(|(id, expected_revision)| StateCas {
+                    id,
+                    expected_revision,
+                    change: Change::Task(TaskState::Cancelled),
+                })
+                .collect(),
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    // Its verification, while it is still cancelling: the rounds close superseded, in this transaction.
+    super::closing::reconcile_in(&tx, run_id, pending, ctx)?;
+    if super::closing::open_rounds(&tx, run_id)? > 0 {
+        return Ok(Finished::Recovering);
+    }
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let cas = vec![StateCas {
         id: run_id.to_owned(),
         expected_revision: revision,
         change: Change::Run(RunState::Cancelled),
-    });
+    }];
     // The logs kept with the workspace record: each attempt's raw log (REQ-043 behaviour 4).
     let logs: Vec<Value> = {
         let mut statement = tx
@@ -519,6 +553,7 @@ fn finish_cancel(
         record.insert("logs".to_owned(), Value::Array(logs));
     }
     let event = |kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.clone(),
         event_id: child_id(run_id, kind),
         run_id: Some(run_id.to_owned()),
@@ -540,7 +575,7 @@ fn finish_cancel(
         },
         ctx,
     )?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit_unhooked(tx)?;
     Ok(Finished::Cancelled)
 }
 

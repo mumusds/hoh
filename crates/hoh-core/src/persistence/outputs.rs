@@ -8,7 +8,7 @@
 
 use super::blockers::{self, Claims};
 use super::decide::{self, Decided};
-use super::writer::{self, Commit, Ctx, NewEvent};
+use super::writer::{self, Commit, Ctx, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::decision::{Context, Proposal};
 use crate::ids::child_id;
@@ -33,6 +33,7 @@ pub(super) fn recorded(
     lines: &[Value],
 ) -> Vec<NewEvent> {
     let event = |id: String, kind: &str, payload: Value| NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: id,
         run_id: Some(run_id.to_owned()),
@@ -331,6 +332,7 @@ pub(super) fn dispose(
                         &tx,
                         &Commit {
                             events: vec![NewEvent {
+                                intent: Intent::Progress,
                                 project_id: project_id.clone(),
                                 event_id: child_id(&output_id, "disposed"),
                                 run_id: Some(run_id.to_owned()),
@@ -342,14 +344,24 @@ pub(super) fn dispose(
                         ctx,
                     )?;
                 }
-                ctx.before_commit()?;
-                tx.commit().map_err(sqlite_error)?;
+                super::writer::commit(tx, ctx)?;
                 processed += 1;
                 spent += 1;
             }
             Err(e) => {
                 drop(tx);
-                failed(conn, &project_id, run_id, &output_id, &attempt_id, &e, ctx)?;
+                // A stopped run's progress is no failure of the output: rolled back and answered Held, never counted
+                // (docs/adr/ADR-031.md correction D, rule 2 (c)).
+                let failure = super::hold::Failure::try_from(e)?;
+                failed(
+                    conn,
+                    &project_id,
+                    run_id,
+                    &output_id,
+                    &attempt_id,
+                    &failure,
+                    ctx,
+                )?;
                 return Ok(false);
             }
         }
@@ -392,7 +404,7 @@ fn failed(
     run_id: &str,
     output_id: &str,
     attempt_id: &str,
-    error: &PersistError,
+    error: &super::hold::Failure,
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tx = writer::begin(conn, ctx)?;
@@ -409,6 +421,7 @@ fn failed(
         )
         .map_err(sqlite_error)?;
     let mut events = vec![NewEvent {
+        intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(output_id, &format!("failed/{n}")),
         run_id: Some(run_id.to_owned()),
@@ -417,6 +430,7 @@ fn failed(
     }];
     if n >= FAILURES {
         events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: project_id.to_owned(),
             event_id: child_id(output_id, "disposed"),
             run_id: Some(run_id.to_owned()),
@@ -432,8 +446,7 @@ fn failed(
         },
         ctx,
     )?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)
+    super::writer::commit(tx, ctx)
 }
 
 /// One output's disposal in `tx`: its end to record, or none when a decision event ended it.

@@ -7,7 +7,7 @@ use super::candidates::{Freeze, Frozen};
 use super::results::TaskResultOutcome;
 use super::retry::{Repair, RepairRequest, RepairVerdict};
 use super::runner::Ending;
-use super::writer::{self, Change, Commit, NewEvent, StateCas};
+use super::writer::{self, Change, Commit, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::protocol::{BlockedReason, RejectionReason, TaskResult, TaskState};
@@ -99,8 +99,7 @@ pub(super) fn complete(
     // settle ends the attempt CANCELLED (read again in its transaction) and leaves its task to the cancel.
     if cancelled {
         super::runner::finished_in(&tx, &job.attempt_id, &job.ending, ctx)?;
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit(tx, ctx)?;
         return Ok(WriterCompleted::Cancelled);
     }
     let task = Task {
@@ -141,8 +140,7 @@ pub(super) fn complete(
     // The attempt settles in the same commit; its task has moved (VERIFYING, READY or BLOCKED), so the settle leaves it
     // alone, and the write lease goes with the attempt's end.
     super::runner::finished_in(&tx, &job.attempt_id, &job.ending, ctx)?;
-    ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)?;
+    super::writer::commit(tx, ctx)?;
     Ok(done)
 }
 
@@ -249,8 +247,7 @@ pub(super) fn complete_verifier(
     }
     let finish = |tx: Transaction<'_>, done| -> Result<VerifierCompleted, PersistError> {
         super::runner::finished_in(&tx, &job.attempt_id, &job.ending, ctx)?;
-        ctx.before_commit()?;
-        tx.commit().map_err(sqlite_error)?;
+        super::writer::commit(tx, ctx)?;
         Ok(done)
     };
     if cancelled {
@@ -267,6 +264,7 @@ pub(super) fn complete_verifier(
         revision,
     };
     let event = |name: &str, kind: &str, payload: serde_json::Value| NewEvent {
+        intent: Intent::Progress,
         project_id: task.project_id.clone(),
         event_id: child_id(&job.attempt_id, name),
         run_id: Some(task.run_id.clone()),
@@ -322,7 +320,7 @@ pub(super) fn complete_verifier(
                 },
                 ctx,
             )?;
-            super::issues::settle_all(&tx, &task.run_id)?;
+            super::issues::settle_all(&tx, &task.run_id, Intent::Progress)?;
             if intake.state == super::reports::ReportState::Rejected {
                 // The exit of a verifier dispatched in a session not its own (ADR-028 decision 10, M2T16D-361): the
                 // same session would only be refused again; its task waits for a decision (M2-T13's to clear).
@@ -396,6 +394,7 @@ pub(super) fn complete_verifier(
                     change: Change::Task(TaskState::Ready),
                 });
                 commit.events.push(NewEvent {
+                    intent: Intent::Progress,
                     project_id: task.project_id.clone(),
                     event_id: child_id(&job.attempt_id, "reverify"),
                     run_id: Some(task.run_id.clone()),
@@ -412,6 +411,7 @@ pub(super) fn complete_verifier(
         &tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: task.project_id.clone(),
                 event_id: child_id(&job.attempt_id, "verification_result"),
                 run_id: Some(task.run_id.clone()),
@@ -466,6 +466,7 @@ fn register_self_tests(
         tx,
         &Commit {
             events: vec![NewEvent {
+                intent: Intent::Progress,
                 project_id: task.project_id.clone(),
                 event_id: child_id(attempt_id, super::context::SELF_TESTS_EVENT),
                 run_id: Some(task.run_id.clone()),
@@ -529,6 +530,7 @@ fn freeze_and_accept(
                     change: Change::Task(TaskState::Ready),
                 }],
                 events: vec![NewEvent {
+                    intent: Intent::Progress,
                     project_id: task.project_id.clone(),
                     event_id: child_id(&job.attempt_id, "rework"),
                     run_id: Some(task.run_id.clone()),
@@ -699,6 +701,7 @@ fn correct_attempt(
             change: Change::Task(TaskState::Ready),
         });
         commit.events.push(NewEvent {
+            intent: Intent::Progress,
             project_id: task.project_id.clone(),
             event_id: child_id(attempt_id, "protocol_correction"),
             run_id: Some(task.run_id.clone()),
@@ -733,6 +736,7 @@ fn decide(
             change: Change::Task(TaskState::Blocked),
         }],
         events: vec![NewEvent {
+            intent: Intent::Progress,
             project_id: task.project_id.clone(),
             event_id: child_id(&job.attempt_id, "need_decision"),
             run_id: Some(task.run_id.clone()),

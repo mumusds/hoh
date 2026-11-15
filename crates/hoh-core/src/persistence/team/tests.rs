@@ -3,7 +3,7 @@
 
 use crate::config::{Agent, Budget, Config};
 use crate::persistence::{
-    CommandOutcome, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
+    CommandOutcome, Intent, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -40,6 +40,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
             policy: "balanced".to_owned(),
         },
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: format!("e-{run_id}"),
             run_id: Some(run_id.to_owned()),
@@ -282,6 +283,7 @@ fn team_change(key: &str, expected: i64, bindings: Value) -> SubmitCommand {
             file: None,
         }),
         event: NewEvent {
+            intent: Intent::Progress,
             project_id: "p1".to_owned(),
             event_id: format!("e-{key}"),
             run_id: None,
@@ -2369,6 +2371,7 @@ async fn a_session_native_record_comes_only_from_a_completed_turns_settle() -> R
         "UPDATE sessions SET capabilities_json = '{\"structured_events\": true, \"resume\": true}' WHERE session_id = 'sd';",
     )?;
     let forged = |attempt: &str| crate::persistence::NewEvent {
+        intent: crate::persistence::Intent::Progress,
         project_id: "p1".to_owned(),
         event_id: format!("forged/{attempt}"),
         run_id: Some("R1".to_owned()),
@@ -2877,6 +2880,7 @@ async fn a_control_notice_to_the_commander_carries_its_epoch_after_a_handover() 
             payload_sha256: format!("{:064}", 9),
             target: RunTarget::To(crate::protocol::RunState::PauseRequested),
             event: NewEvent {
+                intent: Intent::Progress,
                 project_id: "p1".to_owned(),
                 event_id: "e-pause".to_owned(),
                 run_id: Some("R1".to_owned()),
