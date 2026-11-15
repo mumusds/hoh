@@ -408,6 +408,17 @@ fn a_file_that_does_not_parse_is_refused_with_its_line_and_column() -> R {
 }
 
 #[test]
+fn a_config_under_a_hoh_that_is_not_a_directory_is_a_missing_file() -> R {
+    // docs/adr/ADR-031.md decision 9: a missing file gives the defaults; a `.hoh` that is a file holds no config.toml,
+    // so the client goes on to the host (which refuses the project, 69) instead of calling it an invalid file (78).
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join(".hoh"), "not a directory")?;
+    assert_eq!(load(dir.path())?, Config::default());
+    assert_eq!(load_file(dir.path())?.1, None);
+    Ok(())
+}
+
+#[test]
 fn a_config_that_is_not_a_regular_file_is_refused() -> R {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join(FILE))?;
