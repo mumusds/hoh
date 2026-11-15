@@ -269,6 +269,18 @@ impl State<'_> {
         }
     }
 
+    /// Stop the turn after codex refused a request of its handshake (initialize, the thread, turn/start), before any
+    /// turn is active: the direct mode ends the process at once ([`State::begin_stop`]); the runner's closes stdin and
+    /// gives the process the term grace to exit by itself, then ends it ([`State::close_gently`]), as after the re-check
+    /// before the first input. A refusal is the turn's own end: no cancel of the host's follows it (M2T15R-02).
+    fn stop_refused(&mut self, process: Option<&Process>) {
+        if self.native_only {
+            self.close_gently();
+        } else {
+            self.begin_stop(process);
+        }
+    }
+
     /// Close stdin and give the process the term grace to exit by itself.
     fn close_gently(&mut self) {
         self.conn.close();
@@ -496,7 +508,7 @@ impl State<'_> {
                 }
                 Some(_) => {
                     self.failure = Some(format!("initialize: {message}"));
-                    self.begin_stop(process);
+                    self.stop_refused(process);
                 }
                 // Before the first input, the agent's files are still the ones its gate verified (docs/adr/ADR-030.md
                 // decision 9, "首个输入之前的再核对"): else nothing more is sent and stdin is closed.
@@ -546,7 +558,7 @@ impl State<'_> {
                         "thread/start"
                     };
                     self.failure = Some(format!("{what}: {message}"));
-                    self.begin_stop(process);
+                    self.stop_refused(process);
                 }
                 None => {
                     let result = &frame["result"];
@@ -580,7 +592,7 @@ impl State<'_> {
             Pending::TurnStart => match refused {
                 Some(_) => {
                     self.failure = Some(format!("turn/start: {message}"));
-                    self.begin_stop(process);
+                    self.stop_refused(process);
                 }
                 None => {
                     self.turn_id = frame["result"]["turn"]["id"].as_str().map(str::to_owned);

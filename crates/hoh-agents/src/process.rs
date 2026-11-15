@@ -359,10 +359,10 @@ impl Process {
         }
     }
 
-    /// Whether a cancel asked to end it, for a unit test.
+    /// The plan a cancel asks to end it with, as it changes (none until one does), for a unit test.
     #[cfg(test)]
-    pub(crate) fn cancel_requested(&self) -> bool {
-        self.control.slot.borrow().is_some()
+    pub(crate) fn cancels(&self) -> watch::Receiver<Option<Escalation>> {
+        self.control.slot.subscribe()
     }
 
     /// The next frame, then the exit report; `None` after that.

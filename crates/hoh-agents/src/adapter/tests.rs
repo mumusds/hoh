@@ -822,9 +822,12 @@ fn a_gate_refusal_is_shown_to_the_observer_as_its_diagnostic_is_collected() -> R
 /// What a [`Timed`] process does as one of its events is handed out.
 type Then = Option<Box<dyn FnOnce() + Send + Sync>>;
 
-/// A process whose events come at set times of the paused clock, in order: each handed out once its time came, its
-/// [`Then`] run as it is; none after the last. A wait the event loop drops for another branch hands nothing out.
-struct Timed(std::collections::VecDeque<(tokio::time::Instant, crate::process::Event, Then)>);
+/// One step of a [`Timed`] process: when, on the paused clock, the event it hands out (none: only its [`Then`] runs).
+type Step = (tokio::time::Instant, Option<crate::process::Event>, Then);
+
+/// A process whose steps come at set times of the paused clock, in order: each taken once its time came, its [`Then`]
+/// run, its event handed out; nothing after the last. A wait the event loop drops for another branch takes nothing.
+struct Timed(std::collections::VecDeque<Step>);
 
 impl std::fmt::Debug for Timed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -839,13 +842,17 @@ impl crate::process::FakeEvents for Timed {
         Box<dyn std::future::Future<Output = Option<crate::process::Event>> + Send + '_>,
     > {
         Box::pin(async move {
-            let at = self.0.front()?.0;
-            tokio::time::sleep_until(at).await;
-            let (_, event, then) = self.0.pop_front()?;
-            if let Some(then) = then {
-                then();
+            loop {
+                let at = self.0.front()?.0;
+                tokio::time::sleep_until(at).await;
+                let (_, event, then) = self.0.pop_front()?;
+                if let Some(then) = then {
+                    then();
+                }
+                if event.is_some() {
+                    return event;
+                }
             }
-            Some(event)
         })
     }
 }
@@ -853,30 +860,45 @@ impl crate::process::FakeEvents for Timed {
 /// The handshake timeout of a [`codex_facts_timed`] turn.
 const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// A step of a [`Timed`] script: its time in milliseconds from the start, its event, its [`Then`].
+type At = (u64, Option<crate::process::Event>, Then);
+
 /// A codex App Server frame handed out at `ms` milliseconds.
-fn frame_at(ms: u64, frame: serde_json::Value, then: Then) -> (u64, crate::process::Event, Then) {
+fn frame_at(ms: u64, frame: serde_json::Value, then: Then) -> At {
     (
         ms,
-        crate::process::Event::Frame(crate::frame::Frame::Line(frame.to_string().into_bytes())),
+        Some(crate::process::Event::Frame(crate::frame::Frame::Line(
+            frame.to_string().into_bytes(),
+        ))),
         then,
     )
 }
 
 /// The process's exit at `ms` milliseconds, its streams complete, `stdout_bytes` read from its stdout.
-fn exit_at(ms: u64, stdout_bytes: u64) -> (u64, crate::process::Event, Then) {
+fn exit_at(ms: u64, stdout_bytes: u64) -> At {
     let mut report = replayed_exit();
     report.stdout.bytes = stdout_bytes;
-    (ms, crate::process::Event::Exit(Box::new(report)), None)
+    (
+        ms,
+        Some(crate::process::Event::Exit(Box::new(report))),
+        None,
+    )
 }
 
-/// The facts of a codex App Server turn of the runner's mode (its handshake timeout [`HANDSHAKE`]) driven on a
-/// [`Timed`] process whose `script` gives each event's time in milliseconds from now, watching `expect`, its gate
-/// `gate`; its stdin a pipe nobody reads. With them, whether the adapter asked to end the process.
+/// `then` run at `ms` milliseconds, no event handed out.
+fn act_at(ms: u64, then: Box<dyn FnOnce() + Send + Sync>) -> At {
+    (ms, None, Some(then))
+}
+
+/// The facts of a codex App Server turn of the runner's mode (its handshake timeout [`HANDSHAKE`], its native cancel
+/// `native`) driven on a [`Timed`] process run by `script`, watching `expect`, its gate `gate`; its stdin a pipe nobody
+/// reads. With them, when (from the start) the adapter asked to end the process, if it did.
 async fn codex_facts_timed(
-    script: Vec<(u64, crate::process::Event, Then)>,
+    script: Vec<At>,
     expect: Option<Expect>,
     gate: &GateCommand,
-) -> R<(Facts, bool)> {
+    native: &tokio::sync::Notify,
+) -> R<(Facts, Option<std::time::Duration>)> {
     let start = tokio::time::Instant::now();
     let events = Timed(
         script
@@ -886,6 +908,12 @@ async fn codex_facts_timed(
     );
     let (stdin, unread) = tokio::net::unix::pipe::pipe()?;
     let mut process = crate::process::Process::fake(4242, Some(stdin), Box::new(events));
+    // The paused clock stands still while tasks can run, so this is the time the cancel was asked for.
+    let mut cancels = process.cancels();
+    let asked = tokio::spawn(async move {
+        cancels.changed().await.ok()?;
+        Some(tokio::time::Instant::now() - start)
+    });
     let mut watch = Watch::new(expect);
     let facts = crate::codex::app_server_facts_watched(
         &mut process,
@@ -893,10 +921,25 @@ async fn codex_facts_timed(
         Observer::default(),
         gate,
         HANDSHAKE,
+        native,
     )
     .await;
     drop(unread);
-    Ok((facts, process.cancel_requested()))
+    // Its control dropped, a cancel never asked for ends the wait.
+    drop(process);
+    Ok((facts, asked.await?))
+}
+
+/// The term grace of a [`codex_facts_timed`] turn: the default escalation's.
+fn term_grace() -> std::time::Duration {
+    crate::codex::Turn::default_escalation().term_grace
+}
+
+/// Whether the adapter asked to end the process `asked` after the start at `ms` milliseconds plus the term grace (within
+/// the clock's millisecond).
+fn ended_after_the_term_grace(asked: Option<std::time::Duration>, ms: u64) -> bool {
+    let due = std::time::Duration::from_millis(ms) + term_grace();
+    asked.is_some_and(|at| at >= due && at <= due + std::time::Duration::from_millis(1))
 }
 
 /// A gate with no expectation and no status: today's `go`.
@@ -946,6 +989,7 @@ async fn a_refusal_before_the_first_input_outlasts_the_handshake_deadline() -> R
         ],
         Some(expect),
         &plain_gate(),
+        &tokio::sync::Notify::new(),
     )
     .await?;
     assert_eq!(
@@ -977,24 +1021,99 @@ async fn a_refusal_before_the_first_input_outlasts_the_handshake_deadline() -> R
     Ok(())
 }
 
+/// M2T15R-02, a refused handshake request in the runner's mode: codex answers `refused` with an error at 900 ms after
+/// `before` was answered, and would exit by itself only at 7 s. The turn fails with `failure`, never moves to exec, and
+/// the adapter itself ends the process once the term grace from the refusal is over (stdin closed at once, then the
+/// end the turn's escalation plans), as after the re-check before the first input: a refusal is the turn's own end, and
+/// no cancel of the host's follows it.
+async fn refused_in_the_runners_mode(
+    before: Vec<At>,
+    refused: serde_json::Value,
+    failure: &str,
+) -> R {
+    let mut script = before;
+    script.push(frame_at(900, refused, None));
+    script.push(exit_at(7000, 64));
+    let (facts, asked) =
+        codex_facts_timed(script, None, &plain_gate(), &tokio::sync::Notify::new()).await?;
+    assert_eq!(
+        (
+            facts.state,
+            facts.failure.as_deref(),
+            facts.degraded.as_deref()
+        ),
+        (AttemptState::Failed, Some(failure), None),
+        "{facts:?}"
+    );
+    assert!(
+        ended_after_the_term_grace(asked, 900),
+        "{failure}: the adapter asked to end the process at {asked:?}, not the term grace after the refusal"
+    );
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
-async fn an_initialize_refused_in_the_runners_mode_outlasts_the_handshake_deadline() -> R {
-    // M2T15R-02, the same flaw on another path: initialize refused with an error other than "method not found" just
-    // before the handshake deadline; in the runner's mode that stop only closes stdin ("nothing more": the host's ladder
-    // ends the process), and the process exits after the deadline and after the term grace that a degrade would have
-    // armed. The refusal is the turn's failure, never a move to exec, and the adapter asks no end of the process. Red
-    // before the fix: the timer's degrade won; with only `conclude` fixed, the timer's degrade still escalated.
-    let (facts, cancelled) = codex_facts_timed(
+async fn an_initialize_refused_in_the_runners_mode_is_ended_after_the_term_grace() -> R {
+    // Initialize refused with an error other than "method not found", just before the handshake deadline. Red at
+    // 689abe8: the handshake timer's degrade won (CAPABILITY_UNSUPPORTED) and its end came at the deadline plus the term
+    // grace; red with only M2T15R-02's first fix: no end at all (the stop only closed stdin).
+    refused_in_the_runners_mode(
+        Vec::new(),
+        serde_json::json!({"id": 0, "error": {"code": -32000, "message": "boom"}}),
+        "initialize: boom",
+    )
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thread_start_refused_in_the_runners_mode_is_ended_after_the_term_grace() -> R {
+    // Red at 689abe8 and before this fix: no end at all (the stop only closed stdin, and no timer covers the thread).
+    refused_in_the_runners_mode(
+        vec![frame_at(
+            100,
+            serde_json::json!({"id": 0, "result": {}}),
+            None,
+        )],
+        serde_json::json!({"id": 1, "error": {"code": -32000, "message": "no thread"}}),
+        "thread/start: no thread",
+    )
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_turn_start_refused_in_the_runners_mode_is_ended_after_the_term_grace() -> R {
+    // Red at 689abe8 and before this fix: no end at all (the stop only closed stdin, and no timer covers the turn's start).
+    refused_in_the_runners_mode(
         vec![
+            frame_at(100, serde_json::json!({"id": 0, "result": {}}), None),
             frame_at(
-                900,
-                serde_json::json!({"id": 0, "error": {"code": -32000, "message": "boom"}}),
+                200,
+                serde_json::json!({"id": 1, "result": {"thread": {"id": "thread-1"}, "model": "m"}}),
                 None,
             ),
-            exit_at(7000, 64),
+        ],
+        serde_json::json!({"id": 2, "error": {"code": -32000, "message": "no turn"}}),
+        "turn/start: no turn",
+    )
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_native_cancel_before_initialize_is_answered_is_left_to_the_host() -> R {
+    // M2T15R-02, the handshake timer once initialize no longer waits: a native cancel at 500 ms closes stdin (the host's
+    // ladder ends the process, ADR-022 decision 14); codex would exit by itself only at 7 s. The handshake deadline (1 s)
+    // no longer applies, so the adapter asks no end of its own and nothing degrades: the turn is CANCELLED. Red with the
+    // 689abe8 timer guard: the timer's degrade closed gently at 1 s and the adapter ended the process at 6 s.
+    let native = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancel = native.clone();
+    let (facts, asked) = codex_facts_timed(
+        vec![
+            act_at(500, Box::new(move || cancel.notify_one())),
+            exit_at(7000, 0),
         ],
         None,
         &plain_gate(),
+        &native,
     )
     .await?;
     assert_eq!(
@@ -1003,12 +1122,12 @@ async fn an_initialize_refused_in_the_runners_mode_outlasts_the_handshake_deadli
             facts.failure.as_deref(),
             facts.degraded.as_deref()
         ),
-        (AttemptState::Failed, Some("initialize: boom"), None),
+        (AttemptState::Cancelled, None, None),
         "{facts:?}"
     );
-    assert!(
-        !cancelled,
-        "the adapter escalated a turn that was only closing"
+    assert_eq!(
+        asked, None,
+        "the adapter escalated a cancel the host's ladder ends"
     );
     Ok(())
 }
@@ -1024,7 +1143,13 @@ async fn degraded_after_an_in_turn_change(answer: Option<serde_json::Value>) -> 
     replace(&dir.path().join("versions/A"), b"#!/bin/sh\necho C\n")?;
     let mut script: Vec<_> = answer.map(|a| frame_at(300, a, None)).into_iter().collect();
     script.push(exit_at(1500, 64));
-    let (facts, _) = codex_facts_timed(script, Some(expect), &plain_gate()).await?;
+    let (facts, _) = codex_facts_timed(
+        script,
+        Some(expect),
+        &plain_gate(),
+        &tokio::sync::Notify::new(),
+    )
+    .await?;
     assert_eq!(
         (facts.state, facts.failure.as_deref()),
         (AttemptState::Failed, Some("CAPABILITY_UNSUPPORTED")),
@@ -1078,7 +1203,13 @@ async fn a_gate_refusal_outranks_a_handshake_that_timed_out() -> R {
         status: Some(status(dir.path(), KEY)),
         ..plain_gate()
     };
-    let (facts, _) = codex_facts_timed(vec![exit_at(1500, 0)], None, &gate).await?;
+    let (facts, _) = codex_facts_timed(
+        vec![exit_at(1500, 0)],
+        None,
+        &gate,
+        &tokio::sync::Notify::new(),
+    )
+    .await?;
     assert_eq!(
         (
             facts.state,
