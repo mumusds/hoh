@@ -408,8 +408,9 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
     assert_eq!(seen.len(), 1, "{seen:?}");
     // R's events after run.created: staffing's judgments of its bindings (docs/adr/ADR-030.md decisions 1 and 5), each
     // committed with the binding's state in one transaction once the registry has looked at the binding's agent. The
-    // agents are this test's fakes (FAKE_AGENT), each found Unsupported at a host's first look, well within the 10 s:
-    // every binding BLOCKED with one team.binding_blocked, by this host or already by the one the detach started. A
+    // agents are this test's fakes (FAKE_AGENT), each found Unsupported at a host's first look, normally well within the
+    // 10 s: every binding BLOCKED with one team.binding_blocked, by this host or already by the one the detach started
+    // (a first look that timed out under load is a waiting probe_failed, looked at again 30 s after it). A
     // binding ACTIVE with a session, or BLOCKED by no verdict that waits (decision 3), is judged for good on the premise
     // that its agent's answers are fixed, as the fakes' are (the same at every look, their files unchanged): its next
     // looks write nothing. An agent whose answers change (a probe that keeps failing, a login check that times out
@@ -526,8 +527,11 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
     );
     // And they are R's events: every one received, none committed after the clients had all of them.
     assert_eq!(sequences[0], run_now()?.1, "{sequences:?}");
-    // With the fake agents those events are known: run.created, then one team.binding_blocked of each binding of R's
-    // team, its agent unsupported, in the order the hosts judged them; and each binding is as its event left it.
+    // And the agents were the fakes: R's events begin with run.created and bind no session, the last
+    // team.binding_blocked of each binding of R's team names its agent unsupported (AGENT_UNAVAILABLE), and each binding
+    // is as that event left it. Before it a binding may have had a judgment that waited (a first look that timed out
+    // under load: probe_failed) and the detach's host may have written other events of R while R was CREATED (a
+    // supervisor's deferral, M2T15R-250); those are R's events all the same and the clients' equality above covers them.
     let known: Value = serde_json::from_str(&query(
         &env.project(),
         &format!(
@@ -542,13 +546,13 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         .iter()
         .collect();
     events.sort_by_key(|e| e[0].as_i64());
-    let kinds: Vec<&str> = events.iter().filter_map(|e| e[1].as_str()).collect();
     assert_eq!(
-        kinds,
-        ["run.created"]
-            .into_iter()
-            .chain(["team.binding_blocked"; 6])
-            .collect::<Vec<_>>(),
+        events.first().and_then(|e| e[1].as_str()),
+        Some("run.created"),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e[1] != "team.session_bound"),
         "{events:?}"
     );
     let team = [
@@ -563,15 +567,16 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
         items.sort_by_key(Value::to_string);
         items
     };
-    let blocked = sorted(
-        events[1..]
-            .iter()
-            .map(|e| {
-                let p = &e[2];
-                serde_json::json!([p["role"], p["agent"], p["reason"], p["missing"]])
-            })
-            .collect(),
-    );
+    // Each role's last team.binding_blocked, later ones replacing earlier ones in seq order.
+    let mut last = std::collections::BTreeMap::new();
+    for e in events.iter().filter(|e| e[1] == "team.binding_blocked") {
+        let p = &e[2];
+        last.insert(
+            p["role"].to_string(),
+            serde_json::json!([p["role"], p["agent"], p["reason"], p["missing"]]),
+        );
+    }
+    let blocked = sorted(last.into_values().collect());
     let want = sorted(
         team.iter()
             .map(|(role, agent)| {
@@ -584,7 +589,7 @@ fn test_005_02_concurrent_attaches_start_exactly_one_host_and_see_the_same_event
             })
             .collect(),
     );
-    assert_eq!(blocked, want);
+    assert_eq!(blocked, want, "{events:?}");
     let bindings = sorted(known["bindings"].as_array().ok_or("no bindings")?.clone());
     let want = sorted(
         team.iter()
