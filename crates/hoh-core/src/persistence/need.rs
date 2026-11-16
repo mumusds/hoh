@@ -232,7 +232,7 @@ impl VerifierReason {
 /// A run-level question of the Runtime (W13, W14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RunReason {
-    /// W13: the project has no approved specification for the run (decision 1, slice S2b).
+    /// W13: the project has no approved specification for the run (decision 1, `adoption::ask`).
     NoSpec,
     /// W14: the Commander's turns moved the run no further (correction C).
     Stalled,

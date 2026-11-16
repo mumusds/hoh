@@ -35,7 +35,7 @@ pub enum Redispatch {
 pub enum Route {
     /// The Commander's own question: its answer applies its request (decision 7).
     Commander,
-    /// `runtime:no_spec`: the project's specification adopted (slice S2b's exit).
+    /// `runtime:no_spec`: the project's specification adopted (decision 1's exit, `adoption::adopt_exit`).
     Adopt,
     /// `runtime:stalled`: retry or cancel.
     Stalled,
@@ -662,11 +662,13 @@ pub(super) fn answer(
             claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
         }
         Route::Adopt => {
-            // Slice S2b fills this arm (decision 1's adopt exit). Unreachable before it: no product writer claims
-            // `runtime:no_spec` until then, so `open` lists no such question.
-            return Err(PersistError::IntegrityViolation(
-                "the no_spec question's adopt exit is slice S2b's".to_owned(),
-            ));
+            // Decision 8's row runtime:no_spec (W13's exit, decision 1): the project's latest approved specification
+            // adopted, its spec.changed written and the claim released, the run back in its resume state by the
+            // follow below unless another claim holds it; still none: nothing, the run stays BLOCKED with the question
+            // open, its revision touched below and the commit ending with its run.result.
+            if super::adoption::adopt_exit(tx, a.project_id, a.run_id, ctx)? {
+                claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
+            }
         }
         Route::Stalled => {
             claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
