@@ -80,11 +80,14 @@ pub struct HostConfig {
     /// The effective configuration at the start (docs/adr/ADR-022.md decisions 1 and 6): its process settings are
     /// this host's ([`HostConfig::product`]); a new run reads the file again for its team, budget and scheduler.
     pub config: hoh_core::config::Config,
+    /// How long [`Host::shutdown`] waits for what the host started to end after aborting what it can (docs/adr/
+    /// ADR-031.md, implementation review round 4, correction 4): past it the stop says so and is not clean.
+    pub stop_bound: std::time::Duration,
 }
 
-/// How long [`Host::shutdown`] waits for what the host started to end after aborting what it can: what is left to
-/// wait for is bounded work (file system, git with its limit, a check's cancel ladder of 5 s and 5 s, store commits).
-const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+/// The stop's bound unless another is configured: what is left to wait for is bounded work (file system, git with its
+/// limit, a check's cancel ladder of 5 s and 5 s, store commits).
+pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The host's TCP port unless another is configured (docs/11-deployment.md: `ssh -L 8787`).
 pub const DEFAULT_PORT: u16 = 8787;
@@ -117,6 +120,7 @@ impl HostConfig {
             jitter_seed: None,
             cancel: hoh_core::cancel::GRACES,
             config: hoh_core::config::Config::default(),
+            stop_bound: STOP_BOUND,
         }
     }
 
@@ -294,6 +298,8 @@ pub struct Host {
     served: Vec<tokio::task::JoinHandle<()>>,
     /// host.json and the socket, removed at the stop or when the Host is dropped.
     host_files: HostFiles,
+    /// How long the stop waits for what the host started (HostConfig::stop_bound).
+    stop_bound: std::time::Duration,
 }
 
 impl std::fmt::Debug for Host {
@@ -572,6 +578,7 @@ impl Host {
             stop,
             served,
             host_files,
+            stop_bound: config.stop_bound,
         })
     }
 
@@ -630,9 +637,10 @@ impl Host {
     /// Stop (ADR-016 decision 12): no new connections, event streams end, every connection finishes or is ended
     /// after the grace; then what the served tasks started is accounted for (docs/adr/ADR-031.md, implementation review
     /// round 4, correction 3: every counted task aborted, the finishing ones finished, the counted work waited for,
-    /// 30 s at most, what still runs then said on stderr); `host.json` and the socket go; then the store, and the
-    /// writer ends after its last write and lets the project lock go. Returns after that: true when the writer
-    /// finished, false when it had ended by a panic (the lock is then still held until the process ends). The database
+    /// [`HostConfig::stop_bound`] at most); `host.json` and the socket go; then the store, and the writer ends after its
+    /// last write and lets the project lock go. Returns after that: true when the writer finished and nothing the host
+    /// started still ran, false when the writer had ended by a panic (the lock is then still held until the process
+    /// ends) or something still ran past the bound (said on stderr: it may still write the project). The database
     /// stays. A Host dropped without this stops the same way, without waiting.
     pub async fn shutdown(self) -> bool {
         let Host {
@@ -640,18 +648,20 @@ impl Host {
             stop,
             served,
             mut host_files,
+            stop_bound,
             ..
         } = self;
         let _ = stop.send(true);
         for task in served {
             let _ = task.await;
         }
-        let left = shared.begun.stop(STOP_BOUND).await;
+        let deadline = std::time::Instant::now() + stop_bound;
+        let left = shared.begun.stop(stop_bound).await;
         if left > 0 {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "hoh host: {left} task(s) or step(s) it started still run {STOP_BOUND:?} into its stop: they may \
+                "hoh host: {left} task(s) or step(s) it started still run {stop_bound:?} into its stop: they may \
                  still write the project"
             );
         }
@@ -659,7 +669,17 @@ impl Host {
         let ended = shared.store.writer_ended();
         drop(shared);
         drop(stop);
-        ended.await
+        if left == 0 {
+            return ended.await;
+        }
+        // What still runs may hold the store, whose writer then cannot end before it does: not waited for past the
+        // bound either (the project's lock is let go when it ends, or with the process).
+        let _ = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            ended,
+        )
+        .await;
+        false
     }
 }
 
@@ -723,7 +743,12 @@ pub async fn run_ready(config: HostConfig, ready: impl FnOnce()) -> u8 {
         use std::io::Write as _;
         let _ = writeln!(
             std::io::stderr(),
-            "hoh host: the database writer ended; the host stopped"
+            "{}",
+            if ended_first {
+                "hoh host: the database writer ended; the host stopped"
+            } else {
+                "hoh host: the stop was not clean: its database writer ended, or what it started still ran (above)"
+            }
         );
         return 1;
     }

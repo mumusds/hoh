@@ -395,3 +395,98 @@ async fn a_check_running_at_the_stop_is_cancelled_and_still_recorded_before_the_
     assert!(new.is_empty(), "new after the return: {new:?}");
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_past_its_bound_says_it_was_not_clean() -> R {
+    // M2T13R-352: a step held past the stop's bound (2 s here): the stop returns at the bound and says it was not
+    // clean (false; and on stderr), rather than claim that nothing the host started still runs.
+    use std::sync::atomic::Ordering::SeqCst;
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    let hold = std::sync::Arc::new(HoldCompletion::default());
+    let mut config = world.host_config()?;
+    config.hooks = hold.clone();
+    config.stop_bound = Duration::from_secs(2);
+    let host = hoh_app::host::Host::start(config).await?;
+    let started = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        let end = Instant::now() + Duration::from_secs(90);
+        while !hold.held.load(SeqCst) {
+            if Instant::now() > end {
+                return Err("no completion was held".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        R::Ok(())
+    }
+    .await;
+    let releasing = {
+        let hold = hold.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            hold.release.store(true, SeqCst);
+        })
+    };
+    let begun = Instant::now();
+    let clean = host.shutdown().await;
+    let took = begun.elapsed();
+    releasing.join().map_err(|_| "the releaser panicked")?;
+    // The step ends after its release: let it, before the world goes.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    started?;
+    assert!(!clean, "a stop past its bound said it was clean");
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(6),
+        "the stop took {took:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_past_its_bound_returns_at_it_even_when_what_still_runs_holds_the_store() -> R {
+    // M2T13R-352: what still runs past the bound is a finishing task that holds the store (the commit of pending check
+    // records, held here 8 s; the bound 2 s): its store's writer cannot end before it does, and the stop does not wait
+    // for that either; it returns at its bound and says it was not clean.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    let hold = std::sync::Arc::new(HoldReconcile::default());
+    let mut config = world.host_config()?;
+    config.hooks = hold.clone();
+    config.stop_bound = Duration::from_secs(2);
+    let host = hoh_app::host::Host::start(config).await?;
+    let started = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        hold.0.reached(Duration::from_secs(90)).await
+    }
+    .await;
+    let releasing = {
+        let hold = hold.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(8));
+            hold.0
+                .release
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    };
+    let begun = Instant::now();
+    let clean = host.shutdown().await;
+    let took = begun.elapsed();
+    releasing.join().map_err(|_| "the releaser panicked")?;
+    // The held task ends after its release: let it, before the world goes.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    started?;
+    assert!(!clean, "a stop past its bound said it was clean");
+    assert!(took < Duration::from_secs(6), "the stop took {took:?}");
+    Ok(())
+}
