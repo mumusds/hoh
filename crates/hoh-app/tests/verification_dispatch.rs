@@ -2381,8 +2381,32 @@ async fn a_change_request_left_in_a_verifiers_bridge_is_answered_when_a_reconcil
     outcome
 }
 
-/// POST `body` to the host's commands endpoint; the status.
-async fn command(host: &Host, body: &Value) -> R<u16> {
+/// Submit run R's control command `kind` (its id and key `name`) at R's revision as the database has it, and again at
+/// the revision the host names while it answers STALE_REVISION (the host moves R on meanwhile: a Commander's decision,
+/// the pace waking it), as the client does (`client::fresh`), at most 20 times: the last answer's status and body.
+async fn fresh_command(host: &Host, project: &Path, kind: &str, name: &str) -> R<(u16, String)> {
+    let mut revision =
+        rows(project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
+    let mut tries = 0;
+    loop {
+        let (status, said) = answer(
+            host,
+            &json!({"schema_version": "1.0", "command_id": format!("c-{name}"), "idempotency_key": name,
+                "expected_revision": revision, "kind": kind, "run_id": "R", "payload": {"reason": name}}),
+        )
+        .await?;
+        let refused: Value = serde_json::from_str(&said).unwrap_or(Value::Null);
+        tries += 1;
+        if status == 409 && refused["code"] == "STALE_REVISION" && tries < 20 {
+            revision = refused["current_revision"].clone();
+            continue;
+        }
+        return Ok((status, said));
+    }
+}
+
+/// POST command `body` to the host's commands endpoint: the answer's status and body.
+async fn answer(host: &Host, body: &Value) -> R<(u16, String)> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let body = body.to_string();
     let request = format!(
@@ -2397,8 +2421,11 @@ async fn command(host: &Host, body: &Value) -> R<u16> {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
     let text = String::from_utf8(raw)?;
-    let (head, _) = text.split_once("\r\n\r\n").ok_or("no response head")?;
-    Ok(head.split(' ').nth(1).ok_or("no status")?.parse()?)
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("no response head")?;
+    Ok((
+        head.split(' ').nth(1).ok_or("no status")?.parse()?,
+        body.to_owned(),
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2422,14 +2449,8 @@ async fn a_cancelled_runs_open_round_is_closed_superseded_and_its_handoffs_rejec
              WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
             &|r| r[0]["n"] == json!(2),
         )?;
-        let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
-        let status = command(
-            &host,
-            &json!({"schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
-                "expected_revision": revision, "kind": "CancelRun", "run_id": "R", "payload": {"reason": "cancel"}}),
-        )
-        .await?;
-        assert_eq!(status, 202);
+        let (status, said) = fresh_command(&host, &project, "CancelRun", "cancel").await?;
+        assert_eq!(status, 202, "{said}");
         let closed = wait_for(
             &project,
             &clock,
@@ -4409,17 +4430,15 @@ async fn in_the_verification_world_a_cancelled_run_is_held_only_in_the_tick_of_i
              WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
             &|r| r[0]["n"] == json!(2),
         )?;
-        let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
-        let status = command(
-            &host,
-            &json!({"schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
-                "expected_revision": revision, "kind": "CancelRun", "run_id": "R", "payload": {"reason": "cancel"}}),
-        )
-        .await?;
-        assert_eq!(status, 202);
-        wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| {
-            r[0]["state"] == "CANCELLED"
-        })?;
+        let (status, said) = fresh_command(&host, &project, "CancelRun", "cancel").await?;
+        assert_eq!(status, 202, "{said}");
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT state FROM runs WHERE run_id = 'R'",
+            &|r| r[0]["state"] == "CANCELLED",
+        )?;
         ticked(&held, &clock, 5)
     }
     .await;
@@ -4532,18 +4551,23 @@ async fn a_run_stopped_incomplete_leaves_its_pending_record_alone_and_a_paused_o
         let step = Duration::from_millis(500);
         let failed = "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_failed'";
         let outcome = async {
-            wait_for(&project, &clock, Duration::from_millis(100), failed, &|r| r[0]["n"].as_i64().is_some_and(|n| n >= 1))?;
+            wait_for(&project, &clock, Duration::from_millis(100), failed, &|r| {
+                r[0]["n"].as_i64().is_some_and(|n| n >= 1)
+            })?;
             if paused {
-                let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
-                let status = command(
-                    &host,
-                    &json!({"schema_version": "1.0", "command_id": "c-pause", "idempotency_key": "pause",
-                        "expected_revision": revision, "kind": "PauseRun", "run_id": "R", "payload": {"reason": "p"}}),
-                )
-                .await?;
-                assert_eq!(status, 202);
-                wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| r[0]["state"] == "PAUSED")?;
-                let result = rows(&project, "SELECT max(seq) AS s FROM events WHERE run_id = 'R' AND kind = 'run.result'")?[0]["s"]
+                let (status, said) = fresh_command(&host, &project, "PauseRun", "pause").await?;
+                assert_eq!(status, 202, "{said}");
+                wait_for(
+                    &project,
+                    &clock,
+                    step,
+                    "SELECT state FROM runs WHERE run_id = 'R'",
+                    &|r| r[0]["state"] == "PAUSED",
+                )?;
+                let result = rows(
+                    &project,
+                    "SELECT max(seq) AS s FROM events WHERE run_id = 'R' AND kind = 'run.result'",
+                )?[0]["s"]
                     .as_i64()
                     .ok_or("no run.result")?;
                 // The fault goes and the record is put aside: the recovery, not held by PAUSED, succeeds, as the run's.
@@ -4557,10 +4581,19 @@ async fn a_run_stopped_incomplete_leaves_its_pending_record_alone_and_a_paused_o
                     &|r| r.as_array().is_some_and(|a| !a.is_empty()),
                 )?;
                 assert_eq!(recovered[0]["run_id"], "R");
-                assert!(recovered[0]["seq"].as_i64().is_some_and(|s| s > result), "{recovered}");
+                assert!(
+                    recovered[0]["seq"].as_i64().is_some_and(|s| s > result),
+                    "{recovered}"
+                );
                 return R::Ok(());
             }
-            wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| r[0]["state"] == "INCOMPLETE")?;
+            wait_for(
+                &project,
+                &clock,
+                step,
+                "SELECT state FROM runs WHERE run_id = 'R'",
+                &|r| r[0]["state"] == "INCOMPLETE",
+            )?;
             R::Ok(())
         }
         .await;
