@@ -143,13 +143,18 @@ pub(super) struct Termed {
 }
 
 /// The directory below `top` that `names` lead to, opened one from another (never through a path that may name
-/// another cgroup by then), at most two of them open at once.
+/// another cgroup by then), at most two of them open at once; `None` when `spent` says the budget is spent before a
+/// step (`top` itself is always opened, M2T06R-1250, CGW-01).
 fn open_below(
     top: &rustix::fd::OwnedFd,
     names: &[std::ffi::CString],
-) -> rustix::io::Result<rustix::fd::OwnedFd> {
+    spent: &dyn Fn() -> bool,
+) -> rustix::io::Result<Option<rustix::fd::OwnedFd>> {
     let mut dir = rustix::fs::openat(top, ".", directory(), rustix::fs::Mode::empty())?;
     for name in names {
+        if spent() {
+            return Ok(None);
+        }
         dir = rustix::fs::openat(
             &dir,
             name.as_c_str(),
@@ -157,28 +162,27 @@ fn open_below(
             rustix::fs::Mode::empty(),
         )?;
     }
-    Ok(dir)
+    Ok(Some(dir))
 }
 
 /// `top` and every directory below it, however deep, parents first, each given to `visit` open, with the names that
 /// lead to it from `top` (none for `top`): `populated` and `cgroup.kill` cover the whole subtree, and so must SIGTERM
 /// (decision 8d v7, M2T06R-501, -651). Each is opened again from `top` by its names, so only a few descriptors are
-/// open at once however large or deep the subtree (M2T06R-1101). `top` is always visited, a cgroup below it only before
-/// `until` (M2T06R-1250). Whether every one was read: false when one could not be opened or listed for a reason other
-/// than its removal (a cgroup goes only once empty, with all below it), or was left at `until`.
+/// open at once however large or deep the subtree (M2T06R-1101). `top` is always visited; below it, `spent` is looked
+/// at before each step of opening a cgroup and each cgroup listed, and `visit` looks at it within one (M2T06R-1250,
+/// CGW-01). Whether every one was read: false when one could not be opened or listed for a reason other than its
+/// removal (a cgroup goes only once empty, with all below it), or was left once the budget was spent.
 fn walk(
     top: &rustix::fd::OwnedFd,
-    until: Instant,
+    spent: &dyn Fn() -> bool,
     mut visit: impl FnMut(&[std::ffi::CString], &rustix::fd::OwnedFd),
 ) -> bool {
     let mut queue = std::collections::VecDeque::from([Vec::new()]);
     let mut whole = true;
     while let Some(names) = queue.pop_front() {
-        if !names.is_empty() && Instant::now() >= until {
-            return false;
-        }
-        let dir = match open_below(top, &names) {
-            Ok(dir) => dir,
+        let dir = match open_below(top, &names, spent) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => return false,
             Err(rustix::io::Errno::NOENT) => continue,
             Err(_) => {
                 whole = false;
@@ -202,6 +206,9 @@ fn walk(
                         && name.to_bytes() != b"."
                         && name.to_bytes() != b".."
                     {
+                        if spent() {
+                            return false;
+                        }
                         let mut below = names.clone();
                         below.push(name.to_owned());
                         queue.push_back(below);
@@ -473,8 +480,14 @@ impl AttemptGroup {
     /// still (a pid that ended and was reused is never signalled). Only the recorded cgroup, read through its checked
     /// directories: a cgroup made later at its path holds another's processes (M2T06R-1000). The subtree is walked
     /// with few descriptors open however large it is, its own members first (M2T06R-1101), for at most
-    /// [`TERM_WALK_BUDGET`] below it (M2T06R-1250).
+    /// [`TERM_WALK_BUDGET`] below it, the work within each cgroup included (M2T06R-1250, CGW-01).
     pub(super) fn terminate(&self) -> Termed {
+        let until = Instant::now() + TERM_WALK_BUDGET;
+        self.terminate_by(&|| Instant::now() >= until)
+    }
+
+    /// As [`AttemptGroup::terminate`], `spent` saying when its budget is spent (the clock, or a test's stub).
+    fn terminate_by(&self, spent: &dyn Fn() -> bool) -> Termed {
         use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
         let top = match self.open_checked() {
@@ -496,7 +509,7 @@ impl AttemptGroup {
         let wanted = wanted.as_os_str().as_bytes();
         let mut sent = false;
         let mut unread = false;
-        let walked = walk(&top, Instant::now() + TERM_WALK_BUDGET, |_, cgroup| {
+        let walked = walk(&top, spent, |names, cgroup| {
             let fd = match rustix::fs::openat(
                 cgroup,
                 "cgroup.procs",
@@ -517,6 +530,11 @@ impl AttemptGroup {
                 return;
             }
             for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+                // Below the top, members left once the budget is spent are cgroup.kill's (CGW-01).
+                if !names.is_empty() && spent() {
+                    unread = true;
+                    return;
+                }
                 let Some(raw) = rustix::process::Pid::from_raw(pid) else {
                     continue;
                 };
@@ -789,21 +807,17 @@ mod tests {
         let group = AttemptGroup::witnessed(root.path(), &at)?;
         let top = group.open_checked()?.ok_or("not there")?;
         let mut found = Vec::new();
-        let whole = walk(
-            &top,
-            Instant::now() + Duration::from_secs(60),
-            |names, _| {
-                use std::os::unix::ffi::OsStrExt as _;
-                found.push(
-                    at.join(
-                        names
-                            .iter()
-                            .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes()))
-                            .collect::<PathBuf>(),
-                    ),
-                );
-            },
-        );
+        let whole = walk(&top, &|| false, |names, _| {
+            use std::os::unix::ffi::OsStrExt as _;
+            found.push(
+                at.join(
+                    names
+                        .iter()
+                        .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes()))
+                        .collect::<PathBuf>(),
+                ),
+            );
+        });
         drop(top);
         assert!(whole);
         assert_eq!(found.first(), Some(&at), "the cgroup itself first");
@@ -977,9 +991,8 @@ mod tests {
         std::fs::create_dir_all(at.join("y"))?;
         let group = AttemptGroup::witnessed(root.path(), &at)?;
         let top = group.open_checked()?.ok_or("not there")?;
-        let until = Instant::now() + Duration::from_secs(60);
         let mut visited = 0;
-        let whole = walk(&top, until, |names, _| {
+        let whole = walk(&top, &|| false, |names, _| {
             visited += 1;
             if let [name] = names {
                 let other = if name.as_bytes() == b"x" { "y" } else { "x" };
@@ -989,7 +1002,7 @@ mod tests {
         assert_eq!((visited, whole), (2, true), "a sibling removed first");
         assert_eq!(std::fs::read_dir(&at)?.count(), 1);
         let mut visited = 0;
-        let whole = walk(&top, until, |names, _| {
+        let whole = walk(&top, &|| false, |names, _| {
             visited += 1;
             if let [name] = names {
                 let _ = std::fs::remove_dir(at.join(std::ffi::OsStr::from_bytes(name.as_bytes())));
@@ -1011,9 +1024,7 @@ mod tests {
         let group = AttemptGroup::witnessed(root.path(), &at)?;
         let top = group.open_checked()?.ok_or("not there")?;
         let mut visited = 0;
-        let whole = walk(&top, Instant::now() + Duration::from_secs(60), |_, _| {
-            visited += 1
-        });
+        let whole = walk(&top, &|| false, |_, _| visited += 1);
         std::fs::set_permissions(at.join("unlisted"), std::fs::Permissions::from_mode(0o755))?;
         assert_eq!((visited, whole), (2, false));
         Ok(())
@@ -1117,7 +1128,7 @@ mod tests {
         };
         let top = group.open_checked()?.ok_or("not there")?;
         let mut found = Vec::new();
-        let whole = walk(&top, Instant::now() + Duration::from_secs(60), |_, dir| {
+        let whole = walk(&top, &|| false, |_, dir| {
             found.push(rustix::fs::fstat(dir).map(|s| (s.st_dev, s.st_ino)));
         });
         assert!(whole);
@@ -1148,20 +1159,97 @@ mod tests {
         let group = AttemptGroup::witnessed(root.path(), &at)?;
         let top = group.open_checked()?.ok_or("not there")?;
         let mut visited = Vec::new();
-        let spent = walk(&top, Instant::now(), |names, _| visited.push(names.len()));
+        let spent = walk(&top, &|| true, |names, _| visited.push(names.len()));
         assert_eq!((visited, spent), (vec![0], false), "past the budget");
         let mut visited = 0;
-        let lasting = walk(&top, Instant::now() + Duration::from_secs(60), |_, _| {
-            visited += 1
-        });
+        let lasting = walk(&top, &|| false, |_, _| visited += 1);
         assert_eq!((visited, lasting), (4, true), "within it");
         let leaf = root.path().join("attempt-fedcba9876543210");
         std::fs::create_dir(&leaf)?;
         let leaf = AttemptGroup::witnessed(root.path(), &leaf)?;
         let top = leaf.open_checked()?.ok_or("not there")?;
         assert!(
-            walk(&top, Instant::now(), |_, _| {}),
+            walk(&top, &|| true, |_, _| {}),
             "nothing below the top was left"
+        );
+        Ok(())
+    }
+
+    /// A test's stub of a budget: spent from its `lasts + 1`-th look on.
+    fn lasting(lasts: usize) -> impl Fn() -> bool {
+        let looks = std::cell::Cell::new(0);
+        move || {
+            looks.set(looks.get() + 1);
+            looks.get() > lasts
+        }
+    }
+
+    #[test]
+    fn a_sigterm_walk_stops_within_a_cgroup_below_the_top_once_its_budget_is_spent() -> R {
+        // CGW-01 (M2T06R-1250): the budget bounds the work within a cgroup below the top too, not only the step to the
+        // next one: a cgroup taken within the budget whose many members outlast it is left there, the walk incomplete.
+        // The stub lasts 50 looks; the work before the member list (the top's listing, the cgroup's opening) takes a
+        // few, its 100 members many more. (Its members are pids above any pid_max: no process is signalled.)
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("x"))?;
+        std::fs::write(at.join("cgroup.procs"), b"")?;
+        let members: String = (0..100).map(|i| format!("{}\n", 5_000_000 + i)).collect();
+        std::fs::write(at.join("x").join("cgroup.procs"), members)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        assert_eq!(
+            group.terminate_by(&lasting(50)),
+            Termed {
+                sent: false,
+                whole: false
+            }
+        );
+        assert_eq!(
+            group.terminate_by(&|| false),
+            Termed {
+                sent: false,
+                whole: true
+            },
+            "within its budget"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_below_the_top_is_not_opened_once_the_budget_is_spent_on_its_way() -> R {
+        // CGW-01: opening a cgroup below the top takes a step per level; the budget is looked at before each, so a deep
+        // one is not opened once it is spent on the way. The top itself is always opened.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("a").join("b"))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let top = group.open_checked()?.ok_or("not there")?;
+        let names = [c"a".to_owned(), c"b".to_owned()];
+        assert!(open_below(&top, &[], &|| true)?.is_some(), "the top");
+        assert!(open_below(&top, &names, &|| false)?.is_some(), "within it");
+        assert!(
+            open_below(&top, &names, &lasting(1))?.is_none(),
+            "spent on the way"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_tops_own_members_are_read_whole_past_the_budget() -> R {
+        // CGW-01: past the budget the top's own members are still read and signalled whole (only below it is the rest
+        // left to cgroup.kill); a top with nothing below it is then whole.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        let members: String = (0..100).map(|i| format!("{}\n", 5_000_000 + i)).collect();
+        std::fs::write(at.join("cgroup.procs"), members)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        assert_eq!(
+            group.terminate_by(&|| true),
+            Termed {
+                sent: false,
+                whole: true
+            }
         );
         Ok(())
     }
