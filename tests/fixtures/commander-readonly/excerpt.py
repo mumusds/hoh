@@ -111,6 +111,21 @@ def slim_codex(f: dict) -> dict:
     return f
 
 
+def slim_rollout(f: dict) -> dict | None:
+    """A codex rollout line the evidence table reads (turn boundaries, the turn's policy, tool calls and outputs)."""
+    payload = f.get('payload') or {}
+    if f.get('type') == 'event_msg' and payload.get('type') in ('task_started', 'task_complete'):
+        return {'type': f['type'], 'payload': {'type': payload['type'], 'turn_id': payload.get('turn_id')}}
+    if f.get('type') == 'turn_context':
+        return {'type': f['type'], 'payload': {k: payload.get(k) for k in ('turn_id', 'approval_policy', 'sandbox_policy')}}
+    if f.get('type') == 'response_item' and payload.get('type') in RAW_TOOL_ITEMS:
+        kept = {k: payload[k] for k in ('type', 'call_id', 'name', 'status', 'input', 'output', 'arguments') if k in payload}
+        kept['turn_id'] = (payload.get('internal_chat_message_metadata_passthrough') or {}).get('turn_id')
+        line = slim_codex({'method': 'rawResponseItem/completed', 'params': {'item': kept}})
+        return {'type': f['type'], 'payload': line['params']['item']}
+    return None
+
+
 def keep_pi(f: dict) -> bool:
     if f.get('type') == 'extension_ui_request' and 'hoh_observer' in str(f.get('message', '')):
         return True
@@ -137,7 +152,7 @@ def slim_pi(f: dict) -> dict:
 AGENT = {'claude': (keep_claude, slim_claude), 'codex': (keep_codex, slim_codex), 'pi': (keep_pi, slim_pi)}
 
 
-def excerpt_case(case_dir: Path, agent: str, run: Path) -> tuple[list[str], dict]:
+def excerpt_case(case_dir: Path, agent: str, run: Path) -> tuple[list[str], dict, list[str] | None]:
     meta = json.loads((case_dir / 'meta.json').read_text())
     home = os.path.expanduser('~')
     subst = sorted(((k, v) for k, v in meta['placeholders'].items()), key=lambda kv: -len(kv[0])) + [(home, '<HOME>')]
@@ -150,12 +165,22 @@ def excerpt_case(case_dir: Path, agent: str, run: Path) -> tuple[list[str], dict
     for f in frames(stdout):
         if keep(f):
             lines.append(json.dumps(redact(slim(f), subst), ensure_ascii=False))
+    rollout = None
+    if (case_dir / 'rollout.jsonl').is_file():
+        raw = (case_dir / 'rollout.jsonl').read_bytes()
+        rollout = [json.dumps({'_excerpt': {
+            'source': f'.hoh-dev/evidence/commander-readonly/spike/{run.name}/{agent}/{case_dir.name}/rollout.jsonl',
+            'source_sha256': sha256(raw), 'excerpted': True, 'paths': '<P> <W> <T> <HOME>',
+            'kept': "the thread's rollout file (thread.path) at the end of the case: turn boundaries, each turn's "
+                    'approval and sandbox policy, tool calls and their outputs'}}, ensure_ascii=False)]
+        rollout += [json.dumps(redact(line, subst), ensure_ascii=False)
+                    for line in (slim_rollout(f) for f in frames(case_dir / 'rollout.jsonl')) if line]
     snap = json.loads((case_dir / 'snapshot.json').read_text())
     side = {'agent': agent, 'case': case_dir.name, 'argv': redact(meta['argv'], subst), 'exit_code': meta['exit_code'],
             'stopped': meta['stopped'], 'notes': meta['notes'], 'snapshot_diff': redact(snap['diff'], subst),
             'stdout_sha256': meta['stdout_sha256'], 'stderr_sha256': meta['stderr_sha256'],
             'driver': redact((case_dir / 'cells.sh').read_text(), subst)}
-    return lines, side
+    return lines, side, rollout
 
 
 def main() -> int:
@@ -167,7 +192,9 @@ def main() -> int:
     cases = [(run, agent, case_dir) for run in args.runs for agent in AGENT
              for case_dir in (sorted((run / agent).glob('*')) if (run / agent).is_dir() else [])]
     for run, agent, case_dir in cases:
-        lines, side = excerpt_case(case_dir, agent, run)
+        lines, side, rollout = excerpt_case(case_dir, agent, run)
+        if rollout:
+            staged[args.out / agent / f'{case_dir.name}.rollout.excerpt.jsonl'] = '\n'.join(rollout) + '\n'
         staged[args.out / agent / f'{case_dir.name}.stdout.excerpt.jsonl'] = '\n'.join(lines) + '\n'
         staged[args.out / agent / f'{case_dir.name}.meta.json'] = json.dumps(side, ensure_ascii=False, indent=1) + '\n'
     hits = [(str(p), pat.pattern) for p, text in staged.items() for pat in SCAN if pat.search(text)]

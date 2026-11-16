@@ -1,5 +1,5 @@
 {"_excerpt": {"source": ".hoh-dev/evidence/commander-readonly/spike/20261116T201950Z/pi/ro-no-extensions/stdout.jsonl", "source_sha256": "8b4860d9621fcd6a70896e2579f9fd5aab2d401a27afbb7225a6328eee2a7f0f", "excerpted": true, "kept": "the frames the ADR-032 evidence table reads", "paths": "<P> <W> <T> <HOME>"}}
-{"type": "extension_ui_request", "id": "<uuid-90>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\"], \"sources\": {\"read\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
+{"type": "extension_ui_request", "id": "<uuid-91>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\"], \"sources\": {\"read\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
 {"type": "response", "command": "get_state", "success": true}
 {"id": "p1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}
 {"type": "tool_execution_start", "toolCallId": "call_41ae531628604978b6b03951", "toolName": "ls", "args": {"path": "<P>"}}
