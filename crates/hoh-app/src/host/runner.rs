@@ -199,6 +199,14 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     fn cancel(&self, _work: &Work) -> bool {
         false
     }
+
+    /// The host stops (called once, last in the runner's stop, after its attempts' tasks): end what this executor runs
+    /// inside the host for the turns it started, waiting for a write it has begun; once this has returned, nothing of
+    /// it writes the project. The turns' processes run on (an agent outlives its host); the next host's reconcile
+    /// settles them. The default has nothing to end.
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// The runner's fault injection points (CR-006): the product's hooks do nothing. In order, for one attempt: before
@@ -382,6 +390,8 @@ pub(super) async fn run(
         task.abort();
         let _ = task.await;
     }
+    // Then what the executor runs in the host for its turns: nothing of the host writes the project after its stop.
+    common.executor.stop().await;
 }
 
 /// A recovery's outcome as decision 11 records it: what trying again cannot make good (damaged facts, a record that
