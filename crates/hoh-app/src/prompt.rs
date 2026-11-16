@@ -153,11 +153,13 @@ fn fresh(
 }
 
 /// Whether `failure` is a ResumeRun refused because the INCOMPLETE run's stop still holds (decision 16's
-/// `details: {state: INCOMPLETE, stop}`): the input stays accepted and the run INCOMPLETE.
+/// `details: {state: INCOMPLETE, stop}`, the stop named): the input stays accepted and the run INCOMPLETE. A 409 that
+/// names INCOMPLETE but no stop is another refusal, with its own exit (M2T13R-50).
 pub(crate) fn still_stopped(failure: &Failure) -> bool {
     failure.status == Some(409)
         && failure.code == "ILLEGAL_TRANSITION"
         && failure.details["state"] == "INCOMPLETE"
+        && failure.details["stop"].is_string()
 }
 
 /// The stop a refused ResumeRun names (decision 16's `details.stop`): the budget item or the deadline still exhausted.
@@ -367,4 +369,43 @@ fn questions(host: &Option<HostInfo>, run_id: &str, result: &Value, stderr: &Std
         )),
     }
     stderr.say(&format!("hoh: 答复：hoh -p '<答复>' --resume {run_id}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ResumeRun's 409 ILLEGAL_TRANSITION with `details`.
+    fn refused(details: Value) -> Failure {
+        Failure {
+            code: "ILLEGAL_TRANSITION".to_owned(),
+            message: "refused".to_owned(),
+            exit: 3,
+            status: Some(409),
+            details,
+        }
+    }
+
+    #[test]
+    fn only_a_refusal_naming_the_stop_that_still_holds_takes_the_stop_path() {
+        // docs/adr/ADR-031.md decisions 9 and 16, M2T13R-50: a ResumeRun refused because the INCOMPLETE run's stop still
+        // holds names it (`details: {state: INCOMPLETE, stop}`); only then is the input left accepted and the run
+        // INCOMPLETE (its result followed, exit 4). A 409 that names INCOMPLETE without a stop is another refusal: its
+        // own exit, not the stop's.
+        assert!(still_stopped(&refused(
+            json!({"state": "INCOMPLETE", "stop": "max_iterations"})
+        )));
+        for details in [
+            json!({"state": "INCOMPLETE"}),
+            json!({"state": "INCOMPLETE", "stop": null}),
+            json!({"state": "INCOMPLETE", "stop": 3}),
+            json!({"state": "BLOCKED", "stop": "max_iterations"}),
+            Value::Null,
+        ] {
+            assert!(!still_stopped(&refused(details.clone())), "{details}");
+        }
+        let mut other = refused(json!({"state": "INCOMPLETE", "stop": "deadline_at"}));
+        other.code = "STALE_REVISION".to_owned();
+        assert!(!still_stopped(&other));
+    }
 }
