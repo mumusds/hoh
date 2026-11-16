@@ -773,11 +773,14 @@ fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_age
     assert_eq!(s.ended()?, Some(0));
     unchanged("detach")?;
     runtime.block_on(host.shutdown());
-    if let Some(pgid) = i32::try_from(agent)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
+    // The Agent's group, only while the Agent is still the process started at `agent_start` (ADR-022 decision 10:
+    // identity::find holds it by a pidfd and checks its start time, Found::kill signals the group only right after a
+    // look that shows it held); one that ended with the host gets nothing.
+    let boot = hoh_agents::identity::boot_id()?;
+    if let Ok(found) =
+        hoh_agents::identity::find(Some(i64::from(agent)), Some(&boot), Some(&agent_start))?
     {
-        let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        found.kill();
     }
     Ok(())
 }
