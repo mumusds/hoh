@@ -43,8 +43,6 @@ pub(super) struct Shared {
     pub(super) cgroups: Option<super::cgroup::Delegated>,
     /// The project's root (prompt override files are checked against it, docs/adr/ADR-022.md decision 11).
     pub(super) root: std::path::PathBuf,
-    /// What the host started and still runs (super::begun): its served tasks run in this scope.
-    pub(super) begun: Arc<super::begun::Begun>,
 }
 
 /// One open event stream, counted while it lives.
@@ -159,7 +157,9 @@ pub(super) async fn serve(
                 };
                 let service = hyper_util::service::TowerToHyperService::new(router.clone());
                 let mut conn_stop = stop.clone();
-                connections.spawn(async move {
+                // In the host's scope (super::begun): what a request starts is counted; the connection is not, this
+                // loop joins it (ended after the grace) before it returns.
+                connections.spawn(super::begun::scoped(async move {
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
                         .timer(hyper_util::rt::TokioTimer::new())
@@ -174,7 +174,7 @@ pub(super) async fn serve(
                         }
                     }
                     let _ = conn_stop.borrow_and_update();
-                });
+                }));
             }
             // A finished connection is collected as it goes.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}

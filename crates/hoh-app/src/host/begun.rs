@@ -1,7 +1,10 @@
 //! Everything the host process starts and must account for at its stop (docs/adr/ADR-031.md, implementation record,
 //! implementation review round 4: the design correction of the process lifetime at the stop). The host's served tasks
-//! (HTTP, the runner, pause and cancel) run in the host's [`Begun`] scope; every task or blocking step they start goes
-//! through [`spawn`], [`spawn_finishing`] or [`spawn_blocking`], and is counted while it runs. [`Begun::stop`], once
+//! (HTTP and its connections, the runner, pause and cancel) run in the host's [`Begun`] scope; every task or blocking
+//! step they start goes through [`spawn`], [`spawn_finishing`] or [`spawn_blocking`], and is counted while it runs.
+//! The host's Begun keeps the host's shared state, and every counted task and step keeps the Begun: the store, whose
+//! writer holds the project's lock until its last handle is gone (ADR-016 decision 12), cannot close while any of them
+//! runs, whatever the stop waited for. [`Begun::stop`], once
 //! the served tasks have ended, aborts every counted task [`spawn`] started (an aborted future writes nothing after its
 //! abort; what it began on a blocking thread is still counted), lets the finishing tasks finish (a check's run, which
 //! its owner's drop cancels, and its record; the commit of pending check records), and waits until nothing counted
@@ -23,6 +26,8 @@ pub(crate) struct Begun {
     running: AtomicUsize,
     /// The counted tasks [`spawn`] started, aborted at the stop.
     abortable: Mutex<Vec<AbortHandle>>,
+    /// What this keeps alive as long as the host or any counted task or step holds it ([`Begun::keeping`]).
+    _keeps: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 tokio::task_local! {
@@ -68,6 +73,15 @@ fn current() -> Option<Arc<Begun>> {
 }
 
 impl Begun {
+    /// A host's: `keeps` (its shared state, with the store) lives until the host and every counted task and step have
+    /// let go of this.
+    pub(crate) fn keeping(keeps: Box<dyn std::any::Any + Send + Sync>) -> Begun {
+        Begun {
+            _keeps: Some(keeps),
+            ..Begun::default()
+        }
+    }
+
     fn enter(self: &Arc<Self>) -> Running {
         self.running.fetch_add(1, Ordering::SeqCst);
         Running(self.clone())
@@ -124,6 +138,18 @@ where
         let _scope = OnThread::set(begun);
         step()
     })
+}
+
+/// `task` in the scope here, if any, for a task whose starter joins it itself (an HTTP connection, which the server
+/// ends after its grace and joins before it returns): what it starts is counted, it is not.
+pub(crate) fn scoped<F: Future>(task: F) -> impl Future<Output = F::Output> {
+    let begun = current();
+    async move {
+        match begun {
+            Some(begun) => BEGUN.scope(begun, task).await,
+            None => task.await,
+        }
+    }
 }
 
 /// `task` spawned (`tokio::spawn`) in the same scope, counted while it runs and aborted at the host's stop, when it is
@@ -274,6 +300,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_a_begun_keeps_lives_until_its_last_counted_step_ended_whatever_the_stop_waited_for()
+     {
+        /// Says when it is dropped.
+        struct Kept(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Kept {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let begun = Arc::new(Begun::keeping(Box::new(Kept(dropped.clone()))));
+        let (go, gate) = std::sync::mpsc::channel::<()>();
+        let (entered, step_began) = tokio::sync::oneshot::channel::<()>();
+        let (_never, forever) = tokio::sync::oneshot::channel::<()>();
+        begun
+            .clone()
+            .scope(async move {
+                // A step that holds nothing of what is kept, and a task that would wait for ever.
+                drop(spawn_blocking(move || {
+                    let _ = entered.send(());
+                    let _ = gate.recv();
+                }));
+                drop(spawn(async move {
+                    let _ = forever.await;
+                }));
+                // A task an HTTP server would join itself: in the scope, not counted.
+                scoped(async { assert!(current().is_some()) }).await;
+            })
+            .await;
+        step_began.await.expect("the step began");
+        // The stop gives up on the step past its bound, and the host lets go of its Begun: what it keeps stays.
+        assert_eq!(begun.stop(Duration::from_millis(100)).await, 1);
+        drop(begun);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "let go while a counted step ran"
+        );
+        go.send(()).expect("the step waits");
+        let end = Instant::now() + Duration::from_secs(5);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(Instant::now() < end, "kept after its last step ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outside_a_scope_the_three_are_tokios_own() {
         let begun = Arc::new(Begun::default());
         spawn_blocking(|| ()).await.expect("ran");
@@ -331,6 +404,19 @@ mod scan {
             "run_ready's SIGHUP logger: writes stderr only, lives as long as the host process",
         ),
         (
+            "hoh-app/src/host/http.rs",
+            "connections.spawn(super::begun::scoped(",
+            1,
+            "an HTTP connection: serve joins it (ended after the grace) before it returns, and Host::shutdown joins \
+             serve; it runs in the host's Begun scope (begun::scoped), so what a request starts is counted",
+        ),
+        (
+            "hoh-app/src/host/suites.rs",
+            "let run = self.spawn(agent, &ready, registry);",
+            1,
+            "a method of the same file (a suite's run), whose own spawns are scanned",
+        ),
+        (
             "hoh-app/src/host/control.rs",
             "let reader = std::thread::spawn(",
             1,
@@ -340,7 +426,14 @@ mod scan {
             "hoh-core/src/persistence/writer.rs",
             "std::thread::Builder::new()",
             1,
-            "the store's writer thread: Host::shutdown waits for it to end",
+            "the store's writer thread: it ends once every handle of the store is gone (the host's Begun keeps one \
+             while any counted task or step runs) and lets the project's lock go then",
+        ),
+        (
+            "hoh-core/src/persistence/writer.rs",
+            ".spawn(move || {",
+            1,
+            "the same writer thread's Builder chain",
         ),
         (
             "hoh-core/src/persistence/selftest.rs",
@@ -412,15 +505,37 @@ mod scan {
             "a probe's schema worker (writes only its scratch in the system temp directory) and the reaper of a \
              probe's child (writes nothing)",
         ),
+        (
+            "hoh-agents/src/probe.rs",
+            ".spawn(work)",
+            1,
+            "the schema worker's Builder chain",
+        ),
+        (
+            "hoh-agents/src/probe.rs",
+            ".spawn(move || {",
+            1,
+            "the child reaper's Builder chain",
+        ),
     ];
 
-    /// What starts a task or a thread.
-    const SPAWNS: [&str; 4] = [
+    /// What starts a task or a thread, besides any `.spawn(` with an argument ([`spawns`]).
+    const SPAWNS: [&str; 5] = [
         "tokio::spawn(",
-        "tokio::task::spawn_blocking(",
+        "task::spawn(",
+        "task::spawn_blocking(",
         "thread::spawn(",
         "thread::Builder::new(",
     ];
+
+    /// Whether `code` starts a task or a thread: one of [`SPAWNS`], or a `.spawn(` with an argument (a `JoinSet`'s, a
+    /// scoped thread's, a thread `Builder`'s; a process's `.spawn()` takes none).
+    fn spawns(code: &str) -> bool {
+        SPAWNS.iter().any(|s| code.contains(s))
+            || code
+                .match_indices(".spawn(")
+                .any(|(at, _)| !code[at + ".spawn(".len()..].starts_with(')'))
+    }
 
     /// The production source files of `dir`: no `tests.rs`, nothing under a `tests` directory, not this router.
     fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -485,7 +600,7 @@ mod scan {
             let source = std::fs::read_to_string(file).expect("a source file");
             for (n, line) in production(&source).lines().enumerate() {
                 let code = line.trim_start();
-                if code.starts_with("//") || !SPAWNS.iter().any(|s| code.contains(s)) {
+                if code.starts_with("//") || !spawns(code) {
                     continue;
                 }
                 match ALLOWED
