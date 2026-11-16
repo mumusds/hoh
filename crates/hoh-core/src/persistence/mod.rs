@@ -175,6 +175,10 @@ pub trait FaultHooks: Send + Sync + std::fmt::Debug {
     /// because the run has stopped (docs/adr/ADR-031.md correction D, rule 2). A test's hook records when.
     fn held(&self, _job: &'static str, _run: &str) {}
 
+    /// The writer takes a request named `job`, before its transaction begins: a test's hook may change the database
+    /// from another connection here (another writer's commit that lands between a caller's reads and its write).
+    fn before_job(&self, _job: &'static str) {}
+
     /// How many unread wake events an end of a run allows (docs/adr/ADR-031.md decision 4's bound): a test's hook
     /// lowers it; `None`, the supervisor's batch.
     fn unread_limit(&self) -> Option<i64> {
