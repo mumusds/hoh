@@ -254,6 +254,7 @@ impl Processes for HostProcesses {
                 native: native.clone(),
                 outside: outside.clone(),
                 cgroup: cgroup.clone(),
+                term_incomplete: false,
             }
         };
         // The recorded pid, which is the group's number while anything of the group is left.
@@ -337,6 +338,8 @@ struct AttemptControl {
     outside: Arc<Mutex<Outside>>,
     /// Its cgroup, when it has one: the proof is then the cgroup's and the marker scan's together (decision 8d v6).
     cgroup: Option<AttemptGroup>,
+    /// Its last SIGTERM's walk of the cgroup did not reach the whole subtree (CGW-50).
+    term_incomplete: bool,
 }
 
 /// Whether group number `pgid` may still have a member, now or later: a process in that group, or process `pgid`
@@ -405,12 +408,20 @@ impl ProcessControl for AttemptControl {
         let in_cgroup = match &self.cgroup {
             // SIGTERM to each member; SIGKILL to all of them at once, by the kernel.
             Some(cgroup) if sig == rustix::process::Signal::KILL => cgroup.kill(),
-            Some(cgroup) => cgroup.terminate().sent,
+            Some(cgroup) => {
+                let termed = cgroup.terminate();
+                self.term_incomplete = !termed.whole;
+                termed.sent
+            }
             None => false,
         };
         // And what the marker scan pinned (outside the cgroup, if it has one).
         let outside = self.outside.lock().is_ok_and(|mut o| o.signal(sig));
         in_cgroup || outside || group
+    }
+
+    fn sigterm_incomplete(&mut self) -> bool {
+        self.term_incomplete
     }
 }
 
@@ -818,6 +829,7 @@ mod tests {
                 native: Some((Arc::new(Answers(reached)), work.clone())),
                 outside: Arc::new(Mutex::new(Outside::new("p1/A1"))),
                 cgroup: None,
+                term_incomplete: false,
             };
             assert_eq!(control.send(Signal::Native), reached, "reached: {reached}");
         }
@@ -837,6 +849,34 @@ mod tests {
     }
 
     #[test]
+    fn a_cancels_sigterm_says_when_its_cgroup_walk_missed_part_of_the_subtree() -> R {
+        // CGW-50: the cancel's SIGTERM keeps whether its walk of the attempt's cgroup was whole, for the pass to record:
+        // a cgroup below that cannot be opened makes it incomplete; once it can be, the next SIGTERM is whole again.
+        use std::os::unix::fs::PermissionsExt as _;
+        let cgroup = tempfile::tempdir()?;
+        let at = cgroup.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("shut"))?;
+        let root = tree(&[(100, "PATH=/bin")])?;
+        let mut control = AttemptControl {
+            group: Watch::Gone,
+            native: None,
+            outside: Arc::new(Mutex::new(
+                Outside::new("p/A1").with_root(Some(root.path().to_owned())),
+            )),
+            cgroup: Some(AttemptGroup::witnessed(cgroup.path(), &at)?),
+            term_incomplete: false,
+        };
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o000))?;
+        control.send(Signal::Term);
+        let shut = control.sigterm_incomplete();
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o755))?;
+        control.send(Signal::Term);
+        let open = control.sigterm_incomplete();
+        assert_eq!((shut, open), (true, false));
+        Ok(())
+    }
+
+    #[test]
     fn a_cancels_look_with_a_cgroup_not_proved_empty_holds() -> R {
         // M2T06R-451 (decision 8d v6): the group gone, the attempt's cgroup populated or unreadable: Held; once it is
         // empty, the marker scan's two scans are still needed before Empty.
@@ -852,6 +892,7 @@ mod tests {
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
             cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
+            term_incomplete: false,
         };
         assert_eq!(control.look(), Look::Held, "populated");
         std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o000))?;
@@ -1125,6 +1166,7 @@ mod tests {
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
             cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
+            term_incomplete: false,
         };
         let held: Vec<Look> = (0..3).map(|_| watched.look()).collect();
         drop(child.stdin.take());
@@ -1156,6 +1198,7 @@ mod tests {
                 Outside::new("p/A1").with_root(Some(root.path().to_owned())),
             )),
             cgroup: Some(AttemptGroup::witnessed(cgroup.path(), cgroup.path())?),
+            term_incomplete: false,
         };
         let living: Vec<Look> = (0..3).map(|_| control.look()).collect();
         drop(child.stdin.take());

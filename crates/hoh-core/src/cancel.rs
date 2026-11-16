@@ -105,6 +105,11 @@ pub trait ProcessControl {
     fn look(&mut self) -> Look;
     /// Send `signal`; `false` when it was not sent (the group no longer held, so no signal may go to its number).
     fn send(&mut self, signal: Signal) -> bool;
+    /// Whether the SIGTERM just sent may have missed some of the attempt's processes: its cgroup's walk left part of
+    /// the subtree to the SIGKILL step (docs/adr/ADR-021.md decision 8d, CGW-50). The pass records it.
+    fn sigterm_incomplete(&mut self) -> bool {
+        false
+    }
 }
 
 /// How a pass ended.
@@ -120,6 +125,8 @@ pub enum PassEnd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pass {
     pub sent: Vec<(Signal, SystemTime)>,
+    /// Its SIGTERM may have missed some of the attempt's processes ([`ProcessControl::sigterm_incomplete`]).
+    pub term_incomplete: bool,
     pub end: PassEnd,
     pub progress: Progress,
 }
@@ -136,6 +143,7 @@ pub fn pass(
     poll: Duration,
 ) -> Pass {
     let mut sent = Vec::new();
+    let mut term_incomplete = false;
     // A SIGKILL step taken in this pass, whether or not it reached a process.
     let mut killed = false;
     loop {
@@ -145,6 +153,7 @@ pub fn pass(
             Next::Ended(Look::Empty) => {
                 return Pass {
                     sent,
+                    term_incomplete,
                     end: PassEnd::Empty,
                     progress,
                 };
@@ -152,6 +161,7 @@ pub fn pass(
             Next::Ended(_) => {
                 return Pass {
                     sent,
+                    term_incomplete,
                     end: PassEnd::Lost,
                     progress,
                 };
@@ -159,6 +169,7 @@ pub fn pass(
             Next::Send(Signal::Kill) if killed => {
                 return Pass {
                     sent,
+                    term_incomplete,
                     end: PassEnd::Unreaped,
                     progress,
                 };
@@ -166,6 +177,9 @@ pub fn pass(
             Next::Send(signal) => {
                 if control.send(signal) {
                     sent.push((signal, now));
+                }
+                if signal == Signal::Term {
+                    term_incomplete |= control.sigterm_incomplete();
                 }
                 // A step counts for the ladder's times even when it reached nothing (its group empty, nothing pinned,
                 // a scan incomplete): the pass then waits its grace and ends Unreaped at the second SIGKILL instead of
@@ -291,6 +305,7 @@ impl Canceller {
             let mut pass = crate::persistence::CancelPass {
                 attempt_id: attempt.attempt_id,
                 sent: done.sent,
+                term_incomplete: done.term_incomplete,
                 end: done.end,
                 at: clock.now(),
                 workspace: None,
@@ -572,6 +587,60 @@ mod tests {
             (lost.end, lost.sent.len(), group.sent.len()),
             (PassEnd::Lost, 0, 0)
         );
+    }
+
+    #[test]
+    fn a_pass_whose_sigterm_missed_part_of_the_cgroup_says_so_and_still_sends_sigkill() {
+        // CGW-50: the control says the SIGTERM it just sent may have missed some of the attempt's processes (its
+        // cgroup's walk left part of the subtree to the SIGKILL step): the pass carries it, and the ladder goes on,
+        // SIGKILL at 15. Asked after SIGTERM only: a pass the native interrupt ends says nothing of it.
+        struct Partial<'a>(Group<'a>);
+        impl ProcessControl for Partial<'_> {
+            fn look(&mut self) -> Look {
+                self.0.look()
+            }
+            fn send(&mut self, signal: Signal) -> bool {
+                self.0.send(signal)
+            }
+            fn sigterm_incomplete(&mut self) -> bool {
+                true
+            }
+        }
+        for (empty_at, incomplete, sent) in [
+            (
+                18,
+                true,
+                vec![
+                    (Signal::Native, at(0)),
+                    (Signal::Term, at(10)),
+                    (Signal::Kill, at(15)),
+                ],
+            ),
+            (5, false, vec![(Signal::Native, at(0))]),
+        ] {
+            let clock = FakeClock::default();
+            let mut control = Partial(Group {
+                clock: &clock,
+                empty_at,
+                lost: false,
+                sent: Vec::new(),
+            });
+            let mut wait = |d: Duration| clock.advance(d);
+            let done = pass(
+                &mut control,
+                &clock,
+                &mut wait,
+                &GRACES,
+                true,
+                Progress::default(),
+                Duration::from_millis(10),
+            );
+            assert_eq!(
+                (done.end, done.term_incomplete, done.sent),
+                (PassEnd::Empty, incomplete, sent),
+                "empty at {empty_at}"
+            );
+        }
     }
 
     #[test]

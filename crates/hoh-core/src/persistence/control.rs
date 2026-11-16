@@ -19,6 +19,8 @@ pub struct CancelPass {
     pub attempt_id: String,
     /// What was sent, when, in order.
     pub sent: Vec<(Signal, SystemTime)>,
+    /// Its SIGTERM may have missed some of the attempt's processes: recorded as a `cancel.diagnostic` (CGW-50).
+    pub term_incomplete: bool,
     pub end: PassEnd,
     /// When the pass ended.
     pub at: SystemTime,
@@ -352,6 +354,22 @@ fn record_pass(
         .iter()
         .map(|(signal, at)| event(signal.as_str(), *at))
         .collect();
+    // Its SIGTERM may have missed some of the attempt's processes (CGW-50, docs/adr/ADR-021.md decision 8d): said
+    // whether or not it reached any, as stop() records `cgroup_sigterm_incomplete` on the other paths.
+    if pass.term_incomplete {
+        events.push(NewEvent {
+            intent: Intent::Record,
+            project_id: project_id.clone(),
+            event_id: child_id(&pass.attempt_id, &format!("cancel/{number}/sigterm_incomplete")),
+            run_id: Some(run_id.clone()),
+            kind: "cancel.diagnostic".to_owned(),
+            payload: json!({
+                "code": "CGROUP_SIGTERM_INCOMPLETE", "attempt_id": pass.attempt_id,
+                "detail": "its SIGTERM may have missed some of its processes: the walk of its cgroup left part of the \
+                           subtree (not read, or its time budget spent); the SIGKILL step's cgroup.kill covers it",
+            }),
+        });
+    }
     let end = match pass.end {
         PassEnd::Empty => "reaped",
         PassEnd::Lost => "lost",
