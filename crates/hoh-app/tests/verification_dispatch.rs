@@ -7,6 +7,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::Context;
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
@@ -2382,27 +2384,19 @@ async fn a_change_request_left_in_a_verifiers_bridge_is_answered_when_a_reconcil
 }
 
 /// Submit run R's control command `kind` (its id and key `name`) at R's revision as the database has it, and again at
-/// the revision the host names while it answers STALE_REVISION (the host moves R on meanwhile: a Commander's decision,
-/// the pace waking it), as the client does (`client::fresh`), at most 20 times: the last answer's status and body.
-async fn fresh_command(host: &Host, project: &Path, kind: &str, name: &str) -> R<(u16, String)> {
-    let mut revision =
+/// the revision the host names while it answers STALE_REVISION ([`common::fresh`]): the last answer's status and body.
+async fn fresh_command(host: &Host, project: &Path, kind: &str, name: &str) -> R<(u16, Value)> {
+    let revision =
         rows(project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
-    let mut tries = 0;
-    loop {
-        let (status, said) = answer(
-            host,
-            &json!({"schema_version": "1.0", "command_id": format!("c-{name}"), "idempotency_key": name,
-                "expected_revision": revision, "kind": kind, "run_id": "R", "payload": {"reason": name}}),
-        )
-        .await?;
-        let refused: Value = serde_json::from_str(&said).unwrap_or(Value::Null);
-        tries += 1;
-        if status == 409 && refused["code"] == "STALE_REVISION" && tries < 20 {
-            revision = refused["current_revision"].clone();
-            continue;
+    common::fresh(revision, |revision| {
+        let body = json!({"schema_version": "1.0", "command_id": format!("c-{name}"), "idempotency_key": name,
+            "expected_revision": revision, "kind": kind, "run_id": "R", "payload": {"reason": name}});
+        async move {
+            let (status, said) = answer(host, &body).await?;
+            Ok((status, serde_json::from_str(&said).unwrap_or(Value::String(said))))
         }
-        return Ok((status, said));
-    }
+    })
+    .await
 }
 
 /// POST command `body` to the host's commands endpoint: the answer's status and body.

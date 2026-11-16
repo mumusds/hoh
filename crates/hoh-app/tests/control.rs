@@ -6,6 +6,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::Context;
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
@@ -165,13 +167,19 @@ async fn get(host: &Host, path: &str) -> R<(u16, Value)> {
     Ok((status, serde_json::from_str(body)?))
 }
 
-/// A control command for run R at its current revision.
-fn control(project: &Path, kind: &str, key: &str) -> R<Value> {
+/// A control command `kind` (its id and key `key`) for run R at its current revision, and again at the revision the
+/// host names while it answers STALE_REVISION (its runner moves R on meanwhile: a round's dispatch, the pace;
+/// [`common::fresh`]): the last answer.
+async fn control(host: &Host, project: &Path, kind: &str, key: &str) -> R<(u16, Value)> {
     let revision: i64 = query(project, "SELECT revision FROM runs WHERE run_id = 'R'")?.parse()?;
-    Ok(json!({
-        "schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
-        "expected_revision": revision, "kind": kind, "run_id": "R", "payload": {"reason": key},
-    }))
+    common::fresh(json!(revision), |revision| {
+        let body = json!({
+            "schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
+            "expected_revision": revision, "kind": kind, "run_id": "R", "payload": {"reason": key},
+        });
+        async move { command(host, &body).await }
+    })
+    .await
 }
 
 fn context() -> Context {
@@ -473,7 +481,7 @@ async fn test_043_01_a_pause_waits_for_t1_to_end_dispatches_nothing_and_a_resume
     .await?;
     let started = Instant::now();
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let (status, _) = command(&host, &control(&project, "PauseRun", "pause")?).await?;
+    let (status, _) = control(&host, &project, "PauseRun", "pause").await?;
     assert_eq!(status, 202);
     assert_eq!(
         query(
@@ -515,7 +523,7 @@ async fn test_043_01_a_pause_waits_for_t1_to_end_dispatches_nothing_and_a_resume
     tokio::time::sleep(Duration::from_secs(12).saturating_sub(started.elapsed())).await;
     assert_eq!(dispatched()?, "1", "no dispatch from 2 s to 12 s");
     assert_eq!(interrupted(), Vec::<String>::new(), "T1 was interrupted");
-    let (status, _) = command(&host, &control(&project, "ResumeRun", "resume")?).await?;
+    let (status, _) = control(&host, &project, "ResumeRun", "resume").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -598,7 +606,7 @@ async fn test_043_02_a_cancel_escalates_records_the_workspace_and_only_then_is_c
     .await?;
     let leader: u32 = query(&project, "SELECT pid FROM attempts WHERE task_id = 'T1'")?.parse()?;
     let asked = Instant::now();
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     assert_eq!(
         query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?,
@@ -740,7 +748,7 @@ async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R
         Duration::from_secs(10),
     )
     .await?;
-    let (status, _) = command(&host, &control(&project, "PauseRun", "pause")?).await?;
+    let (status, _) = control(&host, &project, "PauseRun", "pause").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -749,7 +757,7 @@ async fn test_043_04_pause_and_cancel_take_effect_with_the_commander_down() -> R
         Duration::from_secs(15),
     )
     .await?;
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -901,7 +909,7 @@ async fn a_cancel_also_ends_a_descendant_that_left_the_agents_process_group() ->
         &project,
         "SELECT p.project_id || '/' || a.attempt_id FROM projects p, attempts a WHERE a.task_id = 'T1'",
     )?);
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -1328,7 +1336,7 @@ async fn cancel_with_a_writer_outside(
         )
         .await;
     }
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     // The scenarios that start their writer once the cancel is accepted are told so.
     std::fs::write(go_mark(file), b"")?;
@@ -1957,7 +1965,7 @@ async fn cgroup_cancel_inside() -> R {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let asked = Instant::now();
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -2267,7 +2275,7 @@ async fn cgroup_moved_out_cancel_inside() -> R {
     .await?;
     assert_eq!(tracking(&project)?.0, "cgroup");
     moved_out(&pid_file, &base).await?;
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -2444,7 +2452,7 @@ async fn cgroup_leaderless_cancel_inside() -> R {
         group_lives(),
         "the precondition: a group without its leader"
     );
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -2548,7 +2556,7 @@ async fn cgroup_leaderless_outside_inside() -> R {
         rustix::process::test_kill_process_group(group).is_ok(),
         "the precondition: a group without its leader"
     );
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     tokio::time::sleep(Duration::from_secs(6)).await;
     let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
@@ -2615,7 +2623,7 @@ async fn cgroup_non_utf8_leader_inside() -> R {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -2682,7 +2690,7 @@ async fn cgroup_unverifiable_leader_inside() -> R {
         rustix::process::test_kill_process_group(group).is_ok(),
         "the precondition: the leader's group lives"
     );
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     tokio::time::sleep(Duration::from_secs(6)).await;
     let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
@@ -2757,7 +2765,7 @@ async fn cgroup_nested_member_inside() -> R {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+    let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
     assert_eq!(status, 202);
     until(
         &project,
@@ -3149,7 +3157,7 @@ async fn in_the_cancel_world_a_run_is_held_only_in_the_tick_of_its_stop() -> R {
             Duration::from_secs(10),
         )
         .await?;
-        let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+        let (status, _) = control(&host, &project, "CancelRun", "cancel").await?;
         assert_eq!(status, 202);
         until(
             &project,
