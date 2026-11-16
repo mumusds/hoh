@@ -339,6 +339,230 @@ async fn test_021_04_a_stale_answer_is_rejected_and_its_retrigger_answered_at_th
     Ok(())
 }
 
+/// Takes each supervision turn and ends it at once saying nothing (no line in its bridge); takes no work dispatch.
+#[derive(Debug, Default)]
+struct SilentCommander;
+
+impl hoh_app::host::Executor for SilentCommander {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(if work.role == "commander" {
+            Ok(())
+        } else {
+            Err("the fixture takes no work".to_owned())
+        });
+        ack
+    }
+
+    fn start(
+        &self,
+        _work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r go; exit 0"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| hoh_app::host::Refusal {
+                reason: "SPAWN".to_owned(),
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                detail: Some(e.to_string()),
+                details: None,
+            })?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut group_gone = hoh_agents::identity::group_empty(pid);
+            while !group_gone && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+                group_gone = hoh_agents::identity::group_empty(pid);
+            }
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: "said nothing".to_owned(),
+                group_gone,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                observed: hoh_core::persistence::Observed::default(),
+                unknown_effect: false,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+
+/// docs/adr/ADR-031.md design correction C through the host's tick (the test plan's 停滞探测 (7), its host half): a
+/// supervised RUNNING run with nothing to do, no obligation and a Commander that never decides: the tick's detector
+/// writes stalled/<P>/1, its turn says nothing, stalled/<P>/2, its turn says nothing, then the run-level question:
+/// runtime:stalled's claim, question.asked{stalled, turns: 2}, BLOCKED (NEED_DECISION) and its run.result after it;
+/// then no STALLED, question or turn more (a BLOCKED run's supervision may still move its horizon: CR-022 (3)). Nothing
+/// is injected: the clock moves, the host ticks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_its_commander_never_moves_is_retriggered_twice_then_asked_by_the_hosts_tick() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+           ('R', :p, 's1', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');",
+    )?;
+    let clock = Arc::new(FakeClock::default());
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(SilentCommander),
+        context: Context::default(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let asked = wait_for(
+        &db,
+        &clock,
+        "SELECT json_extract(payload_json, '$.reason') AS reason, json_extract(payload_json, '$.turns') AS turns, \
+         json_extract(payload_json, '$.choices') AS choices FROM events WHERE kind = 'question.asked'",
+        &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+    )?;
+    assert_eq!(
+        asked,
+        json!([{"reason": "stalled", "turns": 2, "choices": "[\"retry\",\"cancel\"]"}])
+    );
+    let stalled = rows(
+        &db,
+        "SELECT json_extract(payload_json, '$.n') AS n, json_extract(payload_json, '$.progress') AS p FROM events \
+         WHERE kind = 'supervisor.retrigger' AND json_extract(payload_json, '$.reason') = 'STALLED' ORDER BY seq",
+    )?;
+    assert_eq!(stalled.as_array().map(Vec::len), Some(2), "{stalled}");
+    assert_eq!(stalled[0]["p"], stalled[1]["p"]);
+    let turns = rows(
+        &db,
+        "SELECT a.state FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'commander' ORDER BY a.rowid",
+    )?;
+    assert_eq!(
+        turns,
+        json!([{"state": "SETTLED"}, {"state": "SETTLED"}]),
+        "one turn for each STALLED"
+    );
+    let run = rows(
+        &db,
+        "SELECT state, blocked_reason, (SELECT json_extract(payload_json, '$.state') || '/' || \
+         json_extract(payload_json, '$.blocked_reason') FROM events WHERE run_id = 'R' AND kind = 'run.result' \
+         AND seq > (SELECT seq FROM events WHERE kind = 'question.asked') ORDER BY seq LIMIT 1) AS result \
+         FROM runs WHERE run_id = 'R'",
+    )?;
+    assert_eq!(
+        (
+            &run[0]["state"],
+            &run[0]["blocked_reason"],
+            &run[0]["result"]
+        ),
+        (
+            &json!("BLOCKED"),
+            &json!("NEED_DECISION"),
+            &json!("BLOCKED/NEED_DECISION")
+        )
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT json_extract(payload_json, '$.source') AS source FROM events WHERE kind = 'run.blocker_claimed'"
+        )?,
+        json!([{"source": "runtime:stalled"}])
+    );
+    // A few more ticks: no STALLED, question or turn more.
+    let more = "SELECT count(*) AS n FROM events WHERE run_id = 'R' AND (kind IN ('question.asked', \
+                'supervisor.allocated') OR (kind = 'supervisor.retrigger' AND json_extract(payload_json, '$.reason') = 'STALLED'))";
+    let before = rows(&db, more)?;
+    for _ in 0..5 {
+        clock.advance(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(rows(&db, more)?, before);
+    host.shutdown().await;
+    Ok(())
+}
+
+/// docs/adr/ADR-031.md design correction C, M2T13D-301 (the test plan's 停滞探测 (9), its host half): a run in the
+/// Commander's stage SPECIFYING, its deadline passed and a spec.changed owed: the host's tick paces it (its budget only)
+/// to INCOMPLETE with run.incomplete and its run.result; no turn, no STALLED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commander_stage_run_past_its_deadline_is_stopped_by_the_hosts_pace() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, deadline_at, created_at) VALUES
+           ('R', :p, 's1', 'SPECIFYING', 'AUTO', 7, '2026-11-07T00:00:01Z', '2026-11-07T00:00:00Z');
+         INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+           ('sc', 'codex', 'commander', '1', '{}');
+         INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           (:p, 'R/spec', 'R', 'spec.changed', '{\"spec_revision\": 1}', '2026-11-07T00:00:00Z');",
+    )?;
+    let clock = Arc::new(FakeClock::default());
+    let mut config = config(&project);
+    config.clock = hoh_app::host::HostClock(clock.clone());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(SilentCommander),
+        context: Context::default(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    wait_for(
+        &db,
+        &clock,
+        "SELECT state FROM runs WHERE run_id = 'R'",
+        &|r| r[0]["state"] == "INCOMPLETE",
+    )?;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT kind FROM (SELECT seq, kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 2) ORDER BY seq"
+        )?,
+        json!([{"kind": "run.incomplete"}, {"kind": "run.result"}])
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT count(*) AS n FROM events WHERE kind = 'supervisor.allocated' OR (kind = 'supervisor.retrigger' \
+             AND json_extract(payload_json, '$.reason') = 'STALLED')"
+        )?,
+        json!([{"n": 0}])
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
 // The Commander on the product's path (docs/adr/ADR-030.md decision 11, its test plan's "Commander", M2T15D-05): the
 // product's host over fake agent CLIs. Staffing treats the commander binding as any role's (fallback), a supervision
 // turn's permanent failure reaches staffing through the binding it blocks, and an owed wake waits, uncounted, while the
