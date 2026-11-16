@@ -53,6 +53,29 @@ pub enum RunTarget {
     /// applied at once; `expected_revision` is the team revision. An empty `run_id` is the project's command (null in
     /// the request); a run id names a run that must exist.
     Team(super::team::TeamChange),
+    /// An input to the run (AnswerQuestion, SendInput; docs/adr/ADR-031.md decision 7): accepted in any state but a
+    /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
+    /// stays stopped.
+    Input(Input),
+}
+
+/// What an input command brings (docs/adr/ADR-031.md decision 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    /// AnswerQuestion: the answer to one of the run's open questions, by a choice or by its text.
+    Answer {
+        question_id: String,
+        answer: String,
+        choice_id: Option<String>,
+    },
+    /// SendInput: the answer to the run's only open question when it is a REPLY to no role, else queued (a REPLY as a
+    /// STEER, REQ-002's decision) for M3-T04 to deliver.
+    Send {
+        text: String,
+        target_role: Option<String>,
+        /// `ASK`, `STEER`, `CHANGE`, `CONTROL` or `REPLY`.
+        input_kind: String,
+    },
 }
 
 /// What a command came to.
@@ -201,6 +224,10 @@ pub(super) fn submit(
             )?;
             (revision, done.event_seqs[0])
         }
+        RunTarget::Input(input) => {
+            super::hold::command(&tx, &command.run_id)?;
+            input_command(&tx, command, input, ctx)?
+        }
         target => {
             // A run command: every event of its run in this transaction is the command's, written even while the run
             // is stopped (docs/adr/ADR-031.md correction D: an INCOMPLETE run takes commands).
@@ -252,7 +279,9 @@ pub(super) fn submit(
                     }
                     to
                 }
-                RunTarget::Start { .. } | RunTarget::Team(_) => unreachable!("handled above"),
+                RunTarget::Start { .. } | RunTarget::Team(_) | RunTarget::Input(_) => {
+                    unreachable!("handled above")
+                }
             };
             let at = events.len();
             events.push(command.event.clone());
@@ -366,6 +395,161 @@ pub(super) fn submit(
         revision,
         event_seq,
     })
+}
+
+/// An input command `command` of `input` in its transaction (docs/adr/ADR-031.md decision 7, E3, E5): its run must
+/// exist, not have ended (409 ILLEGAL_TRANSITION with `details.state`) and be at `expected_revision`. Its acceptance
+/// event first (`input.accepted{command_id, input_id, kind, question_id}`, or `question.answer_accepted{command_id,
+/// question_id}`), then the answer's exit (`questions::answer`) or the queued input; the run's revision moved; its
+/// result judged at the end. The run's new revision and the acceptance event's seq.
+fn input_command(
+    tx: &rusqlite::Transaction<'_>,
+    command: &SubmitCommand,
+    input: &Input,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(i64, i64), PersistError> {
+    let run: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT state, revision, project_id FROM runs WHERE run_id = ?1",
+            params![command.run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((state, revision, project_id)) = run else {
+        return Err(PersistError::RunNotFound(command.run_id.clone()));
+    };
+    if writer::parse::<RunState>(&state)?.is_terminal() {
+        return Err(PersistError::IllegalTransition {
+            entity: writer::Entity::Run,
+            id: command.run_id.clone(),
+            from: state.clone(),
+            to: "input".to_owned(),
+            why: format!("Run 已结束（{state}），不再受理输入"),
+            details: Some(Box::new(serde_json::json!({"state": state}))),
+        });
+    }
+    if revision != command.expected_revision {
+        return Err(PersistError::StaleRevision {
+            entity: writer::Entity::Run,
+            id: command.run_id.clone(),
+            expected: command.expected_revision,
+            actual: Some(revision),
+        });
+    }
+    // What it answers, if anything, and the input row a SendInput keeps.
+    let input_id = crate::ids::child_id(&command.command_id, "input");
+    let mut accepted = command.event.clone();
+    let (answer, queued) = match input {
+        Input::Answer {
+            question_id,
+            answer,
+            choice_id,
+        } => {
+            accepted.payload["question_id"] = serde_json::json!(question_id);
+            (
+                Some((question_id.clone(), answer.clone(), choice_id.clone())),
+                None,
+            )
+        }
+        Input::Send {
+            text,
+            target_role,
+            input_kind,
+        } => {
+            let only = if input_kind == "REPLY" && target_role.is_none() {
+                let open = super::questions::open(tx, &command.run_id)?;
+                (open.len() == 1)
+                    .then(|| open.into_iter().next().map(|q| q.question_id))
+                    .flatten()
+            } else {
+                None
+            };
+            let kind = match (&only, input_kind.as_str()) {
+                (Some(_), _) => "REPLY",
+                (None, "REPLY") => "STEER",
+                (None, other) => other,
+            };
+            accepted.payload["input_id"] = serde_json::json!(input_id);
+            accepted.payload["kind"] = serde_json::json!(kind);
+            accepted.payload["question_id"] = serde_json::json!(only);
+            match only {
+                Some(question_id) => {
+                    tx.execute(
+                        "INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) \
+                         VALUES (?1, ?2, 'REPLY', NULL, 'APPLIED', ?3)",
+                        params![
+                            input_id,
+                            command.run_id,
+                            serde_json::json!({"text": text, "question_id": question_id}).to_string()
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                    (Some((question_id, text.clone(), None)), None)
+                }
+                None => (
+                    None,
+                    Some(super::inputs::NewInput {
+                        input_id: input_id.clone(),
+                        run_id: command.run_id.clone(),
+                        kind: kind.to_owned(),
+                        target_role: target_role.clone(),
+                        payload: serde_json::json!({"text": text}),
+                    }),
+                ),
+            }
+        }
+    };
+    // The acceptance event is the commit's first (decision 9 finds it by its command_id).
+    let done = writer::write(
+        tx,
+        &Commit {
+            events: vec![accepted],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    let seq = done.event_seqs[0];
+    if let Some((question_id, answer, choice_id)) = answer {
+        super::questions::answer(
+            tx,
+            &super::questions::Answer {
+                project_id: &project_id,
+                run_id: &command.run_id,
+                question_id: &question_id,
+                answer: &answer,
+                choice_id: choice_id.as_deref(),
+                command_id: &command.command_id,
+            },
+            ctx,
+        )?;
+    } else {
+        if let Some(input) = &queued {
+            super::inputs::enqueue(tx, input, ctx)?;
+        }
+        writer::write(
+            tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: command.run_id.clone(),
+                    expected_revision: revision,
+                    change: Change::Touch(writer::Entity::Run),
+                }],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
+    // A run that stays stopped ends the commit with its result (E3).
+    writer::result_due(tx, &command.run_id)?;
+    let now: i64 = tx
+        .query_row(
+            "SELECT revision FROM runs WHERE run_id = ?1",
+            params![command.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    Ok((now, seq))
 }
 
 /// The stop states a ResumeRun takes a run out of (REQ-036 decision 2, docs/adr/ADR-031.md decision 16).
@@ -576,6 +760,7 @@ pub type RunProjection = (
     super::AcceptanceView,
     super::results::ResultView,
     i64,
+    Vec<super::questions::Question>,
 );
 /// [`run_view`] with the run's acceptance snapshot (docs/adr/ADR-029.md decision 5), in one read transaction.
 pub(super) fn run_projection(
@@ -594,7 +779,9 @@ pub(super) fn run_projection(
         };
         // The run's result as of the watermark (docs/adr/ADR-031.md decision 12): in the same read.
         let result = super::results::view(conn, run_id, watermark)?;
-        Ok::<_, PersistError>(Some((run, team, acceptance, result, watermark)))
+        // Its open questions (docs/adr/ADR-031.md decision 6), in the same read.
+        let questions = super::questions::open(conn, run_id)?;
+        Ok::<_, PersistError>(Some((run, team, acceptance, result, watermark, questions)))
     })();
     // Ends the read transaction either way; nothing was written.
     let _ = conn.execute_batch("COMMIT");

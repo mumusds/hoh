@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream::{self, Stream};
 use hoh_core::persistence::{
-    CommandOutcome, EventRow, FileTeam, Intent, NewEvent, NewOutbox, PersistError, Reader,
+    CommandOutcome, EventRow, FileTeam, Input, Intent, NewEvent, NewOutbox, PersistError, Reader,
     RunTarget, Store, SubmitCommand, TeamChange,
 };
 use hoh_core::protocol::{self, Command, CommandBody, RunState};
@@ -632,6 +632,14 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             false,
             None,
         ),
+        // An answer's choice that is not its question's (docs/adr/ADR-031.md decision 7).
+        PersistError::BadRequest(detail) => error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            detail,
+            false,
+            current_revision(shared, run_id).await,
+        ),
         PersistError::Busy(_) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "DB_BUSY",
@@ -816,6 +824,33 @@ async fn submit_command(
             "run.resumed",
             None,
             json!({"reason": reason.reason}),
+        ),
+        // An input to the run (docs/adr/ADR-031.md decision 7): its acceptance event names the command (and the
+        // question it answered, added by the store), so a client follows from it.
+        CommandBody::SendInput(input) => (
+            "SendInput",
+            RunTarget::Input(Input::Send {
+                text: input.text.clone(),
+                target_role: input.target_role.clone(),
+                input_kind: json!(input.input_kind)
+                    .as_str()
+                    .unwrap_or("REPLY")
+                    .to_owned(),
+            }),
+            "input.accepted",
+            None,
+            json!({}),
+        ),
+        CommandBody::AnswerQuestion(answer) => (
+            "AnswerQuestion",
+            RunTarget::Input(Input::Answer {
+                question_id: answer.question_id.clone(),
+                answer: answer.answer.clone(),
+                choice_id: answer.choice_id.clone().flatten(),
+            }),
+            "question.answer_accepted",
+            None,
+            json!({}),
         ),
         _ => {
             return error(
@@ -1239,7 +1274,7 @@ async fn get_run(
     };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.run_projection(&wanted)).await {
-        Ok(Some((run, team, acceptance, result, watermark))) => {
+        Ok(Some((run, team, acceptance, result, watermark, questions))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
                 |s| hoh_core::lifecycle::label(s).to_owned(),
@@ -1275,6 +1310,10 @@ async fn get_run(
                     // CANCEL_REQUESTED is shown as CANCELLING (REQ-043 behaviour 3, ADR-021 decision 8h).
                     "label": label,
                     "result": shown,
+                    // Its open questions, what a client lists on exit 3 and the TUI shows (docs/adr/ADR-031.md
+                    // decision 6).
+                    "questions": questions.iter().map(hoh_core::persistence::questions::Question::json)
+                        .collect::<Vec<_>>(),
                 },
             })),
         )

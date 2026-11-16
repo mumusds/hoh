@@ -531,6 +531,39 @@ fn blocked_reasons(tasks: &[TaskRow]) -> Vec<BlockedReason> {
     )
 }
 
+/// The pace's claim (docs/adr/ADR-025.md decision 5): what blocks the BLOCKED tasks of a run none of whose tasks can
+/// move on (`stalled`), none in the Commander's stages. The pace and an answer share it (docs/adr/ADR-031.md decision
+/// 7).
+fn pace_claim(tasks: &[TaskRow], stalled: bool, commander_stage: bool) -> Vec<BlockedReason> {
+    if stalled && !commander_stage {
+        blocked_reasons(tasks)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Run `run_id`'s pace claim read afresh at `at`, by the pace's own predicate (docs/adr/ADR-031.md decision 7): an
+/// answer that lets a task move clears it in its own commit, so the run is unblocked there and then.
+pub(super) fn stall_reasons(
+    conn: &Connection,
+    run_id: &str,
+    at: SystemTime,
+) -> Result<Vec<BlockedReason>, PersistError> {
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let commander_stage = matches!(
+        writer::parse::<RunState>(&state)?,
+        RunState::Created | RunState::Discovering | RunState::Specifying | RunState::Ready
+    );
+    let tasks = load_tasks(conn, run_id)?;
+    Ok(pace_claim(&tasks, idle(conn, run_id, at)?, commander_stage))
+}
+
 /// The run's tasks not yet ACCEPTED or CANCELLED, as `run.incomplete` lists them.
 fn remaining(tasks: &[TaskRow]) -> Vec<&str> {
     tasks
@@ -737,11 +770,7 @@ pub(super) fn pace(
         );
         claims.set(
             blockers::PACE,
-            &if stalled && !commander_stage {
-                blocked_reasons(&tasks)
-            } else {
-                Vec::new()
-            },
+            &pace_claim(&tasks, stalled, commander_stage),
         );
         let reasons = claims.reasons();
         let changed = claims.changed();

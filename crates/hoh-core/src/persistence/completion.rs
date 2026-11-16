@@ -594,12 +594,13 @@ fn freeze_and_accept(
         Ok(Frozen::New { .. }) => None,
         Ok(Frozen::Existing { state, .. }) if state == "FROZEN" => None,
         Ok(Frozen::Existing { state, .. }) if state == "VERIFYING" => {
-            // A flaky round on it: the same content cannot satisfy FLAKY, a new commit can (M2T16D-454, -557).
+            // A flaky round on it, or a flaky join of it: the same content cannot satisfy FLAKY, a new commit can
+            // (M2T16D-454, -557; docs/adr/ADR-031.md decision 8's flaky row).
             let flaky: bool = tx
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'verification.round_closed' \
-                     AND json_extract(payload_json, '$.candidate_id') = ?1 \
-                     AND json_extract(payload_json, '$.verdict') = 'flaky')",
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(payload_json, '$.candidate_id') = ?1 \
+                     AND ((kind = 'verification.round_closed' AND json_extract(payload_json, '$.verdict') = 'flaky') \
+                       OR (kind = 'verification.joined' AND json_extract(payload_json, '$.class') = 'flaky')))",
                     params![id],
                     |r| r.get(0),
                 )

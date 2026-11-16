@@ -618,6 +618,89 @@ pub(super) fn staff(
     Ok(true)
 }
 
+/// Verifier `role` of run `run_id` moved to its next epoch's session for a SESSION_NOT_INDEPENDENT answer about round
+/// `round_id` (docs/adr/ADR-031.md decision 8, M2T13D-03): the staffing's Rebind (`apply` with `Cause::Rebind` — the
+/// same agent and model, no session, ACTIVE, `team.binding_applied{cause: rebind}` — and the epoch's handover), whose
+/// session `team::session_id(run, role, epoch + 1)` staffing grants next. What to commit, in the answer's transaction;
+/// `Err(detail)` when a precondition does not hold: the role has an attempt in flight in the run (staffing would only
+/// hold the change pending, and an answer does not queue), or the new session is one the round's admission refuses.
+pub(super) fn rebind(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    round_id: &str,
+    role: &str,
+) -> Result<Result<Commit, String>, PersistError> {
+    let row: Option<(String, i64, Judged)> = tx
+        .query_row(
+            "SELECT b.agent, b.role_epoch, r.project_id, b.model, b.config_revision, b.state, b.blocked_reason, \
+             b.missing_json, b.session_id FROM role_bindings b JOIN runs r ON r.run_id = b.run_id \
+             WHERE b.run_id = ?1 AND b.role = ?2",
+            params![run_id, role],
+            |r| {
+                let state: String = r.get(5)?;
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    Judged {
+                        project_id: r.get(2)?,
+                        model: r.get(3)?,
+                        config_revision: r.get(4)?,
+                        blocked: if state == "BLOCKED" { r.get(6)? } else { None },
+                        missing: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
+                        session_id: r.get(8)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((agent, role_epoch, judged)) = row else {
+        return Ok(Err(format!("run {run_id} has no {role} bound")));
+    };
+    if live(tx, run_id, role)? {
+        return Ok(Err(format!(
+            "the {role} has an attempt in flight in run {run_id}: its binding cannot move now"
+        )));
+    }
+    let next = super::team::session_id(run_id, role, role_epoch + 1);
+    if super::verification::conflicting_sessions(tx, run_id, round_id, role)?.contains(&next) {
+        return Ok(Err(format!(
+            "the {role}'s next session {next} is one round {round_id} may not use"
+        )));
+    }
+    let change = StaffChange {
+        run_id: run_id.to_owned(),
+        role: role.to_owned(),
+        role_epoch,
+        agent: agent.clone(),
+        write: StaffWrite::Rebind,
+    };
+    let stem = stem(run_id, role, role_epoch);
+    let mut writes = Writes {
+        change: &change,
+        project_id: judged.project_id.clone(),
+        next: super::series::count(tx, &stem)? + 1,
+        stem,
+        events: Vec::new(),
+        outbox: Vec::new(),
+    };
+    let model = judged.model.clone();
+    apply(
+        tx,
+        &mut writes,
+        &judged,
+        &agent,
+        model.as_ref(),
+        Cause::Rebind,
+    )?;
+    handover(tx, &mut writes, &judged, &agent, model.as_ref())?;
+    Ok(Ok(Commit {
+        events: writes.events,
+        outbox: writes.outbox,
+        ..Commit::default()
+    }))
+}
+
 /// What a settle reads of a failed attempt: its task's role, its epoch, agent and session, and its configuration
 /// revision.
 struct TurnRow {

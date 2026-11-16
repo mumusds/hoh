@@ -1513,6 +1513,153 @@ async fn a_refused_resume_names_the_runs_state_and_what_of_its_stop_still_holds(
     Ok(())
 }
 
+/// The host takes SendInput and AnswerQuestion (docs/adr/ADR-031.md decisions 6, 7 and 9): getRun lists the run's open
+/// questions (`projection.questions`); an answer naming another choice is 400 BAD_REQUEST, one naming no open question
+/// 409 ILLEGAL_TRANSITION without `details.state` (the client's 1), any input to an ended run 409 ILLEGAL_TRANSITION with
+/// `details.state` (the client's 64), nothing stored for any; an accepted answer is 202 with the run's new revision, its
+/// acceptance event naming its command and the question, the question gone from getRun.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inputs_and_answers_are_accepted_and_refused_as_the_contract_says() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let to = To::Tcp(host.port);
+    let error = openapi_schema("/components/schemas/Error")?;
+    let accepted = openapi_schema(
+        "/paths/~1v1~1commands/post/responses/202/content/application~1json/schema",
+    )?;
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit(); \
+                  c.close()";
+    let project = &host.project_id;
+    python(
+        &db(dir.path()),
+        script,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s-seed', '{project}', printf('%064d', 7), 1);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, resume_state, blocked_reason,
+               blocked_reasons_json, created_at) VALUES
+               ('r-q', '{project}', 's-seed', 'BLOCKED', 'AUTO', 4, 'SPECIFYING', 'NEED_DECISION', '[\"NEED_DECISION\"]',
+                '2026-11-06T00:00:00Z'),
+               ('r-done', '{project}', 's-seed', 'COMPLETED', 'AUTO', 5, NULL, NULL, '[]', '2026-11-06T00:00:00Z');
+             INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
+               ('D1', 'r-q', 1, 3, '{{\"kind\": \"request_user_decision\", \"question_id\": \"q\",
+                 \"question\": \"选哪个方案？\", \"choices\": [{{\"choice_id\": \"a\", \"label\": \"方案A\"}}],
+                 \"requires_user\": true}}', 'PROPOSED');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('{project}', 'r-q/blocker/0', 'r-q', 'run.blocker_claimed', '{{\"reason\": \"NEED_DECISION\",
+                 \"source\": \"commander:D1\", \"open\": [[\"commander:D1\", \"NEED_DECISION\"]], \"n\": 0}}',
+                '2026-11-06T00:00:00Z');"
+        ),
+    )?;
+    let got = call(&to, "GET", "/v1/runs/r-q", &host.token, b"")
+        .await?
+        .json()?;
+    assert_eq!(
+        got["projection"]["questions"],
+        json!([{"question_id": "D1", "source": "commander", "task_id": null, "subject": null, "reason": null,
+            "refusal": false, "round_id": null, "round_root": null, "join_id": null, "candidate_id": null,
+            "current_round": null, "candidate_state": null, "text": "选哪个方案？",
+            "choices": [{"choice_id": "a", "label": "方案A"}], "default": null}]),
+        "{got}"
+    );
+    let command = |id: &str, run: &str, revision: i64, kind: &str, payload: Value| {
+        json!({"schema_version": "1.0", "command_id": id, "idempotency_key": format!("k-{id}"),
+               "expected_revision": revision, "kind": kind, "run_id": run, "payload": payload})
+        .to_string()
+    };
+    for (body, status, code, state) in [
+        (
+            command(
+                "c1",
+                "r-q",
+                4,
+                "AnswerQuestion",
+                json!({"question_id": "D1", "answer": "x", "choice_id": "z"}),
+            ),
+            400,
+            "BAD_REQUEST",
+            None,
+        ),
+        (
+            command(
+                "c2",
+                "r-q",
+                4,
+                "AnswerQuestion",
+                json!({"question_id": "nope", "answer": "x"}),
+            ),
+            409,
+            "ILLEGAL_TRANSITION",
+            None,
+        ),
+        (
+            command(
+                "c3",
+                "r-done",
+                5,
+                "SendInput",
+                json!({"text": "x", "target_role": null, "input_kind": "REPLY"}),
+            ),
+            409,
+            "ILLEGAL_TRANSITION",
+            Some("COMPLETED"),
+        ),
+        (
+            command(
+                "c4",
+                "r-done",
+                5,
+                "AnswerQuestion",
+                json!({"question_id": "D1", "answer": "x"}),
+            ),
+            409,
+            "ILLEGAL_TRANSITION",
+            Some("COMPLETED"),
+        ),
+    ] {
+        let reply = call(&to, "POST", "/v1/commands", &host.token, body.as_bytes()).await?;
+        assert_eq!(reply.status, status, "{body}: {reply:?}");
+        let refused = reply.json()?;
+        conforms(&error, &refused)?;
+        assert_eq!(refused["code"], code, "{refused}");
+        assert_eq!(refused["details"]["state"].as_str(), state, "{refused}");
+    }
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
+    let reply = call(
+        &to,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        command(
+            "c5",
+            "r-q",
+            4,
+            "AnswerQuestion",
+            json!({"question_id": "D1", "answer": "方案A"}),
+        )
+        .as_bytes(),
+    )
+    .await?;
+    assert_eq!(reply.status, 202, "{reply:?}");
+    let body = reply.json()?;
+    conforms(&accepted, &body)?;
+    assert_eq!(body["revision"], 5);
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT json_object('command_id', json_extract(payload_json, '$.command_id'), 'question_id', \
+             json_extract(payload_json, '$.question_id')) FROM events WHERE kind = 'question.answer_accepted'"
+        )?,
+        r#"{"command_id":"c5","question_id":"D1"}"#
+    );
+    let got = call(&to, "GET", "/v1/runs/r-q", &host.token, b"")
+        .await?
+        .json()?;
+    assert_eq!(got["projection"]["questions"], json!([]), "{got}");
+    assert_eq!(got["state"], "SPECIFYING", "{got}");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Every route refuses a request without the token, on the port one whose Host is not the bound loopback address or
 /// whose Origin is elsewhere, and on the socket one with any Origin, with 403 FORBIDDEN; `/healthz` needs no token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
