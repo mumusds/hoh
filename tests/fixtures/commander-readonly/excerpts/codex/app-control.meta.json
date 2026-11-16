@@ -1,0 +1,47 @@
+{
+ "agent": "codex",
+ "case": "app-control",
+ "argv": [
+  "codex",
+  "app-server"
+ ],
+ "exit_code": 0,
+ "stopped": "exited",
+ "notes": "App Server, full-access control",
+ "snapshot_diff": {
+  "added": [
+   "P/.git/hoh-patch-create",
+   "P/.git/hoh-shell-create",
+   "P/.hoh/hoh-patch-create",
+   "P/.hoh/hoh-shell-create",
+   "P/hoh-patch-create",
+   "P/hoh-shell-create",
+   "P/hoh-tool-create",
+   "W/hoh-patch-create",
+   "W/hoh-shell-create"
+  ],
+  "removed": [
+   "P/.git/hoh-patch-delete",
+   "P/.git/hoh-shell-delete",
+   "P/.hoh/hoh-patch-delete",
+   "P/.hoh/hoh-shell-delete",
+   "P/hoh-patch-delete",
+   "P/hoh-shell-delete",
+   "W/hoh-patch-delete",
+   "W/hoh-shell-delete"
+  ],
+  "changed": [
+   "P/.git/hoh-patch-modify",
+   "P/.git/hoh-shell-modify",
+   "P/.hoh/hoh-patch-modify",
+   "P/.hoh/hoh-shell-modify",
+   "P/hoh-patch-modify",
+   "P/hoh-shell-modify",
+   "W/hoh-patch-modify",
+   "W/hoh-shell-modify"
+  ]
+ },
+ "stdout_sha256": "7ee1d1f3cc65fa66fc5d41ba1b9601782f33d2d062cf13a4d17d1ce38b71fa81",
+ "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n"
+}

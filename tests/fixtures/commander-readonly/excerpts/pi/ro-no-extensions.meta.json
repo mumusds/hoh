@@ -1,0 +1,34 @@
+{
+ "agent": "pi",
+ "case": "ro-no-extensions",
+ "argv": [
+  "pi",
+  "--mode",
+  "rpc",
+  "--session-dir",
+  "<P>/.hoh/sessions/s1",
+  "--session-id",
+  "<uuid-91>",
+  "--tools",
+  "read,grep,find,ls",
+  "--no-mcp",
+  "--no-extensions",
+  "-e",
+  "<T>/observer.js"
+ ],
+ "exit_code": 0,
+ "stopped": "exited",
+ "notes": "read-only profile with --no-extensions (the explicit -e observer still loads): owner question Q-pi-ext",
+ "snapshot_diff": {
+  "added": [
+   "P/.hoh/sessions",
+   "P/.hoh/sessions/s1",
+   "P/.hoh/sessions/s1/2026-11-16T20-23-16-227Z_<uuid-91>.jsonl"
+  ],
+  "removed": [],
+  "changed": []
+ },
+ "stdout_sha256": "8b4860d9621fcd6a70896e2579f9fd5aab2d401a27afbb7225a6328eee2a7f0f",
+ "stderr_sha256": "a458a81ec87e4188877dcc400e72cc67d45c2d7a3ce97efd1d77138016d1d9af",
+ "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n"
+}

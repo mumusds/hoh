@@ -1,0 +1,13 @@
+{"_excerpt": {"source": ".hoh-dev/evidence/commander-readonly/spike/20261116T201950Z/pi/ordinary-error/stdout.jsonl", "source_sha256": "c32db44a31b436965ef006961c307c4d4c0b05f865c8661e214104fcc9a413ef", "excerpted": true, "kept": "the frames the ADR-032 evidence table reads", "paths": "<P> <W> <T> <HOME>"}}
+{"type": "extension_ui_request", "id": "<uuid-88>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\", \"edit\", \"write\"], \"sources\": {\"read\": \"builtin\", \"edit\": \"builtin\", \"write\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
+{"type": "response", "command": "get_state", "success": true}
+{"id": "p1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}
+{"type": "tool_execution_start", "toolCallId": "call_90f77d2938f54612bdf4c6e5", "toolName": "edit", "args": {"edits": [{"newText": "hoh-cell", "oldText": "no-such-text"}], "path": "<P>/hoh-shell-modify"}}
+{"type": "tool_execution_start", "toolCallId": "call_077287dc6a0740b2a8ad9b0b", "toolName": "write", "args": {"content": "hoh-cell\n", "path": "<P>/TOKEN.txt/hoh-cell"}}
+{"type": "tool_execution_end", "toolCallId": "call_90f77d2938f54612bdf4c6e5", "toolName": "edit", "result": {"content": [{"type": "text", "text": "Could not find the exact text in <P>/hoh-shell-modify. The old text must match exactly including all whitespace and newlines."}], "details": {}}, "isError": true, "durationMs": 2}
+{"type": "tool_execution_end", "toolCallId": "call_077287dc6a0740b2a8ad9b0b", "toolName": "write", "result": {"content": [{"type": "text", "text": "EEXIST: file already exists, mkdir '<P>/TOKEN.txt'"}], "details": {}}, "isError": true, "durationMs": 7}
+{"type": "tool_execution_start", "toolCallId": "call_9c07f6473325488ba0452cd3", "toolName": "read", "args": {"limit": 100, "offset": 1, "path": "<P>/hoh-missing"}}
+{"type": "tool_execution_start", "toolCallId": "call_d732dcce8e2b4cabbdf91bd9", "toolName": "read", "args": {"limit": 100, "offset": 1, "path": "<P>/TOKEN.txt"}}
+{"type": "tool_execution_end", "toolCallId": "call_9c07f6473325488ba0452cd3", "toolName": "read", "result": {"content": [{"type": "text", "text": "ENOENT: no such file or directory, access '<P>/hoh-missing'"}], "details": {}}, "isError": true, "durationMs": 1}
+{"type": "tool_execution_end", "toolCallId": "call_d732dcce8e2b4cabbdf91bd9", "toolName": "read", "result": {"content": [{"type": "text", "text": "HOH-TOKEN-c93e34c43d408526\n"}], "structuredContent": "HOH-TOKEN-c93e34c43d408526\n"}, "isError": false, "durationMs": 2}
+{"type": "agent_settled", "aborted": false}
