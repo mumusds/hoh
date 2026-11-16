@@ -3410,7 +3410,8 @@ mod tests {
         std::fs::write(
             &launcher,
             format!(
-                "#!/bin/sh\nsleep 60 &\necho $! > '{member}'\necho $$ > '{leader}'\nwait\n",
+                "#!/bin/sh\nsleep 60 &\nread -r s < /proc/$!/stat; printf '%s\\n' \"$s\" > '{member}'\n\
+                 read -r s < /proc/$$/stat; printf '%s\\n' \"$s\" > '{leader}'\nwait\n",
                 member = member.display(),
                 leader = leader.display()
             ),
@@ -3436,22 +3437,21 @@ mod tests {
             assert!(Instant::now() < until, "the command never ran");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let pids: [u32; 2] = [
-            std::fs::read_to_string(&leader)?.trim().parse()?,
-            std::fs::read_to_string(&member)?.trim().parse()?,
-        ];
+        // Each wrote by the command itself while it surely ran: its pid and start time (ADR-022 decision 10).
+        let pids = [own_stat(&leader)?, own_stat(&member)?];
         stop.stop();
-        // The probe's thread is still stalled: the stop alone ended both (each looked at by its number, a look that
-        // fails is not an end, M2T07R-1050).
+        // The probe's thread is still stalled: the stop alone ended both (each looked at by its number and start
+        // time, so a number handed out again is not taken for it; a look that fails is not an end, M2T07R-1050).
+        let over = |(pid, start): &(u32, String)| {
+            matches!(crate::identity::ended(*pid, Some(start)), Ok(true))
+        };
         let until = Instant::now() + Duration::from_secs(2);
-        while !pids.iter().all(|p| ended(*p)) && Instant::now() < until {
+        while !pids.iter().all(over) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let alive: Vec<u32> = pids.iter().copied().filter(|p| !ended(*p)).collect();
-        for pid in &alive {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+        let alive: Vec<(u32, String)> = pids.iter().filter(|p| !over(p)).cloned().collect();
+        for (pid, start) in &alive {
+            let _ = crate::identity::signal_if_same(*pid, start, Signal::KILL);
         }
         std::fs::remove_file(&stall)?;
         let result = probing.join().map_err(|_| "the probe panicked")?;
@@ -3544,9 +3544,18 @@ mod tests {
             .collect())
     }
 
-    /// Whether process `pid` has ended: gone, or over; a look that fails is "not ended" (M2T07R-1050).
-    fn ended(pid: u32) -> bool {
-        matches!(crate::identity::ended(pid, None), Ok(true))
+    /// The pid and start time in the stat line a process wrote of itself (or of its child) into `file` while it ran.
+    fn own_stat(file: &Path) -> Result<(u32, String), Box<dyn std::error::Error>> {
+        let stat = std::fs::read(file)?;
+        let pid = String::from_utf8_lossy(&stat)
+            .split_whitespace()
+            .next()
+            .ok_or("an empty stat line")?
+            .parse()?;
+        let start = crate::identity::after_command_name(&stat)
+            .and_then(|fields| fields.split_whitespace().nth(19))
+            .ok_or("the stat line has no start time")?;
+        Ok((pid, start.to_owned()))
     }
 
     /// Whether process `pid` is gone, not even a zombie: no entry left, or its number now another's (its parent no
@@ -4147,7 +4156,7 @@ mod tests {
         std::fs::write(
             &launcher,
             format!(
-                "#!/bin/sh\nsetsid sh -c 'echo $$ > \"$1\"; exec sleep 60' sh '{escaped}' &\n\
+                "#!/bin/sh\nsetsid sh -c 'read -r s < /proc/$$/stat; printf \"%s\\n\" \"$s\" > \"$1\"; exec sleep 60' sh '{escaped}' &\n\
                  while [ ! -s '{escaped}' ]; do sleep 0.01; done\necho $$ > '{pid}'\nexec sleep 60\n",
                 escaped = escaped.display(),
                 pid = pid.display()
@@ -4173,10 +4182,10 @@ mod tests {
         stop.stop();
         let result = probing.join().map_err(|_| "the probe panicked")?;
         let took = stopping.elapsed();
-        let child = std::fs::read_to_string(&escaped)?.trim().to_owned();
-        let _ = Command::new("kill")
-            .args(["-KILL", child.as_str()])
-            .status();
+        // The escaped child, by the stat line it wrote of itself: only while it is still that process (ADR-022
+        // decision 10).
+        let (child, start) = own_stat(&escaped)?;
+        let _ = crate::identity::signal_if_same(child, &start, Signal::KILL);
         assert!(
             took < Duration::from_secs(2),
             "the stopped probe took {took:?}"
