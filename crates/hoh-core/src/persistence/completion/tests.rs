@@ -2380,9 +2380,9 @@ async fn a_failed_recovery_at_the_hosts_start_wakes_the_commander_unless_its_can
     // Superseded since (a persistent fact): a permanent fault is only recorded.
     Connection::open(&path)?.execute(
         "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
-         SELECT project_id, 'stale-spec', 'R', 'candidate.stale', \
+         SELECT project_id, ?2, 'R', 'candidate.stale', \
          json_object('candidate_id', ?1, 'reason', 'spec_changed'), '2026-11-12T00:00:00Z' FROM runs WHERE run_id = 'R'",
-        rusqlite::params![candidate],
+        rusqlite::params![candidate, crate::ids::child_id(&candidate, "stale")],
     )?;
     store
         .record_start_recovery(&candidate, Err((true, "damaged".to_owned())), t0)

@@ -27,27 +27,46 @@ pub(super) fn live_obligation(
     conn: &rusqlite::Connection,
     candidate: &str,
 ) -> Result<bool, PersistError> {
-    conn.query_row(&live_obligation_sql(), params![candidate], |r| r.get(0))
-        .map_err(sqlite_error)
+    live_obligation_counted(conn, candidate, &mut super::recovery::Work::default())
 }
 
-/// [`live_obligation`]'s statement, candidate `?1` (M2T13R-03): every fact read among its run's events through the
-/// `(run_id, kind, seq)` index — its rounds and their closes (never Records: always the run's own), its judgment as
-/// superseded (`hold::of_run`: a Record of a stopped run included), the freezes after it — not the project's history.
+/// [`live_obligation`], its work counted (M2T13R-03, -102): [`live_obligation_sql`], then its judgment as superseded
+/// by its id (`recovery::judged`, of its run: a Record of a stopped run keeps the id) — not the project's history, nor
+/// another run's Records.
+pub(super) fn live_obligation_counted(
+    conn: &rusqlite::Connection,
+    candidate: &str,
+    work: &mut super::recovery::Work,
+) -> Result<bool, PersistError> {
+    let mut statement = conn
+        .prepare_cached(&live_obligation_sql())
+        .map_err(sqlite_error)?;
+    let open: Option<String> = statement
+        .query_row(params![candidate], |r| r.get(0))
+        .optional()
+        .map_err(sqlite_error)?;
+    work.count(&statement);
+    match open {
+        Some(run) => Ok(!super::recovery::judged(conn, candidate, &run, None, work)?),
+        None => Ok(false),
+    }
+}
+
+/// [`live_obligation`]'s statement, candidate `?1` (M2T13R-03): its run, when it is VERIFYING, REJECTED or INVALID,
+/// has a round not closed and no later freeze listed it — its rounds, their closes (never Records: always the run's
+/// own) and the freezes read among its run's events through the `(run_id, kind, seq)` index, not the project's
+/// history. Its judgment is `recovery`'s read.
 pub(super) fn live_obligation_sql() -> String {
     let run = "(SELECT run_id FROM main.candidates WHERE candidate_id = ?1)";
     format!(
-        "SELECT EXISTS(SELECT 1 FROM main.candidates c WHERE c.candidate_id = ?1 \
-           AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
+        "SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = ?1 \
+           AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID') \
          AND EXISTS(SELECT 1 FROM main.events o WHERE o.kind = 'verification.round_opened' AND o.run_id = {run} \
            AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM main.events x \
              WHERE x.kind = 'verification.round_closed' AND x.run_id = o.run_id \
              AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
-         AND NOT EXISTS(SELECT 1 FROM main.events s WHERE s.kind = 'candidate.stale' \
-           AND {} AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
          AND NOT EXISTS(SELECT 1 FROM main.events f, json_each(f.payload_json, '$.superseded') v \
-           WHERE f.kind = 'candidate.frozen' AND f.run_id = {run} AND v.value = ?1)",
-        super::hold::of_run("s", run)
+           WHERE f.kind = 'candidate.frozen' AND f.run_id = {run} AND v.value = ?1)"
     )
 }
 

@@ -451,27 +451,23 @@ fn replayed(
 
 /// Why candidate `candidate` of run `run_id` no longer stands for its reports (decision 8): `superseded` when another
 /// candidate of the run was frozen after it (a `candidate.frozen` later than its own), `candidate_stale` when a
-/// `candidate.stale` names it; none when neither.
+/// `candidate.stale` names it (`recovery::judged`, by its id); none when neither.
 fn stale_reason(
     tx: &Transaction<'_>,
     run_id: &str,
     candidate: &str,
 ) -> Result<Option<&'static str>, PersistError> {
-    let (superseded, stale): (bool, bool) = tx
+    let superseded: bool = tx
         .query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM events f WHERE f.kind = 'candidate.frozen' AND f.run_id = ?1 \
-                   AND json_extract(f.payload_json, '$.candidate_id') <> ?2 \
-                   AND f.seq > coalesce((SELECT max(o.seq) FROM events o WHERE o.kind = 'candidate.frozen' \
-                     AND o.run_id = ?1 AND json_extract(o.payload_json, '$.candidate_id') = ?2), 0)), \
-                 EXISTS(SELECT 1 FROM events s WHERE {} AND s.kind = 'candidate.stale' \
-                   AND json_extract(s.payload_json, '$.candidate_id') = ?2)",
-                super::hold::of_run("s", "?1")
-            ),
+            "SELECT EXISTS(SELECT 1 FROM events f WHERE f.kind = 'candidate.frozen' AND f.run_id = ?1 \
+               AND json_extract(f.payload_json, '$.candidate_id') <> ?2 \
+               AND f.seq > coalesce((SELECT max(o.seq) FROM events o WHERE o.kind = 'candidate.frozen' \
+                 AND o.run_id = ?1 AND json_extract(o.payload_json, '$.candidate_id') = ?2), 0))",
             params![run_id, candidate],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .map_err(sqlite_error)?;
+    let stale = super::recovery::judged(tx, candidate, run_id, None, &mut Default::default())?;
     Ok(if superseded {
         Some("superseded")
     } else if stale {
