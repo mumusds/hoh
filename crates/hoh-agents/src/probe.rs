@@ -3585,13 +3585,16 @@ mod tests {
             })
     }
 
-    /// `probe` run on a thread named `name`, the name of the command it starts. A command its starter kills right after
-    /// the spawn returned can die inside its execve before the kernel names it after the program: the spawn returns
-    /// once the execve lets the old address space go (exec_mm_release), the name is set later (__set_task_comm), and
-    /// in between the execve waits killably for that address space's lock, the spawner's own with CLONE_VFORK, which
-    /// another thread of this process may hold. Such a command keeps the spawning thread's name (M2T07R-900: a
-    /// zombie child named `probe::tests::a`, no child of the command's name, in a parallel run of the probe tests).
-    /// Named alike, it is found by its name either way.
+    /// `probe` run on a thread named `name`, the name of the command it starts, so the command is found by that name
+    /// whether or not its exec named it (M2T07R-900). A command its starter kills right after the spawn returned can
+    /// die inside its execve with the name of the thread that forked it. In parallel runs of the probe tests with
+    /// unnamed probing threads, 2 of 96 runs found no child of the command's name and one zombie child named
+    /// `probe::tests::a`, the probe having returned STOPPING. On this VM's 7.0.0-42-generic kernel, children SIGKILLed
+    /// as soon as posix_spawn returned kept the spawner's name in 2 of 40 000 (the package's experiment) and in 431 of
+    /// 1 000 (its review's) while other threads of the spawner changed its memory map, and never without them. The
+    /// order behind it, checked against upstream Linux v7.0 (fs/exec.c, kernel/fork.c, kernel/exit.c) by that review:
+    /// execve wakes the vfork parent (exec_mm_release) before it takes a lock a fatal signal interrupts, and names the
+    /// task (__set_task_comm) only after.
     fn probing_as<T: Send + 'static>(
         name: &str,
         probe: impl FnOnce() -> T + Send + 'static,
