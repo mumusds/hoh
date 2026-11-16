@@ -1268,3 +1268,114 @@ fn a_refused_input_is_said_with_its_code_and_nothing_follows() {
         sent.said
     );
 }
+
+/// A host that answers `/healthz` and serves one event stream of `events` (SSE blocks), then keeps it open; how many
+/// event streams were asked for. Named by the project's `host.json`, so a link that looks for its host again finds
+/// this one (never starts one).
+fn sse_host(
+    project: &std::path::Path,
+    socket: &std::path::Path,
+    events: &'static [&'static str],
+) -> crate::client::tests::R<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+    use std::io::{BufRead as _, Write as _};
+    let listener = std::os::unix::net::UnixListener::bind(socket)?;
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/host.json"),
+        serde_json::json!({"pid": std::process::id(), "socket": socket, "token": "t"}).to_string(),
+    )?;
+    let streams = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = streams.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let counted = counted.clone();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut out = &stream;
+                if first.contains("/healthz") {
+                    let _ = out.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                    return;
+                }
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = out.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                );
+                for block in events {
+                    let _ = write!(out, "{:x}\r\n{block}\r\n", block.len());
+                }
+                let _ = out.flush();
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            });
+        }
+    });
+    Ok(streams)
+}
+
+#[test]
+fn an_event_the_link_cannot_read_is_said_with_its_id_and_nothing_after_it_is_followed()
+-> crate::client::tests::R {
+    // docs/adr/ADR-031.md decision 10, in the TUI: an event whose data does not parse is never skipped silently; the
+    // message bar names its SSE id, and the link follows no further (no event after it, no new stream).
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let socket = dir.path().join("s");
+    let streams = sse_host(
+        &project,
+        &socket,
+        &[
+            "id: 1\ndata: {\"seq\":1,\"run_id\":\"R\",\"kind\":\"task.created\",\"payload\":{}}\n\n",
+            "id: 2\ndata: {\"seq\":2,\"run_id\":\n\n",
+            "id: 3\ndata: {\"seq\":3,\"run_id\":\"R\",\"kind\":\"task.ready\",\"payload\":{}}\n\n",
+        ],
+    )?;
+    let conn = super::Conn::new(
+        &project,
+        crate::client::HostInfo {
+            pid: std::process::id(),
+            socket: socket.clone(),
+            token: "t".to_owned(),
+        },
+    );
+    let link = conn.link("R");
+    let mut app = app_in(dir.path());
+    app.attach("R", "RUNNING");
+    let said = |app: &App| {
+        screen(app, 100, 20)
+            .iter()
+            .any(|r| r.contains("事件 2 的数据无法解析"))
+    };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !said(&app) && std::time::Instant::now() < end {
+        super::take_events(&mut app, &link);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let rows = screen(&app, 100, 20);
+    assert!(said(&app), "{rows:#?}");
+    // Nothing after it: event 3 is not shown, and the link asks for no new stream.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    super::take_events(&mut app, &link);
+    let rows = screen(&app, 100, 20);
+    assert!(
+        rows.iter().any(|r| r.contains("#1 task.created")),
+        "{rows:#?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("task.ready")), "{rows:#?}");
+    assert!(
+        rows.last().is_some_and(|r| r.contains("事件 1 · #1")),
+        "{rows:#?}"
+    );
+    assert_eq!(streams.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(link);
+    Ok(())
+}
