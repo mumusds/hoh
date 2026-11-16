@@ -13,7 +13,7 @@ use hoh_agents::adapter::AttemptRef;
 use hoh_agents::clock::{Clock, SystemClock, Timer};
 use hoh_agents::identity::group_empty;
 use hoh_agents::pi::{self, Launch, Outcome, SettledBy, Turn};
-use hoh_agents::process::Escalation;
+use hoh_agents::process::{Escalation, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{CancelLatch, CancelReceipt, NewInput};
 use serde_json::{Value, json};
@@ -520,6 +520,9 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
     let fake = world.fake("first", &first)?;
     let attempt = world.attempt("A1").await?;
     let mut turn = world.turn(&fake, "logs/A1")?;
+    // Once the turn settles the adapter closes stdin and gives pi this long to exit before its SIGTERM; the fake holds
+    // and does not exit, so until then only the test's kill ends it (step 2 is a kill -9, not the adapter's stop).
+    turn.escalation.term_grace = Duration::from_secs(30);
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     turn.events = Some(tx);
     let latch = CancelLatch::new();
@@ -528,8 +531,7 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
         while let Some(record) = rx.recv().await {
             if record["type"] == "agent_settled" {
                 // Its own stat line, written while it ran: SIGKILL to that process only, never to a process given its
-                // number later (ADR-022 decision 10). One already gone gets nothing, as the old kill of its number
-                // was let fail.
+                // number later (ADR-022 decision 10); whether it went is asserted below.
                 let stat = std::fs::read(fake.parent().ok_or("no dir")?.join("stat"))?;
                 let pid: u32 = String::from_utf8_lossy(&stat)
                     .split_whitespace()
@@ -539,19 +541,31 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
                 let start = hoh_agents::identity::after_command_name(&stat)
                     .and_then(|fields| fields.split_whitespace().nth(19))
                     .ok_or("the stat line has no start time")?;
-                let _ = hoh_agents::identity::signal_if_same(
+                let sent = hoh_agents::identity::signal_if_same(
                     pid,
                     start,
                     rustix::process::Signal::KILL,
                 )?;
-                break;
+                return Ok::<_, Box<dyn std::error::Error>>((pid, sent));
             }
         }
-        Ok::<(), Box<dyn std::error::Error>>(())
+        Err("the turn never settled".into())
     };
     let (outcome, killed) = tokio::join!(running, killer);
-    killed?;
-    assert_eq!(outcome?.state, AttemptState::Settled);
+    let (killed, sent) = killed?;
+    let outcome = outcome?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    // The kill landed before resume(): SIGKILL went to the fake the adapter ran while it was still that process, and
+    // that is how it ended; the adapter signalled nothing itself.
+    assert!(sent, "the fake {killed} had ended before its kill -9");
+    assert_eq!(outcome.pid, Some(killed));
+    assert_eq!(
+        outcome.exit,
+        Some(Termination::Signal(9)),
+        "{:?}",
+        outcome.steps
+    );
+    assert!(outcome.steps.is_empty(), "{:?}", outcome.steps);
     let before = world.store.reader()?.session("S1")?.ok_or("no session")?;
     assert_eq!(count(&world, "SELECT count(*) FROM sessions")?, 1);
     assert_eq!(
