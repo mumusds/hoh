@@ -529,12 +529,12 @@ pub(crate) fn last_failure_sql() -> String {
     )
 }
 
-/// [`unrecovered_candidates`]' statement (M2T13R-03): each kind of recovery fact read through the `(run_id, kind, seq)`
-/// index in one pass — a candidate's last failure and last recovery grouped by candidate, its judgment as
-/// unrecoverable looked up for it — never the events of other kinds, nor the history once per failure. Of every run:
+/// The `WITH` of the candidates whose last recovery failed and none succeeded since, `failing(candidate)` (M2T13R-03):
+/// each kind of recovery fact read through the `(run_id, kind, seq)` index in one pass, the last failure and the last
+/// recovery grouped by candidate — never the events of other kinds, nor the history once per failure. Of every run:
 /// the events of any run (`run_id` in runs, which its foreign key makes every one) or none (a Record of a stopped
 /// run); of run `?1` (`by_run`): its own and its Records written project-scoped (`hold::of_run`).
-pub(crate) fn unrecovered_sql(by_run: bool) -> String {
+pub(crate) fn failing_sql(by_run: bool) -> String {
     let scope = |alias: &str| {
         if by_run {
             hold::of_run(alias, "?1")
@@ -546,17 +546,26 @@ pub(crate) fn unrecovered_sql(by_run: bool) -> String {
         "WITH failed AS (SELECT json_extract(f.payload_json, '$.candidate_id') AS candidate, max(f.seq) AS seq \
            FROM main.events f WHERE f.kind = 'candidate.reconcile_failed' AND {} GROUP BY 1), \
          recovered AS (SELECT json_extract(r.payload_json, '$.candidate_id') AS candidate, max(r.seq) AS seq \
-           FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' AND {} GROUP BY 1) \
-         SELECT failed.candidate FROM failed LEFT JOIN recovered ON recovered.candidate = failed.candidate \
-         WHERE failed.seq > coalesce(recovered.seq, 0) \
-           AND NOT EXISTS(SELECT 1 FROM main.events s WHERE s.kind = 'candidate.stale' AND {} \
-             AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
-             AND json_extract(s.payload_json, '$.candidate_id') = failed.candidate)",
+           FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' AND {} GROUP BY 1), \
+         failing AS (SELECT failed.candidate FROM failed LEFT JOIN recovered ON recovered.candidate = failed.candidate \
+           WHERE failed.seq > coalesce(recovered.seq, 0))",
         scope("f"),
         scope("r"),
+    )
+}
+
+/// [`unrecovered_candidates`]' statement: those of [`failing_sql`] not judged unrecoverable, the judgment looked up for
+/// each.
+pub(crate) fn unrecovered_sql(by_run: bool) -> String {
+    format!(
+        "{} SELECT failing.candidate FROM failing \
+         WHERE NOT EXISTS(SELECT 1 FROM main.events s WHERE s.kind = 'candidate.stale' AND {} \
+           AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+           AND json_extract(s.payload_json, '$.candidate_id') = failing.candidate)",
+        failing_sql(by_run),
         hold::of_run(
             "s",
-            "(SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = failed.candidate)"
+            "(SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = failing.candidate)"
         ),
     )
 }
