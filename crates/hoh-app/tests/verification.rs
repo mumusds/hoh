@@ -2575,10 +2575,13 @@ impl FaultHooks for StopBeforeEvidence {
     }
 }
 
-/// Run R's published INCOMPLETE, as another writer's commit leaves it.
-const STOP_INCOMPLETE: &str = "UPDATE runs SET state = 'INCOMPLETE', revision = revision + 1 WHERE run_id = 'R';
+/// Run R's published INCOMPLETE, as another writer's commit leaves it (its run.result named by the revision it moved R
+/// to, as the writer names it).
+const STOP_INCOMPLETE: &str =
+    "UPDATE runs SET state = 'INCOMPLETE', revision = revision + 1 WHERE run_id = 'R';
     INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-      ('p1', 'R/result/stop', 'R', 'run.result', json_object('run_id', 'R', 'state', 'INCOMPLETE'), '2026-11-15T00:00:00Z');";
+      ('p1', 'R/result/' || (SELECT revision FROM runs WHERE run_id = 'R'), 'R', 'run.result',
+       json_object('run_id', 'R', 'state', 'INCOMPLETE'), '2026-11-15T00:00:00Z');";
 
 /// A fixture whose qa check of candidate C (run R, a qa script `qa`) left its record pending (its commit failed).
 async fn pending_with(qa: &str) -> R<(Fixture, Arc<StopBeforeEvidence>, String)> {
