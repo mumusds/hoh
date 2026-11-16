@@ -1341,22 +1341,41 @@ impl World {
 }
 
 impl Drop for World {
-    /// Its processes stopped, its directory removed here and not only by the TempDir, whose removal ignores its errors:
-    /// a removal that fails reports why ([`leftover`]) on stderr, written directly so that the test harness, which
-    /// captures only the print macros, shows it for a passing test too. Nothing is tried again.
+    /// Its processes stopped, its directory removed here and not only by the TempDir, whose removal ignores its errors
+    /// ([`removed`]): a removal that fails, or a directory made again just after it, is reported ([`leftover`]) on
+    /// stderr, written directly so that the test harness, which captures only the print macros, shows it for a passing
+    /// test too. Nothing is tried again.
     fn drop(&mut self) {
         use std::io::Write as _;
         self.stop();
-        if let Err(e) = std::fs::remove_dir_all(self.root()) {
-            let _ = std::io::stderr().write_all(leftover(self.root(), &e).as_bytes());
+        if let Some(report) = removed(self.root()) {
+            let _ = std::io::stderr().write_all(report.as_bytes());
         }
     }
+}
+
+/// How long after a removal [`removed`] looks once more for a directory made again.
+const RECHECK: Duration = Duration::from_millis(250);
+
+/// `root` removed: none when it was and is still gone [`RECHECK`] later; else the report of what is there
+/// ([`leftover`]): the removal's error, or that it was made again after its removal (a late writer's create_dir_all).
+pub fn removed(root: &Path) -> Option<String> {
+    if let Err(e) = std::fs::remove_dir_all(root) {
+        return Some(leftover(root, &e));
+    }
+    std::thread::sleep(RECHECK);
+    root.exists().then(|| {
+        leftover(
+            root,
+            &format!("it was removed, then made again within {RECHECK:?}"),
+        )
+    })
 }
 
 /// Why `root` was not removed (`error`): every entry left under it with its size and its last write (seconds and
 /// nanoseconds since the epoch), and every process with a file open under it (`fd <n> -> <path>`) or working there
 /// (`cwd <dir>`), with its command line.
-pub fn leftover(root: &Path, error: &std::io::Error) -> String {
+pub fn leftover(root: &Path, error: &dyn std::fmt::Display) -> String {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt as _;
     let mut out = format!(
