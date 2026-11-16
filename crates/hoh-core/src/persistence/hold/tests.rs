@@ -294,7 +294,8 @@ async fn a_command_of_a_stopped_incomplete_run_is_written_and_none_is_accepted_f
         (last.1.as_str(), last.2.as_deref()),
         ("e-cancel", Some("R"))
     );
-    // In the command's own transaction, its run is the command's even while stopped: an event of it in G is written.
+    // In the command's own transaction, its run is the command's even while stopped: an event of it in G is written,
+    // and the run, moved by the command (E3, M2T13R-02), ends it with its result.
     let dir = tempfile::tempdir()?;
     let (store, path) = stopped_world(&dir, RunState::Incomplete).await?;
     drop(store);
@@ -302,12 +303,35 @@ async fn a_command_of_a_stopped_incomplete_run_is_written_and_none_is_accepted_f
     let ctx = Ctx::quiet();
     let tx = writer::begin(&mut conn, &ctx)?;
     super::command(&tx, "R")?;
-    writer::insert_event(
+    let current = revision(&path)?;
+    writer::write(
         &tx,
-        &event("commanded", Some("R"), "test.input", Intent::Progress),
+        &Commit {
+            cas: vec![StateCas {
+                id: "R".to_owned(),
+                expected_revision: current,
+                change: Change::Touch(writer::Entity::Run),
+            }],
+            events: vec![event(
+                "commanded",
+                Some("R"),
+                "test.input",
+                Intent::Progress,
+            )],
+            ..Commit::default()
+        },
+        &ctx,
     )?;
     writer::commit(tx, &ctx)?;
-    assert_eq!(latest(&path)?.0, "test.input");
+    let all = events(&path)?;
+    assert_eq!(
+        all.iter()
+            .rev()
+            .take(2)
+            .map(|e| e.3.as_str())
+            .collect::<Vec<_>>(),
+        ["run.result", "test.input"]
+    );
     // A command's run that has ended is an IntegrityViolation at the commit, and nothing of it is written.
     for state in [RunState::Completed, RunState::Failed, RunState::Cancelled] {
         let dir = tempfile::tempdir()?;
@@ -742,6 +766,230 @@ async fn a_stopped_runs_history_is_recovered_as_records_and_its_live_obligation_
             store.submit_command(cancel(revision(&path)?)).await?;
             assert!(store.reader()?.recovery_due("C3")?);
         }
+    }
+    Ok(())
+}
+
+// M2T13R-02: whether a run is stopped is read without its history, and equals the ADR's definition read from it.
+
+/// The ADR's own definition of a stopped run, read from R's whole history: in G, and R's latest event the run.result of
+/// that state (docs/adr/ADR-031.md correction D). The reference [`super::stopped`]'s indexed reading must equal.
+fn stopped_by_history(path: &Path) -> R<bool> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs r WHERE r.run_id = 'R' \
+           AND r.state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'INCOMPLETE') \
+           AND (SELECT e.kind || '/' || coalesce(json_extract(e.payload_json, '$.state'), '') FROM events e \
+                WHERE e.run_id = 'R' ORDER BY e.seq DESC LIMIT 1) = 'run.result/' || r.state)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// After `step`: the store's reading of R's stop equals the ADR's.
+fn same(path: &Path, step: &str) -> R {
+    assert_eq!(
+        stopped(path)?.is_some(),
+        stopped_by_history(path)?,
+        "{step}: {:?}",
+        events(path)?.iter().rev().take(3).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// R moved by a compare-and-set that changes nothing but its revision, with no event (`Touch`).
+async fn touch(store: &Store, path: &Path) -> R<Result<(), PersistError>> {
+    Ok(store
+        .commit(Commit {
+            cas: vec![StateCas {
+                id: "R".to_owned(),
+                expected_revision: revision(path)?,
+                change: Change::Touch(writer::Entity::Run),
+            }],
+            ..Commit::default()
+        })
+        .await
+        .map(drop))
+}
+
+/// A ResumeRun of R at `revision`.
+fn resume(revision: i64) -> SubmitCommand {
+    SubmitCommand {
+        command_id: format!("c-resume-{revision}"),
+        idempotency_key: format!("k-resume-{revision}"),
+        kind: "ResumeRun".to_owned(),
+        target: RunTarget::Resume,
+        event: event(
+            &format!("e-resume-{revision}"),
+            Some("R"),
+            "run.resumed",
+            Intent::Progress,
+        ),
+        ..cancel(revision)
+    }
+}
+
+#[tokio::test]
+async fn a_runs_stop_read_by_its_current_results_id_is_the_adrs_on_every_path() -> R {
+    // M2T13R-02: `stopped` reads R's latest run.result by the (run_id, kind, seq) index and its id's revision, not R's
+    // whole history. It equals the ADR's definition (latest event the result of the state) because every transaction
+    // that leaves R in G with its revision moved ends with R's result at that revision, and every event of a stopped R
+    // is a command's, which moves it. Walked here on every path a run's events take around its stops.
+    // Each state of G and the stay states, entered by a commit; then a Record, Progress, a Touch with no event.
+    for state in [
+        RunState::Completed,
+        RunState::Failed,
+        RunState::Cancelled,
+        RunState::Incomplete,
+        RunState::Paused,
+        RunState::Blocked,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = stopped_world(&dir, state).await?;
+        same(&path, &format!("{state:?} entered"))?;
+        store
+            .commit(Commit {
+                events: vec![event("rec", Some("R"), "runner.diagnostic", Intent::Record)],
+                ..Commit::default()
+            })
+            .await?;
+        same(&path, &format!("{state:?} a record"))?;
+        let _held = store
+            .commit(Commit {
+                events: vec![event("prog", Some("R"), "test.progress", Intent::Progress)],
+                ..Commit::default()
+            })
+            .await;
+        same(&path, &format!("{state:?} progress"))?;
+        touch(&store, &path).await??;
+        same(&path, &format!("{state:?} touched"))?;
+        let _held = store
+            .commit(Commit {
+                events: vec![event("prog2", Some("R"), "test.progress", Intent::Progress)],
+                ..Commit::default()
+            })
+            .await;
+        same(&path, &format!("{state:?} progress after the touch"))?;
+    }
+    // INCOMPLETE: a command that keeps R in G moves it and ends with its result; one that does not is refused.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = stopped_world(&dir, RunState::Incomplete).await?;
+    drop(store);
+    let ctx = Ctx::quiet();
+    let mut conn = Connection::open(&path)?;
+    let tx = writer::begin(&mut conn, &ctx)?;
+    super::command(&tx, "R")?;
+    writer::insert_event(
+        &tx,
+        &event("commanded", Some("R"), "test.input", Intent::Progress),
+    )?;
+    let refused = writer::commit(tx, &ctx);
+    assert!(
+        matches!(refused, Err(PersistError::IntegrityViolation(_))),
+        "{refused:?}"
+    );
+    same(&path, "a command that does not move its stopped run")?;
+    let tx = writer::begin(&mut conn, &ctx)?;
+    super::command(&tx, "R")?;
+    let current = revision(&path)?;
+    writer::write(
+        &tx,
+        &Commit {
+            cas: vec![StateCas {
+                id: "R".to_owned(),
+                expected_revision: current,
+                change: Change::Touch(writer::Entity::Run),
+            }],
+            events: vec![event(
+                "commanded",
+                Some("R"),
+                "test.input",
+                Intent::Progress,
+            )],
+            ..Commit::default()
+        },
+        &ctx,
+    )?;
+    writer::commit(tx, &ctx)?;
+    same(&path, "a command that moves its stopped run")?;
+    assert_eq!(stopped(&path)?, Some(RunState::Incomplete));
+    drop(conn);
+    // INCOMPLETE left by ResumeRun and entered again; left by CancelRun.
+    let (store, _) = open(&dir)?;
+    store.submit_command(resume(revision(&path)?)).await?;
+    same(&path, "resumed")?;
+    enter(&store, &path, RunState::Incomplete, "again").await?;
+    same(&path, "INCOMPLETE again")?;
+    assert_eq!(stopped(&path)?, Some(RunState::Incomplete));
+    store.submit_command(cancel(revision(&path)?)).await?;
+    same(&path, "cancel requested")?;
+    // A run SQL put into G with no result, and its progress.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&path, "INCOMPLETE")?;
+    same(&path, "seeded")?;
+    store
+        .commit(Commit {
+            events: vec![event("after", Some("R"), "test.progress", Intent::Progress)],
+            ..Commit::default()
+        })
+        .await?;
+    same(&path, "seeded, then progress")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn whether_a_run_is_stopped_is_read_without_its_history() -> R {
+    // M2T13R-02: the stop's reading does the same work for a run with 1 000 events as for one with 100 000 (SQLite's
+    // VM steps of its statement), stopped or not.
+    let mut steps = Vec::new();
+    for history in [1_000, 100_000] {
+        for stopped_now in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = stopped_world(&dir, RunState::Incomplete).await?;
+            drop(store);
+            let conn = Connection::open(&path)?;
+            // R's history before its stop: `history` events of a few kinds, then its result again last.
+            conn.execute_batch(&format!(
+                "CREATE TEMP TABLE result AS SELECT * FROM events WHERE kind = 'run.result';
+                 DELETE FROM events WHERE kind = 'run.result';
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', '2026-11-15T00:00:00Z' FROM n;
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   SELECT project_id, event_id, run_id, kind, payload_json, created_at FROM temp.result;"
+            ))?;
+            if !stopped_now {
+                conn.execute_batch(
+                    "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                       ('p1', 'later', 'R', 'k1', '{}', '2026-11-15T00:00:00Z');
+                     UPDATE runs SET revision = revision + 1 WHERE run_id = 'R';",
+                )?;
+            }
+            let mut statement = conn.prepare(&format!(
+                "SELECT state FROM main.runs WHERE run_id = ?1 AND {}",
+                super::stopped_sql("?1")
+            ))?;
+            let found = statement.exists(params!["R"])?;
+            assert_eq!(found, stopped_now, "{history}");
+            steps.push((
+                history,
+                stopped_now,
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+            ));
+        }
+    }
+    for stopped_now in [true, false] {
+        let of = |history: i64| {
+            steps
+                .iter()
+                .find(|(h, s, _)| *h == history && *s == stopped_now)
+                .map(|(.., n)| *n)
+                .unwrap_or(i32::MAX)
+        };
+        assert!(
+            of(100_000) <= of(1_000) + 10,
+            "stopped {stopped_now}: {steps:?}"
+        );
     }
     Ok(())
 }

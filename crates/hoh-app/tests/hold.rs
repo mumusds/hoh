@@ -323,7 +323,7 @@ impl HostHooks for FlipAt {
                 &self.project,
                 "UPDATE runs SET state = 'COMPLETED', revision = revision + 1 WHERE run_id = 'X';
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-                   (:p, 'X/result', 'X', 'run.result', '{\"run_id\": \"X\", \"state\": \"COMPLETED\"}',
+                   (:p, 'X/result/4', 'X', 'run.result', '{\"run_id\": \"X\", \"state\": \"COMPLETED\"}',
                     '2026-11-15T00:00:00Z');
                  UPDATE supervisor_triggers SET due_at = '2000-01-01T00:00:00Z' WHERE run_id = 'Y';",
             ) {
@@ -416,7 +416,7 @@ async fn a_held_step_skips_its_run_and_the_tick_goes_on_with_nothing_counted_as_
     let failed = rows(
         &project,
         "SELECT count(*) AS n FROM events WHERE kind IN ('supervisor.step_failed', 'supervisor.output_failed') \
-         OR (run_id = 'X' AND seq > (SELECT seq FROM events WHERE event_id = 'X/result'))",
+         OR (run_id = 'X' AND seq > (SELECT seq FROM events WHERE event_id = 'X/result/4'))",
     )?;
     assert_eq!(failed[0]["n"], 0);
     Ok(())
@@ -481,11 +481,12 @@ INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_re
   ('R2', 'developer', 'codex', NULL, 1, 1, '2026-11-15T00:00:00Z');
 ";
 
-/// R1's cancel ended and published, as another writer's commit leaves it.
+/// R1's cancel ended and published, as another writer's commit leaves it (its run.result named by R1's new
+/// revision).
 const STOP_R1: &str =
     "UPDATE runs SET state = 'CANCELLED', revision = revision + 1 WHERE run_id = 'R1';
     INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-      (:p, 'R1/result/stop', 'R1', 'run.result', json_object('run_id', 'R1', 'state', 'CANCELLED'),
+      (:p, 'R1/result/4', 'R1', 'run.result', json_object('run_id', 'R1', 'state', 'CANCELLED'),
        '2026-11-15T00:00:00Z');";
 
 /// The runs' events of staffing: (run, kind).
@@ -588,7 +589,7 @@ async fn a_held_staffing_write_in_a_host_with_a_registry() -> R {
         rows(
             &project,
             "SELECT count(*) AS n FROM events WHERE run_id = 'R1' AND seq > \
-             (SELECT seq FROM events WHERE event_id = 'R1/result/stop')"
+             (SELECT seq FROM events WHERE event_id = 'R1/result/4')"
         )?[0]["n"],
         0
     );

@@ -1220,10 +1220,14 @@ pub(super) fn write(
     for cas in &commit.cas {
         revisions.push(compare_and_set(tx, cas)?);
         // A run that enters a stopping state gets its run.result at the end of the transaction, if it is still in one
-        // then (docs/adr/ADR-031.md decision 3).
-        if let Change::Run(to) = cas.change
-            && crate::exit::run_code(to).is_some()
-        {
+        // then (docs/adr/ADR-031.md decision 3); so does a run in G moved without a change of state (a Touch): its
+        // revision moved, and a stopped run is read by its result of the revision it is at (hold.rs, M2T13R-02).
+        let due = match cas.change {
+            Change::Run(to) => crate::exit::run_code(to).is_some(),
+            Change::Touch(Entity::Run) => super::hold::in_g(tx, &cas.id)?,
+            _ => false,
+        };
+        if due {
             tx.execute(
                 "INSERT OR IGNORE INTO temp.results_due(run_id) VALUES (?1)",
                 params![cas.id],
@@ -1340,6 +1344,26 @@ fn finish(tx: &Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     if let Some(run) = ended {
         return Err(PersistError::IntegrityViolation(format!(
             "a command was accepted for run {run}, which has ended"
+        )));
+    }
+    // A command's run in G ends with its result (E3), so it is moved: a stopped run's events are a command's only, and
+    // its stop is read by its result of the revision it is at (hold.rs, M2T13R-02).
+    let unmoved: Option<String> = tx
+        .query_row(
+            &format!(
+                "SELECT c.run_id FROM temp.command_run c JOIN main.runs r ON r.run_id = c.run_id \
+                 WHERE r.state IN ({}) AND c.run_id NOT IN (SELECT run_id FROM temp.results_due) \
+                 ORDER BY c.run_id LIMIT 1",
+                super::hold::G
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(run) = unmoved {
+        return Err(PersistError::IntegrityViolation(format!(
+            "a command was accepted for run {run}, which stays stopped in G, without moving it"
         )));
     }
     let due: Vec<String> = {
