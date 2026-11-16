@@ -224,6 +224,54 @@ fn walk(
     whole
 }
 
+/// The pids a cgroup's member list `procs` gives, one per line, each handed to `each` as soon as it is read. The list is
+/// read a piece at a time and `spent` is looked at before each piece and each pid, so a long or slow list is left where
+/// the budget ran out (CGW-01, CGW-100). Whether it was read whole: false once the budget was spent or the list could
+/// not be read.
+fn each_member(
+    mut procs: impl std::io::Read,
+    spent: &dyn Fn() -> bool,
+    mut each: impl FnMut(i32),
+) -> bool {
+    // One line: a pid handed on (false when the budget was spent first), anything else passed over.
+    let mut hand = |line: &[u8]| match std::str::from_utf8(line)
+        .ok()
+        .and_then(|l| l.trim().parse::<i32>().ok())
+    {
+        Some(_) if spent() => false,
+        Some(pid) => {
+            each(pid);
+            true
+        }
+        None => true,
+    };
+    let mut piece = [0u8; 4096];
+    // The line read so far, which may go on in the next piece.
+    let mut line = Vec::new();
+    loop {
+        if spent() {
+            return false;
+        }
+        let n = match procs.read(&mut piece) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        };
+        for &byte in &piece[..n] {
+            if byte != b'\n' {
+                line.push(byte);
+                continue;
+            }
+            if !hand(&line) {
+                return false;
+            }
+            line.clear();
+        }
+    }
+    hand(&line)
+}
+
 /// A directory on a removal's way down: what it is, its name in the directory above it, and the directories in it not
 /// yet removed.
 struct Down {
@@ -489,7 +537,6 @@ impl AttemptGroup {
 
     /// As [`AttemptGroup::terminate`], `spent` saying when its budget is spent (the clock, or a test's stub).
     fn terminate_by(&self, spent: &dyn Fn() -> bool) -> Termed {
-        use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
         let top = match self.open_checked() {
             Ok(Some(top)) => top,
@@ -525,24 +572,17 @@ impl AttemptGroup {
                     return;
                 }
             };
-            let mut procs = String::new();
-            if std::fs::File::from(fd).read_to_string(&mut procs).is_err() {
-                unread = true;
-                return;
-            }
-            for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
-                // Below the top, members left once the budget is spent are cgroup.kill's (CGW-01).
-                if !names.is_empty() && spent() {
-                    unread = true;
-                    return;
-                }
+            // Below the top, members left once the budget is spent are cgroup.kill's (CGW-01); the top's are all read.
+            let never = || false;
+            let budget: &dyn Fn() -> bool = if names.is_empty() { &never } else { spent };
+            let whole = each_member(std::fs::File::from(fd), budget, |pid| {
                 let Some(raw) = rustix::process::Pid::from_raw(pid) else {
-                    continue;
+                    return;
                 };
                 let Ok(pidfd) =
                     rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty())
                 else {
-                    continue;
+                    return;
                 };
                 // Its cgroup as bytes (a cgroup's name need not be UTF-8): this one or one below it.
                 let here = std::fs::read(format!("/proc/{pid}/cgroup")).is_ok_and(|c| {
@@ -558,7 +598,8 @@ impl AttemptGroup {
                         rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM)
                             .is_ok();
                 }
-            }
+            });
+            unread |= !whole;
         });
         Termed {
             sent,
@@ -1249,6 +1290,73 @@ mod tests {
             "spent on the way"
         );
         Ok(())
+    }
+
+    /// A member list served a few bytes at a time, counting its reads.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let n = self.step.min(buf.len()).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    fn trickle(data: &str, step: usize) -> (Trickle, std::rc::Rc<std::cell::Cell<usize>>) {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stub = Trickle {
+            data: data.as_bytes().to_vec(),
+            at: 0,
+            step,
+            reads: reads.clone(),
+        };
+        (stub, reads)
+    }
+
+    #[test]
+    fn a_member_list_read_in_pieces_keeps_a_pid_split_between_them_whole() {
+        // CGW-100: the list is read a piece at a time; a pid split between pieces is one pid, lines that are no pid
+        // are passed over, and the last line needs no newline.
+        let (procs, _) = trickle("101\n2002\n30003\n\n x \n4", 3);
+        let mut pids = Vec::new();
+        assert!(each_member(procs, &|| false, |pid| pids.push(pid)));
+        assert_eq!(pids, [101, 2002, 30003, 4]);
+    }
+
+    #[test]
+    fn a_member_list_below_the_top_is_left_between_its_pieces_once_the_budget_is_spent() {
+        // CGW-100: a long or slow list is not read to its end before the budget is looked at: it is looked at before
+        // each piece, so the list is left at the first piece after the budget was spent (here after two reads, each
+        // too short for a whole pid).
+        let (procs, reads) = trickle(&"5000000\n".repeat(50), 2);
+        let spent = {
+            let reads = reads.clone();
+            move || reads.get() >= 2
+        };
+        let mut pids = Vec::new();
+        assert!(!each_member(procs, &spent, |pid| pids.push(pid)));
+        assert_eq!((reads.get(), pids), (2, Vec::new()));
+    }
+
+    #[test]
+    fn a_member_list_below_the_top_is_left_between_its_pids_once_the_budget_is_spent() {
+        // CGW-01: within a piece, the budget is looked at before each pid.
+        let (procs, _) = trickle(&"5000000\n".repeat(10), 4096);
+        let handed = std::cell::Cell::new(0);
+        let mut pids = Vec::new();
+        assert!(!each_member(procs, &|| handed.get() >= 3, |pid| {
+            handed.set(handed.get() + 1);
+            pids.push(pid);
+        }));
+        assert_eq!(pids, [5_000_000; 3]);
     }
 
     #[test]
