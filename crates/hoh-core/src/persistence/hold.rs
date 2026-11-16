@@ -158,6 +158,13 @@ impl TryFrom<PersistError> for Failure {
     }
 }
 
+impl Failure {
+    /// The store's error it is.
+    pub fn error(&self) -> &PersistError {
+        &self.0
+    }
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
