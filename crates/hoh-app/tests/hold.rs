@@ -421,3 +421,201 @@ async fn a_held_step_skips_its_run_and_the_tick_goes_on_with_nothing_counted_as_
     assert_eq!(failed[0]["n"], 0);
     Ok(())
 }
+
+/// What the writer and the runner did, in order: each request's name before it begins, each Held answer with its run,
+/// and each tick's point after its staffing. Before the first `Staff` request, `stop` is committed from another
+/// connection: a run's cancel that lands between the tick's read of the staffing list and the staffing's write.
+#[derive(Debug, Default)]
+struct StaffingOrder {
+    stop: Mutex<Option<(PathBuf, String)>>,
+    seen: Mutex<Vec<String>>,
+    errors: Mutex<Vec<String>>,
+}
+
+impl StaffingOrder {
+    fn push(&self, entry: String) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(entry);
+        }
+    }
+}
+
+impl FaultHooks for StaffingOrder {
+    fn before_job(&self, job: &'static str) {
+        self.push(format!("job {job}"));
+        if job != "Staff" {
+            return;
+        }
+        let Some((project, sql)) = self.stop.lock().ok().and_then(|mut s| s.take()) else {
+            return;
+        };
+        if let Err(e) = seed(&project, &sql)
+            && let Ok(mut errors) = self.errors.lock()
+        {
+            errors.push(e.to_string());
+        }
+    }
+
+    fn held(&self, job: &'static str, run: &str) {
+        self.push(format!("held {job} {run}"));
+    }
+}
+
+impl HostHooks for StaffingOrder {
+    fn runner(&self, point: RunnerPoint) {
+        if point == RunnerPoint::AfterStaffing {
+            self.push("after staffing".to_owned());
+        }
+    }
+}
+
+/// R1 and R2 RUNNING, R1 first, each with a developer binding to codex and no session: the registry, whose PATH has no
+/// agent, finds codex not installed, so staffing writes for both.
+const STAFFING_WORLD: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+  ('R1', :p, 's1', 'RUNNING', 'AUTO', 3, '2026-11-15T00:00:01Z'),
+  ('R2', :p, 's1', 'RUNNING', 'AUTO', 3, '2026-11-15T00:00:02Z');
+INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+  ('R1', 'developer', 'codex', NULL, 1, 1, '2026-11-15T00:00:00Z'),
+  ('R2', 'developer', 'codex', NULL, 1, 1, '2026-11-15T00:00:00Z');
+";
+
+/// R1's cancel ended and published, as another writer's commit leaves it.
+const STOP_R1: &str =
+    "UPDATE runs SET state = 'CANCELLED', revision = revision + 1 WHERE run_id = 'R1';
+    INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+      (:p, 'R1/result/stop', 'R1', 'run.result', json_object('run_id', 'R1', 'state', 'CANCELLED'),
+       '2026-11-15T00:00:00Z');";
+
+/// The runs' events of staffing: (run, kind).
+fn staffing_events(project: &Path) -> R<Value> {
+    rows(
+        project,
+        "SELECT run_id, kind FROM events WHERE run_id IS NOT NULL AND kind LIKE 'team.%' ORDER BY seq",
+    )
+}
+
+/// The host half of [`a_held_staffing_write_skips_its_binding_and_the_tick_goes_on`], run by it in a child process
+/// whose stderr it reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run by a_held_staffing_write_skips_its_binding_and_the_tick_goes_on in a child process"]
+async fn a_held_staffing_write_in_a_host_with_a_registry() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    let empty = dir.path().join("bin");
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&empty)?;
+    let first = host(&project, &Arc::new(HeldLog::default())).await?;
+    first.shutdown().await;
+    seed(&project, STAFFING_WORLD)?;
+    let order = Arc::new(StaffingOrder::default());
+    if let Ok(mut stop) = order.stop.lock() {
+        *stop = Some((project.clone(), STOP_R1.to_owned()));
+    }
+    let registry = hoh_app::host::agents::Registry::with_pi_dir(
+        empty.clone().into_os_string(),
+        Some(dir.path().join("pi-agent")),
+    );
+    let mut config = HostConfig::product_with(
+        &project,
+        hoh_core::config::Config::default(),
+        env!("CARGO_BIN_EXE_hoh").into(),
+        Arc::new(registry),
+    );
+    config.port = 0;
+    config.store.wal_probe = Some(probe());
+    config.store.faults = order.clone();
+    config.hooks = order.clone();
+    let host = Host::start(config).await?;
+    let outcome = async {
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            let after = order.seen.lock().map(|s| s.clone()).unwrap_or_default();
+            let ticked = after
+                .iter()
+                .skip_while(|e| !e.starts_with("held"))
+                .filter(|e| *e == "after staffing")
+                .count();
+            if ticked >= 3 {
+                break;
+            }
+            if Instant::now() > end {
+                return Err(
+                    format!("no Held staffing write and 3 ticks after it: {after:?}").into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+    assert_eq!(
+        order.errors.lock().map(|e| e.clone()).unwrap_or_default(),
+        Vec::<String>::new()
+    );
+    let seen = order.seen.lock().map(|s| s.clone()).unwrap_or_default();
+    // R1's staffing write is Held; the same tick goes on: R2's staffing write, then the tick's point after staffing,
+    // with no new tick (its first request, the reconcile scan) between them.
+    let held = seen
+        .iter()
+        .position(|e| e.starts_with("held"))
+        .ok_or("no Held")?;
+    assert_eq!(seen[held], "held Staff R1", "{seen:?}");
+    let rest: Vec<&String> = seen[held + 1..]
+        .iter()
+        .take_while(|e| *e != "after staffing")
+        .collect();
+    assert!(
+        rest.iter().any(|e| *e == "job Staff") && !rest.iter().any(|e| *e == "job Reconcile"),
+        "the tick of R1's Held: {rest:?} (all: {seen:?})"
+    );
+    assert!(
+        seen.iter().filter(|e| e.starts_with("held")).count() == 1,
+        "{seen:?}"
+    );
+    // R2 staffed; R1 nothing after its run.result.
+    let staffing = staffing_events(&project)?;
+    assert!(
+        staffing
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e["run_id"] == "R2")),
+        "{staffing}"
+    );
+    assert_eq!(
+        rows(
+            &project,
+            "SELECT count(*) AS n FROM events WHERE run_id = 'R1' AND seq > \
+             (SELECT seq FROM events WHERE event_id = 'R1/result/stop')"
+        )?[0]["n"],
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn a_held_staffing_write_skips_its_binding_and_the_tick_goes_on() -> R {
+    // docs/adr/ADR-031.md correction D rule 2 (b), M2T13R-01: a host with an agent registry; R1's cancel lands between
+    // the tick's read of the staffing list and R1's staffing write. That write is Held: R1's binding is skipped and
+    // marked held, the tick goes on (R2's staffing, the steps after staffing), nothing is said on stderr, and R1 gets
+    // no event after its run.result.
+    let out = Command::new(std::env::current_exe()?)
+        .args([
+            "a_held_staffing_write_in_a_host_with_a_registry",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{}\n{stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!stderr.contains("hoh host:"), "a diagnostic: {stderr}");
+    Ok(())
+}

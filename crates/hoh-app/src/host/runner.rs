@@ -401,28 +401,108 @@ fn recovery_outcome(
     }
 }
 
-/// A store call's answer for one item of a tick (docs/adr/ADR-031.md correction D, rule 2 (b)): a stopped run's Held
-/// is no failure — the item is skipped and its run noted in `held`, so the tick's later steps of that run skip it too;
-/// nothing is said on stderr and the tick goes on. Any other error is its caller's, as before.
-fn unless_held<T>(
-    result: Result<T, PersistError>,
-    held: &mut std::collections::BTreeSet<String>,
-) -> Result<Option<T>, PersistError> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(PersistError::Held { run, .. }) => {
-            held.insert(run);
-            Ok(None)
-        }
-        Err(e) => Err(e),
+/// What ends a tick, or the host's start for verification (docs/adr/ADR-031.md correction D, rule 2 (b); M2T13R-01): a
+/// store's failure, which is never a stopped run's Held, or a blocking step whose task ended without its answer. It has
+/// no `From<PersistError>`: every store call in the tick says what a stopped run's Held means there — one item of
+/// that run skipped ([`Held::item`]) or a call that writes no run's event ([`no_run`]) — so a `?` on a store call
+/// does not compile, and a Held never ends the tick.
+#[derive(Debug)]
+pub(super) enum TickError {
+    Store(hoh_core::persistence::hold::Failure),
+    /// A call that writes no run's event answered a stopped run's Held: the store's fault, said as one.
+    HeldWithoutRun(String),
+    /// A blocking step's task ended without its answer.
+    Lost(String),
+}
+
+impl From<hoh_core::persistence::hold::Failure> for TickError {
+    fn from(failure: hoh_core::persistence::hold::Failure) -> TickError {
+        TickError::Store(failure)
     }
+}
+
+impl std::fmt::Display for TickError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TickError::Store(failure) => failure.fmt(f),
+            TickError::HeldWithoutRun(said) => {
+                write!(f, "a call that writes no run's event answered {said}")
+            }
+            TickError::Lost(said) => f.write_str(said),
+        }
+    }
+}
+
+impl TickError {
+    /// A store that cannot write any more (stopped, busy, full): the tick ends, whatever its item (v13 decision 5,
+    /// M2T08R-51).
+    fn ends_the_tick(&self) -> bool {
+        matches!(
+            self,
+            TickError::Store(failure) if matches!(
+                failure.error(),
+                PersistError::WriterStopped | PersistError::Busy(_) | PersistError::Full(_)
+            )
+        )
+    }
+
+    /// A store's error that is not a stopped run's Held (the caller has matched those).
+    fn failed(error: PersistError) -> TickError {
+        match hoh_core::persistence::hold::Failure::try_from(error) {
+            Ok(failure) => TickError::Store(failure),
+            Err(held) => TickError::HeldWithoutRun(held.to_string()),
+        }
+    }
+}
+
+/// The runs a store call of this tick found stopped (Held, docs/adr/ADR-031.md correction D rule 2 (b)): their later
+/// steps of this tick are skipped.
+#[derive(Debug, Default)]
+pub(super) struct Held(std::collections::BTreeSet<String>);
+
+impl Held {
+    pub(super) fn contains(&self, run: &str) -> bool {
+        self.0.contains(run)
+    }
+
+    /// The answer of a store call that is one item of the tick and writes for one run at most (a Store method: one
+    /// writer transaction, or a run's batches of one step; or [`settle`], one attempt): a stopped run's Held is that
+    /// item skipped and its run noted, so the tick's later steps of it skip it too; nothing is said and the tick goes
+    /// on with the other items. Any other error ends the tick.
+    pub(super) fn item<T>(
+        &mut self,
+        result: Result<T, PersistError>,
+    ) -> Result<Option<T>, TickError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(PersistError::Held { run, .. } | PersistError::RunStopped { run, .. }) => {
+                self.0.insert(run);
+                Ok(None)
+            }
+            Err(e) => Err(TickError::failed(e)),
+        }
+    }
+}
+
+/// The answer of a store call that writes no run's event (a read, a lease's renewal): a stopped run's Held from it
+/// would be the store's fault, and ends the tick as one.
+pub(super) fn no_run<T>(result: Result<T, PersistError>) -> Result<T, TickError> {
+    result.map_err(TickError::failed)
+}
+
+/// A blocking step's answer: its task's end, then the store's.
+fn joined<T>(
+    answer: Result<Result<T, PersistError>, tokio::task::JoinError>,
+    what: &str,
+) -> Result<T, TickError> {
+    no_run(answer.map_err(|e| TickError::Lost(format!("{what} ended: {e}")))?)
 }
 
 /// The host's start for verification (docs/adr/ADR-028.md decision 16), before the first tick: every candidate with a
 /// record directory, frozen here and not judged unrecoverable, recovered once and recorded (a failure wakes the
 /// Commander unless the candidate was superseded, and holds its verifiers); the run directories and request
 /// directories of no live attempt removed; then one round sweep.
-async fn verification_start(common: &Common) -> Result<(), PersistError> {
+async fn verification_start(common: &Common) -> Result<(), TickError> {
     let store = &common.shared.store;
     let state = common.shared.root.join(".hoh");
     let evidence = state.join("evidence");
@@ -438,12 +518,14 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
     .await
     .unwrap_or_default();
     let handle = store.evidence_handle();
+    let mut held = Held::default();
     for candidate in &recorded {
-        let reader = store.reader()?;
+        let reader = no_run(store.reader())?;
         let id = candidate.clone();
-        let wanted = tokio::task::spawn_blocking(move || reader.start_recovery_wanted(&id))
-            .await
-            .map_err(|e| PersistError::Storage(format!("the start's look-up ended: {e}")))??;
+        let wanted = joined(
+            tokio::task::spawn_blocking(move || reader.start_recovery_wanted(&id)).await,
+            "the start's look-up",
+        )?;
         if !wanted {
             continue;
         }
@@ -452,35 +534,35 @@ async fn verification_start(common: &Common) -> Result<(), PersistError> {
         else {
             continue;
         };
-        unless_held(
+        held.item(
             store
                 .record_start_recovery(candidate, outcome, common.clock.now())
                 .await,
-            &mut std::collections::BTreeSet::new(),
         )?;
     }
     remove_unused(common).await?;
-    let waiting = store.runner_waiting(&common.shared.project_id).await?;
-    let held = common.shared.root.join(".hoh");
+    let waiting = no_run(store.runner_waiting(&common.shared.project_id).await)?;
+    let state = common.shared.root.join(".hoh");
     let pending =
-        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&held))
+        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
             .await
             .unwrap_or_default();
     for run in verified_runs(common, &waiting).await? {
-        unless_held(
-            store.reconcile_verification(&run, pending.clone()).await,
-            &mut std::collections::BTreeSet::new(),
-        )?;
+        if held.contains(&run) {
+            continue;
+        }
+        held.item(store.reconcile_verification(&run, pending.clone()).await)?;
     }
     Ok(())
 }
 
 /// The run directories and request directories of no live attempt removed (docs/adr/ADR-028.md decisions 6 and 16).
-async fn remove_unused(common: &Common) -> Result<(), PersistError> {
-    let reader = common.shared.store.reader()?;
-    let live = tokio::task::spawn_blocking(move || reader.live_attempts())
-        .await
-        .map_err(|e| PersistError::Storage(format!("the attempts' look-up ended: {e}")))??;
+async fn remove_unused(common: &Common) -> Result<(), TickError> {
+    let reader = no_run(common.shared.store.reader())?;
+    let live = joined(
+        tokio::task::spawn_blocking(move || reader.live_attempts()).await,
+        "the attempts' look-up",
+    )?;
     let (root, runs, project_id) = (
         common.shared.root.clone(),
         common.runs.clone(),
@@ -498,13 +580,13 @@ async fn remove_unused(common: &Common) -> Result<(), PersistError> {
 async fn verified_runs(
     common: &Common,
     waiting: &hoh_core::persistence::Waiting,
-) -> Result<Vec<String>, PersistError> {
-    let reader = common.shared.store.reader()?;
+) -> Result<Vec<String>, TickError> {
+    let reader = no_run(common.shared.store.reader())?;
     let project = common.shared.project_id.clone();
-    let cancelled =
-        tokio::task::spawn_blocking(move || reader.cancelled_with_open_rounds(&project))
-            .await
-            .map_err(|e| PersistError::Storage(format!("the runs' look-up ended: {e}")))??;
+    let cancelled = joined(
+        tokio::task::spawn_blocking(move || reader.cancelled_with_open_rounds(&project)).await,
+        "the runs' look-up",
+    )?;
     let mut runs: Vec<String> = Vec::new();
     for run in waiting
         .runs
@@ -593,14 +675,14 @@ async fn tick(
     context: &Context,
     renewed: &mut Instant,
     held_back: &mut BTreeMap<String, (Instant, String)>,
-) -> Result<(), PersistError> {
+) -> Result<(), TickError> {
     let store = &common.shared.store;
     let project_id = common.shared.project_id.clone();
     let now = common.clock.now();
     // The runs a store call of this tick found stopped (Held): their later steps of this tick are skipped.
-    let mut held = std::collections::BTreeSet::new();
+    let mut held = Held::default();
     // Expired leases first, so the rounds below can grant their slots again (ADR-019 decision 7).
-    for row in store.reconcile_scan(&project_id, now).await? {
+    for row in no_run(store.reconcile_scan(&project_id, now).await)? {
         let waiting = held_back
             .get(&row.attempt_id)
             .is_some_and(|(at, _)| at.elapsed() < common.settings.retry);
@@ -611,8 +693,10 @@ async fn tick(
         let id = row.attempt_id.clone();
         let entry = common.inflight.lock().ok().and_then(|mut f| f.remove(&id));
         let last = held_back.get(&id).map(|(_, seen)| seen.clone());
-        let settled = settle(common, &id, entry, "lease_expired", last.as_deref()).await;
-        match unless_held(settled, &mut held)?.flatten() {
+        match held
+            .item(settle(common, &id, entry, "lease_expired", last.as_deref()).await)?
+            .flatten()
+        {
             Some((Disposition::Unreaped, seen)) => {
                 held_back.insert(id, (Instant::now(), seen));
             }
@@ -633,10 +717,10 @@ async fn tick(
                     .collect()
             })
             .unwrap_or_default();
-        store.renew_leases(running, now).await?;
+        no_run(store.renew_leases(running, now).await)?;
         *renewed = Instant::now();
     }
-    let waiting = store.runner_waiting(&project_id).await?;
+    let waiting = no_run(store.runner_waiting(&project_id).await)?;
     // The product's agents as the registry last saw them: it looks at the ones the team, the bindings and their
     // fallbacks name in its own task (registry_watch), so no probe holds up a tick (docs/adr/ADR-022.md decision 10).
     let registry = common.executor.registry();
@@ -657,10 +741,7 @@ async fn tick(
     // (decision 8), before any pace or round: a change to an agent unavailable is refused, one to an agent not looked
     // at yet waits.
     for run in &waiting.team_behind {
-        unless_held(
-            store.team_checkpoint(run, availability.clone()).await,
-            &mut held,
-        )?;
+        held.item(store.team_checkpoint(run, availability.clone()).await)?;
     }
     // Staffing (docs/adr/ADR-030.md decision 1), where the binder was: after the checkpoints, before the first inputs,
     // the reconcile, the paces and the rounds, so they read the bindings it wrote; every binding judged against one
@@ -678,6 +759,7 @@ async fn tick(
             &common.shared.root,
             &snapshot,
             waiting.staffing.clone(),
+            &mut held,
         )
         .await?;
         context.required_capabilities = waiting
@@ -696,14 +778,11 @@ async fn tick(
     let session_starts = if waiting.team_behind.is_empty() && !staffed {
         waiting.session_starts.clone()
     } else {
-        store.session_starts(&project_id).await?
+        no_run(store.session_starts(&project_id).await)?
     };
     for start in &session_starts {
         if start.current_epoch > start.role_epoch {
-            unless_held(
-                store.supersede_session_start(&start.message_id).await,
-                &mut held,
-            )?;
+            held.item(store.supersede_session_start(&start.message_id).await)?;
             continue;
         }
         let Some(session) = &start.session_id else {
@@ -712,11 +791,10 @@ async fn tick(
         let answer = tokio::time::timeout(OPEN_SESSION, common.executor.open_session(start)).await;
         let failure = match answer {
             Ok(Ok(Ok(()))) => {
-                unless_held(
+                held.item(
                     store
                         .deliver_session_start(&start.message_id, session)
                         .await,
-                    &mut held,
                 )?;
                 continue;
             }
@@ -725,13 +803,13 @@ async fn tick(
             Err(_) => format!("no answer within {OPEN_SESSION:?}"),
         };
         // Seen in the run's events, once, not only on stderr: the role waits for its first input (M2T17R-150).
-        if unless_held(
-            store
-                .session_start_undelivered(&start.message_id, &failure)
-                .await,
-            &mut held,
-        )?
-        .is_none()
+        if held
+            .item(
+                store
+                    .session_start_undelivered(&start.message_id, &failure)
+                    .await,
+            )?
+            .is_none()
         {
             continue;
         }
@@ -768,19 +846,22 @@ async fn tick(
     // recovery is tried again even with none left; each failure is recorded and judged (a permanent one at once,
     // transient ones after 3 over 10 minutes, decisions 11 and 16).
     let handle = store.evidence_handle();
-    let reader = store.reader()?;
-    let unrecovered = tokio::task::spawn_blocking(move || reader.unrecovered_candidates())
-        .await
-        .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
+    let reader = no_run(store.reader())?;
+    let unrecovered = joined(
+        tokio::task::spawn_blocking(move || reader.unrecovered_candidates()).await,
+        "the recovery's look-up",
+    )?;
     for candidate in pending.union(&unrecovered) {
-        let reader = store.reader()?;
+        let reader = no_run(store.reader())?;
         let id = candidate.clone();
         // Due, and past its last failure's backoff (decision 11, M2T16D-1251).
-        let (due, not_before) = tokio::task::spawn_blocking(move || {
-            Ok::<_, PersistError>((reader.recovery_due(&id)?, reader.recovery_not_before(&id)?))
-        })
-        .await
-        .map_err(|e| PersistError::Storage(format!("the recovery's look-up ended: {e}")))??;
+        let (due, not_before) = joined(
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, PersistError>((reader.recovery_due(&id)?, reader.recovery_not_before(&id)?))
+            })
+            .await,
+            "the recovery's look-up",
+        )?;
         if !due || not_before.is_some_and(|t| common.clock.now() < t) {
             continue;
         }
@@ -790,21 +871,17 @@ async fn tick(
         ) else {
             continue;
         };
-        unless_held(
+        held.item(
             store
                 .record_recovery(candidate, outcome, common.clock.now())
                 .await,
-            &mut held,
         )?;
     }
     for run in verified_runs(common, &waiting).await? {
         if held.contains(&run) {
             continue;
         }
-        unless_held(
-            store.reconcile_verification(&run, pending.clone()).await,
-            &mut held,
-        )?;
+        held.item(store.reconcile_verification(&run, pending.clone()).await)?;
     }
     // Run directories and request directories no live attempt uses, whichever path ended theirs (a cancel's included,
     // M2T16R-54): removed, off the async threads.
@@ -812,11 +889,10 @@ async fn tick(
     for run in &waiting.paced {
         // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7);
         // in the Commander's stages, its budget only (docs/adr/ADR-031.md correction C).
-        if held.contains(run) || unless_held(store.pace_run(run, at()).await, &mut held)?.is_none()
-        {
+        if held.contains(run) || held.item(store.pace_run(run, at()).await)?.is_none() {
             continue;
         }
-        while let Some(round) = unless_held(store.schedule_round(run, at()).await, &mut held)?
+        while let Some(round) = held.item(store.schedule_round(run, at()).await)?
             && round.dispatched.is_some()
         {}
     }
@@ -828,22 +904,17 @@ async fn tick(
         if held.contains(run) {
             continue;
         }
-        let stepped = store.supervise(run, at()).await;
         // A run's failing step is its own: said once, and the tick goes on with the other runs, the allocation and
         // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51). A stopped run's step is
         // no failure (Held, docs/adr/ADR-031.md correction D): not recorded, not said.
-        match unless_held(stepped, &mut held) {
+        match held.item(store.supervise(run, at()).await) {
             Ok(_) => {}
-            Err(
-                e @ (PersistError::WriterStopped | PersistError::Busy(_) | PersistError::Full(_)),
-            ) => return Err(e),
+            Err(e) if e.ends_the_tick() => return Err(e),
             Err(e) => {
-                let Ok(failure) = hoh_core::persistence::hold::Failure::try_from(e) else {
-                    continue;
-                };
-                let e = failure;
-                // Seen in the run's events too, once per error (v15, M2T08R-152); its own failure only said.
-                if let Err(failed) = store.supervision_failed(run, &e.to_string()).await {
+                // Seen in the run's events too, once per error (v15, M2T08R-152); its own failure only said; a run
+                // that stopped meanwhile records nothing (Held).
+                if let Err(failed) = held.item(store.supervision_failed(run, &e.to_string()).await)
+                {
                     use std::io::Write as _;
                     let _ = writeln!(
                         std::io::stderr(),
@@ -866,17 +937,18 @@ async fn tick(
         }
     }
     // The allocation judges by the same looks (docs/adr/ADR-025.md v14 decision 5).
-    unless_held(
-        store.allocate_supervision(&project_id, at()).await,
-        &mut held,
-    )?;
-    for stop in store.supervision_stops(&project_id, at()).await? {
+    held.item(store.allocate_supervision(&project_id, at()).await)?;
+    // The turns to stop: one transaction, which writes the stopped turns' events (a run that stopped meanwhile is
+    // Held, the others' stops come at the next tick).
+    let stops = held
+        .item(store.supervision_stops(&project_id, at()).await)?
+        .unwrap_or_default();
+    for stop in stops {
         if stop.state == "PREPARED" {
-            unless_held(
+            held.item(
                 store
                     .withdraw_turn(&stop.attempt_id, common.clock.now())
                     .await,
-                &mut held,
             )?;
             continue;
         }
@@ -894,15 +966,17 @@ async fn tick(
         let last = held_back
             .get(&stop.attempt_id)
             .map(|(_, seen)| seen.clone());
-        let settled = settle(
-            common,
-            &stop.attempt_id,
-            entry,
-            stop.reason,
-            last.as_deref(),
-        )
-        .await;
-        match unless_held(settled, &mut held)?.flatten() {
+        let settled = held.item(
+            settle(
+                common,
+                &stop.attempt_id,
+                entry,
+                stop.reason,
+                last.as_deref(),
+            )
+            .await,
+        )?;
+        match settled.flatten() {
             Some((Disposition::Unreaped, seen)) => {
                 held_back.insert(stop.attempt_id.clone(), (Instant::now(), seen));
             }
@@ -912,7 +986,7 @@ async fn tick(
         }
     }
     for (message_id, _) in &waiting.started {
-        unless_held(store.ack_notice(message_id).await, &mut held)?;
+        held.item(store.ack_notice(message_id).await)?;
     }
     // Dispatches made by these rounds are taken on the next tick (their commit wakes the loop).
     for notice in waiting.dispatches {
@@ -951,7 +1025,13 @@ async fn tick(
                     use std::io::Write as _;
                     let _ = writeln!(std::io::stderr(), "hoh host: an attempt of the runner: {e}");
                     let entry = Entry { work, task: None };
-                    if let Err(e) = settle(&common, &id, Some(entry), "runner_error", None).await {
+                    // Its run stopped meanwhile: nothing to settle and nothing to say (Held).
+                    if let Err(e) = settle(&common, &id, Some(entry), "runner_error", None)
+                        .await
+                        .or_else(|e| {
+                            hoh_core::persistence::hold::Failure::try_from(e).map_or(Ok(None), Err)
+                        })
+                    {
                         let _ = writeln!(std::io::stderr(), "hoh host: the settle of {id}: {e}");
                     }
                 }
@@ -976,10 +1056,7 @@ async fn tick(
         if held.contains(run) {
             continue;
         }
-        unless_held(
-            store.detect_stall(run, pending.clone(), at()).await,
-            &mut held,
-        )?;
+        held.item(store.detect_stall(run, pending.clone(), at()).await)?;
     }
     Ok(())
 }
@@ -1864,5 +1941,45 @@ mod observed_tests {
         assert_eq!(detail["artifacts"], json!([row.json()]));
         assert_eq!(detail["artifacts_failed"][0]["name"], "stdout.jsonl");
         assert_eq!(detail["success"], true);
+    }
+}
+
+#[cfg(test)]
+mod held_tests {
+    /// docs/adr/ADR-031.md correction D rule 2 (b), M2T13R-01: a stopped run's Held is one item skipped, so
+    /// [`super::Held::item`] wraps only what is one run's item — a store call (one writer transaction, or a run's
+    /// batches of one step) or [`super::settle`] (one attempt) — never a helper that goes over several runs' items,
+    /// whose first Held would skip the others. (A `?` on a store call does not compile in the tick: [`super::TickError`]
+    /// has no `From<PersistError>`.)
+    #[test]
+    fn a_held_item_is_a_store_call_or_one_attempts_settle() {
+        let sources = [
+            ("runner.rs", include_str!("runner.rs")),
+            ("agents.rs", include_str!("agents.rs")),
+            ("control.rs", include_str!("control.rs")),
+        ];
+        let mut items = 0;
+        let mut wrong = Vec::new();
+        for (name, source) in sources {
+            let source = source.split("mod held_tests").next().unwrap_or(source);
+            let mut rest = source;
+            while let Some(at) = rest.find(".item(") {
+                let (before, after) = rest.split_at(at);
+                rest = &after[".item(".len()..];
+                if !before.trim_end().ends_with("held") {
+                    continue;
+                }
+                items += 1;
+                let argument = rest.trim_start();
+                if !(argument.starts_with("store") || argument.starts_with("settle(")) {
+                    wrong.push(format!("{name}: {}", argument.lines().next().unwrap_or("")));
+                }
+            }
+        }
+        assert!(
+            items >= 21,
+            "only {items} Held items found: the scan lost them"
+        );
+        assert_eq!(wrong, Vec::<String>::new());
     }
 }

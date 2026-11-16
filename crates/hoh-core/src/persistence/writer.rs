@@ -484,6 +484,8 @@ impl Job {
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Stall { .. }) => {
                 "Stall"
             }
+            // A staffing judgment's write, a binding's (docs/adr/ADR-030.md decision 5).
+            Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Staff(..)) => "Staff",
             // A run's team checkpoint is the run's, not an attempt's write (docs/adr/ADR-022.md decision 8).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Checkpoint(..)) => {
                 "Checkpoint"
