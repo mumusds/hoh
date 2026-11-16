@@ -131,7 +131,7 @@ impl Fakes for World {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/bash\nd='{d}'\nprintf '%s\\n' \"$@\" > \"$d/argv.$$\"\necho $$ > \"$d/pid\"\n\
+                "#!/bin/bash\nd='{d}'\nprintf '%s\\n' \"$@\" > \"$d/argv.$$\"\nread -r s < /proc/$$/stat; printf '%s\\n' \"$s\" > \"$d/stat\"\n\
                  exec python3 '{FAKE}' \"$d/frames.jsonl\" \"$d/commands.json\" \"$d/log\" -- \"$@\"\n",
                 d = d.display()
             ),
@@ -527,10 +527,23 @@ async fn test_026_03_the_session_survives_a_kill_and_dialogs_are_cancelled() -> 
     let killer = async {
         while let Some(record) = rx.recv().await {
             if record["type"] == "agent_settled" {
-                let pid = read(fake.parent().ok_or("no dir")?.join("pid"))?;
-                std::process::Command::new("kill")
-                    .args(["-9", pid.trim()])
-                    .status()?;
+                // Its own stat line, written while it ran: SIGKILL to that process only, never to a process given its
+                // number later (ADR-022 decision 10). One already gone gets nothing, as the old kill of its number
+                // was let fail.
+                let stat = std::fs::read(fake.parent().ok_or("no dir")?.join("stat"))?;
+                let pid: u32 = String::from_utf8_lossy(&stat)
+                    .split_whitespace()
+                    .next()
+                    .ok_or("an empty stat line")?
+                    .parse()?;
+                let start = hoh_agents::identity::after_command_name(&stat)
+                    .and_then(|fields| fields.split_whitespace().nth(19))
+                    .ok_or("the stat line has no start time")?;
+                let _ = hoh_agents::identity::signal_if_same(
+                    pid,
+                    start,
+                    rustix::process::Signal::KILL,
+                )?;
                 break;
             }
         }
@@ -1484,6 +1497,9 @@ async fn pi_runner_mode_cancel_is_an_abort_only() -> R {
         ..turn.escalation
     };
     let held = pi::start(&attempt, &turn, &gate(&world)?)?;
+    // Its identity while its gate waits to be opened, so it surely runs: its group is ended below only while its
+    // leader is still this process (ADR-022 decision 10).
+    let leader = hoh_agents::identity::of(held.pid)?.ok_or("the gate is not running")?;
     held.open.send(()).map_err(|()| "gate closed")?;
     let end = std::time::Instant::now() + Duration::from_secs(10);
     while !received(&fake)?.iter().any(|r| r["type"] == "prompt") {
@@ -1498,10 +1514,13 @@ async fn pi_runner_mode_cancel_is_an_abort_only() -> R {
         .filter(|r| r["type"] == "abort")
         .count();
     let alive = !held.ended.is_finished();
-    let _ = rustix::process::kill_process_group(
-        rustix::process::Pid::from_raw(held.pid as i32).ok_or("pid")?,
-        rustix::process::Signal::KILL,
-    );
+    if let Ok(found) = hoh_agents::identity::find(
+        Some(i64::from(leader.pid)),
+        Some(&leader.boot_id),
+        Some(&leader.start_id),
+    )? {
+        found.kill();
+    }
     let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
     assert_eq!(aborts, 1, "{facts:?}");
     assert!(alive, "the adapter ended the turn itself");
