@@ -39,6 +39,14 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   `.hoh-dev/evidence/commander-readonly/spike/` in order (the raw runs are on the machine that recorded them), then
   run `excerpt_check.py`.
 
+- `judge_check.py` is the evidence table of ADR-032 decision 8 executed (design correction 4): each row's rule is a
+  function whose docstring is the rule, run on every committed excerpt and, where present locally with the recorded
+  sha256, on the raw recording it was cut from. A verdict that differs between the two is a defect (exit 1). It also
+  judges each read-only round as decision 8 does, and E6 on one-value changes of the recorded rounds. Its output is
+  committed as `judge_check.out.md` and `judge_check.out.json` (made on the recording machine, so the raw column is
+  filled); the bundle self-test reruns it on the excerpts and requires the committed verdicts. M2-T20's judge must give
+  the same verdicts on the same fixtures.
+
 ## Run 20261116T180821Z
 
 Versions: claude 2.1.325, codex-cli 0.166.0, pi 1.5.0.

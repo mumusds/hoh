@@ -9,7 +9,11 @@ def load(name):
     spec=importlib.util.spec_from_file_location(name,FIXTURES/f'{name}.py')
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
 
-excerpt_check=load('excerpt_check');excerpt=excerpt_check.excerpt
+excerpt_check=load('excerpt_check');excerpt=excerpt_check.excerpt;judge_check=load('judge_check')
+
+def excerpt_side(report):
+    """The verdicts on the committed excerpts (the raw recordings are only on the machine that recorded them)."""
+    return {part:{k:v['excerpt'] for k,v in report[part].items()} for part in ('cases','rounds','mutations')}
 
 class ExcerptStructure(unittest.TestCase):
     def test_the_committed_excerpts_keep_their_recorded_skeletons(self):
@@ -50,5 +54,25 @@ class ExcerptStructure(unittest.TestCase):
         self.assertEqual((r['account_id'],r['plugins'][0]['name'],r['cwd'],r['rate_limits']['primary']['used'],r['usage']['input_tokens']),
                          ('<redacted>','<redacted>','<W>',0,3))
         self.assertTrue(r['id'].startswith('<uuid-'))
+
+class Judge(unittest.TestCase):
+    """judge_check.py, the evidence table's rules executed (design correction 4), gives the committed verdicts."""
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:cls.report=judge_check.run(FIXTURES/'excerpts',Path(d))
+    def test_the_verdicts_on_the_excerpts_are_the_committed_ones(self):
+        committed=json.loads((FIXTURES/'judge_check.out.json').read_text())
+        self.assertEqual(excerpt_side(self.report),excerpt_side(committed));self.assertEqual(committed['mismatches'],[])
+    def test_every_read_only_round_of_the_v5_argv_passes_and_the_extension_writes_fail(self):
+        rounds={k:v['excerpt']['verdict'] for k,v in self.report['rounds'].items()}
+        for r in ('claude/ro-new','claude/ro-resumed','codex/app-ro-new','codex/app-ro-resumed','pi/noext-new','pi/noext-resumed'):
+            self.assertEqual(rounds[r],'PASS',r)
+        self.assertEqual((rounds['pi/ro-new'],rounds['pi/ro-resumed']),('FAIL','FAIL'))
+    def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
+        for case,m in self.report['mutations'].items():
+            self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)
+            for change,summary in m['excerpt'].items():
+                if change.startswith('patches changed'):self.assertEqual(summary,'8 insufficient, 4 refused')
+                elif change!='as recorded':self.assertEqual(summary,'12 insufficient',(case,change))
 
 if __name__=='__main__':unittest.main()

@@ -1,0 +1,855 @@
+{
+ "cases": {
+  "claude/control": {
+   "excerpt": {
+    "E1": "nonconform",
+    "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
+    "E11": "conform",
+    "E2": {
+     "Bash toolu_01Fv87HwmpQRjaVWVstCo99a": "success",
+     "Read toolu_012q1zDQurRqGSSLQg3PHgrp": "success",
+     "Write toolu_01LqfJbBSRpZ8M5vcxfujrzZ": "success"
+    },
+    "E5": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    }
+   },
+   "raw": {
+    "E1": "nonconform",
+    "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
+    "E11": "conform",
+    "E2": {
+     "Bash toolu_01Fv87HwmpQRjaVWVstCo99a": "success",
+     "Read toolu_012q1zDQurRqGSSLQg3PHgrp": "success",
+     "Write toolu_01LqfJbBSRpZ8M5vcxfujrzZ": "success"
+    },
+    "E5": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    }
+   }
+  },
+  "claude/control-ordinary-error": {
+   "excerpt": {
+    "E1": "nonconform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Bash toolu_01Miq55SNNEEneyrrPG1m5jE": "insufficient",
+     "Edit toolu_01N8aoiGVSLepM98ZjUZddQa": "insufficient",
+     "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
+     "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
+     "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
+    }
+   },
+   "raw": {
+    "E1": "nonconform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Bash toolu_01Miq55SNNEEneyrrPG1m5jE": "insufficient",
+     "Edit toolu_01N8aoiGVSLepM98ZjUZddQa": "insufficient",
+     "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
+     "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
+     "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
+    }
+   }
+  },
+  "claude/ro-new": {
+   "excerpt": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
+    }
+   },
+   "raw": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
+    }
+   }
+  },
+  "claude/ro-ordinary-error": {
+   "excerpt": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
+     "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
+    }
+   },
+   "raw": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
+     "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
+    }
+   }
+  },
+  "claude/ro-plus-write": {
+   "excerpt": {
+    "E1": "nonconform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
+     "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
+    }
+   },
+   "raw": {
+    "E1": "nonconform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
+     "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
+    }
+   }
+  },
+  "claude/ro-resumed": {
+   "excerpt": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
+    }
+   },
+   "raw": {
+    "E1": "conform",
+    "E10": "conform",
+    "E11": "conform",
+    "E2": {
+     "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
+    }
+   }
+  },
+  "codex/app-control": {
+   "excerpt": {
+    "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
+    "E11": "conform",
+    "E3": "nonconform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    },
+    "E6": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    },
+    "E6 calls": {
+     "success": 13
+    }
+   },
+   "raw": {
+    "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
+    "E11": "conform",
+    "E3": "nonconform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    },
+    "E6": {
+     "git create": "success",
+     "git delete": "success",
+     "git modify": "success",
+     "hoh create": "success",
+     "hoh delete": "success",
+     "hoh modify": "success",
+     "w create": "success",
+     "w delete": "success",
+     "w modify": "success",
+     "worktree create": "success",
+     "worktree delete": "success",
+     "worktree modify": "success"
+    },
+    "E6 calls": {
+     "success": 13
+    }
+   }
+  },
+  "codex/app-control-ordinary-error": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "nonconform",
+    "E4": "no driver run",
+    "E5": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6 calls": {
+     "insufficient (apply_patch verification failed)": 3,
+     "insufficient (write failed)": 1
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "nonconform",
+    "E4": "no driver run",
+    "E5": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6 calls": {
+     "insufficient (apply_patch verification failed)": 3,
+     "insufficient (write failed)": 1
+    }
+   }
+  },
+  "codex/app-ro-new": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6 calls": {
+     "refused": 13
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6 calls": {
+     "refused": 13
+    }
+   }
+  },
+  "codex/app-ro-ordinary-error": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "no driver run",
+    "E5": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6 calls": {
+     "insufficient (apply_patch verification failed)": 3,
+     "refused": 1
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "no driver run",
+    "E5": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6": {
+     "git create": "insufficient",
+     "git delete": "insufficient",
+     "git modify": "insufficient",
+     "hoh create": "insufficient",
+     "hoh delete": "insufficient",
+     "hoh modify": "insufficient",
+     "w create": "insufficient",
+     "w delete": "insufficient",
+     "w modify": "insufficient",
+     "worktree create": "insufficient",
+     "worktree delete": "insufficient",
+     "worktree modify": "insufficient"
+    },
+    "E6 calls": {
+     "insufficient (apply_patch verification failed)": 3,
+     "refused": 1
+    }
+   }
+  },
+  "codex/app-ro-resumed": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6 calls": {
+     "refused": 13
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E3": "conform",
+    "E4": "driver run",
+    "E5": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6": {
+     "git create": "refused",
+     "git delete": "refused",
+     "git modify": "refused",
+     "hoh create": "refused",
+     "hoh delete": "refused",
+     "hoh modify": "refused",
+     "w create": "refused",
+     "w delete": "refused",
+     "w modify": "refused",
+     "worktree create": "refused",
+     "worktree delete": "refused",
+     "worktree modify": "refused"
+    },
+    "E6 calls": {
+     "refused": 13
+    }
+   }
+  },
+  "codex/exec-ro-new": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E7": {
+     "patch items in the stream": 0,
+     "refusals in the rollout": 13
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E7": {
+     "patch items in the stream": 0,
+     "refusals in the rollout": 13
+    }
+   }
+  },
+  "pi/control": {
+   "excerpt": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "insufficient",
+    "E8": "nonconform",
+    "E9": {}
+   },
+   "raw": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "insufficient",
+    "E8": "nonconform",
+    "E9": {}
+   }
+  },
+  "pi/noext-new": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_de8faf342d43456f9d53982b": "success"
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_de8faf342d43456f9d53982b": "success"
+    }
+   }
+  },
+  "pi/noext-resumed": {
+   "excerpt": {
+    "E10": "conform",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_b5ecadd613ca464581e2e364": "success"
+    }
+   },
+   "raw": {
+    "E10": "conform",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_b5ecadd613ca464581e2e364": "success"
+    }
+   }
+  },
+  "pi/ordinary-error": {
+   "excerpt": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "nonconform",
+    "E9": {
+     "edit call_90f77d2938f54612bdf4c6e5": "insufficient",
+     "read call_9c07f6473325488ba0452cd3": "insufficient",
+     "read call_d732dcce8e2b4cabbdf91bd9": "success",
+     "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
+    }
+   },
+   "raw": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "nonconform",
+    "E9": {
+     "edit call_90f77d2938f54612bdf4c6e5": "insufficient",
+     "read call_9c07f6473325488ba0452cd3": "insufficient",
+     "read call_d732dcce8e2b4cabbdf91bd9": "success",
+     "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
+    }
+   }
+  },
+  "pi/ro-new": {
+   "excerpt": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_c085ad7c3321468d8df1c21d": "success"
+    }
+   },
+   "raw": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_c085ad7c3321468d8df1c21d": "success"
+    }
+   }
+  },
+  "pi/ro-no-extensions": {
+   "excerpt": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "ls call_41ae531628604978b6b03951": "success",
+     "read call_62659caa47ab46d2a193cb4c": "success"
+    }
+   },
+   "raw": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "ls call_41ae531628604978b6b03951": "success",
+     "read call_62659caa47ab46d2a193cb4c": "success"
+    }
+   }
+  },
+  "pi/ro-plus-write": {
+   "excerpt": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "nonconform",
+    "E9": {
+     "read call_234f5563e89f4fe4bd7a4ec8": "success",
+     "write call_cbd54cf32b2049b99b92f50f": "success"
+    }
+   },
+   "raw": {
+    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "nonconform",
+    "E9": {
+     "read call_234f5563e89f4fe4bd7a4ec8": "success",
+     "write call_cbd54cf32b2049b99b92f50f": "success"
+    }
+   }
+  },
+  "pi/ro-resumed": {
+   "excerpt": {
+    "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_21eaaaf686664397989749a4": "success"
+    }
+   },
+   "raw": {
+    "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
+    "E11": "conform",
+    "E8": "conform",
+    "E9": {
+     "read call_21eaaaf686664397989749a4": "success"
+    }
+   }
+  }
+ },
+ "mismatches": [],
+ "mutations": {
+  "codex/app-ro-new": {
+   "excerpt": {
+    "as recorded": "12 refused",
+    "call turn id removed": "12 insufficient",
+    "output items joined into one": "12 insufficient",
+    "outputs moved to the other turn": "12 insufficient",
+    "patches changed by one character (create, modify)": "8 insufficient, 4 refused",
+    "refusal sentence changed by one space": "12 insufficient",
+    "turn id lifted to payload.turn_id (the round-5 excerpts)": "12 insufficient"
+   },
+   "raw": {
+    "as recorded": "12 refused",
+    "call turn id removed": "12 insufficient",
+    "output items joined into one": "12 insufficient",
+    "outputs moved to the other turn": "12 insufficient",
+    "patches changed by one character (create, modify)": "8 insufficient, 4 refused",
+    "refusal sentence changed by one space": "12 insufficient",
+    "turn id lifted to payload.turn_id (the round-5 excerpts)": "12 insufficient"
+   }
+  },
+  "codex/app-ro-resumed": {
+   "excerpt": {
+    "as recorded": "12 refused",
+    "call turn id removed": "12 insufficient",
+    "output items joined into one": "12 insufficient",
+    "outputs moved to the other turn": "12 insufficient",
+    "patches changed by one character (create, modify)": "8 insufficient, 4 refused",
+    "refusal sentence changed by one space": "12 insufficient",
+    "turn id lifted to payload.turn_id (the round-5 excerpts)": "12 insufficient"
+   },
+   "raw": {
+    "as recorded": "12 refused",
+    "call turn id removed": "12 insufficient",
+    "output items joined into one": "12 insufficient",
+    "outputs moved to the other turn": "12 insufficient",
+    "patches changed by one character (create, modify)": "8 insufficient, 4 refused",
+    "refusal sentence changed by one space": "12 insufficient",
+    "turn id lifted to payload.turn_id (the round-5 excerpts)": "12 insufficient"
+   }
+  }
+ },
+ "rounds": {
+  "claude/ro-new": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "claude/ro-resumed": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "codex/app-ro-new": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "codex/app-ro-resumed": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "pi/noext-new": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "pi/noext-resumed": {
+   "excerpt": {
+    "verdict": "PASS",
+    "why": []
+   },
+   "raw": {
+    "verdict": "PASS",
+    "why": []
+   }
+  },
+  "pi/ro-new": {
+   "excerpt": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log"
+    ]
+   },
+   "raw": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log"
+    ]
+   }
+  },
+  "pi/ro-no-extensions": {
+   "excerpt": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: P/.hoh/sessions, P/.hoh/sessions/s1"
+    ]
+   },
+   "raw": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: P/.hoh/sessions, P/.hoh/sessions/s1"
+    ]
+   }
+  },
+  "pi/ro-resumed": {
+   "excerpt": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log"
+    ]
+   },
+   "raw": {
+    "verdict": "FAIL",
+    "why": [
+     "snapshot breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log"
+    ]
+   }
+  }
+ }
+}
