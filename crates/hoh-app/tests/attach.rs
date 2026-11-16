@@ -1,10 +1,14 @@
 //! `hoh -p --detach` and `hoh attach` through the product binary (REQ-005, docs/adr/ADR-021.md decisions 1-6):
 //! TEST-005-02 (concurrent attaches start exactly one host), TEST-005-03 (an attach without a run id never picks one
 //! of several; an unknown id is RUN_NOT_FOUND), TEST-005-05 (a StartRun that does not commit prints nothing), and the
-//! supplementary detach tests of CR-010 decision 2 (no TEST id: AC-005-01 belongs to M2-T13).
+//! supplementary detach tests of CR-010 decision 2 (no TEST id: AC-005-01 belongs to M2-T13). TEST-003-03 (M2-T13,
+//! docs/adr/ADR-031.md decision 12) runs in the M2-T13 test world (`world`).
 
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
+
+mod pty;
+mod world;
 
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
@@ -734,6 +738,89 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
         "the running host was used"
     );
     host.shutdown().await;
+    Ok(())
+}
+
+/// TEST-003-03's runs, their ids as a host gives them (UUIDs), the same in their first 8 characters, so only a whole id
+/// tells them apart: R1 RUNNING at revision 4, R2 PAUSED at revision 6.
+const R1: &str = "c3d9a0b2-7e41-4f6a-9b8c-2d5e7f103a64";
+const R2: &str = "c3d9a0b2-1f8e-4c37-a5d2-96b0e4c71f58";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_003_03_an_attach_without_a_tty_names_both_runs_and_subscribes_to_nothing() -> R {
+    // AC-003-03: two attachable runs, R1 RUNNING and R2 PAUSED, neither with a Commander binding or a specification
+    // (unsupervised: the stall detector does not look at them; R1 has no task, so its pace has nothing to do); their
+    // host runs (in this process, its runner the world's scripted Team). `hoh attach </dev/null >out 2>err` with no
+    // terminal.
+    let world = world::World::new()?;
+    world.init_store().await?;
+    world.exec(&format!(
+        "INSERT INTO runs(run_id, project_id, state, mode, revision, resume_state, created_at) VALUES
+           ('{R1}', :p, 'RUNNING', 'AUTO', 4, NULL, '2026-11-15T00:00:00Z'),
+           ('{R2}', :p, 'PAUSED', 'AUTO', 6, 'RUNNING', '2026-11-15T00:00:01Z');"
+    ))?;
+    let team = world::Team::new(|_| Vec::new());
+    let host = world.team_host(team.clone(), None).await?;
+    let started = Instant::now();
+    let outcome = async {
+        let runs = || world.rows("SELECT run_id, state, revision FROM runs ORDER BY run_id");
+        let before = runs()?;
+        let subscribers = host.subscribers();
+        let opened = host.streams_opened();
+        let (out, err) = (world.root().join("out"), world.root().join("err"));
+        let child = world
+            .command(&["attach"])
+            .stdout(std::fs::File::create(&out)?)
+            .stderr(std::fs::File::create(&err)?)
+            .spawn()?;
+        let attach =
+            tokio::task::spawn_blocking(move || world::finish(child, LIMIT).map_err(|e| e.to_string()));
+        // Sampled while it runs: it subscribes to nothing, not even for a moment.
+        let mut most = subscribers;
+        while !attach.is_finished() {
+            most = most.max(host.subscribers());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            (most, host.subscribers(), host.streams_opened()),
+            (subscribers, subscribers, opened),
+            "a subscription by the attach"
+        );
+        let status = attach.await??.status;
+        let said = std::fs::read_to_string(&err)?;
+        // 64; out 0 bytes; err names both runs by their whole ids.
+        assert_eq!(status.code(), Some(64), "{said}");
+        assert_eq!(std::fs::metadata(&out)?.len(), 0);
+        assert!(said.contains(R1) && said.contains(R2), "{said}");
+        // Both runs' state and revision as before.
+        assert_eq!(runs()?, before);
+        assert_eq!(
+            before,
+            [
+                serde_json::json!({"run_id": R2, "state": "PAUSED", "revision": 6}),
+                serde_json::json!({"run_id": R1, "state": "RUNNING", "revision": 4}),
+            ]
+        );
+        // The host's ticks of at least 2 s (ten) asked neither run anything: no STALLED re-trigger, no stalled question.
+        tokio::time::sleep(Duration::from_secs(2).saturating_sub(started.elapsed())).await;
+        let stalled = world.rows(&format!(
+            "SELECT run_id, seq, kind FROM events WHERE run_id IN ('{R1}', '{R2}') AND \
+             ((kind = 'supervisor.retrigger' AND json_extract(payload_json, '$.reason') = 'STALLED') \
+              OR (kind = 'question.asked' AND json_extract(payload_json, '$.reason') = 'stalled'))"
+        ))?;
+        assert!(stalled.is_empty(), "{stalled:?}");
+        assert_eq!(runs()?, before);
+        // The host of this process was the one used: no other was started.
+        assert!(world.hosts()?.is_empty(), "{:?}", world.hosts());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+    assert!(
+        team.turns().is_empty() && team.refused().is_empty(),
+        "{team:?}"
+    );
     Ok(())
 }
 
