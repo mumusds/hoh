@@ -1,0 +1,7 @@
+{"_excerpt": {"source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/pi/ro-resumed/stdout.jsonl", "source_sha256": "f4cc82152ef10c3e4e4fc20601c03b42e4603348407d78a3ed718417a16270f1", "excerpted": true, "kept": "the frames the ADR-032 evidence table reads", "paths": "<P> <W> <T> <HOME>"}}
+{"type": "extension_ui_request", "id": "<uuid-62>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\"], \"sources\": {\"read\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
+{"type": "response", "command": "get_state", "success": true}
+{"id": "p1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}
+{"type": "tool_execution_start", "toolCallId": "call_21eaaaf686664397989749a4", "toolName": "read", "args": {"path": "<P>/TOKEN.txt"}}
+{"type": "tool_execution_end", "toolCallId": "call_21eaaaf686664397989749a4", "toolName": "read", "result": {"content": [{"type": "text", "text": "HOH-TOKEN-99e14616e6b10fe0\n"}], "structuredContent": "HOH-TOKEN-99e14616e6b10fe0\n"}, "isError": false, "durationMs": 1}
+{"type": "agent_settled", "aborted": false}
