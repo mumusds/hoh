@@ -582,8 +582,10 @@ settle_instances() {
 # is: it ends with its main thread); "No such process": it was reaped while being looked at; "Permission denied" or
 # "Operation not permitted": the kernel denies this user a look (another user's, under /proc's hidepid too; one made
 # undumpable; one with other credentials, such as the user's own systemd manager with its capability, or a run started
-# under another group). A run the scan so cannot see refuses for itself once it takes the run lock, which the uninstall
-# holds; the scan only covers a run between its exec and that lock. Any other reason cannot be told.
+# under another group). Safety does not rest on the scan: a run that has not taken the run lock refuses itself at it
+# (held by the uninstall, or gone after it), seen by the scan or not. The scan is a courtesy refusal, for a run it can
+# tell is this installation's or a process of this user's it cannot tell; which unreadable processes it excuses is
+# decided by the reasons listed here, not by that (M2T14R-1551). Any other reason cannot be told.
 nothing_to_tell() {
   case "$1" in
     *": No such file or directory" | *": No such process" | *": Permission denied" | *": Operation not permitted")
