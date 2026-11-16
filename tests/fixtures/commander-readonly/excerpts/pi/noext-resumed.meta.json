@@ -1,0 +1,36 @@
+{
+ "agent": "pi",
+ "case": "noext-resumed",
+ "argv": [
+  "pi",
+  "--mode",
+  "rpc",
+  "--session-dir",
+  "<P>/.hoh/sessions/s1",
+  "--session-id",
+  "<uuid-171>",
+  "--tools",
+  "read,grep,find,ls",
+  "--no-mcp",
+  "--no-extensions",
+  "-e",
+  "<T>/observer.js"
+ ],
+ "exit_code": 0,
+ "stopped": "exited",
+ "notes": "the same, the same session id in a new process",
+ "snapshot_diff": {
+  "added": [],
+  "removed": [],
+  "changed": [
+   "P/.hoh/sessions/s1/2026-11-16T21-28-08-895Z_<uuid-171>.jsonl"
+  ]
+ },
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T212808Z/pi/noext-resumed/snapshot.json",
+ "snapshot_sha256": "c36168ae558888427308dcd6bb4b96616e48c9c98ecc5aae13faea3159af5c14",
+ "stdout_sha256": "eb1322f55e241afdbad02ced5fd50ae8886a93790122745f7c7e09f2c43c79fc",
+ "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "token_sha256": "790fd8c25b5f7322f3be07e76312e46dc31823aa6e8bf77aa286232d7b34a6c4",
+ "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
+ "session_dir": "<P>/.hoh/sessions/s1"
+}

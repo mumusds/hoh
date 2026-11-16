@@ -72,3 +72,16 @@ file. Every snapshot except pi's is unchanged.
 | codex | app-control-ordinary-error | full access: the same `apply_patch verification failed: …` texts without a fileChange item; the add under a regular file is a fileChange item with status `failed` and the output `Failed to write file` |
 | pi | ordinary-error | `edit` and `write` added: `tool_execution_end` `isError` true for the edit ("Could not find the exact text"), the write (`EEXIST … mkdir`) and the read of a missing file (`ENOENT`); the extension again wrote into W |
 | pi | ro-no-extensions | read-only profile plus `--no-extensions`: the explicitly loaded observer still reports exactly read, grep, find, ls, all builtin; the snapshot shows only pi's session file, nothing in W |
+
+## Run 20261116T212808Z (`--set noext`)
+
+pi with the read-only argv of ADR-032 v5 (`--tools read,grep,find,ls --no-mcp --no-extensions`, plus the observer by
+`-e`), a new session and the same session resumed in a new process. From this run on, the recorder creates pi's
+session directory and its parents before the baseline snapshot, as the product's pi adapter does before it starts pi
+(crates/hoh-agents/src/pi.rs, `create_dir_all` of the launch's `session_dir`); the earlier pi recordings were taken
+without that step, so their snapshots also show the new `P/.hoh/sessions` and `P/.hoh/sessions/s1` directories.
+
+| Agent | Case | What the recording shows |
+|---|---|---|
+| pi | noext-new | the observer reports exactly read, grep, find, ls, all builtin; one read of TOKEN.txt; the final message has the decision block with the token; the snapshot shows only pi's session file inside `P/.hoh/sessions/s1/` |
+| pi | noext-resumed | the same report; the same session file changed, nothing else |
