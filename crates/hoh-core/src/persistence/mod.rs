@@ -245,6 +245,10 @@ pub enum PersistError {
         from: String,
         to: String,
         why: String,
+        /// What the API's error `details` say (machine-readable, CR-003): a ResumeRun's refusal names the run's state
+        /// and, in a stop state, the item of its stop that still holds (docs/adr/ADR-031.md decision 16); none
+        /// otherwise. Boxed: the error stays small.
+        details: Option<Box<serde_json::Value>>,
     },
     /// A move found another state than the one it expected (an attempt changed meanwhile); nothing was written.
     StaleState {
@@ -410,6 +414,7 @@ impl std::fmt::Display for PersistError {
                 from,
                 to,
                 why,
+                ..
             } => write!(
                 f,
                 "ILLEGAL_TRANSITION: {entity:?} {id} {from} -> {to}: {why}"

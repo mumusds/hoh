@@ -252,6 +252,21 @@ impl Claims {
     }
 }
 
+/// Run `run_id`'s blocker set as its row records it (`blocked_reasons_json`, in its order): never empty in BLOCKED (the
+/// row's CHECK), and what keeps a working move out until the blocking mechanism's own move clears it. A ResumeRun of a
+/// BLOCKED run is refused while it is not empty, and one of another stop state goes to BLOCKED with it
+/// (docs/adr/ADR-031.md decision 16).
+pub(super) fn recorded(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<String>, PersistError> {
+    let reasons: String = tx
+        .query_row(
+            "SELECT blocked_reasons_json FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    Ok(serde_json::from_str(&reasons).unwrap_or_default())
+}
+
 /// The run's move after its claims changed (`changed`) to `union`, in the caller's transaction: a working or
 /// WAITING_EXTERNAL run with claims open is BLOCKED (its decision-class dispatches withdrawn, `run.blocked` with
 /// `detail`); a BLOCKED run whose claims are all released goes back to its resume state (`Change::Unblock`); a

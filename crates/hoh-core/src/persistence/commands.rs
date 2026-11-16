@@ -37,8 +37,9 @@ pub struct SubmitCommand {
 pub enum RunTarget {
     /// To this state, by compare-and-set.
     To(RunState),
-    /// Back to the state saved when it was paused (ResumeRun), after a reconcile of the run recorded first
-    /// (docs/adr/ADR-021.md decision 7).
+    /// Back to the state saved when it stopped (ResumeRun from PAUSED, INCOMPLETE, WAITING_EXTERNAL or BLOCKED), after
+    /// a reconcile of the run recorded first (docs/adr/ADR-021.md decision 7), once that stop's own predicate no longer
+    /// holds; to BLOCKED while blockers are claimed (REQ-036 decision 2, docs/adr/ADR-031.md decision 16).
     Resume,
     /// A new run, CREATED, in this mode (StartRun, decision 5): `run_id` is the id the host gave it. It binds the
     /// project's current team and gets `budget` (docs/adr/ADR-022.md decision 7).
@@ -219,22 +220,36 @@ pub(super) fn submit(
             let to = match target {
                 RunTarget::To(to) => *to,
                 RunTarget::Resume => {
+                    let from = writer::parse::<RunState>(&state)?;
                     let to = saved
                         .as_deref()
                         .map(writer::parse::<RunState>)
                         .transpose()?
-                        .filter(|_| state == RunState::Paused.as_str());
+                        .filter(|_| STOPS.contains(&from));
                     let Some(to) = to else {
+                        return Err(PersistError::IllegalTransition {
+                            entity: writer::Entity::Run,
+                            id: command.run_id.clone(),
+                            from: state.clone(),
+                            to: "resume_state".to_owned(),
+                            why: "only a run in a stop state (PAUSED, INCOMPLETE, WAITING_EXTERNAL, BLOCKED) \
+                                  resumes, to the state it stopped in"
+                                .to_owned(),
+                            details: Some(Box::new(serde_json::json!({"state": state}))),
+                        });
+                    };
+                    // Reconcile first, then the stop's own predicate (docs/adr/ADR-031.md decision 16 (1), (2)).
+                    events.push(resume_reconcile(&tx, &project_id, from, command)?);
+                    if let Some(details) = still_stopped(&tx, &command.run_id, from, ctx)? {
                         return Err(PersistError::IllegalTransition {
                             entity: writer::Entity::Run,
                             id: command.run_id.clone(),
                             from: state,
                             to: "resume_state".to_owned(),
-                            why: "only a paused run resumes, to the state it was paused in"
-                                .to_owned(),
+                            why: format!("its stop still holds: {details}"),
+                            details: Some(Box::new(details)),
                         });
-                    };
-                    events.push(resume_reconcile(&tx, &project_id, command)?);
+                    }
                     to
                 }
                 RunTarget::Start { .. } | RunTarget::Team(_) => unreachable!("handled above"),
@@ -246,14 +261,7 @@ pub(super) fn submit(
             let mut to = to;
             let mut cas = Vec::new();
             if *target == RunTarget::Resume {
-                let reasons: String = tx
-                    .query_row(
-                        "SELECT blocked_reasons_json FROM runs WHERE run_id = ?1",
-                        params![command.run_id],
-                        |r| r.get(0),
-                    )
-                    .map_err(sqlite_error)?;
-                let reasons: Vec<String> = serde_json::from_str(&reasons).unwrap_or_default();
+                let reasons = super::blockers::recorded(&tx, &command.run_id)?;
                 if !reasons.is_empty() {
                     to = RunState::Blocked;
                     let (moves, withdrawn) = super::control::withdraw(
@@ -360,12 +368,48 @@ pub(super) fn submit(
     })
 }
 
+/// The stop states a ResumeRun takes a run out of (REQ-036 decision 2, docs/adr/ADR-031.md decision 16).
+const STOPS: [RunState; 4] = [
+    RunState::Paused,
+    RunState::Incomplete,
+    RunState::WaitingExternal,
+    RunState::Blocked,
+];
+
+/// What still holds of the stop of run `run_id`, in stop state `from`, judged in the command's transaction at the
+/// host's clock (the store's, the one the pace's context carries; docs/adr/ADR-031.md decision 16): the pace's own
+/// predicates, never another condition — INCOMPLETE's budget stop, WAITING_EXTERNAL's earliest retry still to come with
+/// no task due, BLOCKED's blocker set (never empty in BLOCKED); PAUSED has none (only the user's request holds it). The
+/// refusal's `details` (`state` and that item); `None`, the run may resume.
+fn still_stopped(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    from: RunState,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Option<serde_json::Value>, PersistError> {
+    let state = from.as_str();
+    Ok(match from {
+        RunState::Incomplete => super::retry::budget_and_stop(tx, run_id, ctx.now(), ctx.wall())?
+            .1
+            .map(|stop| serde_json::json!({"state": state, "stop": stop.as_str()})),
+        RunState::WaitingExternal => super::retry::waiting_until(tx, run_id, ctx.now())?
+            .map(|next| serde_json::json!({"state": state, "next_retry_at": next})),
+        RunState::Blocked => {
+            let reasons = super::blockers::recorded(tx, run_id)?;
+            (!reasons.is_empty()).then(|| serde_json::json!({"state": state, "reasons": reasons}))
+        }
+        _ => None,
+    })
+}
+
 /// A resume's reconcile of its run, recorded before the run works again so that every later dispatch comes after it
-/// (REQ-043 behaviour 2, docs/adr/ADR-021.md decision 7): the run's attempts still unfinished (none, for a paused run),
-/// those whose effect is unknown, and the leases its attempts hold.
+/// (REQ-043 behaviour 2, docs/adr/ADR-021.md decision 7): from which stop state, the run's attempts still unfinished
+/// (none is expected in any of the four: an attempt not finished refuses the resume, named by that state, decision 16
+/// (1)), those whose effect is unknown, and the leases its attempts hold.
 fn resume_reconcile(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
+    from: RunState,
     command: &SubmitCommand,
 ) -> Result<NewEvent, PersistError> {
     let ids = |sql: &str| -> Result<Vec<String>, PersistError> {
@@ -392,9 +436,10 @@ fn resume_reconcile(
         return Err(PersistError::IllegalTransition {
             entity: writer::Entity::Run,
             id: command.run_id.clone(),
-            from: RunState::Paused.as_str().to_owned(),
+            from: from.as_str().to_owned(),
             to: "resume_state".to_owned(),
             why: format!("attempts of it are not finished: {}", unfinished.join(", ")),
+            details: None,
         });
     }
     Ok(NewEvent {
@@ -406,6 +451,7 @@ fn resume_reconcile(
         payload: serde_json::json!({
             "run_id": command.run_id,
             "command_id": command.command_id,
+            "from": from.as_str(),
             "unfinished": unfinished,
             "unknown_effect": unknown,
             "leases": leases,
