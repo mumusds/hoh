@@ -434,7 +434,7 @@ pub(super) async fn recover(
     };
     let bridge = super::product::bridge_of(project, &row.attempt_id);
     let (messages, truncated) =
-        tokio::task::spawn_blocking(move || super::product::read_bridge(&bridge))
+        super::begun::spawn_blocking(move || super::product::read_bridge(&bridge))
             .await
             .map_err(|e| PersistError::Storage(format!("the read of a bridge ended: {e}")))?;
     let mut observed = Observed::default();

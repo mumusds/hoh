@@ -35,6 +35,8 @@ pub struct ProductExecutor {
     keys: Option<KeyHook>,
     /// A test's look at each diagnostic a turn collects as it collects it; the product has none.
     observe: Option<hoh_agents::adapter::Observe>,
+    /// A test's hold as a finished turn's raw logs are kept, before they are (CR-006); the product has none.
+    keeping: Option<KeepingHook>,
     /// Set once the host stops ([`Executor::stop`]): a turn that ends after it has nothing done for it here.
     stopping: tokio::sync::watch::Sender<bool>,
     /// The task that waits for each turn's end and keeps its raw logs, until the host stops.
@@ -51,6 +53,20 @@ pub type KeySeen = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Called with (attempt id, diagnostic) for each diagnostic a turn collects, as it collects it (a test's: a turn's
 /// diagnostics are in memory until it ends, docs/adr/ADR-030.md decision 9, M2T15D-401).
 pub type DiagnosticSeen = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
+
+/// Called with the attempt id on the blocking thread that keeps a finished turn's raw logs, before it keeps them (a
+/// test's).
+pub type KeepingSeen = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A [`KeepingSeen`] the executor holds.
+#[derive(Clone)]
+struct KeepingHook(KeepingSeen);
+
+impl std::fmt::Debug for KeepingHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeepingHook")
+    }
+}
 
 /// A [`KeySeen`] the executor holds.
 #[derive(Clone)]
@@ -78,6 +94,7 @@ impl ProductExecutor {
             exec_only: Arc::default(),
             keys: None,
             observe: None,
+            keeping: None,
             stopping: tokio::sync::watch::Sender::new(false),
             watchers: Mutex::default(),
         }
@@ -96,6 +113,14 @@ impl ProductExecutor {
     #[doc(hidden)]
     pub fn with_observe(mut self, hook: DiagnosticSeen) -> ProductExecutor {
         self.observe = Some(hoh_agents::adapter::Observe(hook));
+        self
+    }
+
+    /// The executor calling `hook` with the attempt id as each finished turn's raw logs are about to be kept as objects,
+    /// on the blocking thread that keeps them: a test's way to hold that copy while the host stops.
+    #[doc(hidden)]
+    pub fn with_keeping(mut self, hook: KeepingSeen) -> ProductExecutor {
+        self.keeping = Some(KeepingHook(hook));
         self
     }
 }
@@ -774,7 +799,7 @@ impl Executor for ProductExecutor {
         match agent {
             Some(agent) if self.registry.seen(agent).is_none() => {
                 let registry = self.registry.clone();
-                tokio::spawn(async move {
+                super::begun::spawn(async move {
                     let until = std::time::Instant::now() + DELIVER_WAIT;
                     while registry.seen(agent).is_none() && std::time::Instant::now() < until {
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -848,7 +873,8 @@ impl Executor for ProductExecutor {
         let logs = attempt_logs(&self.project, &work.attempt_id);
         let project = self.project.clone();
         let mut stopping = self.stopping.subscribe();
-        let watcher = tokio::spawn(async move {
+        let keeping = self.keeping.clone();
+        let watcher = super::begun::spawn(async move {
             let facts = tokio::select! {
                 facts = turn => facts,
                 // The host stopped first: the turn runs on and the next host's reconcile settles it; nothing of its end
@@ -875,15 +901,21 @@ impl Executor for ProductExecutor {
             ) = read_bridge(&bridge);
             // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10): one that cannot be
             // kept as an object is registered in place; one that cannot be read is a recorded failure.
-            let (logs, kept_in) = (logs.clone(), project.clone());
-            let (rows, failed) = tokio::task::spawn_blocking(move || keep_logs(&kept_in, &logs))
-                .await
-                .unwrap_or_else(|e| {
-                    (
-                        Vec::new(),
-                        vec![serde_json::json!({"name": "*", "error": e.to_string()})],
-                    )
-                });
+            let (logs, kept_in, keeping, kept_for) =
+                (logs.clone(), project.clone(), keeping.clone(), id.clone());
+            let (rows, failed) = super::begun::spawn_blocking(move || {
+                if let Some(KeepingHook(hook)) = &keeping {
+                    hook(&kept_for);
+                }
+                keep_logs(&kept_in, &logs)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                (
+                    Vec::new(),
+                    vec![serde_json::json!({"name": "*", "error": e.to_string()})],
+                )
+            });
             outcome.observed.artifacts = rows;
             outcome.observed.artifacts_failed = failed;
             keep_diagnostics(&outcome);

@@ -1417,7 +1417,7 @@ async fn evidence(root: &Path, snapshot: &Snapshot, lines: &[String]) -> Option<
     let bytes = compat::canonical(&serde_json::Value::Array(items));
     let root = root.to_path_buf();
     let size = bytes.len() as u64;
-    let sha256 = tokio::task::spawn_blocking(move || hoh_core::objects::put(&root, &bytes))
+    let sha256 = super::begun::spawn_blocking(move || hoh_core::objects::put(&root, &bytes))
         .await
         .ok()?
         .ok()?;

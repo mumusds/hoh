@@ -509,6 +509,9 @@ fn planned_of(entry: &Value) -> Planned {
 pub struct Launch {
     pub env: Vec<(String, String)>,
     pub adopt: Option<Box<dyn FnOnce(u32) + Send>>,
+    /// Called in the commit of the candidate's pending records before the command ([`reconcile`]'s own task), before
+    /// it reads them: a test's hold there while the host stops (CR-006); none in the product.
+    pub reconciling: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl std::fmt::Debug for Launch {
@@ -516,6 +519,7 @@ impl std::fmt::Debug for Launch {
         f.debug_struct("Launch")
             .field("env", &self.env)
             .field("adopt", &self.adopt.is_some())
+            .field("reconciling", &self.reconciling.is_some())
             .finish()
     }
 }
@@ -579,7 +583,14 @@ pub async fn run_with(
     let (ready, tree_before, timeout, export) = before;
     // Then the records a crash or a failed commit left without their evidence: a later run never takes their place in
     // the history (M2T10R-05). After the pre-check, which has put back any frozen object a judgement reads (M2T10R-352).
-    reconcile(&handle, state, &request.candidate_id).await?;
+    let mut launch = launch;
+    reconcile_with(
+        &handle,
+        state,
+        &request.candidate_id,
+        launch.reconciling.take(),
+    )
+    .await?;
     // The record's own new directory, and its lock.
     let (record_id, record_dir, lock) = {
         let (state, request) = (state.to_owned(), request.clone());
@@ -608,7 +619,7 @@ pub async fn run_with(
     // The run, its post-check and its record are a task of their own: dropping this future cancels the command, never
     // its record (docs/adr/ADR-027.md decision 6, M2T10R-03).
     let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let finishing = crate::host::begun::spawn(finish(
+    let finishing = crate::host::begun::spawn_finishing(finish(
         handle,
         Finish {
             checkout: checkout.to_owned(),
@@ -802,7 +813,7 @@ async fn finish(
             export.clone(),
             state.clone(),
         );
-        tokio::task::spawn_blocking(move || -> Result<Facts, CheckError> {
+        crate::host::begun::spawn_blocking(move || -> Result<Facts, CheckError> {
             let io = |e: String| CheckError::Io(e);
             // A post-check that cannot run cannot show the source unchanged: that is recorded, never lost (M2T10R-02).
             let mut integrity =
@@ -939,7 +950,7 @@ async fn finish(
             ready.clone(),
             record_dir.clone(),
         );
-        tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+        crate::host::begun::spawn_blocking(move || -> Result<_, CheckError> {
             let text =
                 serde_json::to_vec_pretty(&facts).map_err(|e| CheckError::Io(e.to_string()))?;
             write_new(&pending_path(&state, &facts.record.record_id), &text)?;
@@ -1004,7 +1015,7 @@ pub async fn record_attempt_change(
     reconcile(&handle, state, &change.candidate_id).await?;
     let reader = handle.reader().map_err(CheckError::Store)?;
     let (held, change) = (state.to_owned(), change.clone());
-    let (recording, ran, record_id, lock) = tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+    let (recording, ran, record_id, lock) = crate::host::begun::spawn_blocking(move || -> Result<_, CheckError> {
         let state = held;
         let io = |e: String| CheckError::Io(e);
         let project = state
@@ -1597,13 +1608,31 @@ pub async fn reconcile(
     state: &Path,
     candidate_id: &str,
 ) -> Result<usize, CheckError> {
+    reconcile_with(handle, state, candidate_id, None).await
+}
+
+/// [`reconcile`], calling `before` in its own task before it reads the records (a test's hold, [`Launch::reconciling`]).
+async fn reconcile_with(
+    handle: &EvidenceHandle,
+    state: &Path,
+    candidate_id: &str,
+    before: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<usize, CheckError> {
     let (h, state, candidate_id) = (handle.clone(), state.to_owned(), candidate_id.to_owned());
-    tokio::spawn(async move {
+    // A task that finishes what it records once its caller has gone (M2T10R-201): counted, never aborted at the host's
+    // stop (docs/adr/ADR-031.md, implementation review round 4, correction 3).
+    crate::host::begun::spawn_finishing(async move {
+        if let Some(before) = before {
+            crate::host::begun::spawn_blocking(before)
+                .await
+                .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))?;
+        }
         let reader = h.reader().map_err(CheckError::Store)?;
         let settled = state.clone();
-        let found = tokio::task::spawn_blocking(move || pending(&reader, &state, &candidate_id))
-            .await
-            .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))??;
+        let found =
+            crate::host::begun::spawn_blocking(move || pending(&reader, &state, &candidate_id))
+                .await
+                .map_err(|e| CheckError::Io(format!("the reconciliation stopped: {e}")))??;
         let recorded = found.len();
         for (lock, recording) in found {
             let record_id = recording.record.record_id.clone();

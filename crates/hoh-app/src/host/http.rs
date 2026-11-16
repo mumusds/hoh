@@ -43,6 +43,8 @@ pub(super) struct Shared {
     pub(super) cgroups: Option<super::cgroup::Delegated>,
     /// The project's root (prompt override files are checked against it, docs/adr/ADR-022.md decision 11).
     pub(super) root: std::path::PathBuf,
+    /// What the host started and still runs (super::begun): its served tasks run in this scope.
+    pub(super) begun: Arc<super::begun::Begun>,
 }
 
 /// One open event stream, counted while it lives.
@@ -358,7 +360,7 @@ pub(super) async fn read<T: Send + 'static>(
     query: impl FnOnce(&Reader) -> Result<T, PersistError> + Send + 'static,
 ) -> Result<T, PersistError> {
     let shared = shared.clone();
-    tokio::task::spawn_blocking(move || {
+    super::begun::spawn_blocking(move || {
         let pooled = shared.readers.lock().ok().and_then(|mut pool| pool.pop());
         let reader = match pooled {
             Some(reader) => reader,
@@ -391,7 +393,7 @@ pub(super) async fn sync_config(
     shared: &Arc<Shared>,
 ) -> Result<hoh_core::config::Config, Unsynced> {
     let root = shared.root.clone();
-    let loaded = tokio::task::spawn_blocking(move || hoh_core::config::load_file(&root))
+    let loaded = super::begun::spawn_blocking(move || hoh_core::config::load_file(&root))
         .await
         .unwrap_or_else(|e| {
             Err(hoh_core::config::ConfigError {

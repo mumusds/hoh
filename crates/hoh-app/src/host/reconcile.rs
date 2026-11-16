@@ -306,14 +306,14 @@ async fn answer_left_messages(
 ) -> Result<(), PersistError> {
     let reader = store.reader()?;
     let (run, task) = (row.run_id.clone(), row.task_id.clone());
-    let round = tokio::task::spawn_blocking(move || reader.verifier_round(&run, &task))
+    let round = super::begun::spawn_blocking(move || reader.verifier_round(&run, &task))
         .await
         .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??;
     let Some((round_id, candidate_id)) = round else {
         return Ok(());
     };
     let bridge = super::product::bridge_of(project, &row.attempt_id);
-    let (lines, _) = tokio::task::spawn_blocking(move || super::product::read_bridge(&bridge))
+    let (lines, _) = super::begun::spawn_blocking(move || super::product::read_bridge(&bridge))
         .await
         .map_err(|e| PersistError::Storage(format!("the read of a bridge ended: {e}")))?;
     let identity = hoh_core::bridge::Identity {
@@ -348,7 +348,7 @@ pub(super) async fn run(
     // (docs/adr/ADR-021.md decision 8d v5 to v7).
     let reader = store.reader()?;
     let ids: Vec<String> = rows.iter().map(|r| r.attempt_id.clone()).collect();
-    let trackings: BTreeMap<String, Tracking> = tokio::task::spawn_blocking(move || {
+    let trackings: BTreeMap<String, Tracking> = super::begun::spawn_blocking(move || {
         ids.into_iter()
             .map(|id| {
                 let event = reader.attempt_event("attempt.tracking", &id)?;
@@ -366,7 +366,7 @@ pub(super) async fn run(
                 .get(&row.attempt_id)
                 .cloned()
                 .unwrap_or_else(|| Tracking::of(None));
-            tokio::task::spawn_blocking(move || -> Result<_, PersistError> {
+            super::begun::spawn_blocking(move || -> Result<_, PersistError> {
                 let process = process_of(&row, &tracking, &settings)?;
                 let effects: Vec<Effect> = row
                     .effects

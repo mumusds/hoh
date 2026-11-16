@@ -1284,6 +1284,7 @@ async fn a_check_holds_its_checkout_from_its_command_to_its_record() -> R {
                     *d = Some(checkouts_in_flight().contains(&held));
                 }
             })),
+            reconciling: None,
         },
     )
     .await

@@ -109,7 +109,7 @@ async fn tick(
             .unwrap_or(false);
         if new {
             let common = common.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(super::begun::spawn(async move {
                 cancel(&common, &run).await;
                 if let Ok(mut c) = common.cancelling.lock() {
                     c.remove(&run);

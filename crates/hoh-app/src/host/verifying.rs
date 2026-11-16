@@ -163,7 +163,7 @@ pub(super) async fn check_at_reconcile(
 ) -> Result<Option<PathBuf>, PersistError> {
     let reader = store.reader()?;
     let id = attempt_id.to_owned();
-    let read = tokio::task::spawn_blocking(move || {
+    let read = super::begun::spawn_blocking(move || {
         Ok::<_, PersistError>((
             reader.attempt_event("verification.attempt_started", &id)?,
             reader.attempt_event("verification.tree_checked", &id)?,
@@ -184,9 +184,10 @@ pub(super) async fn check_at_reconcile(
         .to_owned();
     let reader = store.reader()?;
     let (held, candidate) = (project.to_owned(), candidate_id.clone());
-    let sealed = tokio::task::spawn_blocking(move || rundir::sealed_of(&reader, &held, &candidate))
-        .await
-        .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))?;
+    let sealed =
+        super::begun::spawn_blocking(move || rundir::sealed_of(&reader, &held, &candidate))
+            .await
+            .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))?;
     let Ok((sealed, _)) = sealed else {
         return Ok(Some(dir));
     };

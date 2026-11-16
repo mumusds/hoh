@@ -82,6 +82,10 @@ pub struct HostConfig {
     pub config: hoh_core::config::Config,
 }
 
+/// How long [`Host::shutdown`] waits for what the host started to end after aborting what it can: what is left to
+/// wait for is bounded work (file system, git with its limit, a check's cancel ladder of 5 s and 5 s, store commits).
+const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The host's TCP port unless another is configured (docs/11-deployment.md: `ssh -L 8787`).
 pub const DEFAULT_PORT: u16 = 8787;
 
@@ -214,6 +218,10 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// In a writer attempt's completion on its blocking thread, before its outcome (its freeze) is decided (a test's
     /// implementation holds the step here while the host stops).
     fn completing(&self, _attempt_id: &str) {}
+
+    /// In the commit of a candidate's pending check records before a verifier's check runs (check::reconcile's own
+    /// task), on a blocking thread before it reads them (a test's implementation holds it here while the host stops).
+    fn reconciling(&self, _candidate_id: &str) {}
 
     /// Where the runner lists processes for the termination proof of an attempt whose agent ended, instead of `/proc`
     /// (a test's tree makes the proof fail, M2T06R-251).
@@ -460,6 +468,7 @@ impl Host {
             opened: std::sync::atomic::AtomicUsize::new(0),
             cgroups: delegated.as_ref().ok().cloned(),
             root: config.project.clone(),
+            begun: Arc::default(),
         });
         // The project's configuration file as a team revision, once at the start (docs/adr/ADR-022.md decision 6).
         if let Err(e) = http::sync_config(&shared).await {
@@ -469,23 +478,25 @@ impl Host {
                 "hoh host: the project's configuration is invalid, its team is not used: {e}"
             );
         }
+        // The served tasks run in the host's Begun scope: what they start is counted, and the stop accounts for it.
+        let begun = shared.begun.clone();
         let mut served = vec![
-            tokio::spawn(http::serve(
+            tokio::spawn(begun.clone().scope(http::serve(
                 http::Listener::Tcp(tcp),
                 shared.clone(),
                 stopped.clone(),
-            )),
-            tokio::spawn(http::serve(
+            ))),
+            tokio::spawn(begun.clone().scope(http::serve(
                 http::Listener::Unix(unix),
                 shared.clone(),
                 stopped.clone(),
-            )),
+            ))),
         ];
         // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
         // with the listeners and before the store closes (ADR-019 decision 8).
         let inflight: control::Inflight = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
         if let Some(runner) = config.runner.clone() {
-            served.push(tokio::spawn(runner::run(
+            served.push(tokio::spawn(begun.clone().scope(runner::run(
                 shared.clone(),
                 runner,
                 runner::Setup {
@@ -496,10 +507,10 @@ impl Host {
                     inflight: inflight.clone(),
                 },
                 stopped.clone(),
-            )));
+            ))));
         }
         // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
-        served.push(tokio::spawn(control::run(
+        served.push(tokio::spawn(begun.scope(control::run(
             shared.clone(),
             config.clock.0.clone(),
             config.runner.as_ref().map(|r| r.executor.clone()),
@@ -507,7 +518,7 @@ impl Host {
             repo.clone(),
             config.cancel,
             stopped,
-        )));
+        ))));
         let supervisor = std::fs::read_to_string("/proc/self/cgroup")
             .ok()
             .and_then(|text| crate::unit::supervisor_of(&text));
@@ -617,10 +628,12 @@ impl Host {
     }
 
     /// Stop (ADR-016 decision 12): no new connections, event streams end, every connection finishes or is ended
-    /// after the grace; `host.json` and the socket go; then the store, and the writer ends after its last write and
-    /// lets the project lock go. Returns after that: true when the writer finished, false when it had ended by a panic
-    /// (the lock is then still held until the process ends). The database stays. A Host dropped without this stops
-    /// the same way, without waiting.
+    /// after the grace; then what the served tasks started is accounted for (docs/adr/ADR-031.md, implementation review
+    /// round 4, correction 3: every counted task aborted, the finishing ones finished, the counted work waited for,
+    /// 30 s at most, what still runs then said on stderr); `host.json` and the socket go; then the store, and the
+    /// writer ends after its last write and lets the project lock go. Returns after that: true when the writer
+    /// finished, false when it had ended by a panic (the lock is then still held until the process ends). The database
+    /// stays. A Host dropped without this stops the same way, without waiting.
     pub async fn shutdown(self) -> bool {
         let Host {
             shared,
@@ -632,6 +645,15 @@ impl Host {
         let _ = stop.send(true);
         for task in served {
             let _ = task.await;
+        }
+        let left = shared.begun.stop(STOP_BOUND).await;
+        if left > 0 {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: {left} task(s) or step(s) it started still run {STOP_BOUND:?} into its stop: they may \
+                 still write the project"
+            );
         }
         host_files.remove();
         let ended = shared.store.writer_ended();

@@ -89,9 +89,10 @@ pub async fn freeze(
         inputs.clone(),
         run_id.to_owned(),
     );
-    let job = tokio::task::spawn_blocking(move || prepare_job(&checkout, &state, &run, &inputs))
-        .await
-        .map_err(|e| FreezeError::Io(format!("the freeze stopped: {e}")))??;
+    let job =
+        crate::host::begun::spawn_blocking(move || prepare_job(&checkout, &state, &run, &inputs))
+            .await
+            .map_err(|e| FreezeError::Io(format!("the freeze stopped: {e}")))??;
     store
         .freeze_candidate(job)
         .await
