@@ -1036,6 +1036,61 @@ fn status(app: &App, height: u16) -> String {
 }
 
 #[test]
+fn the_attached_runs_status_shows_its_attempts_tracked_degraded_and_says_which_and_why() {
+    // M2T06R-560 (docs/adr/ADR-021.md decision 8d): an attempt tracked by the degraded /proc scan shows in the run's
+    // status: the status bar counts the run's such attempts (getRun's `degraded_tracking` at the attach, then each
+    // attempt.tracking event with `proc`, an attempt counted once), and the event's line says which attempt and why. One
+    // tracked by its cgroup is not degraded.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.attach("R", "RUNNING");
+    assert!(
+        !status(&app, 10).contains("跟踪降级"),
+        "{:?}",
+        status(&app, 10)
+    );
+    app.tracking(&serde_json::json!([{"attempt_id": "T1/attempt-1", "reason": "the host has no delegated cgroup"}]));
+    assert!(
+        status(&app, 10).contains("事件 0 · #0 · 跟踪降级 1 │"),
+        "{:?}",
+        status(&app, 10)
+    );
+    for (seq, attempt, tracking) in [
+        (1, "T2/attempt-1", "cgroup"),
+        (2, "T3/attempt-1", "proc"),
+        (3, "T1/attempt-1", "proc"),
+    ] {
+        app.event(
+            &serde_json::json!({"seq": seq, "run_id": "R", "kind": "attempt.tracking",
+            "payload": {"attempt_id": attempt, "tracking": tracking, "reason": "no cgroup"}}),
+        );
+    }
+    assert!(
+        status(&app, 10).contains("事件 3 · #3 · 跟踪降级 2 │"),
+        "{:?}",
+        status(&app, 10)
+    );
+    let rows = screen(&app, 100, 10);
+    assert!(
+        rows.iter().any(|r| r.contains("#2 attempt.tracking")
+            && r.contains("T3/attempt-1")
+            && r.contains("proc（no cgroup）")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.trim_end() == "#1 attempt.tracking"),
+        "a cgroup one is an event like any other: {rows:?}"
+    );
+    // Attached again: the count is the new run's.
+    app.attach("S", "RUNNING");
+    assert!(
+        !status(&app, 10).contains("跟踪降级"),
+        "{:?}",
+        status(&app, 10)
+    );
+}
+
+#[test]
 fn the_status_bar_counts_each_event_of_the_attached_run_once_and_shows_the_latest_seq() {
     // Decision 13: "事件 <events received> · #<latest seq>"; the client keeps seq strictly increasing, so an event
     // seen again (a stream opened again after the last one) is not counted twice.

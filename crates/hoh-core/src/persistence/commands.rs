@@ -782,7 +782,39 @@ pub type RunProjection = (
     super::results::ResultView,
     i64,
     Vec<super::questions::Question>,
+    Vec<DegradedTracking>,
 );
+
+/// An attempt of a run whose processes are tracked by the degraded /proc scan, as its `attempt.tracking` recorded it
+/// (docs/adr/ADR-021.md decision 8d, M2T06R-560): the attempt and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedTracking {
+    pub attempt_id: String,
+    pub reason: String,
+}
+
+/// Run `run_id`'s attempts tracked by the /proc scan, in the order their tracking was recorded.
+fn degraded_tracking(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<DegradedTracking>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.attempt_id'), coalesce(json_extract(payload_json, '$.reason'), '') \
+             FROM events WHERE run_id = ?1 AND kind = 'attempt.tracking' \
+             AND json_extract(payload_json, '$.tracking') = 'proc' ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![run_id], |r| {
+            Ok(DegradedTracking {
+                attempt_id: r.get(0)?,
+                reason: r.get(1)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
 /// [`run_view`] with the run's acceptance snapshot (docs/adr/ADR-029.md decision 5), in one read transaction.
 pub(super) fn run_projection(
     conn: &Connection,
@@ -802,7 +834,11 @@ pub(super) fn run_projection(
         let result = super::results::view(conn, run_id, watermark)?;
         // Its open questions (docs/adr/ADR-031.md decision 6), in the same read.
         let questions = super::questions::open(conn, run_id)?;
-        Ok::<_, PersistError>(Some((run, team, acceptance, result, watermark, questions)))
+        // Its attempts tracked degraded (docs/adr/ADR-021.md decision 8d, M2T06R-560), in the same read.
+        let degraded = degraded_tracking(conn, run_id)?;
+        Ok::<_, PersistError>(Some((
+            run, team, acceptance, result, watermark, questions, degraded,
+        )))
     })();
     // Ends the read transaction either way; nothing was written.
     let _ = conn.execute_batch("COMMIT");
