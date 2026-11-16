@@ -294,6 +294,8 @@ pub struct Host {
     pub socket: PathBuf,
     pub token: String,
     shared: Arc<http::Shared>,
+    /// What the host started and still runs (super::begun), keeping `shared` (the store, the lock) while it does.
+    begun: Arc<begun::Begun>,
     stop: tokio::sync::watch::Sender<bool>,
     served: Vec<tokio::task::JoinHandle<()>>,
     /// host.json and the socket, removed at the stop or when the Host is dropped.
@@ -474,8 +476,11 @@ impl Host {
             opened: std::sync::atomic::AtomicUsize::new(0),
             cgroups: delegated.as_ref().ok().cloned(),
             root: config.project.clone(),
-            begun: Arc::default(),
         });
+        // What the host starts (super::begun) keeps its shared state, and with it the store whose writer holds the
+        // project's lock (ADR-016 decision 12): the lock goes only once every counted task and step has ended
+        // (docs/adr/ADR-031.md, implementation review round 4, correction 4).
+        let begun = Arc::new(begun::Begun::keeping(Box::new(shared.clone())));
         // The project's configuration file as a team revision, once at the start (docs/adr/ADR-022.md decision 6).
         if let Err(e) = http::sync_config(&shared).await {
             use std::io::Write as _;
@@ -485,7 +490,6 @@ impl Host {
             );
         }
         // The served tasks run in the host's Begun scope: what they start is counted, and the stop accounts for it.
-        let begun = shared.begun.clone();
         let mut served = vec![
             tokio::spawn(begun.clone().scope(http::serve(
                 http::Listener::Tcp(tcp),
@@ -516,7 +520,7 @@ impl Host {
             ))));
         }
         // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
-        served.push(tokio::spawn(begun.scope(control::run(
+        served.push(tokio::spawn(begun.clone().scope(control::run(
             shared.clone(),
             config.clock.0.clone(),
             config.runner.as_ref().map(|r| r.executor.clone()),
@@ -564,6 +568,7 @@ impl Host {
             for task in served.iter_mut() {
                 let _ = task.await;
             }
+            let _ = begun.stop(config.stop_bound).await;
             host_files.remove();
             return Err(e);
         }
@@ -575,6 +580,7 @@ impl Host {
             socket,
             token,
             shared,
+            begun,
             stop,
             served,
             host_files,
@@ -636,15 +642,18 @@ impl Host {
 
     /// Stop (ADR-016 decision 12): no new connections, event streams end, every connection finishes or is ended
     /// after the grace; then what the served tasks started is accounted for (docs/adr/ADR-031.md, implementation review
-    /// round 4, correction 3: every counted task aborted, the finishing ones finished, the counted work waited for,
-    /// [`HostConfig::stop_bound`] at most); `host.json` and the socket go; then the store, and the writer ends after its
-    /// last write and lets the project lock go. Returns after that: true when the writer finished and nothing the host
-    /// started still ran, false when the writer had ended by a panic (the lock is then still held until the process
-    /// ends) or something still ran past the bound (said on stderr: it may still write the project). The database
-    /// stays. A Host dropped without this stops the same way, without waiting.
+    /// round 4, corrections 3 and 4: every counted task aborted, the finishing ones finished, the counted work waited
+    /// for, [`HostConfig::stop_bound`] at most); `host.json` and the socket go. When nothing counted runs any more, the
+    /// store goes and the writer ends after its last write and lets the project lock go; this returns after that: true
+    /// when the writer finished, false when it had ended by a panic (the lock is then still held until the process
+    /// ends). When something counted still runs past the bound, the stop is incomplete: it says so on stderr and
+    /// returns false at once, and the store and the lock stay held by what still runs, until the last of it has ended
+    /// or the process exits; never a normal stop. The database stays. A Host dropped without this stops the same way,
+    /// without waiting (and without the abort).
     pub async fn shutdown(self) -> bool {
         let Host {
             shared,
+            begun,
             stop,
             served,
             mut host_files,
@@ -655,31 +664,22 @@ impl Host {
         for task in served {
             let _ = task.await;
         }
-        let deadline = std::time::Instant::now() + stop_bound;
-        let left = shared.begun.stop(stop_bound).await;
+        let left = begun.stop(stop_bound).await;
+        host_files.remove();
+        let ended = shared.store.writer_ended();
+        drop(shared);
+        drop(begun);
+        drop(stop);
         if left > 0 {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "hoh host: {left} task(s) or step(s) it started still run {stop_bound:?} into its stop: they may \
-                 still write the project"
+                "hoh host: the stop is incomplete: {left} task(s) or step(s) it started still run {stop_bound:?} into \
+                 it and may still write the project, which stays locked until they end or this process exits"
             );
+            return false;
         }
-        host_files.remove();
-        let ended = shared.store.writer_ended();
-        drop(shared);
-        drop(stop);
-        if left == 0 {
-            return ended.await;
-        }
-        // What still runs may hold the store, whose writer then cannot end before it does: not waited for past the
-        // bound either (the project's lock is let go when it ends, or with the process).
-        let _ = tokio::time::timeout(
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            ended,
-        )
-        .await;
-        false
+        ended.await
     }
 }
 
@@ -747,7 +747,8 @@ pub async fn run_ready(config: HostConfig, ready: impl FnOnce()) -> u8 {
             if ended_first {
                 "hoh host: the database writer ended; the host stopped"
             } else {
-                "hoh host: the stop was not clean: its database writer ended, or what it started still ran (above)"
+                "hoh host: the stop is incomplete: its database writer ended by a panic, or what it started still \
+                 runs (above)"
             }
         );
         return 1;
