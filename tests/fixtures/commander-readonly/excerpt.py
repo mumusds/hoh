@@ -124,14 +124,14 @@ def keep_claude(f: dict) -> bool:
 
 
 def keep_codex(f: dict) -> bool:
-    if isinstance(f.get('result'), dict) and ('sandbox' in f['result'] or 'thread' in f['result']):
-        return True
+    if isinstance(f.get('result'), dict) and ('sandbox' in f['result'] or 'thread' in f['result'] or 'turn' in f['result']):
+        return True  # thread/start, thread/resume and turn/start responses: the round's thread and turn ids
     item = (f.get('params') or {}).get('item') or {}
     if f.get('method') in ('item/started', 'item/completed'):
         return item.get('type') in ('commandExecution', 'fileChange', 'agentMessage')
     if f.get('method') == 'rawResponseItem/completed':  # tool calls and their outputs only: messages may carry instructions
         return item.get('type') in RAW_TOOL_ITEMS
-    if f.get('method') in ('turn/completed', 'error', 'warning'):
+    if f.get('method') in ('turn/started', 'turn/completed', 'error', 'warning'):
         return True
     return f.get('type') in ('thread.started', 'item.started', 'item.completed', 'turn.completed', 'turn.failed', 'error')
 

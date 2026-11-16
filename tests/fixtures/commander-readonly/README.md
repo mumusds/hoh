@@ -47,7 +47,13 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   must all be there; per cell all matching records are merged and any success is a breach), and E6 on one-value
   changes of the recorded rounds. Its generator mutates every positive round (each required element dropped in turn,
   the terminal status changed, a success inserted before and after the refusal, stray writes) and every mutant must
-  be non-PASS; duplicated and reordered variants must keep the verdict. A PASSing mutant is a defect (exit 1). Its output is
+  be non-PASS; duplicated and reordered variants must keep the verdict. A PASSing mutant is a defect (exit 1).
+  Since design correction 6 it judges in stages: it first scopes every source to the round's own thread and turn
+  (codex), session (claude) or attempt up to its first agent_settled (pi), ambiguity being insufficient coverage;
+  then requires every driver call to be complete by itself; then merges. The terminal state (E0), for the round and
+  the control, mirrors the adapters' pure settle functions (claude.rs, codex.rs, pi.rs `verdict`). The generator has
+  a family per stage: foreign-scope copies of each record kind both ways, ambiguous scopes, incomplete driver and
+  patch calls, control terminal variants for every agent, and pi provider errors (failing, and retried). Its output is
   committed as `judge_check.out.md` and `judge_check.out.json` (made on the recording machine, so the raw column is
   filled); the bundle self-test reruns it on the excerpts and requires the committed verdicts. M2-T20's judge must give
   the same verdicts on the same fixtures.
