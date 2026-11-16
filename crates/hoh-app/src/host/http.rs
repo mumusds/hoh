@@ -948,7 +948,10 @@ struct RunsQuery {
 }
 
 /// `GET /v1/runs` (openapi `listRuns`; docs/adr/ADR-021.md decision 6): a page of the project's runs, newest first,
-/// each with its label; `cursor` is opaque. A query that cannot be read names no page: 404, within openapi's codes.
+/// each with its label and its goal, and a COMPLETED run's candidate accepted last as `accepted` (null for none; no
+/// such key for a run in any other state), whose commit the Workspace shows as the project's baseline
+/// (docs/adr/ADR-031.md decision 13); `cursor` is opaque. A query that cannot be read names no page: 404, within
+/// openapi's codes.
 async fn list_runs(
     State(shared): State<Arc<Shared>>,
     query: Result<Query<RunsQuery>, axum::extract::rejection::QueryRejection>,
@@ -983,17 +986,29 @@ async fn list_runs(
         }) => (
             StatusCode::OK,
             axum::Json(json!({
-                "items": runs.iter().map(|(run, created_at)| json!({
-                    "run_id": run.run_id,
-                    "state": run.state,
-                    "label": serde_json::from_value::<RunState>(json!(run.state))
-                        .map_or_else(|_| run.state.clone(), |s| hoh_core::lifecycle::label(s).to_owned()),
-                    "mode": run.mode,
-                    "revision": run.revision,
-                    "resume_state": run.resume_state,
-                    "blocked_reason": run.blocked_reason,
-                    "created_at": created_at,
-                })).collect::<Vec<_>>(),
+                "items": runs.iter().map(|listed| {
+                    let run = &listed.run;
+                    let mut item = json!({
+                        "run_id": run.run_id,
+                        "state": run.state,
+                        "label": serde_json::from_value::<RunState>(json!(run.state))
+                            .map_or_else(|_| run.state.clone(), |s| hoh_core::lifecycle::label(s).to_owned()),
+                        "mode": run.mode,
+                        "revision": run.revision,
+                        "resume_state": run.resume_state,
+                        "blocked_reason": run.blocked_reason,
+                        "created_at": listed.created_at,
+                        "goal": listed.goal,
+                    });
+                    if let Some(accepted) = &listed.accepted {
+                        item["accepted"] = accepted.as_ref().map_or(Value::Null, |c| json!({
+                            "candidate_id": c.candidate_id,
+                            "git_commit": c.git_commit,
+                            "seq": c.seq,
+                        }));
+                    }
+                    item
+                }).collect::<Vec<_>>(),
                 "next_cursor": next.map(|n| n.to_string()),
                 "watermark": watermark,
             })),

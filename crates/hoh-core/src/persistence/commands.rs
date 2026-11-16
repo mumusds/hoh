@@ -604,14 +604,56 @@ pub(super) fn run_projection(
 /// A page of runs: each with its creation time, the next page's cursor if there may be one, and the watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunsPage {
-    pub runs: Vec<(RunRow, String)>,
+    pub runs: Vec<ListedRun>,
     pub next: Option<i64>,
     pub watermark: i64,
 }
 
+/// A run of a page (docs/adr/ADR-031.md decision 13): its row, its creation time, its goal (its StartRun's, if one
+/// that is not blank) and, for a COMPLETED run only, the candidate it accepted last (`None` for any other run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedRun {
+    pub run: RunRow,
+    pub created_at: String,
+    pub goal: Option<String>,
+    pub accepted: Option<Option<AcceptedCandidate>>,
+}
+
+/// The candidate a run accepted last: its ACCEPTED candidate whose `candidate.accepted` event has the greatest seq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedCandidate {
+    pub candidate_id: String,
+    pub git_commit: String,
+    pub seq: i64,
+}
+
+/// The candidate `run_id` accepted last (see [`AcceptedCandidate`]), if any.
+fn accepted_last(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<AcceptedCandidate>, PersistError> {
+    conn.query_row(
+        "SELECT c.candidate_id, c.git_commit, e.seq FROM candidates c JOIN events e \
+           ON e.run_id = c.run_id AND e.kind = 'candidate.accepted' \
+           AND json_extract(e.payload_json, '$.candidate_id') = c.candidate_id \
+         WHERE c.run_id = ?1 AND c.state = 'ACCEPTED' ORDER BY e.seq DESC LIMIT 1",
+        params![run_id],
+        |r| {
+            Ok(AcceptedCandidate {
+                candidate_id: r.get(0)?,
+                git_commit: r.get(1)?,
+                seq: r.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
 /// A page of the project's runs, newest first (openapi `listRuns`): at most `limit` runs older than `before` (an
 /// opaque cursor: the rowid of the last run of the previous page), only in `state` if given; each with its creation
-/// time, the cursor of the next page if there may be one, and the watermark the page is consistent with.
+/// time, its goal and a COMPLETED run's candidate accepted last (docs/adr/ADR-031.md decision 13), the cursor of the
+/// next page if there may be one, and the watermark the page is consistent with.
 pub(super) fn list_runs(
     conn: &Connection,
     state: Option<&str>,
@@ -652,8 +694,25 @@ pub(super) fn list_runs(
             .then(|| rows.last().map(|r| r.2))
             .flatten();
         let watermark = max_seq(conn)?;
+        let runs = rows
+            .into_iter()
+            .map(|(run, created_at, _)| {
+                let goal = super::results::started_goal(conn, &run.run_id)?;
+                let accepted = if run.state == RunState::Completed.as_str() {
+                    Some(accepted_last(conn, &run.run_id)?)
+                } else {
+                    None
+                };
+                Ok(ListedRun {
+                    run,
+                    created_at,
+                    goal,
+                    accepted,
+                })
+            })
+            .collect::<Result<_, PersistError>>()?;
         Ok::<_, PersistError>(RunsPage {
-            runs: rows.into_iter().map(|(run, at, _)| (run, at)).collect(),
+            runs,
             next,
             watermark,
         })
