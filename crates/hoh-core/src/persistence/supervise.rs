@@ -386,6 +386,40 @@ pub(super) fn tail(
     Ok(())
 }
 
+/// Whether run `run_id` has events after its supervisor's cursor that wake its Commander under its policy (classified
+/// as the step classifies them): taken in by its next step, not yet a trigger (docs/adr/ADR-031.md correction C's (c),
+/// M2T13D-300).
+pub(super) fn unread_waking(tx: &Transaction<'_>, run_id: &str) -> Result<bool, PersistError> {
+    let (revision, policy): (Option<i64>, Option<String>) = tx
+        .query_row(
+            "SELECT s.revision, json_extract(r.config_snapshot_json, '$.supervision.policy') FROM runs r \
+             LEFT JOIN specs s ON s.spec_id = r.spec_id WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    let policy = policy
+        .as_deref()
+        .and_then(Policy::named)
+        .unwrap_or(Policy::Balanced);
+    let after = cursor(tx, run_id)?;
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT kind, payload_json FROM events WHERE run_id = ?1 AND kind IN ({}) AND seq > ?2 ORDER BY seq",
+            kinds_sql()
+        ))
+        .map_err(sqlite_error)?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![run_id, after], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows.iter().any(|(kind, payload)| {
+        let payload: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+        supervise::classify(policy, kind, &payload, revision).is_some()
+    }))
+}
+
 /// Run `run_id`'s cursor set to `seq`, its end's run.result (docs/adr/ADR-031.md decision 4's (4)): its supervisor has
 /// taken in every event of it.
 pub(super) fn set_cursor(tx: &Transaction<'_>, run_id: &str, seq: i64) -> Result<(), PersistError> {

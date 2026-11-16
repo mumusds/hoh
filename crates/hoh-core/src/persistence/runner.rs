@@ -38,8 +38,12 @@ pub struct Waiting {
     pub dispatches: Vec<DispatchNotice>,
     /// run.started notices not yet taken: (message id, run id).
     pub started: Vec<(String, String)>,
-    /// The runs the runner paces and schedules (RUNNING, VERIFYING, and WAITING_EXTERNAL to be woken).
+    /// The runs the runner schedules and reconciles the verification of (RUNNING, VERIFYING, and WAITING_EXTERNAL to
+    /// be woken).
     pub runs: Vec<String>,
+    /// The runs the runner paces: those of `runs` and the Commander's stages (CREATED, DISCOVERING, SPECIFYING, READY),
+    /// for their budget only (docs/adr/ADR-031.md correction C, M2T13D-301).
+    pub paced: Vec<String>,
     /// The runs whose pause waits for its safe point (PAUSE_REQUESTED) and those being cancelled (CANCEL_REQUESTED),
     /// which the host loop moves on with or without an executor (docs/adr/ADR-021.md decision 7).
     pub pausing: Vec<String>,
@@ -62,6 +66,11 @@ pub struct Waiting {
     /// still has a PENDING trigger, or a woken or an output since its supervision was last closed (superseded and
     /// closed by its next step; v13, M2T08R-06).
     pub supervised: Vec<String>,
+    /// The runs the stall detector looks at, last in each tick (docs/adr/ADR-031.md design correction C): their
+    /// Commander bound and their specification adopted, in a working state or in one the tick's pace may put back in
+    /// one (WAITING_EXTERNAL, BLOCKED; M2T13D-250): the list is read at the tick's start, and the detector judges the
+    /// state in its own transaction.
+    pub stall: Vec<String>,
 }
 
 /// One step of the runner.
@@ -138,6 +147,12 @@ pub(super) enum RunnerJob {
     Checkpoint(String, super::team::Availability),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
     Renew(Vec<String>, std::time::SystemTime),
+    /// One look at a run for a stall (docs/adr/ADR-031.md design correction C), with the tick's pending candidates.
+    Stall {
+        run_id: String,
+        pending: std::collections::BTreeSet<String>,
+        context: Box<crate::decision::Context>,
+    },
 }
 
 /// What a step gave.
@@ -155,6 +170,7 @@ pub(super) enum RunnerDone {
     Allocated(Option<super::wakes::Allocated>),
     Stops(Vec<super::wakes::Stop>),
     Repair(super::retry::RepairVerdict),
+    Stall(super::stall::Detected),
 }
 
 /// How an attempt ended, as the runner reports it (ADR-020 decisions 1 and 3).
@@ -391,6 +407,11 @@ pub(super) fn run(
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
         }
+        RunnerJob::Stall {
+            run_id,
+            pending,
+            context,
+        } => super::stall::detect(conn, &run_id, &pending, &context, ctx).map(RunnerDone::Stall),
         RunnerJob::Renew(attempts, now) => {
             let tx = writer::begin(conn, ctx)?;
             let at = crate::time::rfc3339_utc(now);
@@ -524,7 +545,38 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
     };
+    let paced = {
+        let mut statement = conn
+            .prepare(
+                "SELECT run_id FROM runs WHERE project_id = ?1 AND state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', \
+                 'READY', 'RUNNING', 'VERIFYING', 'WAITING_EXTERNAL', 'BLOCKED') ORDER BY created_at, run_id",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let stall = {
+        let mut statement = conn
+            .prepare(
+                "SELECT r.run_id FROM runs r WHERE r.project_id = ?1 \
+                 AND r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING', \
+                   'WAITING_EXTERNAL', 'BLOCKED') AND r.spec_id IS NOT NULL \
+                 AND EXISTS(SELECT 1 FROM role_bindings b WHERE b.run_id = r.run_id AND b.role = 'commander') \
+                 ORDER BY r.created_at, r.run_id",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![project_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
     Ok(Waiting {
+        paced,
+        stall,
         supervised,
         session_starts: super::handover::waiting(conn, project_id)?,
         dispatches,
