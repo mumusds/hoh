@@ -3846,9 +3846,12 @@ async fn a_stopped_host_abandons_its_suite() -> R {
     std::fs::create_dir_all(&hold)?;
     let mut config = world.config();
     config.hooks = std::sync::Arc::new(HoldSuite(hold.clone()));
+    // The suite's step, held here past the stop, is counted (docs/adr/ADR-031.md, implementation review round 4): the
+    // stop waits for it its bound at most (2 s here) and then is not clean.
+    config.stop_bound = Duration::from_secs(2);
     let host = start_when_free(config).await?;
     let held = exists(&hold.join("held"), Duration::from_secs(60)).await;
-    host.shutdown().await;
+    let clean = host.shutdown().await;
     std::fs::write(hold.join("release"), "")?;
     exists(&hold.join("left"), Duration::from_secs(10)).await?;
     world.stop_fakes()?;
@@ -3868,6 +3871,7 @@ async fn a_stopped_host_abandons_its_suite() -> R {
         json!({"suite_id": events[0].2["suite_id"], "status": "abandoned"})
     );
     assert!(!project.join(".hoh/compat-manifest.json").exists());
+    assert!(!clean, "a stop past its bound said it was clean");
     Ok(())
 }
 
