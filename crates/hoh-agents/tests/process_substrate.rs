@@ -229,16 +229,16 @@ async fn a_descendant_that_left_the_group_cannot_hold_up_the_exit() -> R {
         drain_grace: Duration::from_millis(300),
         ..Config::default()
     };
+    // It says the sleeper's stat line (a builtin read, while the sleeper surely runs), so the test ends the sleeper and
+    // never a process given its number later (ADR-022 decision 10).
     let script = "setsid sleep 600 & pid=$!; \
-                  while [ \"$(cut -d' ' -f5 /proc/$pid/stat)\" = \"$$\" ]; do sleep 0.01; done; echo \"$pid\"; exit 0";
+                  while [ \"$(cut -d' ' -f5 /proc/$pid/stat)\" = \"$$\" ]; do sleep 0.01; done; \
+                  read -r s < /proc/$pid/stat; printf '%s\\n' \"$s\"; exit 0";
     let mut p = Process::spawn(sh(script), config)?;
-    let escaped: u32 = first_line(&mut p).await?.parse()?;
+    let (escaped, start) = identity_of(&first_line(&mut p).await?)?;
     let started = Instant::now();
     let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(escaped as i32).ok_or("bad pid")?,
-        rustix::process::Signal::KILL,
-    );
+    let _ = hoh_agents::identity::signal_if_same(escaped, &start, rustix::process::Signal::KILL);
     let (_, report) = outcome?;
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(report.status, Some(Termination::Code(0)));
@@ -248,24 +248,36 @@ async fn a_descendant_that_left_the_group_cannot_hold_up_the_exit() -> R {
 }
 
 /// A leader that moves itself into another process group of the session (the test's own), ignores SIGTERM and prints
-/// its pid; the group it left is empty.
+/// its own stat line (its pid and start time); the group it left is empty.
 fn leaving_leader() -> Command {
     let mut command = Command::new("python3");
     command.arg("-c").arg(
         "import os, signal, sys, time\n\
          signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
          os.setpgid(0, os.getpgid(os.getppid()))\n\
-         print(os.getpid(), flush=True)\n\
+         print(open('/proc/self/stat').read().strip(), flush=True)\n\
          time.sleep(600)\n",
     );
     command
 }
 
-/// Kill `pid` if a failed test left it running.
-fn kill_left(pid: u32) {
-    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
+/// The pid and start time a process's stat line, said by itself while it ran, names.
+fn identity_of(stat: &str) -> Result<(u32, String), Box<dyn std::error::Error>> {
+    let pid = stat
+        .split_whitespace()
+        .next()
+        .ok_or("an empty stat line")?
+        .parse()?;
+    let start = hoh_agents::identity::after_command_name(stat.as_bytes())
+        .and_then(|fields| fields.split_whitespace().nth(19))
+        .ok_or("the stat line has no start time")?;
+    Ok((pid, start.to_owned()))
+}
+
+/// Kill process `pid` if a failed test left it running, only while it is still the one started at `start`: in a
+/// passing run it was reaped before this, and its number may be another's (ADR-022 decision 10).
+fn kill_left(pid: u32, start: &str) {
+    let _ = hoh_agents::identity::signal_if_same(pid, start, rustix::process::Signal::KILL);
 }
 
 #[tokio::test]
@@ -282,10 +294,10 @@ async fn a_leader_that_left_its_group_is_killed_at_the_deadline() -> R {
         ..Config::default()
     };
     let mut p = Process::spawn(leaving_leader(), config)?;
-    let leader: u32 = first_line(&mut p).await?.parse()?;
+    let (leader, start) = identity_of(&first_line(&mut p).await?)?;
     let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
     let left = alive(leader);
-    kill_left(leader);
+    kill_left(leader, &start);
     let (_, report) = outcome?;
     assert_eq!(report.cause, Cause::DeadlineExceeded);
     assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
@@ -298,9 +310,9 @@ fn shutting_down_the_runtime_kills_a_leader_that_left_its_group() -> R {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let leader = runtime.block_on(async {
+    let (leader, start) = runtime.block_on(async {
         let mut p = Process::spawn(leaving_leader(), Config::default())?;
-        let leader: u32 = first_line(&mut p).await?.parse()?;
+        let leader = identity_of(&first_line(&mut p).await?)?;
         // Only the runtime going away ends it.
         std::mem::forget(p);
         Ok::<_, Box<dyn std::error::Error>>(leader)
@@ -311,7 +323,7 @@ fn shutting_down_the_runtime_kills_a_leader_that_left_its_group() -> R {
         std::thread::sleep(Duration::from_millis(20));
     }
     let left = alive(leader);
-    kill_left(leader);
+    kill_left(leader, &start);
     assert!(!left, "leader {leader} survived the runtime");
     Ok(())
 }
