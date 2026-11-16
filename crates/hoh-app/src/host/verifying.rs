@@ -48,7 +48,7 @@ pub(super) async fn prepare(
     let reader = store.reader()?;
     let (project, held) = (project.to_owned(), dir.clone());
     let candidate = candidate_id.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
+    let prepared = super::begun::spawn_blocking(move || {
         // Only a candidate under verification is verified (decision 10, M2T16D-253): one that no longer is ends its
         // attempt for the reconcile to cancel its task, never for a decision (M2T16R-55).
         let state = reader
@@ -115,7 +115,7 @@ pub(super) async fn check(
     v: &Verifier,
 ) -> (String, String, Value) {
     let (dir, pre_tree, manifest) = (v.dir.clone(), v.pre_tree.clone(), v.sealed.manifest.clone());
-    let checked = tokio::task::spawn_blocking(move || rundir::post(&dir, &pre_tree, &manifest))
+    let checked = super::begun::spawn_blocking(move || rundir::post(&dir, &pre_tree, &manifest))
         .await
         .unwrap_or_else(|e| rundir::TreeCheck {
             post_tree: json!({"error": e.to_string()}),
