@@ -207,6 +207,85 @@ fn walk(
     whole
 }
 
+/// A directory on a removal's way down: what it is, its name in the directory above it, and the directories in it not
+/// yet removed.
+struct Down {
+    id: (u64, u64),
+    name: std::ffi::CString,
+    left: Vec<std::ffi::CString>,
+}
+
+impl Down {
+    /// The open directory `dir`, named `name` in the one above it, with the directories it holds now (none when they
+    /// cannot be listed: it then stays, as its own removal fails).
+    fn of(dir: &rustix::fd::OwnedFd, name: std::ffi::CString) -> rustix::io::Result<Down> {
+        let stat = rustix::fs::fstat(dir)?;
+        let mut left = Vec::new();
+        if let Ok(entries) = rustix::fs::Dir::read_from(dir) {
+            for entry in entries {
+                let Ok(entry) = entry else { break };
+                let name = entry.file_name();
+                if entry.file_type() == rustix::fs::FileType::Directory
+                    && name.to_bytes() != b"."
+                    && name.to_bytes() != b".."
+                {
+                    left.push(name.to_owned());
+                }
+            }
+        }
+        Ok(Down {
+            id: (stat.st_dev, stat.st_ino),
+            name,
+            left,
+        })
+    }
+}
+
+/// Remove every directory below `top`, the deepest first, each by its name in the directory above it (M2T06R-1100):
+/// down by name from the open directory into one with directories in it, back up by `..`, which must be the directory
+/// it came down from (cgroup v2 has no rename), so each is opened once and one name kept for each, at most three
+/// directories open at a time: time and memory linear in the subtree (M2T06R-1250). Where `..` is not that directory
+/// it stops; what is left stays.
+fn remove_below(top: rustix::fd::OwnedFd) {
+    let Ok(first) = Down::of(&top, std::ffi::CString::default()) else {
+        return;
+    };
+    let mut at = top;
+    let mut way = vec![first];
+    while let Some(here) = way.last_mut() {
+        if let Some(name) = here.left.pop() {
+            if let Ok(next) =
+                rustix::fs::openat(&at, name.as_c_str(), directory(), rustix::fs::Mode::empty())
+                && let Ok(down) = Down::of(&next, name)
+            {
+                if down.left.is_empty() {
+                    // Nothing listed below it: removed from here, not entered.
+                    let _ = rustix::fs::unlinkat(
+                        &at,
+                        down.name.as_c_str(),
+                        rustix::fs::AtFlags::REMOVEDIR,
+                    );
+                } else {
+                    at = next;
+                    way.push(down);
+                }
+            }
+            continue;
+        }
+        let (Some(done), Some(above)) = (way.pop(), way.last()) else {
+            return;
+        };
+        let Ok(up) = rustix::fs::openat(&at, "..", directory(), rustix::fs::Mode::empty()) else {
+            return;
+        };
+        if rustix::fs::fstat(&up).map(|stat| (stat.st_dev, stat.st_ino)) != Ok(above.id) {
+            return;
+        }
+        let _ = rustix::fs::unlinkat(&up, done.name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR);
+        at = up;
+    }
+}
+
 impl AttemptGroup {
     /// The cgroup at `path` with no record of what it was: nothing it shows proves anything (M2T06R-900).
     #[cfg(test)]
@@ -464,9 +543,9 @@ impl AttemptGroup {
     }
 
     /// Remove it, proved empty, with the cgroups below it, the deepest first: each by its name in the directory above
-    /// it, opened from its checked directory, and itself by its name in its checked parent once that still holds the
-    /// recorded one. Nothing when it is gone (removed, a successor at its path, or of another boot): what is at its
-    /// path is not its (M2T06R-1100). A leftover empty directory is harmless.
+    /// it, reached from its checked directory ([`remove_below`]), and itself by its name in its checked parent once
+    /// that still holds the recorded one. Nothing when it is gone (removed, a successor at its path, or of another
+    /// boot): what is at its path is not its (M2T06R-1100). A leftover empty directory is harmless.
     pub(super) fn remove(&self) {
         if self.of_another_boot() {
             return;
@@ -478,21 +557,7 @@ impl AttemptGroup {
         else {
             return;
         };
-        let mut below = Vec::new();
-        walk(&dir, |names, _| {
-            if !names.is_empty() {
-                below.push(names.to_vec());
-            }
-        });
-        // Parents are walked before their children: backwards, each goes before the one above it.
-        for names in below.iter().rev() {
-            if let Some((name, path)) = names.split_last()
-                && let Ok(parent) = open_below(&dir, path)
-            {
-                let _ =
-                    rustix::fs::unlinkat(&parent, name.as_c_str(), rustix::fs::AtFlags::REMOVEDIR);
-            }
-        }
+        remove_below(dir);
         let (Some(name), Some(witness)) = (self.path.file_name(), self.witness.as_ref()) else {
             return;
         };
@@ -703,8 +768,8 @@ mod tests {
 
     #[test]
     fn a_cgroups_subtree_is_every_cgroup_below_it_and_goes_bottom_up() -> R {
-        // M2T06R-651 (decision 8d v7): the walk SIGTERM and the removal share reaches every cgroup below the attempt's,
-        // however deep, and a proved cgroup is removed with all of them, the deepest first.
+        // M2T06R-651 (decision 8d v7): the walk SIGTERM uses reaches every cgroup below the attempt's, however deep, and
+        // a proved cgroup is removed with all of them, the deepest first (M2T06R-1250: by a walk of its own).
         let root = tempfile::tempdir()?;
         let at = root.path().join("attempt-0123456789abcdef");
         let deepest = at.join("a").join("b").join("c");
@@ -743,6 +808,53 @@ mod tests {
             "left: {:?}",
             std::fs::read_dir(root.path())?.count()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deep_cgroup_is_removed_in_time_linear_in_its_depth() -> R {
+        // M2T06R-1250: a removal that opened each cgroup below again from the top by its names, and kept every
+        // cgroup's names, took time and memory quadratic in the depth the attempt chose (a chain 4000 deep: 14 s and
+        // 380 MB on real cgroups). Each is opened once, and up again by `..`: a chain 4000 deep goes in milliseconds.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        let mut dir = rustix::fs::open(&at, directory(), rustix::fs::Mode::empty())?;
+        for _ in 0..4000 {
+            rustix::fs::mkdirat(&dir, "d", rustix::fs::Mode::from_raw_mode(0o755))?;
+            dir = rustix::fs::openat(&dir, "d", directory(), rustix::fs::Mode::empty())?;
+        }
+        drop(dir);
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let started = Instant::now();
+        group.remove();
+        let took = started.elapsed();
+        assert!(!at.exists(), "left");
+        assert!(took < Duration::from_secs(2), "took {took:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_below_that_cannot_be_listed_stays_and_the_others_go() -> R {
+        // M2T06R-1250: the removal enters only a directory it could list with directories in it, so it can always go
+        // back up; one it cannot list (no search permission, a same-user process may chmod a delegated cgroup) stays
+        // with what is below it, and the rest of the subtree is removed. (Made first, it is the first one taken on
+        // tmpfs, which lists the newest first.)
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("shut").join("in"))?;
+        std::fs::create_dir_all(at.join("a").join("b"))?;
+        std::fs::create_dir_all(at.join("c"))?;
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o600))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        group.remove();
+        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o755))?;
+        let mut left: Vec<_> = std::fs::read_dir(&at)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        left.sort();
+        assert_eq!(left, ["shut"]);
+        assert!(at.join("shut").join("in").is_dir());
         Ok(())
     }
 
