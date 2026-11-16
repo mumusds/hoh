@@ -495,6 +495,40 @@ pub(crate) fn unrecovered_candidates(
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
+/// A recovery failure's `attempt` and `at_ms`, as its event has them.
+pub(crate) type Failed = (Option<i64>, Option<String>);
+
+/// Candidate `candidate`'s last recovery failure since its last recovery, if any: its `attempt` and `at_ms`
+/// ([`Reader::recovery_not_before`]'s backoff), read through [`last_failure_sql`].
+pub(crate) fn last_failure(
+    conn: &Connection,
+    candidate: &str,
+) -> Result<Option<Failed>, PersistError> {
+    conn.query_row(&last_failure_sql(), rusqlite::params![candidate], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        e => Err(sqlite_error(e)),
+    })
+}
+
+/// [`last_failure`]'s statement, candidate `?1` (M2T13R-03): its failures and recoveries read among its run's events
+/// (its own and its Records written project-scoped, `hold::of_run`) through the `(run_id, kind, seq)` index, as
+/// [`unrecovered_sql`] reads one run's — not the project's history.
+pub(crate) fn last_failure_sql() -> String {
+    let run = "(SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = ?1)";
+    format!(
+        "SELECT json_extract(f.payload_json, '$.attempt'), json_extract(f.payload_json, '$.at_ms') FROM main.events f \
+         WHERE f.kind = 'candidate.reconcile_failed' AND {} AND json_extract(f.payload_json, '$.candidate_id') = ?1 \
+         AND f.seq > coalesce((SELECT max(r.seq) FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' \
+           AND {} AND json_extract(r.payload_json, '$.candidate_id') = ?1), 0) ORDER BY f.seq DESC LIMIT 1",
+        hold::of_run("f", run),
+        hold::of_run("r", run),
+    )
+}
+
 /// [`unrecovered_candidates`]' statement (M2T13R-03): each kind of recovery fact read through the `(run_id, kind, seq)`
 /// index in one pass — a candidate's last failure and last recovery grouped by candidate, its judgment as
 /// unrecoverable looked up for it — never the events of other kinds, nor the history once per failure. Of every run:
@@ -2121,22 +2155,7 @@ impl Reader {
         &self,
         candidate_id: &str,
     ) -> Result<Option<std::time::SystemTime>, PersistError> {
-        let last: Option<(Option<i64>, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT json_extract(f.payload_json, '$.attempt'), json_extract(f.payload_json, '$.at_ms') FROM events f \
-                 WHERE f.kind = 'candidate.reconcile_failed' AND json_extract(f.payload_json, '$.candidate_id') = ?1 \
-                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
-                   AND json_extract(r.payload_json, '$.candidate_id') = ?1), 0) ORDER BY f.seq DESC LIMIT 1",
-                rusqlite::params![candidate_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(sqlite_error(e)),
-            })?;
-        let Some((attempt, at_ms)) = last else {
+        let Some((attempt, at_ms)) = last_failure(&self.conn, candidate_id)? else {
             return Ok(None);
         };
         let at = at_ms.and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(0);
