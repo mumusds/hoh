@@ -421,6 +421,7 @@ fn failed(code: Option<&str>) -> Facts {
         degraded: None,
         final_text: None,
         compat: None,
+        retry_at: None,
     }
 }
 
@@ -496,6 +497,7 @@ fn a_turns_facts_become_its_outcome() {
         degraded: Some("initialize timed out".to_owned()),
         final_text: Some("done\n```hoh-report\n{}\n```".to_owned()),
         compat: None,
+        retry_at: None,
     };
     let o = outcome(facts);
     // Its final assistant message, where a verifier's report is read (docs/adr/ADR-028.md decision 15).

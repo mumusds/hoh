@@ -1389,3 +1389,43 @@ while end > time.monotonic():
     assert_ne!(facts.state, AttemptState::Settled);
     Ok(())
 }
+
+/// The provider-fault recordings of claude 2.1.325 (tests/fixtures/protocol/_provider-faults, record_faults.py).
+const FAULTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/_provider-faults/claude/2.1.325"
+);
+
+#[tokio::test]
+async fn claude_runner_mode_reports_when_a_recorded_usage_limit_lifts() -> R {
+    // M2T07R-256 (REQ-042 behaviour 1): a turn that failed on the subscriber's usage limit reports the reset its
+    // provider gave (unix seconds) for the host to wait for; a 429 whose long Retry-After Claude dropped reports none.
+    let world = World::new()?;
+    for (n, case) in ["fault-usage-limit", "fault-429-retry-after-long"]
+        .into_iter()
+        .enumerate()
+    {
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(format!("{FAULTS}/{case}/meta.json"))?)?;
+        let exit = i32::try_from(meta["exit_code"].as_i64().ok_or("no exit code")?)?;
+        let stdout = std::fs::read(format!("{FAULTS}/{case}/stdout.jsonl"))?;
+        let fake = world.fake(case, &stdout, b"", exit)?;
+        let turn = world.turn(&fake, &format!("logs-{case}"))?;
+        let attempt = world.attempt(&format!("A{n}")).await?;
+        let held = claude::start(&attempt, &turn, &gate(&world, "p/A1")?)?;
+        held.open.send(()).map_err(|()| "gate closed")?;
+        let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+        assert_eq!(facts.state, AttemptState::Failed, "{case}: {facts:?}");
+        let sent = meta["provider"]["requests"][0]["headers"]["anthropic-ratelimit-unified-reset"]
+            .as_str()
+            .map(str::parse::<u64>)
+            .transpose()?;
+        assert_eq!(
+            facts.retry_at,
+            sent.map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s)),
+            "{case}"
+        );
+        assert_eq!(sent.is_some(), case == "fault-usage-limit", "{case}");
+    }
+    Ok(())
+}

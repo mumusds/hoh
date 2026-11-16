@@ -917,6 +917,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 degraded: None,
                 final_text: driven.reply,
                 compat: None,
+                retry_at: None,
             },
             Err(_) => Facts::incomplete(raw_log_path, recorded),
         }
@@ -963,6 +964,7 @@ fn app_server_facts(
             degraded: None,
             final_text: driven.reply,
             compat: None,
+            retry_at: driven.retry_at,
         }
         .before_input(driven.changed.as_ref()),
         // Moved to exec before the agent wrote a frame: its gate, slower than the handshake timeout, may have refused it

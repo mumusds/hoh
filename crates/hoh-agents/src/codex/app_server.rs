@@ -25,7 +25,7 @@ use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
 use hoh_core::persistence::{AttemptFacts, CancelLatch, PersistError, Store};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -192,6 +192,54 @@ struct State<'a> {
     prompt_seen: bool,
     /// Turn-scoped notifications of this thread that came before this turn's id was known, with their bytes.
     early: Vec<(String, Value, Vec<u8>)>,
+    /// The rate-limit windows codex reported during the turn.
+    limits: RateLimits,
+}
+
+/// The rate-limit windows codex reported during a turn (`account/rateLimits/updated`; M2T07R-256, docs/adr/ADR-012.md,
+/// 注记 of 2026-11-16): by limit id and window (primary, secondary), the used percentage and the reset (unix seconds).
+/// A sparse update keeps what an earlier one said: a window or a reset it leaves out or sends as null clears nothing.
+#[derive(Debug, Default)]
+struct RateLimits(BTreeMap<(String, &'static str), Window>);
+
+/// One rate-limit window as codex last reported it.
+#[derive(Debug, Default)]
+struct Window {
+    used_percent: Option<i64>,
+    resets_at: Option<Value>,
+}
+
+impl RateLimits {
+    fn see(&mut self, params: &Value) {
+        let limits = &params["rateLimits"];
+        let id = limits["limitId"].as_str().unwrap_or_default();
+        for side in ["primary", "secondary"] {
+            let window = &limits[side];
+            if !window.is_object() {
+                continue;
+            }
+            let seen = self.0.entry((id.to_owned(), side)).or_default();
+            if let Some(percent) = window["usedPercent"].as_i64() {
+                seen.used_percent = Some(percent);
+            }
+            if !window["resetsAt"].is_null() {
+                seen.resets_at = Some(window["resetsAt"].clone());
+            }
+        }
+    }
+
+    /// When every used-up window lifts: the latest reset among them; none when no window is used up, or when one of
+    /// them has no reset that is an instant.
+    fn lifts(&self) -> Option<std::time::SystemTime> {
+        let mut latest = None;
+        for window in self.0.values() {
+            if window.used_percent.is_some_and(|percent| percent >= 100) {
+                let at = crate::adapter::unix_seconds(window.resets_at.as_ref()?)?;
+                latest = latest.max(Some(at));
+            }
+        }
+        latest
+    }
 }
 
 impl State<'_> {
@@ -427,6 +475,7 @@ impl State<'_> {
                 )
                 .await?;
             }
+            "account/rateLimits/updated" => self.limits.see(params),
             _ => {}
         }
         Ok(())
@@ -719,6 +768,7 @@ impl<'a> State<'a> {
             seen_items: HashSet::new(),
             prompt_seen: false,
             early: Vec::new(),
+            limits: RateLimits::default(),
         }
     }
 
@@ -836,6 +886,26 @@ impl<'a> State<'a> {
             exit_matters: false,
             exit,
         });
+        // A turn that failed on a usage or rate limit: when the windows codex reported used up lift.
+        let limited = matches!(
+            self.error
+                .as_ref()
+                .and_then(|e| e["codexErrorInfo"].as_str()),
+            Some("usageLimitExceeded" | "rateLimitExceeded")
+        );
+        let retry_at = if state == AttemptState::Failed
+            && self.failure.is_none()
+            && !self.cancelled
+            && !self.too_large
+            && !self.deadline
+            && !logs_incomplete
+            && self.status.as_deref() == Some("failed")
+            && limited
+        {
+            self.limits.lifts()
+        } else {
+            None
+        };
         if self.status.as_deref() == Some("failed") {
             let reason = failure_of(self.error.as_ref(), false);
             self.event(
@@ -865,6 +935,7 @@ impl<'a> State<'a> {
             report,
             recorded,
             changed: self.changed,
+            retry_at,
         })))
     }
 }
@@ -1024,6 +1095,8 @@ pub(super) struct Driven {
     pub(super) recorded: Vec<Recorded>,
     /// What its re-check before the first input found changed (docs/adr/ADR-030.md decision 9).
     pub(super) changed: Option<Changed>,
+    /// When the limit the turn failed on lifts ([`RateLimits`]).
+    pub(super) retry_at: Option<std::time::SystemTime>,
 }
 
 /// Drive one App Server turn on `process` until it ended: the handshake, the thread, the turn, its notifications and
@@ -1165,6 +1238,24 @@ pub(super) async fn drive(
 /// decision 10): see [`Replayed`]. What the turn writes goes nowhere; an initialize the App Server refuses as unknown
 /// ends it as the runner's mode does (FAILED, CAPABILITY_UNSUPPORTED).
 pub(super) fn replay(bytes: &[u8], turn: &Turn) -> Replayed {
+    match drove(bytes, turn) {
+        Ok(Drove::Ended(driven)) => Replayed {
+            state: driven.state,
+            failure: driven.failure,
+            unknown_events: driven.unknown_events,
+        },
+        Ok(Drove::Degrade(_)) => Replayed {
+            state: AttemptState::Failed,
+            failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
+            unknown_events: 0,
+        },
+        Err(why) => crate::adapter::unreplayable(&why),
+    }
+}
+
+/// `bytes` through this transport's own judging as the runner's mode drives `turn`, no process started: how the turn
+/// ended, or why it could not be judged.
+fn drove(bytes: &[u8], turn: &Turn) -> Result<Drove, String> {
     let attempt = AttemptRef {
         attempt_id: "replay".to_owned(),
         session_id: "replay".to_owned(),
@@ -1185,26 +1276,17 @@ pub(super) fn replay(bytes: &[u8], turn: &Turn) -> Replayed {
             Replay::Frame(line) => {
                 match crate::adapter::at_once(s.on_line(None, &mut held, &line)) {
                     Some(Ok(())) => {}
-                    Some(Err(e)) => return crate::adapter::unreplayable(&e.to_string()),
-                    None => return crate::adapter::unreplayable("the judging waited"),
+                    Some(Err(e)) => return Err(e.to_string()),
+                    None => return Err("the judging waited".to_owned()),
                 }
             }
         }
     }
     s.conn.close();
     match crate::adapter::at_once(s.conclude(Some(crate::adapter::replayed_exit()), &mut held)) {
-        Some(Ok(Drove::Ended(driven))) => Replayed {
-            state: driven.state,
-            failure: driven.failure,
-            unknown_events: driven.unknown_events,
-        },
-        Some(Ok(Drove::Degrade(_))) => Replayed {
-            state: AttemptState::Failed,
-            failure: Some("CAPABILITY_UNSUPPORTED".to_owned()),
-            unknown_events: 0,
-        },
-        Some(Err(e)) => crate::adapter::unreplayable(&e.to_string()),
-        None => crate::adapter::unreplayable("the judging waited"),
+        Some(Ok(drove)) => Ok(drove),
+        Some(Err(e)) => Err(e.to_string()),
+        None => Err("the judging waited".to_owned()),
     }
 }
 
@@ -1245,5 +1327,185 @@ mod tests {
             }
         }
         assert!(matches!(concluded(None), Some(Ok(Drove::Degrade(_)))));
+    }
+
+    /// The provider-fault recording `case` of codex 0.166.0 (tests/fixtures/protocol/_provider-faults, record_faults.py):
+    /// its App Server frames and its meta.json.
+    fn fault(case: &str) -> (Vec<Value>, Value) {
+        let dir = format!(
+            "{}/../../tests/fixtures/protocol/_provider-faults/codex/0.166.0/{case}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let frames = std::fs::read_to_string(format!("{dir}/stdout.jsonl"))
+            .expect("stdout.jsonl")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("frame"))
+            .collect();
+        let meta = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/meta.json")).expect("meta.json"),
+        )
+        .expect("meta");
+        (frames, meta)
+    }
+
+    /// `frames` judged as the runner's mode drives a turn: its verdict and when its limit lifts.
+    fn judged(frames: &[Value]) -> (AttemptState, Option<std::time::SystemTime>) {
+        let bytes: Vec<u8> = frames
+            .iter()
+            .flat_map(|f| format!("{f}\n").into_bytes())
+            .collect();
+        match drove(&bytes, &super::super::replay_turn()) {
+            Ok(Drove::Ended(driven)) => (driven.state, driven.retry_at),
+            Ok(Drove::Degrade(d)) => panic!("degraded: {}", d.reason),
+            Err(e) => panic!("not judged: {e}"),
+        }
+    }
+
+    fn at(secs: u64) -> Option<std::time::SystemTime> {
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+
+    /// The recorded usage-limit turn with its account/rateLimits/updated frames replaced by `limits` (each a
+    /// rateLimits object) and its turn error's codexErrorInfo by `info`.
+    fn usage_limit_with(limits: &[Value], info: Value) -> Vec<Value> {
+        let (frames, _) = fault("app-server-fault-usage-limit");
+        let mut out = Vec::new();
+        for mut f in frames {
+            if f["method"] == "account/rateLimits/updated" {
+                for l in limits {
+                    out.push(json!({"method": "account/rateLimits/updated", "params": {"rateLimits": l}}));
+                }
+                continue;
+            }
+            if f["method"] == "turn/completed" {
+                f["params"]["turn"]["error"]["codexErrorInfo"] = info.clone();
+            }
+            out.push(f);
+        }
+        out
+    }
+
+    fn window(used: i64, resets_at: Value) -> Value {
+        json!({"usedPercent": used, "windowDurationMins": 300, "resetsAt": resets_at})
+    }
+
+    #[test]
+    fn the_recorded_usage_limit_says_when_it_lifts_and_a_recorded_retry_after_does_not() {
+        // M2T07R-256 (REQ-042 behaviour 1): the exhausted window's resetsAt of account/rateLimits/updated is when the
+        // usage limit that failed the turn lifts; a 429 or 503 Retry-After codex waited itself reaches no frame.
+        let (frames, meta) = fault("app-server-fault-usage-limit");
+        let sent = meta["provider"]["requests"][0]["headers"]["x-codex-primary-reset-at"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("the reset sent");
+        assert_eq!(judged(&frames), (AttemptState::Failed, at(sent)));
+        for case in [
+            "app-server-fault-429-retry-after",
+            "app-server-fault-503-retry-after",
+        ] {
+            assert_eq!(
+                judged(&fault(case).0),
+                (AttemptState::Failed, None),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_exhausted_window_of_a_limit_failure_says_when() {
+        let exhausted = json!({"limitId": "codex", "primary": window(100, json!(2_000)),
+                               "secondary": window(40, json!(9_000))});
+        let limit = json!("usageLimitExceeded");
+        assert_eq!(
+            judged(&usage_limit_with(
+                std::slice::from_ref(&exhausted),
+                limit.clone()
+            ))
+            .1,
+            at(2_000)
+        );
+        assert_eq!(
+            judged(&usage_limit_with(
+                std::slice::from_ref(&exhausted),
+                json!("rateLimitExceeded")
+            ))
+            .1,
+            at(2_000)
+        );
+        // A sparse update keeps what an earlier one said (a null window clears nothing).
+        let sparse =
+            json!({"limitId": "codex", "primary": null, "secondary": window(40, json!(9_500))});
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[exhausted.clone(), sparse],
+                limit.clone()
+            ))
+            .1,
+            at(2_000)
+        );
+        // Every exhausted window has to lift: the latest reset of them, whatever limit they belong to.
+        let both = json!({"limitId": "codex", "primary": window(100, json!(2_000)),
+                          "secondary": window(100, json!(9_000))});
+        let other = json!({"limitId": "codex_other", "primary": window(100, json!(5_000))});
+        assert_eq!(
+            judged(&usage_limit_with(&[both, other], limit.clone())).1,
+            at(9_000)
+        );
+        // A window that is not used up, or no update at all, says nothing.
+        let partial = json!({"limitId": "codex", "primary": window(99, json!(2_000))});
+        assert_eq!(judged(&usage_limit_with(&[partial], limit.clone())).1, None);
+        assert_eq!(judged(&usage_limit_with(&[], limit.clone())).1, None);
+        // Not a limit failure.
+        assert_eq!(
+            judged(&usage_limit_with(
+                std::slice::from_ref(&exhausted),
+                json!("serverOverloaded")
+            )),
+            (AttemptState::Failed, None)
+        );
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[exhausted],
+                json!({"responseTooManyFailedAttempts": {"httpStatusCode": 429}})
+            ))
+            .1,
+            None
+        );
+    }
+
+    #[test]
+    fn a_reset_that_is_no_instant_or_a_turn_that_did_not_fail_on_it_says_nothing() {
+        for resets_at in [
+            json!(0),
+            json!(-5),
+            json!(1.5),
+            json!("2000"),
+            json!(null),
+            json!(u64::MAX),
+        ] {
+            let l = json!({"limitId": "codex", "primary": window(100, resets_at.clone())});
+            assert_eq!(
+                judged(&usage_limit_with(&[l], json!("usageLimitExceeded"))).1,
+                None,
+                "{resets_at}"
+            );
+        }
+        let exhausted = json!({"limitId": "codex", "primary": window(100, json!(2_000))});
+        // A turn that completed after all.
+        let mut completed = usage_limit_with(
+            std::slice::from_ref(&exhausted),
+            json!("usageLimitExceeded"),
+        );
+        for f in &mut completed {
+            if f["method"] == "turn/completed" {
+                f["params"]["turn"]["status"] = json!("completed");
+                f["params"]["turn"]["error"] = Value::Null;
+            }
+        }
+        assert_eq!(judged(&completed), (AttemptState::Settled, None));
+        // A stream cut short before turn/completed.
+        let mut cut = usage_limit_with(&[exhausted], json!("usageLimitExceeded"));
+        cut.retain(|f| f["method"] != "turn/completed");
+        assert_eq!(judged(&cut).1, None);
     }
 }
