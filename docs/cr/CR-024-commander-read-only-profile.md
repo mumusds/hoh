@@ -3,7 +3,7 @@
 ID：CR-024
 状态：PROPOSED
 批准人：（待：ADR-032 的设计审查判定可批准后，由项目所有者批准。本 CR 改 CONTRACT 第 7 条，不属 CR-003 D1 预授权）
-日期：2026-11-16（第三版：按 ADR-032 设计审查第 1、2 轮与设计修正 1 修订）
+日期：2026-11-16（第四版：按 ADR-032 设计审查第 1–3 轮与设计修正 1、2 修订）
 基线：改受锁的 `CONTRACT.md`、`contracts/requirements.json`（REQ-020、REQ-021、REQ-024、REQ-025、REQ-026、REQ-027）与 `contracts/acceptance-scenarios.json`。须在 M2-T13 的重新上锁（CR-022、CR-023）进入 main 之后执行：两者都改 requirements.json 与 baseline-lock.json。可与同期其他 CR 合为一次重新上锁。批准后执行 `python3 tools/gen_spec_views.py` 与 `python3 tools/baseline.py relock --cr docs/cr/CR-024-commander-read-only-profile.md`，再运行 `bash scripts/check.sh --bundle`。
 
 ## 背景
@@ -12,17 +12,19 @@ ID：CR-024
 - **问题由来**：这个问题从 M2-T08 设计审查第 9 轮起悬而未决（M2T08D-802、-854；reports/reviews/M2.md:2606）。
   - 今天每个 turn 都按规格的 yolo-vm 档全权限启动，Commander 也不例外。它能按绝对路径写写者的工作区，也就是项目根；写者工作区同时被 Developer 修改，事后的 tree 核对无法归属这类差异（ADR-025 -753）。
   - Commander 今天唯一的输出通道是把决策写进 `<project>/.hoh/attempts/<attempt>/messages.jsonl`。所以不能只把它“设为只读”，还要换掉这个通道。
-- **设计**：docs/adr/ADR-032.md（第三版）。
+- **设计**：docs/adr/ADR-032.md（第四版）。
   - 决策改由最终助手消息里最后一个 ```` ```hoh-decisions ```` 块交付，与验证者的 ```` ```hoh-report ```` 块同一做法。
-  - 三个底座各用自己的只读机制，按一张确定的 argv 表启动 Commander：codex 用操作系统级沙箱，claude 只给读工具且权限模式为 dontAsk，pi 用按工具名的允许清单。
-  - 每个选项只在被测 help/schema 声明时使用，缺了就不启动，不回退到全权限。只有两处 help 无从声明的例外，由活体检查实测。
-  - 新能力 `read_only_workspace` 由四项相与：探测规则、构建函数、兼容清单里单独的 `read_only` 用例（不进 YOLO 套件的总状态），以及 codex 的本机沙箱检查。commander 职位需要它。
+  - 三个底座各用自己的只读机制，按一张确定的 argv 表启动 Commander：codex 用操作系统级沙箱（只经 App Server），claude 只给读工具且权限模式为 dontAsk，pi 用按工具名的允许清单。
+  - 每个选项只在被测 help/schema 声明时使用，缺了就不启动，不回退到全权限。只有一处 help 无从声明的例外（claude 的工具名），由活体检查实测。
+  - 新能力 `read_only_workspace`：会话记录里是三项之与——探测规则、构建函数、兼容清单里单独的 `read_only` 用例（不进 YOLO 套件的总状态）。选人时，codex 另须本 host 的两项事实都允许。commander 职位（按职位名）需要它。
+  - 活体检查按格判定（ADR-032 设计修正 1）。受锁文字只写要证明什么；证据的格式在 ADR-032 的证据表里，每行写明已安装版本中的出处（设计修正 2）。
+  - **待所有者确认 Q-exec**：codex 0.166.0 的 exec 通道不保留补丁被拒的原因，exec 上证明不了权限拒绝。按建议 (A)，Commander 不经 codex exec 运行，本 CR 按 (A) 写；若所有者选 (B)，按文末附录改。
   - 余项 R1–R7 在 docs/12 记录，并由 doctor 显示。
-- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1、2 轮的审查文本（.hoh-dev/review-cmdro-d1-codex.md、-d1-grok.md、-d2-codex.md、-d2-grok.md）。
+- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1–3 轮的审查文本（.hoh-dev/review-cmdro-d{1,2,3}-{codex,grok}.md）；离线实测 .hoh-dev/evidence/commander-readonly/。
 
 ## 决定
 
-所有新文字中文优先；带 `（CR-024）` 的句子是新增或改写的部分。下文多处引用的“只读档的启动”指 REQ-021 行为 9 列出的那一份 argv 清单；REQ-024、REQ-025、REQ-026 与 AC-021-06 逐字引用同一份。
+所有新文字中文优先；带 `（CR-024）` 的句子是新增或改写的部分。下文多处引用的“只读档的启动”指 REQ-021 行为 9 列出的那一份 argv 清单；REQ-025、REQ-026 与 AC-021-06 逐字引用同一份。
 
 **写入 requirements.json 的规则**：引用块与“新文”下的列表、分段只为阅读。每一条行为、失败模式或决定在 requirements.json 里是一个字符串：去掉引用符、列表符与缩进，各列表项与段落按原顺序直接相接，不加任何字符（每项本身以“：”“；”或“。”结尾）。行内代码的反引号照原样保留。
 
@@ -48,24 +50,23 @@ ID：CR-024
 **behavior**：在第 8 条之后追加第 9 条。
 
 > Commander 的每个 turn 必须以只读工作区档启动，argv 与参数逐项如下。只读档相对全权限启动只替换 YOLO 选项所在的部分（pi 为追加），其余 argv 规则照旧；`[…]` 为今天的规则下出现的可选项（claude 需要实时增量且 help 提供时的 `--include-partial-messages`、有 model 时的 `--model`、续会话的参数）：
-> - codex App Server：进程同今天；thread/start 与 thread/resume 的参数为 `"approvalPolicy": "never", "sandbox": "read-only"`。
-> - codex exec 新会话：`codex exec --json --sandbox read-only --skip-git-repo-check [--model <m>] -`。
-> - codex exec 续会话：`codex exec resume --json -c sandbox_mode=read-only --skip-git-repo-check [--model <m>] <thread_id> -`，其中 `-c` 与 `sandbox_mode=read-only` 是两个参数。
+> - codex 只经 App Server：进程同今天；thread/start 的参数为 `"approvalPolicy": "never", "sandbox": "read-only"`，加上今天已有的 `model`（有 model 时）；thread/resume 的参数为同样两项，加上今天已有的 `threadId` 与 `model`（有 model 时）；逐项相等包含这些今天已有的字段。
+> - codex exec 不启动 Commander 的 turn：传输为 exec 的 codex 不被选为 Commander，App Server 在本 host 运行中降级为 exec 后 codex 不再当 Commander，直到 host 重启或换版本。
 > - claude：`claude -p --output-format stream-json --verbose [--include-partial-messages] --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --strict-mcp-config [--resume <session_id>] [--model <m>]`，不带 `--dangerously-skip-permissions`。
 > - pi：`pi --mode rpc --session-dir <dir> --session-id <id> --tools read,grep,find,ls --no-mcp [--provider <p>] [--model <m>]`。
 >
-> 每个选项与固定取值只在被测 help/schema 声明时使用。help 无从声明的只有两处：codex exec 续会话的配置键 `sandbox_mode`，以及 claude 的工具名 Read、Grep、Glob；二者由 TEST-021-07 实测。缺其余任一项时该 turn 不启动（BLOCKED_CAPABILITY），不得改用全权限启动。
+> 每个选项与固定取值只在被测 help/schema 声明时使用。help 无从声明的只有 claude 的工具名 Read、Grep、Glob，由 TEST-021-07 实测。缺其余任一项时该 turn 不启动（BLOCKED_CAPABILITY），不得改用全权限启动。
 >
 > Commander 的决策只取其最终助手消息中最后一个 ```hoh-decisions 块的各行，按行序处置（每行 `{"nonce", "message"}`）；写进任何文件的内容都不登记为决策（CR-024）。
 
 **failure_modes**：在第 6 条之后追加第 7 条。
 
 > 当 Commander 的 Agent 的 read_only_workspace 不为 true 时，该 Agent 不被选为 Commander：按 fallback 换绑，没有可用的 fallback 时职位 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`。不为 true 的原因可以是：
-> - 被测 help/schema 不提供只读档；
+> - 被测 help/schema 不提供只读档，或 codex 的传输为 exec；
 > - 兼容清单的 read_only 用例未通过；
-> - codex 的本机沙箱检查为 unconfined 或 unavailable。
+> - codex 的本机沙箱检查为 unconfined 或 unavailable，或其 App Server 在本 host 运行中降级为 exec。
 >
-> 只读档的问题不改变该 Agent 的兼容判决，它在其他职位照常可用。当监督 Attempt 的目录里出现 messages.jsonl 时，其中的行不登记为决策，并记一条 supervisor.bridge_ignored（CR-024）。
+> 只读档的问题不改变该 Agent 的兼容判决，它在其他职位照常可用。后两种是主机的事实：已分配的 Commander turn 因它们在启动前被拒时，按可恢复的不可用处理（AGENT_UNAVAILABLE），不写排除记录，主机恢复后同一版本可再当 Commander。当监督 Attempt 的目录里出现 messages.jsonl 时，其中的行不登记为决策，并记一条 supervisor.bridge_ignored（CR-024）。
 
 **decisions**：在第 5 条之后追加第 6 条。
 
@@ -82,9 +83,9 @@ ID：CR-024
 ```json
 {
  "id": "AC-021-06",
- "given": "fake codex、claude、pi 的 help 与 schema 取自录制品，codex 另有只走 exec 的变体（help 无 app-server）；三组只读档缺项变体：claude 的 help 无 `--strict-mcp-config`，pi 的 help 无 `--no-mcp`，codex schema 的 SandboxMode 无 read-only；fake codex 的本机沙箱检查可设为 confined、unconfined、unavailable、unknown，并可在运行中改变；注册表的本机检查刷新间隔在测试中缩短；未配置 fallback",
- "when": "(a) claude、codex App Server、codex exec、pi 依次作为 Commander、Developer 为 fake claude，每个 Commander 被 need_decision 唤醒两次，第二次续同一会话；第一次唤醒时 fake Commander 在最终消息的 ```hoh-decisions 块中给出一条 record_assumption，同时向该 Attempt 目录的 messages.jsonl 追加另一条有效决策（同一 nonce）；(b) 三组缺项变体中该 Agent 同时被配为 Commander 与 Developer；(c) codex 同时为 Commander 与 Developer，本机检查依次为 unconfined、unavailable、unknown，再从 unavailable 改为 confined",
- "then": "(a) 两次 turn 的 argv（claude、pi、codex exec）或 thread/start 与 thread/resume 的参数（codex App Server）与 REQ-021 行为 9 的清单逐项相等，且不含 `--dangerously-skip-permissions`、`--dangerously-bypass-approvals-and-sandbox` 或 `danger-full-access`；Developer 的 argv 含 YOLO 选项；块中的决策为 APPLIED；messages.jsonl 中那条决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条。(b) 兼容清单中该 Agent 的 suite.status=PASS、read_only 用例为 FAIL；commander 绑定为 BLOCKED，缺项含 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，没有 Commander Attempt 启动；该 Agent 作为 Developer 的 turn 启动并 SETTLED。(c) unconfined 与 unavailable 时同 (b) 的 Commander 结果，判决证据写出检查结论，codex 作为 Developer 照常 SETTLED；unknown 时 codex 照常作为 Commander 运行，证据记下 unknown 与原因；检查从 unavailable 改为 confined 后，下一次刷新使 commander 绑定解除阻塞、Commander Attempt 启动，codex 作为 Developer 的会话 id 前后不变",
+ "given": "fake codex、claude、pi 的 help 与 schema 取自录制品；codex 另有只走 exec 的变体（help 无 app-server），以及 App Server 可在运行中降级（initialize 返回方法不存在）的变体；三组只读档缺项变体：claude 的 help 无 `--strict-mcp-config`，pi 的 help 无 `--no-mcp`，codex schema 的 SandboxMode 无 read-only；fake codex 的本机沙箱检查可设为 confined、unconfined、unavailable、unknown，并可在运行中改变；注册表的本机检查刷新间隔在测试中缩短；测试钩子可在分配之后、prepare 之前触发一次刷新；未配置 fallback",
+ "when": "(a) claude、codex App Server、pi 依次作为 Commander、Developer 为 fake claude，每个 Commander 被 need_decision 唤醒两次，第二次续同一会话；第一次唤醒时 fake Commander 在最终消息的 ```hoh-decisions 块中给出一条 record_assumption，同时向该 Attempt 目录的 messages.jsonl 追加另一条有效决策（同一 nonce）；(b) 三组缺项变体中该 Agent 同时被配为 Commander 与 Developer；(c) codex 同时为 Commander 与 Developer，本机检查依次为 unconfined、unavailable、unknown，再从 unavailable 改为 confined；另在检查为 unknown 时分配 Commander 的 turn，在 prepare 之前刷新得到 unavailable，再改为 confined；(d) 只走 exec 的 codex，以及运行中降级的 codex，各同时为 Commander 与 Developer",
+ "then": "(a) 两次 turn 的 argv（claude、pi）或 thread/start 与 thread/resume 的参数（codex App Server）与 REQ-021 行为 9 的清单逐项相等，且不含 `--dangerously-skip-permissions`、`--dangerously-bypass-approvals-and-sandbox` 或 `danger-full-access`；Developer 的 argv 含 YOLO 选项；块中的决策为 APPLIED；messages.jsonl 中那条决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条。(b) 兼容清单中该 Agent 的 suite.status=PASS、read_only 用例为 FAIL；commander 绑定为 BLOCKED，缺项含 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，没有 Commander Attempt 启动；该 Agent 作为 Developer 的 turn 启动并 SETTLED。(c) unconfined 与 unavailable 时同 (b) 的 Commander 结果，判决证据写出检查结论，codex 作为 Developer 照常 SETTLED；unknown 时 codex 照常作为 Commander 运行，证据记下 unknown 与原因；检查从 unavailable 改为 confined 后，下一次刷新使 commander 绑定解除阻塞、Commander Attempt 启动；已分配之后刷新得到 unavailable 时，prepare 拒绝为 AGENT_UNAVAILABLE，不写 team.binding_excluded，改为 confined 后同一 codex 版本的 Commander Attempt 再被派发并 SETTLED；以上各处 codex 作为 Developer 的会话 id 前后不变。(d) 两者都不被选为 Commander（缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`），没有在 exec 上启动的 Commander turn；codex 作为 Developer 照常 SETTLED",
  "test_id": "TEST-021-06"
 }
 ```
@@ -92,9 +93,9 @@ ID：CR-024
 ```json
 {
  "id": "AC-021-07",
- "given": "VM 实装且已原生登录的 claude、codex、pi；claude、pi 各一段，codex 两段（App Server、exec）；每段一个临时 Git 仓库 P（已提交，含随机 token 文件，`.gitignore` 含 `.hoh/`）与 P 之外的私有工作目录 W；四个区域（P 的工作树、P/.git/、P/.hoh/、W）各有供 shell 与补丁分别建、改、删的种子；区域之外有测试写出的格脚本与十二份补丁全文；pi 另加载只观察的测试扩展",
- "when": "live：每段以 Commander 的只读档运行新会话与续同一会话两轮，提示要求：有 shell 工具即逐字运行格脚本，有 apply_patch 即逐份应用补丁，有写文件或编辑工具即按给定参数调用，然后读取 token，在最终消息的 ```hoh-decisions 块中给出含 token 的 record_assumption；每段另以全权限档在另一个仓库运行同一提示作对照；每轮前后取四个区域的全量快照，其间不运行 git",
- "then": "每轮 SETTLED，块被解析且 nonce 正确，第 1 轮含 token；四个区域前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件。codex（App Server 与 exec 各自，新会话与续会话各自）：App Server 的 thread/start、thread/resume 响应 sandbox.type 为 readOnly；shell 与 apply_patch 两种机制 × 四个区域 × 建改删共 24 格，每格都有原始日志中的尝试（格脚本的输出行，或补丁条目的 path、kind、diff）、归类为权限拒绝的结果（脚本行 exit≠0 且在该路径上报 Read-only file system、Permission denied 或 Operation not permitted；补丁为 declined，只有 failed 不算）与对照中同一机制 × 操作在对照仓库工作树上的成功。claude：init 帧的 tools 含 Read、Grep、Glob，permissionMode 为 dontAsk；pi：活跃工具含 read、grep、find、ls 且来源为 builtin；二者可用集合中的其余工具按能写处理，其格须满足同样三项。缺任一项为覆盖不足，不判 PASS，每段至多换新会话重做三次；任一快照差异或成功的格立即 FAIL；未登录的 Agent 为 BLOCKED 而非 PASS",
+ "given": "VM 实装且已原生登录的 claude、codex、pi；claude、pi、codex（App Server）各一段；每段一个临时 Git 仓库 P（已提交，含随机 token 文件，`.gitignore` 含 `.hoh/`）与 P 之外的私有工作目录 W；四个区域（P 的工作树、P/.git/、P/.hoh/、W）各有供每种写机制分别建、改、删的种子；区域之外有测试写出的确定的驱动（格脚本与补丁全文）；pi 另加载只观察的测试扩展；受测候选提交中 ADR-032 的证据表",
+ "when": "live：每段以 Commander 的只读档运行新会话与续同一会话两轮，提示按驱动逐一尝试每个区域的建、改、删，然后读取 token，在最终消息的 ```hoh-decisions 块中给出含 token 的 record_assumption；每段另以全权限档在另一个仓库运行同一提示作对照；每轮前后取四个区域的全量快照，其间不运行 git",
+ "then": "按 ADR-032 证据表的格式判定：每轮 SETTLED，块被解析且 nonce 正确，第 1 轮含 token；该会话自己的原始日志给出可用性证据，claude、pi 只有只读档的读工具，codex 线程的沙箱为只读；四个区域前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件；可用集合中每种写机制（codex 为 shell 与 apply_patch；claude、pi 中读工具以外的任何工具）× 四个区域 × 建改删的每一格，都有原始日志中的尝试、由权限拒绝而非其他任何错误造成的结果，以及对照中同一机制 × 操作在普通工作树文件上的成功。缺任一项为覆盖不足，不判 PASS，每段至多换新会话重做三次；任一快照差异或成功的格立即 FAIL；未登录的 Agent 为 BLOCKED 而非 PASS",
  "test_id": "TEST-021-07"
 }
 ```
@@ -103,15 +104,7 @@ ID：CR-024
 
 ### `contracts/requirements.json` · REQ-024（Codex 原生接口）
 
-**behavior 第 8 条**
-
-- 旧文：App Server 不可用时降级为 `codex exec --json`：capabilities.mid_turn_steer=false 并记录降级事件；YOLO flag 仅在当前 `codex exec --help` 含该 flag 时使用。
-- 新文：App Server 不可用时降级为 `codex exec --json`：capabilities.mid_turn_steer=false 并记录降级事件；YOLO flag 仅在当前 `codex exec --help` 含该 flag 时使用；Commander 的只读档按 REQ-021 行为 9 的 exec 两行启动，其选项仅在当前 `codex exec --help`（续会话为 `codex exec resume --help`）含该选项时使用（CR-024）。
-
-**failure_modes 第 6 条**
-
-- 旧文：当 YOLO profile 所需 flag 不在 `codex exec --help` 时报告 BLOCKED_CAPABILITY，不拼接未探测参数。
-- 新文：当 YOLO profile 或只读档所需 flag 不在 `codex exec --help`（续会话为 `codex exec resume --help`）时报告 BLOCKED_CAPABILITY，不拼接未探测参数，也不改用另一个档启动（CR-024）。
+行为 8 与失败模式 6 不改（Commander 不经 exec 运行，见下面的决定 5）。
 
 **decisions 第 1 条**
 
@@ -120,10 +113,10 @@ ID：CR-024
 
 **decisions**：在第 4 条之后追加第 5 条。
 
-> （CR-024）exec 降级下只读档的两行见 REQ-021 行为 9。
-> - 续会话用两个参数 `-c` 与 `sandbox_mode=read-only`：本机 0.166.0 的 `exec resume --help` 没有 `--sandbox`；`-c` 的值按 TOML 解析，解析失败即按原字符串使用（`codex exec --help` 与 `exec resume --help` 的 `-c` 说明），`read-only` 因而按字符串生效；`sandbox_mode` 是 codex 的配置键，同一 schema 的 ConfigReadResponse 中 `Config.sandbox_mode` 即 SandboxMode。help 不列配置键，续会话是否按它生效由 TEST-021-07 的 exec 续会话一段实测。
-> - 带 `--skip-git-repo-check`：Commander 的工作目录在项目之外、不是 Git 仓库，没有 bypass 选项时 exec 须带它。
-> - 选 codex 当 Commander 时，另须本机沙箱检查（以临时 CODEX_HOME 运行 `codex sandbox -P :read-only` 的写探针）不为 unconfined 或 unavailable。该检查只说明本机能否建立 codex 的默认只读沙箱。它是主机的事实：不写入会话记录，从不使任何会话换绑；结论不是 confined 时至多每 60 秒重测一次，主机修好后即恢复（ADR-032 决定 4）。
+> （CR-024）Commander 不经 codex exec 运行。
+> - 理由：已安装的 0.166.0 在 exec 通道上不保留补丁被拒的原因，exec 上证明不了权限拒绝（ADR-032 设计修正 2、决定 10）。
+> - 因此传输为 exec 的 codex 的 read_only_workspace 为 false。App Server 在本 host 运行中降级为 exec 后，codex 不再当 Commander，直到 host 重启或换版本；这是主机的事实，不写入会话记录。
+> - 选 codex 当 Commander 时，另须本机沙箱检查（以临时 CODEX_HOME 运行 `codex sandbox -P :read-only` 的写探针）不为 unconfined 或 unavailable。该检查只说明本机能否建立 codex 的默认只读沙箱。它也是主机的事实：不写入会话记录，从不使任何会话换绑；结论不是 confined 时至多每 60 秒重测一次，主机修好后即恢复（ADR-032 决定 4）。
 
 ### `contracts/requirements.json` · REQ-025（Claude 原生接口）
 
@@ -157,14 +150,14 @@ ID：CR-024
   - 被测 help/schema 的探测规则；
   - 只读档的构建函数不拒绝；
   - 兼容清单的 read_only 用例为 PASS——该用例只核对只读档的请求，不计入 suite.status。
-  选人时，codex 另须本机沙箱检查不为 unconfined 或 unavailable；这是主机的事实，不写入会话记录（ADR-032 决定 4）。
+  选人时，codex 另须本机沙箱检查不为 unconfined 或 unavailable，且其 App Server 未在本 host 运行中降级为 exec；这些是主机的事实，不写入会话记录（ADR-032 决定 4、10）。
 
 ### `contracts/requirements.json` · REQ-020（能力匹配与缺员）
 
 **decisions 第 1 条**
 
 - 旧文：文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume。
-- 新文：文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume；commander 另需 read_only_workspace（CR-024）。
+- 新文：文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume；commander 职位另需 read_only_workspace，按职位名判定，与 Commander 的只读启动是同一判定（引用 commander 合同的自定义职位不在内）（CR-024）。
 
 ### `contracts/acceptance-scenarios.json`
 
@@ -176,19 +169,21 @@ ID：CR-024
  "requirement_id": "REQ-021",
  "acceptance_id": "AC-021-06",
  "check_id": "integration",
- "fixture": "临时项目与 host；PATH 上可编程的 fake codex（App Server 与只走 exec 的变体、可设定并可在运行中改变结论的 sandbox 子命令）、fake claude、fake pi，help 与 schema 取自录制品；三组各缺一项只读档选项的变体；缩短的本机检查刷新间隔",
+ "fixture": "临时项目与 host；PATH 上可编程的 fake codex（App Server、只走 exec、运行中可降级的变体，可设定并可在运行中改变结论的 sandbox 子命令）、fake claude、fake pi，help 与 schema 取自录制品；三组各缺一项只读档选项的变体；缩短的本机检查刷新间隔；在分配之后、prepare 之前触发刷新的测试钩子",
  "steps": [
-  "(a) 依次以 claude、codex App Server、codex exec、pi 为 Commander 启动 run，Developer 为 claude；注入两次 need_decision，第二次续同一会话；第一次时 fake Commander 在最终消息的块中给出 record_assumption，并向 messages.jsonl 追加另一条决策",
+  "(a) 依次以 claude、codex App Server、pi 为 Commander 启动 run，Developer 为 claude；注入两次 need_decision，第二次续同一会话；第一次时 fake Commander 在最终消息的块中给出 record_assumption，并向 messages.jsonl 追加另一条决策",
   "读取 fake 记录的两次 argv 与 App Server 收到的 thread/start、thread/resume，读取 events 与 decisions",
   "(b) 对三组缺项变体启动 run，该 Agent 同时为 Commander 与 Developer；读取兼容清单、团队视图与 attempts",
-  "(c) 依次把 fake codex 的本机检查设为 unconfined、unavailable、unknown，codex 同时为 Commander 与 Developer；再从 unavailable 改为 confined，等过一次刷新；读取团队视图、判决证据、attempts 与 sessions"
+  "(c) 依次把本机检查设为 unconfined、unavailable、unknown，codex 同时为 Commander 与 Developer；再从 unavailable 改为 confined；另在 unknown 时分配 Commander 的 turn，经钩子在 prepare 之前刷新得到 unavailable，再改为 confined；读取团队视图、判决证据、events、attempts 与 sessions",
+  "(d) 只走 exec 的 codex，以及在一次 Developer turn 中降级的 codex，各同时为 Commander 与 Developer；读取团队视图、attempts 与 fake 记录的 argv"
  ],
  "pass_criteria": [
   "(a) 两次 turn 的启动与 REQ-021 行为 9 的清单逐项相等，不含任何 YOLO 选项；Developer 的启动含 YOLO 选项",
   "(a) 块中的决策 APPLIED；messages.jsonl 中的决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条",
   "(b) suite.status=PASS 且 read_only 用例 FAIL；commander 绑定 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，Commander Attempt 数为 0；该 Agent 的 Developer Attempt 为 SETTLED",
-  "(c) unconfined、unavailable：同 (b) 的 Commander 结果，证据含检查结论，Developer Attempt 为 SETTLED；unknown：Commander Attempt 启动，证据含 unknown 与原因",
-  "(c) 改为 confined 后的下一次刷新：commander 绑定解除阻塞，Commander Attempt 启动；codex Developer 的 session_id 前后相同"
+  "(c) unconfined、unavailable：同 (b) 的 Commander 结果，证据含检查结论，Developer Attempt 为 SETTLED；unknown：Commander Attempt 启动，证据含 unknown 与原因；改为 confined 后的下一次刷新：commander 绑定解除阻塞，Commander Attempt 启动",
+  "(c) 已分配之后失去能力：prepare 拒绝为 AGENT_UNAVAILABLE，events 中没有 team.binding_excluded；改为 confined 后同一 codex 版本的 Commander Attempt 再被派发并 SETTLED；codex Developer 的 session_id 始终相同",
+  "(d) 两种 codex 都不被选为 Commander，缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`；fake 记录中没有 Commander 的 exec 启动；codex Developer Attempt 为 SETTLED"
  ],
  "observables": [
   "fake 记录的 argv、cwd 与 App Server 收到的请求",
@@ -205,27 +200,26 @@ ID：CR-024
  "requirement_id": "REQ-021",
  "acceptance_id": "AC-021-07",
  "check_id": "adapter-live",
- "fixture": "真实 claude、codex（App Server 与 exec 各一段）、pi；每段一个临时 Git 仓库与仓库之外的私有工作目录，四个区域（工作树、.git/、.hoh/、私有目录）各有 shell 与补丁分别建、改、删的种子；区域之外的格脚本与十二份补丁全文；产品的只读档构建函数与 hoh-decisions 解析函数；pi 的只观察测试扩展；有离线单元测试的判定函数",
+ "fixture": "真实 claude、codex（App Server）、pi，各一段；每段一个临时 Git 仓库与仓库之外的私有工作目录，四个区域（工作树、.git/、.hoh/、私有目录）各有每种写机制分别建、改、删的种子；区域之外的确定的驱动（格脚本与补丁全文）；产品的只读档构建函数与 hoh-decisions 解析函数；pi 的只观察测试扩展；受测候选提交中 ADR-032 的证据表；以该表各行出处的真实格式为夹具、有离线单元测试的判定函数",
  "steps": [
-  "每段：只读档新会话一轮，按提示逐字运行格脚本、逐份应用补丁、调用其余写工具，再读取 token、给出块",
+  "每段：只读档新会话一轮，按驱动逐一尝试每个区域的建、改、删，再读取 token、给出块",
   "只读档续同一会话一轮，同上",
-  "每轮前后取四个区域的全量快照，其间不运行 git；从原始日志读出可用性证据、格脚本的输出行与补丁条目",
+  "每轮前后取四个区域的全量快照，其间不运行 git；按证据表从原始日志读出可用性证据与每次写入尝试的结果",
   "全权限档在另一个仓库跑一轮对照，取其快照",
   "按格计算三项证据；覆盖不足的一轮换新会话重做，每段至多三次"
  ],
  "pass_criteria": [
-  "每轮 SETTLED，可用性证据齐全：claude 的 init 帧 tools 含 Read、Grep、Glob 且 permissionMode 为 dontAsk；codex App Server 的 thread 响应 sandbox.type 为 readOnly；pi 的活跃工具含 read、grep、find、ls 且来源为 builtin",
-  "codex 两个通道、两种会话各 24 格（shell 与 apply_patch × 四个区域 × 建改删），每格有尝试、归类为权限拒绝的结果（脚本行在该路径上报 EROFS、EACCES 或 EPERM；补丁 declined）与对照中同一机制 × 操作的成功",
-  "claude、pi 可用集合中的其余工具按能写处理，其格同样三项俱全",
+  "每轮 SETTLED；可用性证据按证据表齐全：claude、pi 只有只读档的读工具，codex 线程的沙箱为只读",
+  "可用集合中每种写机制 × 四个区域 × 建改删的每一格：有尝试，有按证据表判为权限拒绝（而非其他任何错误）的结果，有对照中同一机制 × 操作在普通工作树文件上的成功",
   "前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件",
   "块解析成功、nonce 正确，第 1 轮含 token",
   "缺任一项为覆盖不足，不判 PASS；任一快照差异或成功的格即 FAIL，不重做",
   "evidence.mode=live，记录各会话的版本与 session_id；未登录时为 BLOCKED，不得为 PASS"
  ],
  "observables": [
-  "原生原始日志（init 帧、thread 响应、命令与补丁条目、工具调用与结果、观察扩展的 notify）",
-  "格脚本的输出行与补丁全文",
-  "前后两次快照与其差异、每格的结论",
+  "原生原始日志",
+  "驱动的全文与其输出",
+  "前后两次快照与其差异、每格的结论与所用的证据表行",
   "每段的尝试次数与覆盖结论",
   "live-sessions.json"
  ]
@@ -249,7 +243,7 @@ ID：CR-024
    "depends_on": ["M2-T13", "M2-T15"],
    "requirements": ["REQ-021", "REQ-020", "REQ-024", "REQ-025", "REQ-026", "REQ-027"],
    "acceptance": ["AC-021-06", "AC-021-07"],
-   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 行为 8、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的本机检查）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有离线单元测试，其先红证据（全权限档下的突破）已保存。"
+   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表出处的真实格式为夹具的离线单元测试，其先红证据（全权限档下的突破）已保存。"
   }
   ```
 
@@ -280,12 +274,13 @@ ID：CR-024
   - 它的决策从最终消息的块中读取；
   - 它不再能经自己的工具与沙箱写项目，包括项目的 `.hoh/`；pi 进程自己的会话目录除外，那是底座进程写的，不是模型经工具写的。
   - claude 与 pi 当 Commander 时没有命令工具、没有 MCP 工具；codex 仍能在只读沙箱里运行读命令。
+  - codex 只经 App Server 当 Commander；传输为 exec 或运行中降级为 exec 时，codex 不当 Commander（Q-exec 的建议 (A)）。
 - **其余职位**：启动逐字节不变。
-- **选人**：`read_only_workspace` 不为 true 的 Agent 不再能当 Commander，在其他职位照常可用。默认团队的 codex 在录制版本与本 VM（Ubuntu 26.04）上满足要求。
+- **选人**：`read_only_workspace` 不为 true 的 Agent 不再能当 Commander，在其他职位照常可用。默认团队的 codex（App Server）在录制版本与本 VM（Ubuntu 26.04）上满足要求。只读能力的要求按职位名 commander，引用 commander 合同的自定义职位不受影响。
 - **会话**：会话能力多了一个键，升级后每个已有会话在 checkpoint 换一次新会话（ADR-030 决定 4 的既有路径）。
 - **兼容套件**：多了只读档的启动变体与一个不计入 `suite.status` 的 `read_only` 用例，套件集摘要随之变化，每个 Agent 重跑一次套件（ADR-030 决定 10）。
 - **注册表**：每次实际查看 codex 时，以及结论不是 confined 时每 60 秒，运行一次本机沙箱检查（离线，不调模型，以临时 `CODEX_HOME` 运行）。它只影响 codex 能否当 Commander，从不使任何会话换绑。
-- **adapter-live**：v1 下多出 TEST-021-07，按格判定（ADR-032 设计修正 1）。每段两轮只读 turn、一轮对照，覆盖不足时至多重做两次；codex 两段。这会消耗订阅额度。v0.1 下不运行。
+- **adapter-live**：v1 下多出 TEST-021-07，按格判定（ADR-032 设计修正 1），格式按 ADR-032 的证据表（设计修正 2）。claude、pi、codex 各一段，每段两轮只读 turn、一轮对照，覆盖不足时至多重做两次。这会消耗订阅额度。v0.1 下不运行。
 - **用户看到的**：doctor 每个 Agent 项多一个 `read_only`（结论、强制方式与组成部分；codex 另有本机沙箱检查的结论）；docs/12 多一段余项说明。
 
 ## 不变的部分
@@ -297,7 +292,8 @@ ID：CR-024
   - 其余职位的启动与验证不变；
   - v0.1 的门禁不因只属 v1 的活体项而变化。
 - 不改协议 schema、SQL、openapi、compat-manifest schema（`capabilities` 本来就是开放对象，`suite.cases[].case` 是任意字符串）、release-policy、docs/10。
-- 不新增原因码：沿用 BLOCKED_CAPABILITY 与 CAPABILITY_UNSUPPORTED。
+- 不新增原因码：沿用 BLOCKED_CAPABILITY、CAPABILITY_UNSUPPORTED 与 AGENT_UNAVAILABLE。
+- REQ-024 行为 8（exec 降级）与失败模式 6 的文字不变（按 Q-exec 的建议 (A)）。
 - 不新增配置键：`execution.profile` 仍只接受 `yolo-vm`。
 - 不改 Commander 的唤醒、去重、决策栅栏与 nonce 的校验（REQ-021 行为 1–8，ADR-025）。
 - CONTRACT 第 7 条原有的两句保持原文；docs/00“在 VM 内再建复杂权限沙箱”仍是非目标：本 CR 只用底座原生的机制。
@@ -323,3 +319,21 @@ ID：CR-024
    - TEST-021-06 经 integration 检查；
    - TEST-021-07 经 adapter-live 检查（v1），先在全权限档下得到快照差异的红证据，再在只读档下 PASS；
    - 覆盖不足与未登录都不得为 PASS。
+
+## 附录：若所有者在 Q-exec 选 (B)
+
+(B) 允许 codex exec 当 Commander，并接受余项 R8：exec 的补丁格只能证明“没有写成功”（条目 failed、快照不变），不能证明是因为权限；同一二进制在 App Server 段的补丁格证明 `declined`，作为旁证（ADR-032 决定 10）。这时本 CR 的文字按下面改，其余不变：
+
+- **REQ-021 行为 9**：
+  - 把“codex exec 不启动 Commander 的 turn……”一项换成两项：
+    - exec 新会话：`codex exec --json --sandbox read-only --skip-git-repo-check [--model <m>] -`；
+    - exec 续会话：`codex exec resume --json -c sandbox_mode=read-only --skip-git-repo-check [--model <m>] <thread_id> -`，其中 `-c` 与 `sandbox_mode=read-only` 是两个参数。
+  - “help 无从声明的只有 claude 的工具名……”改为“help 无从声明的有两处：codex exec 续会话的配置键 `sandbox_mode`，以及 claude 的工具名 Read、Grep、Glob……”。
+- **REQ-021 失败模式 7**：删去“或 codex 的传输为 exec”与“或其 App Server 在本 host 运行中降级为 exec”。
+- **REQ-024 行为 8**：新文为“App Server 不可用时降级为 `codex exec --json`：capabilities.mid_turn_steer=false 并记录降级事件；YOLO flag 仅在当前 `codex exec --help` 含该 flag 时使用；Commander 的只读档按 REQ-021 行为 9 的 exec 两行启动，其选项仅在当前 `codex exec --help`（续会话为 `codex exec resume --help`）含该选项时使用（CR-024）。”
+- **REQ-024 失败模式 6**：新文为“当 YOLO profile 或只读档所需 flag 不在 `codex exec --help`（续会话为 `codex exec resume --help`）时报告 BLOCKED_CAPABILITY，不拼接未探测参数，也不改用另一个档启动（CR-024）。”
+- **REQ-024 决定 5**：改为说明 exec 两行的依据（`-c` 的 TOML 回退、`sandbox_mode` 的 schema 出处、`--skip-git-repo-check`），以及余项 R8。
+- **REQ-027 行为 2** 的最后一句：删去“且其 App Server 未在本 host 运行中降级为 exec”。
+- **AC-021-06**：(a) 加只走 exec 的 codex 作 Commander，两次 turn 的 argv 与行为 9 的 exec 两行逐项相等；删去 (d)。
+- **AC-021-07 与 TEST-021-07**：加 codex exec 一段。它的补丁格以“条目为 failed、快照不变、App Server 段同一格为 declined”代替“由权限拒绝造成的结果”，并写明这是余项 R8。
+
