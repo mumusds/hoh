@@ -1146,6 +1146,18 @@ impl World {
         args: &[&str],
         ctty: bool,
     ) -> R<pty::Hoh> {
+        self.spawn_pty_with(pty, program, args, ctty, &[])
+    }
+
+    /// [`World::spawn_pty`] with `more` added to the world's environment.
+    pub fn spawn_pty_with(
+        &self,
+        pty: &pty::Pty,
+        program: &OsStr,
+        args: &[&str],
+        ctty: bool,
+        more: &[(&str, &OsStr)],
+    ) -> R<pty::Hoh> {
         let mut command = Command::new(&self.setsid);
         if ctty {
             command.arg("--ctty");
@@ -1156,6 +1168,7 @@ impl World {
             .current_dir(self.project())
             .env_clear()
             .envs(self.env())
+            .envs(more.iter().copied())
             .env("TERM", "xterm-256color")
             .stdin(pty.stdio()?)
             .stdout(pty.stdio()?)
