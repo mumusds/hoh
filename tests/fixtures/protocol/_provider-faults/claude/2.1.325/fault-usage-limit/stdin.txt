@@ -1,0 +1,1 @@
+Reply with exactly HOH_SAMPLE_OK and nothing else.

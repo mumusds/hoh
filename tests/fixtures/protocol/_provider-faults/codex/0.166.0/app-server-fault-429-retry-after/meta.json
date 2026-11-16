@@ -1,0 +1,216 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "app-server-fault-429-retry-after",
+  "argv": [
+    "codex",
+    "app-server"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-16T11:17:34.341271+00:00",
+  "mode": "fake-provider",
+  "notes": "every request answered 429 with Retry-After: 2 (header only); initialize, thread/start, one turn/start",
+  "env_overrides": [
+    "CODEX_HOME=<fresh temp dir> holding only config.toml: model_provider \"fake\" at the fake provider",
+    "HOH_FAKE_PROVIDER_KEY=<dummy>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>"
+  ],
+  "provider": {
+    "scenario": "codex-429",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/responses",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "retry-after": "2",
+                "x-request-id": "req_fake_429"
+              },
+              "body": {
+                "error": {
+                  "type": "requests",
+                  "code": "rate_limit_exceeded",
+                  "message": "Rate limit reached for requests."
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "error": {
+            "type": "not_found",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827843.7726228,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827845.78614,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827847.7998455,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827849.8141487,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827851.8265774,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827853.8400633,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_429"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

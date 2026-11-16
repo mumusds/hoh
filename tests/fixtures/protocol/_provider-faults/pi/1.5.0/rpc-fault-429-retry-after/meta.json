@@ -1,0 +1,201 @@
+{
+  "agent": "pi",
+  "cli_version": "1.5.0",
+  "case": "rpc-fault-429-retry-after",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions",
+    "--provider",
+    "fake",
+    "--model",
+    "fake-model"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-16T11:18:54.743325+00:00",
+  "mode": "fake-provider",
+  "notes": "models.json provider \"fake\" (anthropic-messages) at the fake provider; every request answered 429 with Retry-After: 3; get_state then one prompt until agent_settled",
+  "env_overrides": [
+    "PI_CODING_AGENT_DIR=<fresh temp dir> holding only models.json",
+    "PI_OFFLINE=1",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "PATH: pi's own node first"
+  ],
+  "provider": {
+    "scenario": "pi-429",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "retry-after": "3",
+                "request-id": "req_fake_pi_429"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "rate_limit_error",
+                  "message": "Number of request tokens has exceeded your per-minute rate limit"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827920.200552,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_pi_429"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1794827922.209765,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_pi_429"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1794827926.2205834,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_pi_429"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1794827934.2303374,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_pi_429"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
