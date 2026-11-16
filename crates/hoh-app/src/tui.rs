@@ -1,8 +1,11 @@
-//! `hoh` with a terminal on stdin and stdout: the Workspace shell (REQ-001; ADR-014). Signals are registered before
-//! the terminal changes, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it. One thread does it all:
-//! the loop waits for input in poll(2), in short slices, looks at the signal flags between them, reads only what poll
-//! said is there and decodes it itself (`input`), and ends when the terminal hangs up. Leaving only closes this
-//! client.
+//! `hoh` with a terminal on stdin and stdout: the Workspace shell (REQ-001; ADR-014; docs/adr/ADR-031.md decision 13).
+//! Signals are registered first; bare `hoh` then refuses an invalid configuration (78) and ensures the project's host
+//! on a worker thread while it looks at the signal flags (a host that cannot be had is 69), lists every run, and only
+//! then changes the terminal, so a SIGTERM, SIGHUP or SIGINT at any point after that restores it. One thread does the
+//! rest: the loop waits for input in poll(2), in short slices, looks at the signal flags between them, reads only what
+//! poll said is there and decodes it itself (`input`), does what Enter or the selector asked of the host in order, and
+//! ends when the terminal hangs up. Opening, listing, attaching and leaving write nothing (E11); leaving only closes
+//! this client.
 
 mod app;
 mod editor;
@@ -12,15 +15,17 @@ mod terminal;
 #[cfg(test)]
 mod tests;
 
+use crate::client::{Failure, HostInfo};
 use crate::exit::{ClientEvent, Ending, exit_code};
-use app::{App, Exit};
+use app::{App, Exit, Request};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{Event, KeyEventKind};
 use rustix::event::{PollFd, PollFlags, Timespec};
+use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use std::io::Stdin;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -54,15 +59,94 @@ fn signal_code(signal: usize) -> u8 {
     }
 }
 
+/// The project's host as the shell talks to it: the one found last, which a host started again (another token)
+/// replaces for the shell and its link (M2T06R-04).
+pub struct Conn {
+    host: Arc<std::sync::Mutex<HostInfo>>,
+    project: PathBuf,
+}
+
+impl Conn {
+    fn new(project: &Path, host: HostInfo) -> Conn {
+        Conn {
+            host: Arc::new(std::sync::Mutex::new(host)),
+            project: project.to_path_buf(),
+        }
+    }
+
+    fn host(&self) -> HostInfo {
+        current(&self.host)
+    }
+
+    /// GET `path`, once more from the host found again when it does not answer or no longer knows the token.
+    fn get(&self, path: &str) -> Result<crate::client::Reply, String> {
+        get_from(&self.project, &self.host, path)
+    }
+
+    /// Every run of the host (every page).
+    fn runs(&self) -> Result<Vec<Value>, Failure> {
+        crate::client::runs(&self.host())
+    }
+
+    fn submit(&self, command: Value) -> Result<Value, Failure> {
+        crate::client::submit(&self.project, &self.host(), command)
+    }
+
+    /// The link to run `run_id`: a reader thread receives its events from the first on, from the host found last.
+    fn link(&self, run_id: &str) -> Link {
+        let (send, events) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let (host, run_id, stop) = (self.host.clone(), run_id.to_owned(), stop.clone());
+            let project = self.project.clone();
+            std::thread::spawn(move || {
+                let mut last = 0i64;
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok(mut stream) =
+                        crate::client::Events::open(&current(&host), &run_id, last)
+                    else {
+                        // The host went or was started again: found again, the stream goes on after `last`.
+                        std::thread::sleep(Duration::from_millis(500));
+                        let _ = again(&project, &host);
+                        continue;
+                    };
+                    while !stop.load(Ordering::SeqCst) {
+                        match stream.next() {
+                            Ok(Some(event)) => {
+                                last = event["seq"].as_i64().unwrap_or(last).max(last);
+                                if send.send(event).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            // An event that cannot be read is never skipped (docs/adr/ADR-031.md decision 10), and
+                            // reading it again gives the same: the following stops, no new event is shown.
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+        }
+        Link {
+            host: self.host.clone(),
+            project: self.project.clone(),
+            run_id: run_id.to_owned(),
+            events,
+            stop,
+        }
+    }
+}
+
 /// A run the shell is attached to (docs/adr/ADR-021.md decision 10): its host, its id, and its events as a reader
 /// thread receives them over the host's socket. The host is the one found last: a host started again (another token)
 /// is found again by the reader and by the commands, which go on after the last event and with the same key
 /// (M2T06R-04).
 pub struct Link {
-    host: Arc<std::sync::Mutex<crate::client::HostInfo>>,
-    project: std::path::PathBuf,
+    host: Arc<std::sync::Mutex<HostInfo>>,
+    project: PathBuf,
     run_id: String,
-    events: std::sync::mpsc::Receiver<serde_json::Value>,
+    events: std::sync::mpsc::Receiver<Value>,
     /// Ends the reader thread (it looks between reads, at least every 200 ms).
     stop: Arc<AtomicBool>,
 }
@@ -74,33 +158,137 @@ impl Drop for Link {
 }
 
 impl Link {
-    fn host(&self) -> crate::client::HostInfo {
+    fn host(&self) -> HostInfo {
         current(&self.host)
     }
 
     /// GET `path` from the run's host; once more from the host found again when it does not answer or no longer
     /// knows the token.
     fn get(&self, path: &str) -> Result<crate::client::Reply, String> {
-        match crate::client::call(&self.host(), "GET", path, None) {
-            Ok(reply) if reply.status != 403 => return Ok(reply),
-            _ => {}
-        }
-        let found =
-            again(&self.project, &self.host).map_err(|f| format!("{}: {}", f.code, f.message))?;
-        crate::client::call(&found, "GET", path, None).map_err(|e| e.to_string())
+        get_from(&self.project, &self.host, path)
     }
 }
 
-fn current(host: &std::sync::Mutex<crate::client::HostInfo>) -> crate::client::HostInfo {
+/// What the shell's input needs of its run's host (docs/adr/ADR-031.md decision 13): the run as getRun shows it and
+/// the commands; a script in the tests.
+pub(crate) trait Port {
+    /// The run (getRun), `None` when the host has no such run.
+    fn run(&self) -> Result<Option<Value>, Failure>;
+    /// Submit a command (`client::submit`): the accepted body, or why not.
+    fn submit(&self, command: Value) -> Result<Value, Failure>;
+}
+
+impl Port for Link {
+    fn run(&self) -> Result<Option<Value>, Failure> {
+        match self.get(&format!("/v1/runs/{}", crate::client::encode(&self.run_id))) {
+            Ok(reply) if reply.status == 200 => Ok(Some(reply.json())),
+            Ok(reply) if reply.status == 404 => Ok(None),
+            Ok(reply) => Err(Failure::unreachable(format!(
+                "the host answered {}",
+                reply.status
+            ))),
+            Err(e) => Err(Failure::unreachable(e)),
+        }
+    }
+
+    fn submit(&self, command: Value) -> Result<Value, Failure> {
+        crate::client::submit(&self.project, &self.host(), command)
+    }
+}
+
+/// What became of an input: what to say now, and the SendInput's command whose acceptance event is to be said
+/// when it comes.
+#[derive(Debug, Default)]
+pub(crate) struct Sent {
+    pub said: Vec<String>,
+    pub awaiting: Option<String>,
+}
+
+/// Enter while attached (docs/adr/ADR-031.md decisions 13 and 16, the same as `hoh -p --resume`): SendInput{text,
+/// target_role: null, REPLY} at the run's revision (read again while it is stale), then, when the run was
+/// INCOMPLETE, ResumeRun at the revision the input left. A resume refused because the run's stop still holds names
+/// that stop; any refusal is said with its code.
+pub(crate) fn input(port: &impl Port, run_id: &str, text: &str) -> Sent {
+    let said = |line: String| Sent {
+        said: vec![line],
+        awaiting: None,
+    };
+    let run = match port.run() {
+        Ok(Some(run)) => run,
+        Ok(None) => return said(format!("输入未发送：没有 Run {run_id}")),
+        Err(f) => return said(format!("输入未发送：{}：{}", f.code, f.message)),
+    };
+    let read = || port.run();
+    let accepted = match crate::client::fresh(
+        |command| port.submit(command),
+        read,
+        run_id,
+        run["revision"].as_i64().unwrap_or_default(),
+        |revision| {
+            json!({
+                "expected_revision": revision,
+                "kind": "SendInput",
+                "run_id": run_id,
+                "payload": {"text": text, "target_role": null, "input_kind": "REPLY"},
+            })
+        },
+    ) {
+        Ok(accepted) => accepted,
+        Err(f) => return said(format!("输入未受理：{}：{}", f.code, f.message)),
+    };
+    let mut sent = Sent {
+        said: Vec::new(),
+        awaiting: accepted["command_id"].as_str().map(str::to_owned),
+    };
+    if run["state"] == "INCOMPLETE" {
+        match crate::client::fresh(
+            |command| port.submit(command),
+            read,
+            run_id,
+            accepted["revision"].as_i64().unwrap_or_default(),
+            |revision| {
+                json!({
+                    "expected_revision": revision,
+                    "kind": "ResumeRun",
+                    "run_id": run_id,
+                    "payload": {"reason": "TUI"},
+                })
+            },
+        ) {
+            Ok(_) => sent.said.push("ResumeRun 已受理".to_owned()),
+            Err(f) if crate::prompt::still_stopped(&f) => sent.said.push(format!(
+                "Run 未恢复：使它停下的预算或期限仍耗尽（{}）；本版本没有提高预算或期限的入口，续做剩余需求请新建 Run",
+                crate::prompt::stop_of(&f)
+            )),
+            Err(f) => sent
+                .said
+                .push(format!("ResumeRun 未受理：{}：{}", f.code, f.message)),
+        }
+    }
+    sent
+}
+
+fn current(host: &std::sync::Mutex<HostInfo>) -> HostInfo {
     host.lock()
         .map_or_else(|p| p.into_inner().clone(), |h| h.clone())
 }
 
-/// The project's host found (or started) again, kept for the link.
-fn again(
+/// GET `path` from `host`; once more from the host found again when it does not answer or no longer knows the token.
+fn get_from(
     project: &Path,
-    host: &std::sync::Mutex<crate::client::HostInfo>,
-) -> Result<crate::client::HostInfo, crate::client::Failure> {
+    host: &std::sync::Mutex<HostInfo>,
+    path: &str,
+) -> Result<crate::client::Reply, String> {
+    match crate::client::call(&current(host), "GET", path, None) {
+        Ok(reply) if reply.status != 403 => return Ok(reply),
+        _ => {}
+    }
+    let found = again(project, host).map_err(|f| format!("{}: {}", f.code, f.message))?;
+    crate::client::call(&found, "GET", path, None).map_err(|e| e.to_string())
+}
+
+/// The project's host found (or started) again, kept for the link.
+fn again(project: &Path, host: &std::sync::Mutex<HostInfo>) -> Result<HostInfo, Failure> {
     let found = crate::client::ensure(project)?;
     match host.lock() {
         Ok(mut h) => *h = found.clone(),
@@ -109,86 +297,131 @@ fn again(
     Ok(found)
 }
 
+/// The signal flags of the shell: the signal that came (its number, 0 for none) and whether the window was resized;
+/// registered before anything else, so a signal is never lost; 74 when they cannot be.
+fn register() -> Result<(Arc<AtomicUsize>, Arc<AtomicBool>), u8> {
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGTERM, SIGHUP, SIGINT] {
+        let value = usize::try_from(sig).unwrap_or(usize::MAX);
+        if let Err(e) = signal_hook::flag::register_usize(sig, Arc::clone(&signal), value) {
+            say!("hoh：无法登记信号处理：{e}");
+            return Err(code(ClientEvent::TerminalIo));
+        }
+    }
+    let resized = Arc::new(AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(SIGWINCH, Arc::clone(&resized)) {
+        say!("hoh：无法登记信号处理：{e}");
+        return Err(code(ClientEvent::TerminalIo));
+    }
+    Ok((signal, resized))
+}
+
 /// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`; the exit code. Leaving, by the
 /// choice or a signal, only closes this client (REQ-043 behaviour 6).
-pub fn attach(project: &Path, host: crate::client::HostInfo, run: &serde_json::Value) -> u8 {
+pub fn attach(project: &Path, host: HostInfo, run: &Value) -> u8 {
+    let (signal, resized) = match register() {
+        Ok(flags) => flags,
+        Err(code) => return code,
+    };
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
     let label = run["projection"]["label"]
         .as_str()
         .or(run["state"].as_str())
         .unwrap_or_default()
         .to_owned();
-    let (send, events) = std::sync::mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let host = Arc::new(std::sync::Mutex::new(host));
-    {
-        let (host, run_id, stop) = (host.clone(), run_id.clone(), stop.clone());
-        let project = project.to_path_buf();
-        std::thread::spawn(move || {
-            let mut last = 0i64;
-            while !stop.load(Ordering::SeqCst) {
-                let Ok(mut stream) = crate::client::Events::open(&current(&host), &run_id, last)
-                else {
-                    // The host went or was started again: found again, the stream goes on after `last`.
-                    std::thread::sleep(Duration::from_millis(500));
-                    let _ = again(&project, &host);
-                    continue;
-                };
-                while !stop.load(Ordering::SeqCst) {
-                    match stream.next() {
-                        Ok(Some(event)) => {
-                            last = event["seq"].as_i64().unwrap_or(last).max(last);
-                            if send.send(event).is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => {}
-                        // An event that cannot be read is never skipped (docs/adr/ADR-031.md decision 10), and
-                        // reading it again gives the same: the following stops, no new event is shown.
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return,
-                        Err(_) => break,
-                    }
-                }
-            }
-        });
-    }
-    let link = Link {
-        host,
-        project: project.to_path_buf(),
-        run_id,
-        events,
-        stop,
+    let conn = Conn::new(project, host);
+    // The runs for the top bar's baseline (docs/adr/ADR-031.md decision 13).
+    let runs = match conn.runs() {
+        Ok(runs) => runs,
+        Err(failure) => return crate::session::fail(&failure),
     };
-    run_with(project, Some((link, label)))
+    let mut app = App::open(project);
+    app.list(&runs);
+    let link = conn.link(&run_id);
+    app.attach(&run_id, &label);
+    run_with(app, &signal, &resized, &conn, Some(link))
 }
 
-/// Run the shell for the project at `project`; the exit code.
+/// `hoh attach` with no run named, several not ended and a terminal (docs/adr/ADR-031.md decision 12): the shell with
+/// the selector of the runs not ended among `runs` (list_runs' items, every page) open; the run chosen is attached,
+/// Esc or the Ctrl+C choice "脱离" leaves with 0.
+pub fn pick(project: &Path, host: HostInfo, runs: &[Value]) -> u8 {
+    let (signal, resized) = match register() {
+        Ok(flags) => flags,
+        Err(code) => return code,
+    };
+    let conn = Conn::new(project, host);
+    let mut app = App::open(project);
+    app.list(runs);
+    app.pick();
+    run_with(app, &signal, &resized, &conn, None)
+}
+
+/// Bare `hoh`: the shell for the project at `project`, unattached; the exit code (docs/adr/ADR-031.md decision 13).
 pub fn run(project: &Path) -> u8 {
-    run_with(project, None)
+    let (signal, resized) = match register() {
+        Ok(flags) => flags,
+        Err(code) => return code,
+    };
+    // Before the terminal changes and before any host (REQ-001 failure mode 4).
+    if let Err(e) = hoh_core::config::load(project) {
+        say!("hoh：配置无效，没有连接或启动 host：{e}");
+        return code(ClientEvent::Config);
+    }
+    let (host, runs) = match connect(project, &signal) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    // A signal that came while the runs were read ends it before the terminal changes.
+    let sig = signal.load(Ordering::SeqCst);
+    if sig != 0 {
+        return signal_code(sig);
+    }
+    let conn = Conn::new(project, host);
+    let mut app = App::open(project);
+    app.list(&runs);
+    run_with(app, &signal, &resized, &conn, None)
 }
 
-fn run_with(project: &Path, link: Option<(Link, String)>) -> u8 {
-    let signal = Arc::new(AtomicUsize::new(0));
-    for sig in [SIGTERM, SIGHUP, SIGINT] {
-        let value = usize::try_from(sig).unwrap_or(usize::MAX);
-        if let Err(e) = signal_hook::flag::register_usize(sig, Arc::clone(&signal), value) {
-            say!("hoh：无法登记信号处理：{e}");
-            return code(ClientEvent::TerminalIo);
+/// The project's host (ensured: found, or started and waited for) and every run of it, on a worker thread while this
+/// one looks at the signal flags every [`TICK`]: a signal ends the wait with its code and the terminal untouched; a
+/// host that cannot be had or read is said on stderr, with its code (69; 78 for a refused location).
+fn connect(project: &Path, signal: &AtomicUsize) -> Result<(HostInfo, Vec<Value>), u8> {
+    let (send, got) = std::sync::mpsc::channel();
+    let dir = project.to_path_buf();
+    std::thread::spawn(move || {
+        let found = crate::client::ensure(&dir)
+            .and_then(|host| crate::client::runs(&host).map(|runs| (host, runs)));
+        let _ = send.send(found);
+    });
+    loop {
+        let sig = signal.load(Ordering::SeqCst);
+        if sig != 0 {
+            return Err(signal_code(sig));
+        }
+        match got.recv_timeout(TICK) {
+            Ok(Ok(found)) => return Ok(found),
+            Ok(Err(failure)) => return Err(crate::session::fail(&failure)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(crate::session::fail(&Failure::unreachable(
+                    "the host could not be found or started",
+                )));
+            }
         }
     }
-    let resized = Arc::new(AtomicBool::new(false));
-    if let Err(e) = signal_hook::flag::register(SIGWINCH, Arc::clone(&resized)) {
-        say!("hoh：无法登记信号处理：{e}");
-        return code(ClientEvent::TerminalIo);
-    }
-    let mut app = App::open(project);
-    let link = link.map(|(link, label)| {
-        app.attach(&link.run_id, &label);
-        link
-    });
+}
+
+fn run_with(
+    mut app: App,
+    signal: &Arc<AtomicUsize>,
+    resized: &Arc<AtomicBool>,
+    conn: &Conn,
+    mut link: Option<Link>,
+) -> u8 {
     terminal::restore_on_panic();
     let (guard, entered) = terminal::enter();
-    let end = entered.and_then(|()| event_loop(&mut app, &signal, &resized, link.as_ref()));
+    let end = entered.and_then(|()| event_loop(&mut app, signal, resized, conn, &mut link));
     drop(link);
     terminal::debug_restore_gate();
     let restored = guard.finish();
@@ -235,13 +468,11 @@ fn outcome(
     }
 }
 
-/// The attached run's events received so far, shown; a run event also refreshes its label.
+/// The attached run's events received so far, shown and counted; a run event also refreshes its label.
 fn take_events(app: &mut App, link: &Link) -> bool {
     let mut any = false;
     while let Ok(event) = link.events.try_recv() {
-        let kind = event["kind"].as_str().unwrap_or_default().to_owned();
-        app.say(format!("#{} {kind}", event["seq"].as_i64().unwrap_or(0)));
-        if kind.starts_with("run.")
+        if app.event(&event)
             && let Ok(reply) =
                 link.get(&format!("/v1/runs/{}", crate::client::encode(&link.run_id)))
             && reply.status == 200
@@ -284,11 +515,80 @@ fn control(link: &Link, kind: &str) -> String {
     said
 }
 
+/// Do what Enter or the selector asked of the host (docs/adr/ADR-031.md decision 13): a new run is started and
+/// attached, a chosen run attached, an input sent to the attached run; each outcome said on the message bar.
+fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request) {
+    match request {
+        Request::Start(goal) => {
+            let command = json!({
+                "expected_revision": 0,
+                "kind": "StartRun",
+                "run_id": null,
+                "payload": {"goal": goal, "mode": app.mode(), "interactive": true},
+            });
+            match conn.submit(command) {
+                Ok(accepted) => {
+                    let run_id = accepted["run_id"].as_str().unwrap_or_default().to_owned();
+                    if let Err(why) = attach_to(app, conn, link, &run_id) {
+                        app.say(format!("已新建 Run {run_id}，但未能附着：{why}"));
+                        return;
+                    }
+                    app.say(format!("已新建 Run {run_id}，已附着"));
+                }
+                Err(f) => app.say(format!("未提交：{}：{}", f.code, f.message)),
+            }
+        }
+        Request::Attach(run_id) => match attach_to(app, conn, link, &run_id) {
+            Ok(()) => app.say(format!("已附着 Run {run_id}")),
+            Err(why) => app.say(format!("未能附着 Run {run_id}：{why}")),
+        },
+        Request::Input(text) => match link.as_ref() {
+            Some(link) => {
+                let sent = input(link, &link.run_id, &text);
+                for line in sent.said {
+                    app.say(line);
+                }
+                if let Some(command) = sent.awaiting {
+                    app.awaiting(&command);
+                }
+            }
+            None => app.say("输入未发送：没有附着的 Run".to_owned()),
+        },
+    }
+}
+
+/// Attach the shell to run `run_id` (getRun for its label) and read the runs again for the top bar's baseline;
+/// why not, said.
+fn attach_to(
+    app: &mut App,
+    conn: &Conn,
+    link: &mut Option<Link>,
+    run_id: &str,
+) -> Result<(), String> {
+    let reply = conn.get(&format!("/v1/runs/{}", crate::client::encode(run_id)))?;
+    if reply.status != 200 {
+        return Err(format!("host 答 {}", reply.status));
+    }
+    let run = reply.json();
+    let label = run["projection"]["label"]
+        .as_str()
+        .or(run["state"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    *link = Some(conn.link(run_id));
+    app.attach(run_id, &label);
+    if let Ok(runs) = conn.runs() {
+        app.list(&runs);
+    }
+    Ok(())
+}
+
 fn event_loop(
     app: &mut App,
     signal: &AtomicUsize,
     resized: &AtomicBool,
-    link: Option<&Link>,
+    conn: &Conn,
+    link: &mut Option<Link>,
 ) -> std::io::Result<End> {
     let mut terminal = Terminal::new(CrosstermBackend::new(terminal::Output::new()?))?;
     let stdin = std::io::stdin();
@@ -300,7 +600,7 @@ fn event_loop(
         if sig != 0 {
             return Ok(End::Signal(sig));
         }
-        if let Some(link) = link
+        if let Some(link) = link.as_ref()
             && take_events(app, link)
         {
             dirty = true;
@@ -349,7 +649,7 @@ fn event_loop(
         ) {
             // Pause and cancel are sent and the shell stays (REQ-043 behaviour 6, ADR-021 decision 10).
             Some(End::Left(exit @ (Exit::Pause | Exit::Cancel))) => {
-                if let Some(link) = link {
+                if let Some(link) = link.as_ref() {
                     let kind = if exit == Exit::Pause {
                         "PauseRun"
                     } else {
@@ -361,6 +661,11 @@ fn event_loop(
             }
             Some(end) => return Ok(end),
             None => {}
+        }
+        // What Enter and the selector asked of the host, in order.
+        for request in app.take_requests() {
+            perform(app, conn, link, request);
+            dirty = true;
         }
     }
 }

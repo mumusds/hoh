@@ -103,6 +103,10 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
                     say!("hoh: 没有可附着的 Run");
                     return 64;
                 }
+                // With a terminal, the TUI's selector: the user picks one (docs/adr/ADR-031.md decision 12).
+                _ if output == Output::Text && terminal() => {
+                    return crate::tui::pick(project, host, &all);
+                }
                 several => {
                     // Never the newest on its own (REQ-003 behaviour 7): the user names one.
                     let list: Vec<String> = several

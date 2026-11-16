@@ -1,8 +1,9 @@
 //! The TUI shell in a real pseudo-terminal (check tui-pty; ADR-014). Each test records `stty -g` before `hoh` starts
 //! and compares it after `hoh` has exited:
-//! - the Workspace opens offline, and opening it without pressing Enter writes nothing;
+//! - the Workspace opens with the project's host connected (bare `hoh` starts one if none runs; each test stops it
+//!   with `Daemons`, docs/adr/ADR-031.md decision 13), and opening it without pressing Enter writes no row;
 //! - an input submitted with Enter is in the project's history and Ctrl+R finds it in the next session, without
-//!   sending anything;
+//!   sending anything more;
 //! - Ctrl+C then "脱离" exits 0;
 //! - SIGTERM exits 143, SIGHUP 129 and SIGINT 130; a panic exits 101 with its message after the terminal is restored.
 //! - a terminal that is closed under it (its window, an SSH connection) ends it: 129, or 74 when it was not the
@@ -36,7 +37,7 @@ struct Session {
     baseline: String,
 }
 
-/// `hoh` started in a 100x30 PTY in `project`, once its Workspace is drawn (project name, mode, offline host).
+/// `hoh` started in a 100x30 PTY in `project`, once its Workspace is drawn (project name, mode, connected host).
 fn open(project: &Path, home: &Path, env: &[(&str, &str)]) -> R<Session> {
     let pty = Pty::new(30, 100)?;
     let baseline = pty.stty()?;
@@ -48,7 +49,7 @@ fn open(project: &Path, home: &Path, env: &[(&str, &str)]) -> R<Session> {
         .ok_or("project name")?;
     pty.wait_for(name, 0, WAIT)?;
     pty.wait_for("AUTO", 0, WAIT)?;
-    pty.wait_for("host 离线", 0, WAIT)?;
+    pty.wait_for("host 已连接", 0, WAIT)?;
     Ok(Session {
         child,
         pty,
@@ -91,8 +92,10 @@ impl Session {
 }
 
 #[test]
-fn the_workspace_opens_offline_and_writes_nothing_until_enter() -> R {
+fn the_workspace_opens_connected_and_writes_nothing_until_enter() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let before = tree(project.path())?;
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.send("草稿 draft".as_bytes())?;
@@ -110,17 +113,34 @@ fn the_workspace_opens_offline_and_writes_nothing_until_enter() -> R {
     );
     s.pty.send(b"\x03")?; // clears the marker
     assert_eq!(s.detach()?, Some(0));
-    assert!(tree(project.path())? == before, "the project changed");
+    // The project held nothing; now only the host's own .hoh/ (whose socket is no file to read). Opening, listing and
+    // detaching write no row and record no input (docs/adr/ADR-031.md E11).
+    assert!(before.is_empty());
+    let names: Vec<std::ffi::OsString> = std::fs::read_dir(project.path())?
+        .map(|entry| entry.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(names, [".hoh"], "the project changed");
+    assert!(!project.path().join(".hoh/input-history.jsonl").exists());
+    for table in ["commands", "runs", "tasks", "input_queue"] {
+        assert_eq!(
+            scalar(project.path(), &format!("SELECT count(*) FROM {table}"))?,
+            "0",
+            "{table}"
+        );
+    }
     Ok(())
 }
 
 #[test]
 fn submitted_input_is_kept_and_found_again_in_the_next_session() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let history = project.path().join(".hoh/input-history.jsonl");
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.send(b"hello\r")?;
-    s.pty.wait_for("未发送", 0, WAIT)?;
+    // The input is the goal of a new run, which the Workspace attaches (docs/adr/ADR-031.md decision 13).
+    s.pty.wait_for("已附着", 0, WAIT)?;
     assert_eq!(std::fs::read_to_string(&history)?, "{\"text\":\"hello\"}\n");
     assert_eq!(s.detach()?, Some(0));
 
@@ -135,7 +155,12 @@ fn submitted_input_is_kept_and_found_again_in_the_next_session() -> R {
     s.pty.send(b"\r")?;
     s.pty.send(b"QZQ")?;
     s.pty.wait_for("QZQ", entered, WAIT)?;
-    assert!(!pty::squash(&s.pty.output()[from..]).contains("未发送"));
+    assert!(!pty::squash(&s.pty.output()[from..]).contains("你："));
+    assert_eq!(
+        scalar(project.path(), "SELECT count(*) FROM commands")?,
+        "1",
+        "only the first session's StartRun"
+    );
     assert_eq!(std::fs::read_to_string(&history)?, "{\"text\":\"hello\"}\n");
     s.pty.send(b"\x03")?; // clears the editor
     assert_eq!(s.detach()?, Some(0));
@@ -145,13 +170,15 @@ fn submitted_input_is_kept_and_found_again_in_the_next_session() -> R {
 #[test]
 fn sigterm_restores_the_terminal_and_exits_143() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.send(b"draft")?;
     s.pty.wait_for("draft", 0, WAIT)?;
     signal(&s.child, Signal::TERM)?;
     assert_eq!(s.ended()?, Some(143));
     assert!(
-        !project.path().join(".hoh").exists(),
+        !project.path().join(".hoh/input-history.jsonl").exists(),
         "a draft is not history"
     );
     Ok(())
@@ -160,6 +187,8 @@ fn sigterm_restores_the_terminal_and_exits_143() -> R {
 #[test]
 fn sighup_restores_the_terminal_and_exits_129() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let s = open(project.path(), home.path(), &[])?;
     signal(&s.child, Signal::HUP)?;
     assert_eq!(s.ended()?, Some(129));
@@ -171,11 +200,14 @@ fn sighup_restores_the_terminal_and_exits_129() -> R {
 #[test]
 fn a_resize_redraws_the_workspace_without_a_key() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let s = open(project.path(), home.path(), &[])?;
     std::thread::sleep(Duration::from_millis(300));
     let from = s.pty.output().len();
     s.pty.resize(40, 120)?;
-    s.pty.wait_for("host 离线", from, Duration::from_secs(2))?;
+    s.pty
+        .wait_for("host 已连接", from, Duration::from_secs(2))?;
     assert_eq!(s.detach()?, Some(0));
     Ok(())
 }
@@ -207,6 +239,8 @@ fn type_into_the_restore_window(
 fn a_restore_gate_left_shut_aborts_hoh() -> R {
     use std::os::unix::process::ExitStatusExt;
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let gate = home.path().join("gate");
     let gate_env = gate.to_str().ok_or("gate path")?;
     let mut s = open(
@@ -230,6 +264,8 @@ fn a_restore_gate_left_shut_aborts_hoh() -> R {
 #[test]
 fn input_typed_while_the_tui_restores_the_terminal_is_left_for_the_shell() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let gate = home.path().join("gate");
     let gate_env = gate.to_str().ok_or("gate path")?;
     let mut s = open(
@@ -256,6 +292,8 @@ fn input_typed_while_the_tui_restores_the_terminal_is_left_for_the_shell() -> R 
 #[test]
 fn an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let gate = home.path().join("gate");
     let gate_env = gate.to_str().ok_or("gate path")?;
     let mut s = open(
@@ -281,6 +319,8 @@ fn an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input() 
 #[test]
 fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.hold_output(true)?;
     // A key to draw, and the draw is held.
@@ -307,10 +347,12 @@ fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
 #[test]
 fn a_sequence_split_by_a_slow_link_is_still_one_key() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let history = project.path().join(".hoh/input-history.jsonl");
     let mut s = open(project.path(), home.path(), &[])?;
     s.pty.send(b"one\r")?;
-    s.pty.wait_for("未发送", 0, WAIT)?;
+    s.pty.wait_for("已附着", 0, WAIT)?;
     for (start, rest) in [
         (&b"\x1b["[..], &b"A\r"[..]),
         (b"\x1b[20", b"0~line1\rline2\x1b[201~\r"),
@@ -351,6 +393,8 @@ fn the_read_handshake_fails_when_nothing_reads() -> R {
 #[test]
 fn input_typed_while_a_panic_restores_the_terminal_is_left_for_the_shell() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let gate = home.path().join("gate");
     let gate_env = gate.to_str().ok_or("gate path")?;
     let s = open(
@@ -375,6 +419,8 @@ fn input_typed_while_a_panic_restores_the_terminal_is_left_for_the_shell() -> R 
 #[test]
 fn a_lone_esc_is_the_esc_key() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let mut s = open(project.path(), home.path(), &[])?;
     let from = s.pty.output().len();
     s.pty.send(b"\x12")?;
@@ -390,6 +436,8 @@ fn a_lone_esc_is_the_esc_key() -> R {
 #[test]
 fn a_burst_of_keys_is_taken_in_full() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let history = project.path().join(".hoh/input-history.jsonl");
     let mut s = open(project.path(), home.path(), &[])?;
     let line = "x".repeat(5000);
@@ -413,6 +461,8 @@ fn a_burst_of_keys_is_taken_in_full() -> R {
 #[test]
 fn a_long_paste_is_drawn_at_once() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let mut s = open(project.path(), home.path(), &[])?;
     let from = s.pty.output().len();
     s.pty
@@ -432,6 +482,8 @@ fn a_long_paste_is_drawn_at_once() -> R {
 fn a_terminal_closed_under_the_tui_ends_it() -> R {
     for ctty in [true, false] {
         let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+        let _daemons = Daemons(project.path().to_path_buf());
         let mut pty = Pty::new(30, 100)?;
         // Declared after the PTY, so dropped before it: a failure stops `hoh` first.
         let mut child = if ctty {
@@ -439,7 +491,7 @@ fn a_terminal_closed_under_the_tui_ends_it() -> R {
         } else {
             spawn_without_ctty_in(&pty, project.path(), home.path())?
         };
-        pty.wait_for("host 离线", 0, WAIT)?;
+        pty.wait_for("host 已连接", 0, WAIT)?;
         pty.hang_up()?;
         let status = exit_within(&mut child, Duration::from_secs(3))
             .map_err(|e| format!("ctty={ctty}: {e}"))?;
@@ -455,6 +507,8 @@ fn a_terminal_closed_under_the_tui_ends_it() -> R {
 #[test]
 fn a_panic_restores_the_terminal_before_its_message() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let s = open(project.path(), home.path(), &[("HOH_DEBUG_TUI_PANIC", "1")])?;
     s.pty.wait_for("HOH_DEBUG_TUI_PANIC", 0, WAIT)?;
     let out = s.pty.output();
@@ -472,6 +526,8 @@ fn a_panic_restores_the_terminal_before_its_message() -> R {
 fn sigint_from_outside_restores_the_terminal_and_exits_130() -> R {
     // In raw mode Ctrl+C is a key; a SIGINT can still come from another process.
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let s = open(project.path(), home.path(), &[])?;
     signal(&s.child, Signal::INT)?;
     assert_eq!(s.ended()?, Some(130));
@@ -481,6 +537,8 @@ fn sigint_from_outside_restores_the_terminal_and_exits_130() -> R {
 #[test]
 fn a_test_that_fails_early_leaves_no_hoh_behind() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
+    let _daemons = Daemons(project.path().to_path_buf());
     let s = open(project.path(), home.path(), &[])?;
     let pid = s.child.0.id();
     assert!(
