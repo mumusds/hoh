@@ -1,0 +1,124 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.325",
+  "case": "fault-usage-limit",
+  "argv": [
+    "env",
+    "--unset=XDG_RUNTIME_DIR",
+    "--unset=DBUS_SESSION_BUS_ADDRESS",
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-16T11:17:22.970949+00:00",
+  "mode": "fake-provider",
+  "notes": "subscriber (OAuth token); every request answered 429 with the unified headers of a rejected 5-hour limit",
+  "env_overrides": [
+    "ANTHROPIC_BASE_URL=<fake provider>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "DISABLE_AUTOUPDATER=1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+    "CLAUDE_CODE_OAUTH_TOKEN=<dummy>"
+  ],
+  "provider": {
+    "scenario": "claude-usage-limit",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "request-id": "req_fake_usage_limit",
+                "anthropic-ratelimit-unified-status": "rejected",
+                "anthropic-ratelimit-unified-reset": "{now+7200}",
+                "anthropic-ratelimit-unified-representative-claim": "five_hour",
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-reset": "{now+7200}",
+                "anthropic-ratelimit-unified-5h-utilization": "1.0",
+                "anthropic-ratelimit-unified-7d-status": "allowed",
+                "anthropic-ratelimit-unified-7d-reset": "{now+400000}",
+                "anthropic-ratelimit-unified-7d-utilization": "0.4",
+                "anthropic-ratelimit-unified-overage-status": "rejected",
+                "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "rate_limit_error",
+                  "message": "This request would exceed your account's rate limit. Please try again later."
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827842.4573271,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_usage_limit",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": "1794835042",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-5h-status": "rejected",
+          "anthropic-ratelimit-unified-5h-reset": "1794835042",
+          "anthropic-ratelimit-unified-5h-utilization": "1.0",
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-reset": "1795227842",
+          "anthropic-ratelimit-unified-7d-utilization": "0.4",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+        },
+        "model": "claude-sonnet-5-5",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

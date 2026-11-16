@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a1e414-9cd5-7202-8c16-9284f9a3ba84"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-fake-5` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 8:18 AM."}
+{"type":"turn.failed","error":{"message":"You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 8:18 AM."}}

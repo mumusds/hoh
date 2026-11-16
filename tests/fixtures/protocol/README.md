@@ -67,3 +67,31 @@ directory is kept until the compat suite has been rerun. Re-record after every C
 Since M0-T06 every case is reproducible on each run: the unauthenticated surfaces use an empty
 `CODEX_HOME` and the model-unavailable surface an invalid `--model`, so a re-recording never mixes cases
 from different login states.
+
+## Provider faults (`_provider-faults/`, M2T07R-256)
+
+What each CLI writes on the stream HoH reads when its provider answers 429, 503 or a usage limit, recorded with
+
+    python3 tests/fixtures/protocol/record_faults.py [--agents claude,codex,pi]
+
+against a fake provider (`FakeProvider`, 127.0.0.1) inside a sealed network namespace: the script re-executes itself
+as `sudo -n unshare -n`, brings only `lo` up, returns to the calling user and refuses to start any CLI unless the
+namespace has no other interface and no route out. Every run has a fresh HOME (and CODEX_HOME or
+PI_CODING_AGENT_DIR) holding only the fake provider's configuration and a dummy key; no model, account or credential
+is involved, and no live verification is claimed. Processes, scopes, staging and all-or-nothing publication are
+`record.py`'s; each case keeps `stdin.txt`, `stdout.jsonl`, `stderr.log` and `meta.json` (`mode: fake-provider`, the
+scenario the provider answered with, and its log of every request: time, path, status, headers sent). The leading `_`
+keeps the directory out of `compat-manifest.json` and of the live recorder's cases. Validators: `VALIDATORS` in
+`record_faults.py`; bundle test `tests/bundle/test_record_faults.py`.
+
+| Agent | Case | What the stream shows |
+|---|---|---|
+| claude 2.1.325 | `fault-429-retry-after-long` | API key, 429 `retry-after: 120`: one request, no `system/api_retry`, assistant `error: "rate_limit"` and a failed result; the 120 s appears nowhere |
+| claude 2.1.325 | `fault-429-retry-after-short` | 429 `retry-after: 3`, `CLAUDE_CODE_MAX_RETRIES=2`: two `system/api_retry` frames with `retry_delay_ms: 3000` (Claude waits itself), then the same failure with no value |
+| claude 2.1.325 | `fault-503-retry-after-long` | 503 `overloaded_error`, `retry-after: 120`: one request, assistant `error: "server_error"`, no value |
+| claude 2.1.325 | `fault-usage-limit` | OAuth (subscriber), 429 with a rejected 5-hour `anthropic-ratelimit-unified-*`: `rate_limit_event` `status: "rejected"`, `resetsAt`; assistant `api_error: "usage_limit_reached"` with `api_error_params.rate_limit_info.resetsAt` |
+| codex 0.166.0 | `app-server-fault-429-retry-after` | 429 `retry-after: 2`: six requests 2 s apart, five `error` notifications `willRetry: true`, then `turn/completed` failed with `responseTooManyFailedAttempts {httpStatusCode: 429}`; no value |
+| codex 0.166.0 | `app-server-fault-503-retry-after` | 503 `server_is_overloaded`, `retry-after: 2`: thirty requests 2 s apart, then `serverOverloaded`; no value |
+| codex 0.166.0 | `app-server-fault-usage-limit` | 429 `usage_limit_reached` with `x-codex-*` window headers: `account/rateLimits/updated` (primary `usedPercent: 100`, `resetsAt`), then `usageLimitExceeded` |
+| codex 0.166.0 | `exec-fault-usage-limit` | the same through `exec --json`: `turn.failed` with message text only |
+| pi 1.5.0 | `rpc-fault-429-retry-after` | 429 `retry-after: 3`: pi's own `auto_retry_start` delays 2/4/8 s, then a text `errorMessage`; nothing structured |

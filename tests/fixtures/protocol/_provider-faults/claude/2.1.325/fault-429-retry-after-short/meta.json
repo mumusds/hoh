@@ -1,0 +1,173 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.325",
+  "case": "fault-429-retry-after-short",
+  "argv": [
+    "env",
+    "--unset=XDG_RUNTIME_DIR",
+    "--unset=DBUS_SESSION_BUS_ADDRESS",
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-16T11:17:21.405296+00:00",
+  "mode": "fake-provider",
+  "notes": "API key; every request answered 429 with Retry-After: 3; two retries allowed to keep the case short",
+  "env_overrides": [
+    "ANTHROPIC_BASE_URL=<fake provider>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "DISABLE_AUTOUPDATER=1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+    "ANTHROPIC_API_KEY=<dummy>",
+    "CLAUDE_CODE_MAX_RETRIES=2"
+  ],
+  "provider": {
+    "scenario": "claude-429-short",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "retry-after": "3",
+                "request-id": "req_fake_429_short"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "rate_limit_error",
+                  "message": "Number of request tokens has exceeded your per-minute rate limit"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827834.8956337,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_429_short"
+        },
+        "model": "claude-opus-5-5",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1794827837.904585,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_429_short"
+        },
+        "model": "claude-opus-5-5",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1794827840.9100592,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "3",
+          "request-id": "req_fake_429_short"
+        },
+        "model": "claude-opus-5-5",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

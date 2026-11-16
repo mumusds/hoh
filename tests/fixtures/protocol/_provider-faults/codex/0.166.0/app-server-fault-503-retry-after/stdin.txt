@@ -1,0 +1,4 @@
+{"method": "initialize", "id": 0, "params": {"clientInfo": {"name": "hoh-recorder", "version": "0.0.0"}}}
+{"method": "initialized"}
+{"method": "thread/start", "id": 1, "params": {"approvalPolicy": "never", "sandbox": "danger-full-access"}}
+{"method": "turn/start", "id": 2, "params": {"threadId": "01a1e413-a2b6-7cb3-94a5-360ccf8fdb2d", "input": [{"type": "text", "text": "Reply with exactly HOH_SAMPLE_OK and nothing else."}]}}

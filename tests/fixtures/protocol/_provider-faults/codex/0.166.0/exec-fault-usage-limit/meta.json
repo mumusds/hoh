@@ -1,0 +1,101 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "exec-fault-usage-limit",
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-16T11:18:39.096002+00:00",
+  "mode": "fake-provider",
+  "notes": "exec --json; every request answered 429 usage_limit_reached with x-codex window headers",
+  "env_overrides": [
+    "CODEX_HOME=<fresh temp dir> holding only config.toml: model_provider \"fake\" at the fake provider",
+    "HOH_FAKE_PROVIDER_KEY=<dummy>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>"
+  ],
+  "provider": {
+    "scenario": "codex-usage-limit",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/responses",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "x-request-id": "req_fake_usage_limit",
+                "x-codex-primary-used-percent": "100",
+                "x-codex-primary-window-minutes": "300",
+                "x-codex-primary-reset-at": "{now+7200}",
+                "x-codex-secondary-used-percent": "40",
+                "x-codex-secondary-window-minutes": "10080",
+                "x-codex-secondary-reset-at": "{now+400000}"
+              },
+              "body": {
+                "error": {
+                  "type": "usage_limit_reached",
+                  "message": "The usage limit has been reached",
+                  "plan_type": "pro",
+                  "resets_at": "{now+7200}",
+                  "resets_in_seconds": 7200
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "error": {
+            "type": "not_found",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827918.5947993,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "x-request-id": "req_fake_usage_limit",
+          "x-codex-primary-used-percent": "100",
+          "x-codex-primary-window-minutes": "300",
+          "x-codex-primary-reset-at": "1794835118",
+          "x-codex-secondary-used-percent": "40",
+          "x-codex-secondary-window-minutes": "10080",
+          "x-codex-secondary-reset-at": "1795227918"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

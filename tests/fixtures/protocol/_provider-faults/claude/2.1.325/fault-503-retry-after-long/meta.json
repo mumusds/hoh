@@ -1,0 +1,104 @@
+{
+  "agent": "claude",
+  "cli_version": "2.1.325",
+  "case": "fault-503-retry-after-long",
+  "argv": [
+    "env",
+    "--unset=XDG_RUNTIME_DIR",
+    "--unset=DBUS_SESSION_BUS_ADDRESS",
+    "claude",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--dangerously-skip-permissions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 1,
+  "recorded_at": "2026-11-16T11:17:22.212614+00:00",
+  "mode": "fake-provider",
+  "notes": "API key; every request answered 503 overloaded_error with Retry-After: 120",
+  "env_overrides": [
+    "ANTHROPIC_BASE_URL=<fake provider>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "DISABLE_AUTOUPDATER=1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+    "ANTHROPIC_API_KEY=<dummy>"
+  ],
+  "provider": {
+    "scenario": "claude-503-long",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 503,
+              "headers": {
+                "retry-after": "120",
+                "request-id": "req_fake_503_long"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "overloaded_error",
+                  "message": "Overloaded"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827841.7116838,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "120",
+          "request-id": "req_fake_503_long"
+        },
+        "model": "claude-opus-5-5",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "anthropic-beta",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "user-agent",
+          "x-app",
+          "x-claude-code-session-id",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
