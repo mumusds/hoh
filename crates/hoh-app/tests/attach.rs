@@ -10,7 +10,7 @@ use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use hoh_core::persistence::{FaultHooks, PersistError};
 use hoh_core::staffing::{Kind, Verdict};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -256,7 +256,9 @@ fn session_and_tty(pid: u32) -> R<(u32, i64)> {
 
 #[test]
 fn detach_starts_a_host_of_its_own_session_and_prints_one_object_after_the_commit() -> R {
-    // CR-010 decision 2 (REQ-005 behaviours 1, 2, 3): the supplementary detach evidence, no TEST id.
+    // CR-010 decision 2 (REQ-005 behaviours 1, 2, 3): the supplementary detach evidence, no TEST id. A new project has
+    // no approved specification: its first run is BLOCKED on its question runtime:no_spec in StartRun's own commit, the
+    // 202 body's revision 1 (docs/adr/ADR-031.md decision 1).
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
     let started = Instant::now();
@@ -276,16 +278,28 @@ fn detach_starts_a_host_of_its_own_session_and_prints_one_object_after_the_commi
     assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
     let accepted: Value = serde_json::from_str(&stdout)?;
     assert_eq!(accepted["status"], "ACCEPTED");
-    assert_eq!(accepted["revision"], 0);
+    assert_eq!(accepted["revision"], 1);
     assert!(accepted["command_id"].is_string());
     let run_id = accepted["run_id"].as_str().ok_or("no run_id")?.to_owned();
     assert_eq!(
         query(
             &env.project(),
-            &format!("SELECT state FROM runs WHERE run_id = '{run_id}'")
+            &format!(
+                "SELECT state || ' ' || blocked_reason || ' ' || revision FROM runs WHERE run_id = '{run_id}'"
+            )
         )?,
-        "CREATED",
+        "BLOCKED NEED_DECISION 1",
         "printed only after the commit"
+    );
+    assert_eq!(
+        query(
+            &env.project(),
+            &format!(
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'question.asked'"
+            )
+        )?,
+        "no_spec"
     );
     // The host runs in a session of its own with no terminal.
     let [host] = hosts_of(&env.project())?[..] else {
@@ -311,13 +325,61 @@ fn detach_starts_a_host_of_its_own_session_and_prints_one_object_after_the_commi
     let snapshot: Value = serde_json::from_slice(&attached.stdout)?;
     assert_eq!(
         (snapshot["run_id"].as_str(), snapshot["state"].as_str()),
-        (Some(run_id.as_str()), Some("CREATED"))
+        (Some(run_id.as_str()), Some("BLOCKED"))
     );
     assert_eq!(counts()?, before);
     assert_eq!(
         hosts_of(&env.project())?,
         vec![host],
         "attach started no other host"
+    );
+    // Once the project has an approved specification, a detached run adopts it in StartRun's commit: CREATED at
+    // revision 0, the 202 body's revision 0 (nothing moved it in that commit), its events run.created then
+    // spec.changed{cause: adopted}. From then on its Commander is woken, so the host may move it at any time after the
+    // commit (these fake agents are never available: BLOCKED, COMMANDER_UNAVAILABLE); the commit's own events say what
+    // it was at its revision 0.
+    execute(
+        &env.project(),
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);",
+    )?;
+    let out = env.hoh(&["-p", "完成fixture目标", "--detach", "--output", "json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let accepted: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(
+        (&accepted["status"], &accepted["revision"]),
+        (&json!("ACCEPTED"), &json!(0))
+    );
+    let adopted = accepted["run_id"].as_str().ok_or("no run_id")?;
+    assert_eq!(
+        query(
+            &env.project(),
+            &format!(
+                "SELECT spec_id || ' ' || (SELECT group_concat(kind, ' ') FROM (SELECT kind FROM events \
+                 WHERE run_id = r.run_id AND seq <= (SELECT seq FROM events WHERE run_id = r.run_id \
+                 AND kind = 'spec.changed') ORDER BY seq)) || ' ' || (SELECT json_extract(payload_json, '$.cause') \
+                 FROM events WHERE run_id = r.run_id AND kind = 'spec.changed') FROM runs r WHERE run_id = '{adopted}'"
+            )
+        )?,
+        "s1 run.created spec.changed adopted"
+    );
+    assert_eq!(
+        query(
+            &env.project(),
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id = '{adopted}' AND kind = 'question.asked'"
+            )
+        )?,
+        "0"
+    );
+    assert_eq!(
+        hosts_of(&env.project())?,
+        vec![host],
+        "the same host took it"
     );
     Ok(())
 }

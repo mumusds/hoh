@@ -304,13 +304,17 @@ fn exec(path: &PathBuf, sql: &str) -> R {
 /// round's `Context::default()` judges the budget by: a fixed start would use up the run's `max_duration_hours` once
 /// that long had passed since it, and the rounds would stop dispatching for that.
 async fn working(store: &Store, path: &PathBuf) -> R {
+    // The project's specification first: StartRun adopts it (docs/adr/ADR-031.md decision 1).
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
+    )?;
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
     exec(
         path,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';
+        "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';
          INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
            ('sd', 'claude', 'developer', '1', '{\"structured_events\": true}');
          UPDATE role_bindings SET session_id = 'sd' WHERE run_id = 'R1' AND role = 'developer';

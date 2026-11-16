@@ -223,13 +223,17 @@ async fn team_and_run(store: &Store, path: &PathBuf) -> R {
             json!({"qa": {"agent": "pi", "fallback": ["claude"]}, "developer": {"agent": "claude", "model": "m-dev"}}),
         ))
         .await?;
+    // The project's specification first: StartRun adopts it (docs/adr/ADR-031.md decision 1).
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
+    )?;
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
     exec(
         path,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
+        "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
     )
 }
 
@@ -1381,13 +1385,17 @@ async fn developer_team(store: &Store, path: &PathBuf, agent: &str, fallback: &[
             json!({"developer": {"agent": agent, "fallback": fallback}}),
         ))
         .await?;
+    // The project's specification first: StartRun adopts it (docs/adr/ADR-031.md decision 1).
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
+    )?;
     store
         .submit_command(start("R1", Config::default().budget))
         .await?;
     exec(
         path,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
+        "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
     )
 }
 
@@ -1894,13 +1902,17 @@ async fn a_supervisor_attempts_capability_or_model_failure_blocks_the_commander_
                 json!({"commander": {"agent": "pi", "fallback": ["claude"]}}),
             ))
             .await?;
+        // The project's specification first: StartRun adopts it (docs/adr/ADR-031.md decision 1).
+        exec(
+            &path,
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
+        )?;
         store
             .submit_command(start("R1", Config::default().budget))
             .await?;
         exec(
             &path,
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-             UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
+            "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R1';",
         )?;
         assert!(
             store
