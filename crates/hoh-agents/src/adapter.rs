@@ -10,6 +10,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 
 /// The attempt a turn runs as, and its session.
 #[derive(Debug, Clone)]
@@ -580,6 +581,18 @@ pub struct Facts {
     /// HoH's own finding that its agent was not the verified one (docs/adr/ADR-030.md decision 6): only this module
     /// makes one, so its failure class never comes from a failure string.
     pub compat: Option<CompatRefusal>,
+    /// When the limit this turn FAILED on lifts, as the agent's provider said it (unix seconds; docs/adr/ADR-012.md,
+    /// M2T07R-256): only for a turn that failed on a usage or rate limit whose stream carried that instant (Claude's
+    /// usage limit, codex App Server's used-up rate-limit window), for the host to wait for as the provider's
+    /// Retry-After (REQ-042 behaviour 1). None otherwise, and for every stream that carries no such instant: a plain
+    /// 429/503 Retry-After the CLI waited or dropped itself, codex exec, pi.
+    pub retry_at: Option<SystemTime>,
+}
+
+/// The instant `value` names in unix seconds, when it is a positive whole number of them that is one.
+pub(crate) fn unix_seconds(value: &serde_json::Value) -> Option<SystemTime> {
+    let secs = value.as_u64().filter(|s| *s > 0)?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
 impl Facts {
@@ -601,6 +614,7 @@ impl Facts {
             degraded: None,
             final_text: None,
             compat: None,
+            retry_at: None,
         }
     }
 
@@ -665,6 +679,7 @@ impl Facts {
             degraded: None,
             final_text: None,
             compat: None,
+            retry_at: None,
         }
     }
 }

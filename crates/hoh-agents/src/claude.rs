@@ -237,6 +237,9 @@ pub fn verdict(e: &Ending<'_>) -> (AttemptState, Option<String>) {
     }
 }
 
+/// The failure of a `result` frame that says `is_error` (an API error among them).
+const ERROR_RESULT: &str = "is_error";
+
 /// The `result` frame and the exit code alone.
 fn judge(result: &ResultFrame, exit: Option<Termination>) -> (AttemptState, Option<String>) {
     let subtype = result.subtype.as_deref().unwrap_or("unknown");
@@ -248,7 +251,7 @@ fn judge(result: &ResultFrame, exit: Option<Termination>) -> (AttemptState, Opti
         );
     }
     if result.is_error != Some(false) {
-        return (AttemptState::Failed, Some("is_error".to_owned()));
+        return (AttemptState::Failed, Some(ERROR_RESULT.to_owned()));
     }
     match exit {
         Some(Termination::Code(0)) => (AttemptState::Settled, None),
@@ -548,6 +551,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             return Facts::incomplete(raw_log_path, recorded);
         };
         let (state, failure) = driven.verdict();
+        let retry_at = driven.retry_at();
         // The agent ended without a frame: its gate may have refused it (docs/adr/ADR-030.md decision 9).
         if state != AttemptState::Cancelled
             && let Some(refused) = crate::adapter::refused_at_gate(
@@ -581,6 +585,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             degraded: None,
             final_text: driven.result.and_then(|r| r.text),
             compat: None,
+            retry_at,
         }
     });
     Ok(Held {
@@ -616,6 +621,59 @@ struct Driven {
     /// `result` frames and unknown records seen, numbering their events.
     results: usize,
     unknown_records: usize,
+    /// What the frames said about a rate or usage limit.
+    limit: Limit,
+}
+
+/// What a turn's frames said about a rate or usage limit (M2T07R-256; docs/adr/ADR-012.md, 注记 of 2026-11-16): the
+/// reset of the last `rate_limit_event` whose status was `rejected` (a later event that is not rejected clears it), and
+/// the rate limit of the turn's last main-thread assistant frame.
+#[derive(Debug, Default)]
+struct Limit {
+    rejected_reset: Option<Value>,
+    last: Option<LimitError>,
+}
+
+/// A main-thread assistant frame's `error: "rate_limit"`: whether it has a typed kind (`api_error`, a field Claude
+/// marks internal) and, for a usage limit, that kind's own record of when it resets.
+#[derive(Debug)]
+struct LimitError {
+    typed: bool,
+    reset: Option<Value>,
+}
+
+impl Limit {
+    fn see(&mut self, frame: &Value) {
+        match frame["type"].as_str() {
+            Some("rate_limit_event") => {
+                let info = &frame["rate_limit_info"];
+                self.rejected_reset =
+                    (info["status"] == "rejected").then(|| info["resetsAt"].clone());
+            }
+            Some("assistant") if frame["parent_tool_use_id"].is_null() => {
+                self.last = (frame["error"] == "rate_limit").then(|| {
+                    let info = &frame["api_error_params"]["rate_limit_info"];
+                    LimitError {
+                        typed: frame["api_error"].is_string(),
+                        reset: (frame["api_error"] == "usage_limit_reached"
+                            && info["status"] == "rejected")
+                            .then(|| info["resetsAt"].clone()),
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// When the limit of the turn's last error lifts: the error's own record when it has a typed kind (only a usage
+    /// limit lifts by time), else the last rejected `rate_limit_event` (public).
+    fn lifts(&self) -> Option<std::time::SystemTime> {
+        let reset = match self.last.as_ref()? {
+            LimitError { typed: true, reset } => reset.as_ref()?,
+            LimitError { typed: false, .. } => self.rejected_reset.as_ref()?,
+        };
+        crate::adapter::unix_seconds(reset)
+    }
 }
 
 impl Driven {
@@ -634,6 +692,7 @@ impl Driven {
             report: None,
             results: 0,
             unknown_records: 0,
+            limit: Limit::default(),
         }
     }
 
@@ -658,6 +717,7 @@ impl Driven {
                 )
                 .await;
         };
+        self.limit.see(&frame);
         let key = known::claude_key(&frame);
         if !known::is_known(known::claude(), key.as_deref()) {
             self.unknown_records += 1;
@@ -724,6 +784,16 @@ impl Driven {
             result: self.result.as_ref(),
             exit: report.and_then(|r| r.status),
         })
+    }
+
+    /// When the limit this turn failed on lifts ([`Limit`]): only for a turn FAILED by its result frame's error.
+    fn retry_at(&self) -> Option<std::time::SystemTime> {
+        let (state, failure) = self.verdict();
+        if state == AttemptState::Failed && failure.as_deref() == Some(ERROR_RESULT) {
+            self.limit.lifts()
+        } else {
+            None
+        }
     }
 }
 
@@ -846,6 +916,22 @@ pub(crate) async fn drive_watched(
 /// adapter's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`]. Every claude version
 /// is judged alike (the frame registry built in, [`known::claude`]); `_version` is the tested one's.
 pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
+    match judged(bytes) {
+        Ok((driven, recorded)) => {
+            let (state, failure) = driven.verdict();
+            Replayed {
+                state,
+                failure,
+                unknown_events: crate::adapter::unknown_events(&recorded),
+            }
+        }
+        Err(unreplayable) => unreplayable,
+    }
+}
+
+/// `bytes` through this adapter's own judging, no process started, ended as a replay ends: what the turn showed and
+/// recorded, or the replay's answer when it could not be judged.
+fn judged(bytes: &[u8]) -> Result<(Driven, Vec<Recorded>), Replayed> {
     let mut recorder = Recorder::Collect(Vec::new(), Observer::default());
     let mut driven = Driven::new(false);
     driven.fed = Some(Ok(()));
@@ -856,23 +942,18 @@ pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
             Replay::Frame(line) => {
                 match crate::adapter::at_once(driven.on_line(&mut recorder, "replay", &line)) {
                     Some(Ok(())) => {}
-                    Some(Err(e)) => return crate::adapter::unreplayable(&e.to_string()),
-                    None => return crate::adapter::unreplayable("the judging waited"),
+                    Some(Err(e)) => return Err(crate::adapter::unreplayable(&e.to_string())),
+                    None => return Err(crate::adapter::unreplayable("the judging waited")),
                 }
             }
         }
     }
     driven.report = Some(crate::adapter::replayed_exit());
-    let (state, failure) = driven.verdict();
     let recorded = match recorder {
         Recorder::Collect(recorded, _) => recorded,
         Recorder::Store { .. } => Vec::new(),
     };
-    Replayed {
-        state,
-        failure,
-        unknown_events: crate::adapter::unknown_events(&recorded),
-    }
+    Ok((driven, recorded))
 }
 
 #[cfg(test)]

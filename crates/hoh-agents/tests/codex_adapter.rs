@@ -47,12 +47,18 @@ struct Case {
 
 impl Case {
     fn load(name: &str) -> R<Case> {
-        let frames = read(format!("{FIXTURES}/{name}/stdout.jsonl"))?
+        Case::load_dir(&format!("{FIXTURES}/{name}"))
+    }
+
+    /// The recorded case in `dir`.
+    fn load_dir(dir: &str) -> R<Case> {
+        let name = dir;
+        let frames = read(format!("{name}/stdout.jsonl"))?
             .lines()
             .map(serde_json::from_str)
             .collect::<Result<Vec<Value>, _>>()?;
         let mut requests = BTreeMap::new();
-        for line in read(format!("{FIXTURES}/{name}/stdin.txt"))?.lines() {
+        for line in read(format!("{name}/stdin.txt"))?.lines() {
             let Ok(m) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
@@ -2300,5 +2306,52 @@ async fn codex_runner_mode_gate_dropped_unopened_runs_nothing() -> R {
     let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
     assert_eq!(facts.failure.as_deref(), Some("GATE_CLOSED"));
     assert!(argvs(&fake)?.is_empty(), "codex ran");
+    Ok(())
+}
+
+/// The provider-fault recordings of codex 0.166.0 (tests/fixtures/protocol/_provider-faults, record_faults.py).
+const FAULTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/_provider-faults/codex/0.166.0"
+);
+
+#[tokio::test]
+async fn codex_runner_mode_reports_when_a_recorded_usage_limit_lifts() -> R {
+    // M2T07R-256 (REQ-042 behaviour 1): an App Server turn that failed on the usage limit reports the exhausted
+    // window's reset (account/rateLimits/updated, unix seconds) for the host to wait for; a 429 whose Retry-After codex
+    // waited itself reports none.
+    let world = World::new()?;
+    for (n, case) in [
+        "app-server-fault-usage-limit",
+        "app-server-fault-429-retry-after",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = format!("{FAULTS}/{case}");
+        let recorded = Case::load_dir(&dir)?;
+        let fake = world.fake(case, Some(&recorded), "exec", false)?;
+        let turn = world.turn(&fake, &format!("logs-{case}"))?;
+        let attempt = world.attempt(&format!("A{n}")).await?;
+        let held = codex::start(&attempt, &turn, &gate(&world)?)?;
+        held.open.send(()).map_err(|()| "gate closed")?;
+        let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+        assert_eq!(facts.state, AttemptState::Failed, "{case}: {facts:?}");
+        let meta: Value = serde_json::from_str(&read(format!("{dir}/meta.json"))?)?;
+        let sent = meta["provider"]["requests"][0]["headers"]["x-codex-primary-reset-at"]
+            .as_str()
+            .map(str::parse::<u64>)
+            .transpose()?;
+        assert_eq!(
+            facts.retry_at,
+            sent.map(|s| std::time::UNIX_EPOCH + Duration::from_secs(s)),
+            "{case}"
+        );
+        assert_eq!(
+            sent.is_some(),
+            case == "app-server-fault-usage-limit",
+            "{case}"
+        );
+    }
     Ok(())
 }

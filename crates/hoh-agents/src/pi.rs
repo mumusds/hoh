@@ -680,6 +680,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 degraded: None,
                 final_text: driven.reply,
                 compat: None,
+                retry_at: None,
             }
             .before_input(driven.changed.as_ref()),
             Err(_) => Facts::incomplete(raw_log_path, sink.recorded),
