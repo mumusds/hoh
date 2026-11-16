@@ -17,17 +17,27 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   app-ro-new copy already holds the resumed turn too).
 - The raw recordings stay local, under `.hoh-dev/evidence/commander-readonly/spike/<run>/`: they carry local paths,
   plugin lists, rate-limit and plan metadata, and the rollout files account identifiers. They are never committed.
-- `excerpt.py` makes the committed `excerpts/`. It keeps only the frames the evidence table reads, replaces the run's
-  temporary paths with `<P>`, `<W>`, `<T>` and the home directory with `<HOME>`, replaces every uuid with `<uuid-N>`
-  (one numbering for all the runs given, so a resumed session keeps its placeholder) and drops every field named like
-  an account, user, e-mail, plan, organisation, credential, rate limit or uuid. For codex it keeps only raw tool calls
-  and their outputs, never raw messages, which may carry instructions; an output in which the model listed its tools is
-  replaced by a marker, because the list names the user's connectors. For pi the observer's report keeps the builtin
-  tools and replaces the names of the user's extensions and their tools by placeholders. The first line of every
-  excerpt names its source file and that file's sha256, and says it is an excerpt. The excerpts are scanned for e-mail
-  addresses, keys and tokens; a hit writes nothing.
-- Regenerate with `python3 tests/fixtures/commander-readonly/excerpt.py .hoh-dev/evidence/commander-readonly/spike/20261116T180821Z
-  .hoh-dev/evidence/commander-readonly/spike/20261116T201950Z` (the raw runs are on the machine that recorded them).
+- `excerpt.py` makes the committed `excerpts/` (ADR-032 design correction 4). It keeps only the lines the evidence
+  table reads, and **every kept line is the raw line with some values replaced**: keys, nesting, array lengths and the
+  JSON type of every value are the source's. It replaces the run's temporary paths with `<P>`, `<W>`, `<T>` and the
+  home directory with `<HOME>`, every uuid with `<uuid-N>` (one numbering for all the runs given, so a resumed session
+  keeps its placeholder), every value under a key named like an account, user, e-mail, plan, organisation, credential,
+  token, rate limit, request id, device, socket or provider base URL with `"<redacted>"` (numbers with 0), and every
+  value listing the user's plugins, skills, slash commands, agents or memory paths with `"<redacted>"`. A string in
+  which the model listed its tools (it names the user's connectors, `mcp__…`) becomes a marker; in pi's observer
+  report the user's extensions' tool names become `<extension-tool-N>`. For codex it keeps raw tool calls and their
+  outputs only, never raw messages, which may carry instructions. The excerpts are scanned for e-mail addresses, keys
+  and tokens; a hit writes nothing.
+- Every excerpt's first line is a header: the source file and its sha256, and for every following line its line
+  index in the source and the sha256 of its key skeleton. `excerpt_check.py` compares each line's skeleton with the
+  recorded one and, where the raw source is present locally with the recorded sha256, with the source line's
+  skeleton; it also compares each `.meta.json`'s `snapshot_diff` with the raw snapshot's. The bundle self-test runs
+  it on the recorded skeletons (tests/bundle/test_commander_readonly.py).
+- `.meta.json` files are summaries, not excerpts: the case's argv, exit, notes, driver text and token hash, and the
+  raw snapshot's `diff` object (values redacted) with the snapshot's sha256.
+- Regenerate with `python3 tests/fixtures/commander-readonly/excerpt.py` followed by every run directory under
+  `.hoh-dev/evidence/commander-readonly/spike/` in order (the raw runs are on the machine that recorded them), then
+  run `excerpt_check.py`.
 
 ## Run 20261116T180821Z
 

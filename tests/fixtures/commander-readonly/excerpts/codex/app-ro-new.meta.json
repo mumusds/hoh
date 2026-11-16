@@ -13,7 +13,10 @@
   "removed": [],
   "changed": []
  },
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/codex/app-ro-new/snapshot.json",
+ "snapshot_sha256": "b68e99b3e49c6ea335dcc08e4f2af745ba8366a78f8a4b29554afbfa5e66e547",
  "stdout_sha256": "af6bf10c42acdad9216a0f92f78efb86079dd1f1d6ef1875afa4276d338204f5",
  "stderr_sha256": "c13705d460f3e1863d9b11079b09ce31e655f7f92066e9ebc184493fdb59ccf7",
+ "token_sha256": "2ecb1985f29554b1662493d1e781f346bb0606063e3e438c98a55cd2d4b5cf4c",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n"
 }
