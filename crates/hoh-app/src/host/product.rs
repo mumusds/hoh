@@ -35,7 +35,14 @@ pub struct ProductExecutor {
     keys: Option<KeyHook>,
     /// A test's look at each diagnostic a turn collects as it collects it; the product has none.
     observe: Option<hoh_agents::adapter::Observe>,
+    /// Set once the host stops ([`Executor::stop`]): a turn that ends after it has nothing done for it here.
+    stopping: tokio::sync::watch::Sender<bool>,
+    /// The task that waits for each turn's end and keeps its raw logs, until the host stops.
+    watchers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// How long the host's stop waits for a turn's raw logs being kept as objects when it stops (a blocking copy).
+const KEEP_STOP: Duration = Duration::from_secs(10);
 
 /// Called with (attempt id, key) for each gate key an executor draws (a test's: the key is in no file, event or
 /// argv).
@@ -71,6 +78,8 @@ impl ProductExecutor {
             exec_only: Arc::default(),
             keys: None,
             observe: None,
+            stopping: tokio::sync::watch::Sender::new(false),
+            watchers: Mutex::default(),
         }
     }
 
@@ -838,8 +847,14 @@ impl Executor for ProductExecutor {
         let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
         let logs = attempt_logs(&self.project, &work.attempt_id);
         let project = self.project.clone();
-        tokio::spawn(async move {
-            let facts = turn.await;
+        let mut stopping = self.stopping.subscribe();
+        let watcher = tokio::spawn(async move {
+            let facts = tokio::select! {
+                facts = turn => facts,
+                // The host stopped first: the turn runs on and the next host's reconcile settles it; nothing of its end
+                // is done here, so nothing of this host writes the project after its stop.
+                _ = stopping.wait_for(|stopped| *stopped) => return,
+            };
             if let Ok(mut cancels) = cancels.lock() {
                 cancels.remove(&id);
             }
@@ -874,6 +889,10 @@ impl Executor for ProductExecutor {
             keep_diagnostics(&outcome);
             let _ = tx.send(outcome);
         });
+        if let Ok(mut watchers) = self.watchers.lock() {
+            watchers.retain(|w| !w.is_finished());
+            watchers.push(watcher);
+        }
         let open = held.open;
         Ok(Started {
             pid: held.pid,
@@ -884,6 +903,24 @@ impl Executor for ProductExecutor {
             ended,
             prompt: Some(record),
             ran: Some(ran),
+        })
+    }
+
+    fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.stopping.send_replace(true);
+            let watchers = self
+                .watchers
+                .lock()
+                .map(|mut w| std::mem::take(&mut *w))
+                .unwrap_or_default();
+            // A turn still running ends its watcher at once; one whose end came first finishes keeping its raw logs
+            // (a blocking copy), within a bound.
+            for mut watcher in watchers {
+                if tokio::time::timeout(KEEP_STOP, &mut watcher).await.is_err() {
+                    watcher.abort();
+                }
+            }
         })
     }
 
