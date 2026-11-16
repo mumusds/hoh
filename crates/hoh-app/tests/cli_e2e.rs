@@ -149,6 +149,34 @@ async fn a_prompt_follows_its_new_run_to_the_result_and_prints_it_as_asked() -> 
     world.configure(&world::TEAM, "[project]\ndefault_mode = \"PLAN\"\n")?;
     let host = world.start_plain_host(None).await?;
     let outcome = tokio::task::block_in_place(|| -> R {
+        // The project has no approved specification yet (docs/adr/ADR-031.md decision 1): the new run is BLOCKED on its
+        // question runtime:no_spec in StartRun's own commit, so the prompt ends 3 with that result.
+        let goal = "没有规格";
+        let out = world::finish(
+            spawn(&world, &["-p", goal, "--output", "json"])?,
+            world::LIMIT,
+        )?;
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let run = run_of_goal(&world, goal)?;
+        let result = result_of(&world, &run)?;
+        assert_eq!(
+            (&result["state"], &result["blocked_reason"]),
+            (&json!("BLOCKED"), &json!("NEED_DECISION"))
+        );
+        assert_eq!(serde_json::from_slice::<Value>(&out.stdout)?, result);
+        assert_eq!(
+            world.query(&format!(
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE run_id = '{run}' \
+                 AND kind = 'question.asked'"
+            ))?,
+            "no_spec"
+        );
+        // Once it has one, a new run adopts it and works on.
         approved(&world)?;
         for (output, end, code, state) in [
             ("stream-json", "PauseRun", 6, "PAUSED"),
