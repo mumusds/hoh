@@ -1,7 +1,7 @@
 //! `hoh` binary (REQ-003, REQ-004): parses the command line, answers help and version, and refuses a usage error with
 //! exit 64 before touching anything (no host, no `.hoh/`, no database, stdout empty). Bare `hoh` opens the TUI shell
-//! (`tui`, M1-T08). The other commands arrive with later tasks; until then each reports NOT_IMPLEMENTED on stderr and
-//! exits 3, so no script can mistake the binary for a working product.
+//! (`tui`), `hoh -p` runs or answers a run (`prompt`), `hoh attach` follows one (`session`). `hoh web` arrives with a
+//! later task; until then it reports NOT_IMPLEMENTED on stderr and exits 3, so no script can mistake it for working.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -20,8 +20,12 @@ mod cli;
 mod client;
 mod doctor;
 mod exit;
+mod follow;
+mod forward;
 mod help;
 mod installer;
+mod output;
+mod prompt;
 mod session;
 mod tui;
 
@@ -204,21 +208,20 @@ fn run(args: &[OsString]) -> u8 {
         Invocation::Prompt {
             text,
             output,
-            detach: true,
+            detach,
+            resume,
             project,
-            ..
         } => {
-            if output == cli::Output::StreamJson {
+            if detach && output == cli::Output::StreamJson {
                 return refuse(
                     "--detach 只输出 run_id（text）或受理结果（json），不能与 --output stream-json 同用",
                 );
             }
             return match here(project.as_deref()) {
-                Ok(dir) => session::detach(&dir, &text, output),
+                Ok(dir) => prompt::run(&dir, &text, output, detach, resume.as_deref()),
                 Err(code) => code,
             };
         }
-        Invocation::Prompt { .. } => "非交互运行（hoh -p）",
         Invocation::Attach {
             run_id,
             output,
