@@ -543,21 +543,35 @@ fn pace_claim(tasks: &[TaskRow], stalled: bool, commander_stage: bool) -> Vec<Bl
 }
 
 /// Run `run_id`'s pace claim read afresh at `at`, by the pace's own predicate (docs/adr/ADR-031.md decision 7): an
-/// answer that lets a task move clears it in its own commit, so the run is unblocked there and then.
+/// answer that lets a task move clears it in its own commit, so the run is unblocked there and then. A run the pace does
+/// not look at while it is held or stopped (PAUSE_REQUESTED, PAUSED, INCOMPLETE, CANCEL_REQUESTED) is judged by the
+/// state it resumes to — the claim it would have once it works again, which a ResumeRun reads as its blocker set
+/// (decision 16, M2T13R-301): an answer in such a stop releases what it made stale.
 pub(super) fn stall_reasons(
     conn: &Connection,
     run_id: &str,
     at: SystemTime,
 ) -> Result<Vec<BlockedReason>, PersistError> {
-    let state: String = conn
+    let (state, resume): (String, Option<String>) = conn
         .query_row(
-            "SELECT state FROM runs WHERE run_id = ?1",
+            "SELECT state, resume_state FROM runs WHERE run_id = ?1",
             params![run_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
+    let state = writer::parse::<RunState>(&state)?;
+    let judged = match (state, resume) {
+        (
+            RunState::PauseRequested
+            | RunState::Paused
+            | RunState::Incomplete
+            | RunState::CancelRequested,
+            Some(resume),
+        ) => writer::parse::<RunState>(&resume)?,
+        _ => state,
+    };
     let commander_stage = matches!(
-        writer::parse::<RunState>(&state)?,
+        judged,
         RunState::Created | RunState::Discovering | RunState::Specifying | RunState::Ready
     );
     let tasks = load_tasks(conn, run_id)?;

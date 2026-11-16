@@ -728,16 +728,13 @@ pub(super) fn answer(
         | Route::SourceRework
         | Route::Redispatch(_) => {
             task_exit(tx, a, &question, picked, ctx)?;
-            // The pace's claim recomputed by its own predicate (decision 7): an answer that lets a task move clears it.
-            let state = writer::parse::<RunState>(&state)?;
-            if crate::lifecycle::is_working(state)
-                || matches!(state, RunState::WaitingExternal | RunState::Blocked)
-            {
-                claims.set(
-                    blockers::PACE,
-                    &super::retry::stall_reasons(tx, a.run_id, ctx.now())?,
-                );
-            }
+            // The pace's claim recomputed by its own predicate (decision 7), in every state an answer is taken in: an
+            // answer that lets a task move clears it — in a stop (PAUSED, INCOMPLETE …) too, where the pace does not
+            // look and a ResumeRun reads the blocker set it leaves (M2T13R-301); the run stays where it stopped.
+            claims.set(
+                blockers::PACE,
+                &super::retry::stall_reasons(tx, a.run_id, ctx.now())?,
+            );
         }
     }
     let changed = claims.changed();

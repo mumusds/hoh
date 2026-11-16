@@ -1922,6 +1922,204 @@ mod real {
         Ok(())
     }
 
+    /// R's command `kind` at its revision now (`target`, its accepted event `event`).
+    async fn run_command(
+        store: &Store,
+        path: &Path,
+        id: &str,
+        kind: &str,
+        event: &str,
+        target: RunTarget,
+    ) -> R<Result<CommandOutcome, PersistError>> {
+        Ok(store
+            .submit_command(SubmitCommand {
+                command_id: id.to_owned(),
+                idempotency_key: format!("k-{id}"),
+                kind: kind.to_owned(),
+                run_id: "R".to_owned(),
+                expected_revision: revision(path)?,
+                payload: json!({}),
+                payload_sha256: crate::context::sha256_hex(id.as_bytes()),
+                target,
+                event: NewEvent {
+                    intent: Intent::Progress,
+                    project_id: "p1".to_owned(),
+                    event_id: format!("e-{id}"),
+                    run_id: Some("R".to_owned()),
+                    kind: event.to_owned(),
+                    payload: json!({"command_id": id}),
+                },
+                outbox: None,
+            })
+            .await)
+    }
+
+    /// R's state, blocked reason and recorded blocker set.
+    fn run_row(path: &Path) -> R<String> {
+        one(
+            path,
+            "SELECT state || ':' || coalesce(blocked_reason, '-') || ':' || blocked_reasons_json FROM runs \
+             WHERE run_id = 'R'",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_task_question_answered_while_paused_or_incomplete_releases_the_pace_claim_its_resume_would_misread()
+    -> R {
+        // M2T13R-301 (decisions 7, 9 and 16): D's agent reports BLOCKED (W12's real path): D BLOCKED (NEED_DECISION),
+        // and the pace blocks R on it (its claim `pace`, R BLOCKED from RUNNING). R is then stopped: paused (PauseRun
+        // and the pause's step), or INCOMPLETE (the pace's budget stop: its iterations used up). D's question answered
+        // continue in that stop: D READY, R still where it stopped, and the pace's claim the answer made stale released
+        // in the same commit (its blocked set empty), the commit ending with R's run.result of that state without a
+        // blocked reason. ResumeRun (the INCOMPLETE's stop lifted first, as a raised budget would) takes R back to
+        // RUNNING: no run.blocked, no BLOCKED NEED_DECISION result.
+        use crate::persistence::WriterOutcome;
+        use crate::persistence::need::WorkReason;
+        use crate::protocol::RunState;
+        for incomplete in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = world(dir.path())?;
+            store
+                .complete_writer_attempt(completion(WriterOutcome::Decide {
+                    reason: WorkReason::AgentBlocked,
+                    detail: "{}".to_owned(),
+                }))
+                .await?;
+            store.pace_run("R", verifiers()).await?;
+            assert_eq!(run_row(&path)?, "BLOCKED:NEED_DECISION:[\"NEED_DECISION\"]");
+            let at = crate::persistence::completion::tests::ending().at;
+            if incomplete {
+                Connection::open(&path)?.execute_batch(
+                    "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value)
+                       VALUES ('run', 'R', 'iterations', 3, 3);",
+                )?;
+                store.pace_run("R", verifiers()).await?;
+            } else {
+                run_command(
+                    &store,
+                    &path,
+                    "pause",
+                    "PauseRun",
+                    "run.pause_requested",
+                    RunTarget::To(RunState::PauseRequested),
+                )
+                .await??;
+                store.pause_step("R", at).await?;
+            }
+            let stop = if incomplete { "INCOMPLETE" } else { "PAUSED" };
+            assert_eq!(
+                run_row(&path)?,
+                format!("{stop}:NEED_DECISION:[\"NEED_DECISION\"]")
+            );
+            let q = open(&Connection::open(&path)?, "R")?.remove(0);
+            assert_eq!(q.reason.as_deref(), Some("agent_blocked"));
+            answer(&store, &path, "c1", &q.question_id, "continue").await??;
+            assert_eq!(task(&path, "D")?, "READY");
+            assert_eq!(
+                run_row(&path)?,
+                format!("{stop}:-:[]"),
+                "{stop}: the stale claim released"
+            );
+            let result = events(&path, "run.result")?;
+            let last = result.last().ok_or("a run.result")?;
+            assert_eq!(
+                (&last["state"], &last["blocked_reason"]),
+                (&json!(stop), &json!(null)),
+                "{stop}"
+            );
+            if incomplete {
+                Connection::open(&path)?.execute_batch(
+                    "UPDATE budgets SET limit_value = 9 WHERE scope_id = 'R' AND kind = 'iterations';",
+                )?;
+            }
+            let before: i64 = one(&path, "SELECT CAST(max(seq) AS TEXT) FROM events")?.parse()?;
+            run_command(
+                &store,
+                &path,
+                "resume",
+                "ResumeRun",
+                "run.resumed",
+                RunTarget::Resume,
+            )
+            .await??;
+            assert_eq!(run_row(&path)?, "RUNNING:-:[]", "{stop}");
+            assert_eq!(
+                texts(
+                    &path,
+                    &format!(
+                        "SELECT kind FROM events WHERE seq > {before} AND kind IN ('run.blocked', 'run.result')"
+                    )
+                )?,
+                Vec::<String>::new(),
+                "{stop}: the resume lands working"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_task_question_answered_while_paused_keeps_the_pace_claim_that_still_holds() -> R {
+        // M2T13R-301's other side: the claim is recomputed by the pace's predicate, not dropped. R paused while blocked
+        // on D's question with a second task E also BLOCKED (NEED_DECISION, its own anchor); D's answered cancel: D
+        // CANCELLED, E still blocks and nothing of R can move, so the pace's claim stands (R PAUSED, its blocker set
+        // NEED_DECISION) and ResumeRun takes R to BLOCKED with that result, as the pace would.
+        use crate::persistence::WriterOutcome;
+        use crate::persistence::need::WorkReason;
+        use crate::protocol::RunState;
+        let dir = tempfile::tempdir()?;
+        let (store, path) = world(dir.path())?;
+        Connection::open(&path)?.execute_batch(
+            "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, blocked_reason)
+               VALUES ('E', 'R', 's1', 'BLOCKED', 1, 'developer', 1, 2, 'NEED_DECISION');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'E/need',
+               'R', 'need_decision', '{\"run_id\": \"R\", \"task_id\": \"E\", \"reason\": \"agent_failed\",
+                 \"detail\": \"d\"}', '2026-11-12T00:00:00Z');",
+        )?;
+        store
+            .complete_writer_attempt(completion(WriterOutcome::Decide {
+                reason: WorkReason::AgentBlocked,
+                detail: "{}".to_owned(),
+            }))
+            .await?;
+        store.pace_run("R", verifiers()).await?;
+        run_command(
+            &store,
+            &path,
+            "pause",
+            "PauseRun",
+            "run.pause_requested",
+            RunTarget::To(RunState::PauseRequested),
+        )
+        .await??;
+        store
+            .pause_step("R", crate::persistence::completion::tests::ending().at)
+            .await?;
+        let q = open(&Connection::open(&path)?, "R")?
+            .into_iter()
+            .find(|q| q.task_id.as_deref() == Some("D"))
+            .ok_or("D's question")?;
+        answer(&store, &path, "c1", &q.question_id, "cancel").await??;
+        assert_eq!(task(&path, "D")?, "CANCELLED");
+        assert_eq!(run_row(&path)?, "PAUSED:NEED_DECISION:[\"NEED_DECISION\"]");
+        run_command(
+            &store,
+            &path,
+            "resume",
+            "ResumeRun",
+            "run.resumed",
+            RunTarget::Resume,
+        )
+        .await??;
+        assert_eq!(run_row(&path)?, "BLOCKED:NEED_DECISION:[\"NEED_DECISION\"]");
+        let result = events(&path, "run.result")?;
+        let last = result.last().ok_or("a run.result")?;
+        assert_eq!(
+            (&last["state"], &last["blocked_reason"]),
+            (&json!("BLOCKED"), &json!("NEED_DECISION"))
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_flaky_join_answered_rework_reworks_and_the_same_content_is_corrected_not_verified_again()
     -> R {
