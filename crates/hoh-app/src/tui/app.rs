@@ -619,11 +619,11 @@ impl App {
                     if picker.leaves { "脱离" } else { "返回" }
                 ),
                 (None, Some(run)) => format!(
-                    " {} │ 事件 {} · #{} │ Enter 记录 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
+                    " {} │ 事件 {} · #{} │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
                     self.mode, run.events, run.last
                 ),
                 (None, None) => format!(
-                    " {} │ host 已连接 │ Enter 记录 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
+                    " {} │ host 已连接 │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
                     self.mode
                 ),
             },

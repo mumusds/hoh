@@ -426,7 +426,7 @@ fn a_lone_esc_is_the_esc_key() -> R {
     s.pty.send(b"\x12")?;
     let from = s.pty.wait_for("反向搜索", from, WAIT)?;
     s.pty.send(b"\x1b")?;
-    s.pty.wait_for("Enter 记录", from, WAIT)?;
+    s.pty.wait_for("Enter 发送", from, WAIT)?;
     assert_eq!(s.detach()?, Some(0));
     Ok(())
 }
