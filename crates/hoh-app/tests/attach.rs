@@ -1885,9 +1885,24 @@ fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would
             &["doctor", "--output", "json"],
             &path,
         ))?;
+        // A failure shows why: doctor's record of its `systemd-run --version` probe too, which is not started once
+        // doctor's shared deadline has passed (follow-up item 21: the real agents' work used it up before 5e74003).
+        let scope_probe: Vec<&Value> = report["probes"]
+            .as_array()
+            .map(|probes| {
+                probes
+                    .iter()
+                    .filter(|p| {
+                        p["argv"][0]
+                            .as_str()
+                            .is_some_and(|a| a.ends_with("/systemd-run"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(
             report["runtime"]["host"]["process_tracking"], "unverified",
-            "{}",
+            "{} {scope_probe:?}",
             report["runtime"]["host"]
         );
         // M2T06R-555: the check names every condition it found, linger included.
