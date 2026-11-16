@@ -1649,3 +1649,62 @@ async fn raw_sql_that_moves_a_stopped_run_meets_the_backstop_trigger() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn the_unrecovered_candidates_grow_linearly_with_the_runs_judged_ones() -> R {
+    // M2T13R-101: N candidates of R, each with a failed recovery and judged unrecoverable (the result stays empty): the
+    // statement's work (SQLite's VM steps) grows linearly with N — the judgments joined once, not looked up by a scan
+    // per candidate. Bound asserted: from N = 100 to N = 3 000 (×30), at most ×60 (a log factor for the sorts).
+    let mut steps: Vec<(usize, bool, i32)> = Vec::new();
+    for n in [100, 3_000] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        drop(store);
+        world(&path, "RUNNING")?;
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+             INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+               test_plan_sha256, source_path, state, created_at)
+               SELECT 'J' || i, 'R', printf('%040d', i), printf('%040d', i), printf('%064d', 1), printf('%064d', 2),
+                 printf('%064d', 3), '/repo', 'STALE', 'x' FROM k;
+             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'J' || i || '/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
+                 json_object('candidate_id', 'J' || i, 'attempt', 1), 'x' FROM k;
+             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'J' || i || '/stale', 'R', 'candidate.stale',
+                 json_object('candidate_id', 'J' || i, 'reason', 'evidence_unrecoverable'), 'x' FROM k;"
+        ))?;
+        for by_run in [false, true] {
+            let mut statement = conn.prepare(&crate::persistence::unrecovered_sql(by_run))?;
+            let found: Vec<String> = if by_run {
+                statement
+                    .query_map(params!["R"], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?
+            } else {
+                statement
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            assert!(found.is_empty(), "{n} {by_run}: {found:?}");
+            steps.push((
+                n,
+                by_run,
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+            ));
+        }
+    }
+    for by_run in [false, true] {
+        let of = |n: usize| {
+            steps
+                .iter()
+                .find(|(m, b, _)| *m == n && *b == by_run)
+                .map_or(i32::MAX, |(.., s)| *s)
+        };
+        assert!(of(3_000) <= of(100) * 60, "by run {by_run}: {steps:?}");
+    }
+    Ok(())
+}
