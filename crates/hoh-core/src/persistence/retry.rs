@@ -433,6 +433,89 @@ struct TaskRow {
     open: i64,
 }
 
+/// Run `run_id`'s tasks as the pace judges them (the Commander's supervision tasks left out), in creation order.
+fn load_tasks(conn: &Connection, run_id: &str) -> Result<Vec<TaskRow>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT t.task_id, t.state, t.revision, t.role, t.next_retry_at, t.blocked_reason, \
+             (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
+              WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
+             FROM tasks t WHERE t.run_id = ?1 AND t.role <> 'commander' ORDER BY t.created_seq, t.task_id",
+        )
+        .map_err(sqlite_error)?;
+    let mut tasks = Vec::new();
+    for row in statement
+        .query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+    {
+        let (task_id, state, revision, role, next_retry_at, blocked_reason, open) =
+            row.map_err(sqlite_error)?;
+        tasks.push(TaskRow {
+            task_id,
+            state: writer::parse::<TaskState>(&state)?,
+            revision,
+            role,
+            next_retry_at,
+            blocked_reason,
+            open,
+        });
+    }
+    drop(statement);
+    Ok(tasks)
+}
+
+/// Task `t` is due at `at`: READY, or PENDING with every dependency ACCEPTED, and no retry in the future.
+fn due(t: &TaskRow, at: &str) -> bool {
+    (t.state == TaskState::Ready || (t.state == TaskState::Pending && t.open == 0))
+        && t.next_retry_at.as_deref().is_none_or(|next| next <= at)
+}
+
+/// Task `t` waits at `at` for a retry.
+fn waiting(t: &TaskRow, at: &str) -> bool {
+    t.state == TaskState::Ready && t.next_retry_at.as_deref().is_some_and(|next| next > at)
+}
+
+/// Whether a task of run `run_id` among `tasks` is in flight: only what can still move on (docs/adr/ADR-028.md
+/// decision 10, M2T16D-202): a verification round's source waiting for its round, and its verifier task once done,
+/// are not. Nothing waits for a join: it is its barrier's own transaction (docs/adr/ADR-029.md decision 13).
+fn in_flight(conn: &Connection, run_id: &str, tasks: &[TaskRow]) -> Result<bool, PersistError> {
+    let verifiers = super::verification::verifier_tasks(conn, run_id)?;
+    let sources = super::verification::sources(conn, run_id)?;
+    Ok(tasks.iter().any(|t| match t.state {
+        TaskState::Leased | TaskState::Running => true,
+        TaskState::Implemented => !verifiers.contains(&t.task_id),
+        TaskState::Verifying => !sources.contains(&t.task_id),
+        _ => false,
+    }))
+}
+
+/// The pace's stall judgement of run `run_id` read afresh at `at` (docs/adr/ADR-031.md correction C's (b), shared by
+/// pace and the stall detector): no work attempt runs, nothing is in flight, nothing is due and nothing waits for a
+/// retry.
+pub(super) fn idle(
+    conn: &Connection,
+    run_id: &str,
+    at: std::time::SystemTime,
+) -> Result<bool, PersistError> {
+    let at = rfc3339_utc(at);
+    let tasks = load_tasks(conn, run_id)?;
+    let (_, unfinished_work) = unfinished_attempts(conn, run_id)?;
+    Ok(unfinished_work == 0
+        && !in_flight(conn, run_id, &tasks)?
+        && !tasks.iter().any(|t| due(t, &at))
+        && !tasks.iter().any(|t| waiting(t, &at)))
+}
+
 /// What blocks the run's BLOCKED tasks, by precedence, each once.
 fn blocked_reasons(tasks: &[TaskRow]) -> Vec<BlockedReason> {
     blockers::ordered(
@@ -483,59 +566,18 @@ pub(super) fn pace(
     let state = writer::parse::<RunState>(&state)?;
     let working = matches!(state, RunState::Running | RunState::Verifying);
     let blocked = state == RunState::Blocked;
-    if !working && !blocked && state != RunState::WaitingExternal {
+    // The Commander's stages: only the budget is paced there (docs/adr/ADR-031.md correction C, M2T13D-301): its stop,
+    // once nothing of the run runs, and a cost limit it cannot enforce. Only the Commander moves such a run on.
+    let commander_stage = matches!(
+        state,
+        RunState::Created | RunState::Discovering | RunState::Specifying | RunState::Ready
+    );
+    if !working && !blocked && state != RunState::WaitingExternal && !commander_stage {
         return Ok(Paced::default());
     }
-    let mut statement = tx
-        .prepare(
-            "SELECT t.task_id, t.state, t.revision, t.role, t.next_retry_at, t.blocked_reason, \
-             (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
-              WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED') \
-             FROM tasks t WHERE t.run_id = ?1 AND t.role <> 'commander' ORDER BY t.created_seq, t.task_id",
-        )
-        .map_err(sqlite_error)?;
-    let mut tasks = Vec::new();
-    for row in statement
-        .query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })
-        .map_err(sqlite_error)?
-    {
-        let (task_id, state, revision, role, next_retry_at, blocked_reason, open) =
-            row.map_err(sqlite_error)?;
-        tasks.push(TaskRow {
-            task_id,
-            state: writer::parse::<TaskState>(&state)?,
-            revision,
-            role,
-            next_retry_at,
-            blocked_reason,
-            open,
-        });
-    }
-    drop(statement);
-    // Which tasks are due (READY, or PENDING with every dependency ACCEPTED, and no retry in the future) and which
-    // wait for a retry.
-    let due = |t: &TaskRow| {
-        (t.state == TaskState::Ready || (t.state == TaskState::Pending && t.open == 0))
-            && t.next_retry_at
-                .as_deref()
-                .is_none_or(|next| next <= at.as_str())
-    };
-    let waiting = |t: &TaskRow| {
-        t.state == TaskState::Ready
-            && t.next_retry_at
-                .as_deref()
-                .is_some_and(|next| next > at.as_str())
-    };
+    let mut tasks = load_tasks(&tx, run_id)?;
+    let due = |t: &TaskRow| due(t, &at);
+    let waiting = |t: &TaskRow| waiting(t, &at);
     let budget = load_budget(&tx, run_id, now)?;
     let mut paced = Paced::default();
     let mut commit = Commit::default();
@@ -575,7 +617,11 @@ pub(super) fn pace(
         // whose binding is BLOCKED for a reason of V are marked BLOCKED for it, and those whose session lacks a
         // required capability BLOCKED_CAPABILITY (AC-042-03 R2; ADR-020 decision 5). Neither makes an attempt or
         // touches `attempt_count`; NEED_DECISION is never V.
-        for task in tasks.iter_mut().filter(|t| t.state == TaskState::Blocked) {
+        // None of it in the Commander's stages, which only the budget paces.
+        for task in tasks
+            .iter_mut()
+            .filter(|t| !commander_stage && t.state == TaskState::Blocked)
+        {
             let Some(reason) = task
                 .blocked_reason
                 .as_deref()
@@ -614,7 +660,7 @@ pub(super) fn pace(
         // A task moved back to READY by this commit is not marked by it: its role is dispatchable.
         for task in tasks
             .iter_mut()
-            .filter(|t| !paced.recovered.contains(&t.task_id))
+            .filter(|t| !commander_stage && !paced.recovered.contains(&t.task_id))
             .filter(|t| due(t))
         {
             let (reason, payload, vacant) = match super::staffing::vacancy(&tx, run_id, &task.role)?
@@ -670,19 +716,9 @@ pub(super) fn pace(
             task.state = TaskState::Blocked;
             task.blocked_reason = Some(reason.as_str().to_owned());
         }
-        // In flight: only what can still move on (docs/adr/ADR-028.md decision 10, M2T16D-202): a verification round's
-        // source waiting for its round, and its verifier task once done, are not. Nothing waits for a join: it is its
-        // barrier's own transaction (docs/adr/ADR-029.md decision 13).
-        let verifiers = super::verification::verifier_tasks(&tx, run_id)?;
-        let sources = super::verification::sources(&tx, run_id)?;
-        let in_flight = tasks.iter().any(|t| match t.state {
-            TaskState::Leased | TaskState::Running => true,
-            TaskState::Implemented => !verifiers.contains(&t.task_id),
-            TaskState::Verifying => !sources.contains(&t.task_id),
-            _ => false,
-        });
         let any_due = tasks.iter().any(due);
         let any_waiting = tasks.iter().any(waiting);
+        let in_flight = in_flight(&tx, run_id, &tasks)?;
         // Stalled: nothing runs, nothing is in flight, nothing is due and nothing waits for a retry.
         let stalled = unfinished_work == 0 && !in_flight && !any_due && !any_waiting;
         let mut claims = blockers::Claims::load(&tx, &project_id, run_id)?;
@@ -697,7 +733,7 @@ pub(super) fn pace(
         );
         claims.set(
             blockers::PACE,
-            &if stalled {
+            &if stalled && !commander_stage {
                 blocked_reasons(&tasks)
             } else {
                 Vec::new()
