@@ -208,6 +208,14 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// At `point` of an attempt the runner runs (AC-041-01: a test's implementation ends the process here).
     fn runner(&self, _point: RunnerPoint) {}
 
+    /// At `point` of attempt `attempt_id`, one of the points of an attempt the runner runs: [`HostHooks::runner`],
+    /// unless a test's implementation selects the attempt (a fault at one attempt's point, whatever other attempt
+    /// reaches the point first, such as the Commander's turn a run's adoption of its specification wakes,
+    /// docs/adr/ADR-031.md decision 1).
+    fn runner_of(&self, point: RunnerPoint, _attempt_id: &str) {
+        self.runner(point);
+    }
+
     /// Just after the host announced itself (host.json written), before it returns from its start.
     fn announced(&self) {}
 
