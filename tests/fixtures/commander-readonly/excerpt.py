@@ -131,12 +131,18 @@ def keep_pi(f: dict) -> bool:
         return True
     if f.get('type') in ('tool_execution_start', 'tool_execution_end', 'agent_settled'):
         return True
+    if f.get('type') == 'message_end' and (f.get('message') or {}).get('role') == 'assistant':
+        return True  # the final message carries the hoh-decisions block
     return f.get('type') == 'response' and f.get('command') in ('prompt', 'get_state')
 
 
 def slim_pi(f: dict) -> dict:
     if f.get('type') == 'response' and f.get('command') == 'get_state':
         return {'type': 'response', 'command': 'get_state', 'success': f.get('success')}
+    if f.get('type') == 'message_end':
+        m = f['message']
+        return {'type': 'message_end', 'message': {'role': m.get('role'), 'stopReason': m.get('stopReason'),
+                                                   'content': [c for c in m.get('content', []) if c.get('type') == 'text']}}
     if f.get('type') == 'extension_ui_request':  # the observer's report: builtin tools kept, the user's extensions not named
         report = json.loads(f['message'])
         names: dict[str, str] = {}
