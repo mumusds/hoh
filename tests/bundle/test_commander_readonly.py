@@ -117,6 +117,31 @@ class Judge(unittest.TestCase):
         self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')  # pi.rs: a provider error not cleared fails
         m=copy.deepcopy(c);judge_check._retried_error(m)
         self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')  # cleared by the later successful message
+    def test_the_round_8_probes(self):
+        # Design correction 7: the adapters' semantics (response correlation, claude's every frame, pi's read to exit),
+        # and the rollout enumerated default-deny.
+        none=Path('/nonexistent')
+        c=judge_check.load(FIXTURES/'excerpts',none,'codex','app-ro-new')[0];control=judge_check.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
+        for field in ('thread','turn'):
+            for mode in ('an id never sent','no id','an error'):
+                m=copy.deepcopy(c);judge_check._bad_response(m,field,mode)
+                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',(field,mode))
+        for syntax in ('a space before the parenthesis','two patches in one exec'):
+            for outcome in (None,'unknown','success'):
+                m=copy.deepcopy(c);judge_check._odd_patch_call(m,syntax,outcome)
+                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',(syntax,outcome))
+        m=copy.deepcopy(c);judge_check._odd_driver_command(m)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
+        m=copy.deepcopy(c);judge_check._driver_before_handshake(m)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
+        c=judge_check.load(FIXTURES/'excerpts',none,'claude','ro-new')[0];control=judge_check.load(FIXTURES/'excerpts',none,'claude','control')[0]
+        m=copy.deepcopy(c);m.stdout.append(dict(copy.deepcopy(next(f for f in m.stdout if f.get('type')=='result')),session_id='other',is_error=True))
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')  # claude.rs reads every result frame
+        c=judge_check.load(FIXTURES/'excerpts',none,'pi','noext-new')[0];control=judge_check.load(FIXTURES/'excerpts',none,'pi','control')[0]
+        m=copy.deepcopy(c);m.stdout.extend(judge_check._tool_success_pair(m))
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'FAIL')  # pi.rs reads to the process's exit
+        m=copy.deepcopy(c);judge_check._late_recovery(m)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)
