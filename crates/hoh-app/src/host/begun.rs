@@ -372,7 +372,9 @@ mod tests {
 #[cfg(test)]
 mod scan {
     //! docs/adr/ADR-031.md, implementation review round 4, correction 2: every spawn the host process runs goes through
-    //! [`super`] or is on [`ALLOWED`] with its reason; any other is this test's failure, not a review's finding.
+    //! [`super`] or is on [`ALLOWED`] with its reason; any other is this test's failure, not a review's finding. The
+    //! whole of each file is scanned but its inline test modules (M2T13R-451), this router too, where only its own
+    //! calls ([`ROUTER`]) are allowed.
 
     use std::path::{Path, PathBuf};
 
@@ -521,6 +523,14 @@ mod scan {
         ),
     ];
 
+    /// The router's own calls of tokio, in this file (`hoh-app/src/host/begun.rs`): each line exactly, once.
+    const ROUTER: [&str; 4] = [
+        "tokio::task::spawn_blocking(move || {",
+        "return tokio::spawn(task);",
+        "None => tokio::spawn(task),",
+        "tokio::spawn(BEGUN.scope(begun, async move {",
+    ];
+
     /// What starts a task or a thread, besides any `.spawn(` with an argument ([`spawns`]).
     const SPAWNS: [&str; 5] = [
         "tokio::spawn(",
@@ -539,7 +549,7 @@ mod scan {
                 .any(|(at, _)| !code[at + ".spawn(".len()..].starts_with(')'))
     }
 
-    /// The production source files of `dir`: no `tests.rs`, nothing under a `tests` directory, not this router.
+    /// The production source files of `dir`: no `tests.rs`, nothing under a `tests` directory.
     fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a scanned tree").flatten() {
             let path = entry.path();
@@ -548,31 +558,100 @@ mod scan {
                 if name != "tests" {
                     sources(&path, out);
                 }
-            } else if name.ends_with(".rs")
-                && name != "tests.rs"
-                && !path.ends_with("host/begun.rs")
-            {
+            } else if name.ends_with(".rs") && name != "tests.rs" {
                 out.push(path);
             }
         }
     }
 
-    /// `source` without its inline test module (`#[cfg(test)]` then `mod <name> {`, to the end).
-    fn production(source: &str) -> &str {
+    /// The lines of `source`, each inline test module's (a `#[cfg(test)]` line, then `mod <name> {`, to its closing
+    /// `}` at the start of a line, as rustfmt writes a module of the file's top level) left empty: what comes after
+    /// a test module is scanned as what comes before it. A test module not closed so is left out to the end.
+    fn production(source: &str) -> Vec<&str> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut kept = Vec::with_capacity(lines.len());
         let mut at = 0;
-        while let Some(found) = source[at..].find("\n#[cfg(test)]\nmod ") {
-            let start = at + found;
-            let rest = &source[start + "\n#[cfg(test)]\nmod ".len()..];
-            if rest
-                .split('\n')
-                .next()
-                .is_some_and(|l| l.trim_end().ends_with('{'))
-            {
-                return &source[..start];
+        while at < lines.len() {
+            let opens = lines[at] == "#[cfg(test)]"
+                && lines.get(at + 1).is_some_and(|l| {
+                    l.strip_prefix("mod ")
+                        .is_some_and(|rest| rest.trim_end().ends_with('{'))
+                });
+            if !opens {
+                kept.push(lines[at]);
+                at += 1;
+                continue;
             }
-            at = start + 1;
+            let end = lines[at + 2..]
+                .iter()
+                .position(|l| *l == "}")
+                .map_or(lines.len(), |n| at + 2 + n + 1);
+            kept.extend(std::iter::repeat_n("", end - at));
+            at = end;
         }
-        source
+        kept
+    }
+
+    /// The spawns of file `name` (`source`) that are neither routed nor allowed, as `name:line: code`; what it uses of
+    /// [`ALLOWED`] and [`ROUTER`] is counted into `allowed` and `router`.
+    fn unrouted(
+        name: &str,
+        source: &str,
+        allowed: &mut [usize],
+        router: &mut [usize],
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        for (n, line) in production(source).into_iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") || !spawns(code) {
+                continue;
+            }
+            if name == "hoh-app/src/host/begun.rs" {
+                match ROUTER.iter().position(|own| code == *own) {
+                    Some(i) => router[i] += 1,
+                    None => found.push(format!("{name}:{}: {code}", n + 1)),
+                }
+                continue;
+            }
+            match ALLOWED
+                .iter()
+                .position(|(path, fragment, _, _)| *path == name && code.contains(fragment))
+            {
+                Some(i) => allowed[i] += 1,
+                None => found.push(format!("{name}:{}: {code}", n + 1)),
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn what_follows_a_test_module_is_scanned_and_the_router_allows_only_its_own_calls() {
+        let source = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        std::thread::spawn(|| ());\n    }\n}\n\
+                      fn b() {\n    std::thread::spawn(|| ());\n}\n";
+        let kept = production(source);
+        assert_eq!(kept.len(), source.lines().count(), "{kept:?}");
+        assert!(
+            kept.iter().all(|l| !l.contains("fn t()")) && kept.contains(&"fn b() {"),
+            "{kept:?}"
+        );
+        let mut allowed = vec![0; ALLOWED.len()];
+        let mut router = [0; ROUTER.len()];
+        assert_eq!(
+            unrouted("x.rs", source, &mut allowed, &mut router),
+            ["x.rs:9: std::thread::spawn(|| ());"]
+        );
+        let begun =
+            "    tokio::task::spawn_blocking(move || {\n    drop(tokio::spawn(async {}));\n";
+        assert_eq!(
+            unrouted(
+                "hoh-app/src/host/begun.rs",
+                begun,
+                &mut allowed,
+                &mut router
+            ),
+            ["hoh-app/src/host/begun.rs:2: drop(tokio::spawn(async {}));"]
+        );
+        assert_eq!(router, [1, 0, 0, 0]);
     }
 
     #[test]
@@ -592,7 +671,8 @@ mod scan {
         files.sort();
         assert!(files.len() > 40, "the scan lost its files: {files:?}");
         let mut used = vec![0usize; ALLOWED.len()];
-        let mut unrouted = Vec::new();
+        let mut router = [0usize; ROUTER.len()];
+        let mut found = Vec::new();
         for file in &files {
             let name = file
                 .strip_prefix(crates)
@@ -600,21 +680,10 @@ mod scan {
                 .to_string_lossy()
                 .into_owned();
             let source = std::fs::read_to_string(file).expect("a source file");
-            for (n, line) in production(&source).lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") || !spawns(code) {
-                    continue;
-                }
-                match ALLOWED
-                    .iter()
-                    .position(|(path, fragment, _, _)| *path == name && code.contains(fragment))
-                {
-                    Some(i) => used[i] += 1,
-                    None => unrouted.push(format!("{name}:{}: {code}", n + 1)),
-                }
-            }
+            found.extend(unrouted(&name, &source, &mut used, &mut router));
         }
-        let stale: Vec<String> = ALLOWED
+        let unrouted = found;
+        let mut stale: Vec<String> = ALLOWED
             .iter()
             .zip(&used)
             .filter(|((_, _, count, _), used)| *count != **used)
@@ -622,6 +691,15 @@ mod scan {
                 format!("{path} `{fragment}`: {count} allowed, {used} found")
             })
             .collect();
+        stale.extend(
+            ROUTER
+                .iter()
+                .zip(router)
+                .filter(|(_, used)| *used != 1)
+                .map(|(own, used)| {
+                    format!("hoh-app/src/host/begun.rs `{own}`: 1 allowed, {used} found")
+                }),
+        );
         assert!(
             unrouted.is_empty() && stale.is_empty(),
             "spawns not through host::begun nor allowed:\n{}\nallowlist entries that do not match:\n{}",
