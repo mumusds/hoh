@@ -1,0 +1,22 @@
+{
+  "cli_version": "0.166.0",
+  "recording_started_at": "2026-11-16T11:17:23.536540+00:00",
+  "recorded_at": "2026-11-16T11:18:39.372099+00:00",
+  "recorder": "tests/fixtures/protocol/record_faults.py",
+  "namespace": {
+    "how": "sudo -n unshare -n; ip link set lo up; setpriv back to the calling user",
+    "interfaces": [
+      "lo"
+    ],
+    "route_out": "ENETUNREACH",
+    "probed": [
+      "192.0.2.1:443",
+      "2001:db8::1:443"
+    ]
+  },
+  "provider": "FakeProvider of record_faults.py on 127.0.0.1",
+  "entry_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/bin/codex.js",
+  "entry_sha256": "e14fc83739c13c1074b12bd1acce4010c893c7f6fbfc1593b4a31d74cabb57af",
+  "native_path": "/home/ai/.nvm/versions/node/v26.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "native_sha256": "b8a11fedf24b2dfb59a70c9e52b030f9a508dcd49cd2dd0d41956f4c785156b8"
+}

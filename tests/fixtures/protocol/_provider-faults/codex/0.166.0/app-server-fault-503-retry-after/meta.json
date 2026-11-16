@@ -1,0 +1,840 @@
+{
+  "agent": "codex",
+  "cli_version": "0.166.0",
+  "case": "app-server-fault-503-retry-after",
+  "argv": [
+    "codex",
+    "app-server"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-16T11:18:33.167317+00:00",
+  "mode": "fake-provider",
+  "notes": "every request answered 503 server_is_overloaded with Retry-After: 2; initialize, thread/start, one turn/start",
+  "env_overrides": [
+    "CODEX_HOME=<fresh temp dir> holding only config.toml: model_provider \"fake\" at the fake provider",
+    "HOH_FAKE_PROVIDER_KEY=<dummy>",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>"
+  ],
+  "provider": {
+    "scenario": "codex-503",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/responses",
+          "responses": [
+            {
+              "status": 503,
+              "headers": {
+                "retry-after": "2",
+                "x-request-id": "req_fake_503"
+              },
+              "body": {
+                "error": {
+                  "type": "server_error",
+                  "code": "server_is_overloaded",
+                  "message": "The server is overloaded."
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "error": {
+            "type": "not_found",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1794827854.557319,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827856.5589225,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827858.5617607,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827860.5641184,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827862.565867,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827864.5772307,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827866.5805,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827868.5832226,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827870.5846229,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827872.5871093,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827874.599868,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827876.6018429,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827878.6042762,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827880.606444,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827882.6088467,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827884.62018,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827886.6235554,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827888.6262157,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827890.6281424,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827892.6296196,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827894.6401925,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827896.6416605,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827898.644371,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827900.6470606,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827902.6487672,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827904.6562538,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827906.6578262,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827908.6600876,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827910.6623392,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      },
+      {
+        "at": 1794827912.6655724,
+        "method": "POST",
+        "path": "/v1/responses",
+        "status": 503,
+        "headers": {
+          "content-type": "application/json",
+          "retry-after": "2",
+          "x-request-id": "req_fake_503"
+        },
+        "model": "gpt-fake-5",
+        "request_headers": [
+          "accept",
+          "content-length",
+          "content-type",
+          "host",
+          "originator",
+          "session-id",
+          "thread-id",
+          "user-agent",
+          "x-client-request-id",
+          "x-codex-beta-features",
+          "x-codex-turn-metadata",
+          "x-codex-window-id"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
