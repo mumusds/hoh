@@ -910,6 +910,23 @@ impl World {
         Ok(id.to_owned())
     }
 
+    /// Run `run` on specification `spec` with the wake of its adoption, as StartRun gives a run the project's latest
+    /// approved specification (docs/adr/ADR-031.md decision 1): written here only where the product has not (before
+    /// slice S2b it does not; once S2b is in, StartRun adopts the spec itself and this writes nothing), so the tests
+    /// using it hold before and after it.
+    pub fn adopt(&self, run: &str, spec: &str) -> R {
+        let sha = self.query(&format!(
+            "SELECT sha256 FROM specs WHERE spec_id = '{spec}'"
+        ))?;
+        self.exec(&format!(
+            "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}' AND spec_id IS NULL;
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT :p, 'adopted-{run}', '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}',
+                 'spec_revision', 1, 'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z'
+               WHERE NOT EXISTS (SELECT 1 FROM events WHERE run_id = '{run}' AND kind = 'spec.changed');"
+        ))
+    }
+
     /// The check ids of the committed plan.
     pub fn checks(&self) -> R<Vec<String>> {
         let plan: Value = serde_json::from_slice(&std::fs::read(
