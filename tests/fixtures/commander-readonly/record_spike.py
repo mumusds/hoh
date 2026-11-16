@@ -13,6 +13,7 @@ Raw recordings go to .hoh-dev/evidence/commander-readonly/spike/<run>/ (local, n
 paths, plugin lists, rate-limit metadata and account identifiers). Only redacted excerpts are committed
 (tests/fixtures/commander-readonly/excerpts/, made by excerpt.py).
 
+The `noext` set records pi's read-only profile with --no-extensions (ADR-032 v5) in a new and a resumed session.
 The `errors` set records ordinary operation errors (a missing file, a patch or edit whose old text does not match, a
 write under a regular file) in read-only and full-access sessions, as the judge's negative fixtures, and pi's read-only
 profile with --no-extensions (owner question Q-pi-ext).
@@ -21,7 +22,7 @@ Each codex case also keeps a copy of its thread's rollout file (the response's `
 under CODEX_HOME/sessions named with the thread id) as rollout.jsonl, local like the other raw files: it is the only
 record of a resumed thread's patch calls and their outputs. `--collect-rollouts <run>` copies them for an earlier run.
 
-Usage: python3 tests/fixtures/commander-readonly/record_spike.py [--agents claude,codex,pi] [--set cells|errors]
+Usage: python3 tests/fixtures/commander-readonly/record_spike.py [--agents claude,codex,pi] [--set cells|errors|noext]
        python3 tests/fixtures/commander-readonly/record_spike.py --collect-rollouts <run>
 """
 from __future__ import annotations
@@ -333,6 +334,9 @@ def codex(sp: Spike) -> None:
 
 def pi_case(sp: Spike, case: str, project: Project, tools: list[str], session_id: str, notes: str, timeout: float = 900,
             prompt: str | None = None) -> None:
+    # The product's pi adapter creates the session directory and its parents before it starts pi (crates/hoh-agents
+    # src/pi.rs, create_dir_all of the launch's session_dir); so does the recorder, before the baseline snapshot.
+    (project.p / '.hoh/sessions/s1').mkdir(parents=True, exist_ok=True)
     before = project.snapshot()
     argv = ['pi', '--mode', 'rpc', '--session-dir', str(project.p / '.hoh/sessions/s1'), '--session-id', session_id,
             *tools, '-e', str(project.observer)]
@@ -374,14 +378,24 @@ def pi_errors(sp: Spike) -> None:
             'read-only profile with --no-extensions (the explicit -e observer still loads): owner question Q-pi-ext')
 
 
+def pi_noext(sp: Spike) -> None:
+    project = Project()
+    sid = str(uuid.uuid4())
+    argv = PI_RO_TOOLS + ['--no-extensions']
+    pi_case(sp, 'noext-new', project, argv, sid, 'the read-only profile of ADR-032 v5 (--no-extensions), new session; '
+            'the session directory is created before the baseline snapshot, as the product does')
+    pi_case(sp, 'noext-resumed', project, argv, sid, 'the same, the same session id in a new process')
+
+
 AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
 ERRORS = {'claude': claude_errors, 'codex': codex_errors, 'pi': pi_errors}
+NOEXT = {'pi': pi_noext}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--agents', default='claude,codex,pi')
-    ap.add_argument('--set', choices=('cells', 'errors'), default='cells')
+    ap.add_argument('--set', choices=('cells', 'errors', 'noext'), default='cells')
     ap.add_argument('--run', help='an existing run name to add to (one agent per invocation)')
     ap.add_argument('--out', default=str(REPO / '.hoh-dev/evidence/commander-readonly/spike'))
     ap.add_argument('--collect-rollouts', metavar='RUN', help='copy the codex rollout files of an earlier run, and exit')
@@ -398,7 +412,7 @@ def main() -> int:
     try:
         for name in args.agents.split(','):
             try:
-                (AGENTS if args.set == 'cells' else ERRORS)[name](sp)
+                {'cells': AGENTS, 'errors': ERRORS, 'noext': NOEXT}[args.set][name](sp)
             except Exception as exc:  # one agent's failure does not stop the others
                 sp.summary.append({'agent': name, 'error': f'{type(exc).__name__}: {exc}'})
                 print(f'{name}: {type(exc).__name__}: {exc}', file=sys.stderr)
