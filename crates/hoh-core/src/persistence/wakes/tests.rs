@@ -5449,3 +5449,113 @@ async fn a_pause_lets_the_attempt_in_flight_end_and_holds_the_supervision_until_
     );
     Ok(())
 }
+
+/// R's command `id` of `kind` with `target`, at R's revision now.
+fn r_command(
+    path: &PathBuf,
+    id: &str,
+    kind: &str,
+    event: &str,
+    target: crate::persistence::RunTarget,
+) -> R<crate::persistence::SubmitCommand> {
+    Ok(crate::persistence::SubmitCommand {
+        command_id: id.to_owned(),
+        idempotency_key: format!("k-{id}"),
+        kind: kind.to_owned(),
+        run_id: "R".to_owned(),
+        expected_revision: run_state(path, "R")?.1,
+        payload: json!({}),
+        payload_sha256: crate::context::sha256_hex(id.as_bytes()),
+        target,
+        event: NewEvent {
+            intent: Intent::Progress,
+            project_id: "p1".to_owned(),
+            event_id: format!("e-{id}"),
+            run_id: Some("R".to_owned()),
+            kind: event.to_owned(),
+            payload: json!({"command_id": id}),
+        },
+        outbox: None,
+    })
+}
+
+#[tokio::test]
+async fn an_answer_taken_by_an_incomplete_run_is_folded_into_its_cancel() -> R {
+    // The test plan's 停住之后的写入口 (9), its AnswerQuestion variant (docs/adr/ADR-031.md decisions 4 and 7): R stopped
+    // INCOMPLETE as its Commander decided (published; the supervisor does not pick it) with the Commander's question
+    // open. An AnswerQuestion is accepted and writes need_decision{answered}, not taken in; a CancelRun and the cancel's
+    // step end the run before any supervisor step: in the CANCELLED commit a trigger holds that need_decision's seq,
+    // SUPERSEDED before the run.result, with no supervisor.woken, and the cursor is exactly the run.result's seq.
+    use crate::persistence::{Input, RunTarget};
+    use crate::protocol::RunState;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    exec(
+        &path,
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';
+         UPDATE runs SET blocked_reason = 'NEED_DECISION', blocked_reasons_json = '[\"NEED_DECISION\"]'
+           WHERE run_id = 'R';
+         INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
+           ('D1', 'R', 1, 0, '{\"kind\": \"request_user_decision\", \"question_id\": \"q\", \"question\": \"?\",
+             \"requires_user\": true}', 'PROPOSED');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'R/blocker/0',
+           'R', 'run.blocker_claimed', '{\"reason\": \"NEED_DECISION\", \"source\": \"commander:D1\",
+             \"open\": [[\"commander:D1\", \"NEED_DECISION\"]], \"n\": 0}', '2027-01-15T08:00:00Z');",
+    )?;
+    store.supervise("R", context(&clock, 0)).await?;
+    move_run(&store, &path, &[RunState::Incomplete]).await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT kind || '/' || json_extract(payload_json, '$.state') FROM events WHERE run_id = 'R' \
+             ORDER BY seq DESC LIMIT 1"
+        )?,
+        json!("run.result/INCOMPLETE")
+    );
+    store
+        .submit_command(r_command(
+            &path,
+            "c1",
+            "AnswerQuestion",
+            "question.answer_accepted",
+            RunTarget::Input(Input::Answer {
+                question_id: "D1".to_owned(),
+                answer: "好".to_owned(),
+                choice_id: None,
+            }),
+        )?)
+        .await?;
+    assert_eq!(run_state(&path, "R")?.0, "INCOMPLETE");
+    let seq = value(
+        &path,
+        "SELECT seq FROM events WHERE kind = 'need_decision' AND json_extract(payload_json, '$.reason') = 'answered'",
+    )?
+    .as_i64()
+    .ok_or("the answer's need_decision")?;
+    store
+        .submit_command(r_command(
+            &path,
+            "c2",
+            "CancelRun",
+            "run.cancel_requested",
+            RunTarget::To(RunState::CancelRequested),
+        )?)
+        .await?;
+    let finished = store
+        .finish_cancel("R", json!({}), Default::default(), t(1000))
+        .await?;
+    assert_eq!(finished, crate::persistence::Finished::Cancelled);
+    let (result, triggers, cursor) = ended_with(&path, seq)?;
+    assert_eq!(triggers, json!([["SUPERSEDED", 1]]));
+    assert_eq!(cursor, json!(result));
+    assert_eq!(
+        value(
+            &path,
+            &format!("SELECT count(*) FROM events WHERE kind = 'supervisor.woken' AND seq > {seq}")
+        )?,
+        json!(0)
+    );
+    Ok(())
+}

@@ -1614,3 +1614,53 @@ async fn a_resume_of_a_commander_decided_incomplete_run_is_stalled_at_that_ticks
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn_with_it() -> R {
+    // Decisions 6 and 7 through the Commander's real output path (outputs.rs `person`): its request_user_decision in
+    // SPECIFYING writes question.asked with its words (`question` equal to the original, quotes and backslash kept),
+    // claims NEED_DECISION and blocks the run, whose run.result is BLOCKED exit 3; the open question is the request's
+    // decision. The answer applies it (APPLIED), releases the claim, unblocks the run to SPECIFYING and writes
+    // need_decision{answered}; the next turn is shown the answer; the detector writes nothing meanwhile.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "SPECIFYING", TWO_WAKES)?;
+    let words = "登录要支持哪些方式？\"OAuth\" 还是 密码\\短信";
+    let ask = Answer::Decide(vec![
+        json!({"kind": "request_user_decision", "question_id": "q1",
+        "question": words, "choices": [{"choice_id": "oauth", "label": "OAuth"},
+        {"choice_id": "pw", "label": "密码"}], "requires_user": true}),
+    ]);
+    let (_, ms) = drive(&store, &clock, &path, 0, 10, &ask, |p| {
+        Ok(state(p)? == json!("BLOCKED/NEED_DECISION"))
+    })
+    .await?;
+    let asked = value(
+        &path,
+        "SELECT payload_json FROM events WHERE kind = 'question.asked'",
+    )?;
+    assert_eq!(asked["question"], words);
+    assert_eq!(asked["commander_question_id"], "q1");
+    assert_eq!(result(&path)?, json!(["BLOCKED", 3]));
+    let open = crate::persistence::questions::open(&Connection::open(&path)?, "R")?;
+    assert_eq!(open.len(), 1);
+    let decision = open[0].question_id.clone();
+    assert_eq!(asked["question_id"], json!(decision));
+    assert_eq!(open[0].text, words);
+    assert_eq!(decisions(&path)?, json!(["PROPOSED"]));
+    store
+        .submit_command(answer_of(&path, "c1", &decision, "OAuth")?)
+        .await?;
+    assert_eq!(state(&path)?, json!("SPECIFYING"));
+    assert_eq!(decisions(&path)?, json!(["APPLIED"]));
+    let (turn, _) = next_turn(&store, &clock, ms).await?;
+    let shown = shown(&store, &turn.attempt_id).await?;
+    assert!(
+        shown.iter().any(|e| e["payload"]["reason"] == "answered"
+            && e["payload"]["choice_id"] == "oauth"
+            && e["payload"]["decision_id"] == json!(decision)),
+        "{shown:?}"
+    );
+    Ok(())
+}
