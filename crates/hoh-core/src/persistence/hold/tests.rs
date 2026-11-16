@@ -1053,10 +1053,49 @@ fn last_failure_by_history(
     Ok(rows.next().transpose()?)
 }
 
+/// `closing::held_by_recovery` as it was written before (the project's history read by kind for each round): the
+/// reference.
+fn held_by_recovery_by_history(
+    conn: &Connection,
+    run: &str,
+) -> R<std::collections::BTreeSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT t.value FROM events o, json_each(o.payload_json, '$.tasks') t \
+         WHERE o.kind = ?1 AND o.run_id = ?2 AND EXISTS(SELECT 1 FROM events f \
+           WHERE f.kind = 'candidate.reconcile_failed' \
+           AND json_extract(f.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id') \
+           AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+             AND json_extract(r.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id')), 0))",
+    )?;
+    let rows = statement.query_map(params!["verification.round_opened", run], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Rounds of C1 and C3 that name their verifier tasks (CANDIDATES' rounds name none).
+const ROUNDS_WITH_TASKS: &str = "
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+  ('p1', 'C1/round-b', 'R', 'verification.round_opened',
+   '{\"round_id\": \"rd1b\", \"candidate_id\": \"C1\", \"tasks\": {\"qa\": \"Q-C1\", \"reviewer\": \"V-C1\"}}', 'x'),
+  ('p1', 'C3/round-b', 'R', 'verification.round_opened',
+   '{\"round_id\": \"rd3b\", \"candidate_id\": \"C3\", \"tasks\": {\"qa\": \"Q-C3\", \"reviewer\": \"V-C3\"}}', 'x');
+";
+
 /// After `step`: the indexed reads of the recovery give what the rules they replace give — the unrecovered set for
-/// every run and each run's own candidates' part of it, and each candidate's live obligation and last failure.
+/// every run and each run's own candidates' part of it, each candidate's live obligation and last failure, and each
+/// run's verifier tasks held by a recovery.
 fn same_recovery_reads(path: &Path, step: &str) -> R<std::collections::BTreeSet<String>> {
     let conn = Connection::open(path)?;
+    let runs: Vec<String> = conn
+        .prepare("SELECT run_id FROM runs")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for run in &runs {
+        assert_eq!(
+            super::super::closing::held_by_recovery(&conn, run)?,
+            held_by_recovery_by_history(&conn, run)?,
+            "{step}: verifiers of {run} held by a recovery"
+        );
+    }
     let candidates: Vec<String> = conn
         .prepare("SELECT candidate_id FROM candidates")?
         .query_map([], |r| r.get(0))?
@@ -1119,7 +1158,7 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     world(&path, "RUNNING")?;
-    Connection::open(&path)?.execute_batch(CANDIDATES)?;
+    Connection::open(&path)?.execute_batch(&format!("{CANDIDATES}{ROUNDS_WITH_TASKS}"))?;
     same_recovery_reads(&path, "none")?;
     let transient = || Err((false, "x".to_owned()));
     let steps: Vec<(&str, crate::persistence::RecoveryOutcome, u64)> = vec![
@@ -1147,7 +1186,7 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
         let (store, path) = open(&dir)?;
         let (from, through) = path_to(state);
         world(&path, from)?;
-        Connection::open(&path)?.execute_batch(CANDIDATES)?;
+        Connection::open(&path)?.execute_batch(&format!("{CANDIDATES}{ROUNDS_WITH_TASKS}"))?;
         for (n, to) in through.into_iter().enumerate() {
             enter(&store, &path, to, &format!("move-{n}")).await?;
         }
@@ -1169,7 +1208,7 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
     let (_store, path) = open(&dir)?;
     world(&path, "RUNNING")?;
     Connection::open(&path)?.execute_batch(&format!(
-        "{CANDIDATES}
+        "{CANDIDATES}{ROUNDS_WITH_TASKS}
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
            ('p1', 'C1/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', 'x'),
            ('p1', 'C1/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C1\", \"reason\": \"evidence_unrecoverable\"}}', 'x'),
@@ -1185,7 +1224,7 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
     let (_store, path) = open(&dir)?;
     world(&path, "RUNNING")?;
     Connection::open(&path)?.execute_batch(&format!(
-        "{CANDIDATES}
+        "{CANDIDATES}{ROUNDS_WITH_TASKS}
          INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES
            ('Q', 'p1', 'RUNNING', 'AUTO', 1, '2026-11-15T00:00:00Z');
          WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
@@ -1207,6 +1246,7 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
                  ELSE 'C' || ((i * 13) % 3 + 1) END,
                'run_id', CASE WHEN i % 2 = 0 THEN 'Q' ELSE 'R' END,
                'round_id', CASE WHEN i % 23 = 4 THEN 'rd' || ((i * 7) % 105) ELSE 'rd' || (i % 211) END,
+               'tasks', json_object('qa', 'q' || i, 'reviewer', 'v' || i),
                'superseded', json_array(CASE WHEN i % 2 = 0 THEN 'Q' || ((i * 17) % 10 + 11) ELSE 'C2' END),
                'reason', CASE WHEN i % 2 = 0 AND (i * 5) % 211 = 2 THEN 'evidence_unrecoverable' ELSE 'superseded' END),
              'x' FROM n;"
@@ -1242,6 +1282,21 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
         "{live:?} {failing} of {}",
         all.len()
     );
+    // And verifiers held by a recovery in both runs, not all of them.
+    for run in ["R", "Q"] {
+        let held = super::super::closing::held_by_recovery(&conn, run)?;
+        let named: i64 = conn.query_row(
+            "SELECT count(DISTINCT t.value) FROM events o, json_each(o.payload_json, '$.tasks') t \
+             WHERE o.kind = 'verification.round_opened' AND o.run_id = ?1",
+            params![run],
+            |r| r.get(0),
+        )?;
+        assert!(
+            !held.is_empty() && i64::try_from(held.len())? < named,
+            "{run}: {} of {named}",
+            held.len()
+        );
+    }
     Ok(())
 }
 
@@ -1349,5 +1404,44 @@ fn a_candidates_live_obligation_and_last_failure_are_read_without_the_history() 
         };
         assert!(of(100_000) <= of(1_000) + 50, "{name}: {steps:?}");
     }
+    Ok(())
+}
+
+#[test]
+fn a_runs_verifiers_held_by_a_recovery_are_read_without_the_history() -> R {
+    // M2T13R-03: `closing::held_by_recovery`, which each scheduling round of a working run reads, does the same work
+    // (SQLite's VM steps) with 1 000 and 100 000 other events in the history; the read it replaces grows with them.
+    let mut steps = Vec::new();
+    for history in [1_000, 100_000] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        drop(store);
+        world(&path, "RUNNING")?;
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(&format!(
+            "{CANDIDATES}{ROUNDS_WITH_TASKS}
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'f' || i, 'R', CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered'
+                 ELSE 'candidate.reconcile_failed' END, json_object('candidate_id', 'C' || (i % 3 + 1)), 'x' FROM n;"
+        ))?;
+        let mut statement = conn.prepare(&super::super::closing::held_by_recovery_sql())?;
+        let held: std::collections::BTreeSet<String> = statement
+            .query_map(params!["R"], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            held,
+            ["Q-C3", "V-C3"].map(str::to_owned).into_iter().collect(),
+            "{history}"
+        );
+        steps.push((
+            history,
+            statement.get_status(rusqlite::StatementStatus::VmStep),
+        ));
+    }
+    assert!(steps[1].1 <= steps[0].1 + 50, "{steps:?}");
     Ok(())
 }

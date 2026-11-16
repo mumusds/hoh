@@ -1807,20 +1807,23 @@ pub(super) fn held_by_recovery(
     tx: &rusqlite::Connection,
     run_id: &str,
 ) -> Result<BTreeSet<String>, PersistError> {
-    let mut statement = tx
-        .prepare(
-            "SELECT t.value FROM events o, json_each(o.payload_json, '$.tasks') t \
-             WHERE o.kind = ?1 AND o.run_id = ?2 AND EXISTS(SELECT 1 FROM events f \
-               WHERE f.kind = 'candidate.reconcile_failed' \
-               AND json_extract(f.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id') \
-               AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
-                 AND json_extract(r.payload_json, '$.candidate_id') = json_extract(o.payload_json, '$.candidate_id')), 0))",
-        )
-        .map_err(sqlite_error)?;
+    let mut statement = tx.prepare(&held_by_recovery_sql()).map_err(sqlite_error)?;
     let rows = statement
-        .query_map(params![ROUND_OPENED, run_id], |r| r.get(0))
+        .query_map(params![run_id], |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// [`held_by_recovery`]'s statement, run `?1` (M2T13R-03): its rounds through the `(run_id, kind, seq)` index, their
+/// candidates held by the run's own recovery facts ([`super::failing_sql`] of the run) — not by a scan of the
+/// project's history per round.
+pub(super) fn held_by_recovery_sql() -> String {
+    format!(
+        "{} SELECT t.value FROM main.events o, json_each(o.payload_json, '$.tasks') t \
+         WHERE o.kind = '{ROUND_OPENED}' AND o.run_id = ?1 \
+           AND json_extract(o.payload_json, '$.candidate_id') IN (SELECT candidate FROM failing)",
+        super::failing_sql(true)
+    )
 }
 
 /// Record one recovery of candidate `candidate`'s pending check records at `now` (decision 11): a failure is
