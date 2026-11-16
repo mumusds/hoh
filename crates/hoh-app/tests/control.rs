@@ -85,7 +85,8 @@ fn python(db: &Path, script: &str, stdin: &str) -> R<String> {
         .take()
         .ok_or("no stdin")?
         .write_all(stdin.as_bytes())?;
-    let out = child.wait_with_output()?;
+    // A bound of its own (CIR-502): a query that hangs fails here, not at the suite's bound.
+    let out = common::output_within(child, Duration::from_secs(60))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
     }
