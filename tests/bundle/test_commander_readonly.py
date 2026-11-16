@@ -92,6 +92,31 @@ class Judge(unittest.TestCase):
                 self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
             m=copy.deepcopy(c);judge_check._insert_shell_success(m,'worktree','create',after=False)
             self.assertEqual(judge_check.round_verdict(m,control)[0],'FAIL')
+    def test_the_round_7_probes(self):
+        # Design correction 6: the round's own records only, each driver call complete, the adapters' settle rules.
+        none=Path('/nonexistent')
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=judge_check.load(FIXTURES/'excerpts',none,'codex',name)[0];control=judge_check.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
+            m=copy.deepcopy(c)
+            for f in judge_check._driver_frames(m,started=True):judge_check._foreign_frame(f)
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')  # the only refusals belong to another turn
+            m=copy.deepcopy(c);m.rollout.insert(0,{'type':'response_item','payload':{'type':'custom_tool_call_output','call_id':'old',
+                'internal_chat_message_metadata_passthrough':{'turn_id':'old-turn'},'output':[{'type':'input_text',
+                'text':json.dumps({'output':f"HOH-CELL worktree create {c.paths['P']}/hoh-shell-create exit=0 err=\n"})}]}})
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')  # a success of an earlier turn is not counted
+            for kind in ('killed','empty output','last cell missing'):
+                m=copy.deepcopy(c);judge_check._incomplete_driver(m,kind,alone=False)
+                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',kind)
+        for agent,name in (('claude','ro-new'),('codex','app-ro-new'),('pi','noext-new')):
+            c=judge_check.load(FIXTURES/'excerpts',none,agent,name)[0];control=judge_check.load(FIXTURES/'excerpts',none,agent,judge_check.CONTROL[agent])[0]
+            for how in ('dropped','failed','interrupted'):
+                mc=copy.deepcopy(control);judge_check._set_terminal(mc,how)
+                self.assertEqual(judge_check.round_verdict(c,mc)[0],'INSUFFICIENT',(agent,how))
+        c=judge_check.load(FIXTURES/'excerpts',none,'pi','noext-new')[0];control=judge_check.load(FIXTURES/'excerpts',none,'pi','control')[0]
+        m=copy.deepcopy(c);judge_check._set_terminal(m,'provider error')
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')  # pi.rs: a provider error not cleared fails
+        m=copy.deepcopy(c);judge_check._retried_error(m)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')  # cleared by the later successful message
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)

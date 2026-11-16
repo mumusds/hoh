@@ -24,7 +24,9 @@
      "worktree create": "success",
      "worktree delete": "success",
      "worktree modify": "success"
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s)"
    },
    "raw": {
     "E0": "settled",
@@ -49,7 +51,9 @@
      "worktree create": "success",
      "worktree delete": "success",
      "worktree modify": "success"
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s)"
    }
   },
   "claude/control-ordinary-error": {
@@ -64,7 +68,8 @@
      "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
      "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
      "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -77,7 +82,8 @@
      "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
      "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
      "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
-    }
+    },
+    "S": "ok"
    }
   },
   "claude/ro-new": {
@@ -88,7 +94,8 @@
     "E11": "conform",
     "E2": {
      "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -97,7 +104,8 @@
     "E11": "conform",
     "E2": {
      "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "claude/ro-ordinary-error": {
@@ -109,7 +117,8 @@
     "E2": {
      "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
      "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -119,7 +128,8 @@
     "E2": {
      "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
      "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
-    }
+    },
+    "S": "ok"
    }
   },
   "claude/ro-plus-write": {
@@ -131,7 +141,8 @@
     "E2": {
      "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
      "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -141,7 +152,8 @@
     "E2": {
      "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
      "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
-    }
+    },
+    "S": "ok"
    }
   },
   "claude/ro-resumed": {
@@ -152,7 +164,8 @@
     "E11": "conform",
     "E2": {
      "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -161,7 +174,8 @@
     "E11": "conform",
     "E2": {
      "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "codex/app-control": {
@@ -170,7 +184,6 @@
     "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "success",
      "git delete": "success",
@@ -201,14 +214,15 @@
     },
     "E6 calls": {
      "success": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    },
    "raw": {
     "E0": "settled",
     "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "success",
      "git delete": "success",
@@ -239,7 +253,9 @@
     },
     "E6 calls": {
      "success": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    }
   },
   "codex/app-control-ordinary-error": {
@@ -248,7 +264,6 @@
     "E10": "conform",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -280,14 +295,15 @@
     "E6 calls": {
      "insufficient (apply_patch verification failed)": 3,
      "insufficient (write failed)": 1
-    }
+    },
+    "S": "ok",
+    "calls": "patch call call_94044e44673b4ebbb585326664da3bf3 has an output of unknown outcome; patch call call_f6e7fd241fb54f7899415b1efbe9fe19 has an output of unknown outcome; patch call call_12b07f52f6a144a4b99d8511d5a527d7 has an output of unknown outcome; patch call call_6b981e9e352c491fb24c00f221ae58f9 has an output of unknown outcome"
    },
    "raw": {
     "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -319,7 +335,9 @@
     "E6 calls": {
      "insufficient (apply_patch verification failed)": 3,
      "insufficient (write failed)": 1
-    }
+    },
+    "S": "ok",
+    "calls": "patch call call_94044e44673b4ebbb585326664da3bf3 has an output of unknown outcome; patch call call_f6e7fd241fb54f7899415b1efbe9fe19 has an output of unknown outcome; patch call call_12b07f52f6a144a4b99d8511d5a527d7 has an output of unknown outcome; patch call call_6b981e9e352c491fb24c00f221ae58f9 has an output of unknown outcome"
    }
   },
   "codex/app-ro-new": {
@@ -328,7 +346,6 @@
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -359,14 +376,15 @@
     },
     "E6 calls": {
      "refused": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    },
    "raw": {
     "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -397,7 +415,9 @@
     },
     "E6 calls": {
      "refused": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    }
   },
   "codex/app-ro-ordinary-error": {
@@ -406,7 +426,6 @@
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -438,14 +457,15 @@
     "E6 calls": {
      "insufficient (apply_patch verification failed)": 3,
      "refused": 1
-    }
+    },
+    "S": "ok",
+    "calls": "patch call call_7eed289bc9ec459f9b7e336b6b7c0886 has an output of unknown outcome; patch call call_d807c3f8f1874cddb23cfbf356b7eade has an output of unknown outcome; patch call call_19ef656be186476a8f1842a2ce778d42 has an output of unknown outcome"
    },
    "raw": {
     "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -477,7 +497,9 @@
     "E6 calls": {
      "insufficient (apply_patch verification failed)": 3,
      "refused": 1
-    }
+    },
+    "S": "ok",
+    "calls": "patch call call_7eed289bc9ec459f9b7e336b6b7c0886 has an output of unknown outcome; patch call call_d807c3f8f1874cddb23cfbf356b7eade has an output of unknown outcome; patch call call_19ef656be186476a8f1842a2ce778d42 has an output of unknown outcome"
    }
   },
   "codex/app-ro-resumed": {
@@ -486,7 +508,6 @@
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -517,14 +538,15 @@
     },
     "E6 calls": {
      "refused": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    },
    "raw": {
     "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -555,7 +577,9 @@
     },
     "E6 calls": {
      "refused": 13
-    }
+    },
+    "S": "ok",
+    "calls": "1 complete driver run(s), every patch call with a known outcome"
    }
   },
   "codex/exec-ro-new": {
@@ -582,14 +606,16 @@
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
-    "E9": {}
+    "E9": {},
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
-    "E9": {}
+    "E9": {},
+    "S": "ok"
    }
   },
   "pi/noext-new": {
@@ -600,7 +626,8 @@
     "E8": "conform",
     "E9": {
      "read call_de8faf342d43456f9d53982b": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -609,7 +636,8 @@
     "E8": "conform",
     "E9": {
      "read call_de8faf342d43456f9d53982b": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/noext-resumed": {
@@ -620,7 +648,8 @@
     "E8": "conform",
     "E9": {
      "read call_b5ecadd613ca464581e2e364": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -629,7 +658,8 @@
     "E8": "conform",
     "E9": {
      "read call_b5ecadd613ca464581e2e364": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/ordinary-error": {
@@ -643,7 +673,8 @@
      "read call_9c07f6473325488ba0452cd3": "insufficient",
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -655,7 +686,8 @@
      "read call_9c07f6473325488ba0452cd3": "insufficient",
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/ro-new": {
@@ -666,7 +698,8 @@
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -675,7 +708,8 @@
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/ro-no-extensions": {
@@ -687,7 +721,8 @@
     "E9": {
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -697,7 +732,8 @@
     "E9": {
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/ro-plus-write": {
@@ -709,7 +745,8 @@
     "E9": {
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -719,7 +756,8 @@
     "E9": {
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
-    }
+    },
+    "S": "ok"
    }
   },
   "pi/ro-resumed": {
@@ -730,7 +768,8 @@
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
-    }
+    },
+    "S": "ok"
    },
    "raw": {
     "E0": "settled",
@@ -739,7 +778,8 @@
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
-    }
+    },
+    "S": "ok"
    }
   }
  },
@@ -764,13 +804,54 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the control does not show full access"
+      "control: session id: none",
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "the result frame",
+     "kind": "control terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "exit 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -780,8 +861,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "failed (is_error true)",
+     "kind": "terminal",
+     "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -790,8 +871,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "interrupted (error_during_execution)",
+     "kind": "terminal",
+     "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -800,8 +881,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "exit code 1",
+     "kind": "terminal",
+     "label": "exit 1",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -815,7 +896,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "availability insufficient"
+      "session id: none",
+      "the turn is not settled"
      ]
     },
     {
@@ -857,6 +939,54 @@
      "why": [
       "the turn is not settled",
       "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the result frame (terminal and decision block) of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful Write of another session",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a failed result of another session",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second init of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "session id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a frame without session_id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a assistant frame without session_id"
      ]
     },
     {
@@ -915,8 +1045,17 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "FAIL",
     "FAIL",
@@ -944,13 +1083,54 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the control does not show full access"
+      "control: session id: none",
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "the result frame",
+     "kind": "control terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "exit 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -960,8 +1140,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "failed (is_error true)",
+     "kind": "terminal",
+     "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -970,8 +1150,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "interrupted (error_during_execution)",
+     "kind": "terminal",
+     "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -980,8 +1160,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "exit code 1",
+     "kind": "terminal",
+     "label": "exit 1",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -995,7 +1175,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "availability insufficient"
+      "session id: none",
+      "the turn is not settled"
      ]
     },
     {
@@ -1037,6 +1218,54 @@
      "why": [
       "the turn is not settled",
       "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the result frame (terminal and decision block) of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful Write of another session",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a failed result of another session",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second init of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "session id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a frame without session_id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a assistant frame without session_id"
      ]
     },
     {
@@ -1095,8 +1324,17 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "FAIL",
     "FAIL",
@@ -1124,7 +1362,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the control does not show full access"
+      "control: thread id: none",
+      "the control turn is not settled"
      ]
     },
     {
@@ -1140,21 +1379,11 @@
     {
      "expect": "non-PASS",
      "kind": "drop control",
-     "label": "the control terminal (turn/completed)",
-     "ok": true,
-     "verdict": "INSUFFICIENT",
-     "why": [
-      "the control does not show full access",
-      "control patch create"
-     ]
-    },
-    {
-     "expect": "non-PASS",
-     "kind": "drop control",
      "label": "the control shell create",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell create"
      ]
     },
@@ -1225,6 +1454,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell modify"
      ]
     },
@@ -1295,6 +1525,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell delete"
      ]
     },
@@ -1360,18 +1591,47 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "turn/completed",
+     "kind": "control terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the turn is not settled",
-      "availability insufficient"
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
      "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -1381,7 +1641,7 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
+     "kind": "terminal",
      "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -1396,7 +1656,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "availability insufficient"
+      "thread id: none",
+      "the turn is not settled"
      ]
     },
     {
@@ -1451,11 +1712,257 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the driver runs in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the driver runs in another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the patch calls and outputs in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: patch worktree create, patch worktree modify, patch worktree delete, patch git create, patch git modify, patch git delete, patch hoh create, patch hoh modify, patch hoh delete, patch w create, patch w modify, patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the decision block in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the terminal event in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the turn_context in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful driver run of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful driver run of another thread",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful patch of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a completed fileChange of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a failed terminal event of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a decision block of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "turn id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second thread id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "thread id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a driver notification without a turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "item/completed without a thread or turn id"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a rollout line without a turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a rollout response_item line without a turn id"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "killed, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-61> incomplete (status failed, exit 137, 0 cell lines)",
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "killed, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-killed incomplete (status failed, exit 137, 0 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "empty output, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 0 cell lines)",
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "empty output, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-empty output incomplete (status completed, exit 0, 0 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "last cell missing, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "last cell missing, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-last cell missing incomplete (status completed, exit 0, 11 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "a second run started and never completed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-never-completed started and never completed"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete patch call",
+     "label": "a second call for a cell without an output",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "patch call mutant-second-call has no output",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete patch call",
+     "label": "a second call for a cell with an unknown output",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "patch call mutant-second-call has an output of unknown outcome",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop attempt",
      "label": "shell worktree create",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree create"
      ]
     },
@@ -1486,6 +1993,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_338872dcd9114ebda454e1d003c57b59 has no output",
       "1 cells not refused: patch worktree create"
      ]
     },
@@ -1536,6 +2044,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree modify"
      ]
     },
@@ -1566,6 +2075,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_173963f45ae84d04a15c9d197d067f00 has no output",
       "1 cells not refused: patch worktree modify"
      ]
     },
@@ -1616,6 +2126,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree delete"
      ]
     },
@@ -1646,6 +2157,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_c25ea517f889461ca93e208753a5dfc8 has no output",
       "1 cells not refused: patch worktree delete"
      ]
     },
@@ -1696,6 +2208,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git create"
      ]
     },
@@ -1726,6 +2239,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_845e48d6a5924cf8a744d4f1e82e039a has no output",
       "1 cells not refused: patch git create"
      ]
     },
@@ -1776,6 +2290,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git modify"
      ]
     },
@@ -1806,6 +2321,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_03e8bed146664f8699b542401e7012bc has no output",
       "1 cells not refused: patch git modify"
      ]
     },
@@ -1856,6 +2372,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git delete"
      ]
     },
@@ -1886,6 +2403,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_62e7e01e9973469fa43c887041631f72 has no output",
       "1 cells not refused: patch git delete"
      ]
     },
@@ -1936,6 +2454,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh create"
      ]
     },
@@ -1966,6 +2485,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_7d2bc02567b440bf92a071cebaabe97b has no output",
       "1 cells not refused: patch hoh create"
      ]
     },
@@ -2016,6 +2536,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh modify"
      ]
     },
@@ -2046,6 +2567,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_d04b3b77c15840b294eccdad05e1c013 has no output",
       "1 cells not refused: patch hoh modify"
      ]
     },
@@ -2096,6 +2618,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh delete"
      ]
     },
@@ -2126,6 +2649,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_2142070e8aa346c6b3fddca3f842bf15 has no output",
       "1 cells not refused: patch hoh delete"
      ]
     },
@@ -2176,6 +2700,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w create"
      ]
     },
@@ -2206,6 +2731,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_d8254f7600854dce8c768456c690fc52 has no output",
       "1 cells not refused: patch w create"
      ]
     },
@@ -2256,6 +2782,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w modify"
      ]
     },
@@ -2286,6 +2813,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_1e2f625dc22d4448a83bf603f752fd40 has no output",
       "1 cells not refused: patch w modify"
      ]
     },
@@ -2336,6 +2864,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-61> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w delete"
      ]
     },
@@ -2366,6 +2895,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_06bbb12d518846a1b6a8fda58f727843 has no output",
       "1 cells not refused: patch w delete"
      ]
     },
@@ -2478,8 +3008,35 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -2602,7 +3159,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the control does not show full access"
+      "control: thread id: none",
+      "the control turn is not settled"
      ]
     },
     {
@@ -2618,21 +3176,11 @@
     {
      "expect": "non-PASS",
      "kind": "drop control",
-     "label": "the control terminal (turn/completed)",
-     "ok": true,
-     "verdict": "INSUFFICIENT",
-     "why": [
-      "the control does not show full access",
-      "control patch create"
-     ]
-    },
-    {
-     "expect": "non-PASS",
-     "kind": "drop control",
      "label": "the control shell create",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell create"
      ]
     },
@@ -2703,6 +3251,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell modify"
      ]
     },
@@ -2773,6 +3322,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "control: driver run exec-<uuid-29> incomplete (status completed, exit 0, 11 cell lines)",
       "control shell delete"
      ]
     },
@@ -2838,18 +3388,47 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "turn/completed",
+     "kind": "control terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the turn is not settled",
-      "availability insufficient"
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
      "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -2859,7 +3438,7 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
+     "kind": "terminal",
      "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -2874,7 +3453,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "availability insufficient"
+      "thread id: none",
+      "the turn is not settled"
      ]
     },
     {
@@ -2929,11 +3509,257 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the driver runs in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the driver runs in another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the patch calls and outputs in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "12 cells not refused: patch worktree create, patch worktree modify, patch worktree delete, patch git create, patch git modify, patch git delete, patch hoh create, patch hoh modify, patch hoh delete, patch w create, patch w modify, patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the decision block in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the terminal event in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "foreign record only",
+     "label": "the turn_context in another turn",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful driver run of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful driver run of another thread",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a successful patch of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a completed fileChange of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a failed terminal event of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "foreign record added",
+     "label": "a decision block of another turn",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "turn id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second thread id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "thread id: ambiguous",
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a driver notification without a turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "item/completed without a thread or turn id"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a rollout line without a turn id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a rollout response_item line without a turn id"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "killed, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-95> incomplete (status failed, exit 137, 0 cell lines)",
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "killed, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-killed incomplete (status failed, exit 137, 0 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "empty output, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 0 cell lines)",
+      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "empty output, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-empty output incomplete (status completed, exit 0, 0 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "last cell missing, alone",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "last cell missing, next to a complete run",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-incomplete-last cell missing incomplete (status completed, exit 0, 11 cell lines)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete driver run",
+     "label": "a second run started and never completed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "driver run mutant-never-completed started and never completed"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete patch call",
+     "label": "a second call for a cell without an output",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "patch call mutant-second-call has no output",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "incomplete patch call",
+     "label": "a second call for a cell with an unknown output",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "patch call mutant-second-call has an output of unknown outcome",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop attempt",
      "label": "shell worktree create",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree create"
      ]
     },
@@ -2964,6 +3790,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_67adaffde47f495496e40aa2b6cff38e has no output",
       "1 cells not refused: patch worktree create"
      ]
     },
@@ -3014,6 +3841,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree modify"
      ]
     },
@@ -3044,6 +3872,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_d8026112e4084c1386796d613953fe79 has no output",
       "1 cells not refused: patch worktree modify"
      ]
     },
@@ -3094,6 +3923,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell worktree delete"
      ]
     },
@@ -3124,6 +3954,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_879661848b5645009abf80e1c26a8190 has no output",
       "1 cells not refused: patch worktree delete"
      ]
     },
@@ -3174,6 +4005,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git create"
      ]
     },
@@ -3204,6 +4036,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_3c4bce6e5c43439689f58410e7913b1d has no output",
       "1 cells not refused: patch git create"
      ]
     },
@@ -3254,6 +4087,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git modify"
      ]
     },
@@ -3284,6 +4118,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_0616d0c3796b4c58851e2f31082d5e0a has no output",
       "1 cells not refused: patch git modify"
      ]
     },
@@ -3334,6 +4169,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell git delete"
      ]
     },
@@ -3364,6 +4200,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_246219d93ed64d83aefd8283ea4af5d1 has no output",
       "1 cells not refused: patch git delete"
      ]
     },
@@ -3414,6 +4251,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh create"
      ]
     },
@@ -3444,6 +4282,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_1eef758eb24c4e93a6f9cdacc20a6abd has no output",
       "1 cells not refused: patch hoh create"
      ]
     },
@@ -3494,6 +4333,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh modify"
      ]
     },
@@ -3524,6 +4364,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_c7ce179ecdf34af4a1d455a601920f06 has no output",
       "1 cells not refused: patch hoh modify"
      ]
     },
@@ -3574,6 +4415,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell hoh delete"
      ]
     },
@@ -3604,6 +4446,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_8e32f285fc9d4285aff500c8c201258b has no output",
       "1 cells not refused: patch hoh delete"
      ]
     },
@@ -3654,6 +4497,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w create"
      ]
     },
@@ -3684,6 +4528,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_0a67cf5874864ecb80fb9b4f3c6525f0 has no output",
       "1 cells not refused: patch w create"
      ]
     },
@@ -3734,6 +4579,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w modify"
      ]
     },
@@ -3764,6 +4610,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_788b14000166428cb51ef16f633d9d95 has no output",
       "1 cells not refused: patch w modify"
      ]
     },
@@ -3814,6 +4661,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "driver run exec-<uuid-95> incomplete (status completed, exit 0, 11 cell lines)",
       "1 cells not refused: shell w delete"
      ]
     },
@@ -3844,6 +4692,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "patch call call_d06576771f5a49aca9f67e52cc552f4c has no output",
       "1 cells not refused: patch w delete"
      ]
     },
@@ -3956,8 +4805,35 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -4085,8 +4961,48 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "agent_settled",
+     "kind": "control terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "provider error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -4095,8 +5011,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "failed (prompt success false)",
+     "kind": "terminal",
+     "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -4105,13 +5021,31 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "interrupted (aborted true)",
+     "kind": "terminal",
+     "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
       "the turn is not settled"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "provider error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "terminal",
+     "label": "a provider error retried by the final message",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -4162,6 +5096,34 @@
      "why": [
       "decision block insufficient"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second get_state of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "pi session id: ambiguous"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second prompt response with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "prompt: ambiguous"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "outside scope added",
+     "label": "a successful write after agent_settled",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -4218,9 +5180,18 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "FAIL",
     "FAIL",
     "FAIL",
@@ -4252,8 +5223,48 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "drop terminal",
-     "label": "agent_settled",
+     "kind": "control terminal",
+     "label": "dropped",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control terminal",
+     "label": "provider error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "dropped",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -4262,8 +5273,8 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "failed (prompt success false)",
+     "kind": "terminal",
+     "label": "failed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -4272,13 +5283,31 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "terminal status",
-     "label": "interrupted (aborted true)",
+     "kind": "terminal",
+     "label": "interrupted",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
       "the turn is not settled"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal",
+     "label": "provider error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "terminal",
+     "label": "a provider error retried by the final message",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -4329,6 +5358,34 @@
      "why": [
       "decision block insufficient"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second get_state of another session",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "pi session id: ambiguous"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "ambiguous scope",
+     "label": "a second prompt response with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "prompt: ambiguous"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "outside scope added",
+     "label": "a successful write after agent_settled",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -4385,9 +5442,18 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "FAIL",
     "FAIL",
     "FAIL",
