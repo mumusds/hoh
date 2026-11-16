@@ -194,6 +194,7 @@ impl hoh_app::host::Executor for FakeCommander {
                     ..Default::default()
                 },
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         Ok(hoh_app::host::Started {
@@ -399,6 +400,7 @@ impl hoh_app::host::Executor for SilentCommander {
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: hoh_core::persistence::Observed::default(),
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         Ok(hoh_app::host::Started {
