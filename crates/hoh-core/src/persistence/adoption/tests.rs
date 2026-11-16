@@ -1,10 +1,9 @@
 //! docs/adr/ADR-031.md decision 1 (owner question Q1 (a)) against a real store: StartRun adopts the project's latest
 //! approved specification and its `spec.changed{cause: "adopted"}` wakes the Commander; with none the run is BLOCKED
-//! by the question `runtime:no_spec` in the same commit, its 202 revision 1; the question's `adopt` exit adopts the
-//! specification approved since, or writes nothing while there is none.
+//! by the question `runtime:no_spec` in the same commit, its 202 revision 1; the question's answer `adopt` (W13's real
+//! path through AnswerQuestion) adopts the specification approved since, or leaves the run BLOCKED while there is none.
 
 use crate::config::Config;
-use crate::persistence::writer::{self, Ctx};
 use crate::persistence::{
     CommandOutcome, Intent, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
 };
@@ -237,50 +236,147 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
     Ok(())
 }
 
-/// Run the `adopt` exit of run `run` in a writer transaction of its own (as an answer's transaction would).
-fn adopt_exit(path: &Path, run: &str) -> R<bool> {
-    let mut conn = Connection::open(path)?;
-    let ctx = Ctx::quiet();
-    let tx = writer::begin(&mut conn, &ctx)?;
-    let adopted = super::adopt_exit(&tx, "p1", run, &ctx)?;
-    writer::commit(tx, &ctx)?;
-    Ok(adopted)
+/// AnswerQuestion of run `run`'s question `question` with its one choice, adopt, at `revision`, as the host submits it.
+fn answer_adopt(id: &str, run: &str, revision: i64, question: &str) -> SubmitCommand {
+    SubmitCommand {
+        command_id: id.to_owned(),
+        idempotency_key: format!("k-{id}"),
+        kind: "AnswerQuestion".to_owned(),
+        run_id: run.to_owned(),
+        expected_revision: revision,
+        payload: json!({"question_id": question, "answer": "采用", "choice_id": "adopt"}),
+        payload_sha256: crate::context::sha256_hex(id.as_bytes()),
+        target: RunTarget::Input(crate::persistence::Input::Answer {
+            question_id: question.to_owned(),
+            answer: "采用".to_owned(),
+            choice_id: Some("adopt".to_owned()),
+        }),
+        event: NewEvent {
+            intent: Intent::Progress,
+            project_id: "p1".to_owned(),
+            event_id: format!("e-{id}"),
+            run_id: Some(run.to_owned()),
+            kind: "question.answer_accepted".to_owned(),
+            payload: json!({"command_id": id, "question_id": question}),
+        },
+        outbox: None,
+    }
+}
+
+/// Run `run`'s open questions as getRun's projection lists them.
+fn open_questions(path: &Path, run: &str) -> R<Vec<Value>> {
+    let conn = Connection::open(path)?;
+    Ok(crate::persistence::questions::open(&conn, run)?
+        .iter()
+        .map(crate::persistence::questions::Question::json)
+        .collect())
 }
 
 #[tokio::test]
-async fn the_adopt_exit_adopts_a_specification_approved_since_or_writes_nothing() -> R {
-    // Decision 8's row `runtime:no_spec` (adopt): still no specification, nothing is written and the run stays BLOCKED
-    // (the answer's own commit ends with its run.result); one approved since, the run's row names it,
-    // spec.changed{cause: adopted, from: null}, the claim released and the run back to CREATED (no run.result: an
-    // Unblock writes none), the question no longer held.
+async fn w13_a_run_without_a_specification_adopts_one_approved_since_by_its_answer() -> R {
+    // W13's real path (decision 1; decision 8's row runtime:no_spec): StartRun without a specification -> BLOCKED,
+    // its question listed by questions::open (run-level, reason no_spec, the one choice adopt, the default); answered
+    // adopt while there is still none: the run stays BLOCKED, its revision moved once (a Touch), the answer's commit
+    // ends with its run.result BLOCKED NEED_DECISION, the question still open; a specification approved, answered adopt
+    // again: runs.spec_id names it, spec.changed{cause: adopted, from: null}, the claim released, run.resumed BLOCKED
+    // -> CREATED, the revision moved once (that Unblock), no run.result, no question open.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     store.submit_command(start("R")).await?;
-    drop(store);
-    let before = events(&path, "R", 0)?;
-    let last = before.last().map_or(0, |e| e.0);
-    assert!(!adopt_exit(&path, "R")?);
-    assert_eq!(events(&path, "R", 0)?, before);
-    assert_eq!(run(&path, "R")?[0], "BLOCKED");
-    exec(&path, SPECS)?;
-    assert!(adopt_exit(&path, "R")?);
-    let written = events(&path, "R", last)?;
+    let question = events(&path, "R", 0)?
+        .into_iter()
+        .find(|e| e.2 == "question.asked")
+        .ok_or("no question")?
+        .1;
+    let listed = open_questions(&path, "R")?;
+    let [listed] = listed.as_slice() else {
+        return Err(format!("not one question: {listed:?}").into());
+    };
+    assert_eq!(
+        (
+            &listed["question_id"],
+            &listed["source"],
+            &listed["subject"],
+            &listed["reason"],
+            &listed["default"]
+        ),
+        (
+            &json!(question),
+            &json!("runtime"),
+            &json!("run"),
+            &json!("no_spec"),
+            &json!("adopt")
+        )
+    );
+    assert_eq!(
+        listed["choices"]
+            .as_array()
+            .map(|c| c.iter().map(|c| c["choice_id"].clone()).collect::<Vec<_>>()),
+        Some(vec![json!("adopt")])
+    );
+    // Still no specification.
+    let before = events(&path, "R", 0)?.last().map_or(0, |e| e.0);
+    let outcome = store
+        .submit_command(answer_adopt("a1", "R", 1, &question))
+        .await?;
+    assert_eq!(accepted(&outcome)?, (json!(2), 2));
+    let written = events(&path, "R", before)?;
     assert_eq!(
         kinds(&written),
-        ["spec.changed", "run.blocker_released", "run.resumed"]
+        [
+            "question.answer_accepted",
+            "question.answered",
+            "run.result"
+        ]
     );
-    assert_eq!(written[0].3, adopted("R", "s2", 2, 2));
+    assert_eq!(written[1].3["exit"], "adopt");
     assert_eq!(
-        (&written[1].3["source"], &written[1].3["reason"]),
+        (&written[2].3["state"], &written[2].3["blocked_reason"]),
+        (&json!("BLOCKED"), &json!("NEED_DECISION"))
+    );
+    assert_eq!(
+        run(&path, "R")?,
+        json!([
+            "BLOCKED",
+            2,
+            null,
+            "CREATED",
+            "NEED_DECISION",
+            ["NEED_DECISION"]
+        ])
+    );
+    assert_eq!(open_questions(&path, "R")?.len(), 1, "still open");
+    // A specification approved since.
+    exec(&path, SPECS)?;
+    let before = written.last().map_or(before, |e| e.0);
+    let outcome = store
+        .submit_command(answer_adopt("a2", "R", 2, &question))
+        .await?;
+    assert_eq!(accepted(&outcome)?, (json!(3), 3));
+    let written = events(&path, "R", before)?;
+    assert_eq!(
+        kinds(&written),
+        [
+            "question.answer_accepted",
+            "question.answered",
+            "spec.changed",
+            "run.blocker_released",
+            "run.resumed"
+        ]
+    );
+    assert_eq!(written[2].3, adopted("R", "s2", 2, 2));
+    assert_eq!(
+        (&written[3].3["source"], &written[3].3["reason"]),
         (&json!("runtime:no_spec"), &json!("NEED_DECISION"))
     );
     assert_eq!(
-        (&written[2].3["from"], &written[2].3["to"]),
+        (&written[4].3["from"], &written[4].3["to"]),
         (&json!("BLOCKED"), &json!("CREATED"))
     );
     assert_eq!(
         run(&path, "R")?,
-        json!(["CREATED", 2, "s2", null, null, []])
+        json!(["CREATED", 3, "s2", null, null, []])
     );
+    assert_eq!(open_questions(&path, "R")?, Vec::<Value>::new());
     Ok(())
 }

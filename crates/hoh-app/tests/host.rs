@@ -1660,6 +1660,117 @@ async fn inputs_and_answers_are_accepted_and_refused_as_the_contract_says() -> R
     Ok(())
 }
 
+/// W13 through the host (docs/adr/ADR-031.md decisions 1, 6 and 8): StartRun in a project with no approved
+/// specification is 202 at revision 1, the run BLOCKED and getRun's `projection.questions` its one question
+/// runtime:no_spec (run-level, the one choice adopt, its default); AnswerQuestion adopt while there is still none is
+/// 202 at the next revision, the run BLOCKED and the question still listed; once a specification is approved, adopt
+/// again: 202 at the next revision, the run CREATED on it and no question left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_without_a_spec_lists_its_no_spec_question_and_its_adopt_answer_takes_one_approved_since()
+-> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let to = To::Tcp(host.port);
+    let accepted = openapi_schema(
+        "/paths/~1v1~1commands/post/responses/202/content/application~1json/schema",
+    )?;
+    let post = |body: Value| {
+        let to = &to;
+        let token = host.token.clone();
+        async move {
+            let reply = call(
+                to,
+                "POST",
+                "/v1/commands",
+                &token,
+                body.to_string().as_bytes(),
+            )
+            .await?;
+            R::Ok((reply.status, reply.json()?))
+        }
+    };
+    let (status, started) = post(json!({"schema_version": "1.0", "command_id": "c-start",
+        "idempotency_key": "k-start", "expected_revision": 0, "kind": "StartRun", "run_id": null,
+        "payload": {"goal": "没有规格", "mode": "AUTO", "interactive": false}}))
+    .await?;
+    assert_eq!(status, 202, "{started}");
+    conforms(&accepted, &started)?;
+    assert_eq!(started["revision"], 1);
+    let run = started["run_id"].as_str().ok_or("no run_id")?.to_owned();
+    let get = || async {
+        call(&to, "GET", &format!("/v1/runs/{run}"), &host.token, b"")
+            .await?
+            .json()
+    };
+    let got = get().await?;
+    assert_eq!(got["state"], "BLOCKED", "{got}");
+    let questions = got["projection"]["questions"].clone();
+    let [question] = questions.as_array().map(Vec::as_slice).unwrap_or_default() else {
+        return Err(format!("not one question: {got}").into());
+    };
+    assert_eq!(
+        (
+            &question["source"],
+            &question["subject"],
+            &question["reason"],
+            &question["choices"],
+            &question["default"]
+        ),
+        (
+            &json!("runtime"),
+            &json!("run"),
+            &json!("no_spec"),
+            &json!([{"choice_id": "adopt", "label": "采用项目已批准的规格"}]),
+            &json!("adopt")
+        ),
+        "{got}"
+    );
+    let question_id = question["question_id"]
+        .as_str()
+        .ok_or("no question_id")?
+        .to_owned();
+    let answer = |id: &str, revision: i64| {
+        json!({"schema_version": "1.0", "command_id": id, "idempotency_key": format!("k-{id}"),
+            "expected_revision": revision, "kind": "AnswerQuestion", "run_id": run,
+            "payload": {"question_id": question_id, "answer": "adopt"}})
+    };
+    let (status, body) = post(answer("c-a1", 1)).await?;
+    assert_eq!((status, &body["revision"]), (202, &json!(2)), "{body}");
+    let got = get().await?;
+    assert_eq!(got["state"], "BLOCKED", "{got}");
+    assert_eq!(
+        got["projection"]["questions"].as_array().map(Vec::len),
+        Some(1),
+        "{got}"
+    );
+    python(
+        &db(dir.path()),
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit(); c.close()",
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', '{}', printf('%064d', 1), 1);",
+            host.project_id
+        ),
+    )?;
+    let (status, body) = post(answer("c-a2", 2)).await?;
+    assert_eq!((status, &body["revision"]), (202, &json!(3)), "{body}");
+    let got = get().await?;
+    assert_eq!(
+        (&got["state"], &got["revision"]),
+        (&json!("CREATED"), &json!(3)),
+        "{got}"
+    );
+    assert_eq!(got["projection"]["questions"], json!([]), "{got}");
+    assert_eq!(
+        scalar(
+            dir.path(),
+            &format!("SELECT spec_id FROM runs WHERE run_id = '{run}'")
+        )?,
+        "s1"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Every route refuses a request without the token, on the port one whose Host is not the bound loopback address or
 /// whose Origin is elsewhere, and on the socket one with any Origin, with 403 FORBIDDEN; `/healthz` needs no token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

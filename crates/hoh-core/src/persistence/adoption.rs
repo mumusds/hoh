@@ -6,19 +6,14 @@
 //! A specs row is approved by construction: its only writer is to be M3-T02's ApproveSpec, which inserts approved
 //! revisions only (a draft is no specs row); the locked table has no approval column to filter by (M2T13D-59).
 
-use super::blockers::{self, Claims};
+use super::need::{self, RunQuestion, RunReason};
 use super::writer::{self, Commit, Ctx, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
-use crate::protocol::BlockedReason;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
 
-/// The question's claim source and reason (correction A's `RunReason::NoSpec`).
-pub(super) const SOURCE: &str = "runtime:no_spec";
-pub(super) const REASON: &str = "no_spec";
-
-/// The question's one choice.
+/// The question's one choice (`questions::route_run(RunReason::NoSpec)`'s).
 const ADOPT: &str = "adopt";
 
 const TEXT: &str = "项目还没有已批准的规格：先在 TUI 用 /plan 生成并批准规格（M3），或在项目中放入已批准的规格后答复本问题";
@@ -59,64 +54,40 @@ pub(super) fn adopt(
     }))
 }
 
-/// The question `runtime:no_spec` of run `run_id` (W13), written in the caller's transaction after the run's own
-/// events: NEED_DECISION claimed for it, `question.asked{question_id: <its own id>, reason: "no_spec", text, choices:
-/// [adopt]}`, and the run BLOCKED by the claim (`blockers::follow`; a working run, CREATED included). Not a
-/// `need_decision` event: a run with no specification has no supervision task, a wake would never be allocated.
+/// The question `runtime:no_spec` of run `run_id` (W13), asked through the run-level questions' one entry
+/// (`need::run_question`) in the caller's transaction after the run's own events: NEED_DECISION claimed by
+/// `runtime:no_spec`, `question.asked{question_id: <its own id>, reason: "no_spec", text, choices: [adopt]}`, and the
+/// run BLOCKED by the claim (`blockers::follow`; a working run, CREATED included). Not a `need_decision` event: a run
+/// with no specification has no supervision task, a wake would never be allocated.
 pub(super) fn ask(
     tx: &Transaction<'_>,
     project_id: &str,
     run_id: &str,
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
-    let mut claims = Claims::load(tx, project_id, run_id)?;
-    claims.set(SOURCE, &[BlockedReason::NeedDecision]);
-    let changed = claims.changed();
-    let reasons = claims.reasons();
-    let mut events = claims.store(tx)?;
-    let id = child_id(run_id, "no_spec/question");
-    events.push(NewEvent {
-        intent: Intent::Progress,
-        project_id: project_id.to_owned(),
-        event_id: id.clone(),
-        run_id: Some(run_id.to_owned()),
-        kind: "question.asked".to_owned(),
-        payload: json!({"question_id": id, "reason": REASON, "text": TEXT, "choices": [ADOPT]}),
-    });
-    let follow = blockers::follow(
+    let at = crate::time::rfc3339_utc(ctx.now());
+    let commit = need::run_question(
         tx,
-        project_id,
-        run_id,
-        changed,
-        &reasons,
-        &crate::time::rfc3339_utc(ctx.now()),
-        "the project has no approved specification",
-        ctx,
-    )?;
-    events.extend(follow.events);
-    writer::write(
-        tx,
-        &Commit {
-            cas: follow.cas,
-            events,
-            ..Commit::default()
+        RunQuestion {
+            project_id,
+            run_id,
+            reason: RunReason::NoSpec,
+            question_id: child_id(run_id, "no_spec/question"),
+            fields: json!({"text": TEXT, "choices": [ADOPT]}),
+            at: &at,
+            detail: "the project has no approved specification",
         },
         ctx,
     )?;
+    writer::write(tx, &commit, ctx)?;
     Ok(())
 }
 
-/// The question's `adopt` exit (decision 8's table), written in the caller's transaction after the answer's own
-/// compare-and-set (it reads the run's revision): the project's latest approved specification adopted ([`adopt`]),
-/// the claim released and the run unblocked when nothing else holds it (`blockers::follow`); true. Still none: nothing
-/// written, the run stays BLOCKED and the question open (the answer's commit ends with its run.result); false.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the answer's exits (slice S2a's route_run) call it once the slices are integrated"
-    )
-)]
+/// The question's `adopt` exit (decision 8's table; `questions::answer`'s `Route::Adopt`), in the answer's
+/// transaction: the project's latest approved specification adopted ([`adopt`]) with its `spec.changed` written;
+/// true, and the answer releases the claim, its run unblocked by its follow when nothing else holds it. Still none:
+/// nothing written, false: the run stays BLOCKED and the question open (the answer's commit touches the run and ends
+/// with its run.result).
 pub(super) fn adopt_exit(
     tx: &Transaction<'_>,
     project_id: &str,
@@ -126,28 +97,10 @@ pub(super) fn adopt_exit(
     let Some(adopted) = adopt(tx, project_id, run_id)? else {
         return Ok(false);
     };
-    let mut claims = Claims::load(tx, project_id, run_id)?;
-    claims.set(SOURCE, &[]);
-    let changed = claims.changed();
-    let reasons = claims.reasons();
-    let mut events = vec![adopted];
-    events.extend(claims.store(tx)?);
-    let follow = blockers::follow(
-        tx,
-        project_id,
-        run_id,
-        changed,
-        &reasons,
-        &crate::time::rfc3339_utc(ctx.now()),
-        "the project's approved specification was adopted",
-        ctx,
-    )?;
-    events.extend(follow.events);
     writer::write(
         tx,
         &Commit {
-            cas: follow.cas,
-            events,
+            events: vec![adopted],
             ..Commit::default()
         },
         ctx,
