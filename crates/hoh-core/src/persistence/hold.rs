@@ -4,7 +4,8 @@
 //!
 //! - a run R is **stopped** ([`stopped`]) when runs.state(R) is in G and R's latest event is the `run.result` whose
 //!   payload state is runs.state(R): the stop is published. Keyed so that the commit entering G (its compare-and-set
-//!   comes before its events) and the commit leaving it (ResumeRun, CancelRun) are not held by an older result;
+//!   comes before its events) and the commit leaving it (ResumeRun, CancelRun) are not held by an older result; read
+//!   by R's current revision rather than its history (M2T13R-02);
 //! - on a stopped run an event of a command accepted for it (`temp.command_run`) is written as it is, a Record (a
 //!   kind of [`RECORD_KINDS`]: audit, history, delivery bookkeeping, diagnostics) is written project-scoped, and
 //!   anything else (Progress) is refused with `RunStopped`, which the writer actor's answer turns into
@@ -17,7 +18,17 @@ use crate::protocol::RunState;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// G, as SQL: the stopping states entered only when quiet (docs/adr/ADR-031.md correction D, its scope).
-const G: &str = "'COMPLETED', 'FAILED', 'CANCELLED', 'INCOMPLETE'";
+pub(super) const G: &str = "'COMPLETED', 'FAILED', 'CANCELLED', 'INCOMPLETE'";
+
+/// Whether run `run` is in G now (stopped or not).
+pub(super) fn in_g(conn: &Connection, run: &str) -> Result<bool, PersistError> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM main.runs WHERE run_id = ?1 AND state IN ({G}))"),
+        params![run],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
 
 /// The kinds an event may be written as a Record (docs/adr/ADR-031.md correction D, rule 1): the history of evidence
 /// and integrity, the outbox's bookkeeping and the diagnostics. A Record of a stopped run is written project-scoped.
@@ -44,14 +55,20 @@ pub(super) const RECORD_KINDS: [&str; 16] = [
 ];
 
 /// SQL: whether the run named by the SQL expression `run` is stopped — in G, its latest event the `run.result` of that
-/// state. Its aliases are its own, so it can be put into any query, once or more.
+/// state — read without the run's history (M2T13R-02): its latest run.result (the `(run_id, kind, seq)` index's last
+/// entry) is the one of its current revision (its id, `child_id(run, "result/<revision>")`, ends with that suffix
+/// however its run part was shortened) and of its current state. The same, because every transaction that leaves a
+/// run in G with its revision moved ends with its run.result at that revision (`writer::write` registers a Touch of a
+/// run in G as it does a move into E), and every event of a stopped run is a command's, whose run is moved (a
+/// command's run in G must end with its result, `writer::finish`). Its aliases are its own, so it can be put into any
+/// query, once or more.
 fn stopped_sql(run: &str) -> String {
     format!(
         "EXISTS(SELECT 1 FROM main.runs hold_r WHERE hold_r.run_id = {run} AND hold_r.state IN ({G}) \
-         AND EXISTS(SELECT 1 FROM main.events hold_e WHERE hold_e.run_id = hold_r.run_id \
-           AND hold_e.kind = 'run.result' AND json_extract(hold_e.payload_json, '$.state') = hold_r.state \
-           AND NOT EXISTS(SELECT 1 FROM main.events hold_l WHERE hold_l.run_id = hold_r.run_id \
-             AND hold_l.seq > hold_e.seq)))"
+         AND EXISTS(SELECT 1 FROM main.events hold_e WHERE hold_e.seq = (SELECT max(hold_m.seq) FROM main.events \
+             hold_m WHERE hold_m.run_id = hold_r.run_id AND hold_m.kind = 'run.result') \
+           AND substr(hold_e.event_id, -length('/result/' || hold_r.revision)) = '/result/' || hold_r.revision \
+           AND json_extract(hold_e.payload_json, '$.state') = hold_r.state))"
     )
 }
 
