@@ -41,7 +41,13 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   `.hoh-dev/evidence/commander-readonly/spike/` in order (the raw runs are on the machine that recorded them), then
   run `excerpt_check.py`.
 
-- `judge_check.py` is the evidence table of ADR-032 decision 8 executed (design correction 4): each row's rule is a
+- `judge_check.py` is a **format prototype, not authoritative** (design correction 7, option (b)): it mirrors the
+  product adapters' replay (claude.rs `Driven::on_line`, `verdict`, `judge`; codex/app_server.rs `on_response` with
+  its pending map, `scope_of`, `on_turn_notification`, codex.rs `verdict`; pi.rs `Rpc::on_record` to the process's
+  exit, `note_message`, `verdict`), names the function each step mirrors, and enumerates the codex rollout and the
+  turn's items default-deny. The authoritative judge is M2-T20's Rust judge on the adapters' `replay_facts`.
+  `--emit DIR` writes every generated variant with its expected verdict class: M2-T20's acceptance fixtures.
+- Before that (design corrections 4 to 6) it was the evidence table of ADR-032 decision 8 executed: each row's rule is a
   function whose docstring is the rule, run on every committed excerpt and, where present locally with the recorded
   sha256, on the raw recording it was cut from. A verdict that differs between the two is a defect (exit 1). It also
   judges each read-only round as decision 8 does, fail-closed (design correction 5: the terminal state, the
