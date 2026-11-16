@@ -6,6 +6,7 @@
 
 use crate::verify::freeze::{self, FreezeError, Inputs};
 use hoh_core::bridge::{self, Identity};
+use hoh_core::persistence::need::WorkReason;
 use hoh_core::persistence::{
     ArtifactRow, Ending, Observed, PersistError, SelfTests, Store, UnfinishedRow,
     VerifierCompletion, VerifierOutcome, WriterCompleted, WriterCompletion, WriterOutcome,
@@ -37,16 +38,16 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
             };
         }
     };
-    let decide = |reason: &str| WriterOutcome::Decide {
-        reason: reason.to_owned(),
+    let decide = |reason: WorkReason| WriterOutcome::Decide {
+        reason,
         detail:
             json!({"status": result.status, "summary": result.summary, "issues": result.issues})
                 .to_string(),
     };
     match result.status {
-        TaskStatus::Failed => return decide("agent_failed"),
-        TaskStatus::Blocked => return decide("agent_blocked"),
-        TaskStatus::Incomplete => return decide("agent_incomplete"),
+        TaskStatus::Failed => return decide(WorkReason::AgentFailed),
+        TaskStatus::Blocked => return decide(WorkReason::AgentBlocked),
+        TaskStatus::Incomplete => return decide(WorkReason::AgentIncomplete),
         TaskStatus::Completed => {}
     }
     let self_tests = self_tests(project, &identity.attempt_id, &result.evidence, ending);
@@ -70,7 +71,7 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
         // The host could not read or write what the freeze needs (git, the object store): not the agent's to correct,
         // so no correction is counted; the task waits for a decision (decision 3 lists only the agent's outputs).
         Err(e) => WriterOutcome::Decide {
-            reason: "freeze_failed".to_owned(),
+            reason: WorkReason::FreezeFailed,
             detail: e.to_string(),
         },
     }

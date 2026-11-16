@@ -8,6 +8,7 @@
 
 use super::blockers;
 use super::decide::{child_id, load_binding};
+use super::need::{self, SourceReason, TaskReason, VerifierReason, WorkReason};
 use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::budget::{self, Budget, Ledger};
@@ -147,46 +148,60 @@ pub(super) fn fail_task(
         }
         AfterFailure::Blocked(reason) => (TaskState::Blocked, None, Some(reason)),
         AfterFailure::Exhausted => {
-            events.push(event(
-                task.project_id,
-                task.run_id,
-                child_id(attempt_id, "need_decision"),
-                "need_decision",
-                json!({
-                    "run_id": task.run_id,
-                    "task_id": task.task_id,
-                    "attempt_id": attempt_id,
-                    "reason": "retries_exhausted",
-                    "attempt_count": failures,
-                    "detail": format!(
-                        "{} failed {failures} times; {} retries are used up",
-                        task.task_id,
-                        crate::retry::MAX_RETRIES
-                    ),
-                }),
-            ));
+            // W1: a verifier's or a work task's question (docs/adr/ADR-031.md correction A).
+            let reason = if need::is_verifier(tx, task.run_id, task.task_id)? {
+                TaskReason::Verifier(VerifierReason::RetriesExhausted)
+            } else {
+                TaskReason::Work(WorkReason::RetriesExhausted)
+            };
+            events.push(need::task_event(
+                tx,
+                need::TaskNeed {
+                    project_id: task.project_id,
+                    run_id: task.run_id,
+                    task_id: task.task_id,
+                    event_id: child_id(attempt_id, need::KIND),
+                    reason,
+                    fields: json!({
+                        "attempt_id": attempt_id,
+                        "attempt_count": failures,
+                        "detail": format!(
+                            "{} failed {failures} times; {} retries are used up",
+                            task.task_id,
+                            crate::retry::MAX_RETRIES
+                        ),
+                    }),
+                },
+            )?);
             (TaskState::Blocked, None, Some(BlockedReason::NeedDecision))
         }
         // Refused before anything ran, and the same input would be refused again (docs/adr/ADR-026.md decision 9):
         // a decision at once; the attempt's failure reason and its `attempt.start_refused` say why.
         AfterFailure::Decide => {
-            events.push(event(
-                task.project_id,
-                task.run_id,
-                child_id(attempt_id, "need_decision"),
-                "need_decision",
-                json!({
-                    "run_id": task.run_id,
-                    "task_id": task.task_id,
-                    "attempt_id": attempt_id,
-                    "reason": "refused_deterministically",
-                    "attempt_count": failures,
-                    "detail": format!(
-                        "{} was refused before anything ran, and the same input would be refused again",
-                        task.task_id
-                    ),
-                }),
-            ));
+            // W2.
+            let reason = if need::is_verifier(tx, task.run_id, task.task_id)? {
+                TaskReason::Verifier(VerifierReason::RefusedDeterministically)
+            } else {
+                TaskReason::Work(WorkReason::RefusedDeterministically)
+            };
+            events.push(need::task_event(
+                tx,
+                need::TaskNeed {
+                    project_id: task.project_id,
+                    run_id: task.run_id,
+                    task_id: task.task_id,
+                    event_id: child_id(attempt_id, need::KIND),
+                    reason,
+                    fields: json!({
+                        "attempt_id": attempt_id,
+                        "attempt_count": failures,
+                        "detail": format!(
+                            "{} was refused before anything ran, and the same input would be refused again",
+                            task.task_id
+                        ),
+                    }),
+                },
+            )?);
             (TaskState::Blocked, None, Some(BlockedReason::NeedDecision))
         }
     };
@@ -909,12 +924,30 @@ impl Repair {
         }
     }
 
-    /// The `need_decision` reason once its limit is reached.
-    fn exhausted(&self) -> &'static str {
-        match self {
-            Repair::Local { .. } => "local_repairs_exhausted",
-            Repair::Protocol { .. } => "protocol_repairs_exhausted",
-            Repair::Reverify { .. } => "reverify_exhausted",
+    /// The question's reason once its limit is reached, by its task's kind (docs/adr/ADR-031.md correction A): a local
+    /// repair is a work task's only (a verifier owns no failure item), a protocol correction a work task's or a
+    /// verifier's, a reverification a source's or a verifier's (`need::task_event` checks the source). A verifier's
+    /// local repair is an IntegrityViolation.
+    fn exhausted(&self, verifier: bool) -> Result<TaskReason, PersistError> {
+        match (self, verifier) {
+            (Repair::Local { .. }, false) => {
+                Ok(TaskReason::Work(WorkReason::LocalRepairsExhausted))
+            }
+            (Repair::Protocol { .. }, false) => {
+                Ok(TaskReason::Work(WorkReason::ProtocolRepairsExhausted))
+            }
+            (Repair::Protocol { .. }, true) => Ok(TaskReason::Verifier(
+                VerifierReason::ProtocolRepairsExhausted,
+            )),
+            (Repair::Reverify { .. }, false) => {
+                Ok(TaskReason::Source(SourceReason::ReverifyExhausted))
+            }
+            (Repair::Reverify { .. }, true) => {
+                Ok(TaskReason::Verifier(VerifierReason::ReverifyExhausted))
+            }
+            (Repair::Local { .. }, true) => Err(PersistError::IntegrityViolation(
+                "a verifier task owns no failure item: no local repair of it".to_owned(),
+            )),
         }
     }
 }
@@ -1047,29 +1080,43 @@ pub(super) fn repair_in(
         ));
         RepairVerdict::Granted { count: n }
     } else {
+        let reason =
+            request
+                .repair
+                .exhausted(need::is_verifier(tx, &request.run_id, &request.task_id)?)?;
         let refused: i64 = tx
             .query_row(
                 &format!(
                     "SELECT count(*) FROM events WHERE run_id = ?1 AND kind = 'need_decision' \
                      AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.{field}') = ?3"
                 ),
-                params![request.run_id, request.repair.exhausted(), key],
+                params![request.run_id, reason.as_str(), key],
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        commit.events.push(event(
-            &project_id,
-            &request.run_id,
-            child_id(
-                &request.run_id,
-                &format!("need_decision/{}/{key}/{}", request.repair.kind(), refused + 1),
-            ),
-            "need_decision",
-            json!({
-                "run_id": request.run_id, "task_id": request.task_id, "reason": request.repair.exhausted(), field: key,
-                "count": count, "limit": request.limit, "detail": request.detail, "action_id": action,
-            }),
-        ));
+        // W3 to W7's refusal (docs/adr/ADR-031.md correction A).
+        commit.events.push(need::task_event(
+            tx,
+            need::TaskNeed {
+                project_id: &project_id,
+                run_id: &request.run_id,
+                task_id: &request.task_id,
+                event_id: child_id(
+                    &request.run_id,
+                    &format!(
+                        "{}/{}/{key}/{}",
+                        need::KIND,
+                        request.repair.kind(),
+                        refused + 1
+                    ),
+                ),
+                reason,
+                fields: json!({
+                    field: key, "count": count, "limit": request.limit, "detail": request.detail,
+                    "action_id": action,
+                }),
+            },
+        )?);
         if !request.hold
             && !matches!(
                 state,
