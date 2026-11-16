@@ -972,6 +972,172 @@ fn a_host_its_unit_ends_with_a_refusal_ends_the_client_with_78_and_the_hosts_lin
     Ok(())
 }
 
+/// A host this test started itself, ended (TERM, then KILL after 10 s) and reaped however the test leaves: its own
+/// child, not yet reaped, so its number is still its (ADR-022 decision 10).
+struct Direct(std::process::Child);
+
+impl Drop for Direct {
+    fn drop(&mut self) {
+        if let Some(pid) = i32::try_from(self.0.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            && matches!(self.0.try_wait(), Ok(None))
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while matches!(self.0.try_wait(), Ok(None)) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `child`'s output once it has ended, within `limit` (its output read until then too); past it the child is killed
+/// and reaped, and that is an error.
+fn output_within(mut child: std::process::Child, limit: Duration) -> R<Output> {
+    use std::io::Read;
+    let end = std::time::Instant::now() + limit;
+    let (sent, read) = std::sync::mpsc::channel();
+    for (which, pipe) in [
+        (
+            1,
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+        (
+            2,
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+    ] {
+        let mut pipe = pipe.ok_or("the child's output is not piped")?;
+        let sent = sent.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sent.send((which, bytes));
+        });
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("the client did not end within {limit:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut out = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    for _ in 0..2 {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        match read.recv_timeout(left.max(Duration::from_secs(1)))? {
+            (1, bytes) => out.stdout = bytes,
+            (_, bytes) => out.stderr = bytes,
+        }
+    }
+    Ok(out)
+}
+
+#[test]
+fn a_host_that_takes_the_project_while_its_unit_starts_is_the_one_the_client_uses() -> R {
+    // M2T14R-152 (ADR-023 decision 6, REQ-005 failure mode 4): another host takes the project between the client's
+    // look for a host and the start of the project's unit. The unit's host finds the project held and ends with 69
+    // (not restarted), and the client goes on with the host that holds it: the unit path's 69 branch, which judges
+    // the unit's end as a direct start's (`ended_before_ready`). A drop-in holds the unit's start (ExecStartPre) until
+    // the other host, started by this test once the start has begun, is ready, so the race is lost in every run.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    let gate = manager.root().join("gate");
+    std::fs::create_dir(&gate)?;
+    dropin(
+        &manager,
+        "race.conf",
+        &format!(
+            "[Service]\nExecStartPre=/bin/touch {g}/begun\nExecStartPre=/usr/bin/timeout 30 /bin/sh -c 'until [ -e {g}/go ]; do sleep 0.05; done'\n",
+            g = gate.display()
+        ),
+    )?;
+    let hoh = manager.home().join(".local/bin/hoh");
+    let client = manager
+        .command(&hoh)
+        .args(["-p", "x", "--detach", "--output", "json"])
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Reaped by output_within on every path but an early error, where the manager's teardown ends it.
+    let begun = manager.wait_until("the unit's start to begin", Duration::from_secs(10), |_| {
+        Ok(gate.join("begun").exists())
+    });
+    let other = begun.and_then(|()| {
+        Ok(Direct(
+            manager
+                .command(&hoh)
+                .arg("__host")
+                .arg(&project)
+                .current_dir(&project)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        ))
+    });
+    let other = match other {
+        Ok(other) => other,
+        Err(e) => {
+            let _ = output_within(client, Duration::from_secs(1));
+            return Err(e);
+        }
+    };
+    let pid = other.0.id();
+    let held = manager.wait_until("the other host to be ready", Duration::from_secs(8), |_| {
+        Ok(host_json(&project).and_then(|h| h["pid"].as_u64()) == Some(u64::from(pid)))
+    });
+    std::fs::write(gate.join("go"), "")?;
+    let out = output_within(client, Duration::from_secs(60))?;
+    held?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    assert!(run["run_id"].is_string(), "{run}");
+    // The unit's host lost: it ended with 69 and was not restarted; the host the client used is the other one.
+    let shown = manager.show(&unit, "ActiveState,ExecMainStatus,NRestarts")?;
+    assert_eq!(
+        shown.get("ExecMainStatus").map(String::as_str),
+        Some("69"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown.get("NRestarts").map(String::as_str),
+        Some("0"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        shown.get("ActiveState").map(String::as_str),
+        Some("failed"),
+        "{shown:?}"
+    );
+    assert_eq!(
+        host_json(&project).and_then(|h| h["pid"].as_u64()),
+        Some(u64::from(pid))
+    );
+    assert_eq!(hosts_of(&project)?, [pid]);
+    drop(other);
+    Ok(())
+}
+
 #[test]
 fn the_uninstall_removes_nothing_while_an_instance_stopped_but_is_still_enabled() -> R {
     // M2T14R-03: a disable that stops the instance but leaves it enabled (a stand-in systemctl stops it and fails):
