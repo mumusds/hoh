@@ -251,6 +251,7 @@ impl Lifecycle for RunState {
                 Failed,
             ],
             CancelRequested => &[Cancelled, Failed],
+            // BLOCKED when a ResumeRun finds blockers claimed, as from PAUSED (docs/adr/ADR-031.md decision 16).
             Incomplete => &[
                 Created,
                 Discovering,
@@ -258,6 +259,7 @@ impl Lifecycle for RunState {
                 Ready,
                 Running,
                 Verifying,
+                Blocked,
                 CancelRequested,
                 Failed,
             ],
