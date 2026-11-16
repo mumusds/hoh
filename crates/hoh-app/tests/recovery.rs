@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+mod common;
 mod installed;
 
 const CHILD_PROJECT: &str = "HOH_TEST_RECOVERY_PROJECT";
@@ -4982,16 +4983,24 @@ fn a_crash_during_the_suite_reopens_the_writer_slot() -> R {
     // The writer ends (the run's cancel); the suite runs, held before its publication, then publishes.
     let info: Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    // At R's revision now, again at the revision the host names while it answers STALE_REVISION: its runner moves R
+    // on meanwhile (common::fresh_blocking).
     let revision = query(
         &db(&project),
         "SELECT revision FROM runs WHERE run_id = 'R'",
     )?;
-    let cancel = json!({
-        "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
-        "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": "R",
-        "payload": {"reason": "the writer ends"},
-    });
-    let (status, body) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
+    let (status, body) = common::fresh_blocking(json!(revision.parse::<i64>()?), |revision| {
+        let cancel = json!({
+            "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+            "expected_revision": revision, "kind": "CancelRun", "run_id": "R",
+            "payload": {"reason": "the writer ends"},
+        });
+        let (status, body) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
+        Ok((
+            status,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        ))
+    })?;
     assert_eq!(status, 202, "{body}");
     wait_file(&second_hold.join("held"))?;
     assert_eq!(suites(next, "compat.suite_started")?, "1");

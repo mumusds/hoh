@@ -5,6 +5,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use serde_json::{Value, json};
@@ -2496,16 +2498,22 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // At the run's revision now, again at the revision the host names while it answers STALE_REVISION: its runner
+        // moves the run on meanwhile (common::fresh).
         let revision = query(
             &project,
             &format!("SELECT revision FROM runs WHERE run_id = '{run_id}'"),
         )?;
-        let body = json!({
-            "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
-            "expected_revision": revision.parse::<i64>()?, "kind": "CancelRun", "run_id": run_id,
-            "payload": {"reason": "stop"},
-        });
-        let (status, accepted) = exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        let (status, accepted) = common::fresh(json!(revision.parse::<i64>()?), |revision| {
+            let body = json!({
+                "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+                "expected_revision": revision, "kind": "CancelRun", "run_id": run_id,
+                "payload": {"reason": "stop"},
+            });
+            let host = &host;
+            async move { exchange(host, "POST", "/v1/commands", Some(&body)).await }
+        })
+        .await?;
         assert_eq!(status, 202, "{accepted}");
         until(
             &project,

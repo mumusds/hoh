@@ -8,6 +8,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
 mod pty;
 mod world;
 
@@ -53,15 +54,18 @@ fn post(project: &Path, mut body: Value) -> R<(u16, Value)> {
     Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
 }
 
-/// `kind` (PauseRun or CancelRun) for run `run` at its revision now; accepted.
+/// `kind` (PauseRun or CancelRun) for run `run` at its revision now, again at the revision the host names while it
+/// answers STALE_REVISION (the world's runner moves the run on meanwhile; [`common::fresh_blocking`]); accepted.
 fn control(world: &World, run: &str, kind: &str) -> R {
     let revision: i64 = world
         .query(&format!("SELECT revision FROM runs WHERE run_id = '{run}'"))?
         .parse()?;
-    let (status, body) = post(
-        &world.project(),
-        json!({"kind": kind, "run_id": run, "expected_revision": revision, "payload": {"reason": "test"}}),
-    )?;
+    let (status, body) = common::fresh_blocking(json!(revision), |revision| {
+        post(
+            &world.project(),
+            json!({"kind": kind, "run_id": run, "expected_revision": revision, "payload": {"reason": "test"}}),
+        )
+    })?;
     if status != 202 {
         return Err(format!("{kind}: {status} {body}").into());
     }
