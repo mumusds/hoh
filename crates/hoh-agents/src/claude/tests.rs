@@ -275,3 +275,197 @@ fn a_yolo_session_runs_commands_where_the_probe_found_it() {
         );
     }
 }
+
+/// The frames of a turn as Claude's stdout.
+fn stdout(frames: &[Value]) -> Vec<u8> {
+    frames
+        .iter()
+        .flat_map(|f| format!("{f}\n").into_bytes())
+        .collect()
+}
+
+/// When a turn of `frames` says the limit it failed on lifts: its replay's [`Driven::retry_at`].
+fn retry_at(frames: &[Value]) -> Option<std::time::SystemTime> {
+    judged(&stdout(frames)).ok()?.0.retry_at()
+}
+
+fn at(secs: u64) -> Option<std::time::SystemTime> {
+    Some(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"sid","model":"m"}"#;
+
+fn init() -> Value {
+    serde_json::from_str(INIT).expect("init")
+}
+
+fn limit_event(status: &str, resets_at: Value) -> Value {
+    json!({"type": "rate_limit_event", "rate_limit_info": {"status": status, "resetsAt": resets_at,
+           "rateLimitType": "five_hour"}, "session_id": "sid"})
+}
+
+/// The API-error assistant frame of a 429: `typed` adds the @internal typed kind and its parameters.
+fn limit_error(error: &str, typed: Option<(&str, Value)>) -> Value {
+    let mut frame = json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid", "error": error,
+                           "is_api_error_message": true, "api_error_status": 429,
+                           "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error"}]}});
+    if let Some((kind, resets_at)) = typed {
+        frame["api_error"] = json!(kind);
+        frame["api_error_params"] =
+            json!({"rate_limit_info": {"status": "rejected", "resetsAt": resets_at}});
+    }
+    frame
+}
+
+fn failed_result() -> Value {
+    json!({"type": "result", "subtype": "success", "is_error": true, "api_error_status": 429,
+           "terminal_reason": "api_error", "result": "API Error", "session_id": "sid"})
+}
+
+fn settled_result() -> Value {
+    json!({"type": "result", "subtype": "success", "is_error": false, "result": "ok", "session_id": "sid"})
+}
+
+#[test]
+fn a_failed_turns_usage_limit_says_when_it_lifts() {
+    // M2T07R-256 (REQ-042 behaviour 1): the error frame's own record of a usage limit (@internal fields) gives the
+    // reset; without a typed kind the turn's last rejected rate_limit_event (public) does.
+    let typed = limit_error("rate_limit", Some(("usage_limit_reached", json!(2_000))));
+    let event = limit_event("rejected", json!(1_000));
+    assert_eq!(
+        retry_at(&[init(), event.clone(), typed.clone(), failed_result()]),
+        at(2_000)
+    );
+    assert_eq!(retry_at(&[init(), typed, failed_result()]), at(2_000));
+    let untyped = limit_error("rate_limit", None);
+    assert_eq!(
+        retry_at(&[init(), event.clone(), untyped.clone(), failed_result()]),
+        at(1_000)
+    );
+    // A plain 429 (an API key, a throttle): nothing says when.
+    assert_eq!(retry_at(&[init(), untyped.clone(), failed_result()]), None);
+    // A limit that was lifted again, by a later event, no longer says when.
+    assert_eq!(
+        retry_at(&[
+            init(),
+            event.clone(),
+            limit_event("allowed", json!(1_000)),
+            untyped.clone(),
+            failed_result()
+        ]),
+        None
+    );
+    // A typed kind that is not a usage limit (credits, an entitlement) is not lifted by time.
+    let credits = limit_error(
+        "rate_limit",
+        Some(("model_requires_usage_credits", json!(2_000))),
+    );
+    assert_eq!(
+        retry_at(&[init(), event.clone(), credits, failed_result()]),
+        None
+    );
+    // Another error (a 503) is no limit.
+    assert_eq!(
+        retry_at(&[
+            init(),
+            event,
+            limit_error("server_error", None),
+            failed_result()
+        ]),
+        None
+    );
+}
+
+#[test]
+fn only_a_turn_that_failed_on_the_limit_carries_its_reset() {
+    let typed = limit_error("rate_limit", Some(("usage_limit_reached", json!(2_000))));
+    // Settled after all (a fallback model, a retry that worked).
+    assert_eq!(retry_at(&[init(), typed.clone(), settled_result()]), None);
+    // The conversation went on after the limit: a later main-thread message without an error.
+    let reply = json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid", "message": {"role": "assistant"}});
+    assert_eq!(
+        retry_at(&[init(), typed.clone(), reply, failed_result()]),
+        None
+    );
+    // A subagent's frame is not the turn's.
+    let mut sub = typed.clone();
+    sub["parent_tool_use_id"] = json!("toolu_1");
+    assert_eq!(retry_at(&[init(), sub, failed_result()]), None);
+    // A stream cut short before the result, and a cancel, end otherwise.
+    assert_eq!(retry_at(&[init(), typed.clone()]), None);
+    let mut cancelled = stdout(&[init(), typed]);
+    cancelled.extend_from_slice(format!("{}\n", crate::adapter::REPLAY_CANCEL).as_bytes());
+    cancelled.extend_from_slice(&stdout(&[failed_result()]));
+    assert_eq!(
+        judged(&cancelled).ok().and_then(|(d, _)| d.retry_at()),
+        None
+    );
+}
+
+#[test]
+fn a_reset_that_is_no_instant_is_none() {
+    for resets_at in [
+        json!(0),
+        json!(-5),
+        json!(1.5),
+        json!("2000"),
+        json!(null),
+        json!(u64::MAX),
+    ] {
+        let typed = limit_error(
+            "rate_limit",
+            Some(("usage_limit_reached", resets_at.clone())),
+        );
+        assert_eq!(
+            retry_at(&[init(), typed, failed_result()]),
+            None,
+            "{resets_at}"
+        );
+        let untyped = limit_error("rate_limit", None);
+        assert_eq!(
+            retry_at(&[
+                init(),
+                limit_event("rejected", resets_at.clone()),
+                untyped,
+                failed_result()
+            ]),
+            None,
+            "{resets_at}"
+        );
+    }
+}
+
+/// The provider-fault recordings of claude 2.1.325 (tests/fixtures/protocol/_provider-faults, record_faults.py).
+fn fault(case: &str) -> (Vec<u8>, Value) {
+    let dir = format!(
+        "{}/../../tests/fixtures/protocol/_provider-faults/claude/2.1.325/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let stdout = std::fs::read(format!("{dir}/stdout.jsonl")).expect("stdout.jsonl");
+    let meta = serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json")).expect("meta"))
+        .expect("meta.json");
+    (stdout, meta)
+}
+
+#[test]
+fn the_recorded_usage_limit_says_when_it_lifts_and_a_recorded_retry_after_does_not() {
+    // M2T07R-256: a subscriber's 5-hour limit carries the reset the fake provider sent; a 429 or 503 with a Retry-After
+    // reaches the stream with no value at all (Claude waits a short one itself and drops a long one).
+    let (bytes, meta) = fault("fault-usage-limit");
+    let sent = meta["provider"]["requests"][0]["headers"]["anthropic-ratelimit-unified-reset"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("the reset sent");
+    let (driven, _) = judged(&bytes).expect("judged");
+    assert_eq!(driven.verdict().0, AttemptState::Failed);
+    assert_eq!(driven.retry_at(), at(sent));
+    for case in [
+        "fault-429-retry-after-long",
+        "fault-429-retry-after-short",
+        "fault-503-retry-after-long",
+    ] {
+        let (driven, _) = judged(&fault(case).0).expect("judged");
+        assert_eq!(driven.verdict().0, AttemptState::Failed, "{case}");
+        assert_eq!(driven.retry_at(), None, "{case}");
+    }
+}
