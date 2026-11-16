@@ -420,7 +420,9 @@ mod scan {
             "hoh-app/src/host/control.rs",
             "let reader = std::thread::spawn(",
             1,
-            "reads a git command's stdout; its caller joins it before returning",
+            "reads a git command's stdout into a buffer (writes nothing); git_run joins it on every path before it \
+             returns, after killing git's process group, so the join waits only for what is already in the pipe \
+             (M2T13R-450)",
         ),
         (
             "hoh-core/src/persistence/writer.rs",
