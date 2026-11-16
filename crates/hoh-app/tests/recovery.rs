@@ -37,6 +37,9 @@ const CHILD_REMOTE: &str = "HOH_TEST_RECOVERY_REMOTE";
 const CHILD_WORK: &str = "HOH_TEST_RECOVERY_WORK";
 /// A runner point: the child kills itself when an attempt reaches it.
 const CHILD_RUNNER_KILL: &str = "HOH_TEST_RECOVERY_RUNNER_KILL";
+/// With [`CHILD_RUNNER_KILL`]: only this attempt's reaching the point kills the child (any other attempt, such as the
+/// Commander's turn its run's adoption of a specification wakes, passes it: docs/adr/ADR-031.md decision 1).
+const CHILD_RUNNER_KILL_ATTEMPT: &str = "HOH_TEST_RECOVERY_RUNNER_KILL_ATTEMPT";
 /// The child runs a runner whose every attempt fails with this class: `auth`, or `retry_after:<seconds>` (a 429).
 const CHILD_FAIL_CLASS: &str = "HOH_TEST_RECOVERY_FAIL_CLASS";
 
@@ -384,20 +387,30 @@ impl hoh_core::reconcile::Observer for Markers {
     }
 }
 
-/// Ends its own process with SIGKILL when an attempt reaches `0` (CR-006 F2).
+/// Ends its own process with SIGKILL when an attempt reaches `0` (CR-006 F2); with `1`, only when that attempt does.
 #[derive(Debug)]
-struct KillAtRunner(hoh_app::host::RunnerPoint);
+struct KillAtRunner(hoh_app::host::RunnerPoint, Option<String>);
+
+impl KillAtRunner {
+    fn kill() {
+        let _ =
+            rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL);
+        loop {
+            std::thread::park();
+        }
+    }
+}
 
 impl hoh_app::host::HostHooks for KillAtRunner {
     fn runner(&self, point: hoh_app::host::RunnerPoint) {
-        if point == self.0 {
-            let _ = rustix::process::kill_process(
-                rustix::process::getpid(),
-                rustix::process::Signal::KILL,
-            );
-            loop {
-                std::thread::park();
-            }
+        if point == self.0 && self.1.is_none() {
+            Self::kill();
+        }
+    }
+
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, attempt_id: &str) {
+        if point == self.0 && self.1.as_deref().is_none_or(|only| only == attempt_id) {
+            Self::kill();
         }
     }
 }
@@ -655,7 +668,10 @@ fn recovery_host() {
     }
     let runner_kill = std::env::var(CHILD_RUNNER_KILL).ok();
     if let Some(point) = &runner_kill {
-        config.hooks = Arc::new(KillAtRunner(runner_point(point).expect("a runner point")));
+        config.hooks = Arc::new(KillAtRunner(
+            runner_point(point).expect("a runner point"),
+            std::env::var(CHILD_RUNNER_KILL_ATTEMPT).ok(),
+        ));
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -5162,6 +5178,12 @@ fn a_model_failure_recovered_after_observed_falls_back_like_a_settled_one() -> R
             env.push((
                 CHILD_RUNNER_KILL,
                 std::ffi::OsStr::new("AfterEffectObserved"),
+            ));
+            // At the developer's first attempt's point, not at whichever attempt gets there first: the Commander's turn
+            // the specification's adoption wakes may (docs/adr/ADR-031.md decision 1).
+            env.push((
+                CHILD_RUNNER_KILL_ATTEMPT,
+                std::ffi::OsStr::new("T1/attempt-1"),
             ));
         }
         let host = start_child(&project, &env)?;

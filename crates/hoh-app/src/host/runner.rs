@@ -1082,14 +1082,14 @@ async fn attempt(
     let store = &common.shared.store;
     let hooks: &dyn HostHooks = common.shared.hooks.as_ref();
     let id = notice.attempt_id.clone();
-    hooks.runner(RunnerPoint::BeforeSend);
+    hooks.runner_of(RunnerPoint::BeforeSend, &id);
     let ack = common.executor.deliver(&work);
-    hooks.runner(RunnerPoint::AfterSend);
+    hooks.runner_of(RunnerPoint::AfterSend, &id);
     if !matches!(ack.await, Ok(Ok(()))) {
         // Not taken: the notice stays PENDING and its attempt PREPARED, so it is delivered again.
         return Ok(());
     }
-    hooks.runner(RunnerPoint::AfterAck);
+    hooks.runner_of(RunnerPoint::AfterAck, &id);
     if !store
         .runner_received(notice.clone(), common.clock.now())
         .await?
@@ -1246,7 +1246,7 @@ async fn attempt(
         remove_run_dir().await;
         return Ok(());
     };
-    hooks.runner(RunnerPoint::AfterSpawn);
+    hooks.runner_of(RunnerPoint::AfterSpawn, &id);
     // Its tracking is recorded with its identity, in the same commit.
     if !store
         .runner_running_with(
@@ -1284,7 +1284,7 @@ async fn attempt(
         );
         return Ok(());
     }
-    hooks.runner(RunnerPoint::AfterEffectStarted);
+    hooks.runner_of(RunnerPoint::AfterEffectStarted, &id);
     // While a verifier runs, its requests are taken in order, one at a time; once its process has ended none is taken
     // (a request is never cut off: its check and record end before the end is looked at; decision 7).
     let mut ended = started.ended;
@@ -1335,7 +1335,7 @@ async fn attempt(
         return Ok(());
     }
     if !unknown {
-        hooks.runner(RunnerPoint::AfterEffectObserved);
+        hooks.runner_of(RunnerPoint::AfterEffectObserved, &id);
     }
     // Its leader ended: the attempt ends, and its slot with it, only if the executor emptied its group first
     // (M2T05R-101, -202); else it stays RUNNING with its slot held, and a diagnostic says why.
@@ -1420,7 +1420,7 @@ async fn attempt(
     {
         return Ok(());
     }
-    hooks.runner(RunnerPoint::AfterEffectCommitted);
+    hooks.runner_of(RunnerPoint::AfterEffectCommitted, &id);
     // A verifier's messages left in its bridge are answered as its requests are (decision 13), before its end.
     if let Some(v) = &verifier {
         answer_bridge_messages(common, &work, v, &outcome.observed.messages).await?;

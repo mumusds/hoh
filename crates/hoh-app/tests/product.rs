@@ -1190,16 +1190,8 @@ async fn test_018_05_a_custom_role_from_the_file_runs_its_override_prompt_in_its
             )
         );
         assert_eq!(record["content_sha256"], json!(sha(contract.as_bytes())));
-        // What codex was sent: the contract, then the task's header; its sha256 is the attempt's.
-        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .filter(|m| m["method"] == "turn/start")
-            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
-            .collect();
+        // What codex was sent for the attempt: the contract, then the task's header; its sha256 is the attempt's.
+        let sent = codex_prompts_of(&world, |a| a == "T-sec/attempt-1")?;
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert!(sent[0].starts_with(contract.trim_end()), "{}", sent[0]);
         assert!(sent[0].contains("T-sec"), "{}", sent[0]);
@@ -1330,7 +1322,11 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
             "BLOCKED"
         );
         assert_eq!(
-            query(&project, "SELECT count(*) FROM prompt_revisions")?,
+            query(
+                &project,
+                "SELECT count(*) FROM attempts WHERE task_id = 'T-a' \
+                 AND (prompt_revision IS NOT NULL OR prompt_sha256 IS NOT NULL)"
+            )?,
             "0",
             "no contract was sent in its place"
         );
@@ -2729,28 +2725,30 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
                    '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
             ),
         )?;
-        until(
-            &project,
-            "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'commander' \
-             AND a.state = 'SETTLED'",
-            "1",
-            limit,
-        )
-        .await?;
-        let mut prompts = Vec::new();
-        for entry in std::fs::read_dir(world.bin().join("pi.d"))? {
-            let received = entry?.path().join("received.jsonl");
-            if let Ok(text) = std::fs::read_to_string(&received) {
-                for line in text.lines() {
-                    let command: Value = serde_json::from_str(line).unwrap_or(Value::Null);
-                    if command["type"] == "prompt" {
-                        prompts.push(command["message"].as_str().unwrap_or_default().to_owned());
-                    }
-                }
+        // The new Commander's first turn, by its attempt (the first of its binding's epoch 2 to settle): the old
+        // Commander's turns are codex's, and the specification's adoption may wake it before the change
+        // (docs/adr/ADR-031.md decision 1); a later wake may give pi another turn.
+        let first = format!(
+            "SELECT coalesce((SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.run_id = '{run_id}' AND t.role = 'commander' AND a.role_epoch = 2 AND a.state = 'SETTLED' \
+             ORDER BY a.rowid LIMIT 1), '')"
+        );
+        let end = Instant::now() + limit;
+        let attempt = loop {
+            let attempt = query(&project, &first)?;
+            if !attempt.is_empty() {
+                break attempt;
             }
-        }
+            assert!(Instant::now() < end, "the new Commander's first turn did not settle");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let prompts: Vec<String> = received_by_attempt(&world.bin().join("pi.d"))?
+            .into_iter()
+            .filter(|(a, command)| *a == attempt && command["type"] == "prompt")
+            .filter_map(|(_, command)| command["message"].as_str().map(str::to_owned))
+            .collect();
         let [sent] = prompts.as_slice() else {
-            return Err(format!("the pi Commander was sent {} prompts", prompts.len()).into());
+            return Err(format!("the pi Commander's first turn was sent {} prompts", prompts.len()).into());
         };
         let (contract, handover, wake) = (
             sent.find("Commander").ok_or("no role contract")?,
@@ -2770,9 +2768,6 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
     world.stop_fakes()?;
     outcome
 }
-
-/// How the Commander's role contract starts: its turns' first input (resources/prompts/commander.md).
-const COMMANDER_CONTRACT: &str = "# HoH 整体负责人";
 
 #[tokio::test]
 async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
@@ -2819,19 +2814,15 @@ async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
         );
         ready(&project, &run_id, &[("T-dev", "developer")])?;
         until(&project, &ended("T-dev/attempt-1"), "SETTLED/", limit).await?;
-        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .filter(|m| m["method"] == "turn/start")
-            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
-            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
-            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
-            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
-            .collect();
+        // The task's turns, by its attempts: the Commander's turns are codex's too in this world (the specification's
+        // adoption and the stall detector wake it: docs/adr/ADR-031.md decision 1, correction C).
+        let sent = codex_prompts_of(&world, |a| a.starts_with("T-dev/"))?;
         assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            codex_prompts_of(&world, |a| a == "T-dev/attempt-1")?,
+            sent,
+            "the first attempt's"
+        );
         let text = &sent[0];
         let block = text
             .split("```json\n")
@@ -2907,19 +2898,15 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
         until(&project, &ended("T-dev/attempt-2"), "FAILED/FIRST_INPUT_UNAVAILABLE", limit).await?;
         std::fs::write(&kept, &whole)?;
         until(&project, &ended("T-dev/attempt-3"), "SETTLED/", limit).await?;
-        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .filter(|m| m["method"] == "turn/start")
-            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
-            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
-            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
-            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
-            .collect();
+        // The task's turns, by its attempts: the Commander's turns are codex's too in this world (the specification's
+        // adoption and the stall detector wake it: docs/adr/ADR-031.md decision 1, correction C).
+        let sent = codex_prompts_of(&world, |a| a.starts_with("T-dev/"))?;
         assert_eq!(sent.len(), 1, "only the third attempt's turn was sent: {sent:?}");
+        assert_eq!(
+            codex_prompts_of(&world, |a| a == "T-dev/attempt-3")?,
+            sent,
+            "the third attempt's"
+        );
         assert!(sent[0].contains("```json"), "the retry's turn has no package: {}", sent[0]);
         R::Ok(())
     }
@@ -3031,26 +3018,20 @@ async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_p
         )
         .await?;
         until(&project, &ended("T-INCOMPLETE/attempt-2"), "SETTLED/", limit).await?;
-        let sent: Vec<String> = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-            .filter(|m| m["method"] == "turn/start")
-            .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
-            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
-            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
-            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
-            .collect();
+        // The task's turns, by its attempts: the Commander's turns are codex's too in this world (the specification's
+        // adoption and the stall detector wake it: docs/adr/ADR-031.md decision 1, correction C).
+        let task = |a: &str| a.starts_with("T-INCOMPLETE/");
+        let sent = codex_prompts_of(&world, |a| a == "T-INCOMPLETE/attempt-2")?;
         assert_eq!(sent.len(), 1, "only the retry's turn was sent: {sent:?}");
+        assert_eq!(
+            codex_prompts_of(&world, task)?.len(),
+            1,
+            "only the retry's turn was sent"
+        );
         assert!(sent[0].contains("```json"), "the first turn codex got has no package: {}", sent[0]);
-        let resumes = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-            .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-            .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-            .filter(|line| line.contains("\"thread/resume\""))
+        let resumes = received_by_attempt(&world.bin().join("codex.d"))?
+            .into_iter()
+            .filter(|(a, m)| task(a) && m["method"] == "thread/resume")
             .count();
         assert_eq!(resumes, 0, "a thread no turn completed was resumed");
         R::Ok(())
@@ -3214,16 +3195,38 @@ async fn a_pi_commander_turn_runs_in_its_sessions_own_directory() -> R {
     a_commander_turn_runs_in_its_sessions_own_directory("pi").await
 }
 
-/// The texts codex was sent in its turns (turn/start's input), oldest first.
-fn codex_prompts(world: &World) -> R<Vec<String>> {
-    Ok(std::fs::read_dir(world.bin().join("codex.d"))?
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with("log."))
-        .filter_map(|e| std::fs::read_to_string(e.path().join("received.jsonl")).ok())
-        .flat_map(|log| log.lines().map(str::to_owned).collect::<Vec<_>>())
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|m| m["method"] == "turn/start")
-        .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+/// What a fake agent's processes under `dir` (`codex.d`, `pi.d`) were sent, by the attempt each ran for: a process's
+/// `marker.<pid>` (the attempt's marker, `<project_id>/<attempt_id>`) and the messages of its `log.<pid>/received.jsonl`.
+/// A test of an attempt's calls selects that attempt's, whatever else the agent ran meanwhile, such as the Commander's
+/// turn its run's adoption of a specification wakes (docs/adr/ADR-031.md decision 1, 实施记录's adoption-wake rule).
+fn received_by_attempt(dir: &Path) -> R<Vec<(String, Value)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("log.") else {
+            continue;
+        };
+        let attempt = std::fs::read_to_string(dir.join(format!("marker.{pid}")))
+            .ok()
+            .and_then(|m| m.trim().split_once('/').map(|(_, a)| a.to_owned()))
+            .unwrap_or_default();
+        if let Ok(text) = std::fs::read_to_string(entry.path().join("received.jsonl")) {
+            for line in text.lines() {
+                if let Ok(message) = serde_json::from_str::<Value>(line) {
+                    out.push((attempt.clone(), message));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The prompts codex was sent (each turn/start's first input) for the attempts `of` selects.
+fn codex_prompts_of(world: &World, of: impl Fn(&str) -> bool) -> R<Vec<String>> {
+    Ok(received_by_attempt(&world.bin().join("codex.d"))?
+        .into_iter()
+        .filter(|(attempt, m)| of(attempt) && m["method"] == "turn/start")
+        .filter_map(|(_, m)| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
         .collect())
 }
 
@@ -3324,8 +3327,8 @@ async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_s
             )?;
             assert_eq!(registered, "1", "{path}");
         }
-        // What codex was sent is what was recorded.
-        let sent = codex_prompts(&world)?;
+        // What codex was sent for the attempt is what was recorded.
+        let sent = codex_prompts_of(&world, |a| a == "T-a/attempt-4")?;
         assert_eq!(sent.len(), 1, "{sent:?}");
         let digest = |bytes: &[u8]| -> String {
             <sha2::Sha256 as sha2::Digest>::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -3443,7 +3446,7 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
             "/",
             "nothing sent, no process"
         );
-        assert!(codex_prompts(&world)?.is_empty());
+        assert!(codex_prompts_of(&world, |a| a.starts_with("T-b/"))?.is_empty());
         R::Ok(())
     }
     .await;
