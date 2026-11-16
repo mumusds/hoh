@@ -337,6 +337,30 @@ pub fn snapshot(bytes: &[u8], rows: u16, cols: u16) -> R<String> {
     screen(bytes, rows, cols)
 }
 
+/// Wait (at most `timeout`) until the screen of `pty` (a terminal of `rows` x `cols`) as [`snapshot`] gives it for all
+/// its output so far satisfies `want`; that screen.
+pub fn screen_until(
+    pty: &Pty,
+    rows: u16,
+    cols: u16,
+    timeout: Duration,
+    want: impl Fn(&str) -> bool,
+) -> R<String> {
+    let end = Instant::now() + timeout;
+    loop {
+        let screen = snapshot(&pty.output(), rows, cols)?;
+        if want(&screen) {
+            return Ok(screen);
+        }
+        if Instant::now() > end {
+            return Err(
+                format!("the screen was not as wanted within {timeout:?}:\n{screen}").into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The screen a terminal of `rows` x `cols` shows after `bytes`: each row's text without its trailing blanks, the rows
 /// joined by LF, trailing empty rows dropped.
 pub fn screen(bytes: &[u8], rows: u16, cols: u16) -> R<String> {
