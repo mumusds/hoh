@@ -283,30 +283,59 @@ pub(in crate::persistence) fn answers(
     task_id: &str,
     attempt_id: &str,
 ) -> Result<Vec<String>, PersistError> {
+    answers_counted(
+        conn,
+        task_id,
+        attempt_id,
+        &mut super::recovery::Work::default(),
+    )
+}
+
+/// An answer as [`answers`] reads it: its question, exit, subject and text.
+type Answered = (Option<String>, Option<String>, String, Option<String>);
+
+/// [`answers`], its work counted (M2T13R-302): both its event reads keyed by the task's run (`events_run_kind`), so
+/// other runs' events are never read; a question's answer and an attempt's move are always its run's events (Progress,
+/// never written project-scoped).
+pub(in crate::persistence) fn answers_counted(
+    conn: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+    work: &mut super::recovery::Work,
+) -> Result<Vec<String>, PersistError> {
+    let mut run = conn
+        .prepare_cached("SELECT run_id FROM tasks WHERE task_id = ?1")
+        .map_err(sqlite_error)?;
+    let run_id: Option<String> = run
+        .query_row(params![task_id], |r| r.get(0))
+        .optional()
+        .map_err(sqlite_error)?;
+    work.count(&run);
+    let Some(run_id) = run_id else {
+        return Ok(Vec::new());
+    };
     let mut statement = conn
-        .prepare(
+        .prepare_cached(
             "SELECT json_extract(payload_json, '$.question_id'), json_extract(payload_json, '$.exit'), \
              coalesce(json_extract(payload_json, '$.subject'), ''), json_extract(payload_json, '$.answer') \
-             FROM events WHERE kind = 'question.answered' AND json_extract(payload_json, '$.task_id') = ?1 \
+             FROM events WHERE run_id = ?3 AND kind = 'question.answered' \
+             AND json_extract(payload_json, '$.task_id') = ?1 \
              AND seq > coalesce((SELECT max(m.seq) FROM events m JOIN attempts a \
                ON a.attempt_id = json_extract(m.payload_json, '$.attempt_id') \
-               WHERE m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.to') = 'RUNNING' \
+               WHERE m.run_id = ?3 AND m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.to') = 'RUNNING' \
                AND a.task_id = ?1 AND a.attempt_id <> ?2), 0) ORDER BY seq",
         )
         .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(params![task_id, attempt_id], |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
+    let rows: Vec<Answered> = statement
+        .query_map(params![task_id, attempt_id, run_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
+    work.count(&statement);
     let mut out = Vec::new();
-    for row in rows {
-        let (question, exit, subject, answer) = row.map_err(sqlite_error)?;
+    for (question, exit, subject, answer) in rows {
         let answer: String = answer.unwrap_or_default().chars().take(2000).collect();
         let exit = exit.unwrap_or_default();
         let more = if exit == "rework" && subject == "source" {

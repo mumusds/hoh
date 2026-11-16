@@ -214,9 +214,10 @@ pub fn open(conn: &Connection, run_id: &str) -> Result<Vec<Question>, PersistErr
     };
     if !blocked.is_empty() {
         let refused = super::verification::refused(conn, run_id)?;
-        let rounds = super::closing::rounds(conn, run_id)?;
+        // The run's rounds, read once and only for a source's question (its current round).
+        let mut rounds = None;
         for task in blocked {
-            if let Some(question) = task_question(conn, run_id, &task, &refused, &rounds)? {
+            if let Some(question) = task_question(conn, run_id, &task, &refused, &mut rounds)? {
                 out.push(question);
             }
         }
@@ -363,7 +364,7 @@ fn task_question(
     run_id: &str,
     task: &str,
     refused: &std::collections::BTreeSet<String>,
-    rounds: &[super::closing::Round],
+    rounds: &mut Option<Vec<super::closing::Round>>,
 ) -> Result<Option<Question>, PersistError> {
     let refusal = refused.contains(task);
     let row: Option<(i64, String, String)> = conn
@@ -401,7 +402,14 @@ fn task_question(
     // A source's current round and its candidate's state now.
     let (mut current_round, mut candidate_state, mut verifying) = (None, None, false);
     if let TaskReason::Source(_) = reason
-        && let Some(round) = super::closing::current(rounds, task)
+        && rounds.is_none()
+    {
+        *rounds = Some(super::closing::rounds(conn, run_id)?);
+    }
+    if let TaskReason::Source(_) = reason
+        && let Some(round) = rounds
+            .as_deref()
+            .and_then(|all| super::closing::current(all, task))
     {
         let state: Option<String> = conn
             .query_row(
