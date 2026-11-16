@@ -77,11 +77,57 @@ fn gate(args: &[OsString], input: &[u8]) -> R<(Option<i32>, String)> {
         _ => {}
     }
     drop(stdin);
-    let out = child.wait_with_output()?;
+    let out = output_within(child, Duration::from_secs(60))?;
     Ok((
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     ))
+}
+
+/// `child`'s output once it has ended, waited for at most `limit` (its pipes read meanwhile); past it the child, this
+/// test's own and not yet reaped, is killed and reaped, and that is an error: a hung gate fails its test instead of
+/// holding it until the suite's bound (ADR-022 decision 10; CIR-502).
+fn output_within(mut child: std::process::Child, limit: Duration) -> R<std::process::Output> {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (sent, got) = std::sync::mpsc::channel();
+        match pipe {
+            Some(mut pipe) => {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+                    let _ = sent.send(bytes);
+                });
+            }
+            None => {
+                let _ = sent.send(Vec::new());
+            }
+        }
+        got
+    }
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let end = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("still running after {limit:?}, so killed").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let left = |pipe: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        pipe.recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "its output was still held open 5 s after it ended")
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: left(&stdout)?,
+        stderr: left(&stderr)?,
+    })
 }
 
 fn sha256_of(path: &Path) -> R<String> {

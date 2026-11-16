@@ -3,6 +3,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -43,7 +45,8 @@ fn gate(argv: &[&str], input: &[u8]) -> R<(Option<i32>, String, u32)> {
         _ => {}
     }
     drop(stdin);
-    let out = child.wait_with_output()?;
+    // A bound of its own (CIR-502): a gate that hangs fails the test here.
+    let out = common::output_within(child, std::time::Duration::from_secs(60))?;
     Ok((out.status.code(), String::from_utf8(out.stdout)?, pid))
 }
 
