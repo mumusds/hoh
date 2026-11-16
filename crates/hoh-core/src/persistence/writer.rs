@@ -577,6 +577,7 @@ impl Writer {
                         continue;
                     }
                     before();
+                    faults.before_job(job.name());
                     let ctx = Ctx {
                         job: job.name(),
                         hooks: faults.as_ref(),

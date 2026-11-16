@@ -3064,3 +3064,126 @@ async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
     second.shutdown().await;
     Ok(())
 }
+
+/// The runner's ticks (counted after each tick's staffing) and every Held answer of the store's writer with the tick
+/// it fell in (docs/adr/ADR-031.md correction D's property: a run is Held only in the tick of its stop).
+#[derive(Debug, Default)]
+struct HeldTicks {
+    tick: Arc<std::sync::atomic::AtomicU64>,
+    held: Mutex<Vec<(u64, &'static str, String)>>,
+}
+
+impl hoh_core::persistence::FaultHooks for HeldTicks {
+    fn held(&self, job: &'static str, run: &str) {
+        let tick = self.tick.load(Ordering::SeqCst);
+        if let Ok(mut held) = self.held.lock() {
+            held.push((tick, job, run.to_owned()));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CountTicks(Arc<std::sync::atomic::AtomicU64>);
+
+impl hoh_app::host::HostHooks for CountTicks {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::AfterStaffing {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// [`host_seeded`]'s host of an already seeded `project`, its store's and its runner's hooks `held`.
+async fn host_held(project: &Path, agents: &Arc<Agents>, held: &Arc<HeldTicks>) -> R<Host> {
+    let mut config = config(project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    config.store.faults = held.clone();
+    config.hooks = Arc::new(CountTicks(held.tick.clone()));
+    Ok(start_when_free(config).await?)
+}
+
+/// Wait until the runner has ticked `n` more times.
+async fn ticked(held: &HeldTicks, n: u64) -> R {
+    let until = held.tick.load(Ordering::SeqCst) + n;
+    let end = Instant::now() + Duration::from_secs(30);
+    while held.tick.load(Ordering::SeqCst) < until {
+        if Instant::now() > end {
+            return Err(format!("the runner did not tick {n} times").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_the_cancel_world_a_run_is_held_only_in_the_tick_of_its_stop() -> R {
+    // docs/adr/ADR-031.md test plan, 停住之后的写入口 (2), over this file's world (T1 running, its Commander bound): the
+    // run is cancelled; every Held the store's hook records for it falls in one tick; after five more ticks and a
+    // restart with five more, none, and the run has no event after its run.result.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 3")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        &format!(
+            "{WORLD}
+             INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+               ('sc', 'codex', 'commander', '1', '{{}}');
+             INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
+               ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');"
+        ),
+    )?;
+    let held = Arc::new(HeldTicks::default());
+    let host = host_held(&project, &agents, &held).await?;
+    let outcome = async {
+        until(
+            &project,
+            "SELECT state FROM attempts WHERE task_id = 'T1'",
+            "RUNNING",
+            Duration::from_secs(10),
+        )
+        .await?;
+        let (status, _) = command(&host, &control(&project, "CancelRun", "cancel")?).await?;
+        assert_eq!(status, 202);
+        until(
+            &project,
+            "SELECT state FROM runs WHERE run_id = 'R'",
+            "CANCELLED",
+            Duration::from_secs(15),
+        )
+        .await?;
+        ticked(&held, 5).await
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+    let first: Vec<(u64, &'static str, String)> =
+        held.held.lock().map(|h| h.clone()).unwrap_or_default();
+    let ticks: std::collections::BTreeSet<u64> = first.iter().map(|(t, ..)| *t).collect();
+    assert!(ticks.len() <= 1, "{first:?}");
+    let last = query(&project, "SELECT max(seq) FROM events WHERE run_id = 'R'")?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1"
+        )?,
+        "run.result"
+    );
+    let restarted = Arc::new(HeldTicks::default());
+    let host = host_held(&project, &agents, &restarted).await?;
+    let outcome = ticked(&restarted, 5).await;
+    host.shutdown().await;
+    outcome?;
+    assert_eq!(restarted.held.lock().map(|h| h.len()).unwrap_or(1), 0);
+    assert_eq!(
+        query(&project, "SELECT max(seq) FROM events WHERE run_id = 'R'")?,
+        last
+    );
+    Ok(())
+}
