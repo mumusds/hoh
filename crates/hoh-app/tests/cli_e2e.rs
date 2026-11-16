@@ -3,6 +3,9 @@
 //! the configuration before any host, the configured mode, the follow to the run's result in each output, signals that
 //! only detach, a closed stdout, and `--resume` to a run that is not there or has ended. The plain host has no runner:
 //! its runs move only by the commands the tests submit (a pause or a cancel lands at once with no attempt).
+//!
+//! TEST-002-01 and TEST-002-03 (AC-002-01, -03; M2-T13) run against an in-process host whose runner is the world's
+//! scripted Team: its Commander asks a person in the specification phase and ends the run INCOMPLETE once answered.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -435,4 +438,243 @@ async fn a_resume_to_no_run_or_an_ended_one_is_64_and_submits_nothing() -> R {
     });
     host.shutdown().await;
     outcome
+}
+
+/// The question the scripted Commander of TEST-002-01 and TEST-002-03 asks.
+const QUESTION: &str = "登录要支持哪些方式？\"OAuth\" 还是 密码\\短信";
+
+/// The scripted Commander of TEST-002-01 and TEST-002-03: a run's turn at CREATED moves it to SPECIFYING and asks
+/// [`QUESTION`] (requires_user); a turn given the answer (a `need_decision{answered}` among its events) decides
+/// INCOMPLETE (SPECIFYING -> INCOMPLETE, the run quiet); every other turn submits nothing.
+fn asking_commander() -> std::sync::Arc<world::Team> {
+    world::Team::new(|turn| {
+        let answered = turn.summary["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|e| e["kind"] == "need_decision" && e["payload"]["reason"] == "answered")
+        });
+        match turn.state.as_str() {
+            "CREATED" => {
+                let mut decided = world::steps("CREATED", "SPECIFYING");
+                decided.push(world::ask("q-login", QUESTION));
+                decided
+            }
+            "SPECIFYING" if answered => vec![world::transition("INCOMPLETE")],
+            _ => Vec::new(),
+        }
+    })
+}
+
+/// The rows of `table`.
+fn count(world: &World, table: &str) -> R<i64> {
+    Ok(world
+        .query(&format!("SELECT count(*) FROM {table}"))?
+        .parse()?)
+}
+
+/// The commands accepted after the first `before`, in order: kind, run_id and payload.
+fn commands_after(world: &World, before: i64) -> R<Vec<Value>> {
+    world.rows(&format!(
+        "SELECT kind, run_id, payload_json FROM commands ORDER BY rowid LIMIT -1 OFFSET {before}"
+    ))
+}
+
+/// The alternate screen's start, which a `-p` never writes.
+const ENTER_ALT: &[u8] = b"\x1b[?1049h";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_002_01_a_question_in_the_spec_phase_blocks_the_run_and_exits_3() -> R {
+    // AC-002-01: a mock Git project with an approved specification, its host in this process, its runner the scripted
+    // Team: the run's Commander moves it to SPECIFYING and asks a person (requires_user). With no terminal and stdin
+    // /dev/null, `hoh -p '实现登录功能' --output json`, within 60 s.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    let team = asking_commander();
+    let host = world.team_host(team.clone(), None).await?;
+    let outcome = tokio::task::block_in_place(|| -> R {
+        let spec = world.seed_spec()?;
+        let goal = "实现登录功能";
+        let (runs, commands) = (count(&world, "runs")?, count(&world, "commands")?);
+        let child = world
+            .command(&["-p", goal, "--output", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // The new run staffed (the scripted Team has no agent registry, so its host leaves the bindings vacant) and,
+        // until slice S2b's StartRun adopts the project's latest approved specification itself, adopted here by SQL
+        // (World::adopt; S2b replaces it, and then it writes nothing).
+        let run = run_of_goal(&world, goal)?;
+        world.staff(&run)?;
+        world.adopt(&run, &spec)?;
+        let out = world::finish(child, Duration::from_secs(60))?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        // Exit 3.
+        assert_eq!(out.status.code(), Some(3), "{stderr}");
+        // stdout is one JSON object as a whole: BLOCKED, NEED_DECISION, the run's id.
+        let result: Value = serde_json::from_slice(&out.stdout)?;
+        assert!(result.is_object(), "{result}");
+        assert_eq!(result["state"], "BLOCKED", "{result}");
+        assert_eq!(result["blocked_reason"], "NEED_DECISION", "{result}");
+        assert_eq!(result["run_id"], json!(run), "{result}");
+        // Exactly one run more, BLOCKED.
+        assert_eq!(count(&world, "runs")?, runs + 1);
+        assert_eq!(
+            world.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?,
+            "BLOCKED"
+        );
+        // Exactly one command more, StartRun: its goal byte for byte, not interactive; no other command of the client.
+        let sent = commands_after(&world, commands)?;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["kind"], "StartRun", "{sent:?}");
+        assert_eq!(sent[0]["run_id"], json!(run), "{sent:?}");
+        let payload: Value =
+            serde_json::from_str(sent[0]["payload_json"].as_str().ok_or("no payload")?)?;
+        assert_eq!(
+            payload["goal"].as_str().map(str::as_bytes),
+            Some(goal.as_bytes()),
+            "{payload}"
+        );
+        assert_eq!(payload["interactive"], false, "{payload}");
+        // The run's events hold the question as the Commander asked it.
+        let asked: Vec<Value> = world
+            .rows(&format!(
+                "SELECT payload_json FROM events WHERE run_id = '{run}' AND kind = 'question.asked'"
+            ))?
+            .iter()
+            .map(|r| serde_json::from_str(r["payload_json"].as_str().unwrap_or("null")))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            asked
+                .iter()
+                .map(|a| a["question"].clone())
+                .collect::<Vec<_>>(),
+            [json!(QUESTION)],
+            "{asked:?}"
+        );
+        // Neither stdout nor stderr enters the alternate screen.
+        assert_eq!(pty::find(&out.stdout, ENTER_ALT, 0), None);
+        assert_eq!(pty::find(&out.stderr, ENTER_ALT, 0), None, "{stderr}");
+        Ok(())
+    });
+    host.shutdown().await;
+    outcome?;
+    assert!(team.refused().is_empty(), "{team:?}");
+    Ok(())
+}
+
+/// TEST-002-03's run C, COMPLETED at revision 5 (its id as a host gives one, a UUID).
+const RUN_C: &str = "c5e2a7d1-0b3f-4e8a-9c6d-2f1e4b7a9d03";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_002_03_usage_errors_and_a_reply_by_resume() -> R {
+    // AC-002-03: run C COMPLETED at revision 5 and run K BLOCKED (NEED_DECISION) on its Commander's question; their
+    // host in this process, its runner the scripted Team, whose Commander decides INCOMPLETE once given the answer.
+    // K is made through the product (StartRun, its staffing, its Commander's turn to SPECIFYING and its request): the
+    // rows the test plan seeds by SQL (its specification, its Commander's binding and session, the PROPOSED
+    // request_user_decision, the claim `commander:<id>`, question.asked, resume_state SPECIFYING, no task, no attempt
+    // unfinished), written by their own writers. C is seeded by SQL. Then, one after the other: `hoh -p`, `-p ''`,
+    // `-p '  '`, `-p x --resume NOPE`, `-p x --resume <C>`, `-p '采用方案A' --resume <K>`.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    let team = asking_commander();
+    let host = world.team_host(team.clone(), None).await?;
+    let outcome = async {
+        let spec = world.seed_spec()?;
+        let k = world::start_run(&host, "k", "实现登录功能").await?;
+        world.staff(&k)?;
+        // Until slice S2b's StartRun adopts the specification itself (World::adopt; S2b replaces it).
+        world.adopt(&k, &spec)?;
+        world
+            .until(
+                &format!("SELECT state || '/' || blocked_reason || '/' || resume_state FROM runs WHERE run_id = '{k}'"),
+                "BLOCKED/NEED_DECISION/SPECIFYING",
+                Duration::from_secs(60),
+            )
+            .await?;
+        // K is quiet: no attempt unfinished, no task but its Commander's turns, its request PROPOSED.
+        world
+            .until(
+                &format!(
+                    "SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = '{k}' \
+                     AND a.state NOT IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')"
+                ),
+                "0",
+                WAIT,
+            )
+            .await?;
+        assert_eq!(
+            world.query(&format!(
+                "SELECT count(*) FROM tasks WHERE run_id = '{k}' AND role <> 'commander'"
+            ))?,
+            "0"
+        );
+        let request = world.query(&format!(
+            "SELECT decision_id || '/' || state FROM decisions WHERE run_id = '{k}' \
+             AND json_extract(payload_json, '$.kind') = 'request_user_decision'"
+        ))?;
+        let (request, proposed) = request.rsplit_once('/').ok_or("no request")?;
+        assert_eq!(proposed, "PROPOSED");
+        world.exec(&format!(
+            "INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES
+               ('{RUN_C}', :p, 'COMPLETED', 'AUTO', 5, '2026-11-15T00:00:00Z');"
+        ))?;
+        let request = request.to_owned();
+        tokio::task::block_in_place(|| -> R {
+            let c = || world.query(&format!("SELECT state || '/' || revision FROM runs WHERE run_id = '{RUN_C}'"));
+            let runs = count(&world, "runs")?;
+            // The first five: 64, nothing on stdout, a message on stderr; the runs as they were, C COMPLETED at 5.
+            for args in [
+                &["-p"][..],
+                &["-p", ""],
+                &["-p", "  "],
+                &["-p", "x", "--resume", "NOPE"],
+                &["-p", "x", "--resume", RUN_C],
+            ] {
+                let out = world.hoh(args)?;
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                assert_eq!(out.status.code(), Some(64), "{args:?}: {stderr}");
+                assert_eq!(out.stdout.len(), 0, "{args:?}");
+                assert!(!stderr.trim().is_empty(), "{args:?}");
+                assert_eq!(count(&world, "runs")?, runs, "{args:?}");
+                assert_eq!(c()?, "COMPLETED/5", "{args:?}");
+            }
+            // The sixth: no run more, exactly one command more (SendInput to K), 4, K INCOMPLETE.
+            let commands = count(&world, "commands")?;
+            let out = world.hoh(&["-p", "采用方案A", "--resume", &k])?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert_eq!(count(&world, "runs")?, runs);
+            let sent = commands_after(&world, commands)?;
+            assert_eq!(sent.len(), 1, "{sent:?}; stderr: {stderr}");
+            assert_eq!(
+                (&sent[0]["kind"], &sent[0]["run_id"]),
+                (&json!("SendInput"), &json!(k)),
+                "{sent:?}"
+            );
+            assert_eq!(out.status.code(), Some(4), "{stderr}");
+            assert_eq!(
+                world.query(&format!("SELECT state FROM runs WHERE run_id = '{k}'"))?,
+                "INCOMPLETE"
+            );
+            // The request answered: APPLIED, and the answer is K's question.answered's.
+            assert_eq!(
+                world.query(&format!("SELECT state FROM decisions WHERE decision_id = '{request}'"))?,
+                "APPLIED"
+            );
+            let answers: Vec<String> = world
+                .rows(&format!(
+                    "SELECT json_extract(payload_json, '$.answer') AS answer FROM events \
+                     WHERE run_id = '{k}' AND kind = 'question.answered'"
+                ))?
+                .iter()
+                .map(|r| r["answer"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            assert_eq!(answers, ["采用方案A"]);
+            Ok(())
+        })
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+    assert!(team.refused().is_empty(), "{team:?}");
+    Ok(())
 }

@@ -207,7 +207,7 @@ fn the_worlds_fake_agents_pass_the_compat_suite_and_are_the_only_agents_on_its_p
 }
 
 /// `world`'s committed project with its specification's rows, its agents registered and its in-process product host
-/// started; a run started on it and adopted ([`adopt`]): the host and the run's id.
+/// started; a run started on it and adopted ([`World::adopt`]): the host and the run's id.
 async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     world.commit_project(&world::fixture_spec())?;
     world.register()?;
@@ -215,7 +215,7 @@ async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     let started = async {
         let spec = world.seed_spec()?;
         let run = world::start_run(&host, key, "完成fixture目标").await?;
-        adopt(world, &run, &spec)?;
+        world.adopt(&run, &spec)?;
         R::Ok(run)
     }
     .await;
@@ -226,22 +226,6 @@ async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
             Err(e)
         }
     }
-}
-
-/// Run `run` on specification `spec` with the wake of its adoption, as StartRun gives a run the project's latest
-/// approved specification (docs/adr/ADR-031.md decision 1): written here only where the product has not (before
-/// slice S2 it does not), so the world's smoke tests hold before and after it.
-fn adopt(world: &World, run: &str, spec: &str) -> R {
-    let sha = world.query(&format!(
-        "SELECT sha256 FROM specs WHERE spec_id = '{spec}'"
-    ))?;
-    world.exec(&format!(
-        "UPDATE runs SET spec_id = '{spec}' WHERE run_id = '{run}' AND spec_id IS NULL;
-         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-           SELECT :p, 'adopted-{run}', '{run}', 'spec.changed', json_object('run_id', '{run}', 'spec_id', '{spec}',
-             'spec_revision', 1, 'spec_sha256', '{sha}', 'from', NULL, 'cause', 'adopted'), '2026-11-15T00:00:00Z'
-           WHERE NOT EXISTS (SELECT 1 FROM events WHERE run_id = '{run}' AND kind = 'spec.changed');"
-    ))
 }
 
 /// Once the pinned Commander moved `run` to RUNNING: the developer task its create_tasks plans (`<run>-develop`, every
@@ -548,7 +532,7 @@ async fn the_scripted_teams_commander_moves_a_run_and_asks_a_person() -> R {
         let spec = world.seed_spec()?;
         let run = world::start_run(&host, "s1", "实现登录功能").await?;
         world.staff(&run)?;
-        adopt(&world, &run, &spec)?;
+        world.adopt(&run, &spec)?;
         world
             .until(
                 &format!("SELECT state || '/' || blocked_reason FROM runs WHERE run_id = '{run}'"),
@@ -784,7 +768,7 @@ async fn a_host_the_worlds_hoh_starts_has_the_worlds_environment_and_runs_its_fa
         .collect();
     want.sort();
     assert_eq!(env, want, "the host has the world's environment only");
-    adopt(&world, &run, &spec)?;
+    world.adopt(&run, &spec)?;
     world.wait(
         &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
         "RUNNING",
