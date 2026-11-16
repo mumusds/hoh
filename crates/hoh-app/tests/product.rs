@@ -2765,15 +2765,31 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
             .filter_map(|l| l.split_once(' '))
             .filter_map(|(name, at)| at.parse().ok().map(|at| (name, at)))
             .collect();
+        // The stand-in confirms that the native cancel came first and SIGTERM after it.
         assert_eq!(
             steps.iter().map(|s| s.0).collect::<Vec<_>>(),
             ["INT", "TERM"],
             "{seen}"
         );
-        let gap = Duration::from_nanos(u64::try_from(steps[1].1 - steps[0].1)?);
+        // The grace is measured between the host's own records of the two steps (each `cancel.<step>` event's at_ms,
+        // when the pass sent it), not where the stand-in received them: its receipt lags the host's record by the
+        // signal's delivery and its scheduling (ADR-022 decision 10, the measuring point; 3 of 60 runs under load saw
+        // 872-894 ms at the stand-in while the host's records were 1002-1003 ms apart).
+        let at = |step: &str| -> R<u64> {
+            Ok(query(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json, '$.at_ms') FROM events WHERE kind = 'cancel.{step}' \
+                     AND json_extract(payload_json, '$.attempt_id') = 'T-CANCEL/attempt-1'"
+                ),
+            )?
+            .parse()?)
+        };
+        let (native, term) = (at("native_cancel")?, at("sigterm")?);
+        let gap = Duration::from_millis(term.checked_sub(native).ok_or("SIGTERM recorded before the native cancel")?);
         assert!(
             gap >= Duration::from_millis(900) && gap < Duration::from_secs(8),
-            "SIGTERM {gap:?} after the native cancel"
+            "SIGTERM {gap:?} after the native cancel, by the host's records"
         );
         keep(
             "cancel-native-then-term",
