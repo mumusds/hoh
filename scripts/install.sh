@@ -692,8 +692,9 @@ remove() {
   fi
   for proc in /proc/[0-9]*; do
     # Its program's path, or the kernel's reason it cannot be read (one look, its words in English: uutils chooses its
-    # language by LANG, not LC_ALL, and gettext by LANGUAGE; design correction 17, M2T14R-1450).
-    if exe="$(env -u LANGUAGE LANG=C LC_ALL=C readlink -v -- "$proc/exe" 2>&1)"; then
+    # language by LANG, not LC_ALL, and gettext by LANGUAGE, which it ignores when empty; design correction 17,
+    # M2T14R-1450). Prefix assignments, not `env`: one exec per process fewer while both locks are held (M2T14R-1553).
+    if exe="$(LANGUAGE='' LANG=C LC_ALL=C readlink -v -- "$proc/exe" 2>&1)"; then
       if [[ "$exe" == "$real"/* || "$exe" == "$root"/* ]]; then
         say "still running from $root: pid ${proc#/proc/}: $(tr '\0' ' ' <"$proc/cmdline" 2>/dev/null || true)"
         running=1
