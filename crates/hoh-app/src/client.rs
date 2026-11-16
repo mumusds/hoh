@@ -884,6 +884,82 @@ pub fn get_run(host: &HostInfo, run_id: &str) -> Result<Option<Value>, Failure> 
     }
 }
 
+/// Every run of the host (listRuns, every page; ADR-021 decision 6), newest first: one not ended on a later page counts
+/// as much as one on the first (M2T06R-05).
+pub fn runs(host: &HostInfo) -> Result<Vec<Value>, Failure> {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let path = match &cursor {
+            Some(cursor) => format!("/v1/runs?limit=500&cursor={}", encode(cursor)),
+            None => "/v1/runs?limit=500".to_owned(),
+        };
+        let page = match call(host, "GET", &path, None) {
+            Ok(reply) if reply.status == 200 => reply.json(),
+            Ok(reply) => {
+                return Err(Failure::unreachable(format!(
+                    "the host answered {}",
+                    reply.status
+                )));
+            }
+            Err(e) => {
+                return Err(Failure::unreachable(format!(
+                    "the host did not answer: {e}"
+                )));
+            }
+        };
+        all.extend(page["items"].as_array().into_iter().flatten().cloned());
+        match page["next_cursor"].as_str() {
+            Some(next) if Some(next) != cursor.as_deref() => cursor = Some(next.to_owned()),
+            _ => return Ok(all),
+        }
+    }
+}
+
+/// Submit the command `build` makes for run `run_id`'s revision, reading the run again (`read`, getRun) and submitting
+/// anew while the host says the revision is stale, within [`WAIT`] (docs/adr/ADR-031.md decision 9). A run found gone
+/// or ended meanwhile is refused as 64.
+pub fn fresh(
+    submit: impl Fn(Value) -> Result<Value, Failure>,
+    read: impl Fn() -> Result<Option<Value>, Failure>,
+    run_id: &str,
+    revision: i64,
+    build: impl Fn(i64) -> Value,
+) -> Result<Value, Failure> {
+    use crate::exit::{ClientEvent, client_code};
+    let end = Instant::now() + WAIT;
+    let mut revision = revision;
+    loop {
+        match submit(build(revision)) {
+            Err(failure) if failure.code == "STALE_REVISION" && Instant::now() < end => {
+                match read()? {
+                    None => {
+                        return Err(Failure::new(
+                            "RUN_NOT_FOUND",
+                            format!("没有 Run {run_id}"),
+                            client_code(ClientEvent::Usage),
+                        ));
+                    }
+                    Some(run) => {
+                        let state = run["state"].as_str().unwrap_or_default();
+                        if crate::follow::TERMINAL.contains(&state) {
+                            return Err(Failure::new(
+                                "ILLEGAL_TRANSITION",
+                                format!(
+                                    "Run {run_id} 已结束（{state}），不能重开；请用 hoh -p '<文本>' 新建 Run"
+                                ),
+                                client_code(ClientEvent::Usage),
+                            ));
+                        }
+                        revision = run["revision"].as_i64().unwrap_or(revision);
+                    }
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 /// An open event stream of the host (`/v1/events`), read event by event.
 pub struct Events {
     reader: BufReader<UnixStream>,
