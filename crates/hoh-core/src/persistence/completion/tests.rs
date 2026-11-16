@@ -1642,7 +1642,7 @@ pub(in crate::persistence) fn evidence_of(
 
 /// [`evidence_of`] of evidence kind `kind` (`check`, or `attempt` for an attempt-level record): evidence is append-only
 /// (docs/adr/ADR-029.md decision 6), so a fixture inserts the kind it needs.
-fn evidence_of_kind(
+pub(in crate::persistence) fn evidence_of_kind(
     path: &Path,
     (attempt, candidate, record): (&str, &str, &str),
     (check, outcome): (&str, &str),
