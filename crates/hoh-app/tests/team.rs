@@ -189,13 +189,12 @@ async fn test_018_04_refused_team_changes_keep_the_revision_and_every_role_epoch
         context: hoh_core::decision::Context::default(),
     });
     let host = start_when_free(config).await?;
+    approved(dir.path())?;
     let run_id = started(&host, "s1").await?;
     exec(
         dir.path(),
         &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
-             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
-             WHERE run_id = '{run_id}';"
+            "UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 WHERE run_id = '{run_id}';"
         ),
     )?;
     let checkpoint = |bindings: Value| json!({"bindings": bindings, "apply_at": "checkpoint"});
@@ -588,6 +587,16 @@ impl hoh_app::host::Executor for Idle {
     ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
         Err("no work is expected".to_owned().into())
     }
+}
+
+/// The project's approved specification s1, before its runs start: StartRun adopts it (docs/adr/ADR-031.md decision
+/// 1; a run started with none is BLOCKED on runtime:no_spec, and that claim would hold it however the test moves it).
+fn approved(project: &Path) -> R {
+    exec(
+        project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
+         FROM projects;",
+    )
 }
 
 /// Run `sql` on the project's database.
@@ -1365,13 +1374,12 @@ async fn test_019_04_two_concurrent_team_changes_one_202_one_409_one_epoch_step(
         context: hoh_core::decision::Context::default(),
     });
     let host = start_when_free(config).await?;
+    approved(dir.path())?;
     let run_id = started(&host, "s1").await?;
     exec(
         dir.path(),
         &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
-             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 \
-             WHERE run_id = '{run_id}';"
+            "UPDATE runs SET state = 'RUNNING', spec_id = 's1', revision = revision + 1 WHERE run_id = '{run_id}';"
         ),
     )?;
     let binding = format!(
@@ -1485,13 +1493,11 @@ async fn a_change_to_a_logged_out_agent_is_refused_blocked_auth_and_the_old_bind
         context: hoh_core::decision::Context::default(),
     });
     let host = start_when_free(config).await?;
+    approved(&project)?;
     let run_id = started(&host, "s1").await?;
     exec(
         &project,
-        &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
-             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
-        ),
+        &format!("UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"),
     )?;
     let (status, body) = exchange(
         &host,
@@ -1645,14 +1651,12 @@ async fn a_session_start_passed_by_the_checkpoint_of_the_same_tick_is_never_offe
         context: hoh_core::decision::Context::default(),
     });
     let host = start_when_free(config).await?;
+    approved(&project)?;
     let run_id = started(&host, "s1").await?;
     *executor.run_id.lock().map_err(|e| e.to_string())? = run_id.clone();
     exec(
         &project,
-        &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 's1', project_id, printf('%064d', 1), 1 \
-             FROM projects; UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
-        ),
+        &format!("UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"),
     )?;
     let commander = format!(
         "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
@@ -1760,6 +1764,7 @@ async fn a_team_change_naming_a_run_is_the_projects_event_and_leaves_a_stopped_r
     // INCOMPLETE); the team's revision moves, the run's revision and latest event do not.
     let dir = tempfile::tempdir()?;
     let host = start_when_free(config(dir.path())).await?;
+    approved(dir.path())?;
     let mut expected = 0;
     for (n, state) in ["RUNNING", "COMPLETED", "INCOMPLETE"]
         .into_iter()
@@ -1857,13 +1862,12 @@ async fn a_team_change_takes_effect_at_a_paused_runs_checkpoint_without_a_resume
         context: hoh_core::decision::Context::default(),
     });
     let host = start_when_free(config).await?;
+    approved(dir.path())?;
     let run_id = started(&host, "s1").await?;
     exec(
         dir.path(),
         &format!(
             "UPDATE runs SET state = 'RUNNING', revision = 3 WHERE run_id = '{run_id}';
-             INSERT INTO specs(spec_id, project_id, sha256, revision)
-               SELECT 's1', project_id, printf('%064d', 1), 1 FROM runs WHERE run_id = '{run_id}';
              INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
                ('D', '{run_id}', 's1', 'RUNNING', 2, 'developer', 1, 1);
              INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES

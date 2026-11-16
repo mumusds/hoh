@@ -809,8 +809,17 @@ fn some(rows: &Value) -> bool {
     rows.as_array().is_some_and(|a| !a.is_empty())
 }
 
-/// Run `run_id` RUNNING on a spec (a run needs one to be supervised, docs/adr/ADR-025.md decision 4), once its
-/// commander binding has a session, and a need_decision of fingerprint `fp` about it.
+/// The project's approved specification s1, before its run starts: StartRun adopts it (docs/adr/ADR-031.md decision 1;
+/// a run started with none is BLOCKED on runtime:no_spec, and that claim would hold it however the test moves it).
+fn approved(project: &Path) -> R {
+    seed(
+        project,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);",
+    )
+}
+
+/// Run `run_id` RUNNING on its spec (a run needs one to be supervised, docs/adr/ADR-025.md decision 4; it adopted the
+/// approved s1 at its start), once its commander binding has a session, and a need_decision of fingerprint `fp` about it.
 async fn supervised(project: &Path, run_id: &str, fp: &str) -> R {
     until(
         project,
@@ -823,10 +832,7 @@ async fn supervised(project: &Path, run_id: &str, fp: &str) -> R {
     .await?;
     seed(
         project,
-        &format!(
-            "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
-             UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
-        ),
+        &format!("UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"),
     )?;
     need_decision(project, run_id, fp)
 }
@@ -877,6 +883,7 @@ async fn a_commander_not_installed_falls_back_and_its_run_is_not_blocked_for_it(
     let host = start_when_free(fakes.config()).await?;
     let project = fakes.project();
     let outcome = async {
+        approved(&project)?;
         let run_id = started(&host).await?;
         supervised(&project, &run_id, "fp-1").await?;
         let commander = rows(
@@ -937,6 +944,7 @@ async fn without_a_fallback_a_commander_not_installed_blocks_its_run() -> R {
     let host = start_when_free(fakes.config()).await?;
     let project = fakes.project();
     let outcome = async {
+        approved(&project)?;
         let run_id = started(&host).await?;
         until(
             &project,
@@ -950,10 +958,7 @@ async fn without_a_fallback_a_commander_not_installed_blocks_its_run() -> R {
         .await?;
         seed(
             &project,
-            &format!(
-                "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
-                 UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
-            ),
+            &format!("UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"),
         )?;
         let run = until(
             &project,
@@ -1003,6 +1008,7 @@ async fn a_commanders_unavailable_model_falls_back() -> R {
     let host = start_when_free(fakes.config()).await?;
     let project = fakes.project();
     let outcome = async {
+        approved(&project)?;
         let run_id = started(&host).await?;
         supervised(&project, &run_id, "fp-1").await?;
         // The wake of the need_decision is the first one given a turn; it is answered once a turn of it settles.
@@ -1115,6 +1121,7 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
     let host = start_when_free(config).await?;
     let project = fakes.project();
     let outcome = async {
+        approved(&project)?;
         let run_id = started(&host).await?;
         supervised(&project, &run_id, "fp-1").await?;
         let settled = |r: &Value| {
