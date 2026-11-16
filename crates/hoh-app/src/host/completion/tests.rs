@@ -48,7 +48,9 @@ fn ending(lines: &[String], truncated: bool) -> Ending {
 fn reasons(outcome: &WriterOutcome) -> String {
     match outcome {
         WriterOutcome::Correct { reasons } => format!("correct: {}", reasons.join("; ")),
-        WriterOutcome::Decide { reason, detail } => format!("decide {reason}: {detail}"),
+        WriterOutcome::Decide { reason, detail } => {
+            format!("decide {}: {detail}", reason.as_str())
+        }
         WriterOutcome::Freeze { job, result, .. } => {
             format!("freeze {} for {:?}", job.sealed.candidate_id, result.status)
         }
@@ -149,7 +151,7 @@ fn a_failed_blocked_or_incomplete_result_needs_a_decision_with_its_summary_and_i
         else {
             return Err(format!("{status}: not a decision").into());
         };
-        assert_eq!(got, reason);
+        assert_eq!(got.as_str(), reason);
         let detail: serde_json::Value = serde_json::from_str(&detail)?;
         assert_eq!(detail["summary"], format!("{status} summary"));
         assert_eq!(detail["status"], status);

@@ -4,6 +4,7 @@
 //! transaction.
 
 use super::decide::load_binding;
+use super::need::VerifierReason;
 use super::writer::{Intent, NewEvent, NewOutbox};
 use super::{PersistError, sqlite_error};
 use crate::handoff::{self, Recipient, Verification};
@@ -380,6 +381,20 @@ pub(super) fn unknown_effect(
     {
         return Ok(None);
     }
+    // W10 (docs/adr/ADR-031.md correction A).
+    let event = super::need::task_event(
+        tx,
+        super::need::TaskNeed {
+            project_id,
+            run_id,
+            task_id,
+            event_id: child_id(attempt_id, super::need::KIND),
+            reason: super::need::TaskReason::Verifier(VerifierReason::VerifierUnknownEffect),
+            fields: json!({"attempt_id": attempt_id,
+                "detail": "the verifier's attempt ended with an effect not confirmed; it is not run again until a \
+                    decision confirms what it did"}),
+        },
+    )?;
     tx.execute(
         "UPDATE tasks SET blocked_reason = 'NEED_DECISION', next_retry_at = NULL WHERE task_id = ?1",
         params![task_id],
@@ -391,17 +406,7 @@ pub(super) fn unknown_effect(
             expected_revision: revision,
             change: super::writer::Change::Task(crate::protocol::TaskState::Blocked),
         },
-        NewEvent {
-            intent: Intent::Progress,
-            project_id: project_id.to_owned(),
-            event_id: child_id(attempt_id, "need_decision"),
-            run_id: Some(run_id.to_owned()),
-            kind: "need_decision".to_owned(),
-            payload: json!({"run_id": run_id, "task_id": task_id, "attempt_id": attempt_id,
-                "reason": "verifier_unknown_effect",
-                "detail": "the verifier's attempt ended with an effect not confirmed; it is not run again until a \
-                    decision confirms what it did"}),
-        },
+        event,
     )))
 }
 
@@ -562,7 +567,7 @@ pub(super) fn admit(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
-    let refuse = |reason: &str, detail: String, invalid: Option<&str>| {
+    let refuse = |reason: VerifierReason, detail: String, invalid: Option<&str>| {
         refuse(
             tx,
             ctx,
@@ -591,7 +596,7 @@ pub(super) fn admit(
         Ok(m) => m,
         Err(violations) => {
             return refuse(
-                "INVALID_HANDOFF",
+                VerifierReason::InvalidHandoff,
                 format!("handoff {handoff} is not a valid verification handoff"),
                 Some(&violations),
             );
@@ -601,7 +606,7 @@ pub(super) fn admit(
     let others = conflicting_sessions(tx, run_id, &round_id, role)?;
     if let Some(session) = session.filter(|s| others.contains(*s)) {
         return refuse(
-            "SESSION_NOT_INDEPENDENT",
+            VerifierReason::SessionNotIndependent,
             format!(
                 "the {role} would verify in session {session}, which a source attempt, the Commander, the Developer \
                  or the other verifier uses"
@@ -706,7 +711,8 @@ pub(super) struct Refusal<'a> {
     pub round_id: &'a str,
     /// What refused it, naming its events with the task's revision: `dispatch-refused` or `report-rejected`.
     pub cause: &'a str,
-    pub reason: &'a str,
+    /// Its question's reason (W11): INVALID_HANDOFF, SESSION_NOT_INDEPENDENT or report_rejected.
+    pub reason: VerifierReason,
     pub detail: String,
     /// An invalid handoff: its id, the role it is for, and what is wrong with it.
     pub invalid: Option<(&'a str, &'a str, &'a str)>,
@@ -748,16 +754,24 @@ pub(super) fn refuse(
             json!({"message_id": message_id, "consumer": role, "violations": violations}),
         ));
     }
-    let mut integrity = json!({"task_id": r.task_id, "round_id": r.round_id, "reason": r.reason, "detail": r.detail});
+    let mut integrity = json!({"task_id": r.task_id, "round_id": r.round_id, "reason": r.reason.as_str(),
+        "detail": r.detail});
     for (key, value) in r.facts.as_object().into_iter().flatten() {
         integrity[key] = value.clone();
     }
     events.push(event(key("integrity"), "integrity_violation", integrity));
-    events.push(event(
-        key("need_decision"),
-        "need_decision",
-        json!({"run_id": r.run_id, "task_id": r.task_id, "reason": r.reason, "detail": r.detail}),
-    ));
+    // W11 (docs/adr/ADR-031.md correction A).
+    events.push(super::need::task_event(
+        tx,
+        super::need::TaskNeed {
+            project_id: r.project_id,
+            run_id: r.run_id,
+            task_id: r.task_id,
+            event_id: key(super::need::KIND),
+            reason: super::need::TaskReason::Verifier(r.reason),
+            fields: json!({"detail": r.detail}),
+        },
+    )?);
     super::writer::write(
         tx,
         &super::writer::Commit {

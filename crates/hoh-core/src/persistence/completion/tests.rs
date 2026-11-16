@@ -336,14 +336,14 @@ async fn an_outcome_that_needs_a_decision_blocks_the_task_and_settles_the_attemp
     let (store, path) = open(dir.path())?;
     let done = store
         .complete_writer_attempt(completion(WriterOutcome::Decide {
-            reason: "task_result_blocked".to_owned(),
+            reason: crate::persistence::need::WorkReason::AgentBlocked,
             detail: "no credentials for the registry".to_owned(),
         }))
         .await?;
     assert_eq!(
         done,
         WriterCompleted::Blocked {
-            reason: "task_result_blocked".to_owned()
+            reason: "agent_blocked".to_owned()
         }
     );
     assert_eq!(
@@ -362,7 +362,7 @@ async fn an_outcome_that_needs_a_decision_blocks_the_task_and_settles_the_attemp
             &path,
             "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision'"
         )?,
-        ["task_result_blocked"]
+        ["agent_blocked"]
     );
     assert_eq!(
         released(&path)?,
@@ -541,7 +541,7 @@ async fn only_a_completion_handed_to_verification_records_its_task_implemented()
         ),
         (
             WriterOutcome::Decide {
-                reason: "agent_incomplete".to_owned(),
+                reason: crate::persistence::need::WorkReason::AgentIncomplete,
                 detail: "{}".to_owned(),
             },
             0,
