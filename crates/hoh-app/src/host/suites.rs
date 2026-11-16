@@ -308,7 +308,7 @@ impl Suites {
         let entry = ready.entry.clone();
         let hooks = self.shared.hooks.clone();
         let running = stop.clone();
-        let task = tokio::task::spawn_blocking(move || {
+        let task = super::begun::spawn_blocking(move || {
             let ran = suite::run(agent, &entry, &env, &running);
             hooks.suite_ran(agent.as_str());
             ran

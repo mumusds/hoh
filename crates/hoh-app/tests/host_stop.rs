@@ -17,6 +17,34 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use world::World;
 
+/// What an agent process writes in its attempt's directory (its bridge, its run-check requests) and the copies of its
+/// output that the one exception appends to (docs/adr/ADR-031.md, implementation review round 4, correction 1): an
+/// agent outlives its host, so these may still change after the stop; nothing else of the project may.
+fn agents(path: &Path) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    path.components().any(|c| c.as_os_str() == "requests")
+        || name.is_some_and(|n| {
+            [
+                "messages.jsonl",
+                "stdout.jsonl",
+                "stderr.log",
+                "app-server.stdout.jsonl",
+                "app-server.stderr.log",
+                "exec.stdout.jsonl",
+                "exec.stderr.log",
+            ]
+            .contains(&n.as_str())
+        })
+}
+
+/// What appeared under `dir` between `before` and now, leaving out what agents may still write ([`agents`]).
+fn new_since(dir: &Path, before: &[PathBuf]) -> Vec<PathBuf> {
+    paths(dir)
+        .into_iter()
+        .filter(|p| !before.contains(p) && !agents(p))
+        .collect()
+}
+
 /// Every path under `dir` (none when it does not exist), sorted.
 fn paths(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -159,5 +187,211 @@ async fn a_step_an_attempt_began_on_a_blocking_thread_ends_before_its_host_stop_
         "the stop returned while the step ran: {returned_early}; written into {} after it returned: {new:?}",
         hoh.display()
     );
+    Ok(())
+}
+
+/// Holds `point`'s step (on its blocking thread) once it is reached, until released, a minute at most.
+#[derive(Debug, Default)]
+struct Hold {
+    held: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+}
+
+impl Hold {
+    fn hold(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.held.store(true, SeqCst);
+        let end = Instant::now() + Duration::from_secs(60);
+        while !self.release.load(SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    async fn reached(&self, limit: Duration) -> R {
+        let end = Instant::now() + limit;
+        while !self.held.load(std::sync::atomic::Ordering::SeqCst) {
+            if Instant::now() > end {
+                return Err("the held step was never reached".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+}
+
+/// Holds the commit of a candidate's pending check records that a verifier's check runs first.
+#[derive(Debug, Default)]
+struct HoldReconcile(Hold);
+
+impl hoh_app::host::HostHooks for HoldReconcile {
+    fn reconciling(&self, _candidate_id: &str) {
+        self.0.hold();
+    }
+}
+
+/// The host stops while `hold`'s step is held; `release` after `after`: whether the stop had returned by then, and
+/// what appeared under the project's `.hoh` after it returned (in 2 s, agents' own writes left out).
+async fn stop_while_held(
+    world: &World,
+    host: hoh_app::host::Host,
+    hold: &Hold,
+    after: Duration,
+) -> R<(bool, bool, Vec<PathBuf>)> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let stopping = tokio::spawn(host.shutdown());
+    tokio::time::sleep(after).await;
+    let returned_early = stopping.is_finished();
+    hold.release.store(true, SeqCst);
+    let clean = stopping.await?;
+    let hoh = world.project().join(".hoh");
+    let at_return = paths(&hoh);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    Ok((returned_early, clean, new_since(&hoh, &at_return)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_commit_of_pending_check_records_at_the_stop_ends_before_the_stop_returns() -> R {
+    // M2T13R-350: QA runs the planned check; its run first commits the candidate's pending records in a task of its
+    // own (check::reconcile, M2T10R-201), held here while the host stops. That task finishes what it records, so the
+    // stop waits for it, and nothing appears in the project after the stop returned.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    let hold = std::sync::Arc::new(HoldReconcile::default());
+    let mut config = world.host_config()?;
+    config.hooks = hold.clone();
+    let host = hoh_app::host::Host::start(config).await?;
+    let started = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        hold.0.reached(Duration::from_secs(90)).await
+    }
+    .await;
+    let (returned_early, clean, new) =
+        stop_while_held(&world, host, &hold.0, Duration::from_secs(1)).await?;
+    started?;
+    assert!(
+        !returned_early && clean && new.is_empty(),
+        "returned while the commit was held: {returned_early}; clean: {clean}; new after the return: {new:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_turns_logs_being_kept_at_the_stop_are_kept_before_the_stop_returns() -> R {
+    // M2T13R-351: the Developer's turn has ended and its raw logs are being kept as objects (held here) when the host
+    // stops, past the executor's own 10 s for its turn watchers: the stop still waits for the copy, and nothing
+    // appears in the project after it returned.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    let hold = std::sync::Arc::new(Hold::default());
+    let mut config = world.host_config()?;
+    let runner = config.runner.as_mut().ok_or("no runner")?;
+    let registry = runner.executor.registry().ok_or("no registry")?;
+    let held = hold.clone();
+    runner.executor = std::sync::Arc::new(
+        hoh_app::host::product::ProductExecutor::new(
+            registry,
+            world.project(),
+            world::HOH.into(),
+            (config.reconcile.native_grace, config.reconcile.term_grace),
+        )
+        .with_keeping(std::sync::Arc::new(move |attempt: &str| {
+            if attempt.ends_with("-develop/attempt-1") {
+                held.hold();
+            }
+        })),
+    );
+    let host = hoh_app::host::Host::start(config).await?;
+    let started = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        hold.reached(Duration::from_secs(90)).await
+    }
+    .await;
+    let (returned_early, clean, new) =
+        stop_while_held(&world, host, &hold, Duration::from_secs(12)).await?;
+    started?;
+    assert!(
+        !returned_early && clean && new.is_empty(),
+        "returned while the logs were kept: {returned_early}; clean: {clean}; new after the return: {new:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_running_at_the_stop_is_cancelled_and_still_recorded_before_the_stop_returns() -> R
+{
+    // M2T13R-352: QA's check runs a command of two minutes when the host stops. The stop aborts the attempt's task, so
+    // the check's run is cancelled (TERM, then KILL after 5 s); its finishing task still writes its record (ADR-027
+    // decision 6), and the stop returns once that is done, long before the command would have ended, cleanly, with
+    // nothing appearing in the project after it.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    let plan = world.project().join("tests/check-plan.json");
+    let mut checks: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan)?)?;
+    checks["checks"]["slow"] = serde_json::json!({"mode": "product", "timeout_seconds": 300,
+        "argv": ["sh", "-c", "echo started > \"$HOH_EVIDENCE_DIR/started\"; exec sleep 120"]});
+    std::fs::write(
+        &plan,
+        format!("{}\n", serde_json::to_string_pretty(&checks)?),
+    )?;
+    world.git(&["commit", "-qam", "a slow check"])?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            checks: vec!["slow".to_owned()],
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    let host = world.start_host().await?;
+    let evidence = world.project().join(".hoh/evidence");
+    let running = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        let end = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Some(started) = paths(&evidence)
+                .into_iter()
+                .find(|p| p.ends_with("artifacts/started"))
+            {
+                return R::Ok(started);
+            }
+            if Instant::now() > end {
+                return Err("the slow check never started".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    .await;
+    let begun = Instant::now();
+    let clean = host.shutdown().await;
+    let took = begun.elapsed();
+    let started = running?;
+    let hoh = world.project().join(".hoh");
+    let at_return = paths(&hoh);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let new = new_since(&hoh, &at_return);
+    let record = started
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("no record directory")?;
+    assert!(clean, "the stop was not clean");
+    assert!(took < Duration::from_secs(25), "the stop took {took:?}");
+    assert!(
+        record.join("execution.json").is_file(),
+        "the cancelled check's record was not written: {:?}",
+        paths(record)
+    );
+    assert!(new.is_empty(), "new after the return: {new:?}");
     Ok(())
 }

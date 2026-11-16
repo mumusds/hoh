@@ -280,8 +280,6 @@ struct Common {
     unsupervised: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Where verifiers' run directories go (docs/adr/ADR-028.md decision 6).
     runs: std::path::PathBuf,
-    /// The steps the attempt tasks began that their abort at the stop does not end (super::begun).
-    begun: Arc<super::begun::Begun>,
 }
 
 impl Common {
@@ -337,7 +335,6 @@ pub(super) async fn run(
         undelivered: std::sync::Mutex::default(),
         unsupervised: std::sync::Mutex::default(),
         runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
-        begun: Arc::default(),
     });
     let registry = config.executor.registry();
     // The project's compat manifest into the registry, the leftovers of a publication that crashed deleted, before the
@@ -347,7 +344,7 @@ pub(super) async fn run(
     }
     let watch = registry.clone().map(|registry| {
         let suites = super::suites::Suites::new(common.shared.clone(), common.clock.clone());
-        tokio::spawn(registry_watch(registry, suites, stop.clone()))
+        super::begun::spawn(registry_watch(registry, suites, stop.clone()))
     });
     let mut renewed = Instant::now();
     let mut held_back: BTreeMap<String, (Instant, String)> = BTreeMap::new();
@@ -393,22 +390,10 @@ pub(super) async fn run(
         task.abort();
         let _ = task.await;
     }
-    // The steps they began run on (an abort does not end a blocking step, nor a task one spawned): waited for, so
-    // nothing of an attempt writes the project after the host's stop.
-    let left = common.begun.drained(BEGUN_STOP).await;
-    if left > 0 {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "hoh host: {left} step(s) its attempts began still run after {BEGUN_STOP:?} of its stop"
-        );
-    }
-    // Then what the executor runs in the host for its turns: nothing of the host writes the project after its stop.
+    // Then what the executor runs in the host for its turns. What they all began is the host's stop's to account for
+    // (super::begun: every counted task aborted, the counted work waited for).
     common.executor.stop().await;
 }
-
-/// How long the host's stop waits for the steps its attempts began (a freeze, a completion, a check's record).
-const BEGUN_STOP: Duration = Duration::from_secs(30);
 
 /// A recovery's outcome as decision 11 records it: what trying again cannot make good (damaged facts, a record that
 /// is not the candidate's) is permanent. None when its run has stopped (Held, docs/adr/ADR-031.md correction D rule 2
@@ -532,7 +517,7 @@ async fn verification_start(common: &Common) -> Result<(), TickError> {
     let store = &common.shared.store;
     let state = common.shared.root.join(".hoh");
     let evidence = state.join("evidence");
-    let recorded: Vec<String> = tokio::task::spawn_blocking(move || {
+    let recorded: Vec<String> = super::begun::spawn_blocking(move || {
         std::fs::read_dir(evidence)
             .into_iter()
             .flatten()
@@ -549,7 +534,7 @@ async fn verification_start(common: &Common) -> Result<(), TickError> {
         let reader = no_run(store.reader())?;
         let id = candidate.clone();
         let wanted = joined(
-            tokio::task::spawn_blocking(move || reader.start_recovery_wanted(&id)).await,
+            super::begun::spawn_blocking(move || reader.start_recovery_wanted(&id)).await,
             "the start's look-up",
         )?;
         if !wanted {
@@ -570,7 +555,7 @@ async fn verification_start(common: &Common) -> Result<(), TickError> {
     let waiting = no_run(store.runner_waiting(&common.shared.project_id).await)?;
     let state = common.shared.root.join(".hoh");
     let pending =
-        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
+        super::begun::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
             .await
             .unwrap_or_default();
     for run in verified_runs(common, &waiting).await? {
@@ -586,7 +571,7 @@ async fn verification_start(common: &Common) -> Result<(), TickError> {
 async fn remove_unused(common: &Common) -> Result<(), TickError> {
     let reader = no_run(common.shared.store.reader())?;
     let live = joined(
-        tokio::task::spawn_blocking(move || reader.live_attempts()).await,
+        super::begun::spawn_blocking(move || reader.live_attempts()).await,
         "the attempts' look-up",
     )?;
     let (root, runs, project_id) = (
@@ -594,7 +579,7 @@ async fn remove_unused(common: &Common) -> Result<(), TickError> {
         common.runs.clone(),
         common.shared.project_id.clone(),
     );
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = super::begun::spawn_blocking(move || {
         super::verifying::remove_unused(&root, &runs, &project_id, &live);
     })
     .await;
@@ -610,7 +595,7 @@ async fn verified_runs(
     let reader = no_run(common.shared.store.reader())?;
     let project = common.shared.project_id.clone();
     let cancelled = joined(
-        tokio::task::spawn_blocking(move || reader.cancelled_with_open_rounds(&project)).await,
+        super::begun::spawn_blocking(move || reader.cancelled_with_open_rounds(&project)).await,
         "the runs' look-up",
     )?;
     let mut runs: Vec<String> = Vec::new();
@@ -633,7 +618,7 @@ async fn verified_runs(
 /// this host epoch (docs/adr/ADR-030.md decision 10).
 async fn open_manifest(common: &Common, registry: &Arc<super::agents::Registry>) {
     let (opening, root) = (registry.clone(), common.shared.root.clone());
-    let said = tokio::task::spawn_blocking(move || opening.open_manifest(&root))
+    let said = super::begun::spawn_blocking(move || opening.open_manifest(&root))
         .await
         .ok()
         .flatten();
@@ -680,7 +665,7 @@ async fn registry_watch(
     loop {
         let looking = registry.clone();
         // Not left behind on a stop: the registry's stop ends the probe, and the host waits for it (M2T07R-202).
-        let _ = tokio::task::spawn_blocking(move || looking.refresh()).await;
+        let _ = super::begun::spawn_blocking(move || looking.refresh()).await;
         if *stop.borrow() {
             break;
         }
@@ -865,7 +850,7 @@ async fn tick(
     // records.
     let state = common.shared.root.join(".hoh");
     let pending =
-        tokio::task::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
+        super::begun::spawn_blocking(move || crate::verify::check::pending_candidates(&state))
             .await
             .unwrap_or_default();
     // The pending records of a candidate still under a round are recovered first, and a candidate held by a failed
@@ -874,7 +859,7 @@ async fn tick(
     let handle = store.evidence_handle();
     let reader = no_run(store.reader())?;
     let unrecovered = joined(
-        tokio::task::spawn_blocking(move || reader.unrecovered_candidates()).await,
+        super::begun::spawn_blocking(move || reader.unrecovered_candidates()).await,
         "the recovery's look-up",
     )?;
     for candidate in pending.union(&unrecovered) {
@@ -882,7 +867,7 @@ async fn tick(
         let id = candidate.clone();
         // Due, and past its last failure's backoff (decision 11, M2T16D-1251).
         let (due, not_before) = joined(
-            tokio::task::spawn_blocking(move || {
+            super::begun::spawn_blocking(move || {
                 Ok::<_, PersistError>((reader.recovery_due(&id)?, reader.recovery_not_before(&id)?))
             })
             .await,
@@ -1034,12 +1019,12 @@ async fn tick(
         if inflight.contains_key(&id) {
             continue;
         }
-        let task = tokio::spawn({
+        // Counted under the host's Begun with what it starts, and aborted at the host's stop if still running.
+        let task = super::begun::spawn({
             let common = common.clone();
             let work = work.clone();
             let id = id.clone();
-            // Its blocking steps and the tasks it spawns are counted under the host's Begun (the stop waits for them).
-            common.begun.clone().scope(async move {
+            async move {
                 let result = attempt(&common, work.clone(), notice).await;
                 // An error is settled at once, its entry still there so no tick takes it meanwhile (M2T05R-260);
                 // however it ends, its entry then goes (no lease is renewed for it any more; a settle that failed is
@@ -1065,7 +1050,7 @@ async fn tick(
                 if let Ok(mut f) = common.inflight.lock() {
                     f.remove(&id);
                 }
-            })
+            }
         });
         inflight.insert(
             id,
@@ -1656,6 +1641,10 @@ async fn run_check(
         Launch {
             env: vec![(super::ATTEMPT_ENV.to_owned(), marker)],
             adopt,
+            reconciling: {
+                let (hooks, candidate) = (common.shared.hooks.clone(), v.candidate_id.clone());
+                Some(Box::new(move || hooks.reconciling(&candidate)))
+            },
         },
     )
     .await;
