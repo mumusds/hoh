@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// The cells a grapheme takes when ratatui draws it: ratatui measures and draws a line grapheme by grapheme, and
 /// leaves out a control character (M1T08R-34).
-fn cells(g: &str) -> usize {
+pub(super) fn cells(g: &str) -> usize {
     if g.chars().any(char::is_control) {
         0
     } else {

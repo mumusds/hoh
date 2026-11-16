@@ -1,6 +1,6 @@
 //! The TUI shell's editor, history, keys and screen (ADR-014), without a terminal.
 
-use super::app::{App, Exit, mode_of};
+use super::app::{App, Exit, Request, mode_of};
 use super::editor::Editor;
 use super::history::History;
 use ratatui::Terminal;
@@ -130,7 +130,7 @@ fn an_unreadable_history_is_reported_and_the_shell_still_opens() {
 }
 
 #[test]
-fn enter_records_the_input_and_says_it_was_not_sent() {
+fn enter_records_the_input_and_asks_to_start_a_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = app_in(dir.path());
     assert_eq!(app.key(key(KeyCode::Enter)), None);
@@ -138,16 +138,15 @@ fn enter_records_the_input_and_says_it_was_not_sent() {
         !dir.path().join(".hoh").exists(),
         "an empty Enter records nothing"
     );
+    assert_eq!(app.take_requests(), [], "and asks for nothing");
     typed(&mut app, "hi");
     assert_eq!(app.key(key(KeyCode::Enter)), None);
     assert_eq!(app.editor_text(), "");
     assert_eq!(History::load(dir.path()).entries(), ["hi"]);
     let rows = screen(&app, 100, 30);
-    assert!(rows.iter().any(|r| r.contains("hi")));
-    assert!(
-        rows.iter().any(|r| r.contains("host 离线，未发送")),
-        "{rows:#?}"
-    );
+    assert!(rows.iter().any(|r| r.contains("你：hi")), "{rows:#?}");
+    // Unattached, the text is the goal of a new run (docs/adr/ADR-031.md decision 13).
+    assert_eq!(app.take_requests(), [Request::Start("hi".to_owned())]);
 }
 
 #[test]
@@ -194,7 +193,12 @@ fn ctrl_r_fills_the_editor_and_neither_enter_nor_esc_sends() {
         3,
         "and sends nothing"
     );
-    assert!(!screen(&app, 100, 30).iter().any(|r| r.contains("未发送")));
+    assert_eq!(
+        app.take_requests(),
+        [],
+        "Enter that ends the search sends nothing"
+    );
+    assert!(!screen(&app, 100, 30).iter().any(|r| r.contains("你：")));
     // Esc gives back the draft from before the search.
     app.key(ctrl('c'));
     typed(&mut app, "mine");
@@ -231,17 +235,17 @@ fn ctrl_c_clears_first_and_then_offers_to_detach() {
 }
 
 #[test]
-fn the_workspace_shows_the_project_the_mode_and_an_offline_host() {
+fn the_workspace_shows_the_project_the_mode_and_a_connected_host() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = app_in(dir.path());
     let rows = screen(&app, 100, 30);
     let top = &rows[0];
-    for part in ["demo", "AUTO", "run 无", "baseline 未知", "host 离线"] {
+    for part in ["demo", "AUTO", "run 无", "baseline 无", "host 已连接"] {
         assert!(top.contains(part), "{part:?} in {top:?}");
     }
     // Narrow terminals still show the editor and the status line.
     let rows = screen(&app, 40, 8);
-    assert!(rows.iter().any(|r| r.contains("host 离线")));
+    assert!(rows.iter().any(|r| r.contains("host 已连接")));
 }
 
 /// A line wider than the editor shows its end, with the cursor right after it (whole graphemes dropped in front).
@@ -826,4 +830,441 @@ fn the_top_bar_shows_the_projects_configured_mode() {
     )
     .expect("write");
     assert_eq!(mode_of(dir.path()), "AUTO");
+}
+
+/// A run as list_runs gives it (docs/adr/ADR-031.md decision 13): no goal, no blocked reason.
+fn listed(run_id: &str, state: &str, created_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "run_id": run_id, "state": state,
+        "label": if state == "CANCEL_REQUESTED" { "CANCELLING" } else { state },
+        "mode": "AUTO", "revision": 1, "resume_state": null, "blocked_reason": null,
+        "created_at": created_at, "goal": null,
+    })
+}
+
+/// A COMPLETED run whose candidate accepted last is `commit`'s, accepted at `seq` (or none: null).
+fn completed(run_id: &str, created_at: &str, accepted: Option<(&str, i64)>) -> serde_json::Value {
+    let mut run = listed(run_id, "COMPLETED", created_at);
+    run["accepted"] = accepted.map_or(serde_json::Value::Null, |(commit, seq)| {
+        serde_json::json!({"candidate_id": format!("c-{run_id}"), "git_commit": commit, "seq": seq})
+    });
+    run
+}
+
+#[test]
+fn the_top_bar_shows_the_baseline_of_the_candidate_accepted_last_among_completed_runs() {
+    // Decision 13: the project's baseline is the git commit of the candidate accepted last (greatest seq) among the
+    // COMPLETED runs' ACCEPTED candidates, its first 12 hex digits; "无" without one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    // A run not COMPLETED gives no baseline, even with an accepted candidate (the host gives it none).
+    let mut running = listed("r", "RUNNING", "2026-11-05T00:00:00Z");
+    running["accepted"] = serde_json::json!({"candidate_id": "x", "git_commit": c, "seq": 99});
+    app.list(&[
+        running,
+        completed("c3", "2026-11-04T00:00:00Z", None),
+        completed("c2", "2026-11-02T00:00:00Z", Some((&b, 10))),
+        completed("c1", "2026-11-03T00:00:00Z", Some((&a, 20))),
+    ]);
+    let top = screen(&app, 120, 10)[0].clone();
+    assert!(top.contains(&format!("baseline {} ", &a[..12])), "{top:?}");
+    // The same while attached.
+    app.attach("c1", "COMPLETED");
+    let top = screen(&app, 120, 10)[0].clone();
+    assert!(top.contains(&format!("baseline {} ", &a[..12])), "{top:?}");
+    for runs in [
+        vec![],
+        vec![listed("r", "RUNNING", "2026-11-05T00:00:00Z")],
+        vec![completed("c3", "2026-11-04T00:00:00Z", None)],
+    ] {
+        let mut app = app_in(dir.path());
+        app.list(&runs);
+        let top = screen(&app, 120, 10)[0].clone();
+        assert!(top.contains("baseline 无"), "{runs:?}: {top:?}");
+    }
+}
+
+#[test]
+fn the_workspace_lists_the_runs_not_ended_first_and_the_newest_first_one_line_each() {
+    // Decision 13: `<short id>  <label>  <blocked reason?>  <goal cut short>`, the short id the run id's first 8
+    // characters; the runs not in a terminal state first, each group newest first; a goal of several lines on one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    let mut paused = listed("aaaaaaaa-1", "PAUSED", "2026-11-01T00:00:00Z");
+    paused["goal"] = "暂停的目标".into();
+    let mut blocked = listed("bbbbbbbb-2", "BLOCKED", "2026-11-03T00:00:00Z");
+    blocked["blocked_reason"] = "NEED_DECISION".into();
+    blocked["goal"] = "一行\n两行".into();
+    let mut long = listed("dddddddd-4", "RUNNING", "2026-11-02T00:00:00Z");
+    long["goal"] = format!("{}END", "长".repeat(100)).into();
+    let cancelling = listed("eeeeeeee-5", "CANCEL_REQUESTED", "2026-10-01T00:00:00Z");
+    let done = listed("cccccccc-3", "COMPLETED", "2026-11-04T00:00:00Z");
+    let failed = listed("ffffffff-6", "FAILED", "2026-11-05T00:00:00Z");
+    app.list(&[done, failed, blocked, long, paused, cancelling]);
+    let rows = screen(&app, 80, 20);
+    let order: Vec<&str> = rows[1..7].iter().map(|r| &r[..8]).collect();
+    assert_eq!(
+        order,
+        [
+            "bbbbbbbb", "dddddddd", "aaaaaaaa", "eeeeeeee", "ffffffff", "cccccccc"
+        ],
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[1].trim_end(),
+        "bbbbbbbb  BLOCKED  NEED_DECISION  一行 两行"
+    );
+    assert_eq!(rows[3].trim_end(), "aaaaaaaa  PAUSED  暂停的目标");
+    assert_eq!(rows[4].trim_end(), "eeeeeeee  CANCELLING");
+    assert_eq!(rows[6].trim_end(), "cccccccc  COMPLETED");
+    let cut = rows[2].trim_end();
+    assert!(cut.starts_with("dddddddd  RUNNING  长长"), "{cut:?}");
+    assert!(cut.ends_with('…') && !cut.contains("END"), "{cut:?}");
+    assert!(cut.width() <= 80, "{cut:?}");
+}
+
+#[test]
+fn a_slash_command_is_the_workspaces_own_and_resume_chooses_among_the_runs_not_ended() {
+    // Decision 13, E11: `/resume` opens the selector of the runs not ended (the one of attach); any other `/…` is
+    // "M3 前未提供"; neither asks the host for anything. Esc closes the selector; Enter on a run attaches it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.list(&[
+        listed("cccccccc-3", "COMPLETED", "2026-11-04T00:00:00Z"),
+        listed("bbbbbbbb-2", "PAUSED", "2026-11-02T00:00:00Z"),
+        listed("aaaaaaaa-1", "RUNNING", "2026-11-01T00:00:00Z"),
+    ]);
+    typed(&mut app, "/plan x");
+    app.key(key(KeyCode::Enter));
+    assert!(
+        screen(&app, 80, 20)
+            .iter()
+            .any(|r| r.contains("M3 前未提供"))
+    );
+    typed(&mut app, "/resume");
+    app.key(key(KeyCode::Enter));
+    let rows = screen(&app, 80, 20);
+    assert!(rows.iter().any(|r| r.contains("选择 Run")), "{rows:#?}");
+    let offered: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.contains("aaaaaaaa") || r.contains("bbbbbbbb") || r.contains("cccccccc"))
+        .collect();
+    assert_eq!(offered.len(), 2, "{rows:#?}");
+    assert!(offered[0].contains("bbbbbbbb") && offered[1].contains("aaaaaaaa"));
+    assert_eq!(app.key(key(KeyCode::Esc)), None, "Esc only closes it");
+    assert!(!screen(&app, 80, 20).iter().any(|r| r.contains("选择 Run")));
+    assert_eq!(app.take_requests(), []);
+    typed(&mut app, "/resume");
+    app.key(key(KeyCode::Enter));
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Up));
+    app.key(key(KeyCode::Down));
+    assert_eq!(app.key(key(KeyCode::Enter)), None);
+    assert_eq!(
+        app.take_requests(),
+        [Request::Attach("aaaaaaaa-1".to_owned())]
+    );
+    assert!(!screen(&app, 80, 20).iter().any(|r| r.contains("选择 Run")));
+    // With no run to resume there is nothing to choose.
+    let mut app = app_in(dir.path());
+    app.list(&[listed("cccccccc-3", "COMPLETED", "2026-11-04T00:00:00Z")]);
+    typed(&mut app, "/resume");
+    app.key(key(KeyCode::Enter));
+    let rows = screen(&app, 80, 20);
+    assert!(
+        rows.iter().any(|r| r.contains("没有可附着的 Run")),
+        "{rows:#?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains("选择 Run")));
+}
+
+#[test]
+fn attachs_selector_leaves_on_esc_or_on_the_ctrl_c_choice() {
+    // Decision 12: the selector `hoh attach` opens with two runs on a terminal leaves with Esc, or with Ctrl+C's
+    // "脱离"; there is no run to pause or cancel.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.list(&[
+        listed("bbbbbbbb-2", "PAUSED", "2026-11-02T00:00:00Z"),
+        listed("aaaaaaaa-1", "RUNNING", "2026-11-01T00:00:00Z"),
+    ]);
+    app.pick();
+    assert_eq!(app.key(key(KeyCode::Esc)), Some(Exit::Detach));
+    app.pick();
+    assert_eq!(app.key(ctrl('c')), None);
+    let rows = screen(&app, 80, 20);
+    assert!(rows.iter().any(|r| r.contains("脱离")), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r.contains("取消任务")));
+    assert_eq!(app.key(key(KeyCode::Enter)), Some(Exit::Detach));
+    app.pick();
+    assert_eq!(app.key(key(KeyCode::Enter)), None);
+    assert_eq!(
+        app.take_requests(),
+        [Request::Attach("bbbbbbbb-2".to_owned())]
+    );
+}
+
+#[test]
+fn enter_while_attached_sends_the_text_as_input_slash_included() {
+    // Decision 13 (Enter, attached): SendInput with the text, whatever it starts with; an Enter after one that starts
+    // a run, before the loop has done it, goes to the run it starts.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    typed(&mut app, "a");
+    app.key(key(KeyCode::Enter));
+    typed(&mut app, "/resume");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(
+        app.take_requests(),
+        [
+            Request::Start("a".to_owned()),
+            Request::Input("/resume".to_owned())
+        ]
+    );
+    app.attach("R", "RUNNING");
+    typed(&mut app, "b");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(app.take_requests(), [Request::Input("b".to_owned())]);
+    assert_eq!(History::load(dir.path()).entries(), ["a", "/resume", "b"]);
+}
+
+/// The status bar: the last row of a screen of `height` rows.
+fn status(app: &App, height: u16) -> String {
+    screen(app, 100, height)[usize::from(height) - 1].clone()
+}
+
+#[test]
+fn the_status_bar_counts_each_event_of_the_attached_run_once_and_shows_the_latest_seq() {
+    // Decision 13: "事件 <events received> · #<latest seq>"; the client keeps seq strictly increasing, so an event
+    // seen again (a stream opened again after the last one) is not counted twice.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    assert!(!status(&app, 10).contains("事件"), "unattached: no count");
+    app.attach("R", "RUNNING");
+    assert!(
+        status(&app, 10).contains("事件 0 · #0"),
+        "{:?}",
+        status(&app, 10)
+    );
+    for seq in [1, 2, 2, 4, 3, 7] {
+        app.event(
+            &serde_json::json!({"seq": seq, "run_id": "R", "kind": "task.ready", "payload": {}}),
+        );
+    }
+    assert!(
+        status(&app, 10).contains("事件 4 · #7"),
+        "{:?}",
+        status(&app, 10)
+    );
+    assert!(
+        app.event(
+            &serde_json::json!({"seq": 8, "run_id": "R", "kind": "run.paused", "payload": {}})
+        ),
+        "a run event: its label is read again"
+    );
+    assert!(
+        !app.event(
+            &serde_json::json!({"seq": 8, "run_id": "R", "kind": "run.paused", "payload": {}})
+        )
+    );
+}
+
+#[test]
+fn the_acceptance_of_an_input_says_whether_it_answered_a_question() {
+    // Decision 13 (Enter, attached): once the acceptance event of the client's SendInput comes (its payload names the
+    // command), the message bar says "已答复 <question_id>", or "已排队（M3-T04 投递）" when it answered none.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.attach("R", "BLOCKED");
+    app.awaiting("c1");
+    app.event(
+        &serde_json::json!({"seq": 3, "kind": "run.result", "payload": {"command_id": "c1"}}),
+    );
+    assert!(!screen(&app, 100, 20).iter().any(|r| r.contains("已答复")));
+    app.event(&serde_json::json!({"seq": 4, "kind": "input.accepted",
+        "payload": {"command_id": "c1", "question_id": "q-7"}}));
+    assert!(
+        screen(&app, 100, 20)
+            .iter()
+            .any(|r| r.contains("已答复 q-7"))
+    );
+    app.awaiting("c2");
+    app.event(
+        &serde_json::json!({"seq": 5, "kind": "input.accepted", "payload": {"command_id": "c2"}}),
+    );
+    let rows = screen(&app, 100, 20);
+    assert!(
+        rows.iter().any(|r| r.contains("已排队（M3-T04 投递）")),
+        "{rows:#?}"
+    );
+    app.event(&serde_json::json!({"seq": 6, "kind": "x", "payload": {"command_id": "c2"}}));
+    assert_eq!(
+        screen(&app, 100, 20)
+            .iter()
+            .filter(|r| r.contains("已排队"))
+            .count(),
+        1,
+        "said once"
+    );
+}
+
+/// A run's host as a script: getRun's successive answers (the last repeats) and the answers to the commands, which
+/// it records.
+struct Scripted {
+    runs: std::cell::RefCell<std::collections::VecDeque<serde_json::Value>>,
+    replies: std::cell::RefCell<
+        std::collections::VecDeque<Result<serde_json::Value, crate::client::Failure>>,
+    >,
+    sent: std::cell::RefCell<Vec<serde_json::Value>>,
+}
+
+impl Scripted {
+    fn new(
+        runs: Vec<serde_json::Value>,
+        replies: Vec<Result<serde_json::Value, crate::client::Failure>>,
+    ) -> Scripted {
+        Scripted {
+            runs: std::cell::RefCell::new(runs.into()),
+            replies: std::cell::RefCell::new(replies.into()),
+            sent: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl super::Port for Scripted {
+    fn run(&self) -> Result<Option<serde_json::Value>, crate::client::Failure> {
+        let mut runs = self.runs.borrow_mut();
+        Ok(if runs.len() > 1 {
+            runs.pop_front()
+        } else {
+            runs.front().cloned()
+        })
+    }
+
+    fn submit(
+        &self,
+        command: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::client::Failure> {
+        self.sent.borrow_mut().push(command);
+        self.replies
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or_else(|| Err(crate::client::Failure::unreachable("no more replies")))
+    }
+}
+
+fn refused(status: u16, code: &str, details: serde_json::Value) -> crate::client::Failure {
+    crate::client::Failure {
+        status: Some(status),
+        details,
+        ..crate::client::Failure::new(code, format!("{code} said"), 1)
+    }
+}
+
+#[test]
+fn an_input_to_an_incomplete_run_resumes_it_after_and_a_refused_resume_names_the_stop() {
+    // Decisions 13 and 16 (the same as `--resume`): SendInput{text, target_role: null, REPLY} at the run's revision,
+    // then, the run being INCOMPLETE, ResumeRun at the revision the input left; a resume refused because the stop
+    // still holds is said with that stop.
+    let port = Scripted::new(
+        vec![serde_json::json!({"run_id": "R", "state": "INCOMPLETE", "revision": 4})],
+        vec![
+            Ok(
+                serde_json::json!({"command_id": "c1", "run_id": "R", "revision": 5, "status": "ACCEPTED"}),
+            ),
+            Err(refused(
+                409,
+                "ILLEGAL_TRANSITION",
+                serde_json::json!({"state": "INCOMPLETE", "stop": "deadline"}),
+            )),
+        ],
+    );
+    let sent = super::input(&port, "R", "继续");
+    let commands = port.sent.borrow();
+    assert_eq!(commands.len(), 2, "{commands:#?}");
+    assert_eq!(
+        (
+            &commands[0]["kind"],
+            &commands[0]["expected_revision"],
+            &commands[0]["run_id"],
+            &commands[0]["payload"]
+        ),
+        (
+            &serde_json::json!("SendInput"),
+            &serde_json::json!(4),
+            &serde_json::json!("R"),
+            &serde_json::json!({"text": "继续", "target_role": null, "input_kind": "REPLY"})
+        )
+    );
+    assert_eq!(
+        (&commands[1]["kind"], &commands[1]["expected_revision"]),
+        (&serde_json::json!("ResumeRun"), &serde_json::json!(5))
+    );
+    assert_eq!(sent.awaiting.as_deref(), Some("c1"));
+    assert!(
+        sent.said
+            .iter()
+            .any(|s| s.contains("未恢复") && s.contains("deadline")),
+        "{:?}",
+        sent.said
+    );
+}
+
+#[test]
+fn an_input_to_a_working_run_is_sent_alone_and_again_at_a_fresh_revision() {
+    let port = Scripted::new(
+        vec![
+            serde_json::json!({"run_id": "R", "state": "RUNNING", "revision": 2}),
+            serde_json::json!({"run_id": "R", "state": "RUNNING", "revision": 3}),
+        ],
+        vec![
+            Err(refused(409, "STALE_REVISION", serde_json::Value::Null)),
+            Ok(
+                serde_json::json!({"command_id": "c2", "run_id": "R", "revision": 4, "status": "ACCEPTED"}),
+            ),
+        ],
+    );
+    let sent = super::input(&port, "R", "x");
+    let commands = port.sent.borrow();
+    let revisions: Vec<(&serde_json::Value, &serde_json::Value)> = commands
+        .iter()
+        .map(|c| (&c["kind"], &c["expected_revision"]))
+        .collect();
+    assert_eq!(
+        revisions,
+        [
+            (&serde_json::json!("SendInput"), &serde_json::json!(2)),
+            (&serde_json::json!("SendInput"), &serde_json::json!(3))
+        ]
+    );
+    assert_eq!(sent.awaiting.as_deref(), Some("c2"));
+    assert!(sent.said.is_empty(), "{:?}", sent.said);
+}
+
+#[test]
+fn a_refused_input_is_said_with_its_code_and_nothing_follows() {
+    let port = Scripted::new(
+        vec![serde_json::json!({"run_id": "R", "state": "INCOMPLETE", "revision": 2})],
+        vec![Err(refused(
+            422,
+            "CAPABILITY_UNSUPPORTED",
+            serde_json::Value::Null,
+        ))],
+    );
+    let sent = super::input(&port, "R", "x");
+    assert_eq!(
+        port.sent.borrow().len(),
+        1,
+        "no ResumeRun after a refused input"
+    );
+    assert_eq!(sent.awaiting, None);
+    assert!(
+        sent.said
+            .iter()
+            .any(|s| s.contains("CAPABILITY_UNSUPPORTED")),
+        "{:?}",
+        sent.said
+    );
 }

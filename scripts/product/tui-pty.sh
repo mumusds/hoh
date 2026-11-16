@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check "tui-pty" (mode product): the TUI in real pseudo-terminals, crates/hoh-app/tests/tui_pty.rs (ADR-014): the
-# Workspace opening offline, the input history across sessions, and the terminal restored (stty -g, alternate screen,
-# cursor) after a detach, SIGTERM, SIGHUP and a panic. Under tools/run_check.py the per-test results are written to
+# Workspace opening with the project's host connected, the input history across sessions, and the terminal restored
+# (stty -g, alternate screen, cursor) after a detach, SIGTERM, SIGHUP and a panic. Under tools/run_check.py the per-test results are written to
 # $HOH_EVIDENCE_DIR/test-results.jsonl, also when tests fail; tests whose names carry no TEST id count but add no line
 # (TEST-001-01/02 arrive with M2-T13). Fails if no test passed.
 set -Eeuo pipefail
