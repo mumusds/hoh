@@ -101,6 +101,7 @@ impl Conn {
             let project = self.project.clone();
             std::thread::spawn(move || {
                 let mut last = 0i64;
+                let mut trace = received_trace();
                 while !stop.load(Ordering::SeqCst) {
                     let Ok(mut stream) =
                         crate::client::Events::open(&current(&host), &run_id, last)
@@ -113,6 +114,10 @@ impl Conn {
                     while !stop.load(Ordering::SeqCst) {
                         match stream.next() {
                             Ok(Some(event)) => {
+                                if let Some(trace) = trace.as_mut() {
+                                    use std::io::Write as _;
+                                    let _ = writeln!(trace, "{}", event["seq"]);
+                                }
                                 last = event["seq"].as_i64().unwrap_or(last).max(last);
                                 if send.send(Got::Event(event)).is_err() {
                                     return;
@@ -755,6 +760,21 @@ fn wait(stdin: &Stdin, timeout: Duration) -> std::io::Result<Wait> {
 
 fn hangup() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "终端已断开")
+}
+
+/// Debug builds only: `HOH_DEBUG_TUI_SEQS=<path>` appends the seq of every event a link's reader receives to that file,
+/// one per line in the order received, so the PTY test sees the sequence attach received (TEST-005-01, docs/adr/
+/// ADR-031.md S5). It writes that file only, never the project's store (E11). Release builds have no such trace.
+fn received_trace() -> Option<std::fs::File> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("HOH_DEBUG_TUI_SEQS") {
+        return std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
+    }
+    None
 }
 
 /// Debug builds only: `HOH_DEBUG_TUI_PANIC` panics after a draw, so the PTY test can see the terminal restored
