@@ -1944,7 +1944,8 @@ async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_dispose
     // docs/adr/ADR-031.md decision 2 (Q2 (a)), 测试计划 "create_tasks": a turn's create_tasks is applied with its
     // decision, its tasks in, the run's revision moved once, so the turn's next decision at that revision plus one is
     // applied too (M2T13D-51); a plan with a cycle, a missing dependency, a duplicate id or a requirement outside the
-    // run's specification ends invalid PLAN with its code (null for the last) and leaves no decisions row.
+    // run's specification ends invalid PLAN with its code (null for the last) and leaves no decisions row; one with a
+    // score out of range ends invalid PAYLOAD, before any plan check.
     let dir = tempfile::tempdir()?;
     let clock = std::sync::Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
@@ -2025,6 +2026,22 @@ async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_dispose
                 plan(json!([task("Q1", &[], &["REQ-9"])])),
             ),
         ),
+        // A score out of range: the message's payload is not a DecisionPayload (its PlanProposal bounds the scores),
+        // so it never gets to the plan's check.
+        line(
+            &nonce,
+            output(
+                "m7",
+                "decision",
+                &w,
+                at,
+                3,
+                plan(
+                    json!([{"task_id": "Q1", "title": "Q1", "role": "developer", "writer": true,
+                    "depends_on": [], "requirement_ids": [], "user_value": 7}]),
+                ),
+            ),
+        ),
     ];
     bridged_turn(&store, &clock, at, 3000, true, &lines).await?;
     store.supervise("R", context(&clock, 4000)).await?;
@@ -2038,6 +2055,7 @@ async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_dispose
             (o(3), "invalid:PLAN".to_owned()),
             (o(4), "invalid:PLAN".to_owned()),
             (o(5), "invalid:PLAN".to_owned()),
+            (o(6), "invalid:PAYLOAD".to_owned()),
         ]
     );
     assert_eq!(
@@ -2050,6 +2068,7 @@ async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_dispose
             "DAG_CYCLE",
             "DAG_MISSING_DEPENDENCY",
             "DAG_DUPLICATE_TASK",
+            null,
             null
         ])
     );
