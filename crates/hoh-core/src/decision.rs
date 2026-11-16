@@ -89,13 +89,11 @@ impl Proposal {
         }
     }
 
-    /// Whether this kind is applied yet: create_tasks arrives with plan validation (M2-T03), request_user_decision
-    /// with the NEED_DECISION flow (M2-T13); until then they are refused before anything is written.
+    /// Whether this kind is applied by the decision itself: a request for a person passes the fences but is applied
+    /// by its answer (docs/adr/ADR-031.md decision 7), so `Store::decide` refuses it before anything is written;
+    /// create_tasks is applied with its plan (decision 2).
     pub fn applicable(&self) -> bool {
-        !matches!(
-            self.payload,
-            DecisionPayload::CreateTasks { .. } | DecisionPayload::RequestUserDecision { .. }
-        )
+        !matches!(self.payload, DecisionPayload::RequestUserDecision { .. })
     }
 
     /// The task the payload names.
@@ -363,6 +361,9 @@ pub enum Effect {
     },
     /// Only the event and the run revision.
     RecordAssumption,
+    /// The plan's tasks, dependencies and requirements, imported in the decision's transaction with the run's one
+    /// revision move (docs/adr/ADR-031.md decision 2); its plan was checked against the run before.
+    CreateTasks,
     /// A kind that is not applied yet ([`Proposal::applicable`]).
     Unsupported(&'static str),
 }
@@ -458,9 +459,8 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
             accepted_requirements.as_deref().unwrap_or_default(),
         ),
         DecisionPayload::RecordAssumption { .. } => Ok(Effect::RecordAssumption),
-        DecisionPayload::RequestUserDecision { .. } | DecisionPayload::CreateTasks { .. } => {
-            Ok(Effect::Unsupported(proposal.kind()))
-        }
+        DecisionPayload::CreateTasks { .. } => Ok(Effect::CreateTasks),
+        DecisionPayload::RequestUserDecision { .. } => Ok(Effect::Unsupported(proposal.kind())),
     }
 }
 

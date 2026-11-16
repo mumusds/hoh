@@ -418,7 +418,9 @@ fn the_commander_cannot_complete_a_run_without_evidence_or_drive_suspension() {
 }
 
 #[test]
-fn kinds_applied_by_later_tasks_are_reported_not_judged() {
+fn a_request_for_a_person_is_reported_not_judged_and_create_tasks_is_applied() {
+    // A request for a person passes the fences and is applied by its answer (docs/adr/ADR-031.md decision 7);
+    // create_tasks is applied by the decision itself (decision 2).
     let ask = proposal(
         json!({"kind": "request_user_decision", "question_id": "q", "question": "?", "requires_user": true}),
     );
@@ -429,7 +431,8 @@ fn kinds_applied_by_later_tasks_are_reported_not_judged() {
     );
     let plan = proposal(json!({"kind": "create_tasks", "plan": {"tasks": [{
         "task_id": "T9", "title": "t", "role": "developer", "writer": true, "depends_on": [], "requirement_ids": []}]}}));
-    assert!(!plan.applicable());
+    assert!(plan.applicable());
+    assert_eq!(validate(&plan, &snapshot()), Ok(Effect::CreateTasks));
     assert!(dispatch_t1().applicable());
 }
 

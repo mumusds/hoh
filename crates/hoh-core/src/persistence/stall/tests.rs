@@ -167,6 +167,8 @@ enum Answer {
     Flip(&'static str),
     /// The run moved to the next of these states; nothing once it is in the last.
     Advance(&'static [&'static str]),
+    /// One create_tasks planning one READY task more (`P<n>`, n its number among the run's tasks).
+    Plan,
 }
 
 fn assumption() -> Value {
@@ -286,6 +288,17 @@ fn lines(path: &PathBuf, turn: &Allocated, answer: &Answer) -> R<Vec<String>> {
                 "READY"
             };
             vec![json!({"kind": "transition_task", "task_id": task, "to_state": to})]
+        }
+        Answer::Plan => {
+            let n = value(
+                path,
+                "SELECT count(*) + 1 FROM tasks WHERE run_id = 'R' AND role <> 'commander'",
+            )?;
+            let id = format!("P{n}");
+            vec![
+                json!({"kind": "create_tasks", "plan": {"tasks": [{"task_id": id, "title": id,
+                "role": "developer", "writer": true, "depends_on": [], "requirement_ids": []}]}}),
+            ]
         }
         Answer::Advance(states) => {
             let now = value(path, "SELECT state FROM runs WHERE run_id = 'R'")?;
@@ -715,11 +728,16 @@ async fn a_commander_that_never_decides_is_retriggered_twice_then_asked() -> R {
 
 #[tokio::test]
 async fn a_plan_only_turn_does_not_count_as_progress_and_a_moved_state_does() -> R {
-    // 停滞探测 (8) (M2T13D-304; create_tasks is decision 2's, slice S2): in SPECIFYING, a Commander whose every turn only
-    // records an assumption, or only moves a task between READY and PENDING, leaves P as it is: two STALLED turns,
-    // then the question. Its outputs still to dispose of hold the detector (the precondition). One whose every turn
-    // moves the run on (CREATED -> DISCOVERING -> SPECIFYING -> READY) changes P each time: no question.
-    for answer in [Answer::Decide(vec![assumption()]), Answer::Flip("P1")] {
+    // 停滞探测 (8) (M2T13D-304): in SPECIFYING, a Commander whose every turn only records an assumption, only moves a
+    // task between READY and PENDING, or only plans one READY task more (create_tasks, decision 2) leaves P as it is:
+    // two STALLED turns, then the question. Its outputs still to dispose of hold the detector (the precondition). One
+    // whose every turn moves the run on (CREATED -> DISCOVERING -> SPECIFYING -> READY) changes P each time: no
+    // question.
+    for answer in [
+        Answer::Decide(vec![assumption()]),
+        Answer::Flip("P1"),
+        Answer::Plan,
+    ] {
         let dir = tempfile::tempdir()?;
         let clock = Arc::new(TestClock::default());
         let (store, path) = open(&dir, &clock)?;

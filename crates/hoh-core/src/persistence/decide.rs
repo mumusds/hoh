@@ -35,9 +35,9 @@ pub enum Decided {
     Replayed { state: String },
     /// Its decision id was decided before with other content: nothing written (KEY_REUSE).
     KeyReuse,
-    /// Past every fence, of a kind not applied yet (`request_user_decision`, `create_tasks`): its decisions row is
-    /// written PROPOSED inside the caller's transaction, nothing else (docs/adr/ADR-025.md v13 decision 8). [`decide`]
-    /// gives [`PersistError::Unsupported`] for it and writes nothing.
+    /// Past every fence, of a kind its answer applies (`request_user_decision`, docs/adr/ADR-031.md decision 7): its
+    /// decisions row is written PROPOSED inside the caller's transaction, nothing else (docs/adr/ADR-025.md v13
+    /// decision 8). [`decide`] gives [`PersistError::Unsupported`] for it and writes nothing.
     Unsupported { kind: &'static str },
 }
 
@@ -199,6 +199,14 @@ pub(super) fn decide_in(
         });
     }
     let (project_id, run) = load_run(tx, &proposal.run_id)?;
+    // A create_tasks's plan is checked before its decisions row: an invalid plan is no decision, refused with its
+    // plan error (docs/adr/ADR-031.md decision 2); a valid one is imported if the decision is applied.
+    let mut plan = match &proposal.payload {
+        protocol::DecisionPayload::CreateTasks { .. } => {
+            Some(super::plan::check(tx, &proposal.run_id, &payload["plan"])?)
+        }
+        _ => None,
+    };
     tx.execute(
         "INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'PROPOSED')",
@@ -270,10 +278,20 @@ pub(super) fn decide_in(
                 commit.events[0].payload["output_id"] = json!(output_id);
             }
             let done = writer::write(tx, &commit, ctx)?;
+            let mut event_seqs = done.event_seqs;
+            if matches!(effect, Effect::CreateTasks) {
+                let plan = plan.take().ok_or_else(|| {
+                    PersistError::IntegrityViolation(format!(
+                        "create_tasks {} applied without its checked plan",
+                        proposal.decision_id
+                    ))
+                })?;
+                event_seqs.push(super::plan::import_in(tx, plan, ctx)?.1);
+            }
             resolve(tx, &proposal.decision_id, "APPLIED", None)?;
             Decided::Applied {
                 run_revision: done.revisions[0],
-                event_seqs: done.event_seqs,
+                event_seqs,
             }
         }
         Err(rejection) => {
@@ -492,7 +510,7 @@ fn applied(
             }
             vec![run(Change::Run(*to))]
         }
-        Effect::RecordAssumption => vec![run(Change::Touch(Entity::Run))],
+        Effect::RecordAssumption | Effect::CreateTasks => vec![run(Change::Touch(Entity::Run))],
         Effect::Unsupported(kind) => return Err(PersistError::Unsupported(kind)),
     };
     Ok(Commit {
