@@ -203,7 +203,7 @@ INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
   (:p, 'R4/round', 'R4', 'verification.round_opened',
    '{\"round_id\": \"rd4\", \"candidate_id\": \"C4\", \"number\": 1, \"tasks\": {\"qa\": \"Q4\", \"reviewer\": \"V4\"}, \"sources\": []}',
    '2026-11-15T00:00:00Z'),
-  (:p, 'C4/failed', 'R4', 'candidate.reconcile_failed',
+  (:p, 'C4/reconcile_failed/1', 'R4', 'candidate.reconcile_failed',
    '{\"candidate_id\": \"C4\", \"attempt\": 1, \"kind\": \"transient\", \"error\": \"x\", \"at_ms\": \"0\"}',
    '2026-11-15T00:00:00Z'),
   (:p, 'R5/round', 'R5', 'verification.round_opened',

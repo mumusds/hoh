@@ -34,6 +34,7 @@ mod outbox;
 mod outputs;
 mod plan;
 mod reconcile;
+mod recovery;
 mod reports;
 mod results;
 mod retry;
@@ -477,100 +478,13 @@ impl std::error::Error for PersistError {}
 
 /// The candidates whose last recovery failed and none succeeded since, and that were not judged unrecoverable
 /// (docs/adr/ADR-028.md decisions 11 and 16; [`Reader::unrecovered_candidates`]): every run's (`run` none), or run
-/// `run`'s, on any connection. One rule for the runner's tick and the stall detector's (d).
+/// `run`'s, on any connection, read by their facts' ids ([`recovery::unrecovered`]). One rule for the runner's tick and
+/// the stall detector's (d).
 pub(crate) fn unrecovered_candidates(
     conn: &Connection,
     run: Option<&str>,
 ) -> Result<std::collections::BTreeSet<String>, PersistError> {
-    let mut statement = conn
-        .prepare(&unrecovered_sql(run.is_some()))
-        .map_err(sqlite_error)?;
-    let params: Vec<&dyn rusqlite::ToSql> = match &run {
-        Some(run) => vec![run],
-        None => Vec::new(),
-    };
-    let rows = statement
-        .query_map(params.as_slice(), |r| r.get(0))
-        .map_err(sqlite_error)?;
-    rows.collect::<Result<_, _>>().map_err(sqlite_error)
-}
-
-/// A recovery failure's `attempt` and `at_ms`, as its event has them.
-pub(crate) type Failed = (Option<i64>, Option<String>);
-
-/// Candidate `candidate`'s last recovery failure since its last recovery, if any: its `attempt` and `at_ms`
-/// ([`Reader::recovery_not_before`]'s backoff), read through [`last_failure_sql`].
-pub(crate) fn last_failure(
-    conn: &Connection,
-    candidate: &str,
-) -> Result<Option<Failed>, PersistError> {
-    conn.query_row(&last_failure_sql(), rusqlite::params![candidate], |r| {
-        Ok((r.get(0)?, r.get(1)?))
-    })
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        e => Err(sqlite_error(e)),
-    })
-}
-
-/// [`last_failure`]'s statement, candidate `?1` (M2T13R-03): its failures and recoveries read among its run's events
-/// (its own and its Records written project-scoped, `hold::of_run`) through the `(run_id, kind, seq)` index, as
-/// [`unrecovered_sql`] reads one run's — not the project's history.
-pub(crate) fn last_failure_sql() -> String {
-    let run = "(SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = ?1)";
-    format!(
-        "SELECT json_extract(f.payload_json, '$.attempt'), json_extract(f.payload_json, '$.at_ms') FROM main.events f \
-         WHERE f.kind = 'candidate.reconcile_failed' AND {} AND json_extract(f.payload_json, '$.candidate_id') = ?1 \
-         AND f.seq > coalesce((SELECT max(r.seq) FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' \
-           AND {} AND json_extract(r.payload_json, '$.candidate_id') = ?1), 0) ORDER BY f.seq DESC LIMIT 1",
-        hold::of_run("f", run),
-        hold::of_run("r", run),
-    )
-}
-
-/// The `WITH` of the candidates whose last recovery failed and none succeeded since, `failing(candidate)`, and of the
-/// judgments of candidates as unrecoverable, `judged(candidate, run)` (M2T13R-03, -101): each kind of recovery fact read
-/// through the `(run_id, kind, seq)` index in one pass — the last failure and the last recovery grouped by candidate,
-/// the judgments with the run each is of (its own, or the run a Record written project-scoped names) — never the
-/// events of other kinds, nor the history once per failure or per candidate. Of every run: the events of any run
-/// (`run_id` in runs, which its foreign key makes every one) or none (a Record of a stopped run); of run `?1`
-/// (`by_run`): its own and its Records written project-scoped (`hold::of_run`).
-pub(crate) fn failing_sql(by_run: bool) -> String {
-    let scope = |alias: &str| {
-        if by_run {
-            hold::of_run(alias, "?1")
-        } else {
-            format!("({alias}.run_id IN (SELECT run_id FROM main.runs) OR {alias}.run_id IS NULL)")
-        }
-    };
-    format!(
-        "WITH failed AS (SELECT json_extract(f.payload_json, '$.candidate_id') AS candidate, max(f.seq) AS seq \
-           FROM main.events f WHERE f.kind = 'candidate.reconcile_failed' AND {} GROUP BY 1), \
-         recovered AS (SELECT json_extract(r.payload_json, '$.candidate_id') AS candidate, max(r.seq) AS seq \
-           FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' AND {} GROUP BY 1), \
-         failing AS (SELECT failed.candidate FROM failed LEFT JOIN recovered ON recovered.candidate = failed.candidate \
-           WHERE failed.seq > coalesce(recovered.seq, 0)), \
-         judged AS MATERIALIZED (SELECT DISTINCT json_extract(s.payload_json, '$.candidate_id') AS candidate, \
-             coalesce(s.run_id, json_extract(s.payload_json, '$.run_id')) AS run \
-           FROM main.events s WHERE s.kind = 'candidate.stale' AND {} \
-           AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable')",
-        scope("f"),
-        scope("r"),
-        scope("s"),
-    )
-}
-
-/// [`unrecovered_candidates`]' statement: those of [`failing_sql`] not judged unrecoverable — by a judgment of the
-/// candidate's own run (`hold::of_run`'s rule: the run of the event, or the run its Record names) — as one set
-/// difference, not a look-up per candidate.
-pub(crate) fn unrecovered_sql(by_run: bool) -> String {
-    format!(
-        "{} SELECT failing.candidate FROM failing \
-         EXCEPT SELECT judged.candidate FROM judged \
-           JOIN main.candidates c ON c.candidate_id = judged.candidate AND c.run_id = judged.run",
-        failing_sql(by_run),
-    )
+    recovery::unrecovered(conn, run, &mut recovery::Work::default())
 }
 
 /// Map a SQLite error: constraint failures are integrity violations, lock timeouts are busy.
@@ -2119,23 +2033,30 @@ impl Reader {
     /// History is always recovered (a Record of a stopped run, project-scoped); a live obligation only while its run is
     /// not stopped (docs/adr/ADR-031.md correction D, A2 and A3).
     pub fn start_recovery_wanted(&self, candidate_id: &str) -> Result<bool, PersistError> {
-        let wanted: bool = self
+        // Its judgment by its id, of its run (`recovery::judged`).
+        let run: Option<String> = self
             .conn
             .query_row(
-                &format!(
-                    "SELECT EXISTS(SELECT 1 FROM candidates WHERE candidate_id = ?1) \
-                     AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
-                       AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
-                       AND json_extract(s.payload_json, '$.candidate_id') = ?1)",
-                    hold::of_run(
-                        "s",
-                        "(SELECT run_id FROM candidates WHERE candidate_id = ?1)"
-                    )
-                ),
+                "SELECT run_id FROM candidates WHERE candidate_id = ?1",
                 rusqlite::params![candidate_id],
                 |r| r.get(0),
             )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
             .map_err(sqlite_error)?;
+        let wanted = match run {
+            Some(run) => !recovery::judged(
+                &self.conn,
+                candidate_id,
+                &run,
+                Some("evidence_unrecoverable"),
+                &mut recovery::Work::default(),
+            )?,
+            None => false,
+        };
         Ok(wanted
             && (!verification::live_obligation(&self.conn, candidate_id)?
                 || !self.candidate_held(candidate_id)?))
@@ -2167,7 +2088,9 @@ impl Reader {
         &self,
         candidate_id: &str,
     ) -> Result<Option<std::time::SystemTime>, PersistError> {
-        let Some((attempt, at_ms)) = last_failure(&self.conn, candidate_id)? else {
+        let Some((attempt, at_ms)) =
+            recovery::last_failure(&self.conn, candidate_id, &mut recovery::Work::default())?
+        else {
             return Ok(None);
         };
         let at = at_ms.and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(0);

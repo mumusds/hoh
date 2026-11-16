@@ -250,9 +250,9 @@ async fn a_stale_candidate_without_a_successor_shows_every_ac_stale_and_counts_n
         [&c1],
     )?;
     Connection::open(&path)?.execute(
-        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', 'stale-c1', \
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', ?2, \
          'R', 'candidate.stale', json_object('candidate_id', ?1, 'reason', 'spec_changed'), '2026-11-12T00:00:09Z')",
-        [&c1],
+        [&c1, &child_id(&c1, "stale")],
     )?;
     let stale = snapshot(&store)?;
     assert_eq!(
