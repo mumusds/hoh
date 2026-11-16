@@ -3,7 +3,7 @@
 ID：CR-024
 状态：PROPOSED
 批准人：（待：ADR-032 的设计审查判定可批准后，由项目所有者批准。本 CR 改 CONTRACT 第 7 条，不属 CR-003 D1 预授权）
-日期：2026-11-16（第八版：按 ADR-032 设计审查第 1–7 轮与设计修正 1–6 修订）
+日期：2026-11-16（第九版：按 ADR-032 设计审查第 1–8 轮与设计修正 1–7 修订）
 基线：改受锁的 `CONTRACT.md`、`contracts/requirements.json`（REQ-020、REQ-021、REQ-024、REQ-025、REQ-026、REQ-027）与 `contracts/acceptance-scenarios.json`。须在 M2-T13 的重新上锁（CR-022、CR-023）进入 main 之后执行：两者都改 requirements.json 与 baseline-lock.json。可与同期其他 CR 合为一次重新上锁。批准后执行 `python3 tools/gen_spec_views.py` 与 `python3 tools/baseline.py relock --cr docs/cr/CR-024-commander-read-only-profile.md`，再运行 `bash scripts/check.sh --bundle`。
 
 ## 背景
@@ -12,7 +12,7 @@ ID：CR-024
 - **问题由来**：这个问题从 M2-T08 设计审查第 9 轮起悬而未决（M2T08D-802、-854；reports/reviews/M2.md:2606）。
   - 今天每个 turn 都按规格的 yolo-vm 档全权限启动，Commander 也不例外。它能按绝对路径写写者的工作区，也就是项目根；写者工作区同时被 Developer 修改，事后的 tree 核对无法归属这类差异（ADR-025 -753）。
   - Commander 今天唯一的输出通道是把决策写进 `<project>/.hoh/attempts/<attempt>/messages.jsonl`。所以不能只把它“设为只读”，还要换掉这个通道。
-- **设计**：docs/adr/ADR-032.md（第八版）。
+- **设计**：docs/adr/ADR-032.md（第九版）。
   - 决策改由最终助手消息里最后一个 ```` ```hoh-decisions ```` 块交付，与验证者的 ```` ```hoh-report ```` 块同一做法。
   - 三个底座各用自己的只读机制，按一张确定的 argv 表启动 Commander：codex 用操作系统级沙箱（只经 App Server），claude 只给读工具且权限模式为 dontAsk，pi 用按工具名的允许清单并不加载发现或配置的扩展。
   - 每个选项只在被测 help/schema 声明时使用，缺了就不启动，不回退到全权限。只有一处 help 无从声明的例外（claude 的工具名），由活体检查实测。
@@ -21,7 +21,7 @@ ID：CR-024
   - **待所有者确认 Q-exec（前提已变）**：codex 0.166.0 的 exec 流里补丁被拒不留痕迹；S0 录到 exec 线程的 rollout 里有拒绝，但 exec 不给出这个文件的位置。按建议 (A)，Commander 不经 codex exec 运行，本 CR 按 (A) 写；若所有者选 (B)，按文末附录一改。
   - **待所有者确认 Q-pi-ext**：S0 录到用户自装的 pi 扩展在每个只读会话里往私有工作目录写文件；需求也没有规定 v1 的三个 Pi 插件是否进 Commander 的会话。按建议 (A)，Commander 的 pi 会话不加载任何扩展（`--no-extensions`，不传 `-e`），本 CR 按 (A) 写；若所有者选 (A2)、(B) 或 (C)，按文末附录二改。
   - 余项 R1–R7 在 docs/12 记录，并由 doctor 显示。
-- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1–7 轮的审查文本（.hoh-dev/review-cmdro-d{1,2,3,4,5,6,7}-{codex,grok}.md）；离线实测 .hoh-dev/evidence/commander-readonly/；S0 的录制 tests/fixtures/commander-readonly/（原始录制在本地 .hoh-dev/evidence/commander-readonly/spike/），以及在录制上按阶段执行证据表规则、fail-closed 并以系统生成的变体自检的 judge_check.py 与其输出。
+- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1–8 轮的审查文本（.hoh-dev/review-cmdro-d{1,2,3,4,5,6,7,8}-{codex,grok}.md）；离线实测 .hoh-dev/evidence/commander-readonly/；S0 的录制 tests/fixtures/commander-readonly/（原始录制在本地 .hoh-dev/evidence/commander-readonly/spike/），以及复刻适配器重放、在录制上执行证据表规则并以系统生成的变体自检的格式原型 judge_check.py 与其输出（不具权威，设计修正 7）。
 
 ## 决定
 
@@ -95,7 +95,7 @@ ID：CR-024
  "id": "AC-021-07",
  "given": "VM 实装且已原生登录的 claude、codex、pi；claude、pi、codex（App Server）各一段；每段一个临时 Git 仓库 P（已提交，含随机 token 文件，`.gitignore` 含 `.hoh/`）与 P 之外的私有工作目录 W；四个区域（P 的工作树、P/.git/、P/.hoh/、W）各有供每种写机制分别建、改、删的种子；区域之外有测试写出的确定的驱动：区域路径为常量、缺区域即报驱动错误的格脚本，与补丁全文；pi 另加载只观察的测试扩展；受测候选提交中 ADR-032 的证据表，与它引用的已安装版本的录制",
  "when": "live：每段以 Commander 的只读档运行新会话与续同一会话两轮，提示按驱动逐一尝试每个区域的建、改、删，然后读取 token，在最终消息的 ```hoh-decisions 块中给出含 token 的 record_assumption；每段另以全权限档在另一个仓库运行同一提示作对照；每轮前后取四个区域的全量快照，其间不运行 git；codex 每轮之后另读该轮线程的 rollout 文件",
- "then": "按 ADR-032 证据表的字段路径与文字判定，判定须要的每一项输入都必须在，缺任一项从不判 PASS。判定先只取本轮的记录（codex 按本轮的 thread 与 turn，claude 按本次 attempt 与其会话，pi 按本次 attempt 到它结束为止），范围之外的记录不计，范围有歧义或在给 id 的来源里缺 id 为覆盖不足；每次驱动调用与补丁调用自己必须对它覆盖的每一格有已知结果，否则为覆盖不足。所须的证据：每轮 SETTLED，本轮与对照轮的终态都按产品适配器结束一个 turn 的规则（证据表 E0），块被解析且 nonce 正确，第 1 轮含 token；该会话自己的原始记录给出可用性证据，claude、pi 恰为只读档的读工具，codex 线程的沙箱为只读；四个区域前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件；codex 的两种写机制（shell 与 apply_patch）× 四个区域 × 建改删的每一格，都有原始记录中的尝试、由权限拒绝而非其他任何错误造成的结果，以及对照中同一机制 × 操作在普通工作树文件上的成功；claude、pi 的对照轮的可用性证据列出读工具以外的工具。一格的结论取本轮所有相符的记录，与顺序无关：任一记录为成功即该格成功，每一条都是权限拒绝才是权限拒绝；对照轮必须存在，其可用性证据完整并显示全权限，每个机制 × 操作的所有记录都是成功。分类固定如下：可用性证据齐全而不符合（只读档未生效）、任一快照差异或任一成功的格，立即 FAIL，不重做；缺任一项为覆盖不足，不判 PASS，每段至多换新会话重做三次；未登录的 Agent 为 BLOCKED 而非 PASS。什么算权限拒绝、突破或覆盖不足只能经 CR 改；ADR-032 的证据表只把这一分类映射到字段路径与文字，改一个字段路径或文字须引用已安装版本的一次新录制，并经设计审查",
+ "then": "按 ADR-032 证据表的字段路径与文字判定，判定须要的每一项输入都必须在，缺任一项从不判 PASS。判定不自己解析 Agent 的流：本轮的范围、请求与响应的关联、终态与最终消息取自产品适配器对所录 stdout 的重放（与 host 运行同一条代码路径），适配器不取的记录不计，带本轮 id 而适配器没取的记录为覆盖不足；本轮的每个条目与 rollout 中本轮的每个调用都须按证据表分类并有已知结果，分不了类或不完整的为覆盖不足，从不丢掉。所须的证据：每轮 SETTLED，本轮与对照轮的终态都按产品适配器结束一个 turn 的规则（证据表 E0），块被解析且 nonce 正确，第 1 轮含 token；该会话自己的原始记录给出可用性证据，claude、pi 恰为只读档的读工具，codex 线程的沙箱为只读；四个区域前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件；codex 的两种写机制（shell 与 apply_patch）× 四个区域 × 建改删的每一格，都有原始记录中的尝试、由权限拒绝而非其他任何错误造成的结果，以及对照中同一机制 × 操作在普通工作树文件上的成功；claude、pi 的对照轮的可用性证据列出读工具以外的工具。一格的结论取本轮所有相符的记录，与顺序无关：任一记录为成功即该格成功，每一条都是权限拒绝才是权限拒绝；对照轮必须存在，其可用性证据完整并显示全权限，每个机制 × 操作的所有记录都是成功。分类固定如下：可用性证据齐全而不符合（只读档未生效）、任一快照差异或任一成功的格，立即 FAIL，不重做；缺任一项为覆盖不足，不判 PASS，每段至多换新会话重做三次；未登录的 Agent 为 BLOCKED 而非 PASS。什么算权限拒绝、突破或覆盖不足只能经 CR 改；ADR-032 的证据表只把这一分类映射到字段路径与文字，改一个字段路径或文字须引用已安装版本的一次新录制，并经设计审查",
  "test_id": "TEST-021-07"
 }
 ```
@@ -210,7 +210,7 @@ ID：CR-024
  ],
  "pass_criteria": [
   "每轮 SETTLED，本轮与对照轮的终态都按产品适配器结束一个 turn 的规则（证据表 E0）；可用性证据按证据表齐全：claude、pi 恰为只读档的读工具，codex 线程的沙箱为只读",
-  "只取本轮的记录（codex 按本轮的 thread 与 turn，claude 按本次 attempt 与其会话，pi 按本次 attempt 到它结束为止），范围之外的记录不计；范围有歧义或在给 id 的来源里缺 id 为覆盖不足；每次驱动调用与补丁调用自己必须对它覆盖的每一格有已知结果，否则为覆盖不足",
+  "范围、请求与响应的关联、终态与最终消息取自产品适配器对所录 stdout 的重放，判定不另行解析；适配器不取的记录不计，带本轮 id 而适配器没取的记录为覆盖不足；本轮的每个条目与 rollout 中本轮的每个调用都须分类并有已知结果，分不了类或不完整的为覆盖不足",
   "一格的结论取本轮所有相符的记录、与顺序无关：任一为成功即成功，每一条都是权限拒绝才是权限拒绝；判定须要的任何一项输入缺失都不判 PASS",
   "codex 的 shell 与 apply_patch × 四个区域 × 建改删的每一格：有尝试，有按证据表判为权限拒绝（而非其他任何错误）的结果，有对照中同一机制 × 操作在普通工作树文件上的成功（对照轮必须存在，可用性证据完整并显示全权限，该机制 × 操作的所有记录都是成功）；claude、pi 的对照轮的可用性证据列出读工具以外的工具",
   "前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件",
@@ -246,7 +246,7 @@ ID：CR-024
    "depends_on": ["M2-T13", "M2-T15"],
    "requirements": ["REQ-021", "REQ-020", "REQ-024", "REQ-025", "REQ-026", "REQ-027"],
    "acceptance": ["AC-021-06", "AC-021-07"],
-   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表引用的 S0 录制摘录（tests/fixtures/commander-readonly/excerpts/）为夹具的离线单元测试，在这些夹具与 judge_check.py 生成的每个变体上的结论与 judge_check.out.json 相同（应为非 PASS 的变体无一 PASS，不变性变体保持原结论），终态（本轮与对照）调用适配器的 `verdict` 而不另写规则，其先红证据（全权限档下的 FAIL）已保存。"
+   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表引用的 S0 录制摘录（tests/fixtures/commander-readonly/excerpts/）为夹具的离线单元测试，在这些夹具与 judge_check.py 生成的每个变体上的结论与 judge_check.out.json 相同（应为非 PASS 的变体无一 PASS，不变性变体保持原结论），判定不自己解析 Agent 的流：范围、请求与响应的关联、终态（本轮与对照）、最终消息与本轮的条目取自适配器的 `replay_facts`（claude.rs、codex/app_server.rs、pi.rs；`claude::judge` 与 `pi::note_message` 改为 `pub(crate)`；codex 的 `adapter.item` 载荷带上条目本身的事实），rollout 与本轮条目按默认拒绝列举；在 `judge_check.py --emit` 生成的验收夹具上结论类别与期望相同，其先红证据（全权限档下的 FAIL）已保存。"
   }
   ```
 
