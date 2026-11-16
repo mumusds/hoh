@@ -4,9 +4,10 @@
 //!
 //! - the Commander (on codex or claude) is the pinned script of M2T13D-52: from its turn's wake header (nonce, output
 //!   file, run_id, role_epoch, expected_revision, spec digest, causation) and the run's state it submits, in one
-//!   batch, a record_assumption (once per run), a create_tasks (once per run) and the transition_run steps
-//!   CREATED→DISCOVERING→SPECIFYING→READY→RUNNING still ahead, each at the revision the one before it leaves; once the
-//!   run is RUNNING (or in any other state) it submits nothing, so it never moves a run past RUNNING;
+//!   batch, a record_assumption and a create_tasks (each until one of them is applied: one REJECTED is submitted
+//!   again) and the transition_run steps CREATED→DISCOVERING→SPECIFYING→READY→RUNNING still ahead, each at the
+//!   revision the one before it leaves; once the run is RUNNING (or in any other state) it submits nothing, so it never
+//!   moves a run past RUNNING;
 //! - the Developer logs each start, writes stderr noise with a marker, works for a while, commits a change and
 //!   writes its TaskResult;
 //! - QA and the Reviewer run planned checks through their `run-check` helper, write a COMPLETED (or other)
@@ -16,6 +17,9 @@
 //! [`World::commander`], [`World::unauthorized`]); every turn, Commander batch, Developer start and check is logged as
 //! a JSON line ([`World::log`]). The world's processes (hosts its commands started, fake turns) are stopped when it
 //! is dropped. A test binary using it declares `mod pty;` beside `mod world;`.
+//!
+//! A test that needs only the Commander's decisions runs an in-process host whose runner is the scripted [`Team`]
+//! instead ([`World::team_host`]): its Commander is a Rust function of the turn, and it takes no work.
 
 #![allow(dead_code)] // each test binary uses a part of it
 
@@ -189,6 +193,9 @@ pub struct Commander {
     /// The suffixes of the developer tasks its create_tasks plans (`<run_id>-<suffix>`), each for every requirement of
     /// the project's `contracts/requirements.json`.
     pub tasks: Vec<String>,
+    /// The decision kinds whose first submission for a run names a revision one past the run's, so the Runtime
+    /// rejects it (STALE_REVISION) and the script submits it again.
+    pub stale_once: Vec<String>,
 }
 
 impl Default for Commander {
@@ -197,13 +204,14 @@ impl Default for Commander {
             statement: "fixture 默认：沿用项目已批准的规格，不另作假设".to_owned(),
             basis: "项目的 contracts/requirements.json".to_owned(),
             tasks: vec!["develop".to_owned()],
+            stale_once: Vec::new(),
         }
     }
 }
 
 /// The fakes' turn (Python, standard library only): see the module's head. `argv`: the world's directory, the agent
 /// (`claude`, `codex-app-server`, `codex-exec`), the protocol fixtures, then the agent's own arguments.
-const AGENT_PY: &str = r##"import hashlib, json, os, re, subprocess, sys, time, uuid
+const AGENT_PY: &str = r##"import hashlib, json, os, re, sqlite3, subprocess, sys, time, uuid
 
 WORLD, AGENT, RECORDINGS = sys.argv[1], sys.argv[2], sys.argv[3]
 ARGS = sys.argv[4:]
@@ -286,30 +294,74 @@ def requirements(wake, c):
         return [r['id'] for r in json.load(f)['requirements']]
 
 
+def written(run):
+    """Every message the fake Commander wrote for `run` before this turn, from its own log: (attempt_id, message)."""
+    try:
+        with open(os.path.join(WORLD, 'commander.jsonl'), encoding='utf-8') as f:
+            batches = [json.loads(line) for line in f.read().split('\n') if line.strip()]
+    except FileNotFoundError:
+        return []
+    return [(b['attempt_id'], m) for b in batches if b['run_id'] == run for m in b['messages']]
+
+
+# A turn that ended: its lines were recorded (or discarded) before it did.
+ENDED = ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')
+
+
+def verdict(db, run, attempt, message):
+    """What became of `message`, written in turn `attempt`: its decision's state (APPLIED; REJECTED; PROPOSED, a kind
+    the product does not apply yet, which stays so), 'ENDED' when its line ended without a decision, None while it
+    waits for its disposal."""
+    mid = message['message_id']
+    row = db.execute('SELECT state FROM decisions WHERE run_id = ? AND decision_id LIKE ?',
+                     (run, '%/' + mid)).fetchone()
+    if row:
+        return row[0]
+    line = db.execute("SELECT json_extract(payload_json, '$.output_id') FROM events WHERE run_id = ? "
+                      "AND kind = 'supervisor.output' AND json_extract(payload_json, '$.attempt_id') = ? "
+                      "AND instr(json_extract(payload_json, '$.text'), ?) > 0", (run, attempt, mid)).fetchone()
+    if line:
+        disposed = db.execute("SELECT 1 FROM events WHERE run_id = ? AND kind = 'supervisor.output_disposed' "
+                              "AND json_extract(payload_json, '$.output_id') = ?", (run, line[0])).fetchone()
+        return 'ENDED' if disposed else None
+    discarded = db.execute("SELECT 1 FROM events WHERE run_id = ? AND kind = 'supervisor.output_discarded' "
+                           "AND json_extract(payload_json, '$.attempt_id') = ?", (run, attempt)).fetchone()
+    turn = db.execute('SELECT state FROM attempts WHERE attempt_id = ?', (attempt,)).fetchone()
+    return 'ENDED' if discarded or (turn and turn[0] in ENDED) else None
+
+
 def commander(text, wake, cfg):
     """The pinned script (M2T13D-52): record_assumption and create_tasks once per run, the transitions still ahead up
-    to RUNNING, nothing in any other state."""
+    to RUNNING, nothing in any other state. "Once" is by what became of the ones written before (read from the store):
+    one APPLIED, one kept PROPOSED (a kind the product does not apply yet) or one still waiting for its disposal is
+    the run's; one REJECTED or ended without a decision is submitted again. A kind in `stale_once` names a revision one
+    past the run's (STALE_REVISION) the first time it is submitted for a run."""
     c = cfg.get('commander', {})
     run, state, revision = wake['run_id'], wake.get('Run 状态', ''), int(wake['expected_revision'])
     spec = re.search(r'spec_sha256：([0-9a-f]{64})', text)
     spec = spec.group(1) if spec else '0' * 64
-    marks = os.path.join(WORLD, 'commander.d', hashlib.sha256(run.encode()).hexdigest()[:16])
-    os.makedirs(marks, exist_ok=True)
+    before = written(run)
+    root = cfg.get('project') or wake.get('项目根') or os.getcwd()
+    db = sqlite3.connect(os.path.join(root, '.hoh', 'state.db'), timeout=10)
+    try:
+        held = {m['payload']['kind'] for attempt, m in before
+                if verdict(db, run, attempt, m) in ('APPLIED', 'PROPOSED', None)}
+    finally:
+        db.close()
 
-    def once(name):
-        try:
-            open(os.path.join(marks, name), 'x').close()
-            return True
-        except FileExistsError:
+    def once(kind):
+        if kind in held:
             return False
+        held.add(kind)
+        return True
 
     payloads = []
     if state in ORDER[:-1]:
-        if once('assumed'):
+        if once('record_assumption'):
             payloads.append({'kind': 'record_assumption', 'statement': c.get('statement', 'fixture'),
                              'basis': c.get('basis', 'fixture')})
         for target in ORDER[ORDER.index(state) + 1:]:
-            if target in ('READY', 'RUNNING') and once('planned'):
+            if target in ('READY', 'RUNNING') and once('create_tasks'):
                 reqs = requirements(wake, c)
                 payloads.append({'kind': 'create_tasks', 'plan': {'tasks': [
                     {'task_id': run + '-' + t, 'title': 'fixture ' + t, 'role': 'developer', 'writer': True,
@@ -317,14 +369,16 @@ def commander(text, wake, cfg):
             payloads.append({'kind': 'transition_run', 'to_state': target})
     attempt = wake['attempt_id']
     key = 'fake-' + hashlib.sha256(attempt.encode()).hexdigest()[:24]
+    submitted = {m['payload']['kind'] for _, m in before}
     messages = []
     for i, payload in enumerate(payloads):
+        stale = payload['kind'] in c.get('stale_once', []) and payload['kind'] not in submitted
         messages.append({
             'schema_version': '1.0', 'message_id': key + '-d' + str(i), 'run_id': run, 'task_id': wake['task_id'],
             'attempt_id': attempt, 'sender_role': 'commander', 'recipient_role': 'runtime',
             'role_epoch': int(wake['role_epoch']), 'correlation_id': key, 'causation_id': wake.get('causation_id'),
-            'idempotency_key': key + '-d' + str(i), 'expected_revision': revision + i, 'spec_sha256': spec,
-            'candidate_id': None, 'kind': 'decision', 'payload': payload})
+            'idempotency_key': key + '-d' + str(i), 'expected_revision': revision + i + (1 if stale else 0),
+            'spec_sha256': spec, 'candidate_id': None, 'kind': 'decision', 'payload': payload})
     for message in messages:
         bridge_write(wake['输出文件'], {'nonce': wake['nonce'], 'message': message})
     append('commander.jsonl', {'agent': AGENT, 'run_id': run, 'state': state, 'revision': revision,
@@ -558,16 +612,25 @@ pub fn probe() -> ProbeCommand {
 pub struct World {
     dir: tempfile::TempDir,
     setsid: PathBuf,
+    /// The project directory's name.
+    name: String,
 }
 
 impl World {
     /// A new world: its directories, the tools and fakes on its PATH, the fakes' default settings and the project's
     /// `.hoh/config.toml` with [`TEAM`]. Nothing is registered or started.
     pub fn new() -> R<World> {
+        World::named("p")
+    }
+
+    /// [`World::new`] with the project directory named `name` (the Workspace's top bar shows it), short as a socket
+    /// path needs.
+    pub fn named(name: &str) -> R<World> {
         let dir = tempfile::Builder::new().prefix("hohw").tempdir_in("/tmp")?;
         let world = World {
             dir,
             setsid: found("setsid")?,
+            name: name.to_owned(),
         };
         for d in [
             world.project(),
@@ -598,6 +661,8 @@ impl World {
             world.verifier(role, &Verifier::default())?;
         }
         world.configure(&TEAM, "")?;
+        // The fake Commander reads the store there (what became of the decisions it wrote).
+        world.set(&["project"], json!(world.project()))?;
         Ok(world)
     }
 
@@ -608,7 +673,7 @@ impl World {
 
     /// The project.
     pub fn project(&self) -> PathBuf {
-        self.root().join("p")
+        self.root().join(&self.name)
     }
 
     /// `HOME` of the world's commands.
@@ -741,6 +806,14 @@ impl World {
         }
         std::fs::create_dir_all(self.project().join(".hoh"))?;
         std::fs::write(self.project().join(".hoh/config.toml"), text)?;
+        Ok(())
+    }
+
+    /// The project without its `.hoh/config.toml`: its configuration is the built-in one (a host then writes no
+    /// ConfigureTeam of its own as it starts, docs/adr/ADR-022.md decision 6).
+    pub fn unconfigure(&self) -> R {
+        std::fs::remove_file(self.project().join(".hoh/config.toml"))?;
+        std::fs::remove_dir(self.project().join(".hoh"))?;
         Ok(())
     }
 
@@ -888,6 +961,55 @@ impl World {
         Ok(Host::start(config).await?)
     }
 
+    /// An in-process host of the project whose runner is the scripted `team` ([`Team`]): every built-in role needs no
+    /// capability and the Commander sessions' directories are the world's own; its clock is `clock` when given. A
+    /// start refused while another start holds the project is tried again for 5 s.
+    pub async fn team_host(
+        &self,
+        team: std::sync::Arc<Team>,
+        clock: Option<std::sync::Arc<FakeClock>>,
+    ) -> R<Host> {
+        let mut config = HostConfig::new(&self.project());
+        config.port = 0;
+        config.store.wal_probe = Some(probe());
+        if let Some(clock) = clock {
+            config.clock = hoh_app::host::HostClock(clock);
+        }
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: team,
+            context: hoh_core::decision::Context {
+                required_capabilities: TEAM
+                    .iter()
+                    .map(|(role, _)| ((*role).to_owned(), Default::default()))
+                    .collect(),
+                commander_dir: Some(self.state().join("hoh/commander")),
+                ..hoh_core::decision::Context::default()
+            },
+        });
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Host::start(config.clone()).await {
+                Err(e) if e.exit_code == 69 && Instant::now() < end => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return Ok(other?),
+            }
+        }
+    }
+
+    /// Each vacant role binding of run `run_id` given a session of its own (`world-<run>-<role>`), as staffing gives
+    /// it on a host whose executor has an agent registry: the scripted [`Team`] has none, so its host leaves them
+    /// vacant and its Commander is never given a turn.
+    pub fn staff(&self, run_id: &str) -> R {
+        self.exec(&format!(
+            "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json)
+               SELECT 'world-' || run_id || '-' || role, agent, role, '1', '{{}}' FROM role_bindings
+               WHERE run_id = '{run_id}' AND session_id IS NULL;
+             UPDATE role_bindings SET session_id = 'world-' || run_id || '-' || role
+               WHERE run_id = '{run_id}' AND session_id IS NULL;"
+        ))
+    }
+
     /// The product's host of the project in this process (docs/adr/ADR-022.md decision 17): the effective
     /// configuration from the project's file, the product executor on the world's PATH, pi's settings and the
     /// Commander sessions' directories the world's own, any free port.
@@ -942,7 +1064,7 @@ impl World {
     pub fn commander(&self, c: &Commander) -> R {
         self.set(
             &["commander"],
-            json!({"statement": c.statement, "basis": c.basis, "tasks": c.tasks}),
+            json!({"statement": c.statement, "basis": c.basis, "tasks": c.tasks, "stale_once": c.stale_once}),
         )
     }
 
@@ -1276,6 +1398,240 @@ impl hoh_core::delivery::Clock for FakeClock {
     fn now(&self) -> std::time::SystemTime {
         std::time::SystemTime::now() + self.0.lock().map(|d| *d).unwrap_or_default()
     }
+}
+
+/// A Commander turn of the scripted [`Team`], as its supervision input gives it.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub run_id: String,
+    pub attempt_id: String,
+    /// The run's state and revision and the Commander's epoch the turn was given.
+    pub state: String,
+    pub revision: i64,
+    pub role_epoch: i64,
+    /// The wake it answers (its decisions' causation) and the whole summary it was shown (its events, tasks, roles).
+    pub wake: String,
+    pub summary: Value,
+}
+
+/// What the scripted Commander decides on a turn: the decision payloads it submits, in order, each at the revision the
+/// one before it leaves (the turn's revision, then one more for each).
+pub type Script = dyn Fn(&Turn) -> Vec<Value> + Send + Sync;
+
+/// An executor of an in-process host (verification_dispatch.rs's pattern, [`World::team_host`]) that plays the
+/// Commander by a script: each supervision turn is a process of its own process group, held at its start gate, that
+/// ends as soon as the gate opens, its bridge lines the script's decisions for the turn, each a valid `Message` of the
+/// turn's nonce, epoch and wake. It takes no work: every other dispatch is refused at its delivery, so no work attempt
+/// starts. Every turn is kept with what it submitted ([`Team::turns`]), every dispatch it refused too
+/// ([`Team::refused`]); a turn still running when it is dropped is ended.
+pub struct Team {
+    script: Box<Script>,
+    turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
+    refused: std::sync::Mutex<Vec<String>>,
+    /// Each turn's process group (its leader's pid) and its leader's start time.
+    agents: std::sync::Mutex<Vec<(u32, Option<String>)>>,
+}
+
+impl std::fmt::Debug for Team {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Team")
+            .field("turns", &self.turns)
+            .field("refused", &self.refused)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Team {
+    /// A Team whose Commander decides by `script`.
+    pub fn new(
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+    ) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            script: Box::new(script),
+            turns: std::sync::Mutex::default(),
+            refused: std::sync::Mutex::default(),
+            agents: std::sync::Mutex::default(),
+        })
+    }
+
+    /// Every Commander turn so far, with the messages it submitted.
+    pub fn turns(&self) -> Vec<(Turn, Vec<Value>)> {
+        self.turns.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// The attempt ids of the work dispatches it refused (none started).
+    pub fn refused(&self) -> Vec<String> {
+        self.refused.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+}
+
+/// The Team's turns end with it: each process group whose leader is still the one it started is SIGKILLed.
+impl Drop for Team {
+    fn drop(&mut self) {
+        let agents = self
+            .agents
+            .lock()
+            .map(|mut a| std::mem::take(&mut *a))
+            .unwrap_or_default();
+        for (pgid, start) in agents {
+            let same =
+                start.is_some() && hoh_agents::identity::start_id(pgid).ok().flatten() == start;
+            if let (true, Some(pgid)) = (
+                same,
+                i32::try_from(pgid)
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw),
+            ) {
+                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+}
+
+impl hoh_app::host::Executor for Team {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        if work.role == "commander" {
+            let _ = answer.send(Ok(()));
+        } else {
+            if let Ok(mut refused) = self.refused.lock() {
+                refused.push(work.attempt_id.clone());
+            }
+            let _ = answer.send(Err("the scripted Team takes no work".to_owned()));
+        }
+        ack
+    }
+
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        use std::os::unix::process::CommandExt as _;
+        let refusal = |reason: &str, detail: Option<String>| hoh_app::host::Refusal {
+            reason: reason.to_owned(),
+            class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+            detail,
+            details: None,
+        };
+        let input = work
+            .assignment
+            .supervision
+            .clone()
+            .filter(|_| work.role == "commander")
+            .ok_or_else(|| refusal("NOT_SCRIPTED", None))?;
+        let turn = Turn {
+            run_id: work.run_id.clone(),
+            attempt_id: work.attempt_id.clone(),
+            state: input.summary["run"]["state"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            revision: input.run_revision,
+            role_epoch: input.role_epoch,
+            wake: input.wake.clone(),
+            summary: input.summary.clone(),
+        };
+        let spec = input.summary["run"]["spec_sha256"]
+            .as_str()
+            .map_or_else(|| "0".repeat(64), str::to_owned);
+        let messages: Vec<Value> = (self.script)(&turn)
+            .into_iter()
+            .zip(0..)
+            .map(|(payload, i)| {
+                json!({
+                    "schema_version": "1.0", "message_id": format!("d{i}"), "run_id": turn.run_id,
+                    "task_id": work.task_id, "attempt_id": turn.attempt_id, "sender_role": "commander",
+                    "recipient_role": "runtime", "role_epoch": turn.role_epoch, "correlation_id": "team",
+                    "causation_id": turn.wake, "idempotency_key": format!("{}/d{i}", turn.attempt_id),
+                    "expected_revision": turn.revision + i, "spec_sha256": spec, "candidate_id": null,
+                    "kind": "decision", "payload": payload,
+                })
+            })
+            .collect();
+        let lines: Vec<String> = messages
+            .iter()
+            .map(|m| json!({"nonce": input.nonce, "message": m}).to_string())
+            .collect();
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.push((turn, messages));
+        }
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r go; exit 0"])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| refusal("SPAWN", Some(e.to_string())))?;
+        let pid = child.id();
+        if let Ok(mut agents) = self.agents.lock() {
+            agents.push((pid, hoh_agents::identity::start_id(pid).ok().flatten()));
+        }
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut group_gone = hoh_agents::identity::group_empty(pid);
+            while !group_gone && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+                group_gone = hoh_agents::identity::group_empty(pid);
+            }
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: "answered".to_owned(),
+                group_gone,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                observed: hoh_core::persistence::Observed {
+                    messages: lines,
+                    ..Default::default()
+                },
+                unknown_effect: false,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+
+/// The scripted Commander's transition_run to `to`.
+pub fn transition(to: &str) -> Value {
+    json!({"kind": "transition_run", "to_state": to})
+}
+
+/// The transition_run steps along CREATED→DISCOVERING→SPECIFYING→READY→RUNNING after `from` up to `to` (none when `to`
+/// is not ahead of `from` on that path).
+pub fn steps(from: &str, to: &str) -> Vec<Value> {
+    const ORDER: [&str; 5] = ["CREATED", "DISCOVERING", "SPECIFYING", "READY", "RUNNING"];
+    let at = |state: &str| ORDER.iter().position(|s| *s == state);
+    match (at(from), at(to)) {
+        (Some(from), Some(to)) if from < to => {
+            ORDER[from + 1..=to].iter().map(|s| transition(s)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The scripted Commander's request_user_decision: `question` for a person, `question_id` its own id.
+pub fn ask(question_id: &str, question: &str) -> Value {
+    json!({"kind": "request_user_decision", "question_id": question_id, "question": question,
+        "requires_user": true})
 }
 
 /// The session id and the controlling terminal (0: none) of process `pid` (`/proc/<pid>/stat` fields 6 and 7).

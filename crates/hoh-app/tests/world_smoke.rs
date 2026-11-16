@@ -1,8 +1,9 @@
 //! The M2-T13 test world on its own (docs/adr/ADR-031.md decision 14, slice S5): the fixtures the eleven TESTs of
 //! M2-T13 share, checked before any TEST uses them. These are tests of the fixtures, not of an acceptance criterion:
 //! the vt100 screen snapshot and its erase counter-example, the PTY and plain-child helpers, the fake CLIs' compat
-//! suites, the pinned fake Commander on codex and on claude, the fake Developer and verifiers through the product
-//! executor, a codex turn that fails unauthorized, and a host the world's own `hoh` starts.
+//! suites, the pinned fake Commander on codex and on claude (and its create_tasks submitted again once refused), the
+//! fake Developer and verifiers through the product executor, a codex turn that fails unauthorized, a host the world's
+//! own `hoh` starts, and the scripted Team's Commander on an in-process host.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -368,6 +369,190 @@ async fn the_pinned_commander_moves_a_run_to_running_on_codex() -> R {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_pinned_commander_moves_a_run_to_running_on_claude() -> R {
     the_pinned_commander_moves_a_run_to_running_on("claude").await
+}
+
+/// Each message of `batches` (the fake Commander's log) as (kind, its decision's state and reason code, or none),
+/// in the order written; `decisions` are the run's rows (a decision's id is its message's under the turn's attempt).
+fn verdicts(batches: &[Value], decisions: &[Value]) -> Vec<(String, Option<(Value, Value)>)> {
+    batches
+        .iter()
+        .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
+        .map(|m| {
+            let id = format!("/{}", m["message_id"].as_str().unwrap_or("?"));
+            let verdict = decisions
+                .iter()
+                .find(|d| d["decision_id"].as_str().is_some_and(|d| d.ends_with(&id)))
+                .map(|d| (d["state"].clone(), d["reason_code"].clone()));
+            (
+                m["payload"]["kind"].as_str().unwrap_or("?").to_owned(),
+                verdict,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pinned_commander_submits_a_refused_create_tasks_again_and_an_applied_assumption_never()
+-> R {
+    // The pinned Commander's "once" is by what became of a decision, not by its writing: its first create_tasks names a
+    // stale revision (stale_once) and is REJECTED, so it is submitted again on the run's next turn; its
+    // record_assumption, APPLIED in the first batch, is never submitted again. The second create_tasks is APPLIED, or
+    // kept PROPOSED while the product does not apply create_tasks (before slice S2b); either way the run reaches
+    // RUNNING.
+    let world = World::new()?;
+    world.commander(&world::Commander {
+        stale_once: vec!["create_tasks".to_owned()],
+        ..world::Commander::default()
+    })?;
+    let started = Instant::now();
+    let (host, run) = adopted_run(&world, "s1").await?;
+    let outcome = async {
+        world
+            .until(
+                &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+                "RUNNING",
+                WAIT,
+            )
+            .await?;
+        let batches = world.log("commander.jsonl")?;
+        let decisions = world.rows(&format!(
+            "SELECT decision_id, state, reason_code FROM decisions WHERE run_id = '{run}'"
+        ))?;
+        let all = verdicts(&batches, &decisions);
+        let of = |kind: &str| -> Vec<Option<(Value, Value)>> {
+            all.iter()
+                .filter(|(k, _)| k == kind)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        let create = of("create_tasks");
+        assert_eq!(create.len(), 2, "{all:?}");
+        assert_eq!(
+            create[0],
+            Some((json!("REJECTED"), json!("STALE_REVISION"))),
+            "{all:?}"
+        );
+        assert!(
+            create[1]
+                .as_ref()
+                .is_some_and(|(state, _)| state == "APPLIED" || state == "PROPOSED"),
+            "{all:?}"
+        );
+        // Submitted again in a later batch than the refused one.
+        let batch_of = |kind: &str, nth: usize| {
+            batches
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    b["messages"]
+                        .as_array()
+                        .is_some_and(|m| m.iter().any(|m| m["payload"]["kind"] == kind))
+                })
+                .map(|(i, _)| i)
+                .nth(nth)
+        };
+        assert!(
+            batch_of("create_tasks", 0) < batch_of("create_tasks", 1),
+            "{batches:?}"
+        );
+        assert_eq!(
+            of("record_assumption"),
+            [Some((json!("APPLIED"), Value::Null))],
+            "{all:?}"
+        );
+        eprintln!(
+            "RUNNING after {:?}, {} batches: {all:?}",
+            started.elapsed(),
+            batches.len()
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scripted_teams_commander_moves_a_run_and_asks_a_person() -> R {
+    // The scripted Team on an in-process host: the run, started, staffed and given the committed specification, wakes
+    // its Commander; the script's first turn (at CREATED) moves it to SPECIFYING and asks a person, its messages valid
+    // and at consecutive revisions from the turn's. The moves are APPLIED, the question is the run's decision of
+    // request_user_decision, and the run waits BLOCKED (NEED_DECISION) for the answer; no work is taken.
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    let question = "登录要支持哪些方式？\"OAuth\" 还是 密码\\短信";
+    let team = world::Team::new(move |turn| {
+        if turn.state == "CREATED" {
+            let mut decided = world::steps("CREATED", "SPECIFYING");
+            decided.push(world::ask("q-login", question));
+            decided
+        } else {
+            Vec::new()
+        }
+    });
+    let host = world.team_host(team.clone(), None).await?;
+    let outcome = async {
+        let spec = world.seed_spec()?;
+        let run = world::start_run(&host, "s1", "实现登录功能").await?;
+        world.staff(&run)?;
+        adopt(&world, &run, &spec)?;
+        world
+            .until(
+                &format!("SELECT state || '/' || blocked_reason FROM runs WHERE run_id = '{run}'"),
+                "BLOCKED/NEED_DECISION",
+                WAIT,
+            )
+            .await?;
+        let turns = team.turns();
+        let (first, messages) = turns.first().ok_or("no turn")?;
+        assert_eq!((first.run_id.as_str(), first.state.as_str()), (run.as_str(), "CREATED"));
+        let kinds: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                let p = &m["payload"];
+                format!("{}:{}", p["kind"].as_str().unwrap_or("?"), p["to_state"].as_str().unwrap_or("-"))
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "transition_run:DISCOVERING",
+                "transition_run:SPECIFYING",
+                "request_user_decision:-"
+            ]
+        );
+        for (m, i) in messages.iter().zip(0..) {
+            assert_eq!(m["expected_revision"].as_i64(), Some(first.revision + i), "{m}");
+            assert_eq!(m["causation_id"], json!(first.wake));
+            let valid = hoh_core::schema::protocol().validate_def("Message", m)?;
+            assert!(valid.is_ok(), "{m}: {valid:?}");
+        }
+        let decisions = world.rows(&format!(
+            "SELECT json_extract(payload_json, '$.kind') AS kind, json_extract(payload_json, '$.to_state') AS \
+             to_state, json_extract(payload_json, '$.question') AS question, state FROM decisions \
+             WHERE run_id = '{run}' ORDER BY rowid"
+        ))?;
+        let applied: Vec<&Value> = decisions
+            .iter()
+            .filter(|d| d["kind"] == "transition_run" && d["state"] == "APPLIED")
+            .map(|d| &d["to_state"])
+            .collect();
+        assert_eq!(applied, [&json!("DISCOVERING"), &json!("SPECIFYING")], "{decisions:?}");
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|d| d["kind"] == "request_user_decision")
+                .map(|d| d["question"].clone())
+                .collect::<Vec<_>>(),
+            [json!(question)],
+            "{decisions:?}"
+        );
+        assert!(team.refused().is_empty(), "{:?}", team.refused());
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
