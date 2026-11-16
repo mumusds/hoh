@@ -489,17 +489,14 @@ pub(super) fn rebuild_handoff(
         )));
     };
     // The handoff it replaces: the round's current one, as the admission reads it.
-    let current: Option<String> = tx
-        .query_row(
-            "SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = ?1 \
-             AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3 \
-             ORDER BY seq DESC LIMIT 1",
-            params![HANDOFF_REISSUED, round_id, role],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let bad = current.unwrap_or_else(|| child_id(round_id, &format!("verify/{role}")));
+    let bad = current_handoff(
+        tx,
+        run_id,
+        round_id,
+        role,
+        &mut super::recovery::Work::default(),
+    )?
+    .unwrap_or_else(|| child_id(round_id, &format!("verify/{role}")));
     message.message_id = child_id(&bad, "rebuilt");
     message.idempotency_key = message.message_id.clone();
     // The admission's own check, on the message as it will be read back.
@@ -530,6 +527,34 @@ pub(super) fn rebuild_handoff(
         outbox: vec![NewOutbox::hcp(0, &message)?],
         ..super::writer::Commit::default()
     }))
+}
+
+/// Round `round_id`'s handoff to verifier `role` of run `run_id` issued last (`verification.handoff_reissued`'s `to`),
+/// if one was issued again: what the admission and an INVALID_HANDOFF answer's rebuild take as its current one (else the
+/// original), its work counted (M2T13R-302): read by the run's key (`events_run_kind`), never other runs' events — a
+/// handoff issued again is always its run's event (Progress, never written project-scoped).
+pub(super) fn current_handoff(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    round_id: &str,
+    role: &str,
+    work: &mut super::recovery::Work,
+) -> Result<Option<String>, PersistError> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT json_extract(payload_json, '$.to') FROM events WHERE run_id = ?4 AND kind = ?1 \
+             AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3 \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(sqlite_error)?;
+    let current = statement
+        .query_row(params![HANDOFF_REISSUED, round_id, role, run_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(sqlite_error)?;
+    work.count(&statement);
+    Ok(current)
 }
 
 /// The kind of the event that issues a round's handoff again at its role's current epoch.
@@ -735,17 +760,14 @@ pub(super) fn admit(
         .ok_or_else(|| PersistError::IntegrityViolation(format!("round {round_id}: {task_id}")))?;
     // Its round's current handoff: the original, or the latest issued again.
     let original = child_id(&round_id, &format!("verify/{role}"));
-    let current: Option<String> = tx
-        .query_row(
-            "SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = ?1 \
-             AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3 \
-             ORDER BY seq DESC LIMIT 1",
-            params![HANDOFF_REISSUED, round_id, role],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    let handoff = current.unwrap_or(original);
+    let handoff = current_handoff(
+        tx,
+        run_id,
+        &round_id,
+        role,
+        &mut super::recovery::Work::default(),
+    )?
+    .unwrap_or(original);
     let (state, payload): (String, String) = tx
         .query_row(
             "SELECT state, payload_json FROM outbox WHERE message_id = ?1",

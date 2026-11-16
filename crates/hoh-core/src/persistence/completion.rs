@@ -596,16 +596,7 @@ fn freeze_and_accept(
         Ok(Frozen::Existing { state, .. }) if state == "VERIFYING" => {
             // A flaky round on it, or a flaky join of it: the same content cannot satisfy FLAKY, a new commit can
             // (M2T16D-454, -557; docs/adr/ADR-031.md decision 8's flaky row).
-            let flaky: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(payload_json, '$.candidate_id') = ?1 \
-                     AND ((kind = 'verification.round_closed' AND json_extract(payload_json, '$.verdict') = 'flaky') \
-                       OR (kind = 'verification.joined' AND json_extract(payload_json, '$.class') = 'flaky')))",
-                    params![id],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_error)?;
-            if flaky {
+            if flaky(tx, &task.run_id, &id, &mut super::recovery::Work::default())? {
                 Some(format!(
                     "the same content is under verification as {id} with a flaky criterion, which the same content \
                      cannot satisfy: a new commit is needed"
@@ -654,6 +645,31 @@ fn freeze_and_accept(
             }
         }
     }
+}
+
+/// Whether candidate `candidate` of run `run_id` was found flaky: a round on it closed `flaky`, or its join was of class
+/// `flaky` (M2T16D-454, -557; docs/adr/ADR-031.md decision 8's flaky row): the same content cannot satisfy it. Its work
+/// counted (M2T13R-302): read by the run's key (`events_run_kind`, one probe per kind), never other runs' events — a
+/// round's close and a join are always the candidate's run's events (Progress, never written project-scoped).
+pub(super) fn flaky(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    candidate: &str,
+    work: &mut super::recovery::Work,
+) -> Result<bool, PersistError> {
+    let mut statement = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?2 AND kind = 'verification.round_closed' \
+               AND json_extract(payload_json, '$.candidate_id') = ?1 AND json_extract(payload_json, '$.verdict') = 'flaky') \
+             OR EXISTS(SELECT 1 FROM events WHERE run_id = ?2 AND kind = 'verification.joined' \
+               AND json_extract(payload_json, '$.candidate_id') = ?1 AND json_extract(payload_json, '$.class') = 'flaky')",
+        )
+        .map_err(sqlite_error)?;
+    let found = statement
+        .query_row(params![candidate, run_id], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    work.count(&statement);
+    Ok(found)
 }
 
 /// One protocol correction of the task, counted by Repair::Protocol keyed by the first attempt of its chain (the

@@ -2413,3 +2413,175 @@ mod real {
         Ok(())
     }
 }
+
+mod scale {
+    //! M2T13R-302: the event reads the answers added — the next attempt's answers (`context::answers`), a round's
+    //! current handoff (`verification::current_handoff`, the admission's and an INVALID_HANDOFF rebuild's) and the
+    //! same-content guard's flaky candidate (`completion::flaky`) — find what they found before (equality with the
+    //! statements as they were written) and do the same work however many events other runs have.
+    use crate::persistence::recovery::Work;
+    use crate::persistence::{Options, Store, selftest};
+    use rusqlite::{Connection, OptionalExtension, params};
+
+    type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Run R's facts the reads look at, and run Q's history of `n` events of the same kinds (and another), Q's own
+    /// task, attempt, rounds and candidates.
+    fn world(n: u64) -> R<(tempfile::TempDir, Connection)> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(".hoh/state.db");
+        drop(Store::open(
+            &path,
+            Options {
+                wal_probe: Some(selftest::test_probe(None)),
+                ..Options::default()
+            },
+        )?);
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(&format!(
+            "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-16T00:00:00Z');
+             INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('R', 'p1', 's1', 'RUNNING', 'AUTO', 1, '2026-11-16T00:00:00Z'),
+               ('Q', 'p1', 's1', 'RUNNING', 'AUTO', 1, '2026-11-16T00:00:00Z');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq) VALUES
+               ('T', 'R', 's1', 'READY', 1, 'developer', 1), ('U', 'Q', 's1', 'READY', 1, 'developer', 1);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision) VALUES
+               ('A1', 'T', 'FAILED', 1, 1, 1), ('A2', 'T', 'PREPARED', 1, 1, 1), ('B1', 'U', 'RUNNING', 1, 1, 1);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'q' || i, 'Q',
+                 CASE i % 6 WHEN 0 THEN 'question.answered' WHEN 1 THEN 'attempt.moved'
+                   WHEN 2 THEN 'verification.handoff_reissued' WHEN 3 THEN 'verification.round_closed'
+                   WHEN 4 THEN 'verification.joined' ELSE 'other' END,
+                 CASE i % 6 WHEN 0 THEN json_object('task_id', 'U', 'question_id', 'qq' || i, 'exit', 'continue',
+                     'answer', 'x')
+                   WHEN 1 THEN json_object('attempt_id', 'B1', 'task_id', 'U', 'to', 'RUNNING')
+                   WHEN 2 THEN json_object('round_id', 'QR' || (i % 50), 'role', 'qa', 'to', 'qm' || i)
+                   WHEN 3 THEN json_object('candidate_id', 'QC' || (i % 50), 'verdict', 'flaky')
+                   WHEN 4 THEN json_object('candidate_id', 'QC' || (i % 50), 'class', 'flaky')
+                   ELSE '{{}}' END,
+                 '2026-11-16T00:00:00Z' FROM n;
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', 'r1', 'R', 'question.answered', '{{\"task_id\": \"T\", \"question_id\": \"old\", \"exit\": \"continue\",
+                 \"answer\": \"before A1 ran\"}}', 'x'),
+               ('p1', 'r2', 'R', 'attempt.moved', '{{\"attempt_id\": \"A1\", \"task_id\": \"T\", \"to\": \"RUNNING\"}}', 'x'),
+               ('p1', 'r3', 'R', 'question.answered', '{{\"task_id\": \"T\", \"question_id\": \"q1\", \"exit\": \"continue\",
+                 \"answer\": \"again\"}}', 'x'),
+               ('p1', 'r4', 'R', 'question.answered', '{{\"task_id\": \"T\", \"question_id\": \"q2\", \"exit\": \"rework\",
+                 \"subject\": \"source\", \"answer\": \"anew\"}}', 'x'),
+               ('p1', 'r5', 'R', 'verification.handoff_reissued', '{{\"round_id\": \"RR\", \"role\": \"qa\", \"to\": \"m1\"}}', 'x'),
+               ('p1', 'r6', 'R', 'verification.handoff_reissued', '{{\"round_id\": \"RR\", \"role\": \"qa\", \"to\": \"m2\"}}', 'x'),
+               ('p1', 'r7', 'R', 'verification.joined', '{{\"candidate_id\": \"C\", \"class\": \"flaky\"}}', 'x'),
+               ('p1', 'r8', 'R', 'verification.round_closed', '{{\"candidate_id\": \"C2\", \"verdict\": \"passable\"}}', 'x');"
+        ))?;
+        Ok((dir, conn))
+    }
+
+    /// The answers as the statement was written before (no run key), formatted as the product does.
+    fn answers_before(conn: &Connection, task: &str, attempt: &str) -> R<Vec<String>> {
+        let mut statement = conn.prepare(
+            "SELECT json_extract(payload_json, '$.question_id'), json_extract(payload_json, '$.exit'), \
+             coalesce(json_extract(payload_json, '$.subject'), ''), json_extract(payload_json, '$.answer') \
+             FROM events WHERE kind = 'question.answered' AND json_extract(payload_json, '$.task_id') = ?1 \
+             AND seq > coalesce((SELECT max(m.seq) FROM events m JOIN attempts a \
+               ON a.attempt_id = json_extract(m.payload_json, '$.attempt_id') \
+               WHERE m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.to') = 'RUNNING' \
+               AND a.task_id = ?1 AND a.attempt_id <> ?2), 0) ORDER BY seq",
+        )?;
+        let rows = statement.query_map(params![task, attempt], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (question, exit, subject, answer) = row?;
+            let exit = exit.unwrap_or_default();
+            let more = if exit == "rework" && subject == "source" {
+                "；须做新的提交，形成新的候选"
+            } else {
+                ""
+            };
+            out.push(format!(
+                "用户的答复（问题 {}，{exit}）：{}{more}",
+                question.unwrap_or_default(),
+                answer.unwrap_or_default()
+            ));
+        }
+        Ok(out)
+    }
+
+    fn current_before(conn: &Connection, round: &str, role: &str) -> R<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = 'verification.handoff_reissued' \
+                 AND json_extract(payload_json, '$.round_id') = ?1 AND json_extract(payload_json, '$.role') = ?2 \
+                 ORDER BY seq DESC LIMIT 1",
+                params![round, role],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn flaky_before(conn: &Connection, candidate: &str) -> R<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(payload_json, '$.candidate_id') = ?1 \
+             AND ((kind = 'verification.round_closed' AND json_extract(payload_json, '$.verdict') = 'flaky') \
+               OR (kind = 'verification.joined' AND json_extract(payload_json, '$.class') = 'flaky')))",
+            params![candidate],
+            |r| r.get(0),
+        )?)
+    }
+
+    #[test]
+    fn the_answers_reads_find_what_they_did_and_do_not_grow_with_other_runs_events() -> R {
+        // M2T13R-302: with 1 000 and 100 000 events of run Q (the same kinds, other tasks, rounds and candidates), each
+        // read of R finds exactly what the statement written without a run key found, and its work (SQLite's VM steps)
+        // with 100 000 is at most its work with 1 000 plus 50.
+        let mut steps: Vec<(u64, &str, i64)> = Vec::new();
+        for n in [1_000, 100_000] {
+            let (_dir, conn) = world(n)?;
+            let mut work = Work::default();
+            let answers =
+                super::super::super::context::answers_counted(&conn, "T", "A2", &mut work)?;
+            assert_eq!(answers, answers_before(&conn, "T", "A2")?, "{n}");
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            steps.push((n, "answers", work.0));
+            let mut work = Work::default();
+            for (round, role) in [("RR", "qa"), ("RR", "reviewer"), ("QR3", "qa")] {
+                let current = super::super::super::verification::current_handoff(
+                    &conn, "R", round, role, &mut work,
+                )?;
+                let expected = if round == "QR3" {
+                    None
+                } else {
+                    current_before(&conn, round, role)?
+                };
+                assert_eq!(current, expected, "{n} {round} {role}");
+            }
+            steps.push((n, "current handoff", work.0));
+            let mut work = Work::default();
+            for candidate in ["C", "C2"] {
+                let found =
+                    super::super::super::completion::flaky(&conn, "R", candidate, &mut work)?;
+                assert_eq!(found, flaky_before(&conn, candidate)?, "{n} {candidate}");
+            }
+            steps.push((n, "flaky", work.0));
+        }
+        for name in ["answers", "current handoff", "flaky"] {
+            let of = |n: u64| {
+                steps
+                    .iter()
+                    .find(|(h, s, _)| *h == n && *s == name)
+                    .map_or(i64::MAX, |(.., w)| *w)
+            };
+            assert!(of(100_000) <= of(1_000) + 50, "{name}: {steps:?}");
+        }
+        eprintln!("{steps:?}");
+        Ok(())
+    }
+}
