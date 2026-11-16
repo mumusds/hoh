@@ -10,8 +10,13 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   whose region paths are constants (it refuses to run when a region is missing), the exact patches and, for pi, an
   observer extension that reports the active tools and their sources. The regions are snapshotted before and after
   every session.
+- For every codex case the recorder also copies the thread's rollout file into the case directory as `rollout.jsonl`:
+  the App Server response's `thread.path` (marked [UNSTABLE] in the 0.166.0 schema), for exec the one file under
+  `CODEX_HOME/sessions` named with the thread id. It is the only record of a resumed thread's patch calls and their
+  outputs. `record_spike.py --collect-rollouts <run>` copied them for the two runs below after the fact (so the
+  app-ro-new copy already holds the resumed turn too).
 - The raw recordings stay local, under `.hoh-dev/evidence/commander-readonly/spike/<run>/`: they carry local paths,
-  plugin lists and rate-limit and plan metadata. They are never committed.
+  plugin lists, rate-limit and plan metadata, and the rollout files account identifiers. They are never committed.
 - `excerpt.py` makes the committed `excerpts/`. It keeps only the frames the evidence table reads, replaces the run's
   temporary paths with `<P>`, `<W>`, `<T>` and the home directory with `<HOME>`, replaces every uuid with `<uuid-N>`
   (one numbering for all the runs given, so a resumed session keeps its placeholder) and drops every field named like
@@ -37,6 +42,7 @@ Versions: claude 2.1.325, codex-cli 0.166.0, pi 1.5.0.
 | codex | app-ro-resumed | thread/resume (which offers no raw events) result `sandbox.type` readOnly; the driver's twelve refusals are visible; the patch attempts leave **no trace at all** in the stream; snapshot unchanged |
 | codex | app-control | full access: the driver's lines are all `exit=0`, and each patch is a fileChange item `completed` with `kind.type` add, update or delete and a diff; the snapshot shows every change |
 | codex | exec-ro-new | exec, read-only: the driver's refusals are visible as a `command_execution` item; the patch attempts leave no trace in the stream; snapshot unchanged |
+| codex | rollouts (`*.rollout.excerpt.jsonl`) | every turn has a `turn_context` with `approval_policy` never and `sandbox_policy.type` read-only (danger-full-access in the controls); every patch attempt of the new **and the resumed** turn, and of the exec thread, is a `response_item` `custom_tool_call` (name `exec`, input `tools.apply_patch("<the exact patch>")`) followed by a `custom_tool_call_output` with the same `call_id` whose text is the read-only refusal; the controls' outputs are `Script completed` |
 | pi | ro-new, ro-resumed | the observer reports active tools exactly read, grep, find, ls, all builtin; one read of TOKEN.txt; the snapshot shows pi's own session file under `.hoh/sessions/` **and files the user-installed pi-lens extension writes into W (`.pi-lens-probe-home/*.log`)** |
 | pi | ro-plus-write | `write` added to `--tools`: pi executes it (`tool_execution_end` `isError` false, "Successfully wrote"); pi has no refusal for a tool in its active set |
 | pi | control | full access (default tools): the model (glm-5.3) declined the task as a suspected probe, so no write happened; the extension again wrote into W |

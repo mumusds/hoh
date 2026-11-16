@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-57>",
+  "<uuid-58>",
   "-e",
   "<T>/observer.js"
  ],
@@ -19,7 +19,7 @@
   "added": [
    "P/.hoh/sessions",
    "P/.hoh/sessions/s1",
-   "P/.hoh/sessions/s1/2026-11-16T18-14-03-521Z_<uuid-57>.jsonl",
+   "P/.hoh/sessions/s1/2026-11-16T18-14-03-521Z_<uuid-58>.jsonl",
    "W/.pi-lens-probe-home",
    "W/.pi-lens-probe-home/cascade.log",
    "W/.pi-lens-probe-home/extension.log",

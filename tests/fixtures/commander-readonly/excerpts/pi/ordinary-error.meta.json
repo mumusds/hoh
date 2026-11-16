@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-89>",
+  "<uuid-90>",
   "--tools",
   "read,grep,find,ls,edit,write",
   "--no-mcp",
@@ -22,7 +22,7 @@
   "added": [
    "P/.hoh/sessions",
    "P/.hoh/sessions/s1",
-   "P/.hoh/sessions/s1/2026-11-16T20-22-42-218Z_<uuid-89>.jsonl",
+   "P/.hoh/sessions/s1/2026-11-16T20-22-42-218Z_<uuid-90>.jsonl",
    "W/.pi-lens-probe-home",
    "W/.pi-lens-probe-home/cascade.log",
    "W/.pi-lens-probe-home/extension.log",

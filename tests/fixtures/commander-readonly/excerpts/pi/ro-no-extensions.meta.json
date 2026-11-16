@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-91>",
+  "<uuid-92>",
   "--tools",
   "read,grep,find,ls",
   "--no-mcp",
@@ -23,7 +23,7 @@
   "added": [
    "P/.hoh/sessions",
    "P/.hoh/sessions/s1",
-   "P/.hoh/sessions/s1/2026-11-16T20-23-16-227Z_<uuid-91>.jsonl"
+   "P/.hoh/sessions/s1/2026-11-16T20-23-16-227Z_<uuid-92>.jsonl"
   ],
   "removed": [],
   "changed": []

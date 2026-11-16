@@ -1,5 +1,5 @@
 {"_excerpt": {"source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/pi/ro-plus-write/stdout.jsonl", "source_sha256": "e3d1857d43b4ccf60aecd0f41fbf2be8f34249d07ae2a1378ebad7ecff847799", "excerpted": true, "kept": "the frames the ADR-032 evidence table reads", "paths": "<P> <W> <T> <HOME>"}}
-{"type": "extension_ui_request", "id": "<uuid-60>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\", \"write\"], \"sources\": {\"read\": \"builtin\", \"write\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
+{"type": "extension_ui_request", "id": "<uuid-61>", "method": "notify", "message": "{\"hoh_observer\": 1, \"active\": [\"read\", \"grep\", \"find\", \"ls\", \"write\"], \"sources\": {\"read\": \"builtin\", \"write\": \"builtin\", \"grep\": \"builtin\", \"find\": \"builtin\", \"ls\": \"builtin\"}}", "notifyType": "info"}
 {"type": "response", "command": "get_state", "success": true}
 {"id": "p1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}
 {"type": "tool_execution_start", "toolCallId": "call_cbd54cf32b2049b99b92f50f", "toolName": "write", "args": {"content": "hoh-cell\n", "path": "<P>/hoh-tool-create"}}

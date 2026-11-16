@@ -17,7 +17,12 @@ The `errors` set records ordinary operation errors (a missing file, a patch or e
 write under a regular file) in read-only and full-access sessions, as the judge's negative fixtures, and pi's read-only
 profile with --no-extensions (owner question Q-pi-ext).
 
+Each codex case also keeps a copy of its thread's rollout file (the response's `thread.path`; for exec, the one file
+under CODEX_HOME/sessions named with the thread id) as rollout.jsonl, local like the other raw files: it is the only
+record of a resumed thread's patch calls and their outputs. `--collect-rollouts <run>` copies them for an earlier run.
+
 Usage: python3 tests/fixtures/commander-readonly/record_spike.py [--agents claude,codex,pi] [--set cells|errors]
+       python3 tests/fixtures/commander-readonly/record_spike.py --collect-rollouts <run>
 """
 from __future__ import annotations
 import argparse, hashlib, importlib.util, json, os, secrets, shutil, sys, time, uuid
@@ -271,6 +276,23 @@ class Server(rec.AppServer):
         return next((f for f in self.p.frames() if predicate(f)), None)
 
 
+def collect_rollout(case_dir: Path) -> bool:
+    """Copy the thread's rollout file into the case directory (raw, local); False when it cannot be found exactly."""
+    path = None
+    for f in rec.frames((case_dir / 'stdout.jsonl').read_bytes()):
+        result = f.get('result')
+        if isinstance(result, dict) and isinstance(result.get('thread'), dict) and result['thread'].get('path'):
+            path = Path(result['thread']['path'])
+        if f.get('type') == 'thread.started' and f.get('thread_id'):
+            home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+            hits = sorted((home / 'sessions').rglob(f"rollout-*{f['thread_id']}.jsonl"))
+            path = hits[0] if len(hits) == 1 else None
+    if path is None or not path.is_file():
+        return False
+    shutil.copyfile(path, case_dir / 'rollout.jsonl')
+    return True
+
+
 def codex_app_case(sp: Spike, case: str, project: Project, thread_params: dict, notes: str, resume: str | None = None,
                    timeout: float = 1200, prompt: str | None = None) -> str | None:
     before = project.snapshot()
@@ -286,6 +308,7 @@ def codex_app_case(sp: Spike, case: str, project: Project, thread_params: dict, 
     how = s.p.stop(grace=20)
     sp.save('codex', case, project, ['codex', 'app-server'], s.p.sent, s.p.out, s.p.err, s.p.returncode, how, before,
             project.snapshot(), notes, {'thread_id_recorded': bool(thread)})
+    collect_rollout(sp.out / 'codex' / case)
     return thread
 
 
@@ -305,6 +328,7 @@ def codex(sp: Spike) -> None:
     out, err, rc, how = rec.run(argv, ex.prompt().encode(), ex.w, timeout=1200)
     sp.save('codex', 'exec-ro-new', ex, argv, ex.prompt().encode(), out, err, rc, how, before, ex.snapshot(),
             'exec, read-only, only to record what exec shows (ADR-032 decision 10)')
+    collect_rollout(sp.out / 'codex' / 'exec-ro-new')
 
 
 def pi_case(sp: Spike, case: str, project: Project, tools: list[str], session_id: str, notes: str, timeout: float = 900,
@@ -360,7 +384,12 @@ def main() -> int:
     ap.add_argument('--set', choices=('cells', 'errors'), default='cells')
     ap.add_argument('--run', help='an existing run name to add to (one agent per invocation)')
     ap.add_argument('--out', default=str(REPO / '.hoh-dev/evidence/commander-readonly/spike'))
+    ap.add_argument('--collect-rollouts', metavar='RUN', help='copy the codex rollout files of an earlier run, and exit')
     args = ap.parse_args()
+    if args.collect_rollouts:
+        for case_dir in sorted((Path(args.out) / args.collect_rollouts / 'codex').glob('*')):
+            print(f'{case_dir.name}: rollout {"copied" if collect_rollout(case_dir) else "not found"}')
+        return 0
     rec.require_scopes()
     ap_run = args.run or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run_dir = Path(args.out) / ap_run  # --run continues a run, one agent per invocation; its summary accumulates
