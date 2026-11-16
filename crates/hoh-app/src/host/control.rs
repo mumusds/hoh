@@ -443,12 +443,18 @@ pub(crate) fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// [`git`] whatever its exit status: the status and the output (`git check-ignore` answers "not ignored" with 1).
+/// [`git`] whatever its exit status: the status and the output (`git check-ignore` answers "not ignored" with 1). git
+/// runs in a process group of its own. On every path, its output's reader is joined before this returns, after the
+/// group is killed while git is not yet reaped (so its pid still names that group): the pipe's writers are gone then,
+/// and the join waits only for what is already in the pipe (M2T13R-450). Only a process git started that left the
+/// group and keeps the pipe open could hold it; git's read-only commands here start none that do.
 pub(crate) fn git_run(
     project: &Path,
     args: &[&str],
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
     let mut child = std::process::Command::new("git")
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
@@ -457,28 +463,42 @@ pub(crate) fn git_run(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
-    let mut stdout = child.stdout.take().ok_or("git: no stdout")?;
+    let git = rustix::process::Pid::from_child(&child);
+    let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
-        stdout.read_to_end(&mut out).map(|_| out)
+        stdout
+            .ok_or_else(|| std::io::Error::other("no stdout"))?
+            .read_to_end(&mut out)
+            .map(|_| out)
     });
     let end = Instant::now() + GIT_LIMIT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+    // Its end is seen without reaping it: its pid, which names its group, stays its own until the wait below.
+    let ended = loop {
+        match rustix::process::waitid(
+            WaitId::Pid(git),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(_)) => break Ok(()),
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("git {}: over {GIT_LIMIT:?}", args.join(" ")));
-            }
-            Err(e) => return Err(format!("git {}: {e}", args.join(" "))),
+            Ok(None) => break Err(format!("git {}: over {GIT_LIMIT:?}", args.join(" "))),
+            Err(e) => break Err(format!("git {}: {e}", args.join(" "))),
         }
     };
-    let out = reader
-        .join()
+    // What git started and left in its group ends with it (and git, past the limit); then git is reaped, then the
+    // reader joined.
+    let _ = rustix::process::kill_process_group(git, rustix::process::Signal::KILL);
+    if ended.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let read = reader.join();
+    ended?;
+    let status = status.map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let out = read
         .map_err(|_| "git: its output was lost".to_owned())?
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
     Ok((status, out))
@@ -687,6 +707,51 @@ mod tests {
         } else {
             Err(format!("git {args:?}: {status}").into())
         }
+    }
+
+    /// The processes whose command line is `sleep <seconds>`.
+    fn sleeping(seconds: &str) -> R<Vec<i32>> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc")?.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            if std::fs::read(entry.path().join("cmdline"))
+                .is_ok_and(|c| c == format!("sleep\0{seconds}\0").as_bytes())
+            {
+                found.push(pid);
+            }
+        }
+        Ok(found)
+    }
+
+    #[test]
+    fn a_git_command_past_its_limit_ends_with_what_it_started_and_its_reader_is_joined() -> R {
+        // M2T13R-450: git (a shell alias here) starts a process that holds its stdout past the limit. git_run returns
+        // at the limit, and nothing git started still runs then: its output's reader saw the pipe close and was
+        // joined, on this path as on the others.
+        let dir = tempfile::tempdir()?;
+        git_in(dir.path(), &["init", "-q"])?;
+        let seconds = format!("40.{}", std::process::id());
+        let began = Instant::now();
+        let ran = git_run(
+            dir.path(),
+            &["-c", &format!("alias.hang=!sleep {seconds}"), "hang"],
+        );
+        let took = began.elapsed();
+        let left = sleeping(&seconds)?;
+        for pid in &left {
+            if let Some(pid) = rustix::process::Pid::from_raw(*pid) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+        assert!(ran.is_err(), "{ran:?}");
+        assert!(
+            left.is_empty(),
+            "what git started still ran when git_run returned: {left:?}"
+        );
+        assert!(took < GIT_LIMIT + Duration::from_secs(3), "{took:?}");
+        Ok(())
     }
 
     /// A /proc tree of a test's own: `processes` as (pid, environment), none of them real.
