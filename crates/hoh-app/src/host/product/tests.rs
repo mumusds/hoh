@@ -497,9 +497,15 @@ fn a_turns_facts_become_its_outcome() {
         degraded: Some("initialize timed out".to_owned()),
         final_text: Some("done\n```hoh-report\n{}\n```".to_owned()),
         compat: None,
-        retry_at: None,
+        retry_at: Some(std::time::UNIX_EPOCH + Duration::from_secs(9_000)),
     };
     let o = outcome(facts);
+    // The provider's reset goes with the outcome as it came: the runner makes it the failure's Retry-After at the time
+    // it records the end, by its own clock (M2T07R-256).
+    assert_eq!(
+        o.retry_at,
+        Some(std::time::UNIX_EPOCH + Duration::from_secs(9_000))
+    );
     // Its final assistant message, where a verifier's report is read (docs/adr/ADR-028.md decision 15).
     assert_eq!(
         o.observed.final_text.as_deref(),

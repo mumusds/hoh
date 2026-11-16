@@ -312,6 +312,7 @@ fn reaping_with(
             class: failed.unwrap_or(hoh_core::retry::FailureClass::Transient { retry_after: None }),
             observed: Default::default(),
             unknown_effect: false,
+            retry_at: None,
         });
     });
     ended
@@ -3148,6 +3149,7 @@ impl hoh_app::host::Executor for LeavesAMember {
                     class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                     observed: Default::default(),
                     unknown_effect: false,
+                    retry_at: None,
                 });
             });
             ended
@@ -3885,6 +3887,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: Default::default(),
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         Ok(hoh_app::host::Started {

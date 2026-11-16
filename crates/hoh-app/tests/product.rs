@@ -27,6 +27,12 @@ const PI_RPC: &str = concat!(
     "/../hoh-agents/tests/fakes/pi_rpc.py"
 );
 
+/// The provider-fault recordings (tests/fixtures/protocol/_provider-faults, record_faults.py).
+const FAULTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/_provider-faults"
+);
+
 /// A line of 8 MiB with no LF (AC-027-03).
 const HUGE: usize = 8 << 20;
 
@@ -257,7 +263,8 @@ impl World {
     /// CANCEL, [`CANCEL_STAND_IN`]; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
     /// identity header ([`RESULT_FAKE`]; with the self-test record `claude.d/self-test` while it exists), then prints
     /// `claude.d/big-log` while it exists (its raw log's extra lines); one whose marker names NATIVE-<code> replays the
-    /// recorded turn with its `result` frame's subtype `<code>` (COMPAT_UNVERIFIED, MODEL_UNAVAILABLE, BLOCKED_AUTH).
+    /// recorded turn with its `result` frame's subtype `<code>` (COMPAT_UNVERIFIED, MODEL_UNAVAILABLE, BLOCKED_AUTH); one whose
+    /// marker names LIMIT or RETRY-AFTER replays `claude.d/limit.jsonl` or `claude.d/retry-after.jsonl` ([`World::faults`]).
     fn claude(&self, hold: Option<&Path>) -> R {
         let body = self.claude_body(hold)?;
         self.script("claude", &body)
@@ -315,6 +322,8 @@ impl World {
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
                   *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED \"$d/self-test\" || exit 1; [ -f \"$d/big-log\" ] && cat \"$d/big-log\";;\n\
                   *NATIVE-*) code=${{HOH_ATTEMPT_ID#*NATIVE-}}; cat \"$d/native-${{code%%/*}}.jsonl\"; exit 0;;\n\
+                  *LIMIT*) cat \"$d/limit.jsonl\"; exit 1;;\n\
+                  *RETRY-AFTER*) cat \"$d/retry-after.jsonl\"; exit 1;;\n\
                  esac\n{wait}cat \"$f/success/stdout.jsonl\"\n",
             bin = self.bin().display()
         ))
@@ -335,7 +344,8 @@ impl World {
     /// for an attempt whose marker names SIXTYFIVE it writes the gate's refusal line on stderr and exits 65 with no
     /// frame; FORGE, the same, its first attempt only after `codex.d/forge.py` (when there) forged records in its
     /// gate's log (a retry forging again would add a `forged.<pid>` of its own and append to that log); NATIVE, the
-    /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`. An App Server run writes
+    /// recorded turn with its `turn/completed` failed by `codexErrorInfo: COMPAT_UNVERIFIED`; LIMIT, `codex.d/limit.jsonl`
+    /// ([`World::faults`]). An App Server run writes
     /// its marker to `codex.d/marker.<pid>` (its log is `codex.d/log.<pid>`); for an attempt whose marker names
     /// HOLD-INIT it waits for `codex.d/release` before it answers anything, HOLD-TURN, the first attempt's turn writes its
     /// first frame and then waits for `codex.d/release` (docs/adr/ADR-030.md decision 9's re-checks) and a later
@@ -447,6 +457,7 @@ impl World {
                      echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
                     *FORGE*) echo 'hoh gate: COMPAT_UNVERIFIED: implementation_sha256' >&2; exit 65;;\n\
                     *NATIVE*) frames=\"$d/native.jsonl\"; opt=;;\n\
+                    *LIMIT*) frames=\"$d/limit.jsonl\"; opt=;;\n\
                     *HOLD-INIT*) while [ ! -e \"$d/release\" ]; do sleep 0.05; done; frames=\"$d/frames.jsonl\"; opt=;;\n\
                     *HOLD-TURN/attempt-1) frames=\"$d/hold-turn.jsonl\"; opt=;;\n\
                     *HOLD-TURN/*) exit 3;;\n\
@@ -469,7 +480,8 @@ impl World {
     /// turn, its marker to `pi.d/marker.<pid>` (its log is `pi.d/log.<pid>`). For an attempt whose marker names
     /// HOLD-ANSWER its turn waits for `pi.d/release` before it answers anything; CHMOD, it first changes its own mode to
     /// the one it has (docs/adr/ADR-030.md decision 9's re-check before the first input), then makes
-    /// `pi.d/chmodded.<attempt-n>` and waits for `pi.d/chmod-go.<attempt-n>` (`<attempt-n>` its attempt id's last part).
+    /// `pi.d/chmodded.<attempt-n>` and waits for `pi.d/chmod-go.<attempt-n>` (`<attempt-n>` its attempt id's last part);
+    /// LIMIT, `pi.d/limit.jsonl` ([`World::faults`]).
     fn pi_body(&self, name: &str) -> R<String> {
         let d = self.bin().join("pi.d");
         std::fs::create_dir_all(&d)?;
@@ -520,7 +532,7 @@ impl World {
               *CHMOD*) python3 -c 'import os, sys; os.chmod(sys.argv[1], os.stat(sys.argv[1]).st_mode & 0o7777)' \"$0\"\n\
                n=\"${{HOH_ATTEMPT_ID##*/}}\"; : > \"$d/chmodded.$n\"; while [ ! -e \"$d/chmod-go.$n\" ]; do sleep 0.05; done;;\n\
              esac\n\
-             frames=\"$d/frames.jsonl\"; case \"$HOH_ATTEMPT_ID\" in *HOLD-ANSWER*) frames=\"$d/hold.jsonl\";; esac\n\
+             frames=\"$d/frames.jsonl\"; case \"$HOH_ATTEMPT_ID\" in *HOLD-ANSWER*) frames=\"$d/hold.jsonl\";; *LIMIT*) frames=\"$d/limit.jsonl\";; esac\n\
              exec timeout 60 python3 '{PI_RPC}' \"$frames\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
             d = d.display()
         ))
@@ -559,6 +571,57 @@ impl World {
                 hold = self.bin().join("pi.d/hold-look").display()
             ),
         )
+    }
+
+    /// The fakes' LIMIT and RETRY-AFTER turns from the provider-fault recordings (record_faults.py; M2T07R-256): claude's
+    /// subscriber usage limit and codex App Server's, each with its reset moved to `reset` (unix seconds) and codex's
+    /// model named `model`; claude's 429 with a Retry-After of 120 s it dropped; pi's 429, which it retried itself and
+    /// ended with text only.
+    fn faults(&self, reset: u64, model: &str) -> R {
+        let moved = |case: &str, header: &str| -> R<String> {
+            let text = std::fs::read_to_string(format!("{FAULTS}/{case}/stdout.jsonl"))?;
+            let meta: Value = serde_json::from_str(&std::fs::read_to_string(format!(
+                "{FAULTS}/{case}/meta.json"
+            ))?)?;
+            let sent = meta["provider"]["requests"][0]["headers"][header]
+                .as_str()
+                .ok_or("no reset sent")?;
+            let (from, to) = (
+                format!("\"resetsAt\":{sent}"),
+                format!("\"resetsAt\":{reset}"),
+            );
+            if !text.contains(&from) {
+                return Err(format!("{case}: no {from}").into());
+            }
+            Ok(text.replace(&from, &to))
+        };
+        for name in ["claude", "codex", "pi"] {
+            std::fs::create_dir_all(self.bin().join(format!("{name}.d")))?;
+        }
+        std::fs::write(
+            self.bin().join("claude.d/limit.jsonl"),
+            moved(
+                "claude/2.1.325/fault-usage-limit",
+                "anthropic-ratelimit-unified-reset",
+            )?,
+        )?;
+        std::fs::copy(
+            format!("{FAULTS}/claude/2.1.325/fault-429-retry-after-long/stdout.jsonl"),
+            self.bin().join("claude.d/retry-after.jsonl"),
+        )?;
+        std::fs::write(
+            self.bin().join("codex.d/limit.jsonl"),
+            moved(
+                "codex/0.166.0/app-server-fault-usage-limit",
+                "x-codex-primary-reset-at",
+            )?
+            .replace("gpt-fake-5", model),
+        )?;
+        std::fs::copy(
+            format!("{FAULTS}/pi/1.5.0/rpc-fault-429-retry-after/stdout.jsonl"),
+            self.bin().join("pi.d/limit.jsonl"),
+        )?;
+        Ok(())
     }
 
     /// Every fake turn process gone: the ones still there are killed (nothing a test started outlives it). A number is
@@ -832,6 +895,129 @@ async fn test_027_03_codex_an_oversized_frame_in_the_host_fails_only_its_attempt
 #[tokio::test]
 async fn test_027_03_pi_an_oversized_frame_in_the_host_fails_only_its_attempt() -> R {
     an_oversized_frame_fails_only_its_attempt("pi").await
+}
+
+/// REQ-042 behaviour 1 in the host for `agent` (M2T07R-256; owner decision 2026-11-16): the developer bound to it runs
+/// task `T-<marker>`, whose turn replays a recorded provider fault. A usage limit whose reset the agent's stream carries
+/// (`reset`) fails the attempt transient with that reset as its Retry-After: the task is due exactly then, the wait is
+/// recorded (`task.retry_scheduled` with `retry_after_ms` and no jitter bound, `attempt.provider_reset` with the
+/// instant, the OBSERVED record with both) and the run waits for it (WAITING_EXTERNAL). A fault whose stream carries
+/// none (a Retry-After the CLI consumed, pi's text) gets the first full-jitter bound, 2 s.
+async fn a_providers_limit_in_the_host(agent: &str, marker: &str, reset_given: bool) -> R {
+    let world = World::new()?;
+    let model = "gpt-6-astra";
+    match agent {
+        "claude" => world.claude(None)?,
+        "codex" => world.codex(model)?,
+        _ => world.pi()?,
+    }
+    let reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 7_200;
+    world.faults(reset, model)?;
+    world.bind_installed()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome = async {
+        if agent != "claude" {
+            configure(&host, "dev", team_revision(&project)?, json!({"developer": {"agent": agent}})).await?;
+        }
+        let run_id = started(&host, &project, "s1").await?;
+        let task = format!("T-{marker}");
+        let attempt = format!("{task}/attempt-1");
+        ready(&project, &run_id, &[(task.as_str(), "developer")])?;
+        let scheduled = format!(
+            "SELECT payload_json FROM events WHERE kind = 'task.retry_scheduled' \
+             AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+        );
+        until(&project, &format!("SELECT count(*) FROM ({scheduled})"), "1", Duration::from_secs(60)).await?;
+        let scheduled: Value = serde_json::from_str(&query(&project, &scheduled)?)?;
+        let observed: Value = serde_json::from_str(&query(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.detail') FROM events WHERE kind = 'effect.observed' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+            ),
+        )?)?;
+        let provider_reset = query(
+            &project,
+            &format!(
+                "SELECT payload_json FROM events WHERE kind = 'attempt.provider_reset' \
+                 AND event_id LIKE '{attempt}/%'"
+            ),
+        )?;
+        let at = hoh_core::time::rfc3339_utc(std::time::UNIX_EPOCH + Duration::from_secs(reset));
+        if reset_given {
+            assert_eq!(scheduled["next_retry_at"], json!(at), "{scheduled}");
+            assert_eq!(scheduled["bound_ms"], Value::Null, "{scheduled}");
+            let failed: std::time::SystemTime = hoh_core::time::parse_rfc3339(
+                scheduled["failed_at"].as_str().ok_or("no failed_at")?,
+            )
+            .ok_or("failed_at")?;
+            // The wait counts from the end's own time, a part of a second after its whole second `failed_at`.
+            let most = u64::try_from(
+                (Duration::from_secs(reset) - failed.duration_since(std::time::UNIX_EPOCH)?).as_millis(),
+            )?;
+            let delay = scheduled["delay_ms"].as_u64().ok_or("no delay")?;
+            assert!(delay <= most && delay + 1_000 > most, "{scheduled}");
+            assert_eq!(scheduled["failure"]["class"], json!("transient"), "{scheduled}");
+            assert_eq!(scheduled["failure"]["retry_after_ms"], json!(delay), "{scheduled}");
+            let event: Value = serde_json::from_str(&provider_reset)?;
+            assert_eq!(event["retry_at"], json!(at), "{event}");
+            assert_eq!(event["retry_after_ms"], scheduled["failure"]["retry_after_ms"], "{event}");
+            assert_eq!(observed["retry_at"], json!(at), "{observed}");
+            assert_eq!(observed["retry_after_ms"], scheduled["failure"]["retry_after_ms"], "{observed}");
+            until(
+                &project,
+                &format!("SELECT state || '/' || next_retry_at FROM tasks WHERE task_id = '{task}'"),
+                &format!("READY/{at}"),
+                Duration::from_secs(10),
+            )
+            .await?;
+            until(
+                &project,
+                &format!("SELECT state FROM runs WHERE run_id = '{run_id}'"),
+                "WAITING_EXTERNAL",
+                Duration::from_secs(30),
+            )
+            .await?;
+        } else {
+            assert_eq!(scheduled["bound_ms"], json!(2_000), "{scheduled}");
+            assert_eq!(scheduled["failure"]["retry_after_ms"], Value::Null, "{scheduled}");
+            assert_eq!(provider_reset, "", "a reset was recorded");
+            assert_eq!(observed.get("retry_at"), None, "{observed}");
+        }
+        keep(
+            &format!("m2t07r-256-{agent}-{marker}"),
+            &json!({"agent": agent, "scheduled": scheduled, "observed": observed, "provider_reset": provider_reset}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn a_claude_usage_limit_waits_for_its_reset() -> R {
+    a_providers_limit_in_the_host("claude", "LIMIT", true).await
+}
+
+#[tokio::test]
+async fn a_codex_usage_limit_waits_for_its_reset() -> R {
+    a_providers_limit_in_the_host("codex", "LIMIT", true).await
+}
+
+#[tokio::test]
+async fn a_claude_429_whose_retry_after_it_dropped_gets_full_jitter() -> R {
+    a_providers_limit_in_the_host("claude", "RETRY-AFTER", false).await
+}
+
+#[tokio::test]
+async fn a_pi_429_it_retried_itself_gets_full_jitter() -> R {
+    a_providers_limit_in_the_host("pi", "LIMIT", false).await
 }
 
 /// Keep `value` as this test's evidence, when the check gives a directory for it.

@@ -388,6 +388,7 @@ fn outcome(facts: Facts) -> Outcome {
             final_text: facts.final_text,
         },
         unknown_effect: facts.state == AttemptState::UnknownEffect,
+        retry_at: facts.retry_at,
     }
 }
 
