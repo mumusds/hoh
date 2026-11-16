@@ -4314,17 +4314,30 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
                 .stdin(std::process::Stdio::null())
                 .output()
         };
-        let out = hoh(&["-p", "x", "--detach", "--output", "json"])?;
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let run_id = serde_json::from_slice::<Value>(&out.stdout)?["run_id"]
-            .as_str()
-            .ok_or("no run_id")?
-            .to_owned();
+        let detached = |goal: &str| -> R<String> {
+            let out = hoh(&["-p", goal, "--detach", "--output", "json"])?;
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(serde_json::from_slice::<Value>(&out.stdout)?["run_id"]
+                .as_str()
+                .ok_or("no run_id")?
+                .to_owned())
+        };
+        // R runs on the project's approved specification, adopted at its start (docs/adr/ADR-031.md decision 1). The
+        // database is the host's: a first run, started through the unit as R is, has none and is BLOCKED on its
+        // question runtime:no_spec; the specification is approved after it, before R.
+        detached("规格之前")?;
+        python(
+            &db(&project),
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit()",
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) \
+             SELECT 's1', project_id, printf('%064d', 1), 1 FROM projects;",
+        )?;
+        let run_id = detached("x")?;
         let unit = hoh_app::unit::unit_name(&hoh_app::unit::instance(&project));
         // T1 and T2 READY for the developer (claude by default), on a spec, the run RUNNING.
         python(
@@ -5130,6 +5143,11 @@ fn a_model_failure_recovered_after_observed_falls_back_like_a_settled_one() -> R
         // The file becomes the project's team revision at a host's start.
         let (code, stderr) = serve_and_stop(&project)?;
         assert_eq!(code, 0, "{stderr}");
+        // The project's approved specification, which the run adopts at its start (docs/adr/ADR-031.md decision 1).
+        seed(
+            &project,
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);",
+        )?;
         let path = format!("{}:/usr/bin:/bin", bin.display());
         for agent in [
             hoh_agents::compat::Agent::Pi,
