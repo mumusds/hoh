@@ -27,25 +27,28 @@ pub(super) fn live_obligation(
     conn: &rusqlite::Connection,
     candidate: &str,
 ) -> Result<bool, PersistError> {
-    conn.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM candidates c WHERE c.candidate_id = ?1 \
-               AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
-             AND EXISTS(SELECT 1 FROM events o WHERE o.kind = 'verification.round_opened' \
-               AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM events x \
-                 WHERE x.kind = 'verification.round_closed' \
-                 AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
-             AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' \
-               AND {} AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
-             AND NOT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
-               WHERE f.kind = 'candidate.frozen' AND f.run_id = (SELECT run_id FROM candidates \
-               WHERE candidate_id = ?1) AND v.value = ?1)",
-            super::hold::of_run("s", "(SELECT run_id FROM candidates WHERE candidate_id = ?1)")
-        ),
-        params![candidate],
-        |r| r.get(0),
+    conn.query_row(&live_obligation_sql(), params![candidate], |r| r.get(0))
+        .map_err(sqlite_error)
+}
+
+/// [`live_obligation`]'s statement, candidate `?1` (M2T13R-03): every fact read among its run's events through the
+/// `(run_id, kind, seq)` index — its rounds and their closes (never Records: always the run's own), its judgment as
+/// superseded (`hold::of_run`: a Record of a stopped run included), the freezes after it — not the project's history.
+pub(super) fn live_obligation_sql() -> String {
+    let run = "(SELECT run_id FROM main.candidates WHERE candidate_id = ?1)";
+    format!(
+        "SELECT EXISTS(SELECT 1 FROM main.candidates c WHERE c.candidate_id = ?1 \
+           AND c.state IN ('VERIFYING', 'REJECTED', 'INVALID')) \
+         AND EXISTS(SELECT 1 FROM main.events o WHERE o.kind = 'verification.round_opened' AND o.run_id = {run} \
+           AND json_extract(o.payload_json, '$.candidate_id') = ?1 AND NOT EXISTS(SELECT 1 FROM main.events x \
+             WHERE x.kind = 'verification.round_closed' AND x.run_id = o.run_id \
+             AND json_extract(x.payload_json, '$.round_id') = json_extract(o.payload_json, '$.round_id'))) \
+         AND NOT EXISTS(SELECT 1 FROM main.events s WHERE s.kind = 'candidate.stale' \
+           AND {} AND json_extract(s.payload_json, '$.candidate_id') = ?1) \
+         AND NOT EXISTS(SELECT 1 FROM main.events f, json_each(f.payload_json, '$.superseded') v \
+           WHERE f.kind = 'candidate.frozen' AND f.run_id = {run} AND v.value = ?1)",
+        super::hold::of_run("s", run)
     )
-    .map_err(sqlite_error)
 }
 
 /// The writer tasks of run `run_id` an open round holds (decision 13, REQ-037 decision 1): a round not closed whose
