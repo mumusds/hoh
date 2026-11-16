@@ -7,12 +7,11 @@
 //! stands. Then, on its progress marker P, the latest obligation settled first: a `STALLED` re-trigger for fewer than K
 //! of them since the last question on P, else the run-level question `runtime:stalled`.
 
-use super::blockers::{self, Claims};
 use super::writer::{self, Commit, Ctx, Intent, NewEvent};
 use super::{PersistError, sqlite_error};
 use crate::decision::Context;
 use crate::ids::child_id;
-use crate::protocol::{BlockedReason, RunState};
+use crate::protocol::RunState;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -22,10 +21,6 @@ pub(super) const K: usize = 2;
 
 /// The re-trigger's reason (REQ-021 behaviour 6's kind, `supervisor.retrigger`).
 pub(super) const STALLED: &str = "STALLED";
-
-/// The question's claim source and reason.
-const SOURCE: &str = "runtime:stalled";
-const REASON: &str = "stalled";
 
 /// The working states the detector looks at.
 const W: [RunState; 6] = [
@@ -229,38 +224,21 @@ fn judge(
     let text = format!(
         "Commander 连续 {c} 个 turn 没有让 Run 前进：答复 retry（可附指示）让它再试，或答复 cancel 取消本 Run"
     );
-    let mut claims = Claims::load(tx, &project_id, run_id)?;
-    claims.set(SOURCE, &[BlockedReason::NeedDecision]);
-    let changed = claims.changed();
-    let reasons = claims.reasons();
-    let mut events = claims.store(tx)?;
-    events.push(event(
-        id.clone(),
-        "question.asked",
-        json!({"question_id": id, "reason": REASON, "progress": marker, "turns": c, "text": text,
-            "choices": ["retry", "cancel"]}),
-    ));
     let at = crate::time::rfc3339_utc(context.now());
-    let follow = blockers::follow(
+    let commit = super::need::run_question(
         tx,
-        &project_id,
-        run_id,
-        changed,
-        &reasons,
-        &at,
-        "the Commander's turns moved the run no further",
-        ctx,
-    )?;
-    events.extend(follow.events);
-    writer::write(
-        tx,
-        &Commit {
-            cas: follow.cas,
-            events,
-            ..Commit::default()
+        super::need::RunQuestion {
+            project_id: &project_id,
+            run_id,
+            reason: super::need::RunReason::Stalled,
+            question_id: id,
+            fields: json!({"progress": marker, "turns": c, "text": text, "choices": ["retry", "cancel"]}),
+            at: &at,
+            detail: "the Commander's turns moved the run no further",
         },
         ctx,
     )?;
+    writer::write(tx, &commit, ctx)?;
     Ok(Detected::Asked)
 }
 

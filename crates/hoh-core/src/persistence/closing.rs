@@ -1663,20 +1663,25 @@ pub(super) fn reverify_source(
             expected_revision: revision,
             change: Change::Task(TaskState::Blocked),
         });
-        let mut payload = json!({"run_id": run_id, "task_id": task, "round_id": round.id,
-            "reason": "reverify_exhausted", "round_root": round.chain_root,
+        let mut fields = json!({"round_id": round.id, "round_root": round.chain_root,
             "detail": format!("round {} was inconclusive and its chain is spent", round.id)});
         if let Some(join) = how.join {
-            payload["join_id"] = json!(join);
+            fields["join_id"] = json!(join);
         }
-        commit.events.push(NewEvent {
-            intent: Intent::Progress,
-            project_id: project_id.to_owned(),
-            event_id: child_id(how.action, &format!("reverify_exhausted/{task}")),
-            run_id: Some(run_id.to_owned()),
-            kind: "need_decision".to_owned(),
-            payload,
-        });
+        // W7's sibling source of the round (docs/adr/ADR-031.md correction A).
+        commit.events.push(super::need::task_event(
+            tx,
+            super::need::TaskNeed {
+                project_id,
+                run_id,
+                task_id: task,
+                event_id: child_id(how.action, &format!("reverify_exhausted/{task}")),
+                reason: super::need::TaskReason::Source(
+                    super::need::SourceReason::ReverifyExhausted,
+                ),
+                fields,
+            },
+        )?);
     }
     super::verification::with_deferred(&mut commit, &deferred);
     writer::write(tx, &commit, ctx)?;
@@ -1700,13 +1705,25 @@ pub(super) fn block_flaky(
         params![task],
     )
     .map_err(sqlite_error)?;
-    let mut payload = json!({"run_id": run_id, "task_id": task, "reason": "flaky",
+    let mut fields = json!({
         "detail": "an acceptance criterion is flaky on this candidate: retesting it cannot satisfy \
             it; the flaky handling or a new candidate is a decision (REQ-055)",
         "deferred": deferred});
-    if let (Some(payload), Some(about)) = (payload.as_object_mut(), about.as_object()) {
-        payload.extend(about.clone());
+    if let (Some(fields), Some(about)) = (fields.as_object_mut(), about.as_object()) {
+        fields.extend(about.clone());
     }
+    // W8 (docs/adr/ADR-031.md correction A).
+    let event = super::need::task_event(
+        tx,
+        super::need::TaskNeed {
+            project_id,
+            run_id,
+            task_id: task,
+            event_id: child_id(at, &format!("flaky/{task}")),
+            reason: super::need::TaskReason::Source(super::need::SourceReason::Flaky),
+            fields,
+        },
+    )?;
     writer::write(
         tx,
         &Commit {
@@ -1715,14 +1732,7 @@ pub(super) fn block_flaky(
                 expected_revision: revision,
                 change: Change::Task(TaskState::Blocked),
             }],
-            events: vec![NewEvent {
-                intent: Intent::Progress,
-                project_id: project_id.to_owned(),
-                event_id: child_id(at, &format!("flaky/{task}")),
-                run_id: Some(run_id.to_owned()),
-                kind: "need_decision".to_owned(),
-                payload,
-            }],
+            events: vec![event],
             ..Commit::default()
         },
         ctx,

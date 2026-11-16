@@ -346,14 +346,22 @@ fn accept(
                 expected_revision: p.revision,
                 change: Change::Task(TaskState::Blocked),
             });
-            commit.events.push(at.event(
-                child_id(at.join_id, &format!("gate_refused/{}", p.task)),
-                "need_decision",
-                json!({"run_id": at.run_id, "task_id": p.task, "candidate_id": at.candidate,
-                    "join_id": at.join_id, "reason": "join_gate_refused",
-                    "detail": "the join was passable but the gate's predicate refuses the task's requirements on \
-                        this candidate: a reverification or a rework is a decision"}),
-            ));
+            // W9 (docs/adr/ADR-031.md correction A).
+            commit.events.push(super::need::task_event(
+                tx,
+                super::need::TaskNeed {
+                    project_id: at.project_id,
+                    run_id: at.run_id,
+                    task_id: &p.task,
+                    event_id: child_id(at.join_id, &format!("gate_refused/{}", p.task)),
+                    reason: super::need::TaskReason::Source(
+                        super::need::SourceReason::JoinGateRefused,
+                    ),
+                    fields: json!({"candidate_id": at.candidate, "join_id": at.join_id,
+                        "detail": "the join was passable but the gate's predicate refuses the task's requirements \
+                            on this candidate: a reverification or a rework is a decision"}),
+                },
+            )?);
         }
         writer::write(tx, &commit, ctx)?;
         return Ok("refused");

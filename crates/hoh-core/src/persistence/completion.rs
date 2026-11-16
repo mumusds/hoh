@@ -4,6 +4,7 @@
 //! reconcile take the same path.
 
 use super::candidates::{Freeze, Frozen};
+use super::need::WorkReason;
 use super::results::TaskResultOutcome;
 use super::retry::{Repair, RepairRequest, RepairVerdict};
 use super::runner::Ending;
@@ -28,8 +29,11 @@ pub enum WriterOutcome {
     /// content already judged): one counted protocol correction, the task back to READY.
     Correct { reasons: Vec<String> },
     /// It needs a decision (FAILED, BLOCKED, INCOMPLETE, no AC to verify, a specification change, no verification
-    /// team): the task BLOCKED for a decision.
-    Decide { reason: String, detail: String },
+    /// team): the task BLOCKED for a decision, its question's reason a work task's (docs/adr/ADR-031.md correction A).
+    Decide {
+        reason: super::need::WorkReason,
+        detail: String,
+    },
 }
 
 /// A Developer's self-test records as the host kept them (docs/adr/ADR-028.md decision 14): the objects of those whose
@@ -116,14 +120,7 @@ pub(super) fn complete(
     // A refused repair standing is the first judgement of every exit (implementation correction 4, M2T16R-101): nothing
     // frozen, corrected or counted; the decision waits.
     let done = if super::verification::refused(&tx, &task.run_id)?.contains(&task.task_id) {
-        decide(
-            &tx,
-            job,
-            &task,
-            "repair_refused",
-            "a refused repair of this task waits for a decision; nothing is frozen or corrected until it is cleared",
-            ctx,
-        )?
+        refusal_holds(&tx, job, &task, ctx)?
     } else {
         match &job.outcome {
             WriterOutcome::Freeze {
@@ -133,7 +130,7 @@ pub(super) fn complete(
             } => freeze_and_accept(&tx, job, &task, freeze, result, ctx)?,
             WriterOutcome::Correct { reasons } => correct(&tx, job, &task, reasons, ctx)?,
             WriterOutcome::Decide { reason, detail } => {
-                decide(&tx, job, &task, reason, detail, ctx)?
+                decide(&tx, job, &task, *reason, detail, ctx)?
             }
         }
     };
@@ -334,7 +331,7 @@ pub(super) fn complete_verifier(
                         revision: task.revision,
                         round_id: &round_id,
                         cause: "report-rejected",
-                        reason: "report_rejected",
+                        reason: super::need::VerifierReason::ReportRejected,
                         detail: intake.reasons.join("; "),
                         invalid: None,
                         facts: json!({"attempt_id": job.attempt_id, "report_id": intake.report_id,
@@ -560,7 +557,7 @@ fn freeze_and_accept(
             tx,
             job,
             task,
-            "no_acceptance_criteria",
+            WorkReason::NoAcceptanceCriteria,
             "the task has no acceptance criterion under the run's specification: nothing to verify (REQ-053 \
              behaviour 8)",
             ctx,
@@ -575,7 +572,7 @@ fn freeze_and_accept(
                 tx,
                 job,
                 task,
-                "verification_team_missing",
+                WorkReason::VerificationTeamMissing,
                 &format!(
                     "no {role} is bound to verify the candidate (docs/adr/ADR-030.md decision 8)"
                 ),
@@ -647,7 +644,7 @@ fn freeze_and_accept(
                     tx,
                     job,
                     task,
-                    "spec_mismatch",
+                    WorkReason::SpecMismatch,
                     &format!("{detail}: a specification change goes through M3-T02's flow"),
                     ctx,
                 )
@@ -715,15 +712,61 @@ fn correct_attempt(
     Ok(verdict)
 }
 
-/// The task BLOCKED for a decision, with the reason.
+/// The task BLOCKED for a decision, with the reason (W12, docs/adr/ADR-031.md correction A).
 fn decide(
     tx: &Transaction<'_>,
     job: &WriterCompletion,
     task: &Task,
-    reason: &str,
+    reason: WorkReason,
     detail: &str,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<WriterCompleted, PersistError> {
+    let event = super::need::task_event(
+        tx,
+        super::need::TaskNeed {
+            project_id: &task.project_id,
+            run_id: &task.run_id,
+            task_id: &task.task_id,
+            event_id: child_id(&job.attempt_id, super::need::KIND),
+            reason: super::need::TaskReason::Work(reason),
+            fields: json!({"attempt_id": job.attempt_id, "detail": detail}),
+        },
+    )?;
+    block(tx, task, event, ctx)?;
+    Ok(WriterCompleted::Blocked {
+        reason: reason.as_str().to_owned(),
+    })
+}
+
+/// The task BLOCKED again while a refused repair of it stands: no question of its own, its anchor stays the refusal
+/// (docs/adr/ADR-031.md decision 6).
+fn refusal_holds(
+    tx: &Transaction<'_>,
+    job: &WriterCompletion,
+    task: &Task,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<WriterCompleted, PersistError> {
+    let event = super::need::refusal_reblock(
+        &task.project_id,
+        &task.run_id,
+        &task.task_id,
+        child_id(&job.attempt_id, super::need::KIND),
+        json!({"attempt_id": job.attempt_id, "detail": "a refused repair of this task waits for a decision; nothing \
+            is frozen or corrected until it is cleared"}),
+    );
+    block(tx, task, event, ctx)?;
+    Ok(WriterCompleted::Blocked {
+        reason: "repair_refused".to_owned(),
+    })
+}
+
+/// Task `task` BLOCKED (NEED_DECISION) with its `need_decision` `event`.
+fn block(
+    tx: &Transaction<'_>,
+    task: &Task,
+    event: NewEvent,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
     tx.execute(
         "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
         params![BlockedReason::NeedDecision.as_str(), task.task_id],
@@ -735,23 +778,10 @@ fn decide(
             expected_revision: task.revision,
             change: Change::Task(TaskState::Blocked),
         }],
-        events: vec![NewEvent {
-            intent: Intent::Progress,
-            project_id: task.project_id.clone(),
-            event_id: child_id(&job.attempt_id, "need_decision"),
-            run_id: Some(task.run_id.clone()),
-            kind: "need_decision".to_owned(),
-            payload: json!({
-                "run_id": task.run_id, "task_id": task.task_id, "attempt_id": job.attempt_id, "reason": reason,
-                "detail": detail,
-            }),
-        }],
+        events: vec![event],
         ..Commit::default()
     };
-    writer::write(tx, &commit, ctx)?;
-    Ok(WriterCompleted::Blocked {
-        reason: reason.to_owned(),
-    })
+    writer::write(tx, &commit, ctx).map(drop)
 }
 
 /// The run's repair limit `kind` (`local` or `protocol`) from its configuration snapshot; a run snapshotted before the
