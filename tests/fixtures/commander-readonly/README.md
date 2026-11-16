@@ -42,7 +42,12 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
 - `judge_check.py` is the evidence table of ADR-032 decision 8 executed (design correction 4): each row's rule is a
   function whose docstring is the rule, run on every committed excerpt and, where present locally with the recorded
   sha256, on the raw recording it was cut from. A verdict that differs between the two is a defect (exit 1). It also
-  judges each read-only round as decision 8 does, and E6 on one-value changes of the recorded rounds. Its output is
+  judges each read-only round as decision 8 does, fail-closed (design correction 5: the terminal state, the
+  availability, every cell, the snapshot, the decision block and the control round with every mechanism x operation
+  must all be there; per cell all matching records are merged and any success is a breach), and E6 on one-value
+  changes of the recorded rounds. Its generator mutates every positive round (each required element dropped in turn,
+  the terminal status changed, a success inserted before and after the refusal, stray writes) and every mutant must
+  be non-PASS; duplicated and reordered variants must keep the verdict. A PASSing mutant is a defect (exit 1). Its output is
   committed as `judge_check.out.md` and `judge_check.out.json` (made on the recording machine, so the raw column is
   filled); the bundle self-test reruns it on the excerpts and requires the committed verdicts. M2-T20's judge must give
   the same verdicts on the same fixtures.

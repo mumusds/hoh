@@ -13,7 +13,7 @@ excerpt_check=load('excerpt_check');excerpt=excerpt_check.excerpt;judge_check=lo
 
 def excerpt_side(report):
     """The verdicts on the committed excerpts (the raw recordings are only on the machine that recorded them)."""
-    return {part:{k:v['excerpt'] for k,v in report[part].items()} for part in ('cases','rounds','mutations')}
+    return {part:{k:v['excerpt'] for k,v in report[part].items()} for part in ('cases','rounds','generated','mutations')}
 
 class ExcerptStructure(unittest.TestCase):
     def test_the_committed_excerpts_keep_their_recorded_skeletons(self):
@@ -62,12 +62,36 @@ class Judge(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:cls.report=judge_check.run(FIXTURES/'excerpts',Path(d))
     def test_the_verdicts_on_the_excerpts_are_the_committed_ones(self):
         committed=json.loads((FIXTURES/'judge_check.out.json').read_text())
-        self.assertEqual(excerpt_side(self.report),excerpt_side(committed));self.assertEqual(committed['mismatches'],[])
+        self.assertEqual(excerpt_side(self.report),excerpt_side(committed))
+        self.assertEqual((committed['mismatches'],committed['defects']),([],[]))
     def test_every_read_only_round_of_the_v5_argv_passes_and_the_extension_writes_fail(self):
         rounds={k:v['excerpt']['verdict'] for k,v in self.report['rounds'].items()}
         for r in ('claude/ro-new','claude/ro-resumed','codex/app-ro-new','codex/app-ro-resumed','pi/noext-new','pi/noext-resumed'):
             self.assertEqual(rounds[r],'PASS',r)
         self.assertEqual((rounds['pi/ro-new'],rounds['pi/ro-resumed']),('FAIL','FAIL'))
+    def test_no_generated_variant_of_a_positive_round_passes_and_the_invariants_hold(self):
+        # Design correction 5: every mutant non-PASS, every invariance variant keeps PASS (M2T20D-500..502).
+        self.assertEqual(self.report['defects'],[])
+        self.assertEqual(sorted(self.report['generated']),sorted(judge_check.POSITIVE))
+        for rnd,v in self.report['generated'].items():
+            rows=v['excerpt'];self.assertGreater(len(rows),10,rnd)
+            for r in rows:
+                if r['expect']=='non-PASS':self.assertNotEqual(r['verdict'],'PASS',(rnd,r['kind'],r['label']))
+                else:self.assertEqual(r['verdict'],'PASS',(rnd,r['kind'],r['label']))
+    def test_the_round_6_probes_are_not_passes(self):
+        # No control, a failed or interrupted turn, an earlier successful driver run before the refusal.
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=judge_check.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex',name)[0]
+            control=judge_check.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex','app-control')[0]
+            self.assertEqual(judge_check.round_verdict(c,control)[0],'PASS')
+            self.assertEqual(judge_check.round_verdict(c,None)[0],'INSUFFICIENT')
+            for status in ('failed','interrupted'):
+                m=copy.deepcopy(c)
+                for f in m.stdout:
+                    if f.get('method')=='turn/completed':f['params']['turn']['status']=status
+                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
+            m=copy.deepcopy(c);judge_check._insert_shell_success(m,'worktree','create',after=False)
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'FAIL')
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)
