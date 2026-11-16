@@ -810,21 +810,29 @@ mod tests {
 
     /// Ends what a test started however the test ends (M2T05R-252), never by a number that may have been handed out
     /// again (ADR-022 decision 10; CIR-302: it KILLed the group by its number after the test had seen the group
-    /// empty). Each process is recorded while it is known to be the test's, by its start time, and at the end gets
-    /// SIGKILL only if it is still that process ([`signal_if_same`]: a pidfd, then the start time). A member its group
-    /// gains after the record is not covered: the relaying groups are ended by [`Relay`].
+    /// empty). Each process is recorded while it is known to be the test's, by its start time. At the end, the group
+    /// of each recorded leader still the process recorded gets SIGKILL ([`find`], then [`Found::kill`], which signals
+    /// the group only right after a look that shows it held), so members it made after the record go too (SIGS-02);
+    /// then each recorded process gets SIGKILL only if it is still that process ([`signal_if_same`]), which ends the
+    /// members of a group whose leader is gone. The relaying groups are ended by [`Relay`].
     #[derive(Default)]
-    struct Guard(Vec<(u32, String)>);
+    struct Guard {
+        leaders: Vec<(u32, String)>,
+        members: Vec<(u32, String)>,
+    }
 
     impl Guard {
-        /// The processes `pids`, each the test's at this moment (its own unreaped child, or a process that runs until
-        /// it is stopped; never one that may have ended already); one whose start time cannot be read is not recorded.
+        /// The group leaders `pids`, each the test's at this moment (its own unreaped child, or a process that runs
+        /// until it is stopped; never one that may have ended already); one whose start time cannot be read is not
+        /// recorded.
         fn of(pids: &[u32]) -> Guard {
-            Guard(
-                pids.iter()
+            Guard {
+                leaders: pids
+                    .iter()
                     .filter_map(|&pid| Some((pid, start_id(pid).ok().flatten()?)))
                     .collect(),
-            )
+                members: Vec::new(),
+            }
         }
 
         /// Also record the processes in group `pgid` now, its leader aside: each found by the scan and recorded only if
@@ -840,7 +848,7 @@ mod tests {
                 if fields.get(2) == Some(&pgid.to_string().as_str())
                     && let Some(start) = fields.get(19)
                 {
-                    self.0.push((pid, (*start).to_owned()));
+                    self.members.push((pid, (*start).to_owned()));
                 }
             }
             Ok(())
@@ -849,41 +857,86 @@ mod tests {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            for (pid, start) in &self.0 {
+            if let Ok(boot) = boot_id() {
+                for (pid, start) in &self.leaders {
+                    if let Ok(Ok(found)) = find(Some(i64::from(*pid)), Some(&boot), Some(start)) {
+                        found.kill();
+                    }
+                }
+            }
+            for (pid, start) in self.leaders.iter().chain(&self.members) {
                 let _ = signal_if_same(*pid, start, Signal::KILL);
             }
         }
     }
 
-    /// A shell that leads its own group, waits for a line on its stdin, then starts members that relay (each starts
-    /// the next, then exits; M2T05R-300) until `stop` exists.
-    fn relaying(stop: &std::path::Path) -> io::Result<std::process::Child> {
-        use std::os::unix::process::CommandExt as _;
-        std::process::Command::new("sh")
-            .args([
-                "-c",
-                "read -r go; relay() { if [ ! -e \"$1\" ]; then (sleep 0.002; relay \"$1\") & fi; }; relay \"$1\"; exit 0",
-                "sh",
-            ])
-            .arg(stop)
-            .process_group(0)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
+    /// A relaying group (M2T05R-300): its leader, a shell in a group of its own and this test's unreaped child, waits
+    /// for a line on its stdin, then starts members that relay (each starts the next, then exits) for as long as its
+    /// marker exists. The relay owns the leader, its start input and the marker's directory. Dropped, however the
+    /// test ends, it removes the marker, then lets the start go (stdin closed), then waits, at most 5 s each, for the
+    /// leader to end (reaping it) and for the group to be empty; it sends no signal (SIGS-01). The marker's absence is
+    /// the stop: a leader or a member run late, past those waits or once the directory is gone, finds it absent and
+    /// starts nothing, and nothing makes it again.
+    struct Relay {
+        leader: std::process::Child,
+        running: std::path::PathBuf,
+        _dir: tempfile::TempDir,
     }
 
-    /// Ends a relaying group however a test ends, by its stop file, not by a signal (its members, none of them the same
-    /// process for long, cannot be recorded for a [`Guard`]): then waits, at most 5 s, for the group to be empty.
-    struct Relay {
-        stop: std::path::PathBuf,
-        pgid: u32,
+    impl Relay {
+        fn start() -> io::Result<Relay> {
+            use std::os::unix::process::CommandExt as _;
+            let dir = tempfile::tempdir()?;
+            let running = dir.path().join("running");
+            std::fs::write(&running, "")?;
+            let leader = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "read -r go; relay() { if [ -e \"$1\" ]; then (sleep 0.002; relay \"$1\") & fi; }; relay \"$1\"; exit 0",
+                    "sh",
+                ])
+                .arg(&running)
+                .process_group(0)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            Ok(Relay {
+                leader,
+                running,
+                _dir: dir,
+            })
+        }
+
+        /// The leader's pid, its group's number.
+        fn pid(&self) -> u32 {
+            self.leader.id()
+        }
+
+        /// Let it start: the line its leader waits for.
+        fn go(&mut self) -> io::Result<()> {
+            use std::io::Write as _;
+            self.leader
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("its start was let go already"))?
+                .write_all(b"go\n")
+        }
+
+        /// Wait for the leader, which ends once it started the relay, and reap it.
+        fn leader_ended(&mut self) -> io::Result<()> {
+            self.leader.wait().map(|_| ())
+        }
     }
 
     impl Drop for Relay {
         fn drop(&mut self) {
-            let _ = std::fs::write(&self.stop, "");
-            wait_until(|| group_empty(self.pgid));
+            let _ = std::fs::remove_file(&self.running);
+            drop(self.leader.stdin.take());
+            let pgid = self.leader.id();
+            let leader = &mut self.leader;
+            wait_until(|| !matches!(leader.try_wait(), Ok(None)));
+            wait_until(|| group_empty(pgid));
         }
     }
 
@@ -1053,23 +1106,150 @@ mod tests {
         Ok(())
     }
 
+    /// Stop process `pid`, this test's own unreaped child (so its number is its own), and wait until it is stopped.
+    fn stopped(pid: u32) -> io::Result<()> {
+        let raw = i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        rustix::process::kill_process(raw, Signal::STOP)?;
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(raw),
+            rustix::process::WaitIdOptions::STOPPED | rustix::process::WaitIdOptions::NOWAIT,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_given_up_before_its_start_and_run_late_starts_nothing() -> io::Result<()> {
+        // SIGS-01 (Codex's reproduction): a test that returns an error before it releases the relay's start (as
+        // `found(leader)?` can), its leader run only after the cleanup (held stopped here, as a scheduling delay would
+        // hold it): once it runs, no member relays. Its number stays its own, an unreaped child of this test, until the
+        // end.
+        let relay = Relay::start()?;
+        let leader = relay.pid();
+        let raw = i32::try_from(leader)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        stopped(leader)?;
+        // The error return, the relay dropped before its start was let go; its leader runs only 200 ms into the drop
+        // (the relay waits for it, still unreaped, so its number is its own when it is continued).
+        let cleanup = std::thread::spawn(move || drop(relay));
+        std::thread::sleep(Duration::from_millis(200));
+        rustix::process::kill_process(raw, Signal::CONT)?;
+        cleanup
+            .join()
+            .map_err(|_| io::Error::other("the cleanup panicked"))?;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen.extend(group_left(leader, leader)?);
+        }
+        assert!(
+            seen.is_empty(),
+            "members relayed after the cleanup: {seen:?}"
+        );
+        assert!(group_empty(leader), "the relay's group did not end");
+        Ok(())
+    }
+
+    #[test]
+    fn a_relay_whose_leader_runs_only_after_its_cleanup_gave_up_starts_nothing() -> io::Result<()> {
+        // SIGS-01: the same, its leader held stopped past the drop's 5 s wait, so the drop gives up and its directory
+        // goes; continued then, the leader finds no marker and relays nothing. It stays this test's unreaped child
+        // until the test reaps it here, so its number is its own when it is continued.
+        let relay = Relay::start()?;
+        let leader = relay.pid();
+        let raw = i32::try_from(leader)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        stopped(leader)?;
+        drop(relay);
+        rustix::process::kill_process(raw, Signal::CONT)?;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(200));
+            seen.extend(group_left(leader, leader)?);
+        }
+        let ended = rustix::process::waitpid(Some(raw), rustix::process::WaitOptions::empty());
+        assert!(
+            seen.is_empty(),
+            "members relayed after the cleanup: {seen:?}"
+        );
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(
+            wait_until(|| group_empty(leader)),
+            "the relay's group did not end"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_guard_ends_the_members_its_leader_made_after_the_record() -> io::Result<()> {
+        // SIGS-02: a group whose leader goes on making members (as orphan_ignoring_term's loop does); a member made after
+        // the guard's record is ended with the group while the leader is still the recorded process. The leader is
+        // this test's own child, so the test's own cleanup below may use its number until it reaps it.
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 20 ]; do sleep 1000 & i=$((i+1)); sleep 0.05; done; wait",
+            ])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let leader = child.id();
+        let raw = i32::try_from(leader)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("no pid"))?;
+        let outcome = (|| {
+            if !wait_until(|| group_left(leader, leader).is_ok_and(|left| !left.is_empty())) {
+                return Err(io::Error::other("no member came"));
+            }
+            let mut guard = Guard::of(&[leader]);
+            guard.and_members_of(leader)?;
+            let recorded = group_left(leader, leader)?;
+            // A member made after the record, by its pid and start time.
+            let mut later = None;
+            wait_until(|| {
+                later = group_left(leader, leader).ok().and_then(|left| {
+                    left.into_iter()
+                        .filter(|pid| !recorded.contains(pid))
+                        .find_map(|pid| Some((pid, start_id(pid).ok()??)))
+                });
+                later.is_some()
+            });
+            let (pid, start) = later.ok_or_else(|| io::Error::other("no later member"))?;
+            drop(guard);
+            let ended = wait_until(|| matches!(ended(pid, Some(&start)), Ok(true)));
+            let _ = signal_if_same(pid, &start, Signal::KILL);
+            Ok::<_, io::Error>((pid, ended))
+        })();
+        // The test's own end: its child's group by its number while the child is unreaped, then the child reaped.
+        let _ = kill_process_group(raw, Signal::KILL);
+        let _ = child.wait();
+        let (pid, ended) = outcome?;
+        assert!(
+            ended,
+            "member {pid}, made after the guard's record, outlived the guard"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_group_that_churns_is_never_seen_empty_until_it_is() -> io::Result<()> {
         // M2T05R-300: its members relay (each starts the next, then exits), so at every instant one is in the group
         // while no pid lasts: a scan of /proc can miss them all, the kernel's look-up of the group cannot.
-        use std::io::Write as _;
-        let dir = tempfile::tempdir()?;
-        let stop = dir.path().join("stop");
-        let mut child = relaying(&stop)?;
-        let leader = child.id();
-        let _relay = Relay { stop, pgid: leader };
+        let mut relay = Relay::start()?;
+        let leader = relay.pid();
         let found = found(leader)?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("no stdin"))?
-            .write_all(b"go\n")?;
-        child.wait()?;
+        relay.go()?;
+        relay.leader_ended()?;
         assert!(!found.unreaped());
         let (mut looks, mut scans_empty) = (0, 0);
         let end = Instant::now() + Duration::from_secs(1);
@@ -1315,19 +1495,11 @@ mod tests {
     fn a_churning_group_whose_leader_is_gone_is_never_read_as_gone() -> io::Result<()> {
         // M2T05R-450: the reconcile's view of a record whose leader is gone (no pidfd of it): its relaying members
         // keep the group, so every inspection is Leaderless (no signal, slot kept), never Gone.
-        use std::io::Write as _;
-        let dir = tempfile::tempdir()?;
-        let stop = dir.path().join("stop");
-        let mut child = relaying(&stop)?;
-        let leader = child.id();
-        let _relay = Relay { stop, pgid: leader };
+        let mut relay = Relay::start()?;
+        let leader = relay.pid();
         let me = of(leader)?.ok_or_else(|| io::Error::other("it is not running"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("no stdin"))?
-            .write_all(b"go\n")?;
-        child.wait()?;
+        relay.go()?;
+        relay.leader_ended()?;
         let mut looks = 0;
         let end = Instant::now() + Duration::from_secs(1);
         while Instant::now() < end {
