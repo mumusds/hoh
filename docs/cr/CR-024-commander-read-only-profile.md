@@ -3,7 +3,7 @@
 ID：CR-024
 状态：PROPOSED
 批准人：（待：ADR-032 的设计审查判定可批准后，由项目所有者批准。本 CR 改 CONTRACT 第 7 条，不属 CR-003 D1 预授权）
-日期：2026-11-16（第五版：按 ADR-032 设计审查第 1–4 轮与设计修正 1–3 修订）
+日期：2026-11-16（第六版：按 ADR-032 设计审查第 1–5 轮与设计修正 1–4 修订）
 基线：改受锁的 `CONTRACT.md`、`contracts/requirements.json`（REQ-020、REQ-021、REQ-024、REQ-025、REQ-026、REQ-027）与 `contracts/acceptance-scenarios.json`。须在 M2-T13 的重新上锁（CR-022、CR-023）进入 main 之后执行：两者都改 requirements.json 与 baseline-lock.json。可与同期其他 CR 合为一次重新上锁。批准后执行 `python3 tools/gen_spec_views.py` 与 `python3 tools/baseline.py relock --cr docs/cr/CR-024-commander-read-only-profile.md`，再运行 `bash scripts/check.sh --bundle`。
 
 ## 背景
@@ -12,16 +12,16 @@ ID：CR-024
 - **问题由来**：这个问题从 M2-T08 设计审查第 9 轮起悬而未决（M2T08D-802、-854；reports/reviews/M2.md:2606）。
   - 今天每个 turn 都按规格的 yolo-vm 档全权限启动，Commander 也不例外。它能按绝对路径写写者的工作区，也就是项目根；写者工作区同时被 Developer 修改，事后的 tree 核对无法归属这类差异（ADR-025 -753）。
   - Commander 今天唯一的输出通道是把决策写进 `<project>/.hoh/attempts/<attempt>/messages.jsonl`。所以不能只把它“设为只读”，还要换掉这个通道。
-- **设计**：docs/adr/ADR-032.md（第五版）。
+- **设计**：docs/adr/ADR-032.md（第六版）。
   - 决策改由最终助手消息里最后一个 ```` ```hoh-decisions ```` 块交付，与验证者的 ```` ```hoh-report ```` 块同一做法。
   - 三个底座各用自己的只读机制，按一张确定的 argv 表启动 Commander：codex 用操作系统级沙箱（只经 App Server），claude 只给读工具且权限模式为 dontAsk，pi 用按工具名的允许清单并不加载发现或配置的扩展。
   - 每个选项只在被测 help/schema 声明时使用，缺了就不启动，不回退到全权限。只有一处 help 无从声明的例外（claude 的工具名），由活体检查实测。
   - 新能力 `read_only_workspace`：会话记录里是三项之与——探测规则、构建函数、兼容清单里单独的 `read_only` 用例（不进 YOLO 套件的总状态）。选人时，codex 另须本 host 的两项事实都允许。commander 职位（按职位名）需要它。
   - 活体检查按格判定（ADR-032 设计修正 1）。受锁文字写要证明什么，并固定分类（什么算权限拒绝、突破、覆盖不足）；证据的字段路径与文字在 ADR-032 的证据表里，每行引用已安装版本在该路径上的录制（设计修正 2、3）。录制已在 S0 跑完，去敏的摘录在 tests/fixtures/commander-readonly/。
   - **待所有者确认 Q-exec（前提已变）**：codex 0.166.0 的 exec 流里补丁被拒不留痕迹；S0 录到 exec 线程的 rollout 里有拒绝，但 exec 不给出这个文件的位置。按建议 (A)，Commander 不经 codex exec 运行，本 CR 按 (A) 写；若所有者选 (B)，按文末附录一改。
-  - **待所有者确认 Q-pi-ext**：S0 录到用户自装的 pi 扩展在每个只读会话里往私有工作目录写文件。按建议 (A)，pi 的只读档加 `--no-extensions`，本 CR 按 (A) 写；若所有者选 (B) 或 (C)，按文末附录二改。
+  - **待所有者确认 Q-pi-ext**：S0 录到用户自装的 pi 扩展在每个只读会话里往私有工作目录写文件；需求也没有规定 v1 的三个 Pi 插件是否进 Commander 的会话。按建议 (A)，Commander 的 pi 会话不加载任何扩展（`--no-extensions`，不传 `-e`），本 CR 按 (A) 写；若所有者选 (A2)、(B) 或 (C)，按文末附录二改。
   - 余项 R1–R7 在 docs/12 记录，并由 doctor 显示。
-- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1–4 轮的审查文本（.hoh-dev/review-cmdro-d{1,2,3,4}-{codex,grok}.md）；离线实测 .hoh-dev/evidence/commander-readonly/；S0 的录制 tests/fixtures/commander-readonly/（原始录制在本地 .hoh-dev/evidence/commander-readonly/spike/）。
+- **依据**：预研 `.hoh-dev/evidence/commander-readonly-research.md`；设计审查第 1–5 轮的审查文本（.hoh-dev/review-cmdro-d{1,2,3,4,5}-{codex,grok}.md）；离线实测 .hoh-dev/evidence/commander-readonly/；S0 的录制 tests/fixtures/commander-readonly/（原始录制在本地 .hoh-dev/evidence/commander-readonly/spike/），以及在录制上执行证据表规则的 judge_check.py 与其输出。
 
 ## 决定
 
@@ -73,7 +73,7 @@ ID：CR-024
 > （CR-024）只读工作区档的强制方式因底座而异：
 > - codex 由其操作系统级沙箱约束模型运行的命令与补丁；用户自己配置的 MCP 服务器与钩子运行在沙箱之外。
 > - claude 只靠进程内的工具集与权限判定：`--tools` 只说覆盖内置工具集，插件、用户或项目设置带来并预先批准的工具是否也被排除，help 没有说。
-> - pi 只靠进程内按工具名的允许清单，并以 `--no-extensions` 不加载发现或配置的扩展：显式加载的扩展（HoH 自己的插件）仍以用户的完整权限运行，可注册同名的 read/grep/find/ls 覆盖内置工具，扩展的钩子包着每次工具调用。
+> - pi 只靠进程内按工具名的允许清单，没有操作系统级屏障；Commander 的 pi 会话不加载任何扩展（`--no-extensions`，不以 `-e` 加载），所以扩展覆盖同名工具、包住工具调用或自己写文件都不在这个会话里。
 > - 同 uid 的其他进程不受约束（CR-013）。
 >
 > 这些余项按所有者的决定如实记在 docs/12，并由 doctor 显示（ADR-032 决定 7）；各底座只读会话的工具集、拒绝记录与快照由 TEST-021-07 实测。`execution.profile="yolo-vm"` 指 Commander 用只读工作区档、其余职位全权限，不新增配置键。
@@ -114,7 +114,7 @@ ID：CR-024
 **decisions**：在第 4 条之后追加第 5 条。
 
 > （CR-024）Commander 不经 codex exec 运行。
-> - 理由：已安装的 0.166.0 在 exec 通道上不保留补丁被拒的原因，exec 上证明不了权限拒绝（ADR-032 设计修正 2、决定 10）。
+> - 理由：exec 的 `--json` 流里补丁被拒不留痕迹，拒绝只记在该线程的 rollout 文件里；exec 不给出这个文件的位置，只能按未声明的文件名约定查找；exec 续会话的只读又要靠 help 不声明的配置键 `sandbox_mode`。App Server 的响应直接给出 rollout 的位置，续会话也有已声明的 `sandbox` 参数（ADR-032 决定 10）。
 > - 因此传输为 exec 的 codex 的 read_only_workspace 为 false。App Server 在本 host 运行中降级为 exec 后，codex 不再当 Commander，直到 host 重启或换版本；这是主机的事实，不写入会话记录。
 > - 选 codex 当 Commander 时，另须本机沙箱检查（以临时 CODEX_HOME 运行 `codex sandbox -P :read-only` 的写探针）不为 unconfined 或 unavailable。该检查只说明本机能否建立 codex 的默认只读沙箱。它也是主机的事实：不写入会话记录，从不使任何会话换绑；结论不是 confined 时至多每 60 秒重测一次，主机修好后即恢复（ADR-032 决定 4）。
 
@@ -139,7 +139,7 @@ ID：CR-024
 
 > Commander 的只读档必须按 REQ-021 行为 9 的 pi 一行启动。仅当 help 声明 `--tools`、`--no-mcp` 与 `--no-extensions`，且其 Built-in Tool Names 段列出 read、grep、find、ls 时使用，否则不启动（BLOCKED_CAPABILITY）。
 >
-> Pi 的只读只靠进程内按工具名的允许清单。`--no-extensions` 使发现的、配置的与内置的扩展都不加载；HoH 自己的插件若要在 Commander 会话里生效，必须以 `-e` 显式传入并写进行为 9 的清单，不得悄悄省略。显式加载的扩展以用户的完整权限运行，可注册同名工具覆盖这四个内置工具，扩展的钩子包着每次工具调用。这些记为余项（ADR-032 R3）（CR-024）。
+> Commander 的 pi 会话不加载任何扩展：`--no-extensions` 使发现的、配置的与内置的扩展都不加载，也不以 `-e` 显式加载任何扩展。v1 的三个 Pi 插件（REQ-048–050）服务于其他 Pi 职位，不进 Commander 的会话；这一点在 docs/12 与 doctor 中写明，不是省略插件。Pi 的只读只靠进程内按工具名的允许清单，没有操作系统级屏障，记为余项（ADR-032 R3）（CR-024）。
 
 ### `contracts/requirements.json` · REQ-027（协议版本与能力）
 
@@ -244,7 +244,7 @@ ID：CR-024
    "depends_on": ["M2-T13", "M2-T15"],
    "requirements": ["REQ-021", "REQ-020", "REQ-024", "REQ-025", "REQ-026", "REQ-027"],
    "acceptance": ["AC-021-06", "AC-021-07"],
-   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表引用的 S0 录制摘录（tests/fixtures/commander-readonly/excerpts/）为夹具的离线单元测试，其先红证据（全权限档下的 FAIL）已保存。"
+   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表引用的 S0 录制摘录（tests/fixtures/commander-readonly/excerpts/）为夹具的离线单元测试，在这些夹具上的结论与 judge_check.out.json 相同，其先红证据（全权限档下的 FAIL）已保存。"
   }
   ```
 
@@ -274,7 +274,7 @@ ID：CR-024
   - 它的每个 turn 都以只读档启动；
   - 它的决策从最终消息的块中读取；
   - 它不再能经自己的工具与沙箱写项目，包括项目的 `.hoh/`；pi 进程自己的会话目录除外，那是底座进程写的，不是模型经工具写的。
-  - claude 与 pi 当 Commander 时没有命令工具、没有 MCP 工具；pi 当 Commander 时也不加载用户自装或配置的扩展（Q-pi-ext 的建议 (A)）；codex 仍能在只读沙箱里运行读命令。
+  - claude 与 pi 当 Commander 时没有命令工具、没有 MCP 工具；pi 当 Commander 时不加载任何扩展，包括用户自装的、配置的与 v1 的三个插件（Q-pi-ext 的建议 (A)）；codex 仍能在只读沙箱里运行读命令。
   - codex 只经 App Server 当 Commander；传输为 exec 或运行中降级为 exec 时，codex 不当 Commander（Q-exec 的建议 (A)）。
 - **其余职位**：启动逐字节不变。
 - **选人**：`read_only_workspace` 不为 true 的 Agent 不再能当 Commander，在其他职位照常可用。默认团队的 codex（App Server）在录制版本与本 VM（Ubuntu 26.04）上满足要求。只读能力的要求按职位名 commander，引用 commander 合同的自定义职位不受影响。
@@ -338,7 +338,14 @@ ID：CR-024
 - **AC-021-06**：(a) 加只走 exec 的 codex 作 Commander，两次 turn 的 argv 与行为 9 的 exec 两行逐项相等；删去 (d)。
 - **AC-021-07 与 TEST-021-07**：加 codex exec 一段，判据与 App Server 段相同；它的原始记录含按线程 id 找到的唯一 rollout 文件，找不到恰好一个即覆盖不足。
 
-## 附录二：若所有者在 Q-pi-ext 选 (B) 或 (C)
+## 附录二：若所有者在 Q-pi-ext 选 (A2)、(B) 或 (C)
+
+**(A2) 以 `-e` 加载三个 v1 插件。** 前提是锁定版本（config/plugins.json）与其生效配置（`memoryDir` 之类解析到项目与私有工作目录之外）的一次录制，覆盖启动、续会话、压缩与退出的钩子，快照严格；在录到之前，pi 的 read_only_workspace 不为 true（本 VM 上 pi-smart-compact 不是锁定版本、@juicesharp/rpiv-todo 没有安装，这一部分为 BLOCKED）。本 CR 的文字按下面改，其余不变：
+
+- **REQ-021 行为 9** 的 pi 一行在 `--no-extensions` 之后加 `-e <pi-smart-compact> -e <pi-hermes-memory> -e <@juicesharp/rpiv-todo>`（各为 REQ-051 解析出的锁定版本的路径）。
+- **REQ-021 决定 6** 的 pi 一项改为“pi 只靠进程内按工具名的允许清单，并以 `--no-extensions` 不加载发现或配置的扩展：显式加载的三个 v1 插件仍以用户的完整权限运行，可注册同名的 read/grep/find/ls 覆盖内置工具，扩展的钩子包着每次工具调用，插件自己也能写文件”。
+- **REQ-026 行为 9** 的第二段改为“Commander 的 pi 会话以 `--no-extensions` 关闭发现的、配置的与内置的扩展，并以 `-e` 加载 v1 的三个插件的锁定版本；它们的生效配置须把一切写入位置解析到项目与 Commander 的私有工作目录之外，并由 TEST-021-07 实测。显式加载的扩展以用户的完整权限运行，记为余项（ADR-032 R3）（CR-024）。”
+- **AC-021-07 与 TEST-021-07** 的 pi 段：加载这三个插件，覆盖启动、续会话、压缩与退出的钩子。
 
 **(B) 保持发现扩展。** 余项 R3 写明“用户自装的扩展在 Commander 会话里照常运行，S0 录到它们写文件”。TEST-021-07 的判据不变：装有会写区域的扩展的主机上 pi 段 FAIL。本 CR 的文字按下面改，其余不变：
 
