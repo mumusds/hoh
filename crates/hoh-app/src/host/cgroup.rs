@@ -967,6 +967,92 @@ mod tests {
     }
 
     #[test]
+    fn a_cgroup_removed_during_the_walk_leaves_it_whole() -> R {
+        // M2T06R-1251: a cgroup goes only once empty, with all below it, so one removed while the walk goes, a sibling
+        // not visited yet or the one just visited before it is listed, leaves nothing unread: the walk is whole.
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("x"))?;
+        std::fs::create_dir_all(at.join("y"))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let top = group.open_checked()?.ok_or("not there")?;
+        let until = Instant::now() + Duration::from_secs(60);
+        let mut visited = 0;
+        let whole = walk(&top, until, |names, _| {
+            visited += 1;
+            if let [name] = names {
+                let other = if name.as_bytes() == b"x" { "y" } else { "x" };
+                let _ = std::fs::remove_dir(at.join(other));
+            }
+        });
+        assert_eq!((visited, whole), (2, true), "a sibling removed first");
+        assert_eq!(std::fs::read_dir(&at)?.count(), 1);
+        let mut visited = 0;
+        let whole = walk(&top, until, |names, _| {
+            visited += 1;
+            if let [name] = names {
+                let _ = std::fs::remove_dir(at.join(std::ffi::OsStr::from_bytes(name.as_bytes())));
+            }
+        });
+        assert_eq!((visited, whole), (2, true), "removed once visited");
+        assert_eq!(std::fs::read_dir(&at)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cgroup_opened_but_not_listed_leaves_the_walk_incomplete() -> R {
+        // M2T06R-1251: a cgroup the walk opens but cannot list (readable, not searchable: a same-user process may chmod
+        // a delegated cgroup) may hold cgroups it never reaches: not whole.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("unlisted").join("below"))?;
+        std::fs::set_permissions(at.join("unlisted"), std::fs::Permissions::from_mode(0o400))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let top = group.open_checked()?.ok_or("not there")?;
+        let mut visited = 0;
+        let whole = walk(&top, Instant::now() + Duration::from_secs(60), |_, _| {
+            visited += 1
+        });
+        std::fs::set_permissions(at.join("unlisted"), std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!((visited, whole), (2, false));
+        Ok(())
+    }
+
+    #[test]
+    fn a_sigterm_to_a_cgroup_not_opened_is_incomplete_and_to_a_removed_one_whole() -> R {
+        // M2T06R-1251: terminate opens the cgroup through its checked chain first. A directory on the way it cannot open
+        // tells nothing: incomplete (in a stop, `cgroup.kill` follows). A removed cgroup has nothing left: whole.
+        let root = tempfile::tempdir()?;
+        let parent = root.path().join("host.scope");
+        let at = parent.join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(&at)?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))?;
+        let shut = group.terminate();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::remove_dir(&at)?;
+        let removed = group.terminate();
+        assert_eq!(
+            shut,
+            Termed {
+                sent: false,
+                whole: false
+            },
+            "its way not opened"
+        );
+        assert_eq!(
+            removed,
+            Termed {
+                sent: false,
+                whole: true
+            },
+            "removed"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_process_listed_by_a_cgroup_but_not_in_it_gets_no_sigterm() -> R {
         // M2T06R-1152: a member is signalled only when its own /proc/<pid>/cgroup puts it in the subtree (a pid that
         // ended and was reused is not the member it was): a live process listed here, but in another cgroup, lives.
