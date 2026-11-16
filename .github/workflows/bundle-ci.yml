@@ -47,7 +47,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
       # Dependency policy and RustSec advisories (deny.toml); pinned like scripts/dev/test-infra.sh. The static check
-      # runs the offline part (licenses, bans, sources), the last step all of it.
+      # runs the non-advisory checks (licenses, bans, sources), the last step all of them with the advisories.
       - run: cargo install --locked cargo-deny@0.20.2
       # The static check as the frozen check plan runs it (TEST-062-05): fmt, clippy with warnings denied on the dev and
       # the release profile in a cleared environment, the AC-062-05 clippy canary, cargo deny and the persistence scan.
