@@ -33,6 +33,8 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   recorded one and, where the raw source is present locally with the recorded sha256, with the source line's
   skeleton; it also compares each `.meta.json`'s `snapshot_diff` with the raw snapshot's. The bundle self-test runs
   it on the recorded skeletons (tests/bundle/test_commander_readonly.py).
+- For codex's App Server and pi, `<case>.stdin.excerpt.jsonl` is the request log (every JSON line the recorder sent),
+  with which the adapters correlate responses to requests (ADR-032 design correction 7).
 - `.meta.json` files are summaries, not excerpts: the case's argv, exit, notes, driver text and token hash, and the
   raw snapshot's `diff` object (values redacted) with the snapshot's sha256.
 - Regenerate with `python3 tests/fixtures/commander-readonly/excerpt.py` followed by every run directory under
