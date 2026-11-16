@@ -4,6 +4,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use serde_json::{Value, json};
@@ -1868,9 +1870,15 @@ async fn a_team_change_takes_effect_at_a_paused_runs_checkpoint_without_a_resume
                ('A', 'D', 'RUNNING', 1, 1, 0, '2026-11-15T00:00:00Z');"
         ),
     )?;
-    let pause = json!({"schema_version": "1.0", "command_id": "c-pause", "idempotency_key": "pause",
-        "expected_revision": 3, "kind": "PauseRun", "run_id": run_id, "payload": {"reason": "lunch"}});
-    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&pause)).await?;
+    // At the revision seeded, again at the revision the host names while it answers STALE_REVISION: its runner may
+    // move the run on before the command arrives (common::fresh).
+    let (status, body) = common::fresh(json!(3), |revision| {
+        let pause = json!({"schema_version": "1.0", "command_id": "c-pause", "idempotency_key": "pause",
+            "expected_revision": revision, "kind": "PauseRun", "run_id": run_id, "payload": {"reason": "lunch"}});
+        let host = &host;
+        async move { exchange(host, "POST", "/v1/commands", Some(&pause)).await }
+    })
+    .await?;
     assert_eq!(status, 202, "{body}");
     let state = format!("SELECT state FROM runs WHERE run_id = '{run_id}'");
     until(dir.path(), &state, "PAUSE_REQUESTED").await?;
