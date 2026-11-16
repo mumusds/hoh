@@ -40,6 +40,59 @@ fn the_screen_snapshot_shows_only_what_erases_and_overwrites_left() -> R {
 }
 
 #[test]
+fn a_world_directory_that_was_not_removed_is_reported_with_what_is_left_and_who_holds_it() -> R {
+    // World::drop removes its directory itself and, when that fails, writes this report to stderr: the error, every
+    // entry left with its size and last write, and every process with a file open there or working in it.
+    let dir = tempfile::tempdir()?;
+    let kept = dir.path().join("kept");
+    std::fs::create_dir(&kept)?;
+    std::fs::write(kept.join("file"), b"abc")?;
+    let held = std::fs::File::open(kept.join("file"))?;
+    let mut sleeper = pty::Hoh(
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&kept)
+            .spawn()?,
+    );
+    // Its working directory set once it runs (before that the forked copy works where this process does).
+    let end = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_link(format!("/proc/{}/cwd", sleeper.0.id())).ok() != Some(kept.clone()) {
+        if Instant::now() > end {
+            return Err("sleep never worked in the directory".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let report = world::leftover(dir.path(), &std::io::Error::other("Directory not empty"));
+    sleeper.0.kill()?;
+    sleeper.0.wait()?;
+    drop(held);
+    let line = |needle: &str| {
+        report
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        line("was not removed").contains("Directory not empty"),
+        "{report}"
+    );
+    let file = line(&format!("{} ", kept.join("file").display()));
+    assert_eq!(file.split_whitespace().nth(1), Some("3"), "{report}");
+    let me = line(&format!("pid {} ", std::process::id()));
+    assert!(
+        me.contains(&format!("-> {}", kept.join("file").display())),
+        "{report}"
+    );
+    let sleeping = line(&format!("pid {} ", sleeper.0.id()));
+    assert!(
+        sleeping.contains(&format!("cwd {}", kept.display())),
+        "{report}"
+    );
+    Ok(())
+}
+
+#[test]
 fn the_pty_helper_runs_a_program_of_the_world_and_snapshots_its_screen() -> R {
     let world = World::new()?;
     let pty = pty::Pty::new(10, 60)?;
