@@ -207,7 +207,8 @@ fn the_worlds_fake_agents_pass_the_compat_suite_and_are_the_only_agents_on_its_p
 }
 
 /// `world`'s committed project with its specification's rows, its agents registered and its in-process product host
-/// started; a run started on it and adopted ([`World::adopt`]): the host and the run's id.
+/// started; a run started on it, which adopted the specification in StartRun's commit (docs/adr/ADR-031.md decision
+/// 1): the host and the run's id.
 async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     world.commit_project(&world::fixture_spec())?;
     world.register()?;
@@ -215,7 +216,10 @@ async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     let started = async {
         let spec = world.seed_spec()?;
         let run = world::start_run(&host, key, "完成fixture目标").await?;
-        world.adopt(&run, &spec)?;
+        assert_eq!(
+            world.query(&format!("SELECT spec_id FROM runs WHERE run_id = '{run}'"))?,
+            spec
+        );
         R::Ok(run)
     }
     .await;
@@ -228,8 +232,8 @@ async fn adopted_run(world: &World, key: &str) -> R<(Host, String)> {
     }
 }
 
-/// Once the pinned Commander moved `run` to RUNNING: the developer task its create_tasks plans (`<run>-develop`, every
-/// requirement), inserted here only where the product did not apply that create_tasks (before slice S2 it does not).
+/// Once the pinned Commander moved `run` to RUNNING: the developer task its create_tasks planned and the product
+/// applied (`<run>-develop`, READY, for every requirement of the specification).
 async fn planned(world: &World, run: &str) -> R<String> {
     world
         .until(
@@ -239,15 +243,13 @@ async fn planned(world: &World, run: &str) -> R<String> {
         )
         .await?;
     let task = format!("{run}-develop");
-    world.exec(&format!(
-        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
-           SELECT '{task}', run_id, spec_id, 'READY', 0, 'developer', 1,
-             (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks WHERE run_id = '{run}'), 1
-           FROM runs WHERE run_id = '{run}' AND NOT EXISTS (SELECT 1 FROM tasks WHERE task_id = '{task}');
-         INSERT INTO task_requirements(task_id, requirement_id, spec_id)
-           SELECT '{task}', q.requirement_id, q.spec_id FROM requirements q JOIN runs r ON r.spec_id = q.spec_id
-           WHERE r.run_id = '{run}' AND NOT EXISTS (SELECT 1 FROM task_requirements WHERE task_id = '{task}');"
-    ))?;
+    assert_eq!(
+        world.query(&format!(
+            "SELECT t.role || ':' || group_concat(q.requirement_id) FROM tasks t \
+             JOIN task_requirements q ON q.task_id = t.task_id WHERE t.task_id = '{task}'"
+        ))?,
+        "developer:REQ-901"
+    );
     Ok(task)
 }
 
@@ -433,9 +435,8 @@ async fn the_pinned_commander_submits_a_refused_create_tasks_again_and_an_applie
 -> R {
     // The pinned Commander's "once" is by what became of a decision, not by its writing: its first create_tasks names a
     // stale revision (stale_once) and is REJECTED, so it is submitted again on the run's next turn; its
-    // record_assumption, APPLIED in the first batch, is never submitted again. The second create_tasks is APPLIED, or
-    // kept PROPOSED while the product does not apply create_tasks (before slice S2b); either way the run reaches
-    // RUNNING.
+    // record_assumption, APPLIED in the first batch, is never submitted again. The second create_tasks is APPLIED and
+    // the run reaches RUNNING.
     let world = World::new()?;
     world.commander(&world::Commander {
         stale_once: vec!["create_tasks".to_owned()],
@@ -469,12 +470,7 @@ async fn the_pinned_commander_submits_a_refused_create_tasks_again_and_an_applie
             Some((json!("REJECTED"), json!("STALE_REVISION"))),
             "{all:?}"
         );
-        assert!(
-            create[1]
-                .as_ref()
-                .is_some_and(|(state, _)| state == "APPLIED" || state == "PROPOSED"),
-            "{all:?}"
-        );
+        assert_eq!(create[1], Some((json!("APPLIED"), Value::Null)), "{all:?}");
         // Submitted again in a later batch than the refused one.
         let batch_of = |kind: &str, nth: usize| {
             batches
@@ -529,10 +525,9 @@ async fn the_scripted_teams_commander_moves_a_run_and_asks_a_person() -> R {
     });
     let host = world.team_host(team.clone(), None).await?;
     let outcome = async {
-        let spec = world.seed_spec()?;
+        world.seed_spec()?;
         let run = world::start_run(&host, "s1", "实现登录功能").await?;
         world.staff(&run)?;
-        world.adopt(&run, &spec)?;
         world
             .until(
                 &format!("SELECT state || '/' || blocked_reason FROM runs WHERE run_id = '{run}'"),
@@ -740,7 +735,7 @@ async fn a_host_the_worlds_hoh_starts_has_the_worlds_environment_and_runs_its_fa
     world.commit_project(&world::fixture_spec())?;
     world.register()?;
     world.init_store().await?;
-    let spec = world.seed_spec()?;
+    world.seed_spec()?;
     let started = Instant::now();
     let out = world.hoh(&["-p", "完成fixture目标", "--detach", "--output", "json"])?;
     assert_eq!(
@@ -768,7 +763,6 @@ async fn a_host_the_worlds_hoh_starts_has_the_worlds_environment_and_runs_its_fa
         .collect();
     want.sort();
     assert_eq!(env, want, "the host has the world's environment only");
-    world.adopt(&run, &spec)?;
     world.wait(
         &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
         "RUNNING",
