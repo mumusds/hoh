@@ -1256,8 +1256,10 @@ mod tests {
 
     #[test]
     fn the_sigterm_step_on_a_deep_cgroup_ends_within_its_budget() -> R {
-        // M2T06R-1250: a chain 4000 deep, which the whole walk takes seconds to go through, gets its SIGTERM step in
-        // about the walk's budget, said to be incomplete (`cgroup.kill` follows in a stop).
+        // M2T06R-1250, CGW-52: the SIGTERM step on a chain 4000 deep. Its budget spent (a stub), it reads the top only
+        // and is incomplete (`cgroup.kill` follows in a stop), however fast the machine. With the clock it ends within
+        // about the budget: only an upper bound, as a fast enough machine walks the whole chain within it (a
+        // terminate() without its budget takes seconds on the machine this was written on, and fails the bound).
         let root = tempfile::tempdir()?;
         let at = root.path().join("attempt-0123456789abcdef");
         std::fs::create_dir(&at)?;
@@ -1268,16 +1270,17 @@ mod tests {
         }
         drop(dir);
         let group = AttemptGroup::witnessed(root.path(), &at)?;
-        let started = Instant::now();
-        let termed = group.terminate();
-        let took = started.elapsed();
         assert_eq!(
-            termed,
+            group.terminate_by(&|| true),
             Termed {
                 sent: false,
                 whole: false
-            }
+            },
+            "its budget spent"
         );
+        let started = Instant::now();
+        group.terminate();
+        let took = started.elapsed();
         assert!(
             took < TERM_WALK_BUDGET + Duration::from_secs(1),
             "took {took:?}"
