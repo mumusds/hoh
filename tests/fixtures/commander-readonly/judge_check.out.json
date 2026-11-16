@@ -2,6 +2,7 @@
  "cases": {
   "claude/control": {
    "excerpt": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
     "E11": "conform",
@@ -26,6 +27,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
     "E11": "conform",
@@ -52,6 +54,7 @@
   },
   "claude/control-ordinary-error": {
    "excerpt": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "conform",
     "E11": "conform",
@@ -64,6 +67,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "conform",
     "E11": "conform",
@@ -78,6 +82,7 @@
   },
   "claude/ro-new": {
    "excerpt": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -86,6 +91,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -96,6 +102,7 @@
   },
   "claude/ro-ordinary-error": {
    "excerpt": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -105,6 +112,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -116,6 +124,7 @@
   },
   "claude/ro-plus-write": {
    "excerpt": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "conform",
     "E11": "conform",
@@ -125,6 +134,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "nonconform",
     "E10": "conform",
     "E11": "conform",
@@ -136,6 +146,7 @@
   },
   "claude/ro-resumed": {
    "excerpt": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -144,6 +155,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E1": "conform",
     "E10": "conform",
     "E11": "conform",
@@ -154,10 +166,11 @@
   },
   "codex/app-control": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "success",
      "git delete": "success",
@@ -191,10 +204,11 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.git/hoh-patch-create, P/.git/hoh-shell-create, P/.hoh/hoh-patch-create, P/.hoh/hoh-shell-create, P/hoh-patch-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-patch-create, W/hoh-shell-create, P/.git/hoh-patch-delete, P/.git/hoh-shell-delete, P/.hoh/hoh-patch-delete, P/.hoh/hoh-shell-delete, P/hoh-patch-delete, P/hoh-shell-delete, W/hoh-patch-delete, W/hoh-shell-delete, P/.git/hoh-patch-modify, P/.git/hoh-shell-modify, P/.hoh/hoh-patch-modify, P/.hoh/hoh-shell-modify, P/hoh-patch-modify, P/hoh-shell-modify, W/hoh-patch-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "success",
      "git delete": "success",
@@ -230,10 +244,11 @@
   },
   "codex/app-control-ordinary-error": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "no driver run",
+    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -268,10 +283,11 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "nonconform",
-    "E4": "no driver run",
+    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -308,10 +324,11 @@
   },
   "codex/app-ro-new": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -345,10 +362,11 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -384,10 +402,11 @@
   },
   "codex/app-ro-ordinary-error": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "no driver run",
+    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -422,10 +441,11 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "no driver run",
+    "E4": "0 driver run(s)",
     "E5": {
      "git create": "insufficient",
      "git delete": "insufficient",
@@ -462,10 +482,11 @@
   },
   "codex/app-ro-resumed": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -499,10 +520,11 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E3": "conform",
-    "E4": "driver run",
+    "E4": "1 driver run(s)",
     "E5": {
      "git create": "refused",
      "git delete": "refused",
@@ -556,12 +578,14 @@
   },
   "pi/control": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
     "E9": {}
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
@@ -570,6 +594,7 @@
   },
   "pi/noext-new": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E8": "conform",
@@ -578,6 +603,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E8": "conform",
@@ -588,6 +614,7 @@
   },
   "pi/noext-resumed": {
    "excerpt": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E8": "conform",
@@ -596,6 +623,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "conform",
     "E11": "conform",
     "E8": "conform",
@@ -606,6 +634,7 @@
   },
   "pi/ordinary-error": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "nonconform",
@@ -617,6 +646,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "nonconform",
@@ -630,6 +660,7 @@
   },
   "pi/ro-new": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "conform",
@@ -638,6 +669,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "conform",
@@ -648,6 +680,7 @@
   },
   "pi/ro-no-extensions": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
     "E11": "conform",
     "E8": "conform",
@@ -657,6 +690,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
     "E11": "conform",
     "E8": "conform",
@@ -668,6 +702,7 @@
   },
   "pi/ro-plus-write": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "nonconform",
@@ -677,6 +712,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "nonconform",
@@ -688,6 +724,7 @@
   },
   "pi/ro-resumed": {
    "excerpt": {
+    "E0": "settled",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "conform",
@@ -696,6 +733,7 @@
     }
    },
    "raw": {
+    "E0": "settled",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "conform",
     "E8": "conform",
@@ -703,6 +741,3659 @@
      "read call_21eaaaf686664397989749a4": "success"
     }
    }
+  }
+ },
+ "defects": [],
+ "generated": {
+  "claude/ro-new": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (init)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "the result frame",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed (is_error true)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted (error_during_execution)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "exit code 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "init",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "a write tool call before the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "a write tool call after the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "a write tool call, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
+  },
+  "claude/ro-resumed": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (init)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "the result frame",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed (is_error true)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted (error_during_execution)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "exit code 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "init",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "a write tool call before the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "a write tool call after the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "a write tool call, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: Write toolu_mutant"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
+  },
+  "codex/app-ro-new": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (responses)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (turn_context)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control terminal (turn/completed)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access",
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell create refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell modify refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell delete refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "turn/completed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "thread response",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "turn_context",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "shell worktree create, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal + reversed",
+     "label": "patch worktree create, cell evidence reversed",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
+  },
+  "codex/app-ro-resumed": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (responses)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (turn_context)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control terminal (turn/completed)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access",
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch create refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell create refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch modify refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell modify refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete fileChange",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control patch delete refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control shell delete refused instead",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change shell delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control shell delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control snapshot change patch delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control patch delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "turn/completed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "thread response",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "turn_context",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch worktree delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch git delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch git delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch hoh delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch hoh delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w create",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w modify",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w modify"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop attempt",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "1 cells not refused: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "shell w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "patch w delete",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch w delete"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "shell worktree create, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: shell worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal + reversed",
+     "label": "patch worktree create, cell evidence reversed",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
+  },
+  "pi/noext-new": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (observer)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "agent_settled",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed (prompt success false)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted (aborted true)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "observer report",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "a write tool call before the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "a write tool call after the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "a write tool call, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
+  },
+  "pi/noext-resumed": {
+   "excerpt": [
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control round",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "no control round"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop control",
+     "label": "the control availability (observer)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop terminal",
+     "label": "agent_settled",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "failed (prompt success false)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "terminal status",
+     "label": "interrupted (aborted true)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop availability",
+     "label": "observer report",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop snapshot",
+     "label": "the snapshot diff",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "snapshot insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file added in W",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: W/hoh-mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "stray write",
+     "label": "a file changed in P/.git",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "snapshot breach: P/.git/index"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "drop decision block",
+     "label": "the final message",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal",
+     "label": "a write tool call before the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success after refusal",
+     "label": "a write tool call after the read",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "success before refusal + duplicated",
+     "label": "a write tool call, all lines twice",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "a write tool succeeded: write call_mutant"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "duplicate",
+     "label": "all lines twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "reorder",
+     "label": "cell evidence reversed",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    }
+   ],
+   "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
+    "FAIL",
+    "PASS",
+    "PASS"
+   ]
   }
  },
  "mismatches": [],
