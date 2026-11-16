@@ -1443,6 +1443,76 @@ async fn commands_and_runs_follow_the_openapi_contract() -> R {
     Ok(())
 }
 
+/// A ResumeRun refused answers 409 ILLEGAL_TRANSITION whose `details` name the run's state and, in a stop state, what of
+/// its stop still holds (docs/adr/ADR-031.md decision 16; the client reads `details.state` and `details.stop`, never
+/// the message): INCOMPLETE with its iterations used up names `stop`, WAITING_EXTERNAL with a retry to come its
+/// earliest `next_retry_at`, BLOCKED its `reasons`; a run in no stop state only its `state`. The body is openapi's
+/// Error with the run's revision; no command is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_resume_names_the_runs_state_and_what_of_its_stop_still_holds() -> R {
+    let dir = tempfile::tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let to = To::Tcp(host.port);
+    let error = openapi_schema("/components/schemas/Error")?;
+    let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.stdin.read()); c.commit(); \
+                  c.close()";
+    let project = &host.project_id;
+    python(
+        &db(dir.path()),
+        script,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s-seed', '{project}', printf('%064d', 7), 1);
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, resume_state, blocked_reason,
+               blocked_reasons_json, created_at) VALUES
+               ('r-inc', '{project}', 's-seed', 'INCOMPLETE', 'AUTO', 2, 'RUNNING', NULL, '[]', '2026-11-06T00:00:00Z'),
+               ('r-wait', '{project}', 's-seed', 'WAITING_EXTERNAL', 'AUTO', 3, 'RUNNING', NULL, '[]',
+                '2026-11-06T00:00:00Z'),
+               ('r-blk', '{project}', 's-seed', 'BLOCKED', 'AUTO', 4, 'RUNNING', 'BLOCKED_AUTH', '[\"BLOCKED_AUTH\"]',
+                '2026-11-06T00:00:00Z'),
+               ('r-run', '{project}', 's-seed', 'RUNNING', 'AUTO', 5, NULL, NULL, '[]', '2026-11-06T00:00:00Z');
+             INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES
+               ('run', 'r-inc', 'iterations', 3, 3);
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, next_retry_at)
+               VALUES ('r-wait/t', 'r-wait', 's-seed', 'READY', 1, 'developer', 1, 1, '2099-01-01T00:00:00Z');"
+        ),
+    )?;
+    for (run, revision, details) in [
+        (
+            "r-inc",
+            2,
+            json!({"state": "INCOMPLETE", "stop": "max_iterations"}),
+        ),
+        (
+            "r-wait",
+            3,
+            json!({"state": "WAITING_EXTERNAL", "next_retry_at": "2099-01-01T00:00:00Z"}),
+        ),
+        (
+            "r-blk",
+            4,
+            json!({"state": "BLOCKED", "reasons": ["BLOCKED_AUTH"]}),
+        ),
+        ("r-run", 5, json!({"state": "RUNNING"})),
+    ] {
+        let body = json!({"schema_version": "1.0", "command_id": format!("c-{run}"),
+                          "idempotency_key": format!("k-{run}"), "expected_revision": revision,
+                          "kind": "ResumeRun", "run_id": run, "payload": {"reason": "later"}})
+        .to_string();
+        let reply = call(&to, "POST", "/v1/commands", &host.token, body.as_bytes()).await?;
+        assert_eq!(reply.status, 409, "{run}: {reply:?}");
+        let body = reply.json()?;
+        conforms(&error, &body)?;
+        assert_eq!(
+            (&body["code"], &body["current_revision"], &body["details"]),
+            (&json!("ILLEGAL_TRANSITION"), &json!(revision), &details),
+            "{run}: {body}"
+        );
+    }
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// Every route refuses a request without the token, on the port one whose Host is not the bound loopback address or
 /// whose Origin is elsewhere, and on the socket one with any Origin, with 403 FORBIDDEN; `/healthz` needs no token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
