@@ -1723,6 +1723,7 @@ impl hoh_app::host::Executor for Team {
                     ..Default::default()
                 },
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         Ok(hoh_app::host::Started {

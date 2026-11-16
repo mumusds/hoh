@@ -209,6 +209,7 @@ impl hoh_app::host::Executor for Scripted {
                 class: failure.unwrap_or(FailureClass::Transient { retry_after: None }),
                 observed: Default::default(),
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         Ok(hoh_app::host::Started {

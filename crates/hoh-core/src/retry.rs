@@ -55,6 +55,21 @@ impl FailureClass {
         })
     }
 
+    /// This failure with the instant its provider said the limit lifts (`reset`; M2T07R-256) as its Retry-After, counted
+    /// from `failed_at` (REQ-042 behaviour 1; the owner's decision of 2026-11-16: an exhausted quota waits for its reset,
+    /// bounded by the deadline and the retry budget): only for a transient failure without one, and only for a reset
+    /// still to come. A reset already past, or none, leaves it as it was (full jitter); so does every other class.
+    pub fn with_reset(self, reset: Option<SystemTime>, failed_at: SystemTime) -> FailureClass {
+        match (self, reset.and_then(|r| r.duration_since(failed_at).ok())) {
+            (FailureClass::Transient { retry_after: None }, Some(wait)) if !wait.is_zero() => {
+                FailureClass::Transient {
+                    retry_after: Some(wait),
+                }
+            }
+            _ => self,
+        }
+    }
+
     /// The class `to_json` wrote; `None` for anything else (an old record without a class).
     pub fn from_json(value: &serde_json::Value) -> Option<FailureClass> {
         match value.get("class")?.as_str()? {
@@ -392,5 +407,60 @@ mod tests {
         let mut seeded = SplitMix64::new(42);
         assert_eq!(seeded.next_u32(), 0xbdd7_3226);
         assert_eq!(seeded.next_u64(), 0x28ef_e333_b266_f103);
+    }
+
+    #[test]
+    fn a_providers_reset_is_a_transient_failures_retry_after() {
+        // REQ-042 behaviour 1 (M2T07R-256; owner decision 2026-11-16): the instant the provider said its limit lifts is
+        // waited exactly from the failure, however far (the deadline and the retry budget bound it), and the task is
+        // due at that instant, never before, whatever part of a second the failure came at.
+        let reset = at(9_000, 0);
+        for failed in [at(1_800, 0), at(1_800, 1), at(1_800, 999)] {
+            let class = transient().with_reset(Some(reset), failed);
+            assert_eq!(
+                class,
+                FailureClass::Transient {
+                    retry_after: reset.duration_since(failed).ok()
+                }
+            );
+            let AfterFailure::Retry {
+                next_retry_at,
+                bound,
+                ..
+            } = after_failure(class, 1, failed, u32::MAX)
+            else {
+                panic!("no wait");
+            };
+            assert_eq!((next_retry_at, bound), (reset, None));
+        }
+        // A reset already past, or none: the failure is as it was (full jitter).
+        for stale in [Some(at(1_800, 0)), Some(at(1_000, 0)), None] {
+            assert_eq!(transient().with_reset(stale, at(1_800, 0)), transient());
+        }
+        // A Retry-After the executor already gave, and every other class, are kept.
+        let given = FailureClass::Transient {
+            retry_after: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(given.with_reset(Some(reset), at(1_800, 0)), given);
+        for class in [
+            FailureClass::Auth,
+            FailureClass::Capability,
+            FailureClass::Model,
+            FailureClass::Unavailable,
+            FailureClass::Compat,
+            FailureClass::Decision,
+        ] {
+            assert_eq!(class.with_reset(Some(reset), at(1_800, 0)), class);
+        }
+        // Its retries still run out (REQ-042 behaviour 3).
+        assert_eq!(
+            after_failure(
+                transient().with_reset(Some(reset), at(1_800, 0)),
+                MAX_RETRIES + 1,
+                at(1_800, 0),
+                0
+            ),
+            AfterFailure::Exhausted
+        );
     }
 }

@@ -88,6 +88,10 @@ pub struct Outcome {
     /// attempt ends UNKNOWN_EFFECT, its task untouched and nothing run again, as a reconcile ends one (ADR-019 decision
     /// 5, M2T07R-200); its work effect is left STARTED, never recorded as a result.
     pub unknown_effect: bool,
+    /// When the limit the turn failed on lifts, as its agent's provider said it (`Facts.retry_at`; M2T07R-256): the
+    /// runner makes it the failure's Retry-After at the time it records the end, by its own clock. Test executors give
+    /// none.
+    pub retry_at: Option<std::time::SystemTime>,
 }
 
 /// The host's source of the retries' jitter draws (ADR-020 decision 2): one SplitMix64 for the reconcile and the
@@ -1317,6 +1321,12 @@ async fn attempt(
     // The class and the time it ended go with the outcome, so a host that crashes after OBSERVED retries it as it would
     // have, from the time it ended (ADR-020 decision 1, M2T19R-03).
     let ended = common.clock.now();
+    // A failure whose provider said when its limit lifts waits for that as its Retry-After, counted by this clock from
+    // the time it ended, so its task is due exactly then (REQ-042 behaviour 1, M2T07R-256).
+    let mut outcome = outcome;
+    if !outcome.success {
+        outcome.class = outcome.class.with_reset(outcome.retry_at, ended);
+    }
     let unknown = outcome.unknown_effect;
     let observed = observed_detail(&outcome, ended);
     // An unknown effect has no result to record: its work effect stays STARTED, so a crash from here on settles it
@@ -1440,6 +1450,7 @@ async fn attempt(
         unknown_effect: unknown,
     };
     ending.observed.events.extend(tree_checked);
+    ending.observed.events.extend(provider_reset(&id, &outcome));
     // A writer's success is its completion, still under its write lease and its processes proven gone above: frozen and
     // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
     if work.assignment.writer && ending.success && !unknown {
@@ -1897,6 +1908,18 @@ async fn settle(
 /// A work's OBSERVED detail from its outcome: its verdict and end, its class, a supervision turn's bridge lines, and
 /// its raw logs kept as objects and those that could not be (docs/adr/ADR-025.md decision 8; docs/adr/ADR-026.md
 /// decision 10): the store registers the logs with their producer in this OBSERVED's transaction.
+/// The event of a failed turn whose provider said when its limit lifts (M2T07R-256): that instant and the Retry-After
+/// it gave the failure (none when it was already past).
+fn provider_reset(attempt_id: &str, outcome: &Outcome) -> Option<(String, String, Value)> {
+    let reset = outcome.retry_at.filter(|_| !outcome.success)?;
+    Some((
+        "provider-reset".to_owned(),
+        "attempt.provider_reset".to_owned(),
+        json!({"attempt_id": attempt_id, "retry_at": hoh_core::time::rfc3339_utc(reset),
+               "retry_after_ms": outcome.class.to_json()["retry_after_ms"]}),
+    ))
+}
+
 fn observed_detail(outcome: &Outcome, ended: std::time::SystemTime) -> Value {
     let mut observed = json!({
         "success": outcome.success,
@@ -1926,6 +1949,9 @@ fn observed_detail(outcome: &Outcome, ended: std::time::SystemTime) -> Value {
         (observed.as_object_mut(), outcome.class.to_json())
     {
         observed.extend(class);
+    }
+    if let Some(reset) = outcome.retry_at.filter(|_| !outcome.success) {
+        observed["retry_at"] = json!(hoh_core::time::rfc3339_utc(reset));
     }
     observed
 }
@@ -1958,6 +1984,7 @@ mod observed_tests {
                 ..Default::default()
             },
             unknown_effect: false,
+            retry_at: None,
         };
         let detail = observed_detail(&outcome, std::time::UNIX_EPOCH);
         assert_eq!(detail["artifacts"], json!([row.json()]));

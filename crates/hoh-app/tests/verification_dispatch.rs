@@ -637,6 +637,7 @@ impl hoh_app::host::Executor for Team {
                     ..Default::default()
                 },
                 unknown_effect: false,
+                retry_at: None,
             });
         });
         // What the turn runs as, as the product's prepare takes it from the registry (docs/adr/ADR-030.md decision 2).
