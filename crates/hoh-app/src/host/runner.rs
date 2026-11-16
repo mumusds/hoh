@@ -1756,7 +1756,7 @@ async fn settle(
     cause: &'static str,
     last: Option<&str>,
 ) -> Result<Option<(Disposition, String)>, PersistError> {
-    common.shared.hooks.runner(RunnerPoint::Settling);
+    common.shared.hooks.runner_of(RunnerPoint::Settling, id);
     let (work, task) = match entry {
         Some(Entry { work, task }) => (Some(work), task),
         None => (None, None),
