@@ -591,7 +591,7 @@ where
     match end(None).await {
         Err(PersistError::WorkspaceRecordRequired(_)) => {
             let project = project.to_path_buf();
-            let record = tokio::task::spawn_blocking(move || workspace(&project))
+            let record = super::begun::spawn_blocking(move || workspace(&project))
                 .await
                 .map_err(|e| PersistError::Storage(format!("the workspace record ended: {e}")))?;
             end(Some(record)).await

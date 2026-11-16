@@ -97,3 +97,67 @@ async fn a_turn_that_ends_after_its_host_stopped_has_nothing_written_for_it() ->
     );
     Ok(())
 }
+
+/// Holds every writer attempt's completion step (on its blocking thread, before its freeze) until released.
+#[derive(Debug, Default)]
+struct HoldCompletion {
+    held: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+}
+
+impl hoh_app::host::HostHooks for HoldCompletion {
+    fn completing(&self, _attempt_id: &str) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.held.store(true, SeqCst);
+        // Never longer than a minute, whatever the test does.
+        let end = Instant::now() + Duration::from_secs(60);
+        while !self.release.load(SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_an_attempt_began_on_a_blocking_thread_ends_before_its_host_stop_returns() -> R {
+    // The product's world: a run whose Developer completes at once; its completion (the freeze of its candidate, on a
+    // blocking thread) is held while the host stops. The stop aborts the attempt's task; the step it began still runs.
+    // The stop returns only once it has ended, and nothing is written into the project after it returned.
+    use std::sync::atomic::Ordering::SeqCst;
+    let world = World::new()?;
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    let hold = std::sync::Arc::new(HoldCompletion::default());
+    let mut config = world.host_config()?;
+    config.hooks = hold.clone();
+    let host = hoh_app::host::Host::start(config).await?;
+    let started = async {
+        world.seed_spec()?;
+        world::start_run(&host, "s", "完成fixture目标").await?;
+        let end = Instant::now() + Duration::from_secs(60);
+        while !hold.held.load(SeqCst) {
+            if Instant::now() > end {
+                return Err("no completion was held".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        R::Ok(())
+    }
+    .await;
+    let stopping = tokio::spawn(host.shutdown());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let returned_early = stopping.is_finished();
+    hold.release.store(true, SeqCst);
+    stopping.await?;
+    started?;
+    let hoh = world.project().join(".hoh");
+    let at_return = paths(&hoh);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let later = paths(&hoh);
+    let new: Vec<&PathBuf> = later.iter().filter(|p| !at_return.contains(p)).collect();
+    assert!(
+        !returned_early && new.is_empty(),
+        "the stop returned while the step ran: {returned_early}; written into {} after it returned: {new:?}",
+        hoh.display()
+    );
+    Ok(())
+}

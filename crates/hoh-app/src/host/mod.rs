@@ -10,6 +10,7 @@
 //! WAL self-test refuses.
 
 pub mod agents;
+pub(crate) mod begun;
 mod cgroup;
 mod completion;
 pub mod requests;
@@ -209,6 +210,10 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// Between reading the team's revision and submitting the configuration file's revision over it (a test's
     /// implementation moves the team on here, M2T07R-454).
     fn before_file_revision(&self) {}
+
+    /// In a writer attempt's completion on its blocking thread, before its outcome (its freeze) is decided (a test's
+    /// implementation holds the step here while the host stops).
+    fn completing(&self, _attempt_id: &str) {}
 
     /// Where the runner lists processes for the termination proof of an attempt whose agent ended, instead of `/proc`
     /// (a test's tree makes the proof fail, M2T06R-251).
