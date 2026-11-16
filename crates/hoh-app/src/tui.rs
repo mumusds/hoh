@@ -114,14 +114,18 @@ impl Conn {
                         match stream.next() {
                             Ok(Some(event)) => {
                                 last = event["seq"].as_i64().unwrap_or(last).max(last);
-                                if send.send(event).is_err() {
+                                if send.send(Got::Event(event)).is_err() {
                                     return;
                                 }
                             }
                             Ok(None) => {}
                             // An event that cannot be read is never skipped (docs/adr/ADR-031.md decision 10), and
-                            // reading it again gives the same: the following stops, no new event is shown.
-                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return,
+                            // reading it again gives the same: the following stops, no new event is shown, and the
+                            // shell says which event it was (its SSE id).
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                                let _ = send.send(Got::Unreadable(e.to_string()));
+                                return;
+                            }
                             Err(_) => break,
                         }
                     }
@@ -138,6 +142,14 @@ impl Conn {
     }
 }
 
+/// What a link's reader thread hands the shell.
+enum Got {
+    /// An event of the run.
+    Event(Value),
+    /// An event whose data could not be read, as the error names it (its SSE id): the reader follows no further.
+    Unreadable(String),
+}
+
 /// A run the shell is attached to (docs/adr/ADR-021.md decision 10): its host, its id, and its events as a reader
 /// thread receives them over the host's socket. The host is the one found last: a host started again (another token)
 /// is found again by the reader and by the commands, which go on after the last event and with the same key
@@ -146,7 +158,7 @@ pub struct Link {
     host: Arc<std::sync::Mutex<HostInfo>>,
     project: PathBuf,
     run_id: String,
-    events: std::sync::mpsc::Receiver<Value>,
+    events: std::sync::mpsc::Receiver<Got>,
     /// Ends the reader thread (it looks between reads, at least every 200 ms).
     stop: Arc<AtomicBool>,
 }
@@ -468,10 +480,19 @@ fn outcome(
     }
 }
 
-/// The attached run's events received so far, shown and counted; a run event also refreshes its label.
+/// The attached run's events received so far, shown and counted; a run event also refreshes its label. An event that
+/// could not be read is said with its SSE id, and that no event after it is followed (docs/adr/ADR-031.md decision 10).
 fn take_events(app: &mut App, link: &Link) -> bool {
     let mut any = false;
-    while let Ok(event) = link.events.try_recv() {
+    while let Ok(got) = link.events.try_recv() {
+        any = true;
+        let event = match got {
+            Got::Event(event) => event,
+            Got::Unreadable(why) => {
+                app.say(format!("{why}；之后的事件不再跟随（脱离后重新附着可再试）"));
+                continue;
+            }
+        };
         if app.event(&event)
             && let Ok(reply) =
                 link.get(&format!("/v1/runs/{}", crate::client::encode(&link.run_id)))
@@ -482,7 +503,6 @@ fn take_events(app: &mut App, link: &Link) -> bool {
                 app.relabel(label);
             }
         }
-        any = true;
     }
     any
 }
