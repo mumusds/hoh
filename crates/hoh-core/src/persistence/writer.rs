@@ -1539,6 +1539,19 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
             cas.id
         )));
     }
+    // A stopped run is moved by its command only (docs/adr/ADR-031.md's record, review round 2, M2T13R-100): judged here,
+    // on the run as it is before this compare-and-set, whatever the change (a Touch or a move). Only an accepted command
+    // may move it (and it ends with its run.result, `finish`), so within any transaction the stop can change only
+    // through a command's move, and the insert function's judgment holds in every order.
+    if entity == Entity::Run
+        && let Some(state) = super::hold::stopped(tx, &cas.id)?
+        && !super::hold::commanded(tx, &cas.id)?
+    {
+        return Err(PersistError::RunStopped {
+            run: cas.id.clone(),
+            state,
+        });
+    }
     let (table, key) = entity.table();
     let stale = |actual| PersistError::StaleRevision {
         entity,

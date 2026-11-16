@@ -852,9 +852,42 @@ async fn a_suspended_run_resumes_only_to_its_saved_state() -> R {
     assert_eq!(run_row(&path)?, ("DISCOVERING".to_owned(), 5, None));
     step(5, RunState::Incomplete).await?;
     assert_eq!(run_row(&path)?.2.as_deref(), Some("DISCOVERING"));
-    // A run that reaches a terminal state keeps no resume_state.
-    step(6, RunState::Failed).await?;
-    assert_eq!(run_row(&path)?, ("FAILED".to_owned(), 7, None));
+    // Stopped INCOMPLETE (its run.result published), the run is moved by its command only (docs/adr/ADR-031.md's record,
+    // review round 2, M2T13R-100): a writer's move to FAILED is Held, the run as it was.
+    assert!(matches!(
+        step(6, RunState::Failed).await,
+        Err(PersistError::Held { .. })
+    ));
+    assert_eq!(
+        run_row(&path)?,
+        ("INCOMPLETE".to_owned(), 6, Some("DISCOVERING".to_owned()))
+    );
+    // A run that reaches a terminal state keeps no resume_state: r2, its resume_state kept through WAITING_EXTERNAL.
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES ('r2', 'p1', 'CREATED', 'AUTO', '2026-11-04T00:00:00Z');",
+    )?;
+    let r2 = |expected, to| {
+        store.commit(Commit {
+            cas: vec![StateCas {
+                id: "r2".to_owned(),
+                expected_revision: expected,
+                change: Change::Run(to),
+            }],
+            ..Commit::default()
+        })
+    };
+    let row = |run: &str| -> Result<(String, i64, Option<String>), Box<dyn std::error::Error>> {
+        Ok(Connection::open(&path)?.query_row(
+            "SELECT state, revision, resume_state FROM runs WHERE run_id = ?1",
+            [run],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    };
+    r2(0, RunState::Discovering).await?;
+    r2(1, RunState::WaitingExternal).await?;
+    assert_eq!(row("r2")?.2.as_deref(), Some("DISCOVERING"));
+    r2(2, RunState::Failed).await?;
+    assert_eq!(row("r2")?, ("FAILED".to_owned(), 3, None));
     Ok(())
 }
 

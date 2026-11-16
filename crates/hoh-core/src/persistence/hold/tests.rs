@@ -359,8 +359,34 @@ async fn a_command_of_a_stopped_incomplete_run_is_written_and_none_is_accepted_f
 async fn the_commit_that_stops_and_a_direct_move_from_a_stay_state_are_not_held() -> R {
     // (1): the commit entering G writes its own events (its compare-and-set comes first, and the run's latest event is
     // not yet its result); a stay state with its result published moves straight to FAILED with an event, its
-    // result then FAILED's; after it the run is stopped and its progress Held.
-    for state in [RunState::Blocked, RunState::Paused, RunState::Incomplete] {
+    // result then FAILED's; after it the run is stopped and its progress Held. A stopped INCOMPLETE run is in G: a
+    // writer that is not its command does not move it (M2T13R-100, ADR-031's record, review round 2).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = stopped_world(&dir, RunState::Incomplete).await?;
+    let before = events(&path)?;
+    let refused = store
+        .commit(Commit {
+            cas: vec![StateCas {
+                id: "R".to_owned(),
+                expected_revision: revision(&path)?,
+                change: Change::Run(RunState::Failed),
+            }],
+            events: vec![event(
+                "to-failed",
+                Some("R"),
+                "test.moved",
+                Intent::Progress,
+            )],
+            ..Commit::default()
+        })
+        .await;
+    assert!(
+        matches!(refused, Err(PersistError::Held { .. })),
+        "INCOMPLETE: {refused:?}"
+    );
+    assert_eq!(events(&path)?, before);
+    assert_eq!(stopped(&path)?, Some(RunState::Incomplete));
+    for state in [RunState::Blocked, RunState::Paused] {
         let dir = tempfile::tempdir()?;
         let (store, path) = stopped_world(&dir, state).await?;
         enter(&store, &path, RunState::Failed, "to-failed").await?;
@@ -860,7 +886,14 @@ async fn a_runs_stop_read_by_its_current_results_id_is_the_adrs_on_every_path() 
             })
             .await;
         same(&path, &format!("{state:?} progress"))?;
-        touch(&store, &path).await??;
+        // A Touch with no event; then, in one transaction, a Touch and Progress (M2T13R-100: a stopped run is moved
+        // by its command only, so both are Held for G; a stay state's are written).
+        let touched = touch(&store, &path).await?;
+        assert_eq!(
+            touched.is_err(),
+            G.contains(&state),
+            "{state:?} touched: {touched:?}"
+        );
         same(&path, &format!("{state:?} touched"))?;
         let _held = store
             .commit(Commit {
@@ -869,6 +902,26 @@ async fn a_runs_stop_read_by_its_current_results_id_is_the_adrs_on_every_path() 
             })
             .await;
         same(&path, &format!("{state:?} progress after the touch"))?;
+        let together = store
+            .commit(Commit {
+                cas: vec![StateCas {
+                    id: "R".to_owned(),
+                    expected_revision: revision(&path)?,
+                    change: Change::Touch(writer::Entity::Run),
+                }],
+                events: vec![event("prog3", Some("R"), "test.progress", Intent::Progress)],
+                ..Commit::default()
+            })
+            .await;
+        assert_eq!(
+            together.is_err(),
+            G.contains(&state),
+            "{state:?} a touch and progress in one transaction: {together:?}"
+        );
+        same(
+            &path,
+            &format!("{state:?} a touch and progress in one transaction"),
+        )?;
     }
     // INCOMPLETE: a command that keeps R in G moves it and ends with its result; one that does not is refused.
     let dir = tempfile::tempdir()?;
@@ -1443,5 +1496,156 @@ fn a_runs_verifiers_held_by_a_recovery_are_read_without_the_history() -> R {
         ));
     }
     assert!(steps[1].1 <= steps[0].1 + 50, "{steps:?}");
+    Ok(())
+}
+
+// M2T13R-100: the stop is judged on the transaction's pre-image, at the gate where the revision can move.
+
+/// The spec and one requirement of R (`s1`, `REQ-1`), for a plan.
+const SPEC: &str = "
+INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's1', 'r', 1);
+UPDATE runs SET spec_id = 's1' WHERE run_id = 'R';
+";
+
+/// R, its tasks and its events, as they are.
+fn r_as_it_is(path: &Path) -> R<(Value, Vec<Row>)> {
+    Ok((
+        Connection::open(path)?
+            .query_row(
+                "SELECT json_object('state', state, 'revision', revision, 'tasks', \
+             (SELECT count(*) FROM tasks WHERE run_id = 'R')) FROM runs WHERE run_id = 'R'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|text| serde_json::from_str(&text).unwrap_or(Value::Null))?,
+        events(path)?,
+    ))
+}
+
+#[tokio::test]
+async fn a_stopped_run_is_moved_by_its_command_only_in_any_order_within_a_transaction() -> R {
+    // M2T13R-100 (the design correction of ADR-031's record, review round 2): in one transaction, a writer that is not
+    // the run's command moves a stopped run's revision first (a Touch) or its state (INCOMPLETE -> FAILED), then writes
+    // Progress or a Record of it: the move itself is refused (RunStopped, Held at the actor) and nothing of the
+    // transaction is written; so is a plan imported on it (its Touch and plan.imported). The run, its tasks and its
+    // events stay as they were.
+    for state in G {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = stopped_world(&dir, state).await?;
+        Connection::open(&path)?.execute_batch(SPEC)?;
+        let before = r_as_it_is(&path)?;
+        let touch = || -> R<StateCas> {
+            Ok(StateCas {
+                id: "R".to_owned(),
+                expected_revision: revision(&path)?,
+                change: Change::Touch(writer::Entity::Run),
+            })
+        };
+        let mut tries: Vec<(&str, Commit)> = vec![
+            (
+                "touch + progress",
+                Commit {
+                    cas: vec![touch()?],
+                    events: vec![event("p", Some("R"), "test.progress", Intent::Progress)],
+                    ..Commit::default()
+                },
+            ),
+            (
+                "touch + record",
+                Commit {
+                    cas: vec![touch()?],
+                    events: vec![event("r", Some("R"), "runner.diagnostic", Intent::Record)],
+                    ..Commit::default()
+                },
+            ),
+            (
+                "touch alone",
+                Commit {
+                    cas: vec![touch()?],
+                    ..Commit::default()
+                },
+            ),
+        ];
+        if state == RunState::Incomplete {
+            tries.push((
+                "a move to FAILED + progress",
+                Commit {
+                    cas: vec![StateCas {
+                        id: "R".to_owned(),
+                        expected_revision: revision(&path)?,
+                        change: Change::Run(RunState::Failed),
+                    }],
+                    events: vec![event("f", Some("R"), "test.progress", Intent::Progress)],
+                    ..Commit::default()
+                },
+            ));
+        }
+        for (what, commit) in tries {
+            let refused = store.commit(commit).await;
+            assert!(
+                matches!(refused, Err(PersistError::Held { .. })),
+                "{state:?} {what}: {refused:?}"
+            );
+            assert_eq!(r_as_it_is(&path)?, before, "{state:?} {what}");
+        }
+        let imported = store
+            .import_plan(
+                "R",
+                json!({"tasks": [{"task_id": "X", "title": "x", "role": "developer", "writer": false,
+                    "depends_on": [], "requirement_ids": ["REQ-1"]}]}),
+            )
+            .await;
+        assert!(
+            matches!(imported, Err(PersistError::Held { .. })),
+            "{state:?} import_plan: {imported:?}"
+        );
+        assert_eq!(r_as_it_is(&path)?, before, "{state:?} import_plan");
+        assert_eq!(stopped(&path)?, Some(state));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn raw_sql_that_moves_a_stopped_run_meets_the_backstop_trigger() -> R {
+    // M2T13R-100: on the writer connection, SQL that moves a stopped run's revision or state around the
+    // compare-and-set is refused by the TEMP trigger (judged on the run before the update), so it cannot open the
+    // window in which the run reads as not stopped: the progress after it is refused too. Another column of the run
+    // moves; a command's run moves.
+    for state in G {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = stopped_world(&dir, state).await?;
+        drop(store);
+        let conn = Connection::open(&path)?;
+        super::install(&conn)?;
+        for sql in [
+            "UPDATE runs SET revision = revision + 1 WHERE run_id = 'R'",
+            "UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R'",
+        ] {
+            let refused = conn.execute(sql, []);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains(super::RUN_STOPPED)),
+                "{state:?} {sql}: {refused:?}"
+            );
+        }
+        let progress = conn.execute(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+             VALUES ('p1', 'raw', 'R', 'test.progress', '{}', '2026-11-15T00:00:00Z')",
+            [],
+        );
+        assert!(progress.is_err(), "{state:?}: {progress:?}");
+        assert_eq!(stopped(&path)?, Some(state));
+        conn.execute(
+            "UPDATE runs SET config_snapshot_json = '{}' WHERE run_id = 'R'",
+            [],
+        )?;
+        conn.execute("INSERT INTO temp.command_run(run_id) VALUES ('R')", [])?;
+        conn.execute(
+            "UPDATE runs SET revision = revision + 1 WHERE run_id = 'R'",
+            [],
+        )?;
+    }
     Ok(())
 }
