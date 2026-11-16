@@ -15,6 +15,9 @@ array lengths and the JSON type of every value stay the source's. Replaced value
 - a string in which the model listed its tools (it names the user's connectors: `mcp__`) becomes a marker;
 - in the pi observer's report, the names of the user's extensions' tools become <extension-tool-N>.
 
+For codex and pi it also excerpts the request log (stdin.txt, every JSON line), with which the adapters correlate the
+responses (ADR-032 design correction 7).
+
 The first line of an excerpt is a header: the source file and its sha256, and for every following line its line
 index in the source and the sha256 of its key skeleton (excerpt_check.py checks both). Every excerpt is scanned for
 e-mail addresses, keys and tokens before anything is written; a hit writes nothing (exit 1).
@@ -181,6 +184,11 @@ def excerpt_case(case_dir: Path, agent: str, run: Path) -> dict[str, str]:
     base = f'.hoh-dev/evidence/commander-readonly/spike/{run.name}/{agent}/{case_dir.name}'
     out = {'stdout.excerpt.jsonl': excerpt_file(case_dir / 'stdout.jsonl', f'{base}/stdout.jsonl', KEEP[agent], subst,
                                                 'the lines the ADR-032 evidence table reads')}
+    if (agent == 'pi' or (agent == 'codex' and not case_dir.name.startswith('exec'))) and (case_dir / 'stdin.txt').is_file():
+        # The request log: the adapters correlate the responses with the requests it holds (app_server.rs pending,
+        # pi.rs pending); ADR-032 design correction 7.
+        out['stdin.excerpt.jsonl'] = excerpt_file(case_dir / 'stdin.txt', f'{base}/stdin.txt', lambda f: True, subst,
+                                                  'every request and notification the recorder sent')
     if (case_dir / 'rollout.jsonl').is_file():
         out['rollout.excerpt.jsonl'] = excerpt_file(
             case_dir / 'rollout.jsonl', f'{base}/rollout.jsonl', keep_rollout, subst,
