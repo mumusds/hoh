@@ -2530,3 +2530,168 @@ async fn a_verifier_attempt_whose_run_directory_changed_is_recorded_invalid_by_i
     }
     Ok(())
 }
+
+/// Fails the next commit once `fail` is armed; the first time the writer takes an Evidence request, before its
+/// transaction begins, commits `stop` (SQL by another connection: a run's stop that lands between a recovery's read of
+/// its files and its write; docs/adr/ADR-031.md test plan, 停住之后的写入口 (6)).
+#[derive(Debug, Default)]
+struct StopBeforeEvidence {
+    fail: AtomicBool,
+    stop: std::sync::Mutex<Option<(PathBuf, String)>>,
+    failed: std::sync::Mutex<Vec<String>>,
+}
+
+impl FaultHooks for StopBeforeEvidence {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(PersistError::Storage("injected commit failure".to_owned()));
+        }
+        Ok(())
+    }
+
+    fn before_job(&self, job: &'static str) {
+        if job != "Evidence" {
+            return;
+        }
+        let Some((db, sql)) = self.stop.lock().ok().and_then(|mut s| s.take()) else {
+            return;
+        };
+        let out = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1])\nc.executescript(sys.argv[2])\nc.commit()",
+            ])
+            .arg(db)
+            .arg(sql)
+            .output();
+        let error = match out {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => String::from_utf8_lossy(&out.stderr).into_owned(),
+            Err(e) => e.to_string(),
+        };
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.push(error);
+        }
+    }
+}
+
+/// Run R's published INCOMPLETE, as another writer's commit leaves it.
+const STOP_INCOMPLETE: &str = "UPDATE runs SET state = 'INCOMPLETE', revision = revision + 1 WHERE run_id = 'R';
+    INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+      ('p1', 'R/result/stop', 'R', 'run.result', json_object('run_id', 'R', 'state', 'INCOMPLETE'), '2026-11-15T00:00:00Z');";
+
+/// A fixture whose qa check of candidate C (run R, a qa script `qa`) left its record pending (its commit failed).
+async fn pending_with(qa: &str) -> R<(Fixture, Arc<StopBeforeEvidence>, String)> {
+    let hook = Arc::new(StopBeforeEvidence::default());
+    let f = Fixture::with_files(PLAN, qa, hook.clone(), &[]).await?;
+    let c = f.frozen().await?;
+    hook.fail.store(true, Ordering::SeqCst);
+    assert!(f.run(&c, "qa", QA).await.is_err());
+    assert_eq!(pending_files(&f)?, 1);
+    Ok((f, hook, c))
+}
+
+fn pending_files(f: &Fixture) -> R<usize> {
+    Ok(std::fs::read_dir(f.state().join("pending"))?
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "json"))
+        })
+        .count())
+}
+
+#[tokio::test]
+async fn a_live_recovery_whose_run_stops_before_its_write_is_held_and_done_once_the_run_works_again()
+-> R {
+    // docs/adr/ADR-031.md correction D (-601, the test plan's 停住之后的写入口 (6), interleaving one): candidate C is a
+    // live obligation (VERIFYING, its round open); its recovery has read its pending files when the run's INCOMPLETE is
+    // published, before its evidence::record: the intent stays Progress (the stop does not make it history), the write
+    // is Held — no evidence, no event of it anywhere, the record still pending. Once the run works again (a direct state
+    // change: ResumeRun from INCOMPLETE is slice S1d) the recovery records it, as the run's.
+    let (f, hook, c) = pending_with(QA_PASSES).await?;
+    f.seed(&format!(
+        "UPDATE candidates SET state = 'VERIFYING' WHERE candidate_id = '{c}';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'rd/opened', 'R', 'verification.round_opened', json_object('round_id', 'rd', 'candidate_id', '{c}'),
+            '2026-11-15T00:00:00Z');"
+    ))?;
+    if let Ok(mut stop) = hook.stop.lock() {
+        *stop = Some((f.state().join("state.db"), STOP_INCOMPLETE.to_owned()));
+    }
+    let held = hoh_app::verify::check::reconcile(&f.store.evidence_handle(), &f.state(), &c).await;
+    assert!(
+        matches!(held, Err(CheckError::Store(PersistError::Held { .. }))),
+        "{held:?}"
+    );
+    assert_eq!(
+        hook.failed.lock().map(|e| e.clone()).unwrap_or_default(),
+        Vec::<String>::new()
+    );
+    assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["0"]);
+    assert_eq!(
+        f.query(
+            "SELECT count(*) FROM events WHERE kind IN ('evidence.recorded', 'integrity_violation')"
+        )?,
+        ["0"]
+    );
+    assert_eq!(pending_files(&f)?, 1);
+    f.seed("UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R';")?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(
+        f.query("SELECT coalesce(run_id, 'null') FROM events WHERE kind = 'evidence.recorded'")?,
+        ["R"]
+    );
+    assert_eq!(pending_files(&f)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_history_recovery_whose_run_stops_before_its_write_is_written_as_records_and_settled() -> R
+{
+    // docs/adr/ADR-031.md correction D (-401, -502; the test plan's 停住之后的写入口 (6) interleaving two and (7) with a
+    // real pending record): C's qa check rewrote src/lib.rs (SOURCE_CHANGED) and its record stayed pending; C2 frozen
+    // from that change supersedes C, so C's recovery is history. The run still works when the recovery reads C's files,
+    // and stops (INCOMPLETE published) before the write: the intent is Record, so the evidence row is written and its
+    // evidence.recorded and integrity_violation (source changed: src/lib.rs) are project-scoped (run_id null, R in the payload),
+    // the run's latest event is still its run.result, and the record is settled. The start's bookkeeping after it is a
+    // Record too, and C is no longer unrecovered.
+    let (f, hook, c) = pending_with(&format!(
+        "printf 'pub fn a() {{ 1; }}\\n' > src/lib.rs\n{QA_PASSES}"
+    ))
+    .await?;
+    git(&f.root(), &["commit", "-qam", "the change the check made"])?;
+    let c2 = new_id(f.freeze("R").await?)?;
+    assert_ne!(c, c2);
+    if let Ok(mut stop) = hook.stop.lock() {
+        *stop = Some((f.state().join("state.db"), STOP_INCOMPLETE.to_owned()));
+    }
+    let reader = f.store.reader()?;
+    assert!(reader.start_recovery_wanted(&c)?);
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(
+        hook.failed.lock().map(|e| e.clone()).unwrap_or_default(),
+        Vec::<String>::new()
+    );
+    f.store
+        .record_start_recovery(&c, Ok(1), std::time::SystemTime::now())
+        .await?;
+    assert_eq!(
+        f.query(
+            "SELECT kind || ' ' || coalesce(run_id, 'null') || ' ' || coalesce(json_extract(payload_json, '$.run_id'), '-') \
+             FROM events WHERE kind IN ('evidence.recorded', 'integrity_violation') ORDER BY seq"
+        )?,
+        ["evidence.recorded null R", "integrity_violation null R"]
+    );
+    assert!(
+        f.query("SELECT json_extract(payload_json, '$.reasons') FROM events WHERE kind = 'integrity_violation'")?[0]
+            .contains("source changed: src/lib.rs")
+    );
+    assert_eq!(f.query("SELECT count(*) FROM evidence")?, ["1"]);
+    assert_eq!(
+        f.query("SELECT kind FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1")?,
+        ["run.result"]
+    );
+    assert_eq!(pending_files(&f)?, 0);
+    assert!(!f.store.reader()?.unrecovered_candidates()?.contains(&c));
+    Ok(())
+}

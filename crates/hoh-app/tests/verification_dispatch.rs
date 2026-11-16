@@ -4320,3 +4320,307 @@ async fn a_developer_fallback_whose_help_turns_bash_off_is_not_selected() -> R {
     team.end_agents();
     outcome
 }
+
+/// The runner's ticks (counted after each tick's staffing) and every Held answer of the store's writer with the tick
+/// it fell in (docs/adr/ADR-031.md correction D's property).
+#[derive(Debug, Default)]
+struct HeldTicks {
+    tick: Arc<std::sync::atomic::AtomicU64>,
+    held: std::sync::Mutex<Vec<(u64, &'static str, String)>>,
+}
+
+impl hoh_core::persistence::FaultHooks for HeldTicks {
+    fn held(&self, job: &'static str, run: &str) {
+        let tick = self.tick.load(Ordering::SeqCst);
+        if let Ok(mut held) = self.held.lock() {
+            held.push((tick, job, run.to_owned()));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CountTicks(Arc<std::sync::atomic::AtomicU64>);
+
+impl hoh_app::host::HostHooks for CountTicks {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::AfterStaffing {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// [`host`] with its store's and its runner's hooks `held`.
+async fn host_held(
+    project: &Path,
+    team: Arc<Team>,
+    clock: Arc<FakeClock>,
+    held: &Arc<HeldTicks>,
+) -> R<Host> {
+    let mut config = config(project);
+    config.clock = hoh_app::host::HostClock(clock);
+    config.store.faults = held.clone();
+    config.hooks = Arc::new(CountTicks(held.tick.clone()));
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: team,
+        context: Context {
+            required_capabilities: ["commander", "developer", "qa", "reviewer", "researcher"]
+                .map(|r| (r.to_owned(), Default::default()))
+                .into(),
+            commander_dir: project.parent().map(|d| d.join("state/hoh/commander")),
+            ..Context::default()
+        },
+    });
+    Ok(Host::start(config).await?)
+}
+
+/// Wait until the runner has ticked `n` more times, moving `clock` on.
+fn ticked(held: &HeldTicks, clock: &FakeClock, n: u64) -> R {
+    let until = held.tick.load(Ordering::SeqCst) + n;
+    let end = Instant::now() + Duration::from_secs(30);
+    while held.tick.load(Ordering::SeqCst) < until {
+        if Instant::now() > end {
+            return Err(format!("the runner did not tick {n} times").into());
+        }
+        clock.advance(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_the_verification_world_a_cancelled_run_is_held_only_in_the_tick_of_its_stop() -> R {
+    // docs/adr/ADR-031.md test plan, 停住之后的写入口 (2), over this file's world (C1's verifiers running when the run is
+    // cancelled, the world of the cancel close-out): every Held of the run falls in one tick; after five more ticks and
+    // a restart with five more, none, and nothing of the run after its run.result.
+    let dir = tempfile::tempdir()?;
+    let (project, spec) = project(dir.path()).await?;
+    seed(&project, &world(&spec))?;
+    let clock = Arc::new(FakeClock::default());
+    let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+    let held = Arc::new(HeldTicks::default());
+    let host = host_held(&project, team.clone(), clock.clone(), &held).await?;
+    let outcome = async {
+        let step = Duration::from_millis(100);
+        wait_for(
+            &project,
+            &clock,
+            step,
+            "SELECT count(*) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'RUNNING'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
+        let status = command(
+            &host,
+            &json!({"schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+                "expected_revision": revision, "kind": "CancelRun", "run_id": "R", "payload": {"reason": "cancel"}}),
+        )
+        .await?;
+        assert_eq!(status, 202);
+        wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| {
+            r[0]["state"] == "CANCELLED"
+        })?;
+        ticked(&held, &clock, 5)
+    }
+    .await;
+    host.shutdown().await;
+    team.end_agents();
+    outcome?;
+    let first = held.held.lock().map(|h| h.clone()).unwrap_or_default();
+    let ticks: std::collections::BTreeSet<u64> = first.iter().map(|(t, ..)| *t).collect();
+    assert!(ticks.len() <= 1, "{first:?}");
+    let last = rows(
+        &project,
+        "SELECT kind, seq FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1",
+    )?;
+    assert_eq!(last[0]["kind"], "run.result");
+    let restarted = Arc::new(HeldTicks::default());
+    let host = host_held(&project, team.clone(), clock.clone(), &restarted).await?;
+    let outcome = ticked(&restarted, &clock, 5);
+    host.shutdown().await;
+    team.end_agents();
+    outcome?;
+    assert_eq!(restarted.held.lock().map(|h| h.len()).unwrap_or(1), 0);
+    assert_eq!(
+        rows(
+            &project,
+            "SELECT kind, seq FROM events WHERE run_id = 'R' ORDER BY seq DESC LIMIT 1"
+        )?,
+        last
+    );
+    Ok(())
+}
+
+/// Makes its directory readable again when dropped, however the test ends, so the test's directory can be removed.
+struct ReadableAgain(PathBuf);
+
+impl Drop for ReadableAgain {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// The world after a first host whose verifiers' starts were refused (C1's round open, its verifier attempts FAILED,
+/// none running), with a pending record of C1 its recovery cannot read (a transient fault: its check directory made
+/// unreadable): the candidate, the pending file and the check directory.
+async fn with_unreadable_pending(
+    dir: &Path,
+    team: &Arc<Team>,
+    clock: &Arc<FakeClock>,
+    project: &Path,
+) -> R<(String, PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = dir;
+    team.refuse_verifiers.store(true, Ordering::SeqCst);
+    let first = host(project, team.clone(), clock.clone()).await?;
+    let started = async {
+        wait_for(
+            project,
+            clock,
+            Duration::from_millis(100),
+            "SELECT count(DISTINCT t.task_id) AS n FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role IN ('qa', 'reviewer') AND a.state = 'FAILED'",
+            &|r| r[0]["n"] == json!(2),
+        )?;
+        R::Ok(candidate(project)?.0)
+    }
+    .await;
+    first.shutdown().await;
+    team.refuse_verifiers.store(false, Ordering::SeqCst);
+    let id = started?;
+    let record = "00000000-0000-4000-8000-000000000004";
+    let check_dir = project.join(format!(".hoh/evidence/{id}/unit"));
+    std::fs::create_dir_all(check_dir.join(record))?;
+    std::fs::create_dir_all(project.join(".hoh/pending"))?;
+    let pending = project.join(format!(".hoh/pending/{record}.json"));
+    std::fs::write(
+        &pending,
+        json!({"record": {"candidate_id": id}}).to_string(),
+    )?;
+    std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o000))?;
+    Ok((id, pending, check_dir))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_stopped_incomplete_leaves_its_pending_record_alone_and_a_paused_one_recovers_it() -> R
+{
+    // docs/adr/ADR-031.md correction D, A1 (-400; the test plan's 停住之后的写入口 (5)): the verifiers' attempts ended, C1's
+    // round open, its pending record in backoff after a transient failure. The deadline passes: pace stops the run
+    // INCOMPLETE with its run.result. Five ticks past the record's recovery_not_before and a restart with five more: no
+    // event of the run after its run.result, no project-scoped record of it, the pending file still there, the count of
+    // candidate.reconcile_failed unchanged. The same world PAUSED by PauseRun instead: the recovery goes on as today, its
+    // event the run's. (The INCOMPLETE world resumed is slice S1d's ResumeRun.)
+    use std::os::unix::fs::PermissionsExt as _;
+    for paused in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (project, spec) = project(dir.path()).await?;
+        seed(&project, &world(&spec))?;
+        let clock = Arc::new(FakeClock::default());
+        let team = Arc::new(Team::new(Commander::Answers, &spec, &project));
+        let (_, pending, check_dir) =
+            with_unreadable_pending(dir.path(), &team, &clock, &project).await?;
+        let _readable = ReadableAgain(check_dir.clone());
+        if !paused {
+            seed(
+                &project,
+                "UPDATE runs SET deadline_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+20 seconds') WHERE run_id = 'R';",
+            )?;
+        }
+        let held = Arc::new(HeldTicks::default());
+        let host = host_held(&project, team.clone(), clock.clone(), &held).await?;
+        let step = Duration::from_millis(500);
+        let failed = "SELECT count(*) AS n FROM events WHERE kind = 'candidate.reconcile_failed'";
+        let outcome = async {
+            wait_for(&project, &clock, Duration::from_millis(100), failed, &|r| r[0]["n"].as_i64().is_some_and(|n| n >= 1))?;
+            if paused {
+                let revision = rows(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?[0]["revision"].clone();
+                let status = command(
+                    &host,
+                    &json!({"schema_version": "1.0", "command_id": "c-pause", "idempotency_key": "pause",
+                        "expected_revision": revision, "kind": "PauseRun", "run_id": "R", "payload": {"reason": "p"}}),
+                )
+                .await?;
+                assert_eq!(status, 202);
+                wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| r[0]["state"] == "PAUSED")?;
+                let result = rows(&project, "SELECT max(seq) AS s FROM events WHERE run_id = 'R' AND kind = 'run.result'")?[0]["s"]
+                    .as_i64()
+                    .ok_or("no run.result")?;
+                // The fault goes and the record is put aside: the recovery, not held by PAUSED, succeeds, as the run's.
+                std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755))?;
+                std::fs::remove_file(&pending)?;
+                let recovered = wait_for(
+                    &project,
+                    &clock,
+                    step,
+                    "SELECT run_id, seq FROM events WHERE kind = 'candidate.reconcile_recovered'",
+                    &|r| r.as_array().is_some_and(|a| !a.is_empty()),
+                )?;
+                assert_eq!(recovered[0]["run_id"], "R");
+                assert!(recovered[0]["seq"].as_i64().is_some_and(|s| s > result), "{recovered}");
+                return R::Ok(());
+            }
+            wait_for(&project, &clock, step, "SELECT state FROM runs WHERE run_id = 'R'", &|r| r[0]["state"] == "INCOMPLETE")?;
+            R::Ok(())
+        }
+        .await;
+        if paused {
+            host.shutdown().await;
+            team.end_agents();
+            outcome?;
+            continue;
+        }
+        let snapshot = || -> R<(Value, Value, Value)> {
+            Ok((
+                rows(
+                    &project,
+                    "SELECT seq, kind FROM events WHERE run_id = 'R' ORDER BY seq",
+                )?,
+                rows(
+                    &project,
+                    "SELECT count(*) AS n FROM events WHERE run_id IS NULL AND json_extract(payload_json, '$.run_id') = 'R'",
+                )?,
+                rows(&project, failed)?,
+            ))
+        };
+        let outcome = async {
+            outcome?;
+            let at_stop = snapshot()?;
+            assert_eq!(
+                at_stop
+                    .0
+                    .as_array()
+                    .and_then(|a| a.last())
+                    .map(|e| e["kind"].clone()),
+                Some(json!("run.result"))
+            );
+            for _ in 0..5 {
+                clock.advance(Duration::from_secs(5));
+                ticked(&held, &clock, 1)?;
+            }
+            R::Ok(at_stop)
+        }
+        .await;
+        host.shutdown().await;
+        team.end_agents();
+        let at_stop = outcome?;
+        assert_eq!(snapshot()?, at_stop);
+        let restarted = Arc::new(HeldTicks::default());
+        let host = host_held(&project, team.clone(), clock.clone(), &restarted).await?;
+        let outcome = (|| {
+            for _ in 0..5 {
+                clock.advance(Duration::from_secs(5));
+                ticked(&restarted, &clock, 1)?;
+            }
+            R::Ok(())
+        })();
+        host.shutdown().await;
+        team.end_agents();
+        outcome?;
+        assert_eq!(snapshot()?, at_stop);
+        assert!(pending.exists(), "the pending record is still there");
+        assert_eq!(restarted.held.lock().map(|h| h.len()).unwrap_or(1), 0);
+        std::fs::set_permissions(&check_dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}

@@ -5286,3 +5286,166 @@ async fn a_cancel_with_more_unread_wake_events_than_its_commit_takes_in_waits_fo
     );
     Ok(())
 }
+
+/// A PENDING trigger of R, due at `due`, as a step that took in `R/<fp>` leaves it (its cursor past the event).
+async fn pending_trigger(
+    store: &Store,
+    clock: &TestClock,
+    path: &PathBuf,
+    fp: &str,
+    due: &str,
+) -> R {
+    event(
+        store,
+        "R",
+        &format!("R/{fp}"),
+        "need_decision",
+        json!({"task_id": "D", "fingerprint": fp}),
+    )
+    .await?;
+    let _ = clock;
+    exec(
+        path,
+        &format!(
+            "INSERT INTO supervisor_triggers(trigger_id, run_id, fingerprint, spec_id, severity, event_seqs_json, \
+             first_seq, last_seq, due_at, state, created_at) SELECT 'R/trigger/{fp}', 'R', '{fp}', 's3', 'normal', \
+             json_array(seq), seq, seq, '{due}', 'PENDING', '2027-01-15T08:00:30.000Z' FROM events WHERE event_id = 'R/{fp}';
+             INSERT INTO supervisor_cursor(run_id, last_handled_seq) SELECT 'R', seq FROM events WHERE event_id = 'R/{fp}'
+               ON CONFLICT(run_id) DO UPDATE SET last_handled_seq = excluded.last_handled_seq;"
+        ),
+    )
+}
+
+#[tokio::test]
+async fn an_incomplete_run_keeps_its_trigger_and_outputs_while_supervision_and_pace_tick() -> R {
+    // docs/adr/ADR-031.md test plan, the guard's (a): a run with a PENDING trigger (due) and outputs still to dispose of
+    // goes INCOMPLETE (published); three ticks of the supervisor (its step, its disposal and close) and the pace write
+    // nothing of it: the trigger stays PENDING, the outputs stay to dispose of.
+    use crate::protocol::RunState;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    exec(
+        &path,
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2027-01-15T08:00:00Z' WHERE attempt_id = 'A';",
+    )?;
+    let waiting = two_generations(&store, &clock, &path).await?;
+    pending_trigger(&store, &clock, &path, "fp3", "2000-01-01T00:00:00.000Z").await?;
+    move_run(&store, &path, &[RunState::Incomplete]).await?;
+    let after = value(&path, "SELECT max(seq) FROM events")?;
+    for tick in 0..3 {
+        let at = 40_000 + tick * 1000;
+        store.pace_run("R", context(&clock, at)).await?;
+        store.supervise("R", context(&clock, at)).await?;
+        store
+            .allocate_supervision("p1", context(&clock, at))
+            .await?;
+    }
+    assert_eq!(value(&path, "SELECT max(seq) FROM events")?, after);
+    assert_eq!(
+        value(
+            &path,
+            "SELECT state FROM supervisor_triggers WHERE trigger_id = 'R/trigger/fp3'"
+        )?,
+        json!("PENDING")
+    );
+    let conn = Connection::open(&path)?;
+    let still: Vec<String> = crate::persistence::outputs::waiting(&conn, "R")?
+        .into_iter()
+        .map(|w| w.output_id)
+        .collect();
+    assert_eq!(still, waiting);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pause_lets_the_attempt_in_flight_end_and_holds_the_supervision_until_paused() -> R {
+    // docs/adr/ADR-031.md test plan, the guard's (g) (M2T13D-102): Developer attempt A runs when the run goes
+    // PAUSE_REQUESTED; it then ends as usual (its effect, its end, its task's move are written), while the supervisor's
+    // ticks write nothing of supervision (no horizon, no disposal, no trigger fired); pause_step then writes run.paused
+    // and PAUSED's run.result.
+    use crate::protocol::RunState;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let waiting = two_generations(&store, &clock, &path).await?;
+    pending_trigger(&store, &clock, &path, "fp3", "2000-01-01T00:00:00.000Z").await?;
+    move_run(&store, &path, &[RunState::PauseRequested]).await?;
+    let paused_at = value(&path, "SELECT max(seq) FROM events")?;
+    assert_eq!(
+        store.pause_step("R", t(40_000)).await?,
+        crate::persistence::PauseStep::Running(1)
+    );
+    store
+        .runner_effect(
+            "A",
+            "A/work",
+            crate::reconcile::EffectState::Started,
+            crate::reconcile::EffectState::Committed,
+            json!({}),
+        )
+        .await?;
+    assert!(
+        store
+            .runner_finished(
+                "A",
+                crate::persistence::Ending {
+                    success: true,
+                    detail: "done".to_owned(),
+                    class: TRANSIENT,
+                    at: t(41_000),
+                    draw: 0,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                },
+            )
+            .await?
+    );
+    for tick in 0..3 {
+        store
+            .supervise("R", context(&clock, 42_000 + tick * 1000))
+            .await?;
+    }
+    assert_eq!(
+        store.pause_step("R", t(46_000)).await?,
+        crate::persistence::PauseStep::Paused
+    );
+    let kinds: Vec<String> = serde_json::from_value(value(
+        &path,
+        &format!(
+            "SELECT json_group_array(kind) FROM (SELECT kind FROM events WHERE run_id = 'R' AND seq > {paused_at} ORDER BY seq)"
+        ),
+    )?)?;
+    assert!(kinds.iter().any(|k| k == "attempt.moved"), "{kinds:?}");
+    assert!(kinds.iter().any(|k| k.starts_with("task.")), "{kinds:?}");
+    assert!(
+        !kinds.iter().any(|k| k.starts_with("supervisor.")),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["run.paused", "run.result"],
+        "{kinds:?}"
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT state FROM supervisor_triggers WHERE trigger_id = 'R/trigger/fp3'"
+        )?,
+        json!("PENDING")
+    );
+    let conn = Connection::open(&path)?;
+    assert_eq!(
+        crate::persistence::outputs::waiting(&conn, "R")?.len(),
+        waiting.len()
+    );
+    Ok(())
+}

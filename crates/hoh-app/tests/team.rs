@@ -1811,3 +1811,128 @@ async fn a_team_change_naming_a_run_is_the_projects_event_and_leaves_a_stopped_r
     host.shutdown().await;
     Ok(())
 }
+
+/// Every Held answer of the store's writer (docs/adr/ADR-031.md correction D, rule 2): (job, run).
+#[derive(Debug, Default)]
+struct HeldLog(std::sync::Mutex<Vec<(&'static str, String)>>);
+
+impl hoh_core::persistence::FaultHooks for HeldLog {
+    fn held(&self, job: &'static str, run: &str) {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push((job, run.to_owned()));
+        }
+    }
+}
+
+/// Wait at most 10 s until `sql` reads `want`.
+async fn until(project: &Path, sql: &str, want: &str) -> R {
+    let end = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = query(project, sql)?;
+        if got == want {
+            return Ok(());
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("{sql}: {got}, not {want}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_team_change_takes_effect_at_a_paused_runs_checkpoint_without_a_resume() -> R {
+    // docs/adr/ADR-031.md correction D's scope (-602; the test plan's 停住之后的写入口 (8)): PAUSED is not in G. The
+    // developer's attempt runs when PauseRun comes; once it ends, the pause settles PAUSED with its run.result. A
+    // ConfigureTeam then moves the developer to codex, and with no ResumeRun the next checkpoint applies it: the binding
+    // at the next epoch and revision with no session, team.binding_applied the run's own event after that run.result,
+    // the run's config_revision moved; the run stays PAUSED, no attempt is started, nothing is dispatched, no Held.
+    let dir = tempfile::tempdir()?;
+    let log = std::sync::Arc::new(HeldLog::default());
+    let mut config = config(dir.path());
+    config.store.faults = log.clone();
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(Idle),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = start_when_free(config).await?;
+    let run_id = started(&host, "s1").await?;
+    exec(
+        dir.path(),
+        &format!(
+            "UPDATE runs SET state = 'RUNNING', revision = 3 WHERE run_id = '{run_id}';
+             INSERT INTO specs(spec_id, project_id, sha256, revision)
+               SELECT 's1', project_id, printf('%064d', 1), 1 FROM runs WHERE run_id = '{run_id}';
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+               ('D', '{run_id}', 's1', 'RUNNING', 2, 'developer', 1, 1);
+             INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+               ('A', 'D', 'RUNNING', 1, 1, 0, '2026-11-15T00:00:00Z');"
+        ),
+    )?;
+    let pause = json!({"schema_version": "1.0", "command_id": "c-pause", "idempotency_key": "pause",
+        "expected_revision": 3, "kind": "PauseRun", "run_id": run_id, "payload": {"reason": "lunch"}});
+    let (status, body) = exchange(&host, "POST", "/v1/commands", Some(&pause)).await?;
+    assert_eq!(status, 202, "{body}");
+    let state = format!("SELECT state FROM runs WHERE run_id = '{run_id}'");
+    until(dir.path(), &state, "PAUSE_REQUESTED").await?;
+    exec(
+        dir.path(),
+        "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-15T00:00:09Z' WHERE attempt_id = 'A';",
+    )?;
+    until(dir.path(), &state, "PAUSED").await?;
+    let result = query(
+        dir.path(),
+        &format!("SELECT max(seq) FROM events WHERE run_id = '{run_id}' AND kind = 'run.result'"),
+    )?;
+    assert!(!result.is_empty(), "PAUSED's run.result");
+    let attempts = query(dir.path(), "SELECT count(*) FROM attempts")?;
+    let dispatch =
+        "SELECT count(*) FROM outbox WHERE json_extract(payload_json, '$.kind') = 'dispatch'";
+    let dispatches = query(dir.path(), dispatch)?;
+    let (status, body) = exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&configure(
+            "dev",
+            None,
+            0,
+            json!({"bindings": {"developer": {"agent": "codex"}}, "apply_at": "checkpoint"}),
+        )),
+    )
+    .await?;
+    assert_eq!(status, 202, "{body}");
+    let binding = format!(
+        "SELECT agent || '/' || role_epoch || '/' || config_revision || '/' || coalesce(session_id, 'none') \
+         FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer'"
+    );
+    until(dir.path(), &binding, "codex/2/1/none").await?;
+    let applied = query(
+        dir.path(),
+        &format!(
+            "SELECT seq FROM events WHERE run_id = '{run_id}' AND kind = 'team.binding_applied' \
+             AND json_extract(payload_json, '$.config_revision') = 1"
+        ),
+    )?;
+    assert!(
+        applied.parse::<i64>()? > result.parse::<i64>()?,
+        "{applied} after {result}"
+    );
+    until(
+        dir.path(),
+        &format!("SELECT config_revision FROM runs WHERE run_id = '{run_id}'"),
+        "1",
+    )
+    .await?;
+    assert_eq!(query(dir.path(), &state)?, "PAUSED");
+    assert_eq!(
+        query(dir.path(), "SELECT count(*) FROM attempts")?,
+        attempts
+    );
+    assert_eq!(query(dir.path(), dispatch)?, dispatches);
+    host.shutdown().await;
+    assert_eq!(
+        log.0.lock().map(|h| h.clone()).unwrap_or_default(),
+        Vec::new()
+    );
+    Ok(())
+}
