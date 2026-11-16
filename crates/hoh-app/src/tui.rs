@@ -143,6 +143,9 @@ pub fn attach(project: &Path, host: crate::client::HostInfo, run: &serde_json::V
                             }
                         }
                         Ok(None) => {}
+                        // An event that cannot be read is never skipped (docs/adr/ADR-031.md decision 10), and
+                        // reading it again gives the same: the following stops, no new event is shown.
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return,
                         Err(_) => break,
                     }
                 }

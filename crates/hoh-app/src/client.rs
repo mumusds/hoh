@@ -1,5 +1,6 @@
-//! The client side of `hoh -p --detach` and `hoh attach` (REQ-005, docs/adr/ADR-021.md decisions 1-6): find the
-//! project's host or start one in its own session and wait for it, then talk HTTP/1.1 to it over its Unix socket.
+//! The client side of `hoh -p` and `hoh attach` (REQ-005, docs/adr/ADR-021.md decisions 1-6, docs/adr/ADR-031.md
+//! decisions 9-12): find the project's host or start one in its own session and wait for it, then talk HTTP/1.1 to it
+//! over its Unix socket.
 
 use serde_json::{Value, json};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -23,20 +24,25 @@ pub struct HostInfo {
     pub token: String,
 }
 
-/// Why a client could not do what it was asked, with the exit code it ends with.
+/// Why a client could not do what it was asked, with the exit code it ends with: a refused command's code, message and
+/// `details` as the host gave them (openapi Error), the status it answered with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     pub code: String,
     pub message: String,
     pub exit: u8,
+    pub status: Option<u16>,
+    pub details: Value,
 }
 
 impl Failure {
-    fn new(code: &str, message: impl Into<String>, exit: u8) -> Failure {
+    pub fn new(code: &str, message: impl Into<String>, exit: u8) -> Failure {
         Failure {
             code: code.to_owned(),
             message: message.into(),
             exit,
+            status: None,
+            details: Value::Null,
         }
     }
 
@@ -786,6 +792,26 @@ pub fn new_id() -> String {
     )
 }
 
+/// The exit code a command the host refused ends a client with (docs/adr/ADR-031.md decision 9): by the response's
+/// status, its error code and its `details`, never by its message's text (M2T13D-54).
+pub fn refusal_exit(status: u16, code: &str, details: &Value) -> u8 {
+    use crate::exit::{ClientEvent, client_code};
+    match (status, code) {
+        (400, "INVALID_TEAM_CONFIG") => client_code(ClientEvent::Config),
+        (404 | 409, "RUN_NOT_FOUND") => client_code(ClientEvent::Usage),
+        // The run ended between the client's read and its command (decision 7's `details.state`).
+        (409, "ILLEGAL_TRANSITION")
+            if details["state"]
+                .as_str()
+                .is_some_and(|state| crate::follow::TERMINAL.contains(&state)) =>
+        {
+            client_code(ClientEvent::Usage)
+        }
+        (503, _) => client_code(ClientEvent::HostUnavailable),
+        _ => 1,
+    }
+}
+
 /// Submit a command (its body with a fresh id and key) and retry the very same bytes while the host is unreachable,
 /// answers a retryable 503 or no longer knows the token (a host started again), within 10 s (ADR-021 decision 4): the
 /// accepted body, or why not.
@@ -802,13 +828,18 @@ pub fn submit(project: &Path, host: &HostInfo, mut command: Value) -> Result<Val
             Ok(reply) if reply.status == 202 => return Ok(reply.json()),
             Ok(reply) => {
                 let error = reply.json();
-                let failure = Failure::new(
-                    error["code"]
-                        .as_str()
-                        .unwrap_or_else(|| status_code(reply.status)),
-                    error["message"].as_str().unwrap_or("refused"),
-                    if reply.status == 503 { 69 } else { 1 },
-                );
+                let code = error["code"]
+                    .as_str()
+                    .unwrap_or_else(|| status_code(reply.status));
+                let failure = Failure {
+                    status: Some(reply.status),
+                    details: error["details"].clone(),
+                    ..Failure::new(
+                        code,
+                        error["message"].as_str().unwrap_or("refused"),
+                        refusal_exit(reply.status, code, &error["details"]),
+                    )
+                };
                 // A host started again meanwhile does not know the token this client read: the very same bytes go to
                 // the one that answers now (M2T06R-04).
                 if reply.status == 403 {
@@ -834,6 +865,22 @@ pub fn submit(project: &Path, host: &HostInfo, mut command: Value) -> Result<Val
         if let Some(again) = running(project) {
             host = again;
         }
+    }
+}
+
+/// Run `run_id` as the host shows it (getRun): `None` when it has no such run.
+pub fn get_run(host: &HostInfo, run_id: &str) -> Result<Option<Value>, Failure> {
+    match call(host, "GET", &format!("/v1/runs/{}", encode(run_id)), None) {
+        Ok(reply) if reply.status == 200 => Ok(Some(reply.json())),
+        Ok(reply) if reply.status == 404 => Ok(None),
+        Ok(reply) => Err(Failure::unreachable(format!(
+            "the host answered {}: {}",
+            reply.status,
+            reply.json()["message"].as_str().unwrap_or_default()
+        ))),
+        Err(e) => Err(Failure::unreachable(format!(
+            "the host did not answer: {e}"
+        ))),
     }
 }
 
@@ -866,7 +913,8 @@ impl Events {
     }
 
     /// The next event, `Ok(None)` when none came within the read timeout (the caller looks at its signals and asks
-    /// again); an error when the stream ended.
+    /// again); an error when the stream ended, and an `InvalidData` one naming its SSE id when an event's data cannot
+    /// be read (dropping it would leave a gap, docs/adr/ADR-031.md decision 10).
     pub fn next(&mut self) -> std::io::Result<Option<Value>> {
         loop {
             if let Some(end) = self.pending.windows(2).position(|w| w == b"\n\n") {
@@ -881,7 +929,19 @@ impl Events {
                 if data.is_empty() {
                     continue;
                 }
-                return Ok(serde_json::from_str(&data).ok());
+                return match serde_json::from_str(&data) {
+                    Ok(event) => Ok(Some(event)),
+                    Err(e) => {
+                        let id = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("id:"))
+                            .map_or("（无 id）", str::trim);
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("事件 {id} 的数据无法解析：{e}"),
+                        ))
+                    }
+                };
             }
             match chunk(&mut self.reader) {
                 Ok(data) if data.is_empty() => {
@@ -1053,6 +1113,158 @@ pub(crate) mod tests {
         assert_eq!(
             events.next().map_err(|e| e.kind()),
             Err(std::io::ErrorKind::UnexpectedEof)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_whose_data_cannot_be_read_is_an_error_naming_its_id() -> R {
+        // Decision 10: dropping it would leave a gap in what the client shows (REQ-004 behaviour 3).
+        let frames: &[&[u8]] = &[
+            b"id: 6\ndata: {\"seq\":6}\n\n",
+            b"id: 7\ndata: {\"seq\": 7,\n\n",
+        ];
+        let mut body = Vec::new();
+        for frame in frames {
+            body.extend_from_slice(format!("{:x}\r\n", frame.len()).as_bytes());
+            body.extend_from_slice(frame);
+            body.extend_from_slice(b"\r\n");
+        }
+        let (reader, _theirs) = fed(&body, true)?;
+        let mut events = Events {
+            reader,
+            pending: Vec::new(),
+        };
+        assert_eq!(events.next()?, Some(json!({"seq": 6})));
+        let error = events
+            .next()
+            .err()
+            .ok_or("an unreadable event was not an error")?;
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("7"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_command_ends_the_client_by_its_status_code_and_details() {
+        // Decision 9 and M2T13D-54.
+        let state = |s: &str| json!({"state": s});
+        for ended in ["COMPLETED", "FAILED", "CANCELLED"] {
+            assert_eq!(
+                refusal_exit(409, "ILLEGAL_TRANSITION", &state(ended)),
+                64,
+                "{ended}"
+            );
+        }
+        for (details, why) in [
+            (json!({}), "no state"),
+            (json!(null), "no details"),
+            (state("RUNNING"), "a state not ended"),
+            (state("INCOMPLETE"), "INCOMPLETE is not ended"),
+            (
+                json!({"question_id": "q1", "precondition": "handoff", "detail": "x"}),
+                "an answer's precondition",
+            ),
+        ] {
+            assert_eq!(
+                refusal_exit(409, "ILLEGAL_TRANSITION", &details),
+                1,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            refusal_exit(400, "INVALID_TEAM_CONFIG", &json!({"key_path": "team"})),
+            78
+        );
+        assert_eq!(refusal_exit(400, "BAD_REQUEST", &json!(null)), 1);
+        assert_eq!(refusal_exit(404, "RUN_NOT_FOUND", &json!(null)), 64);
+        assert_eq!(refusal_exit(409, "RUN_NOT_FOUND", &json!(null)), 64);
+        assert_eq!(refusal_exit(409, "STALE_REVISION", &json!(null)), 1);
+        assert_eq!(refusal_exit(422, "CAPABILITY_UNSUPPORTED", &json!(null)), 1);
+        assert_eq!(refusal_exit(503, "UNPROCESSABLE", &json!(null)), 69);
+    }
+
+    /// A host on a socket of `dir` that answers each request with the next of `replies` (status, body), then closes.
+    fn scripted(
+        dir: &Path,
+        replies: Vec<(u16, Value)>,
+    ) -> R<(HostInfo, std::thread::JoinHandle<()>)> {
+        let socket = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let served = std::thread::spawn(move || {
+            for (status, body) in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("a socket clone"));
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request = vec![0; length];
+                let _ = reader.read_exact(&mut request);
+                let body = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        Ok((
+            HostInfo {
+                pid: 1,
+                socket,
+                token: "t".to_owned(),
+            },
+            served,
+        ))
+    }
+
+    #[test]
+    fn two_refusals_with_the_same_message_and_other_details_end_differently() -> R {
+        // M2T13D-54: "the run has ended" for a run in T is 64; the same text for an answer's precondition is 1.
+        let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+        let message = "Run 已结束";
+        let mut got = Vec::new();
+        for details in [
+            json!({"state": "CANCELLED"}),
+            json!({"question_id": "q1", "precondition": "p"}),
+        ] {
+            let sub = tempfile::Builder::new()
+                .prefix("s")
+                .tempdir_in(dir.path())?;
+            let (host, served) = scripted(
+                sub.path(),
+                vec![(
+                    409,
+                    json!({"code": "ILLEGAL_TRANSITION", "message": message, "retryable": false,
+                    "current_revision": 3, "details": details}),
+                )],
+            )?;
+            let failure = submit(
+                dir.path(),
+                &host,
+                json!({"kind": "SendInput", "run_id": "K"}),
+            )
+            .err()
+            .ok_or("not refused")?;
+            served.join().map_err(|_| "the scripted host panicked")?;
+            assert_eq!((failure.status, &failure.details), (Some(409), &details));
+            got.push((failure.code, failure.message, failure.exit));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("ILLEGAL_TRANSITION".to_owned(), message.to_owned(), 64),
+                ("ILLEGAL_TRANSITION".to_owned(), message.to_owned(), 1),
+            ]
         );
         Ok(())
     }

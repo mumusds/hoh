@@ -675,35 +675,70 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
     Ok(())
 }
 
+/// A `run.result` payload of run `run` in `state` at its own seq, as a SQL `json(...)` value.
+fn result_sql(run: &str, state: &str, exit: u8, seq_sql: &str) -> String {
+    format!(
+        "json_object('run_id', '{run}', 'state', '{state}', 'exit_code', {exit}, 'blocked_reason', NULL, \
+         'spec_revision', NULL, 'accepted', 0, 'total', 0, 'last_event_seq', {seq_sql}, 'cost_usd', NULL, \
+         'cost_status', 'unknown', 'remaining_requirements', json('[]'))"
+    )
+}
+
+/// The stream-json lines of an attach as (seq, replays).
+fn lines_of(stdout: &[u8]) -> R<Vec<(i64, bool)>> {
+    let mut seen = Vec::new();
+    for line in String::from_utf8(stdout.to_vec())?.split_terminator('\n') {
+        let event: Value = serde_json::from_str(line)?;
+        hoh_core::schema::protocol()
+            .validate_def("Event", &event)?
+            .map_err(|v| format!("{v:?}: {line}"))?;
+        let replays = match event.get("replay") {
+            None => false,
+            Some(v) if v == &Value::Bool(true) => true,
+            Some(other) => return Err(format!("replay {other} in {line}").into()),
+        };
+        seen.push((event["seq"].as_i64().unwrap_or(-1), replays));
+    }
+    Ok(seen)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attach_to_a_run_that_ended_shows_every_event_of_it_before_it_exits() -> R {
-    // M2T06R-03 (REQ-005 behaviour 3): R ended CANCELLED before the attach, its events between another run's. The
-    // follow replays all of R's events, in order, and exits with the cancel's code only after R's ending event.
+    // M2T06R-03 (REQ-005 behaviour 3), docs/adr/ADR-031.md decision 12: R ended CANCELLED before the attach, its events
+    // between another run's, its run.result its last. The follow replays all of R's events, in order, each marked a
+    // replay (all are at or before the watermark), and exits with the result's code at the result, not after a wait.
     let env = Env::new()?;
     // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
     let _daemons = Daemons(env.project());
     let host = Host::start(config(&env.project())).await?;
     execute(
         &env.project(),
-        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
-           ('R', :p, 'CANCELLED', 'AUTO', '2026-11-07T00:00:00Z'),
-           ('Q', :p, 'RUNNING', 'AUTO', '2026-11-07T00:00:01Z');
-         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           (:p, 'e1', 'R', 'run.created', '{}', '2026-11-07T00:00:00Z'),
-           (:p, 'e2', 'Q', 'run.created', '{}', '2026-11-07T00:00:01Z'),
-           (:p, 'e3', 'R', 'run.cancel_requested', '{}', '2026-11-07T00:00:02Z'),
-           (:p, 'e4', 'R', 'cancel.reaped', '{}', '2026-11-07T00:00:03Z'),
-           (:p, 'e5', 'Q', 'run.paused', '{}', '2026-11-07T00:00:04Z'),
-           (:p, 'e6', 'R', 'cancel.workspace', '{}', '2026-11-07T00:00:05Z'),
-           (:p, 'e7', 'R', 'run.cancelled', '{}', '2026-11-07T00:00:06Z');",
+        &format!(
+            "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+               ('R', :p, 'CANCELLED', 'AUTO', '2026-11-07T00:00:00Z'),
+               ('Q', :p, 'RUNNING', 'AUTO', '2026-11-07T00:00:01Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               (:p, 'e1', 'R', 'run.created', '{{}}', '2026-11-07T00:00:00Z'),
+               (:p, 'e2', 'Q', 'run.created', '{{}}', '2026-11-07T00:00:01Z'),
+               (:p, 'e3', 'R', 'run.cancel_requested', '{{}}', '2026-11-07T00:00:02Z'),
+               (:p, 'e4', 'R', 'cancel.reaped', '{{}}', '2026-11-07T00:00:03Z'),
+               (:p, 'e5', 'Q', 'run.paused', '{{}}', '2026-11-07T00:00:04Z'),
+               (:p, 'e6', 'R', 'cancel.workspace', '{{}}', '2026-11-07T00:00:05Z'),
+               (:p, 'e7', 'R', 'run.cancelled', '{{}}', '2026-11-07T00:00:06Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) SELECT
+               :p, 'e8', 'R', 'run.result', {}, '2026-11-07T00:00:07Z'
+               FROM (SELECT max(seq) + 1 AS next FROM events);",
+            result_sql("R", "CANCELLED", 5, "next")
+        ),
     )?;
-    let want: Vec<i64> = query(
+    let want: Vec<(i64, bool)> = query(
         &env.project(),
         "SELECT group_concat(seq, ' ') FROM (SELECT seq FROM events WHERE run_id = 'R' ORDER BY seq)",
     )?
     .split(' ')
-    .map(str::parse)
+    .map(|s| s.parse().map(|seq| (seq, true)))
     .collect::<Result<_, _>>()?;
+    let started = Instant::now();
     let out = env.hoh(&["attach", "R", "--output", "stream-json"])?;
     assert_eq!(
         out.status.code(),
@@ -711,11 +746,350 @@ async fn an_attach_to_a_run_that_ended_shows_every_event_of_it_before_it_exits()
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let seen: Vec<i64> = String::from_utf8(out.stdout)?
-        .lines()
-        .map(|l| serde_json::from_str::<Value>(l).map(|e| e["seq"].as_i64().unwrap_or(-1)))
-        .collect::<Result<_, _>>()?;
-    assert_eq!(seen, want);
+    assert_eq!(lines_of(&out.stdout)?, want);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "ended at the result, not by the quiet wait: {:?}",
+        started.elapsed()
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_to_a_run_that_ended_with_no_result_ends_after_the_quiet_wait() -> R {
+    // Decision 12: a run that ended before run results were written keeps the quiet fallback: after its replay and a
+    // quiet wait, its state ends the follow (text: the run and its state on stdout).
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+           ('R', :p, 'CANCELLED', 'AUTO', '2026-11-07T00:00:00Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           (:p, 'e1', 'R', 'run.created', '{}', '2026-11-07T00:00:00Z'),
+           (:p, 'e2', 'R', 'run.cancelled', '{}', '2026-11-07T00:00:01Z');",
+    )?;
+    let out = env.hoh(&["attach", "R"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8(out.stdout)?, "R CANCELLED\n");
+    host.shutdown().await;
+    Ok(())
+}
+
+/// POST `body` to the commands of the project's host over its socket; the response's status.
+fn post(project: &Path, body: &Value) -> R<u16> {
+    use std::io::{Read as _, Write as _};
+    let info: Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(info["socket"].as_str().ok_or("no socket")?)?;
+    let body = body.to_string();
+    write!(
+        stream,
+        "POST /v1/commands HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-HoH-Token: {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        info["token"].as_str().ok_or("no token")?,
+        body.len()
+    )?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    Ok(reply.split(' ').nth(1).ok_or("no status")?.parse()?)
+}
+
+/// `kind` for run `run` at its revision now, command `id`; its status.
+fn control(project: &Path, run: &str, kind: &str, id: &str) -> R<u16> {
+    let revision: i64 = query(
+        project,
+        &format!("SELECT revision FROM runs WHERE run_id = '{run}'"),
+    )?
+    .parse()?;
+    post(
+        project,
+        &serde_json::json!({"schema_version": "1.0", "command_id": id, "idempotency_key": id,
+            "expected_revision": revision, "kind": kind, "run_id": run, "payload": {"reason": "test"}}),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_ends_at_a_result_past_its_watermark_never_at_an_older_stop() -> R {
+    // Decision 12 (ADR-021:87): a PAUSED run's old result, in the replay, does not end the follow: the run may go on.
+    // Resumed and paused again, its new result (past W0) does, with 6. Lines up to W0 replay history; later ones not.
+    // An INCOMPLETE run's old result does not end it either; a signal ends that follow, which sends nothing.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        &format!(
+            "INSERT INTO runs(run_id, project_id, state, mode, revision, resume_state, created_at) VALUES
+               ('P', :p, 'PAUSED', 'AUTO', 2, 'RUNNING', '2026-11-07T00:00:00Z'),
+               ('I', :p, 'INCOMPLETE', 'AUTO', 4, 'RUNNING', '2026-11-07T00:00:01Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               (:p, 'p1', 'P', 'run.created', '{{}}', '2026-11-07T00:00:00Z'),
+               (:p, 'i1', 'I', 'run.created', '{{}}', '2026-11-07T00:00:00Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) SELECT
+               :p, 'p2', 'P', 'run.result', {}, '2026-11-07T00:00:01Z' FROM (SELECT max(seq) + 1 AS next FROM events);
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) SELECT
+               :p, 'i2', 'I', 'run.result', {}, '2026-11-07T00:00:01Z' FROM (SELECT max(seq) + 1 AS next FROM events);",
+            result_sql("P", "PAUSED", 6, "next"),
+            result_sql("I", "INCOMPLETE", 4, "next")
+        ),
+    )?;
+    let w0: i64 = query(&env.project(), "SELECT max(seq) FROM events")?.parse()?;
+    let spawn = |run: &str| {
+        env.command(&["attach", run, "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let paused = spawn("P")?;
+    let incomplete = spawn("I")?;
+    let end = Instant::now() + LIMIT;
+    while host.subscribers() < 2 && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut paused = paused;
+    let mut incomplete = incomplete;
+    assert!(
+        paused.try_wait()?.is_none(),
+        "an old PAUSED result ended the attach"
+    );
+    assert!(
+        incomplete.try_wait()?.is_none(),
+        "an old INCOMPLETE result ended the attach"
+    );
+    let project = env.project();
+    let posted = tokio::task::block_in_place(|| -> R<(u16, u16)> {
+        let resumed = control(&project, "P", "ResumeRun", "c-resume")?;
+        let end = Instant::now() + LIMIT;
+        while query(&project, "SELECT state FROM runs WHERE run_id = 'P'")? == "PAUSED"
+            && Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok((resumed, control(&project, "P", "PauseRun", "c-pause")?))
+    })?;
+    assert_eq!(posted, (202, 202));
+    let out = tokio::task::block_in_place(|| finish(paused, LIMIT))?;
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines = lines_of(&out.stdout)?;
+    let want: Vec<(i64, bool)> = query(
+        &env.project(),
+        "SELECT group_concat(seq, ' ') FROM (SELECT seq FROM events WHERE run_id = 'P' ORDER BY seq)",
+    )?
+    .split(' ')
+    .map(|s| s.parse().map(|seq: i64| (seq, seq <= w0)))
+    .collect::<Result<_, _>>()?;
+    assert_eq!(lines, want);
+    assert!(lines.last().is_some_and(|(seq, _)| *seq > w0));
+    let pid = rustix::process::Pid::from_raw(i32::try_from(incomplete.id())?).ok_or("no pid")?;
+    rustix::process::kill_process(pid, rustix::process::Signal::INT)?;
+    let out = tokio::task::block_in_place(|| finish(incomplete, LIMIT))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{stderr}");
+    assert!(stderr.contains("hoh attach I"), "{stderr}");
+    assert_eq!(
+        query(
+            &env.project(),
+            "SELECT state || ' ' || revision || ' ' || (SELECT count(*) FROM commands WHERE run_id = 'I') FROM runs \
+             WHERE run_id = 'I'"
+        )?,
+        "INCOMPLETE 4 0"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_in_json_prints_the_runs_result_as_of_now_and_exits_0() -> R {
+    // Decision 12: one object, REQ-004 behaviour 1's keys and the label, revision, requirements left and cost; the
+    // exit code null for a run at work and the state's for a stopped one; last_event_seq the watermark. A snapshot:
+    // 0 whatever the state.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        "INSERT INTO runs(run_id, project_id, state, mode, revision, blocked_reason, created_at) VALUES
+           ('W', :p, 'RUNNING', 'AUTO', 1, NULL, '2026-11-07T00:00:00Z'),
+           ('B', :p, 'BLOCKED', 'AUTO', 3, 'BLOCKED_AUTH', '2026-11-07T00:00:01Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           (:p, 'w1', 'W', 'run.created', '{}', '2026-11-07T00:00:00Z');",
+    )?;
+    let watermark: i64 = query(&env.project(), "SELECT max(seq) FROM events")?.parse()?;
+    for (run, state, exit, reason, label) in [
+        ("W", "RUNNING", Value::Null, Value::Null, "RUNNING"),
+        (
+            "B",
+            "BLOCKED",
+            serde_json::json!(3),
+            serde_json::json!("BLOCKED_AUTH"),
+            "BLOCKED",
+        ),
+    ] {
+        let out = env.hoh(&["attach", run, "--output", "json"])?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout)?;
+        assert!(
+            text.ends_with("}\n") && text.matches('\n').count() == 1,
+            "{text:?}"
+        );
+        let shown: Value = serde_json::from_str(&text)?;
+        let keys: Vec<&str> = shown
+            .as_object()
+            .ok_or("no object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "accepted",
+                "blocked_reason",
+                "cost_status",
+                "cost_usd",
+                "exit_code",
+                "label",
+                "last_event_seq",
+                "remaining_requirements",
+                "revision",
+                "run_id",
+                "spec_revision",
+                "state",
+                "total"
+            ]
+        );
+        assert_eq!(
+            (
+                &shown["run_id"],
+                &shown["state"],
+                &shown["exit_code"],
+                &shown["blocked_reason"],
+                &shown["label"]
+            ),
+            (
+                &serde_json::json!(run),
+                &serde_json::json!(state),
+                &exit,
+                &reason,
+                &serde_json::json!(label)
+            )
+        );
+        assert_eq!(
+            (
+                &shown["spec_revision"],
+                &shown["accepted"],
+                &shown["total"],
+                &shown["last_event_seq"]
+            ),
+            (
+                &Value::Null,
+                &serde_json::json!(0),
+                &serde_json::json!(0),
+                &serde_json::json!(watermark)
+            )
+        );
+    }
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_forwards_its_runs_native_stderr_to_stderr_only_and_a_full_stderr_never_holds_it()
+-> R {
+    // Decision 11: the attempts the run's events name (the event's attempt_id, from its payload) have their
+    // `*stderr.log` forwarded to the client's stderr, never its stdout; with 10 MiB of it and a stderr nobody reads, the
+    // follow still shows every event and exits at the result, the forwarding given at most its bound.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let host = Host::start(config(&env.project())).await?;
+    execute(
+        &env.project(),
+        &format!(
+            "INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES
+               ('R', :p, 'CANCELLED', 'AUTO', '2026-11-07T00:00:00Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               (:p, 'e1', 'R', 'run.created', '{{}}', '2026-11-07T00:00:00Z'),
+               (:p, 'e2', 'R', 'attempt.started', '{{\"attempt_id\": \"R/a1\"}}', '2026-11-07T00:00:01Z'),
+               (:p, 'e3', 'R', 'run.cancelled', '{{}}', '2026-11-07T00:00:02Z');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) SELECT
+               :p, 'e4', 'R', 'run.result', {}, '2026-11-07T00:00:03Z' FROM (SELECT max(seq) + 1 AS next FROM events);",
+            result_sql("R", "CANCELLED", 5, "next")
+        ),
+    )?;
+    let logs = hoh_app::host::product::attempt_logs(&env.project(), "R/a1");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::write(logs.join("exec.stderr.log"), "NATIVE-MARKER one line\n")?;
+    let out = env.hoh(&["attach", "R", "--output", "stream-json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("NATIVE-MARKER one line"));
+    let stdout = String::from_utf8(out.stdout)?;
+    assert!(!stdout.contains("NATIVE-MARKER"));
+    assert!(stdout.contains("\"attempt_id\":\"R/a1\""), "{stdout}");
+    // 10 MiB of it, and a stderr pipe nobody reads until the client has exited.
+    let noise = "NOISE-MARKER ".repeat(10 * 1024 * 1024 / 13 + 1);
+    std::fs::write(logs.join("exec.stderr.log"), &noise)?;
+    let mut child = env
+        .command(&["attach", "R", "--output", "stream-json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let read = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > LIMIT {
+            let _ = child.kill();
+            return Err("the attach was held by its stderr".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status.code(), Some(5));
+    let stdout = read.join().map_err(|_| "the reader panicked")?;
+    assert_eq!(lines_of(&stdout)?.len(), 4);
+    let mut stderr = Vec::new();
+    {
+        use std::io::Read as _;
+        child
+            .stderr
+            .take()
+            .ok_or("no stderr")?
+            .read_to_end(&mut stderr)?;
+    }
+    assert!(String::from_utf8_lossy(&stderr).contains("NOISE-MARKER"));
     host.shutdown().await;
     Ok(())
 }

@@ -122,14 +122,12 @@ pub struct Report {
     pub probes: Vec<Run>,
 }
 
-/// One JSON object and one LF; U+2028 and U+2029 escaped (REQ-004).
+/// One JSON object and one LF; U+2028 and U+2029 escaped (REQ-004), by every client output's one serializer
+/// (docs/adr/ADR-031.md decision 10).
 pub fn json(report: &Report) -> String {
-    let text = serde_json::to_string(report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
-    format!(
-        "{}\n",
-        text.replace('\u{2028}', "\\u2028")
-            .replace('\u{2029}', "\\u2029")
-    )
+    let text =
+        crate::output::json_line(report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+    format!("{text}\n")
 }
 
 fn word<T: Serialize>(value: T) -> String {
