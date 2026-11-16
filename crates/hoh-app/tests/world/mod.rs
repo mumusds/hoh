@@ -1138,7 +1138,7 @@ impl World {
 
     /// `program args…` in the project with the world's environment and `TERM=xterm-256color`, the PTY its stdio and,
     /// when `ctty`, its controlling terminal (`setsid --ctty`; else a session of its own without one); returned once
-    /// it leads its session.
+    /// it leads its session and, when `ctty`, has the PTY as its controlling terminal.
     pub fn spawn_pty(
         &self,
         pty: &pty::Pty,
@@ -1161,12 +1161,24 @@ impl World {
             .stdout(pty.stdio()?)
             .stderr(pty.stdio()?);
         let child = pty::Hoh(command.spawn()?);
-        // Returned once it leads its session (setsid runs in the same process, then execs the program).
+        // Returned once it leads its session and, with `ctty`, once the PTY is its controlling terminal: setsid runs in
+        // the same process, calls setsid(2), then with --ctty takes the terminal (TIOCSCTTY) a moment later, then execs
+        // the program, so a session of its own does not yet mean a terminal. A program that has already ended (a
+        // zombie, which /proc shows with no terminal) had both.
         let pid = child.0.id();
         let end = Instant::now() + Duration::from_secs(10);
-        while session_and_tty(pid)?.0 != pid {
+        loop {
+            let (session, tty) = session_and_tty(pid)?;
+            if session == pid && (!ctty || tty != 0 || ended(pid)?) {
+                break;
+            }
             if Instant::now() > end {
-                return Err(format!("{program:?} did not get a session of its own").into());
+                return Err(if session == pid {
+                    format!("{program:?} leads a session of its own but has no controlling terminal after 10 s")
+                } else {
+                    format!("{program:?} did not get a session of its own within 10 s")
+                }
+                .into());
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -1643,6 +1655,13 @@ pub fn session_and_tty(pid: u32) -> R<(u32, i64)> {
         fields.get(3).ok_or("no session")?.parse()?,
         fields.get(4).ok_or("no tty")?.parse()?,
     ))
+}
+
+/// Whether process `pid` (a child not yet reaped) has ended: its state in `/proc/<pid>/stat` is Z.
+fn ended(pid: u32) -> R<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after = stat.rsplit_once(") ").ok_or("no stat")?.1;
+    Ok(after.starts_with('Z'))
 }
 
 /// One HTTP exchange with an in-process host over its TCP port: the status and the JSON body.
