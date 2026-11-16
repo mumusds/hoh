@@ -1315,3 +1315,76 @@ async fn a_stalled_obligation_past_the_horizon_is_read_by_its_identity() -> R {
     );
     Ok(())
 }
+
+/// R's history before the world's present, `n` events (M2T13R-03): stale re-triggers and allocations of old wakes (the
+/// kinds the detector's obligations and settlement read), other events of R, and failed recoveries of another run's
+/// candidates (the project's); the supervisor's cursor and horizon after them all.
+fn history(path: &PathBuf, n: u64) -> R {
+    exec(
+        path,
+        &format!(
+            "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+               ('Q', 'p1', 's3', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:01Z');
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'h' || i, CASE i % 4 WHEN 3 THEN 'Q' ELSE 'R' END,
+                 CASE i % 4 WHEN 0 THEN 'supervisor.retrigger' WHEN 1 THEN 'supervisor.allocated'
+                   WHEN 2 THEN 'old.progress' ELSE 'candidate.reconcile_failed' END,
+                 CASE i % 4 WHEN 0 THEN '{{\"reason\": \"STALE_REVISION\", \"base_fingerprint\": \"x\", \"n\": 0}}'
+                   WHEN 1 THEN '{{\"wake\": \"old\", \"run_id\": \"R\"}}'
+                   WHEN 3 THEN json_object('candidate_id', 'Q-c' || i) ELSE '{{}}' END,
+                 '2026-11-07T00:00:00Z' FROM n;
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'R/supervisor/horizon/' || (max(seq) + 1), 'R', 'supervisor.horizon',
+                 json_object('seq', max(seq) + 1), '2026-11-07T00:00:00Z' FROM events;
+             INSERT INTO supervisor_cursor(run_id, last_handled_seq) SELECT 'R', max(seq) FROM events;"
+        ),
+    )
+}
+
+#[tokio::test]
+#[ignore = "a measurement (M2T13R-03): run with --ignored --nocapture to see the detector's time on a long history"]
+async fn the_detectors_work_does_not_grow_with_the_runs_history() -> R {
+    // The detection that writes stalled/<P>/1 and the one that writes stalled/<P>/2 (its precondition read through the
+    // first's settlement), timed on a run with 1 000 and with 100 000 events of history.
+    let mut times = Vec::new();
+    for n in [1_000, 100_000] {
+        let dir = tempfile::tempdir()?;
+        let clock = Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        world(&path, "RUNNING", "")?;
+        history(&path, n)?;
+        let began = std::time::Instant::now();
+        let first = store
+            .detect_stall("R", Default::default(), context(&clock, 0))
+            .await?;
+        let first_took = began.elapsed();
+        assert_eq!(first, Detected::Retriggered(1), "{n}");
+        let (turn, at) = next_turn(&store, &clock, 0).await?;
+        start(&store, &clock, &turn.attempt_id, at + 100).await?;
+        finish(&store, &clock, &path, &turn, at + 300, &Answer::Nothing).await?;
+        let waiting = before_allocation(&store, &clock, at + 1000).await?;
+        assert!(
+            store
+                .allocate_supervision("p1", context(&clock, at + 1000))
+                .await?
+                .is_none()
+        );
+        let began = std::time::Instant::now();
+        let second = store
+            .detect_stall("R", Default::default(), context(&clock, at + 1000))
+            .await?;
+        let second_took = began.elapsed();
+        drop(waiting);
+        assert_eq!(second, Detected::Retriggered(2), "{n}");
+        eprintln!("history {n:>6}: first detection {first_took:?}, second {second_took:?}");
+        times.push((first_took, second_took));
+    }
+    let (small, large) = (times[0], times[1]);
+    let bounded = |a: Duration, b: Duration| b <= a * 5 + Duration::from_millis(5);
+    assert!(
+        bounded(small.0, large.0) && bounded(small.1, large.1),
+        "{times:?}"
+    );
+    Ok(())
+}
