@@ -126,8 +126,9 @@ impl hoh_core::delivery::Clock for FakeClock {
 #[derive(Debug)]
 struct Scripted {
     script: BTreeMap<String, Option<FailureClass>>,
-    /// The groups it started and has not seen empty (only those are killed when it is dropped, M2T19R-60).
-    started: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// The groups it started and has not seen empty (only those are killed when it is dropped, M2T19R-60), each by its
+    /// leader's pid and start time, read while the leader was its own unreaped child.
+    started: Arc<std::sync::Mutex<Vec<(u32, String)>>>,
 }
 
 impl hoh_app::host::Executor for Scripted {
@@ -154,8 +155,14 @@ impl hoh_app::host::Executor for Scripted {
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // Its own child, not reaped yet: the start time read now is its own.
+        let Some(start) = hoh_agents::identity::start_id(pid).ok().flatten() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no start time for {pid}").into());
+        };
         if let Ok(mut started) = self.started.lock() {
-            started.push(pid);
+            started.push((pid, start));
         }
         let stdin = child.stdin.take();
         let gate = hoh_app::host::Gate::new(move || {
@@ -188,7 +195,7 @@ impl hoh_app::host::Executor for Scripted {
                 group_gone = hoh_agents::identity::group_empty(pid);
             }
             if group_gone && let Ok(mut started) = started.lock() {
-                started.retain(|&p| p != pid);
+                started.retain(|(p, _)| *p != pid);
             }
             let _ = end.send(hoh_app::host::Outcome {
                 success: failure.is_none()
@@ -215,13 +222,19 @@ impl hoh_app::host::Executor for Scripted {
 }
 
 impl Drop for Scripted {
+    /// Each group not yet seen empty, only while its leader is still the process it started (ADR-022 decision 10:
+    /// identity::find holds it by a pidfd and checks its start time; Found::kill signals the group only right after a
+    /// look that shows it held). A leader its waiter has reaped meanwhile, whose number the kernel may have handed out
+    /// again, gets nothing.
     fn drop(&mut self) {
-        for pid in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            if let Some(pgid) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
+        let Ok(boot) = hoh_agents::identity::boot_id() else {
+            return;
+        };
+        for (pid, start) in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            if let Ok(Ok(found)) =
+                hoh_agents::identity::find(Some(i64::from(pid)), Some(&boot), Some(&start))
             {
-                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+                found.kill();
             }
         }
     }

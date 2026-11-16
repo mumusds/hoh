@@ -33,9 +33,9 @@ enum Status {
     NotLoggedIn,
     /// Sleeps 60 s, with a child in its group.
     Hangs,
-    /// Exits as soon as a helper it started is in a session of its own (pid in `$HOME/helper.pid`), leaving
-    /// `$HOME/launcher.exited`. The helper holds both pipes: it closes stdout at 12 s and gives the logged-in answer on
-    /// stderr at 28 s, past doctor's 20 s limit.
+    /// Exits as soon as a helper it started is in a session of its own (its own stat line, so its pid and start time,
+    /// in `$HOME/helper.pid`), leaving `$HOME/launcher.exited`. The helper holds both pipes: it closes stdout at 12 s
+    /// and gives the logged-in answer on stderr at 28 s, past doctor's 20 s limit.
     Escapes,
 }
 
@@ -117,7 +117,7 @@ impl Sandbox {
             Status::NotLoggedIn => format!("{}{not}", self.echo()),
             Status::Hangs => "sleep 60 & sleep 60\n".to_owned(),
             Status::Escapes => format!(
-                "setsid sh -s <<'HELPER' &\necho $$ > \"{home}/helper.tmp\"; mv \"{home}/helper.tmp\" \"{home}/helper.pid\"\n\
+                "setsid sh -s <<'HELPER' &\nread -r s < /proc/$$/stat; printf '%s\\n' \"$s\" > \"{home}/helper.tmp\"; mv \"{home}/helper.tmp\" \"{home}/helper.pid\"\n\
                  sleep 12\nexec >&-\nsleep 16\n{logged}HELPER\nwhile [ ! -s '{home}/helper.pid' ]; do sleep 0.01; done\n\
                  : > '{home}/launcher.exited'\nexit 0\n",
                 home = self.home.path().display()
@@ -720,11 +720,22 @@ fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
         ),
     )?;
     let (out, report, took) = s.doctor()?;
-    // The helper left codex's group, out of doctor's reach: stop it here.
-    if let Ok(pid) = std::fs::read_to_string(s.home.path().join("helper.pid")) {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", pid.trim())])
-            .status();
+    // The helper left codex's group, out of doctor's reach: stop its group here, only while the helper that wrote
+    // its stat line is still the process of that number (ADR-022 decision 10: identity::find holds it by a pidfd and
+    // checks its start time; Found::kill signals the group only right after a look that shows it held).
+    if let Ok(stat) = std::fs::read(s.home.path().join("helper.pid")) {
+        let pid: i64 = String::from_utf8_lossy(&stat)
+            .split_whitespace()
+            .next()
+            .ok_or("an empty stat line")?
+            .parse()?;
+        let start = hoh_agents::identity::after_command_name(&stat)
+            .and_then(|fields| fields.split_whitespace().nth(19))
+            .ok_or("the helper's stat line has no start time")?;
+        let boot = hoh_agents::identity::boot_id()?;
+        if let Ok(found) = hoh_agents::identity::find(Some(pid), Some(&boot), Some(start))? {
+            found.kill();
+        }
     }
     assert!(took <= Duration::from_secs(25), "doctor took {took:?}");
     assert!(
