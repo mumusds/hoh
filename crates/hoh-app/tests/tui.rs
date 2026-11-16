@@ -83,12 +83,11 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
 
     // 1. No controlling terminal (a new session without one), stdin /dev/null, stdout and stderr files.
     let (out, err) = (files.path().join("out"), files.path().join("err"));
-    let mut child = Hoh(Command::new("setsid")
+    let mut setsid = Command::new("setsid");
+    pty::isolate(&mut setsid, home.path())?;
+    let mut child = Hoh(setsid
         .arg(env!("CARGO_BIN_EXE_hoh"))
         .current_dir(&project)
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .stdin(Stdio::null())
         .stdout(File::create(&out)?)
         .stderr(File::create(&err)?)
@@ -102,13 +101,12 @@ fn test_001_03_without_a_terminal_bare_hoh_is_a_usage_error() -> R {
     // 2. In a PTY (its controlling terminal, stdin and stderr) with only stdout redirected to a file.
     let pty = Pty::new(30, 100)?;
     let out = files.path().join("out2");
-    let mut child = Hoh(Command::new("setsid")
+    let mut setsid = Command::new("setsid");
+    pty::isolate(&mut setsid, home.path())?;
+    let mut child = Hoh(setsid
         .arg("--ctty")
         .arg(env!("CARGO_BIN_EXE_hoh"))
         .current_dir(&project)
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("TERM", "xterm-256color")
         .stdin(pty.stdio()?)
         .stdout(File::create(&out)?)
