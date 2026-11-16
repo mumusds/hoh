@@ -442,6 +442,85 @@ async fn a_changed_role_is_rebound_at_its_checkpoint_with_the_next_epoch() -> R 
 }
 
 #[tokio::test]
+async fn a_change_made_while_a_run_is_incomplete_applies_at_its_first_checkpoint_after_resume_run()
+-> R {
+    // docs/adr/ADR-031.md correction D (-501; the test plan's 停住之后的写入口 (8)) and decision 16: R1 INCOMPLETE as its
+    // Commander decides it (its run.result published, nothing of it running) is behind no checkpoint while stopped; a
+    // ConfigureTeam changes the developer. ResumeRun takes R1 back to RUNNING; the first checkpoint after it applies the
+    // change: team.binding_applied is R1's and comes after the ResumeRun's accepted event.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    working(&store, &path).await?;
+    a0_ends(&path)?;
+    store
+        .commit(crate::persistence::Commit {
+            cas: vec![crate::persistence::StateCas {
+                id: "R1".to_owned(),
+                expected_revision: 0,
+                change: crate::persistence::Change::Run(crate::protocol::RunState::Incomplete),
+            }],
+            ..crate::persistence::Commit::default()
+        })
+        .await?;
+    store
+        .submit_command(team_change(
+            "dev",
+            0,
+            json!({"developer": {"agent": "codex", "model": "m-test"}}),
+        ))
+        .await?;
+    assert_eq!(
+        store.runner_waiting("p1").await?.team_behind,
+        Vec::<String>::new(),
+        "stopped"
+    );
+    let CommandOutcome::Accepted { event_seq, .. } = store
+        .submit_command(SubmitCommand {
+            command_id: "c-resume".to_owned(),
+            idempotency_key: "k-resume".to_owned(),
+            kind: "ResumeRun".to_owned(),
+            run_id: "R1".to_owned(),
+            expected_revision: 1,
+            payload: json!({"reason": "test"}),
+            payload_sha256: format!("{:064}", 7),
+            target: RunTarget::Resume,
+            event: NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".to_owned(),
+                event_id: "e-resume".to_owned(),
+                run_id: Some("R1".to_owned()),
+                kind: "run.resumed".to_owned(),
+                payload: json!({"reason": "test"}),
+            },
+            outbox: None,
+        })
+        .await?
+    else {
+        return Err("ResumeRun not accepted".into());
+    };
+    assert_eq!(store.runner_waiting("p1").await?.team_behind, ["R1"]);
+    assert!(
+        store
+            .team_checkpoint("R1", crate::persistence::Availability::default())
+            .await?
+    );
+    let applied = values(
+        &path,
+        "SELECT run_id, seq, json_extract(payload_json, '$.to.agent') FROM events \
+         WHERE kind = 'team.binding_applied'",
+    )?;
+    let [row] = applied.as_slice() else {
+        return Err(format!("not one binding applied: {applied:?}").into());
+    };
+    assert_eq!((&row[0], &row[2]), (&json!("R1"), &json!("codex")));
+    assert!(
+        row[1].as_i64() > Some(event_seq),
+        "after the ResumeRun's event {event_seq}: {row:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_role_waiting_for_its_checkpoint_is_not_dispatched_and_its_next_attempt_has_the_new_binding()
 -> R {
     // ADR-022 decisions 8 and 9: while the developer's change waits for A0 to end, no developer task is leased under
