@@ -1405,6 +1405,78 @@ mod real {
     }
 
     #[tokio::test]
+    async fn a_rejected_report_is_redispatched_and_rebound_only_when_its_conflict_is_the_bound_session()
+    -> R {
+        // W11 report_rejected's real path (the report's intake, reports.rs) and decision 8's row: the qa's report
+        // names the reviewer's session sr (REPORT_SESSION_MISMATCH, SESSION_ROLE_MISMATCH, SESSION_NOT_INDEPENDENT of
+        // sr): the conflicting session is not the one qa is bound to, so the answer redispatches it plainly (epoch 1).
+        // When the qa's own bound session sq is the conflicting one (the developer's binding forged onto it before the
+        // report), the answer rebinds qa to epoch 2 as for SESSION_NOT_INDEPENDENT.
+        use crate::persistence::completion::tests::{
+            consistent, fresh_objects, verifier_completion, verifier_running,
+        };
+        use crate::persistence::{VerifierCompleted, VerifierOutcome};
+        for own in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = world(dir.path())?;
+            let (_, task_id, attempt) = verifier_running(&store, &path).await?;
+            let mut report = consistent(&path, &attempt, ("qa", "FAIL"), fresh_objects(&path)?)?;
+            if own {
+                Connection::open(&path)?.execute_batch(
+                    "UPDATE role_bindings SET session_id = 'sq' WHERE run_id = 'R' AND role = 'developer';",
+                )?;
+            } else {
+                report.report_json["session_id"] = json!("sr");
+            }
+            let done = store
+                .complete_verifier_attempt(verifier_completion(
+                    &attempt,
+                    VerifierOutcome::Settle {
+                        report: Box::new(report),
+                    },
+                ))
+                .await?;
+            assert!(
+                matches!(done, VerifierCompleted::ReportRejected { .. }),
+                "{done:?}"
+            );
+            assert_eq!(
+                routed(&path)?,
+                [(
+                    Some("verifier"),
+                    Some("report_rejected".to_owned()),
+                    false,
+                    Route::Redispatch(super::super::Redispatch::Report)
+                )]
+            );
+            let q = open(&Connection::open(&path)?, "R")?.remove(0);
+            answer(&store, &path, "c1", &q.question_id, "").await??;
+            assert_eq!(task(&path, &task_id)?, "READY");
+            assert_eq!(
+                one(
+                    &path,
+                    "SELECT CAST(role_epoch AS TEXT) FROM role_bindings WHERE role = 'qa'"
+                )?,
+                if own { "2" } else { "1" },
+                "own {own}"
+            );
+            assert_eq!(
+                texts(
+                    &path,
+                    "SELECT json_extract(payload_json, '$.cause') FROM events \
+                    WHERE kind = 'team.binding_applied'"
+                )?,
+                if own {
+                    vec!["rebind".to_owned()]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_flaky_join_answered_rework_reworks_and_the_same_content_is_corrected_not_verified_again()
     -> R {
         // W8's real path for a join (join.rs): a late UNKNOWN row makes C's join flaky: D and E BLOCKED
