@@ -6006,6 +6006,36 @@ mod tests {
             cancel: None,
         };
         let baseline = (count("/proc/self/fd"), count("/proc/self/task"));
+        // This process's threads: id, name and state, for a count that fails.
+        let tasks = || {
+            let mut seen = Vec::new();
+            for entry in std::fs::read_dir("/proc/self/task")
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let stat = std::fs::read(entry.path().join("stat")).unwrap_or_default();
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                let state = crate::identity::after_command_name(&stat)
+                    .and_then(|fields| fields.split_whitespace().next())
+                    .unwrap_or("?")
+                    .to_owned();
+                seen.push(format!(
+                    "{} {} {state}",
+                    entry.file_name().to_string_lossy(),
+                    comm.trim()
+                ));
+            }
+            seen
+        };
+        // The thread count once it is at most `limit`, or after 1 s.
+        let settled = |limit: usize| {
+            let until = Instant::now() + Duration::from_secs(1);
+            while count("/proc/self/task") > limit && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            count("/proc/self/task")
+        };
         for round in 0..2 {
             RELEASE.store(false, std::sync::atomic::Ordering::SeqCst);
             let callers: Vec<_> = moments
@@ -6046,11 +6076,18 @@ mod tests {
                     left.push((moment, listing(&dir), dir));
                 }
             }
-            // Stalled: one thread each, and at most the walk's directories, a file, the scratch and its parent.
-            let (fds, threads) = (count("/proc/self/fd"), count("/proc/self/task"));
+            // Stalled: one thread each, and at most the walk's directories, a file, the scratch and its parent. A caller
+            // just joined can still be in /proc/self/task, running its exit (its join wakes on its tid futex, cleared
+            // before its task is released; seen as a second `probe::tests::r` task in state R, CIR-900): the count is
+            // read once it is down to the bound or after 1 s, whichever comes first. The stalled readers cannot end
+            // before the release below, so the wait lets only exiting threads go.
+            let threads = settled(baseline.1 + moments.len());
+            let fds = count("/proc/self/fd");
             assert!(
                 threads <= baseline.1 + moments.len(),
-                "{round}: {threads} threads"
+                "{round}: {threads} threads (baseline {}): {:?}",
+                baseline.1,
+                tasks()
             );
             assert!(
                 fds <= baseline.0 + moments.len() * (MAX_SCHEMA_DEPTH + 4),
