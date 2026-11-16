@@ -597,22 +597,33 @@ mod tests {
     fn a_pass_whose_sigterm_missed_part_of_the_cgroup_says_so_and_still_sends_sigkill() {
         // CGW-50: the control says the SIGTERM it just sent may have missed some of the attempt's processes (its
         // cgroup's walk left part of the subtree to the SIGKILL step): the pass carries it, and the ladder goes on,
-        // SIGKILL at 15. Asked after SIGTERM only: a pass the native interrupt ends says nothing of it.
-        struct Partial<'a>(Group<'a>);
+        // SIGKILL at 15. Asked after SIGTERM only: a pass the native interrupt ends says nothing of it. CGW-150: the
+        // control knows only once its SIGTERM was sent, and says so also when that SIGTERM reached nobody.
+        struct Partial<'a> {
+            group: Group<'a>,
+            reaches: bool,
+            termed: bool,
+        }
         impl ProcessControl for Partial<'_> {
             fn look(&mut self) -> Look {
-                self.0.look()
+                self.group.look()
             }
             fn send(&mut self, signal: Signal) -> bool {
-                self.0.send(signal)
+                let reached = self.group.send(signal);
+                if signal == Signal::Term {
+                    self.termed = true;
+                    return reached && self.reaches;
+                }
+                reached
             }
             fn sigterm_incomplete(&mut self) -> bool {
-                true
+                self.termed
             }
         }
-        for (empty_at, incomplete, sent) in [
+        for (empty_at, reaches, incomplete, sent) in [
             (
                 18,
+                true,
                 true,
                 vec![
                     (Signal::Native, at(0)),
@@ -620,15 +631,25 @@ mod tests {
                     (Signal::Kill, at(15)),
                 ],
             ),
-            (5, false, vec![(Signal::Native, at(0))]),
+            (
+                18,
+                false,
+                true,
+                vec![(Signal::Native, at(0)), (Signal::Kill, at(15))],
+            ),
+            (5, true, false, vec![(Signal::Native, at(0))]),
         ] {
             let clock = FakeClock::default();
-            let mut control = Partial(Group {
-                clock: &clock,
-                empty_at,
-                lost: false,
-                sent: Vec::new(),
-            });
+            let mut control = Partial {
+                group: Group {
+                    clock: &clock,
+                    empty_at,
+                    lost: false,
+                    sent: Vec::new(),
+                },
+                reaches,
+                termed: false,
+            };
             let mut wait = |d: Duration| clock.advance(d);
             let done = pass(
                 &mut control,
@@ -642,7 +663,7 @@ mod tests {
             assert_eq!(
                 (done.end, done.term_incomplete, done.sent),
                 (PassEnd::Empty, incomplete, sent),
-                "empty at {empty_at}"
+                "empty at {empty_at}, its SIGTERM reaching some: {reaches}"
             );
         }
     }
