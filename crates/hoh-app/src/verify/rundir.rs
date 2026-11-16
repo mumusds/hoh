@@ -175,7 +175,7 @@ pub fn remove(dir: &Path) {
 
 /// [`remove`] off the async threads: a run directory holds a checkout and its checks' outputs (M2T16R-57).
 pub async fn remove_off_thread(dir: PathBuf) {
-    let _ = tokio::task::spawn_blocking(move || remove(&dir)).await;
+    let _ = crate::host::begun::spawn_blocking(move || remove(&dir)).await;
 }
 
 #[cfg(test)]
