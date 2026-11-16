@@ -757,8 +757,9 @@ fn launch(
     });
     loop {
         if let Some(host) = host_json(project).filter(|h| h.pid == pid && healthy(h)) {
-            // Not waited for: the host runs on in its own session; its pipe closes when it moves stderr to its log.
-            drop(child);
+            // The host runs on in its own session; its pipe closes when it moves stderr to its log. It stays this
+            // client's child, reaped as soon as it ends however long the client lives.
+            reap(child);
             return Ok(host);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -767,12 +768,26 @@ fn launch(
             return ended_before_ready(project, status.code(), line);
         }
         if Instant::now() >= end {
+            // Not ready yet, and not stopped: it may still be, and is reaped whenever it ends.
+            reap(child);
             return Err(Failure::unreachable(
                 "the host did not become ready in 10 s",
             ));
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Wait for `child`, a host this client started, on a thread of its own (as the probe runner reaps a command it could
+/// not wait for), so that it is reaped as soon as it ends while the client lives on (a TUI, an attach), never left a
+/// zombie for the client's lifetime. Only this client's own child, by its handle: no signal, nothing about SIGCHLD
+/// changed.
+fn reap(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("hoh-reap".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// A fresh id for a command and its idempotency key.

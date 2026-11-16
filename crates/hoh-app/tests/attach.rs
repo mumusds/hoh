@@ -270,6 +270,136 @@ fn session_and_tty(pid: u32) -> R<(u32, i64)> {
     Ok((fields[3].parse()?, fields[4].parse()?))
 }
 
+/// The parent of `pid` (`/proc/<pid>/stat` field 4).
+fn parent_of(pid: u32) -> R<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after = stat.rsplit_once(") ").ok_or("no stat")?.1;
+    Ok(after.split(' ').nth(1).ok_or("no parent")?.parse()?)
+}
+
+#[test]
+fn a_host_an_attach_started_is_reaped_when_it_ends_while_the_attach_lives() -> R {
+    // ADR-021 decision 2 (REQ-005 behaviour 4): a host a client starts is that client's child, so one that ends while a
+    // long-lived client (an attach that follows a run, the TUI) still runs must be reaped by the client, not left a
+    // zombie for as long as the client lives (follow-up item 20). R PAUSED with its host stopped, as in test_005_02; an
+    // attach starts the host and follows R; the host is ended by its recorded identity (its number and start time,
+    // ADR-022 decision 10); while the attach still runs, /proc has no entry for it any more.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let out = env.hoh(&["-p", "x", "--detach", "--output", "json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run: Value = serde_json::from_slice(&out.stdout)?;
+    let run_id = run["run_id"].as_str().ok_or("no run_id")?.to_owned();
+    drop(Daemons(env.project()));
+    assert!(hosts_of(&env.project())?.is_empty(), "the host stopped");
+    execute(
+        &env.project(),
+        &format!(
+            "UPDATE runs SET state = 'PAUSED', resume_state = 'CREATED', revision = revision + 1 WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    let mut client = env
+        .command(&["attach", &run_id, "--output", "stream-json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // The attach's lines as they come: its first is R's first event, printed once it follows R with its host.
+    let (line, lines) = std::sync::mpsc::channel();
+    let stdout = client.stdout.take().ok_or("no stdout")?;
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for read in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = line.send(read);
+        }
+    });
+    let outcome = (|| -> R {
+        let first = lines
+            .recv_timeout(LIMIT)
+            .map_err(|e| format!("the attach printed nothing: {e}"))?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&first)?["run_id"],
+            json!(run_id),
+            "{first}"
+        );
+        // The host the attach started and follows R with: its child.
+        let end = Instant::now() + LIMIT;
+        let host = loop {
+            let hosts = hosts_of(&env.project())?;
+            if let [host] = hosts.as_slice()
+                && parent_of(*host)? == client.id()
+            {
+                break *host;
+            }
+            if Instant::now() > end {
+                return Err(format!("the attach started no host: {hosts:?}").into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let start = hoh_agents::identity::start_id(host)?.ok_or("the host is gone already")?;
+        assert!(
+            hoh_agents::identity::signal_if_same(host, &start, rustix::process::Signal::KILL)?,
+            "the host was not signalled"
+        );
+        // Reaped, and the attach lives on: it starts the next host and follows R with it. Only a host it started
+        // again, its child, shows it lived on: a process that exits hands its children to whoever adopts orphans
+        // before its parent can see it end, so "still running" read right after the reap could be an attach on its way
+        // out whose zombie init reaped.
+        let ended = |client: &mut Child, what: &str| -> R {
+            let status = client.try_wait()?;
+            let Some(status) = status else {
+                return Ok(());
+            };
+            let mut said = String::new();
+            if let Some(mut stderr) = client.stderr.take() {
+                use std::io::Read as _;
+                let _ = stderr.read_to_string(&mut said);
+            }
+            Err(format!("the attach ended ({status}: {said}) {what}").into())
+        };
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut stat = String::new();
+        while !hoh_agents::identity::reaped(host)? {
+            stat = std::fs::read_to_string(format!("/proc/{host}/stat")).unwrap_or_default();
+            ended(&mut client, &format!("with its host not reaped: {stat}"))?;
+            if Instant::now() > end {
+                return Err(format!("the host ended and was not reaped in 10 s: {stat}").into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let end = Instant::now() + LIMIT;
+        loop {
+            let hosts = hosts_of(&env.project())?;
+            if let [next] = hosts.as_slice()
+                && *next != host
+                && parent_of(*next)? == client.id()
+            {
+                break;
+            }
+            ended(
+                &mut client,
+                &format!("after its host was reaped (last seen as {stat})"),
+            )?;
+            if Instant::now() > end {
+                return Err(format!("the attach started no host again: {hosts:?}").into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ended(&mut client, "after it started the next host")?;
+        Ok(())
+    })();
+    let _ = client.kill();
+    let _ = client.wait();
+    outcome
+}
+
 #[test]
 fn detach_starts_a_host_of_its_own_session_and_prints_one_object_after_the_commit() -> R {
     // CR-010 decision 2 (REQ-005 behaviours 1, 2, 3): the supplementary detach evidence, no TEST id. A new project has
