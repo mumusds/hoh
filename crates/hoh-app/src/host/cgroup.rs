@@ -864,26 +864,42 @@ mod tests {
     }
 
     #[test]
-    fn a_cgroup_below_that_cannot_be_listed_stays_and_the_others_go() -> R {
-        // M2T06R-1250: the removal enters only a directory it could list with directories in it, so it can always go
-        // back up; one it cannot list (no search permission, a same-user process may chmod a delegated cgroup) stays
-        // with what is below it, and the rest of the subtree is removed. (Made first, it is the first one taken on
-        // tmpfs, which lists the newest first.)
-        let root = tempfile::tempdir()?;
-        let at = root.path().join("attempt-0123456789abcdef");
-        std::fs::create_dir_all(at.join("shut").join("in"))?;
-        std::fs::create_dir_all(at.join("a").join("b"))?;
-        std::fs::create_dir_all(at.join("c"))?;
-        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o600))?;
-        let group = AttemptGroup::witnessed(root.path(), &at)?;
-        group.remove();
-        std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o755))?;
-        let mut left: Vec<_> = std::fs::read_dir(&at)?
-            .map(|e| e.map(|e| e.file_name()))
-            .collect::<Result<_, _>>()?;
-        left.sort();
-        assert_eq!(left, ["shut"]);
-        assert!(at.join("shut").join("in").is_dir());
+    fn a_cgroup_below_that_cannot_be_listed_is_not_entered_and_the_others_go() -> R {
+        // M2T06R-1250, CGW-53: the removal enters only a directory it could list with directories in it, so it can
+        // always go back up. One it cannot list (no search permission: a same-user process may chmod a delegated
+        // cgroup) is removed from above when empty (`p/empty`), else stays with what is below it (`shut/in`); the rest
+        // of the subtree is removed. Whatever the listing order: `p` goes only after `empty` was dealt with, so a
+        // removal that entered `empty`, or stopped at `shut` before, leaves `p`. Both orders of making them, too.
+        for names in [["shut", "p", "a", "c"], ["c", "a", "p", "shut"]] {
+            let root = tempfile::tempdir()?;
+            let at = root.path().join("attempt-0123456789abcdef");
+            for name in names {
+                let below = match name {
+                    "shut" => "in",
+                    "p" => "empty",
+                    "a" => "b",
+                    _ => "",
+                };
+                std::fs::create_dir_all(at.join(name).join(below))?;
+            }
+            for unlisted in [at.join("shut"), at.join("p").join("empty")] {
+                std::fs::set_permissions(unlisted, std::fs::Permissions::from_mode(0o600))?;
+            }
+            let group = AttemptGroup::witnessed(root.path(), &at)?;
+            group.remove();
+            std::fs::set_permissions(at.join("shut"), std::fs::Permissions::from_mode(0o755))?;
+            // Whatever a failed removal left, so the temporary directory goes.
+            let _ = std::fs::set_permissions(
+                at.join("p").join("empty"),
+                std::fs::Permissions::from_mode(0o755),
+            );
+            let mut left: Vec<_> = std::fs::read_dir(&at)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<Result<_, _>>()?;
+            left.sort();
+            assert_eq!(left, ["shut"], "made in the order {names:?}");
+            assert!(at.join("shut").join("in").is_dir());
+        }
         Ok(())
     }
 
