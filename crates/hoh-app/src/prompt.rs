@@ -13,7 +13,6 @@ use crate::session::{fail, signals};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 /// `hoh -p <text> [--resume <run>] [--detach] [--output …]` in `project`.
 pub fn run(project: &Path, text: &str, output: Output, detach: bool, resume: Option<&str>) -> u8 {
@@ -136,7 +135,7 @@ fn ended(run_id: &str, state: &str) -> u8 {
 }
 
 /// Submit the command `build` makes for the run's revision, reading the run again and submitting anew while the host
-/// says the revision is stale, within `client::WAIT` (decision 9). A run found ended meanwhile is 64.
+/// says the revision is stale (`client::fresh`, decision 9). A run found ended meanwhile is 64.
 fn fresh(
     project: &Path,
     host: &HostInfo,
@@ -144,55 +143,36 @@ fn fresh(
     revision: i64,
     build: impl Fn(i64) -> Value,
 ) -> Result<Value, Failure> {
-    let end = Instant::now() + client::WAIT;
-    let mut revision = revision;
-    loop {
-        match client::submit(project, host, build(revision)) {
-            Err(failure) if failure.code == "STALE_REVISION" && Instant::now() < end => {
-                match client::get_run(host, run_id)? {
-                    None => {
-                        return Err(Failure::new(
-                            "RUN_NOT_FOUND",
-                            format!("没有 Run {run_id}"),
-                            client_code(ClientEvent::Usage),
-                        ));
-                    }
-                    Some(run) => {
-                        let state = run["state"].as_str().unwrap_or_default();
-                        if TERMINAL.contains(&state) {
-                            return Err(Failure::new(
-                                "ILLEGAL_TRANSITION",
-                                format!(
-                                    "Run {run_id} 已结束（{state}），不能重开；请用 hoh -p '<文本>' 新建 Run"
-                                ),
-                                client_code(ClientEvent::Usage),
-                            ));
-                        }
-                        revision = run["revision"].as_i64().unwrap_or(revision);
-                    }
-                }
-            }
-            other => return other,
-        }
-    }
+    client::fresh(
+        |command| client::submit(project, host, command),
+        || client::get_run(host, run_id),
+        run_id,
+        revision,
+        build,
+    )
 }
 
 /// Whether `failure` is a ResumeRun refused because the INCOMPLETE run's stop still holds (decision 16's
 /// `details: {state: INCOMPLETE, stop}`): the input stays accepted and the run INCOMPLETE.
-fn still_stopped(failure: &Failure) -> bool {
+pub(crate) fn still_stopped(failure: &Failure) -> bool {
     failure.status == Some(409)
         && failure.code == "ILLEGAL_TRANSITION"
         && failure.details["state"] == "INCOMPLETE"
 }
 
-/// What a ResumeRun refused by a stop still holding is said with: the stop, and that no entry raises a run's budget
-/// or deadline in this version (decision 9).
-fn refused_resume(failure: &Failure) -> String {
-    let stop = match &failure.details["stop"] {
+/// The stop a refused ResumeRun names (decision 16's `details.stop`): the budget item or the deadline still exhausted.
+pub(crate) fn stop_of(failure: &Failure) -> String {
+    match &failure.details["stop"] {
         Value::String(stop) => stop.clone(),
         Value::Null => "未说明".to_owned(),
         other => other.to_string(),
-    };
+    }
+}
+
+/// What a ResumeRun refused by a stop still holding is said with: the stop, and that no entry raises a run's budget
+/// or deadline in this version (decision 9).
+fn refused_resume(failure: &Failure) -> String {
+    let stop = stop_of(failure);
     format!(
         "hoh: Run 未恢复：使它停下的预算或期限仍耗尽（{stop}）；本版本没有提高一个 Run 的预算或期限的入口，\
          请以 hoh -p '<文本>' 新建 Run 继续剩余需求"
