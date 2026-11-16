@@ -216,7 +216,7 @@ INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, 
 #[derive(Debug)]
 struct Agents {
     scripts: BTreeMap<String, String>,
-    leaders: Arc<Mutex<Vec<u32>>>,
+    leaders: Arc<Mutex<Vec<(u32, String)>>>,
     native: Arc<Mutex<Vec<String>>>,
     commander: Arc<AtomicUsize>,
 }
@@ -277,8 +277,14 @@ impl hoh_app::host::Executor for Agents {
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // Its own child, not reaped yet: the start time read now is its own (ADR-022 decision 10).
+        let Some(start) = hoh_agents::identity::start_id(pid).ok().flatten() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no start time for {pid}").into());
+        };
         if let Ok(mut leaders) = self.leaders.lock() {
-            leaders.push(pid);
+            leaders.push((pid, start));
         }
         let stdin = child.stdin.take();
         let gate = hoh_app::host::Gate::new(move || {
@@ -345,20 +351,69 @@ fn reaping(
     ended
 }
 
-/// Kills the agents' groups when dropped, however the test ends.
-struct Leaders(Arc<Mutex<Vec<u32>>>);
+/// Kills the agents' groups when dropped, however the test ends, each only while its leader is still the process
+/// started (its pid and start time, read while it was the executor's unreaped child): identity::find holds it by a
+/// pidfd and checks its start time, Found::kill signals the group only right after a look that shows it held. A leader
+/// reaped meanwhile, whose number the kernel may have handed out again, gets nothing (ADR-022 decision 10); what its
+/// group still holds is ended by the test's own records ([`Recorded`]).
+struct Leaders(Arc<Mutex<Vec<(u32, String)>>>);
 
 impl Drop for Leaders {
     fn drop(&mut self) {
-        for pid in self.0.lock().map(|l| l.clone()).unwrap_or_default() {
-            if let Some(pgid) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
-            }
+        end_leaders(&self.0);
+    }
+}
+
+/// SIGKILL to the group of each leader in `leaders` still the process started ([`Leaders`]).
+fn end_leaders(leaders: &Mutex<Vec<(u32, String)>>) {
+    let Ok(boot) = hoh_agents::identity::boot_id() else {
+        return;
+    };
+    for (pid, start) in leaders.lock().map(|l| l.clone()).unwrap_or_default() {
+        if let Ok(Ok(found)) =
+            hoh_agents::identity::find(Some(i64::from(pid)), Some(&boot), Some(&start))
+        {
+            found.kill();
         }
     }
+}
+
+/// SIGKILL to each process the records at `mark` name, only while it is still that process ([`Recorded`]).
+fn end_recorded(mark: &Path) {
+    for (pid, start) in recorded_processes(mark) {
+        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
+    }
+}
+
+/// Ends, however the test leaves, every process the test's records at `mark` name by its pid and start time:
+/// `proc <pid> <start>` (a fixture's process at its fork, or a member for it as soon as it started), `established
+/// <pid> <sid> <ms> <handled|ignored> <start>` (a writer) and `w <pid> <sid> <start>` (W). Each gets SIGKILL through
+/// identity::signal_if_same, so a number the kernel handed out again gets nothing (ADR-022 decision 10; CIR-800,
+/// -801, -850: the spawner's child before its execve, C, and W were ended by nothing, or by a bare number). None is
+/// the test's child: once ended, the reaper of orphans reaps it.
+struct Recorded(PathBuf);
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        end_recorded(&self.0);
+    }
+}
+
+/// The processes the records at `mark` name ([`Recorded`]).
+fn recorded_processes(mark: &Path) -> Vec<(u32, String)> {
+    std::fs::read_to_string(mark)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split(' ').collect();
+            let (pid, start) = match words.as_slice() {
+                ["proc", pid, start] | ["w", pid, _, start] => (pid, start),
+                ["established", pid, _, _, _, start] => (pid, start),
+                _ => return None,
+            };
+            Some((pid.parse().ok()?, (*start).to_owned()))
+        })
+        .collect()
 }
 
 /// A project with a host database (made by a first start) and the world seeded; the host started with `agents`.
@@ -1039,7 +1094,10 @@ fn go_mark(file: &Path) -> PathBuf {
 /// The test's spawner for `file`'s writer: started by the test, outside the attempt and without its marker, it waits
 /// for the leader's request (the attempt's marker, written at its SIGTERM), then makes the writer in a session of its
 /// own with that marker as its whole environment, SIGTERM blocked until the writer's evidence is written. No parent
-/// chain leads from the attempt to that writer: only the marker scan can find it (CIR-701).
+/// chain leads from the attempt to that writer: only the marker scan can find it (CIR-701). Only its forked child
+/// blocks SIGTERM, before its setsid and execve; the spawner itself takes SIGTERM as it comes and leaves its wait once
+/// its parent changes, so a test process ended by a bare SIGTERM leaves no spawner polling (CIR-851). The child records
+/// its pid and start time at once (`proc`), so the test's [`Recorded`] ends it even before its execve (CIR-800).
 fn spawner(file: &Path) -> R<Killed> {
     let script = file.with_extension("spawner.py");
     std::fs::write(
@@ -1047,12 +1105,18 @@ fn spawner(file: &Path) -> R<Killed> {
         r#"import os, signal, sys, time
 request, marker = sys.argv[1:3]
 writer = sys.argv[3:]
-signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+parent = os.getppid()
 while not os.path.exists(request):
+    if os.getppid() != parent:
+        sys.exit(0)
     time.sleep(0.01)
 value = open(request).read()
 pid = os.fork()
 if pid == 0:
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
+    with open(writer[-1], 'a') as f:
+        f.write('proc %d %s\n' % (os.getpid(), start))
     os.setsid()
     os.execve(writer[0], writer, {marker: value})
 os.waitpid(pid, 0)
@@ -1110,6 +1174,11 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 if what in ('StartsUnmarkedOnGo', 'StartsPinnedW') and marker in os.environ:
     env = {k: v for k, v in os.environ.items() if k != marker}
     os.execve(sys.executable, [sys.executable] + sys.argv, env)
+def own():
+    # This process's pid and start time, for the test's Recorded guard (CIR-800, -801, -850).
+    start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
+    with open(writer[-1], 'a') as f:
+        f.write('proc %d %s\n' % (os.getpid(), start))
 def recorded(kind):
     mark = writer[-1]
     while not (os.path.exists(mark) and any(l.startswith(kind + ' ') for l in open(mark))):
@@ -1122,8 +1191,10 @@ def established():
 def orphan():
     pid = os.fork()
     if pid == 0:
+        own()
         os.setsid()
         if os.fork() == 0:
+            own()
             os.execv(writer[0], writer)
         os._exit(0)
     os.waitpid(pid, 0)
@@ -1143,10 +1214,13 @@ if what == 'StartsPinnedW':
                 "os.read(int(sys.argv[1]), 1)\n"
                 "c = os.fork()\n"
                 "if c == 0:\n"
+                "    s = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]\n"
+                "    open(sys.argv[-1], 'a').write('proc %d %s\\n' % (os.getpid(), s))\n"
                 "    os.execve(sys.argv[2], sys.argv[2:], {})\n"
                 "os.waitpid(c, 0)\n")
     pid = os.fork()
     if pid == 0:
+        own()
         os.close(w)
         os.setsid()
         os.execve(sys.executable, [sys.executable, '-c', w_script, str(r)] + writer, {})
@@ -1174,6 +1248,7 @@ if what == 'StartsUnmarkedOnGo':
         time.sleep(0.02)
     pid = os.fork()
     if pid == 0:
+        own()
         os.setsid()
         os.execve(writer[0], writer, {})
     open(pid_file, 'w').write(str(pid))
@@ -1283,6 +1358,9 @@ async fn cancel_with_a_writer_outside(
     let _leaders = Leaders(agents.leaders.clone());
     let clock = Arc::new(TestClock::new());
     let _released = Released(clock.clone());
+    // Declared before the spawner, so it is dropped after it: the spawner ends, then everything it and the scenario
+    // recorded (CIR-800, -801, -850).
+    let _recorded = Recorded(established_mark(file));
     let _spawner = spawner(file)?;
     let (project, host) = host_with(dir, &agents, Some(clock.clone())).await?;
     until(
@@ -1500,27 +1578,12 @@ async fn a_cancel_ends_a_descendant_without_the_marker_that_left_the_group_while
     let file = dir.path().join("written.txt");
     let pid_file = dir.path().join("writer.pid");
     let script = leader(&file, Leader::StartsUnmarkedOnGo, Some(&pid_file))?;
-    let guard = KillPidFile(pid_file.clone());
+    let guard = Recorded(established_mark(&file));
     cancel_with_a_writer_outside(dir.path(), &script, &file, Created::OnceTheCancelIsAccepted)
         .await?;
     assert!(gone(&pid_file)?, "the writer lives");
     drop(guard);
     Ok(())
-}
-
-/// SIGKILLs the process whose pid a file names when dropped, however the test ends.
-struct KillPidFile(PathBuf);
-
-impl Drop for KillPidFile {
-    fn drop(&mut self) {
-        if let Some(pid) = std::fs::read_to_string(&self.0)
-            .ok()
-            .and_then(|t| t.trim().parse::<i32>().ok())
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
-    }
 }
 
 /// A clock the test moves ahead.
@@ -1737,7 +1800,7 @@ async fn a_hosts_start_reconcile_pins_through_the_leader_a_descendant_without_th
         writer(&file)?,
         pid_file.display()
     );
-    let guard = KillPidFile(pid_file.clone());
+    let guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, first) = host(dir.path(), &agents).await?;
@@ -1857,7 +1920,7 @@ async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the
     let file = dir.path().join("written.txt");
     let pid_file = dir.path().join("w.pid");
     let script = leader(&file, Leader::StartsPinnedW, Some(&pid_file))?;
-    let guard = KillPidFile(pid_file.clone());
+    let guard = Recorded(established_mark(&file));
     cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm).await?;
     drop(guard);
     Ok(())
@@ -1960,7 +2023,7 @@ async fn cgroup_cancel_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         hidden_writer(&file, &pid_file)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -2020,7 +2083,7 @@ async fn cgroup_runner_end_inside() -> R {
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let (file, pid_file) = (dir.path().join("written.txt"), dir.path().join("w.pid"));
     let script = format!("{}; sleep 0.3; exit 0", hidden_writer(&file, &pid_file)?);
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -2066,7 +2129,7 @@ async fn cgroup_settle_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         hidden_writer(&file, &pid_file)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let project = dir.path().join("p");
@@ -2138,7 +2201,7 @@ async fn cgroup_start_reconcile_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         hidden_writer(&file, &pid_file)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, first) = host(dir.path(), &agents).await?;
@@ -2278,7 +2341,7 @@ async fn cgroup_moved_out_cancel_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         migrating_writer(&file, &pid_file, &base)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -2326,7 +2389,7 @@ async fn cgroup_moved_out_runner_end_inside() -> R {
         "{}; sleep 1; exit 0",
         migrating_writer(&file, &pid_file, &base)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -2355,7 +2418,8 @@ async fn cgroup_moved_out_runner_end_inside() -> R {
 /// Starts each task's script as the leader of its own process group and, when the leader ends, reaps it without
 /// emptying its group: a member it left behind keeps the group without its leader.
 #[derive(Debug)]
-struct LeavesItsGroup(Arc<Mutex<Vec<u32>>>, &'static str);
+/// Its members' records ([`Recorded`]) at `.2`: each member's pid and start time, read as soon as it started.
+struct LeavesItsGroup(Arc<Mutex<Vec<(u32, String)>>>, &'static str, PathBuf);
 
 impl hoh_app::host::Executor for LeavesItsGroup {
     fn deliver(
@@ -2376,8 +2440,10 @@ impl hoh_app::host::Executor for LeavesItsGroup {
             .args([
                 "-c",
                 &format!(
-                    "read -r go; [ \"$go\" = go ] || exit 0; {} & exit 0",
-                    self.1
+                    "read -r go; [ \"$go\" = go ] || exit 0; {} & read -r s < /proc/$!/stat; \
+                     set -- ${{s##*) }}; eval \"start=\\${{20}}\"; echo \"proc $! $start\" >> {}; exit 0",
+                    self.1,
+                    self.2.display()
                 ),
             ])
             .process_group(0)
@@ -2388,8 +2454,14 @@ impl hoh_app::host::Executor for LeavesItsGroup {
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // Its own child, not reaped yet: the start time read now is its own (ADR-022 decision 10).
+        let Some(start) = hoh_agents::identity::start_id(pid).ok().flatten() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no start time for {pid}").into());
+        };
         if let Ok(mut leaders) = self.0.lock() {
-            leaders.push(pid);
+            leaders.push((pid, start));
         }
         let stdin = child.stdin.take();
         let gate = hoh_app::host::Gate::new(move || {
@@ -2439,13 +2511,15 @@ async fn cgroup_leaderless_cancel_inside() -> R {
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let leaders = Arc::new(Mutex::new(Vec::new()));
     let _leaders = Leaders(leaders.clone());
+    let members = dir.path().join("members");
+    let _members = Recorded(members.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
     seed(&project, WORLD)?;
     let mut config = config(&project);
     config.runner = Some(hoh_app::host::RunnerConfig {
-        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60")),
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60", members.clone())),
         context: context(),
     });
     let host = start_when_free(config).await?;
@@ -2540,6 +2614,8 @@ async fn cgroup_leaderless_outside_inside() -> R {
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let leaders = Arc::new(Mutex::new(Vec::new()));
     let _leaders = Leaders(leaders.clone());
+    let members = dir.path().join("members");
+    let _members = Recorded(members.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -2553,7 +2629,7 @@ async fn cgroup_leaderless_outside_inside() -> R {
     );
     let mut config = config(&project);
     config.runner = Some(hoh_app::host::RunnerConfig {
-        executor: Arc::new(LeavesItsGroup(leaders.clone(), member)),
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), member, members.clone())),
         context: context(),
     });
     let host = start_when_free(config).await?;
@@ -2577,8 +2653,9 @@ async fn cgroup_leaderless_outside_inside() -> R {
     assert_eq!(status, 202);
     tokio::time::sleep(Duration::from_secs(6)).await;
     let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
-    // Stop the member by hand (the test's own), then let the cancel finish.
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    // Stop the member by hand (the test's own), by its recorded pid and start time (ADR-022 decision 10: the group's
+    // leader is reaped, so its number is held only while a member lives), then let the cancel finish.
+    end_recorded(&members);
     assert_eq!(
         state, "CANCEL_REQUESTED",
         "cancelled while its leaderless group lived"
@@ -2711,8 +2788,9 @@ async fn cgroup_unverifiable_leader_inside() -> R {
     assert_eq!(status, 202);
     tokio::time::sleep(Duration::from_secs(6)).await;
     let state = query(&project, "SELECT state FROM runs WHERE run_id = 'R'")?;
-    // Stop the leader by hand (the test's own), then let the cancel finish.
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    // Stop the leader by hand (the test's own), only while it is still the process started (ADR-022 decision 10), then
+    // let the cancel finish.
+    end_leaders(&agents.leaders);
     assert_eq!(
         state, "CANCEL_REQUESTED",
         "cancelled while the leader's group lived"
@@ -2745,15 +2823,19 @@ async fn cgroup_nested_member_inside() -> R {
     }
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let (term, pid_file) = (dir.path().join("term.txt"), dir.path().join("m.pid"));
+    let records = dir.path().join("member.records");
     let member = dir.path().join("member.sh");
-    // Read by sh, not executed: nothing is written and then executed (M2T06R-354).
+    // Read by sh, not executed: nothing is written and then executed (M2T06R-354). It records its pid and start time
+    // first, for the test's guard (ADR-022 decision 10).
     std::fs::write(
         &member,
         format!(
-            "trap 'echo term > {}; exit 0' TERM\n\
+            "read -r s < /proc/$$/stat; set -- ${{s##*) }}; echo \"proc $$ ${{20}}\" >> {}\n\
+             trap 'echo term > {}; exit 0' TERM\n\
              cg=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)\n\
              mkdir \"$cg/nested\" && echo $$ > \"$cg/nested/cgroup.procs\" && echo $$ > {}\n\
              while :; do sleep 0.1; done\n",
+            records.display(),
             term.display(),
             pid_file.display()
         ),
@@ -2762,7 +2844,7 @@ async fn cgroup_nested_member_inside() -> R {
         "(env -i PATH=/usr/bin:/bin /usr/bin/setsid /bin/sh {} &); while :; do sleep 0.1; done",
         member.display()
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(records.clone());
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, host) = host(dir.path(), &agents).await?;
@@ -2826,7 +2908,7 @@ async fn cgroup_moved_out_settle_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         migrating_writer(&file, &pid_file, &base)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let project = dir.path().join("p");
@@ -2895,7 +2977,7 @@ async fn cgroup_moved_out_start_reconcile_inside() -> R {
         "{}; while :; do sleep 0.1; done",
         migrating_writer(&file, &pid_file, &base)?
     );
-    let _guard = KillPidFile(pid_file.clone());
+    let _guard = Recorded(established_mark(&file));
     let agents = Arc::new(Agents::new(&[("T1", script.as_str())]));
     let _leaders = Leaders(agents.leaders.clone());
     let (project, first) = host(dir.path(), &agents).await?;
@@ -2960,13 +3042,15 @@ async fn cgroup_leaderless_start_reconcile_inside() -> R {
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let leaders = Arc::new(Mutex::new(Vec::new()));
     let _leaders = Leaders(leaders.clone());
+    let members = dir.path().join("members");
+    let _members = Recorded(members.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
     seed(&project, WORLD)?;
     let mut with_runner = config(&project);
     with_runner.runner = Some(hoh_app::host::RunnerConfig {
-        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60")),
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), "sleep 60", members.clone())),
         context: context(),
     });
     let first = start_when_free(with_runner).await?;
@@ -3033,6 +3117,8 @@ async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let leaders = Arc::new(Mutex::new(Vec::new()));
     let _leaders = Leaders(leaders.clone());
+    let members = dir.path().join("members");
+    let _members = Recorded(members.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -3046,7 +3132,7 @@ async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
     );
     let mut with_runner = config(&project);
     with_runner.runner = Some(hoh_app::host::RunnerConfig {
-        executor: Arc::new(LeavesItsGroup(leaders.clone(), member)),
+        executor: Arc::new(LeavesItsGroup(leaders.clone(), member, members.clone())),
         context: context(),
     });
     let first = start_when_free(with_runner).await?;
@@ -3080,8 +3166,8 @@ async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
     )
     .await?;
     let state = query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?;
-    // Stop the member by hand (the test's own).
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    // Stop the member by hand (the test's own), by its recorded pid and start time (ADR-022 decision 10).
+    end_recorded(&members);
     assert_eq!(
         state, "RUNNING",
         "the attempt ended while its leaderless group lived"
