@@ -281,33 +281,52 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
     Ok(())
 }
 
-/// [`Fake`]'s processes, whose SIGTERM leaves part of the attempt's cgroup to the SIGKILL step (CGW-50).
-struct Unwalked(Fake);
+/// [`Fake`]'s processes, whose SIGTERM leaves part of the attempt's cgroup to the SIGKILL step (CGW-50), reaching some
+/// of them or none.
+struct Unwalked {
+    fake: Fake,
+    reaches: bool,
+}
 
-/// A control whose every SIGTERM may have missed some of the attempt's processes.
-struct Partial(Box<dyn ProcessControl + Send>);
+/// A control that knows its SIGTERM missed some of the attempt's processes only once it was sent, reached or not
+/// (CGW-150).
+struct Partial {
+    group: Box<dyn ProcessControl + Send>,
+    reaches: bool,
+    termed: bool,
+}
 
 impl ProcessControl for Partial {
     fn look(&mut self) -> Look {
-        self.0.look()
+        self.group.look()
     }
     fn send(&mut self, signal: Signal) -> bool {
-        self.0.send(signal)
+        if signal == Signal::Term {
+            self.termed = true;
+            if !self.reaches {
+                return false;
+            }
+        }
+        self.group.send(signal)
     }
     fn sigterm_incomplete(&mut self) -> bool {
-        true
+        self.termed
     }
 }
 
 impl Processes for Unwalked {
     fn control(&self, attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
-        self.0.control(attempt).map(|(group, native)| {
-            let partial: Box<dyn ProcessControl + Send> = Box::new(Partial(group));
+        self.fake.control(attempt).map(|(group, native)| {
+            let partial: Box<dyn ProcessControl + Send> = Box::new(Partial {
+                group,
+                reaches: self.reaches,
+                termed: false,
+            });
             (partial, native)
         })
     }
     fn workspace(&self) -> Value {
-        self.0.workspace()
+        self.fake.workspace()
     }
 }
 
@@ -316,58 +335,64 @@ async fn a_cancels_sigterm_that_missed_part_of_the_cgroup_is_recorded_and_sigkil
     // CGW-50 (docs/adr/ADR-021.md decision 8d): on the cancel ladder, a SIGTERM whose cgroup walk left part of the
     // subtree (not read, or its budget spent) is recorded as a cancel.diagnostic CGROUP_SIGTERM_INCOMPLETE with the
     // pass that sent it, once; SIGKILL follows at 15 all the same and the run is CANCELLED once the group exits.
-    let dir = tempfile::tempdir()?;
-    let (store, path) = open(&dir)?;
-    Connection::open(&path)?.execute_batch(WORLD)?;
-    store.submit_command(cancel_run(1)).await?;
-    let clock = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
-    let advance = clock.clone();
-    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(move |d| {
-        if let Ok(mut at) = advance.0.lock() {
-            *at += d;
+    // CGW-150: also when that SIGTERM reached nobody, with no cancel.sigterm then.
+    for reaches in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(WORLD)?;
+        store.submit_command(cancel_run(1)).await?;
+        let clock = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+        let advance = clock.clone();
+        let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(move |d| {
+            if let Ok(mut at) = advance.0.lock() {
+                *at += d;
+            }
+        });
+        let state = Arc::new(Mutex::new((None, Vec::new())));
+        let processes: Arc<dyn Processes> = Arc::new(Unwalked {
+            fake: Fake {
+                clock: clock.clone(),
+                state: state.clone(),
+            },
+            reaches,
+        });
+        let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+        let mut steps = 0;
+        while canceller
+            .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
+            .await?
+            != Finished::Cancelled
+        {
+            steps += 1;
+            if steps > 20 {
+                return Err("never ended".into());
+            }
         }
-    });
-    let state = Arc::new(Mutex::new((None, Vec::new())));
-    let processes: Arc<dyn Processes> = Arc::new(Unwalked(Fake {
-        clock: clock.clone(),
-        state: state.clone(),
-    }));
-    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
-    let mut steps = 0;
-    while canceller
-        .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
-        .await?
-        != Finished::Cancelled
-    {
-        steps += 1;
-        if steps > 20 {
-            return Err("never ended".into());
-        }
-    }
-    let killed = state.lock().map(|s| s.0).unwrap_or(None);
-    assert_eq!(killed, Some(15), "SIGKILL at 15");
-    let kinds: Vec<(String, Option<String>)> = {
-        let conn = Connection::open(&path)?;
-        let mut statement = conn.prepare(
-            "SELECT kind, json_extract(payload_json, '$.code') FROM events WHERE (kind IN ('cancel.sigterm', \
-             'cancel.diagnostic', 'run.cancelled') OR (kind = 'cancel.sigkill' AND seq = (SELECT min(seq) FROM events \
-             WHERE kind = 'cancel.sigkill'))) AND json_extract(payload_json, '$.code') IS NOT 'UNKNOWN_EFFECT' \
-             ORDER BY seq",
-        )?;
-        statement
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?
-    };
-    let kind = |k: &str, code: Option<&str>| (k.to_owned(), code.map(str::to_owned));
-    assert_eq!(
-        kinds,
-        [
-            kind("cancel.sigterm", None),
+        let killed = state.lock().map(|s| s.0).unwrap_or(None);
+        assert_eq!(killed, Some(15), "SIGKILL at 15");
+        let kinds: Vec<(String, Option<String>)> = {
+            let conn = Connection::open(&path)?;
+            let mut statement = conn.prepare(
+                "SELECT kind, json_extract(payload_json, '$.code') FROM events WHERE (kind IN ('cancel.sigterm', \
+                 'cancel.diagnostic', 'run.cancelled') OR (kind = 'cancel.sigkill' AND seq = (SELECT min(seq) FROM \
+                 events WHERE kind = 'cancel.sigkill'))) AND json_extract(payload_json, '$.code') IS NOT \
+                 'UNKNOWN_EFFECT' ORDER BY seq",
+            )?;
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let kind = |k: &str, code: Option<&str>| (k.to_owned(), code.map(str::to_owned));
+        let mut wanted = vec![
             kind("cancel.sigkill", None),
             kind("cancel.diagnostic", Some("CGROUP_SIGTERM_INCOMPLETE")),
             kind("run.cancelled", None),
-        ]
-    );
+        ];
+        if reaches {
+            wanted.insert(0, kind("cancel.sigterm", None));
+        }
+        assert_eq!(kinds, wanted, "its SIGTERM reaching some: {reaches}");
+    }
     Ok(())
 }
 
