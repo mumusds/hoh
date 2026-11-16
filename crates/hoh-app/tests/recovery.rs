@@ -1208,8 +1208,9 @@ fn an_old_hosts_live_agent_is_stopped_before_its_attempt_is_disposed_of() -> R {
     );
     let out = Command::new("sh").args(["-c", &script]).output()?;
     let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
-    // Gone whatever happens below (M2T05R-61).
-    let _guard = GroupGuard(pid);
+    // Gone whatever happens below (M2T05R-61), its group only while it is still this process (ADR-022 decision 10): it
+    // loops until stopped, so it runs as its start time is read.
+    let _guard = common::GroupOf(pid, common::start_of(pid)?);
     let end = Instant::now() + Duration::from_secs(5);
     // Until its trap is set: its loop's first sleep (a member besides the leader) comes after it.
     while hoh_agents::identity::group_left(pid, pid).map_or(0, |l| l.len()) < 1
@@ -1783,11 +1784,13 @@ impl hoh_core::delivery::Clock for FakeClock {
 }
 
 /// Starts each attempt's work as an agent that ignores SIGTERM (and passes the ignore to its children) and never
-/// ends; its native cancel is recorded, and ignored too. Every group it started is killed when it is dropped.
+/// ends; its native cancel is recorded, and ignored too. When it is dropped, every group it started is killed while its
+/// leader is still the process started, and every member by its own record (ADR-022 decision 10).
 #[derive(Debug)]
 struct StuckExecutor {
     cancels: PathBuf,
-    started: std::sync::Mutex<Vec<u32>>,
+    /// Each leader's pid and start time, read while it was this executor's unreaped child.
+    started: std::sync::Mutex<Vec<(u32, String)>>,
     /// Whether it holds the turns it started, so a native cancel reaches them (an executor that lost one does not).
     holds: bool,
 }
@@ -1859,7 +1862,9 @@ impl StuckExecutor {
                 "-c",
                 &format!(
                     "trap '' TERM; read -r go; [ \"$go\" = go ] || exit 0; sleep 1000 & \
+                     read -r s < /proc/$!/stat; set -- ${{s##*) }}; echo \"proc $! ${{20}}\" >> {}; \
                      trap 'echo term >> {}; trap \"\" TERM' TERM; echo $$ >> {}; while :; do sleep 0.05; done",
+                    self.members().display(),
                     terms.display(),
                     ready.display()
                 ),
@@ -1869,11 +1874,31 @@ impl StuckExecutor {
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // Its own child, not reaped yet: the start time read now is its own.
+        let Some(start) = hoh_agents::identity::start_id(pid).ok().flatten() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no start time for {pid}"));
+        };
         let gate = gate(&mut child);
         if let Ok(mut started) = self.started.lock() {
-            started.push(pid);
+            started.push((pid, start));
         }
         Ok((child, pid, gate))
+    }
+
+    /// Where its agents' members are recorded ([`common::Recorded`]).
+    fn members(&self) -> PathBuf {
+        self.cancels.with_extension("members")
+    }
+
+    /// SIGKILL to each leader it started, only while it is still that process (an executor's native cancel that ends
+    /// the leader alone, ADR-022 decision 10).
+    fn kill_leaders(&self) {
+        for (pid, start) in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            let _ =
+                hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
+        }
     }
 }
 
@@ -1894,14 +1919,10 @@ impl StuckExecutor {
 
 impl Drop for StuckExecutor {
     fn drop(&mut self) {
-        for pid in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            if let Some(pgid) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
-            }
+        for (pid, start) in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            common::end_group_of(pid, &start);
         }
+        common::end_recorded(&self.members());
     }
 }
 
@@ -2472,15 +2493,6 @@ fn kill_group(pgid: u32) {
     }
 }
 
-/// Kills a process group when dropped, however the test ends.
-struct GroupGuard(u32);
-
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        kill_group(self.0);
-    }
-}
-
 /// M2T05R-02: a recorded leader that exited and left a member in its group (which logs every catchable signal). Its
 /// lease expired and another writer task waits. Neither the reconcile at the start nor the runner's expiry can tell
 /// whether the member is the attempt's: no signal, the attempt and its slot stay, no writer lease is granted, and a
@@ -2494,10 +2506,16 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
     assert_eq!(code, 0, "{stderr}");
     let log = dir.path().join("signals.log");
     let member = dir.path().join("member.sh");
+    // The member records its pid and start time first, for the test's guard: its leader is gone at once, so its group's
+    // number may not be signalled (ADR-022 decision 10).
+    let records = dir.path().join("member.records");
+    let _member = common::Recorded(records.clone());
     std::fs::write(
         &member,
         format!(
-            "for s in TERM INT HUP; do trap \"echo $s >> {}\" $s; done\necho $$ > {}\nwhile :; do sleep 0.05; done\n",
+            "read -r s < /proc/$$/stat; set -- ${{s##*) }}; echo \"proc $$ ${{20}}\" >> {}\n\
+             for s in TERM INT HUP; do trap \"echo $s >> {}\" $s; done\necho $$ > {}\nwhile :; do sleep 0.05; done\n",
+            records.display(),
             log.display(),
             log.with_extension("ready").display()
         ),
@@ -2512,7 +2530,6 @@ async fn a_leaderless_group_keeps_its_slot_and_gets_no_signal() -> R {
         ])
         .output()?;
     let leader: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
-    let _guard = GroupGuard(leader);
     // The member, once its traps are set, with its start time for the end's look (CIR-150, -151).
     let member_pid = trapped_at(&log.with_extension("ready"))?;
     let member_start =
@@ -3095,14 +3112,18 @@ fn a_running_attempt_with_no_process_record_keeps_its_slot() -> R {
 
 /// Runs each attempt's work as a gated agent whose leader leaves a member in its group that ignores SIGTERM and lives
 /// on, then ends at once with success (M2T05R-101). It arms `probe` with each process it starts (M2T05R-251); a
-/// `negligent` one reaps the leader at once without emptying the group (and says so, M2T05R-250). Every group it
-/// started is killed when it is dropped (M2T05R-252).
+/// `negligent` one reaps the leader at once without emptying the group (and says so, M2T05R-250). When it is dropped,
+/// every group it started is killed while its leader is still the process started, and every member by its own record
+/// (M2T05R-252; ADR-022 decision 10: the leader is reaped by then, so the group's number was signalled bare).
 #[derive(Debug)]
 struct LeavesAMember {
     inner: FakeExecutor,
     probe: Option<Arc<GrantProbe>>,
     negligent: bool,
-    started: std::sync::Mutex<Vec<u32>>,
+    /// Each leader's pid and start time, read while it was this executor's unreaped child.
+    started: std::sync::Mutex<Vec<(u32, String)>>,
+    /// Where its members' pids and start times are recorded ([`common::Recorded`]).
+    members: PathBuf,
 }
 
 impl hoh_app::host::Executor for LeavesAMember {
@@ -3121,15 +3142,25 @@ impl hoh_app::host::Executor for LeavesAMember {
         let mut child = Command::new("sh")
             .args([
                 "-c",
-                "read -r go; [ \"$go\" = go ] || exit 0; sh -c 'trap \"\" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & exit 0",
+                &format!(
+                    "read -r go; [ \"$go\" = go ] || exit 0; sh -c 'trap \"\" TERM; exec sleep 1000' </dev/null >/dev/null 2>&1 & \
+                     read -r s < /proc/$!/stat; set -- ${{s##*) }}; echo \"proc $! ${{20}}\" >> {}; exit 0",
+                    self.members.display()
+                ),
             ])
             .process_group(0)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // Its own child, not reaped yet: the start time read now is its own.
+        let Some(start) = hoh_agents::identity::start_id(pid).ok().flatten() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("no start time for {pid}").into());
+        };
         if let Ok(mut started) = self.started.lock() {
-            started.push(pid);
+            started.push((pid, start));
         }
         if let Some(probe) = &self.probe
             && let Ok(mut watched) = probe.pid.lock()
@@ -3168,9 +3199,10 @@ impl hoh_app::host::Executor for LeavesAMember {
 
 impl Drop for LeavesAMember {
     fn drop(&mut self) {
-        for pid in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            kill_group(pid);
+        for (pid, start) in self.started.lock().map(|p| p.clone()).unwrap_or_default() {
+            common::end_group_of(pid, &start);
         }
+        common::end_recorded(&self.members);
     }
 }
 
@@ -3195,6 +3227,7 @@ async fn a_finished_leader_settles_only_once_its_group_is_gone() -> R {
         probe: Some(probe.clone()),
         negligent: false,
         started: std::sync::Mutex::new(Vec::new()),
+        members: dir.path().join("members"),
     });
     let host = runner_host(&project, executor.clone(), clock, Some(probe.clone())).await?;
     let db = db(&project);
@@ -3245,6 +3278,7 @@ async fn a_leader_whose_group_was_not_emptied_keeps_its_slot() -> R {
         probe: None,
         negligent: true,
         started: std::sync::Mutex::new(Vec::new()),
+        members: dir.path().join("members"),
     });
     let host = runner_host(
         &project,
@@ -3798,14 +3832,7 @@ impl hoh_app::host::Executor for Cancellable {
 
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
         let held = self.0.cancel(work);
-        for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            if let Some(pid) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            }
-        }
+        self.0.kill_leaders();
         held
     }
 }
@@ -3901,14 +3928,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
 
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
         let held = self.0.cancel(work);
-        for pid in self.0.started.lock().map(|p| p.clone()).unwrap_or_default() {
-            if let Some(pid) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            }
-        }
+        self.0.kill_leaders();
         held
     }
 }

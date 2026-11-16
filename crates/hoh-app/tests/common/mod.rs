@@ -110,3 +110,71 @@ pub fn output_within(
         stderr: left(&stderr)?,
     })
 }
+
+/// Ends, however the test leaves, every process the records at `.0` name by its pid and start time: `proc <pid>
+/// <start>` (written by a fixture's process at its fork, or for a member as soon as it started), `established <pid>
+/// <sid> <ms> <handled|ignored> <start>` (control.rs's writer) and `w <pid> <sid> <start>` (its W). Each gets SIGKILL
+/// through identity::signal_if_same, so a number the kernel handed out again gets nothing (ADR-022 decision 10;
+/// CIR-800, -801, -850). None is the test's child: once ended, the reaper of orphans reaps it.
+pub struct Recorded(pub std::path::PathBuf);
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        end_recorded(&self.0);
+    }
+}
+
+/// The processes the records at `mark` name ([`Recorded`]).
+pub fn recorded_processes(mark: &std::path::Path) -> Vec<(u32, String)> {
+    std::fs::read_to_string(mark)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split(' ').collect();
+            let (pid, start) = match words.as_slice() {
+                ["proc", pid, start] | ["w", pid, _, start] => (pid, start),
+                ["established", pid, _, _, _, start] => (pid, start),
+                _ => return None,
+            };
+            Some((pid.parse().ok()?, (*start).to_owned()))
+        })
+        .collect()
+}
+
+/// SIGKILL to each process the records at `mark` name, only while it is still that process ([`Recorded`]).
+pub fn end_recorded(mark: &std::path::Path) {
+    for (pid, start) in recorded_processes(mark) {
+        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
+    }
+}
+
+/// SIGKILL to the group led by process `pid` started at `start`, only while that leader is still that process:
+/// identity::find holds it by a pidfd and checks its start time, Found::kill signals the group only right after a look
+/// that shows it held. A leader reaped meanwhile, whose number the kernel may have handed out again, gets nothing
+/// (ADR-022 decision 10); its members are ended by their own records ([`Recorded`]).
+pub fn end_group_of(pid: u32, start: &str) {
+    let Ok(boot) = hoh_agents::identity::boot_id() else {
+        return;
+    };
+    if let Ok(Ok(found)) =
+        hoh_agents::identity::find(Some(i64::from(pid)), Some(&boot), Some(start))
+    {
+        found.kill();
+    }
+}
+
+/// [`end_group_of`] however the test leaves.
+pub struct GroupOf(pub u32, pub String);
+
+impl Drop for GroupOf {
+    fn drop(&mut self) {
+        end_group_of(self.0, &self.1);
+    }
+}
+
+/// `pid`'s start time now, for a process the test knows to be running (its own unreaped child, or one that runs until
+/// it is stopped): an error when it cannot be read.
+pub fn start_of(pid: u32) -> R<String> {
+    Ok(hoh_agents::identity::start_id(pid)?
+        .ok_or_else(|| format!("process {pid} is not running"))?)
+}
