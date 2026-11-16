@@ -300,6 +300,12 @@ impl Ctx<'_> {
             .map_or_else(std::time::SystemTime::now, |c| c.0.now())
     }
 
+    /// The wall-clock time absolute deadlines are judged at, by the store's clock (the host's: ADR-020 decision 4).
+    pub(super) fn wall(&self) -> std::time::SystemTime {
+        self.clock
+            .map_or_else(std::time::SystemTime::now, |c| c.0.wall())
+    }
+
     /// How many of a run's events not taken in by its supervisor an end of the run reads at most
     /// (docs/adr/ADR-031.md decision 4: one step's batch, [`super::supervise::STEP`]; a test's hook may lower it).
     pub(super) fn unread_limit(&self) -> i64 {
@@ -1252,6 +1258,7 @@ pub(super) fn write(
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
+                    details: None,
                 });
             }
         }
@@ -1543,6 +1550,7 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
         from: from.to_owned(),
         to: to.to_owned(),
         why,
+        details: None,
     };
     let not_in_table = || "not in the transition table".to_owned();
     // Blockers are facts: no move clears them, and no run works or task becomes ready while one is recorded; only

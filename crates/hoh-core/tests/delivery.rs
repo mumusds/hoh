@@ -2505,6 +2505,44 @@ async fn move_run(
     Ok(())
 }
 
+/// ResumeRun of run `run` at its revision now, as the host submits it (docs/adr/ADR-031.md decision 16).
+async fn resume(store: &Store, db: &Path, run: &str) -> R {
+    let revision = one(
+        db,
+        &format!("SELECT revision FROM runs WHERE run_id = '{run}'"),
+    )?
+    .as_i64()
+    .ok_or("no revision")?;
+    let outcome = store
+        .submit_command(hoh_core::persistence::SubmitCommand {
+            command_id: format!("{run}-resume-{revision}"),
+            idempotency_key: format!("{run}-resume-{revision}"),
+            kind: "ResumeRun".to_owned(),
+            run_id: run.to_owned(),
+            expected_revision: revision,
+            payload: json!({"reason": "test"}),
+            payload_sha256: format!("{:064}", revision),
+            target: hoh_core::persistence::RunTarget::Resume,
+            event: NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".to_owned(),
+                event_id: format!("{run}-resumed-{revision}"),
+                run_id: Some(run.to_owned()),
+                kind: "run.resumed".to_owned(),
+                payload: json!({"reason": "test"}),
+            },
+            outbox: None,
+        })
+        .await?;
+    if !matches!(
+        outcome,
+        hoh_core::persistence::CommandOutcome::Accepted { .. }
+    ) {
+        return Err(format!("ResumeRun of {run}: {outcome:?}").into());
+    }
+    Ok(())
+}
+
 /// A steer to qa about run `run`'s task T.
 fn steer(id: &str, run: &str) -> R<Message> {
     let mut m = to_qa(id, 3, 2, &sha(2), None)?;
@@ -2517,7 +2555,7 @@ async fn a_stopped_runs_messages_wait_or_are_dead_lettered_and_cost_no_other_mes
     // docs/adr/ADR-031.md correction D (-500; the test plan's 停住之后的写入口 (3)): M1, of run R, comes first by
     // event_seq, its deliveries spent and due; M2 of working run R2 is due. R a published INCOMPLETE: one claim takes
     // and delivers M2; M1's row, count and retry time stay, no event, over three more ticks and a restart. When R works
-    // again (a direct state change: ResumeRun from INCOMPLETE is slice S1d) the claim dead-letters M1 as R's. R a
+    // again (ResumeRun from the Commander-decided INCOMPLETE, decision 16) the claim dead-letters M1 as R's. R a
     // published COMPLETED instead: the same claim dead-letters M1 project-scoped (run_ended), then takes M2; M1's late
     // answer makes it ACKED with a project-scoped outbox.delivered_late. R a published PAUSED: claimed and delivered
     // as before (not in G).
@@ -2530,9 +2568,11 @@ async fn a_stopped_runs_messages_wait_or_are_dead_lettered_and_cost_no_other_mes
         let dir = tempfile::tempdir()?;
         let (store, db) = open(&dir)?;
         seed(&db, WORLD)?;
+        // R stops when quiet (decision 4): its attempt A has ended.
         seed(
             &db,
-            "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
+            "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-07T00:00:01Z' WHERE attempt_id = 'A';
+             INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
                ('R2', 'p1', 's2', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:00Z');",
         )?;
         enqueue(&store, "m1", &[steer("M1", "R")?]).await?;
@@ -2599,8 +2639,8 @@ async fn a_stopped_runs_messages_wait_or_are_dead_lettered_and_cost_no_other_mes
                     hoh_core::delivery::Tick::default()
                 );
                 assert_eq!(m1_row()?, before);
-                // R works again (as a ResumeRun would leave it): M1's spent deliveries dead-letter it, as R's.
-                seed(&db, "UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R';")?;
+                // R works again by ResumeRun: M1's spent deliveries dead-letter it, as R's.
+                resume(&store, &db, "R").await?;
                 dispatcher.tick().await?;
                 assert_eq!(
                     rows(
@@ -2680,8 +2720,8 @@ async fn a_delivery_whose_run_stops_before_its_consume_is_given_back_unapplied()
     // generation g), then R's stop before the consume: the consume is refused, the transport answers DeliveryError::Held
     // (typed), the dispatcher settles Unapplied: Tick.held has M, not failed; the row PENDING again, its count g - 1, no
     // retry time, no receipt, no event of the consume or a dead letter, R's events as they were. The same at the last
-    // allowed delivery. Three more ticks and a restart: M not taken. R working again (a direct state change: ResumeRun is
-    // slice S1d): taken at g, applied, ACKED, one receipt. R CANCELLED instead: given back the same, then dead-lettered
+    // allowed delivery. Three more ticks and a restart: M not taken. R working again (ResumeRun, decision 16): taken at
+    // g, applied, ACKED, one receipt. R CANCELLED instead: given back the same, then dead-lettered
     // project-scoped (run_ended) by the next claim.
     use hoh_core::protocol::RunState;
     for (variant, stop, max) in [
@@ -2790,8 +2830,8 @@ async fn a_delivery_whose_run_stops_before_its_consume_is_given_back_unapplied()
             )?,
             r_after_stop
         );
-        // R works again: M is taken at the same generation and applied once.
-        seed(&db, "UPDATE runs SET state = 'RUNNING' WHERE run_id = 'R';")?;
+        // R works again by ResumeRun: M is taken at the same generation and applied once.
+        resume(&store, &db, "R").await?;
         let tick = dispatcher.tick().await?;
         assert_eq!(tick.delivered, ["M"], "{variant}");
         assert_eq!(

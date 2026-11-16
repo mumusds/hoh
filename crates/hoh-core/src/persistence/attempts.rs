@@ -409,6 +409,7 @@ pub(super) fn move_attempt(
         from: m.from.as_str().to_owned(),
         to: m.to.as_str().to_owned(),
         why: "not in the transition table".to_owned(),
+        details: None,
     })?;
     let f = &m.facts;
     if m.from == AttemptState::Prepared && m.to == AttemptState::Starting {
