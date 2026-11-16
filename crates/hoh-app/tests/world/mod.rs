@@ -1341,9 +1341,90 @@ impl World {
 }
 
 impl Drop for World {
+    /// Its processes stopped, its directory removed here and not only by the TempDir, whose removal ignores its errors:
+    /// a removal that fails reports why ([`leftover`]) on stderr, written directly so that the test harness, which
+    /// captures only the print macros, shows it for a passing test too. Nothing is tried again.
     fn drop(&mut self) {
+        use std::io::Write as _;
         self.stop();
+        if let Err(e) = std::fs::remove_dir_all(self.root()) {
+            let _ = std::io::stderr().write_all(leftover(self.root(), &e).as_bytes());
+        }
     }
+}
+
+/// Why `root` was not removed (`error`): every entry left under it with its size and its last write (seconds and
+/// nanoseconds since the epoch), and every process with a file open under it (`fd <n> -> <path>`) or working there
+/// (`cwd <dir>`), with its command line.
+pub fn leftover(root: &Path, error: &std::io::Error) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let mut out = format!(
+        "hoh test world: {} was not removed: {error}\nleft (path, bytes, last write):\n",
+        root.display()
+    );
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if let Ok(m) = std::fs::symlink_metadata(&path) {
+                let _ = writeln!(
+                    out,
+                    "  {} {} {}.{:09}",
+                    path.display(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec()
+                );
+                if m.is_dir() {
+                    todo.push(path);
+                }
+            }
+        }
+    }
+    out.push_str("holders:\n");
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let mut found = Vec::new();
+        if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd"))
+            && cwd.starts_with(root)
+        {
+            found.push(format!("cwd {}", cwd.display()));
+        }
+        for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Ok(target) = std::fs::read_link(fd.path())
+                && target.starts_with(root)
+            {
+                found.push(format!(
+                    "fd {} -> {}",
+                    fd.file_name().to_string_lossy(),
+                    target.display()
+                ));
+            }
+        }
+        if !found.is_empty() {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "  pid {pid} [{}] {}",
+                String::from_utf8_lossy(&cmdline)
+                    .replace('\0', " ")
+                    .trim_end(),
+                found.join(", ")
+            );
+        }
+    }
+    out
 }
 
 /// `child`'s output once it ends; past `limit` it is killed and this is an error.
