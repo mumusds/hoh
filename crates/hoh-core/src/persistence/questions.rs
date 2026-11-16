@@ -946,9 +946,9 @@ fn task_exit(
     Ok(())
 }
 
-/// Whether a rejected report's reasons name an HoH session conflict of the session its role is bound to now
-/// (decision 8's report_rejected row): its attempt ran in the binding's current session and the intake found
-/// SESSION_ROLE_MISMATCH or SESSION_NOT_INDEPENDENT.
+/// Whether a rejected report's reasons name an HoH session conflict (SESSION_ROLE_MISMATCH, SESSION_NOT_INDEPENDENT)
+/// of the session its role is bound to now (decision 8's report_rejected row): then the same session would only
+/// conflict again, and the answer moves the role to its next epoch as for SESSION_NOT_INDEPENDENT.
 fn report_conflicts(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -956,19 +956,29 @@ fn report_conflicts(
     anchor: &Value,
 ) -> Result<bool, PersistError> {
     let detail = anchor["detail"].as_str().unwrap_or_default();
-    let named = detail.split("; ").any(|r| {
-        r.starts_with("SESSION_ROLE_MISMATCH:") || r.starts_with("SESSION_NOT_INDEPENDENT:")
-    });
-    let Some(attempt) = anchor["attempt_id"].as_str().filter(|_| named) else {
+    // The intake's reasons, joined: "<CODE>: session conflict: session <id> …" (reports.rs).
+    let named: Vec<&str> = detail
+        .split("; ")
+        .filter(|r| {
+            r.starts_with("SESSION_ROLE_MISMATCH:") || r.starts_with("SESSION_NOT_INDEPENDENT:")
+        })
+        .filter_map(|r| r.split("conflict: session ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    if named.is_empty() {
         return Ok(false);
-    };
-    tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM attempts a JOIN role_bindings b ON b.run_id = ?1 AND b.role = ?2 \
-         WHERE a.attempt_id = ?3 AND a.session_id IS NOT NULL AND a.session_id = b.session_id)",
-        params![run_id, role, attempt],
-        |r| r.get(0),
-    )
-    .map_err(sqlite_error)
+    }
+    let bound: Option<Option<String>> = tx
+        .query_row(
+            "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+            params![run_id, role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(bound
+        .flatten()
+        .is_some_and(|session| named.contains(&session.as_str())))
 }
 
 /// The reverify exit (decision 8): the candidate still VERIFYING and the task's current round closed, else refused;
