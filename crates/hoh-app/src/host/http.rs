@@ -605,13 +605,26 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             });
             (StatusCode::CONFLICT, axum::Json(body)).into_response()
         }
-        PersistError::IllegalTransition { from, to, why, .. } => error(
-            StatusCode::CONFLICT,
-            "ILLEGAL_TRANSITION",
-            format!("{from} -> {to}: {why}"),
-            false,
-            current_revision(shared, run_id).await,
-        ),
+        // With the store's details when it gives them: a ResumeRun's refusal names the run's state and what of its
+        // stop still holds, which a client reads instead of the message (docs/adr/ADR-031.md decision 16).
+        PersistError::IllegalTransition {
+            from,
+            to,
+            why,
+            details,
+            ..
+        } => {
+            let mut body = json!({
+                "code": "ILLEGAL_TRANSITION",
+                "message": format!("{from} -> {to}: {why}"),
+                "retryable": false,
+                "current_revision": current_revision(shared, run_id).await,
+            });
+            if let Some(details) = details {
+                body["details"] = *details;
+            }
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
         PersistError::RunNotFound(id) => error(
             StatusCode::CONFLICT,
             "RUN_NOT_FOUND",
