@@ -18,6 +18,8 @@
 
 `hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
+没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。本版本还没有在产品里写入或批准规格的途径：TUI 的 `/plan` 显示“M3 前未提供”，API 的 ProposeSpecChange、ApproveSpec 返回 422 CAPABILITY_UNSUPPORTED；规格的生成、批准与追踪属于 M3-T02。
+
 不存在hoh plan/hoh mode plan/hoh run子命令。Shell帮助保持短；TUI输入/可搜索命令，低频设置从面板进入。
 
 ## 观察团队
@@ -40,7 +42,7 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 ## 异常解释
 
-NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --resume <run_id>` 或在 TUI 中回答；BLOCKED_AUTH：需要原生登录（恢复见下）；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；AGENT_UNAVAILABLE / MODEL_UNAVAILABLE：Agent 未安装或无法探测 / 配置的模型不可用（见下“职位缺员”）；COMMANDER_UNAVAILABLE：Commander 无法启动，已派发的 QA/Review 照常进行；BUDGET_UNENFORCEABLE：设置了费用上限但模型价格未知，不会继续花费；COMPAT_UNVERIFIED：原生 CLI 变了，host 在没有写任务时自动跑兼容套件（恢复见下）；DB_WAL_UNSUPPORTED / DB_ON_NETWORK_FS：项目所在文件系统不支持可靠的 SQLite WAL；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足；FAILED：不可恢复的运行失败或数据完整性异常。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
+NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --resume <run_id>` 或在 TUI 中回答（原因 `no_spec`：项目还没有已批准的规格，见“常用操作”）；BLOCKED_AUTH：需要原生登录（恢复见下）；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；AGENT_UNAVAILABLE / MODEL_UNAVAILABLE：Agent 未安装或无法探测 / 配置的模型不可用（见下“职位缺员”）；COMMANDER_UNAVAILABLE：Commander 无法启动，已派发的 QA/Review 照常进行；BUDGET_UNENFORCEABLE：设置了费用上限但模型价格未知，不会继续花费；COMPAT_UNVERIFIED：原生 CLI 变了，host 在没有写任务时自动跑兼容套件（恢复见下）；DB_WAL_UNSUPPORTED / DB_ON_NETWORK_FS：项目所在文件系统不支持可靠的 SQLite WAL；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足；FAILED：不可恢复的运行失败或数据完整性异常。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
 
 **职位缺员**（ADR-030 决定 3–7、11）：职位的 Agent 未安装、不受支持、未登录、配置的模型不可用、缺该职位所需的能力（所有职位要 structured_events，commander、reviewer 另要 resume，developer、qa 另要 command_execution），或新版本的兼容套件 FAIL 或判不了时，HoH 按 `[team.<role>]` 的 `fallback` 顺序换到第一个可用的 Agent，commander 也一样；不在列表里的 Agent 不会被启用，默认没有 fallback。换绑等该职位正在运行的 turn 结束后生效（role_epoch+1，新会话从交接包开始；qa、reviewer 总在新会话里，不用开发者的会话），首选恢复后不自动换回。探测暂时失败、兼容待验证与 429/503 只等待，不触发 fallback。没有可用候选时该职位 BLOCKED，团队视图列出每个候选的缺项，如 `pi:not_installed`、`claude:BLOCKED_AUTH`、`codex:CAPABILITY_UNSUPPORTED:resume`；该职位到期的 Task 以同一原因 BLOCKED，不建 Attempt、不排重试，别的职位照常推进，没有别的事可做时 Run 才 BLOCKED；qa 或 reviewer 缺员时候选停在 VERIFYING，不会 ACCEPTED；commander 连 fallback 都不可用时才持续 COMMANDER_UNAVAILABLE。Agent 恢复可用（重新登录、升级后能力回来、兼容套件通过）后，HoH 自己给该职位新会话并把这些 Task 放回 READY，不需要重新提交。
 
