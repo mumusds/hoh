@@ -179,6 +179,9 @@ fn work(
     // What its previous attempt is to correct or do again (docs/adr/ADR-028.md decisions 3, 11 and 12, M2T16R-07): the
     // reasons the Runtime gave, in the mandatory scope, so the next turn knows them whatever the budget.
     facts.scope.extend(corrections(conn, task_id, attempt_id)?);
+    // What a person answered its question with since an earlier attempt of it last ran (docs/adr/ADR-031.md decision
+    // 8): the user's instruction, in the mandatory scope.
+    facts.scope.extend(answers(conn, task_id, attempt_id)?);
     // Its earlier attempts' ends: runtime facts only (state, failure reason, end), never what the agent said.
     let mut statement = conn
         .prepare(
@@ -272,6 +275,53 @@ fn work(
 /// yet answered — the latest an attempt's end gave, kept across ends that gave no result (a start that failed, a
 /// transient failure, a cancel) and cleared by an accepted end (SETTLED with neither) — and a refreeze its candidate's
 /// loss asked for since its last completion; each bounded (implementation correction 4, M2T16R-07, -102).
+/// The answers given to task `task_id`'s questions since an attempt of it other than `attempt_id` last started
+/// running (docs/adr/ADR-031.md decision 8: the user's instruction goes into its next attempt's prompt; a rework of a
+/// source asks for a new commit), oldest first, each bounded.
+pub(in crate::persistence) fn answers(
+    conn: &Connection,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<Vec<String>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.question_id'), json_extract(payload_json, '$.exit'), \
+             coalesce(json_extract(payload_json, '$.subject'), ''), json_extract(payload_json, '$.answer') \
+             FROM events WHERE kind = 'question.answered' AND json_extract(payload_json, '$.task_id') = ?1 \
+             AND seq > coalesce((SELECT max(m.seq) FROM events m JOIN attempts a \
+               ON a.attempt_id = json_extract(m.payload_json, '$.attempt_id') \
+               WHERE m.kind = 'attempt.moved' AND json_extract(m.payload_json, '$.to') = 'RUNNING' \
+               AND a.task_id = ?1 AND a.attempt_id <> ?2), 0) ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![task_id, attempt_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (question, exit, subject, answer) = row.map_err(sqlite_error)?;
+        let answer: String = answer.unwrap_or_default().chars().take(2000).collect();
+        let exit = exit.unwrap_or_default();
+        let more = if exit == "rework" && subject == "source" {
+            "；须做新的提交，形成新的候选"
+        } else {
+            ""
+        };
+        out.push(format!(
+            "用户的答复（问题 {}，{exit}）：{answer}{more}",
+            question.unwrap_or_default()
+        ));
+    }
+    Ok(out)
+}
+
 pub(super) fn corrections(
     conn: &Connection,
     task_id: &str,

@@ -34,6 +34,7 @@ pub mod need;
 mod outbox;
 mod outputs;
 mod plan;
+pub mod questions;
 mod reconcile;
 mod recovery;
 mod reports;
@@ -97,8 +98,8 @@ pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
 pub use commands::{
-    AcceptedCandidate, CommandOutcome, EventRow, HostStart, ListedRun, RunProjection, RunRow,
-    RunTarget, RunsPage, SubmitCommand,
+    AcceptedCandidate, CommandOutcome, EventRow, HostStart, Input, ListedRun, RunProjection,
+    RunRow, RunTarget, RunsPage, SubmitCommand,
 };
 pub use decide::{Decided, Fenced};
 pub use inputs::{InputMove, InputRow, NewInput};
@@ -262,6 +263,9 @@ pub enum PersistError {
     },
     /// The run does not exist (`RUN_NOT_FOUND`); nothing was written.
     RunNotFound(String),
+    /// A command names what its run does not have (`BAD_REQUEST`): an answer's choice that is not its question's
+    /// (docs/adr/ADR-031.md decision 7); nothing was written.
+    BadRequest(String),
     /// A scheduler change for a run that exists: a run keeps the parameters of its snapshot (`RUN_CONFIG_FROZEN`,
     /// CR-007); nothing was written.
     RunConfigFrozen(String),
@@ -432,6 +436,7 @@ impl std::fmt::Display for PersistError {
                 "{entity:?} {id} expected state {expected}, found {actual:?}"
             ),
             PersistError::RunNotFound(id) => write!(f, "RUN_NOT_FOUND: {id}"),
+            PersistError::BadRequest(detail) => write!(f, "BAD_REQUEST: {detail}"),
             PersistError::InvalidTeamConfig {
                 key_path, message, ..
             } => write!(f, "INVALID_TEAM_CONFIG: {key_path}: {message}"),
@@ -1537,8 +1542,9 @@ impl Store {
         self.writer.complete_writer_attempt(completion).await
     }
 
-    /// Clear task `task_id`'s standing repair refusal by decision `decision_id` (docs/adr/ADR-028.md decision 12; M2-T13's
-    /// AnswerQuestion calls it in its transaction, CR-018).
+    /// Clear task `task_id`'s standing repair refusal by decision `decision_id` (docs/adr/ADR-028.md decision 12): a
+    /// transaction of its own around `verification::refusal_cleared`, the event an AnswerQuestion's exit writes in its
+    /// own transaction (docs/adr/ADR-031.md decision 8, CR-018).
     pub async fn clear_repair_refusal(
         &self,
         task_id: &str,
@@ -1549,14 +1555,12 @@ impl Store {
             .task_run(task_id)?
             .ok_or_else(|| PersistError::IntegrityViolation(format!("no task {task_id}")))?;
         self.commit(Commit {
-            events: vec![NewEvent {
-                intent: Intent::Progress,
-                project_id,
-                event_id: crate::ids::child_id(task_id, &format!("refusal_cleared/{decision_id}")),
-                run_id: Some(run_id),
-                kind: "repair.refusal_cleared".to_owned(),
-                payload: serde_json::json!({"task_id": task_id, "decision_id": decision_id}),
-            }],
+            events: vec![verification::refusal_cleared(
+                &project_id,
+                &run_id,
+                task_id,
+                decision_id,
+            )],
             ..Commit::default()
         })
         .await

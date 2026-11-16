@@ -59,7 +59,7 @@ impl Claims {
     /// The run's open claims. A row with a set and no claim event (a run M2-T19 blocked) is taken over: its reasons
     /// become the budget's (BUDGET_UNENFORCEABLE) and the pace's (the others) claims, recorded as `migrated`.
     pub(super) fn load(
-        tx: &Transaction<'_>,
+        tx: &rusqlite::Connection,
         project_id: &str,
         run_id: &str,
     ) -> Result<Claims, PersistError> {
@@ -215,6 +215,16 @@ impl Claims {
         }
     }
 
+    /// The sources holding `reason` open, in order (the run's questions are the NEED_DECISION ones, docs/adr/ADR-031.md
+    /// decision 6).
+    pub(super) fn held(&self, reason: BlockedReason) -> Vec<String> {
+        self.open
+            .iter()
+            .filter(|(_, r)| *r == reason)
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
     /// Whether `source` holds any open claim.
     pub(super) fn held_by(&self, source: &str) -> bool {
         self.open.iter().any(|(s, _)| s == source)
@@ -232,9 +242,19 @@ impl Claims {
 
     /// Write the set into the run's row (its `blocked_reason` the first by precedence); the claim events to append in
     /// the same commit. A set emptied here is cleared by the run's own move out of BLOCKED (`Change::Unblock`), which
-    /// the caller adds to the commit: a BLOCKED row always names a reason.
+    /// the caller adds to the commit: a BLOCKED row always names a reason. A run in another state (PAUSED,
+    /// INCOMPLETE, … where `follow` moves nothing) has its row cleared here, so a later ResumeRun finds the set as the
+    /// claims leave it (docs/adr/ADR-031.md decisions 8 and 16: an answer's release on a stopped run).
     pub(super) fn store(self, tx: &Transaction<'_>) -> Result<Vec<NewEvent>, PersistError> {
         let reasons = self.reasons();
+        if reasons != self.stored && reasons.is_empty() {
+            tx.execute(
+                "UPDATE runs SET blocked_reasons_json = '[]', blocked_reason = NULL WHERE run_id = ?1 \
+                 AND state <> 'BLOCKED'",
+                params![self.run_id],
+            )
+            .map_err(sqlite_error)?;
+        }
         if reasons != self.stored && !reasons.is_empty() {
             let json: Vec<&str> = reasons.iter().map(|r| r.as_str()).collect();
             tx.execute(
