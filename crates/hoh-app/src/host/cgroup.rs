@@ -16,6 +16,11 @@ const MOUNT: &str = "/sys/fs/cgroup";
 /// How often a stop looks again.
 const LOOK_EVERY: Duration = Duration::from_millis(10);
 
+/// How long the SIGTERM step may walk a cgroup's subtree below the cgroup itself: the walk opens each cgroup again from
+/// the top, so its time grows with the square of the subtree's depth, which the attempt chooses. Past it the step is
+/// incomplete and `cgroup.kill`, which covers the whole subtree, follows as usual (M2T06R-1250).
+const TERM_WALK_BUDGET: Duration = Duration::from_secs(1);
+
 /// The host's own cgroup, delegated: it may make cgroups below it and move its children into them.
 #[derive(Debug, Clone)]
 pub(super) struct Delegated {
@@ -158,15 +163,20 @@ fn open_below(
 /// `top` and every directory below it, however deep, parents first, each given to `visit` open, with the names that
 /// lead to it from `top` (none for `top`): `populated` and `cgroup.kill` cover the whole subtree, and so must SIGTERM
 /// (decision 8d v7, M2T06R-501, -651). Each is opened again from `top` by its names, so only a few descriptors are
-/// open at once however large or deep the subtree (M2T06R-1101). Whether every one was read: false when one could
-/// not be opened or listed for a reason other than its removal (a cgroup goes only once empty, with all below it).
+/// open at once however large or deep the subtree (M2T06R-1101). `top` is always visited, a cgroup below it only before
+/// `until` (M2T06R-1250). Whether every one was read: false when one could not be opened or listed for a reason other
+/// than its removal (a cgroup goes only once empty, with all below it), or was left at `until`.
 fn walk(
     top: &rustix::fd::OwnedFd,
+    until: Instant,
     mut visit: impl FnMut(&[std::ffi::CString], &rustix::fd::OwnedFd),
 ) -> bool {
     let mut queue = std::collections::VecDeque::from([Vec::new()]);
     let mut whole = true;
     while let Some(names) = queue.pop_front() {
+        if !names.is_empty() && Instant::now() >= until {
+            return false;
+        }
         let dir = match open_below(top, &names) {
             Ok(dir) => dir,
             Err(rustix::io::Errno::NOENT) => continue,
@@ -462,7 +472,8 @@ impl AttemptGroup {
     /// SIGTERM to each process in it or in a cgroup below it, each pinned by a pidfd and checked to be in this subtree
     /// still (a pid that ended and was reused is never signalled). Only the recorded cgroup, read through its checked
     /// directories: a cgroup made later at its path holds another's processes (M2T06R-1000). The subtree is walked
-    /// with few descriptors open however large it is, its own members first (M2T06R-1101).
+    /// with few descriptors open however large it is, its own members first (M2T06R-1101), for at most
+    /// [`TERM_WALK_BUDGET`] below it (M2T06R-1250).
     pub(super) fn terminate(&self) -> Termed {
         use std::io::Read as _;
         use std::os::unix::ffi::OsStrExt as _;
@@ -485,7 +496,7 @@ impl AttemptGroup {
         let wanted = wanted.as_os_str().as_bytes();
         let mut sent = false;
         let mut unread = false;
-        let walked = walk(&top, |_, cgroup| {
+        let walked = walk(&top, Instant::now() + TERM_WALK_BUDGET, |_, cgroup| {
             let fd = match rustix::fs::openat(
                 cgroup,
                 "cgroup.procs",
@@ -778,17 +789,21 @@ mod tests {
         let group = AttemptGroup::witnessed(root.path(), &at)?;
         let top = group.open_checked()?.ok_or("not there")?;
         let mut found = Vec::new();
-        let whole = walk(&top, |names, _| {
-            use std::os::unix::ffi::OsStrExt as _;
-            found.push(
-                at.join(
-                    names
-                        .iter()
-                        .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes()))
-                        .collect::<PathBuf>(),
-                ),
-            );
-        });
+        let whole = walk(
+            &top,
+            Instant::now() + Duration::from_secs(60),
+            |names, _| {
+                use std::os::unix::ffi::OsStrExt as _;
+                found.push(
+                    at.join(
+                        names
+                            .iter()
+                            .map(|n| std::ffi::OsStr::from_bytes(n.as_bytes()))
+                            .collect::<PathBuf>(),
+                    ),
+                );
+            },
+        );
         drop(top);
         assert!(whole);
         assert_eq!(found.first(), Some(&at), "the cgroup itself first");
@@ -1016,7 +1031,7 @@ mod tests {
         };
         let top = group.open_checked()?.ok_or("not there")?;
         let mut found = Vec::new();
-        let whole = walk(&top, |_, dir| {
+        let whole = walk(&top, Instant::now() + Duration::from_secs(60), |_, dir| {
             found.push(rustix::fs::fstat(dir).map(|s| (s.st_dev, s.st_ino)));
         });
         assert!(whole);
@@ -1032,6 +1047,67 @@ mod tests {
         ];
         wanted.sort();
         assert_eq!(found, wanted);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sigterm_walk_past_its_budget_stops_below_the_top_and_says_so() -> R {
+        // M2T06R-1250: the walk opens each cgroup again from the top by its names, so a deep subtree takes time
+        // quadratic in its depth; past its budget it visits no further cgroup below the top and is not whole, and
+        // `cgroup.kill`, which covers the whole subtree, follows. The top's own members are always walked.
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir_all(at.join("a").join("b"))?;
+        std::fs::create_dir_all(at.join("c"))?;
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let top = group.open_checked()?.ok_or("not there")?;
+        let mut visited = Vec::new();
+        let spent = walk(&top, Instant::now(), |names, _| visited.push(names.len()));
+        assert_eq!((visited, spent), (vec![0], false), "past the budget");
+        let mut visited = 0;
+        let lasting = walk(&top, Instant::now() + Duration::from_secs(60), |_, _| {
+            visited += 1
+        });
+        assert_eq!((visited, lasting), (4, true), "within it");
+        let leaf = root.path().join("attempt-fedcba9876543210");
+        std::fs::create_dir(&leaf)?;
+        let leaf = AttemptGroup::witnessed(root.path(), &leaf)?;
+        let top = leaf.open_checked()?.ok_or("not there")?;
+        assert!(
+            walk(&top, Instant::now(), |_, _| {}),
+            "nothing below the top was left"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_sigterm_step_on_a_deep_cgroup_ends_within_its_budget() -> R {
+        // M2T06R-1250: a chain 4000 deep, which the whole walk takes seconds to go through, gets its SIGTERM step in
+        // about the walk's budget, said to be incomplete (`cgroup.kill` follows in a stop).
+        let root = tempfile::tempdir()?;
+        let at = root.path().join("attempt-0123456789abcdef");
+        std::fs::create_dir(&at)?;
+        let mut dir = rustix::fs::open(&at, directory(), rustix::fs::Mode::empty())?;
+        for _ in 0..4000 {
+            rustix::fs::mkdirat(&dir, "d", rustix::fs::Mode::from_raw_mode(0o755))?;
+            dir = rustix::fs::openat(&dir, "d", directory(), rustix::fs::Mode::empty())?;
+        }
+        drop(dir);
+        let group = AttemptGroup::witnessed(root.path(), &at)?;
+        let started = Instant::now();
+        let termed = group.terminate();
+        let took = started.elapsed();
+        assert_eq!(
+            termed,
+            Termed {
+                sent: false,
+                whole: false
+            }
+        );
+        assert!(
+            took < TERM_WALK_BUDGET + Duration::from_secs(1),
+            "took {took:?}"
+        );
         Ok(())
     }
 
