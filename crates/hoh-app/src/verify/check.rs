@@ -557,7 +557,7 @@ pub async fn run_with(
             request.clone(),
             project.clone(),
         );
-        tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+        crate::host::begun::spawn_blocking(move || -> Result<_, CheckError> {
             let ready = pre_check(&reader, &checkout, &state, &request)?;
             let row = reader
                 .candidate(&request.candidate_id)
@@ -583,7 +583,7 @@ pub async fn run_with(
     // The record's own new directory, and its lock.
     let (record_id, record_dir, lock) = {
         let (state, request) = (state.to_owned(), request.clone());
-        tokio::task::spawn_blocking(move || -> Result<_, CheckError> {
+        crate::host::begun::spawn_blocking(move || -> Result<_, CheckError> {
             let record_id = new_record_id();
             let dir = state
                 .join("evidence")
@@ -608,7 +608,7 @@ pub async fn run_with(
     // The run, its post-check and its record are a task of their own: dropping this future cancels the command, never
     // its record (docs/adr/ADR-027.md decision 6, M2T10R-03).
     let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-    let finishing = tokio::spawn(finish(
+    let finishing = crate::host::begun::spawn(finish(
         handle,
         Finish {
             checkout: checkout.to_owned(),

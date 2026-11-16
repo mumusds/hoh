@@ -361,7 +361,7 @@ pub(super) async fn complete_verifier(
     reporting: Option<Reporting>,
 ) -> Result<hoh_core::persistence::VerifierCompleted, PersistError> {
     let held = identity.clone();
-    let (outcome, ending) = tokio::task::spawn_blocking(move || {
+    let (outcome, ending) = super::begun::spawn_blocking(move || {
         let mut ending = ending;
         let outcome = verifier_outcome(&held, &mut ending, reporting.as_ref());
         (outcome, ending)
@@ -385,10 +385,12 @@ pub(super) async fn complete(
     project: &Path,
     identity: Identity,
     ending: Ending,
+    hooks: std::sync::Arc<dyn super::HostHooks>,
 ) -> Result<WriterCompleted, PersistError> {
     let held = project.to_path_buf();
     let attempt_id = identity.attempt_id.clone();
-    let (outcome, ending) = tokio::task::spawn_blocking(move || {
+    let (outcome, ending) = super::begun::spawn_blocking(move || {
+        hooks.completing(&identity.attempt_id);
         let mut ending = ending;
         let outcome = outcome(&held, &identity, &mut ending);
         (outcome, ending)
@@ -449,7 +451,15 @@ pub(super) async fn recover(
         unknown_effect: false,
     };
     if row.writer {
-        complete(store, project, identity, ending).await
+        // A reconcile's completion: no test holds it.
+        complete(
+            store,
+            project,
+            identity,
+            ending,
+            std::sync::Arc::new(super::NoHostFaults),
+        )
+        .await
     } else {
         // A verifier's: its result from the same bridge (decision 11); its final message is not kept across a restart,
         // so a COMPLETED result cannot be reported here and is corrected (verified again).

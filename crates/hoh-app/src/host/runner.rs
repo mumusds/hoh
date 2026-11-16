@@ -280,6 +280,8 @@ struct Common {
     unsupervised: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Where verifiers' run directories go (docs/adr/ADR-028.md decision 6).
     runs: std::path::PathBuf,
+    /// The steps the attempt tasks began that their abort at the stop does not end (super::begun).
+    begun: Arc<super::begun::Begun>,
 }
 
 impl Common {
@@ -335,6 +337,7 @@ pub(super) async fn run(
         undelivered: std::sync::Mutex::default(),
         unsupervised: std::sync::Mutex::default(),
         runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
+        begun: Arc::default(),
     });
     let registry = config.executor.registry();
     // The project's compat manifest into the registry, the leftovers of a publication that crashed deleted, before the
@@ -390,9 +393,22 @@ pub(super) async fn run(
         task.abort();
         let _ = task.await;
     }
+    // The steps they began run on (an abort does not end a blocking step, nor a task one spawned): waited for, so
+    // nothing of an attempt writes the project after the host's stop.
+    let left = common.begun.drained(BEGUN_STOP).await;
+    if left > 0 {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "hoh host: {left} step(s) its attempts began still run after {BEGUN_STOP:?} of its stop"
+        );
+    }
     // Then what the executor runs in the host for its turns: nothing of the host writes the project after its stop.
     common.executor.stop().await;
 }
+
+/// How long the host's stop waits for the steps its attempts began (a freeze, a completion, a check's record).
+const BEGUN_STOP: Duration = Duration::from_secs(30);
 
 /// A recovery's outcome as decision 11 records it: what trying again cannot make good (damaged facts, a record that
 /// is not the candidate's) is permanent. None when its run has stopped (Held, docs/adr/ADR-031.md correction D rule 2
@@ -1022,7 +1038,8 @@ async fn tick(
             let common = common.clone();
             let work = work.clone();
             let id = id.clone();
-            async move {
+            // Its blocking steps and the tasks it spawns are counted under the host's Begun (the stop waits for them).
+            common.begun.clone().scope(async move {
                 let result = attempt(&common, work.clone(), notice).await;
                 // An error is settled at once, its entry still there so no tick takes it meanwhile (M2T05R-260);
                 // however it ends, its entry then goes (no lease is renewed for it any more; a settle that failed is
@@ -1048,7 +1065,7 @@ async fn tick(
                 if let Ok(mut f) = common.inflight.lock() {
                     f.remove(&id);
                 }
-            }
+            })
         });
         inflight.insert(
             id,
@@ -1100,7 +1117,7 @@ async fn attempt(
     let handoff_package = match work.assignment.handoff.clone() {
         Some(handoff) => {
             let root = common.shared.root.clone();
-            let kept = tokio::task::spawn_blocking(move || keep_handoff(&root, &handoff))
+            let kept = super::begun::spawn_blocking(move || keep_handoff(&root, &handoff))
                 .await
                 .unwrap_or_else(|e| Err(format!("its keeping ended: {e}")));
             match kept {
@@ -1156,7 +1173,7 @@ async fn attempt(
             let (root, attempt) = (common.shared.root.clone(), id.clone());
             let plan_sha = v.sealed.manifest.test_plan.sha256.clone();
             let grace = common.settings.term_grace + common.settings.kill_grace;
-            let written = tokio::task::spawn_blocking(move || {
+            let written = super::begun::spawn_blocking(move || {
                 // Its run-check waits for the frozen plan's longest check and the stop's grace (decision 7).
                 let plan: serde_json::Value = hoh_core::objects::get(&root, &plan_sha)
                     .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))?;
@@ -1179,7 +1196,7 @@ async fn attempt(
         None => None,
     };
     held.helpers = helpers.clone();
-    let start = tokio::task::spawn_blocking(move || executor.start(&held))
+    let start = super::begun::spawn_blocking(move || executor.start(&held))
         .await
         .unwrap_or_else(|e| Err(Refusal::from(format!("its start was lost: {e}"))));
     let started = match start {
@@ -1216,7 +1233,7 @@ async fn attempt(
     // With the watermark of the context its prompt was packed from: failures attached after it were not seen
     // (decision 3's row, M2T16R-01).
     let context_seq = work.assignment.context_seq;
-    let (who, tracking, start) = tokio::task::spawn_blocking(move || {
+    let (who, tracking, start) = super::begun::spawn_blocking(move || {
         let start = root.map(|root| {
             let head = super::control::git(&root, &["rev-parse", "--verify", "HEAD"])
                 .ok()
@@ -1360,7 +1377,7 @@ async fn attempt(
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
     let root = common.shared.hooks.proc_root();
     let group = tracking.cgroup();
-    let (steps, proof) = tokio::task::spawn_blocking(move || {
+    let (steps, proof) = super::begun::spawn_blocking(move || {
         let mut outside = Outside::new(&marker).with_root(root);
         match group {
             // The cgroup, then what may have left it with its marker (decision 8d v6, M2T06R-400).
@@ -1443,7 +1460,13 @@ async fn attempt(
     if work.assignment.writer && ending.success && !unknown {
         let identity = identity_of(&work)?;
         finished(common, &id, ran.as_ref(), ending, |e| {
-            super::completion::complete(store, &common.shared.root, identity, e)
+            super::completion::complete(
+                store,
+                &common.shared.root,
+                identity,
+                e,
+                common.shared.hooks.clone(),
+            )
         })
         .await?;
         return Ok(());
@@ -1521,7 +1544,7 @@ async fn serve_request(
 ) -> Result<u64, PersistError> {
     let store = &common.shared.store;
     let held = helpers.clone();
-    let request = tokio::task::spawn_blocking(move || super::requests::next(&held, n))
+    let request = super::begun::spawn_blocking(move || super::requests::next(&held, n))
         .await
         .map_err(|e| PersistError::Storage(format!("the request's read ended: {e}")))?;
     let Some(request) = request else {
@@ -1558,7 +1581,7 @@ async fn serve_request(
         },
     };
     let held = helpers.clone();
-    tokio::task::spawn_blocking(move || super::requests::respond(&held, n, &answer))
+    super::begun::spawn_blocking(move || super::requests::respond(&held, n, &answer))
         .await
         .map_err(|e| PersistError::Storage(format!("the answer's write ended: {e}")))?
         .map_err(|e| PersistError::Storage(format!("the answer to request {n}: {e}")))?;
@@ -1579,7 +1602,7 @@ async fn run_check(
     let root = common.shared.root.clone();
     let plan_sha = v.sealed.manifest.test_plan.sha256.clone();
     let id = check_id.to_owned();
-    let argv: Option<Vec<String>> = tokio::task::spawn_blocking(move || {
+    let argv: Option<Vec<String>> = super::begun::spawn_blocking(move || {
         let plan: Value = hoh_core::objects::get(&root, &plan_sha)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())?;
@@ -1639,7 +1662,7 @@ async fn run_check(
     match ran {
         Ok(ran) => {
             let record = ran.record_dir.join("execution.json");
-            let exit_code = tokio::task::spawn_blocking(move || {
+            let exit_code = super::begun::spawn_blocking(move || {
                 std::fs::read(&record)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -1777,7 +1800,7 @@ async fn settle(
     );
     let executor = common.executor.clone();
     let repeated = last.map(str::to_owned);
-    let stop = tokio::task::spawn_blocking(move || {
+    let stop = super::begun::spawn_blocking(move || {
         // A record of another world is one finding, whatever it names here: written once, not at every retry
         // (M2T06R-1054); the end keeps it uncertain.
         let seen = if matches!(tracking, Tracking::Foreign(_)) {
