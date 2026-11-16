@@ -260,9 +260,10 @@ impl Down {
 
 /// Remove every directory below `top`, the deepest first, each by its name in the directory above it (M2T06R-1100):
 /// down by name from the open directory into one with directories in it, back up by `..`, which must be the directory
-/// it came down from (cgroup v2 has no rename), so each is opened once and one name kept for each, at most three
-/// directories open at a time: time and memory linear in the subtree (M2T06R-1250). Where `..` is not that directory
-/// it stops; what is left stays.
+/// it came down from (cgroup v2 has no rename): each is opened once going down by its name, and each one entered costs
+/// one more open, of its parent by `..` coming back up (at most twice as many opens as directories); one name is kept
+/// for each, and at most three directories are open at a time: time and memory linear in the subtree (M2T06R-1250,
+/// CGW-51). Where `..` is not that directory it stops; what is left stays.
 fn remove_below(top: rustix::fd::OwnedFd) {
     let Ok(first) = Down::of(&top, std::ffi::CString::default()) else {
         return;
