@@ -131,6 +131,20 @@ pub struct Pass {
     pub progress: Progress,
 }
 
+impl Pass {
+    /// Whether it has nothing to record but how it ended: no signal sent and no diagnostic. Every field is named, so a
+    /// new part of a pass's outcome must be decided on here (docs/adr/ADR-021.md decision 8d, CGW-101's rule).
+    pub fn only_its_end(&self) -> bool {
+        let Pass {
+            sent,
+            term_incomplete,
+            end: _,
+            progress: _,
+        } = self;
+        sent.is_empty() && !term_incomplete
+    }
+}
+
 /// Drive `control` from `progress` until a look ends it or the group outlives this pass's SIGKILL by its grace.
 /// Between steps it looks at least every `poll` (`wait` sleeps, or advances a test's clock).
 pub fn pass(
@@ -222,8 +236,8 @@ pub trait Processes: Send + Sync {
 #[derive(Debug)]
 pub struct Canceller {
     progress: std::sync::Mutex<std::collections::BTreeMap<String, Progress>>,
-    /// The attempts whose last pass found their group lost track of: another such pass that sent nothing is not
-    /// recorded again (one record per finding).
+    /// The attempts whose last recorded pass found their group lost track of: another such pass with nothing else to
+    /// record is not recorded again (one record per finding; CGW-101's rule).
     lost: std::sync::Mutex<std::collections::BTreeSet<String>>,
     pub graces: Graces,
     /// How often a pass looks at least.
@@ -291,26 +305,28 @@ impl Canceller {
                     progress.remove(&attempt.attempt_id);
                 }
             }
-            // A lost pass after a lost one is the same finding unless it sent something or carries a diagnostic
-            // of its own (CGW-101).
-            let repeated = self.lost.lock().is_ok_and(|mut lost| {
-                if done.end == PassEnd::Lost {
-                    !lost.insert(attempt.attempt_id.clone())
-                        && done.sent.is_empty()
-                        && !done.term_incomplete
-                } else {
-                    lost.remove(&attempt.attempt_id);
-                    false
-                }
-            });
+            // A lost pass after a recorded lost one is the same finding when it has nothing else to record: its
+            // whole outcome is compared, and only what was committed is remembered (CGW-101's rule).
+            let repeated = done.end == PassEnd::Lost
+                && done.only_its_end()
+                && self
+                    .lost
+                    .lock()
+                    .is_ok_and(|lost| lost.contains(&attempt.attempt_id));
             if repeated {
                 continue;
             }
+            let Pass {
+                sent,
+                term_incomplete,
+                end,
+                progress: _,
+            } = done;
             let mut pass = crate::persistence::CancelPass {
-                attempt_id: attempt.attempt_id,
-                sent: done.sent,
-                term_incomplete: done.term_incomplete,
-                end: done.end,
+                attempt_id: attempt.attempt_id.clone(),
+                sent,
+                term_incomplete,
+                end,
                 at: clock.now(),
                 workspace: None,
             };
@@ -325,6 +341,13 @@ impl Canceller {
                 }
                 other => {
                     other?;
+                }
+            }
+            if let Ok(mut lost) = self.lost.lock() {
+                if end == PassEnd::Lost {
+                    lost.insert(attempt.attempt_id);
+                } else {
+                    lost.remove(&attempt.attempt_id);
                 }
             }
         }

@@ -1205,6 +1205,47 @@ async fn a_group_lost_track_of_keeps_the_run_cancelling_and_is_recorded_once() -
     Ok(())
 }
 
+#[tokio::test]
+async fn a_lost_pass_whose_record_failed_is_not_taken_for_recorded() -> R {
+    // CGW-101's rule (docs/adr/ADR-021.md decision 8d): the Lost dedupe compares a pass with what was recorded. A lost
+    // pass whose record failed (a trigger refuses its cancel.lost) is not remembered as recorded, so the next lost
+    // pass, with nothing else to record, is recorded rather than skipped as the same finding.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    Connection::open(&path)?.execute_batch(
+        "CREATE TRIGGER refuse_lost BEFORE INSERT ON events WHEN NEW.kind = 'cancel.lost' \
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+    )?;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(|_| {});
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    let refused = canceller
+        .step(
+            &store,
+            "R",
+            Arc::new(LostTrack),
+            clock.clone(),
+            wait.clone(),
+        )
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    Connection::open(&path)?.execute_batch("DROP TRIGGER refuse_lost;")?;
+    let step = canceller
+        .step(&store, "R", Arc::new(LostTrack), clock, wait)
+        .await?;
+    assert_eq!(step, Finished::Running(1));
+    assert_eq!(
+        count(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'cancel.lost'"
+        )?,
+        1
+    );
+    Ok(())
+}
+
 /// A1's control, pass by pass: the first finds its group lost; each later one finds it held, its SIGTERM refused and,
 /// once sent, said to have missed part of the cgroup, then lost again (CGW-101).
 struct LostThenPartial(Mutex<u32>);
