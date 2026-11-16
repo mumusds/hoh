@@ -134,6 +134,25 @@ pub(super) struct Opened {
     pub handoffs: Vec<String>,
 }
 
+/// Candidate `candidate_id`'s next round of run `run_id`: its number (one more than the rounds opened on it) and its id
+/// `child_id(candidate, "round/<n>")` (docs/adr/ADR-031.md decision 8: the reverify exit names its new chain by it).
+pub(super) fn next_round(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+    candidate_id: &str,
+) -> Result<(i64, String), PersistError> {
+    let opened: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind = ?1 AND run_id = ?2 \
+             AND json_extract(payload_json, '$.candidate_id') = ?3",
+            params![ROUND_OPENED, run_id, candidate_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let number = opened + 1;
+    Ok((number, child_id(candidate_id, &format!("round/{number}"))))
+}
+
 /// Open the candidate's next round in `tx`: its number, the union of its sources' criteria under the run's
 /// specification (never empty), the handoff to each verifier at its current epoch (enveloped by the first source,
 /// M2T16D-659) and the two verifier tasks: `child_id(round, "task/<role>")`, readers in layer 0, READY, with no
@@ -145,16 +164,7 @@ pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, P
     let first = sources.first().ok_or_else(|| {
         PersistError::IntegrityViolation("a round with no source task".to_owned())
     })?;
-    let opened: i64 = tx
-        .query_row(
-            "SELECT count(*) FROM events WHERE kind = ?1 AND run_id = ?2 \
-             AND json_extract(payload_json, '$.candidate_id') = ?3",
-            params![ROUND_OPENED, o.run_id, o.candidate.id],
-            |r| r.get(0),
-        )
-        .map_err(sqlite_error)?;
-    let number = opened + 1;
-    let round_id = child_id(&o.candidate.id, &format!("round/{number}"));
+    let (number, round_id) = next_round(tx, o.run_id, &o.candidate.id)?;
     let mut acceptance_ids = Vec::new();
     for source in &sources {
         acceptance_ids.extend(criteria(tx, &source.task_id, o.spec_id)?);
@@ -229,6 +239,9 @@ pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, P
             "acceptance_ids": acceptance_ids,
             "tasks": tasks,
             "handoffs": handoffs,
+            // What its handoffs were built from that the round does not keep otherwise: an INVALID_HANDOFF answer
+            // rebuilds a handoff with the same construction (docs/adr/ADR-031.md decision 8).
+            "opened_by": {"attempt_id": o.attempt_id, "cause": o.cause, "task_revision": first.revision},
         }),
     };
     let mut event = event;
@@ -344,6 +357,179 @@ fn criteria(
         .query_map(params![task_id, spec_id], |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// The event that clears task `task_id`'s standing repair refusal by decision (or answering command) `decision_id`
+/// (docs/adr/ADR-028.md decision 12; docs/adr/ADR-031.md decision 8's `clear_repair_refusal_in`): after it the task is
+/// no longer in [`refused`].
+pub(super) fn refusal_cleared(
+    project_id: &str,
+    run_id: &str,
+    task_id: &str,
+    decision_id: &str,
+) -> NewEvent {
+    NewEvent {
+        intent: Intent::Progress,
+        project_id: project_id.to_owned(),
+        event_id: child_id(task_id, &format!("refusal_cleared/{decision_id}")),
+        run_id: Some(run_id.to_owned()),
+        kind: "repair.refusal_cleared".to_owned(),
+        payload: json!({"task_id": task_id, "decision_id": decision_id}),
+    }
+}
+
+/// Round `round_id`'s handoff to verifier `role` rebuilt for an INVALID_HANDOFF answer (docs/adr/ADR-031.md decision
+/// 8, M2T13D-03): the construction that issued it (`handoff::verification`) from the round's `round_opened` — its
+/// candidate, sources and scope (the criteria still in the run's specification), and its `opened_by` — the
+/// candidate's identity, the run's specification, and the goal, references and budget as they are now, to the role
+/// at its current epoch; `child_id(<its current handoff>, "rebuilt")`, issued by `verification.handoff_reissued{reason:
+/// rebuilt}` so the next admission reads it. `Err(detail)`: a precondition does not hold (no `opened_by`, a round
+/// opened before it was recorded; nothing left to verify; the message not passing the admission's own check).
+pub(super) fn rebuild_handoff(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    round_id: &str,
+    role: &str,
+    command_id: &str,
+) -> Result<Result<super::writer::Commit, String>, PersistError> {
+    let opened: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = ?1 AND run_id = ?2 \
+             AND json_extract(payload_json, '$.round_id') = ?3",
+            params![ROUND_OPENED, run_id, round_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(opened) = opened else {
+        return Ok(Err(format!("round {round_id} is not run {run_id}'s")));
+    };
+    let opened: serde_json::Value = serde_json::from_str(&opened)
+        .map_err(|e| PersistError::IntegrityViolation(format!("round {round_id}: {e}")))?;
+    let by = &opened["opened_by"];
+    let (Some(attempt_id), Some(cause), Some(task_revision)) = (
+        by["attempt_id"].as_str(),
+        by["cause"].as_str(),
+        by["task_revision"].as_u64(),
+    ) else {
+        return Ok(Err(format!(
+            "round {round_id} records no opened_by: it was opened before its handoffs could be rebuilt"
+        )));
+    };
+    let candidate_id = opened["candidate_id"].as_str().unwrap_or_default();
+    let Some((candidate, _)) = super::results::load_candidate(tx, run_id, candidate_id)? else {
+        return Ok(Err(format!(
+            "candidate {candidate_id} is not run {run_id}'s"
+        )));
+    };
+    let (project_id, spec_id, spec_sha256, spec_revision): (String, String, String, i64) = tx
+        .query_row(
+            "SELECT r.project_id, r.spec_id, s.sha256, s.revision FROM runs r JOIN specs s ON s.spec_id = r.spec_id \
+             WHERE r.run_id = ?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(sqlite_error)?;
+    let sources: Vec<String> = opened["source_task_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str().map(str::to_owned))
+        .collect();
+    let Some(first) = sources.first() else {
+        return Ok(Err(format!("round {round_id} names no source")));
+    };
+    // Its scope as the round recorded it, of the criteria the run's specification still has.
+    let mut acceptance_ids = Vec::new();
+    for ac in opened["acceptance_ids"].as_array().into_iter().flatten() {
+        let Some(ac) = ac.as_str() else { continue };
+        let kept: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM acceptance_criteria WHERE spec_id = ?1 AND ac_id = ?2)",
+                params![spec_id, ac],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if kept {
+            acceptance_ids.push(ac.to_owned());
+        }
+    }
+    let Some(binding) = load_binding(tx, run_id, role)? else {
+        return Ok(Err(format!("run {run_id} has no {role} bound")));
+    };
+    let verification = Verification {
+        round_id: round_id.to_owned(),
+        run_id: run_id.to_owned(),
+        task_id: first.clone(),
+        attempt_id: attempt_id.to_owned(),
+        candidate,
+        spec_sha256,
+        spec_revision: u64::try_from(spec_revision)
+            .map_err(|_| PersistError::IntegrityViolation("spec revision".to_owned()))?,
+        acceptance_ids,
+        goal: super::results::goal(tx, run_id, first, candidate_id)?,
+        task_revision,
+        cause: cause.to_owned(),
+        references: super::context::references(
+            tx,
+            &[attempt_id.to_owned()],
+            super::results::REFERENCES,
+        )?,
+        budget_tokens: super::context::budget(tx, run_id)?,
+    };
+    let recipient = Recipient {
+        role: role.to_owned(),
+        role_epoch: binding.role_epoch,
+    };
+    let Some(mut message) =
+        handoff::verification(&verification, &[recipient]).and_then(|m| m.into_iter().next())
+    else {
+        return Ok(Err(format!(
+            "round {round_id} has no acceptance criterion left under the run's specification"
+        )));
+    };
+    // The handoff it replaces: the round's current one, as the admission reads it.
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.to') FROM events WHERE kind = ?1 \
+             AND json_extract(payload_json, '$.round_id') = ?2 AND json_extract(payload_json, '$.role') = ?3 \
+             ORDER BY seq DESC LIMIT 1",
+            params![HANDOFF_REISSUED, round_id, role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let bad = current.unwrap_or_else(|| child_id(round_id, &format!("verify/{role}")));
+    message.message_id = child_id(&bad, "rebuilt");
+    message.idempotency_key = message.message_id.clone();
+    // The admission's own check, on the message as it will be read back.
+    let checked = crate::protocol::encode(&message)
+        .map_err(|e| e.to_string())
+        .and_then(|v| {
+            crate::protocol::decode::<crate::protocol::Message>(&v).map_err(|e| e.to_string())
+        })
+        .and_then(|m| m.check_payload());
+    if let Err(violations) = checked {
+        return Ok(Err(format!(
+            "the rebuilt handoff does not pass its admission's check: {violations}"
+        )));
+    }
+    let role_epoch = binding.role_epoch;
+    Ok(Ok(super::writer::Commit {
+        events: vec![NewEvent {
+            intent: Intent::Progress,
+            project_id,
+            event_id: child_id(&message.message_id, "issued"),
+            run_id: Some(run_id.to_owned()),
+            kind: HANDOFF_REISSUED.to_owned(),
+            payload: json!({
+                "round_id": round_id, "role": role, "from": bad, "to": message.message_id,
+                "role_epoch": role_epoch, "reason": "rebuilt", "command_id": command_id,
+            }),
+        }],
+        outbox: vec![NewOutbox::hcp(0, &message)?],
+        ..super::writer::Commit::default()
+    }))
 }
 
 /// The kind of the event that issues a round's handoff again at its role's current epoch.

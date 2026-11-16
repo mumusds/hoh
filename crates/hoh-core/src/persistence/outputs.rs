@@ -570,9 +570,10 @@ fn one(
     }
 }
 
-/// A request for a person past decide's fences (decide does not apply it yet, M2-T13; its decisions row stays
-/// PROPOSED, so the same id again is a replay or a key reuse): `unsupported`, with NEED_DECISION claimed for it (source
-/// `commander:<decision_id>`, released by its answer) and the run blocked by it.
+/// A request for a person past decide's fences (decide does not apply it: its answer does, docs/adr/ADR-031.md decision
+/// 7; its decisions row stays PROPOSED until then, so the same id again is a replay or a key reuse): `unsupported`,
+/// its `question.asked`, with NEED_DECISION claimed for it (source `commander:<decision_id>`, released by its answer)
+/// and the run blocked by it.
 fn person(
     tx: &Transaction<'_>,
     project_id: &str,
@@ -595,6 +596,25 @@ fn person(
         events: claims.store(tx)?,
         ..Commit::default()
     };
+    // The question as asked (docs/adr/ADR-031.md decision 6): its id is the request's decision id, its words the
+    // Commander's own.
+    if let DecisionPayload::RequestUserDecision {
+        question_id,
+        question,
+        choices,
+        requires_user,
+    } = &proposal.payload
+    {
+        commit.events.push(NewEvent {
+            intent: Intent::Progress,
+            project_id: project_id.to_owned(),
+            event_id: child_id(&proposal.decision_id, "question"),
+            run_id: Some(run_id.to_owned()),
+            kind: super::need::QUESTION_ASKED.to_owned(),
+            payload: json!({"question_id": proposal.decision_id, "commander_question_id": question_id,
+                "question": question, "choices": choices, "requires_user": requires_user}),
+        });
+    }
     let moved = blockers::follow(
         tx,
         project_id,

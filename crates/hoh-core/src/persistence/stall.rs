@@ -171,18 +171,41 @@ fn judge(
     }
     let marker = progress(tx, run_id)?;
     // Its STALLED re-triggers and questions on P, read by their ids (each `child_id(run, "stalled/<P>/…")`, numbered
-    // from 1 with no gap), not by a scan of its events.
+    // from 1 with no gap), not by a scan of its events; and the retry answers to those questions, each by its id
+    // (`child_id(<question>, "retry")`, questions.rs).
     let stalled = numbered(tx, run_id, &|n| format!("stalled/{marker}/{n}"))?;
     let asked = numbered(tx, run_id, &|k| format!("stalled/{marker}/question/{k}"))?;
-    // The precondition (M2T13D-300, -402, -451): the latest obligation on P consumed, its turn ended and its outputs
-    // disposed of, read by its identity.
-    if let Some(&latest) = stalled.last()
-        && !settled(tx, run_id, &marker, stalled.len(), latest)?
+    let retries = retry_answers(tx, run_id, &marker, asked.len())?;
+    // The precondition (M2T13D-300, -402, -451): the latest obligation on P — its latest STALLED, or the
+    // `need_decision{answered}` of its latest retry answer — consumed, its turn ended and its outputs disposed of, read
+    // by its identity (its trigger by the fingerprint it was taken in under).
+    let latest = [
+        stalled.last().map(|seq| {
+            (
+                *seq,
+                format!("stalled/{marker}/{}#retrigger", stalled.len()),
+            )
+        }),
+        retries.last().map(|(question, seq)| {
+            (
+                *seq,
+                crate::supervise::escape(&format!("answer/{question}")),
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|(seq, _)| *seq);
+    if let Some((latest, fingerprint)) = latest
+        && !settled(tx, run_id, &fingerprint, latest)?
     {
         return Ok(Detected::Nothing);
     }
+    // c: the STALLED on P since its latest question (from the start without one), and one more when that question was
+    // answered retry (its turn was one of the K).
     let since = asked.last().copied().unwrap_or(0);
-    let c = stalled.iter().filter(|seq| **seq > since).count();
+    let c = stalled.iter().filter(|seq| **seq > since).count()
+        + usize::from(retries.iter().any(|(_, seq)| *seq > since));
     let event = |id: String, kind: &str, payload: Value| NewEvent {
         intent: Intent::Progress,
         project_id: project_id.clone(),
@@ -302,21 +325,47 @@ fn recovery_owed(
     Ok(false)
 }
 
-/// Whether the STALLED re-trigger `stalled/<marker>/<n>` (event `seq`) of run `run_id` is settled: its trigger (keyed by
-/// its fingerprint, `stalled/<marker>/<n>#retrigger`) HANDLED, and the wake it woke (the trigger's own, or the one it
-/// was merged into, read from its `woken` by id) settled by its identity (`wakes::settled_by_id`).
-fn settled(
+/// The retry answers of run `run_id`'s first `asked` stalled questions on marker `marker`, each read by its id
+/// (`child_id(<question>, "retry")`, the `need_decision{answered}` its stalled exit writes): (the question, its seq), in
+/// order (docs/adr/ADR-031.md decision 8's stalled row: each retry answer's turn counts in K).
+fn retry_answers(
     tx: &Transaction<'_>,
     run_id: &str,
     marker: &str,
-    n: usize,
+    asked: usize,
+) -> Result<Vec<(String, i64)>, PersistError> {
+    let mut statement = tx
+        .prepare("SELECT seq FROM events WHERE event_id = ?1 AND run_id = ?2")
+        .map_err(sqlite_error)?;
+    let mut answers = Vec::new();
+    for k in 1..=asked {
+        let question = child_id(run_id, &format!("stalled/{marker}/question/{k}"));
+        if let Some(seq) = statement
+            .query_row(params![child_id(&question, "retry"), run_id], |r| r.get(0))
+            .optional()
+            .map_err(sqlite_error)?
+        {
+            answers.push((question, seq));
+        }
+    }
+    Ok(answers)
+}
+
+/// Whether the obligation event at `seq` of run `run_id` — a STALLED re-trigger, or a retry answer's `need_decision` —
+/// is settled: its trigger (keyed by the fingerprint it was taken in under, `fingerprint`: `stalled/<P>/<n>#retrigger`,
+/// or the answer's `answer/<question>`) HANDLED, and the wake it woke (the trigger's own, or the one it was merged
+/// into, read from its `woken` by id) settled by its identity (`wakes::settled_by_id`).
+fn settled(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    fingerprint: &str,
     seq: i64,
 ) -> Result<bool, PersistError> {
     let trigger: Option<(String, String)> = tx
         .query_row(
             "SELECT t.trigger_id, t.state FROM supervisor_triggers t WHERE t.run_id = ?1 AND t.fingerprint = ?2 \
              AND EXISTS(SELECT 1 FROM json_each(t.event_seqs_json) s WHERE s.value = ?3)",
-            params![run_id, format!("stalled/{marker}/{n}#retrigger"), seq],
+            params![run_id, fingerprint, seq],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()

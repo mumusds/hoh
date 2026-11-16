@@ -302,7 +302,9 @@ impl Lifecycle for TaskState {
             Running => &[Implemented, Ready, Blocked, Cancelled],
             Implemented => &[Verifying, Ready, Blocked, Cancelled],
             Verifying => &[Accepted, Ready, Blocked, Cancelled],
-            Blocked => &[Pending, Ready, Cancelled],
+            // VERIFYING: the Runtime's reverify exit of an answer only, its next round opened in the same transaction
+            // (docs/adr/ADR-031.md decision 8; never the Commander's, decision::COMMANDER_TASK_MOVES).
+            Blocked => &[Pending, Ready, Verifying, Cancelled],
             Accepted | Cancelled => &[],
         }
     }

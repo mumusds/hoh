@@ -1311,6 +1311,17 @@ pub(super) fn temp_tables(conn: &Connection) -> Result<(), PersistError> {
     .map_err(sqlite_error)
 }
 
+/// Run `run_id`'s result judged at the end of this transaction (docs/adr/ADR-031.md decision 7, E3; the ADR's
+/// `Commit.results`): an input command that leaves it in a stopping state ends the commit with its `run.result`.
+pub(super) fn result_due(tx: &Transaction<'_>, run_id: &str) -> Result<(), PersistError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO temp.results_due(run_id) VALUES (?1)",
+        params![run_id],
+    )
+    .map(drop)
+    .map_err(sqlite_error)
+}
+
 /// The end of a write transaction of the writer (docs/adr/ADR-031.md decision 3): [`finish`], then the fault hooks'
 /// word (an error fails the commit and the transaction rolls back), then the commit.
 pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {

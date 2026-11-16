@@ -65,6 +65,8 @@ fn task_rule(from: Task, to: Task) -> bool {
         (Verifying, Accepted),
         (Ready, Pending),
         (Blocked, Pending),
+        // The Runtime's reverify exit of an answer (docs/adr/ADR-031.md decision 8).
+        (Blocked, Verifying),
     ];
     if forward.contains(&(from, to)) {
         return true;
@@ -175,7 +177,7 @@ fn test_036_01_every_ordered_pair_is_judged_as_the_table_says() {
     assert_eq!(run_pairs + task_pairs + attempt_pairs, 355);
     assert_eq!(
         (run_legal, task_legal, attempt_legal),
-        (88, 26, 14),
+        (88, 27, 14),
         "legal edges per ADR-011"
     );
     rows.extend(task_rows);

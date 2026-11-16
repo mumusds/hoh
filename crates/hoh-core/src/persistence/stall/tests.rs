@@ -1389,3 +1389,228 @@ async fn the_detectors_work_does_not_grow_with_the_runs_history() -> R {
     );
     Ok(())
 }
+
+/// R's input command `id` at its revision now: an AnswerQuestion of `question` with `text`, or a ResumeRun.
+fn input(
+    path: &PathBuf,
+    id: &str,
+    target: crate::persistence::RunTarget,
+    kind: &str,
+) -> R<crate::persistence::SubmitCommand> {
+    let revision = value(path, "SELECT revision FROM runs WHERE run_id = 'R'")?
+        .as_i64()
+        .ok_or("no revision")?;
+    let event = match kind {
+        "AnswerQuestion" => "question.answer_accepted",
+        _ => "run.resumed",
+    };
+    Ok(crate::persistence::SubmitCommand {
+        command_id: id.to_owned(),
+        idempotency_key: format!("k-{id}"),
+        kind: kind.to_owned(),
+        run_id: "R".to_owned(),
+        expected_revision: revision,
+        payload: json!({}),
+        payload_sha256: crate::context::sha256_hex(id.as_bytes()),
+        target,
+        event: crate::persistence::NewEvent {
+            intent: crate::persistence::Intent::Progress,
+            project_id: "p1".to_owned(),
+            event_id: format!("e-{id}"),
+            run_id: Some("R".to_owned()),
+            kind: event.to_owned(),
+            payload: json!({"command_id": id}),
+        },
+        outbox: None,
+    })
+}
+
+fn answer_of(
+    path: &PathBuf,
+    id: &str,
+    question: &str,
+    text: &str,
+) -> R<crate::persistence::SubmitCommand> {
+    input(
+        path,
+        id,
+        crate::persistence::RunTarget::Input(crate::persistence::Input::Answer {
+            question_id: question.to_owned(),
+            answer: text.to_owned(),
+            choice_id: None,
+        }),
+        "AnswerQuestion",
+    )
+}
+
+/// The id of R's latest stalled question.
+fn question_id(path: &PathBuf) -> R<String> {
+    Ok(value(
+        path,
+        "SELECT event_id FROM events WHERE kind = 'question.asked' ORDER BY seq DESC LIMIT 1",
+    )?
+    .as_str()
+    .ok_or("no question")?
+    .to_owned())
+}
+
+/// R's latest run.result: its state and exit code.
+fn result(path: &PathBuf) -> R<Value> {
+    value(
+        path,
+        "SELECT json_array(json_extract(payload_json, '$.state'), json_extract(payload_json, '$.exit_code')) \
+         FROM events WHERE run_id = 'R' AND kind = 'run.result' ORDER BY seq DESC LIMIT 1",
+    )
+}
+
+#[tokio::test]
+async fn a_stalled_question_answered_retry_gives_one_turn_then_one_stalled_then_asks_again_and_cancel_ends_it()
+-> R {
+    // 停滞探测 (6)'s AnswerQuestion half and (7)'s answers, decision 8's stalled row, S1c's c and precondition with the
+    // retry answer (stall.rs): asked after two STALLED turns (its run.result BLOCKED, exit 3: `hoh -p` exits 3). An
+    // AnswerQuestion(retry) committed between a tick's step and its detection: the claim released, the run back to
+    // RUNNING, need_decision{answered, retry, progress P}; that tick's detector sees it unread and writes nothing; the
+    // next ticks take it in and allocate the retry turn, shown the user's words. That turn moves nothing: one STALLED
+    // (n = 3: the retry answer's turn counted in c), its turn moves nothing: the second question. Answered cancel: the
+    // run CANCEL_REQUESTED, then CANCELLED by the cancel's step, its run.result exit 5.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "RUNNING", "")?;
+    let (_, ms) = drive(&store, &clock, &path, 0, 12, &Answer::Nothing, asked).await?;
+    assert_asked(&path, 2)?;
+    assert_eq!(result(&path)?, json!(["BLOCKED", 3]));
+    // Its marker, P as the run was in W when asked.
+    let marker = value(
+        &path,
+        "SELECT json_extract(payload_json, '$.progress') FROM events WHERE kind = 'question.asked'",
+    )?;
+    let first = question_id(&path)?;
+    let open = crate::persistence::questions::open(&Connection::open(&path)?, "R")?;
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].question_id, first);
+    // The answer lands between the next tick's step and its detection.
+    let ms = ms + 1000;
+    let waiting = before_allocation(&store, &clock, ms).await?;
+    store
+        .submit_command(answer_of(&path, "c1", &first, "retry 请推进到 READY")?)
+        .await?;
+    assert_eq!(state(&path)?, json!("RUNNING"));
+    let woke = value(
+        &path,
+        "SELECT payload_json FROM events WHERE kind = 'need_decision' ORDER BY seq DESC LIMIT 1",
+    )?;
+    assert_eq!(
+        (
+            &woke["reason"],
+            &woke["choice_id"],
+            &woke["progress"],
+            &woke["question_id"]
+        ),
+        (
+            &json!("answered"),
+            &json!("retry"),
+            &json!(marker),
+            &json!(first)
+        )
+    );
+    let (detected, none) = from_allocation(&store, &clock, ms, &waiting).await?;
+    assert_eq!((detected, none.is_none()), (Detected::Nothing, true));
+    let (turn, at) = next_turn(&store, &clock, ms).await?;
+    let shown = shown(&store, &turn.attempt_id).await?;
+    assert!(
+        shown
+            .iter()
+            .any(|e| e["payload"]["answer"] == "retry 请推进到 READY"),
+        "the retry turn sees the user's words: {shown:?}"
+    );
+    start(&store, &clock, &turn.attempt_id, at + 100).await?;
+    finish(&store, &clock, &path, &turn, at + 300, &Answer::Nothing).await?;
+    let (detected, _) = tick(&store, &clock, at + 1000).await?;
+    assert_eq!(detected, Detected::Retriggered(3));
+    let (turn, at) = next_turn(&store, &clock, at + 1000).await?;
+    start(&store, &clock, &turn.attempt_id, at + 100).await?;
+    finish(&store, &clock, &path, &turn, at + 300, &Answer::Nothing).await?;
+    let (detected, _) = tick(&store, &clock, at + 1000).await?;
+    assert_eq!(detected, Detected::Asked);
+    let second = question_id(&path)?;
+    assert_ne!(second, first);
+    assert_eq!(questions(&path)?.as_array().map(Vec::len), Some(2));
+    assert_eq!(state(&path)?, json!("BLOCKED/NEED_DECISION"));
+    store
+        .submit_command(answer_of(&path, "c2", &second, "cancel")?)
+        .await?;
+    assert_eq!(state(&path)?, json!("CANCEL_REQUESTED/NEED_DECISION"));
+    assert_eq!(
+        crate::persistence::questions::open(&Connection::open(&path)?, "R")?,
+        Vec::new()
+    );
+    let finished = store
+        .finish_cancel("R", json!({}), Default::default(), t(at + 2000))
+        .await?;
+    assert_eq!(finished, crate::persistence::Finished::Cancelled);
+    assert_eq!(result(&path)?, json!(["CANCELLED", 5]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resume_of_a_commander_decided_incomplete_run_is_stalled_at_that_ticks_end_across_a_restart()
+-> R {
+    // 停滞探测 (2) (M2T13D-101) and (5)'s first half: the scripted Commander decides INCOMPLETE in SPECIFYING (no stop
+    // item); a ResumeRun takes the run back to SPECIFYING and writes no re-trigger; that tick's detector writes a
+    // STALLED; its turn moves the run to READY. The same with the host restarted between the ResumeRun and the next
+    // tick: the first tick after the restart writes it.
+    for restart in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let clock = Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        world(&path, "SPECIFYING", "")?;
+        let (_, ms) = drive(&store, &clock, &path, 0, 10, &to("INCOMPLETE"), |p| {
+            Ok(state(p)? == json!("INCOMPLETE"))
+        })
+        .await?;
+        assert_eq!(state(&path)?, json!("INCOMPLETE"));
+        let resume = input(
+            &path,
+            "c1",
+            crate::persistence::RunTarget::Resume,
+            "ResumeRun",
+        )?;
+        let before = value(&path, "SELECT max(seq) FROM events")?
+            .as_i64()
+            .unwrap_or(0);
+        store.submit_command(resume).await?;
+        assert_eq!(state(&path)?, json!("SPECIFYING"));
+        assert_eq!(
+            value(
+                &path,
+                &format!(
+                    "SELECT count(*) FROM events WHERE seq > {before} AND kind = 'supervisor.retrigger'"
+                )
+            )?,
+            json!(0),
+            "the resume writes no re-trigger"
+        );
+        let n = stalled(&path)?.len();
+        let store = if restart {
+            drop(store);
+            open(&dir, &clock)?.0
+        } else {
+            store
+        };
+        let (detected, _) = tick(&store, &clock, ms + 1000).await?;
+        assert_eq!(detected, Detected::Retriggered(n + 1), "restart {restart}");
+        drive(
+            &store,
+            &clock,
+            &path,
+            ms + 1000,
+            10,
+            &Answer::Advance(&["SPECIFYING", "READY"]),
+            |p| Ok(state(p)? == json!("READY")),
+        )
+        .await?;
+        assert_eq!(state(&path)?, json!("READY"), "restart {restart}");
+    }
+    Ok(())
+}

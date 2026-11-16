@@ -154,7 +154,7 @@ pub fn classify(
 /// An event's own fingerprint as the stored key holds it (docs/adr/ADR-025.md v13 decision 2, M2T08R-07): `%`, `#`
 /// and `@` escaped, so only the suffixes the Runtime adds (`#retrigger`, `@r<revision>`) carry `#` and `@` and an
 /// ordinary key never equals a re-trigger chain's or another revision's.
-fn escape(fingerprint: &str) -> String {
+pub(crate) fn escape(fingerprint: &str) -> String {
     fingerprint
         .replace('%', "%25")
         .replace('#', "%23")

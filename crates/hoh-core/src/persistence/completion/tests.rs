@@ -615,6 +615,9 @@ async fn a_completion_opens_its_candidates_first_round_with_its_two_runtime_veri
             "round_id": round, "candidate_id": c1, "number": 1, "source_task_ids": ["D"],
             "acceptance_ids": ["AC-1-01"], "tasks": {"qa": id("task/qa"), "reviewer": id("task/reviewer")},
             "handoffs": [id("verify/qa"), id("verify/reviewer")],
+            // What its handoffs were built from (docs/adr/ADR-031.md decision 8: an INVALID_HANDOFF answer rebuilds
+            // one with the same construction).
+            "opened_by": {"attempt_id": "A", "cause": "A/result", "task_revision": 6},
         })]
     );
     assert_eq!(

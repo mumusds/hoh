@@ -385,6 +385,23 @@ pub(super) fn refusal_reblock(
     )
 }
 
+/// An answer the Commander is to decide on (decision 7, decision 8's stalled retry): `need_decision{reason: answered}`
+/// with `fields` (question_id, answer, choice_id, fingerprint…), which wakes it with the answer in its turn's context.
+pub(super) fn answered(
+    project_id: &str,
+    run_id: &str,
+    event_id: String,
+    fields: Value,
+) -> NewEvent {
+    event(
+        project_id,
+        run_id,
+        event_id,
+        json!({"run_id": run_id, "reason": "answered"}),
+        fields,
+    )
+}
+
 fn event(project_id: &str, run_id: &str, event_id: String, base: Value, fields: Value) -> NewEvent {
     let mut payload = base;
     if let (Some(payload), Value::Object(more)) = (payload.as_object_mut(), fields) {
