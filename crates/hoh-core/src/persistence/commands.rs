@@ -42,7 +42,9 @@ pub enum RunTarget {
     /// holds; to BLOCKED while blockers are claimed (REQ-036 decision 2, docs/adr/ADR-031.md decision 16).
     Resume,
     /// A new run, CREATED, in this mode (StartRun, decision 5): `run_id` is the id the host gave it. It binds the
-    /// project's current team and gets `budget` (docs/adr/ADR-022.md decision 7).
+    /// project's current team and gets `budget` (docs/adr/ADR-022.md decision 7), and adopts the project's latest
+    /// approved specification, or is BLOCKED on its question `runtime:no_spec` when there is none
+    /// (docs/adr/ADR-031.md decision 1).
     Start {
         mode: String,
         budget: crate::config::Budget,
@@ -181,16 +183,35 @@ pub(super) fn submit(
                 budget,
                 policy,
             )?;
+            // The project's latest approved specification, adopted after run.created; with none, the run is BLOCKED
+            // on its question runtime:no_spec in this commit (docs/adr/ADR-031.md decision 1).
+            let project_id = &command.event.project_id;
+            let adopted = super::adoption::adopt(&tx, project_id, &command.run_id)?;
+            let asks = adopted.is_none();
             let done = writer::write(
                 &tx,
                 &Commit {
-                    events: vec![command.event.clone()],
+                    events: std::iter::once(command.event.clone())
+                        .chain(adopted)
+                        .collect(),
                     outbox: command.outbox.clone().into_iter().collect(),
                     ..Commit::default()
                 },
                 ctx,
             )?;
-            (0, done.event_seqs[0])
+            if asks {
+                super::adoption::ask(&tx, project_id, &command.run_id, ctx)?;
+            }
+            // The 202 body's revision is the run's after this transaction, as for every other run command: 0, or 1
+            // once its question blocked it.
+            let revision: i64 = tx
+                .query_row(
+                    "SELECT revision FROM runs WHERE run_id = ?1",
+                    params![command.run_id],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            (revision, done.event_seqs[0])
         }
         RunTarget::Team(change) => {
             if !command.run_id.is_empty() {

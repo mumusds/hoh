@@ -661,8 +661,14 @@ async fn exchange(host: &Host, method: &str, path: &str, body: Option<&Value>) -
     Ok((status, serde_json::from_str(body)?))
 }
 
-/// A started run's id.
-async fn started(host: &Host, key: &str) -> R<String> {
+/// A started run's id. The project has an approved specification first (s1, revision 1, the one [`ready`] names): a
+/// run adopts it at its start (docs/adr/ADR-031.md decision 1; with none it would be BLOCKED on runtime:no_spec).
+async fn started(host: &Host, project: &Path, key: &str) -> R<String> {
+    exec(
+        project,
+        "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) \
+         SELECT 's1', project_id, printf('%064d', 1), 1 FROM projects;",
+    )?;
     let body = json!({
         "schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
         "expected_revision": 0, "kind": "StartRun", "run_id": null,
@@ -752,7 +758,7 @@ async fn an_oversized_frame_fails_only_its_attempt(agent: &str) -> R {
         if agent != "claude" {
             configure(&host, "dev", team_revision(&project)?, json!({"developer": {"agent": agent}})).await?;
         }
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-OK", "developer"), ("T-HUGE", "developer")])?;
         let limit = Duration::from_secs(60);
         until(
@@ -864,7 +870,7 @@ async fn test_018_02_a_team_change_waits_for_the_running_attempt_and_the_next_on
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T1", "developer")])?;
         let limit = Duration::from_secs(60);
         until(
@@ -997,7 +1003,7 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let revision = query(&project, "SELECT coalesce(max(revision), 0) FROM team_revisions")?;
         ready(&project, &run_id, &[("T-cto", "cto"), ("T-dev", "developer")])?;
         let limit = Duration::from_secs(60);
@@ -1090,7 +1096,14 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
             .filter_map(|e| std::fs::read_to_string(e.path()).ok())
             .any(|argv| argv.lines().any(|a| a == native));
         assert!(resumed, "no turn resumed {native}");
-        // Every turn was started through the start gate, which gave it its attempt's marker.
+        // Every turn was started through the start gate, which gave it its attempt's marker. The Commander's turns are
+        // claude's too in this world: the specification the run adopted at its start wakes it (docs/adr/ADR-031.md
+        // decision 1); only the cto's and the developer's turns are counted.
+        let commander = query(
+            &project,
+            "SELECT coalesce(group_concat(a.attempt_id, ' '), '') FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.role = 'commander'",
+        )?;
         let markers: Vec<String> = std::fs::read_dir(world.bin().join("claude.d"))?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("env."))
@@ -1099,6 +1112,7 @@ async fn test_018_03_each_role_has_its_own_session_and_an_agents_exit_changes_no
                 env.lines()
                     .find_map(|l| l.strip_prefix("HOH_ATTEMPT_ID=").map(str::to_owned))
             })
+            .filter(|m| !commander.split(' ').any(|a| !a.is_empty() && m.ends_with(&format!("/{a}"))))
             .collect();
         assert_eq!(markers.len(), 4, "{markers:?}");
         for attempt in [
@@ -1144,7 +1158,7 @@ async fn test_018_05_a_custom_role_from_the_file_runs_its_override_prompt_in_its
     )?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let (status, snapshot) = exchange(&host, "GET", &format!("/v1/runs/{run_id}"), None).await?;
         assert_eq!(status, 200, "{snapshot}");
         let member = snapshot["projection"]["team"]
@@ -1220,7 +1234,7 @@ async fn a_change_to_an_agent_not_installed_is_refused_until_it_is_and_the_old_b
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         configure(&host, "dev", team_revision(&project)?, json!({"developer": {"agent": "pi"}})).await?;
         let limit = Duration::from_secs(30);
         until(
@@ -1286,7 +1300,7 @@ async fn a_turn_that_cannot_start_fails_by_its_refusals_reason_and_class() -> R 
     world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(30);
         until(
             &project,
@@ -1419,7 +1433,7 @@ async fn once_a_turn_ended_the_executor_no_longer_holds_it_and_a_cancel_reaches_
     let host = start_when_free(config).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-END", "developer")])?;
         until(
             &project,
@@ -1463,7 +1477,7 @@ async fn a_turn_that_ends_after_starting_a_command_ends_unknown_effect_and_is_no
     let project = world.project();
     let outcome = async {
         configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-UNKNOWN", "developer")])?;
         until(
             &project,
@@ -1558,7 +1572,7 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
     let sha: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         exec(
             &project,
             &format!(
@@ -1709,7 +1723,7 @@ fn verified_project(world: &World) -> R<String> {
 /// round's QA handoff package and the candidate.
 async fn first_qa_prompt(world: &World, host: &Host, spec_sha: &str) -> R<(String, Value, String)> {
     let project = world.project();
-    let run_id = started(host, "s1").await?;
+    let run_id = started(host, &project, "s1").await?;
     exec(
         &project,
         &format!(
@@ -1915,7 +1929,7 @@ async fn a_writer_the_host_stops_for_an_oversize_frame_lets_its_lease_go_with_th
     world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[])?;
         exec(
             &project,
@@ -2005,7 +2019,7 @@ async fn a_writers_turn_that_ends_unknown_effect_lets_its_lease_go_with_the_work
     let project = world.project();
     let outcome = async {
         configure(&host, "dev", 0, json!({"developer": {"agent": "codex"}})).await?;
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[])?;
         exec(
             &project,
@@ -2096,7 +2110,7 @@ async fn an_app_server_that_cannot_start_a_turn_degrades_that_codex_to_exec() ->
             json!({"developer": {"agent": "codex"}}),
         )
         .await?;
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-DEGRADE", "developer")])?;
         let limit = Duration::from_secs(60);
         until(
@@ -2123,11 +2137,28 @@ async fn an_app_server_that_cannot_start_a_turn_degrades_that_codex_to_exec() ->
             "the failed attempt's facts were recorded"
         );
         until(&project, &ended("T-DEGRADE/attempt-2"), "SETTLED/", limit).await?;
-        let exec_turns = std::fs::read_dir(world.bin().join("codex.d"))?
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().starts_with("exec-argv."))
-            .count();
-        assert_eq!(exec_turns, 1, "the second attempt ran on exec");
+        // The task's turns on exec, by the attempt each was started for: the Commander's turns are codex's too in this
+        // world, on exec as well once codex is degraded, and the specification the run adopted at its start wakes it
+        // (docs/adr/ADR-031.md decision 1); only the developer's are counted.
+        let calls = std::fs::read_to_string(world.bin().join("codex.d/calls"))?;
+        let exec_turns: Vec<&str> = calls
+            .lines()
+            .filter(|l| {
+                let mut words = l.split(' ').skip(1);
+                words.next().is_some_and(|a| a.contains("/T-DEGRADE/"))
+                    && words.next() == Some("exec")
+                    && words.next() != Some("--help")
+            })
+            .collect();
+        assert_eq!(
+            exec_turns.len(),
+            1,
+            "the second attempt ran on exec: {exec_turns:?}"
+        );
+        assert!(
+            exec_turns[0].contains("/T-DEGRADE/attempt-2 "),
+            "{exec_turns:?}"
+        );
         R::Ok(())
     }
     .await;
@@ -2147,7 +2178,7 @@ async fn a_task_dispatched_before_the_first_look_at_its_agent_waits_for_it() -> 
     world.bind_installed()?;
     let host = start_when_free(world.config()).await?;
     let run_id = match async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         until(
             &project,
             &format!(
@@ -2207,7 +2238,7 @@ async fn a_hosts_stop_ends_the_probe_it_has_running() -> R {
     let project = world.project();
     let pid_file = world.bin().join("claude.d/probe-pid");
     let outcome = async {
-        started(&host, "s1").await?;
+        started(&host, &project, "s1").await?;
         let end = Instant::now() + Duration::from_secs(30);
         // Its number and start time while it hangs, so that the end's look and kill are of this process alone and
         // never of one that took its number since (CIR-056; convention v2).
@@ -2480,7 +2511,7 @@ async fn a_cancelled_run_stops_its_agent_by_its_native_cancel_then_sigterm_after
     let project = world.project();
     let signals = world.bin().join("claude.d/signals");
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-CANCEL", "developer")])?;
         until(
             &project,
@@ -2565,7 +2596,7 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         let commander = format!(
             "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
@@ -2756,7 +2787,7 @@ async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -2846,7 +2877,7 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -2911,7 +2942,7 @@ async fn a_new_holders_later_turns_in_its_session_carry_no_package() -> R {
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -2973,7 +3004,7 @@ async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_p
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -3043,7 +3074,7 @@ async fn a_first_pi_start_that_ends_before_its_prompt_leaves_the_package_owed() 
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -3103,7 +3134,7 @@ async fn a_commander_turn_runs_in_its_sessions_own_directory(agent: &str) -> R {
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         until(
             &project,
@@ -3252,7 +3283,7 @@ async fn test_039_04_repacking_from_an_attempts_record_gives_the_prompt_it_was_s
     )?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[])?;
         task_with_acceptance(&project, &run_id, "T-a", 3, 40_000)?;
         until(&project, &ended("T-a/attempt-4"), "SETTLED/", Duration::from_secs(60)).await?;
@@ -3378,7 +3409,7 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
     )?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         exec(
             &project,
             &format!(
@@ -3438,7 +3469,7 @@ async fn test_039_03_a_new_commanders_prompt_carries_references_and_none_of_the_
     let host = start_when_free(world.config()).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         let commander = format!(
             "SELECT agent || '/' || role_epoch || '/' || coalesce(session_id, '-') FROM role_bindings \
@@ -3589,7 +3620,7 @@ async fn a_turns_logs_that_cannot_be_kept_as_objects_are_registered_where_they_a
     )?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         ready(&project, &run_id, &[("T-l", "developer")])?;
         until(
             &project,
@@ -3698,7 +3729,7 @@ async fn a_writer_waits_for_a_running_suite() -> R {
     config.hooks = std::sync::Arc::new(HoldSuite(hold.clone()));
     let host = start_when_free(config).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         assert_eq!(
             query(
                 &project,
@@ -4105,7 +4136,7 @@ async fn a_turn_whose_agent_went_after_staffing_is_refused_before_it_starts() ->
     config.hooks = points.clone();
     let host = start_when_free(config).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(30);
         until(
             &project,
@@ -4260,7 +4291,7 @@ async fn a_codex_replaced_while_held_at_the_gate_does_not_run() -> R {
     let (world, host, keys, _) = codex_world(&points).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         until(
             &project,
@@ -4388,7 +4419,7 @@ async fn a_pi_whose_current_version_moved_is_refused_once_until_its_look() -> R 
             .collect()
     };
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         until(
             &project,
@@ -4527,7 +4558,7 @@ async fn a_verified_cli_exiting_65_without_frames_is_retried_as_its_own_failure(
     let (world, host, keys, registry) = codex_world(&points).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         until(
             &project,
@@ -4655,7 +4686,7 @@ async fn a_native_error_named_like_a_reserved_code_is_its_own_failure() -> R {
     }
     let host = start_when_free(world.config()).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         until(
             &project,
@@ -4741,7 +4772,7 @@ async fn a_suite_passing_after_the_snapshot_does_not_start_the_new_codex_in_the_
     let (world, host, _, registry) = codex_world(&points).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         let session_of = |role: &str| {
             query(
@@ -5064,7 +5095,7 @@ async fn pi_held_before_its_first_answer(
     config.hooks = points;
     let host = start_when_free(config).await?;
     let run = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         ready(&project, &run_id, &[])?;
         let developer = format!(
@@ -5319,7 +5350,7 @@ async fn codex_app_server_sends_no_thread_start_when_its_implementation_changed(
     let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         developer_session(&project, &run_id).await?;
         ready(&project, &run_id, &[("T-HOLD-INIT", "developer")])?;
@@ -5401,7 +5432,7 @@ async fn a_codex_replaced_during_its_turn_is_recorded_and_settles() -> R {
     let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         developer_session(&project, &run_id).await?;
         ready(&project, &run_id, &[("T-HOLD-TURN", "developer")])?;
@@ -5522,7 +5553,7 @@ async fn a_claude_launcher_retargeted_during_its_turn_is_recorded() -> R {
     let (world, host, observed) = claude_versions_world(&hold, &suites).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         developer_session(&project, &run_id).await?;
         ready(&project, &run_id, &[("T-RETARGET", "developer")])?;
@@ -5575,7 +5606,7 @@ async fn a_turn_whose_agent_files_did_not_change_records_no_change() -> R {
     let (world, host, observed) = claude_versions_world(&hold, &suites).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         developer_session(&project, &run_id).await?;
         ready(
@@ -5669,7 +5700,7 @@ async fn a_metadata_only_change_before_the_first_input_is_retried_to_the_cap() -
     config.clock = hoh_app::host::HostClock(clock.clone());
     let host = start_when_free(config).await?;
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         developer_session(&project, &run_id).await?;
         ready(&project, &run_id, &[("T-CHMOD", "developer")])?;
         let task = "SELECT state || '/' || coalesce(blocked_reason, '') || '/' || coalesce(next_retry_at, '') FROM tasks \
@@ -5823,7 +5854,7 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
     let (world, host, _, _) = codex_world_with(&points, Some(hook)).await?;
     let project = world.project();
     let outcome = async {
-        let run_id = started(&host, "s1").await?;
+        let run_id = started(&host, &project, "s1").await?;
         let limit = Duration::from_secs(60);
         let (s1, e1) = developer_session(&project, &run_id).await?;
         let manifest_path = project.join(".hoh/compat-manifest.json");

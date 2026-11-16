@@ -11,6 +11,7 @@
 // The one module allowed to call SQLite (clippy.toml `disallowed-methods`, AC-062-05).
 #![allow(clippy::disallowed_methods)]
 
+mod adoption;
 mod attempts;
 mod blockers;
 mod candidates;

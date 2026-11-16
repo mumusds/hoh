@@ -54,6 +54,14 @@ fn post(project: &Path, mut body: Value) -> R<(u16, Value)> {
     Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
 }
 
+/// The project's approved specification, which a new run adopts (docs/adr/ADR-031.md decision 1: with none, a new run
+/// is BLOCKED on runtime:no_spec and `-p` ends 3 at once).
+fn approved(world: &World) -> R {
+    world.exec(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);",
+    )
+}
+
 /// `kind` (PauseRun or CancelRun) for run `run` at its revision now, again at the revision the host names while it
 /// answers STALE_REVISION (the world's runner moves the run on meanwhile; [`common::fresh_blocking`]); accepted.
 fn control(world: &World, run: &str, kind: &str) -> R {
@@ -141,6 +149,7 @@ async fn a_prompt_follows_its_new_run_to_the_result_and_prints_it_as_asked() -> 
     world.configure(&world::TEAM, "[project]\ndefault_mode = \"PLAN\"\n")?;
     let host = world.start_plain_host(None).await?;
     let outcome = tokio::task::block_in_place(|| -> R {
+        approved(&world)?;
         for (output, end, code, state) in [
             ("stream-json", "PauseRun", 6, "PAUSED"),
             ("json", "CancelRun", 5, "CANCELLED"),
@@ -260,6 +269,7 @@ async fn a_signal_only_detaches_a_prompt_with_its_code_and_the_way_back() -> R {
     let world = World::new()?;
     let host = world.start_plain_host(None).await?;
     let outcome = tokio::task::block_in_place(|| -> R {
+        approved(&world)?;
         for (sig, code) in [
             (rustix::process::Signal::INT, 130),
             (rustix::process::Signal::TERM, 143),
@@ -299,6 +309,7 @@ async fn a_closed_stdout_ends_a_prompt_with_74_and_no_panic() -> R {
     let world = World::new()?;
     let host = world.start_plain_host(None).await?;
     let outcome = tokio::task::block_in_place(|| -> R {
+        approved(&world)?;
         let mut child = spawn(&world, &["-p", "管道", "--output", "stream-json"])?;
         drop(child.stdout.take());
         let run = run_of_goal(&world, "管道")?;

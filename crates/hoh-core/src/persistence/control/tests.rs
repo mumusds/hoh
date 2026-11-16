@@ -831,11 +831,14 @@ async fn a_resume_of_a_blocked_run_or_one_with_attempts_unfinished_or_in_another
 #[tokio::test]
 async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte_for_byte() -> R {
     // REQ-005 behaviour 1, decision 5 (docs/adr/ADR-021.md decision 5): StartRun creates the run the host named,
-    // CREATED at revision 0, in the command's transaction, and stores the 202 body a replay returns.
+    // CREATED at revision 0, in the command's transaction, and stores the 202 body a replay returns. The project has an
+    // approved specification, which the run adopts (docs/adr/ADR-031.md decision 1; with none it is BLOCKED at
+    // revision 1, persistence/adoption/tests.rs).
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     Connection::open(&path)?.execute_batch(
-        "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-07T00:00:00Z');",
+        "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-07T00:00:00Z');
+         INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
     )?;
     let start = |key: &str, revision: i64| SubmitCommand {
         run_id: "R-new".to_owned(),
