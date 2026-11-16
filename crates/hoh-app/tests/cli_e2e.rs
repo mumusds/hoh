@@ -500,12 +500,14 @@ async fn test_002_01_a_question_in_the_spec_phase_blocks_the_run_and_exits_3() -
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        // The new run staffed (the scripted Team has no agent registry, so its host leaves the bindings vacant) and,
-        // until slice S2b's StartRun adopts the project's latest approved specification itself, adopted here by SQL
-        // (World::adopt; S2b replaces it, and then it writes nothing).
+        // The new run adopted the project's approved specification in StartRun's commit (decision 1); it is staffed
+        // here: the scripted Team has no agent registry, so its host leaves the bindings vacant.
         let run = run_of_goal(&world, goal)?;
         world.staff(&run)?;
-        world.adopt(&run, &spec)?;
+        assert_eq!(
+            world.query(&format!("SELECT spec_id FROM runs WHERE run_id = '{run}'"))?,
+            spec
+        );
         let out = world::finish(child, Duration::from_secs(60))?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         // Exit 3.
@@ -569,11 +571,12 @@ const RUN_C: &str = "c5e2a7d1-0b3f-4e8a-9c6d-2f1e4b7a9d03";
 async fn test_002_03_usage_errors_and_a_reply_by_resume() -> R {
     // AC-002-03: run C COMPLETED at revision 5 and run K BLOCKED (NEED_DECISION) on its Commander's question; their
     // host in this process, its runner the scripted Team, whose Commander decides INCOMPLETE once given the answer.
-    // K is made through the product (StartRun, its staffing, its Commander's turn to SPECIFYING and its request): the
-    // rows the test plan seeds by SQL (its specification, its Commander's binding and session, the PROPOSED
-    // request_user_decision, the claim `commander:<id>`, question.asked, resume_state SPECIFYING, no task, no attempt
-    // unfinished), written by their own writers. C is seeded by SQL. Then, one after the other: `hoh -p`, `-p ''`,
-    // `-p '  '`, `-p x --resume NOPE`, `-p x --resume <C>`, `-p '采用方案A' --resume <K>`.
+    // K is made through the product (StartRun, which adopts the approved specification, its staffing, its Commander's
+    // turn to SPECIFYING and its request): the rows the test plan seeds by SQL (its specification, its Commander's
+    // binding and session, the PROPOSED request_user_decision, the claim `commander:<id>`, question.asked,
+    // resume_state SPECIFYING, no task, no attempt unfinished), written by their own writers. C is seeded by SQL.
+    // Then, one after the other: `hoh -p`, `-p ''`, `-p '  '`, `-p x --resume NOPE`, `-p x --resume <C>`,
+    // `-p '采用方案A' --resume <K>`.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
     let team = asking_commander();
@@ -582,8 +585,10 @@ async fn test_002_03_usage_errors_and_a_reply_by_resume() -> R {
         let spec = world.seed_spec()?;
         let k = world::start_run(&host, "k", "实现登录功能").await?;
         world.staff(&k)?;
-        // Until slice S2b's StartRun adopts the specification itself (World::adopt; S2b replaces it).
-        world.adopt(&k, &spec)?;
+        assert_eq!(
+            world.query(&format!("SELECT spec_id FROM runs WHERE run_id = '{k}'"))?,
+            spec
+        );
         world
             .until(
                 &format!("SELECT state || '/' || blocked_reason || '/' || resume_state FROM runs WHERE run_id = '{k}'"),
