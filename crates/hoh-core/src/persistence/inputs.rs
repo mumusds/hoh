@@ -130,6 +130,7 @@ pub(super) fn move_input(
         from: m.from.as_str().to_owned(),
         to: m.to.as_str().to_owned(),
         why: "not in the transition table".to_owned(),
+        details: None,
     })?;
     tx.execute(
         "UPDATE input_queue SET state = ?1 WHERE input_id = ?2 AND state = ?3",

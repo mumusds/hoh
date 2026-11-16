@@ -474,17 +474,6 @@ fn load_tasks(conn: &Connection, run_id: &str) -> Result<Vec<TaskRow>, PersistEr
     Ok(tasks)
 }
 
-/// Task `t` is due at `at`: READY, or PENDING with every dependency ACCEPTED, and no retry in the future.
-fn due(t: &TaskRow, at: &str) -> bool {
-    (t.state == TaskState::Ready || (t.state == TaskState::Pending && t.open == 0))
-        && t.next_retry_at.as_deref().is_none_or(|next| next <= at)
-}
-
-/// Task `t` waits at `at` for a retry.
-fn waiting(t: &TaskRow, at: &str) -> bool {
-    t.state == TaskState::Ready && t.next_retry_at.as_deref().is_some_and(|next| next > at)
-}
-
 /// Whether a task of run `run_id` among `tasks` is in flight: only what can still move on (docs/adr/ADR-028.md
 /// decision 10, M2T16D-202): a verification round's source waiting for its round, and its verifier task once done,
 /// are not. Nothing waits for a join: it is its barrier's own transaction (docs/adr/ADR-029.md decision 13).
@@ -512,8 +501,8 @@ pub(super) fn idle(
     let (_, unfinished_work) = unfinished_attempts(conn, run_id)?;
     Ok(unfinished_work == 0
         && !in_flight(conn, run_id, &tasks)?
-        && !tasks.iter().any(|t| due(t, &at))
-        && !tasks.iter().any(|t| waiting(t, &at)))
+        && !tasks.iter().any(|t| is_due(t, &at))
+        && !tasks.iter().any(|t| is_waiting(t, &at)))
 }
 
 /// What blocks the run's BLOCKED tasks, by precedence, each once.
@@ -576,9 +565,10 @@ pub(super) fn pace(
         return Ok(Paced::default());
     }
     let mut tasks = load_tasks(&tx, run_id)?;
-    let due = |t: &TaskRow| due(t, &at);
-    let waiting = |t: &TaskRow| waiting(t, &at);
-    let budget = load_budget(&tx, run_id, now)?;
+    // Which tasks are due and which wait for a retry.
+    let due = |t: &TaskRow| is_due(t, &at);
+    let waiting = |t: &TaskRow| is_waiting(t, &at);
+    let (budget, stop) = budget_and_stop(&tx, run_id, now, context.wall())?;
     let mut paced = Paced::default();
     let mut commit = Commit::default();
     let run_cas = |to: RunState| StateCas {
@@ -586,7 +576,6 @@ pub(super) fn pace(
         expected_revision: revision,
         change: Change::Run(to),
     };
-    let stop = budget::stop(&budget, context.wall());
     // Two counts of the attempts not ended (docs/adr/ADR-025.md decision 3): every one, supervision turns too, for a
     // budget stop, which waits for them; the work attempts only for whether the run can move on or only waits.
     let (unfinished, unfinished_work) = unfinished_attempts(&tx, run_id)?;
@@ -781,7 +770,9 @@ pub(super) fn pace(
                 ));
                 paced.blocked = reasons;
             }
-        } else if blocked || (state == RunState::WaitingExternal && (any_due || !any_waiting)) {
+        } else if blocked
+            || (state == RunState::WaitingExternal && retry_wait(&tasks, &at).is_none())
+        {
             // Back to work: its claims all released, its retry due, or nothing of it waits any more (M2T19R-05).
             let to = back(&resume)?;
             commit.cas.push(if blocked {
@@ -832,6 +823,55 @@ pub(super) fn pace(
     writer::write(&tx, &commit, ctx)?;
     super::writer::commit(tx, ctx)?;
     Ok(paced)
+}
+
+/// Whether task `t` is due at `at` (UTC text, as `next_retry_at` is stored): READY, or PENDING with every dependency
+/// ACCEPTED, and no retry in the future.
+fn is_due(t: &TaskRow, at: &str) -> bool {
+    (t.state == TaskState::Ready || (t.state == TaskState::Pending && t.open == 0))
+        && t.next_retry_at.as_deref().is_none_or(|next| next <= at)
+}
+
+/// Whether task `t` waits at `at` for its retry: READY with its `next_retry_at` still to come.
+fn is_waiting(t: &TaskRow, at: &str) -> bool {
+    t.state == TaskState::Ready && t.next_retry_at.as_deref().is_some_and(|next| next > at)
+}
+
+/// What keeps a WAITING_EXTERNAL run waiting at `at` (REQ-042 behaviour 2: nothing is dispatched before its
+/// `next_retry_at`): no task due and at least one waiting for its retry; then the earliest of those retries. `None` is
+/// the run free to leave: [`pace`] wakes it, and a ResumeRun may take it back to work (docs/adr/ADR-031.md decision 16).
+fn retry_wait(tasks: &[TaskRow], at: &str) -> Option<String> {
+    if tasks.iter().any(|t| is_due(t, at)) {
+        return None;
+    }
+    tasks
+        .iter()
+        .filter(|t| is_waiting(t, at))
+        .filter_map(|t| t.next_retry_at.clone())
+        .min()
+}
+
+/// Run `run_id`'s WAITING_EXTERNAL stop at `now`, read in the caller's transaction: [`retry_wait`] of its tasks.
+pub(super) fn waiting_until(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: SystemTime,
+) -> Result<Option<String>, PersistError> {
+    Ok(retry_wait(&load_tasks(tx, run_id)?, &rfc3339_utc(now)))
+}
+
+/// Run `run_id`'s budget at `now` and the first of its stops that holds at the wall-clock time `wall` (REQ-042
+/// behaviour 6): what ends a working run INCOMPLETE in [`pace`], and what keeps an INCOMPLETE run from resuming
+/// (docs/adr/ADR-031.md decision 16). A cost limit that cannot be enforced is no stop (BUDGET_UNENFORCEABLE is a claim).
+pub(super) fn budget_and_stop(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: SystemTime,
+    wall: SystemTime,
+) -> Result<(Budget, Option<budget::Stop>), PersistError> {
+    let budget = load_budget(tx, run_id, now)?;
+    let stop = budget::stop(&budget, wall);
+    Ok((budget, stop))
 }
 
 /// A repair a task asks for (REQ-042 behaviour 5, ADR-020 decision 10).

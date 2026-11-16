@@ -2,7 +2,7 @@
 
 use crate::cancel::{Canceller, GRACES, Look, ProcessControl, Processes, Signal};
 use crate::delivery::Clock;
-use crate::lifecycle;
+use crate::lifecycle::{self, Lifecycle as _};
 use crate::persistence::{
     AttemptRow, CommandOutcome, Finished, Intent, NewEvent, NewOutbox, Options, RunTarget, Store,
     SubmitCommand, selftest,
@@ -345,9 +345,11 @@ fn run_state(path: &Path) -> R<(String, i64, Option<String>)> {
 }
 
 #[tokio::test]
-async fn a_resume_records_the_runs_reconcile_before_it_works_again_and_only_from_paused() -> R {
-    // REQ-043 behaviour 2 (docs/adr/ADR-021.md decision 7): a paused run resumes to the state it was paused in, its
-    // reconcile recorded first; a run not paused does not resume.
+async fn a_resume_records_the_runs_reconcile_before_it_works_again_and_only_from_a_stop_state() -> R
+{
+    // REQ-043 behaviour 2 (docs/adr/ADR-021.md decision 7), REQ-036 decision 2 (docs/adr/ADR-031.md decision 16): a run
+    // in a stop state (PAUSED, INCOMPLETE, WAITING_EXTERNAL, BLOCKED; here PAUSED) resumes to the state it stopped in,
+    // its reconcile recorded first, and no retrigger with it; a run in no stop state (RUNNING) does not resume.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
     Connection::open(&path)?.execute_batch(&format!(
@@ -421,6 +423,408 @@ async fn a_resume_with_blockers_claimed_returns_to_blocked_and_keeps_its_resume_
         |r| r.get(0),
     )?;
     assert_eq!(reasons, "[\"NEED_DECISION\"]");
+    Ok(())
+}
+
+/// A store whose clock is `clock`: the host's, which a ResumeRun's stop is judged by (docs/adr/ADR-031.md decision
+/// 16), with `faults`.
+fn open_at(
+    dir: &tempfile::TempDir,
+    clock: Arc<FakeClock>,
+    faults: Arc<dyn crate::persistence::FaultHooks>,
+) -> R<(Store, PathBuf)> {
+    let path = dir.path().join(".hoh/state.db");
+    let options = Options {
+        wal_probe: Some(selftest::test_probe(None)),
+        clock: Some(crate::persistence::StoreClock(clock)),
+        faults,
+        ..Options::default()
+    };
+    Ok((Store::open(&path, options)?, path))
+}
+
+/// The clock at 00:00:00 plus `secs`.
+fn clock_at(secs: u64) -> Arc<FakeClock> {
+    Arc::new(FakeClock(Mutex::new(Duration::from_secs(secs))))
+}
+
+/// T1's A1 ended: nothing of R runs.
+const QUIET: &str = "UPDATE attempts SET state = 'SETTLED', ended_at = '2026-11-07T00:00:05Z' WHERE attempt_id = 'A1';";
+
+/// R moved by the store's writer from `revision` to `to`, in one commit: a stop's run.result is published by it, as a
+/// Commander's transition_run publishes one (no budget stop: decision 16's Commander-decided INCOMPLETE).
+async fn move_r(store: &Store, revision: i64, to: RunState) -> R {
+    store
+        .commit(crate::persistence::Commit {
+            cas: vec![crate::persistence::StateCas {
+                id: "R".to_owned(),
+                expected_revision: revision,
+                change: crate::persistence::Change::Run(to),
+            }],
+            ..crate::persistence::Commit::default()
+        })
+        .await?;
+    Ok(())
+}
+
+/// What a refused command leaves as it was: R's row, every event and every command.
+fn written(path: &Path) -> R<(String, i64, Option<String>, i64, i64, i64)> {
+    let (state, revision, resume) = run_state(path)?;
+    Ok((
+        state,
+        revision,
+        resume,
+        count(path, "SELECT coalesce(max(seq), 0) FROM events")?,
+        count(path, "SELECT count(*) FROM events")?,
+        count(path, "SELECT count(*) FROM commands")?,
+    ))
+}
+
+/// A ResumeRun refused as ILLEGAL_TRANSITION: the state it names as `from`, why, and its details.
+fn refused(
+    result: Result<CommandOutcome, crate::persistence::PersistError>,
+) -> R<(String, String, Option<Value>)> {
+    match result {
+        Err(crate::persistence::PersistError::IllegalTransition {
+            from, why, details, ..
+        }) => Ok((from, why, details.map(|d| *d))),
+        other => Err(format!("not refused as ILLEGAL_TRANSITION: {other:?}").into()),
+    }
+}
+
+/// R's events after seq `after`: kind and payload.
+fn events_after(path: &Path, after: i64) -> R<Vec<(String, Value)>> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(
+        "SELECT kind, payload_json FROM events WHERE run_id = 'R' AND seq > ?1 ORDER BY seq",
+    )?;
+    let rows = statement
+        .query_map([after], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(kind, payload)| Ok((kind, serde_json::from_str(&payload)?)))
+        .collect()
+}
+
+/// The points each request of the writer reached, by job, in order.
+#[derive(Debug, Default)]
+struct Points(Mutex<Vec<(&'static str, crate::persistence::WritePoint)>>);
+
+impl crate::persistence::FaultHooks for Points {
+    fn at(&self, job: &'static str, point: crate::persistence::WritePoint) {
+        if let Ok(mut points) = self.0.lock() {
+            points.push((job, point));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_resume_from_paused_or_a_commander_decided_incomplete_moves_first_and_returns_to_its_resume_state()
+-> R {
+    // docs/adr/ADR-031.md decision 16 (REQ-036 decision 2, CR-023): neither stop has a stop of its own (PAUSED holds
+    // only by the user's request; an INCOMPLETE the Commander decided names no budget item), so ResumeRun is accepted:
+    // its commit moves R first (its compare-and-set before its events), then writes `reconcile.run{from}` and the
+    // accepted event, as R's events though the INCOMPLETE was published; no retrigger (the stall detector carries on,
+    // E12), no run.result; R is in its resume state.
+    for from in [RunState::Paused, RunState::Incomplete] {
+        let dir = tempfile::tempdir()?;
+        let points = Arc::new(Points::default());
+        let (store, path) = open_at(&dir, clock_at(0), points.clone())?;
+        Connection::open(&path)?.execute_batch(&format!("{WORLD}{QUIET}"))?;
+        if from == RunState::Paused {
+            move_r(&store, 1, RunState::PauseRequested).await?;
+            move_r(&store, 2, RunState::Paused).await?;
+        } else {
+            move_r(&store, 1, RunState::Incomplete).await?;
+        }
+        let revision = run_state(&path)?.1;
+        let latest: String = Connection::open(&path)?.query_row(
+            "SELECT kind || '/' || json_extract(payload_json, '$.state') FROM events WHERE run_id = 'R' \
+             ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(latest, format!("run.result/{}", from.as_str()), "published");
+        let before = count(&path, "SELECT coalesce(max(seq), 0) FROM events")?;
+        if let Ok(mut p) = points.0.lock() {
+            p.clear();
+        }
+        let resumed = store
+            .submit_command(command("ResumeRun", "resume", revision, RunTarget::Resume))
+            .await?;
+        assert!(
+            matches!(resumed, CommandOutcome::Accepted { revision: r, .. } if r == revision + 1),
+            "{from:?}: {resumed:?}"
+        );
+        assert_eq!(
+            run_state(&path)?,
+            ("RUNNING".to_owned(), revision + 1, None),
+            "{from:?}"
+        );
+        let events = events_after(&path, before)?;
+        let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["reconcile.run", "run.resumerun"], "{from:?}");
+        assert_eq!(events[0].1["from"], from.as_str(), "{from:?}");
+        assert_eq!(
+            count(
+                &path,
+                &format!(
+                    "SELECT count(*) FROM events WHERE seq > {before} AND (run_id IS NULL OR run_id <> 'R')"
+                )
+            )?,
+            0,
+            "{from:?}: nothing else written"
+        );
+        let command: Vec<crate::persistence::WritePoint> = points
+            .0
+            .lock()
+            .map_err(|_| "points")?
+            .iter()
+            .filter(|(job, _)| *job == "Command")
+            .map(|(_, p)| *p)
+            .collect();
+        let at = |p| command.iter().position(|q| *q == p);
+        let (Some(moved), Some(written)) = (
+            at(crate::persistence::WritePoint::StateWritten),
+            at(crate::persistence::WritePoint::EventsWritten),
+        ) else {
+            return Err(format!("{from:?}: the command's points: {command:?}").into());
+        };
+        assert!(
+            moved < written,
+            "{from:?}: the move comes before the events: {command:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resume_of_an_incomplete_run_with_blockers_claimed_is_blocked_until_they_are_released()
+-> R {
+    // docs/adr/ADR-031.md decision 16 and its edge INCOMPLETE -> BLOCKED: R BLOCKED by a claim, then INCOMPLETE (a
+    // stop entered from BLOCKED keeps the claims and the resume state). ResumeRun: R BLOCKED, its events
+    // reconcile.run{from: INCOMPLETE}, the accepted event, run.blocked with the claimed reasons and run.result{BLOCKED}
+    // last; its resume state RUNNING kept. Once the claim is released (the pace's own, as nothing stalls), R goes back
+    // to RUNNING.
+    let clock = clock_at(0);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_at(&dir, clock.clone(), Arc::new(crate::persistence::NoFaults))?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}{QUIET}
+         UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
+           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}}',
+            '2026-11-07T00:00:00Z');"
+    ))?;
+    move_r(&store, 1, RunState::Incomplete).await?;
+    assert_eq!(
+        run_state(&path)?,
+        ("INCOMPLETE".to_owned(), 2, Some("RUNNING".to_owned()))
+    );
+    let before = count(&path, "SELECT coalesce(max(seq), 0) FROM events")?;
+    let resumed = store
+        .submit_command(command("ResumeRun", "resume", 2, RunTarget::Resume))
+        .await?;
+    assert!(
+        matches!(resumed, CommandOutcome::Accepted { revision: 3, .. }),
+        "{resumed:?}"
+    );
+    assert_eq!(
+        run_state(&path)?,
+        ("BLOCKED".to_owned(), 3, Some("RUNNING".to_owned()))
+    );
+    let events = events_after(&path, before)?;
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "reconcile.run",
+            "run.resumerun",
+            "run.blocked",
+            "run.result"
+        ]
+    );
+    assert_eq!(events[0].1["from"], "INCOMPLETE");
+    assert_eq!(events[2].1["reasons"], json!(["NEED_DECISION"]));
+    let result =
+        crate::persistence::results::assert_ends_with_result(&path, before, "R", "BLOCKED")?;
+    assert_eq!(result["blocked_reason"], "NEED_DECISION");
+    let context = crate::decision::Context {
+        now: Some(clock.now()),
+        wall: Some(clock.now()),
+        ..crate::decision::Context::default()
+    };
+    let paced = store.pace_run("R", context).await?;
+    assert!(paced.unblocked, "{paced:?}");
+    assert_eq!(run_state(&path)?, ("RUNNING".to_owned(), 4, None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resume_of_an_incomplete_run_whose_budget_stop_still_holds_is_refused_and_writes_nothing()
+-> R {
+    // docs/adr/ADR-031.md decision 16: INCOMPLETE's stop is the pace's own predicate, budget::stop of the run's budget
+    // at the host's clock. Iterations used up, or the deadline passed on the FakeClock: 409 ILLEGAL_TRANSITION with
+    // details {state: INCOMPLETE, stop} (the stop as run.incomplete names it); R's row, the events and the commands
+    // unchanged. The same run before its deadline (the clock earlier) has no stop: accepted, back to RUNNING.
+    for (variant, seed, secs, stop) in [
+        (
+            "iterations",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 3, 3);",
+            0,
+            Some("max_iterations"),
+        ),
+        (
+            "deadline passed",
+            "UPDATE runs SET deadline_at = '2026-11-07T00:01:00Z' WHERE run_id = 'R';",
+            61,
+            Some("deadline_at"),
+        ),
+        (
+            "deadline to come",
+            "UPDATE runs SET deadline_at = '2026-11-07T00:01:00Z' WHERE run_id = 'R';",
+            30,
+            None,
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open_at(&dir, clock_at(secs), Arc::new(crate::persistence::NoFaults))?;
+        Connection::open(&path)?.execute_batch(&format!("{WORLD}{QUIET}{seed}"))?;
+        move_r(&store, 1, RunState::Incomplete).await?;
+        let before = written(&path)?;
+        let result = store
+            .submit_command(command("ResumeRun", "resume", 2, RunTarget::Resume))
+            .await;
+        match stop {
+            Some(stop) => {
+                let (from, _, details) = refused(result)?;
+                assert_eq!(from, "INCOMPLETE", "{variant}");
+                assert_eq!(
+                    details,
+                    Some(json!({"state": "INCOMPLETE", "stop": stop})),
+                    "{variant}"
+                );
+                assert_eq!(written(&path)?, before, "{variant}: nothing written");
+            }
+            None => {
+                assert!(
+                    matches!(result, Ok(CommandOutcome::Accepted { revision: 3, .. })),
+                    "{variant}: {result:?}"
+                );
+                assert_eq!(run_state(&path)?, ("RUNNING".to_owned(), 3, None));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resume_of_a_waiting_run_is_refused_until_its_earliest_retry_is_due() -> R {
+    // docs/adr/ADR-031.md decision 16: WAITING_EXTERNAL's stop is the pace's own (no task due and one waiting for its
+    // next_retry_at, REQ-042 behaviour 2). T2 waits until 00:02:00, T3 until 00:05:00: at 00:00:00 ResumeRun is 409
+    // ILLEGAL_TRANSITION with details {state: WAITING_EXTERNAL, next_retry_at: the earliest}, nothing written; with the
+    // FakeClock past it, accepted and back to RUNNING.
+    let clock = clock_at(0);
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_at(&dir, clock.clone(), Arc::new(crate::persistence::NoFaults))?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}{QUIET}
+         UPDATE runs SET state = 'WAITING_EXTERNAL', resume_state = 'RUNNING', revision = 4 WHERE run_id = 'R';
+         UPDATE tasks SET next_retry_at = '2026-11-07T00:02:00Z' WHERE task_id = 'T2';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, next_retry_at)
+           VALUES ('T3', 'R', 's1', 'READY', 1, 'developer', 3, 1, '2026-11-07T00:05:00Z');"
+    ))?;
+    let before = written(&path)?;
+    let (from, _, details) = refused(
+        store
+            .submit_command(command("ResumeRun", "resume-early", 4, RunTarget::Resume))
+            .await,
+    )?;
+    assert_eq!(from, "WAITING_EXTERNAL");
+    assert_eq!(
+        details,
+        Some(json!({"state": "WAITING_EXTERNAL", "next_retry_at": "2026-11-07T00:02:00Z"}))
+    );
+    assert_eq!(written(&path)?, before, "nothing written");
+    if let Ok(mut at) = clock.0.lock() {
+        *at = Duration::from_secs(121);
+    }
+    let resumed = store
+        .submit_command(command("ResumeRun", "resume", 4, RunTarget::Resume))
+        .await?;
+    assert!(
+        matches!(resumed, CommandOutcome::Accepted { revision: 5, .. }),
+        "{resumed:?}"
+    );
+    assert_eq!(run_state(&path)?, ("RUNNING".to_owned(), 5, None));
+    let from: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json, '$.from') FROM events WHERE kind = 'reconcile.run'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(from, "WAITING_EXTERNAL");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resume_of_a_blocked_run_or_one_with_attempts_unfinished_or_in_another_state_is_refused()
+-> R {
+    // docs/adr/ADR-031.md decision 16: BLOCKED's stop is its blocker set, never empty in BLOCKED: 409 with details
+    // {state: BLOCKED, reasons}. A stop state with an attempt not finished is refused by the reconcile first, its
+    // `from` that state (not PAUSED). Any other state (RUNNING, COMPLETED) keeps its 409 with details {state}. Nothing is
+    // written by any of them.
+    let blocked = "UPDATE runs SET blocked_reason = 'BLOCKED_AUTH', \
+                   blocked_reasons_json = '[\"BLOCKED_AUTH\", \"NEED_DECISION\"]' WHERE run_id = 'R';";
+    let cases = [
+        (
+            "BLOCKED",
+            QUIET,
+            Some(json!({"state": "BLOCKED", "reasons": ["BLOCKED_AUTH", "NEED_DECISION"]})),
+        ),
+        ("PAUSED", "", None),
+        ("INCOMPLETE", "", None),
+        ("WAITING_EXTERNAL", "", None),
+        ("BLOCKED", "", None),
+        ("RUNNING", QUIET, Some(json!({"state": "RUNNING"}))),
+        ("COMPLETED", QUIET, Some(json!({"state": "COMPLETED"}))),
+    ];
+    for (state, quiet, want) in cases {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open_at(&dir, clock_at(0), Arc::new(crate::persistence::NoFaults))?;
+        let resume = if state == "RUNNING" || state == "COMPLETED" {
+            "NULL"
+        } else {
+            "'RUNNING'"
+        };
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}{quiet}{}
+             UPDATE runs SET state = '{state}', resume_state = {resume}, revision = 4 WHERE run_id = 'R';",
+            if state == "BLOCKED" { blocked } else { "" }
+        ))?;
+        let before = written(&path)?;
+        let (from, why, details) = refused(
+            store
+                .submit_command(command("ResumeRun", "resume", 4, RunTarget::Resume))
+                .await,
+        )?;
+        let case = format!(
+            "{state} {}",
+            if quiet.is_empty() {
+                "A1 running"
+            } else {
+                "quiet"
+            }
+        );
+        assert_eq!(from, state, "{case}");
+        assert_eq!(details, want, "{case}");
+        if quiet.is_empty() {
+            assert!(why.contains("A1"), "{case}: {why}");
+        }
+        assert_eq!(written(&path)?, before, "{case}: nothing written");
+    }
     Ok(())
 }
 
