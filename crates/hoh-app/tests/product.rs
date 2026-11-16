@@ -2725,31 +2725,10 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
                    '2026-11-10T00:00:00Z' FROM runs WHERE run_id = '{run_id}';"
             ),
         )?;
-        // The new Commander's first turn, by its attempt (the first of its binding's epoch 2 to settle): the old
-        // Commander's turns are codex's, and the specification's adoption may wake it before the change
-        // (docs/adr/ADR-031.md decision 1); a later wake may give pi another turn.
-        let first = format!(
-            "SELECT coalesce((SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-             WHERE t.run_id = '{run_id}' AND t.role = 'commander' AND a.role_epoch = 2 AND a.state = 'SETTLED' \
-             ORDER BY a.rowid LIMIT 1), '')"
-        );
-        let end = Instant::now() + limit;
-        let attempt = loop {
-            let attempt = query(&project, &first)?;
-            if !attempt.is_empty() {
-                break attempt;
-            }
-            assert!(Instant::now() < end, "the new Commander's first turn did not settle");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        let prompts: Vec<String> = received_by_attempt(&world.bin().join("pi.d"))?
-            .into_iter()
-            .filter(|(a, command)| *a == attempt && command["type"] == "prompt")
-            .filter_map(|(_, command)| command["message"].as_str().map(str::to_owned))
-            .collect();
-        let [sent] = prompts.as_slice() else {
-            return Err(format!("the pi Commander's first turn was sent {} prompts", prompts.len()).into());
-        };
+        // The new Commander's first turn, by its attempt: the old Commander's turns are codex's, and the
+        // specification's adoption may wake it before the change (docs/adr/ADR-031.md decision 1); a later wake may
+        // give pi another turn.
+        let sent = &first_commander_prompt(&project, &world.bin().join("pi.d"), &run_id, 2, limit).await?;
         let (contract, handover, wake) = (
             sent.find("Commander").ok_or("no role contract")?,
             sent.find("# 交接包").ok_or("no handover package")?,
@@ -2767,6 +2746,102 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
     host.shutdown().await;
     world.stop_fakes()?;
     outcome
+}
+
+/// The one prompt the fake pi under `pi_d` was sent for the first turn of run `run_id`'s Commander at binding epoch
+/// `epoch`: that epoch's first Commander attempt by order, whatever its state (a first turn that failed is not skipped
+/// for a later one, M2T13R-600), once it ended, which must be SETTLED; each waited for at most `limit`. A later
+/// attempt of the epoch (another wake's) is a test's to select by its identity.
+async fn first_commander_prompt(
+    project: &Path,
+    pi_d: &Path,
+    run_id: &str,
+    epoch: i64,
+    limit: Duration,
+) -> R<String> {
+    let first = format!(
+        "SELECT coalesce((SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+         WHERE t.run_id = '{run_id}' AND t.role = 'commander' AND a.role_epoch = {epoch} \
+         ORDER BY a.rowid LIMIT 1), '')"
+    );
+    let end = Instant::now() + limit;
+    let (attempt, ended_as) = loop {
+        let attempt = query(project, &first)?;
+        if !attempt.is_empty() {
+            let ended_as = query(project, &ended(&attempt))?;
+            if !ended_as.is_empty() {
+                break (attempt, ended_as);
+            }
+        }
+        if Instant::now() > end {
+            return Err(format!("the new Commander's first turn did not end: {attempt:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if ended_as != "SETTLED/" {
+        return Err(format!("the new Commander's first turn {attempt} ended {ended_as}").into());
+    }
+    let prompts: Vec<String> = received_by_attempt(pi_d)?
+        .into_iter()
+        .filter(|(a, command)| *a == attempt && command["type"] == "prompt")
+        .filter_map(|(_, command)| command["message"].as_str().map(str::to_owned))
+        .collect();
+    let [sent] = prompts.as_slice() else {
+        return Err(format!(
+            "the pi Commander's first turn {attempt} was sent {} prompts",
+            prompts.len()
+        )
+        .into());
+    };
+    Ok(sent.clone())
+}
+
+#[tokio::test]
+async fn the_new_commanders_first_turn_is_its_first_attempt_whatever_its_state() -> R {
+    // M2T13R-600: the first turn test_019_02 checks is the epoch's first Commander attempt by order, not the first to
+    // settle. Here (the reviewer's case, rows written directly) that attempt was sent a prompt with no handover package
+    // and FAILED, and a later wake's attempt was sent the whole package and SETTLED: the first turn is the failed one,
+    // so the selection refuses it instead of checking the later one.
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    exec(
+        &project,
+        "CREATE TABLE tasks(task_id TEXT PRIMARY KEY, run_id TEXT, role TEXT);
+         CREATE TABLE attempts(attempt_id TEXT PRIMARY KEY, task_id TEXT, role_epoch INTEGER, state TEXT,
+           failure_reason TEXT);
+         INSERT INTO tasks VALUES ('R/trigger/5/turn/0', 'R', 'commander'), ('R/trigger/5/turn/1', 'R', 'commander');
+         INSERT INTO attempts VALUES ('R/trigger/5/turn/0/attempt-1', 'R/trigger/5/turn/0', 2, 'FAILED', 'AGENT_ERROR'),
+           ('R/trigger/5/turn/1/attempt-1', 'R/trigger/5/turn/1', 2, 'SETTLED', NULL);",
+    )?;
+    let pi_d = dir.path().join("pi.d");
+    for (pid, attempt, message) in [
+        (
+            11,
+            "R/trigger/5/turn/0/attempt-1",
+            "Commander\n# 本次唤醒\nevents/first: missing handover".to_owned(),
+        ),
+        (
+            12,
+            "R/trigger/5/turn/1/attempt-1",
+            format!("Commander\n# 交接包\n{:064}\n# 本次唤醒\nevents/second", 3),
+        ),
+    ] {
+        std::fs::create_dir_all(pi_d.join(format!("log.{pid}")))?;
+        std::fs::write(pi_d.join(format!("marker.{pid}")), format!("P/{attempt}\n"))?;
+        std::fs::write(
+            pi_d.join(format!("log.{pid}/received.jsonl")),
+            format!("{}\n", json!({"type": "prompt", "message": message})),
+        )?;
+    }
+    match first_commander_prompt(&project, &pi_d, "R", 2, Duration::from_secs(1)).await {
+        Err(e) => assert!(
+            e.to_string().contains("R/trigger/5/turn/0/attempt-1"),
+            "{e}"
+        ),
+        Ok(sent) => return Err(format!("the later turn was taken for the first: {sent}").into()),
+    }
+    Ok(())
 }
 
 #[tokio::test]
