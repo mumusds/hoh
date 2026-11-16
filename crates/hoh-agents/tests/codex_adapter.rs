@@ -1125,12 +1125,13 @@ async fn an_unwritten_prompt_does_not_hold_up_the_end() -> R {
     case.frames.truncate(thread_response + 1);
     let fake = world.fake("holder", Some(&case), "exec", true)?;
     // The fake leaves a sleeper in its own session holding stdin's read end (`<&0`: bash gives a background job
-    // /dev/null otherwise) and reading nothing.
+    // /dev/null otherwise) and reading nothing. It records the sleeper's stat line (a builtin read, while the sleeper
+    // surely runs), so the test ends the sleeper and never a process given its number later (ADR-022 decision 10).
     let d = fake.parent().ok_or("no dir")?.to_path_buf();
     let script = read(&fake)?.replace(
         "if [ \"$1\" = app-server ]; then exec",
         &format!(
-            "if [ \"$1\" = app-server ]; then setsid sleep 30 <&0 >/dev/null 2>&1 & echo $! > '{}/sleeper.pid'; exec",
+            "if [ \"$1\" = app-server ]; then setsid sleep 30 <&0 >/dev/null 2>&1 & read -r s < /proc/$!/stat; printf '%s\\n' \"$s\" > '{}/sleeper.stat'; exec",
             d.display()
         ),
     );
@@ -1141,8 +1142,16 @@ async fn an_unwritten_prompt_does_not_hold_up_the_end() -> R {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(20), run(&world, &attempt, &turn)).await;
     let took = started.elapsed();
-    if let Ok(pid) = read(d.join("sleeper.pid")) {
-        let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+    if let Ok(stat) = std::fs::read(d.join("sleeper.stat")) {
+        let pid = String::from_utf8_lossy(&stat)
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        let start = hoh_agents::identity::after_command_name(&stat)
+            .and_then(|fields| fields.split_whitespace().nth(19));
+        if let (Some(pid), Some(start)) = (pid, start) {
+            let _ = hoh_agents::identity::signal_if_same(pid, start, rustix::process::Signal::TERM);
+        }
     }
     let outcome = outcome??;
     assert!(took < Duration::from_secs(5), "{took:?}");
