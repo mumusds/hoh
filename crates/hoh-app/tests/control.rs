@@ -972,7 +972,7 @@ impl Drop for Marked {
 }
 
 /// A writer for `file`: `/usr/bin/python3 <script> <file> <mark>`. It first writes `established <pid> <sid> <ms>
-/// <handled|ignored>` to its mark ([`established_mark`]), one write, and only then unblocks SIGTERM, which the
+/// <handled|ignored> <start>` to its mark ([`established_mark`]), one write, and only then unblocks SIGTERM, which the
 /// processes of its creation hold blocked when the leader stand-in ([`leader`]) made it (W's writer inherits SIGTERM
 /// ignored instead, as do the writers the shell helpers below start with `trap ''`): the product's SIGTERM,
 /// sent before or after, reaches it only once its evidence is written. Unless it inherited SIGTERM ignored, it records
@@ -1210,14 +1210,16 @@ impl hoh_app::host::HostHooks for UnreadableProc {
 }
 
 /// When a test's writer exists: before the cancel (the test's premise, so the cancel waits for the writer's evidence:
-/// nothing of the product acts before the cancel), or once the cancel began (made by the leader at its SIGTERM, or
-/// told to go once the cancel is accepted, or after the leader's end).
+/// nothing of the product acts before the cancel), or once the cancel began (made by the test's spawner at the
+/// leader's request at its SIGTERM, or by the leader once told to go after the cancel is accepted, or by W once the
+/// leader is gone).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Created {
     BeforeTheCancel,
     /// Told to go once the cancel is accepted, and established before the SIGTERM step (the leader lives until it).
     OnceTheCancelIsAccepted,
-    /// Made at the SIGTERM step or after it (by the leader's trap, or once the leader is gone).
+    /// Made at the SIGTERM step or after it (by the test's spawner at the leader's request, or by W once the leader is
+    /// gone).
     AtOrAfterTheSigterm,
 }
 
@@ -1441,10 +1443,12 @@ async fn cancel_with_a_writer_outside(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_cancel_ends_a_writer_the_leader_started_and_orphaned_after_the_cancel_began() -> R {
-    // M2T06R-01 (REQ-043 behaviours 4, 5, decision 3; docs/adr/ADR-021.md decision 8d): on SIGTERM the leader starts a
-    // writer in a session of its own whose parent exits at once, then waits for SIGKILL. The writer is
-    // found by the attempt's marker, signalled, and the run is CANCELLED only after it is gone.
+async fn a_cancel_ends_a_writer_made_at_the_sigterm_with_only_the_attempts_marker() -> R {
+    // M2T06R-01 (REQ-043 behaviours 4, 5, decision 3; docs/adr/ADR-021.md decision 8d): at SIGTERM the leader has the
+    // test's spawner (outside the attempt, no parent chain to it) make a writer in a session of its own with the
+    // attempt's marker as its whole environment, then waits for SIGKILL. The writer is found by the marker,
+    // signalled, and the run is CANCELLED only after it is gone (CIR-853: the name and this comment said the leader
+    // made it and its parent exited at once).
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
     let file = dir.path().join("written.txt");
     let script = leader(&file, Leader::OrphansOnTermThenWaits, None)?;
