@@ -165,51 +165,24 @@ fn judge(
     {
         return Ok(Detected::Nothing);
     }
-    // (d) No live recovery obligation of its candidates (the runner's own filter: pending or held by a failure, and
-    // due; one still backing off counts).
-    let unrecovered = super::unrecovered_candidates(tx)?;
-    let candidates: Vec<String> = {
-        let mut statement = tx
-            .prepare("SELECT candidate_id FROM candidates WHERE run_id = ?1")
-            .map_err(sqlite_error)?;
-        statement
-            .query_map(params![run_id], |r| r.get(0))
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
-    };
-    for candidate in candidates
-        .iter()
-        .filter(|c| pending.contains(*c) || unrecovered.contains(*c))
-    {
-        if super::verification::live_obligation(tx, candidate)? {
-            return Ok(Detected::Nothing);
-        }
-    }
     // (e) A budget stop is the pace's to settle.
     if super::retry::budget_stop(tx, run_id, context)?.is_some() {
         return Ok(Detected::Nothing);
     }
+    // (d), the dearer reads last (M2T13R-03): no live recovery obligation of its candidates (the runner's own filter:
+    // pending or held by a failure, and due; one still backing off counts), the failures read for its candidates only.
+    if recovery_owed(tx, run_id, pending)? {
+        return Ok(Detected::Nothing);
+    }
     let marker = progress(tx, run_id)?;
-    let stalled = obligations(tx, run_id, &marker)?;
-    let asked: Vec<i64> = {
-        let mut statement = tx
-            .prepare(
-                "SELECT seq FROM events WHERE run_id = ?1 AND kind = 'question.asked' \
-                 AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.progress') = ?3 \
-                 ORDER BY seq",
-            )
-            .map_err(sqlite_error)?;
-        statement
-            .query_map(params![run_id, REASON, marker], |r| r.get(0))
-            .map_err(sqlite_error)?
-            .collect::<Result<_, _>>()
-            .map_err(sqlite_error)?
-    };
+    // Its STALLED re-triggers and questions on P, read by their ids (each `child_id(run, "stalled/<P>/…")`, numbered
+    // from 1 with no gap), not by a scan of its events.
+    let stalled = numbered(tx, run_id, &|n| format!("stalled/{marker}/{n}"))?;
+    let asked = numbered(tx, run_id, &|k| format!("stalled/{marker}/question/{k}"))?;
     // The precondition (M2T13D-300, -402, -451): the latest obligation on P consumed, its turn ended and its outputs
     // disposed of, read by its identity.
     if let Some(&latest) = stalled.last()
-        && !settled(tx, run_id, latest)?
+        && !settled(tx, run_id, &marker, stalled.len(), latest)?
     {
         return Ok(Detected::Nothing);
     }
@@ -291,30 +264,94 @@ fn judge(
     Ok(Detected::Asked)
 }
 
-/// The seqs of run `run_id`'s STALLED re-triggers on marker `marker`, in order.
-fn obligations(tx: &Transaction<'_>, run_id: &str, marker: &str) -> Result<Vec<i64>, PersistError> {
+/// The seqs of run `run_id`'s events `child_id(run_id, name(1))`, `child_id(run_id, name(2))`, … up to the first
+/// missing: each a lookup by its unique id.
+fn numbered(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    name: &dyn Fn(usize) -> String,
+) -> Result<Vec<i64>, PersistError> {
     let mut statement = tx
-        .prepare(
-            "SELECT seq FROM events WHERE run_id = ?1 AND kind = 'supervisor.retrigger' \
-             AND json_extract(payload_json, '$.reason') = ?2 AND json_extract(payload_json, '$.progress') = ?3 \
-             ORDER BY seq",
-        )
+        .prepare("SELECT seq FROM events WHERE event_id = ?1 AND run_id = ?2")
         .map_err(sqlite_error)?;
-    statement
-        .query_map(params![run_id, STALLED, marker], |r| r.get(0))
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
-        .map_err(sqlite_error)
+    let mut seqs = Vec::new();
+    loop {
+        let id = child_id(run_id, &name(seqs.len() + 1));
+        match statement
+            .query_row(params![id, run_id], |r| r.get(0))
+            .optional()
+            .map_err(sqlite_error)?
+        {
+            Some(seq) => seqs.push(seq),
+            None => return Ok(seqs),
+        }
+    }
 }
 
-/// Whether the STALLED re-trigger at `seq` of run `run_id` is settled: its trigger HANDLED, and the wake it woke (the
-/// trigger's own, or the one it was merged into) settled by its identity (`wakes::settled_by_id`).
-fn settled(tx: &Transaction<'_>, run_id: &str, seq: i64) -> Result<bool, PersistError> {
+/// Whether a candidate of run `run_id` has a live recovery obligation the runner would act on: its records pending
+/// (`pending`) or its last recovery failed with none recovered since and not judged unrecoverable — as
+/// `unrecovered_candidates` judges, for this run's candidates only — and `verification::live_obligation`.
+fn recovery_owed(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    pending: &BTreeSet<String>,
+) -> Result<bool, PersistError> {
+    // Only a candidate in a state a live obligation needs (VERIFYING, REJECTED, INVALID) is looked at further.
+    let candidates: Vec<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT candidate_id FROM candidates WHERE run_id = ?1 \
+                 AND state IN ('VERIFYING', 'REJECTED', 'INVALID')",
+            )
+            .map_err(sqlite_error)?;
+        statement
+            .query_map(params![run_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    let by_run = |alias: &str, kind: &str| {
+        format!(
+            "{alias}.kind = '{kind}' AND {} AND json_extract({alias}.payload_json, '$.candidate_id') = ?2",
+            super::hold::of_run(alias, "?1")
+        )
+    };
+    let unrecovered = format!(
+        "SELECT EXISTS(SELECT 1 FROM events f WHERE {} \
+           AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE {}), 0) \
+           AND NOT EXISTS(SELECT 1 FROM events s WHERE {} \
+             AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable'))",
+        by_run("f", "candidate.reconcile_failed"),
+        by_run("r", "candidate.reconcile_recovered"),
+        by_run("s", "candidate.stale"),
+    );
+    for candidate in &candidates {
+        let owed = pending.contains(candidate)
+            || tx
+                .query_row(&unrecovered, params![run_id, candidate], |r| r.get(0))
+                .map_err(sqlite_error)?;
+        if owed && super::verification::live_obligation(tx, candidate)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the STALLED re-trigger `stalled/<marker>/<n>` (event `seq`) of run `run_id` is settled: its trigger (keyed by
+/// its fingerprint, `stalled/<marker>/<n>#retrigger`) HANDLED, and the wake it woke (the trigger's own, or the one it
+/// was merged into, read from its `woken` by id) settled by its identity (`wakes::settled_by_id`).
+fn settled(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    marker: &str,
+    n: usize,
+    seq: i64,
+) -> Result<bool, PersistError> {
     let trigger: Option<(String, String)> = tx
         .query_row(
-            "SELECT t.trigger_id, t.state FROM supervisor_triggers t, json_each(t.event_seqs_json) s \
-             WHERE t.run_id = ?1 AND s.value = ?2",
-            params![run_id, seq],
+            "SELECT t.trigger_id, t.state FROM supervisor_triggers t WHERE t.run_id = ?1 AND t.fingerprint = ?2 \
+             AND EXISTS(SELECT 1 FROM json_each(t.event_seqs_json) s WHERE s.value = ?3)",
+            params![run_id, format!("stalled/{marker}/{n}#retrigger"), seq],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
@@ -327,9 +364,8 @@ fn settled(tx: &Transaction<'_>, run_id: &str, seq: i64) -> Result<bool, Persist
     }
     let merged: Option<Option<String>> = tx
         .query_row(
-            "SELECT json_extract(payload_json, '$.merged_into') FROM events WHERE run_id = ?1 \
-             AND kind = 'supervisor.woken' AND json_extract(payload_json, '$.trigger_id') = ?2 ORDER BY seq LIMIT 1",
-            params![run_id, trigger_id],
+            "SELECT json_extract(payload_json, '$.merged_into') FROM events WHERE event_id = ?1 AND run_id = ?2",
+            params![child_id(&trigger_id, "woken"), run_id],
             |r| r.get(0),
         )
         .optional()

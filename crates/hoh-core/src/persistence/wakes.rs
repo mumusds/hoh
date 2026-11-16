@@ -206,23 +206,36 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
 
 /// Whether wake `wake_id` of run `run_id` is settled for good (docs/adr/ADR-031.md correction C's precondition,
 /// M2T13D-402): its last turn SETTLED or the wake superseded, and none of its turns' outputs still to dispose of. Read
-/// by its identity from the run's whole history — never limited by the horizon, which can pass a settled wake.
+/// by its identity — never limited by the horizon, which can pass a settled wake: from its `woken` (found by its id,
+/// `child_id(wake, "woken")`), the events of its life all come after it, so only those are read (M2T13R-03).
 pub(super) fn settled_by_id(
     tx: &Transaction<'_>,
     run_id: &str,
     wake_id: &str,
 ) -> Result<bool, PersistError> {
+    let woken: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM events WHERE event_id = ?1 AND run_id = ?2",
+            params![child_id(wake_id, "woken"), run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(woken) = woken else {
+        return Ok(false);
+    };
     let mut statement = tx
         .prepare(
             "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5, ?6) \
-             AND (json_extract(payload_json, '$.wake') = ?7 OR json_extract(payload_json, '$.trigger_id') = ?7 \
-               OR json_extract(payload_json, '$.target_wake') = ?7) ORDER BY seq",
+             AND seq >= ?8 AND (json_extract(payload_json, '$.wake') = ?7 \
+               OR json_extract(payload_json, '$.trigger_id') = ?7 OR json_extract(payload_json, '$.target_wake') = ?7) \
+             ORDER BY seq",
         )
         .map_err(sqlite_error)?;
     let rows: Vec<(i64, String, String)> = statement
         .query_map(
             params![
-                run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT, wake_id
+                run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT, wake_id, woken
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
