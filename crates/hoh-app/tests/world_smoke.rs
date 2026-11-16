@@ -93,6 +93,36 @@ fn a_world_directory_that_was_not_removed_is_reported_with_what_is_left_and_who_
 }
 
 #[test]
+fn a_world_directory_made_again_just_after_its_removal_is_reported_too() -> R {
+    // World::drop removes its directory (world::removed) and, when that succeeded, looks once more a moment later: a
+    // directory something made again meanwhile (a late writer's create_dir_all) is reported as a failed removal is.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("w");
+    std::fs::create_dir_all(root.join("p/.hoh"))?;
+    let again = root.join("p/.hoh/attempts");
+    let late = {
+        let again = again.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::create_dir_all(&again)
+        })
+    };
+    let report = world::removed(&root).ok_or("nothing reported")?;
+    late.join().map_err(|_| "the late writer panicked")??;
+    assert!(report.contains("made again"), "{report}");
+    assert!(
+        report.contains(&format!("{} ", again.display())),
+        "{report}"
+    );
+    // A removal nothing undoes reports nothing.
+    std::fs::create_dir_all(root.join("p"))?;
+    std::fs::remove_dir_all(&again)?;
+    assert_eq!(world::removed(&root), None);
+    assert!(!root.exists());
+    Ok(())
+}
+
+#[test]
 fn the_pty_helper_runs_a_program_of_the_world_and_snapshots_its_screen() -> R {
     let world = World::new()?;
     let pty = pty::Pty::new(10, 60)?;
