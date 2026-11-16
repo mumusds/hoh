@@ -8,11 +8,28 @@ use std::process::{Command, Stdio};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// `hoh __gate <argv>` given `input` on stdin (then closed): its exit code and stdout, and its pid. A gate may end
-/// without reading all of it (a usage error, a closed gate): the write then meets a closed pipe, which is no failure
-/// of the test; its exit code and output say what the gate did.
+/// `command`'s environment cleared and isolated in `dir`: HOME `<dir>/home`, XDG_RUNTIME_DIR `<dir>/run`, PATH
+/// /usr/bin:/bin (no agent or anything else of this machine's user).
+fn isolated(command: &mut Command, dir: &std::path::Path) -> R {
+    for sub in ["home", "run"] {
+        std::fs::create_dir_all(dir.join(sub))?;
+    }
+    command
+        .env_clear()
+        .env("HOME", dir.join("home"))
+        .env("XDG_RUNTIME_DIR", dir.join("run"))
+        .env("PATH", "/usr/bin:/bin");
+    Ok(())
+}
+
+/// `hoh __gate <argv>` given `input` on stdin (then closed), in an isolated environment: its exit code and stdout, and
+/// its pid. A gate may end without reading all of it (a usage error, a closed gate): the write then meets a closed
+/// pipe, which is no failure of the test; its exit code and output say what the gate did.
 fn gate(argv: &[&str], input: &[u8]) -> R<(Option<i32>, String, u32)> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hoh"))
+    let dir = tempfile::tempdir()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hoh"));
+    isolated(&mut command, dir.path())?;
+    let mut child = command
         .arg("__gate")
         .args(argv)
         .stdin(Stdio::piped())
@@ -96,7 +113,10 @@ fn an_opened_gate_gives_the_agent_default_signals_whatever_it_inherited() -> R {
                   out = subprocess.run([sys.argv[1], '__gate', 'cat', '/proc/self/status'], input=b'go\\n',\n\
                                        capture_output=True, restore_signals=False).stdout.decode()\n\
                   print('\\n'.join(l for l in out.splitlines() if l.startswith(('SigIgn', 'SigBlk'))))\n";
-    let out = Command::new("python3")
+    let dir = tempfile::tempdir()?;
+    let mut python = Command::new("python3");
+    isolated(&mut python, dir.path())?;
+    let out = python
         .args(["-c", script, env!("CARGO_BIN_EXE_hoh")])
         .output()?;
     assert!(out.status.success(), "{out:?}");

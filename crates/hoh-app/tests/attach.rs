@@ -146,6 +146,18 @@ impl Env {
         path
     }
 
+    /// [`Env::command`] with XDG_RUNTIME_DIR a directory of its own (0700), where no user manager answers: a test's
+    /// `hoh` reaches neither this machine's HOME, its agents nor its runtime directory (systemd, D-Bus).
+    fn isolated(&self, args: &[&str]) -> R<Command> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runtime = self.dir.path().join("run");
+        std::fs::create_dir_all(&runtime)?;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+        let mut command = self.command(args);
+        command.env("XDG_RUNTIME_DIR", runtime);
+        Ok(command)
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(HOH);
         command
@@ -703,11 +715,9 @@ async fn test_005_03_an_attach_without_a_tty_lists_two_runs_and_an_unknown_id_is
     )?;
     let runs = query(&env.project(), "SELECT count(*) FROM runs")?;
     let opened = host.streams_opened();
-    let project = env.project();
+    let mut command = env.isolated(&["attach"])?;
     let attach = tokio::task::spawn_blocking(move || -> Result<Output, String> {
-        let child = Command::new(HOH)
-            .arg("attach")
-            .current_dir(&project)
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1783,11 +1793,9 @@ async fn test_005_05_a_startrun_whose_commit_fails_prints_nothing_and_leaves_no_
     // A product host this test's commands would start is stopped however the test ends (M2T06R-62).
     let _daemons = Daemons(env.project());
     let host = Host::start(config).await?;
-    let project = env.project();
+    let mut command = env.isolated(&["-p", "目标", "--detach", "--output", "json"])?;
     let out = tokio::task::spawn_blocking(move || -> Result<Output, String> {
-        let child = Command::new(HOH)
-            .args(["-p", "目标", "--detach", "--output", "json"])
-            .current_dir(&project)
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
