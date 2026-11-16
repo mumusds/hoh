@@ -1939,6 +1939,150 @@ async fn each_output_of_a_turn_ends_exactly_once() -> R {
 }
 
 #[tokio::test]
+async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_disposed_of_as_plan() -> R
+{
+    // docs/adr/ADR-031.md decision 2 (Q2 (a)), 测试计划 "create_tasks": a turn's create_tasks is applied with its
+    // decision, its tasks in, the run's revision moved once, so the turn's next decision at that revision plus one is
+    // applied too (M2T13D-51); a plan with a cycle, a missing dependency, a duplicate id or a requirement outside the
+    // run's specification ends invalid PLAN with its code (null for the last) and leaves no decisions row.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    exec(
+        &path,
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's3', 'one', 1);",
+    )?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let nonce = nonce_of(&path, &a.attempt_id)?;
+    let at = a.attempt_id.as_str();
+    let task = |id: &str, depends_on: &[&str], requirements: &[&str]| {
+        json!({"task_id": id, "title": id, "role": "developer", "writer": true, "depends_on": depends_on,
+            "requirement_ids": requirements})
+    };
+    let plan = |tasks: Value| json!({"kind": "create_tasks", "plan": {"tasks": tasks}});
+    let lines = [
+        line(
+            &nonce,
+            output(
+                "m1",
+                "decision",
+                &w,
+                at,
+                1,
+                plan(json!([
+                    task("P1", &[], &["REQ-1"]),
+                    task("P2", &["P1"], &[])
+                ])),
+            ),
+        ),
+        line(&nonce, output("m2", "decision", &w, at, 2, assumption())),
+        line(
+            &nonce,
+            output(
+                "m3",
+                "decision",
+                &w,
+                at,
+                3,
+                plan(json!([task("Q1", &["Q2"], &[]), task("Q2", &["Q1"], &[])])),
+            ),
+        ),
+        line(
+            &nonce,
+            output(
+                "m4",
+                "decision",
+                &w,
+                at,
+                3,
+                plan(json!([task("Q1", &["Q9"], &[])])),
+            ),
+        ),
+        line(
+            &nonce,
+            output(
+                "m5",
+                "decision",
+                &w,
+                at,
+                3,
+                plan(json!([task("D", &[], &[])])),
+            ),
+        ),
+        line(
+            &nonce,
+            output(
+                "m6",
+                "decision",
+                &w,
+                at,
+                3,
+                plan(json!([task("Q1", &[], &["REQ-9"])])),
+            ),
+        ),
+    ];
+    bridged_turn(&store, &clock, at, 3000, true, &lines).await?;
+    store.supervise("R", context(&clock, 4000)).await?;
+    let o = |n: usize| format!("{at}/output/{n}");
+    assert_eq!(
+        ends(&path)?,
+        [
+            (o(0), "decision.applied".to_owned()),
+            (o(1), "decision.applied".to_owned()),
+            (o(2), "invalid:PLAN".to_owned()),
+            (o(3), "invalid:PLAN".to_owned()),
+            (o(4), "invalid:PLAN".to_owned()),
+            (o(5), "invalid:PLAN".to_owned()),
+        ]
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(c) FROM (SELECT json_extract(payload_json, '$.code') AS c FROM events \
+             WHERE kind = 'supervisor.output_disposed' ORDER BY seq)"
+        )?,
+        json!([
+            "DAG_CYCLE",
+            "DAG_MISSING_DEPENDENCY",
+            "DAG_DUPLICATE_TASK",
+            null
+        ])
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(d) FROM (SELECT decision_id || ':' || state AS d FROM decisions ORDER BY rowid)"
+        )?,
+        json!([format!("{at}/m1:APPLIED"), format!("{at}/m2:APPLIED")])
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_group_array(t) FROM (SELECT task_id || ':' || state AS t FROM tasks WHERE run_id = 'R' \
+             AND role <> 'commander' ORDER BY created_seq)"
+        )?,
+        json!(["D:RUNNING", "P1:READY", "P2:PENDING"])
+    );
+    assert_eq!(
+        value(&path, "SELECT revision FROM runs WHERE run_id = 'R'")?,
+        json!(3)
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'plan.imported'"
+        )?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn outputs_wait_while_their_run_is_paused_and_are_superseded_when_it_is_cancelled() -> R {
     // Decision 6 (non-working states): a paused run's outputs are not disposed of; a cancelled run's are superseded.
     let dir = tempfile::tempdir()?;

@@ -1,12 +1,15 @@
-//! [`super::Store::import_plan`]: a validated plan's tasks, dependencies and requirements in one IMMEDIATE
-//! transaction with one `plan.imported` event, or nothing at all (REQ-038, AC-038-03).
+//! A plan's import (REQ-038, AC-038-03): [`check`] validates it against its run, [`import_in`] writes its tasks,
+//! dependencies and requirements with one `plan.imported` event in the caller's transaction, moving no run
+//! (docs/adr/ADR-031.md decision 2: a Commander's create_tasks is imported in its decision's transaction, the run moved
+//! once by the decision). [`super::Store::import_plan`] is both in one IMMEDIATE transaction with the run's one
+//! revision move, or nothing at all.
 
 use super::decide::child_id;
 use super::writer::{self, Change, Commit, Entity, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::dag;
 use crate::schedule::DEFAULT_COST;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +23,22 @@ pub struct Imported {
     pub event_seq: i64,
 }
 
+/// A plan [`check`] found valid for its run, as the transaction that checked it read the run: what [`import_in`]
+/// writes in that transaction.
+pub(super) struct ValidPlan {
+    run_id: String,
+    project_id: String,
+    spec_id: String,
+    /// The run's revision when it was checked.
+    run_revision: i64,
+    plan: dag::Plan,
+    /// The run's tasks and their states (whether a planned task's dependencies are all ACCEPTED).
+    states: BTreeMap<String, String>,
+    /// The run's highest `created_seq`: the plan's tasks come after it.
+    base: i64,
+}
+
+/// Import `raw` (a `PlanProposal`) for run `run_id` in one transaction of its own, with the run's one revision move.
 pub(super) fn import(
     conn: &mut Connection,
     run_id: &str,
@@ -27,6 +46,32 @@ pub(super) fn import(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Imported, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
+    let plan = check(&tx, run_id, raw)?;
+    let touched = writer::write(
+        &tx,
+        &Commit {
+            cas: vec![StateCas {
+                id: run_id.to_owned(),
+                expected_revision: plan.run_revision,
+                change: Change::Touch(Entity::Run),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    let (task_ids, event_seq) = import_in(&tx, plan, ctx)?;
+    super::writer::commit_unhooked(tx, ctx)?;
+    Ok(Imported {
+        task_ids,
+        run_revision: touched.revisions[0],
+        event_seq,
+    })
+}
+
+/// Validate `raw` (a `PlanProposal`) for run `run_id` in the caller's transaction, writing nothing: its schema, scores,
+/// ids and dependencies (`dag::validate`), no task of the Commander's and none behind a supervision task, and only
+/// requirements of the run's specification. A refused plan is `PersistError::Plan`.
+pub(super) fn check(tx: &Connection, run_id: &str, raw: &Value) -> Result<ValidPlan, PersistError> {
     let run: Option<(String, Option<String>, i64)> = tx
         .query_row(
             "SELECT project_id, spec_id, revision FROM runs WHERE run_id = ?1",
@@ -145,6 +190,35 @@ pub(super) fn import(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
+    Ok(ValidPlan {
+        run_id: run_id.to_owned(),
+        project_id,
+        spec_id,
+        run_revision,
+        plan,
+        states,
+        base,
+    })
+}
+
+/// Write `plan`'s tasks, dependencies and requirements and its `plan.imported` in the caller's transaction, the one
+/// that checked it; the run's revision is not moved here (its caller moves it once). The new tasks' ids in their
+/// canonical order and the event's seq.
+pub(super) fn import_in(
+    tx: &Transaction<'_>,
+    plan: ValidPlan,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(Vec<String>, i64), PersistError> {
+    let ValidPlan {
+        run_id,
+        project_id,
+        spec_id,
+        plan,
+        states,
+        base,
+        ..
+    } = plan;
+    let run_id = run_id.as_str();
     // A task another one of the plan waits for unblocks it (layer 1); the rest are normal (layer 2). Layer 0 is set
     // for critical fixes by their own path (M2-T16/T18).
     let depended_on: BTreeSet<&str> = plan
@@ -211,11 +285,6 @@ pub(super) fn import(
     }
     let task_ids: Vec<String> = plan.tasks.iter().map(|t| t.task_id.clone()).collect();
     let commit = Commit {
-        cas: vec![StateCas {
-            id: run_id.to_owned(),
-            expected_revision: run_revision,
-            change: Change::Touch(Entity::Run),
-        }],
         events: vec![NewEvent {
             intent: Intent::Progress,
             project_id,
@@ -224,13 +293,8 @@ pub(super) fn import(
             kind: "plan.imported".to_owned(),
             payload: json!({ "run_id": run_id, "tasks": listed }),
         }],
-        outbox: Vec::new(),
+        ..Commit::default()
     };
-    let done = writer::write(&tx, &commit, ctx)?;
-    super::writer::commit_unhooked(tx, ctx)?;
-    Ok(Imported {
-        task_ids,
-        run_revision: done.revisions[0],
-        event_seq: done.event_seqs[0],
-    })
+    let done = writer::write(tx, &commit, ctx)?;
+    Ok((task_ids, done.event_seqs[0]))
 }
