@@ -291,9 +291,13 @@ impl Canceller {
                     progress.remove(&attempt.attempt_id);
                 }
             }
+            // A lost pass after a lost one is the same finding unless it sent something or carries a diagnostic
+            // of its own (CGW-101).
             let repeated = self.lost.lock().is_ok_and(|mut lost| {
                 if done.end == PassEnd::Lost {
-                    !lost.insert(attempt.attempt_id.clone()) && done.sent.is_empty()
+                    !lost.insert(attempt.attempt_id.clone())
+                        && done.sent.is_empty()
+                        && !done.term_incomplete
                 } else {
                     lost.remove(&attempt.attempt_id);
                     false
