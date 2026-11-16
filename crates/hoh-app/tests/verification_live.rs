@@ -402,11 +402,16 @@ async fn live(out: &Path, path: &OsString, team: &Team, dir: &Path) -> R<Found> 
     });
     let at = Instant::now();
     let host = Host::start(config).await?;
-    let run = started(&host).await;
+    // The project's specification approved before the run starts: StartRun adopts it (docs/adr/ADR-031.md decision 1;
+    // a project with none blocks a new run on runtime:no_spec).
+    let run = match approve(&project, &spec_sha) {
+        Ok(()) => started(&host).await,
+        Err(e) => Err(e),
+    };
     let (end, shown, cleanup) = match &run {
         Ok(run_id) => {
             let end = async {
-                seed(&project, run_id, &spec_sha)?;
+                seed(&project, run_id)?;
                 watch(&project, run_id).await
             }
             .await;
@@ -754,21 +759,30 @@ async fn started(host: &Host) -> R<String> {
     Ok(accepted["run_id"].as_str().ok_or("no run_id")?.to_owned())
 }
 
-/// Run `run_id` RUNNING on the fixture's specification (`spec_sha`) with REQ-090 (AC-090-01 checked by feature-a,
-/// AC-090-02 by feature-b), and its developer task READY over it, titled by an imported plan.
-fn seed(project: &Path, run_id: &str, spec_sha: &str) -> R {
+/// The project's approved specification (`spec_sha`, the fixture's) with REQ-090 (AC-090-01 checked by feature-a,
+/// AC-090-02 by feature-b): written before the run starts, which adopts it.
+fn approve(project: &Path, spec_sha: &str) -> R {
+    exec(
+        project,
+        &format!(
+            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 'sv', project_id, '{spec_sha}', 1 FROM projects;
+             INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-090', 'sv', 'lib.sh', 1);
+             INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+               ('AC-090-01', 'REQ-090', 'sv', 'lib.sh 的 a() 输出 1（检查 feature-a，TEST-090-01）', 'feature-a'),
+               ('AC-090-02', 'REQ-090', 'sv', 'lib.sh 的 b() 输出 2（检查 feature-b，TEST-090-02）', 'feature-b');"
+        ),
+    )
+}
+
+/// Run `run_id` RUNNING on the fixture's specification (adopted at its start), and its developer task READY over
+/// REQ-090, titled by an imported plan.
+fn seed(project: &Path, run_id: &str) -> R {
     let run = quoted(run_id);
     let plan = json!({"run_id": run_id, "tasks": [{"task_id": TASK, "title": TITLE}]}).to_string();
     exec(
         project,
         &format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) SELECT 'sv', project_id, '{spec_sha}', 1 FROM runs \
-               WHERE run_id = {run};
-             UPDATE runs SET state = 'RUNNING', spec_id = 'sv' WHERE run_id = {run};
-             INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-090', 'sv', 'lib.sh', 1);
-             INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
-               ('AC-090-01', 'REQ-090', 'sv', 'lib.sh 的 a() 输出 1（检查 feature-a，TEST-090-01）', 'feature-a'),
-               ('AC-090-02', 'REQ-090', 'sv', 'lib.sh 的 b() 输出 2（检查 feature-b，TEST-090-02）', 'feature-b');
+            "UPDATE runs SET state = 'RUNNING', spec_id = 'sv' WHERE run_id = {run};
              INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) VALUES
                ('{TASK}', {run}, 'sv', 'READY', 1, 'developer', 1, (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks), 1);
              INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{TASK}', 'REQ-090', 'sv');
