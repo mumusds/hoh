@@ -573,6 +573,34 @@ async fn an_answer_on_a_stopped_run_is_accepted_and_ends_with_its_result() -> R 
 }
 
 #[tokio::test]
+async fn a_send_input_to_a_published_incomplete_run_is_the_commands_and_ends_with_its_result() -> R
+{
+    // The test plan's 守卫 (b) and 停住之后的写入口 (1)'s accepted SendInput (correction D, E3): on a run stopped INCOMPLETE
+    // (published) with no question, a SendInput is accepted (no RunStopped, its events the command's), queued as a
+    // STEER, the run INCOMPLETE and touched; the commit ends with run.result{INCOMPLETE}, so the run's latest event is
+    // its result again and it stays stopped.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_store(&dir)?;
+    world(&path, "RUNNING", &[], "")?;
+    moved(&store, &path, &[RunState::Incomplete]).await?;
+    let before = max_seq(&path)?;
+    store
+        .submit_command(send("c1", 6, "继续", "REPLY", None))
+        .await?;
+    assert_eq!(
+        kinds_after(&path, before)?,
+        ["input.accepted", "input.queued", "run.result"]
+    );
+    assert_eq!(run_state(&path)?, json!("INCOMPLETE/7"));
+    assert_eq!(last_of(&path, "run.result")?["state"], "INCOMPLETE");
+    assert_eq!(
+        super::super::hold::stopped(&Connection::open(&path)?, "R")?,
+        Some(RunState::Incomplete)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_refused_answer_writes_nothing_and_says_why() -> R {
     // Decision 7, E5: a question that is not open (409 ILLEGAL_TRANSITION, details naming it); a choice_id that is not
     // one of its own (400 BAD_REQUEST); a stale revision (409 STALE_REVISION); a run that ended (409
@@ -1119,6 +1147,260 @@ mod real {
         assert_eq!(snapshot(&path)?, before);
         answer(&store, &path, "c2", &q.question_id, "reverify").await??;
         assert_eq!(task(&path, "D")?, "READY");
+        Ok(())
+    }
+
+    /// Every question of R now, as (subject, reason, refusal, route): correction A's guard (4), "every real writer's
+    /// pair routes".
+    type Routed = (Option<&'static str>, Option<String>, bool, Route);
+
+    fn routed(path: &Path) -> R<Vec<Routed>> {
+        Ok(open(&Connection::open(path)?, "R")?
+            .into_iter()
+            .map(|q| (q.subject, q.reason, q.refusal, q.route))
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn a_spent_reverify_chain_answered_reverify_starts_a_new_chain_and_its_join_accepts() -> R
+    {
+        // W7's real path (M2T13D-02): D's rounds inconclusive until its chain is spent (REVERIFY_LIMIT 2): the
+        // reconcile's need_decision{reverify_exhausted}. Its question: source, refusal, reverify or rework, no cancel.
+        // Answered reverify: in one commit repair.refusal_cleared, D BLOCKED -> VERIFYING and round 4, its chain root
+        // itself; once its verifiers pass with the check's evidence, the join is join/4 and C1 ACCEPTED.
+        use crate::persistence::completion::tests::{evidence_of, settle_verifiers, verified};
+        let dir = tempfile::tempdir()?;
+        let (store, path) = world(dir.path())?;
+        let (_, candidate, _) = verified(&store, &path, "PASS", "PASS").await?;
+        reconcile(&store).await?;
+        settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        reconcile(&store).await?;
+        settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        reconcile(&store).await?;
+        assert_eq!(task(&path, "D")?, "BLOCKED:NEED_DECISION");
+        assert_eq!(
+            routed(&path)?,
+            [(
+                Some("source"),
+                Some("reverify_exhausted".to_owned()),
+                true,
+                Route::Reverify
+            )]
+        );
+        let q = open(&Connection::open(&path)?, "R")?.remove(0);
+        assert!(q.choices.iter().all(|(id, _)| id != "cancel"), "{q:?}");
+        let before: i64 = one(&path, "SELECT CAST(max(seq) AS TEXT) FROM events")?.parse()?;
+        answer(&store, &path, "c1", &q.question_id, "reverify").await??;
+        let kinds = texts(
+            &path,
+            &format!("SELECT kind FROM events WHERE seq > {before} ORDER BY seq"),
+        )?;
+        let cleared = kinds
+            .iter()
+            .position(|k| k == "repair.refusal_cleared")
+            .ok_or("cleared")?;
+        let opened = kinds
+            .iter()
+            .position(|k| k == "verification.round_opened")
+            .ok_or("opened")?;
+        assert!(cleared < opened, "{kinds:?}");
+        assert_eq!(task(&path, "D")?, "VERIFYING");
+        let r4 = child_id(&candidate, "round/4");
+        let round = events(&path, "verification.round_opened")?
+            .into_iter()
+            .find(|o| o["round_id"] == json!(r4))
+            .ok_or("round 4")?;
+        assert_eq!(
+            (&round["number"], &round["chain_root"]),
+            (&json!(4), &json!(r4))
+        );
+        let [qa, _] = settle_verifiers(&store, &path, "PASS", "PASS").await?;
+        evidence_of(
+            &path,
+            (&qa, &candidate, "rec-4"),
+            ("unit", "PASS"),
+            &[("AC-1-01", "PASS")],
+            true,
+        )?;
+        reconcile(&store).await?;
+        let joined = events(&path, "verification.joined")?;
+        assert_eq!(
+            joined
+                .last()
+                .map(|j| (j["join_id"].clone(), j["outcome"].clone())),
+            Some((json!(child_id(&candidate, "join/4")), json!("accepted")))
+        );
+        assert_eq!(
+            one(
+                &path,
+                &format!("SELECT state FROM candidates WHERE candidate_id = '{candidate}'")
+            )?,
+            "ACCEPTED"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verifiers_own_spent_reverifications_and_unknown_effect_are_redispatched_to_the_next_admission()
+    -> R {
+        // W4's and W10's real paths: the qa verifier's own FAILED results reverified within its round until refused
+        // (need_decision{reverify_exhausted} on the verifier task: subject verifier, refusal, redispatch only); and,
+        // in another world, its attempt ended UNKNOWN_EFFECT (verifier_unknown_effect, no refusal). Answered: the
+        // refusal cleared (no longer refused, so the next scheduling round does not filter it out), the task READY
+        // with its attempt count kept, and the next scheduling round leases it again.
+        use crate::persistence::completion::tests::{
+            ending, verifier_completion, verifier_running,
+        };
+        use crate::persistence::{VerifierCompleted, VerifierOutcome};
+        for unknown in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = world(dir.path())?;
+            let (_, task_id, mut attempt) = verifier_running(&store, &path).await?;
+            if unknown {
+                let mut ended = ending();
+                ended.unknown_effect = true;
+                store.runner_finished(&attempt, ended).await?;
+            } else {
+                for n in 0..3 {
+                    let done = store
+                        .complete_verifier_attempt(verifier_completion(
+                            &attempt,
+                            VerifierOutcome::Reverify {
+                                status: "FAILED".to_owned(),
+                                reason: "it failed".to_owned(),
+                            },
+                        ))
+                        .await?;
+                    if n < 2 {
+                        assert!(
+                            matches!(done, VerifierCompleted::Reverified { .. }),
+                            "{done:?}"
+                        );
+                        attempt = format!("{task_id}/again-{n}");
+                        Connection::open(&path)?.execute_batch(&format!(
+                            "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = '{task_id}';
+                             INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch,
+                               config_revision) VALUES ('{attempt}', '{task_id}', 'sq', 'RUNNING', 1, 1, 1);"
+                        ))?;
+                    }
+                }
+            }
+            assert_eq!(task(&path, &task_id)?, "BLOCKED:NEED_DECISION");
+            let reason = if unknown {
+                "verifier_unknown_effect"
+            } else {
+                "reverify_exhausted"
+            };
+            assert_eq!(
+                routed(&path)?,
+                [(
+                    Some("verifier"),
+                    Some(reason.to_owned()),
+                    !unknown,
+                    Route::Redispatch(super::super::Redispatch::Plain)
+                )]
+            );
+            let count = one(
+                &path,
+                &format!(
+                    "SELECT CAST(attempt_count AS TEXT) FROM tasks WHERE task_id = '{task_id}'"
+                ),
+            )?;
+            let q = open(&Connection::open(&path)?, "R")?.remove(0);
+            answer(&store, &path, "c1", &q.question_id, "好").await??;
+            assert_eq!(task(&path, &task_id)?, "READY");
+            assert_eq!(
+                one(
+                    &path,
+                    &format!(
+                        "SELECT CAST(attempt_count AS TEXT) FROM tasks WHERE task_id = '{task_id}'"
+                    )
+                )?,
+                count
+            );
+            assert!(
+                !crate::persistence::verification::refused(&Connection::open(&path)?, "R")?
+                    .contains(&task_id)
+            );
+            let mut again = None;
+            while let Some(d) = store.schedule_round("R", verifiers()).await?.dispatched {
+                if d.task_id == task_id {
+                    again = Some(d.attempt_id);
+                }
+            }
+            assert!(
+                again.is_some(),
+                "the verifier dispatched again (unknown {unknown})"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_developers_own_end_and_spent_corrections_ask_the_work_question_and_its_answer_dispatches_it()
+    -> R {
+        // W12's and W3's real paths (completion.rs): D's attempt reports FAILED (need_decision{agent_failed}: work,
+        // continue or cancel); in another world its output is to be corrected past max_protocol_repairs (2): the
+        // refusal need_decision{protocol_repairs_exhausted} (work, refusal, rework or cancel). Answered continue and
+        // rework: D READY (rework in layer 0, its refusal cleared) and the next scheduling round leases it again.
+        use crate::persistence::WriterOutcome;
+        use crate::persistence::need::WorkReason;
+        for correct in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let (store, path) = world(dir.path())?;
+            let mut attempt = "A".to_owned();
+            for n in 0..3 {
+                let outcome = if correct {
+                    WriterOutcome::Correct {
+                        reasons: vec!["no TaskResult".to_owned()],
+                    }
+                } else {
+                    WriterOutcome::Decide {
+                        reason: WorkReason::AgentFailed,
+                        detail: "{}".to_owned(),
+                    }
+                };
+                store
+                    .complete_writer_attempt(WriterCompletion {
+                        attempt_id: attempt.clone(),
+                        ..completion(outcome)
+                    })
+                    .await?;
+                if !correct || n == 2 {
+                    break;
+                }
+                attempt = format!("A{n}");
+                Connection::open(&path)?.execute_batch(&format!(
+                    "UPDATE tasks SET state = 'RUNNING', revision = revision + 1 WHERE task_id = 'D';
+                     INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch,
+                       config_revision, started_at) VALUES ('{attempt}', 'D', 'sd', 'RUNNING', 1, 1, 1,
+                       '2026-11-12T00:00:0{n}Z');"
+                ))?;
+            }
+            assert_eq!(task(&path, "D")?, "BLOCKED:NEED_DECISION");
+            let (reason, route, text) = if correct {
+                ("protocol_repairs_exhausted", Route::Rework, "rework")
+            } else {
+                ("agent_failed", Route::Continue, "continue")
+            };
+            assert_eq!(
+                routed(&path)?,
+                [(Some("work"), Some(reason.to_owned()), correct, route)]
+            );
+            let q = open(&Connection::open(&path)?, "R")?.remove(0);
+            answer(&store, &path, "c1", &q.question_id, text).await??;
+            assert_eq!(task(&path, "D")?, "READY");
+            let context = crate::decision::Context {
+                required_capabilities: [("developer".to_owned(), Default::default())].into(),
+                ..verifiers()
+            };
+            let d = store
+                .schedule_round("R", context)
+                .await?
+                .dispatched
+                .ok_or("D dispatched")?;
+            assert_eq!(d.task_id, "D", "correct {correct}");
+        }
         Ok(())
     }
 
