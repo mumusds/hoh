@@ -15,6 +15,7 @@ mod common;
 mod pty;
 mod world;
 
+use hoh_app::host::Host;
 use pty::R;
 use serde_json::{Value, json};
 use std::io::{BufRead as _, Read as _, Write as _};
@@ -682,4 +683,704 @@ async fn test_002_03_usage_errors_and_a_reply_by_resume() -> R {
     outcome?;
     assert!(team.refused().is_empty(), "{team:?}");
     Ok(())
+}
+
+/// The product's world of TEST-002-02, -004-02, -004-03, -004-04 and -042-04 Ra (docs/adr/ADR-031.md decision 14): the
+/// committed fixture project (REQ-901, AC-901-01, whose check passes) with `team` and `toml` in its configuration, its
+/// fake CLIs registered, its in-process product host started and the specification approved; QA runs the planned
+/// check.
+async fn product_world(world: &World, team: &[(&str, &str)], toml: &str) -> R<Host> {
+    world.configure(team, toml)?;
+    world.commit_project(&world::fixture_spec())?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    let host = world.start_host().await?;
+    if let Err(e) = world.seed_spec() {
+        host.shutdown().await;
+        return Err(e);
+    }
+    Ok(host)
+}
+
+/// Every string in `value`, at any depth.
+fn strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().flat_map(strings).collect(),
+        Value::Object(o) => o.values().flat_map(strings).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The run StartRun made of the `n`-th StartRun after the first `before` commands, once there is one.
+fn nth_started(world: &World, before: i64, n: usize) -> R<String> {
+    let end = Instant::now() + WAIT;
+    loop {
+        let started: Vec<Value> = commands_after(world, before)?
+            .into_iter()
+            .filter(|c| c["kind"] == "StartRun")
+            .collect();
+        if let Some(run) = started.get(n).and_then(|c| c["run_id"].as_str()) {
+            return Ok(run.to_owned());
+        }
+        if Instant::now() > end {
+            return Err(format!("no StartRun #{n} after {before}").into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What run `run` decided: its decisions' kind, state, to_state and basis.
+fn decided(world: &World, run: &str) -> R<Vec<Value>> {
+    world.rows(&format!(
+        "SELECT json_extract(payload_json, '$.kind') AS kind, state, json_extract(payload_json, '$.to_state') AS \
+         to_state, json_extract(payload_json, '$.basis') AS basis FROM decisions WHERE run_id = '{run}' ORDER BY rowid"
+    ))
+}
+
+/// The pinned script's outcome on run `run` (M2T13D-52): at least one APPLIED record_assumption with a basis, and no
+/// APPLIED transition_run to VERIFYING, COMPLETED, FAILED or INCOMPLETE (its end is the pace's budget stop).
+fn assumed_and_never_moved_past_running(world: &World, run: &str) -> R {
+    let decided = decided(world, run)?;
+    assert!(
+        decided.iter().any(|d| d["kind"] == "record_assumption"
+            && d["state"] == "APPLIED"
+            && d["basis"].as_str().is_some_and(|b| !b.trim().is_empty())),
+        "{run}: {decided:?}"
+    );
+    assert!(
+        !decided.iter().any(|d| d["kind"] == "transition_run"
+            && d["state"] == "APPLIED"
+            && ["VERIFYING", "COMPLETED", "FAILED", "INCOMPLETE"]
+                .contains(&d["to_state"].as_str().unwrap_or("-"))),
+        "{run}: {decided:?}"
+    );
+    Ok(())
+}
+
+/// Why run `run` stopped: its `run.incomplete`'s stop and how many iterations it completed.
+fn stopped_by(world: &World, run: &str) -> R<(String, i64)> {
+    let stop = world.query(&format!(
+        "SELECT json_extract(payload_json, '$.stop') FROM events WHERE run_id = '{run}' AND kind = 'run.incomplete'"
+    ))?;
+    let iterations: i64 = world
+        .query(&format!(
+            "SELECT count(*) FROM events WHERE run_id = '{run}' AND kind = 'iteration.completed'"
+        ))?
+        .parse()?;
+    Ok((stop, iterations))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_002_02_defaults_become_assumptions_and_the_iteration_budget_ends_incomplete() -> R {
+    // AC-002-02: the product's world with `[budget] max_iterations = 1`; the pinned fake Commander records an
+    // assumption, plans the developer task and moves the run to RUNNING, never further; the Developer commits, QA and
+    // the Reviewer pass (one join, one iteration), so the run ends only by the pace's budget stop: INCOMPLETE. (a) `hoh
+    // -p 'fix bug'` in a PTY, `y` and Enter typed once it runs; (b) the same with stdin a pipe never written nor closed.
+    let world = World::new()?;
+    let host = product_world(&world, &world::TEAM, "[budget]\nmax_iterations = 1\n").await?;
+    let outcome = tokio::task::block_in_place(|| -> R {
+        let goal = "fix bug";
+        let (runs, commands) = (count(&world, "runs")?, count(&world, "commands")?);
+        // (a) In a PTY.
+        let pty = pty::Pty::new(30, 100)?;
+        let started = Instant::now();
+        let mut a = world.hoh_pty(&pty, &["-p", goal])?;
+        let run_a = nth_started(&world, commands, 0)?;
+        let mut typed = pty;
+        typed.send(b"y\n")?;
+        let status_a = pty::exit_within(&mut a, Duration::from_secs(60))?;
+        let took_a = started.elapsed();
+        typed.drained(WAIT)?;
+        let shown_a = typed.output();
+        assert_eq!(count(&world, "runs")?, runs + 1, "one run more for (a)");
+        // (b) stdin a pipe, never written nor closed.
+        let started = Instant::now();
+        let mut b = world
+            .command(&["-p", goal])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let open_stdin = b.stdin.take();
+        let out_b = world::finish(b, Duration::from_secs(60))?;
+        let took_b = started.elapsed();
+        drop(open_stdin);
+        let run_b = nth_started(&world, commands, 1)?;
+        assert_eq!(count(&world, "runs")?, runs + 2, "one run more for (b)");
+        // Both 4, both runs INCOMPLETE.
+        assert_eq!(
+            status_a.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&shown_a)
+        );
+        assert_eq!(
+            out_b.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&out_b.stderr)
+        );
+        for run in [&run_a, &run_b] {
+            assert_eq!(
+                world.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?,
+                "INCOMPLETE",
+                "{run}"
+            );
+            assumed_and_never_moved_past_running(&world, run)?;
+            // The fixture as pinned: one join counted the one iteration, and the pace stopped the run on it.
+            assert_eq!(
+                stopped_by(&world, run)?,
+                ("max_iterations".to_owned(), 1),
+                "{run}"
+            );
+        }
+        // The PTY never showed the alternate screen.
+        assert_eq!(pty::find(&shown_a, ENTER_ALT, 0), None);
+        // No command's or input's payload holds the `y` typed: each field compared, the goals `fix bug`.
+        for row in world.rows("SELECT kind, payload_json FROM commands UNION ALL SELECT kind, payload_json FROM input_queue")? {
+            let payload: Value = serde_json::from_str(row["payload_json"].as_str().unwrap_or("null"))?;
+            assert!(
+                !strings(&payload).iter().any(|s| s.trim_end() == "y"),
+                "{row}"
+            );
+            if row["kind"] == "StartRun" {
+                assert_eq!(payload["goal"], goal, "{row}");
+            }
+        }
+        // (b) ended within its 60 s although its stdin stayed open.
+        assert!(took_b < Duration::from_secs(60), "{took_b:?}");
+        eprintln!("(a) {took_a:?}, (b) {took_b:?}");
+        Ok(())
+    });
+    host.shutdown().await;
+    outcome
+}
+
+/// Every value under a key `statement` in `value`, at any depth, a string that is itself a JSON document (a bridge
+/// line an event carries) looked into as well.
+fn statements(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(o) => o
+            .iter()
+            .flat_map(|(k, v)| {
+                let mut found = statements(v);
+                if k == "statement"
+                    && let Some(s) = v.as_str()
+                {
+                    found.push(s.to_owned());
+                }
+                found
+            })
+            .collect(),
+        Value::Array(a) => a.iter().flat_map(statements).collect(),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(|v| v.is_object() || v.is_array())
+            .map(|v| statements(&v))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many times `needle` occurs in `hay`.
+fn occurrences(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_004_02_stream_json_is_every_event_of_the_run_escaped_and_ends_with_run_result() -> R {
+    // AC-004-02: the product's world on TEST-002-02's pinned script (max_iterations = 1: the end can only be
+    // INCOMPLETE); the Commander's assumption in Chinese with an emoji ZWJ sequence, U+2028, U+2029 and a line feed
+    // inside the string; the Developer writes 10 MiB of marked noise to its stderr. `hoh -p 'x' --output stream-json`,
+    // its stdout read one line at a time with 50 ms between lines, its stderr drained alongside.
+    let statement = "按默认规格实现 👩\u{200d}👩\u{200d}👧\u{2028}第二段\u{2029}第三段\n第四行";
+    let marker = "HOH-004-02-NOISE";
+    let world = World::new()?;
+    world.commander(&world::Commander {
+        statement: statement.to_owned(),
+        ..world::Commander::default()
+    })?;
+    world.developer(&world::Developer {
+        stderr_bytes: 10 << 20,
+        stderr_marker: marker.to_owned(),
+        ..world::Developer::default()
+    })?;
+    let host = product_world(&world, &world::TEAM, "[budget]\nmax_iterations = 1\n").await?;
+    let outcome = tokio::task::block_in_place(|| -> R {
+        let commands = count(&world, "commands")?;
+        let mut child = world
+            .command(&["-p", "x", "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut err = child.stderr.take().ok_or("no stderr")?;
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = err.read_to_end(&mut bytes);
+            bytes
+        });
+        // The slow reader: one line, then 50 ms, until the end of stdout.
+        let mut out = std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+            let (mut all, mut line) = (Vec::new(), Vec::new());
+            while out.read_until(b'\n', &mut line)? > 0 {
+                all.extend_from_slice(&line);
+                line.clear();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(all)
+        });
+        let end = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() > end {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("the follow did not end within 120 s".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stdout = reader.join().map_err(|_| "the stdout reader panicked")??;
+        let stderr = stderr.join().map_err(|_| "the stderr reader panicked")?;
+        let run = nth_started(&world, commands, 0)?;
+        // Every line (framed by 0x0A) parses and is an Event; the last one a RunResultEvent.
+        let lines: Vec<&[u8]> = stdout
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        let (mut unparsed, mut invalid, mut events) = (0, 0, Vec::new());
+        for raw in &lines {
+            match serde_json::from_slice::<Value>(raw) {
+                Ok(event) => {
+                    if hoh_core::schema::protocol()
+                        .validate_def("Event", &event)?
+                        .is_err()
+                    {
+                        invalid += 1;
+                    }
+                    events.push(event);
+                }
+                Err(_) => unparsed += 1,
+            }
+        }
+        assert_eq!(
+            (unparsed, invalid),
+            (0, 0),
+            "{}",
+            String::from_utf8_lossy(&stdout)
+        );
+        let last = events.last().ok_or("no line")?;
+        let valid = hoh_core::schema::protocol().validate_def("RunResultEvent", last)?;
+        assert!(valid.is_ok(), "{last}: {valid:?}");
+        // Seqs strictly increasing, and the set of them the run's events in the store once the client is gone.
+        let seqs: Vec<i64> = events
+            .iter()
+            .map(|e| e["seq"].as_i64().unwrap_or(-1))
+            .collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+        let stored: Vec<i64> = world
+            .rows(&format!(
+                "SELECT seq FROM events WHERE run_id = '{run}' ORDER BY seq"
+            ))?
+            .iter()
+            .map(|r| r["seq"].as_i64().unwrap_or(-2))
+            .collect();
+        assert_eq!(seqs, stored);
+        // U+2028 (and U+2029) escaped, never raw; decoded, the statement is the Commander's own.
+        assert_eq!(occurrences(&stdout, "\u{2028}".as_bytes()), 0);
+        assert_eq!(occurrences(&stdout, "\u{2029}".as_bytes()), 0);
+        assert!(occurrences(&stdout, b"\\u2028") > 0);
+        assert!(occurrences(&stdout, b"\\u2029") > 0);
+        let said: Vec<String> = events.iter().flat_map(statements).collect();
+        assert!(said.iter().any(|s| s == statement), "{said:?}");
+        // No escape byte and none of the noise on stdout; no line marked a replay.
+        assert_eq!(occurrences(&stdout, b"\x1b"), 0);
+        assert_eq!(occurrences(&stdout, marker.as_bytes()), 0);
+        assert!(events.iter().all(|e| e.get("replay").is_none()));
+        // The last line is the run.result, exit_code 4, and the process exits 4.
+        assert_eq!(last["kind"], "run.result", "{last}");
+        assert_eq!(last["payload"]["exit_code"], 4, "{last}");
+        assert_eq!(
+            status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&stderr[..stderr.len().min(2000)])
+        );
+        // The fixture: the noise was written to the native stderr (the client forwards it).
+        assert!(occurrences(&stderr, marker.as_bytes()) > 0);
+        eprintln!("{} lines, stderr {} bytes", lines.len(), stderr.len());
+        Ok(())
+    });
+    host.shutdown().await;
+    outcome
+}
+
+/// `hoh args…` of the world (`env` added) with stdout redirected to file `out` and stderr piped, run to its end
+/// (killed after 60 s): its status, stdout (the file's bytes) and stderr.
+fn to_file(
+    world: &World,
+    args: &[&str],
+    env: &[(&str, &str)],
+    out: &Path,
+) -> R<(Option<i32>, Vec<u8>, Vec<u8>)> {
+    let mut command = world.command(args);
+    command.envs(env.iter().copied());
+    let child = command
+        .stdout(std::fs::File::create(out)?)
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let done = world::finish(child, Duration::from_secs(60))?;
+    Ok((done.status.code(), std::fs::read(out)?, done.stderr))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_004_03_json_text_and_detach_outputs() -> R {
+    // AC-004-03: TEST-002-02's pinned script (each foreground run ends INCOMPLETE, 4), the Developer's stderr marked
+    // noise; stdout redirected to a file: `--output json`, `--output text`, `NO_COLOR=1 … --output text`, then
+    // `--detach --output json`.
+    let marker = "HOH-004-03-NOISE";
+    let world = World::new()?;
+    world.developer(&world::Developer {
+        stderr_bytes: 256 << 10,
+        stderr_marker: marker.to_owned(),
+        ..world::Developer::default()
+    })?;
+    let host = product_world(&world, &world::TEAM, "[budget]\nmax_iterations = 1\n").await?;
+    let outcome = tokio::task::block_in_place(|| -> R {
+        let file = world.root().join("stdout");
+        let commands = count(&world, "commands")?;
+        // json: one JSON value with exactly one LF after it, REQ-004 behaviour 1's eight keys, its exit_code the
+        // process's, 4.
+        let (code, stdout, stderr) = to_file(&world, &["-p", "j", "--output", "json"], &[], &file)?;
+        let said = String::from_utf8_lossy(&stderr[..stderr.len().min(2000)]).into_owned();
+        let result: Value = serde_json::from_slice(&stdout)?;
+        assert!(
+            stdout.ends_with(b"\n") && !stdout.ends_with(b"\n\n"),
+            "{stdout:?}"
+        );
+        assert_eq!(
+            stdout.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "{stdout:?}"
+        );
+        for key in [
+            "run_id",
+            "state",
+            "exit_code",
+            "blocked_reason",
+            "spec_revision",
+            "accepted",
+            "total",
+            "last_event_seq",
+        ] {
+            assert!(result.get(key).is_some(), "{key} not in {result}");
+        }
+        assert_eq!(code, Some(4), "{said}");
+        assert_eq!(
+            result["exit_code"].as_i64(),
+            code.map(i64::from),
+            "{result}"
+        );
+        let mut foreground = vec![(stdout, stderr)];
+        // text, twice (the second with NO_COLOR=1): no ESC, the run's id and INCOMPLETE.
+        for (n, env) in [(1, &[][..]), (2, &[("NO_COLOR", "1")][..])] {
+            let (code, stdout, stderr) =
+                to_file(&world, &["-p", "t", "--output", "text"], env, &file)?;
+            let run = nth_started(&world, commands, n)?;
+            let text = String::from_utf8(stdout.clone())?;
+            assert_eq!(
+                code,
+                Some(4),
+                "{env:?}: {}",
+                String::from_utf8_lossy(&stderr[..stderr.len().min(2000)])
+            );
+            assert_eq!(occurrences(&stdout, b"\x1b"), 0, "{env:?}: {text:?}");
+            assert!(
+                text.contains(&run) && text.contains("INCOMPLETE"),
+                "{env:?}: {text:?}"
+            );
+            foreground.push((stdout, stderr));
+        }
+        // The three foreground runs: the noise on stderr, never on stdout.
+        for (stdout, stderr) in &foreground {
+            assert!(occurrences(stderr, marker.as_bytes()) > 0);
+            assert_eq!(occurrences(stdout, marker.as_bytes()), 0);
+        }
+        // detach: 0, ACCEPTED, and its run is in the store once its id is read.
+        let (code, stdout, stderr) = to_file(
+            &world,
+            &["-p", "d", "--detach", "--output", "json"],
+            &[],
+            &file,
+        )?;
+        let accepted: Value = serde_json::from_slice(&stdout)?;
+        let run = accepted["run_id"].as_str().ok_or("no run_id")?;
+        let stored = world.query(&format!("SELECT count(*) FROM runs WHERE run_id = '{run}'"))?;
+        assert_eq!(code, Some(0), "{}", String::from_utf8_lossy(&stderr));
+        assert_eq!(accepted["status"], "ACCEPTED", "{accepted}");
+        assert_eq!(stored, "1");
+        Ok(())
+    });
+    host.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_004_04_auth_blocks_with_3_and_sigint_detaches_with_130() -> R {
+    // AC-004-04, two projects on TEST-002-02's pinned script. P1: the developer bound to codex, whose fake replays an
+    // unauthorized turn (codex_adapter's synthesis), the Commander to claude: `hoh -p 'x' --output json`. P2: the
+    // Developer works on and on: `hoh -p 'y' --output stream-json`, SIGINT once a line was read and the run works.
+    let p1 = World::new()?;
+    let mut team = world::TEAM.to_vec();
+    team[0] = ("commander", "claude");
+    team[2] = ("developer", "codex");
+    p1.unauthorized("codex", &["developer"])?;
+    let p2 = World::new()?;
+    p2.developer(&world::Developer {
+        seconds: 600.0,
+        ..world::Developer::default()
+    })?;
+    let host1 = product_world(&p1, &team, "").await?;
+    let host2 = match product_world(&p2, &world::TEAM, "").await {
+        Ok(host) => host,
+        Err(e) => {
+            host1.shutdown().await;
+            return Err(e);
+        }
+    };
+    let outcome = tokio::task::block_in_place(|| -> R {
+        // P1: 3, BLOCKED for BLOCKED_AUTH, never COMPLETED.
+        let out = p1.hoh(&["-p", "x", "--output", "json"])?;
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(3), "{said}");
+        let result: Value = serde_json::from_slice(&out.stdout)?;
+        assert_eq!(result["state"], "BLOCKED", "{result}");
+        assert_eq!(result["blocked_reason"], "BLOCKED_AUTH", "{result}");
+        assert_ne!(result["state"], "COMPLETED", "{result}");
+        // P2: once a line was read and the run works, SIGINT.
+        let commands = count(&p2, "commands")?;
+        let mut child = p2
+            .command(&["-p", "y", "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut err = child.stderr.take().ok_or("no stderr")?;
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = err.read_to_end(&mut bytes);
+            bytes
+        });
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut out = std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        let lines = read.clone();
+        let stdout = std::thread::spawn(move || {
+            let mut line = String::new();
+            while out.read_line(&mut line).unwrap_or(0) > 0 {
+                lines.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                line.clear();
+            }
+        });
+        let run = nth_started(&p2, commands, 0)?;
+        let end = Instant::now() + Duration::from_secs(60);
+        while read.load(std::sync::atomic::Ordering::SeqCst) == 0
+            || p2.query(&format!(
+                "SELECT r.state || '/' || (SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = r.run_id AND t.role = 'developer' AND a.state = 'RUNNING') FROM runs r \
+                 WHERE r.run_id = '{run}'"
+            ))? != "RUNNING/1"
+        {
+            if Instant::now() > end {
+                let _ = child.kill();
+                return Err("P2's run did not work within 60 s".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        signal(child.id(), rustix::process::Signal::INT)?;
+        let sent = Instant::now();
+        let status = child.wait()?;
+        let _ = stdout.join();
+        let stderr =
+            String::from_utf8_lossy(&stderr.join().map_err(|_| "the stderr reader panicked")?)
+                .into_owned();
+        // 130; stderr names the run and `hoh attach`, and no panic.
+        assert_eq!(status.code(), Some(130), "{stderr}");
+        assert!(
+            stderr.contains(&run) && stderr.contains("hoh attach"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("panicked at"), "{stderr}");
+        // For 5 s from the SIGINT the run works on, RUNNING, and no CancelRun was sent.
+        while sent.elapsed() < Duration::from_secs(5) {
+            assert_eq!(
+                p2.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?,
+                "RUNNING"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            p2.query("SELECT count(*) FROM commands WHERE kind = 'CancelRun'")?,
+            "0"
+        );
+        Ok(())
+    });
+    host1.shutdown().await;
+    host2.shutdown().await;
+    outcome
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_042_04_iterations_and_deadline_end_incomplete_with_unknown_cost() -> R {
+    // AC-042-04. Ra: the product's world, `max_iterations = 2`, no price for any model (CR-002: the cost is unknown),
+    // TEST-002-02's pinned Commander; each round QA ends COMPLETED with a FAIL report (CR-018) and the Reviewer
+    // COMPLETED with a PASS one, so each join fails, counts an iteration and sends the work back: `hoh -p
+    // '完成fixture目标' --output json`. Rb: an in-process host on a FakeClock, its runner the scripted Team, a run moved
+    // to RUNNING with no attempt in flight and `deadline_at = T0 + 60 s`; the clock moved on to T0 + 60 s.
+    let ra = World::new()?;
+    let host = product_world(&ra, &world::TEAM, "[budget]\nmax_iterations = 2\n").await?;
+    let outcome = async {
+        ra.verifier(
+            "qa",
+            &world::Verifier {
+                report: "FAIL".to_owned(),
+                checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
+                ..world::Verifier::default()
+            },
+        )?;
+        tokio::task::block_in_place(|| -> R {
+            let commands = count(&ra, "commands")?;
+            let out = ra.hoh(&["-p", "完成fixture目标", "--output", "json"])?;
+            let said = String::from_utf8_lossy(&out.stderr).into_owned();
+            let run = nth_started(&ra, commands, 0)?;
+            let result: Value = serde_json::from_slice(&out.stdout)?;
+            assert_eq!(out.status.code(), Some(4), "{said}");
+            // Two iterations, each a failed join.
+            let iterations = ra.rows(&format!(
+                "SELECT seq, json_extract(payload_json, '$.iteration') AS n, json_extract(payload_json, '$.verdict') \
+                 AS verdict FROM events WHERE run_id = '{run}' AND kind = 'iteration.completed' ORDER BY seq"
+            ))?;
+            assert_eq!(
+                iterations.iter().map(|i| i["n"].clone()).collect::<Vec<_>>(),
+                [json!(1), json!(2)],
+                "{iterations:?}"
+            );
+            assert_eq!(count_where(&ra, "iterations", &format!("run_id = '{run}'"))?, 2);
+            // Each round's QA attempt SETTLED with a COMPLETED result, no re-verification, and its report FAIL.
+            let qa = ra.rows(&format!(
+                "SELECT a.attempt_id, a.state, (SELECT json_extract(e.payload_json, '$.result_status') FROM events e \
+                 WHERE e.kind = 'verification.result' AND json_extract(e.payload_json, '$.attempt_id') = a.attempt_id) \
+                 AS result, (SELECT r.status FROM independent_reports r WHERE r.attempt_id = a.attempt_id) AS report \
+                 FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = '{run}' AND t.role = 'qa' \
+                 ORDER BY a.rowid"
+            ))?;
+            assert_eq!(qa.len(), 2, "{qa:?}");
+            for a in &qa {
+                assert_eq!(
+                    (&a["state"], &a["result"], &a["report"]),
+                    (&json!("SETTLED"), &json!("COMPLETED"), &json!("FAIL")),
+                    "{qa:?}"
+                );
+            }
+            assert_eq!(
+                count_where(&ra, "events", &format!("run_id = '{run}' AND kind = 'task.reverify'"))?,
+                0
+            );
+            // After the second iteration no dispatch more.
+            let second = iterations[1]["seq"].as_i64().ok_or("no seq")?;
+            assert_eq!(
+                count_where(
+                    &ra,
+                    "outbox",
+                    &format!("run_id = '{run}' AND event_seq > {second} AND json_extract(payload_json, '$.kind') = 'dispatch'")
+                )?,
+                0
+            );
+            // INCOMPLETE, the requirements of the specification not accepted left, the cost unknown, never COMPLETED.
+            let spec: Vec<Value> = ra
+                .rows(&format!(
+                    "SELECT q.requirement_id AS id FROM requirements q JOIN runs r ON r.spec_id = q.spec_id \
+                     WHERE r.run_id = '{run}' ORDER BY q.requirement_id"
+                ))?
+                .into_iter()
+                .map(|r| r["id"].clone())
+                .collect();
+            assert_eq!(result["state"], "INCOMPLETE", "{result}");
+            assert_eq!(result["accepted"], 0, "{result}");
+            assert_eq!(result["remaining_requirements"], json!(spec), "{result}");
+            assert!(!spec.is_empty());
+            assert_eq!(result["cost_usd"], Value::Null, "{result}");
+            assert_eq!(result["cost_status"], "unknown", "{result}");
+            assert_ne!(result["state"], "COMPLETED", "{result}");
+            assert_eq!(
+                ra.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?,
+                "INCOMPLETE"
+            );
+            Ok(())
+        })
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+
+    // Rb.
+    let rb = World::new()?;
+    rb.commit_project(&world::fixture_spec())?;
+    let clock = std::sync::Arc::new(world::FakeClock::default());
+    let team = world::Team::new(|turn| world::steps(&turn.state, "RUNNING"));
+    let host = rb.team_host(team.clone(), Some(clock.clone())).await?;
+    let outcome = async {
+        rb.seed_spec()?;
+        let run = world::start_run(&host, "rb", "完成fixture目标").await?;
+        let t0 = hoh_core::delivery::Clock::now(clock.as_ref());
+        let deadline = hoh_core::time::rfc3339_utc(t0 + Duration::from_secs(60));
+        rb.exec(&format!("UPDATE runs SET deadline_at = '{deadline}' WHERE run_id = '{run}';"))?;
+        rb.staff(&run)?;
+        rb.until(
+            &format!(
+                "SELECT r.state || '/' || (SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = r.run_id AND a.state NOT IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')) \
+                 FROM runs r WHERE r.run_id = '{run}'"
+            ),
+            "RUNNING/0",
+            WAIT,
+        )
+        .await?;
+        clock.advance(Duration::from_secs(60));
+        rb.until(
+            &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+            "INCOMPLETE",
+            WAIT,
+        )
+        .await?;
+        let result = result_of(&rb, &run)?;
+        assert_eq!(result["state"], "INCOMPLETE", "{result}");
+        assert_ne!(result["state"], "COMPLETED", "{result}");
+        assert_eq!(
+            rb.query(&format!(
+                "SELECT json_extract(payload_json, '$.stop') FROM events WHERE run_id = '{run}' AND kind = 'run.incomplete'"
+            ))?,
+            "deadline_at"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome?;
+    assert!(team.refused().is_empty(), "{team:?}");
+    Ok(())
+}
+
+/// The rows of `table` where `condition` holds.
+fn count_where(world: &World, table: &str, condition: &str) -> R<i64> {
+    Ok(world
+        .query(&format!("SELECT count(*) FROM {table} WHERE {condition}"))?
+        .parse()?)
 }
