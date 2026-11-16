@@ -3585,9 +3585,26 @@ mod tests {
             })
     }
 
+    /// `probe` run on a thread named `name`, the name of the command it starts. A command its starter kills right after
+    /// the spawn returned can die inside its execve before the kernel names it after the program: the spawn returns
+    /// once the execve lets the old address space go (exec_mm_release), the name is set later (__set_task_comm), and
+    /// in between the execve waits killably for that address space's lock, the spawner's own with CLONE_VFORK, which
+    /// another thread of this process may hold. Such a command keeps the spawning thread's name (M2T07R-900: a
+    /// zombie child named `probe::tests::a`, no child of the command's name, in a parallel run of the probe tests).
+    /// Named alike, it is found by its name either way.
+    fn probing_as<T: Send + 'static>(
+        name: &str,
+        probe: impl FnOnce() -> T + Send + 'static,
+    ) -> io::Result<std::thread::JoinHandle<T>> {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(probe)
+    }
+
     /// This process's children named `comm`, once one is seen (within 5 s), so a single look that misses it is not
-    /// taken for "none": M2T07R-900 saw none once in a parallel run, cause unproven (a name set by the exec after the
-    /// spawn returned, or /proc not listed). Unseen: an error listing every child of this process.
+    /// taken for "none". A command killed inside its execve keeps the name of the thread that spawned it: the tests
+    /// probe on a thread of the command's name ([`probing_as`], M2T07R-900). Unseen: an error listing every child of
+    /// this process.
     fn children_seen(comm: &str) -> Result<Vec<(u32, char)>, String> {
         let until = Instant::now() + Duration::from_secs(5);
         loop {
@@ -3692,7 +3709,9 @@ mod tests {
             deadline: None,
             cancel: Some(stop.clone()),
         };
-        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let probing = probing_as(&name, move || {
+            run(&launcher, &["--version"], &env).map(|_| ())
+        })?;
         let inside = wait_until(Duration::from_secs(10), || held_open(&stop_stall));
         let stopper = {
             let stop = stop.clone();
@@ -3915,7 +3934,9 @@ mod tests {
             deadline: None,
             cancel: Some(stop.clone()),
         };
-        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let probing = probing_as("hslflag", move || {
+            run(&launcher, &["--version"], &env).map(|_| ())
+        })?;
         let start_held = wait_until(Duration::from_secs(10), || held_open(&spawned));
         let (tried, at_slot) = std::sync::mpsc::channel();
         let (go, gone_on) = std::sync::mpsc::channel::<()>();
@@ -3993,13 +4014,15 @@ mod tests {
             deadline: None,
             cancel: Some(stop.clone()),
         };
-        let probe = |launcher: PathBuf| {
+        let probe = |launcher: PathBuf, name: &str| {
             let env = env.clone();
-            std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()))
+            probing_as(name, move || {
+                run(&launcher, &["--version"], &env).map(|_| ())
+            })
         };
-        let first = probe(held);
+        let first = probe(held, &held_name)?;
         let first_held = wait_until(Duration::from_secs(10), || held_open(&held_stall));
-        let second = probe(other);
+        let second = probe(other, &other_name)?;
         let other_held = wait_until(Duration::from_secs(10), || held_open(&other_stall));
         let stopper = std::thread::spawn(move || stop.stop());
         if let Some(after) = let_go {
@@ -4074,7 +4097,9 @@ mod tests {
             deadline: None,
             cancel: Some(stop.clone()),
         };
-        let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
+        let probing = probing_as(&name, move || {
+            run(&launcher, &["--version"], &env).map(|_| ())
+        })?;
         let held = wait_until(Duration::from_secs(10), || held_open(&stall));
         // Without `dead_at`, the command is seen while the probe is held, so "none left alive" once it returned is
         // not taken from a look that missed it.
