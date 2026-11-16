@@ -142,9 +142,11 @@ pub(super) fn commanded(conn: &Connection, run: &str) -> Result<bool, PersistErr
 /// The message of the backstop trigger's refusal.
 pub(super) const RUN_STOPPED: &str = "RUN_STOPPED";
 
-/// Install, on writer connection `conn`, the backstop of the insert function (correction D): a TEMP trigger that
-/// refuses an event of a stopped run that is not its `run.result` nor a command's. The insert function decides first
-/// (and writes a Record project-scoped), so on the product's paths it never fires; it stops raw SQL that bypasses it.
+/// Install, on writer connection `conn`, the backstops of the insert function and of the compare-and-set's gate
+/// (correction D; M2T13R-100): TEMP triggers that refuse an event of a stopped run that is not its `run.result` nor a
+/// command's, and a move of a stopped run's revision or state that is not its command's (judged on the run before the
+/// update). The writer decides first (the insert function writes a Record project-scoped; `compare_and_set` refuses
+/// the move), so on the product's paths they never fire; they stop raw SQL that bypasses them.
 pub(crate) fn install(conn: &Connection) -> Result<(), PersistError> {
     super::writer::temp_tables(conn)?;
     conn.execute_batch(&format!(
@@ -152,8 +154,13 @@ pub(crate) fn install(conn: &Connection) -> Result<(), PersistError> {
          WHEN NEW.run_id IS NOT NULL AND NEW.kind <> 'run.result' \
            AND NOT EXISTS(SELECT 1 FROM temp.command_run c WHERE c.run_id = NEW.run_id) \
            AND {} \
+         BEGIN SELECT RAISE(ABORT, '{RUN_STOPPED}'); END; \
+         CREATE TEMP TRIGGER IF NOT EXISTS moves_of_a_stopped_run BEFORE UPDATE OF revision, state ON main.runs \
+         WHEN NOT EXISTS(SELECT 1 FROM temp.command_run c WHERE c.run_id = OLD.run_id) \
+           AND {} \
          BEGIN SELECT RAISE(ABORT, '{RUN_STOPPED}'); END;",
-        stopped_sql("NEW.run_id")
+        stopped_sql("NEW.run_id"),
+        stopped_sql("OLD.run_id")
     ))
     .map_err(sqlite_error)
 }
