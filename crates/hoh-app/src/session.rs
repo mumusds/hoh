@@ -15,6 +15,12 @@ fn attachable(state: &str) -> bool {
     !crate::follow::TERMINAL.contains(&state)
 }
 
+/// Whether stdin and stdout are both a terminal: the TUI's condition.
+fn terminal() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 /// Say why the client could not do what it was asked (the code, the message and any `details`); its exit code.
 pub fn fail(failure: &Failure) -> u8 {
     say!("hoh: {}: {}", failure.code, failure.message);
@@ -80,40 +86,14 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
         },
         None => {
             // Every page: one run not ended on a later page makes two (M2T06R-05).
-            let mut open: Vec<Value> = Vec::new();
-            let mut cursor: Option<String> = None;
-            loop {
-                let path = match &cursor {
-                    Some(cursor) => format!("/v1/runs?limit=500&cursor={cursor}"),
-                    None => "/v1/runs?limit=500".to_owned(),
-                };
-                let page = match client::call(&host, "GET", &path, None) {
-                    Ok(reply) if reply.status == 200 => reply.json(),
-                    Ok(reply) => {
-                        return fail(&Failure::unreachable(format!(
-                            "the host answered {}",
-                            reply.status
-                        )));
-                    }
-                    Err(e) => {
-                        return fail(&Failure::unreachable(format!(
-                            "the host did not answer: {e}"
-                        )));
-                    }
-                };
-                open.extend(
-                    page["items"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|r| attachable(r["state"].as_str().unwrap_or_default()))
-                        .cloned(),
-                );
-                match page["next_cursor"].as_str() {
-                    Some(next) if Some(next) != cursor.as_deref() => cursor = Some(next.to_owned()),
-                    _ => break,
-                }
-            }
+            let all = match client::runs(&host) {
+                Ok(all) => all,
+                Err(failure) => return fail(&failure),
+            };
+            let open: Vec<&Value> = all
+                .iter()
+                .filter(|r| attachable(r["state"].as_str().unwrap_or_default()))
+                .collect();
             match open.as_slice() {
                 [one] => match run_of(&host, one["run_id"].as_str().unwrap_or_default()) {
                     Ok(run) => run,
@@ -147,14 +127,8 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
     };
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
     // A terminal on both sides and text: the Workspace bound to the run (ADR-021 decision 10).
-    {
-        use std::io::IsTerminal as _;
-        if output == Output::Text
-            && std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-        {
-            return crate::tui::attach(project, host, &run);
-        }
+    if output == Output::Text && terminal() {
+        return crate::tui::attach(project, host, &run);
     }
     if output == Output::Json {
         // The run's result as of now, from the host's own function (decision 12): a snapshot, so 0.
