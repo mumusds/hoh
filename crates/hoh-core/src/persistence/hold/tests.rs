@@ -1095,7 +1095,7 @@ fn live_obligation_by_history(conn: &Connection, candidate: &str) -> R<bool> {
 fn last_failure_by_history(
     conn: &Connection,
     candidate: &str,
-) -> R<Option<crate::persistence::Failed>> {
+) -> R<Option<crate::persistence::recovery::Failed>> {
     let mut statement = conn.prepare(
         "SELECT json_extract(f.payload_json, '$.attempt'), json_extract(f.payload_json, '$.at_ms') FROM events f \
          WHERE f.kind = 'candidate.reconcile_failed' AND json_extract(f.payload_json, '$.candidate_id') = ?1 \
@@ -1122,6 +1122,58 @@ fn held_by_recovery_by_history(
     )?;
     let rows = statement.query_map(params!["verification.round_opened", run], |r| r.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The judgment as `closing::superseded`, `reports::stale_reason`, `verification::live_obligation`, record_recovery and
+/// `Reader::start_recovery_wanted` read it before (a scan of the run's events and every Record): a `candidate.stale`
+/// of run `run` naming `candidate`, for `reason` when one is given — the reference.
+fn judged_by_history(
+    conn: &Connection,
+    candidate: &str,
+    run: &str,
+    reason: Option<&str>,
+) -> R<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM events s WHERE {} AND s.kind = 'candidate.stale' \
+               AND json_extract(s.payload_json, '$.candidate_id') = ?1 \
+               AND (?3 IS NULL OR json_extract(s.payload_json, '$.reason') = ?3))",
+            super::of_run("s", "?2")
+        ),
+        params![candidate, run, reason],
+        |r| r.get(0),
+    )?)
+}
+
+/// `closing::record_recovery`'s reads as it made them before (every event of the kind naming the candidate): its
+/// failures, its recoveries and the payloads of its failures since its last recovery — the reference.
+fn streak_by_history(conn: &Connection, candidate: &str) -> R<(u64, u64, Vec<Value>)> {
+    let of = |kind: &str| -> R<Vec<(i64, Value)>> {
+        let mut statement = conn.prepare(
+            "SELECT seq, payload_json FROM events WHERE kind = ?1 AND json_extract(payload_json, '$.candidate_id') = ?2 \
+             ORDER BY seq",
+        )?;
+        let rows = statement.query_map(params![kind, candidate], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (seq, payload) = row?;
+            Ok((seq, serde_json::from_str(&payload)?))
+        })
+        .collect()
+    };
+    let recovered = of("candidate.reconcile_recovered")?;
+    let failed = of("candidate.reconcile_failed")?;
+    let since = recovered.last().map_or(0, |(seq, _)| *seq);
+    Ok((
+        u64::try_from(failed.len())?,
+        u64::try_from(recovered.len())?,
+        failed
+            .into_iter()
+            .filter(|(seq, _)| *seq > since)
+            .map(|(_, payload)| payload)
+            .collect(),
+    ))
 }
 
 /// Rounds of C1 and C3 that name their verifier tasks (CANDIDATES' rounds name none).
@@ -1160,10 +1212,32 @@ fn same_recovery_reads(path: &Path, step: &str) -> R<std::collections::BTreeSet<
             "{step}: live obligation of {candidate}"
         );
         assert_eq!(
-            crate::persistence::last_failure(&conn, candidate)?,
+            crate::persistence::recovery::last_failure(&conn, candidate, &mut Default::default())?,
             last_failure_by_history(&conn, candidate)?,
             "{step}: last failure of {candidate}"
         );
+        let streak =
+            crate::persistence::recovery::streak(&conn, candidate, &mut Default::default())?;
+        assert_eq!(
+            (streak.failures, streak.recoveries, streak.since),
+            streak_by_history(&conn, candidate)?,
+            "{step}: the failures and recoveries of {candidate}"
+        );
+        for run in &runs {
+            for reason in [None, Some("evidence_unrecoverable")] {
+                assert_eq!(
+                    crate::persistence::recovery::judged(
+                        &conn,
+                        candidate,
+                        run,
+                        reason,
+                        &mut Default::default()
+                    )?,
+                    judged_by_history(&conn, candidate, run, reason)?,
+                    "{step}: the judgment of {candidate} on {run} ({reason:?})"
+                );
+            }
+        }
     }
     same_unrecovered(path, step)
 }
@@ -1203,9 +1277,10 @@ fn minutes(n: u64) -> std::time::SystemTime {
 
 #[tokio::test]
 async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
-    // M2T13R-03: the indexed reads of the recovery and the rules they replace give the same answers — the unrecovered
-    // candidates for every run and for each run's own, each candidate's live obligation and last failure — on the worlds
-    // the tests of recovery use and on a long history.
+    // M2T13R-03, -102: the reads of the recovery by the facts' ids and the rules they replace give the same answers —
+    // the unrecovered candidates for every run and for each run's own, each candidate's live obligation, last failure,
+    // judgment and streak, each run's verifiers held by a recovery — on the worlds the tests of recovery use, on the
+    // reviewer's two dimensions (another run's Records, a run's judged candidates) and on a long history.
     // Recoveries of a working run's candidates: failures, a recovery, failures again, judged unrecoverable; a
     // permanent failure; a superseded candidate's failure.
     let dir = tempfile::tempdir()?;
@@ -1263,15 +1338,27 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
     Connection::open(&path)?.execute_batch(&format!(
         "{CANDIDATES}{ROUNDS_WITH_TASKS}
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           ('p1', 'C1/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', 'x'),
+           ('p1', 'C1/reconcile_failed/1', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', 'x'),
            ('p1', 'C1/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C1\", \"reason\": \"evidence_unrecoverable\"}}', 'x'),
-           ('p1', 'C3/failed', 'R', 'candidate.reconcile_failed',
+           ('p1', 'C3/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
             '{{\"candidate_id\": \"C3\", \"recovery_not_before\": \"2100-01-01T00:00:00Z\"}}', 'x'),
            ('p1', 'C2/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C2\", \"reason\": \"superseded\"}}', 'x'),
-           ('p1', 'C2/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C2\"}}', 'x'),
+           ('p1', 'C2/reconcile_failed/1', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C2\"}}', 'x'),
            ('p1', 'C3/closed', 'R', 'verification.round_closed', '{{\"round_id\": \"rd3\"}}', 'x');"
     ))?;
     assert_eq!(same_recovery_reads(&path, "the detector's world")?.len(), 2);
+    // The reviewer's dimensions (M2T13R-102, -101): stopped Q's Records, and R's candidates judged unrecoverable.
+    for (name, world_sql) in [
+        ("another run's Records", another_runs_records(2_000)),
+        ("judged candidates", judged_candidates(200)),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        drop(store);
+        world(&path, "RUNNING")?;
+        Connection::open(&path)?.execute_batch(&world_sql)?;
+        same_recovery_reads(&path, name)?;
+    }
     // A long history: two runs, 3 000 recovery facts of either run or project-scoped, among 20 000 other events.
     let dir = tempfile::tempdir()?;
     let (_store, path) = open(&dir)?;
@@ -1287,9 +1374,8 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
              printf('%064d', 3), '/repo',
              CASE i % 5 WHEN 0 THEN 'REJECTED' WHEN 1 THEN 'INVALID' WHEN 2 THEN 'FROZEN' ELSE 'VERIFYING' END,
              'x' FROM n;
-         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 23000)
-         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-           SELECT 'p1', 'e' || i,
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 23000),
+           g(i, run, kind, payload) AS (SELECT i,
              CASE WHEN i % 23 < 3 AND (i * 7) % 11 = 0 THEN NULL WHEN i % 2 = 0 THEN 'Q' ELSE 'R' END,
              CASE i % 23 WHEN 0 THEN 'candidate.reconcile_failed' WHEN 1 THEN 'candidate.reconcile_recovered'
                WHEN 2 THEN 'candidate.stale' WHEN 3 THEN 'verification.round_opened'
@@ -1301,8 +1387,18 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
                'round_id', CASE WHEN i % 23 = 4 THEN 'rd' || ((i * 7) % 105) ELSE 'rd' || (i % 211) END,
                'tasks', json_object('qa', 'q' || i, 'reviewer', 'v' || i),
                'superseded', json_array(CASE WHEN i % 2 = 0 THEN 'Q' || ((i * 17) % 10 + 11) ELSE 'C2' END),
-               'reason', CASE WHEN i % 2 = 0 AND (i * 5) % 211 = 2 THEN 'evidence_unrecoverable' ELSE 'superseded' END),
-             'x' FROM n;"
+               'reason', CASE WHEN i % 2 = 0 AND ((i * 13) % 10) % 3 = 0 THEN 'evidence_unrecoverable'
+                 ELSE 'superseded' END) FROM n),
+           -- The product's ids (M2T13R-102): each candidate's failures and recoveries numbered from 1, its first
+           -- judgment `<c>/stale` and the later ones, which the product never writes, events of another kind.
+           h AS (SELECT g.*, json_extract(payload, '$.candidate_id') AS c,
+             row_number() OVER (PARTITION BY json_extract(payload, '$.candidate_id'), kind ORDER BY i) AS k FROM g)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', CASE WHEN kind = 'candidate.reconcile_failed' THEN c || '/reconcile_failed/' || k
+               WHEN kind = 'candidate.reconcile_recovered' THEN c || '/reconcile_recovered/' || k
+               WHEN kind = 'candidate.stale' AND k = 1 THEN c || '/stale' ELSE 'e' || i END,
+             run, CASE WHEN kind = 'candidate.stale' AND k > 1 THEN 'k' || (i % 5) ELSE kind END, payload, 'x'
+           FROM h ORDER BY i;"
     ))?;
     let found = same_recovery_reads(&path, "a long history")?;
     let judged: i64 = Connection::open(&path)?.query_row(
@@ -1328,7 +1424,10 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
         live.insert(super::super::verification::live_obligation(
             &conn, candidate,
         )?);
-        failing += usize::from(crate::persistence::last_failure(&conn, candidate)?.is_some());
+        failing += usize::from(
+            crate::persistence::recovery::last_failure(&conn, candidate, &mut Default::default())?
+                .is_some(),
+        );
     }
     assert!(
         live.len() == 2 && failing > 0 && failing < all.len(),
@@ -1353,44 +1452,57 @@ async fn the_recovery_reads_by_index_are_the_rules_they_replace() -> R {
     Ok(())
 }
 
+/// R's 30 recovery facts at the product's ids, over C1 to C3 by turns: C1's recoveries, C2's and C3's failures.
+const THIRTY_FACTS: &str = "
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30),
+  f(i, c, kind) AS (SELECT i, 'C' || (i % 3 + 1),
+    CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered' ELSE 'candidate.reconcile_failed' END FROM n)
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+  SELECT 'p1', c || CASE kind WHEN 'candidate.reconcile_failed' THEN '/reconcile_failed/' ELSE '/reconcile_recovered/' END
+      || row_number() OVER (PARTITION BY c, kind ORDER BY i),
+    'R', kind, json_object('candidate_id', c, 'attempt', i, 'at_ms', '0'), 'x'
+  FROM f ORDER BY i;
+";
+
+/// A store of R with C1 to C3, `extra`, `history` other events of R and [`THIRTY_FACTS`]: (its directory, a connection).
+fn with_history(extra: &str, history: usize) -> R<(tempfile::TempDir, Connection)> {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    drop(store);
+    world(&path, "RUNNING")?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(&format!(
+        "{CANDIDATES}{extra}
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
+         {THIRTY_FACTS}"
+    ))?;
+    Ok((dir, conn))
+}
+
+/// What `read` found, and its work (SQLite's VM steps).
+fn work_of<T>(
+    read: impl FnOnce(&mut crate::persistence::recovery::Work) -> Result<T, PersistError>,
+) -> R<(T, i64)> {
+    let mut work = crate::persistence::recovery::Work::default();
+    let found = read(&mut work)?;
+    Ok((found, work.0))
+}
+
 #[test]
 fn the_unrecovered_candidates_are_read_without_the_history() -> R {
-    // M2T13R-03: the statement's work (SQLite's VM steps) is the same with 1 000 and 100 000 other events in the
-    // history, for every run and for one run, with the same 30 recovery facts; the rule it replaces grows with them.
-    let mut steps: Vec<(usize, bool, i32)> = Vec::new();
+    // M2T13R-03, -102: the read's work (SQLite's VM steps) is the same with 1 000 and 100 000 other events in the
+    // history, for every run and for one run, with the same 30 recovery facts.
+    let mut steps: Vec<(usize, bool, i64)> = Vec::new();
     for history in [1_000, 100_000] {
-        let dir = tempfile::tempdir()?;
-        let (store, path) = open(&dir)?;
-        drop(store);
-        world(&path, "RUNNING")?;
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(&format!(
-            "{CANDIDATES}
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'f' || i, 'R', CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered'
-                 ELSE 'candidate.reconcile_failed' END, json_object('candidate_id', 'C' || (i % 3 + 1)), 'x' FROM n;"
-        ))?;
+        let (_dir, conn) = with_history("", history)?;
         for by_run in [false, true] {
-            let mut statement = conn.prepare(&crate::persistence::unrecovered_sql(by_run))?;
-            let found: Vec<String> = if by_run {
-                statement
-                    .query_map(params!["R"], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?
-            } else {
-                statement
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?
-            };
+            let (found, work) = work_of(|work| {
+                crate::persistence::recovery::unrecovered(&conn, by_run.then_some("R"), work)
+            })?;
             assert!(!found.is_empty(), "{history} {by_run}");
-            steps.push((
-                history,
-                by_run,
-                statement.get_status(rusqlite::StatementStatus::VmStep),
-            ));
+            steps.push((history, by_run, work));
         }
     }
     for by_run in [false, true] {
@@ -1398,7 +1510,7 @@ fn the_unrecovered_candidates_are_read_without_the_history() -> R {
             steps
                 .iter()
                 .find(|(h, b, _)| *h == history && *b == by_run)
-                .map_or(i32::MAX, |(.., n)| *n)
+                .map_or(i64::MAX, |(.., n)| *n)
         };
         assert!(of(100_000) <= of(1_000) + 50, "by run {by_run}: {steps:?}");
     }
@@ -1407,53 +1519,27 @@ fn the_unrecovered_candidates_are_read_without_the_history() -> R {
 
 #[test]
 fn a_candidates_live_obligation_and_last_failure_are_read_without_the_history() -> R {
-    // M2T13R-03: what the runner's tick reads for each candidate it may recover — `recovery_due`'s live obligation and
-    // `recovery_not_before`'s last failure — does the same work (SQLite's VM steps) with 1 000 and 100 000 other events
-    // in the history; the reads they replace grow with them.
-    let mut steps: Vec<(usize, &str, i32)> = Vec::new();
+    // M2T13R-03, -102: what the runner's tick reads for each candidate it may recover — `recovery_due`'s live obligation
+    // and `recovery_not_before`'s last failure — does the same work (SQLite's VM steps) with 1 000 and 100 000 other
+    // events in the history.
+    let mut steps: Vec<(usize, &str, i64)> = Vec::new();
     for history in [1_000, 100_000] {
-        let dir = tempfile::tempdir()?;
-        let (store, path) = open(&dir)?;
-        drop(store);
-        world(&path, "RUNNING")?;
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(&format!(
-            "{CANDIDATES}
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'f' || i, 'R', CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered'
-                 ELSE 'candidate.reconcile_failed' END,
-                 json_object('candidate_id', 'C' || (i % 3 + 1), 'attempt', i, 'at_ms', '0'), 'x' FROM n;"
-        ))?;
-        for (name, sql) in [
-            (
-                "live obligation",
-                super::super::verification::live_obligation_sql(),
-            ),
-            ("last failure", crate::persistence::last_failure_sql()),
-        ] {
-            let mut statement = conn.prepare(&sql)?;
-            let found = statement
-                .query_map(params!["C3"], |r| r.get_ref(0).map(drop))?
-                .count();
-            assert_eq!(found, 1, "{history} {name}");
-            steps.push((
-                history,
-                name,
-                statement.get_status(rusqlite::StatementStatus::VmStep),
-            ));
-        }
-        assert!(super::super::verification::live_obligation(&conn, "C3")?);
+        let (_dir, conn) = with_history("", history)?;
+        let (live, work) =
+            work_of(|work| super::super::verification::live_obligation_counted(&conn, "C3", work))?;
+        assert!(live, "{history}");
+        steps.push((history, "live obligation", work));
+        let (failed, work) =
+            work_of(|work| crate::persistence::recovery::last_failure(&conn, "C3", work))?;
+        assert!(failed.is_some(), "{history}");
+        steps.push((history, "last failure", work));
     }
     for name in ["live obligation", "last failure"] {
         let of = |history: usize| {
             steps
                 .iter()
                 .find(|(h, n, _)| *h == history && *n == name)
-                .map_or(i32::MAX, |(.., s)| *s)
+                .map_or(i64::MAX, |(.., s)| *s)
         };
         assert!(of(100_000) <= of(1_000) + 50, "{name}: {steps:?}");
     }
@@ -1462,38 +1548,19 @@ fn a_candidates_live_obligation_and_last_failure_are_read_without_the_history() 
 
 #[test]
 fn a_runs_verifiers_held_by_a_recovery_are_read_without_the_history() -> R {
-    // M2T13R-03: `closing::held_by_recovery`, which each scheduling round of a working run reads, does the same work
-    // (SQLite's VM steps) with 1 000 and 100 000 other events in the history; the read it replaces grows with them.
+    // M2T13R-03, -102: `closing::held_by_recovery`, which each scheduling round of a working run reads, does the same
+    // work (SQLite's VM steps) with 1 000 and 100 000 other events in the history.
     let mut steps = Vec::new();
     for history in [1_000, 100_000] {
-        let dir = tempfile::tempdir()?;
-        let (store, path) = open(&dir)?;
-        drop(store);
-        world(&path, "RUNNING")?;
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(&format!(
-            "{CANDIDATES}{ROUNDS_WITH_TASKS}
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
-             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'f' || i, 'R', CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered'
-                 ELSE 'candidate.reconcile_failed' END, json_object('candidate_id', 'C' || (i % 3 + 1)), 'x' FROM n;"
-        ))?;
-        let mut statement = conn.prepare(&super::super::closing::held_by_recovery_sql())?;
-        let held: std::collections::BTreeSet<String> = statement
-            .query_map(params!["R"], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
+        let (_dir, conn) = with_history(ROUNDS_WITH_TASKS, history)?;
+        let (held, work) =
+            work_of(|work| super::super::closing::held_by_recovery_counted(&conn, "R", work))?;
         assert_eq!(
             held,
             ["Q-C3", "V-C3"].map(str::to_owned).into_iter().collect(),
             "{history}"
         );
-        steps.push((
-            history,
-            statement.get_status(rusqlite::StatementStatus::VmStep),
-        ));
+        steps.push((history, work));
     }
     assert!(steps[1].1 <= steps[0].1 + 50, "{steps:?}");
     Ok(())
@@ -1650,51 +1717,45 @@ async fn raw_sql_that_moves_a_stopped_run_meets_the_backstop_trigger() -> R {
     Ok(())
 }
 
+/// R's `n` candidates J1.. (STALE), each with a failed recovery and judged unrecoverable, at the product's ids.
+fn judged_candidates(n: usize) -> String {
+    format!(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           SELECT 'J' || i, 'R', printf('%040d', i), printf('%040d', i), printf('%064d', 1), printf('%064d', 2),
+             printf('%064d', 3), '/repo', 'STALE', 'x' FROM k;
+         WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', 'J' || i || '/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
+             json_object('candidate_id', 'J' || i, 'attempt', 1), 'x' FROM k;
+         WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', 'J' || i || '/stale', 'R', 'candidate.stale',
+             json_object('candidate_id', 'J' || i, 'reason', 'evidence_unrecoverable'), 'x' FROM k;"
+    )
+}
+
 #[test]
 fn the_unrecovered_candidates_grow_linearly_with_the_runs_judged_ones() -> R {
-    // M2T13R-101: N candidates of R, each with a failed recovery and judged unrecoverable (the result stays empty): the
-    // statement's work (SQLite's VM steps) grows linearly with N — the judgments joined once, not looked up by a scan
-    // per candidate. Bound asserted: from N = 100 to N = 3 000 (×30), at most ×60 (a log factor for the sorts).
-    let mut steps: Vec<(usize, bool, i32)> = Vec::new();
+    // M2T13R-101, -102: N candidates of R, each with a failed recovery and judged unrecoverable (the result stays
+    // empty): the read's work (SQLite's VM steps) grows linearly with N — a bounded number of look-ups by id per
+    // candidate, none a scan. Bound asserted: from N = 100 to N = 3 000 (×30), at most ×30.
+    let mut steps: Vec<(usize, bool, i64)> = Vec::new();
     for n in [100, 3_000] {
         let dir = tempfile::tempdir()?;
         let (store, path) = open(&dir)?;
         drop(store);
         world(&path, "RUNNING")?;
         let conn = Connection::open(&path)?;
-        conn.execute_batch(&format!(
-            "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
-             INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
-               test_plan_sha256, source_path, state, created_at)
-               SELECT 'J' || i, 'R', printf('%040d', i), printf('%040d', i), printf('%064d', 1), printf('%064d', 2),
-                 printf('%064d', 3), '/repo', 'STALE', 'x' FROM k;
-             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'J' || i || '/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
-                 json_object('candidate_id', 'J' || i, 'attempt', 1), 'x' FROM k;
-             WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {n})
-             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'J' || i || '/stale', 'R', 'candidate.stale',
-                 json_object('candidate_id', 'J' || i, 'reason', 'evidence_unrecoverable'), 'x' FROM k;"
-        ))?;
+        conn.execute_batch(&judged_candidates(n))?;
         for by_run in [false, true] {
-            let mut statement = conn.prepare(&crate::persistence::unrecovered_sql(by_run))?;
-            let found: Vec<String> = if by_run {
-                statement
-                    .query_map(params!["R"], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?
-            } else {
-                statement
-                    .query_map([], |r| r.get(0))?
-                    .collect::<Result<_, _>>()?
-            };
+            let (found, work) = work_of(|work| {
+                crate::persistence::recovery::unrecovered(&conn, by_run.then_some("R"), work)
+            })?;
             assert!(found.is_empty(), "{n} {by_run}: {found:?}");
-            steps.push((
-                n,
-                by_run,
-                statement.get_status(rusqlite::StatementStatus::VmStep),
-            ));
+            steps.push((n, by_run, work));
         }
     }
     for by_run in [false, true] {
@@ -1702,9 +1763,158 @@ fn the_unrecovered_candidates_grow_linearly_with_the_runs_judged_ones() -> R {
             steps
                 .iter()
                 .find(|(m, b, _)| *m == n && *b == by_run)
-                .map_or(i32::MAX, |(.., s)| *s)
+                .map_or(i64::MAX, |(.., s)| *s)
         };
-        assert!(of(3_000) <= of(100) * 60, "by run {by_run}: {steps:?}");
+        assert!(of(3_000) <= of(100) * 30, "by run {by_run}: {steps:?}");
+    }
+    Ok(())
+}
+
+/// Another run Q, stopped (COMPLETED), with `records` / 10 candidates and `records` recovery facts of them written as
+/// Records (project-scoped: `run_id` null, Q in the payload) at the product's ids: failures and recoveries by turns, and
+/// each candidate judged unrecoverable; and R's own: C1 failed then recovered, C3 failing.
+fn another_runs_records(records: usize) -> String {
+    format!(
+        "{CANDIDATES}{ROUNDS_WITH_TASKS}
+         INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES
+           ('Q', 'p1', 'COMPLETED', 'AUTO', 1, '2026-11-15T00:00:00Z');
+         WITH RECURSIVE k(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM k WHERE i < {candidates})
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           SELECT 'Q' || i, 'Q', printf('%040d', i), printf('%040d', i), printf('%064d', 1), printf('%064d', 2),
+             printf('%064d', 3), '/repo', 'REJECTED', 'x' FROM k;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {facts}),
+           f(i, c, kind) AS (SELECT i, 'Q' || (i % {candidates} + 1), CASE (i / {candidates}) % 2
+             WHEN 0 THEN 'candidate.reconcile_failed' ELSE 'candidate.reconcile_recovered' END FROM n)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', c || CASE kind WHEN 'candidate.reconcile_failed' THEN '/reconcile_failed/'
+               ELSE '/reconcile_recovered/' END || row_number() OVER (PARTITION BY c, kind ORDER BY i),
+             NULL, kind, json_object('candidate_id', c, 'run_id', 'Q', 'attempt', 1, 'at_ms', '0'), 'x'
+           FROM f ORDER BY i;
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', candidate_id || '/stale', NULL, 'candidate.stale',
+             json_object('candidate_id', candidate_id, 'run_id', 'Q', 'reason', 'evidence_unrecoverable'), 'x'
+           FROM candidates WHERE run_id = 'Q';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'C1/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
+            '{{\"candidate_id\": \"C1\", \"attempt\": 1, \"at_ms\": \"0\"}}', 'x'),
+           ('p1', 'C3/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
+            '{{\"candidate_id\": \"C3\", \"attempt\": 1, \"at_ms\": \"0\"}}', 'x'),
+           ('p1', 'C1/reconcile_recovered/1', 'R', 'candidate.reconcile_recovered',
+            '{{\"candidate_id\": \"C1\"}}', 'x'),
+           ('p1', 'C3/reconcile_failed/2', 'R', 'candidate.reconcile_failed',
+            '{{\"candidate_id\": \"C3\", \"attempt\": 2, \"at_ms\": \"0\"}}', 'x');",
+        candidates = records / 10,
+        facts = records - records / 10,
+    )
+}
+
+#[test]
+fn a_runs_recovery_reads_do_not_grow_with_another_runs_records() -> R {
+    // M2T13R-102 (the reviewer's dimension): stopped Q's recovery facts, written as Records (project-scoped), grow from
+    // 1 000 to 100 000 (its candidates with them, 100 to 10 000). Every read of R's does the same work (SQLite's VM
+    // steps, +50): its unrecovered candidates, C3's last failure, live obligation, judgment (any reason: closing's
+    // `superseded`, reports' `stale_reason`; as unrecoverable: `start_recovery_wanted`) and streak (record_recovery's),
+    // R's verifiers held by a recovery. Every run's unrecovered candidates grow with the candidates only: Q's ×100, a
+    // bounded number of look-ups by id each, so at most ×100.
+    use crate::persistence::recovery;
+    let mut steps: Vec<(usize, &str, i64)> = Vec::new();
+    let c3: std::collections::BTreeSet<String> = ["C3".to_owned()].into_iter().collect();
+    for records in [1_000, 100_000] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        drop(store);
+        world(&path, "RUNNING")?;
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(&another_runs_records(records))?;
+        let (found, work) = work_of(|work| recovery::unrecovered(&conn, Some("R"), work))?;
+        assert_eq!(found, c3, "{records}");
+        steps.push((records, "unrecovered of R", work));
+        let (found, work) = work_of(|work| recovery::unrecovered(&conn, None, work))?;
+        assert_eq!(found, c3, "{records}");
+        steps.push((records, "unrecovered of every run", work));
+        let (found, work) = work_of(|work| recovery::last_failure(&conn, "C3", work))?;
+        assert_eq!(found, Some((Some(2), Some("0".to_owned()))), "{records}");
+        steps.push((records, "last failure of C3", work));
+        let (found, work) =
+            work_of(|work| super::super::verification::live_obligation_counted(&conn, "C3", work))?;
+        assert!(found, "{records}");
+        steps.push((records, "live obligation of C3", work));
+        for (name, reason) in [
+            ("judgment of C3", None),
+            (
+                "judgment of C3 as unrecoverable",
+                Some("evidence_unrecoverable"),
+            ),
+        ] {
+            let (found, work) = work_of(|work| recovery::judged(&conn, "C3", "R", reason, work))?;
+            assert!(!found, "{records}");
+            steps.push((records, name, work));
+        }
+        let (found, work) = work_of(|work| recovery::streak(&conn, "C3", work))?;
+        assert_eq!(
+            (found.failures, found.recoveries, found.since.len()),
+            (2, 0, 2)
+        );
+        steps.push((records, "streak of C3", work));
+        let (found, work) =
+            work_of(|work| super::super::closing::held_by_recovery_counted(&conn, "R", work))?;
+        assert_eq!(
+            found,
+            ["Q-C3", "V-C3"].map(str::to_owned).into_iter().collect(),
+            "{records}"
+        );
+        steps.push((records, "held by recovery of R", work));
+    }
+    let of = |records: usize, name: &str| {
+        steps
+            .iter()
+            .find(|(r, n, _)| *r == records && *n == name)
+            .map_or(i64::MAX, |(.., s)| *s)
+    };
+    for (_, name, _) in steps.iter().filter(|(r, ..)| *r == 1_000) {
+        let bound = if *name == "unrecovered of every run" {
+            of(1_000, name) * 100
+        } else {
+            of(1_000, name) + 50
+        };
+        assert!(of(100_000, name) <= bound, "{name}: {steps:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_recovery_facts_are_named_only_by_their_module() -> R {
+    // M2T13R-102: the kinds of a candidate's recovery facts are named in persistence/recovery.rs only — so every read of
+    // them is one of its reads by the product's ids and every write takes its ids from it (a read by a scan of the
+    // history, or a write under another id, would have to name a kind) — and its list of them is used only by hold.rs's
+    // list of the kinds written as Records.
+    let module = |path: &Path| path.ends_with("hoh-core/src/persistence/recovery.rs");
+    let kinds = super::super::recovery::KINDS;
+    let sources = product_sources()?;
+    assert!(
+        sources.iter().any(|(path, code)| module(path)
+            && kinds
+                .iter()
+                .all(|kind| code.contains(&format!("\"{kind}\"")))),
+        "the scan reads the module that names them"
+    );
+    for (path, code) in &sources {
+        if module(path) {
+            continue;
+        }
+        for kind in kinds {
+            assert!(!code.contains(kind), "{} names {kind}", path.display());
+        }
+        if !path.ends_with("hoh-core/src/persistence/hold.rs") {
+            assert!(
+                !code
+                    .lines()
+                    .any(|line| line.contains("recovery::") && line.contains("KINDS")),
+                "{} uses recovery's KINDS",
+                path.display()
+            );
+        }
     }
     Ok(())
 }

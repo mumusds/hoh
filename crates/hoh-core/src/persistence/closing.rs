@@ -143,16 +143,15 @@ pub(super) fn candidate_state(
 }
 
 /// Candidate `candidate` has a persistent fact that it was superseded: a later freeze of its run listed it, or
-/// `candidate.stale` names it (a specification change, evidence found unrecoverable); later vetoes do not change it.
+/// `candidate.stale` names it (a specification change, evidence found unrecoverable; `recovery::judged`, by its id);
+/// later vetoes do not change it.
 fn superseded(tx: &Transaction<'_>, run_id: &str, candidate: &str) -> Result<bool, PersistError> {
+    if super::recovery::judged(tx, candidate, run_id, None, &mut Default::default())? {
+        return Ok(true);
+    }
     tx.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM events t WHERE {} AND t.kind = 'candidate.stale' \
-               AND json_extract(t.payload_json, '$.candidate_id') = ?2) \
-             OR EXISTS(SELECT 1 FROM events e, json_each(e.payload_json, '$.superseded') s \
-               WHERE e.kind = 'candidate.frozen' AND e.run_id = ?1 AND s.value = ?2)",
-            super::hold::of_run("t", "?1")
-        ),
+        "SELECT EXISTS(SELECT 1 FROM events e, json_each(e.payload_json, '$.superseded') s \
+           WHERE e.kind = 'candidate.frozen' AND e.run_id = ?1 AND s.value = ?2)",
         params![run_id, candidate],
         |r| r.get(0),
     )
@@ -1807,23 +1806,50 @@ pub(super) fn held_by_recovery(
     tx: &rusqlite::Connection,
     run_id: &str,
 ) -> Result<BTreeSet<String>, PersistError> {
-    let mut statement = tx.prepare(&held_by_recovery_sql()).map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(params![run_id], |r| r.get(0))
-        .map_err(sqlite_error)?;
-    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+    held_by_recovery_counted(tx, run_id, &mut super::recovery::Work::default())
 }
 
-/// [`held_by_recovery`]'s statement, run `?1` (M2T13R-03): its rounds through the `(run_id, kind, seq)` index, their
-/// candidates held by the run's own recovery facts ([`super::failing_sql`] of the run) — not by a scan of the
-/// project's history per round.
-pub(super) fn held_by_recovery_sql() -> String {
-    format!(
-        "{} SELECT t.value FROM main.events o, json_each(o.payload_json, '$.tasks') t \
-         WHERE o.kind = '{ROUND_OPENED}' AND o.run_id = ?1 \
-           AND json_extract(o.payload_json, '$.candidate_id') IN (SELECT candidate FROM failing)",
-        super::failing_sql(true)
-    )
+/// [`held_by_recovery`], its work counted (M2T13R-03, -102): the run's rounds through the `(run_id, kind, seq)` index,
+/// each round's candidate judged by its recovery facts' ids (`recovery::failing`), once per candidate — no scan of the
+/// project's history.
+pub(super) fn held_by_recovery_counted(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+    work: &mut super::recovery::Work,
+) -> Result<BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(o.payload_json, '$.candidate_id'), t.value \
+             FROM main.events o, json_each(o.payload_json, '$.tasks') t WHERE o.kind = ?1 AND o.run_id = ?2",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(Option<String>, String)> = statement
+        .query_map(params![ROUND_OPENED, run_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    work.count(&statement);
+    let mut failing: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    let mut held = BTreeSet::new();
+    for (candidate, task) in rows {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let is = match failing.get(&candidate) {
+            Some(is) => *is,
+            None => {
+                let is = super::recovery::failing(tx, &candidate, work)?;
+                failing.insert(candidate, is);
+                is
+            }
+        };
+        if is {
+            held.insert(task);
+        }
+    }
+    Ok(held)
 }
 
 /// Record one recovery of candidate `candidate`'s pending check records at `now` (decision 11): a failure is
@@ -1857,28 +1883,10 @@ pub(super) fn record_recovery(
     } else {
         Intent::Record
     };
-    let of = |kind: &str| -> Result<Vec<(i64, Value)>, PersistError> {
-        let mut statement = tx
-            .prepare(
-                "SELECT seq, payload_json FROM events WHERE kind = ?1 AND json_extract(payload_json, '$.candidate_id') = ?2 \
-                 ORDER BY seq",
-            )
-            .map_err(sqlite_error)?;
-        let rows = statement
-            .query_map(params![kind, candidate], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(sqlite_error)?;
-        rows.map(|row| {
-            let (seq, payload) = row.map_err(sqlite_error)?;
-            Ok((seq, serde_json::from_str(&payload).unwrap_or(Value::Null)))
-        })
-        .collect()
-    };
-    let recovered = of("candidate.reconcile_recovered")?;
-    let failed = of("candidate.reconcile_failed")?;
-    let since = recovered.last().map_or(0, |(seq, _)| *seq);
-    let run: Vec<&(i64, Value)> = failed.iter().filter(|(seq, _)| *seq > since).collect();
+    // Its failures and recoveries by their ids (`recovery::streak`): the failures since its last recovery are the run of
+    // failures a judgment weighs.
+    let streak = super::recovery::streak(&tx, candidate, &mut Default::default())?;
+    let run = &streak.since;
     let millis = |t: std::time::SystemTime| {
         t.duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis())
@@ -1895,53 +1903,36 @@ pub(super) fn record_recovery(
     match outcome {
         Ok(recorded) => {
             if !run.is_empty() {
+                let (id, kind) = super::recovery::recovery(candidate, streak.recoveries + 1);
                 events.push(event(
-                    child_id(candidate, &format!("reconcile_recovered/{}", recovered.len() + 1)),
-                    "candidate.reconcile_recovered",
+                    id,
+                    kind,
                     json!({"candidate_id": candidate, "recorded": recorded, "after_failures": run.len()}),
                 ));
             }
         }
         Err((permanent, error)) => {
             let attempt = run.len() + 1;
+            let (id, kind) = super::recovery::failure(candidate, streak.failures + 1);
             events.push(event(
-                child_id(candidate, &format!("reconcile_failed/{}", failed.len() + 1)),
-                "candidate.reconcile_failed",
+                id,
+                kind,
                 json!({"candidate_id": candidate, "attempt": attempt,
                     "kind": if *permanent { "permanent" } else { "transient" }, "error": error,
                     "at_ms": millis(now).to_string()}),
             ));
             let first = run
                 .first()
-                .and_then(|(_, p)| p["at_ms"].as_str().and_then(|s| s.parse::<u128>().ok()))
+                .and_then(|p| p["at_ms"].as_str().and_then(|s| s.parse::<u128>().ok()))
                 .unwrap_or_else(|| millis(now));
             let judged = *permanent
                 || (attempt >= TRANSIENT_FAILURES
                     && millis(now).saturating_sub(first) >= TRANSIENT_SPAN_MS);
-            let stale: bool = tx
-                .query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM events s WHERE {} AND s.kind = 'candidate.stale' \
-                         AND json_extract(s.payload_json, '$.candidate_id') = ?1)",
-                        super::hold::of_run("s", "?2")
-                    ),
-                    params![candidate, run_id],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_error)?;
             // Superseded: a later freeze listed it, or it is STALE; either fact persists (decision 16).
-            let superseded = stale
-                || tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM events f, json_each(f.payload_json, '$.superseded') v \
-                         WHERE f.run_id = ?2 AND f.kind = 'candidate.frozen' AND v.value = ?1)",
-                        params![candidate, run_id],
-                        |r| r.get(0),
-                    )
-                    .map_err(sqlite_error)?;
+            let superseded = superseded(&tx, &run_id, candidate)?;
             if at_start && !superseded && !judged {
                 events.push(event(
-                    child_id(candidate, &format!("reconcile_failed/{}/start", failed.len() + 1)),
+                    child_id(candidate, &format!("reconcile_failed/{}/start", streak.failures + 1)),
                     "integrity_violation",
                     json!({"candidate_id": candidate, "reason": "reconcile_failed_at_start", "error": error}),
                 ));
@@ -1952,9 +1943,10 @@ pub(super) fn record_recovery(
                     params![candidate],
                 )
                 .map_err(sqlite_error)?;
+                let (id, kind) = super::recovery::judgment(candidate);
                 events.push(event(
-                    child_id(candidate, "stale"),
-                    "candidate.stale",
+                    id,
+                    kind,
                     json!({"candidate_id": candidate, "reason": "evidence_unrecoverable", "error": error}),
                 ));
                 events.push(event(

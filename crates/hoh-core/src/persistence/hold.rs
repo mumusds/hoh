@@ -38,9 +38,9 @@ pub(super) const RECORD_KINDS: [&str; 16] = [
     "integrity_violation",
     "issue.resolved",
     "issue.reopened",
-    "candidate.reconcile_failed",
-    "candidate.reconcile_recovered",
-    "candidate.stale",
+    super::recovery::KINDS[0],
+    super::recovery::KINDS[1],
+    super::recovery::KINDS[2],
     // (ii) delivery bookkeeping.
     "outbox.dead_letter",
     "outbox.delivered_late",

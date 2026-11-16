@@ -755,7 +755,11 @@ async fn a_reconcile_makes_stale_a_current_report_whose_candidate_no_longer_stan
             "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES ('p1', ?1, 'R', \
              ?2, ?3, '2026-11-12T00:00:09Z')",
             rusqlite::params![
-                format!("fixture/{fact}"),
+                if fact == "candidate.stale" {
+                    child_id(&c1, "stale")
+                } else {
+                    format!("fixture/{fact}")
+                },
                 fact,
                 json!({"candidate_id": named, "superseded": [], "reason": "fixture"}).to_string()
             ],

@@ -873,7 +873,7 @@ fn candidates(extra: &str) -> String {
             '/repo', 'VERIFYING', '2026-11-07T00:00:01Z');
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
            ('p1', 'C1/opened', 'R', 'verification.round_opened', '{{\"round_id\": \"r1\", \"candidate_id\": \"C1\"}}', '2026-11-07T00:00:00Z'),
-           ('p1', 'C1/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', '2026-11-07T00:00:00Z'),
+           ('p1', 'C1/reconcile_failed/1', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', '2026-11-07T00:00:00Z'),
            ('p1', 'C1/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C1\", \"reason\": \"evidence_unrecoverable\"}}', '2026-11-07T00:00:00Z'),
            ('p1', 'C2/opened', 'R', 'verification.round_opened', '{{\"round_id\": \"r2\", \"candidate_id\": \"C2\"}}', '2026-11-07T00:00:01Z');
          {extra}"
@@ -894,7 +894,7 @@ async fn only_a_live_recovery_obligation_holds_the_detector() -> R {
         ),
         (
             "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-               ('p1', 'C2/failed', 'R', 'candidate.reconcile_failed',
+               ('p1', 'C2/reconcile_failed/1', 'R', 'candidate.reconcile_failed',
                 '{\"candidate_id\": \"C2\", \"recovery_not_before\": \"2100-01-01T00:00:00Z\"}', '2026-11-07T00:00:02Z');",
             Detected::Nothing,
         ),
@@ -1327,7 +1327,8 @@ fn history(path: &PathBuf, n: u64) -> R {
                ('Q', 'p1', 's3', 'RUNNING', 'AUTO', 1, '2026-11-07T00:00:01Z');
              WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {n})
              INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
-               SELECT 'p1', 'h' || i, CASE i % 4 WHEN 3 THEN 'Q' ELSE 'R' END,
+               SELECT 'p1', CASE i % 4 WHEN 3 THEN 'Q-c' || i || '/reconcile_failed/1' ELSE 'h' || i END,
+                 CASE i % 4 WHEN 3 THEN 'Q' ELSE 'R' END,
                  CASE i % 4 WHEN 0 THEN 'supervisor.retrigger' WHEN 1 THEN 'supervisor.allocated'
                    WHEN 2 THEN 'old.progress' ELSE 'candidate.reconcile_failed' END,
                  CASE i % 4 WHEN 0 THEN '{{\"reason\": \"STALE_REVISION\", \"base_fingerprint\": \"x\", \"n\": 0}}'
