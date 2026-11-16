@@ -1280,3 +1280,202 @@ async fn an_end_decided_while_the_run_is_not_quiet_is_rejected_with_nothing_else
     }
     Ok(())
 }
+
+/// Requirements of R's specification s2 a plan may name.
+const REQUIREMENTS: &str = "
+INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES
+  ('REQ-1', 's2', 'one', 1), ('REQ-2', 's2', 'two', 1);
+";
+
+/// A create_tasks of `tasks`.
+fn create_tasks(tasks: Value) -> Value {
+    json!({"kind": "create_tasks", "plan": {"tasks": tasks}})
+}
+
+/// A planned task of the developer's.
+fn planned(id: &str, depends_on: &[&str], requirements: &[&str]) -> Value {
+    json!({"task_id": id, "title": id, "role": "developer", "writer": true, "depends_on": depends_on,
+        "requirement_ids": requirements})
+}
+
+/// What a decision may change: tasks, their dependencies and requirements, the run, decisions, events.
+fn planned_tables(path: &Path) -> Result<[Rows; 6], Box<dyn std::error::Error>> {
+    Ok([
+        rows(
+            path,
+            "SELECT task_id, state, revision, layer, created_seq FROM tasks ORDER BY task_id",
+        )?,
+        rows(
+            path,
+            "SELECT task_id, depends_on FROM task_dependencies ORDER BY task_id, depends_on",
+        )?,
+        rows(
+            path,
+            "SELECT task_id, requirement_id, spec_id FROM task_requirements ORDER BY task_id, requirement_id",
+        )?,
+        rows(path, "SELECT state, revision FROM runs WHERE run_id = 'R'")?,
+        rows(
+            path,
+            "SELECT decision_id, state, reason_code FROM decisions ORDER BY rowid",
+        )?,
+        rows(path, "SELECT seq, kind FROM events ORDER BY seq")?,
+    ])
+}
+
+#[tokio::test]
+async fn create_tasks_imports_its_plan_in_its_decisions_transaction_and_moves_the_run_once() -> R {
+    // docs/adr/ADR-031.md decision 2 (Q2 (a)), 测试计划 "create_tasks": a valid plan is applied past the fences by
+    // plan::check and import_in in the decision's own transaction; the run gets only the decision's Touch (M2T13D-51),
+    // so the next decision names the revision plus one. The transaction failing at its last write (the decision's
+    // APPLIED) leaves no task and no decision.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, REQUIREMENTS)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let plan = create_tasks(json!([
+        planned("P1", &[], &["REQ-1"]),
+        planned("P2", &["P1"], &["REQ-1", "REQ-2"]),
+        planned("P3", &["T0"], &[]),
+    ]));
+    let before = planned_tables(&path)?;
+    seed(
+        &path,
+        "CREATE TRIGGER fail_applied BEFORE UPDATE OF state ON decisions WHEN NEW.state = 'APPLIED' \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )?;
+    let failed = store
+        .decide(commander.decide(3, 7, plan.clone()), context())
+        .await;
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(planned_tables(&path)?, before, "nothing of it is left");
+    seed(&path, "DROP TRIGGER fail_applied;")?;
+    let decided = store
+        .decide(commander.decide(3, 7, plan), context())
+        .await?;
+    let Decided::Applied {
+        run_revision,
+        event_seqs,
+    } = decided
+    else {
+        return Err(format!("not applied: {decided:?}").into());
+    };
+    assert_eq!(run_revision, 8);
+    let [tasks, dependencies, requirements, run, decisions, events] = planned_tables(&path)?;
+    // P1 waits for nothing, P3 for an ACCEPTED task: READY; P2 waits for P1: PENDING. P1 unblocks P2 (layer 1).
+    assert_eq!(
+        tasks
+            .iter()
+            .filter(|t| t[0].as_str().is_some_and(|id| id.starts_with('P')))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            vec![json!("P1"), json!("READY"), json!(0), json!(1), json!(8)],
+            vec![json!("P2"), json!("PENDING"), json!(0), json!(2), json!(9)],
+            vec![json!("P3"), json!("READY"), json!(0), json!(2), json!(10)],
+        ]
+    );
+    assert_eq!(
+        dependencies,
+        [
+            [json!("P2"), json!("P1")],
+            [json!("P3"), json!("T0")],
+            [json!("T1"), json!("T0")],
+            [json!("T2"), json!("T3")],
+        ]
+    );
+    assert_eq!(
+        requirements,
+        [
+            [json!("P1"), json!("REQ-1"), json!("s2")],
+            [json!("P2"), json!("REQ-1"), json!("s2")],
+            [json!("P2"), json!("REQ-2"), json!("s2")],
+        ]
+    );
+    assert_eq!(run, [[json!("RUNNING"), json!(8)]]);
+    assert_eq!(decisions, [[json!("d2"), json!("APPLIED"), Value::Null]]);
+    let kinds: Vec<&Value> = events.iter().map(|e| &e[1]).collect();
+    assert_eq!(kinds, [&json!("decision.applied"), &json!("plan.imported")]);
+    assert_eq!(
+        event_seqs,
+        events
+            .iter()
+            .filter_map(|e| e[0].as_i64())
+            .collect::<Vec<_>>()
+    );
+    // The next decision of the same turn names the revision after this one.
+    let next = store
+        .decide(
+            commander.decide(
+                3,
+                8,
+                json!({"kind": "record_assumption", "statement": "s", "basis": "b"}),
+            ),
+            context(),
+        )
+        .await?;
+    assert!(matches!(next, Decided::Applied { .. }), "{next:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_invalid_plan_is_refused_with_its_code_before_any_decision_is_written() -> R {
+    // docs/adr/ADR-031.md decision 2, 测试计划 "create_tasks": a cycle, a missing dependency, a duplicate id (in the
+    // plan, or a task of the run), a requirement outside the run's specification: PersistError::Plan with its code
+    // (none for the last), and no decisions row, no task, no event. A score out of range never gets this far: the
+    // decision's payload is held to $defs.DecisionPayload, whose PlanProposal bounds the scores (InvalidProposal).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, REQUIREMENTS)?;
+    let before = planned_tables(&path)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    use crate::protocol::ErrorCode;
+    for (tasks, code) in [
+        (
+            json!([planned("P1", &["P2"], &[]), planned("P2", &["P1"], &[])]),
+            Some(ErrorCode::DagCycle),
+        ),
+        (
+            json!([planned("P1", &["P9"], &[])]),
+            Some(ErrorCode::DagMissingDependency),
+        ),
+        (
+            json!([planned("P1", &[], &[]), planned("P1", &[], &[])]),
+            Some(ErrorCode::DagDuplicateTask),
+        ),
+        (
+            json!([planned("T1", &[], &[])]),
+            Some(ErrorCode::DagDuplicateTask),
+        ),
+        (json!([planned("P1", &[], &["REQ-9"])]), None),
+    ] {
+        let refused = store
+            .decide(
+                commander.decide(3, 7, create_tasks(tasks.clone())),
+                context(),
+            )
+            .await;
+        let Err(PersistError::Plan(e)) = refused else {
+            return Err(format!("{tasks}: not refused as a plan: {refused:?}").into());
+        };
+        assert_eq!(e.code(), code, "{tasks}");
+        assert_eq!(planned_tables(&path)?, before, "{tasks}");
+    }
+    let mut scored = commander.decide(3, 7, create_tasks(json!([planned("P1", &[], &[])])));
+    if let crate::protocol::DecisionPayload::CreateTasks { plan } = &mut scored.payload {
+        plan.tasks[0].user_value = Some(7);
+    }
+    assert!(matches!(
+        store.decide(scored, context()).await,
+        Err(PersistError::InvalidProposal(_))
+    ));
+    assert_eq!(planned_tables(&path)?, before);
+    Ok(())
+}

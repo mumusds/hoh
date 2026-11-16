@@ -2,9 +2,9 @@
 //! `supervisor.output` when the turn succeeded, then each disposed of exactly once by the supervisor's step, one
 //! transaction each. An output's end is the first `decision.applied`/`decision.rejected` that names it (a decision put
 //! through `decide` in the output's transaction) or one `supervisor.output_disposed{outcome}`: `replay`, `deferred`
-//! (not a decision), `invalid` (with a reason), `unsupported` (past decide's fences but not applied yet: a request for
-//! a person, NEED_DECISION claimed for it; create_tasks) or `superseded` (the run cancelled or ended). A paused run's
-//! outputs wait.
+//! (not a decision), `invalid` (with a reason; `PLAN` with its code for a create_tasks whose plan is refused),
+//! `unsupported` (past decide's fences but not applied yet: a request for a person, NEED_DECISION claimed for it) or
+//! `superseded` (the run cancelled or ended). A paused run's outputs wait.
 
 use super::blockers::{self, Claims};
 use super::decide::{self, Decided};
@@ -566,6 +566,13 @@ fn one(
             extra: json!({"decision_id": proposal.decision_id}),
         })),
         Err(PersistError::InvalidProposal(_)) => Ok(Some(end("invalid", Some("PAYLOAD")))),
+        // A create_tasks whose plan is refused: no decision, the plan's code (null for a schema failure) and details
+        // (docs/adr/ADR-031.md decision 2; DAG_CYCLE and the others are ErrorCodes, not RejectionReasons).
+        Err(PersistError::Plan(plan)) => Ok(Some(End {
+            outcome: "invalid",
+            reason: Some("PLAN"),
+            extra: json!({"code": plan.code(), "detail": plan.details()}),
+        })),
         Err(e) => Err(e),
     }
 }
