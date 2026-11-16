@@ -1702,11 +1702,14 @@ fn a_program_whose_path_cannot_be_read_keeps_the_uninstall_from_removing_anythin
 
 #[test]
 fn a_process_the_kernel_says_runs_no_program_or_may_not_be_looked_at_does_not_refuse() -> R {
-    // Design correction 16 (M2T14R-1350, -1351): a process whose program's path cannot be read is judged by the
-    // kernel's own reason. "No such file or directory" (it has no address space: exiting, a zombie, a kernel thread,
-    // or gone) and "Operation not permitted" (another user's under /proc's hidepid=1) are, like "Permission denied",
-    // nothing the scan has to tell: a stand-in readlink gives each for an unrelated live process, and the uninstall
-    // completes. Before, the first refused (69) unless the process was already Z or X, and so did the second.
+    // Design corrections 16 and 17 (M2T14R-1350, -1351, -1451, -1454): a process whose program's path cannot be read
+    // is judged by the kernel's own reason. "No such file or directory" (the task or its thread-group leader has no
+    // address space: gone, a zombie, exiting, or a group whose main thread ended while others run), "Operation not
+    // permitted" (another user's under /proc's hidepid=1) and "No such process" (reaped while being looked at) are,
+    // like "Permission denied" (the kernel denies this user a look: another user's process, a kernel thread, an
+    // undumpable one), nothing the scan has to tell: a stand-in readlink gives each for an unrelated live process, and
+    // the uninstall completes. Before correction 16 the first refused (69) unless the process was already Z or X, and
+    // so did the second; before correction 17 the third did.
     for reason in [
         "No such file or directory",
         "Operation not permitted",
@@ -1739,12 +1742,53 @@ fn a_process_the_kernel_says_runs_no_program_or_may_not_be_looked_at_does_not_re
 #[test]
 fn an_uninstall_in_another_language_reads_the_kernels_reasons_in_english() -> R {
     // M2T14R-1450 (design correction 17): the scan reads the kernel's reasons in English whatever the user's language:
-    // uutils chooses its messages by LANG (not LC_ALL), so the scan's readlink runs with LANG=C and LC_ALL=C and
-    // without LANGUAGE. Run with LANG, LANGUAGE and LC_MESSAGES set to French, the uninstall completes (this user's
-    // own systemd manager answers "Permission denied", in English).
+    // uutils chooses its messages by LANG alone (not LC_ALL, LC_MESSAGES or LANGUAGE), so the scan's readlink runs with
+    // LANG=C and LC_ALL=C and without LANGUAGE. uutils 0.10.0 translates ls's reasons into French but not yet
+    // readlink's, so the readlink here is a stand-in that answers as one with them translated would (M2T14R-1550): in
+    // French whenever LANG is French, and for one unrelated live process "Permission denied" (as for a run started
+    // under another group, which the scan leaves to the run lock). Run with LANG, LANGUAGE and LC_MESSAGES set to
+    // French, the uninstall completes. Read with `LC_ALL=C` alone, the reason would be French, which the scan cannot
+    // tell from any other: 69.
     let install = Install::new()?;
     let out = install.run("bundle", &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let other = Running(
+        Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdout(std::process::Stdio::null())
+            .spawn()?,
+    );
+    let pid = other.0.id();
+    let asked = install.root.path().join("asked");
+    script(
+        &install.stubs().join("readlink"),
+        &format!(
+            r#"#!/bin/bash
+in_french() {{
+  case "$LANG" in
+  fr*)
+    sed -e 's/: Permission denied$/: Permission refusée/' \
+      -e 's/: No such file or directory$/: Aucun fichier ou répertoire de ce type/' \
+      -e 's/: No such process$/: Aucun processus de ce type/' \
+      -e 's/: Operation not permitted$/: Opération non permise/'
+    ;;
+  *) cat ;;
+  esac
+}}
+for last; do :; done
+if [ "$last" = /proc/{pid}/exe ]; then
+  echo asked >> {asked}
+  echo 'readlink: /proc/{pid}/exe: Permission denied' | in_french >&2
+  exit 1
+fi
+case "$LANG" in fr*) ;; *) exec /usr/bin/readlink "$@" ;; esac
+exec 3>&1
+/usr/bin/readlink "$@" 2>&1 1>&3 3>&- | in_french >&2
+exit "${{PIPESTATUS[0]}}"
+"#,
+            asked = asked.display()
+        ),
+    )?;
     let out = install.run_with(
         "bundle",
         &["--uninstall"],
@@ -1756,6 +1800,9 @@ fn an_uninstall_in_another_language_reads_the_kernels_reasons_in_english() -> R 
     )?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(!install.data().join("hoh").exists());
+    // The stand-in was asked about that process: the scan judged its reason.
+    assert!(asked.exists(), "the scan never asked about process {pid}");
+    drop(other);
     Ok(())
 }
 
