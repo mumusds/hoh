@@ -1452,7 +1452,16 @@ fn test_005_01_a_detached_run_survives_the_hangup_and_attach_sees_what_happened(
         .parse()?;
     let (rows, cols) = (30, 120);
     let apty = Pty::new(rows, cols)?;
-    let mut attach = world.hoh_pty(&apty, &["attach", &run])?;
+    // The seqs attach receives: its follower appends each to the debug build's trace (HOH_DEBUG_TUI_SEQS, docs/adr/
+    // ADR-031.md S5), outside the project.
+    let seqs = world.root().join("attach-received-seqs");
+    let mut attach = world.spawn_pty_with(
+        &apty,
+        std::ffi::OsStr::new(world::HOH),
+        &["attach", &run],
+        true,
+        &[("HOH_DEBUG_TUI_SEQS", seqs.as_os_str())],
+    )?;
     // Its status bar: `事件 N · #S`, S at least the run's latest seq at the attach.
     let counted = |s: &str| -> Option<(i64, i64)> {
         let status = s.lines().last()?;
@@ -1481,6 +1490,45 @@ fn test_005_01_a_detached_run_survives_the_hangup_and_attach_sees_what_happened(
     pty::screen_until(&apty, rows, cols, WAIT, |s| s.contains("> 脱离"))?;
     apty.send(b"\r")?;
     assert_eq!(exit_within(&mut attach, WAIT)?.code(), Some(0));
+    // What attach received: strictly increasing, every one of the run's events in (S0, watermark] among them, none
+    // that is not one of the run's events; and its status bar counted exactly those up to its S.
+    let received: Vec<i64> = std::fs::read_to_string(&seqs)
+        .map_err(|e| format!("no trace of the seqs attach received: {e}"))?
+        .lines()
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    assert!(
+        received.windows(2).all(|w| w[0] < w[1]),
+        "not strictly increasing: {received:?}"
+    );
+    let of_run = |range: &str| -> R<Vec<i64>> {
+        let listed = world.query(&format!(
+            "SELECT group_concat(seq, ' ') FROM (SELECT seq FROM events WHERE run_id = '{run}' {range} ORDER BY seq)"
+        ))?;
+        Ok(listed
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?)
+    };
+    let after_s0 = of_run(&format!("AND seq > {s0} AND seq <= {watermark}"))?;
+    assert!(
+        !after_s0.is_empty(),
+        "no event of the run in (S0, watermark]"
+    );
+    let missed: Vec<&i64> = after_s0.iter().filter(|q| !received.contains(q)).collect();
+    assert!(
+        missed.is_empty(),
+        "attach did not receive {missed:?} of (S0 {s0}, watermark {watermark}]: {received:?}"
+    );
+    let all = of_run("")?;
+    let foreign: Vec<&i64> = received.iter().filter(|q| !all.contains(q)).collect();
+    assert!(foreign.is_empty(), "not the run's events: {foreign:?}");
+    assert!(received.contains(&s), "#{s} was not received: {received:?}");
+    assert_eq!(
+        usize::try_from(n)?,
+        received.iter().filter(|q| **q <= s).count(),
+        "{screen}"
+    );
     // All within the same attempt, still in flight: no attempt row and no Developer start more or fewer.
     assert_eq!(
         world.query(&format!(
