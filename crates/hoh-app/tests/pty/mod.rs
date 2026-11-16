@@ -425,7 +425,8 @@ pub fn erase_check(screen: &Screen) -> R {
     Ok(())
 }
 
-/// `hoh args…` in `project` with the PTY as its controlling terminal and stdio, in a clean environment.
+/// `hoh args…` in `project` with the PTY as its controlling terminal and stdio, in an environment isolated in `home`
+/// ([`isolate`]).
 pub fn spawn_in(
     pty: &Pty,
     project: &Path,
@@ -442,6 +443,42 @@ pub fn spawn_without_ctty_in(pty: &Pty, project: &Path, home: &Path) -> R<Hoh> {
     spawn(pty, false, project, home, &[], &[])
 }
 
+/// What a stand-in agent answers to every command (attach.rs's fake agents): a version, and a help that offers nothing
+/// HoH drives an agent by, so a host's registry finds it unsupported for good and never runs it again.
+const STAND_IN: &str = "#!/bin/sh\necho 'stand-in agent 0.0.0 (hoh PTY tests)'\n";
+
+/// `command`'s environment cleared and isolated in `home`: HOME `home`; XDG_RUNTIME_DIR `<home>/run` (0700, where no
+/// user manager answers, so a host is started directly); PATH `<home>/agents` (stand-ins for codex, claude and pi, so
+/// no agent installed on this machine is ever run, by `hoh` or by a host it starts) then /usr/bin:/bin.
+pub fn isolate(command: &mut Command, home: &Path) -> R {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let (agents, runtime) = (home.join("agents"), home.join("run"));
+    std::fs::create_dir_all(&agents)?;
+    std::fs::create_dir_all(&runtime)?;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+    // Written once: a stand-in's file never changes after (the stamps a host's look compares).
+    for agent in ["codex", "claude", "pi"] {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(agents.join(agent))
+        {
+            Ok(mut file) => file.write_all(STAND_IN.as_bytes())?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut path = agents.into_os_string();
+    path.push(":/usr/bin:/bin");
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("PATH", path);
+    Ok(())
+}
+
 fn spawn(
     pty: &Pty,
     ctty: bool,
@@ -451,15 +488,13 @@ fn spawn(
     env: &[(&str, &str)],
 ) -> R<Hoh> {
     let mut cmd = Command::new("setsid");
+    isolate(&mut cmd, home)?;
     if ctty {
         cmd.arg("--ctty");
     }
     cmd.arg(env!("CARGO_BIN_EXE_hoh"))
         .args(args)
         .current_dir(project)
-        .env_clear()
-        .env("HOME", home)
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("TERM", "xterm-256color")
         .stdin(pty.stdio()?)
         .stdout(pty.stdio()?)

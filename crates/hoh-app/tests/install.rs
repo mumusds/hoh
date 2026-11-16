@@ -289,9 +289,17 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// The version directory a bundle's binary gets: `<semver>-<first 12 hex digits of its SHA-256>`.
+/// The version directory a bundle's binary gets: `<semver>-<first 12 hex digits of its SHA-256>` (its `--version` run
+/// in an isolated environment).
 fn version_of(binary: &Path) -> R<String> {
-    let out = Command::new(binary).arg("--version").output()?;
+    let dir = tempfile::tempdir()?;
+    let out = Command::new(binary)
+        .arg("--version")
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("PATH", "/usr/bin:/bin")
+        .output()?;
     let semver = String::from_utf8(out.stdout)?
         .lines()
         .next()
