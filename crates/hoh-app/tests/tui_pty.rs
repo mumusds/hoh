@@ -9,14 +9,18 @@
 //! - a terminal that is closed under it (its window, an SSH connection) ends it: 129, or 74 when it was not the
 //!   controlling terminal.
 //!
-//! In every case the alternate screen is entered and left, and the terminal attributes are those of before. The
-//! names carry no TEST id: TEST-001-01/02 (the host parts) are M2-T13's.
+//! In every case the alternate screen is entered and left, and the terminal attributes are those of before.
+//!
+//! TEST-001-01 and TEST-001-02 (M2-T13, docs/adr/ADR-031.md decisions 13 and 14) run `hoh` in the M2-T13 test world
+//! (`world`) against an in-process host whose runner is the world's scripted Team, and read the screen as a vt100
+//! snapshot.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
 mod pty;
+mod world;
 
 use pty::{
     Hoh, Pty, R, exit_within, find, in_write, signal, spawn_in, spawn_without_ctty_in, tree,
@@ -1060,5 +1064,255 @@ fn an_attached_tui_goes_on_with_its_run_through_a_host_started_again() -> R {
     );
     assert_eq!(s.detach()?, Some(0));
     runtime.block_on(second.shutdown());
+    Ok(())
+}
+
+/// TEST-001-01's runs, their ids as a host gives them (UUIDs): A PAUSED at revision 7, B COMPLETED; neither has a
+/// specification or a Commander binding, so nothing wakes for them.
+const RUN_A: &str = "a1f04c7e-2b9d-4e63-8c5a-7d2e9b13f046";
+const RUN_B: &str = "b7c2e815-6d4f-4a90-9e3b-15f8a0c4d272";
+
+/// The rows of the commands, runs, tasks and input_queue tables.
+const COUNTS: &str = "SELECT (SELECT count(*) FROM commands) || ' ' || (SELECT count(*) FROM runs) || ' ' || \
+    (SELECT count(*) FROM tasks) || ' ' || (SELECT count(*) FROM input_queue)";
+
+#[test]
+fn test_001_01_the_workspace_shows_the_runs_and_a_sigterm_changes_nothing() -> R {
+    // AC-001-01: the project's store holds run A PAUSED at revision 7 and run B COMPLETED; its host runs (in this
+    // process, its runner the world's scripted Team: nothing wakes, it takes no work). `hoh` in a 120x40 PTY
+    // (TERM=xterm-256color): once the top bar is drawn (within 10 s), 5 s idle, `draft` typed without Enter, 2 s idle,
+    // SIGTERM.
+    let name = "hoh-tui-runs";
+    let world = world::World::named(name)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(world.init_store())?;
+    world.exec(&format!(
+        "INSERT INTO runs(run_id, project_id, state, mode, revision, resume_state, created_at) VALUES
+           ('{RUN_A}', :p, 'PAUSED', 'AUTO', 7, 'RUNNING', '2026-11-15T00:00:01Z'),
+           ('{RUN_B}', :p, 'COMPLETED', 'AUTO', 3, NULL, '2026-11-15T00:00:00Z');"
+    ))?;
+    let team = world::Team::new(|_| Vec::new());
+    let host = runtime.block_on(world.team_host(team.clone(), None))?;
+    let outcome = (|| -> R {
+        let counts = world.query(COUNTS)?;
+        let runs = world.rows("SELECT * FROM runs ORDER BY run_id")?;
+        let seq: i64 = world
+            .query("SELECT coalesce(max(seq), 0) FROM events")?
+            .parse()?;
+        let info: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(world.project().join(".hoh/host.json"))?)?;
+        let host_pid = u32::try_from(info["pid"].as_u64().ok_or("no host pid")?)?;
+        let host_start =
+            hoh_agents::identity::start_id(host_pid)?.ok_or("the host's process is gone")?;
+        let (rows, cols) = (40, 120);
+        let mut pty = Pty::new(rows, cols)?;
+        let stty = pty.stty()?;
+        let mut hoh = world.hoh_pty(&pty, &[])?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines()
+                .next()
+                .is_some_and(|top| top.contains(name) && top.contains("host 已连接"))
+        })?;
+        std::thread::sleep(Duration::from_secs(5));
+        pty.send(b"draft")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines().nth(usize::from(rows) - 2) == Some("> draft")
+        })?;
+        std::thread::sleep(Duration::from_secs(2));
+        // The screen before SIGTERM: everything written so far read first.
+        pty.drained(WAIT)?;
+        let screen = pty::snapshot(&pty.output(), rows, cols)?;
+        signal(&hoh, Signal::TERM)?;
+        let status = exit_within(&mut hoh, WAIT)?;
+        pty.drained(WAIT)?;
+        let out = pty.output();
+        // Exit 143.
+        assert_eq!(status.code(), Some(143), "{screen}");
+        // The screen before SIGTERM shows the project's name (its top bar) and run A by its short id, PAUSED.
+        let top = screen.lines().next().unwrap_or_default();
+        assert!(top.contains(&format!(" {name} ")), "{screen}");
+        let short = &RUN_A[..8];
+        assert!(
+            screen
+                .lines()
+                .any(|l| l.starts_with(short) && l.contains("PAUSED")),
+            "no line of run A ({short}, PAUSED):\n{screen}"
+        );
+        // After the last ESC[?1049h come ESC[?1049l and ESC[?25h.
+        let entered = out
+            .windows(ENTER_ALT.len())
+            .rposition(|w| w == ENTER_ALT)
+            .ok_or("the alternate screen was never entered")?;
+        assert!(
+            find(&out, LEAVE_ALT, entered).is_some(),
+            "the alternate screen was not left"
+        );
+        assert!(
+            find(&out, SHOW_CURSOR, entered).is_some(),
+            "the cursor was not shown again"
+        );
+        // `stty -g` byte for byte as before.
+        assert_eq!(pty.stty()?, stty, "terminal attributes");
+        // The host's process is still there and serving: the host this process runs (no other was started).
+        assert_eq!(host_pid, std::process::id());
+        assert!(!hoh_agents::identity::ended(host_pid, Some(&host_start))?);
+        let (served, _) = runtime.block_on(world::exchange(&host, "GET", "/v1/runs", None))?;
+        assert_eq!(served, 200);
+        assert!(world.hosts()?.is_empty(), "{:?}", world.hosts());
+        // Nothing written: the four tables' rows as before, the runs as they were (A PAUSED at 7, B COMPLETED), and
+        // no run or task transition among the events of the time.
+        assert_eq!(
+            world.query(COUNTS)?,
+            counts,
+            "commands runs tasks input_queue"
+        );
+        assert_eq!(world.rows("SELECT * FROM runs ORDER BY run_id")?, runs);
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state || ' ' || revision FROM runs WHERE run_id = '{RUN_A}'"
+            ))?,
+            "PAUSED 7"
+        );
+        assert_eq!(
+            world.query(&format!("SELECT state FROM runs WHERE run_id = '{RUN_B}'"))?,
+            "COMPLETED"
+        );
+        let moved = world.rows(&format!(
+            "SELECT seq, kind FROM events WHERE seq > {seq} AND (kind LIKE 'run.%' OR kind LIKE 'task.%')"
+        ))?;
+        assert!(moved.is_empty(), "{moved:?}");
+        Ok(())
+    })();
+    runtime.block_on(host.shutdown());
+    outcome?;
+    assert!(
+        team.turns().is_empty() && team.refused().is_empty(),
+        "{team:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_001_02_enter_starts_one_run_and_a_detach_sends_nothing_more() -> R {
+    // AC-001-02: an empty Git repository with no configuration file (docs/adr/ADR-031.md, implementation record S4: its
+    // effective default_mode is the built-in AUTO; a file would make the host write a ConfigureTeam of its own), its host
+    // running (in this process, its runner the world's scripted Team). `hoh` in a 100x30 PTY: `hello` and Enter, then
+    // Ctrl+C on the empty editor and 脱离; `hoh` again: Ctrl+R and `hel`, then it leaves. The new run's state is not
+    // the AC's (CREATED, or BLOCKED for no specification once StartRun adopts one, decision 1).
+    let world = world::World::named("hoh-tui-enter")?;
+    world.unconfigure()?;
+    world.git(&["init", "-q"])?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let team = world::Team::new(|_| Vec::new());
+    let host = runtime.block_on(world.team_host(team.clone(), None))?;
+    let outcome = (|| -> R {
+        assert!(!world.project().join(".hoh/config.toml").exists());
+        assert_eq!(
+            world.git(&["rev-parse", "--is-inside-work-tree"])?,
+            "true\n"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM runs")?, "0");
+        let commands =
+            || world.rows("SELECT kind, run_id, payload_json FROM commands ORDER BY rowid");
+        let (rows, cols) = (30, 100);
+        let editor = usize::from(rows) - 2;
+        let top_shows_auto = |s: &str| {
+            s.lines()
+                .next()
+                .is_some_and(|top| top.contains("模式 AUTO"))
+        };
+        // First session: the top bar shows AUTO; no command before Enter.
+        let mut pty = Pty::new(rows, cols)?;
+        let mut hoh = world.hoh_pty(&pty, &[])?;
+        pty::screen_until(&pty, rows, cols, WAIT, top_shows_auto)?;
+        let before = commands()?;
+        assert!(before.is_empty(), "a command before Enter: {before:?}");
+        pty.send(b"hello")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines().nth(editor) == Some("> hello")
+        })?;
+        pty.send(b"\r")?;
+        // One StartRun, which the Workspace attaches (its status bar counts the run's events).
+        world.wait("SELECT count(*) FROM commands", "1", WAIT)?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines()
+                .last()
+                .is_some_and(|status| status.contains("事件"))
+        })?;
+        let sent = commands()?;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0]["kind"], "StartRun");
+        let payload: serde_json::Value =
+            serde_json::from_str(sent[0]["payload_json"].as_str().ok_or("no payload")?)?;
+        assert_eq!(
+            payload["goal"].as_str().map(str::as_bytes),
+            Some(&b"hello"[..]),
+            "{payload}"
+        );
+        assert_eq!(payload["mode"], "AUTO", "{payload}");
+        assert_eq!(payload["interactive"], true, "{payload}");
+        let run = sent[0]["run_id"].as_str().ok_or("no run_id")?.to_owned();
+        // Ctrl+C on the empty editor, 脱离 chosen: exit 0, the run not cancelled, no command more.
+        pty.send(b"\x03")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| s.contains("> 脱离"))?;
+        pty.send(b"\r")?;
+        let first = exit_within(&mut hoh, WAIT)?;
+        assert_eq!(first.code(), Some(0));
+        let state = world.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?;
+        assert!(
+            !["CANCEL_REQUESTED", "CANCELLED"].contains(&state.as_str()),
+            "{state}"
+        );
+        assert_eq!(commands()?, sent, "a command after the detach");
+        drop(hoh);
+        drop(pty);
+        // Second session: Ctrl+R and `hel` give `hello` in the editor; nothing sent; it leaves.
+        let mut pty = Pty::new(rows, cols)?;
+        let mut hoh = world.hoh_pty(&pty, &[])?;
+        pty::screen_until(&pty, rows, cols, WAIT, top_shows_auto)?;
+        pty.send(b"\x12")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines()
+                .last()
+                .is_some_and(|status| status.contains("反向搜索"))
+        })?;
+        pty.send(b"hel")?;
+        let found = pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines()
+                .last()
+                .is_some_and(|status| status.contains("反向搜索：hel "))
+        })?;
+        assert_eq!(found.lines().nth(editor), Some("> hello"), "{found}");
+        assert_eq!(commands()?, sent, "a command from the search");
+        // Ctrl+C ends the search (the editor back to its empty draft), Ctrl+C again opens the choice, 脱离.
+        pty.send(b"\x03")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines().nth(editor) == Some(">")
+        })?;
+        pty.send(b"\x03")?;
+        pty::screen_until(&pty, rows, cols, WAIT, |s| s.contains("> 脱离"))?;
+        pty.send(b"\r")?;
+        assert_eq!(exit_within(&mut hoh, WAIT)?.code(), Some(0));
+        assert_eq!(commands()?, sent, "commands at the second session's end");
+        assert_eq!(
+            std::fs::read_to_string(world.project().join(".hoh/input-history.jsonl"))?,
+            "{\"text\":\"hello\"}\n"
+        );
+        let state = world.query(&format!("SELECT state FROM runs WHERE run_id = '{run}'"))?;
+        assert!(
+            !["CANCEL_REQUESTED", "CANCELLED"].contains(&state.as_str()),
+            "{state}"
+        );
+        Ok(())
+    })();
+    runtime.block_on(host.shutdown());
+    outcome?;
+    assert!(team.refused().is_empty(), "{team:?}");
     Ok(())
 }
