@@ -9,7 +9,7 @@ use hoh_agents::launch;
 use hoh_agents::login::{self, Login};
 use hoh_agents::probe::{self, ProbeEnv, ProbeError};
 use hoh_core::decision::Observation;
-use hoh_core::persistence::{Evidence, PersistError, StaffChange, StaffWrite, Store};
+use hoh_core::persistence::{Evidence, StaffChange, StaffWrite, Store};
 use hoh_core::staffing::{
     AgentIdentity, BindingState, Cause, Compat, Fact, FileStamp, Judgment, Kind, Snapshot, Staffed,
     Stamp, Usable,
@@ -1291,22 +1291,33 @@ pub(super) async fn staff(
     root: &Path,
     snapshot: &Snapshot,
     staffing: Vec<Staffed>,
-) -> Result<bool, PersistError> {
+    held: &mut super::runner::Held,
+) -> Result<bool, super::runner::TickError> {
     let mut wrote = false;
     for staffed in staffing {
+        // A run found stopped this tick (Held) is not staffed again in it (docs/adr/ADR-031.md correction D rule 2 (b)).
+        if held.contains(&staffed.run_id) {
+            continue;
+        }
         let judgment = hoh_core::staffing::judge(&staffed, &snapshot.facts, &staffed.excluded);
         let Some(write) = write_of(&staffed, judgment, snapshot, root).await else {
             continue;
         };
-        wrote |= store
-            .staff(StaffChange {
-                run_id: staffed.run_id,
-                role: staffed.role,
-                role_epoch: staffed.role_epoch,
-                agent: staffed.agent,
-                write,
-            })
-            .await?;
+        // One binding's write: a run that stopped since the tick's look is Held, its binding skipped and the run
+        // noted; the other bindings are staffed in this tick all the same (M2T13R-01).
+        wrote |= held
+            .item(
+                store
+                    .staff(StaffChange {
+                        run_id: staffed.run_id,
+                        role: staffed.role,
+                        role_epoch: staffed.role_epoch,
+                        agent: staffed.agent,
+                        write,
+                    })
+                    .await,
+            )?
+            .unwrap_or(false);
     }
     Ok(wrote)
 }

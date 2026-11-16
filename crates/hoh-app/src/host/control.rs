@@ -92,11 +92,14 @@ pub(super) async fn run(
 async fn tick(
     common: &Arc<Common>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> Result<(), PersistError> {
+) -> Result<(), super::runner::TickError> {
     let store = &common.shared.store;
-    let waiting = store.runner_waiting(&common.shared.project_id).await?;
+    let waiting = super::runner::no_run(store.runner_waiting(&common.shared.project_id).await)?;
+    // Each pausing run's step is its own item: a run stopped meanwhile is Held, skipped, and the others go on
+    // (docs/adr/ADR-031.md correction D rule 2 (b), M2T13R-01).
+    let mut held = super::runner::Held::default();
     for run in &waiting.pausing {
-        store.pause_step(run, common.clock.now()).await?;
+        held.item(store.pause_step(run, common.clock.now()).await)?;
     }
     for run in waiting.cancelling {
         let new = common
