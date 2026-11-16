@@ -972,7 +972,8 @@ impl Drop for Marked {
 }
 
 /// A writer for `file`: `/usr/bin/python3 <script> <file> <mark>`. It first writes `established <pid> <sid> <ms>
-/// <handled|ignored> <start>` to its mark ([`established_mark`]), one write, and only then unblocks SIGTERM, which the
+/// <handled|ignored> <start>` to its mark ([`established_mark`]), one write, then `unblocking <ms>` the moment before it
+/// unblocks SIGTERM (CIR-802), which the
 /// processes of its creation hold blocked when the leader stand-in ([`leader`]) made it (W's writer inherits SIGTERM
 /// ignored instead, as do the writers the shell helpers below start with `trap ''`): the product's SIGTERM,
 /// sent before or after, reaches it only once its evidence is written. Unless it inherited SIGTERM ignored, it records
@@ -1001,6 +1002,10 @@ start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
 with open(mark, 'a') as f:
     f.write('established %d %d %d %s %s\n' % (os.getpid(), os.getsid(0), int(time.time() * 1000),
                                              'ignored' if ignored else 'handled', start))
+# The moment before the unblock, the point a promptness bound is measured from: nothing of the writer's own lies
+# between this record and its `term` but the unblock (ADR-022 decision 10, the measuring point; CIR-802).
+with open(mark, 'a') as f:
+    f.write('unblocking %d\n' % int(time.time() * 1000))
 signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
 end = time.monotonic() + 120
 while time.monotonic() < end:
@@ -1254,11 +1259,11 @@ async fn recorded(file: &Path, kind: &str, what: &str) -> R {
     Ok(())
 }
 
-/// What a writer's own record says ([`writer`]): when it was established and, if it handles SIGTERM, when it got it
-/// (wall-clock milliseconds).
+/// What a writer's own record says ([`writer`]): when it unblocked SIGTERM and, if it handles SIGTERM, when it got it
+/// (wall-clock milliseconds, both its own records).
 #[derive(Debug, Clone, Copy)]
 struct WriterRecord {
-    established: u64,
+    unblocking: u64,
     term: Option<u64>,
 }
 
@@ -1379,7 +1384,7 @@ async fn cancel_with_a_writer_outside(
         .as_raw_nonzero()
         .get()
         .unsigned_abs();
-    let (sid, at) = (established.1.get(1).copied(), established.1.get(2).copied());
+    let sid = established.1.get(1).copied();
     assert!(
         sid.is_some_and(|s| u64::from(own) != s),
         "the writer was not established in a session of its own: {:?}",
@@ -1436,10 +1441,12 @@ async fn cancel_with_a_writer_outside(
         "another project's process was signalled"
     );
     host.shutdown().await;
-    Ok(WriterRecord {
-        established: at.ok_or("no time in the established record")?,
-        term,
-    })
+    let unblocking = record()
+        .into_iter()
+        .find(|(k, _)| k == "unblocking")
+        .and_then(|(_, v)| v.first().copied())
+        .ok_or("no unblocking record")?;
+    Ok(WriterRecord { unblocking, term })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1456,13 +1463,17 @@ async fn a_cancel_ends_a_writer_made_at_the_sigterm_with_only_the_attempts_marke
         cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm)
             .await?;
     // Found after the SIGTERM step, it was sent that signal at once (the strongest sent so far), not left for SIGKILL:
-    // its own record of the SIGTERM within 2 s of its being established, however long its creation took (its record,
-    // not a file's time: CIR-601).
+    // its own record of the SIGTERM within 2 s of its record made the moment before it unblocked SIGTERM, however long
+    // its creation took. Both are the writer's records with nothing of its own between them (ADR-022 decision 10, the
+    // measuring point; CIR-802: measured from `established`, a pause before the unblock counted); its record, not a
+    // file's time (CIR-601).
     let term = record.term.ok_or("the writer was never sent SIGTERM")?;
-    let after = term.saturating_sub(record.established);
+    let after = term
+        .checked_sub(record.unblocking)
+        .ok_or("the writer recorded its SIGTERM before it unblocked it")?;
     assert!(
         after < 2000,
-        "the writer got SIGTERM {after} ms after it was established"
+        "the writer got SIGTERM {after} ms after it unblocked it"
     );
     Ok(())
 }
