@@ -1180,6 +1180,89 @@ async fn a_group_lost_track_of_keeps_the_run_cancelling_and_is_recorded_once() -
     Ok(())
 }
 
+/// A1's control, pass by pass: the first finds its group lost; each later one finds it held, its SIGTERM refused and,
+/// once sent, said to have missed part of the cgroup, then lost again (CGW-101).
+struct LostThenPartial(Mutex<u32>);
+
+/// Looks as scripted (lost once they run out); its SIGTERM reaches nobody and is incomplete only once it was sent.
+struct Scripted {
+    looks: std::collections::VecDeque<Look>,
+    termed: bool,
+}
+
+impl ProcessControl for Scripted {
+    fn look(&mut self) -> Look {
+        self.looks.pop_front().unwrap_or(Look::Lost)
+    }
+    fn send(&mut self, signal: Signal) -> bool {
+        self.termed |= signal == Signal::Term;
+        false
+    }
+    fn sigterm_incomplete(&mut self) -> bool {
+        self.termed
+    }
+}
+
+impl Processes for LostThenPartial {
+    fn control(&self, _attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        let pass = self.0.lock().map(|mut n| {
+            *n += 1;
+            *n
+        });
+        let looks = match pass {
+            Ok(1) => vec![Look::Lost],
+            _ => vec![Look::Held, Look::Lost],
+        };
+        Some((
+            Box::new(Scripted {
+                looks: looks.into(),
+                termed: false,
+            }),
+            false,
+        ))
+    }
+    fn workspace(&self) -> Value {
+        json!({})
+    }
+}
+
+#[tokio::test]
+async fn a_lost_pass_that_carries_a_new_incomplete_sigterm_is_recorded_after_an_earlier_lost_one()
+-> R {
+    // CGW-101: a lost group's passes are recorded once per finding, but a pass that ends lost with nothing sent may
+    // still carry a new finding: here its group was held long enough for a SIGTERM that reached nobody and missed part
+    // of its cgroup. That pass is recorded, its CGROUP_SIGTERM_INCOMPLETE with it (and no cancel.sigterm, as nothing
+    // was reached); the run stays cancelling.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(|_| {});
+    let processes: Arc<dyn Processes> = Arc::new(LostThenPartial(Mutex::new(0)));
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    for _ in 0..2 {
+        let step = canceller
+            .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
+            .await?;
+        assert_eq!(step, Finished::Running(1));
+    }
+    let counts = [
+        "SELECT count(*) FROM events WHERE kind = 'cancel.lost'",
+        "SELECT count(*) FROM events WHERE kind = 'cancel.diagnostic' \
+         AND json_extract(payload_json, '$.code') = 'CGROUP_SIGTERM_INCOMPLETE'",
+        "SELECT count(*) FROM events WHERE kind LIKE 'cancel.sig%'",
+    ]
+    .map(|sql| count(&path, sql));
+    assert_eq!(
+        counts.into_iter().collect::<Result<Vec<_>, _>>()?,
+        [2, 1, 0],
+        "lost twice, the second with its diagnostic; nothing sent"
+    );
+    assert_eq!(run_state(&path)?.0, "CANCEL_REQUESTED");
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_ends_it() -> R {
     // ADR-021 decision 8e: an attempt of a cancelled run ends CANCELLED, not counted and with no retry, whether its
