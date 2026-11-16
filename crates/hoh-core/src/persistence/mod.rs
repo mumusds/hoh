@@ -475,30 +475,56 @@ impl std::fmt::Display for PersistError {
 
 impl std::error::Error for PersistError {}
 
-/// The candidates whose last recovery failed and none succeeded since, not judged unrecoverable
-/// ([`Reader::unrecovered_candidates`]), on any connection.
+/// The candidates whose last recovery failed and none succeeded since, and that were not judged unrecoverable
+/// (docs/adr/ADR-028.md decisions 11 and 16; [`Reader::unrecovered_candidates`]): every run's (`run` none), or run
+/// `run`'s, on any connection. One rule for the runner's tick and the stall detector's (d).
 pub(crate) fn unrecovered_candidates(
     conn: &Connection,
+    run: Option<&str>,
 ) -> Result<std::collections::BTreeSet<String>, PersistError> {
     let mut statement = conn
-            .prepare(&format!(
-                "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
-                 WHERE f.kind = 'candidate.reconcile_failed' \
-                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
-                   AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
-                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
-                   AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
-                   AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
-                hold::of_run(
-                    "s",
-                    "(SELECT run_id FROM candidates WHERE candidate_id = json_extract(f.payload_json, '$.candidate_id'))"
-                )
-            ))
-            .map_err(sqlite_error)?;
+        .prepare(&unrecovered_sql(run.is_some()))
+        .map_err(sqlite_error)?;
+    let params: Vec<&dyn rusqlite::ToSql> = match &run {
+        Some(run) => vec![run],
+        None => Vec::new(),
+    };
     let rows = statement
-        .query_map([], |r| r.get(0))
+        .query_map(params.as_slice(), |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// [`unrecovered_candidates`]' statement (M2T13R-03): each kind of recovery fact read through the `(run_id, kind, seq)`
+/// index in one pass — a candidate's last failure and last recovery grouped by candidate, its judgment as
+/// unrecoverable looked up for it — never the events of other kinds, nor the history once per failure. Of every run:
+/// the events of any run (`run_id` in runs, which its foreign key makes every one) or none (a Record of a stopped
+/// run); of run `?1` (`by_run`): its own and its Records written project-scoped (`hold::of_run`).
+pub(crate) fn unrecovered_sql(by_run: bool) -> String {
+    let scope = |alias: &str| {
+        if by_run {
+            hold::of_run(alias, "?1")
+        } else {
+            format!("({alias}.run_id IN (SELECT run_id FROM main.runs) OR {alias}.run_id IS NULL)")
+        }
+    };
+    format!(
+        "WITH failed AS (SELECT json_extract(f.payload_json, '$.candidate_id') AS candidate, max(f.seq) AS seq \
+           FROM main.events f WHERE f.kind = 'candidate.reconcile_failed' AND {} GROUP BY 1), \
+         recovered AS (SELECT json_extract(r.payload_json, '$.candidate_id') AS candidate, max(r.seq) AS seq \
+           FROM main.events r WHERE r.kind = 'candidate.reconcile_recovered' AND {} GROUP BY 1) \
+         SELECT failed.candidate FROM failed LEFT JOIN recovered ON recovered.candidate = failed.candidate \
+         WHERE failed.seq > coalesce(recovered.seq, 0) \
+           AND NOT EXISTS(SELECT 1 FROM main.events s WHERE s.kind = 'candidate.stale' AND {} \
+             AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+             AND json_extract(s.payload_json, '$.candidate_id') = failed.candidate)",
+        scope("f"),
+        scope("r"),
+        hold::of_run(
+            "s",
+            "(SELECT c.run_id FROM main.candidates c WHERE c.candidate_id = failed.candidate)"
+        ),
+    )
 }
 
 /// Map a SQLite error: constraint failures are integrity violations, lock timeouts are busy.
@@ -2038,7 +2064,7 @@ impl Reader {
     pub fn unrecovered_candidates(
         &self,
     ) -> Result<std::collections::BTreeSet<String>, PersistError> {
-        unrecovered_candidates(&self.conn)
+        unrecovered_candidates(&self.conn, None)
     }
 
     /// Whether candidate `candidate_id`'s records are recovered at the host's start (docs/adr/ADR-028.md decision 16):
