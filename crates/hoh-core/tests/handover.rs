@@ -105,9 +105,14 @@ fn one(path: &Path, sql: &str) -> R<String> {
     Ok(out.trim_end_matches('\n').to_owned())
 }
 
-/// Run R started (goal "G"), RUNNING on spec s1, its commander codex at epoch 1 (session sc); developer task T RUNNING
-/// at revision 5 with its one attempt A RUNNING; task T2 ACCEPTED at revision 3; message M ACKED after one delivery.
+/// Run R started (goal "G") on the project's approved spec s1, which it adopts (docs/adr/ADR-031.md decision 1), then
+/// RUNNING, its commander codex at epoch 1 (session sc); developer task T RUNNING at revision 5 with its one attempt A
+/// RUNNING; task T2 ACCEPTED at revision 3; message M ACKED after one delivery.
 async fn world(store: &Store, path: &Path) -> R {
+    exec(
+        path,
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);",
+    )?;
     store
         .submit_command(SubmitCommand {
             command_id: "c-start".to_owned(),
@@ -135,8 +140,7 @@ async fn world(store: &Store, path: &Path) -> R {
         .await?;
     exec(
         path,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
-         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R';
+        "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = 'R';
          INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
            ('sc', 'codex', 'commander', '1', '{\"structured_events\": true}'),
            ('sd', 'claude', 'developer', '1', '{\"structured_events\": true, \"command_exec\": true}');
