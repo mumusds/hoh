@@ -1562,7 +1562,7 @@ async fn a_verifiers_missing_result_is_a_protocol_correction_and_an_unknown_effe
 
 /// C1's round 1 with both verifiers settled, their reports `qa` and `review` (PASS, FAIL or UNKNOWN): the round, the
 /// candidate and the two attempts.
-async fn verified(
+pub(in crate::persistence) async fn verified(
     store: &Store,
     path: &Path,
     qa: &str,
@@ -1575,7 +1575,12 @@ async fn verified(
 }
 
 /// The two READY verifier tasks dispatched, started and settled with reports `qa` and `review`: their attempts.
-async fn settle_verifiers(store: &Store, path: &Path, qa: &str, review: &str) -> R<[String; 2]> {
+pub(in crate::persistence) async fn settle_verifiers(
+    store: &Store,
+    path: &Path,
+    qa: &str,
+    review: &str,
+) -> R<[String; 2]> {
     let mut attempts = Vec::new();
     for _ in 0..2 {
         let d = store

@@ -1784,3 +1784,114 @@ async fn a_paces_stop_into_incomplete_or_blocked_ends_its_commit_with_a_run_resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_task_refused_again_and_again_asks_its_question_and_its_answer_dispatches_it_once_more()
+-> R {
+    // docs/adr/ADR-031.md correction A's guard (4) for W1 and W2 (`fail_task`): a work task's start refused as the
+    // same input would be again (Decision class) asks refused_deterministically at once; nine transient failures use
+    // its retries up and ask retries_exhausted. Each question routes to continue or cancel; the pace's tick blocks the
+    // run on it (its claim), and the answer continue releases it in its own commit: T1 READY with its attempt count
+    // kept, the run working, and the next tick dispatches T1 once more.
+    for (class, n) in [
+        (FailureClass::Decision, 1),
+        (FailureClass::Transient { retry_after: None }, 9),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(WORLD)?;
+        let mut clock = at("2026-11-07T00:00:00Z")?;
+        for _ in 0..n {
+            let mut dispatched = tick(&store, clock).await?;
+            for _ in 0..20 {
+                if !dispatched.is_empty() {
+                    break;
+                }
+                clock += std::time::Duration::from_secs(600);
+                dispatched = tick(&store, clock).await?;
+            }
+            let attempt = dispatched.pop().ok_or("T1 dispatched")?;
+            let notice = store
+                .runner_waiting("p1")
+                .await?
+                .dispatches
+                .into_iter()
+                .find(|d| d.attempt_id == attempt)
+                .ok_or("no dispatch notice")?;
+            assert!(store.runner_received(notice, clock).await?);
+            assert!(
+                store
+                    .runner_finished(
+                        &attempt,
+                        Ending {
+                            success: false,
+                            detail: "refused".to_owned(),
+                            class,
+                            at: clock,
+                            draw: 0,
+                            observed: Default::default(),
+                            unknown_effect: false,
+                        },
+                    )
+                    .await?
+            );
+        }
+        let reason = if n == 1 {
+            "refused_deterministically"
+        } else {
+            "retries_exhausted"
+        };
+        tick(&store, clock).await?;
+        assert_eq!(run_state(&path)?, "BLOCKED");
+        let open = crate::persistence::questions::open(&Connection::open(&path)?, "R")?;
+        assert_eq!(
+            open.iter()
+                .map(|q| (q.subject, q.reason.clone(), q.route))
+                .collect::<Vec<_>>(),
+            [(
+                Some("work"),
+                Some(reason.to_owned()),
+                crate::persistence::questions::Route::Continue
+            )]
+        );
+        let revision: i64 = Connection::open(&path)?.query_row(
+            "SELECT revision FROM runs WHERE run_id = 'R'",
+            [],
+            |r| r.get(0),
+        )?;
+        store
+            .submit_command(crate::persistence::SubmitCommand {
+                command_id: "c1".to_owned(),
+                idempotency_key: "k1".to_owned(),
+                kind: "AnswerQuestion".to_owned(),
+                run_id: "R".to_owned(),
+                expected_revision: revision,
+                payload: json!({}),
+                payload_sha256: format!("{:064}", 1),
+                target: crate::persistence::RunTarget::Input(crate::persistence::Input::Answer {
+                    question_id: open[0].question_id.clone(),
+                    answer: "继续".to_owned(),
+                    choice_id: Some("continue".to_owned()),
+                }),
+                event: crate::persistence::NewEvent {
+                    intent: crate::persistence::Intent::Progress,
+                    project_id: "p1".to_owned(),
+                    event_id: "e-c1".to_owned(),
+                    run_id: Some("R".to_owned()),
+                    kind: "question.answer_accepted".to_owned(),
+                    payload: json!({"command_id": "c1"}),
+                },
+                outbox: None,
+            })
+            .await?;
+        assert_eq!(run_state(&path)?, "RUNNING");
+        let count: i64 = Connection::open(&path)?.query_row(
+            "SELECT attempt_count FROM tasks WHERE task_id = 'T1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, n);
+        assert_eq!(tick(&store, clock).await?.len(), 1, "{reason}");
+    }
+    Ok(())
+}
