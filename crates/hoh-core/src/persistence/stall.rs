@@ -289,8 +289,8 @@ fn numbered(
 }
 
 /// Whether a candidate of run `run_id` has a live recovery obligation the runner would act on: its records pending
-/// (`pending`) or its last recovery failed with none recovered since and not judged unrecoverable — as
-/// `unrecovered_candidates` judges, for this run's candidates only — and `verification::live_obligation`.
+/// (`pending`) or unrecovered — the runner's own rule, `unrecovered_candidates`, of this run's candidates — and
+/// `verification::live_obligation`.
 fn recovery_owed(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -310,27 +310,14 @@ fn recovery_owed(
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
     };
-    let by_run = |alias: &str, kind: &str| {
-        format!(
-            "{alias}.kind = '{kind}' AND {} AND json_extract({alias}.payload_json, '$.candidate_id') = ?2",
-            super::hold::of_run(alias, "?1")
-        )
-    };
-    let unrecovered = format!(
-        "SELECT EXISTS(SELECT 1 FROM events f WHERE {} \
-           AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE {}), 0) \
-           AND NOT EXISTS(SELECT 1 FROM events s WHERE {} \
-             AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable'))",
-        by_run("f", "candidate.reconcile_failed"),
-        by_run("r", "candidate.reconcile_recovered"),
-        by_run("s", "candidate.stale"),
-    );
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    let unrecovered = super::unrecovered_candidates(tx, Some(run_id))?;
     for candidate in &candidates {
-        let owed = pending.contains(candidate)
-            || tx
-                .query_row(&unrecovered, params![run_id, candidate], |r| r.get(0))
-                .map_err(sqlite_error)?;
-        if owed && super::verification::live_obligation(tx, candidate)? {
+        if (pending.contains(candidate) || unrecovered.contains(candidate))
+            && super::verification::live_obligation(tx, candidate)?
+        {
             return Ok(true);
         }
     }

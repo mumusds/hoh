@@ -993,3 +993,220 @@ async fn whether_a_run_is_stopped_is_read_without_its_history() -> R {
     }
     Ok(())
 }
+
+// M2T13R-03 (the runner's unrecovered candidates): one indexed rule for the runner's tick and the stall detector's (d).
+
+/// The rule as it was written before (one scan of the history per failure): the reference of the indexed statement.
+fn unrecovered_by_history(path: &Path) -> R<std::collections::BTreeSet<String>> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
+         WHERE f.kind = 'candidate.reconcile_failed' \
+         AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+           AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
+         AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
+           AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+           AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
+        super::of_run(
+            "s",
+            "(SELECT run_id FROM candidates WHERE candidate_id = json_extract(f.payload_json, '$.candidate_id'))"
+        )
+    ))?;
+    let rows = statement.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// After `step`: the indexed statement gives the reference's set for every run, and its own candidates' part of it for
+/// each run.
+fn same_unrecovered(path: &Path, step: &str) -> R<std::collections::BTreeSet<String>> {
+    let reference = unrecovered_by_history(path)?;
+    let conn = Connection::open(path)?;
+    assert_eq!(
+        crate::persistence::unrecovered_candidates(&conn, None)?,
+        reference,
+        "{step}"
+    );
+    let runs: Vec<String> = conn
+        .prepare("SELECT run_id FROM runs")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for run in runs {
+        let of_run: std::collections::BTreeSet<String> = conn
+            .prepare("SELECT candidate_id FROM candidates WHERE run_id = ?1")?
+            .query_map(params![run], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            crate::persistence::unrecovered_candidates(&conn, Some(&run))?,
+            reference.intersection(&of_run).cloned().collect(),
+            "{step}: run {run}"
+        );
+    }
+    Ok(reference)
+}
+
+/// `n` minutes after the epoch.
+fn minutes(n: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + 60 * n)
+}
+
+#[tokio::test]
+async fn the_unrecovered_candidates_are_the_same_set_read_by_index() -> R {
+    // M2T13R-03: the indexed statement and the rule it replaces give the same candidates, for every run and for each
+    // run's own, on the worlds the tests of recovery use and on a long history.
+    // Recoveries of a working run's candidates: failures, a recovery, failures again, judged unrecoverable; a
+    // permanent failure; a superseded candidate's failure.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&path, "RUNNING")?;
+    Connection::open(&path)?.execute_batch(CANDIDATES)?;
+    same_unrecovered(&path, "none")?;
+    let transient = || Err((false, "x".to_owned()));
+    let steps: Vec<(&str, crate::persistence::RecoveryOutcome, u64)> = vec![
+        ("C1", transient(), 0),
+        ("C3", transient(), 1),
+        ("C1", Ok(1), 2),
+        ("C1", transient(), 3),
+        ("C2", transient(), 4),
+        ("C1", transient(), 8),
+        ("C1", transient(), 20),
+        ("C3", Err((true, "damaged".to_owned())), 21),
+        ("C2", Ok(0), 22),
+    ];
+    let mut seen = 0;
+    for (n, (candidate, outcome, at)) in steps.into_iter().enumerate() {
+        store
+            .record_recovery(candidate, outcome, minutes(at))
+            .await?;
+        seen = seen.max(same_unrecovered(&path, &format!("step {n} {candidate}"))?.len());
+    }
+    assert!(seen > 0, "a candidate was unrecovered on the way");
+    // A stopped run's recoveries, written as Records project-scoped (run_id null, the run in the payload).
+    for state in [RunState::Completed, RunState::Incomplete] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        let (from, through) = path_to(state);
+        world(&path, from)?;
+        Connection::open(&path)?.execute_batch(CANDIDATES)?;
+        for (n, to) in through.into_iter().enumerate() {
+            enter(&store, &path, to, &format!("move-{n}")).await?;
+        }
+        store
+            .record_start_recovery("C1", Err((false, "lost".to_owned())), minutes(0))
+            .await?;
+        assert_eq!(
+            same_unrecovered(&path, &format!("{state:?} failed"))?.len(),
+            1
+        );
+        store.record_recovery("C1", Ok(1), minutes(1)).await?;
+        assert_eq!(
+            same_unrecovered(&path, &format!("{state:?} recovered"))?.len(),
+            0
+        );
+    }
+    // The stall detector's worlds (stall/tests.rs (10)): one judged unrecoverable, one backing off.
+    let dir = tempfile::tempdir()?;
+    let (_store, path) = open(&dir)?;
+    world(&path, "RUNNING")?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{CANDIDATES}
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'C1/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C1\"}}', 'x'),
+           ('p1', 'C1/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C1\", \"reason\": \"evidence_unrecoverable\"}}', 'x'),
+           ('p1', 'C3/failed', 'R', 'candidate.reconcile_failed',
+            '{{\"candidate_id\": \"C3\", \"recovery_not_before\": \"2100-01-01T00:00:00Z\"}}', 'x'),
+           ('p1', 'C2/stale', 'R', 'candidate.stale', '{{\"candidate_id\": \"C2\", \"reason\": \"superseded\"}}', 'x'),
+           ('p1', 'C2/failed', 'R', 'candidate.reconcile_failed', '{{\"candidate_id\": \"C2\"}}', 'x');"
+    ))?;
+    assert_eq!(same_unrecovered(&path, "the detector's world")?.len(), 2);
+    // A long history: two runs, 3 000 recovery facts of either run or project-scoped, among 20 000 other events.
+    let dir = tempfile::tempdir()?;
+    let (_store, path) = open(&dir)?;
+    world(&path, "RUNNING")?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{CANDIDATES}
+         INSERT INTO runs(run_id, project_id, state, mode, revision, created_at) VALUES
+           ('Q', 'p1', 'RUNNING', 'AUTO', 1, '2026-11-15T00:00:00Z');
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           SELECT 'Q' || i, 'Q', printf('%040d', i), printf('%040d', i), printf('%064d', 1), printf('%064d', 2),
+             printf('%064d', 3), '/repo', 'VERIFYING', 'x' FROM n;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 23000)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+           SELECT 'p1', 'e' || i,
+             CASE WHEN i % 23 < 3 AND (i * 7) % 11 = 0 THEN NULL WHEN i % 2 = 0 THEN 'Q' ELSE 'R' END,
+             CASE i % 23 WHEN 0 THEN 'candidate.reconcile_failed' WHEN 1 THEN 'candidate.reconcile_recovered'
+               WHEN 2 THEN 'candidate.stale' ELSE 'k' || (i % 5) END,
+             json_object('candidate_id', CASE WHEN i % 2 = 0 THEN 'Q' || ((i * 13) % 40 + 1)
+                 ELSE 'C' || ((i * 13) % 3 + 1) END,
+               'run_id', CASE WHEN i % 2 = 0 THEN 'Q' ELSE 'R' END,
+               'reason', CASE WHEN i % 2 = 0 AND (i * 5) % 211 = 2 THEN 'evidence_unrecoverable' ELSE 'superseded' END),
+             'x' FROM n;"
+    ))?;
+    let found = same_unrecovered(&path, "a long history")?;
+    let judged: i64 = Connection::open(&path)?.query_row(
+        "SELECT count(DISTINCT json_extract(payload_json, '$.candidate_id')) FROM events \
+         WHERE kind = 'candidate.stale' AND json_extract(payload_json, '$.reason') = 'evidence_unrecoverable'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert!(
+        found.iter().any(|c| c.starts_with('Q'))
+            && found.iter().any(|c| c.starts_with('C'))
+            && judged > 0,
+        "the long history has unrecovered candidates of both runs, and judged ones: {found:?}, {judged}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_unrecovered_candidates_are_read_without_the_history() -> R {
+    // M2T13R-03: the statement's work (SQLite's VM steps) is the same with 1 000 and 100 000 other events in the
+    // history, for every run and for one run, with the same 30 recovery facts; the rule it replaces grows with them.
+    let mut steps: Vec<(usize, bool, i32)> = Vec::new();
+    for history in [1_000, 100_000] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        drop(store);
+        world(&path, "RUNNING")?;
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(&format!(
+            "{CANDIDATES}
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', 'x' FROM n;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+               SELECT 'p1', 'f' || i, 'R', CASE i % 3 WHEN 0 THEN 'candidate.reconcile_recovered'
+                 ELSE 'candidate.reconcile_failed' END, json_object('candidate_id', 'C' || (i % 3 + 1)), 'x' FROM n;"
+        ))?;
+        for by_run in [false, true] {
+            let mut statement = conn.prepare(&crate::persistence::unrecovered_sql(by_run))?;
+            let found: Vec<String> = if by_run {
+                statement
+                    .query_map(params!["R"], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?
+            } else {
+                statement
+                    .query_map([], |r| r.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            assert!(!found.is_empty(), "{history} {by_run}");
+            steps.push((
+                history,
+                by_run,
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+            ));
+        }
+    }
+    for by_run in [false, true] {
+        let of = |history: usize| {
+            steps
+                .iter()
+                .find(|(h, b, _)| *h == history && *b == by_run)
+                .map_or(i32::MAX, |(.., n)| *n)
+        };
+        assert!(of(100_000) <= of(1_000) + 50, "by run {by_run}: {steps:?}");
+    }
+    Ok(())
+}
