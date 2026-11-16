@@ -275,18 +275,17 @@ fn valid_commands_that_are_not_built_yet_say_so_and_exit_3() -> R {
     let env = Env::new()?;
     // Bare `hoh` is built (M1-T08): without a terminal it is a usage error, tests/tui.rs (TEST-001-03); `hoh doctor`
     // is built (M1-T07), tests/doctor.rs (TEST-006-01/02); `hoh attach` and `hoh -p --detach` are built (M2-T06),
-    // tests/attach.rs and the test below. A foreground `hoh -p` comes with M2-T13.
-    for args in [&["-p", "x"][..], &["web"]] {
-        let out = env.hoh(args)?;
-        assert_eq!(
-            out.status.code(),
-            Some(3),
-            "{args:?}: exit 3 means NOT_IMPLEMENTED/BLOCKED"
-        );
-        assert!(out.stdout.is_empty(), "stdout is reserved for results");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("NOT_IMPLEMENTED"), "{args:?}: {stderr}");
-    }
+    // tests/attach.rs and the test below; the foreground `hoh -p` is built (M2-T13), tests/cli_e2e.rs.
+    let args = &["web"][..];
+    let out = env.hoh(args)?;
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{args:?}: exit 3 means NOT_IMPLEMENTED/BLOCKED"
+    );
+    assert!(out.stdout.is_empty(), "stdout is reserved for results");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NOT_IMPLEMENTED"), "{args:?}: {stderr}");
     assert!(!env.project.path().join(".hoh").exists());
     Ok(())
 }

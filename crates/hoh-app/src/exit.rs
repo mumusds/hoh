@@ -1,7 +1,4 @@
 //! The exit code table of REQ-004, one place for every client: a run's final state, or what ended the client.
-//! Until the clients that wait for runs and hosts arrive (M2-T13), only the usage code and the TUI shell's codes are
-//! used outside the tests.
-#![allow(dead_code)]
 
 use hoh_core::protocol::RunState;
 
@@ -31,6 +28,18 @@ pub enum ClientEvent {
 pub enum Ending {
     Run(RunState),
     Client(ClientEvent),
+}
+
+/// The exit code of client event `event` (each has one).
+pub fn client_code(event: ClientEvent) -> u8 {
+    exit_code(Ending::Client(event)).unwrap_or(1)
+}
+
+/// The exit code of a run that stopped in `state` (its name), if that state ends a client.
+pub fn run_code(state: &str) -> Option<u8> {
+    serde_json::from_value::<RunState>(serde_json::Value::String(state.to_owned()))
+        .ok()
+        .and_then(|state| exit_code(Ending::Run(state)))
 }
 
 /// The process exit code for `ending`; `None` for a run state that does not end a client (it keeps waiting).
