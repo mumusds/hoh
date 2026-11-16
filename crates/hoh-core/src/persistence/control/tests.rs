@@ -279,6 +279,96 @@ async fn test_043_05_a_cancel_stays_cancelling_while_the_group_lives_after_sigki
     Ok(())
 }
 
+/// [`Fake`]'s processes, whose SIGTERM leaves part of the attempt's cgroup to the SIGKILL step (CGW-50).
+struct Unwalked(Fake);
+
+/// A control whose every SIGTERM may have missed some of the attempt's processes.
+struct Partial(Box<dyn ProcessControl + Send>);
+
+impl ProcessControl for Partial {
+    fn look(&mut self) -> Look {
+        self.0.look()
+    }
+    fn send(&mut self, signal: Signal) -> bool {
+        self.0.send(signal)
+    }
+    fn sigterm_incomplete(&mut self) -> bool {
+        true
+    }
+}
+
+impl Processes for Unwalked {
+    fn control(&self, attempt: &AttemptRow) -> Option<(Box<dyn ProcessControl + Send>, bool)> {
+        self.0.control(attempt).map(|(group, native)| {
+            let partial: Box<dyn ProcessControl + Send> = Box::new(Partial(group));
+            (partial, native)
+        })
+    }
+    fn workspace(&self) -> Value {
+        self.0.workspace()
+    }
+}
+
+#[tokio::test]
+async fn a_cancels_sigterm_that_missed_part_of_the_cgroup_is_recorded_and_sigkill_follows() -> R {
+    // CGW-50 (docs/adr/ADR-021.md decision 8d): on the cancel ladder, a SIGTERM whose cgroup walk left part of the
+    // subtree (not read, or its budget spent) is recorded as a cancel.diagnostic CGROUP_SIGTERM_INCOMPLETE with the
+    // pass that sent it, once; SIGKILL follows at 15 all the same and the run is CANCELLED once the group exits.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    store.submit_command(cancel_run(1)).await?;
+    let clock = Arc::new(FakeClock(Mutex::new(Duration::ZERO)));
+    let advance = clock.clone();
+    let wait: Arc<dyn Fn(Duration) + Send + Sync> = Arc::new(move |d| {
+        if let Ok(mut at) = advance.0.lock() {
+            *at += d;
+        }
+    });
+    let state = Arc::new(Mutex::new((None, Vec::new())));
+    let processes: Arc<dyn Processes> = Arc::new(Unwalked(Fake {
+        clock: clock.clone(),
+        state: state.clone(),
+    }));
+    let canceller = Canceller::new(GRACES, Duration::from_secs(1));
+    let mut steps = 0;
+    while canceller
+        .step(&store, "R", processes.clone(), clock.clone(), wait.clone())
+        .await?
+        != Finished::Cancelled
+    {
+        steps += 1;
+        if steps > 20 {
+            return Err("never ended".into());
+        }
+    }
+    let killed = state.lock().map(|s| s.0).unwrap_or(None);
+    assert_eq!(killed, Some(15), "SIGKILL at 15");
+    let kinds: Vec<(String, Option<String>)> = {
+        let conn = Connection::open(&path)?;
+        let mut statement = conn.prepare(
+            "SELECT kind, json_extract(payload_json, '$.code') FROM events WHERE (kind IN ('cancel.sigterm', \
+             'cancel.diagnostic', 'run.cancelled') OR (kind = 'cancel.sigkill' AND seq = (SELECT min(seq) FROM events \
+             WHERE kind = 'cancel.sigkill'))) AND json_extract(payload_json, '$.code') IS NOT 'UNKNOWN_EFFECT' \
+             ORDER BY seq",
+        )?;
+        statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let kind = |k: &str, code: Option<&str>| (k.to_owned(), code.map(str::to_owned));
+    assert_eq!(
+        kinds,
+        [
+            kind("cancel.sigterm", None),
+            kind("cancel.sigkill", None),
+            kind("cancel.diagnostic", Some("CGROUP_SIGTERM_INCOMPLETE")),
+            kind("run.cancelled", None),
+        ]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_cancel_is_not_finished_while_an_attempt_still_runs_however_it_is_asked() -> R {
     // The final transaction runs only once nothing runs (docs/adr/ADR-021.md decision 8f): a FinishCancel that
@@ -1028,6 +1118,7 @@ async fn a_cancels_pass_that_ends_an_attempt_names_the_effects_it_left_unknown()
         .cancel_pass(super::CancelPass {
             attempt_id: "A1".to_owned(),
             sent: Vec::new(),
+            term_incomplete: false,
             end: crate::cancel::PassEnd::Empty,
             at,
             workspace: None,
@@ -1103,6 +1194,7 @@ async fn a_cancelled_writer_lets_its_lease_go_with_its_workspace_record_which_th
         .cancel_pass(super::CancelPass {
             attempt_id: "A1".to_owned(),
             sent: Vec::new(),
+            term_incomplete: false,
             end: crate::cancel::PassEnd::Empty,
             at: parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?,
             workspace: None,
