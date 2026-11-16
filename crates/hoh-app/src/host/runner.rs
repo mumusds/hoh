@@ -809,8 +809,9 @@ async fn tick(
     // Run directories and request directories no live attempt uses, whichever path ended theirs (a cancel's included,
     // M2T16R-54): removed, off the async threads.
     remove_unused(common).await?;
-    for run in &waiting.runs {
-        // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7).
+    for run in &waiting.paced {
+        // The run as a whole first: woken when a retry is due, parked, blocked or stopped (ADR-020 decisions 4, 5, 7);
+        // in the Commander's stages, its budget only (docs/adr/ADR-031.md correction C).
         if held.contains(run) || unless_held(store.pace_run(run, at()).await, &mut held)?.is_none()
         {
             continue;
@@ -966,6 +967,19 @@ async fn tick(
                 task: Some(task),
             },
         );
+    }
+    // The stall detector last (docs/adr/ADR-031.md design correction C): each supervised run in a working state (as its
+    // own transaction finds it, the pace may have put it back in one) looked at once, after the pace, the rounds, the
+    // verification, the supervisor, the allocation, the stops and the dispatches of this tick, each in a writer job of
+    // its own.
+    for run in &waiting.stall {
+        if held.contains(run) {
+            continue;
+        }
+        unless_held(
+            store.detect_stall(run, pending.clone(), at()).await,
+            &mut held,
+        )?;
     }
     Ok(())
 }

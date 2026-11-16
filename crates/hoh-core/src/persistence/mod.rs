@@ -42,6 +42,7 @@ mod runner;
 mod series;
 mod snapshot;
 mod staffing;
+mod stall;
 mod suites;
 mod supervise;
 mod team;
@@ -74,6 +75,7 @@ pub use staffing::{
     BINDING_BLOCKED, BINDING_EXCLUDED, BINDING_FALLBACK, BINDING_UNBLOCKED, CHANGE_PENDING,
     CHANGE_WITHDRAWN, EXCLUSION_SKIPPED, Evidence, StaffChange, StaffWrite, TASK_UNBLOCKED,
 };
+pub use stall::Detected;
 pub use suites::{
     ABANDONED, Admission, DISCARDED, Publication, Published, SUITE_COMPLETED, SUITE_DEFERRED,
     SUITE_ENDED, SUITE_OPENED, SUITE_STARTED, SuiteSubject, TIMED_OUT, UNPUBLISHED, WITHDRAWN,
@@ -466,6 +468,32 @@ impl std::fmt::Display for PersistError {
 }
 
 impl std::error::Error for PersistError {}
+
+/// The candidates whose last recovery failed and none succeeded since, not judged unrecoverable
+/// ([`Reader::unrecovered_candidates`]), on any connection.
+pub(crate) fn unrecovered_candidates(
+    conn: &Connection,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = conn
+            .prepare(&format!(
+                "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
+                 WHERE f.kind = 'candidate.reconcile_failed' \
+                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
+                   AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
+                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
+                   AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
+                   AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
+                hold::of_run(
+                    "s",
+                    "(SELECT run_id FROM candidates WHERE candidate_id = json_extract(f.payload_json, '$.candidate_id'))"
+                )
+            ))
+            .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map([], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
 
 /// Map a SQLite error: constraint failures are integrity violations, lock timeouts are busy.
 fn sqlite_error(e: rusqlite::Error) -> PersistError {
@@ -1214,6 +1242,31 @@ impl Store {
             error.to_owned(),
         ))
         .await
+    }
+
+    /// Look once at run `run_id` for a stall at `context.now()` (docs/adr/ADR-031.md design correction C), in a writer
+    /// transaction of its own, at the end of a runner tick; `pending` holds the candidates with check records still to
+    /// be recorded (the tick's).
+    pub async fn detect_stall(
+        &self,
+        run_id: &str,
+        pending: std::collections::BTreeSet<String>,
+        context: crate::decision::Context,
+    ) -> Result<Detected, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::Stall {
+                run_id: run_id.to_owned(),
+                pending,
+                context: Box::new(context),
+            })
+            .await?
+        {
+            runner::RunnerDone::Stall(detected) => Ok(detected),
+            _ => Err(PersistError::IntegrityViolation(
+                "a stall detection answered with something else".to_owned(),
+            )),
+        }
     }
 
     /// Withdraw supervision turn `attempt_id` while it is PREPARED (docs/adr/ADR-025.md decision 3); whether it was.
@@ -1979,26 +2032,7 @@ impl Reader {
     pub fn unrecovered_candidates(
         &self,
     ) -> Result<std::collections::BTreeSet<String>, PersistError> {
-        let mut statement = self
-            .conn
-            .prepare(&format!(
-                "SELECT DISTINCT json_extract(f.payload_json, '$.candidate_id') FROM events f \
-                 WHERE f.kind = 'candidate.reconcile_failed' \
-                 AND f.seq > coalesce((SELECT max(r.seq) FROM events r WHERE r.kind = 'candidate.reconcile_recovered' \
-                   AND json_extract(r.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id')), 0) \
-                 AND NOT EXISTS(SELECT 1 FROM events s WHERE s.kind = 'candidate.stale' AND {} \
-                   AND json_extract(s.payload_json, '$.reason') = 'evidence_unrecoverable' \
-                   AND json_extract(s.payload_json, '$.candidate_id') = json_extract(f.payload_json, '$.candidate_id'))",
-                hold::of_run(
-                    "s",
-                    "(SELECT run_id FROM candidates WHERE candidate_id = json_extract(f.payload_json, '$.candidate_id'))"
-                )
-            ))
-            .map_err(sqlite_error)?;
-        let rows = statement
-            .query_map([], |r| r.get(0))
-            .map_err(sqlite_error)?;
-        rows.collect::<Result<_, _>>().map_err(sqlite_error)
+        unrecovered_candidates(&self.conn)
     }
 
     /// Whether candidate `candidate_id`'s records are recovered at the host's start (docs/adr/ADR-028.md decision 16):

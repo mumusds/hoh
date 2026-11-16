@@ -2732,6 +2732,9 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
     outcome
 }
 
+/// How the Commander's role contract starts: its turns' first input (resources/prompts/commander.md).
+const COMMANDER_CONTRACT: &str = "# HoH 整体负责人";
+
 #[tokio::test]
 async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
     // REQ-019 b2, b4 (docs/adr/ADR-024.md decisions 1 and 4, M2T17R-03): the developer changes from claude to codex in
@@ -2785,6 +2788,9 @@ async fn a_new_developers_first_turn_starts_from_its_handover_package() -> R {
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .filter(|m| m["method"] == "turn/start")
             .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
+            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
+            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
             .collect();
         assert_eq!(sent.len(), 1, "{sent:?}");
         let text = &sent[0];
@@ -2870,6 +2876,9 @@ async fn a_new_holders_first_turn_without_its_kept_input_fails_first_input_unava
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .filter(|m| m["method"] == "turn/start")
             .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
+            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
+            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
             .collect();
         assert_eq!(sent.len(), 1, "only the third attempt's turn was sent: {sent:?}");
         assert!(sent[0].contains("```json"), "the retry's turn has no package: {}", sent[0]);
@@ -2991,6 +3000,9 @@ async fn a_first_turn_cut_short_after_the_agent_gave_its_session_id_leaves_the_p
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .filter(|m| m["method"] == "turn/start")
             .filter_map(|m| m["params"]["input"][0]["text"].as_str().map(str::to_owned))
+            // The Commander's turns are codex's too in this world: the stall detector wakes it on the run, in a working
+            // state with nothing to do (docs/adr/ADR-031.md correction C); only the developer's turns are counted.
+            .filter(|text| !text.starts_with(COMMANDER_CONTRACT))
             .collect();
         assert_eq!(sent.len(), 1, "only the retry's turn was sent: {sent:?}");
         assert!(sent[0].contains("```json"), "the first turn codex got has no package: {}", sent[0]);

@@ -474,6 +474,10 @@ impl Job {
             Job::Reconcile(..) => "Reconcile",
             // A run's pace is a write of its own kind (fault hooks tell it from an attempt's runner writes).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Pace { .. }) => "Pace",
+            // The stall detector's look (docs/adr/ADR-031.md design correction C).
+            Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Stall { .. }) => {
+                "Stall"
+            }
             // A run's team checkpoint is the run's, not an attempt's write (docs/adr/ADR-022.md decision 8).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Checkpoint(..)) => {
                 "Checkpoint"

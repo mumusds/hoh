@@ -201,6 +201,51 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
+    wakes_of(tx, run_id, rows)
+}
+
+/// Whether wake `wake_id` of run `run_id` is settled for good (docs/adr/ADR-031.md correction C's precondition,
+/// M2T13D-402): its last turn SETTLED or the wake superseded, and none of its turns' outputs still to dispose of. Read
+/// by its identity from the run's whole history — never limited by the horizon, which can pass a settled wake.
+pub(super) fn settled_by_id(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    wake_id: &str,
+) -> Result<bool, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT seq, kind, payload_json FROM events WHERE run_id = ?1 AND kind IN (?2, ?3, ?4, ?5, ?6) \
+             AND (json_extract(payload_json, '$.wake') = ?7 OR json_extract(payload_json, '$.trigger_id') = ?7 \
+               OR json_extract(payload_json, '$.target_wake') = ?7) ORDER BY seq",
+        )
+        .map_err(sqlite_error)?;
+    let rows: Vec<(i64, String, String)> = statement
+        .query_map(
+            params![
+                run_id, WOKEN, ALLOCATED, REARMED, SUPERSEDED, PREEMPT, wake_id
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?;
+    let Some(wake) = wakes_of(tx, run_id, rows)?
+        .into_iter()
+        .find(|w| w.id == wake_id)
+    else {
+        return Ok(false);
+    };
+    let waiting = super::outputs::pending_attempts(tx, run_id)?;
+    Ok((wake.settled() || wake.superseded)
+        && !wake.turns.iter().any(|t| waiting.contains(&t.attempt_id)))
+}
+
+/// The wakes run `run_id`'s supervisor events `rows` (seq, kind, payload) make, their turns' attempts read.
+fn wakes_of(
+    tx: &Connection,
+    run_id: &str,
+    rows: Vec<(i64, String, String)>,
+) -> Result<Vec<Wake>, PersistError> {
     let mut wakes: Vec<Wake> = Vec::new();
     // Each wake's place by its id: linear in the run's supervisor events (v14, M2T08R-101).
     let mut index: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
