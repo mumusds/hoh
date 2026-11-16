@@ -4098,6 +4098,24 @@ fn attempt_events(project: &Path, attempt_id: &str, kind: &str) -> R<Vec<Value>>
     Ok(serde_json::from_str(&rows)?)
 }
 
+/// The attempts of the Commander's turns allocated to the wake of run `run_id`'s adoption of its specification
+/// (docs/adr/ADR-031.md decision 1): the wake the `supervisor.woken` of the trigger whose first event is the run's
+/// `spec.changed{cause: adopted}` names.
+fn adoption_wake_attempts(project: &Path, run_id: &str) -> R<Vec<String>> {
+    let rows = query(
+        project,
+        &format!(
+            "SELECT json_group_array(json_extract(a.payload_json, '$.attempt_id')) FROM events a \
+             WHERE a.kind = 'supervisor.allocated' AND a.run_id = '{run_id}' \
+             AND json_extract(a.payload_json, '$.wake') = (SELECT json_extract(w.payload_json, '$.wake') \
+             FROM events w JOIN supervisor_triggers t ON json_extract(w.payload_json, '$.trigger_id') = t.trigger_id \
+             JOIN events s ON s.seq = t.first_seq WHERE w.kind = 'supervisor.woken' AND t.run_id = '{run_id}' \
+             AND s.kind = 'spec.changed' AND json_extract(s.payload_json, '$.cause') = 'adopted')"
+        ),
+    )?;
+    Ok(serde_json::from_str(&rows)?)
+}
+
 /// The lines of `codex.d/calls` (`<name> <marker> <argv>`) whose marker names `attempt_id`.
 fn codex_calls(world: &World, attempt_id: &str) -> Vec<String> {
     std::fs::read_to_string(world.bin().join("codex.d/calls"))
@@ -5935,7 +5953,14 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
             manifest_before
         );
         // B ran no turn: only the looks' and the suite's commands (`--version`, a `--help`, the App Server's schema, the
-        // login check), with no attempt's marker.
+        // login check), with no attempt's marker. One process of B's may have one, and only with the product's
+        // guarantee for it (docs/adr/ADR-031.md 实施记录's adoption-wake rule): the Commander's turn the run's adoption
+        // of its specification wakes is a new codex attempt too, and its gate may verify A just before the rename
+        // while bash then opens the script by its path, B's — ADR-030 decision 9's R2, which the owner accepted
+        // (2026-11-13) together with the re-check before the first input. So that process must be the adoption wake's
+        // Commander attempt's, sent `initialize` and nothing else (no `initialized`, `thread/start` or `turn/start`),
+        // and the attempt must end FAILED COMPAT_UNVERIFIED with one adapter.diagnostic
+        // {IMPLEMENTATION_CHANGED_BEFORE_INPUT}. Every other B call with a marker is a turn of B's.
         let b_calls = || -> R<Vec<String>> {
             Ok(std::fs::read_to_string(world.bin().join("codex.d/calls"))?
                 .lines()
@@ -5943,8 +5968,22 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
                 .map(str::to_owned)
                 .collect())
         };
+        let adoption = adoption_wake_attempts(&project, &run_id)?;
+        let mut adoption_b: Vec<String> = Vec::new();
         for call in b_calls()? {
-            let args = call.strip_prefix("B  ").ok_or_else(|| format!("a turn of B's: {call}"))?;
+            let Some(args) = call.strip_prefix("B  ") else {
+                let attempt = call
+                    .split(' ')
+                    .nth(1)
+                    .and_then(|marker| marker.split_once('/'))
+                    .map(|(_, attempt)| attempt.to_owned())
+                    .unwrap_or_default();
+                if !adoption.contains(&attempt) || !adoption_b.is_empty() {
+                    return Err(format!("a turn of B's: {call} (adoption wake: {adoption:?})").into());
+                }
+                adoption_b.push(attempt);
+                continue;
+            };
             assert!(
                 args == "--version"
                     || args == "login status"
@@ -5952,6 +5991,20 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
                     || args.starts_with("app-server generate-json-schema"),
                 "{call}"
             );
+        }
+        for attempt in &adoption_b {
+            until(&project, &ended(attempt), "FAILED/COMPAT_UNVERIFIED", limit).await?;
+            let sent: Vec<Value> = received_by_attempt(&world.bin().join("codex.d"))?
+                .into_iter()
+                .filter(|(of, _)| of == attempt)
+                .map(|(_, message)| message["method"].clone())
+                .collect();
+            assert_eq!(sent, [json!("initialize")], "{attempt}");
+            let changed: Vec<Value> = attempt_events(&project, attempt, "adapter.diagnostic")?
+                .into_iter()
+                .filter(|d| d["reason"] == "IMPLEMENTATION_CHANGED_BEFORE_INPUT")
+                .collect();
+            assert_eq!(changed.len(), 1, "{attempt}: {changed:?}");
         }
         // T1 released: it SETTLED as A, having recorded B's arrival once.
         std::fs::write(world.bin().join("codex.d/release"), "")?;
