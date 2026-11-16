@@ -2241,6 +2241,64 @@ async fn each_attempt_records_how_its_processes_are_tracked_and_why_it_is_degrad
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_runs_status_lists_each_attempt_whose_tracking_is_degraded_and_why() -> R {
+    // M2T06R-560 (decision 8d, REQ-043 decision 3): an attempt tracked by the degraded /proc scan is shown in its run's
+    // status, not only in its event: getRun's projection lists it with why (outside a delegated cgroup here).
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 60")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "proc");
+    let (status, run) = get(&host, "/v1/runs/R").await?;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(
+        run["projection"]["degraded_tracking"],
+        json!([{"attempt_id": "T1/attempt-1", "reason": "the host has no delegated cgroup"}]),
+        "{run}"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_the_runs_status_lists_no_attempt_its_cgroup_tracks() -> R {
+    in_delegated_scope("cgroup_status_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_the_runs_status_lists_no_attempt_its_cgroup_tracks"]
+async fn cgroup_status_inside() -> R {
+    // M2T06R-560: an attempt tracked by its cgroup is not degraded, and its run's status lists none.
+    if std::env::var_os(IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let agents = Arc::new(Agents::new(&[("T1", "sleep 60")]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host(dir.path(), &agents).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(tracking(&project)?.0, "cgroup");
+    let (status, run) = get(&host, "/v1/runs/R").await?;
+    assert_eq!(status, 200, "{run}");
+    assert_eq!(run["projection"]["degraded_tracking"], json!([]), "{run}");
+    host.shutdown().await;
+    Ok(())
+}
+
 /// This process's own cgroup directory (the delegated scope's, inside one).
 fn own_cgroup() -> R<PathBuf> {
     let text = std::fs::read_to_string("/proc/self/cgroup")?;

@@ -356,6 +356,7 @@ pub fn attach(project: &Path, host: HostInfo, run: &Value) -> u8 {
     app.list(&runs);
     let link = conn.link(&run_id);
     app.attach(&run_id, &label);
+    app.tracking(&run["projection"]["degraded_tracking"]);
     run_with(app, &signal, &resized, &conn, Some(link))
 }
 
@@ -507,6 +508,7 @@ fn take_events(app: &mut App, link: &Link) -> bool {
             if let Some(label) = run["projection"]["label"].as_str() {
                 app.relabel(label);
             }
+            app.tracking(&run["projection"]["degraded_tracking"]);
         }
     }
     any
@@ -602,6 +604,7 @@ fn attach_to(
         .to_owned();
     *link = Some(conn.link(run_id));
     app.attach(run_id, &label);
+    app.tracking(&run["projection"]["degraded_tracking"]);
     if let Ok(runs) = conn.runs() {
         app.list(&runs);
     }

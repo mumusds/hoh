@@ -101,8 +101,8 @@ pub use attempts::{
     AttemptFacts, AttemptMove, AttemptRow, CancelLatch, CancelReceipt, NewAttempt, Session,
 };
 pub use commands::{
-    AcceptedCandidate, CommandOutcome, EventRow, HostStart, Input, ListedRun, RunProjection,
-    RunRow, RunTarget, RunsPage, SubmitCommand,
+    AcceptedCandidate, CommandOutcome, DegradedTracking, EventRow, HostStart, Input, ListedRun,
+    RunProjection, RunRow, RunTarget, RunsPage, SubmitCommand,
 };
 pub use decide::{Decided, Fenced};
 pub use inputs::{InputMove, InputRow, NewInput};

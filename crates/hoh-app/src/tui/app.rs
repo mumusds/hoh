@@ -135,13 +135,15 @@ const RUN_CHOICES: &[(&str, Exit)] = &[
     ("取消任务", Exit::Cancel),
 ];
 
-/// The run a client is attached to, with how many of its events it received and the latest one's seq.
+/// The run a client is attached to, with how many of its events it received and the latest one's seq, and its attempts
+/// tracked by the degraded /proc scan (docs/adr/ADR-021.md decision 8d, M2T06R-560).
 #[derive(Debug)]
 struct Attached {
     run_id: String,
     label: String,
     events: u64,
     last: i64,
+    degraded: std::collections::BTreeSet<String>,
 }
 
 /// The built-in default mode (REQ-001; docs/adr/ADR-022.md decision 6).
@@ -226,6 +228,7 @@ impl App {
             label: label.to_owned(),
             events: 0,
             last: 0,
+            degraded: std::collections::BTreeSet::new(),
         });
         self.messages.clear();
         self.picker = None;
@@ -299,7 +302,18 @@ impl App {
         run.last = seq;
         run.events += 1;
         let kind = event["kind"].as_str().unwrap_or_default();
-        self.messages.push(format!("#{seq} {kind}"));
+        let payload = &event["payload"];
+        match payload["attempt_id"].as_str() {
+            // An attempt tracked by the degraded /proc scan: said with which and why, and counted on the status bar.
+            Some(attempt) if kind == "attempt.tracking" && payload["tracking"] == "proc" => {
+                run.degraded.insert(attempt.to_owned());
+                self.messages.push(format!(
+                    "#{seq} {kind}：{attempt} 的进程跟踪降级为 proc（{}）",
+                    payload["reason"].as_str().unwrap_or("原因未记录")
+                ));
+            }
+            _ => self.messages.push(format!("#{seq} {kind}")),
+        }
         if kind != "run.result"
             && let Some(command) = event["payload"]["command_id"].as_str()
             && let Some(at) = self.awaiting.iter().position(|c| c == command)
@@ -312,6 +326,20 @@ impl App {
                 });
         }
         kind.starts_with("run.")
+    }
+
+    /// The attached run's attempts tracked by the degraded /proc scan, as getRun's `projection.degraded_tracking`
+    /// lists them (with those its events said since).
+    pub fn tracking(&mut self, degraded: &Value) {
+        if let Some(run) = self.run.as_mut() {
+            run.degraded.extend(
+                degraded
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|d| d["attempt_id"].as_str().map(str::to_owned)),
+            );
+        }
     }
 
     /// The attached run's label changed.
@@ -619,8 +647,15 @@ impl App {
                     if picker.leaves { "脱离" } else { "返回" }
                 ),
                 (None, Some(run)) => format!(
-                    " {} │ 事件 {} · #{} │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
-                    self.mode, run.events, run.last
+                    " {} │ 事件 {} · #{}{} │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
+                    self.mode,
+                    run.events,
+                    run.last,
+                    if run.degraded.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · 跟踪降级 {}", run.degraded.len())
+                    }
                 ),
                 (None, None) => format!(
                     " {} │ host 已连接 │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
