@@ -1379,3 +1379,16 @@ fn an_event_the_link_cannot_read_is_said_with_its_id_and_nothing_after_it_is_fol
     drop(link);
     Ok(())
 }
+
+#[test]
+fn the_status_bar_says_that_enter_sends() {
+    // Decision 13: Enter sends (StartRun unattached, SendInput attached), so the hint says so, not that it only records.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    for state in ["unattached", "attached"] {
+        let bar = status(&app, 10);
+        assert!(bar.contains("Enter 发送"), "{state}: {bar:?}");
+        assert!(!bar.contains("Enter 记录"), "{state}: {bar:?}");
+        app.attach("R", "RUNNING");
+    }
+}
