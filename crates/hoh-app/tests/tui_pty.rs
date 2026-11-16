@@ -11,9 +11,9 @@
 //!
 //! In every case the alternate screen is entered and left, and the terminal attributes are those of before.
 //!
-//! TEST-001-01 and TEST-001-02 (M2-T13, docs/adr/ADR-031.md decisions 13 and 14) run `hoh` in the M2-T13 test world
-//! (`world`) against an in-process host whose runner is the world's scripted Team, and read the screen as a vt100
-//! snapshot.
+//! TEST-001-01, TEST-001-02 and TEST-005-01 (M2-T13, docs/adr/ADR-031.md decisions 12 to 14) run `hoh` in the M2-T13
+//! test world (`world`) and read the screen as a vt100 snapshot: the first two against an in-process host whose runner
+//! is the world's scripted Team, TEST-005-01 against the host its own detach starts, with the world's fake CLIs.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -1314,5 +1314,181 @@ fn test_001_02_enter_starts_one_run_and_a_detach_sends_nothing_more() -> R {
     runtime.block_on(host.shutdown());
     outcome?;
     assert!(team.refused().is_empty(), "{team:?}");
+    Ok(())
+}
+
+/// The developer attempts of `run` per task (task id, rows) and the fake Developer's starts so far.
+fn work_done(world: &world::World, run: &str) -> R<(Vec<serde_json::Value>, usize)> {
+    Ok((
+        world.rows(&format!(
+            "SELECT t.task_id, count(*) AS attempts FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.run_id = '{run}' GROUP BY t.task_id ORDER BY t.task_id"
+        ))?,
+        world.log("calls.jsonl")?.len(),
+    ))
+}
+
+#[test]
+fn test_005_01_a_detached_run_survives_the_hangup_and_attach_sees_what_happened() -> R {
+    // AC-005-01: a committed Git project with its specification, no host, HOME and XDG_RUNTIME_DIR of its own; the fake
+    // CLIs on its PATH: the pinned Commander (codex) plans a developer task and moves the run to RUNNING, the Developer
+    // (claude) works 20 s per attempt and logs each start, QA reports FAIL each round so the work comes back (a budget
+    // of 20 iterations). bash in a PTY runs `hoh -p '完成fixture目标' --detach --output json`; the terminal is then hung
+    // up (SIGHUP to its foreground process group, its master closed); 60 s later a new PTY attaches the run while one
+    // of its developer attempts is in flight, and detaches within it.
+    let world = world::World::new()?;
+    world.configure(&world::TEAM, "[budget]\nmax_iterations = 20\n")?;
+    world.commit_project(&world::fixture_spec())?;
+    world.developer(&world::Developer {
+        seconds: 20.0,
+        ..world::Developer::default()
+    })?;
+    world.verifier(
+        "qa",
+        &world::Verifier {
+            report: "FAIL".to_owned(),
+            checks: vec![world::fixture_spec()[0].criteria[0].check_id()],
+            ..world::Verifier::default()
+        },
+    )?;
+    world.register()?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(world.init_store())?;
+    world.seed_spec()?;
+    assert!(world.hosts()?.is_empty(), "a host before the detach");
+    // bash in a PTY runs the detach between two markers its own arithmetic makes (so its echo of the line is neither).
+    let mut pty = Pty::new(30, 120)?;
+    let mut shell = world.spawn_pty(
+        &pty,
+        std::ffi::OsStr::new("bash"),
+        &["--noprofile", "--norc"],
+        true,
+    )?;
+    let shell_pid = shell.0.id();
+    let (shell_sid, _) = world::session_and_tty(shell_pid)?;
+    let from = pty.output().len();
+    pty.send(
+        "echo \"B$((6*7))X\"; s=$EPOCHREALTIME; hoh -p '完成fixture目标' --detach --output json; \
+         echo \"E$((6*7))X $? $s $EPOCHREALTIME\"\n"
+            .as_bytes(),
+    )?;
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    let (shown, ended) = loop {
+        let out = String::from_utf8_lossy(&pty.output()[from..]).into_owned();
+        if let Some(at) = out.find("E42X ")
+            && let Some(len) = out[at..].find("\r\n")
+        {
+            break (out.clone(), out[at + 5..at + len].to_owned());
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("the detach did not end: {out:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let start = shown.find("B42X\r\n").ok_or("no start marker")? + "B42X\r\n".len();
+    let stdout = &shown[start..shown.find("E42X ").ok_or("no end marker")?];
+    let fields: Vec<&str> = ended.split(' ').collect();
+    let (code, began, finished): (i32, f64, f64) =
+        (fields[0].parse()?, fields[1].parse()?, fields[2].parse()?);
+    // Exit 0 within 10 s; stdout exactly one JSON object with run_id, command_id, revision and status ACCEPTED.
+    assert_eq!(code, 0, "{stdout:?}");
+    assert!(finished - began <= 10.0, "{} s", finished - began);
+    let accepted: serde_json::Value = serde_json::from_str(stdout.trim())?;
+    assert!(accepted.is_object(), "{stdout:?}");
+    for key in ["run_id", "command_id", "revision"] {
+        assert!(accepted.get(key).is_some(), "{key}: {accepted}");
+    }
+    assert_eq!(accepted["status"], "ACCEPTED", "{accepted}");
+    let run = accepted["run_id"].as_str().ok_or("no run_id")?.to_owned();
+    // The host it started: its pid, session and terminal, and the events' latest seq S0.
+    let info: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(world.project().join(".hoh/host.json"))?)?;
+    let host = u32::try_from(info["pid"].as_u64().ok_or("no host pid")?)?;
+    let host_start = hoh_agents::identity::start_id(host)?.ok_or("the host is gone")?;
+    let s0: i64 = world.query("SELECT max(seq) FROM events")?.parse()?;
+    // SIGHUP to the terminal's foreground process group, then its master closed.
+    let foreground = i32::try_from(pty.foreground()?)?;
+    rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(foreground).ok_or("no group")?,
+        Signal::HUP,
+    )?;
+    pty.hang_up()?;
+    let _ = exit_within(&mut shell, WAIT);
+    std::thread::sleep(Duration::from_secs(60));
+    // The host lives on: no terminal (`ps` shows `?`), a session not the shell's; the run went on (seq past S0).
+    assert!(
+        !hoh_agents::identity::ended(host, Some(&host_start))?,
+        "the host is gone"
+    );
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "tty=", "-p", &host.to_string()])
+        .output()?;
+    assert_eq!(String::from_utf8(ps.stdout)?.trim(), "?");
+    let (host_sid, _) = world::session_and_tty(host)?;
+    assert_ne!(host_sid, shell_sid);
+    let latest: i64 = world.query("SELECT max(seq) FROM events")?.parse()?;
+    assert!(latest > s0, "{latest} <= {s0}");
+    // A developer attempt that has just started: attach and detach within its 20 s.
+    let (_, calls) = work_done(&world, &run)?;
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while work_done(&world, &run)?.1 == calls {
+        if std::time::Instant::now() > end {
+            return Err("no developer attempt started within 60 s".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let working = world.query(&format!(
+        "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = '{run}' \
+         AND t.role = 'developer' AND a.state = 'RUNNING'"
+    ))?;
+    assert!(!working.is_empty(), "no developer attempt in flight");
+    let before = work_done(&world, &run)?;
+    let watermark: i64 = world
+        .query(&format!(
+            "SELECT max(seq) FROM events WHERE run_id = '{run}'"
+        ))?
+        .parse()?;
+    let (rows, cols) = (30, 120);
+    let apty = Pty::new(rows, cols)?;
+    let mut attach = world.hoh_pty(&apty, &["attach", &run])?;
+    // Its status bar: `事件 N · #S`, S at least the run's latest seq at the attach.
+    let counted = |s: &str| -> Option<(i64, i64)> {
+        let status = s.lines().last()?;
+        let rest = status.split("事件 ").nth(1)?;
+        let (n, rest) = rest.split_once(" · #")?;
+        let s = rest.split(' ').next()?;
+        Some((n.parse().ok()?, s.parse().ok()?))
+    };
+    let screen = pty::screen_until(&apty, rows, cols, Duration::from_secs(15), |s| {
+        counted(s).is_some_and(|(_, seq)| seq >= watermark)
+    })?;
+    let (n, s) = counted(&screen).ok_or("no count")?;
+    let stored: i64 = world
+        .query(&format!(
+            "SELECT count(*) FROM events WHERE run_id = '{run}' AND seq <= {s}"
+        ))?
+        .parse()?;
+    assert_eq!(n, stored, "{screen}");
+    assert!(
+        s >= watermark && watermark > s0,
+        "S {s}, watermark {watermark}, S0 {s0}"
+    );
+    // Detach: Ctrl+C, 脱离.
+    let mut apty = apty;
+    apty.send(b"\x03")?;
+    pty::screen_until(&apty, rows, cols, WAIT, |s| s.contains("> 脱离"))?;
+    apty.send(b"\r")?;
+    assert_eq!(exit_within(&mut attach, WAIT)?.code(), Some(0));
+    // All within the same attempt, still in flight: no attempt row and no Developer start more or fewer.
+    assert_eq!(
+        world.query(&format!(
+            "SELECT state FROM attempts WHERE attempt_id = '{working}'"
+        ))?,
+        "RUNNING",
+        "the attempt ended during the attach"
+    );
+    assert_eq!(work_done(&world, &run)?, before);
     Ok(())
 }

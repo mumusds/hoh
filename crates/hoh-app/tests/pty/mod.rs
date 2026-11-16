@@ -200,6 +200,15 @@ impl Pty {
         Ok(buf[..n].to_vec())
     }
 
+    /// The terminal's foreground process group, asked of its master (on the slave, tcgetpgrp(3) answers only the
+    /// processes whose controlling terminal it is).
+    pub fn foreground(&self) -> R<u32> {
+        let master = self.master.as_ref().ok_or("the terminal was hung up")?;
+        Ok(u32::try_from(
+            rustix::termios::tcgetpgrp(master)?.as_raw_pid(),
+        )?)
+    }
+
     /// Resize the terminal as its window would be: the kernel then sends SIGWINCH to its foreground process group.
     pub fn resize(&self, rows: u16, cols: u16) -> R {
         let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
