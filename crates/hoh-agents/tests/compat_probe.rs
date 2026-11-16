@@ -1939,13 +1939,15 @@ fn output_held_open_past_the_limit_by_an_escaped_helper_times_out() -> R {
     let pidfile = tmp.path().join("helper.pid");
     let exited = tmp.path().join("launcher.exited");
     // The launcher exits only once the helper is in a session of its own, else the group kill could take it too; the
-    // marker shows the launcher did exit, so the timeout below is the reads', not the wait for the launcher.
+    // marker shows the launcher did exit, so the timeout below is the reads', not the wait for the launcher. The helper
+    // writes its own stat line (a builtin read, while it surely runs), so the test can tell it from a process given its
+    // number later (ADR-022 decision 10).
     let (dir, path) = fake(
         tmp.path(),
         "escape",
         "codex",
         &format!(
-            "#!/bin/sh\nsetsid sh -c 'echo $$ > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; sleep 1; exec >&-; sleep 1.5; echo late >&2' &\n\
+            "#!/bin/sh\nsetsid sh -c 'read -r s < /proc/$$/stat; printf \"%s\\n\" \"$s\" > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; sleep 1; exec >&-; sleep 1.5; echo late >&2' &\n\
              while [ ! -s '{pid}' ]; do sleep 0.01; done\n: > '{exited}'\nexit 0\n",
             pid = pidfile.display(),
             exited = exited.display()
@@ -1958,10 +1960,9 @@ fn output_held_open_past_the_limit_by_an_escaped_helper_times_out() -> R {
     let started = std::time::Instant::now();
     let held = run_status(&path, &["login", "status"], &env);
     let took = started.elapsed();
-    if let Ok(pid) = std::fs::read_to_string(&pidfile) {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", pid.trim())])
-            .status();
+    // Its group, only while the helper that wrote this is still the process of that number.
+    if let Ok(stat) = std::fs::read(&pidfile) {
+        kill_group_of(&stat)?;
     }
     assert!(
         matches!(
@@ -1978,6 +1979,26 @@ fn output_held_open_past_the_limit_by_an_escaped_helper_times_out() -> R {
     let runs = log.lock().map_err(|_| "poisoned")?.clone();
     assert_eq!(runs.len(), 1);
     assert_eq!((runs[0].exit_code, runs[0].timed_out), (None, true));
+    Ok(())
+}
+
+/// SIGKILL to the group led by the process whose own stat line `stat` is, written by it while it ran, and only while
+/// that process still has its number (ADR-022 decision 10: identity::find holds it by a pidfd and checks its start
+/// time, Found::kill signals the group only right after a look that shows it held). One gone gets nothing.
+fn kill_group_of(stat: &[u8]) -> R {
+    let text = String::from_utf8_lossy(stat);
+    let pid: i64 = text
+        .split_whitespace()
+        .next()
+        .ok_or("an empty stat line")?
+        .parse()?;
+    let start = hoh_agents::identity::after_command_name(stat)
+        .and_then(|fields| fields.split_whitespace().nth(19))
+        .ok_or("the stat line has no start time")?;
+    let boot = hoh_agents::identity::boot_id()?;
+    if let Ok(found) = hoh_agents::identity::find(Some(pid), Some(&boot), Some(start))? {
+        found.kill();
+    }
     Ok(())
 }
 

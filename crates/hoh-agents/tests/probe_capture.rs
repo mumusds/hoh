@@ -28,9 +28,11 @@ fn an_escaped_helper_holding_the_output_leaves_nothing_in_the_probe()
         deadline: None,
         cancel: None,
     };
-    // The helper inherits stdout and stderr and outlives the command in a session of its own.
+    // The helper inherits stdout and stderr and outlives the command in a session of its own. It appends its own stat
+    // line (a builtin read, while it surely runs), so the test ends it and never a process given its number later
+    // (ADR-022 decision 10).
     let script = format!(
-        "setsid sh -c 'echo $$ >> {pids}; exec sleep 30' & sleep 0.05; exit 0",
+        "setsid sh -c 'read -r s < /proc/$$/stat; printf \"%s\\n\" \"$s\" >> {pids}; exec sleep 30' & sleep 0.05; exit 0",
         pids = pids.display()
     );
     let before = (count("/proc/self/fd"), count("/proc/self/task"));
@@ -39,10 +41,19 @@ fn an_escaped_helper_holding_the_output_leaves_nothing_in_the_probe()
         results.push(run_status(Path::new("/bin/sh"), &["-c", &script], &env));
     }
     let after = (count("/proc/self/fd"), count("/proc/self/task"));
-    for pid in std::fs::read_to_string(&pids).unwrap_or_default().lines() {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", pid])
-            .status();
+    for stat in std::fs::read(&pids)
+        .unwrap_or_default()
+        .split(|&b| b == b'\n')
+    {
+        let pid = String::from_utf8_lossy(stat)
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        let start = hoh_agents::identity::after_command_name(stat)
+            .and_then(|fields| fields.split_whitespace().nth(19));
+        if let (Some(pid), Some(start)) = (pid, start) {
+            let _ = hoh_agents::identity::signal_if_same(pid, start, rustix::process::Signal::KILL);
+        }
     }
     for result in &results {
         assert!(
