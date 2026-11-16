@@ -640,8 +640,8 @@ async fn a_hosts_runner_applies_a_team_change_at_the_roles_checkpoint() -> R {
     )
     .await?;
     assert_eq!(status, 202, "{body}");
-    // The run is still CREATED: a run not ended that is behind the revision is checkpointed whatever its state
-    // (M2T07R-02, -54).
+    // The run is BLOCKED on runtime:no_spec (its project has no approved specification, docs/adr/ADR-031.md decision
+    // 1), not ended: a run not ended that is behind the revision is checkpointed whatever its state (M2T07R-02, -54).
     let binding = format!(
         "SELECT agent || '/' || role_epoch || '/' || config_revision FROM role_bindings \
          WHERE run_id = '{run_id}' AND role = 'developer'"
