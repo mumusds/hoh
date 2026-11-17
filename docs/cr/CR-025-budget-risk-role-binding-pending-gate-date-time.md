@@ -81,7 +81,7 @@ ADR-025 决定 6、7 已写明这一拒绝不需要 Commander 再派：屏障解
 }
 ```
 
-这给 v0.1 与 v1 两档门禁加了同样的一项：REQ-042 的 `release_targets` 含两档，所以 `expected_ac` 都多出 AC-042-07；门禁要求 acceptance-scenarios 里有这个场景，`unit` 检查里有名字含 `test_042_07` 的测试，并且该检查的 `test-results.jsonl` 里有它的一条 PASS（release_gate.py:196-198 的规则，未改）。AC-042-07 归 M2-T19（预算持久化与停止，REQ-042 的实现任务）：`contracts/development-tasks.json`（不在锁内）中 M2-T19 的 `acceptance` 加 AC-042-07，`done_when` 写明由本 CR 的实现满足；它的检查 `unit` 的归属不变。
+这给 v0.1 与 v1 两档门禁加了同样的一项：REQ-042 的 `release_targets` 含两档，所以 `expected_ac` 都多出 AC-042-07；门禁要求 acceptance-scenarios 里有这个场景，`unit` 检查里有名字含 `test_042_07` 的测试，并且该检查的 `test-results.jsonl` 里有它的一条 PASS（release_gate.py:196-198 的规则，未改）。AC-042-07 归新的实现任务 M2-T21（见下文“不在锁内、随 CR 同步”）；已完成的 M2-T19 不改。
 
 REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在由 REQ-042 行为 9 定义，事件名 `budget.risk` 即实现已在消费的那个。
 
@@ -143,6 +143,30 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
 
 不在锁内、随视图重新生成：docs/02-functional-spec.md 与 docs/18（REQ-042 的行为 9、决定 6 与 AC-042-07）。
 
+### 不在锁内、随 CR 同步
+
+**`contracts/development-tasks.json`**
+
+- 新增实现任务 M2-T21，固定此编号。它在 `tasks` 中插在 M2-T20 之后（列表顺序即领取优先级）；M2-T20 由 CR-024 新增，CR-024 尚未批准、main 上还没有它，所以本 CR 先插在 M2-T15 之后，CR-024 之后把 M2-T20 插在 M2-T15 与 M2-T21 之间：
+
+  ```json
+  {
+   "id": "M2-T21",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "CR-025 细化：预算风险（budget.risk）的产生、交接期间的派发拒绝码 ROLE_BINDING_PENDING、门禁在无 date-time 校验时拒绝判定",
+   "depends_on": ["M2-T13", "M2-T19"],
+   "requirements": ["REQ-042", "REQ-035", "REQ-021"],
+   "acceptance": ["AC-042-07"],
+   "done_when": "AC-042-07 通过；REQ-042 行为 9 与决定 6 的其余部分（各种预算的口径、deadline_at 的墙钟与不为正的跨度、按水平判定、每个上限一条、pace 没有别的写入时也提交、WAITING_EXTERNAL 与 BLOCKED 中照写、不计入重试、经 supervise 唤醒 Commander 与提交后崩溃的恢复）由 CR-025“影响”所列的 budget.rs、pace 与唤醒测试覆盖。ROLE_BINDING_PENDING 没有自己的 AC：由 CR-025“影响”所列的单元与 decide 测试覆盖（五项各自成立、首个派发与失败后重试的正对照、交叉与优先次序、被接受与否不变、屏障解除后调度轮派发），AC-035-01（TEST-035-01）的缺能力一例仍为 ROLE_CAPABILITY_MISSING。门禁的拒绝没有 AC：由与 release_gate.py 的修改同一提交的 bundle 测试（红灯先行）与无 format 附加包 venv 的实测覆盖，仿本一半已由 tests/bundle/test_traceability.py:90 覆盖。"
+  }
+  ```
+
+  M2-T19 与 M2-T13 的 `acceptance` 是显式列表（AC-042-01/02/03/05/06 与 AC-042-04），所以 AC-042-07 只有 M2-T21 一个实现任务；REQ-035 与 REQ-021 列为它的需求，但不认领它们的 AC（显式的 `acceptance` 只含 AC-042-07）。AC-042-07 需要的 `unit` 检查由 M0-T03 交付，M0-T03 是 M2-T21 的祖先（经 M2-T19 或 M2-T13）；v0.1 档的 V01-T01 经 M2-T11 以 M2-T21 为祖先，v1 档的 M7-T04 经 V01-T02、V01-T01 与 M2-T11 以它为祖先（tools/validate_bundle.py 的任务图规则，已在模拟应用本 CR 的副本上核对，见“验证方式”）。
+- M2-T11 的 `depends_on` 加 M2-T21。它的 `done_when` 已经要求对 M1/M2 每条 AC 给出 PASS/FAIL/BLOCKED/NOT_RUN，自然包括 AC-042-07。
+
 ## 影响
 
 - 预算风险（实现，批准并重新上锁之后，红灯先行）：
@@ -168,7 +192,7 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
     - 每一例被接受与否都与本 CR 之前相同（只比较拒绝码以外的结果）；
     - 屏障解除之后，同一 READY 任务由调度轮派发，不需要新的决策。
 - 门禁：见决定 3，bundle 测试与 release_gate.py 的修改在同一提交，红灯在插入 `need(...)` 之前。
-- ADR 与记录：ADR-025 决定 1 中 `budget.risk` 的“产生方”改为本 CR 与 pace；ADR-024 决定 4 的 M2T17R-352 改为“已由 CR-025 的 ROLE_BINDING_PENDING 履行”；PROGRESS 的三个后续项关闭；`contracts/development-tasks.json`（不在锁内）中 M2-T19 加 AC-042-07。
+- ADR 与记录：ADR-025 决定 1 中 `budget.risk` 的“产生方”改为本 CR 与 pace；ADR-024 决定 4 的 M2T17R-352 改为“已由 CR-025 的 ROLE_BINDING_PENDING 履行”；PROGRESS 的三个后续项关闭；`contracts/development-tasks.json`（不在锁内）按上文新增 M2-T21，M2-T11 依赖它。
 
 ## 不变的部分
 
@@ -189,6 +213,7 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
 ## 验证方式
 
 - 两名独立设计审查判定后批准。
+- 批准之前已在一个副本上模拟应用本 CR（从 CR 正文取出全部受锁的新文本与 M2-T21，把副本里的 CR 标为 APPROVED 只为模拟）：`gen_spec_views` 之后 `validate_bundle` 只余“受锁文件已改、需重新上锁”一项，任务图与 AC 归属无误；`baseline.py relock --cr` 得到第 18 版，`validate_bundle` PASS（167 条 AC、59 个任务）；`scripts/check.sh --bundle` 退出 0（487 项，1 项跳过）。
 - 改上述四个受锁文件（门禁的修改与它的 bundle 测试同一提交，红灯在先），`python3 tools/gen_spec_views.py`，`python3 tools/baseline.py relock --cr docs/cr/CR-025-budget-risk-role-binding-pending-gate-date-time.md`，`bash scripts/check.sh --bundle` 通过（含 schema 语料与 examples 对 protocol.schema.json 的校验、AC 与任务的归属检查）。
 - 实现之后，“影响”中列出的测试都先红后绿：预算风险的单元、pace（含 `test_042_07`）与唤醒测试；拒绝码的单元与 decide 测试。
 - `cargo test -p hoh-core -p hoh-agents`、`-p hoh-app`，以及 static.sh 通过。
@@ -205,7 +230,7 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
   - CR25D-04、-52（medium）：deadline 的时钟、比较与非正跨度未定义。已改：deadline 用墙钟，跨度为 runs.created_at 至 deadline_at 的墙钟秒，比较为 `used >= 0.8 * limit`，跨度不为正不判定；其余用量按账本口径；按水平判定（暂停期间越过的恢复后写），WAITING_EXTERNAL、BLOCKED 中照写，不计入重试；测试加时钟分开、非正跨度等例。
   - CR25D-05（medium）：载荷的单位不能唯一判定。已改：threshold 为比例 0.8，used 为判定所用总量（含预留；deadline 为已过墙钟秒），limit 同单位（deadline 为跨度秒）；测试断言完整载荷，含同次多种越线。
   - CR25D-53（medium）：每种只写一次使上限改变后不再警告，字面 id 可能超过 160 字符。已改：每个 (Run, 种, 上限) 一条，id 用 `child_id`，pace 没有别的写入时也提交。
-  - CR25D-54（medium）：建议加 AC-042-07。已加（D1 加严），并写明它给 v0.1 与 v1 门禁带来的要求与归属（M2-T19）。
+  - CR25D-54（medium）：建议加 AC-042-07。已加（D1 加严），并写明它给 v0.1 与 v1 门禁带来的要求；它归新的实现任务 M2-T21（第 2 稿曾写 M2-T19，按 CTO 的决定改为新任务：已完成任务的验收不改）。
   - CR25D-55（medium）：门禁的 bundle 测试排在实现之后，上锁到实现之间没有回归测试。已改：bundle 测试与 release_gate.py 的修改同一提交，红灯在插入 `need(...)` 之前，无附加包 venv 的实测作为该提交的证据。
   - CR25D-56（low）：写明检查位置不变。已写入决定 2。
   - 另按 Codex 的说明：决定 6 的“缩小范围”改为“向用户提出范围调整”，并写明 80% 是预警而非保证；门禁拒绝的时机写为“读取 manifest 所引用的证据之前”；测试加“提交之后、supervise 消费之前崩溃”，并区分记录风险事件与实际分配 Commander turn。
