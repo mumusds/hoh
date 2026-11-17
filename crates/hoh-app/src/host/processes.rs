@@ -18,14 +18,18 @@ pub(super) const RESCAN: Duration = Duration::from_millis(100);
 /// How often a stop looks again.
 const LOOK_EVERY: Duration = Duration::from_millis(10);
 
-/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22), and whether it is a zombie
-/// (field 3, Z or X).
+/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22), whether it is a zombie
+/// (field 3, Z or X), and whether it is exiting (PF_EXITING in its flags, field 9).
 pub(super) struct Proc {
     pub(super) pid: u32,
     pub(super) ppid: u32,
     pub(super) start: u64,
     pub(super) zombie: bool,
+    pub(super) exiting: bool,
 }
+
+/// The kernel's PF_EXITING in a `stat`'s flags (include/linux/sched.h): the task is in its exit.
+const PF_EXITING: u64 = 0x4;
 
 /// What reading one process's `stat` gave.
 enum Stat {
@@ -67,6 +71,7 @@ fn parse_stat(pid: u32, bytes: &[u8]) -> Option<Proc> {
         ppid: u32::try_from(number(1)?).ok()?,
         start: number(19)?,
         zombie: fields.first().is_some_and(|f| matches!(f, [b'Z' | b'X'])),
+        exiting: number(6)? & PF_EXITING != 0,
     })
 }
 
@@ -190,7 +195,8 @@ pub(super) enum Tools {
 /// Whether a process of the attempt marked `marker` other than its leader (`leader`, pid and start time) runs, as `root`
 /// (/proc) shows them now: a child of the leader, or a process with the marker in its environment or in a thread's. A
 /// process runs while any of its threads does: one whose main thread ended (a zombie in its `stat`) may run on in
-/// another (WD-02). Read only: nothing is pinned or signalled. What cannot be read and cannot be shown unrelated
+/// another (WD-02); one whose every thread is a zombie or exiting is ending, no tool (decision 19's correction of
+/// 2026-11-17: an exiting process refuses its environment, and unrelated ones exit all the time). Read only: nothing is pinned or signalled. What cannot be read and cannot be shown unrelated
 /// leaves it unknown, which the watchdog takes as a tool (docs/adr/ADR-022.md decision 19 item 4, WD-03). Unrelated:
 /// a process started before the leader (all of the attempt's descend from it), or another user's (the attempt's run as
 /// the host's user, and a set-user-id tool keeps its real user).
@@ -205,7 +211,7 @@ pub(super) fn tools(root: &Path, leader: (u32, Option<u64>), marker: &str) -> To
         if leader.1.is_some_and(|start| process.start < start) {
             continue;
         }
-        if process.zombie {
+        if process.zombie || process.exiting {
             match thread_runs(root, process.pid) {
                 Some(true) => {}
                 Some(false) => continue,
@@ -236,7 +242,8 @@ fn gone(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3)
 }
 
-/// Whether a thread of `pid` runs (is no zombie): `None` when its threads cannot be listed or one cannot be read.
+/// Whether a thread of `pid` runs (is neither a zombie nor exiting): `None` when its threads cannot be listed or one
+/// cannot be read.
 fn thread_runs(root: &Path, pid: u32) -> Option<bool> {
     let tasks = match std::fs::read_dir(root.join(pid.to_string()).join("task")) {
         Ok(tasks) => tasks,
@@ -258,7 +265,7 @@ fn thread_runs(root: &Path, pid: u32) -> Option<bool> {
         };
         match std::fs::read(task.path().join("stat")) {
             Ok(bytes) => match parse_stat(tid, &bytes) {
-                Some(thread) if !thread.zombie => return Some(true),
+                Some(thread) if !thread.zombie && !thread.exiting => return Some(true),
                 Some(_) => {}
                 None => known = false,
             },
@@ -294,6 +301,12 @@ fn marked_tri(root: &Path, process: &Proc, marker: &[u8], me: u32) -> Option<boo
         }
     }
     if readable {
+        return Some(false);
+    }
+    // Refused because it is ending: an exiting process (past its memory, not yet a zombie) refuses its environment,
+    // so its threads' stat, read after the refusal, says whether it still runs (docs/adr/ADR-022.md decision 19, the
+    // correction of 2026-11-17).
+    if thread_runs(root, process.pid) == Some(false) {
         return Some(false);
     }
     match std::fs::read_to_string(dir.join("status")) {
@@ -1104,6 +1117,69 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         assert_eq!(
             [older.path(), other.path(), same.path()].map(|r| tools(r, (100, Some(500)), "p/A1")),
             [Tools::Absent, Tools::Absent, Tools::Unknown]
+        );
+        Ok(())
+    }
+
+    /// A process 300 of the host's user started after the leader whose environment cannot be read (a directory), its
+    /// `stat` at the listing `listed` and its threads' `(tid, stat)`: each a `(state, flags)` pair.
+    fn refused(
+        listed: (&str, u64),
+        threads: &[(u32, (&str, u64))],
+    ) -> std::io::Result<tempfile::TempDir> {
+        let me = rustix::process::getuid().as_raw();
+        let line = |pid: u32, (state, flags): (&str, u64)| {
+            format!("{pid} (python3) {state} 1 300 300 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 900 0")
+        };
+        let root = tree(&[(100, LEADER, MARKED)])?;
+        let dir = root.path().join("300");
+        std::fs::create_dir_all(dir.join("environ"))?;
+        std::fs::write(dir.join("stat"), line(300, listed))?;
+        for (tid, thread) in threads {
+            std::fs::create_dir_all(dir.join(format!("task/{tid}/environ")))?;
+            std::fs::write(dir.join(format!("task/{tid}/stat")), line(*tid, *thread))?;
+        }
+        std::fs::write(
+            dir.join("status"),
+            format!("Name:\tpython3\nUid:\t{me}\t{me}\t{me}\t{me}\n"),
+        )?;
+        Ok(root)
+    }
+
+    #[test]
+    fn a_process_that_is_exiting_is_no_tool_though_its_environment_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Decision 19's correction of 2026-11-17: on Linux a process that is exiting (PF_EXITING, 0x4 in its stat's
+        // flags; past its memory, not yet a zombie) refuses /proc/<pid>/environ. Any unrelated process of the host's
+        // user that exits during a look was unknown, so a busy machine kept every attempt's quiet time from ever
+        // completing. The flags are what a real one showed (0x40000C). Judged by its threads' stat after the refusal:
+        // ending when none of them runs; unknown while one runs.
+        let exiting = ("R", 0x40_000C);
+        let running = ("S", 0x40_0000);
+        let zombie = ("Z", 0x40_800C);
+        let cases = [
+            // Exiting as listed and as its thread says.
+            refused(exiting, &[(300, exiting)])?,
+            // Running when listed, exiting by the time its environment was refused.
+            refused(running, &[(300, exiting)])?,
+            // A zombie main thread and its other thread exiting.
+            refused(zombie, &[(300, zombie), (301, exiting)])?,
+            // Its main thread exiting while another thread runs: it runs, and cannot be read.
+            refused(exiting, &[(300, exiting), (301, running)])?,
+            // Not exiting at all (PR_SET_DUMPABLE=0 refuses the same way): unknown, as before.
+            refused(running, &[(300, running)])?,
+        ];
+        assert_eq!(
+            cases
+                .each_ref()
+                .map(|r| tools(r.path(), (100, Some(500)), "p/A1")),
+            [
+                Tools::Absent,
+                Tools::Absent,
+                Tools::Absent,
+                Tools::Unknown,
+                Tools::Unknown
+            ]
         );
         Ok(())
     }
