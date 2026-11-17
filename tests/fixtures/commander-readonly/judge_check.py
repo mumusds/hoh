@@ -2073,7 +2073,8 @@ def emit(excerpts: Path, root: Path, out: Path) -> None:
                     (d / f'{prefix}stdin.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.requests))
                 (d / f'{prefix}observations.json').write_text(json.dumps(case.observations, ensure_ascii=False) + '\n')
                 (d / f'{prefix}diff.json').write_text(json.dumps({'diff': case.diff, 'exit_code': case.exit_code,
-                                                                  'session_arg': case.session_arg, 'token_sha256': case.token_sha256}) + '\n')
+                                                                  'session_arg': case.session_arg, 'token_sha256': case.token_sha256,
+                                                                  'paths': case.paths}) + '\n')
             verdict = round_verdict(m, mc)[0]
             (d / 'expect.json').write_text(json.dumps({'kind': kind, 'label': label, 'expect': expect, 'prototype_verdict': verdict}) + '\n')
 
