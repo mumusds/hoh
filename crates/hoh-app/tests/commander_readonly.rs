@@ -1017,3 +1017,77 @@ async fn test_021_06_d_codex_on_exec_only_is_no_commander_and_still_a_developer(
 async fn test_021_06_d_codex_degraded_to_exec_in_the_run_is_no_commander_after() -> R {
     on_exec(None).await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_021_06_d_a_new_implementation_after_a_degrade_is_the_commander_again() -> R {
+    // AC-021-06 (d), M2T20R-01: the degrade to exec is a fact of the implementation it happened on (its whole
+    // identity), never of its version string. codex degrades in run R's Developer turn, so the commander binding is
+    // BLOCKED for the read-only profile; then codex is replaced by another implementation with the same `--version`.
+    // Once the registry has looked at it and its compat suite has verified it, codex is the Commander again: a
+    // need_decision's Commander attempt runs on the App Server in the read-only profile and SETTLES, and no
+    // team.binding_excluded is ever written (a host fact never excludes).
+    let world = World::new()?;
+    world.configure(&team_of("codex"), "")?;
+    world.developer(&world::Developer {
+        commit: false,
+        ..world::Developer::default()
+    })?;
+    world.degrade(&["/D/attempt-1"])?;
+    world.commit_project(&world::fixture_spec())?;
+    world.register()?;
+    let host = world.start_host().await?;
+    let outcome = async {
+        world.seed_spec()?;
+        seeded_run(&world, "R", "D", &team_of("codex"))?;
+        developer_settled(&world, "D").await?;
+        commander_blocked(&world, "R", "codex").await?;
+        // Another implementation, the same version: one more line in the launcher.
+        {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(world.bin().join("codex"))?
+                .write_all(b"# another implementation of codex-cli 0.166.0\n")?;
+        }
+        need_decision(&world, "R", "fp-swap")?;
+        world
+            .until(
+                "SELECT count(*) > 0 FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = 'R' AND t.role = 'commander' AND a.state = 'SETTLED'",
+                "1",
+                WAIT,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "{e}; attempts: {:?}; bindings: {:?}; events: {:?}",
+                    world.rows("SELECT attempt_id, state, failure_reason FROM attempts"),
+                    world.rows("SELECT role, agent, role_epoch, state, blocked_reason, missing_json FROM role_bindings WHERE run_id = 'R'"),
+                    world.rows("SELECT kind, substr(payload_json, 1, 200) AS p FROM events WHERE run_id = 'R' \
+                                AND (kind LIKE 'team.%' OR kind LIKE 'attempt.%' OR kind LIKE 'compat.%') ORDER BY seq")
+                )
+            })?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM events WHERE kind = 'team.binding_excluded'")?,
+            "0"
+        );
+        let turns = world.log("turns.jsonl")?;
+        assert!(
+            turns
+                .iter()
+                .filter(|t| t["role"] == "commander" && t["event"] == "start")
+                .all(|t| t["agent"] == "codex-app-server"),
+            "{turns:?}"
+        );
+        assert!(
+            turns
+                .iter()
+                .any(|t| t["role"] == "commander" && t["agent"] == "codex-app-server"),
+            "{turns:?}"
+        );
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}

@@ -11,7 +11,7 @@ use hoh_core::persistence::{Observed, PromptRecord, SessionStart};
 use hoh_core::retry::FailureClass;
 use hoh_core::staffing::{Compat, Fact, Usable};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,8 +29,6 @@ pub struct ProductExecutor {
     graces: (Duration, Duration),
     /// The native cancel of each attempt whose turn runs.
     cancels: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
-    /// Codex implementations (launcher, version) whose App Server degraded: their next turns use exec (decision 15).
-    exec_only: Arc<Mutex<BTreeSet<(PathBuf, String)>>>,
     /// A test's look at each attempt's gate key as it is drawn; the product has none.
     keys: Option<KeyHook>,
     /// A test's look at each diagnostic a turn collects as it collects it; the product has none.
@@ -107,7 +105,6 @@ impl ProductExecutor {
             gate,
             graces,
             cancels: Arc::default(),
-            exec_only: Arc::default(),
             keys: None,
             observe: None,
             keeping: None,
@@ -646,6 +643,7 @@ impl ProductExecutor {
             ready,
             ran,
             host_check,
+            exec_only,
             ..
         } = current;
         let contract = hoh_core::config::contract(&self.project, &work.role, a.prompt.as_deref())
@@ -691,10 +689,6 @@ impl ProductExecutor {
             );
         }
         let session_id = a.session_id.clone().unwrap_or_default();
-        let exec_only = self
-            .exec_only
-            .lock()
-            .is_ok_and(|e| e.contains(&(ready.launcher.clone(), ready.version.clone())));
         let hoh = self.project.join(".hoh");
         // A Commander turn runs in its session's own directory, outside the project (docs/adr/ADR-025.md decision 3):
         // no project file is found from there; it is told the paths it reads.
@@ -962,10 +956,9 @@ impl Executor for ProductExecutor {
         }
         let (tx, ended) = oneshot::channel();
         let cancels = self.cancels.clone();
-        let exec_only = self.exec_only.clone();
-        let implementation = (ready.launcher.clone(), ready.version.clone());
-        // A degrade withholds the read-only profile from this identity in the registry too (docs/adr/ADR-032.md
-        // decision 10 (A)): a host fact, so staffing moves the commander and prepare refuses it as unavailable.
+        // A degrade is one fact, the registry's, of this identity (decision 15; docs/adr/ADR-032.md decision 10 (A),
+        // M2T20R-01): its next turns use exec and the read-only profile is withheld from it, both read by a prepare in
+        // one look; a host fact, so staffing moves the commander and prepare refuses it as unavailable.
         let registry = self.registry.clone();
         let identity = ready.entry.identity();
         let turn = held.ended;
@@ -992,9 +985,6 @@ impl Executor for ProductExecutor {
                 return;
             };
             if agent == Agent::Codex && facts.degraded.is_some() {
-                if let Ok(mut e) = exec_only.lock() {
-                    e.insert(implementation);
-                }
                 registry.exec_degraded(Agent::Codex, identity);
             }
             let mut outcome = outcome(facts);
