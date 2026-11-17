@@ -119,11 +119,21 @@ pub(super) fn run_named(
 
 /// Create the self-test's database file at the first name that is free: neither the file nor a companion of it
 /// exists. A name that exists is another creator's and is left to it: the next name is tried, up to the last, and
-/// the self-test fails at its open step when none is free.
+/// the self-test fails at its open step when none is free. A file it made for a name whose companion exists is removed
+/// before the next is tried; when it cannot be, the open step fails naming it.
 ///
 /// The file is made before SQLite opens it, so that a directory refusing it for want of permission or room says so by
 /// the OS's error (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database.
 fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf, PersistError> {
+    claim_with(dir, names, &|path| std::fs::remove_file(path))
+}
+
+/// [`claim`], with `remove` removing a file this call made and gave up.
+fn claim_with(
+    dir: &Path,
+    names: impl IntoIterator<Item = PathBuf>,
+    remove: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> Result<PathBuf, PersistError> {
     let mut taken = None;
     for db in names {
         match std::fs::OpenOptions::new()
@@ -142,7 +152,16 @@ fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf
             .iter()
             .any(|suffix| std::fs::symlink_metadata(with_suffix(&db, suffix)).is_ok())
         {
-            let _ = std::fs::remove_file(&db);
+            // Given up: the file this call made goes, or the self-test stops here and names it (F7-150).
+            if let Err(e) = remove(&db) {
+                return Err(PersistError::WalUnsupported {
+                    step: Step::Open.name(),
+                    detail: format!(
+                        "cannot remove {}, made for the self-test and given up for a taken companion: {e}",
+                        db.display()
+                    ),
+                });
+            }
             taken = Some(db);
             continue;
         }
@@ -1059,6 +1078,28 @@ mod tests {
                 kept.display()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_it_made_and_cannot_remove_fails_the_open_step_naming_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // F7-150: a name given up for a taken companion leaves the file this call just made; when it cannot be
+        // removed, the self-test fails at its open step and names it, rather than leave it unsaid and try the next.
+        let dir = tempfile::tempdir()?;
+        let names: Vec<PathBuf> = (0..2)
+            .map(|n| dir.path().join(format!("selftest-{n}.db")))
+            .collect();
+        std::fs::write(with_suffix(&names[0], "-wal"), "another's")?;
+        let refused = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        match claim_with(dir.path(), names.clone(), &refused) {
+            Err(PersistError::WalUnsupported { step, detail }) => {
+                assert_eq!(step, Step::Open.name(), "{detail}");
+                assert!(detail.contains("selftest-0.db"), "{detail}");
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+        assert!(!names[1].exists(), "the next name was tried");
         Ok(())
     }
 
