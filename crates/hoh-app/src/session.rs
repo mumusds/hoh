@@ -8,7 +8,9 @@ use crate::follow::{End, Follower, Replay, Watch};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 /// Whether a run in `state` can be attached to: it is not in a terminal state (ADR-021:85; INCOMPLETE can).
 fn attachable(state: &str) -> bool {
@@ -59,9 +61,67 @@ pub fn run_of(host: &HostInfo, run_id: &str) -> Result<Value, u8> {
     }
 }
 
+/// How often a wait for the host looks at the signal flag (the shell's tick).
+const LOOK: Duration = Duration::from_millis(100);
+
+/// The project's host ([`client::ensure`], which may start one and wait for it) on a worker thread while this one looks
+/// at `signal` every [`LOOK`]: a signal ends the wait with its exit code, `code(signal)`, and a host the worker already
+/// started goes on in the background, in its own session (CLT-01; REQ-001 failure mode 3). A host that cannot be had is
+/// said, with its code. Without a worker thread the wait is done here, the signal looked at after it.
+fn host_unless_signalled(
+    project: &Path,
+    signal: &AtomicUsize,
+    code: impl Fn(usize) -> u8,
+) -> Result<HostInfo, u8> {
+    let (send, got) = std::sync::mpsc::channel();
+    let dir = project.to_path_buf();
+    let worker = std::thread::Builder::new()
+        .name("hoh-ensure".to_owned())
+        .spawn(move || {
+            let _ = send.send(client::ensure(&dir));
+        });
+    if worker.is_err() {
+        let host = client::ensure(project).map_err(|failure| fail(&failure))?;
+        return match signal.load(Ordering::SeqCst) {
+            0 => Ok(host),
+            sig => Err(code(sig)),
+        };
+    }
+    loop {
+        let sig = signal.load(Ordering::SeqCst);
+        if sig != 0 {
+            return Err(code(sig));
+        }
+        match got.recv_timeout(LOOK) {
+            Ok(Ok(host)) => return Ok(host),
+            Ok(Err(failure)) => return Err(fail(&failure)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(fail(&Failure::unreachable(
+                    "the host could not be found or started",
+                )));
+            }
+        }
+    }
+}
+
+/// The signal state of an attach, registered before anything else and kept to its end (CLT-01): the shell's flags when
+/// it may open the Workspace (a terminal and text), the follower's otherwise.
+enum Signals {
+    Shell(crate::tui::Flags),
+    Follow(Arc<AtomicUsize>),
+}
+
 /// `hoh attach [run_id]`.
 pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
-    let got = signals();
+    let signals = if output == Output::Text && terminal() {
+        match crate::tui::register() {
+            Ok(flags) => Signals::Shell(flags),
+            Err(code) => return code,
+        }
+    } else {
+        Signals::Follow(signals())
+    };
     // No database: no run, and nothing is started for none.
     if !project.join(".hoh/state.db").exists() {
         return match run_id {
@@ -75,9 +135,20 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
             }
         };
     }
-    let host = match client::ensure(project) {
+    // The start wait answers a signal (CLT-01): the shell's ends as bare `hoh`'s, the terminal untouched; the follower's
+    // says so.
+    let waited = match &signals {
+        Signals::Shell(flags) => {
+            host_unless_signalled(project, flags.signal(), crate::tui::Flags::code)
+        }
+        Signals::Follow(got) => host_unless_signalled(project, got, |code| {
+            say!("hoh: 收到信号，没有附着");
+            u8::try_from(code).unwrap_or(1)
+        }),
+    };
+    let host = match waited {
         Ok(host) => host,
-        Err(failure) => return fail(&failure),
+        Err(code) => return code,
     };
     let run = match run_id {
         Some(id) => match run_of(&host, id) {
@@ -103,11 +174,11 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
                     say!("hoh: 没有可附着的 Run");
                     return 64;
                 }
-                // With a terminal, the TUI's selector: the user picks one (docs/adr/ADR-031.md decision 12).
-                _ if output == Output::Text && terminal() => {
-                    return crate::tui::pick(project, host, &all);
-                }
                 several => {
+                    // With a terminal, the TUI's selector: the user picks one (docs/adr/ADR-031.md decision 12).
+                    if let Signals::Shell(flags) = signals {
+                        return crate::tui::pick(project, host, &all, flags);
+                    }
                     // Never the newest on its own (REQ-003 behaviour 7): the user names one.
                     let list: Vec<String> = several
                         .iter()
@@ -131,9 +202,10 @@ pub fn attach(project: &Path, run_id: Option<&str>, output: Output) -> u8 {
     };
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
     // A terminal on both sides and text: the Workspace bound to the run (ADR-021 decision 10).
-    if output == Output::Text && terminal() {
-        return crate::tui::attach(project, host, &run);
-    }
+    let got = match signals {
+        Signals::Shell(flags) => return crate::tui::attach(project, host, &run, flags),
+        Signals::Follow(got) => got,
+    };
     if output == Output::Json {
         // The run's result as of now, from the host's own function (decision 12): a snapshot, so 0.
         let snapshot = &run["projection"]["result"];
