@@ -1530,6 +1530,109 @@ fn a_hash_that_does_not_fit_doctors_limit_is_given_up_said_and_recorded() -> R {
     Ok(())
 }
 
+#[test]
+fn a_signal_while_doctors_start_check_asks_systemd_run_leaves_no_probe_behind() -> R {
+    // Package G2 on ADR-031's addendum, rule 5: the check before a host's start runs from doctor's start, beside the
+    // agents (docs/adr/ADR-015.md note of package G2), and its probe is the client's helper like any other: SIGTERM
+    // while its `systemd-run --version` does not answer (a stand-in that sleeps; a fake runtime directory stands in for
+    // the user's manager, so none is contacted) ends doctor with 143, no report, and that probe has ended by the time
+    // doctor has.
+    let user = std::env::var("USER").unwrap_or_default();
+    if user.is_empty()
+        || !Path::new("/var/lib/systemd/linger").join(&user).is_file()
+        || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no linger record for this user, or no cgroup v2, here"
+        );
+        return Ok(());
+    }
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let pid_file = s.home.path().join("probe.pid");
+    s.write(
+        "systemd-run",
+        &format!(
+            "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )?;
+    let runtime = s.tmp.path().join("run");
+    std::fs::create_dir_all(runtime.join("systemd"))?;
+    std::fs::File::create(runtime.join("systemd/private"))?;
+    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("USER", &user)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let outcome = (|| -> R<(bool, Duration)> {
+        let end = Instant::now() + Duration::from_secs(20);
+        let pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse()?;
+            }
+            if Instant::now() > end {
+                return Err("systemd-run --version never started".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let probe = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?;
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&doctor),
+            rustix::process::Signal::TERM,
+        )?;
+        let at = Instant::now();
+        while doctor.try_wait()?.is_none() {
+            if at.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = at.elapsed();
+        let gone = {
+            use rustix::event::{PollFd, PollFlags, Timespec};
+            let mut fds = [PollFd::new(&probe, PollFlags::IN)];
+            let none = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            rustix::event::poll(&mut fds, Some(&none))? > 0
+        };
+        if !gone {
+            let _ = rustix::process::pidfd_send_signal(&probe, rustix::process::Signal::KILL);
+        }
+        Ok((gone, took))
+    })();
+    // Whatever happened, doctor is ended and waited for here.
+    let _ = doctor.kill();
+    let out = doctor.wait_with_output()?;
+    let (gone, took) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
+    assert!(gone, "systemd-run --version outlived doctor");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    Ok(())
+}
+
 /// The text form carries what the JSON carries for each agent: path, binary sha256, protocol, auth and capabilities
 /// (M1T07R-05).
 #[test]
