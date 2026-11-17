@@ -32,14 +32,24 @@ pub trait Spawner: Send + Sync + fmt::Debug {
     fn host(&self, command: &mut Command) -> io::Result<WaitOnly>;
 }
 
-/// The spawner that just starts the process: the host's own (its stop is its `ProbeStop`), and tests'.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Direct;
+/// The spawner that just starts the process: the host's own (its stop is its `ProbeStop`), a client's gate's
+/// underneath, and tests'. Made only by [`Direct::plain`] or [`Direct::shared`], so every place that makes one names its
+/// type and the spawn-site scan sees it (docs/adr/ADR-031.md, 设计修正 2, E). It has no `Default`, which code could reach
+/// without naming it.
+#[derive(Debug, Clone, Copy)]
+pub struct Direct {
+    _made_by_plain: (),
+}
 
 impl Direct {
-    /// [`Direct`], shared.
+    /// A [`Direct`].
+    pub const fn plain() -> Direct {
+        Direct { _made_by_plain: () }
+    }
+
+    /// A [`Direct`], shared.
     pub fn shared() -> Arc<dyn Spawner> {
-        Arc::new(Direct)
+        Arc::new(Direct::plain())
     }
 }
 
@@ -50,6 +60,27 @@ impl Spawner for Direct {
 
     fn host(&self, command: &mut Command) -> io::Result<WaitOnly> {
         command.spawn().map(WaitOnly)
+    }
+}
+
+/// The spawner of code that starts nothing (a compat replay judges recorded output): it refuses every start.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoStart;
+
+impl NoStart {
+    /// [`NoStart`], shared.
+    pub fn shared() -> Arc<dyn Spawner> {
+        Arc::new(NoStart)
+    }
+}
+
+impl Spawner for NoStart {
+    fn helper(&self, _command: &mut Command) -> io::Result<Helper> {
+        Err(io::Error::other("this code starts no process"))
+    }
+
+    fn host(&self, _command: &mut Command) -> io::Result<WaitOnly> {
+        Err(io::Error::other("this code starts no process"))
     }
 }
 

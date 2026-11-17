@@ -62,7 +62,7 @@ async fn orphans_left_in_the_group_are_killed_when_the_leader_exits() -> R {
     let mut p = Process::spawn(
         sh("sleep 600 & echo \"$!\"; exit 3"),
         Config::default(),
-        &hoh_core::spawn::Direct,
+        &hoh_core::spawn::Direct::plain(),
     )?;
     let pgid = p.pid();
     let grandchild: u32 = first_line(&mut p).await?.parse()?;
@@ -82,7 +82,11 @@ async fn orphans_left_in_the_group_are_killed_when_the_leader_exits() -> R {
 async fn a_child_ignoring_int_and_term_is_killed_after_the_graces() -> R {
     // Both the leader and its same-group grandchild ignore SIGINT and SIGTERM (ignored dispositions survive exec).
     let script = "trap '' INT TERM; sleep 600 & echo \"$!\"; while :; do sleep 1; done";
-    let mut p = Process::spawn(sh(script), Config::default(), &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(
+        sh(script),
+        Config::default(),
+        &hoh_core::spawn::Direct::plain(),
+    )?;
     let pgid = p.pid();
     let grandchild: u32 = first_line(&mut p).await?.parse()?;
     let grace = Duration::from_secs(1);
@@ -123,9 +127,13 @@ async fn an_oversized_frame_is_refused_with_a_bounded_buffer() -> R {
     let normal = Process::spawn(
         sh("sleep 0.5; echo fine"),
         Config::default(),
-        &hoh_core::spawn::Direct,
+        &hoh_core::spawn::Direct::plain(),
     );
-    let mut p = Process::spawn(sh(script), Config::default(), &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(
+        sh(script),
+        Config::default(),
+        &hoh_core::spawn::Direct::plain(),
+    )?;
     let mut normal = normal?;
     let (frames, report) = until_exit(&mut p, Duration::from_secs(20)).await?;
     let config = Config::default();
@@ -169,7 +177,7 @@ async fn a_slow_consumer_blocks_the_writer_while_stderr_keeps_draining() -> R {
         stderr_tail: 1024,
         ..Config::default()
     };
-    let mut p = Process::spawn(sh(&script), config, &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(sh(&script), config, &hoh_core::spawn::Direct::plain())?;
     // 4 MiB of stderr nobody consumes must not stall the child...
     let wait_for = Instant::now() + Duration::from_secs(10);
     while !marker("stderr-done").exists() && Instant::now() < wait_for {
@@ -218,7 +226,7 @@ async fn the_wall_deadline_escalates_without_a_cancel() -> R {
     let started = Instant::now();
     let mut command = Command::new("sleep");
     command.arg("600");
-    let mut p = Process::spawn(command, config, &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(command, config, &hoh_core::spawn::Direct::plain())?;
     let (_, report) = until_exit(&mut p, Duration::from_secs(10)).await?;
     assert_eq!(report.cause, Cause::DeadlineExceeded);
     assert_eq!(report.status, Some(Termination::Signal(15)));
@@ -242,7 +250,7 @@ async fn a_descendant_that_left_the_group_cannot_hold_up_the_exit() -> R {
     let script = "setsid sleep 600 & pid=$!; \
                   while [ \"$(cut -d' ' -f5 /proc/$pid/stat)\" = \"$$\" ]; do sleep 0.01; done; \
                   read -r s < /proc/$pid/stat; printf '%s\\n' \"$s\"; exit 0";
-    let mut p = Process::spawn(sh(script), config, &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(sh(script), config, &hoh_core::spawn::Direct::plain())?;
     let (escaped, start) = identity_of(&first_line(&mut p).await?)?;
     let started = Instant::now();
     let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
@@ -301,7 +309,7 @@ async fn a_leader_that_left_its_group_is_killed_at_the_deadline() -> R {
         },
         ..Config::default()
     };
-    let mut p = Process::spawn(leaving_leader(), config, &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(leaving_leader(), config, &hoh_core::spawn::Direct::plain())?;
     let (leader, start) = identity_of(&first_line(&mut p).await?)?;
     let outcome = until_exit(&mut p, Duration::from_secs(10)).await;
     let left = alive(leader);
@@ -322,7 +330,7 @@ fn shutting_down_the_runtime_kills_a_leader_that_left_its_group() -> R {
         let mut p = Process::spawn(
             leaving_leader(),
             Config::default(),
-            &hoh_core::spawn::Direct,
+            &hoh_core::spawn::Direct::plain(),
         )?;
         let leader = identity_of(&first_line(&mut p).await?)?;
         // Only the runtime going away ends it.
@@ -354,7 +362,7 @@ async fn dropping_the_process_kills_its_group() -> R {
     let mut p = Process::spawn(
         sh("trap '' TERM; sleep 600 & echo \"$!\"; wait"),
         config,
-        &hoh_core::spawn::Direct,
+        &hoh_core::spawn::Direct::plain(),
     )?;
     let pgid = p.pid();
     let grandchild: u32 = first_line(&mut p).await?.parse()?;
@@ -377,7 +385,7 @@ fn shutting_down_the_runtime_kills_the_group() -> R {
         let mut p = Process::spawn(
             sh("sleep 600 & echo \"$!\"; wait"),
             Config::default(),
-            &hoh_core::spawn::Direct,
+            &hoh_core::spawn::Direct::plain(),
         )?;
         let grandchild: u32 = first_line(&mut p).await?.parse()?;
         // Keep the process alive past block_on: only the runtime going away ends it.
@@ -406,7 +414,7 @@ fn a_cancel_requested_before_the_exit_is_seen_is_reported_as_cancelled() -> R {
         let mut p = Process::spawn(
             sh("sleep 0.1; exit 0"),
             Config::default(),
-            &hoh_core::spawn::Direct,
+            &hoh_core::spawn::Direct::plain(),
         )?;
         p.cancel(Escalation {
             native: Some(Signal::Interrupt),
@@ -436,7 +444,7 @@ async fn the_first_cancel_wins_and_repeats_are_dropped() -> R {
     let mut p = Process::spawn(
         sh("trap '' INT; echo up; while :; do sleep 1; done"),
         Config::default(),
-        &hoh_core::spawn::Direct,
+        &hoh_core::spawn::Direct::plain(),
     )?;
     first_line(&mut p).await?;
     let first = Escalation {
@@ -490,7 +498,7 @@ async fn both_streams_can_be_copied_byte_for_byte() -> R {
         ..Config::default()
     };
     let tail = config.stderr_tail;
-    let mut p = Process::spawn(sh(script), config, &hoh_core::spawn::Direct)?;
+    let mut p = Process::spawn(sh(script), config, &hoh_core::spawn::Direct::plain())?;
     let (frames, report) = until_exit(&mut p, Duration::from_secs(30)).await?;
     assert_eq!(
         frames,

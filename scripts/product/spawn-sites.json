@@ -1,0 +1,101 @@
+{
+  "_doc": "docs/adr/ADR-031.md, 设计修正 2, E: every place in non-test code that starts or replaces a process or makes the plain spawner, with its owner (scripts/product/spawn_scan.py).",
+  "client_files": [
+    "crates/hoh-app/src/cli.rs",
+    "crates/hoh-app/src/client.rs",
+    "crates/hoh-app/src/debug_hold.rs",
+    "crates/hoh-app/src/doctor.rs",
+    "crates/hoh-app/src/doctor/",
+    "crates/hoh-app/src/exit.rs",
+    "crates/hoh-app/src/follow.rs",
+    "crates/hoh-app/src/forward.rs",
+    "crates/hoh-app/src/help.rs",
+    "crates/hoh-app/src/output.rs",
+    "crates/hoh-app/src/owned.rs",
+    "crates/hoh-app/src/owned/",
+    "crates/hoh-app/src/prompt.rs",
+    "crates/hoh-app/src/session.rs",
+    "crates/hoh-app/src/signals.rs",
+    "crates/hoh-app/src/tui.rs",
+    "crates/hoh-app/src/tui/"
+  ],
+  "host_only_functions": [
+    "hoh_app::gate::main",
+    "hoh_app::host::run_ready",
+    "hoh_app::host::control::git_run",
+    "hoh_app::verify::check::run",
+    "hoh_app::verify::check::run_with"
+  ],
+  "sites": [
+    {
+      "file": "crates/hoh-core/src/spawn.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 6,
+      "owner": "spawner",
+      "reason": "the plain spawner's own definition and constructors"
+    },
+    {
+      "file": "crates/hoh-core/src/spawn.rs",
+      "item": "std::process::Command::spawn",
+      "count": 2,
+      "owner": "spawner",
+      "reason": "Direct::host's wait-only spawn and Helper::spawn (process group of its own, pidfd at once)"
+    },
+    {
+      "file": "crates/hoh-app/src/owned.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 3,
+      "owner": "gate",
+      "reason": "the client's start gate spawns through a plain spawner under its tickets (A)"
+    },
+    {
+      "file": "crates/hoh-app/src/gate.rs",
+      "item": "std::os::unix::process::CommandExt::exec",
+      "count": 2,
+      "owner": "host-only",
+      "reason": "`hoh __gate`, the agent start gate the host runs (ADR-022 decision 13), replaces itself with the agent"
+    },
+    {
+      "file": "crates/hoh-app/src/host/agents.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 4,
+      "owner": "host-only",
+      "reason": "the host's agent probes and compat suite (its stop is its ProbeStop)"
+    },
+    {
+      "file": "crates/hoh-app/src/host/control.rs",
+      "item": "std::process::Command::spawn",
+      "count": 1,
+      "owner": "host-only",
+      "reason": "git_run, the host's bounded git invocation"
+    },
+    {
+      "file": "crates/hoh-app/src/host/mod.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 1,
+      "owner": "host-only",
+      "reason": "the host's store (its WAL self-test probe)"
+    },
+    {
+      "file": "crates/hoh-app/src/verify/check.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 1,
+      "owner": "host-only",
+      "reason": "a verification check's command, run by the host"
+    },
+    {
+      "file": "crates/hoh-app/src/installer.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 1,
+      "owner": "entry",
+      "reason": "`hoh __unit`, the installer's internal entry, asks systemctl; it registers no client signal state"
+    },
+    {
+      "file": "crates/hoh-app/src/compat.rs",
+      "item": "hoh_core::spawn::Direct",
+      "count": 1,
+      "owner": "test-seam",
+      "reason": "compat::register, called only by tests before a host starts (ADR-030 decision 10)"
+    }
+  ]
+}

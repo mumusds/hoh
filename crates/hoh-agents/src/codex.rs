@@ -782,7 +782,7 @@ fn replay_turn() -> Turn {
         handshake_timeout: Duration::from_secs(60),
         deadline: None,
         observe: None,
-        spawner: hoh_core::spawn::Direct::shared(),
+        spawner: hoh_core::spawn::NoStart::shared(),
     }
 }
 

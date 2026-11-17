@@ -804,7 +804,7 @@ mod tests {
                 },
                 ..Config::default()
             },
-            &hoh_core::spawn::Direct,
+            &hoh_core::spawn::Direct::plain(),
         )?;
         let mut lines = Vec::new();
         let report = tokio::time::timeout(Duration::from_secs(10), async {
@@ -851,7 +851,11 @@ mod tests {
              while True:\n    time.sleep(1)\n",
             count = count.display()
         ));
-        let mut p = Process::spawn(command, Config::default(), &hoh_core::spawn::Direct)?;
+        let mut p = Process::spawn(
+            command,
+            Config::default(),
+            &hoh_core::spawn::Direct::plain(),
+        )?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
         // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
         // and never a number the supervisor's reap has freed (CIR-103, -152).
@@ -924,7 +928,11 @@ mod tests {
             count = count.display(),
             marker = marker.display()
         ));
-        let mut p = Process::spawn(command, Config::default(), &hoh_core::spawn::Direct)?;
+        let mut p = Process::spawn(
+            command,
+            Config::default(),
+            &hoh_core::spawn::Direct::plain(),
+        )?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
         // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
         // and never a number the supervisor's reap has freed (CIR-103, -152).

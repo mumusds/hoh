@@ -16,7 +16,7 @@ fn the_hoh_binary_is_the_wal_probe() -> Result<(), Box<dyn std::error::Error>> {
         env: Vec::new(),
         answer_timeout: Duration::from_secs(10),
     };
-    wal_self_test(dir.path(), &probe, &hoh_core::spawn::Direct)?;
+    wal_self_test(dir.path(), &probe, &hoh_core::spawn::Direct::plain())?;
     assert_eq!(
         std::fs::read_dir(dir.path())?.count(),
         0,

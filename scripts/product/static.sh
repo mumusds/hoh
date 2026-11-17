@@ -36,3 +36,6 @@ cargo deny --locked check licenses bans sources
 scan=(python3 scripts/product/persistence_scan.py --canary-log "$logs/canary.log")
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then scan+=(--out "$HOH_EVIDENCE_DIR/test-results.jsonl"); fi
 "${scan[@]}"
+# docs/adr/ADR-031.md, 设计修正 2, E: every place that starts a process or makes the plain spawner is listed with its
+# owner, and no client source but the start gate holds one.
+python3 scripts/product/spawn_scan.py

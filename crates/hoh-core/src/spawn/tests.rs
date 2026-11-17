@@ -51,7 +51,7 @@ fn a_helper_that_exits_by_itself_has_its_group_cleaned_before_it_is_reaped() -> 
         "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exit 0",
         member.display()
     ));
-    let helper = Direct.helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command)?;
     let member = written_pid(&member)?;
     let shared = &helper.shared;
     assert!(
@@ -80,7 +80,7 @@ fn a_helper_is_reaped_once_and_its_status_is_shared() -> R {
     // A2: only `reap` consumes the status; observing before it and asking after it read the same published status.
     let mut command = Command::new("sh");
     command.arg("-c").arg("exit 3");
-    let helper = Direct.helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command)?;
     let shared = helper.shared.clone();
     assert!(shared.exited_within(Duration::from_secs(5)));
     assert_eq!(shared.observe()?.and_then(|s| s.code()), Some(3));
@@ -101,7 +101,7 @@ fn ending_a_helper_kills_it_and_its_group_and_reaps_it() -> R {
         "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exec sleep 30",
         member.display()
     ));
-    let helper = Direct.helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command)?;
     let member = written_pid(&member)?;
     let status = helper.shared.end(END_WAIT).ok_or("not reaped")?;
     assert_eq!(status.signal(), Some(9), "{status:?}");
@@ -114,7 +114,7 @@ fn a_host_can_only_be_waited_for_and_dropping_it_leaves_it_running() -> R {
     // A (CLT-650): a host comes back wait-only; dropping it signals nothing and the host lives on.
     let mut command = Command::new("sleep");
     command.arg("30");
-    let host = Direct.host(&mut command)?;
+    let host = Direct::plain().host(&mut command)?;
     let raw = i32::try_from(host.id())?;
     let pidfd = pidfd_open(Pid::from_raw(raw).ok_or("no pid")?, PidfdFlags::empty())?;
     drop(host);

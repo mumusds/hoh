@@ -762,37 +762,38 @@ async fn finish(
         stdout: identity(&stdout),
         stderr: identity(&stderr),
     };
-    let (exit_code, timed_out) = match Process::spawn(command, config, &hoh_core::spawn::Direct) {
-        Ok(mut process) => {
-            if let Some(adopt) = launch.adopt {
-                adopt(process.pid());
-            }
-            let mut report = None;
-            let mut cancelling = false;
-            loop {
-                tokio::select! {
-                    event = process.next() => match event {
-                        Some(Event::Exit(r)) => report = Some(r),
-                        Some(_) => {}
-                        None => break,
-                    },
-                    _ = &mut cancelled, if !cancelling => {
-                        cancelling = true;
-                        process.cancel(Escalation::default());
+    let (exit_code, timed_out) =
+        match Process::spawn(command, config, &hoh_core::spawn::Direct::plain()) {
+            Ok(mut process) => {
+                if let Some(adopt) = launch.adopt {
+                    adopt(process.pid());
+                }
+                let mut report = None;
+                let mut cancelling = false;
+                loop {
+                    tokio::select! {
+                        event = process.next() => match event {
+                            Some(Event::Exit(r)) => report = Some(r),
+                            Some(_) => {}
+                            None => break,
+                        },
+                        _ = &mut cancelled, if !cancelling => {
+                            cancelling = true;
+                            process.cancel(Escalation::default());
+                        }
                     }
                 }
+                let report = report
+                    .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
+                recorded_exit(report.status, report.cause)
             }
-            let report = report
-                .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
-            recorded_exit(report.status, report.cause)
-        }
-        Err(e) => {
-            // As run_check does when the command cannot start: 127, the error as its stderr.
-            std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
-            std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
-            (127, false)
-        }
-    };
+            Err(e) => {
+                // As run_check does when the command cannot start: 127, the error as its stderr.
+                std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
+                std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
+                (127, false)
+            }
+        };
     let elapsed = began.elapsed();
     let wall_finished = std::time::SystemTime::now();
     // The record's finish is its start plus the monotonic time: interval and duration agree by construction and never

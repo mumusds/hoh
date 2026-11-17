@@ -245,11 +245,11 @@ impl Gate {
 
 impl Spawner for Gate {
     fn helper(&self, command: &mut Command) -> std::io::Result<Helper> {
-        self.helper_by(command, &|command| Direct.helper(command))
+        self.helper_by(command, &|command| Direct::plain().helper(command))
     }
 
     fn host(&self, command: &mut Command) -> std::io::Result<WaitOnly> {
-        self.host_by(command, &|command| Direct.host(command))
+        self.host_by(command, &|command| Direct::plain().host(command))
     }
 }
 
