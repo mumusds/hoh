@@ -5848,3 +5848,71 @@ async fn an_answer_taken_by_an_incomplete_run_is_folded_into_its_cancel() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_budget_at_risk_wakes_the_commander_and_gets_a_turn_while_the_budget_admits_one() -> R {
+    // REQ-042 behaviour 9 and REQ-021 behaviour 1 (CR-025): the pace writes R's budget.risk (iterations at 80 of 100);
+    // the supervisor takes it in as a high trigger, fires its wake, and the wake is given a Commander turn. With R's
+    // deadline past as well (its stop holds; D still runs, so R is not INCOMPLETE yet) the iterations' risk is written
+    // and woken the same, but no turn is given: the supervision's budget rule is unchanged. A host that ended after the
+    // pace's commit and before its supervisor took the event in (the store opened again) still wakes it: taken in after
+    // the restart, its trigger is due 2 s after the step that took it in.
+    for (deadline_past, reopened) in [(false, false), (true, false), (false, true)] {
+        let case = format!("deadline past {deadline_past}, reopened {reopened}");
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        let deadline = if deadline_past {
+            "UPDATE runs SET deadline_at = '2026-11-08T00:00:00Z' WHERE run_id = 'R';"
+        } else {
+            ""
+        };
+        exec(
+            &path,
+            &format!(
+                "{WORLD}{deadline}
+                 INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 80);"
+            ),
+        )?;
+        store.pace_run("R", context(&clock, 0)).await?;
+        assert_eq!(
+            value(
+                &path,
+                "SELECT json_group_array(json_extract(payload_json, '$.kind')) FROM events WHERE kind = 'budget.risk'"
+            )?,
+            json!(["max_iterations"]),
+            "{case}"
+        );
+        let store = if reopened {
+            drop(store);
+            open(&dir, &clock)?.0
+        } else {
+            store
+        };
+        let mut fired = store.supervise("R", context(&clock, 2000)).await?.fired;
+        if reopened {
+            assert!(fired.is_empty(), "{case}: {fired:?}");
+            fired = store.supervise("R", context(&clock, 4000)).await?.fired;
+        }
+        let [fired] = fired.as_slice() else {
+            return Err(format!("{case}: fired {fired:?}").into());
+        };
+        assert_eq!(
+            value(
+                &path,
+                "SELECT json_group_array(json_extract(payload_json, '$.wake_severity')) FROM events WHERE kind = 'supervisor.woken'"
+            )?,
+            json!(["high"]),
+            "{case}"
+        );
+        let turn = store
+            .allocate_supervision("p1", context(&clock, if reopened { 4500 } else { 2500 }))
+            .await?;
+        assert_eq!(
+            turn.map(|t| t.wake),
+            (!deadline_past).then(|| fired.trigger_id.clone()),
+            "{case}"
+        );
+    }
+    Ok(())
+}

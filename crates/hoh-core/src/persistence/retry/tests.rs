@@ -1990,3 +1990,270 @@ async fn a_task_refused_again_and_again_asks_its_question_and_its_answer_dispatc
     }
     Ok(())
 }
+
+/// Run R's `budget.risk` payloads, in the order written.
+fn risk_events(path: &Path) -> R<Vec<Value>> {
+    let conn = Connection::open(path)?;
+    let mut statement =
+        conn.prepare("SELECT payload_json FROM events WHERE kind = 'budget.risk' ORDER BY seq")?;
+    let texts = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(texts
+        .iter()
+        .map(|t| serde_json::from_str(t))
+        .collect::<Result<_, _>>()?)
+}
+
+/// What a risk must not change: R's state, its dispatches (outbox rows and attempts) and T1's retry count and time.
+fn untouched(path: &Path) -> R<(String, i64, i64, i64, Option<String>)> {
+    let (count, next): (i64, Option<String>) = Connection::open(path)?.query_row(
+        "SELECT attempt_count, next_retry_at FROM tasks WHERE task_id = 'T1'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((
+        run_state(path)?,
+        self::count(path, "SELECT count(*) FROM outbox")?,
+        self::count(path, "SELECT count(*) FROM attempts")?,
+        count,
+        next,
+    ))
+}
+
+/// A `budget.risk` payload.
+fn risk(kind: &str, used: Value, limit: Value, unit: &str) -> Value {
+    json!({"kind": kind, "used": used, "limit": limit, "unit": unit, "threshold": 0.8})
+}
+
+#[tokio::test]
+async fn test_042_07_a_budget_at_80_percent_is_reported_once_however_often_judged_or_restarted() -> R
+{
+    // AC-042-07 (REQ-042 behaviour 9, CR-025): Re (max_iterations 100) at 79 has no budget.risk; at 80 exactly one,
+    // its whole payload as given, and judging it again or after a restart (the database opened again) writes no
+    // second. Rf (deadline_at 100 s after its creation, by the wall clock) has none at 79 s and one at 80 s. Neither
+    // run's state, dispatches nor retry count change for it.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 79);"
+    ))?;
+    let now = at("2026-11-07T00:00:10Z")?;
+    let before = untouched(&path)?;
+    store.pace_run("R", context(now)).await?;
+    assert_eq!(risk_events(&path)?, Vec::<Value>::new(), "Re at 79");
+    Connection::open(&path)?
+        .execute_batch("UPDATE budgets SET used_value = 80 WHERE kind = 'iterations';")?;
+    store.pace_run("R", context(now)).await?;
+    store.pace_run("R", context(now)).await?;
+    drop(store);
+    let (store, _) = open(&dir)?;
+    store.pace_run("R", context(now)).await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [risk("max_iterations", json!(80), json!(100), "iterations")],
+        "Re at 80, judged three times across a restart"
+    );
+    assert_eq!(untouched(&path)?, before, "Re");
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}UPDATE runs SET deadline_at = '2026-11-07T00:01:40Z' WHERE run_id = 'R';"
+    ))?;
+    let before = untouched(&path)?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:19Z")?))
+        .await?;
+    assert_eq!(risk_events(&path)?, Vec::<Value>::new(), "Rf at 79 s");
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:20Z")?))
+        .await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [risk("deadline_at", json!(80), json!(100), "seconds")],
+        "Rf at 80 s"
+    );
+    assert_eq!(untouched(&path)?, before, "Rf");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pace_reports_every_kind_at_risk_in_one_commit_with_its_payload() -> R {
+    // REQ-042 behaviour 9 (CR-025): the deadline (80 s of 100 by the wall clock), the iterations (80 of 100), the
+    // duration (2880 s of 3600) and a known cost (4 of 5 usd) cross together: one event each, in the order of the
+    // stops, each payload whole; a cost whose limit is set but whose price is unknown, an unset limit and a kind whose
+    // stop holds have none.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE runs SET deadline_at = '2026-11-07T00:01:40Z' WHERE run_id = 'R';
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value, price_known) VALUES
+           ('run', 'R', 'iterations', 100, 80, 0), ('run', 'R', 'wall_seconds', 3600, 2880, 0),
+           ('run', 'R', 'usd', 5, 4, 1);"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:20Z")?))
+        .await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [
+            risk("deadline_at", json!(80), json!(100), "seconds"),
+            risk("max_iterations", json!(80), json!(100), "iterations"),
+            risk("max_duration_hours", json!(2880), json!(3600), "seconds"),
+            risk("max_usd", json!(4), json!(5), "usd"),
+        ]
+    );
+    for (name, setup) in [
+        (
+            "an unknown price",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value, price_known) VALUES ('run', 'R', 'usd', 5, 4.5, 0);",
+        ),
+        (
+            "an unset limit",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', NULL, 90);",
+        ),
+        (
+            "its stop holding",
+            "INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 100);",
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!("{WORLD}{setup}"))?;
+        store
+            .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+            .await?;
+        assert_eq!(risk_events(&path)?, Vec::<Value>::new(), "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_risk_is_judged_by_the_pace_only_and_reported_again_for_a_new_limit() -> R {
+    // REQ-042 behaviour 9 (CR-25D-100): a round that sees the deadline at 80 % first (the pace before it saw 79 %) writes
+    // nothing; the next pace does. A raised limit is a new (run, kind, limit): crossing 80 % of it is reported again.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE runs SET deadline_at = '2026-11-07T00:01:40Z' WHERE run_id = 'R';
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 80);"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:19Z")?))
+        .await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [risk("max_iterations", json!(80), json!(100), "iterations")]
+    );
+    let round = store
+        .schedule_round("R", context(at("2026-11-07T00:01:20Z")?))
+        .await?;
+    assert!(round.dispatched.is_some(), "the round dispatches T1");
+    assert_eq!(risk_events(&path)?.len(), 1, "the round wrote a risk");
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:20Z")?))
+        .await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE budgets SET limit_value = 200, used_value = 160 WHERE kind = 'iterations';",
+    )?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:01:21Z")?))
+        .await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [
+            risk("max_iterations", json!(80), json!(100), "iterations"),
+            risk("deadline_at", json!(80), json!(100), "seconds"),
+            risk("max_iterations", json!(160), json!(200), "iterations"),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_risk_is_written_while_waiting_or_blocked_and_after_a_pause_and_costs_no_retry() -> R {
+    // REQ-042 behaviour 9 (CR-025): WAITING_EXTERNAL and BLOCKED are paced, so the risk is written there, with T1's
+    // attempt_count and next_retry_at unchanged; a PAUSED run is not paced: the threshold it crossed while paused is
+    // reported by the first pace after it resumed (by level).
+    for (state, resume) in [("WAITING_EXTERNAL", "RUNNING"), ("BLOCKED", "RUNNING")] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}
+             UPDATE runs SET state = '{state}', resume_state = '{resume}',
+               blocked_reason = CASE '{state}' WHEN 'BLOCKED' THEN 'NEED_DECISION' END WHERE run_id = 'R';
+             UPDATE tasks SET attempt_count = 2, next_retry_at = '2026-11-07T00:05:00Z' WHERE task_id = 'T1';
+             INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 85);"
+        ))?;
+        store
+            .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+            .await?;
+        assert_eq!(
+            risk_events(&path)?,
+            [risk("max_iterations", json!(85), json!(100), "iterations")],
+            "{state}"
+        );
+        let retry: (i64, Option<String>) = Connection::open(&path)?.query_row(
+            "SELECT attempt_count, next_retry_at FROM tasks WHERE task_id = 'T1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(
+            retry,
+            (2, Some("2026-11-07T00:05:00Z".to_owned())),
+            "{state}"
+        );
+    }
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING' WHERE run_id = 'R';
+         INSERT INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 100, 90);"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    assert_eq!(risk_events(&path)?, Vec::<Value>::new(), "paused");
+    Connection::open(&path)?.execute_batch(
+        "UPDATE runs SET state = 'RUNNING', resume_state = NULL WHERE run_id = 'R';",
+    )?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:11Z")?))
+        .await?;
+    assert_eq!(
+        risk_events(&path)?,
+        [risk("max_iterations", json!(90), json!(100), "iterations")],
+        "resumed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_deadlines_risk_reads_the_wall_clock_not_the_timers() -> R {
+    // REQ-042 behaviour 9 (CR-25D-04): with the timers at 70 s and the wall clock at 85 s of the 100 s span, the deadline
+    // is at risk (85 s); with them the other way round, it is not.
+    for (now, wall, expected) in [
+        (
+            "2026-11-07T00:01:10Z",
+            "2026-11-07T00:01:25Z",
+            vec![risk("deadline_at", json!(85), json!(100), "seconds")],
+        ),
+        ("2026-11-07T00:01:25Z", "2026-11-07T00:01:10Z", Vec::new()),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        Connection::open(&path)?.execute_batch(&format!(
+            "{WORLD}UPDATE runs SET deadline_at = '2026-11-07T00:01:40Z' WHERE run_id = 'R';"
+        ))?;
+        let context = Context {
+            wall: Some(at(wall)?),
+            ..context(at(now)?)
+        };
+        store.pace_run("R", context).await?;
+        assert_eq!(risk_events(&path)?, expected, "timers {now}, wall {wall}");
+    }
+    Ok(())
+}

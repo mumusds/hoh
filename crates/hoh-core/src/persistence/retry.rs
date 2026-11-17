@@ -633,6 +633,14 @@ pub(super) fn pace(
     let (budget, stop) = budget_and_stop(&tx, run_id, now, context.wall())?;
     let mut paced = Paced::default();
     let mut commit = Commit::default();
+    // Budget risk is judged here only, with the stop and in this transaction (REQ-042 behaviour 9, CR-025).
+    commit.events.extend(budget_risks(
+        &tx,
+        &project_id,
+        run_id,
+        &budget,
+        context.wall(),
+    )?);
     let run_cas = |to: RunState| StateCas {
         id: run_id.to_owned(),
         expected_revision: revision,
@@ -881,6 +889,63 @@ pub(super) fn pace(
     writer::write(&tx, &commit, ctx)?;
     super::writer::commit(tx, ctx)?;
     Ok(paced)
+}
+
+/// The `budget.risk` events run `run_id` writes now: [`budget::risks`] at the wall-clock time `wall`, each once per run,
+/// kind and limit (REQ-042 behaviour 9, CR-025). Its id names all three, so a judgement again, or after a restart, finds
+/// it written; a changed limit is a new id, reported again.
+fn budget_risks(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    run_id: &str,
+    budget: &Budget,
+    wall: SystemTime,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let created: String = tx
+        .query_row(
+            "SELECT created_at FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let created = crate::time::parse_rfc3339(&created).ok_or_else(|| {
+        PersistError::IntegrityViolation(format!("runs.created_at of {run_id}: {created}"))
+    })?;
+    let mut events = Vec::new();
+    for risk in budget::risks(budget, created, wall) {
+        let limit = number(risk.limit);
+        let id = child_id(
+            run_id,
+            &format!("budget.risk/{}/{limit}", risk.kind.as_str()),
+        );
+        let written: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if !written {
+            events.push(event(
+                project_id,
+                run_id,
+                id,
+                "budget.risk",
+                json!({"kind": risk.kind.as_str(), "used": number(risk.used), "limit": limit, "unit": risk.unit(),
+                       "threshold": budget::RISK_THRESHOLD}),
+            ));
+        }
+    }
+    Ok(events)
+}
+
+/// `x` as JSON: a whole number as an integer (80, not 80.0), any other as it is.
+fn number(x: f64) -> Value {
+    if x.fract() == 0.0 && x.abs() < 9.0e15 {
+        json!(x as i64)
+    } else {
+        json!(x)
+    }
 }
 
 /// Whether task `t` is due at `at` (UTC text, as `next_retry_at` is stored): READY, or PENDING with every dependency
