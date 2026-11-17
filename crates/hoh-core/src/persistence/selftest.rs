@@ -324,50 +324,15 @@ impl Drop for Probe {
     }
 }
 
-/// Bytes the room probe writes ([`room`]): twice the largest single allocation of the self-test (the -shm's 32 KiB).
-const ROOM_BYTES: usize = 64 << 10;
-
-/// What an I/O error of a call that writes or grows a store file did, by its extended result code; `None` for any
-/// other code. Besides SQLITE_FULL these are the failures a full file system or an exceeded quota gives, and the room
-/// probe settles which they are ([`judge`]). The -shm's mapping (SQLITE_IOERR_SHMMAP) is not one: it is WAL's
-/// (AC-062-06).
-fn growing_write(extended: i32) -> Option<&'static str> {
-    use rusqlite::ffi;
-    match extended {
-        ffi::SQLITE_IOERR_WRITE => Some("a write"),
-        ffi::SQLITE_IOERR_FSYNC => Some("an fsync"),
-        ffi::SQLITE_IOERR_TRUNCATE => Some("a truncate"),
-        ffi::SQLITE_IOERR_SHMSIZE => Some("the -shm's growth"),
-        _ => None,
-    }
-}
-
-/// Whether the directory of `db` has room now, seen directly: a new file of this call's (`<db>-room`, which [`claim`]
-/// found free) takes [`ROOM_BYTES`] of non-repeating bytes (a compressing file system must allocate them too) and an
-/// fsync, and is removed. The OS error that refused it, if one did.
+/// Whether the directory of `db` has room now ([`super::room::probe`]), with a file of this call's: `<db>-room`, which
+/// [`claim`] found free.
 fn room(db: &Path) -> std::io::Result<()> {
-    let path = with_suffix(db, "-room");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    let mut bytes = vec![0u8; ROOM_BYTES];
-    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-    for chunk in bytes.chunks_mut(8) {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
-    }
-    let written = file.write_all(&bytes).and_then(|()| file.sync_all());
-    drop(file);
-    let _ = std::fs::remove_file(&path);
-    written
+    super::room::probe(&with_suffix(db, "-room"))
 }
 
 /// The rule for a failed SQLite call of either process at `step`, said by `detail` (ADR-016's note, round 2): no errno
 /// read after SQLite returns, which may be a later call's. SQLITE_FULL is SQLite's own attribution: DB_FULL. A write or
-/// growth that failed ([`growing_write`]) is DB_FULL when `room`, seen right away, is refused for want of space or
+/// growth that failed ([`super::room::growing_write`]) is DB_FULL when `room`, seen right away, is refused for want of space or
 /// quota; otherwise, and for any other failure, it is WAL's failure at `step` (REQ-062 behaviour 7), saying what
 /// failed and what the room probe saw.
 fn judge(
@@ -376,7 +341,6 @@ fn judge(
     detail: String,
     room: impl FnOnce() -> std::io::Result<()>,
 ) -> PersistError {
-    use std::io::ErrorKind::{QuotaExceeded, StorageFull};
     let wal = |detail: String| PersistError::WalUnsupported {
         step: step.name(),
         detail,
@@ -387,13 +351,13 @@ fn judge(
     if extended & 0xff == rusqlite::ffi::SQLITE_FULL {
         return PersistError::Full(format!("WAL self-test at {}: {detail}", step.name()));
     }
-    let Some(what) = growing_write(extended) else {
+    let Some(what) = super::room::growing_write(extended) else {
         return wal(detail);
     };
     let what = format!("{what} failed, SQLite extended code {extended}");
-    let kib = ROOM_BYTES >> 10;
+    let kib = super::room::BYTES >> 10;
     match room() {
-        Err(e) if matches!(e.kind(), StorageFull | QuotaExceeded) => PersistError::Full(format!(
+        Err(e) if super::room::none(&e) => PersistError::Full(format!(
             "WAL self-test at {}: {detail} ({what}); its directory has no room: a {kib} KiB write and fsync \
              failed: {e}",
             step.name()

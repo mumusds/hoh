@@ -442,6 +442,62 @@ fn full_a_new_stores_switch_to_wal_that_cannot_commit_is_db_full() -> R {
     project.stop_host()
 }
 
+#[test]
+fn full_a_commands_commit_that_fails_for_quota_is_db_full_and_writes_nothing() -> R {
+    // The store's own commits (docs/09 fault matrix item 7; ADR-016's note, round 3 addition): a command's commit whose
+    // WAL fsync fails over quota is DB_FULL, retryable, when the store's directory is seen to have no room right after;
+    // with room it stays UNPROCESSABLE, its reason naming the I/O that failed. Nothing is written either way, and once
+    // the fault is gone commands are taken.
+    for (sticky, says) in [
+        (true, ["DB_FULL", "nothing was written"].as_slice()),
+        (
+            false,
+            ["UNPROCESSABLE", "an fsync failed", "not for want of room"].as_slice(),
+        ),
+    ] {
+        let project = Project::new()?;
+        let arm = project.root.join("io-fault-arm");
+        let state = project.root.join("io-fault-state");
+        let mut env = vec![
+            ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+            ("F7_IO_MATCH", "/.hoh/state.db".into()),
+            ("F7_IO_OP", "sync".into()),
+            ("F7_IO_SUFFIX", "state.db-wal".into()),
+            ("F7_IO_ERRNO", "122".into()),
+            ("F7_IO_ARM", arm.clone().into_os_string()),
+        ];
+        if sticky {
+            env.push(("F7_IO_STATE", state.clone().into_os_string()));
+        }
+        let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let before = project.quiet_dump()?;
+        std::fs::write(&arm, "")?;
+        let out = project.submit("second")?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let after = project.dump()?;
+        std::fs::remove_file(&arm)?;
+        let _ = std::fs::remove_file(&state);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "sticky {sticky}: {}",
+            text(&out)
+        );
+        for words in says {
+            assert!(
+                stderr.contains(words),
+                "sticky {sticky}: `{words}` not in {stderr}"
+            );
+        }
+        assert_eq!(after, before, "sticky {sticky}");
+        project.accepted("third")?;
+        assert_eq!(project.sql("SELECT count(*) FROM runs")?, "2");
+        project.stop_host()?;
+    }
+    Ok(())
+}
+
 /// Another process's write lock on a database (`BEGIN IMMEDIATE`), held until released.
 struct Lock(Child);
 
