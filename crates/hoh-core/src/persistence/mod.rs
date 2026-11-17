@@ -516,11 +516,12 @@ fn sqlite_error(e: rusqlite::Error) -> PersistError {
     }
 }
 
-/// A failed commit of the writer (docs/09 fault matrix item 7; docs/adr/ADR-016.md, the note's round 3): as
-/// [`sqlite_error`] maps it, except a write, fsync, truncate or -shm growth that failed ([`room::growing_write`]). That
-/// is DB_FULL, retryable, when the directory of `db` is seen to have no room right after ([`room::probe`], in a private
-/// directory `<db>-room-<pid>-<random>`); otherwise it stays a storage error, its reason naming the I/O that failed,
-/// SQLite's extended code and what the probe saw. No errno is read after SQLite returns.
+/// A failed commit of the writer (docs/09 fault matrix item 7; docs/adr/ADR-016.md, the note's rounds 3 to 5): as
+/// [`sqlite_error`] maps it, except a write, fsync, truncate, -shm growth or an open that creates a file
+/// (SQLITE_CANTOPEN) that failed ([`room::growing_write`]). That is DB_FULL, retryable, when the directory of `db` is
+/// seen to have no room right after ([`room::probe`], in a private directory `<db>-room-<pid>-<random>` held open
+/// while it lives); otherwise it stays a storage error, its reason naming the I/O that failed, SQLite's extended code
+/// and what the probe saw. No errno is read after SQLite returns.
 pub(super) fn commit_error(e: rusqlite::Error, db: Option<&Path>) -> PersistError {
     let Some((extended, what)) = e
         .sqlite_extended_error_code()
