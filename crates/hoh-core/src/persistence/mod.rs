@@ -91,8 +91,8 @@ pub use team::{
 };
 pub use verification::{ChangeRequest, Deferred, VerifierRequest};
 pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
-mod created;
 pub mod location;
+mod private;
 mod room;
 pub mod selftest;
 mod writer;
@@ -518,8 +518,8 @@ fn sqlite_error(e: rusqlite::Error) -> PersistError {
 
 /// A failed commit of the writer (docs/09 fault matrix item 7; docs/adr/ADR-016.md, the note's round 3): as
 /// [`sqlite_error`] maps it, except a write, fsync, truncate or -shm growth that failed ([`room::growing_write`]). That
-/// is DB_FULL, retryable, when the directory of `db` is seen to have no room right after ([`room::probe`], with a file
-/// named for this process and moment); otherwise it stays a storage error, its reason naming the I/O that failed,
+/// is DB_FULL, retryable, when the directory of `db` is seen to have no room right after ([`room::probe`], in a private
+/// directory `<db>-room-<pid>-<random>`); otherwise it stays a storage error, its reason naming the I/O that failed,
 /// SQLite's extended code and what the probe saw. No errno is read after SQLite returns.
 pub(super) fn commit_error(e: rusqlite::Error, db: Option<&Path>) -> PersistError {
     let Some((extended, what)) = e
@@ -532,14 +532,10 @@ pub(super) fn commit_error(e: rusqlite::Error, db: Option<&Path>) -> PersistErro
     let Some(db) = db.filter(|db| !db.as_os_str().is_empty()) else {
         return PersistError::Storage(format!("{e} ({what})"));
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut name = db.as_os_str().to_owned();
-    name.push(format!("-room-{}-{nanos}", std::process::id()));
+    let mut base = db.as_os_str().to_owned();
+    base.push("-room-");
     let kib = room::BYTES >> 10;
-    let seen = room::probe(Path::new(&name));
+    let seen = room::probe(Path::new(&base));
     let left = seen.left_told();
     match seen.written {
         Err(r) if room::none(&r) => PersistError::Full(format!(

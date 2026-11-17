@@ -4,23 +4,24 @@
 //! in-process lock and wal-index state and prove nothing, M2T01R-02) reads it, sees a later write of ours and we see
 //! one of its (the `-shm` wal-index is really shared), and each side is refused the write lock while the other holds
 //! it (file locks really work). Finally the WAL is checkpointed. Any failure is `DB_WAL_UNSUPPORTED`, but for a
-//! directory that refuses the temporary database's file (not writable: [`PersistError::NotWritable`]; full) and a file
-//! system that is full at any step (`DB_FULL`), which are not WAL's (docs/09 fault matrix item 7); the temporary files
-//! are removed in every case.
+//! directory that refuses the self-test's private directory (not writable: [`PersistError::NotWritable`]; full) and a
+//! file system that is full at a step before the checkpoint (`DB_FULL`), which are not WAL's (docs/09 fault matrix item
+//! 7). Everything lives in a private directory of the call's own, removed with its files in every case
+//! (docs/adr/ADR-016.md, the note's round 4).
 //!
 //! The second process is started from a [`ProbeCommand`]: in the product the `hoh` binary itself with the hidden
 //! argument [`PROBE_ARG`], which runs [`probe_main`]. It gets the database path in [`PROBE_DB_ENV`] and answers one
 //! line per command on stdout after the marker `hoh-wal-probe: ` (other output is ignored).
 
 use super::PersistError;
-use super::created::{Created, Leftover};
+use super::private::{Private, names, told};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Hidden argument of the `hoh` binary that runs [`probe_main`].
 pub const PROBE_ARG: &str = "__wal-probe";
@@ -79,12 +80,11 @@ pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistErro
     run(dir, probe, &|_| Ok(()))
 }
 
-/// How many names the self-test tries for its database before it gives up (F7-03).
-const NAME_ATTEMPTS: u32 = 8;
+/// How many names the self-test tries for its private directory before it gives up (F7-03).
+const NAME_ATTEMPTS: usize = 8;
 
-/// SQLite's files beside the self-test's database, which [`claim`] makes with it (the room probe's `-room` is the
-/// probe's own: [`room`]).
-const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// The database's name in the self-test's private directory.
+const DB_NAME: &str = "selftest.db";
 
 /// The self-test with `inject` called before each step; an `Err` from it fails that step (fault injection).
 pub(super) fn run(
@@ -92,126 +92,87 @@ pub(super) fn run(
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let names =
-        (0..NAME_ATTEMPTS).map(|n| dir.join(format!(".hoh-wal-selftest-{pid}-{nanos}-{n}.db")));
+    let names = names(&dir.join(".hoh-wal-selftest-"), NAME_ATTEMPTS).map_err(|e| {
+        PersistError::WalUnsupported {
+            step: Step::Open.name(),
+            detail: format!("no random name for the self-test's directory: {e}"),
+        }
+    })?;
     run_named(dir, names, probe, inject)
 }
 
-/// The self-test with its database at the first of `names` that this call can claim ([`claim`]). After it, the files
-/// the claim made are removed through their tokens, and nothing else (ADR-016's note, round 3: F7-200); one that
-/// cannot be removed is told with its path (F7-202). `steps` fails only as DB_FULL or DB_WAL_UNSUPPORTED.
+/// The self-test in the first of `names` it can make as its private directory ([`Private`]; a name that exists is
+/// another's and is skipped; with none left, the open step fails). The database and every file of the self-test live
+/// there, and the directory is removed with them after: nothing outside it is touched (docs/adr/ADR-016.md, the note's
+/// round 4). A path that stays is told with the self-test's own failure, whose kind it keeps; a self-test that passed
+/// fails at its cleanup, naming them (F7-202, F7-302).
 pub(super) fn run_named(
     dir: &Path,
     names: impl IntoIterator<Item = PathBuf>,
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
-    let claimed = claim(dir, names)?;
-    let result = steps(claimed.db.path(), probe, inject);
-    let left: Vec<String> = claimed
-        .companions
-        .into_iter()
-        .chain([claimed.db])
-        .filter_map(|made| made.remove().err())
-        .map(|left| left.to_string())
-        .collect();
-    if left.is_empty() {
-        return result;
-    }
-    // A file of this call's that stays is told, with its path, after the self-test's own failure if it had one; a
-    // self-test that passed fails at its cleanup (F7-202).
-    let left = left.join("; ");
-    Err(match result {
-        Ok(()) => PersistError::WalUnsupported {
+    let private = Private::make_first(names).map_err(|(path, e)| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            PersistError::WalUnsupported {
+                step: Step::Open.name(),
+                detail: format!(
+                    "every name tried for the self-test's directory exists already, the last {}",
+                    path.display()
+                ),
+            }
+        } else {
+            not_created(dir, &path, &e)
+        }
+    })?;
+    let result = steps(&private.path().join(DB_NAME), probe, inject);
+    let left = private.remove();
+    let cleanup = (!left.is_empty()).then(|| told(&left));
+    match (result, cleanup) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(left)) => Err(PersistError::WalUnsupported {
             step: "cleanup",
             detail: left,
-        },
-        Err(PersistError::Full(detail)) => PersistError::Full(format!("{detail}; cleanup: {left}")),
-        Err(PersistError::WalUnsupported { step, detail }) => PersistError::WalUnsupported {
-            step,
-            detail: format!("{detail}; cleanup: {left}"),
-        },
-        Err(other) => other,
-    })
+        }),
+        (Err(failed), left) => Err(failed.with_cleanup(left)),
+    }
 }
 
-/// The files a [`claim`] made: the database and its companions, each with its token.
+/// A failure of the self-test's steps: a full file system ([`PersistError::Full`]) or WAL's
+/// ([`PersistError::WalUnsupported`]) at a step. Only these, so that a leftover is told with each (F7-352).
 #[derive(Debug)]
-struct Claimed {
-    db: Created,
-    companions: Vec<Created>,
+enum Failed {
+    Full(String),
+    Wal { step: &'static str, detail: String },
 }
 
-/// Make the self-test's database file and its companions' ([`COMPANIONS`], empty: SQLite uses them as they are) with
-/// create_new, at the first name where all of them are new. A name where any exists is another creator's and is left to
-/// it: the files this call made for it are removed through their tokens and the next name is tried, up to the last; the
-/// self-test fails at its open step when none is free, or when a file it made and gave up cannot be removed (named).
-///
-/// The files are made before SQLite opens them, so that a directory refusing them for want of permission or room says
-/// so by the OS's error (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database.
-fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<Claimed, PersistError> {
-    claim_with(dir, names, &Created::remove)
-}
-
-/// [`claim`], with `remove` removing a file this call made and gave up.
-fn claim_with(
-    dir: &Path,
-    names: impl IntoIterator<Item = PathBuf>,
-    remove: &dyn Fn(Created) -> Result<(), Leftover>,
-) -> Result<Claimed, PersistError> {
-    let mut taken = None;
-    'names: for db in names {
-        let mut made: Vec<Created> = Vec::new();
-        for path in
-            std::iter::once(db.clone()).chain(COMPANIONS.map(|suffix| with_suffix(&db, suffix)))
-        {
-            match Created::new(&path) {
-                Ok((file, _)) => made.push(file),
-                Err(e) => {
-                    // Given up: what this call made for the name goes, or the self-test stops here naming it (F7-150).
-                    for file in made {
-                        remove(file).map_err(|left| PersistError::WalUnsupported {
-                            step: Step::Open.name(),
-                            detail: format!("a file made for the self-test and given up: {left}"),
-                        })?;
-                    }
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        taken = Some(path);
-                        continue 'names;
-                    }
-                    return Err(not_created(dir, &path, &e));
-                }
-            }
-        }
-        let mut made = made.into_iter();
-        if let Some(db) = made.next() {
-            return Ok(Claimed {
-                db,
-                companions: made.collect(),
-            });
+impl Failed {
+    fn wal(step: Step, detail: String) -> Failed {
+        Failed::Wal {
+            step: step.name(),
+            detail,
         }
     }
-    Err(PersistError::WalUnsupported {
-        step: Step::Open.name(),
-        detail: match taken {
-            Some(path) => format!(
-                "every name tried for the self-test database is taken, the last by {}",
-                path.display()
-            ),
-            None => "no name to try for the self-test database".to_owned(),
-        },
-    })
+
+    /// The store's error, the cleanup's leftovers, if any, after its reason.
+    fn with_cleanup(self, left: Option<String>) -> PersistError {
+        let left = left
+            .map(|left| format!("; cleanup: {left}"))
+            .unwrap_or_default();
+        match self {
+            Failed::Full(detail) => PersistError::Full(format!("{detail}{left}")),
+            Failed::Wal { step, detail } => PersistError::WalUnsupported {
+                step,
+                detail: format!("{detail}{left}"),
+            },
+        }
+    }
 }
 
-/// The self-test's database file could not be created at `db` in `dir`, for `e` (not that the name exists): a
-/// directory that refuses a new file is NotWritable, one without room DB_FULL, and anything else the open step's
+/// The self-test's private directory could not be made at `path` in `dir`, for `e` (not that the name exists): a
+/// directory that refuses a new entry is NotWritable, one without room DB_FULL, and anything else the open step's
 /// failure.
-fn not_created(dir: &Path, db: &Path, e: &std::io::Error) -> PersistError {
+fn not_created(dir: &Path, path: &Path, e: &std::io::Error) -> PersistError {
     use std::io::ErrorKind::{PermissionDenied, QuotaExceeded, ReadOnlyFilesystem, StorageFull};
     match e.kind() {
         PermissionDenied | ReadOnlyFilesystem => PersistError::NotWritable {
@@ -223,7 +184,7 @@ fn not_created(dir: &Path, db: &Path, e: &std::io::Error) -> PersistError {
         }
         _ => PersistError::WalUnsupported {
             step: Step::Open.name(),
-            detail: format!("cannot create {}: {e}", db.display()),
+            detail: format!("cannot create {}: {e}", path.display()),
         },
     }
 }
@@ -325,16 +286,13 @@ impl ProbeError {
     }
 
     /// Judged at `step` by the same rule as our own failed calls ([`judge`]), the room seen beside `db`.
-    fn judged(self, step: Step, db: &Path) -> PersistError {
+    fn judged(self, step: Step, db: &Path) -> Failed {
         match self {
             ProbeError::Sql { command, failure } => {
                 let detail = format!("the probe's `{command}` failed: {}", failure.message);
                 judge(step, &failure, detail, || room(db))
             }
-            ProbeError::Other(detail) => PersistError::WalUnsupported {
-                step: step.name(),
-                detail,
-            },
+            ProbeError::Other(detail) => Failed::wal(step, detail),
         }
     }
 }
@@ -353,10 +311,9 @@ impl Drop for Probe {
     }
 }
 
-/// Whether the directory of `db` has room now ([`super::room::probe`]), with a file of this call's: `<db>-room`, which
-/// [`claim`] found free.
+/// Whether the directory of `db`, the self-test's private one, has room now ([`super::room::probe`]).
 fn room(db: &Path) -> super::room::Seen {
-    super::room::probe(&with_suffix(db, "-room"))
+    super::room::probe(&with_suffix(db, "-room-"))
 }
 
 /// The rule for a failed SQLite call of either process at `step`, said by `detail` (ADR-016's note, round 2): no errno
@@ -370,11 +327,8 @@ fn judge(
     failure: &SqlFailure,
     detail: String,
     room: impl FnOnce() -> super::room::Seen,
-) -> PersistError {
-    let wal = |detail: String| PersistError::WalUnsupported {
-        step: step.name(),
-        detail,
-    };
+) -> Failed {
+    let wal = |detail: String| Failed::wal(step, detail);
     let Some(extended) = failure.extended else {
         return wal(detail);
     };
@@ -388,7 +342,7 @@ fn judge(
         ));
     }
     if extended & 0xff == rusqlite::ffi::SQLITE_FULL {
-        return PersistError::Full(format!("WAL self-test at {}: {detail}", step.name()));
+        return Failed::Full(format!("WAL self-test at {}: {detail}", step.name()));
     }
     let Some(what) = super::room::growing_write(extended) else {
         return wal(detail);
@@ -398,7 +352,7 @@ fn judge(
     let seen = room();
     let left = seen.left_told();
     match seen.written {
-        Err(e) if super::room::none(&e) => PersistError::Full(format!(
+        Err(e) if super::room::none(&e) => Failed::Full(format!(
             "WAL self-test at {}: {detail} ({what}); its directory has no room: a {kib} KiB write and fsync \
              failed: {e}{left}",
             step.name()
@@ -472,11 +426,8 @@ fn steps(
     db: &Path,
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
-) -> Result<(), PersistError> {
-    let failed = |step: Step, detail: String| PersistError::WalUnsupported {
-        step: step.name(),
-        detail,
-    };
+) -> Result<(), Failed> {
+    let failed = Failed::wal;
     let at = |step: Step| inject(step).map_err(|d| failed(step, d));
     // A full file system is not WAL's failure ([`judge`]): the room beside the database is seen at once.
     let sql = |step: Step| {
@@ -517,7 +468,7 @@ fn steps(
     other
         .expect("count", "count 2")
         .map_err(from_probe(Step::SharedMemory))?;
-    // The claim made the -shm empty; SQLite grows the one it shares to 32 KiB.
+    // SQLite grows the -shm it shares to 32 KiB.
     if std::fs::metadata(with_suffix(db, "-shm")).map_or(true, |m| m.len() == 0) {
         return Err(shared("no -shm file in use (missing or empty)".to_owned()));
     }
@@ -1033,50 +984,32 @@ mod tests {
     #[test]
     fn a_name_another_creator_holds_is_left_to_it_and_another_is_tried()
     -> Result<(), Box<dyn std::error::Error>> {
-        // F7-03: a database name that exists already (another creator's file, or a companion of that name) is not
-        // this call's: the self-test takes the next name and removes only what it created.
+        // F7-03, round 4: the private directory's name exists already (another creator's file or directory): it is
+        // left as it is and the next name is made; with every name taken the open step fails and deletes nothing.
         let dir = tempfile::tempdir()?;
         let names: Vec<PathBuf> = (0..3)
-            .map(|n| dir.path().join(format!("selftest-{n}.db")))
+            .map(|n| dir.path().join(format!("selftest-{n}")))
             .collect();
         let foreign = "owned by another creator\n";
         std::fs::write(&names[0], foreign)?;
-        let first = run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(()));
-        assert_eq!(
-            std::fs::read_to_string(&names[0]).ok().as_deref(),
-            Some(foreign),
-            "{first:?}"
-        );
-        first?;
-        assert_eq!(leftovers(dir.path()), ["selftest-0.db"]);
-
-        // A free name whose -wal exists is taken too: neither its -wal nor any file of ours stays.
-        std::fs::write(with_suffix(&names[1], "-wal"), foreign)?;
         run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(()))?;
-        assert_eq!(
-            std::fs::read_to_string(with_suffix(&names[1], "-wal"))?,
-            foreign
-        );
-        let mut left = leftovers(dir.path());
-        left.sort();
-        assert_eq!(left, ["selftest-0.db", "selftest-1.db-wal"]);
+        assert_eq!(std::fs::read_to_string(&names[0])?, foreign);
+        assert_eq!(leftovers(dir.path()), ["selftest-0"]);
 
-        // Every name taken: the self-test fails at open, and deletes none of them.
+        std::fs::create_dir(&names[1])?;
+        std::fs::write(names[1].join("selftest.db-journal"), foreign)?;
         std::fs::write(&names[2], foreign)?;
         match run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(())) {
             Err(PersistError::WalUnsupported { step, detail }) => {
                 assert_eq!(step, Step::Open.name(), "{detail}");
-                assert!(detail.contains("selftest-2.db"), "{detail}");
+                assert!(detail.contains("selftest-2"), "{detail}");
             }
             other => return Err(format!("{other:?}").into()),
         }
         let mut left = leftovers(dir.path());
         left.sort();
-        assert_eq!(
-            left,
-            ["selftest-0.db", "selftest-1.db-wal", "selftest-2.db"]
-        );
-        for kept in [&names[0], &with_suffix(&names[1], "-wal"), &names[2]] {
+        assert_eq!(left, ["selftest-0", "selftest-1", "selftest-2"]);
+        for kept in [&names[0], &names[1].join("selftest.db-journal"), &names[2]] {
             assert_eq!(
                 std::fs::read_to_string(kept)?,
                 foreign,
@@ -1084,33 +1017,6 @@ mod tests {
                 kept.display()
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn a_file_it_made_and_cannot_remove_fails_the_open_step_naming_it()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // F7-150: a name given up for a taken companion leaves the file this call just made; when it cannot be
-        // removed, the self-test fails at its open step and names it, rather than leave it unsaid and try the next.
-        let dir = tempfile::tempdir()?;
-        let names: Vec<PathBuf> = (0..2)
-            .map(|n| dir.path().join(format!("selftest-{n}.db")))
-            .collect();
-        std::fs::write(with_suffix(&names[0], "-wal"), "another's")?;
-        let refused = |made: Created| {
-            Err(Leftover {
-                path: made.path().to_owned(),
-                error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-            })
-        };
-        match claim_with(dir.path(), names.clone(), &refused) {
-            Err(PersistError::WalUnsupported { step, detail }) => {
-                assert_eq!(step, Step::Open.name(), "{detail}");
-                assert!(detail.contains("selftest-0.db"), "{detail}");
-            }
-            other => return Err(format!("{other:?}").into()),
-        }
-        assert!(!names[1].exists(), "the next name was tried");
         Ok(())
     }
 
@@ -1177,7 +1083,7 @@ mod tests {
             let judged =
                 ProbeError::of("insert-commit", answer, String::new).judged(Step::Locking, &db);
             assert_eq!(
-                matches!(judged, PersistError::Full(_)),
+                matches!(judged, Failed::Full(_)),
                 full,
                 "{answer}: {judged:?}"
             );
@@ -1185,7 +1091,7 @@ mod tests {
         let text = ProbeError::of("hold", "held twice", || "said otherwise".to_owned())
             .judged(Step::Locking, &db);
         assert!(
-            matches!(&text, PersistError::WalUnsupported { detail, .. } if detail == "said otherwise"),
+            matches!(&text, Failed::Wal { detail, .. } if detail == "said otherwise"),
             "{text:?}"
         );
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
@@ -1309,7 +1215,7 @@ mod tests {
                 || panic!("probed at the checkpoint"),
             );
             match &judged {
-                PersistError::WalUnsupported { step, detail } => {
+                Failed::Wal { step, detail } => {
                     assert_eq!(*step, Step::Checkpoint.name());
                     assert!(detail.contains(says), "{detail}");
                 }
@@ -1320,9 +1226,10 @@ mod tests {
 
     #[test]
     fn a_failed_write_is_db_full_only_when_its_directory_has_no_room_now() {
-        // F7-100: SQLITE_FULL is DB_FULL, unprobed; a write, fsync, truncate or -shm growth that failed is DB_FULL
-        // only when the room probe is refused for space or quota, and otherwise WAL's, saying what failed and what the
-        // probe saw; any other code (the plain I/O error, a read, the -shm's mapping, an open) is WAL's, unprobed.
+        // F7-100, F7-302: SQLITE_FULL is DB_FULL, unprobed; a write, fsync, truncate, -shm growth or an open that
+        // creates a file that failed is DB_FULL only when the room probe is refused for space or quota, and otherwise
+        // WAL's, saying what failed and what the probe saw; any other code (the plain I/O error, a read, the -shm's
+        // mapping, an open of a directory) is WAL's, unprobed.
         use rusqlite::ffi::*;
         use std::io::{Error, ErrorKind};
         let nospc = || Err(Error::from(ErrorKind::StorageFull));
@@ -1341,7 +1248,8 @@ mod tests {
             (Some(SQLITE_IOERR_SHMMAP), nospc, "wal", false),
             (Some(SQLITE_IOERR), nospc, "wal", false),
             (Some(SQLITE_IOERR_READ), nospc, "wal", false),
-            (Some(SQLITE_CANTOPEN), nospc, "wal", false),
+            (Some(SQLITE_CANTOPEN), nospc, "full", true),
+            (Some(SQLITE_CANTOPEN_ISDIR), nospc, "wal", false),
             (None, nospc, "wal", false),
         ] {
             let failure = SqlFailure {
@@ -1353,64 +1261,51 @@ mod tests {
                 seen.set(true);
                 super::super::room::Seen {
                     written: room(),
-                    left: None,
+                    left: Vec::new(),
                 }
             });
             assert_eq!(seen.get(), probed, "{extended:?}: {judged:?}");
             let got = match &judged {
-                PersistError::Full(_) => "full",
-                PersistError::WalUnsupported { detail, .. }
-                    if detail.contains("not for want of room") =>
-                {
+                Failed::Full(_) => "full",
+                Failed::Wal { detail, .. } if detail.contains("not for want of room") => {
                     "not for want of room"
                 }
-                PersistError::WalUnsupported { detail, .. }
-                    if detail.contains("room not known") =>
-                {
-                    "room not known"
-                }
-                PersistError::WalUnsupported { detail, .. } => {
+                Failed::Wal { detail, .. } if detail.contains("room not known") => "room not known",
+                Failed::Wal { detail, .. } => {
                     assert_eq!(detail, "disk I/O error");
                     "wal"
                 }
-                other => panic!("{extended:?}: {other:?}"),
             };
             assert_eq!(got, want, "{extended:?}: {judged:?}");
             if probed {
                 let x = extended.unwrap_or_default();
                 assert!(
-                    judged
-                        .to_string()
-                        .contains(&format!("SQLite extended code {x}")),
-                    "{judged}"
+                    format!("{judged:?}").contains(&format!("SQLite extended code {x}")),
+                    "{judged:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn the_room_probe_writes_and_syncs_in_the_directory_and_leaves_nothing_of_another()
+    fn the_room_probe_writes_and_syncs_in_a_private_directory_and_leaves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
-        // F7-100: the room probe is a file of this call's beside the database, removed after; a file of that name
-        // that exists already is another's: the probe fails and leaves it.
+        // F7-100, round 4: the room probe writes in a private directory of its own beside the database, removed
+        // with its file after; another's file of any name there stays as it is.
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("selftest.db");
         let seen = room(&db);
         seen.written?;
-        assert!(seen.left.is_none(), "{:?}", seen.left);
+        assert!(seen.left.is_empty(), "{:?}", seen.left);
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
         std::fs::write(with_suffix(&db, "-room"), "another's")?;
-        let taken = room(&db);
-        assert_eq!(
-            taken.written.as_ref().map_err(std::io::Error::kind).err(),
-            Some(std::io::ErrorKind::AlreadyExists),
-            "{taken:?}"
-        );
-        assert!(taken.left.is_none(), "{:?}", taken.left);
-        assert_eq!(
-            std::fs::read_to_string(with_suffix(&db, "-room"))?,
-            "another's"
-        );
+        std::fs::write(with_suffix(&db, "-room-"), "another's")?;
+        let seen = room(&db);
+        seen.written?;
+        assert!(seen.left.is_empty(), "{:?}", seen.left);
+        let mut left = leftovers(dir.path());
+        left.sort();
+        assert_eq!(left, ["selftest.db-room", "selftest.db-room-"]);
         Ok(())
     }
 
