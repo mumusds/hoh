@@ -218,6 +218,9 @@ pub enum PersistError {
     OnNetworkFs { path: PathBuf, fstype: String },
     /// WAL does not work in the database directory (`DB_WAL_UNSUPPORTED`).
     WalUnsupported { step: &'static str, detail: String },
+    /// The database directory refuses a new file (no permission, a read-only file system): the OS's reason
+    /// (docs/09 fault matrix item 7, the note on it in docs/adr/ADR-016.md).
+    NotWritable { path: PathBuf, detail: String },
     /// A connection setting differs from the required value; the store refuses writes.
     Pragma {
         name: &'static str,
@@ -380,6 +383,9 @@ impl std::fmt::Display for PersistError {
                     f,
                     "DB_WAL_UNSUPPORTED: WAL self-test failed at {step}: {detail}"
                 )
+            }
+            PersistError::NotWritable { path, detail } => {
+                write!(f, "{} is not writable: {detail}", path.display())
             }
             PersistError::Pragma {
                 name,
@@ -703,7 +709,7 @@ fn user_version(conn: &Connection) -> Result<i64, PersistError> {
 fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
     use rusqlite::fallible_iterator::FallibleIterator;
     let mut batch = rusqlite::Batch::new(conn, sql);
-    while let Some(mut statement) = batch.next().map_err(|e| e.to_string())? {
+    while let Some(mut statement) = batch.next().map_err(statement_error)? {
         let text = statement.expanded_sql().unwrap_or_default();
         let refused = || {
             format!(
@@ -720,7 +726,7 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
             _ if statement.readonly() => return Err(refused()),
             _ => {}
         }
-        statement.raw_execute().map_err(|e| e.to_string())?;
+        statement.raw_execute().map_err(statement_error)?;
         if conn.is_autocommit() {
             return Err(format!(
                 "the statement `{}` ended the transaction",
@@ -729,6 +735,15 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A script statement's error without the script: the error of one SQLite could not prepare carries the rest of the
+/// script, whose text would bury the reason in its migration's error (docs/09 fault matrix item 7).
+fn statement_error(e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::SqlInputError { msg, .. } => msg,
+        e => e.to_string(),
+    }
 }
 
 /// The first keyword of a statement, after whitespace, a byte-order mark, empty statements (`;`) and `--` / `/* */`
