@@ -1091,8 +1091,9 @@ async fn tick(
 
 /// One look of `work`'s inactivity watchdog (docs/adr/ADR-022.md decision 19), its leader `leader` (pid and start
 /// time): its output and, when it had none since the last look, its tool processes, read on a blocking thread; what
-/// changed recorded as an event of its run. The watch for the next look, or none once it no longer watches: its run
-/// stopped, or the look was lost.
+/// changed recorded as an event of its run, only while the attempt runs with no cancel begun (WD-01, WD-52). The watch
+/// for the next look, or none once it no longer watches: the attempt no longer runs, a cancel began, its run stopped,
+/// or the look was lost.
 async fn inactivity(
     common: &Arc<Common>,
     work: &Work,
@@ -1138,23 +1139,25 @@ async fn inactivity(
     let written = common
         .shared
         .store
-        .commit(Commit {
-            events: vec![NewEvent {
+        .runner_watched(
+            id,
+            NewEvent {
                 intent: Intent::Progress,
                 project_id: common.shared.project_id.clone(),
                 event_id: hoh_core::ids::child_id(id, &name),
                 run_id: Some(work.run_id.clone()),
                 kind: kind.to_owned(),
                 payload,
-            }],
-            ..Commit::default()
-        })
+            },
+        )
         .await;
     match written {
-        Ok(_) => {
+        Ok(true) => {
             watch.recorded(change, at);
             Some(watch)
         }
+        // The attempt no longer runs, or a cancel began: nothing of it is recorded any more.
+        Ok(false) => None,
         // Its run stopped: nothing of it is recorded any more.
         Err(PersistError::Held { .. } | PersistError::RunStopped { .. }) => None,
         Err(e) => {
@@ -1382,7 +1385,9 @@ async fn attempt(
     hooks.runner_of(RunnerPoint::AfterEffectStarted, &id);
     // While a verifier runs, its requests are taken in order, one at a time; once its process has ended none is taken
     // (a request is never cut off: its check and record end before the end is looked at; decision 7). Its inactivity
-    // watchdog looks at it meanwhile, on its own clock, and only records (docs/adr/ADR-022.md decision 19).
+    // watchdog looks at it meanwhile, on its own clock, and only records (docs/adr/ADR-022.md decision 19): a look is
+    // an operation of the attempt in flight beside its end and its requests, never in their way; one not done when
+    // the attempt ends is dropped with it, and a record is written only while the attempt runs (WD-01).
     let mut ended = started.ended;
     let mut served = 0;
     // (An interval of zero would panic; the product's is 15 s.)
@@ -1391,6 +1396,7 @@ async fn attempt(
     looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut watch = Some(Watch::new(common.watchdog.quiet, Instant::now()));
     let leader = (pid, who.start_id.parse::<u64>().ok());
+    let mut look = None;
     let end = loop {
         let serving = verifier.as_ref().zip(helpers.as_ref());
         tokio::select! {
@@ -1400,11 +1406,21 @@ async fn attempt(
                     served += serve_request(common, &work, v, helpers, served + 1).await?;
                 }
             }
-            _ = looks.tick(), if watch.is_some() => {
-                watch = inactivity(common, &work, watch.take(), leader).await;
+            _ = looks.tick(), if look.is_none() && watch.is_some() => {
+                look = Some(Box::pin(inactivity(common, &work, watch.take(), leader)));
+            }
+            next = async {
+                match look.as_mut() {
+                    Some(look) => look.await,
+                    None => std::future::pending().await,
+                }
+            }, if look.is_some() => {
+                look = None;
+                watch = next;
             }
         }
     };
+    drop(look);
     let Ok(outcome) = end else {
         // The executor lost the process: its end is not known, so it is settled as an expired lease would be, never
         // taken as a failure to run again (M2T05R-04).

@@ -1371,6 +1371,20 @@ impl Store {
             .await
     }
 
+    /// Record `event`, an event of attempt `attempt_id`'s inactivity watchdog (docs/adr/ADR-022.md decision 19); whether
+    /// it was.
+    pub async fn runner_watched(
+        &self,
+        attempt_id: &str,
+        event: NewEvent,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Watched {
+            attempt_id: attempt_id.to_owned(),
+            event: Box::new(event),
+        })
+        .await
+    }
+
     /// Renew the unexpired leases `attempts` hold, at `now` for [`LEASE_TTL`]; how many were renewed.
     pub async fn renew_leases(
         &self,
