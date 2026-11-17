@@ -674,12 +674,14 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
                 current_revision(shared, run_id).await,
             )
         }
+        // With the store's reason: the host's log may be where it cannot write either (a file system turned
+        // read-only, docs/09 fault matrix item 7).
         other => {
             log(&other.to_string());
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "UNPROCESSABLE",
-                "the store could not apply the request",
+                format!("the store could not apply the request: {other}"),
                 false,
                 None,
             )

@@ -284,6 +284,7 @@ impl StartError {
         let exit_code = match e {
             PersistError::OnNetworkFs { .. }
             | PersistError::WalUnsupported { .. }
+            | PersistError::NotWritable { .. }
             | PersistError::Pragma { .. }
             | PersistError::SchemaTooNew { .. } => 78,
             _ => 1,
@@ -729,9 +730,11 @@ pub async fn run_ready(config: HostConfig, ready: impl FnOnce()) -> u8 {
     }
     let host = match Host::start(config).await {
         Ok(host) => host,
+        // On one line: a client that started it reads its reason from its last line (docs/09 fault matrix item 7).
         Err(e) => {
             use std::io::Write as _;
-            let _ = writeln!(std::io::stderr(), "hoh host: {e}");
+            let reason = e.to_string().lines().collect::<Vec<_>>().join(" ");
+            let _ = writeln!(std::io::stderr(), "hoh host: {reason}");
             return e.exit_code;
         }
     };

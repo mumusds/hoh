@@ -3,8 +3,10 @@
 //! is switched to WAL and written; then a second **process** (two connections in one process would share SQLite's
 //! in-process lock and wal-index state and prove nothing, M2T01R-02) reads it, sees a later write of ours and we see
 //! one of its (the `-shm` wal-index is really shared), and each side is refused the write lock while the other holds
-//! it (file locks really work). Finally the WAL is checkpointed. Any failure is `DB_WAL_UNSUPPORTED`; the temporary
-//! files are removed in every case.
+//! it (file locks really work). Finally the WAL is checkpointed. Any failure is `DB_WAL_UNSUPPORTED`, but for a
+//! directory that refuses the temporary database's file (not writable: [`PersistError::NotWritable`]; full) and a file
+//! system that is full at any step (`DB_FULL`), which are not WAL's (docs/09 fault matrix item 7); the temporary files
+//! are removed in every case.
 //!
 //! The second process is started from a [`ProbeCommand`]: in the product the `hoh` binary itself with the hidden
 //! argument [`PROBE_ARG`], which runs [`probe_main`]. It gets the database path in [`PROBE_DB_ENV`] and answers one
@@ -90,6 +92,33 @@ pub(super) fn run(
         ".hoh-wal-selftest-{}-{nanos}.db",
         std::process::id()
     ));
+    // Its file made first, so that a directory refusing it for want of permission or room says so by the OS's error
+    // (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database. Any other
+    // failure is left to the open step, as before.
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&db)
+    {
+        use std::io::ErrorKind::{
+            PermissionDenied, QuotaExceeded, ReadOnlyFilesystem, StorageFull,
+        };
+        match e.kind() {
+            PermissionDenied | ReadOnlyFilesystem => {
+                return Err(PersistError::NotWritable {
+                    path: dir.to_path_buf(),
+                    detail: e.to_string(),
+                });
+            }
+            StorageFull | QuotaExceeded => {
+                return Err(PersistError::Full(format!(
+                    "{} has no room: {e}",
+                    dir.display()
+                )));
+            }
+            _ => {}
+        }
+    }
     let result = steps(&db, probe, inject);
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(with_suffix(&db, suffix));
@@ -198,7 +227,15 @@ fn steps(
         detail,
     };
     let at = |step: Step| inject(step).map_err(|d| failed(step, d));
-    let sql = |step: Step| move |e: rusqlite::Error| failed(step, e.to_string());
+    // A full file system is not WAL's failure.
+    let sql = |step: Step| {
+        move |e: rusqlite::Error| match e.sqlite_error_code() {
+            Some(ErrorCode::DiskFull) => {
+                PersistError::Full(format!("WAL self-test at {}: {e}", step.name()))
+            }
+            _ => failed(step, e.to_string()),
+        }
+    };
 
     at(Step::Open)?;
     let flags = OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW;

@@ -572,6 +572,20 @@ impl FaultHooks for FullDisk {
     }
 }
 
+/// Commits that fail as a write to a file system turned read-only does (SQLite's SQLITE_IOERR_WRITE), while on.
+#[derive(Debug)]
+struct FailingWrites(AtomicBool);
+
+impl FaultHooks for FailingWrites {
+    fn before_commit(&self) -> Result<(), PersistError> {
+        if self.0.load(Ordering::SeqCst) {
+            Err(PersistError::Storage("disk I/O error".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// A WAL self-test whose step fails.
 #[derive(Debug)]
 struct FailingStep(Step);
@@ -784,6 +798,64 @@ async fn test_036_04_failed_commit_is_retryable_and_reaches_no_subscriber() -> R
     assert_eq!(sse.count("r1", "run.pause_requested"), 1);
     assert_eq!(projection.count("r1", "run.pause_requested"), 1);
     drop((sse, projection));
+    host.shutdown().await;
+    Ok(())
+}
+
+/// A commit that fails for another reason than a full disk or a lock (docs/09 fault matrix item 7: a file system
+/// turned read-only under the host) is a non-retryable 503 whose message says the store's reason, since the host's
+/// log may be on the same file system; nothing is written, and once writes work again a command is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_failure_reaches_the_client_with_its_reason_and_writes_nothing() -> R {
+    let dir = tempfile::tempdir()?;
+    let failing = Arc::new(FailingWrites(AtomicBool::new(true)));
+    let mut config = config(dir.path());
+    config.store.faults = failing.clone();
+    let host = Host::start(config).await?;
+    seed_runs(&host, dir.path(), &["r1".to_owned()])?;
+    let tcp = To::Tcp(host.port);
+    let before = call(&tcp, "GET", "/v1/runs/r1", &host.token, b"")
+        .await?
+        .json()?;
+    let failed = call(
+        &tcp,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c1", "k1", "r1", 0, "io"),
+    )
+    .await?;
+    assert_eq!(failed.status, 503, "{failed:?}");
+    let error = failed.json()?;
+    assert_eq!(
+        (&error["code"], &error["retryable"]),
+        (&json!("UNPROCESSABLE"), &json!(false)),
+        "{error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("disk I/O error")),
+        "{error}"
+    );
+    let after = call(&tcp, "GET", "/v1/runs/r1", &host.token, b"")
+        .await?
+        .json()?;
+    assert_eq!(
+        (&after["state"], &after["revision"]),
+        (&before["state"], &before["revision"])
+    );
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "0");
+    failing.0.store(false, Ordering::SeqCst);
+    let applied = call(
+        &tcp,
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &pause("c2", "k2", "r1", 0, "io"),
+    )
+    .await?;
+    assert_eq!(applied.status, 202, "{applied:?}");
     host.shutdown().await;
     Ok(())
 }
