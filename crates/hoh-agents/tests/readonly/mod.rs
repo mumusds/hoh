@@ -75,6 +75,9 @@ pub struct Case {
     pub diff: Value,
     pub paths: BTreeMap<String, String>,
     pub token_sha256: String,
+    /// A live turn's nonce (TEST-021-07): its block is the product's (`supervise::decision_lines`) and its message a
+    /// record_assumption naming the token. `None`: an S0 recording's `{"nonce": "spike", "message": {"token": …}}`.
+    pub nonce: Option<String>,
     facts: OnceCell<ReplayFacts>,
 }
 
@@ -117,12 +120,14 @@ impl Case {
             diff: meta["snapshot_diff"].clone(),
             paths,
             token_sha256: meta["token_sha256"].as_str().unwrap_or_default().to_owned(),
+            nonce: None,
             facts: OnceCell::new(),
         })
     }
 
-    /// A variant `judge_check.py --emit` wrote: `<dir>/<prefix>{stdout.jsonl, rollout.jsonl, stdin.jsonl,
-    /// observations.json, diff.json}` (`prefix` "control." for its control round).
+    /// A variant `judge_check.py --emit` wrote, or a live turn TEST-021-07 recorded in the same layout:
+    /// `<dir>/<prefix>{stdout.jsonl, rollout.jsonl, stdin.jsonl, observations.json, diff.json}` (`prefix` "control."
+    /// for its control round); a live turn's diff.json also names its nonce.
     pub fn emitted(dir: &Path, agent: Agent, prefix: &str) -> R<Option<Case>> {
         let file = |kind: &str| dir.join(format!("{prefix}{kind}"));
         let Some(stdout) = read_if(&file("stdout.jsonl"))? else {
@@ -147,6 +152,7 @@ impl Case {
             diff: side["diff"].clone(),
             paths,
             token_sha256: side["token_sha256"].as_str().unwrap_or_default().to_owned(),
+            nonce: side["nonce"].as_str().map(str::to_owned),
             facts: OnceCell::new(),
         }))
     }
@@ -1004,6 +1010,33 @@ fn blocks(text: &str) -> Vec<&str> {
 /// token whose sha256 the case recorded.
 pub fn e11_block(c: &Case) -> &'static str {
     let text = c.facts().final_text.clone().unwrap_or_default();
+    let names_token = |t: &str| {
+        Sha256::digest(t.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            == c.token_sha256
+    };
+    if let Some(nonce) = &c.nonce {
+        // TEST-021-07 (E11): the product's parser takes the last block; its one line has the wake's nonce and a
+        // record_assumption whose statement names the token.
+        let (lines, truncated) = hoh_core::supervise::decision_lines(&text);
+        let ok = !truncated
+            && lines.len() == 1
+            && serde_json::from_str::<Value>(&lines[0])
+                .ok()
+                .is_some_and(|d| {
+                    let payload = &d["message"]["payload"];
+                    d["nonce"].as_str() == Some(nonce.as_str())
+                        && d["message"]["kind"] == "decision"
+                        && payload["kind"] == "record_assumption"
+                        && payload["statement"].as_str().is_some_and(|s| {
+                            s.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+                                .any(names_token)
+                        })
+                });
+        return if ok { "conform" } else { "insufficient" };
+    }
     let found = blocks(&text);
     let lines: Vec<&str> = found
         .last()
@@ -1013,14 +1046,7 @@ pub fn e11_block(c: &Case) -> &'static str {
         && serde_json::from_str::<Value>(lines[0])
             .ok()
             .is_some_and(|d| {
-                d["nonce"] == "spike"
-                    && d["message"]["token"].as_str().is_some_and(|t| {
-                        Sha256::digest(t.as_bytes())
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                            == c.token_sha256
-                    })
+                d["nonce"] == "spike" && d["message"]["token"].as_str().is_some_and(names_token)
             });
     if ok { "conform" } else { "insufficient" }
 }

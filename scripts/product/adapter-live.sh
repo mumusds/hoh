@@ -5,11 +5,16 @@
 #   TEST-026-04  pi      crates/hoh-agents/tests/pi_live.rs::pi_live_turns_resume_and_cancel
 #   TEST-006-03  doctor  crates/hoh-app/tests/doctor_live.rs::doctor_live_versions_whitelist_and_verified_logins
 #   TEST-053-05  qa      crates/hoh-app/tests/verification_live.rs::verification_live_candidate_to_qa
+#   TEST-021-07  commander  crates/hoh-agents/tests/commander_live.rs::commander_live_read_only_turns
 # Each is an ignored test whose name carries no TEST id (so the integration check never reports it as skipped); it
 # writes $HOH_EVIDENCE_DIR/<agent>-live-verdict.json, which this script turns into test-results.jsonl lines and
 # live-sessions.json (contracts/live-session.schema.json). A verdict is PASS, BLOCKED (CLI missing, not logged in, or
 # claude run as root), NOT_RUN (pi not installed, AC-026-04) or FAIL; BLOCKED and NOT_RUN are reported SKIPPED, never
 # PASS. Exit 0 = all PASS, 1 = any FAIL, 3 = otherwise BLOCKED or NOT_RUN.
+# commander is the Commander's read-only profile on claude, codex and pi (CR-024, docs/adr/ADR-032.md decision 8): it
+# needs all three (its full-access controls run claude's YOLO profile, so not as root). It is v1 only: under
+# HOH_LIVE_PROFILE=v0.1 it is not run, recorded NOT_RUN ("v1 only"), and that NOT_RUN alone does not make the exit code
+# 3; every other BLOCKED or NOT_RUN still does. Under v1 it runs and counts like the others.
 # qa is one candidate->QA loop through hoh with the default team (docs/adr/ADR-029.md, AC-053-05): Developer claude,
 # QA pi, Reviewer codex; claude in place of a missing pi or codex only under an explicit HOH_LIVE_PROFILE=v0.1. It is
 # BLOCKED without claude, as root, or without pi or codex otherwise; its PASS counts only with the native sessions of
@@ -31,9 +36,14 @@ live() {
   rm -f "$verdict"
   # doctor runs every installed CLI itself ("hoh" stands for the binary under test, always present); qa needs claude for
   # its Developer, and pi and codex for its default QA and Reviewer unless HOH_LIVE_PROFILE=v0.1.
-  case "$agent" in doctor) cli=hoh;; qa) cli=claude;; *) cli="$agent";; esac
+  case "$agent" in doctor) cli=hoh;; qa|commander) cli=claude;; *) cli="$agent";; esac
   if [[ "$cli" == hoh ]]; then bin=hoh; else bin="$(command -v "$cli" || true)"; fi
   codex="$bin" pi="$bin"
+  if [[ "$agent" == commander ]]; then
+    codex="$(command -v codex || true)" pi="$(command -v pi || true)"
+    [[ -n "$pi" ]] || missing+="pi "
+    [[ -n "$codex" ]] || missing+="codex "
+  fi
   if [[ "$agent" == qa ]]; then
     codex="$(command -v codex || true)" pi="$(command -v pi || true)"
     if [[ "${HOH_LIVE_PROFILE:-}" != v0.1 ]]; then
@@ -41,13 +51,18 @@ live() {
       [[ -n "$codex" ]] || missing+="codex "
     fi
   fi
-  if [[ -z "$bin" && "$agent" == pi ]]; then
+  if [[ "$agent" == commander && "${HOH_LIVE_PROFILE:-}" == v0.1 ]]; then
+    printf '{"status": "NOT_RUN", "detail": "v1 only", "sessions": []}\n' > "$verdict"
+  elif [[ -z "$bin" && "$agent" == pi ]]; then
     printf '{"status": "NOT_RUN", "detail": "pi is not installed", "sessions": []}\n' > "$verdict"
   elif [[ -z "$bin" ]]; then
     printf '{"status": "BLOCKED", "detail": "%s is not installed", "sessions": []}\n' "$cli" > "$verdict"
-  elif [[ ("$agent" == claude || "$agent" == qa) && "$(id -u)" == 0 ]]; then
+  elif [[ ("$agent" == claude || "$agent" == qa || "$agent" == commander) && "$(id -u)" == 0 ]]; then
     # AC-025-04 runs as a non-root user: the adapter never bypasses permissions as root.
     printf '{"status": "BLOCKED", "detail": "running as root", "sessions": []}\n' > "$verdict"
+  elif [[ -n "$missing" && "$agent" == commander ]]; then
+    printf '{"status": "BLOCKED", "detail": "%s not installed (the Commander read-only check runs on claude, codex and pi)", "sessions": []}\n' \
+      "${missing% }" > "$verdict"
   elif [[ -n "$missing" ]]; then
     printf '{"status": "BLOCKED", "detail": "%s not installed (the default QA and Reviewer; HOH_LIVE_PROFILE=v0.1 puts claude in their place)", "sessions": []}\n' \
       "${missing% }" > "$verdict"
@@ -62,6 +77,7 @@ live pi pi_live pi_live_turns_resume_and_cancel
 # doctor runs every installed CLI itself; "hoh" stands for the binary under test (always present).
 live doctor doctor_live doctor_live_versions_whitelist_and_verified_logins hoh-app
 live qa verification_live verification_live_candidate_to_qa hoh-app
+live commander commander_live commander_live_read_only_turns
 
 python3 - "$out" <<'PY'
 import json, os, sys
@@ -71,7 +87,8 @@ cases = [('claude', 'TEST-025-04', 'crates/hoh-agents/tests/claude_live.rs::clau
          ('codex', 'TEST-024-04', 'crates/hoh-agents/tests/codex_live.rs::codex_live_turn_and_cancel'),
          ('pi', 'TEST-026-04', 'crates/hoh-agents/tests/pi_live.rs::pi_live_turns_resume_and_cancel'),
          ('doctor', 'TEST-006-03', 'crates/hoh-app/tests/doctor_live.rs::doctor_live_versions_whitelist_and_verified_logins'),
-         ('qa', 'TEST-053-05', 'crates/hoh-app/tests/verification_live.rs::verification_live_candidate_to_qa')]
+         ('qa', 'TEST-053-05', 'crates/hoh-app/tests/verification_live.rs::verification_live_candidate_to_qa'),
+         ('commander', 'TEST-021-07', 'crates/hoh-agents/tests/commander_live.rs::commander_live_read_only_turns')]
 # The team TEST-053-05 may pass with: the default bindings, or claude in place of QA and Reviewer under v0.1.
 team = {'developer': {'claude'}, 'qa': {'pi'}, 'reviewer': {'codex'}}
 if os.environ.get('HOH_LIVE_PROFILE') == 'v0.1':
@@ -93,7 +110,9 @@ with (out / 'test-results.jsonl').open('a', encoding='utf-8') as results:
                     or not set(bound.values()) <= {s.get('agent') for s in ran}
                     or len({s['session_id'] for s in ran}) < 2):
                 status, v = 'FAIL', {**v, 'detail': f"PASS without the live sessions of its bindings {bound}: {v.get('detail', '')}"}
-        statuses.append(status)
+        # TEST-021-07 is v1 only: its NOT_RUN under v0.1 is recorded but does not count toward the exit code.
+        if not (agent == 'commander' and status == 'NOT_RUN' and os.environ.get('HOH_LIVE_PROFILE') == 'v0.1'):
+            statuses.append(status)
         results.write(json.dumps({'schema_version': '1.0', 'test_id': test_id, 'name': name,
                                   'status': {'PASS': 'PASS', 'BLOCKED': 'SKIPPED', 'NOT_RUN': 'SKIPPED'}.get(status, 'FAIL'),
                                   'detail': f"{status}: {v.get('detail', '')}"[:4096]}, ensure_ascii=False) + '\n')
