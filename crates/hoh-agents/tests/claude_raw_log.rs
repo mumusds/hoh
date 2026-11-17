@@ -44,7 +44,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
             program: fake,
             help: std::fs::read_to_string(HELP)?,
             cwd: world.dir.path().to_path_buf(),
-            yolo: true,
+            profile: hoh_agents::Profile::Yolo,
             partial: false,
             resume: None,
             model: None,

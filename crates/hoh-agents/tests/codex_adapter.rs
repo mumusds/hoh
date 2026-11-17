@@ -104,7 +104,7 @@ fn launch(program: &Path, cwd: &Path) -> R<Launch> {
         exec_help: read(format!("{FIXTURES}/help-exec.txt"))?,
         exec_resume_help: None,
         cwd: cwd.to_path_buf(),
-        yolo: true,
+        profile: hoh_agents::Profile::Yolo,
         resume: None,
         model: None,
         known: codex::known_notifications(&schema),
@@ -1776,7 +1776,7 @@ for line in sys.stdin:
     turn.launch.app_server_help =
         Some("  --listen <URL>  Supported values: `stdio://` (default)".to_owned());
     turn.launch.exec_help = "--json".to_owned();
-    turn.launch.yolo = false;
+    turn.launch.profile = hoh_agents::Profile::Plain;
     turn.launch.known = codex::APP_SERVER_NOTIFICATIONS
         .iter()
         .map(|m| (*m).to_owned())
@@ -1855,7 +1855,11 @@ async fn an_exec_session_resumes_only_if_a_resumed_exec_turn_could_start() -> R 
         let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
         turn.launch.app_server_help = None;
         turn.launch.exec_resume_help = help.map(str::to_owned);
-        turn.launch.yolo = yolo;
+        turn.launch.profile = if yolo {
+            hoh_agents::Profile::Yolo
+        } else {
+            hoh_agents::Profile::Plain
+        };
         turn.launch
             .capabilities
             .insert("token_usage".to_owned(), Some(true));

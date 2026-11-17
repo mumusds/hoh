@@ -89,7 +89,7 @@ impl Fakes for World {
                 program: program.to_path_buf(),
                 help: std::fs::read_to_string(format!("{FIXTURES}/help.txt"))?,
                 cwd: self.dir.path().to_path_buf(),
-                yolo: true,
+                profile: hoh_agents::Profile::Yolo,
                 partial: false,
                 resume: None,
                 model: None,

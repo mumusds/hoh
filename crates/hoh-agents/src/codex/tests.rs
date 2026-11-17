@@ -18,7 +18,7 @@ fn launch() -> Launch {
         exec_help: help("help-exec.txt"),
         exec_resume_help: None,
         cwd: PathBuf::from("/tmp"),
-        yolo: true,
+        profile: crate::Profile::Yolo,
         resume: None,
         model: None,
         known: BTreeSet::new(),
@@ -67,7 +67,7 @@ fn exec_args_come_from_the_help() {
     // The YOLO profile needs its flag; without YOLO it is not added.
     l.exec_help = l.exec_help.replace(YOLO_FLAG, "");
     assert!(matches!(exec_args(&l), Err(Blocked(d)) if d.contains(YOLO_FLAG)));
-    l.yolo = false;
+    l.profile = crate::Profile::Plain;
     assert!(!exec_args(&l).expect("argv").iter().any(|a| a == YOLO_FLAG));
     // No --json, no exec.
     l.exec_help = "Usage: codex exec [PROMPT]\n".to_owned();
@@ -329,11 +329,11 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
         l
     };
     for app_server in [true, false] {
-        for (probed, yolo, expected) in [
-            (Some(true), true, Some(true)),
-            (Some(false), true, Some(false)),
-            (None, true, None),
-            (Some(true), false, Some(false)),
+        for (probed, profile, expected) in [
+            (Some(true), crate::Profile::Yolo, Some(true)),
+            (Some(false), crate::Profile::Yolo, Some(false)),
+            (None, crate::Profile::Yolo, None),
+            (Some(true), crate::Profile::Plain, Some(false)),
         ] {
             let mut l = if app_server {
                 served(launch())
@@ -344,7 +344,7 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
                 .insert("command_execution".to_owned(), probed);
             l.capabilities
                 .insert("partial_messages".to_owned(), Some(true));
-            l.yolo = yolo;
+            l.profile = profile;
             let turn = Turn {
                 launch: l,
                 prompt: String::new(),
@@ -360,7 +360,7 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
             assert_eq!(
                 caps.get("command_execution").and_then(Value::as_bool),
                 expected,
-                "app server {app_server}, probed {probed:?}, yolo {yolo}: {caps}"
+                "app server {app_server}, probed {probed:?}, profile {profile:?}: {caps}"
             );
         }
     }
@@ -461,7 +461,7 @@ async fn the_driver_writes_what_the_request_builders_give() {
     let built = vec![
         requests::initialize(0),
         requests::initialized(),
-        requests::thread_start(1, true, None),
+        requests::thread_start(1, crate::Profile::Yolo, None),
         requests::turn_start(2, Some(&thread), &prompt),
     ];
     assert_eq!(written.len(), built.len(), "{written:#?}");

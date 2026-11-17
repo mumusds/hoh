@@ -139,9 +139,9 @@ pub fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
     match suite {
         "codex" => {
             let thread = if variant.resume {
-                requests::thread_resume(1, true, model, SUITE_SESSION)
+                requests::thread_resume(1, crate::Profile::Yolo, model, SUITE_SESSION)
             } else {
-                requests::thread_start(1, true, model)
+                requests::thread_start(1, crate::Profile::Yolo, model)
             };
             let mut messages = vec![
                 requests::initialize(0),
@@ -207,7 +207,7 @@ pub fn argv(
             exec_help: help.to_owned(),
             exec_resume_help: resume_help.map(str::to_owned),
             cwd: PathBuf::from(SUITE_CWD),
-            yolo: true,
+            profile: crate::Profile::Yolo,
             resume,
             model,
             known: Default::default(),
@@ -220,7 +220,7 @@ pub fn argv(
             program: PathBuf::from("claude"),
             help: help.to_owned(),
             cwd: PathBuf::from(SUITE_CWD),
-            yolo: true,
+            profile: crate::Profile::Yolo,
             partial: false,
             resume,
             model,
@@ -239,6 +239,7 @@ pub fn argv(
             provider: None,
             model,
             settled_event: true,
+            profile: crate::Profile::Yolo,
             capabilities: crate::capabilities::Probed::new(),
         })
         .map_err(|crate::pi::Blocked(why)| why),

@@ -48,8 +48,8 @@ pub struct Launch {
     /// The probed `claude --help` output.
     pub help: String,
     pub cwd: PathBuf,
-    /// Run with the agent's own permission bypass (HoH's YOLO runtime profile).
-    pub yolo: bool,
+    /// The launch profile (docs/adr/ADR-032.md decision 2); `Yolo` runs with the agent's own permission bypass.
+    pub profile: crate::Profile,
     /// The caller wants live deltas.
     pub partial: bool,
     /// Claude's session id to continue.
@@ -107,7 +107,7 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     if launch.partial && partial {
         args.push(PARTIAL_FLAG.to_owned());
     }
-    if launch.yolo {
+    if launch.profile == crate::Profile::Yolo {
         if !offers(&launch.help, YOLO_FLAG) {
             return Err(Blocked(format!(
                 "claude --help offers no {YOLO_FLAG} for the YOLO profile"
@@ -146,7 +146,7 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
                 ("token_usage", true),
                 ("resume", resume),
                 ("partial_messages", partial),
-                ("command_execution", launch.yolo),
+                ("command_execution", launch.profile == crate::Profile::Yolo),
             ],
         ),
     })

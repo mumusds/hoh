@@ -320,7 +320,11 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
             program: "claude".into(),
             help: help.to_owned(),
             cwd: "/".into(),
-            yolo: full,
+            profile: if full {
+                hoh_agents::Profile::Yolo
+            } else {
+                hoh_agents::Profile::Plain
+            },
             partial: full,
             resume: full.then(|| "hoh-id".to_owned()),
             model: None,
@@ -341,6 +345,7 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
             provider: full.then(|| "provider".to_owned()),
             model: full.then(|| "model".to_owned()),
             settled_event: false,
+            profile: hoh_agents::Profile::Yolo,
             capabilities: Default::default(),
         })
         .map_err(|blocked| blocked.0)
@@ -352,7 +357,11 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
             exec_help: help.to_owned(),
             exec_resume_help: None,
             cwd: "/".into(),
-            yolo: full,
+            profile: if full {
+                hoh_agents::Profile::Yolo
+            } else {
+                hoh_agents::Profile::Plain
+            },
             resume: None,
             model: full.then(|| "model".to_owned()),
             known: Default::default(),

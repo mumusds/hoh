@@ -628,13 +628,13 @@ impl State<'_> {
                     self.running = true;
                     self.phase = Phase::Thread;
                     let launch = &self.turn.launch;
-                    let (yolo, model) = (launch.yolo, launch.model.as_deref());
+                    let (profile, model) = (launch.profile, launch.model.as_deref());
                     match &launch.resume {
                         Some(thread) => self.conn.request(Pending::Thread, |id| {
-                            requests::thread_resume(id, yolo, model, thread)
+                            requests::thread_resume(id, profile, model, thread)
                         }),
                         None => self.conn.request(Pending::Thread, |id| {
-                            requests::thread_start(id, yolo, model)
+                            requests::thread_start(id, profile, model)
                         }),
                     }
                 }

@@ -55,7 +55,7 @@ async fn a_raw_log_cut_short_during_a_refused_handshake_fails_the_attempt() -> R
             exec_help: "--json --dangerously-bypass-approvals-and-sandbox".to_owned(),
             exec_resume_help: None,
             cwd: world.dir.path().to_path_buf(),
-            yolo: false,
+            profile: hoh_agents::Profile::Plain,
             resume: None,
             model: None,
             // What every App Server turn needs, so the App Server is tried and its handshake refused.

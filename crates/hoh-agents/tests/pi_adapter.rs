@@ -152,6 +152,7 @@ impl Fakes for World {
             provider: None,
             model: None,
             settled_event: true,
+            profile: hoh_agents::Profile::Yolo,
             // What `probe()` finds for the recorded pi 1.5.0 help.
             capabilities: probed(&[("structured_events", true), ("resume", true)]),
         })

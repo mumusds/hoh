@@ -132,7 +132,7 @@ async fn codex_live_turn_and_cancel() -> R {
         exec_help: stdout_of(&program, &["exec", "--help"])?,
         exec_resume_help: Some(stdout_of(&program, &["exec", "resume", "--help"])?),
         cwd: repo.clone(),
-        yolo: true,
+        profile: hoh_agents::Profile::Yolo,
         resume: None,
         model: None,
         known,
