@@ -564,11 +564,28 @@ fn verify_pragmas(conn: &Connection, busy_timeout: Duration) -> Result<(), Persi
     Ok(())
 }
 
+/// The first row of `sql`, a statement that may write (a PRAGMA that changes the database), run to its end:
+/// `query_row` stops at the first row, and an error of the statement's later work (the commit of `journal_mode=WAL`
+/// on a new database) would be lost in the reset that drops it (docs/adr/ADR-016.md, the note's round 2: F7-101).
+pub(crate) fn first_row_to_end<T>(
+    conn: &Connection,
+    sql: &str,
+    row: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([])?;
+    let first = match rows.next()? {
+        Some(r) => row(r)?,
+        None => return Err(rusqlite::Error::QueryReturnedNoRows),
+    };
+    while rows.next()?.is_some() {}
+    Ok(first)
+}
+
 /// Apply the per-connection settings (journal_mode is a property of the database and set by the writer only).
 fn configure(conn: &Connection, options: &Options, writer: bool) -> Result<(), PersistError> {
     if writer {
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        let mode: String = first_row_to_end(conn, "PRAGMA journal_mode=WAL", |r| r.get(0))
             .map_err(sqlite_error)?;
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(PersistError::Pragma {

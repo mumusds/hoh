@@ -372,6 +372,76 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
     ])
 }
 
+#[test]
+fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
+    // F7-101: `PRAGMA journal_mode=WAL` commits on the self-test's new database (its journal, then its header); its
+    // failure came after the first row and was lost, and the host later said "no -shm file".
+    check_all(&[
+        IoFault {
+            why: "the first write of the database without space",
+            op: "pwrite",
+            file: ".db",
+            errno: 28,
+            sticky: false,
+            in_probe: false,
+            interrupted_read: false,
+            exit: 69,
+            says: &["DB_FULL", "enable WAL", "database or disk is full"],
+        },
+        IoFault {
+            why: "the journal's fsync over quota, and it stays so",
+            op: "sync",
+            file: "-journal",
+            errno: 122,
+            sticky: true,
+            in_probe: false,
+            interrupted_read: false,
+            exit: 69,
+            says: &["DB_FULL", "enable WAL", "Disk quota exceeded"],
+        },
+        IoFault {
+            why: "one fsync of the journal over quota, the directory with room after it",
+            op: "sync",
+            file: "-journal",
+            errno: 122,
+            sticky: false,
+            in_probe: false,
+            interrupted_read: false,
+            exit: 78,
+            says: &[
+                "DB_WAL_UNSUPPORTED",
+                "enable WAL",
+                "fsync",
+                "not for want of room",
+            ],
+        },
+    ])
+}
+
+#[test]
+fn full_a_new_stores_switch_to_wal_that_cannot_commit_is_db_full() -> R {
+    // F7-101 in the store itself: the writer's `PRAGMA journal_mode=WAL` commits on a new state.db, and its failure
+    // (here the database's first write, without space) must reach the start, not be lost after the first row. The
+    // next start, with room, makes the store.
+    let project = Project::new()?;
+    let env = [
+        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+        ("F7_IO_MATCH", "/.hoh/state.db".into()),
+        ("F7_IO_OP", "pwrite".into()),
+        ("F7_IO_SUFFIX", "state.db".into()),
+        ("F7_IO_ERRNO", "28".into()),
+    ];
+    let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+    assert!(stderr.contains("DB_FULL"), "{stderr}");
+    project.stop_host()?;
+    project.accepted("second")?;
+    assert_eq!(project.sql("SELECT count(*) FROM runs")?, "1");
+    assert_eq!(project.sql("PRAGMA journal_mode")?, "wal");
+    project.stop_host()
+}
+
 /// Another process's write lock on a database (`BEGIN IMMEDIATE`), held until released.
 struct Lock(Child);
 

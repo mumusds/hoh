@@ -464,8 +464,8 @@ fn steps(
     let ours = Connection::open_with_flags(db, flags).map_err(sql(Step::Open))?;
 
     at(Step::EnableWal)?;
-    let mode: String = ours
-        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+    // Run to its end: on the new database it commits (F7-101).
+    let mode: String = super::first_row_to_end(&ours, "PRAGMA journal_mode=WAL", |r| r.get(0))
         .map_err(sql(Step::EnableWal))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(failed(Step::EnableWal, format!("journal_mode is {mode}")));
@@ -541,8 +541,8 @@ fn steps(
     drop(other);
 
     at(Step::Checkpoint)?;
-    let (busy, log, done): (i64, i64, i64) = ours
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+    let (busy, log, done): (i64, i64, i64) =
+        super::first_row_to_end(&ours, "PRAGMA wal_checkpoint(TRUNCATE)", |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .map_err(sql(Step::Checkpoint))?;
