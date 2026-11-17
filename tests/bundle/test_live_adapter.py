@@ -1,7 +1,8 @@
-"""scripts/product/adapter-live.sh's qa path (TEST-053-05, docs/adr/ADR-029.md S7) with fake agents and a stand-in for the
-ignored live tests: availability and root are judged by the script before any test runs, the qa verdict maps to
-TEST-053-05, and nothing but a live run's own verdict with the native sessions of its bindings is ever a PASS. No agent
-and no cargo is ever run: every program the script finds is this test's own."""
+"""scripts/product/adapter-live.sh's qa path (TEST-053-05, docs/adr/ADR-029.md S7) and its commander path (TEST-021-07,
+docs/adr/ADR-032.md, CR-024) with fake agents and a stand-in for the ignored live tests: availability and root are judged
+by the script before any test runs, the qa verdict maps to TEST-053-05, and nothing but a live run's own verdict with the
+native sessions of its bindings is ever a PASS; TEST-021-07 is v1 only: not run and not counted under v0.1, counted
+under v1. No agent and no cargo is ever run: every program the script finds is this test's own."""
 import json,os,shlex,shutil,subprocess,sys,tempfile,unittest
 from pathlib import Path
 from helpers import ROOT,own_python
@@ -16,7 +17,8 @@ args=sys.argv[1:]
 with open(os.environ['CALLS'],'a') as f:f.write(json.dumps({'argv':args,'env':{k:v for k,v in os.environ.items() if k.startswith('HOH_LIVE')}})+'\n')
 name=args[args.index('--exact')+1]
 agent={'claude_live_turns_resume_and_cancel':'claude','codex_live_turn_and_cancel':'codex','pi_live_turns_resume_and_cancel':'pi',
-       'doctor_live_versions_whitelist_and_verified_logins':'doctor','verification_live_candidate_to_qa':'qa'}[name]
+       'doctor_live_versions_whitelist_and_verified_logins':'doctor','verification_live_candidate_to_qa':'qa',
+       'commander_live_read_only_turns':'commander'}[name]
 v=json.loads(os.environ.get('FAKE_VERDICTS','{}')).get(agent)
 if v is not None:open(os.path.join(os.environ['HOH_LIVE_OUT'],agent+'-live-verdict.json'),'w').write(json.dumps(v))
 """
@@ -30,7 +32,8 @@ def passed(agents=DEFAULT):
     return {'status':'PASS','detail':'fake','agents':agents,
             'sessions':[session(agents[r],f'native-{r}') for r in ('developer','qa','reviewer')]}
 
-class AdapterLiveQa(unittest.TestCase):
+class Harness(unittest.TestCase):
+    """The script in a directory of its own, with this test's fakes and stand-in cargo only."""
     def setUp(self):
         t=tempfile.TemporaryDirectory(prefix='hoh-adapter-live-');self.addCleanup(t.cleanup);self.root=Path(t.name)
         (self.root/'scripts/product').mkdir(parents=True)
@@ -50,7 +53,8 @@ class AdapterLiveQa(unittest.TestCase):
         if root:self.script('id','[ "$1" = -u ] && { echo 0; exit 0; }; exit 1')
         # The other live tests' verdicts are given too, so the qa path is the only one under test.
         given={'claude':{'status':'BLOCKED','detail':'fake','sessions':[]},'codex':{'status':'BLOCKED','detail':'fake','sessions':[]},
-               'pi':{'status':'BLOCKED','detail':'fake','sessions':[]},'doctor':{'status':'BLOCKED','detail':'fake','sessions':[]}}|(verdicts or {})
+               'pi':{'status':'BLOCKED','detail':'fake','sessions':[]},'doctor':{'status':'BLOCKED','detail':'fake','sessions':[]},
+               'commander':{'status':'BLOCKED','detail':'fake','sessions':[]}}|(verdicts or {})
         base={'PATH':own_python(self.bin,str(self.tools)),'HOME':str(self.root),'HOH_EVIDENCE_DIR':str(self.ev),
               'CALLS':str(self.calls),'FAKE_VERDICTS':json.dumps(given)}
         p=subprocess.run([shutil.which('bash'),str(self.root/'scripts/product/adapter-live.sh')],capture_output=True,text=True,
@@ -60,6 +64,8 @@ class AdapterLiveQa(unittest.TestCase):
             row=json.loads(line);results[row['test_id']]=row
         calls=[json.loads(l) for l in self.calls.read_text().splitlines()] if self.calls.exists() else []
         return p,results,[c for c in calls if 'verification_live' in c['argv']]
+
+class AdapterLiveQa(Harness):
     def assertBlocked(self,results,calls,why):
         row=results['TEST-053-05'];self.assertEqual((row['status'],row['name']),('SKIPPED',QA_TEST),row)
         self.assertTrue(row['detail'].startswith('BLOCKED: '),row);self.assertIn(why,row['detail'])
@@ -124,5 +130,53 @@ class AdapterLiveQa(unittest.TestCase):
         self.calls.unlink(missing_ok=True);(self.ev/'test-results.jsonl').unlink(missing_ok=True)
         _,results,_=self.run_script(verdicts={'qa':passed(v01)},env={'HOH_LIVE_PROFILE':'v0.1'})
         self.assertEqual(results['TEST-053-05']['status'],'PASS',results['TEST-053-05'])
+
+COMMANDER_TEST='crates/hoh-agents/tests/commander_live.rs::commander_live_read_only_turns'
+
+class AdapterLiveCommander(Harness):
+    """TEST-021-07 in the check (CR-024): v1 only."""
+    def commander_calls(self):
+        return [json.loads(l) for l in self.calls.read_text().splitlines() if 'commander_live' in l] if self.calls.exists() else []
+    def everything_else_passes(self,v01):
+        bound=dict(DEFAULT,qa='claude',reviewer='claude') if v01 else DEFAULT
+        ok={'status':'PASS','detail':'fake','sessions':[session('claude','native-x')]}
+        return {'claude':ok,'codex':ok,'pi':ok,'doctor':ok,'qa':passed(bound)}
+    def test_test_021_07_is_not_run_under_v01_and_does_not_count(self):
+        # Under v0.1 the commander test is never invoked, TEST-021-07 is SKIPPED with "v1 only", and with every other
+        # item PASS the exit code is 0; another item's NOT_RUN still makes it 3.
+        env={'HOH_LIVE_PROFILE':'v0.1'}
+        p,results,_=self.run_script(verdicts=self.everything_else_passes(True)|{'commander':{'status':'PASS','detail':'never read','sessions':[]}},env=env)
+        self.assertEqual(self.commander_calls(),[],'the commander test is never run under v0.1')
+        row=results['TEST-021-07'];self.assertEqual((row['status'],row['name']),('SKIPPED',COMMANDER_TEST),row)
+        self.assertEqual(row['detail'],'NOT_RUN: v1 only',row)
+        self.assertEqual(p.returncode,0,p.stderr)
+        (self.ev/'test-results.jsonl').unlink();self.calls.unlink(missing_ok=True)
+        p,results,_=self.run_script(verdicts=self.everything_else_passes(True)|{'pi':{'status':'NOT_RUN','detail':'pi is not installed','sessions':[]}},
+                                    env=env)
+        self.assertEqual(results['TEST-021-07']['detail'],'NOT_RUN: v1 only')
+        self.assertEqual(p.returncode,3,'another NOT_RUN still counts')
+    def test_test_021_07_runs_and_counts_under_v1(self):
+        # Under v1 it is run with the three agents' paths; its FAIL makes the exit code 1, its PASS lets it be 0, and a
+        # missing agent or root BLOCKS it without a run.
+        for verdict,status,code in [({'status':'FAIL','detail':'a round FAILED','sessions':[]},'FAIL',1),
+                                    ({'status':'PASS','detail':'fake','sessions':[session('codex','native-c')]},'PASS',0)]:
+            with self.subTest(status=status):
+                self.calls.unlink(missing_ok=True);(self.ev/'test-results.jsonl').unlink(missing_ok=True)
+                p,results,_=self.run_script(verdicts=self.everything_else_passes(False)|{'commander':verdict})
+                calls=self.commander_calls();self.assertEqual(len(calls),1,calls)
+                self.assertEqual(calls[0]['argv'],['test','-p','hoh-agents','--locked','--test','commander_live','--','--ignored',
+                                                   '--exact','commander_live_read_only_turns','--nocapture'])
+                self.assertEqual(calls[0]['env'],{'HOH_LIVE_OUT':str(self.ev),'HOH_LIVE_CLAUDE':str(self.bin/'claude'),
+                                                  'HOH_LIVE_PI':str(self.bin/'pi'),'HOH_LIVE_CODEX':str(self.bin/'codex')})
+                row=results['TEST-021-07'];self.assertEqual((row['status'],row['name']),(status,COMMANDER_TEST),row)
+                self.assertEqual(p.returncode,code,p.stderr)
+        for agents,root,why in [(('claude','codex'),False,'pi not installed'),(('claude','pi'),False,'codex not installed'),
+                                (('codex','pi'),False,'claude is not installed'),(('claude','codex','pi'),True,'running as root')]:
+            with self.subTest(why=why):
+                self.calls.unlink(missing_ok=True);(self.ev/'test-results.jsonl').unlink(missing_ok=True)
+                p,results,_=self.run_script(agents=agents,root=root,verdicts=self.everything_else_passes(False))
+                self.assertEqual(self.commander_calls(),[])
+                row=results['TEST-021-07'];self.assertEqual(row['status'],'SKIPPED',row);self.assertIn(why,row['detail'])
+                self.assertTrue(row['detail'].startswith('BLOCKED: '),row)
 
 if __name__=='__main__':unittest.main()
