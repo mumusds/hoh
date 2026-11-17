@@ -562,44 +562,72 @@ fn full_a_journal_swapped_before_sqlite_opens_the_database_is_left_to_its_maker(
     )
 }
 
+/// Make every directory under `.hoh` writable again (a test made one 0500), so it can be removed.
+fn unlock(project: &Project) -> R {
+    fn walk(path: &Path) -> R {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_dir() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            for entry in std::fs::read_dir(path)? {
+                walk(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    for entry in std::fs::read_dir(project.hoh_dir())? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.starts_with(".hoh-wal-selftest-") || name.starts_with("state.db-room-") {
+            walk(&path)?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path() -> R {
-    // F7-202, F7-302: removals of the self-test's own files that fail (unlink: EIO) are not dropped: every path left
-    // is told, and the original failure keeps its class (a full file system stays DB_FULL); a self-test that passed
-    // fails at its cleanup, naming them.
-    for (why, unlink, fault, exit, says) in [
+    // F7-202, F7-302: removals of the self-test's own files that fail (here their directory lost its write permission
+    // when the file was closed: EACCES) are not dropped: every path left is told, and the original failure keeps its
+    // class (a full file system stays DB_FULL); a self-test that passed fails at its cleanup, naming them.
+    not_root()?;
+    for (why, closed, fault, exit, says) in [
         (
             "the room probe's file, after one fsync over quota with room",
-            "room",
+            "/room",
             [("F7_IO_OP", "sync"), ("F7_IO_SUFFIX", "-wal")].as_slice(),
             78,
             [
                 "DB_WAL_UNSUPPORTED",
                 "not for want of room",
-                "Input/output error",
+                "Permission denied",
             ]
             .as_slice(),
         ),
         (
             "the database, after a self-test that passed",
-            ".db",
+            "/selftest.db",
             [].as_slice(),
             78,
-            ["DB_WAL_UNSUPPORTED", "at cleanup", "Input/output error"].as_slice(),
+            ["DB_WAL_UNSUPPORTED", "at cleanup", "Permission denied"].as_slice(),
         ),
         (
             "the database, after the -journal could not be made for want of space that stays",
-            ".db",
+            "/selftest.db",
             [("F7_IO_OP", "open"), ("F7_IO_SUFFIX", "-journal")].as_slice(),
             69,
-            ["DB_FULL", "No space left on device", "Input/output error"].as_slice(),
+            ["DB_FULL", "No space left on device", "Permission denied"].as_slice(),
         ),
     ] {
         let (project, before) = made()?;
         let mut env = vec![
             ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
-            ("F7_UNLINK_ERRNO", "5".into()),
-            ("F7_UNLINK_SUFFIX", unlink.into()),
+            ("F7_RIVAL_OP", "close".into()),
+            ("F7_RIVAL_ON", closed.into()),
+            ("F7_RIVAL_DO", "chmod".into()),
+            ("F7_RIVAL_PARENT", "1".into()),
         ];
         env.extend(fault.iter().map(|&(k, v)| (k, v.into())));
         if !fault.is_empty() {
@@ -613,15 +641,16 @@ fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path
             }
         }
         let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let left = selftest_paths(&project)?;
+        unlock(&project)?;
         assert_eq!(out.status.code(), Some(exit), "{why}: {}", text(&out));
         for words in says {
             assert!(stderr.contains(words), "{why}: `{words}` not in {stderr}");
         }
-        let left = selftest_paths(&project)?;
         assert!(
             left.iter()
-                .any(|path| path.to_string_lossy().ends_with(unlink)),
+                .any(|path| path.to_string_lossy().ends_with(closed)),
             "{why}: {left:?}"
         );
         for path in &left {
@@ -634,6 +663,150 @@ fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path
         assert_eq!(project.dump()?, before, "{why}");
     }
     Ok(())
+}
+
+/// Another process swaps a private directory of the self-test or of a room probe for a symlink to a directory of its
+/// own (`victim`, holding `sentinel`; F7_RIVAL_DO swapself or swapdir) at the moment `rival` says; `start` and `fault`
+/// set the rest of the shim, `command` is what is run after (a made project's next start, or a running host's
+/// command). The cleanup removes nothing outside the private directory: `sentinel` stays; the client says `exit` and
+/// `says`.
+fn swap_leaves_the_outside_alone(
+    why: &str,
+    rival: [(&str, &str); 3],
+    fault: &[(&str, &str)],
+    running: bool,
+    says: &[&str],
+) -> R {
+    let (project, before) = if running {
+        let project = Project::new()?;
+        (project, String::new())
+    } else {
+        made()?
+    };
+    let victim = project.root.join("victim");
+    std::fs::create_dir(&victim)?;
+    std::fs::write(victim.join("sentinel"), "SENTINEL\n")?;
+    let arm = project.root.join("io-fault-arm");
+    let mut env = vec![
+        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+        ("F7_RIVAL_VICTIM", victim.clone().into_os_string()),
+        ("F7_RIVAL_PARENT", "1".into()),
+    ];
+    env.extend(rival.map(|(k, v)| (k, v.into())));
+    env.extend(fault.iter().map(|&(k, v)| (k, v.into())));
+    let out = if running {
+        env.push(("F7_IO_ARM", arm.clone().into_os_string()));
+        let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
+        assert_eq!(out.status.code(), Some(0), "{why}: {}", text(&out));
+        project.quiet_dump()?;
+        std::fs::write(&arm, "")?;
+        let out = project.submit("second")?;
+        std::fs::remove_file(&arm)?;
+        out
+    } else {
+        project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?
+    };
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    project.stop_host()?;
+    assert_eq!(
+        std::fs::read_to_string(victim.join("sentinel"))
+            .ok()
+            .as_deref(),
+        Some("SENTINEL\n"),
+        "{why}: the file outside the private directory: {}",
+        text(&out)
+    );
+    assert_ne!(out.status.code(), Some(0), "{why}: {}", text(&out));
+    for words in says {
+        assert!(stderr.contains(words), "{why}: `{words}` not in {stderr}");
+    }
+    if !running {
+        assert_eq!(project.dump()?, before, "{why}");
+    }
+    Ok(())
+}
+
+#[test]
+fn full_a_private_directory_swapped_for_a_symlink_right_after_it_is_made_takes_nothing_outside() -> R
+{
+    // F7-400: swapped before the self-test opens it; it is opened with O_NOFOLLOW, so the self-test stops at its open
+    // step, and nothing behind the symlink is removed.
+    swap_leaves_the_outside_alone(
+        "the self-test's directory, right after mkdir",
+        [
+            ("F7_RIVAL_OP", "mkdir"),
+            ("F7_RIVAL_ON", ""),
+            ("F7_RIVAL_DO", "swapself"),
+        ],
+        &[],
+        false,
+        &["DB_WAL_UNSUPPORTED", "at open"],
+    )
+}
+
+#[test]
+fn full_a_private_directory_swapped_for_a_symlink_after_the_self_test_takes_nothing_outside() -> R {
+    // F7-400: swapped once the self-test passed, before its cleanup; the cleanup works through the directory it
+    // opened, and the name, no longer that directory, is left and told.
+    swap_leaves_the_outside_alone(
+        "the self-test's directory, before its cleanup",
+        [
+            ("F7_RIVAL_OP", "close"),
+            ("F7_RIVAL_ON", "/selftest.db"),
+            ("F7_RIVAL_DO", "swapdir"),
+        ],
+        &[],
+        false,
+        &["DB_WAL_UNSUPPORTED", "at cleanup", "is left, not removed"],
+    )
+}
+
+/// The rival of the room probe cases: the probe's directory swapped when its file is closed.
+const ROOM_SWAP: [(&str, &str); 3] = [
+    ("F7_RIVAL_OP", "close"),
+    ("F7_RIVAL_ON", "/room"),
+    ("F7_RIVAL_DO", "swapdir"),
+];
+
+#[test]
+fn full_the_self_tests_room_probe_directory_swapped_for_a_symlink_takes_nothing_outside() -> R {
+    // F7-400: the self-test's room probe, after one fsync over quota.
+    swap_leaves_the_outside_alone(
+        "the self-test's room probe",
+        ROOM_SWAP,
+        &[
+            ("F7_IO_OP", "sync"),
+            ("F7_IO_SUFFIX", "-wal"),
+            ("F7_IO_ERRNO", "122"),
+        ],
+        false,
+        &[
+            "DB_WAL_UNSUPPORTED",
+            "not for want of room",
+            "is left, not removed",
+        ],
+    )
+}
+
+#[test]
+fn full_the_stores_room_probe_directory_swapped_for_a_symlink_takes_nothing_outside() -> R {
+    // F7-400: the store's room probe, after a command's commit whose WAL fsync fails once.
+    swap_leaves_the_outside_alone(
+        "the store's room probe",
+        ROOM_SWAP,
+        &[
+            ("F7_IO_MATCH", "/.hoh/state.db"),
+            ("F7_IO_OP", "sync"),
+            ("F7_IO_SUFFIX", "state.db-wal"),
+            ("F7_IO_ERRNO", "122"),
+        ],
+        true,
+        &[
+            "UNPROCESSABLE",
+            "not for want of room",
+            "is left, not removed",
+        ],
+    )
 }
 
 #[test]
@@ -811,7 +984,8 @@ fn full_a_commands_commit_that_fails_for_quota_is_db_full_and_writes_nothing() -
 fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_logs_the_path() -> R {
     // F7-303: over HTTP to the product host, a PauseRun whose commit's WAL fsync fails over a quota that stays: the
     // room probe finds no room (DB_FULL, 503, retryable, nothing written) and its private directory cannot be removed
-    // (unlink: EIO). The response keeps its fixed text; the leftover's exact path reaches host.log.
+    // (it lost its write permission when the probe's file was closed: EACCES). The response keeps its fixed text, no
+    // path in it (F7-451); the leftover's exact path reaches host.log.
     let project = Project::new()?;
     let arm = project.root.join("io-fault-arm");
     let env = [
@@ -825,9 +999,11 @@ fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_log
             "F7_IO_STATE",
             project.root.join("io-fault-state").into_os_string(),
         ),
-        ("F7_UNLINK_ERRNO", "5".into()),
-        ("F7_UNLINK_SUFFIX", "/room".into()),
+        ("F7_RIVAL_OP", "close".into()),
+        ("F7_RIVAL_ON", "/room".into()),
+        ("F7_RIVAL_DO", "chmod".into()),
     ];
+    not_root()?;
     let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let before = project.quiet_dump()?;
@@ -854,6 +1030,12 @@ fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_log
         (&serde_json::json!("DB_FULL"), &serde_json::json!(true)),
         "{error}"
     );
+    assert_eq!(
+        error["message"],
+        serde_json::json!("the database's file system is full; nothing was written"),
+        "{error}"
+    );
+    assert!(!reply.contains("state.db-room-"), "{reply}");
     assert_eq!(after, before);
     let mut left = Vec::new();
     for entry in std::fs::read_dir(project.hoh_dir())? {
@@ -864,6 +1046,7 @@ fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_log
         }
     }
     project.stop_host()?;
+    unlock(&project)?;
     let log = std::fs::read_to_string(project.hoh_dir().join("host.log"))?;
     assert!(!left.is_empty(), "the probe's directory stays: {log}");
     for path in &left {
@@ -872,7 +1055,6 @@ fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_log
             "{} not in host.log: {log}",
             path.display()
         );
-        let _ = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
     }
     Ok(())
 }

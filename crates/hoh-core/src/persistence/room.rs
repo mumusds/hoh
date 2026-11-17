@@ -69,10 +69,8 @@ pub(super) fn probe(base: &Path) -> Seen {
         x ^= x << 17;
         chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
     }
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(private.path().join("room"))
+    let written = private
+        .create("room")
         .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()));
     Seen {
         written,
