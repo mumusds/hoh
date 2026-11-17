@@ -103,7 +103,8 @@ pub(super) fn run(
 }
 
 /// The self-test with its database at the first of `names` that this call can claim ([`claim`]). After it, the files
-/// the claim made are removed through their tokens, and nothing else (ADR-016's note, round 3: F7-200).
+/// the claim made are removed through their tokens, and nothing else (ADR-016's note, round 3: F7-200); one that
+/// cannot be removed is told with its path (F7-202). `steps` fails only as DB_FULL or DB_WAL_UNSUPPORTED.
 pub(super) fn run_named(
     dir: &Path,
     names: impl IntoIterator<Item = PathBuf>,
@@ -112,10 +113,31 @@ pub(super) fn run_named(
 ) -> Result<(), PersistError> {
     let claimed = claim(dir, names)?;
     let result = steps(claimed.db.path(), probe, inject);
-    for made in claimed.companions.into_iter().chain([claimed.db]) {
-        let _ = made.remove();
+    let left: Vec<String> = claimed
+        .companions
+        .into_iter()
+        .chain([claimed.db])
+        .filter_map(|made| made.remove().err())
+        .map(|left| left.to_string())
+        .collect();
+    if left.is_empty() {
+        return result;
     }
-    result
+    // A file of this call's that stays is told, with its path, after the self-test's own failure if it had one; a
+    // self-test that passed fails at its cleanup (F7-202).
+    let left = left.join("; ");
+    Err(match result {
+        Ok(()) => PersistError::WalUnsupported {
+            step: "cleanup",
+            detail: left,
+        },
+        Err(PersistError::Full(detail)) => PersistError::Full(format!("{detail}; cleanup: {left}")),
+        Err(PersistError::WalUnsupported { step, detail }) => PersistError::WalUnsupported {
+            step,
+            detail: format!("{detail}; cleanup: {left}"),
+        },
+        Err(other) => other,
+    })
 }
 
 /// The files a [`claim`] made: the database and its companions, each with its token.
@@ -333,7 +355,7 @@ impl Drop for Probe {
 
 /// Whether the directory of `db` has room now ([`super::room::probe`]), with a file of this call's: `<db>-room`, which
 /// [`claim`] found free.
-fn room(db: &Path) -> std::io::Result<()> {
+fn room(db: &Path) -> super::room::Seen {
     super::room::probe(&with_suffix(db, "-room"))
 }
 
@@ -347,7 +369,7 @@ fn judge(
     step: Step,
     failure: &SqlFailure,
     detail: String,
-    room: impl FnOnce() -> std::io::Result<()>,
+    room: impl FnOnce() -> super::room::Seen,
 ) -> PersistError {
     let wal = |detail: String| PersistError::WalUnsupported {
         step: step.name(),
@@ -373,17 +395,19 @@ fn judge(
     };
     let what = format!("{what} failed, SQLite extended code {extended}");
     let kib = super::room::BYTES >> 10;
-    match room() {
+    let seen = room();
+    let left = seen.left_told();
+    match seen.written {
         Err(e) if super::room::none(&e) => PersistError::Full(format!(
             "WAL self-test at {}: {detail} ({what}); its directory has no room: a {kib} KiB write and fsync \
-             failed: {e}",
+             failed: {e}{left}",
             step.name()
         )),
         Ok(()) => wal(format!(
-            "{detail} ({what}); not for want of room: its directory took a {kib} KiB write and fsync"
+            "{detail} ({what}); not for want of room: its directory took a {kib} KiB write and fsync{left}"
         )),
         Err(e) => wal(format!(
-            "{detail} ({what}); room not known: a {kib} KiB write and fsync in its directory failed: {e}"
+            "{detail} ({what}); room not known: a {kib} KiB write and fsync in its directory failed: {e}{left}"
         )),
     }
 }
@@ -1327,7 +1351,10 @@ mod tests {
             let seen = std::cell::Cell::new(false);
             let judged = judge(Step::Write, &failure, "disk I/O error".to_owned(), || {
                 seen.set(true);
-                room()
+                super::super::room::Seen {
+                    written: room(),
+                    left: None,
+                }
             });
             assert_eq!(seen.get(), probed, "{extended:?}: {judged:?}");
             let got = match &judged {
@@ -1368,15 +1395,18 @@ mod tests {
         // that exists already is another's: the probe fails and leaves it.
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("selftest.db");
-        room(&db)?;
+        let seen = room(&db);
+        seen.written?;
+        assert!(seen.left.is_none(), "{:?}", seen.left);
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
         std::fs::write(with_suffix(&db, "-room"), "another's")?;
         let taken = room(&db);
         assert_eq!(
-            taken.as_ref().map_err(std::io::Error::kind).err(),
+            taken.written.as_ref().map_err(std::io::Error::kind).err(),
             Some(std::io::ErrorKind::AlreadyExists),
             "{taken:?}"
         );
+        assert!(taken.left.is_none(), "{:?}", taken.left);
         assert_eq!(
             std::fs::read_to_string(with_suffix(&db, "-room"))?,
             "another's"
