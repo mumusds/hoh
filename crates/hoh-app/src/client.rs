@@ -709,8 +709,67 @@ fn launch(
     unscoped: Option<&str>,
     unsupervised: &str,
 ) -> Result<HostInfo, Failure> {
+    launch_with(project, end, scope, unscoped, unsupervised, &thread)
+}
+
+/// A thread named `name` running `work`, or why it could not be made.
+type Spawn<'a> =
+    &'a dyn Fn(&'static str, Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()>;
+
+/// [`Spawn`] by `std::thread::Builder`.
+fn thread(name: &'static str, work: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(work)
+        .map(drop)
+}
+
+/// [`launch`], its threads made by `spawn`. The two a host's start needs are made before the host is (CLT-02): one
+/// reads its stderr until it closes (its start errors), one waits for it once it is handed over, so that it is reaped as
+/// soon as it ends however long the client lives (a TUI, an attach), never left a zombie. A thread that cannot be made
+/// ends the start before anything is started; a host started always has its waiter. Only this client's own child, by
+/// its handle: no signal, nothing about SIGCHLD changed.
+fn launch_with(
+    project: &Path,
+    end: Instant,
+    scope: Option<&Scope>,
+    unscoped: Option<&str>,
+    unsupervised: &str,
+    spawn: Spawn<'_>,
+) -> Result<HostInfo, Failure> {
     let program = std::env::current_exe()
         .map_err(|e| Failure::unreachable(format!("cannot find the hoh program: {e}")))?;
+    let (give_stderr, take_stderr) = std::sync::mpsc::channel::<std::process::ChildStderr>();
+    let (tell, said) = std::sync::mpsc::channel::<String>();
+    spawn(
+        "hoh-host-stderr",
+        Box::new(move || {
+            let mut text = String::new();
+            if let Ok(mut stderr) = take_stderr.recv() {
+                let _ = stderr.read_to_string(&mut text);
+            }
+            let _ = tell.send(text);
+        }),
+    )
+    .map_err(|e| {
+        Failure::unreachable(format!(
+            "cannot start the host: no thread to read its start errors: {e}"
+        ))
+    })?;
+    let (give_child, take_child) = std::sync::mpsc::channel::<std::process::Child>();
+    spawn(
+        "hoh-reap",
+        Box::new(move || {
+            if let Ok(mut child) = take_child.recv() {
+                let _ = child.wait();
+            }
+        }),
+    )
+    .map_err(|e| {
+        Failure::unreachable(format!(
+            "cannot start the host: no thread to wait for it: {e}"
+        ))
+    })?;
     let mut command = match scope {
         // `--scope` runs the command itself (the pid stays the child's); `$` in the path is not expanded.
         Some(scope) => {
@@ -747,47 +806,34 @@ fn launch(
         .map_err(|e| Failure::unreachable(format!("cannot start the host: {e}")))?;
     let pid = child.id();
     // Its start errors come on its stderr until it is ready (then it writes .hoh/host.log).
-    let mut stderr = child.stderr.take();
-    let said = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(stderr) = stderr.as_mut() {
-            let _ = stderr.read_to_string(&mut text);
-        }
-        text
-    });
+    if let Some(stderr) = child.stderr.take() {
+        let _ = give_stderr.send(stderr);
+    }
+    // The waiter takes it: it receives until it gets one, so it is there for the send.
+    let hand_over = |child: std::process::Child| {
+        let _ = give_child.send(child);
+    };
     loop {
         if let Some(host) = host_json(project).filter(|h| h.pid == pid && healthy(h)) {
             // The host runs on in its own session; its pipe closes when it moves stderr to its log. It stays this
-            // client's child, reaped as soon as it ends however long the client lives.
-            reap(child);
+            // client's child, reaped by the waiter whenever it ends.
+            hand_over(child);
             return Ok(host);
         }
         if let Ok(Some(status)) = child.try_wait() {
-            let text = said.join().unwrap_or_default();
+            let text = said.recv().unwrap_or_default();
             let line = text.lines().last().unwrap_or("the host ended").to_owned();
             return ended_before_ready(project, status.code(), line);
         }
         if Instant::now() >= end {
             // Not ready yet, and not stopped: it may still be, and is reaped whenever it ends.
-            reap(child);
+            hand_over(child);
             return Err(Failure::unreachable(
                 "the host did not become ready in 10 s",
             ));
         }
         std::thread::sleep(POLL);
     }
-}
-
-/// Wait for `child`, a host this client started, on a thread of its own (as the probe runner reaps a command it could
-/// not wait for), so that it is reaped as soon as it ends while the client lives on (a TUI, an attach), never left a
-/// zombie for the client's lifetime. Only this client's own child, by its handle: no signal, nothing about SIGCHLD
-/// changed.
-fn reap(mut child: std::process::Child) {
-    let _ = std::thread::Builder::new()
-        .name("hoh-reap".to_owned())
-        .spawn(move || {
-            let _ = child.wait();
-        });
 }
 
 /// A fresh id for a command and its idempotency key.
@@ -1062,6 +1108,43 @@ pub(crate) mod tests {
     use hoh_core::persistence::selftest::ProbeCommand;
 
     pub(crate) type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn a_start_whose_helper_thread_cannot_be_made_starts_no_host() {
+        // CLT-02: the stderr reader and the waiter are made before the host is; when either cannot be (EAGAIN), the
+        // start ends with why and nothing is started, so no host is ever left without its waiter. The project does
+        // not exist: a start that went on to spawn the host would fail there instead, saying so.
+        let project = Path::new("/nonexistent/hoh-clt-02");
+        for (failing, why) in [
+            (1, "no thread to read its start errors"),
+            (2, "no thread to wait for it"),
+        ] {
+            let made = std::sync::atomic::AtomicUsize::new(0);
+            let spawn = |name: &'static str, work: Box<dyn FnOnce() + Send + 'static>| {
+                if made.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == failing {
+                    return Err(std::io::Error::from_raw_os_error(11));
+                }
+                thread(name, work)
+            };
+            let started = launch_with(
+                project,
+                Instant::now() + Duration::from_secs(1),
+                None,
+                None,
+                "test",
+                &spawn,
+            );
+            let failure = started
+                .err()
+                .unwrap_or_else(|| Failure::unreachable("started"));
+            assert!(
+                failure.message.contains(why),
+                "{failing}: {}",
+                failure.message
+            );
+            assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), failing);
+        }
+    }
 
     #[test]
     fn only_a_plain_user_name_with_a_linger_file_lingers() -> R {
