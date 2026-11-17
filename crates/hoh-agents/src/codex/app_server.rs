@@ -196,8 +196,8 @@ struct State<'a> {
     limits: RateLimits,
 }
 
-/// The quotas codex reported during a turn (`account/rateLimits/updated`; M2T07R-256, docs/adr/ADR-012.md, 注记 of
-/// 2026-11-16): by limit id, the model the quota is for (`normalModelSlug`; none for the account's own) and its windows
+/// The quotas codex reported during a turn (`account/rateLimits/updated`; M2T07R-256, docs/adr/ADR-022.md decision 16's
+/// design correction): by limit id, the model the quota is for (`normalModelSlug`, once reported) and its windows
 /// (primary, secondary), each with its used percentage and reset (unix seconds). A sparse update keeps what an earlier
 /// one said: a slug, window or reset it leaves out or sends as null clears nothing.
 #[derive(Debug, Default)]
@@ -248,44 +248,39 @@ impl RateLimits {
         }
     }
 
-    /// When the quota a turn on `model` (the thread's) failed on lifts (RA-01): only the used-up quotas that apply to
-    /// it count, the account's own (no model) and the ones for `model`; another model's is unrelated. When that cannot
-    /// be told (a used-up model quota with the thread's model unknown, or more than one used-up quota of the account's
-    /// own), or nothing applies, none. Otherwise the latest reset of their used-up windows, all of which have to lift;
-    /// none when one of them has no reset that is an instant.
+    /// When the quota a turn on `model` (the thread's) failed on lifts (ADR-022 decision 16, design correction rule 1):
+    /// only a used-up quota positively identified as applying to the turn counts: the account's own ([`ACCOUNT`] with no
+    /// model ever reported) or one whose reported model is `model`; another model's is unrelated. A used-up quota whose
+    /// attribution is unknown (another id with no model reported, a model quota with `model` unknown), or more than one
+    /// that applies, gives none; so does a used-up window of it without a reset that is an instant. Otherwise the latest
+    /// reset of its used-up windows.
     fn lifts(&self, model: Option<&str>) -> Option<std::time::SystemTime> {
-        let mut applying = Vec::new();
-        let mut accounts = 0;
-        for quota in self
-            .0
-            .values()
-            .filter(|q| q.windows.values().any(Window::used_up))
-        {
-            match (quota.model.as_deref(), model) {
-                (None, _) => {
-                    accounts += 1;
-                    applying.push(quota);
-                }
-                (Some(its), Some(model)) if its == model => applying.push(quota),
-                (Some(_), Some(_)) => {}
-                (Some(_), None) => return None,
+        let mut applying = None;
+        for (id, quota) in &self.0 {
+            if !quota.windows.values().any(Window::used_up) {
+                continue;
+            }
+            let applies = match (quota.model.as_deref(), model) {
+                (None, _) if id == ACCOUNT => true,
+                (Some(its), Some(model)) => its == model,
+                _ => return None,
+            };
+            if applies && applying.replace(quota).is_some() {
+                return None;
             }
         }
-        if accounts > 1 {
-            return None;
-        }
         let mut latest = None;
-        for window in applying
-            .iter()
-            .flat_map(|q| q.windows.values())
-            .filter(|w| w.used_up())
-        {
+        for window in applying?.windows.values().filter(|w| w.used_up()) {
             let at = crate::adapter::unix_seconds(window.resets_at.as_ref()?)?;
             latest = latest.max(Some(at));
         }
         latest
     }
 }
+
+/// The limit id codex reports the account's own quota under (recorded: codex/0.166.0/app-server-turn's live account,
+/// and the snapshot `_provider-faults` got from the `x-codex-primary-*` headers).
+const ACCOUNT: &str = "codex";
 
 impl State<'_> {
     /// The next number for events named `name-N`.
@@ -1566,16 +1561,26 @@ mod tests {
             .1,
             None
         );
-        // The thread's own model quota and the account's both apply: both have to lift.
+        // The thread's own model quota alone applies. With the account's used up too there are two candidates, and
+        // which one failed the turn cannot be told: none (design correction rule 1; RA-01's "both have to lift" was
+        // the wrong expectation).
         let own_model = json!({"limitId": "codex_fake", "normalModelSlug": "gpt-fake-5",
                                "primary": window(100, json!(500))});
+        assert_eq!(
+            judged(&usage_limit_with(
+                std::slice::from_ref(&own_model),
+                limit.clone()
+            ))
+            .1,
+            at(500)
+        );
         assert_eq!(
             judged(&usage_limit_with(
                 &[account.clone(), own_model.clone()],
                 limit.clone()
             ))
             .1,
-            at(500)
+            None
         );
         // Two quotas of the account's own kind used up: which one failed the turn cannot be told.
         let second = json!({"limitId": "codex_second", "primary": window(100, json!(86_400))});
@@ -1601,6 +1606,45 @@ mod tests {
             .1,
             at(120)
         );
+    }
+
+    #[test]
+    fn a_quota_of_unknown_attribution_gives_no_reset() {
+        // RA-100 (M2T07R-256 review round 2; design correction rule 1): a quota is the account's only as limitId
+        // `codex` with no model ever reported, and the thread's model's only by its (merged) normalModelSlug. A sparse
+        // update that leaves the slug out proves neither, so a used-up quota so reported makes the reset unknown.
+        let limit = json!("usageLimitExceeded");
+        let own_model = json!({"limitId": "codex_fake", "normalModelSlug": "gpt-fake-5",
+                               "primary": window(100, json!(120))});
+        let unknown = json!({"limitId": "codex_x", "primary": window(100, json!(86_400))});
+        // Codex's probes: the active model's T+120 and an unidentified T+86400; the unidentified one alone.
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[own_model.clone(), unknown.clone()],
+                limit.clone()
+            ))
+            .1,
+            None
+        );
+        assert_eq!(
+            judged(&usage_limit_with(
+                std::slice::from_ref(&unknown),
+                limit.clone()
+            ))
+            .1,
+            None
+        );
+        // A slug reported once is kept by a later sparse update of the same limit.
+        let earlier = json!({"limitId": "codex_fake", "normalModelSlug": "gpt-fake-5",
+                             "primary": window(40, json!(500))});
+        let sparse = json!({"limitId": "codex_fake", "primary": window(100, json!(500))});
+        assert_eq!(
+            judged(&usage_limit_with(&[earlier, sparse], limit.clone())).1,
+            at(500)
+        );
+        // `codex` that reports a model is that model's quota, not the account's.
+        let named = json!({"limitId": "codex", "normalModelSlug": "gpt-other", "primary": window(100, json!(120))});
+        assert_eq!(judged(&usage_limit_with(&[named], limit)).1, None);
     }
 
     #[test]

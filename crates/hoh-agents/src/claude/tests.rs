@@ -404,31 +404,82 @@ fn only_a_turn_that_failed_on_the_limit_carries_its_reset() {
 
 #[test]
 fn a_rejected_event_counts_only_for_the_failure_it_came_with() {
-    // RA-04 (M2T07R-256 review): a successful message after a rejected rate_limit_event shows the limit no longer held;
-    // a later untyped 429 is a new failure that event says nothing about (Codex's replay: rejected, success, untyped
-    // 429, failed result). A subagent's success shows the same. A rejected event after the success does count.
+    // RA-04 (M2T07R-256 review): a successful main-thread message after a rejected account-wide rate_limit_event (five
+    // hours) shows the limit no longer held; a later untyped 429 is a new failure that event says nothing about
+    // (Codex's replay: rejected, success, untyped 429, failed result). A rejected event after the success does count.
     let event = limit_event("rejected", json!(1_000));
     let untyped = limit_error("rate_limit", None);
     let reply = json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid",
-                       "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}});
-    let mut sub_reply = reply.clone();
-    sub_reply["parent_tool_use_id"] = json!("toolu_1");
-    for success in [reply.clone(), sub_reply] {
-        assert_eq!(
-            retry_at(&[
-                init(),
-                event.clone(),
-                success.clone(),
-                untyped.clone(),
-                failed_result()
-            ]),
-            None,
-            "{success}"
-        );
-    }
+                       "message": {"role": "assistant", "model": "m", "content": [{"type": "text", "text": "ok"}]}});
+    assert_eq!(
+        retry_at(&[
+            init(),
+            event.clone(),
+            reply.clone(),
+            untyped.clone(),
+            failed_result()
+        ]),
+        None
+    );
     assert_eq!(
         retry_at(&[init(), reply, event, untyped, failed_result()]),
         at(1_000)
+    );
+}
+
+#[test]
+fn only_a_success_of_the_same_thread_and_limit_clears_a_rejected_event() {
+    // RA-103 (M2T07R-256 review round 2; design correction rule 4): a subagent's success never clears the main
+    // thread's evidence (it may run another model: Codex's replay, seven_day_opus rejected, a Sonnet subagent's
+    // success, an untyped 429); a model limit is cleared only by a main-thread success of the model it was recorded
+    // under. RA-04's "a subagent's success clears it" was the wrong expectation.
+    let opus = json!({"type": "system", "subtype": "init", "session_id": "sid", "model": "claude-opus-5-5"});
+    let weekly_opus = json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected",
+                             "resetsAt": 1_000, "rateLimitType": "seven_day_opus"}, "session_id": "sid"});
+    let success = |parent: Value, model: &str| {
+        json!({"type": "assistant", "parent_tool_use_id": parent, "session_id": "sid",
+               "message": {"role": "assistant", "model": model, "content": [{"type": "text", "text": "ok"}]}})
+    };
+    let untyped = limit_error("rate_limit", None);
+    for (frame, kept) in [
+        (success(json!("toolu_1"), "claude-sonnet-5-5"), true),
+        (success(json!("toolu_1"), "claude-opus-5-5"), true),
+        (success(Value::Null, "claude-sonnet-5-5"), true),
+        (success(Value::Null, "claude-opus-5-5"), false),
+    ] {
+        assert_eq!(
+            retry_at(&[
+                opus.clone(),
+                weekly_opus.clone(),
+                frame.clone(),
+                untyped.clone(),
+                failed_result()
+            ]),
+            if kept { at(1_000) } else { None },
+            "{frame}"
+        );
+    }
+    // An account-wide limit (five hours) is cleared by any main-thread success, but not by a subagent's.
+    let five_hours = limit_event("rejected", json!(1_000));
+    assert_eq!(
+        retry_at(&[
+            opus.clone(),
+            five_hours.clone(),
+            success(json!("toolu_1"), "claude-opus-5-5"),
+            untyped.clone(),
+            failed_result()
+        ]),
+        at(1_000)
+    );
+    assert_eq!(
+        retry_at(&[
+            opus,
+            five_hours,
+            success(Value::Null, "claude-sonnet-5-5"),
+            untyped,
+            failed_result()
+        ]),
+        None
     );
 }
 
