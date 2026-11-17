@@ -29,6 +29,7 @@
    "returncode": 0,
    "how": "exited"
   },
-  "logs_complete": true
+  "logs_complete": true,
+  "version": "2.1.325"
  }
 }

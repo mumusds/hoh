@@ -261,8 +261,13 @@ def excerpt_case(case_dir: Path, agent: str, run: Path) -> dict[str, str]:
         side['session_dir'] = redact(meta['session_dir'], subst)
     # The external observations the adapter makes (design correction 7, M2T20D-801): as recorded, else from the
     # recorder's own record of the process's end (the stream read to its end when it exited by itself).
-    side['observations'] = redact(meta.get('observations') or {
-        'exit': {'returncode': meta['exit_code'], 'how': meta['stopped']}, 'logs_complete': meta['stopped'] == 'exited'}, subst)
+    observations = meta.get('observations') or {
+        'exit': {'returncode': meta['exit_code'], 'how': meta['stopped']}, 'logs_complete': meta['stopped'] == 'exited'}
+    if 'version' not in observations:
+        # The agent's version as the run probed it (`<agent> --version`, the run's summary.json): the host's launch has
+        # it too (the frame registry; pi's agent_settled), M2T20D-950.
+        observations = {**observations, 'version': json.loads((run / 'summary.json').read_text())['versions'][agent]}
+    side['observations'] = redact(observations, subst)
     out['meta.json'] = json.dumps(side, ensure_ascii=False, indent=1) + '\n'
     return out
 

@@ -18,17 +18,18 @@
   "removed": [],
   "changed": []
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/codex/exec-ro-new/snapshot.json",
- "snapshot_sha256": "d1b1e46326ea2d398eae2124ebd4d8373d60c97fb88c5e23b23c79aea8e82f2d",
- "stdout_sha256": "b02a00213aa00cd526f9b63c5bec91f58511cca6229c8fbf8399bd06e4c06b4d",
- "stderr_sha256": "ca5900b89d547aa51ad046fd9d3793eea1f409cae8c74b0a73b540a9d912cbe7",
- "token_sha256": "6cd956790a47a3336f62c0ba88ad0cc522770b8926f849318319bd71477b111d",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T012650Z/codex/exec-ro-new/snapshot.json",
+ "snapshot_sha256": "66a05e6979d207ac9fc121537e9852cc5fe7b339781b8c44a7f2be625b335202",
+ "stdout_sha256": "9ae6f56a1e249d2cd9219c3ec00508edde07ad90920d796da6d7942eec60e9b5",
+ "stderr_sha256": "d8dd34d0ca9903d02b19dc4d33813526cf5e43466b2ed62f31fb5caca006ad60",
+ "token_sha256": "c652479dda2ced0a685bf11efbde5b220ef76511b2342f8f0bf1104dcfc2927d",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "observations": {
   "exit": {
    "returncode": 0,
    "how": "exited"
   },
-  "logs_complete": true
+  "logs_complete": true,
+  "version": "0.166.0"
  }
 }

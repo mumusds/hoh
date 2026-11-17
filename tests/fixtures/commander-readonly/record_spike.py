@@ -35,6 +35,10 @@ REPO = HERE.parents[2]
 _spec = importlib.util.spec_from_file_location('record', REPO / 'tests/fixtures/protocol/record.py')
 rec = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rec)
+# The product's own messages (judge_check.py mirrors requests.rs, decision 3 and codex.rs `headless_answer`).
+_spec = importlib.util.spec_from_file_location('judge_check', HERE / 'judge_check.py')
+product = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(product)
 
 REGIONS = ('worktree', 'git', 'hoh', 'w')
 OPS = ('create', 'modify', 'delete')
@@ -45,8 +49,7 @@ CLAUDE_RO = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--t
 CLAUDE_YOLO = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
 CLAUDE_RO_PLUS_WRITE = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--tools', 'Read,Grep,Glob,Write',
                         '--allowedTools', 'Read,Grep,Glob', '--permission-mode', 'dontAsk', '--strict-mcp-config']
-CODEX_RO = {'approvalPolicy': 'never', 'sandbox': 'read-only'}
-CODEX_YOLO = {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}
+CODEX_APP_SERVER = ['codex', 'app-server', '--listen', 'stdio://']  # codex.rs `app_server_args` (0.166.0 offers --listen)
 PI_RO_TOOLS = ['--tools', 'read,grep,find,ls', '--no-mcp']
 
 OBSERVER = """// HoH ADR-032 S0 observer: reports the session's active tools and their sources; registers nothing, hooks no tool.
@@ -201,6 +204,7 @@ class Spike:
     def __init__(self, out: Path) -> None:
         self.out = out
         self.summary: list[dict] = []
+        self.versions: dict[str, str] = {}  # each agent's `--version`, as the host probes it
 
     def save(self, agent: str, case: str, project: Project, argv: list[str], sent: bytes, out: bytes, err: bytes, rc,
              stop, before: dict, after: dict, notes: str, extra: dict | None = None) -> None:
@@ -217,6 +221,8 @@ class Spike:
                 'regions': {k: str(v) for k, v in project.regions.items()}, 'driver_dir': str(project.t),
                 'token_sha256': sha256(project.token.encode()), 'stdout_sha256': sha256(out), 'stderr_sha256': sha256(err),
                 'placeholders': project.placeholders(), **(extra or {})}
+        if 'observations' in meta:  # the version the host probed is part of the launch (frame registry, pi's agent_settled)
+            meta['observations'] = {**meta['observations'], 'version': self.versions.get(agent)}
         (d / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2) + '\n')
         self.summary.append({'agent': agent, 'case': case, 'exit_code': rc, 'stopped': str(stop), 'diff': changes,
                              'token_in_stdout': project.token in out.decode('utf-8', 'replace')})
@@ -270,16 +276,12 @@ def claude(sp: Spike) -> None:
 
 
 class Server(rec.AppServer):
-    """record.py's App Server driver; server requests are answered headless (approvals declined, others refused)."""
+    """record.py's App Server driver; server requests are answered as codex.rs `headless_answer` answers them."""
 
     def __init__(self, cwd: Path) -> None:
-        super().__init__(cwd)
+        self.p = rec.Proc(CODEX_APP_SERVER, cwd)
+        self.next_id = 0
         self.answered: set = set()
-
-    def start_experimental(self) -> None:
-        self.response(self.send('initialize', {'clientInfo': {'name': 'hoh-recorder', 'version': '0.0.0'},
-                                               'capabilities': {'experimentalApi': True}}))
-        self.send('initialized', notify=True)
 
     def until(self, predicate, timeout: float) -> dict | None:
         deadline = time.monotonic() + timeout
@@ -287,11 +289,7 @@ class Server(rec.AppServer):
             for f in self.p.frames():
                 if 'method' in f and 'id' in f and f['id'] not in self.answered:
                     self.answered.add(f['id'])
-                    if f['method'].endswith('requestApproval'):
-                        reply = {'id': f['id'], 'result': {'decision': 'decline'}}
-                    else:
-                        reply = {'id': f['id'], 'error': {'code': -32601, 'message': 'headless recorder'}}
-                    self.p.write(json.dumps(reply).encode() + b'\n')
+                    self.p.write(json.dumps(product.codex_answer(f['id'], f['method'])).encode() + b'\n')
                 if predicate(f):
                     return f
             if not self.p.pump(1.0):
@@ -316,35 +314,53 @@ def collect_rollout(case_dir: Path) -> bool:
     return True
 
 
-def codex_app_case(sp: Spike, case: str, project: Project, thread_params: dict, notes: str, resume: str | None = None,
+def codex_app_case(sp: Spike, case: str, project: Project, profile: str, notes: str, resume: str | None = None,
                    timeout: float = 1200, prompt: str | None = None) -> str | None:
+    """One App Server turn spoken as codex/app_server.rs speaks (M2T20D-950): the launch (profile, resumed thread,
+    model) is recorded first as an observation, and every message is the product's own, built from that launch alone
+    (initialize; once answered, initialized and the thread request; once that is answered, turn/start; server requests
+    answered by `headless_answer`). Nothing experimental is asked for."""
+    launch = {'profile': profile, 'resume': resume, 'model': None}
     before = project.snapshot()
     s = Server(project.w)
-    s.start_experimental()
-    if resume:
-        thread = resume
-        s.response(s.send('thread/resume', {'threadId': resume, **thread_params}))
-    else:
-        thread = s.response(s.send('thread/start', thread_params)).get('result', {}).get('thread', {}).get('id')
-    s.send('turn/start', {'threadId': thread, 'input': rec.text(prompt or project.prompt())})
-    s.until(rec.turn_done(thread), timeout)
+
+    def send(message: dict) -> None:
+        s.p.write(json.dumps(message).encode() + b'\n')
+
+    def answer(rid: int):
+        return s.until(lambda f: 'method' not in f and f.get('id') == rid and ('result' in f or 'error' in f), 120)
+
+    thread = None
+    send(product.codex_initialize(0))
+    init = answer(0)
+    if init is not None and init.get('error') is None:
+        send(product.codex_initialized())
+        send(product.codex_thread(1, launch))
+        started = answer(1)
+        if started is not None and started.get('error') is None:
+            thread = ((started.get('result') or {}).get('thread') or {}).get('id')
+            send(product.codex_turn_start(2, thread, prompt or project.prompt()))
+            s.until(rec.turn_done(thread), timeout)
     how = s.p.stop(grace=20)
-    sp.save('codex', case, project, ['codex', 'app-server'], s.p.sent, s.p.out, s.p.err, s.p.returncode, how, before,
-            project.snapshot(), notes, {'thread_id_recorded': bool(thread)})
+    observations = {'launch': launch, 'exit': {'returncode': s.p.returncode, 'how': str(how)},
+                    'logs_complete': str(how) == 'exited' and not s.p.reading()}
+    sp.save('codex', case, project, CODEX_APP_SERVER, s.p.sent, s.p.out, s.p.err,
+            s.p.returncode, how, before, project.snapshot(), notes,
+            {'thread_id_recorded': bool(thread), 'observations': observations})
     collect_rollout(sp.out / 'codex' / case)
     return thread
 
 
 def codex(sp: Spike) -> None:
     ro = Project()
-    params = {**CODEX_RO, 'experimentalRawEvents': True}
-    thread = codex_app_case(sp, 'app-ro-new', ro, params,
-                            'App Server, read-only profile (approvalPolicy never, sandbox read-only); experimentalApi and '
-                            'experimentalRawEvents added only to observe the raw tool outputs')
+    thread = codex_app_case(sp, 'app-ro-new', ro, 'read_only',
+                            'App Server, read-only profile (decision 3: approvalPolicy never, sandbox read-only), the '
+                            "product's own messages")
     if thread:
-        codex_app_case(sp, 'app-ro-resumed', ro, CODEX_RO, 'App Server, read-only profile, the thread resumed in a new process '
-                       '(thread/resume has no experimentalRawEvents)', resume=thread)
-    codex_app_case(sp, 'app-control', Project(), {**CODEX_YOLO, 'experimentalRawEvents': True}, 'App Server, full-access control')
+        codex_app_case(sp, 'app-ro-resumed', ro, 'read_only', 'App Server, read-only profile, the thread resumed in a new '
+                       "process, the product's own messages", resume=thread)
+    codex_app_case(sp, 'app-control', Project(), 'yolo', "App Server, full-access control (the YOLO profile), the product's "
+                   'own messages')
     ex = Project()
     argv = ['codex', 'exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-']
     before = ex.snapshot()
@@ -432,10 +448,10 @@ def claude_errors(sp: Spike) -> None:
 
 
 def codex_errors(sp: Spike) -> None:
-    for case, params, notes in (('app-ro-ordinary-error', CODEX_RO, 'App Server, read-only profile: ordinary errors'),
-                                ('app-control-ordinary-error', CODEX_YOLO, 'App Server, full access: ordinary errors')):
+    for case, profile, notes in (('app-ro-ordinary-error', 'read_only', 'App Server, read-only profile: ordinary errors'),
+                                 ('app-control-ordinary-error', 'yolo', 'App Server, full access: ordinary errors')):
         project = Project()
-        codex_app_case(sp, case, project, {**params, 'experimentalRawEvents': True}, notes, prompt=project.prompt_errors())
+        codex_app_case(sp, case, project, profile, notes, prompt=project.prompt_errors())
 
 
 def pi_errors(sp: Spike) -> None:
@@ -478,6 +494,7 @@ def main() -> int:
     run_dir = Path(args.out) / ap_run  # --run continues a run, one agent per invocation; its summary accumulates
     sp = Spike(run_dir)
     versions = {a: rec.INSTALLED_VERSION[a]() for a in AGENTS}
+    sp.versions = versions
     try:
         for name in args.agents.split(','):
             try:

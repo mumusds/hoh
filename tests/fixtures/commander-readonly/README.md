@@ -37,12 +37,17 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   recorded one and, where the raw source is present locally with the recorded sha256, with the source line's
   skeleton; it also compares each `.meta.json`'s `snapshot_diff` with the raw snapshot's. The bundle self-test runs
   it on the recorded skeletons (tests/bundle/test_commander_readonly.py).
-- For codex's App Server and pi, `<case>.stdin.excerpt.jsonl` is the request log (every JSON line the recorder sent),
-  with which the adapters correlate responses to requests (ADR-032 design correction 7).
+- For codex's App Server and pi, `<case>.stdin.excerpt.jsonl` is the request log (every JSON line the recorder sent).
+  The recorder speaks as the product: pi as pi.rs (since run 20261117T002630Z) and codex's App Server as
+  codex/app_server.rs with ADR-032 decision 3's profiles (since run 20261117T012650Z; the messages are
+  `judge_check.py`'s mirror of requests.rs and codex.rs `headless_answer`, built from the launch alone). The replay
+  never registers requests from it; it compares it with the product's own messages (M2T20D-950).
 - Each `.meta.json` carries `observations`, the external facts the adapter observes besides the stream (design
   correction 7, M2T20D-801): the process's end (`exit`) and whether both streams were read to their end
-  (`logs_complete`); for claude also whether the prompt was fed (`prompt_fed`: every byte written before stdin closed,
-  as claude.rs `fed`); for pi also the launch (`session_id`, `resume`), the session files noted before the start
+  (`logs_complete`), and the agent's version as the run probed it (`version`; from the run's summary.json for runs
+  before 20261117T012650Z); for claude also whether the prompt was fed (`prompt_fed`: every byte written before stdin
+  closed, as claude.rs `fed`); for codex's App Server also the launch (`profile` read_only or yolo, the `resume`d
+  thread id or null, `model` or null), recorded before the first message; for pi also the launch (`session_id`, `resume`), the session files noted before the start
   (`noted`: canonical path, device, inode, as pi.rs `session_files`) and the identity of the session file the
   get_state answer named (`opened`, as pi.rs `identity`, taken when the answer arrived).
 - `.meta.json` files are summaries, not excerpts: the case's argv, exit, notes, driver text and token hash, and the
@@ -160,3 +165,18 @@ a delivered prompt on them; they stay local and their claude cases are no longer
 Glob, Grep and Read only, snapshot unchanged; ro-plus-write's Write is refused (`permission_denied`); the control's
 driver lines are all `exit=0` and the snapshot shows every change; the ordinary-error cases end with the decision
 block and no change.
+
+## Run 20261117T012650Z (`--set cells`, then `--set errors`, codex only)
+
+The codex cases recorded once more with the recorder speaking as the product (M2T20D-950, -901): `codex app-server
+--listen stdio://` as codex.rs `app_server_args` starts it; initialize with the product's clientInfo
+(`{"name": "hoh", "version": <the workspace version>}`) and no capabilities; once it is answered, `initialized` and
+thread/start or thread/resume with exactly decision 3's parameters for the launch's profile (read-only:
+`approvalPolicy` never, `sandbox` read-only; the control: danger-full-access) and the resumed `threadId`; once that is
+answered, turn/start with the thread and the prompt; server requests answered by `headless_answer` (there were none).
+The launch (`profile`, `resume`, `model`) is recorded as an observation before the first message. Unlike the earlier
+codex runs, nothing experimental is asked for (`experimentalApi`, `experimentalRawEvents`), so the stream no longer
+carries raw response items; the patch refusals are read from the rollout as before. What the recordings show is the
+same as in runs 20261116T180821Z and 20261116T201950Z: the read-only threads report `sandbox.type` readOnly, the
+driver's twelve lines are `Read-only file system`, every patch is refused in the rollout, the snapshot is unchanged;
+the control writes every cell. These codex cases are the codex excerpts now; the earlier codex recordings stay local.

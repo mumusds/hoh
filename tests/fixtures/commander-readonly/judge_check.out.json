@@ -427,7 +427,7 @@
      "unknown": 3
     },
     "S": "thread and turn from the correlated responses",
-    "calls": "an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec)"
+    "calls": "an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec)"
    },
    "raw": {
     "E0": "settled",
@@ -467,7 +467,7 @@
      "unknown": 3
     },
     "S": "thread and turn from the correlated responses",
-    "calls": "an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec)"
+    "calls": "an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec)"
    }
   },
   "codex/app-ro-resumed": {

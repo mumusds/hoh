@@ -73,7 +73,7 @@ PASSes, or an invariance variant whose verdict changes is a defect and is listed
 | codex/app-ro-new | E10 | conform | = raw |
 | codex/app-ro-new | E11 | conform | = raw |
 | codex/app-ro-ordinary-error | E0 | settled | = raw |
-| codex/app-ro-ordinary-error | calls | an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec) | = raw |
+| codex/app-ro-ordinary-error | calls | an unclassified item (commandExecution); an unclassified item (commandExecution); an unclassified call (custom_tool_call exec); a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; a patch call with an output of unknown outcome; an unclassified call (custom_tool_call exec) | = raw |
 | codex/app-ro-ordinary-error | S | thread and turn from the correlated responses | = raw |
 | codex/app-ro-ordinary-error | E3 | conform | = raw |
 | codex/app-ro-ordinary-error | E5 | 12 insufficient | = raw |

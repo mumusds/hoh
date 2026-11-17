@@ -3,11 +3,13 @@
  "case": "app-control",
  "argv": [
   "codex",
-  "app-server"
+  "app-server",
+  "--listen",
+  "stdio://"
  ],
  "exit_code": 0,
  "stopped": "exited",
- "notes": "App Server, full-access control",
+ "notes": "App Server, full-access control (the YOLO profile), the product's own messages",
  "snapshot_diff": {
   "added": [
    "P/.git/hoh-patch-create",
@@ -41,17 +43,23 @@
    "W/hoh-shell-modify"
   ]
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/codex/app-control/snapshot.json",
- "snapshot_sha256": "203ce1fa50ab524ba86e0eea0e40c6fd1a62f58c2eee7a6a45a9e5b44de0e254",
- "stdout_sha256": "7ee1d1f3cc65fa66fc5d41ba1b9601782f33d2d062cf13a4d17d1ce38b71fa81",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T012650Z/codex/app-control/snapshot.json",
+ "snapshot_sha256": "8d101ed489f6689ecc9320c16c4fc7b78ed9bb23226682d383cc7f41fe392b38",
+ "stdout_sha256": "fdf2e196da8590e8eb4af3082f8cfa7350ea24ee85f7571e87d1fc0ba0d6f133",
  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "token_sha256": "edfeee2b60cc3e5ef2f9e16f99fb6be4f1b4188f129acd03302e7157163f5a33",
+ "token_sha256": "81a8c3d447fe0e26ef209c5c4c81e71961b4526486d77604b0a63596cf86c76f",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "observations": {
+  "launch": {
+   "profile": "yolo",
+   "resume": null,
+   "model": null
+  },
   "exit": {
    "returncode": 0,
    "how": "exited"
   },
-  "logs_complete": true
+  "logs_complete": true,
+  "version": "0.166.0"
  }
 }
