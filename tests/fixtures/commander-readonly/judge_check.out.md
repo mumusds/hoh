@@ -96,9 +96,9 @@ PASSes, or an invariance variant whose verdict changes is a defect and is listed
 | pi/control | E0 | settled | = raw |
 | pi/control | calls | every item and call classified and complete | = raw |
 | pi/control | E8 | nonconform | = raw |
-| pi/control | E9 | (none) | = raw |
-| pi/control | E10 | breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log | = raw |
-| pi/control | E11 | insufficient | = raw |
+| pi/control | E9 | 3 success | = raw |
+| pi/control | E10 | breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify | = raw |
+| pi/control | E11 | conform | = raw |
 | pi/noext-new | E0 | settled | = raw |
 | pi/noext-new | calls | every item and call classified and complete | = raw |
 | pi/noext-new | E8 | conform | = raw |

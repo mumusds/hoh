@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-144>",
+  "<uuid-297>",
   "-e",
   "<T>/observer.js"
  ],
@@ -17,26 +17,49 @@
  "notes": "full-access control: pi with its default tools",
  "snapshot_diff": {
   "added": [
-   "P/.hoh/sessions",
-   "P/.hoh/sessions/s1",
-   "P/.hoh/sessions/s1/2026-11-16T18-14-03-521Z_<uuid-144>.jsonl",
+   "P/.git/hoh-shell-create",
+   "P/.hoh/hoh-shell-create",
+   "P/.hoh/sessions/s1/2026-11-17T00-26-54-066Z_<uuid-297>.jsonl",
+   "P/hoh-shell-create",
+   "P/hoh-tool-create",
    "W/.pi-lens-probe-home",
+   "W/.pi-lens-probe-home/bus-events.log",
    "W/.pi-lens-probe-home/cascade.log",
    "W/.pi-lens-probe-home/extension.log",
    "W/.pi-lens-probe-home/latency.log",
-   "W/.pi-lens-probe-home/sessionstart.log"
+   "W/.pi-lens-probe-home/read-guard.log",
+   "W/.pi-lens-probe-home/sessionstart.log",
+   "W/hoh-shell-create"
   ],
-  "removed": [],
-  "changed": []
+  "removed": [
+   "P/.git/hoh-shell-delete",
+   "P/.hoh/hoh-shell-delete",
+   "P/hoh-shell-delete",
+   "W/hoh-shell-delete"
+  ],
+  "changed": [
+   "P/.git/hoh-shell-modify",
+   "P/.hoh/hoh-shell-modify",
+   "P/hoh-shell-modify",
+   "W/hoh-shell-modify"
+  ]
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/pi/control/snapshot.json",
- "snapshot_sha256": "9414079552bbfb8355358bb19307c6efb31bc7a596fee91251bdfcc1b341ecd9",
- "stdout_sha256": "aeacea7cf2139bd098ed1bc346698f80541bee5a9b503e7eb5075dfeab99671e",
- "stderr_sha256": "a318d7dbf535e67d6815b4138c69834bff659f82485a4001144fd5fcfc2a4700",
- "token_sha256": "e25d3a492a57c54dad38bda45f555ff320f194e969e13f11e60b510d58654bfc",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T002630Z/pi/control/snapshot.json",
+ "snapshot_sha256": "128435146837ee7828f41736bd1044d56047f8bd7a685cfe40380ee9ab6e30e3",
+ "stdout_sha256": "a9d733366f1d623e527d084ebbabb920a035432b0c64cdb2e082e49beb119515",
+ "stderr_sha256": "858df7fe6714411b33feae858eccecee3e8e1b1ac3e69fa8860d3c3f9fb5b27c",
+ "token_sha256": "ab365b91393db22a572a8f28bcadd13055e61b6e335dfb1afe3f1682f29c4125",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "session_dir": "<P>/.hoh/sessions/s1",
  "observations": {
+  "launch": {
+   "session_id": "<uuid-297>",
+   "resume": false
+  },
+  "noted": [],
+  "prompt_sent": true,
+  "get_state_session_file": "<P>/.hoh/sessions/s1/2026-11-17T00-26-54-066Z_<uuid-297>.jsonl",
+  "opened": null,
   "exit": {
    "returncode": 0,
    "how": "exited"

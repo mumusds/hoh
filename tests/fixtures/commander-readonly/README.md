@@ -129,3 +129,12 @@ makes besides the stream: the resumed session's files noted before the start, an
 the get_state answer names, taken when the answer arrived (M2T20D-801). The resumed session's get_state names the
 noted file (same canonical path, device and inode). These cases replace run 20261116T212808Z's in the excerpts; that
 run stays local and is no longer excerpted (its session files are gone, so their identity cannot be observed now).
+
+## Run 20261117T002630Z (`--set noext`, speaking as pi.rs)
+
+The same pi cases and pi's full-access control, recorded once more with the recorder speaking as pi.rs does: get_state
+as `hoh-state-1`, and only after its answer succeeds for the launch's session (and, resumed, names a noted file) the
+prompt as `hoh-prompt-2`; agent_settled closes stdin. Run 20261117T001941Z had used the recorder's own command ids
+(`s1`, `p1`), which pi.rs would not correlate with its own commands, so the product's replay could not judge it as the
+host does; it stays local and is not excerpted. These three cases (noext-new, noext-resumed, control) are the pi
+excerpts now; run 20261116T180821Z's pi control is no longer excerpted.

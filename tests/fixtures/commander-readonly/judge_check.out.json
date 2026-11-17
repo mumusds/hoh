@@ -571,18 +571,26 @@
   "pi/control": {
    "excerpt": {
     "E0": "settled",
-    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "insufficient",
+    "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
+    "E11": "conform",
     "E8": "nonconform",
-    "E9": {},
+    "E9": {
+     "bash call_7c0f604a87dc495194e6e412": "success",
+     "read call_5245bd247a704cf58637e875": "success",
+     "write call_69a7d53cfdd44d9fb4a9fb0a": "success"
+    },
     "calls": "every item and call classified and complete"
    },
    "raw": {
     "E0": "settled",
-    "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "insufficient",
+    "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
+    "E11": "conform",
     "E8": "nonconform",
-    "E9": {},
+    "E9": {
+     "bash call_7c0f604a87dc495194e6e412": "success",
+     "read call_5245bd247a704cf58637e875": "success",
+     "write call_69a7d53cfdd44d9fb4a9fb0a": "success"
+    },
     "calls": "every item and call classified and complete"
    }
   },
@@ -593,7 +601,7 @@
     "E11": "conform",
     "E8": "conform",
     "E9": {
-     "read call_db90be09417540b6af557308": "success"
+     "read call_0629e545b2984d52913b8a30": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -603,7 +611,7 @@
     "E11": "conform",
     "E8": "conform",
     "E9": {
-     "read call_db90be09417540b6af557308": "success"
+     "read call_0629e545b2984d52913b8a30": "success"
     },
     "calls": "every item and call classified and complete"
    }
@@ -615,7 +623,7 @@
     "E11": "conform",
     "E8": "conform",
     "E9": {
-     "read call_ba3a3661e21747599439abc9": "success"
+     "read call_16485e6ae76041a4bbd203d2": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -625,7 +633,7 @@
     "E11": "conform",
     "E8": "conform",
     "E9": {
-     "read call_ba3a3661e21747599439abc9": "success"
+     "read call_16485e6ae76041a4bbd203d2": "success"
     },
     "calls": "every item and call classified and complete"
    }
