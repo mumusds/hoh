@@ -2569,7 +2569,10 @@ fn stopped_after_reading_its_path(install: &Install) -> R<Stopped> {
 
 /// [`stopped_after_exec`], stopped once it opened the installation's lock and before its `flock`.
 fn stopped_after_opening_the_lock(install: &Install) -> R<Stopped> {
-    let lock = install.data().join("hoh/.lock").display().to_string();
+    // As strace and /proc name it (ILF-02: a TMPDIR through a link).
+    let lock = std::fs::canonicalize(install.data().join("hoh/.lock"))?
+        .display()
+        .to_string();
     stopped(
         install,
         &[
@@ -2592,15 +2595,14 @@ fn stopped_after_opening_the_lock(install: &Install) -> R<Stopped> {
 fn stopped(install: &Install, held: &[&str]) -> R<Stopped> {
     let log = install.root.path().join("strace-stopped.log");
     let held: Vec<String> = held.iter().map(|a| (*a).to_owned()).collect();
-    let (strace, pid) = under_strace(install, &log, &held)?;
+    let (traced, pid) = under_strace(install, &log, &held)?;
     let stopped = Stopped {
-        strace: Some(strace),
+        traced,
         pid,
         released: false,
     };
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let word = format!("{pid} --- stopped by SIGSTOP ---");
-    while !std::fs::read_to_string(&log).is_ok_and(|text| text.lines().any(|l| l == word)) {
+    while !std::fs::read_to_string(&log).is_ok_and(|text| stopped_in(&text, pid)) {
         if std::time::Instant::now() > end {
             return Err(format!("hoh {pid} was never stopped: {held:?}").into());
         }
@@ -2609,11 +2611,25 @@ fn stopped(install: &Install, held: &[&str]) -> R<Stopped> {
     Ok(stopped)
 }
 
+/// Whether strace's log `text` says `pid` was stopped by SIGSTOP: a line of the pid's digits, the blanks strace pads a
+/// pid shorter than its column with (ILF-01: a fresh machine's or a PID namespace's small pids), then exactly the
+/// stop's words.
+fn stopped_in(text: &str, pid: u32) -> bool {
+    text.lines().any(|line| {
+        line.split_once(' ').is_some_and(|(head, rest)| {
+            !head.is_empty()
+                && head.bytes().all(|b| b.is_ascii_digit())
+                && head.parse::<u32>() == Ok(pid)
+                && rest.trim_start_matches(' ') == "--- stopped by SIGSTOP ---"
+        })
+    })
+}
+
 /// A run of the installed `hoh` stopped under strace ([`stopped`]). Stopped, it cannot end, so its pid is its own
-/// until it is let go, which happens once: by [`Stopped::release`], or when dropped unreleased (its strace then
-/// killed, the run left to end on its own).
+/// until it is let go, which happens once ([`Stopped::release`]). Dropped before it was waited for, its strace's
+/// [`Traced`] ends both.
 struct Stopped {
-    strace: Option<std::process::Child>,
+    traced: Traced,
     pid: u32,
     released: bool,
 }
@@ -2636,6 +2652,7 @@ impl Stopped {
     fn wait(mut self) -> R<Output> {
         self.release()?;
         Ok(self
+            .traced
             .strace
             .take()
             .ok_or("waited for already")?
@@ -2643,19 +2660,69 @@ impl Stopped {
     }
 }
 
-impl Drop for Stopped {
+/// A strace this test started, owned from its spawn (ILF-02): dropped before it was waited for, every child of the
+/// strace is killed (the run, stopped or not, and any helper of strace's own: a child its parent has not reaped keeps
+/// its pid, and each is signalled only while it is still the process of its start time), then the strace, which ends
+/// once they did, is reaped; one that has not ended within 10 s is killed and reaped too. Neither outlives the test,
+/// whatever step failed, the run's lookup included.
+struct Traced {
+    strace: Option<std::process::Child>,
+}
+
+impl Drop for Traced {
     fn drop(&mut self) {
-        let _ = self.release();
-        if let Some(mut strace) = self.strace.take() {
+        let Some(mut strace) = self.strace.take() else {
+            return;
+        };
+        if !matches!(strace.try_wait(), Ok(Some(_))) {
+            let id = strace.id();
+            let children = std::fs::read_to_string(format!("/proc/{id}/task/{id}/children"))
+                .unwrap_or_default();
+            for pid in children
+                .split_whitespace()
+                .filter_map(|p| p.parse::<u32>().ok())
+            {
+                if let Ok(Some(start)) = hoh_agents::identity::start_id(pid) {
+                    let _ = hoh_agents::identity::signal_if_same(
+                        pid,
+                        &start,
+                        rustix::process::Signal::KILL,
+                    );
+                }
+            }
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !matches!(strace.try_wait(), Ok(Some(_))) && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = strace.kill();
-            let _ = strace.wait();
         }
+        let _ = strace.wait();
     }
 }
 
 /// `hoh --version` from the installed command under strace with `held` (its injection), strace's log in `log`; the
 /// strace and the pid of hoh once it runs the installed binary.
-fn under_strace(install: &Install, log: &Path, held: &[String]) -> R<(std::process::Child, u32)> {
+fn under_strace(install: &Install, log: &Path, held: &[String]) -> R<(Traced, u32)> {
+    // As /proc names its program: the installation's root by its canonical path (ILF-02: a TMPDIR through a link).
+    let root = std::fs::canonicalize(install.data().join("hoh"))?;
+    trace(
+        install,
+        log,
+        held,
+        &root,
+        std::time::Duration::from_secs(10),
+    )
+}
+
+/// [`under_strace`], hoh found as the strace's child whose program is under `root`, for at most `limit`; the strace
+/// owned from its spawn ([`Traced`]), so a failure ends it and its run.
+fn trace(
+    install: &Install,
+    log: &Path,
+    held: &[String],
+    root: &Path,
+    limit: std::time::Duration,
+) -> R<(Traced, u32)> {
     let strace = Command::new("strace")
         .args(["-f", "-qq", "-o"])
         .arg(log)
@@ -2668,25 +2735,24 @@ fn under_strace(install: &Install, log: &Path, held: &[String]) -> R<(std::proce
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("precondition: strace ({e})"))?;
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let id = strace.id();
+    let traced = Traced {
+        strace: Some(strace),
+    };
+    let end = std::time::Instant::now() + limit;
     loop {
-        let children = std::fs::read_to_string(format!(
-            "/proc/{}/task/{}/children",
-            strace.id(),
-            strace.id()
-        ))
-        .unwrap_or_default();
+        let children =
+            std::fs::read_to_string(format!("/proc/{id}/task/{id}/children")).unwrap_or_default();
         // strace may first fork a helper of its own (to probe ptrace): hoh is the child running a binary of the
         // installation.
-        let root = install.data().join("hoh");
         if let Some(pid) = children
             .split_whitespace()
             .filter_map(|p| p.parse::<u32>().ok())
             .find(|p| {
-                std::fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|exe| exe.starts_with(&root))
+                std::fs::read_link(format!("/proc/{p}/exe")).is_ok_and(|exe| exe.starts_with(root))
             })
         {
-            return Ok((strace, pid));
+            return Ok((traced, pid));
         }
         if std::time::Instant::now() > end {
             return Err("strace started nothing".into());
@@ -2706,7 +2772,8 @@ fn a_run_that_gets_its_lock_only_after_the_uninstall_removed_it_does_not_run_on(
     let (uninstall, go) = paused_uninstall(&install)?;
     let held = stopped_after_opening_the_lock(&install)?;
     let pid = held.pid;
-    let lock = install.data().join("hoh/.lock");
+    // As /proc names it (ILF-02: a TMPDIR through a link).
+    let lock = std::fs::canonicalize(install.data().join("hoh/.lock"))?;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !std::fs::read_dir(format!("/proc/{pid}/fd"))?
         .flatten()
@@ -2755,6 +2822,70 @@ fn a_run_whose_binary_the_uninstall_removed_before_it_looked_does_not_run_on() -
             && !said.contains("or replaced"),
         "{said}"
     );
+    Ok(())
+}
+
+#[test]
+fn a_stop_in_straces_log_is_read_whatever_the_padding_of_its_pid() {
+    // ILF-01: strace pads a pid shorter than its column (five wide), as in a PID namespace of its own: the line is
+    // still that pid's stop; another pid, another signal or another word is not.
+    assert!(stopped_in("4     --- stopped by SIGSTOP ---\n", 4));
+    assert!(stopped_in(
+        "4     brk(NULL) = 0x1\n4     --- stopped by SIGSTOP ---\n",
+        4
+    ));
+    assert!(stopped_in("1234567 --- stopped by SIGSTOP ---", 1_234_567));
+    assert!(!stopped_in("40    --- stopped by SIGSTOP ---", 4));
+    assert!(!stopped_in("14    --- stopped by SIGSTOP ---", 4));
+    assert!(!stopped_in(
+        "4     --- SIGSTOP {si_signo=SIGSTOP, si_code=SI_KERNEL} ---",
+        4
+    ));
+    assert!(!stopped_in("4     --- stopped by SIGTSTP ---", 4));
+    assert!(!stopped_in("+4    --- stopped by SIGSTOP ---", 4));
+    assert!(!stopped_in(
+        "4     --- stopped by SIGSTOP --- (and more)",
+        4
+    ));
+}
+
+#[test]
+fn a_traced_run_never_found_leaves_neither_it_nor_its_strace() -> R {
+    // ILF-02: a strace this test starts is owned from its spawn. When its run is never found (here looked for under a
+    // root it does not run from, as when /proc names its program by another path than the installation's), the error
+    // returns with the strace and its run, stopped at its first system call, both gone; and so when a stopped run is
+    // dropped unreleased.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let log = install.root.path().join("strace-unfound.log");
+    let held: Vec<String> = ["-e", "trace=brk", "-e", "inject=brk:signal=SIGSTOP:when=1"]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+    let found = trace(
+        &install,
+        &log,
+        &held,
+        &install.root.path().join("elsewhere"),
+        std::time::Duration::from_secs(2),
+    );
+    assert!(found.is_err(), "found under a root it does not run from");
+    let named = install.root.path().display().to_string();
+    let left = || {
+        hoh_agents::identity::running_with(|cmdline| {
+            cmdline.windows(named.len()).any(|w| w == named.as_bytes())
+        })
+    };
+    assert_eq!(left()?, Vec::<u32>::new(), "processes left naming {named}");
+    // A run found and stopped, dropped unreleased (a test that fails before it lets it go): the same.
+    let held = stopped_after_exec(&install)?;
+    assert!(
+        !left()?.is_empty(),
+        "the stopped run and its strace are there"
+    );
+    drop(held);
+    assert_eq!(left()?, Vec::<u32>::new(), "processes left naming {named}");
     Ok(())
 }
 
@@ -2813,7 +2944,8 @@ fn a_run_holding_a_removed_lock_does_not_run_on_after_a_reinstall() -> R {
     // again (a new lock and a binary at the same paths) before its flock goes on: the lock it holds is not the
     // installation's (red without the inode check: it ran on).
     let run = held_across_a_reinstall(stopped_after_opening_the_lock, |install, pid| {
-        let lock = install.data().join("hoh/.lock");
+        // As /proc names it (ILF-02: a TMPDIR through a link).
+        let lock = std::fs::canonicalize(install.data().join("hoh/.lock"))?;
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !std::fs::read_dir(format!("/proc/{pid}/fd"))?
             .flatten()
