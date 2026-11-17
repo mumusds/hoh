@@ -365,11 +365,15 @@ impl Drop for Leaders {
     }
 }
 
-/// SIGKILL to the group of each leader in `leaders` still the process started ([`Leaders`]).
+/// SIGKILL to the group of each leader in `leaders` still the process started ([`Leaders`]), then until each has ended
+/// (at most 10 s): a leader creates processes and registers them, so it is ended before the records are read
+/// ([`common::Recorded`], declared before it so it is dropped after it; CIRF-02).
 fn end_leaders(leaders: &Mutex<Vec<(u32, String)>>) {
-    for (pid, start) in leaders.lock().map(|l| l.clone()).unwrap_or_default() {
-        common::end_group_of(pid, &start);
+    let leaders = leaders.lock().map(|l| l.clone()).unwrap_or_default();
+    for (pid, start) in &leaders {
+        common::end_group_of(*pid, start);
     }
+    common::until_ended(&leaders);
 }
 
 /// A project with a host database (made by a first start) and the world seeded; the host started with `agents`.
@@ -1051,39 +1055,64 @@ fn go_mark(file: &Path) -> PathBuf {
 /// for the leader's request (the attempt's marker, written at its SIGTERM), then makes the writer in a session of its
 /// own with that marker as its whole environment, SIGTERM blocked until the writer's evidence is written. No parent
 /// chain leads from the attempt to that writer: only the marker scan can find it (CIR-701). Only its forked child
-/// blocks SIGTERM, before its setsid and execve; the spawner itself takes SIGTERM as it comes and leaves its wait once
-/// its parent changes, so a test process ended by a bare SIGTERM leaves no spawner polling (CIR-851). The child records
-/// its pid and start time at once (`proc`), so the test's [`common::Recorded`] ends it even before its execve (CIR-800).
+/// blocks SIGTERM, before its setsid and execve; the spawner itself takes SIGTERM as it comes. Its parent is the test
+/// process, named by pid and start time on its command line: once its parent is not that one (the test ended, even
+/// before the spawner first looked), it leaves, ending and reaping its own child first, whether it waits for the
+/// request or for the child (CIR-851, CIRF-03). It registers the child (`proc <pid> <start>`, read while the child is
+/// its own) before it lets the child go on, and a child never registered ends without doing anything, so the test's
+/// [`common::Recorded`] names whatever the spawner made (CIR-800, CIRF-02).
 fn spawner(file: &Path) -> R<Killed> {
     let script = file.with_extension("spawner.py");
     std::fs::write(
         &script,
         r#"import os, signal, sys, time
-request, marker = sys.argv[1:3]
-writer = sys.argv[3:]
-parent = os.getppid()
+request, marker, parent, parent_start = sys.argv[1:5]
+writer = sys.argv[5:]
+def start_of(pid):
+    return open('/proc/%d/stat' % pid).read().rsplit(') ', 1)[1].split()[19]
+def parent_here():
+    if os.getppid() != int(parent):
+        return False
+    try:
+        return start_of(int(parent)) == parent_start
+    except OSError:
+        return False
 while not os.path.exists(request):
-    if os.getppid() != parent:
+    if not parent_here():
         sys.exit(0)
     time.sleep(0.01)
 value = open(request).read()
+held, release = os.pipe()
 pid = os.fork()
 if pid == 0:
+    os.close(release)
     signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
-    start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
-    with open(writer[-1], 'a') as f:
-        f.write('proc %d %s\n' % (os.getpid(), start))
+    if os.read(held, 1) != b'x':
+        os._exit(0)
     os.setsid()
     os.execve(writer[0], writer, {marker: value})
-os.waitpid(pid, 0)
+os.close(held)
+with open(writer[-1], 'a') as f:
+    f.write('proc %d %s\n' % (pid, start_of(pid)))
+os.write(release, b'x')
+os.close(release)
+while os.waitpid(pid, os.WNOHANG) == (0, 0):
+    if not parent_here():
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        break
+    time.sleep(0.01)
 "#,
     )?;
     let request = PathBuf::from(format!("{}.spawn", go_mark(file).display()));
+    let me = std::process::id();
     Ok(Killed(
         Command::new("/usr/bin/python3")
             .arg(&script)
             .arg(&request)
             .arg(hoh_app::host::ATTEMPT_ENV)
+            .arg(me.to_string())
+            .arg(common::start_of(me)?)
             .args(writer(file)?.split(' '))
             .spawn()?,
     ))
@@ -1130,11 +1159,25 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 if what in ('StartsUnmarkedOnGo', 'StartsPinnedW') and marker in os.environ:
     env = {k: v for k, v in os.environ.items() if k != marker}
     os.execve(sys.executable, [sys.executable] + sys.argv, env)
-def own():
-    # This process's pid and start time, for the test's Recorded guard (CIR-800, -801, -850).
-    start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]
+def fork_registered():
+    # A child registered by its parent (its pid and start time, read while it is the parent's own child, for the
+    # test's Recorded guard) before it goes on; one its parent never registered ends without doing anything (CIR-800,
+    # -801, -850; CIRF-02). 0 in the child, the child's pid in the parent.
+    held, release = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(release)
+        if os.read(held, 1) != b'x':
+            os._exit(0)
+        os.close(held)
+        return 0
+    os.close(held)
+    start = open('/proc/%d/stat' % pid).read().rsplit(') ', 1)[1].split()[19]
     with open(writer[-1], 'a') as f:
-        f.write('proc %d %s\n' % (os.getpid(), start))
+        f.write('proc %d %s\n' % (pid, start))
+    os.write(release, b'x')
+    os.close(release)
+    return pid
 def recorded(kind):
     mark = writer[-1]
     while not (os.path.exists(mark) and any(l.startswith(kind + ' ') for l in open(mark))):
@@ -1145,12 +1188,10 @@ def established():
 # reset on the way, whatever the PATH holds (dash gives its foreground commands an empty mask: evidence
 # ci-reliability-r7-dash).
 def orphan():
-    pid = os.fork()
+    pid = fork_registered()
     if pid == 0:
-        own()
         os.setsid()
-        if os.fork() == 0:
-            own()
+        if fork_registered() == 0:
             os.execv(writer[0], writer)
         os._exit(0)
     os.waitpid(pid, 0)
@@ -1168,15 +1209,21 @@ if what == 'StartsPinnedW':
                 "start = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]\n"
                 "open(sys.argv[-1], 'a').write('w %d %d %s\\n' % (os.getpid(), os.getsid(0), start))\n"
                 "os.read(int(sys.argv[1]), 1)\n"
+                "held, release = os.pipe()\n"
                 "c = os.fork()\n"
                 "if c == 0:\n"
-                "    s = open('/proc/self/stat').read().rsplit(') ', 1)[1].split()[19]\n"
-                "    open(sys.argv[-1], 'a').write('proc %d %s\\n' % (os.getpid(), s))\n"
+                "    os.close(release)\n"
+                "    if os.read(held, 1) != b'x':\n"
+                "        os._exit(0)\n"
                 "    os.execve(sys.argv[2], sys.argv[2:], {})\n"
+                "os.close(held)\n"
+                "s = open('/proc/%d/stat' % c).read().rsplit(') ', 1)[1].split()[19]\n"
+                "open(sys.argv[-1], 'a').write('proc %d %s\\n' % (c, s))\n"
+                "os.write(release, b'x')\n"
+                "os.close(release)\n"
                 "os.waitpid(c, 0)\n")
-    pid = os.fork()
+    pid = fork_registered()
     if pid == 0:
-        own()
         os.close(w)
         os.setsid()
         os.execve(sys.executable, [sys.executable, '-c', w_script, str(r)] + writer, {})
@@ -1202,9 +1249,8 @@ if what in ('OrphansOnTermThenWaits', 'OrphansOnTermThenExits'):
 if what == 'StartsUnmarkedOnGo':
     while not os.path.exists(go):
         time.sleep(0.02)
-    pid = os.fork()
+    pid = fork_registered()
     if pid == 0:
-        own()
         os.setsid()
         os.execve(writer[0], writer, {})
     open(pid_file, 'w').write(str(pid))
@@ -1310,13 +1356,13 @@ async fn cancel_with_a_writer_outside(
     file: &Path,
     when: Created,
 ) -> R<WriterRecord> {
+    // Declared first, so it is dropped last: the creators (the spawner, the leaders) are ended and confirmed ended
+    // first, then everything they registered (CIR-800, -801, -850; CIRF-02).
+    let _recorded = common::Recorded(established_mark(file));
     let agents = Arc::new(Agents::new(&[("T1", script)]));
     let _leaders = Leaders(agents.leaders.clone());
     let clock = Arc::new(TestClock::new());
     let _released = Released(clock.clone());
-    // Declared before the spawner, so it is dropped after it: the spawner ends, then everything it and the scenario
-    // recorded (CIR-800, -801, -850).
-    let _recorded = common::Recorded(established_mark(file));
     let _spawner = spawner(file)?;
     let (project, host) = host_with(dir, &agents, Some(clock.clone())).await?;
     until(
@@ -2465,10 +2511,11 @@ async fn cgroup_leaderless_cancel_inside() -> R {
         return Ok(());
     }
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
-    let leaders = Arc::new(Mutex::new(Vec::new()));
-    let _leaders = Leaders(leaders.clone());
+    // The members' guard first, so it is dropped after the leaders' (CIRF-02).
     let members = dir.path().join("members");
     let _members = common::Recorded(members.clone());
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -2568,10 +2615,11 @@ async fn cgroup_leaderless_outside_inside() -> R {
     }
     let base = own_cgroup()?;
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
-    let leaders = Arc::new(Mutex::new(Vec::new()));
-    let _leaders = Leaders(leaders.clone());
+    // The members' guard first, so it is dropped after the leaders' (CIRF-02).
     let members = dir.path().join("members");
     let _members = common::Recorded(members.clone());
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -2996,10 +3044,11 @@ async fn cgroup_leaderless_start_reconcile_inside() -> R {
         return Ok(());
     }
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
-    let leaders = Arc::new(Mutex::new(Vec::new()));
-    let _leaders = Leaders(leaders.clone());
+    // The members' guard first, so it is dropped after the leaders' (CIRF-02).
     let members = dir.path().join("members");
     let _members = common::Recorded(members.clone());
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
@@ -3071,10 +3120,11 @@ async fn cgroup_leaderless_outside_start_reconcile_inside() -> R {
     }
     let base = own_cgroup()?;
     let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
-    let leaders = Arc::new(Mutex::new(Vec::new()));
-    let _leaders = Leaders(leaders.clone());
+    // The members' guard first, so it is dropped after the leaders' (CIRF-02).
     let members = dir.path().join("members");
     let _members = common::Recorded(members.clone());
+    let leaders = Arc::new(Mutex::new(Vec::new()));
+    let _leaders = Leaders(leaders.clone());
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
