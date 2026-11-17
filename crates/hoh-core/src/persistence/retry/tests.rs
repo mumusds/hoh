@@ -599,6 +599,72 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
 }
 
 #[tokio::test]
+async fn a_providers_reset_recovered_after_a_crash_is_due_at_the_reset_not_before() -> R {
+    // RA-03 (M2T07R-256 review): a turn failed at 08:00:00.9995 on a quota that resets at 10:00:00; the host recorded
+    // its OBSERVED (the class as the runner gives it, its end kept to the second) and was killed before the task's
+    // retry. The reconcile rebuilds the wait from that record: the task is due at 10:00:00, as it would have been
+    // without the crash, never at 09:59:59.
+    use crate::reconcile::{Disposition, Process};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let key = crate::reconcile::work_key("A1");
+    let ended = at("2027-01-15T08:00:00Z")? + Duration::from_micros(999_500);
+    let reset = at("2027-01-15T10:00:00Z")?;
+    let mut detail = json!({"success": false, "detail": "is_error", "ended_at": rfc3339_utc(ended),
+                            "retry_at": rfc3339_utc(reset)});
+    if let (Some(detail), serde_json::Value::Object(class)) = (
+        detail.as_object_mut(),
+        FailureClass::Transient { retry_after: None }
+            .with_reset(Some(reset), ended)
+            .to_json(),
+    ) {
+        detail.extend(class);
+    }
+    let payload = json!({"effect_key": key, "detail": detail}).to_string();
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'RUNNING', revision = 3, attempt_count = 0 WHERE task_id = 'T1';
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
+           ('A1', 'T1', 'RUNNING', 1, 1, 1, '2027-01-15T07:59:00Z');
+         INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'COMMITTED');"
+    ))?;
+    conn.execute(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+         ('p1', ?1, 'R', 'effect.observed', ?2, '2027-01-15T08:00:00Z')",
+        rusqlite::params![format!("{key}/effect.observed"), payload],
+    )?;
+    let now = at("2027-01-15T08:05:00Z")?;
+    let rows = store.reconcile_scan("p1", now).await?;
+    let [row] = rows.as_slice() else {
+        return Err(format!("unfinished: {rows:?}").into());
+    };
+    store
+        .reconcile_apply(
+            row.clone(),
+            Disposition::Ended {
+                to: crate::lifecycle::AttemptState::Failed,
+                task_to: crate::protocol::TaskState::Ready,
+                effects: Vec::new(),
+            },
+            Process::Gone {
+                basis: "no_process".to_owned(),
+            },
+            "reconcile",
+            now,
+            0,
+        )
+        .await?;
+    let next: String = Connection::open(&path)?.query_row(
+        "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(next, "2027-01-15T10:00:00Z");
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_ending_records_what_the_agents_turn_showed() -> R {
     // docs/adr/ADR-022.md decision 12: the resolved model, the usage and the turn's events are written in the commit of
     // the attempt's end; the agent's own session id only when the turn completed (ADR-024 decision 4).
