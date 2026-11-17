@@ -331,13 +331,23 @@ fn ran(registry: &Registry) -> R<Ran> {
 /// `project`'s manifest with claude's entry as the registry's last probe found it, its suite `status` under
 /// [`suite_set`].
 fn record(project: &Path, registry: &Registry, status: SuiteStatus) -> R {
+    record_cases(project, registry, status, Vec::new())
+}
+
+/// [`record`] with the suite's `cases`.
+fn record_cases(
+    project: &Path,
+    registry: &Registry,
+    status: SuiteStatus,
+    cases: Vec<compat::SuiteCase>,
+) -> R {
     let ready = registry.seen(Agent::Claude).ok_or("not seen")??;
     let mut entry = ready.entry.clone();
     entry.suite = Suite {
         status,
         fixture_set_sha256: suite_set(),
         run_at: Some(Some("2026-11-14T00:00:00Z".to_owned())),
-        cases: Some(Vec::new()),
+        cases: Some(cases),
     };
     let manifest = CompatManifest::new([(Agent::Claude, entry)].into());
     std::fs::create_dir_all(project.join(".hoh"))?;
@@ -606,7 +616,12 @@ fn a_snapshot_reads_each_wanted_agents_fact_and_observation_and_fact_is_its_item
     assert!(claude.generation.1 <= snapshot.observations["claude"].n);
     assert_eq!(
         claude.session,
-        ready.session_capabilities(Agent::Claude, project.path())?
+        ready.session_record(
+            Agent::Claude,
+            project.path(),
+            None,
+            compat::SUITE_SET_SHA256.as_str()
+        )?
     );
     assert_eq!(
         claude.granted,
@@ -1000,27 +1015,38 @@ pub(in crate::host) fn pi_install(root: &Path, versions: &[&str], current: &str)
 }
 
 /// A registry of the pi found on `path` (no pi settings, so no login check) for a fresh project, looked at and
-/// verified: its manifest entry is the look's, PASS under this build's suite set. The project and the registry.
+/// verified: its manifest entry is the look's, PASS under this build's suite set, its read_only case too. The project
+/// and the registry.
 pub(in crate::host) fn verified_pi(path: OsString) -> R<(tempfile::TempDir, Arc<Registry>)> {
     let project = tempfile::tempdir()?;
     let registry = Registry::with_pi_dir(path, None);
     registry.open_manifest(project.path());
     registry.want(&wanted(&["pi"]));
     registry.refresh();
-    let mut entry = registry.seen(Agent::Pi).ok_or("not seen")??.entry;
+    verify(project.path(), &registry, Agent::Pi)?;
+    Ok((project, Arc::new(registry)))
+}
+
+/// `project`'s manifest with `agent`'s entry as `registry`'s last look found it, PASS under this build's suite set
+/// with a passed read_only case (as every suite of this build has it), opened by `registry`.
+fn verify(project: &Path, registry: &Registry, agent: Agent) -> R {
+    let mut entry = registry.seen(agent).ok_or("not seen")??.entry;
     entry.suite = Suite {
         status: SuiteStatus::Pass,
         fixture_set_sha256: compat::SUITE_SET_SHA256.as_str().to_owned(),
         run_at: Some(Some("2026-11-14T00:00:00Z".to_owned())),
-        cases: Some(Vec::new()),
+        cases: Some(vec![compat::SuiteCase {
+            case: compat::suite::READ_ONLY_CASE.to_owned(),
+            status: SuiteStatus::Pass,
+        }]),
     };
-    std::fs::create_dir_all(project.path().join(".hoh"))?;
+    std::fs::create_dir_all(project.join(".hoh"))?;
     std::fs::write(
-        project.path().join(".hoh/compat-manifest.json"),
-        serde_json::to_vec_pretty(&CompatManifest::new([(Agent::Pi, entry)].into()))?,
+        project.join(".hoh/compat-manifest.json"),
+        serde_json::to_vec_pretty(&CompatManifest::new([(agent, entry)].into()))?,
     )?;
-    registry.open_manifest(project.path());
-    Ok((project, Arc::new(registry)))
+    registry.open_manifest(project);
+    Ok(())
 }
 
 #[test]
@@ -1292,6 +1318,7 @@ fn codexs_host_check_takes_the_read_only_profile_from_granted_only() -> R {
     registry.open_manifest(project.path());
     registry.want(&wanted(&["codex"]));
     registry.refresh();
+    verify(project.path(), &registry, Agent::Codex)?;
     let codex = usable(registry.fact(Agent::Codex))?;
     assert_eq!(
         codex.session[READ_ONLY_WORKSPACE], true,
@@ -1354,7 +1381,72 @@ fn codexs_host_check_takes_the_read_only_profile_from_granted_only() -> R {
     registry.open_manifest(project.path());
     registry.want(&wanted(&["codex"]));
     registry.refresh();
+    verify(project.path(), &registry, Agent::Codex)?;
     let codex = usable(registry.fact(Agent::Codex))?;
     assert_eq!(codex.withheld, [READ_ONLY_WORKSPACE.to_owned()].into());
+    Ok(())
+}
+
+#[test]
+fn the_session_has_read_only_workspace_only_while_the_manifests_read_only_case_passed() -> R {
+    // docs/adr/ADR-032.md decision 4, item 3: a verified agent's session record has read_only_workspace as the probe
+    // rule, the builder and its manifest entry's read_only case together. A PASS keeps the probe's true, a FAIL makes it
+    // false, a NOT_RUN or no such case leaves it unknown; granted follows, and the agent stays verified for every other
+    // role. Before any manifest verifies it the probe's value stands (its compat verdict is what waits, ADR-030
+    // decision 11). A manifest adopted later (a suite run) moves it too.
+    let case = |status| compat::SuiteCase {
+        case: "read_only".to_owned(),
+        status,
+    };
+    for (cases, want) in [
+        (vec![case(SuiteStatus::Pass)], serde_json::json!(true)),
+        (vec![case(SuiteStatus::Fail)], serde_json::json!(false)),
+        (vec![case(SuiteStatus::NotRun)], serde_json::Value::Null),
+        (Vec::new(), serde_json::Value::Null),
+    ] {
+        let bin = tempfile::tempdir()?;
+        claude(bin.path(), "A")?;
+        let project = tempfile::tempdir()?;
+        let registry = Registry::new(path_of(bin.path())).with_suite_set(&suite_set());
+        registry.open_manifest(project.path());
+        registry.want(&wanted(&["claude"]));
+        registry.refresh();
+        let probed = registry.seen(Agent::Claude).ok_or("not seen")??;
+        assert_eq!(
+            probed.entry.capabilities.get(READ_ONLY_WORKSPACE),
+            Some(&Some(true)),
+            "the probe rule holds for the recorded help"
+        );
+        let pending = usable(registry.fact(Agent::Claude))?;
+        assert!(matches!(pending.compat, Compat::Pending(_)));
+        assert_eq!(
+            pending.session[READ_ONLY_WORKSPACE],
+            serde_json::json!(true)
+        );
+        record_cases(project.path(), &registry, SuiteStatus::Pass, cases.clone())?;
+        registry.open_manifest(project.path());
+        let fact = usable(registry.fact(Agent::Claude))?;
+        assert_eq!(fact.compat, Compat::Verified, "{cases:?}");
+        assert_eq!(fact.session[READ_ONLY_WORKSPACE], want, "{cases:?}");
+        assert_eq!(
+            fact.granted.contains(READ_ONLY_WORKSPACE),
+            want == serde_json::json!(true),
+            "{cases:?}"
+        );
+        assert!(fact.granted.contains("command_execution"), "{cases:?}");
+        // The suite runs again and passes the case: the adopted manifest moves the session record.
+        record_cases(
+            project.path(),
+            &registry,
+            SuiteStatus::Pass,
+            vec![case(SuiteStatus::Pass)],
+        )?;
+        registry.adopt(serde_json::from_slice(&std::fs::read(
+            project.path().join(".hoh/compat-manifest.json"),
+        )?)?)?;
+        let fact = usable(registry.fact(Agent::Claude))?;
+        assert_eq!(fact.session[READ_ONLY_WORKSPACE], serde_json::json!(true));
+        assert!(fact.granted.contains(READ_ONLY_WORKSPACE));
+    }
     Ok(())
 }

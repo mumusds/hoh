@@ -873,9 +873,9 @@ fn fake_codex(bin: &Path, note: &str) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// A registry for `project` whose codex is the fake in `bin`, looked at and verified: its manifest entry is the look's,
-/// PASS under this build's suite set.
+/// PASS under this build's suite set, its read_only case too (as every suite of this build has it).
 fn verified_codex(bin: &Path, project: &Path) -> Result<Arc<Registry>, Box<dyn std::error::Error>> {
-    use hoh_agents::compat::{CompatManifest, SUITE_SET_SHA256, Suite, SuiteStatus};
+    use hoh_agents::compat::{CompatManifest, SUITE_SET_SHA256, Suite, SuiteCase, SuiteStatus};
     let registry = Registry::with_pi_dir(format!("{}:/usr/bin:/bin", bin.display()).into(), None);
     registry.open_manifest(project);
     registry.want(&["codex".to_owned()]);
@@ -885,7 +885,10 @@ fn verified_codex(bin: &Path, project: &Path) -> Result<Arc<Registry>, Box<dyn s
         status: SuiteStatus::Pass,
         fixture_set_sha256: SUITE_SET_SHA256.as_str().to_owned(),
         run_at: Some(Some("2026-11-14T00:00:00Z".to_owned())),
-        cases: Some(Vec::new()),
+        cases: Some(vec![SuiteCase {
+            case: "read_only".to_owned(),
+            status: SuiteStatus::Pass,
+        }]),
     };
     std::fs::create_dir_all(project.join(".hoh"))?;
     std::fs::write(

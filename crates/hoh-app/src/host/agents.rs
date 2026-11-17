@@ -398,6 +398,27 @@ struct State {
 }
 
 impl State {
+    /// Every looked-at agent's session record again, in the project and against the manifest now held.
+    fn sessions_again(&mut self, suite_set: &str) {
+        let State {
+            agents,
+            manifest,
+            root,
+            ..
+        } = self;
+        let Some(root) = root.as_deref() else {
+            return;
+        };
+        for (agent, known) in agents.iter_mut() {
+            if let Some(seen) = known.seen.as_mut()
+                && let Ok(ready) = &seen.outcome
+            {
+                seen.session =
+                    Some(ready.session_record(*agent, root, manifest.as_ref(), suite_set));
+            }
+        }
+    }
+
     /// `agent`'s fact and observation as the registry knows them now: the one constructor of a snapshot's items and of
     /// [`Registry::fact`] (docs/adr/ADR-030.md decision 1, M2T15D-100).
     fn item(&self, agent: Agent, basis: Basis<'_>) -> (Option<Fact>, Option<Observation>) {
@@ -690,7 +711,10 @@ impl Registry {
     pub(super) fn adopt(&self, manifest: serde_json::Value) -> Result<(), String> {
         let manifest: CompatManifest =
             serde_json::from_value(manifest).map_err(|e| e.to_string())?;
-        self.state().manifest = Some(manifest);
+        let mut state = self.state();
+        state.manifest = Some(manifest);
+        // Its read_only cases are part of the session records (docs/adr/ADR-032.md decision 4, item 3).
+        state.sessions_again(&self.suite_set);
         Ok(())
     }
 
@@ -739,16 +763,8 @@ impl Registry {
         };
         let mut state = self.state();
         state.manifest = manifest;
-        let moved = state.root.as_deref() != Some(root);
         state.root = Some(root.to_path_buf());
-        for (agent, known) in &mut state.agents {
-            if let Some(seen) = known.seen.as_mut()
-                && let Ok(ready) = &seen.outcome
-                && (moved || seen.session.is_none())
-            {
-                seen.session = Some(ready.session_capabilities(*agent, root));
-            }
-        }
+        state.sessions_again(&self.suite_set);
         said
     }
 
@@ -929,11 +945,13 @@ impl Registry {
     /// none were found. Read under the registry's lock (`since` runs no process).
     fn cached(&self, agent: Agent, path: &OsStr) -> Look {
         let mut state = self.state();
-        let root = state.root.clone();
-        let seen = state
-            .agents
-            .get_mut(&agent)
-            .and_then(|known| known.seen.as_mut());
+        let State {
+            agents,
+            manifest,
+            root,
+            ..
+        } = &mut *state;
+        let seen = agents.get_mut(&agent).and_then(|known| known.seen.as_mut());
         let last = seen.as_ref().and_then(|seen| seen.files.as_ref());
         let files = match since(agent, path, last) {
             Ok(files) => files,
@@ -955,7 +973,8 @@ impl Registry {
             return Look::Probe(files);
         }
         if let (Ok(ready), None, Some(root)) = (&seen.outcome, &seen.session, &root) {
-            seen.session = Some(ready.session_capabilities(agent, root));
+            seen.session =
+                Some(ready.session_record(agent, root, manifest.as_ref(), &self.suite_set));
         }
         Look::Cached(Box::new(seen.outcome.clone()))
     }
@@ -969,8 +988,13 @@ impl Registry {
         mut outcome: Result<Ready, Probe>,
     ) -> Result<Ready, Probe> {
         let mut state = self.state();
-        let root = state.root.clone();
-        let known = state.agents.entry(agent).or_default();
+        let State {
+            agents,
+            manifest,
+            root,
+            ..
+        } = &mut *state;
+        let known = agents.entry(agent).or_default();
         known.looks += 1;
         let mut session = None;
         if let Ok(ready) = &mut outcome {
@@ -985,7 +1009,9 @@ impl Registry {
                 known.latched = None;
             }
             known.identity = Some(identity);
-            session = root.map(|root| ready.session_capabilities(agent, &root));
+            session = root
+                .as_deref()
+                .map(|root| ready.session_record(agent, root, manifest.as_ref(), &self.suite_set));
         }
         known.seen = Some(Seen {
             files,
@@ -1223,6 +1249,28 @@ fn probed(agent: Agent, files: &Files, env: &ProbeEnv) -> Result<Ready, Probe> {
     })
 }
 
+/// The status of the read_only case (docs/adr/ADR-032.md decision 4, item 3) of `manifest`'s entry for `agent`, while
+/// that entry verifies `entry` under `suite_set` (`compat::verdict`); `None` otherwise, or when it has no such case.
+pub(crate) fn read_only_case(
+    manifest: Option<&CompatManifest>,
+    agent: Agent,
+    entry: &AgentEntry,
+    suite_set: &str,
+) -> Option<compat::SuiteStatus> {
+    if compat::verdict(manifest, agent.as_str(), entry, suite_set) != Compat::Verified {
+        return None;
+    }
+    manifest?
+        .agents
+        .get(&agent)?
+        .suite
+        .cases
+        .as_ref()?
+        .iter()
+        .find(|c| c.case == compat::suite::READ_ONLY_CASE)
+        .map(|c| c.status)
+}
+
 /// The compat manifest at `path`: `None` when there is none; why when it cannot be read or is not valid against the
 /// locked schema.
 pub(crate) fn read_manifest(path: &Path) -> Result<Option<CompatManifest>, String> {
@@ -1378,6 +1426,33 @@ impl Ready {
                 ));
             }
         })
+    }
+
+    /// The session record of this agent in the project at `cwd` (decision 9): [`Ready::session_capabilities`], and once
+    /// `manifest` has an entry verifying it under `suite_set`, its read_only_workspace true only while that entry's
+    /// read_only case passed: a failed one makes it false, any other (not run, no such case) unknown. So a verified
+    /// agent's is the probe rule, the read-only builder and the case together, the binary's facts
+    /// (docs/adr/ADR-032.md decision 4, items 1 to 3); a host's facts never touch it. Before its suite verified it the
+    /// agent's compat verdict is what waits (ADR-030 decision 11), not its capabilities.
+    pub fn session_record(
+        &self,
+        agent: Agent,
+        cwd: &Path,
+        manifest: Option<&CompatManifest>,
+        suite_set: &str,
+    ) -> Result<serde_json::Value, String> {
+        let mut session = self.session_capabilities(agent, cwd)?;
+        if session.get(READ_ONLY_WORKSPACE) == Some(&serde_json::Value::Bool(true))
+            && compat::verdict(manifest, agent.as_str(), &self.entry, suite_set) == Compat::Verified
+        {
+            session[READ_ONLY_WORKSPACE] =
+                match read_only_case(manifest, agent, &self.entry, suite_set) {
+                    Some(compat::SuiteStatus::Pass) => serde_json::Value::Bool(true),
+                    Some(compat::SuiteStatus::Fail) => serde_json::Value::Bool(false),
+                    _ => serde_json::Value::Null,
+                };
+        }
+        Ok(session)
     }
 
     /// What a session of this agent has (decision 9), for a turn in `cwd` under the YOLO profile; or why no turn of it
