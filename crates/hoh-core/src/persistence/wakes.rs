@@ -433,7 +433,20 @@ pub(super) fn rearm(
                 .and_then(crate::time::parse_rfc3339)
                 .unwrap_or(now);
             let n = u32::try_from(failures - 1).unwrap_or(u32::MAX);
-            (failures, Some(rfc3339_utc(from + crate::retry::bound(n))))
+            // A failure that carries a Retry-After (a provider's quota reset, as the runner gives it: M2T07R-256, RA-02;
+            // REQ-042 behaviour 1, the owner's rule for every role) waits for it from its end's whole second, as a task's
+            // retry does; read from its recorded failure, so a host started again waits the same. Otherwise ADR-020's
+            // bound.
+            let not_before = match turn_failure(tx, &turn.attempt_id)? {
+                Some(crate::retry::FailureClass::Transient {
+                    retry_after: Some(after),
+                }) => {
+                    crate::retry::whole_seconds(from)
+                        + Duration::from_secs(after.as_secs() + u64::from(after.subsec_nanos() > 0))
+                }
+                _ => from + crate::retry::bound(n),
+            };
+            (failures, Some(rfc3339_utc(not_before)))
         } else {
             (failures, None)
         };
@@ -1635,6 +1648,25 @@ fn latest_allocation(conn: &Connection, run_id: &str) -> Result<Option<(i64, i64
 }
 
 /// Whether event `event_id` exists (the unique index; v18).
+/// The failure recorded for supervision attempt `attempt_id` (its `supervisor.turn_failed`), if any.
+fn turn_failure(
+    tx: &Connection,
+    attempt_id: &str,
+) -> Result<Option<crate::retry::FailureClass>, PersistError> {
+    let failure: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json, '$.failure') FROM events WHERE event_id = ?1",
+            params![child_id(attempt_id, "turn_failed")],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    Ok(failure
+        .and_then(|f| serde_json::from_str::<Value>(&f).ok())
+        .and_then(|f| crate::retry::FailureClass::from_json(&f)))
+}
+
 fn has_event(tx: &Connection, event_id: &str) -> Result<bool, PersistError> {
     tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE event_id = ?1)",

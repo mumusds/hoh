@@ -558,6 +558,68 @@ async fn a_failed_turn_cancels_its_supervision_task_and_rearms_its_wake_after_a_
 }
 
 #[tokio::test]
+async fn a_supervision_turn_failed_on_a_quota_waits_for_its_reset_even_after_a_restart() -> R {
+    // RA-02 (M2T07R-256 review; the owner's rule for every role, the Commander's too): a supervision turn whose failure
+    // carries a Retry-After (a provider's quota reset, as the runner gives it: 7200 s from the end's second) is rearmed
+    // not before then, not by ADR-020's bound alone; the wake is not allocated in between, before or after the host
+    // restarts (the wait is read from the turn's recorded failure), and is allocated once it is due.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    let w = wake(&store, &clock, "R", "D", "fp", 0).await?;
+    let a = store
+        .allocate_supervision("p1", context(&clock, 3000))
+        .await?
+        .ok_or("allocated")?;
+    let quota = crate::retry::FailureClass::Transient {
+        retry_after: Some(Duration::from_secs(7_200)),
+    };
+    run_turn(&store, &clock, &a.attempt_id, 3000, false, quota).await?;
+    // Past ADR-020's first bound (2 s) and well into the wait: not allocated.
+    for ms in [6_000, 3_600_000] {
+        assert!(
+            store
+                .allocate_supervision("p1", context(&clock, ms))
+                .await?
+                .is_none(),
+            "allocated at {ms} ms"
+        );
+    }
+    let rearmed = rearms(&path)?;
+    assert_eq!(rearmed.len(), 1);
+    // The turn ended at 3.5 s, kept as its second: due 3 s + 7200 s.
+    let due = t(3_000) + Duration::from_secs(7_200);
+    assert_eq!(
+        (
+            &rearmed[0]["reason"],
+            &rearmed[0]["failures"],
+            &rearmed[0]["retry_not_before"]
+        ),
+        (
+            &json!("failure"),
+            &json!(1),
+            &json!(crate::time::rfc3339_utc(due))
+        )
+    );
+    drop(store);
+    let (store, _) = open(&dir, &clock)?;
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, 7_202_999))
+            .await?
+            .is_none(),
+        "allocated before its reset after a restart"
+    );
+    let again = store
+        .allocate_supervision("p1", context(&clock, 7_203_000))
+        .await?
+        .ok_or("allocated at its reset")?;
+    assert_eq!((again.wake.as_str(), again.generation), (w.as_str(), 1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_withdrawn_turn_rearms_without_a_failure_or_a_backoff() -> R {
     // Decision 3: a PREPARED turn withdrawn by a pause: its supervision task CANCELLED (not READY), the wake rearmed
     // (withdrawn) with no failure counted, allocated at once when the run works again.
