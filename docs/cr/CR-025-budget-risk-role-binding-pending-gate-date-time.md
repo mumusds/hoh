@@ -1,9 +1,9 @@
 # CR-025 · 预算风险的定义与产生、交接期间的派发拒绝码、门禁拒绝在无 date-time 校验时判定
 
 ID：CR-025
-状态：PROPOSED
-批准人：待两名独立设计审查判定后，由 CTO 依 CR-003 D1 预授权批准
-日期：2026-11-16（第 2 稿：设计审查第 1 轮之后，见文末“审查记录”）
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立设计审查第 1 轮：Codex 01a1e6dc-f79b-7ba1-b683-6f3c4992c399（attempt 7f25dc0b-e822-4550-8b8b-0615942b13af）与 Grok 01a1e6dc-f341-72f3-82d8-7109f0e663df（attempt e01cb72d-0384-4c87-84f8-d26e99af912b）判 FAIL；第 2 轮在冻结提交 faf393e 上：Codex 01a1e6ff-4c64-7942-8434-9d7e9d04a605（attempt 6e4688df-d8f5-4267-a465-aa385b5b532e）与 Grok 01a1e6ff-5181-71b0-9cac-c1233736d9ec（attempt 569d8dcb-630a-4ae9-94ea-b396769183b3）判 PASS，两位都判三项属 CR-003 D1 的细化（预算风险与拒绝码属第 1 条，AC-042-07 与门禁属第 3 条的加严），无 critical、high；批准前按第 2 轮改正了 CR25D-100（medium）与 CR25D-150（low），决定未变）
+日期：2026-11-17（第 2 稿在设计审查第 1 轮之后，第 3 稿加 M2-T21，批准稿按第 2 轮改正；见文末“审查记录”）
 基线：改受锁文件 `contracts/requirements.json`（REQ-042：新增行为 9、决定 6 与 AC-042-07）、`contracts/acceptance-scenarios.json`（新增 TEST-042-07）、`contracts/protocol.schema.json`（`$defs.RejectionReason`）、`tools/release_gate.py`（`validate_manifest`）；`python3 tools/gen_spec_views.py` 重新生成视图；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-025-budget-risk-role-binding-pending-gate-date-time.md`
 
 本 CR 是 M2-T11 之前的后续项包 H（`.hoh-dev/evidence/followups-before-m2t11-2026-11-16.md` §1a 第 1、2 项，§2 的 M2T10R-750 门禁一半，§6 H）。CR-024（Commander 只读）仍在审查中，与本 CR 无交集，各自重新上锁。
@@ -42,7 +42,7 @@ ADR-025 决定 6、7 已写明这一拒绝不需要 Commander 再派：屏障解
 - 旧：无（REQ-042 有 8 条行为）。
 - 新：
 
-  > 预算风险（REQ-021行为1的“budget 风险”）：Runtime每次按预算判定停止时，对每种已设上限的预算也判定风险：max_iterations、max_duration_hours与价格已知的max_usd按停止的同一口径（已用加预留）达到上限的80%；deadline_at按墙钟，自Run创建起经过的时长达到创建至deadline_at时长的80%（该时长不为正时不判定）。成立、该预算的停止尚不成立、且该Run该种在该上限下还没有风险事件时，在同一事务内写一条budget.risk{kind, used, limit, unit, threshold}：threshold为0.8；used为判定所用的总量（已用加预留，deadline_at为已过去的墙钟秒数）；limit为同单位的上限（deadline_at为创建至deadline_at的秒数）。按水平判定：暂停期间越过的，在恢复后第一次判定时写。上限改变后按新上限重新判定。同一Run、同一种、同一上限只写一次，重启后不重复。它只唤醒Commander，不改变任何预算的执行：停止派发仍只在用尽或deadline到达时发生，也不计入重试次数（CR-025）。
+  > 预算风险（REQ-021行为1的“budget 风险”）：Runtime每次推进Run（pace）判定预算停止时，在同一事务内对每种已设上限的预算也判定风险；读取预算、查重与写事件同在这一事务；其他只判定能否派发的预算检查（调度准入、派发决策、Commander turn的分配）不判定风险，它们先看到的越线在下一次pace时写。判定：max_iterations、max_duration_hours与价格已知的max_usd按停止的同一口径（已用加预留）达到上限的80%；deadline_at按墙钟，自Run创建起经过的时长达到创建至deadline_at时长的80%（该时长不为正时不判定）。成立、该预算的停止尚不成立、且该Run该种在该上限下还没有风险事件时，写一条budget.risk{kind, used, limit, unit, threshold}：threshold为0.8；used为判定所用的总量（已用加预留，deadline_at为已过去的墙钟秒数）；limit为同单位的上限（deadline_at为创建至deadline_at的秒数）。按水平判定：暂停期间越过的，在恢复后第一次判定时写。上限改变后按新上限重新判定。同一Run、同一种、同一上限只写一次，重启后不重复。它只唤醒Commander，不改变任何预算的执行：停止派发仍只在用尽或deadline到达时发生，也不计入重试次数（CR-025）。
 
 `decisions` 在第 5 条之后新增第 6 条：
 
@@ -81,7 +81,7 @@ ADR-025 决定 6、7 已写明这一拒绝不需要 Commander 再派：屏障解
 }
 ```
 
-这给 v0.1 与 v1 两档门禁加了同样的一项：REQ-042 的 `release_targets` 含两档，所以 `expected_ac` 都多出 AC-042-07；门禁要求 acceptance-scenarios 里有这个场景，`unit` 检查里有名字含 `test_042_07` 的测试，并且该检查的 `test-results.jsonl` 里有它的一条 PASS（release_gate.py:196-198 的规则，未改）。AC-042-07 归新的实现任务 M2-T21（见下文“不在锁内、随 CR 同步”）；已完成的 M2-T19 不改。
+这给 v0.1 与 v1 两档门禁加了同样的一项：REQ-042 的 `release_targets` 含两档，所以 `expected_ac` 都多出 AC-042-07；门禁的规则未改：`expected_ac` 等于该档全部 AC（release_gate.py:196-198）；acceptance-scenarios 里有 TEST-042-07 且其 `acceptance_id` 为 AC-042-07（:201-202）；`unit` 检查的 `test-results.jsonl` 里有 `test_id` 为 TEST-042-07 的记录，且这些记录全部为 PASS（:223-229）。测试名里的 `test_042_07` 由 docs/10-acceptance.md:37 与 scripts/product/test_results.py:14-25 映射为 TEST-042-07。AC-042-07 归新的实现任务 M2-T21（见下文“不在锁内、随 CR 同步”）；已完成的 M2-T19 不改。
 
 REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在由 REQ-042 行为 9 定义，事件名 `budget.risk` 即实现已在消费的那个。
 
@@ -171,13 +171,13 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
 
 - 预算风险（实现，批准并重新上锁之后，红灯先行）：
   - hoh-core `budget.rs` 加纯函数 `risks(&Budget, created_at: SystemTime, wall: SystemTime) -> Vec<Risk>`：用量类（迭代、时长、价格已知的费用）用账本的已用加预留，与 `budget::stop` 同口径；`Budget` 本身仍按 `context.now()` 装载（在途时长的口径不变）；deadline 只用 `wall`（`context.wall()`，与它的停止 `budget::stop(&budget, wall)` 相同），跨度为 `deadline_at - created_at` 的墙钟秒数（`runs.created_at`），跨度不为正时不判定；每种的停止已成立时不报该种。比较为 `used >= 0.8 * limit`。
-  - pace（persistence/retry.rs）已在每个 tick 用 `budget_and_stop` 读取同一份预算。对每个成立的风险，若还没有 id 为 `child_id(run_id, "budget.risk/<kind>/<limit>")` 的事件（ids.rs，至多 160 字符），就在 pace 自己的事务里写它；pace 没有别的写入时也提交这一条。`<limit>` 是载荷中 limit 的十进制写法，所以上限改变后 id 不同，按新上限再报一次；同一上限的重复判定与重启都找到同一个 id，不再写。
+  - pace（persistence/retry.rs）已在每个 tick 用 `budget_and_stop` 读取同一份预算；风险只在这里判定与写入。调度准入（rounds.rs:80）、派发决策的快照（decide.rs:705）与 Commander turn 的分配（wakes.rs:901）各自的 `budget_stop` 语义不变，不写风险：host 在 pace 与调度轮之间各取一次时间（runner.rs:900），调度轮先看到 80% 时，事件在下一次 pace 写出。对每个成立的风险，若还没有 id 为 `child_id(run_id, "budget.risk/<kind>/<limit>")` 的事件（ids.rs，至多 160 字符），就在 pace 自己的事务里写它；pace 没有别的写入时也提交这一条。`<limit>` 是载荷中 limit 的十进制写法，所以上限改变后 id 不同，按新上限再报一次；同一上限的重复判定与重启都找到同一个 id，不再写。
   - 写在 pace 而不是记录用量的那几处（迭代计数在 `closing::iteration` 的事务里、Attempt 结束时的 wall 累计），原因有二：预留的运行时长与 deadline 随时钟变化，没有一次写入与之对应；而且停止判定也在 pace，风险与停止用的是同一份计算，不会说法不一。迭代的越线由 `iteration.completed` 的提交造成，下一个 tick 的 pace 写出风险，至多晚一个 tick。
   - pace 也在 WAITING_EXTERNAL、BLOCKED 与 Commander 阶段运行（retry.rs:618-628），这些状态下照样写；暂停中的 Run 不经 pace，恢复后第一个 tick 判定（按水平判定，暂停期间越过的阈值不会漏）。这些状态都不在停住集合 G 里，`budget.risk` 以普通的 Progress 意图写（ADR-031 更正 D）。
   - 风险事件不改 `attempt_count`、`next_retry_at`，不消耗 8 次重试，不改 Run 的 revision 与状态。
 - 预算风险的测试：
   - budget.rs 单元测试：每种的 79%/80%；预留计入；价格未知的 usd 不报；未设上限不报；deadline 的墙钟比例，以及单调时钟与墙钟分开时（例如单调 70 s、墙钟 85 s）按墙钟判定；`deadline_at <= created_at` 不报；该种的停止已成立时不报；
-  - pace 测试（含 TEST-042-07 即 `test_042_07`）：越线写一条且断言完整载荷；同一次 pace 中几种同时越线各写一条；再判定不再写；重启（重新打开库）后不重复；低于阈值不写；上限改变后按新上限再写一条；迭代经 `iteration.completed` 越线；暂停期间越过、恢复后写；WAITING_EXTERNAL 与 BLOCKED 中写，且 `attempt_count`、`next_retry_at` 不变；pace 没有别的写入时也提交；
+  - pace 测试（含 TEST-042-07 即 `test_042_07`）：pace 之后、调度准入先看到 80% 时那次准入不写，下一次 pace 写一条；越线写一条且断言完整载荷；同一次 pace 中几种同时越线各写一条；再判定不再写；重启（重新打开库）后不重复；低于阈值不写；上限改变后按新上限再写一条；迭代经 `iteration.completed` 越线；暂停期间越过、恢复后写；WAITING_EXTERNAL 与 BLOCKED 中写，且 `attempt_count`、`next_retry_at` 不变；pace 没有别的写入时也提交；
   - 经 supervise 的 Commander 唤醒：`budget.risk` 产生 High 的触发器；仍可分配 Commander turn 时被唤醒，预算停止已成立时不另分配（监督的预算规则不变）；提交之后、supervise 消费之前崩溃，重启后照样被消费；
   - 价格已知的 usd 分支只有夹具测试（产品尚无价格表），不能当作实际费用的验证。
 - 拒绝码：
@@ -234,3 +234,11 @@ REQ-021 不改：它的行为 1 说“budget 风险”唤醒 Commander，现在�
   - CR25D-55（medium）：门禁的 bundle 测试排在实现之后，上锁到实现之间没有回归测试。已改：bundle 测试与 release_gate.py 的修改同一提交，红灯在插入 `need(...)` 之前，无附加包 venv 的实测作为该提交的证据。
   - CR25D-56（low）：写明检查位置不变。已写入决定 2。
   - 另按 Codex 的说明：决定 6 的“缩小范围”改为“向用户提出范围调整”，并写明 80% 是预警而非保证；门禁拒绝的时机写为“读取 manifest 所引用的证据之前”；测试加“提交之后、supervise 消费之前崩溃”，并区分记录风险事件与实际分配 Commander turn。
+  - 第 3 稿（faf393e）按 CTO 的决定把 AC-042-07 的归属改为新的实现任务 M2-T21，已完成的 M2-T19 不改；在模拟应用的副本上核对了任务图与重新上锁。
+- 设计审查第 2 轮，冻结提交 faf393e：
+  - Codex（会话 01a1e6ff-4c64-7942-8434-9d7e9d04a605，attempt 6e4688df-d8f5-4267-a465-aa385b5b532e）：PASS，第 1 轮各项均已解决；CR25D-100 medium。
+  - Grok（会话 01a1e6ff-5181-71b0-9cac-c1233736d9ec，attempt 569d8dcb-630a-4ae9-94ea-b396769183b3）：PASS，第 1 轮各项均已收口；CR25D-150 low。
+  - 两位都判三项属 CR-003 D1 的细化。副本模拟的证据目录不在冻结的候选里，两位都把其中的数字当作未独立核实的开发者诊断，结论来自对 CR、任务图与校验器源码的静态核对。
+  - CR25D-100（medium）：锁定的行为 9 说“每次按预算判定停止时”，而调度准入、派发决策与 Commander turn 的分配也各自判定停止，越线出现的时刻不唯一。已改：风险只在 pace 的预算判定里判定与写入，读取预算、查重与写事件同一事务；其他准入检查语义不变，它们先看到的越线在下一次 pace 写；测试加这一边界。
+  - CR25D-150（low）：门禁要求的出处应为 release_gate.py:201-202（场景）与 :223-229（test-results 记录全部为 PASS），名字映射为 docs/10-acceptance.md:37 与 scripts/product/test_results.py:14-25。已改。
+- 批准：CTO 依 CR-003 D1 预授权批准（见文首）。
