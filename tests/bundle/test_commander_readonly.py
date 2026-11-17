@@ -220,6 +220,34 @@ class Judge(unittest.TestCase):
             self.assertEqual(verdict(c,mc),'INSUFFICIENT',(path,value))
         m=copy.deepcopy(c);J._observe(m,prompt_sent=J.UNOBSERVED,get_state_session_file=J.UNOBSERVED)
         self.assertEqual(verdict(m,control),'PASS')  # recorder-only, named
+    def test_the_round_11_probes(self):
+        # Typed JSON: a boolean or a float never equals an integer id; an observation is type-checked before its enum
+        # test; exit's fields are closed (M2T20D-1000, -1001).
+        none=Path('/nonexistent');ex=FIXTURES/'excerpts';J=judge_check
+        def verdict(m,control):return J.round_verdict(m,control)[0]
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=J.load(ex,none,'codex',name)[0];control=J.load(ex,none,'codex','app-control')[0]
+            for edit in (lambda m:J._logged(m,'initialize').update(id=False),
+                         lambda m:J._thread_request(m).update(id=True),
+                         lambda m:J._logged(m,'turn/start').update(id=2.0)):
+                m=copy.deepcopy(c);edit(m)
+                self.assertEqual(verdict(m,control),'INSUFFICIENT')
+                mc=copy.deepcopy(control);edit(mc)
+                self.assertEqual(verdict(c,mc),'INSUFFICIENT')
+            for value in ([],{},False,['read_only'],{'profile':'read_only'}):
+                m=copy.deepcopy(c);J._edit_observation(m,('launch','profile'),value)
+                self.assertTrue(J.adapter_replay(m).failure.startswith('NOT_OBSERVED'),value)
+                self.assertEqual(verdict(m,control),'INSUFFICIENT',value)
+        for agent,name in (('claude','ro-new'),('codex','app-ro-new'),('pi','noext-resumed')):
+            c=J.load(ex,none,agent,name)[0];control=J.load(ex,none,agent,J.CONTROL[agent])[0]
+            m=copy.deepcopy(c);J._edit_observation(m,('exit','signal'),9)
+            self.assertTrue(J.adapter_replay(m).failure.startswith('NOT_OBSERVED'),agent)
+            self.assertEqual(verdict(m,control),'INSUFFICIENT',agent)
+            mc=copy.deepcopy(control);J._edit_observation(mc,('exit','signal'),9)
+            self.assertEqual(verdict(c,mc),'INSUFFICIENT',agent)
+            self.assertTrue(J._json_equal({'a':[1,{'b':None}]},{'a':[1,{'b':None}]}))
+            for a,b in ((0,False),(1,True),(2,2.0),('1',1),([],{}),(None,False),({'a':1},{'a':1,'b':None})):
+                self.assertFalse(J._json_equal(a,b),(a,b))
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)
