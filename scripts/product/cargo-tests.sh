@@ -12,8 +12,10 @@ case "${1:-}" in
 esac
 log="$(mktemp)"; trap 'rm -f "$log"' EXIT
 rc=0
-cargo test --workspace --locked "${selector[@]}" 2>&1 | tee "$log" || rc=$?
-if [[ "$1" == unit ]]; then cargo test --workspace --locked --doc 2>&1 | tee -a "$log" || rc=$?; fi
+# --no-fail-fast: every test binary runs even after one failed, so the results after it are evidence too (QA-C-006);
+# cargo still exits non-zero when any failed.
+cargo test --workspace --locked --no-fail-fast "${selector[@]}" 2>&1 | tee "$log" || rc=$?
+if [[ "$1" == unit ]]; then cargo test --workspace --locked --no-fail-fast --doc 2>&1 | tee -a "$log" || rc=$?; fi
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
   python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"
 fi
