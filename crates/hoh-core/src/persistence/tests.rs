@@ -1817,3 +1817,54 @@ async fn a_watchdog_event_is_recorded_only_while_its_attempt_runs_with_no_cancel
     assert_eq!(written, ["a1/watchdog/1/inactive"]);
     Ok(())
 }
+
+#[test]
+fn a_commit_that_failed_writing_is_db_full_only_when_the_stores_directory_has_no_room()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/09 fault matrix item 7 (ADR-016's note, round 3): a commit's write, fsync, truncate or -shm growth that
+    // failed is judged by the room seen in the store's directory, here a directory with room: a storage error naming
+    // the I/O and SQLite's extended code; SQLITE_FULL stays DB_FULL and a lock stays DB_BUSY, unprobed; the probe
+    // leaves nothing.
+    use rusqlite::ffi;
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.db");
+    let failed = |code: i32, text: &str| {
+        rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some(text.to_owned()))
+    };
+    match commit_error(failed(ffi::SQLITE_IOERR_FSYNC, "disk I/O error"), Some(&db)) {
+        PersistError::Storage(detail) => assert_eq!(
+            detail,
+            "disk I/O error (an fsync failed, SQLite extended code 1034); not for want of room: the store's \
+             directory took a 64 KiB write and fsync"
+        ),
+        other => return Err(format!("{other:?}").into()),
+    }
+    match commit_error(failed(ffi::SQLITE_IOERR_WRITE, "disk I/O error"), None) {
+        PersistError::Storage(detail) => assert_eq!(
+            detail,
+            "disk I/O error (a write failed, SQLite extended code 778)"
+        ),
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert!(matches!(
+        commit_error(
+            failed(ffi::SQLITE_FULL, "database or disk is full"),
+            Some(&db)
+        ),
+        PersistError::Full(_)
+    ));
+    assert!(matches!(
+        commit_error(failed(ffi::SQLITE_BUSY, "database is locked"), Some(&db)),
+        PersistError::Busy(_)
+    ));
+    match commit_error(failed(ffi::SQLITE_IOERR_READ, "disk I/O error"), Some(&db)) {
+        PersistError::Storage(detail) => assert_eq!(detail, "disk I/O error"),
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path())?.count(),
+        0,
+        "the probe left a file"
+    );
+    Ok(())
+}

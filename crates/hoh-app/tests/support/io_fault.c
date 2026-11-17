@@ -12,6 +12,7 @@
  *                  truncate of a self-test file fails with the same errno, in every process (a file system that stays
  *                  full or over quota)
  *   F7_IO_PROBE    optional: the first fault only in the probe process (the one with HOH_WAL_PROBE_DB set)
+ *   F7_IO_ARM      optional, a path: the first fault only while it exists (a running host's command, not its start)
  *   F7_CLEANUP_ERRNO  optional: after the first fault, the next pread of a self-test file fails once with this errno
  *                  (EINTR: SQLite retries it, and the errno of the failed call is gone when SQLite returns)
  */
@@ -50,7 +51,8 @@ static int fault(int fd, const char *op) {
     if (err && selftest_file(fd, path, sizeof path)) {
         if (state && access(state, F_OK) == 0) {
             result = atoi(err);
-        } else if (!fired && (!getenv("F7_IO_PROBE") || getenv("HOH_WAL_PROBE_DB"))) {
+        } else if (!fired && (!getenv("F7_IO_PROBE") || getenv("HOH_WAL_PROBE_DB")) &&
+                   (!getenv("F7_IO_ARM") || access(getenv("F7_IO_ARM"), F_OK) == 0)) {
             const char *kind = getenv("F7_IO_OP");
             const char *suffix = getenv("F7_IO_SUFFIX");
             size_t len = strlen(path);

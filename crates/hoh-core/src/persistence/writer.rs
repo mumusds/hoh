@@ -6,7 +6,7 @@
 use super::attempts::{self, AttemptJob, AttemptMove, CancelLatch};
 use super::commands::{self, CommandOutcome, HostStart, SubmitCommand};
 use super::decide::{self, Decided};
-use super::{FaultHooks, Options, PersistError, Pragmas, WritePoint, sqlite_error};
+use super::{FaultHooks, Options, PersistError, Pragmas, WritePoint, commit_error, sqlite_error};
 use crate::decision::{Context, Proposal};
 use crate::lifecycle::AttemptState;
 use crate::lifecycle::{self, Lifecycle};
@@ -1327,13 +1327,15 @@ pub(super) fn result_due(tx: &Transaction<'_>, run_id: &str) -> Result<(), Persi
 pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     finish(&tx, ctx)?;
     ctx.before_commit()?;
-    tx.commit().map_err(sqlite_error)
+    let db = tx.path().map(std::path::PathBuf::from);
+    tx.commit().map_err(|e| commit_error(e, db.as_deref()))
 }
 
 /// [`commit`] for the transactions that never were a point of the fault hooks (CR-006): their behaviour unchanged.
 pub(super) fn commit_unhooked(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     finish(&tx, ctx)?;
-    tx.commit().map_err(sqlite_error)
+    let db = tx.path().map(std::path::PathBuf::from);
+    tx.commit().map_err(|e| commit_error(e, db.as_deref()))
 }
 
 /// What every write transaction of the writer does last (docs/adr/ADR-031.md decisions 3 and 4): each run registered in

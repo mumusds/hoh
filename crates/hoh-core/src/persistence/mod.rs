@@ -92,6 +92,7 @@ pub use team::{
 pub use verification::{ChangeRequest, Deferred, VerifierRequest};
 pub use wakes::{Allocated, SUPERVISION_TURN, Stop, Supervision};
 pub mod location;
+mod room;
 pub mod selftest;
 mod writer;
 
@@ -511,6 +512,42 @@ fn sqlite_error(e: rusqlite::Error) -> PersistError {
         }
         Some(rusqlite::ErrorCode::DiskFull) => PersistError::Full(e.to_string()),
         _ => PersistError::Storage(e.to_string()),
+    }
+}
+
+/// A failed commit of the writer (docs/09 fault matrix item 7; docs/adr/ADR-016.md, the note's round 3): as
+/// [`sqlite_error`] maps it, except a write, fsync, truncate or -shm growth that failed ([`room::growing_write`]). That
+/// is DB_FULL, retryable, when the directory of `db` is seen to have no room right after ([`room::probe`], with a file
+/// named for this process and moment); otherwise it stays a storage error, its reason naming the I/O that failed,
+/// SQLite's extended code and what the probe saw. No errno is read after SQLite returns.
+pub(super) fn commit_error(e: rusqlite::Error, db: Option<&Path>) -> PersistError {
+    let Some((extended, what)) = e
+        .sqlite_extended_error_code()
+        .and_then(|x| room::growing_write(x).map(|what| (x, what)))
+    else {
+        return sqlite_error(e);
+    };
+    let what = format!("{what} failed, SQLite extended code {extended}");
+    let Some(db) = db.filter(|db| !db.as_os_str().is_empty()) else {
+        return PersistError::Storage(format!("{e} ({what})"));
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = db.as_os_str().to_owned();
+    name.push(format!("-room-{}-{nanos}", std::process::id()));
+    let kib = room::BYTES >> 10;
+    match room::probe(Path::new(&name)) {
+        Err(r) if room::none(&r) => PersistError::Full(format!(
+            "{e} ({what}); the store's directory has no room: a {kib} KiB write and fsync failed: {r}"
+        )),
+        Ok(()) => PersistError::Storage(format!(
+            "{e} ({what}); not for want of room: the store's directory took a {kib} KiB write and fsync"
+        )),
+        Err(r) => PersistError::Storage(format!(
+            "{e} ({what}); room not known: a {kib} KiB write and fsync in the store's directory failed: {r}"
+        )),
     }
 }
 
