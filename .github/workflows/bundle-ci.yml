@@ -64,6 +64,15 @@ jobs:
           [ -S "$runtime/systemd/private" ]
           echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked
+      # docs/09 fault matrix item 7 on file systems of the tests' own (a small tmpfs, an ext4 image that turns
+      # read-only), mounted with sudo -n: the tests marked ignore for that. GitHub's ubuntu runners have passwordless
+      # sudo; where it does not work the step fails, never skips.
+      - name: fault matrix item 7 on real mounts (sudo -n)
+        run: |
+          sudo -n true
+          cargo test -p hoh-app --locked --test db_faults -- --ignored
+          cargo test -p hoh-core --locked --lib -- --ignored --exact \
+            persistence::selftest::tests::a_file_system_that_fills_before_the_probes_commit_is_db_full
       - run: cargo deny --locked check
   deployment:
     # TEST-005-06 (M2-T14, docs/adr/ADR-023.md decision 13): the release bundle built from this commit, installed into a
