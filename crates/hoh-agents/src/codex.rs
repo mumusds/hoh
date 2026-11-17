@@ -375,8 +375,9 @@ pub fn verdict(e: &Ending<'_>) -> (AttemptState, Option<String>) {
     }
 }
 
-/// Item types that only carry text: their start changes nothing outside the conversation.
-fn is_text_item(kind: &str) -> bool {
+/// Item types that only carry text: their start changes nothing outside the conversation (the read-only judge reads
+/// the same list, docs/adr/ADR-032.md decision 8 row C).
+pub fn is_text_item(kind: &str) -> bool {
     matches!(
         kind,
         "userMessage" | "agentMessage" | "reasoning" | "plan" | "agent_message" | "error"
