@@ -18,6 +18,7 @@ macro_rules! say {
 
 mod cli;
 mod client;
+mod debug_hold;
 mod doctor;
 mod exit;
 mod follow;
@@ -55,6 +56,8 @@ fn main() {
     if args.first().map(OsString::as_os_str)
         == Some(hoh_core::persistence::selftest::PROBE_ARG.as_ref())
     {
+        // Where a test holds the probe (debug builds only).
+        debug_hold::at("wal-probe");
         std::process::exit(hoh_core::persistence::selftest::probe_main());
     }
     // Internal mode: the start gate an agent is started through (docs/adr/ADR-022.md decision 13); not a user command and

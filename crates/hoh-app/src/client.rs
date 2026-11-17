@@ -812,8 +812,10 @@ fn launch_with(
         None => command.env_remove(hoh_app::host::UNSCOPED_ENV),
     };
     command.env(hoh_app::host::UNSUPERVISED_ENV, unsupervised);
+    // Where a test holds the start just before the host is spawned, and sees what came of it (debug builds only).
+    crate::debug_hold::at("before-launch");
     // A host is wait-only from its spawn: nothing of this client ever signals it (docs/adr/ADR-031.md, 设计修正 2, A).
-    let mut child = hoh_core::spawn::Spawner::host(
+    let started = hoh_core::spawn::Spawner::host(
         &hoh_core::spawn::Direct,
         command
             .arg("__host")
@@ -822,8 +824,16 @@ fn launch_with(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped()),
-    )
-    .map_err(|e| Failure::unreachable(format!("cannot start the host: {e}")))?;
+    );
+    crate::debug_hold::mark(
+        "launch-tried",
+        &match &started {
+            Ok(child) => format!("launched {}", child.id()),
+            Err(e) => format!("refused: {e}"),
+        },
+    );
+    let mut child =
+        started.map_err(|e| Failure::unreachable(format!("cannot start the host: {e}")))?;
     let pid = child.id();
     // Its start errors come on its stderr until it is ready (then it writes .hoh/host.log).
     if let Some(stderr) = child.take_stderr() {
