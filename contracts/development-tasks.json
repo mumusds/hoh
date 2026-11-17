@@ -704,6 +704,31 @@
    "done_when": "REQ-020 全部 AC 与 AC-027-04 通过。绑定恢复后，BLOCKED_AUTH/BLOCKED_CAPABILITY 的验证 Task 回到可派发（ADR-028 的出口表，CR-018）。"
   },
   {
+   "id": "M2-T20",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Commander 只读工作区档：决策经最终消息交付、各底座的只读启动、read_only_workspace 能力（CR-024、ADR-032）",
+   "depends_on": [
+    "M2-T13",
+    "M2-T15"
+   ],
+   "requirements": [
+    "REQ-021",
+    "REQ-020",
+    "REQ-024",
+    "REQ-025",
+    "REQ-026",
+    "REQ-027"
+   ],
+   "acceptance": [
+    "AC-021-06",
+    "AC-021-07"
+   ],
+   "done_when": "AC-021-06、AC-021-07 通过；REQ-021 行为 9 与失败模式 7、REQ-024 决定 5、REQ-025 行为 6、REQ-026 行为 9、REQ-027 行为 2 的 read_only_workspace（会话记录的三项与选人时的主机事实）由 ADR-032 测试计划的单元测试覆盖；兼容清单的 read_only 用例不计入 suite.status；TEST-021-07 的判定函数有以 ADR-032 证据表引用的 S0 录制摘录（tests/fixtures/commander-readonly/excerpts/）为夹具的离线单元测试，在这些夹具与 `judge_check.py --emit` 生成的每个变体上，结论属于冻结的期望类别（摘录各轮的 PASS 或 FAIL，变体的 `expect.json`：应为非 PASS 的无一 PASS，不变性变体保持原结论）；准绳是这些类别加适配器的重放，judge_check.py 与 judge_check.out.json 只是原型，不是准绳。判定不自己解析 Agent 的流：范围、请求与响应的关联、终态（本轮与对照）、最终消息与本轮的条目取自适配器的 `replay_facts`（claude.rs、codex/app_server.rs、pi.rs；`claude::judge` 与 `pi::note_message` 改为 `pub(crate)`；codex 的 `adapter.item` 载荷带上条目本身的事实），其输入按 ADR-032 设计修正 7 第 2 条的输入契约：所录的 stdout 与外部观察，字段与类型按契约（三者的版本、退出状态与日志是否读完，claude 的 prompt 是否送达，codex 的启动参数，pi 的启动参数与续会话时启动前记下的会话文件和 get_state 所指文件的身份；缺失、错型或未知即 NOT_OBSERVED，从不取默认值；live 运行记下、重放注入，pi 的会话核对是 live 与重放共用的一个函数，不用兼容套件固定成功的 `replayed_exit`）；适配器写的每一条消息由 `replay_facts` 从启动参数建出，所录的请求记录按设计修正 7 第 2 条的比较约定与之逐条、逐键比较（只不比较 initialize 的 `clientInfo.version` 与提示正文）；rollout 与本轮条目按默认拒绝列举；其先红证据（全权限档下的 FAIL）已保存。"
+  },
+  {
    "id": "M2-T21",
    "milestone": "M2",
    "kind": "implement",
@@ -776,7 +801,8 @@
     "M2-T15",
     "M2-T17",
     "M2-T18",
-    "M2-T21"
+    "M2-T21",
+    "M2-T20"
    ],
    "requirements": [
     "REQ-001",

@@ -941,7 +941,7 @@
     }
    ],
    "decisions": [
-    "文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume。",
+    "文档没有列出各内置职位的 required_capabilities。初值：所有职位需要 structured_events，或可用 TaskResult 结构化桥替代；developer/qa 需要经 probe 实测的命令执行能力；commander/reviewer 需要 resume；commander 职位另需 read_only_workspace，按职位名判定，与 Commander 的只读启动是同一判定（引用 commander 合同的自定义职位不在内）（CR-024）。",
     "默认配置不含任何隐式 fallback，未配置 fallback 即直接 BLOCKED。",
     "文档没有说明 429/503 是否触发 fallback。选择不触发，按重试与预算规则等待；只有永久错误（缺认证/能力不支持/未安装/无模型）才评估 fallback。",
     "agent 缺失和 model 缺失的原因码文档未定义。初值：AGENT_UNAVAILABLE、MODEL_UNAVAILABLE。"
@@ -959,7 +959,7 @@
     "v1"
    ],
    "spec_maturity": "detailed",
-   "summary": "Commander 只被重要事件或策略规定的轮次边界唤醒；同类事件按去重键聚合并去抖；触发进度持久化在 last_handled_seq；过期决策被拒绝并重新触发；每次监督的延迟和决定都可查询。",
+   "summary": "Commander 只被重要事件或策略规定的轮次边界唤醒；同类事件按去重键聚合并去抖；触发进度持久化在 last_handled_seq；过期决策被拒绝并重新触发；每次监督的延迟和决定都可查询。Commander 以只读工作区档运行，决策经最终消息交付（CR-024）。",
    "behavior": [
     "只有重要事件集合（need_decision、critical/high issue、no_progress、budget 风险、角色失效、规格变更、milestone_ready、release_request）和 balanced 策略下的轮次边界可以唤醒 Commander。",
     "token delta、工具输出、心跳、medium/low issue 和常规 candidate_ready 不得唤醒 Commander；candidate_ready 由 Runtime 直接派发 QA 与 Review。",
@@ -968,7 +968,8 @@
     "触发器必须持久化 last_handled_seq；Commander 只收到该 seq 之后的摘要和证据引用。超出上下文预算时按严重性和因果链取舍，但保留 spec_sha256 与 candidate_id。",
     "Commander 决策必须带 expected_revision 和 role_epoch；任一过期即不 apply，标 REJECTED，并基于最新状态重新触发。",
     "每个触发器和决策都必须可查询：去重键、event_seqs、首事件时间、唤醒时间、决策时间、监督延迟（单调时钟毫秒）和决策状态。",
-    "reserve_supervisor_slot=true 时，即使写槽和读槽全部被占用也不能推迟 Commander 唤醒；Commander 不可用时，已授权的低风险动作继续执行，新的重大决策使 run 进入 BLOCKED。"
+    "reserve_supervisor_slot=true 时，即使写槽和读槽全部被占用也不能推迟 Commander 唤醒；Commander 不可用时，已授权的低风险动作继续执行，新的重大决策使 run 进入 BLOCKED。",
+    "Commander 的每个 turn 必须以只读工作区档启动，argv 与参数逐项如下。只读档相对全权限启动只替换 YOLO 选项所在的部分（pi 为追加），其余 argv 规则照旧；`[…]` 为今天的规则下出现的可选项（claude 需要实时增量且 help 提供时的 `--include-partial-messages`、有 model 时的 `--model`、续会话的参数）：codex 只经 App Server：进程同今天；thread/start 的参数为 `\"approvalPolicy\": \"never\", \"sandbox\": \"read-only\"`，加上今天已有的 `model`（有 model 时）；thread/resume 的参数为同样两项，加上今天已有的 `threadId` 与 `model`（有 model 时）；逐项相等包含这些今天已有的字段。codex exec 不启动 Commander 的 turn：传输为 exec 的 codex 不被选为 Commander，App Server 在本 host 运行中降级为 exec 后 codex 不再当 Commander，直到 host 重启或换版本。claude：`claude -p --output-format stream-json --verbose [--include-partial-messages] --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --strict-mcp-config [--resume <session_id>] [--model <m>]`，不带 `--dangerously-skip-permissions`。pi：`pi --mode rpc --session-dir <dir> --session-id <id> --tools read,grep,find,ls --no-mcp --no-extensions [--provider <p>] [--model <m>]`。每个选项与固定取值只在被测 help/schema 声明时使用。help 无从声明的只有 claude 的工具名 Read、Grep、Glob，由 TEST-021-07 实测。缺其余任一项时该 turn 不启动（BLOCKED_CAPABILITY），不得改用全权限启动。Commander 的决策只取其最终助手消息中最后一个 ```hoh-decisions 块的各行，按行序处置（每行 `{\"nonce\", \"message\"}`）；写进任何文件的内容都不登记为决策（CR-024）。"
    ],
    "failure_modes": [
     "Agent 每秒产生数千条 token 事件时，Commander 唤醒次数仍为 0。",
@@ -976,7 +977,8 @@
     "host 重启后，seq≤last_handled_seq 的事件不再唤醒 Commander，已 APPLIED 的决策不会重放。",
     "决策的 expected_revision 过期时，state=REJECTED(STALE_REVISION)，task 不变，并产生恰好一次重新触发。",
     "Commander 不可用时出现 need_decision，run 进入 BLOCKED 并记录原因，不无限等待；candidate_ready 照常派发 QA/Review。",
-    "Commander 决策试图直接把 AC 或 candidate 标为通过时被拒绝，验收仍以证据门禁为准。"
+    "Commander 决策试图直接把 AC 或 candidate 标为通过时被拒绝，验收仍以证据门禁为准。",
+    "当 Commander 的 Agent 的 read_only_workspace 不为 true 时，该 Agent 不被选为 Commander：按 fallback 换绑，没有可用的 fallback 时职位 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`。不为 true 的原因分两类：主机的事实，只有两项：codex 的本机沙箱检查为 unconfined 或 unavailable；codex 的 App Server 在本 host 运行中降级为 exec。已分配的 Commander turn 因它们在启动前被拒时，按可恢复的不可用处理（AGENT_UNAVAILABLE），不写排除记录，主机恢复后同一版本可再当 Commander。其余都是二进制的事实，例如被测 help/schema 不提供只读档、codex 的传输为 exec、兼容清单的 read_only 用例未通过。已分配的 Commander turn 因它们在启动前被拒时为 BLOCKED_CAPABILITY（Capability 类）。只读档的问题不改变该 Agent 的兼容判决，它在其他职位照常可用。当监督 Attempt 的目录里出现 messages.jsonl 时，其中的行不登记为决策，并记一条 supervisor.bridge_ignored（CR-024）。"
    ],
    "doc_refs": [
     "docs/06-orchestration.md",
@@ -986,7 +988,9 @@
     "docs/05-data-api.md",
     "config/hoh.example.toml",
     "resources/prompts/commander.md",
-    "contracts/sql/001_initial.sql"
+    "contracts/sql/001_initial.sql",
+    "docs/13-adapters.md",
+    "docs/adr/ADR-032.md"
    ],
    "acceptance": [
     {
@@ -1023,6 +1027,20 @@
      "when": "t=0 注入 1 条 critical issue；处理完后让 FakeCommander 不可用，再注入 need_decision 和 candidate_ready",
      "then": "critical issue 在 t=2.0s 唤醒 Commander，不排在读写槽之后；Commander 不可用后 run=BLOCKED、blocked_reason=COMMANDER_UNAVAILABLE 且 blocked_reasons 含 NEED_DECISION，candidate_ready 仍产生 qa 与 reviewer 各 1 条 kind=handoff 消息；GetEvents 能读到每个触发器的去重键、event_seqs 和延迟毫秒数",
      "test_id": "TEST-021-05"
+    },
+    {
+     "id": "AC-021-06",
+     "given": "fake codex、claude、pi 的 help 与 schema 取自录制品；codex 另有只走 exec 的变体（help 无 app-server），以及 App Server 可在运行中降级（initialize 返回方法不存在）的变体；三组只读档缺项变体：claude 的 help 无 `--strict-mcp-config`，pi 的 help 无 `--no-mcp`，codex schema 的 SandboxMode 无 read-only；fake codex 的本机沙箱检查可设为 confined、unconfined、unavailable、unknown，并可在运行中改变；注册表的本机检查刷新间隔在测试中缩短；测试钩子可在分配之后、prepare 之前触发一次刷新；未配置 fallback",
+     "when": "(a) claude、codex App Server、pi 依次作为 Commander、Developer 为 fake claude，每个 Commander 被 need_decision 唤醒两次，第二次续同一会话；第一次唤醒时 fake Commander 在最终消息的 ```hoh-decisions 块中给出一条 record_assumption，同时向该 Attempt 目录的 messages.jsonl 追加另一条有效决策（同一 nonce）；(b) 三组缺项变体中该 Agent 同时被配为 Commander 与 Developer；(c) codex 同时为 Commander 与 Developer，本机检查依次为 unconfined、unavailable、unknown，再从 unavailable 改为 confined；另在检查为 unknown 时分配 Commander 的 turn，在 prepare 之前刷新得到 unavailable，再改为 confined；(d) 只走 exec 的 codex，以及运行中降级的 codex，各同时为 Commander 与 Developer",
+     "then": "(a) 两次 turn 的 argv（claude、pi）或 thread/start 与 thread/resume 的参数（codex App Server）与 REQ-021 行为 9 的清单逐项相等，且不含 `--dangerously-skip-permissions`、`--dangerously-bypass-approvals-and-sandbox` 或 `danger-full-access`；Developer 的 argv 含 YOLO 选项；块中的决策为 APPLIED；messages.jsonl 中那条决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条。(b) 兼容清单中该 Agent 的 suite.status=PASS、read_only 用例为 FAIL；commander 绑定为 BLOCKED，缺项含 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，没有 Commander Attempt 启动；该 Agent 作为 Developer 的 turn 启动并 SETTLED。(c) unconfined 与 unavailable 时 commander 绑定为 BLOCKED，缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`，判决证据写出检查结论，没有 Commander Attempt 启动；兼容清单中 codex 的 read_only 用例仍为 PASS，会话记录的 capabilities_json 不变（主机的事实只作用于选人）；codex 作为 Developer 照常 SETTLED；unknown 时 codex 照常作为 Commander 运行，证据记下 unknown 与原因；检查从 unavailable 改为 confined 后，下一次刷新使 commander 绑定解除阻塞、Commander Attempt 启动；已分配之后刷新得到 unavailable 时，prepare 拒绝为 AGENT_UNAVAILABLE，不写 team.binding_excluded，改为 confined 后同一 codex 版本的 Commander Attempt 再被派发并 SETTLED；以上各处 codex 作为 Developer 的会话 id 前后不变。(d) 两者都不被选为 Commander（缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`），没有在 exec 上启动的 Commander turn；codex 作为 Developer 照常 SETTLED",
+     "test_id": "TEST-021-06"
+    },
+    {
+     "id": "AC-021-07",
+     "given": "VM 实装且已原生登录的 claude、codex、pi；claude、pi、codex（App Server）各一段；每段一个临时 Git 仓库 P（已提交，含随机 token 文件，`.gitignore` 含 `.hoh/`）与 P 之外的私有工作目录 W；四个区域（P 的工作树、P/.git/、P/.hoh/、W）各有供每种写机制分别建、改、删的种子；区域之外有测试写出的确定的驱动：区域路径为常量、缺区域即报驱动错误的格脚本，与补丁全文；pi 另加载只观察的测试扩展；受测候选提交中 ADR-032 的证据表，与它引用的已安装版本的录制",
+     "when": "live：每段以 Commander 的只读档运行新会话与续同一会话两轮，提示按驱动逐一尝试每个区域的建、改、删，然后读取 token，在最终消息的 ```hoh-decisions 块中给出含 token 的 record_assumption；每段另以全权限档在另一个仓库运行同一提示作对照；每轮前后取四个区域的全量快照，其间不运行 git；codex 每轮之后另读该轮线程的 rollout 文件",
+     "then": "按 ADR-032 证据表的字段路径与文字判定，判定须要的每一项输入都必须在，缺任一项从不判 PASS。判定不自己解析 Agent 的流：本轮的范围、请求与响应的关联、终态与最终消息取自产品适配器对所录 stdout 与所录的外部观察的重放（与 host 运行同一条代码路径）。各适配器必需的观察（ADR-032 设计修正 7 第 2 条）：三者都有 Agent 的版本、进程的退出状态与日志是否读完；claude 另有 prompt 是否送达；codex 另有启动参数（只读档或全权限档、新线程或续的 thread id、model）；pi 另有启动参数（非空的会话 id、显式布尔的是否续会话）与续会话时启动前记下的会话文件和 get_state 所指文件的身份。缺一项、类型不对或有未知的观察，不给出已结束。适配器写给 Agent 的消息由它从启动参数建出，所录的请求记录按 ADR-032 的比较约定与之逐条、逐键比较，不同为覆盖不足；适配器不取的记录不计，带本轮 id 而适配器没取的记录为覆盖不足；本轮的每个条目与 rollout 中本轮的每个调用都须按证据表分类并有已知结果，分不了类或不完整的为覆盖不足，从不丢掉。所须的证据：每轮 SETTLED，本轮与对照轮的终态都按产品适配器结束一个 turn 的规则（证据表 E0），块被解析且 nonce 正确，第 1 轮含 token；该会话自己的原始记录给出可用性证据，claude、pi 恰为只读档的读工具，codex 线程的沙箱为只读；四个区域前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件；codex 的两种写机制（shell 与 apply_patch）× 四个区域 × 建改删的每一格，都有原始记录中的尝试、由权限拒绝而非其他任何错误造成的结果，以及对照中同一机制 × 操作在普通工作树文件上的成功；claude、pi 的对照轮的可用性证据列出读工具以外的工具。一格的结论取本轮所有相符的记录，与顺序无关：任一记录为成功即该格成功，每一条都是权限拒绝才是权限拒绝；对照轮必须存在，其可用性证据完整并显示全权限，每个机制 × 操作的所有记录都是成功。分类固定如下：可用性证据齐全而不符合（只读档未生效）、任一快照差异或任一成功的格，立即 FAIL，不重做；缺任一项为覆盖不足，不判 PASS，每段至多换新会话重做三次；未登录的 Agent 为 BLOCKED 而非 PASS。什么算权限拒绝、突破或覆盖不足只能经 CR 改；ADR-032 的证据表只把这一分类映射到字段路径与文字，改一个字段路径或文字须引用已安装版本的一次新录制，并经设计审查",
+     "test_id": "TEST-021-07"
     }
    ],
    "decisions": [
@@ -1030,7 +1048,8 @@
     "紧急事件集合：选择只有 IntegrityViolation 类（例如验证中候选被改、DB integrity 失败）绕过去抖；critical issue 属于重要事件，仍走去抖。",
     "同键已有未处理触发器时，新事件并入该触发器，不并发第二个触发器。",
     "触发器字段名（dedup_key、event_seqs、wake_latency_ms）和事件 kind 名称是初值；延迟的测量起点为首事件提交时刻（单调时钟）。",
-    "文档没有量化 efficient/intensive 的唤醒差异。选择只断言：同一 fixture 下唤醒次数满足 intensive≥balanced≥efficient，且重要事件在三种策略下都会唤醒。"
+    "文档没有量化 efficient/intensive 的唤醒差异。选择只断言：同一 fixture 下唤醒次数满足 intensive≥balanced≥efficient，且重要事件在三种策略下都会唤醒。",
+    "（CR-024）只读工作区档的强制方式因底座而异：codex 由其操作系统级沙箱约束模型运行的命令与补丁；用户自己配置的 MCP 服务器与钩子运行在沙箱之外。claude 只靠进程内的工具集与权限判定：`--tools` 只说覆盖内置工具集，插件、用户或项目设置带来并预先批准的工具是否也被排除，help 没有说。pi 只靠进程内按工具名的允许清单，没有操作系统级屏障；Commander 的 pi 会话不加载任何扩展（`--no-extensions`，不以 `-e` 加载），所以扩展覆盖同名工具、包住工具调用或自己写文件都不在这个会话里。同 uid 的其他进程不受约束（CR-013）。这些余项按所有者的决定如实记在 docs/12，并由 doctor 显示（ADR-032 决定 7）；各底座只读会话的工具集、拒绝记录与快照由 TEST-021-07 实测。`execution.profile=\"yolo-vm\"` 指 Commander 用只读工作区档、其余职位全权限，不新增配置键。"
    ]
   },
   {
@@ -1212,10 +1231,11 @@
     }
    ],
    "decisions": [
-    "App Server 的 YOLO 通过 thread/start 的 approvalPolicy=never、sandbox=danger-full-access 表达，依据本机 codex 0.166 generate-json-schema；docs/13 只描述 exec flag。",
+    "App Server 的 YOLO 通过 thread/start 的 approvalPolicy=never、sandbox=danger-full-access 表达，依据本机 codex 0.166 generate-json-schema；docs/13 只描述 exec flag。（CR-024）Commander 的只读档通过 thread/start 与 thread/resume 的 approvalPolicy=never、sandbox=read-only 表达，同一 schema 的 SandboxMode 含 read-only。",
     "native cancel grace 10 s 与 TERM grace 5 s 为初值，三个适配器共用。",
     "降级 exec 的 resume 用 `codex exec resume <id>`（本机 help 存在），是否计为 resume 能力由兼容套件确认。",
-    "（CR-003）鉴权失败识别：App Server 为 turn/completed status=failed 且 codexErrorInfo=unauthorized（0.166.0 schema 枚举值，录制中未出现，fixture 依 schema 合成并在 meta.json 标 synthetic=true，只用于 integration）；exec 降级为 turn.failed，且其 error.message 或之前的 error 事件含 `unexpected status 401`（录制样例 exec-unauthenticated）。二者都映射 BLOCKED_AUTH 且不重试。"
+    "（CR-003）鉴权失败识别：App Server 为 turn/completed status=failed 且 codexErrorInfo=unauthorized（0.166.0 schema 枚举值，录制中未出现，fixture 依 schema 合成并在 meta.json 标 synthetic=true，只用于 integration）；exec 降级为 turn.failed，且其 error.message 或之前的 error 事件含 `unexpected status 401`（录制样例 exec-unauthenticated）。二者都映射 BLOCKED_AUTH 且不重试。",
+    "（CR-024）Commander 不经 codex exec 运行。理由：exec 的 `--json` 流里补丁被拒不留痕迹，拒绝只记在该线程的 rollout 文件里；exec 不给出这个文件的位置，只能按未声明的文件名约定查找；exec 续会话的只读又要靠 help 不声明的配置键 `sandbox_mode`。App Server 的响应直接给出 rollout 的位置，续会话也有已声明的 `sandbox` 参数（ADR-032 决定 10）。因此传输为 exec 的 codex 的 read_only_workspace 为 false。App Server 在本 host 运行中降级为 exec 后，codex 不再当 Commander，直到 host 重启或换版本；这是主机的事实，不写入会话记录。选 codex 当 Commander 时，另须本机沙箱检查（以临时 CODEX_HOME 运行 `codex sandbox -P :read-only` 的写探针）不为 unconfined 或 unavailable。该检查只说明本机能否建立 codex 的默认只读沙箱。它也是主机的事实：不写入会话记录，从不使任何会话换绑；结论不是 confined 时至多每 60 秒重测一次，主机修好后即恢复（ADR-032 决定 4）。"
    ]
   },
   {
@@ -1238,7 +1258,7 @@
     "必须从 system init 帧记录 session_id 与 resolved model，从 result 帧记录 subtype、is_error、usage 与费用；缺失项为 unknown 而非0。",
     "仅当 result.subtype=success、is_error=false 且进程退出码0时 attempt=SETTLED；error_max_turns、error_during_execution、中断均不是成功。",
     "后续轮次必须以 `--resume <session_id>` 继续同一会话；需要独立会话的角色不得复用开发会话 id。",
-    "YOLO profile 仅在 help 含 `--dangerously-skip-permissions` 时使用；HoH Auto 不得映射为 `--permission-mode auto`；HoH Prompt 经官方追加方式或任务上下文注入，不替换原生 system prompt。",
+    "YOLO profile 仅在 help 含 `--dangerously-skip-permissions` 时使用；Commander 的只读档按 REQ-021 行为 9 的 claude 一行启动，不带 `--dangerously-skip-permissions`；其选项与 `dontAsk` 取值仅在 help 声明时使用，否则不启动（BLOCKED_CAPABILITY），工具名 Read、Grep、Glob 由 TEST-021-07 实测（CR-024）；HoH Auto 不得映射为 `--permission-mode auto`；HoH Prompt 经官方追加方式或任务上下文注入，不替换原生 system prompt。",
     "取消必须先发 SIGINT（原生中断）→ grace 后对进程组 SIGTERM → 再有界 SIGKILL 并 reap；默认 grace 10 s/5 s（初值）。",
     "已请求取消的 attempt 一律以 CANCELLED 结束：取消优先于 result 帧与退出码判定，取消后收到的 result 帧（如 error_during_execution）只作诊断保存（CR-003）。"
    ],
@@ -1292,7 +1312,8 @@
     "原生取消选 SIGINT；`--input-format stream-json` 下是否有协议级 interrupt 需以版本样例确认后再启用。",
     "成功判定同时要求 result success、is_error=false 与退出码0，属从严选择。",
     "PROTOCOL_INCOMPLETE 命名为初值；`--include-partial-messages` 默认关闭，仅在需要实时增量时开启。",
-    "（CR-003）claude 2.1.317 录制样例 sigint-cancel 显示：SIGINT 后仍输出 result(subtype=error_during_execution, is_error=true) 且退出码0，故取消判定以「已请求取消」为准；AC-025-01 所需含 tool_use 的成功样例由 M1-T03 补录。"
+    "（CR-003）claude 2.1.317 录制样例 sigint-cancel 显示：SIGINT 后仍输出 result(subtype=error_during_execution, is_error=true) 且退出码0，故取消判定以「已请求取消」为准；AC-025-01 所需含 tool_use 的成功样例由 M1-T03 补录。",
+    "（CR-024）`dontAsk` 的语义依据本机 claude 2.1.325 二进制内的 SDK 说明“Don't prompt for permissions, deny if not pre-approved”；`--allowedTools` 是这种预先批准。不传 `--add-dir`：不把项目设为工作目录，避免按环境变量加载项目的 CLAUDE.md。不传 `--restricted`：它会忽略用户设置。`--tools` 的说明只覆盖内置工具集；插件、用户或项目设置带来并预先批准的工具是否被排除，help 没有说，记为余项（ADR-032 R4）。干净配置下的工具集由 TEST-021-07 从 init 帧实测。"
    ]
   },
   {
@@ -1316,7 +1337,8 @@
     "disposition=handled 必须立即结束该次交付（未启动模型 run，不等 settled）；started/queued 必须等 agent_settled 才判定静止；agent_end 后的重试/压缩不算完成。",
     "版本不支持 agent_settled 时必须在 agent_end 等事件后用状态查询核验（非 streaming、无待重试/压缩、队列空）或声明能力不支持；禁止用 sleep 推测空闲。",
     "对话类扩展 UI 请求（confirm/select/input/editor）在 headless 下必须按策略回 cancel 并记录阻塞事件；非对话类 UI 请求只映射为数据事件，不嵌入 Pi 画面。",
-    "取消必须先发原生中止命令，超 grace 后对进程组 SIGTERM→SIGKILL 并 reap。"
+    "取消必须先发原生中止命令，超 grace 后对进程组 SIGTERM→SIGKILL 并 reap。",
+    "Commander 的只读档必须按 REQ-021 行为 9 的 pi 一行启动。仅当 help 声明 `--tools`、`--no-mcp` 与 `--no-extensions`，且其 Built-in Tool Names 段列出 read、grep、find、ls 时使用，否则不启动（BLOCKED_CAPABILITY）。Commander 的 pi 会话不加载任何扩展：`--no-extensions` 使发现的、配置的与内置的扩展都不加载，也不以 `-e` 显式加载任何扩展。v1 的三个 Pi 插件（REQ-048–050）服务于其他 Pi 职位，不进 Commander 的会话；这一点在 docs/12 与 doctor 中写明，不是省略插件。Pi 的只读只靠进程内按工具名的允许清单，没有操作系统级屏障，记为余项（ADR-032 R3）（CR-024）。"
    ],
    "failure_modes": [
     "当帧内含 U+2028/U+2029 或一帧跨多次 read 到达时，解析出的帧数与内容必须与 fixture 完全一致。",
@@ -1385,7 +1407,7 @@
    "summary": "适配器从实际版本、--help 与原生 schema 探测能力并写入 compat manifest，按能力而非品牌启用功能；未知事件/字段原样保存不 panic，超大帧有界失败，不支持的能力显式降级。",
    "behavior": [
     "probe() 必须记录 launcher path 与 sha256，以及解析后的实际实现 path 与 sha256（如 pi 由 install/current-version 解析到 releases/<版本>，codex 由 npm 包装解析到 vendored 原生二进制）、--version 原文、相关 --help 的 sha256、原生 schema hash（Codex 用 `codex app-server generate-json-schema` 输出），写入符合 contracts/compat-manifest.schema.json 的 compat manifest（CR-003）。",
-    "Capabilities（structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage、command_execution）必须由探测与兼容套件结果得出，不按品牌硬编码，并写入 sessions.capabilities_json；command_execution 指适配器在 HoH 的启动选项下可运行命令，由被测二进制的 help/schema 实测（ADR-030 决定 12）。",
+    "Capabilities（structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage、command_execution、read_only_workspace）必须由探测与兼容套件结果得出，不按品牌硬编码，并写入 sessions.capabilities_json；command_execution 指适配器在 HoH 的全权限启动选项下可运行命令，由被测二进制的 help/schema 实测（ADR-030 决定 12）。（CR-024）read_only_workspace 指适配器能以只读工作区档启动该 Agent，会话记录里为下列三项之与：被测 help/schema 的探测规则；只读档的构建函数不拒绝；兼容清单的 read_only 用例为 PASS——该用例只核对只读档的请求，不计入 suite.status。选人时，codex 另须本机沙箱检查不为 unconfined 或 unavailable，且其 App Server 未在本 host 运行中降级为 exec；这些是主机的事实，不写入会话记录（ADR-032 决定 4、10）。",
     "兼容套件 fixture 必须对每个 agent 覆盖成功、失败、取消、压缩、工具、未知字段6类，manifest 记录所用 fixture 集 hash（本构建的套件集摘要：覆盖嵌入 fixture、请求构建函数的实际输出与套件定义，ADR-030 决定 10）与结果。",
     "实现 sha256、help 或 schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。",
     "未知事件类型与已知事件中的未知字段必须保存原始帧并产生 `adapter.unknown_event` 诊断，不 panic、不改变终态判定。",
