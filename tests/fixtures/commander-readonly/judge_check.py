@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Format prototype of ADR-032's evidence-table judge (design corrections 4 to 7). NOT AUTHORITATIVE.
+"""Format prototype of ADR-032's evidence-table judge (design corrections 4 to 8). NOT AUTHORITATIVE.
 
 Design correction 7 ("一个解析器"): the authoritative judge is M2-T20's Rust judge. It never parses an agent's stream
 itself: scope, request/response correlation, terminal state, final message and the turn's items come from the
@@ -58,9 +58,6 @@ PI_SESSION_DIR = 'P/.hoh/sessions/s1'  # the segment's own session directory, as
 CONTROL = {'claude': 'control', 'codex': 'app-control', 'pi': 'control'}
 POSITIVE = ('claude/ro-new', 'claude/ro-resumed', 'codex/app-ro-new', 'codex/app-ro-resumed', 'pi/noext-new', 'pi/noext-resumed')
 CELL_LINE = re.compile(r'^HOH-CELL (\S+) (\S+) (\S+) exit=(\d+) err=(.*)$')
-JS_STRING = r'("(?:[^"\\]|\\.)*")'
-APPLY_PATCH_CALL = re.compile(r'text\(await tools\.apply_patch\(' + JS_STRING + r'\)\);\n?')
-EXEC_COMMAND_CALL = re.compile(r'text\(await tools\.exec_command\(\{cmd:' + JS_STRING + r',max_output_tokens:\d+\}\)\);\n?')
 PATCH_HEADER = re.compile(r'^\*\*\* (?:Add|Update|Delete) File: (.+)$', re.M)
 BLOCK = re.compile(r'```hoh-decisions[ \t]*\n(.*?)\n```', re.S)
 CHANGED = {'create': 'added', 'modify': 'changed', 'delete': 'removed'}
@@ -684,20 +681,370 @@ def _decode(js: str) -> str | None:
     return v if isinstance(v, str) else None
 
 
+# ------------------------------------------------------------------------- codex code mode (design correction 8)
+
+class _NotScript(Exception):
+    """A code-mode script outside design correction 8's grammar: unclassified."""
+
+
+# The pure members a discovery expression may use, and the properties of an ALL_TOOLS element (`{name, description}`).
+_TOOL_FIELDS = ('name', 'description')
+# The code-mode globals that act (codex 0.166.0's exec description and codex-code-mode-host): never in a discovery.
+EXCLUDED_GLOBALS = ('tools', 'store', 'load', 'notify', 'setTimeout', 'clearTimeout', 'yield_control', 'exit', 'image',
+                    'audio', 'generatedImage', 'as_settled', 'stream_settled')
+
+
+def _tokens(src: str) -> list[tuple[str, str]]:
+    """The tokens of `src`: (kind, text), kind one of str, regex, int, id, punct. Whitespace separates; a "/" begins a
+    regex literal only where an operand starts (after "(", "=>", "||", "&&", "!", "," or at the start); anything else
+    is not a script of the grammar."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch in ' \t\r\n':
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                if src[j] == '\n':
+                    raise _NotScript('a newline in a string')
+                j += 2 if src[j] == '\\' else 1
+            if j >= n or _decode(src[i:j + 1]) is None:
+                raise _NotScript('an unterminated string, or one that does not decode')
+            out.append(('str', src[i:j + 1]))
+            i = j + 1
+        elif ch == '/':
+            if out and out[-1] not in (('punct', '('), ('punct', '=>'), ('punct', '||'), ('punct', '&&'), ('punct', '!'), ('punct', ',')):
+                raise _NotScript('a "/" that is no regex literal')
+            j, klass = i + 1, False
+            while j < n and (klass or src[j] != '/'):
+                if src[j] == '\n':
+                    raise _NotScript('a newline in a regex')
+                if src[j] == '\\':
+                    j += 2
+                    continue
+                klass = (klass and src[j] != ']') or (not klass and src[j] == '[')
+                j += 1
+            if j >= n or j == i + 1:
+                raise _NotScript('an unterminated regex')
+            j += 1
+            while j < n and src[j] in 'gimsuy':
+                j += 1
+            out.append(('regex', src[i:j]))
+            i = j
+        elif ch in '0123456789':
+            j = i
+            while j < n and src[j] in '0123456789':
+                j += 1
+            out.append(('int', src[i:j]))
+            i = j
+        elif (ch.isascii() and ch.isalpha()) or ch in '_$':
+            j = i
+            while j < n and ((src[j].isascii() and src[j].isalnum()) or src[j] in '_$'):
+                j += 1
+            out.append(('id', src[i:j]))
+            i = j
+        else:
+            two = src[i:i + 2]
+            if two in ('=>', '||', '&&'):
+                out.append(('punct', two))
+                i += 2
+            elif ch in '(){}.,;:=+!':
+                out.append(('punct', ch))
+                i += 1
+            else:
+                raise _NotScript(f'a character outside the grammar: {ch!r}')
+    return out
+
+
+class _Parser:
+    """Design correction 8's grammar of a code-mode script, nothing else (any other token is not a script):
+    script  := stmt+                                  (no pragma, no other statement)
+    stmt    := "text" "(" "await" call ")" ";"
+             | "const" ID "=" "await" call ";" "text" "(" ID ")" ";"     (the same fresh ID, used once, next)
+             | "text" "(" disc ")" ";"
+    call    := "tools" "." "exec_command" "(" "{" "cmd" ":" STR [ "," "max_output_tokens" ":" INT ] "}" ")"
+             | "tools" "." "apply_patch" "(" STR ")"
+    disc    := "ALL_TOOLS" { "." ("filter" | "some") "(" P "=>" bool ")" | "." "map" "(" P "=>" obj ")" }
+    obj     := "(" "{" field { "," field } "}" ")"      field := ("name" | "description") ":" sexpr
+    bool    := term { ("||" | "&&") term }
+    term    := [ "!" ] ( REGEX "." "test" "(" sexpr ")" | sexpr "." "includes" "(" STR ")" | "(" bool ")" )
+    sexpr   := satom { "+" satom }
+    satom   := STR | P "." ("name" | "description") { "." "toLowerCase" "(" ")" | "." "slice" "(" INT [ "," INT ] ")" }
+    P is the arrow's one parameter (optionally parenthesized), bound only in its body."""
+
+    def __init__(self, src: str) -> None:
+        self.t, self.i = _tokens(src), 0
+
+    def peek(self, k: int = 0) -> tuple[str, str] | None:
+        return self.t[self.i + k] if self.i + k < len(self.t) else None
+
+    def take(self, kind: str, text: str | None = None) -> str:
+        tok = self.peek()
+        if tok is None or tok[0] != kind or (text is not None and tok[1] != text):
+            raise _NotScript(f'expected {text or kind}, found {tok}')
+        self.i += 1
+        return tok[1]
+
+    def at(self, kind: str, text: str) -> bool:
+        return self.peek() == (kind, text)
+
+    def script(self) -> list[tuple]:
+        stmts = []
+        while self.peek() is not None:
+            stmts.append(self.stmt())
+        if not stmts:
+            raise _NotScript('no statement')
+        return stmts
+
+    def stmt(self) -> tuple:
+        if self.at('id', 'const'):
+            self.take('id', 'const')
+            name = self.take('id')
+            if name in ('text', 'tools', 'ALL_TOOLS', 'await', 'const') or name in EXCLUDED_GLOBALS:
+                raise _NotScript('a const that shadows a global')
+            self.take('punct', '=')
+            self.take('id', 'await')
+            call = self.call()
+            self.take('punct', ';')
+            self.take('id', 'text')
+            self.take('punct', '(')
+            if self.take('id') != name:
+                raise _NotScript('a const not passed to text() next')
+            self.take('punct', ')')
+            self.take('punct', ';')
+            return call
+        self.take('id', 'text')
+        self.take('punct', '(')
+        if self.at('id', 'await'):
+            self.take('id', 'await')
+            out = self.call()
+        else:
+            self.disc()
+            out = ('discovery',)
+        self.take('punct', ')')
+        self.take('punct', ';')
+        return out
+
+    def call(self) -> tuple:
+        self.take('id', 'tools')
+        self.take('punct', '.')
+        tool = self.take('id')
+        self.take('punct', '(')
+        if tool == 'exec_command':
+            self.take('punct', '{')
+            self.take('id', 'cmd')
+            self.take('punct', ':')
+            cmd = _decode(self.take('str'))
+            if self.at('punct', ','):
+                self.take('punct', ',')
+                self.take('id', 'max_output_tokens')
+                self.take('punct', ':')
+                self.take('int')
+            self.take('punct', '}')
+            out = ('exec', cmd)
+        elif tool == 'apply_patch':
+            out = ('patch', _decode(self.take('str')))
+        else:
+            raise _NotScript(f'a call of tools.{tool}')
+        self.take('punct', ')')
+        if out[1] is None:
+            raise _NotScript('a string literal that does not decode')
+        return out
+
+    def disc(self) -> None:
+        self.take('id', 'ALL_TOOLS')
+        while self.at('punct', '.'):
+            self.take('punct', '.')
+            method = self.take('id')
+            self.take('punct', '(')
+            param = self.param()
+            if method in ('filter', 'some'):
+                self.bool(param)
+            elif method == 'map':
+                self.obj(param)
+            else:
+                raise _NotScript(f'ALL_TOOLS.{method}')
+            self.take('punct', ')')
+
+    def param(self) -> str:
+        paren = self.at('punct', '(')
+        if paren:
+            self.take('punct', '(')
+        name = self.take('id')
+        if name in ('text', 'tools', 'ALL_TOOLS', 'await', 'const') or name in EXCLUDED_GLOBALS:
+            raise _NotScript('a parameter that shadows a global')
+        if paren:
+            self.take('punct', ')')
+        self.take('punct', '=>')
+        return name
+
+    def obj(self, p: str) -> None:
+        self.take('punct', '(')
+        self.take('punct', '{')
+        while True:
+            if self.take('id') not in _TOOL_FIELDS:
+                raise _NotScript('an object field other than name or description')
+            self.take('punct', ':')
+            self.sexpr(p)
+            if not self.at('punct', ','):
+                break
+            self.take('punct', ',')
+        self.take('punct', '}')
+        self.take('punct', ')')
+
+    def bool(self, p: str) -> None:
+        self.term(p)
+        while self.at('punct', '||') or self.at('punct', '&&'):
+            self.i += 1
+            self.term(p)
+
+    def term(self, p: str) -> None:
+        if self.at('punct', '!'):
+            self.take('punct', '!')
+        tok = self.peek()
+        if tok is not None and tok[0] == 'regex':
+            self.i += 1
+            self.take('punct', '.')
+            self.take('id', 'test')
+            self.take('punct', '(')
+            self.sexpr(p)
+            self.take('punct', ')')
+        elif self.at('punct', '('):
+            self.take('punct', '(')
+            self.bool(p)
+            self.take('punct', ')')
+        else:
+            self.sexpr(p)
+            self.take('punct', '.')
+            self.take('id', 'includes')
+            self.take('punct', '(')
+            self.take('str')
+            self.take('punct', ')')
+
+    def sexpr(self, p: str) -> None:
+        self.satom(p)
+        while self.at('punct', '+'):
+            self.take('punct', '+')
+            self.satom(p)
+
+    def satom(self, p: str) -> None:
+        tok = self.peek()
+        if tok is not None and tok[0] == 'str':
+            self.i += 1
+            return
+        if self.take('id') != p:
+            raise _NotScript('an identifier other than the parameter')
+        self.take('punct', '.')
+        if self.take('id') not in _TOOL_FIELDS:
+            raise _NotScript('a property other than name or description')
+        # A method call follows only as ".toLowerCase()" or ".slice(INT[, INT])"; ".test"/".includes" belong to term.
+        while self.at('punct', '.') and self.peek(1) in (('id', 'toLowerCase'), ('id', 'slice')):
+            self.take('punct', '.')
+            if self.take('id') == 'toLowerCase':
+                self.take('punct', '(')
+            else:
+                self.take('punct', '(')
+                self.take('int')
+                if self.at('punct', ','):
+                    self.take('punct', ',')
+                    self.take('int')
+            self.take('punct', ')')
+
+
+def code_mode_script(src: str) -> list[tuple] | None:
+    """A code-mode `exec` input as design correction 8's statements, in order: ("exec", cmd), ("patch", patch) or
+    ("discovery",); None when it is not a script of the grammar."""
+    try:
+        return _Parser(src).script()
+    except _NotScript:
+        return None
+
+
+def _exec_body(text) -> str | None:
+    """An exec_command item: a JSON object with an integer exit_code and a string output; its output."""
+    try:
+        body = json.loads(text) if isinstance(text, str) else None
+    except ValueError:
+        return None
+    if isinstance(body, dict) and isinstance(body.get('exit_code'), int) and not isinstance(body.get('exit_code'), bool) \
+            and isinstance(body.get('output'), str):
+        return body['output']
+    return None
+
+
+def _script_outcomes(entries: list[dict], items: list, texts: list) -> list[str]:
+    """One output of a code-mode call of `entries` (its statements in order), each statement's outcome added to it;
+    the problems. One statement: as S0 recorded (a patch: success when some item starts "Script completed\\n", refused
+    when the output is exactly the "Script failed" header and the refusal; a command: the "Script completed" header and
+    its JSON body; a discovery: a "Script completed" header and one item). Several (design correction 8): after the
+    header every statement that ran added exactly one item, in order; a completed script has one item per statement; a
+    failed one ends with the "Script error:" item of the statement that threw, and the statements after it did not run
+    (no outcome). A patch's item in the run is a success, its error a refusal only when it is exactly the refusal; a
+    command's item its body; a discovery's item is not read. Anything else is an unknown outcome."""
+    problems = []
+    header = texts[0] if texts and isinstance(texts[0], str) and SCRIPT_HEADER.match(texts[0]) else None
+    if len(entries) == 1:
+        e = entries[0]
+        if e['kind'] == 'patch':
+            if any(isinstance(t, str) and t.startswith(SCRIPT_COMPLETED) for t in texts):
+                e['outcomes'].append('success')
+            elif len(items) == 2 and len(texts) == 2 and header and header.startswith('Script failed') and texts[1] == PATCH_REFUSAL:
+                e['outcomes'].append('refused')
+            else:
+                e['outcomes'].append('unknown')
+                problems.append('a patch call with an output of unknown outcome')
+        elif e['kind'] in ('driver', 'read'):
+            out = _exec_body(texts[1]) if len(texts) == 2 and header and header.startswith(SCRIPT_COMPLETED) else None
+            if out is None:
+                problems.append('an exec_command call with an output of unknown outcome')
+            else:
+                e['outcomes'].append(out)
+        elif not (len(texts) == 2 and len(items) == 2 and header and header.startswith(SCRIPT_COMPLETED)):
+            problems.append('a discovery call with an output of unknown outcome')
+        return problems
+    unknown = 'a code-mode script with an output of unknown outcome'
+    if header is None or len(items) != len(texts):
+        return [unknown]
+    ran = texts[1:]
+    if header.startswith(SCRIPT_COMPLETED):
+        if len(ran) != len(entries):
+            return [unknown]
+        failed = None
+    else:
+        if not (1 <= len(ran) <= len(entries) and isinstance(ran[-1], str) and ran[-1].startswith('Script error:\n')):
+            return [unknown]
+        failed, ran = ran[-1], ran[:-1]
+    for e, t in zip(entries, ran):
+        if e['kind'] == 'patch':
+            e['outcomes'].append('success')
+        elif e['kind'] in ('driver', 'read'):
+            out = _exec_body(t)
+            if out is None:
+                problems.append(unknown)
+            else:
+                e['outcomes'].append(out)
+    if failed is not None:
+        e = entries[len(ran)]
+        if e['kind'] == 'patch' and failed == PATCH_REFUSAL:
+            e['outcomes'].append('refused')
+        else:
+            if e['kind'] == 'patch':
+                e['outcomes'].append('unknown')
+            problems.append(unknown)
+    return problems
+
+
 def rollout_calls(c: Case) -> tuple[list[dict], list[str]]:
     """Stage 2 on the rollout, default-deny (no adapter reads it). The adapter's turn id selects the lines; a call or
     output line (a response_item whose payload.type ends in "_call" or "_call_output") without a turn id cannot be
     placed and is a problem. Every call of the turn, whatever its form, must have a call_id and at least one output of
-    the turn with that call_id, and be classified:
-    - payload.type == "custom_tool_call", payload.name == "exec", payload.input entirely
-      `text(await tools.apply_patch("<patch>"));` with one patch (exactly one "*** Begin Patch" and one file header):
-      a patch of that target; each output must be a refusal (payload.output is exactly two input_text items, a
-      "Script failed" header and the refusal sentence) or a success (some input_text item starting "Script
-      completed\\n");
-    - the same with `text(await tools.exec_command({cmd:"<cmd>",max_output_tokens:<n>}));` where <cmd> is exactly
-      "sh <T>/cells.sh" (a driver call) or "cat <P>/TOKEN.txt" (the token read): each output must be a "Script
-      completed" header and one JSON object with an integer exit_code and a string output;
-    - anything else is unclassified.
+    the turn with that call_id, and be classified: a "custom_tool_call" named "exec" whose input is a script of design
+    correction 8's grammar (`code_mode_script`) and every statement of it classified — a patch with exactly one "***
+    Begin Patch" and one file header (of that target), a command exactly "sh <T>/cells.sh" (a driver call) or "cat
+    <P>/TOKEN.txt" (the token read), or a discovery (it changes nothing and is no cell's) — each output distributed over
+    the statements by `_script_outcomes`; anything else is unclassified, the whole call.
     An output whose call_id no call of the turn has is a problem too. Returns (the classified calls, the problems)."""
     tid = turn_id(c)
     lines, problems = [], []
@@ -723,42 +1070,29 @@ def rollout_calls(c: Case) -> tuple[list[dict], list[str]]:
         outs = outputs.get(cid, [])
         if not outs:
             problems.append('a call without an output')
-        call = {'call_id': cid, 'kind': None, 'outcomes': []}
         text = p.get('input') if p.get('type') == 'custom_tool_call' and p.get('name') == 'exec' and isinstance(p.get('input'), str) else None
-        m_patch = APPLY_PATCH_CALL.fullmatch(text) if text is not None else None
-        m_exec = EXEC_COMMAND_CALL.fullmatch(text) if text is not None else None
-        if m_patch and (patch := _decode(m_patch[1])) is not None and patch.count('*** Begin Patch') == 1 and len(PATCH_HEADER.findall(patch)) == 1:
-            call.update(kind='patch', patch=patch.rstrip('\n'), target=PATCH_HEADER.findall(patch)[0])
-            for o in outs:
-                items = o.get('output') if isinstance(o.get('output'), list) else []
-                texts = [e.get('text') for e in items if isinstance(e, dict) and e.get('type') == 'input_text']
-                if any(isinstance(t, str) and t.startswith(SCRIPT_COMPLETED) for t in texts):
-                    call['outcomes'].append('success')
-                elif (len(items) == 2 and len(texts) == 2 and isinstance(texts[0], str) and SCRIPT_HEADER.match(texts[0])
-                      and texts[0].startswith('Script failed') and texts[1] == PATCH_REFUSAL):
-                    call['outcomes'].append('refused')
-                else:
-                    call['outcomes'].append('unknown')
-                    problems.append('a patch call with an output of unknown outcome')
-        elif m_exec and (cmd := _decode(m_exec[1])) in (f"sh {c.paths['T']}/cells.sh", f"cat {c.paths['P']}/TOKEN.txt"):
-            call.update(kind='driver' if cmd.startswith('sh ') else 'read')
-            for o in outs:
-                items = o.get('output') if isinstance(o.get('output'), list) else []
-                texts = [e.get('text') for e in items if isinstance(e, dict) and e.get('type') == 'input_text']
-                body = None
-                if len(texts) == 2 and isinstance(texts[0], str) and SCRIPT_HEADER.match(texts[0]) and texts[0].startswith(SCRIPT_COMPLETED):
-                    try:
-                        body = json.loads(texts[1])
-                    except (ValueError, TypeError):
-                        body = None
-                if isinstance(body, dict) and isinstance(body.get('exit_code'), int) and isinstance(body.get('output'), str):
-                    call['outcomes'].append(body['output'])
-                else:
-                    problems.append('an exec_command call with an output of unknown outcome')
-        else:
+        stmts = code_mode_script(text) if text is not None else None
+        drive, read = f"sh {c.paths['T']}/cells.sh", f"cat {c.paths['P']}/TOKEN.txt"
+        entries = []
+        for st in stmts or []:
+            if st[0] == 'patch' and st[1].count('*** Begin Patch') == 1 and len(PATCH_HEADER.findall(st[1])) == 1:
+                entries.append({'call_id': cid, 'kind': 'patch', 'patch': st[1].rstrip('\n'),
+                                'target': PATCH_HEADER.findall(st[1])[0], 'outcomes': []})
+            elif st[0] == 'exec' and st[1] in (drive, read):
+                entries.append({'call_id': cid, 'kind': 'driver' if st[1] == drive else 'read', 'outcomes': []})
+            elif st[0] == 'discovery':
+                entries.append({'call_id': cid, 'kind': 'discovery', 'outcomes': []})
+            else:
+                entries = None
+                break
+        if not entries:
             problems.append(f"an unclassified call ({p.get('type')} {p.get('name')})")
             continue
-        classified.append(call)
+        for o in outs:
+            items = o.get('output') if isinstance(o.get('output'), list) else []
+            texts = [e.get('text') for e in items if isinstance(e, dict) and e.get('type') == 'input_text']
+            problems += _script_outcomes(entries, items, texts)
+        classified += [e for e in entries if e['kind'] != 'discovery']
     known = {p.get('call_id') for p in calls}
     problems += ['an output of no call of the turn' for cid in outputs if cid not in known]
     return classified, problems
@@ -1521,6 +1855,48 @@ def _odd_patch_call(m: Case, syntax: str, outcome: str | None) -> None:
         m.rollout.append(out)
 
 
+DISCOVERY = 'text(ALL_TOOLS.filter(t => /write.*file|create.*file/i.test(t.description+" "+t.name)).map(t=>({name:t.name,description:t.description.slice(0,160)})));\n'
+COMPLETED = 'Script completed\nWall time 0.0 seconds\nOutput:\n'
+
+
+def _exec_calls(m: Case) -> list[dict]:
+    """The payloads of the round's own code-mode calls of exec_command."""
+    return [l['payload'] for l in _turn_lines(m) if (l.get('payload') or {}).get('type') == 'custom_tool_call'
+            and 'tools.exec_command(' in (l['payload'].get('input') or '')]
+
+
+def _rewrite_exec_calls(m: Case, form: str) -> None:
+    """Every exec_command call of the turn re-encoded in another form of design correction 8 (the same calls)."""
+    for p in _exec_calls(m):
+        match = re.fullmatch(r'text\(await tools\.exec_command\(\{cmd:("(?:[^"\\]|\\.)*"),max_output_tokens:(\d+)\}\)\);\n?', p['input'])
+        assert match, p['input']
+        cmd, n = match[1], match[2]
+        p['input'] = {'no max_output_tokens': f'text(await tools.exec_command({{cmd:{cmd}}}));\n',
+                      'const then text': f'const result = await tools.exec_command({{cmd:{cmd},max_output_tokens:{n}}});\ntext(result);\n',
+                      'const then text, one line': f'const result = await tools.exec_command({{cmd: {cmd}, max_output_tokens: {n}}}); text(result);\n'}[form]
+
+
+def _code_mode_call(m: Case, source: str, texts: list[str] | None, call_id: str = 'mutant-code-mode') -> None:
+    """A code-mode call of the turn with input `source` and, unless None, one output of these input_text items."""
+    turn = turn_id(m)
+    meta = {'internal_chat_message_metadata_passthrough': {'turn_id': turn}}
+    m.rollout.append({'type': 'response_item', 'payload': {'type': 'custom_tool_call', 'name': 'exec', 'status': 'completed',
+                                                           'call_id': call_id, 'input': source, **meta}})
+    if texts is not None:
+        m.rollout.append({'type': 'response_item', 'payload': {'type': 'custom_tool_call_output', 'call_id': call_id,
+                                                               'output': [{'type': 'input_text', 'text': t} for t in texts], **meta}})
+
+
+def _driver_then(m: Case, extra: str, extra_texts: list[str]) -> None:
+    """The turn's first driver call with `extra` statements after it in the same script, its output with
+    `extra_texts` appended (a script of several statements, design correction 8)."""
+    p = next(p for p in _exec_calls(m) if '/cells.sh' in p['input'])
+    p['input'] = p['input'] + extra
+    out = next(l['payload'] for l in _turn_lines(m) if (l.get('payload') or {}).get('type') == 'custom_tool_call_output'
+               and l['payload'].get('call_id') == p['call_id'])
+    out['output'] = out['output'] + [{'type': 'input_text', 'text': t} for t in extra_texts]
+
+
 def _odd_call(m: Case, payload: dict) -> None:
     turn = scope(m)[0].turn
     m.rollout.append({'type': 'response_item', 'payload': {**payload, 'call_id': 'mutant-odd-call',
@@ -1768,6 +2144,45 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         add('rollout default-deny', 'a call without a call_id', edit=_call_without_id)
         add('rollout default-deny', 'an output of no call', edit=_orphan_output)
         add('rollout default-deny', 'a refusal with an unknown second outcome', edit=_refusal_plus_unknown)
+        # Design correction 8: code mode's other forms of the same calls, a discovery script, several statements.
+        for form in ('no max_output_tokens', 'const then text', 'const then text, one line'):
+            add('code mode', f'every exec_command call written as {form}', expect='same',
+                edit=lambda m, f=form: _rewrite_exec_calls(m, f))
+        add('code mode', 'a discovery script added', expect='same', edit=lambda m: _code_mode_call(m, DISCOVERY, [COMPLETED, '[]']))
+        add('code mode', 'the driver call then a discovery in one script', expect='same',
+            edit=lambda m: _driver_then(m, DISCOVERY, ['[]']))
+        patch = lambda m, op: json.dumps(patch_text(m, 'P', op))
+        add('code mode', 'two patches in one script, the first refused, the second not run', expect='same',
+            edit=lambda m: _code_mode_call(m, f'text(await tools.apply_patch({patch(m, "create")}));\ntext(await tools.apply_patch({patch(m, "modify")}));\n',
+                                           ['Script failed\nWall time 0.0 seconds\nOutput:\n', PATCH_REFUSAL]))
+        add('code mode', 'two patches in one script, both written',
+            edit=lambda m: _code_mode_call(m, f'text(await tools.apply_patch({patch(m, "create")}));\ntext(await tools.apply_patch({patch(m, "modify")}));\n',
+                                           [COMPLETED, '{}', '{}']))
+        add('code mode', 'two patches in one script, one item for two statements',
+            edit=lambda m: _code_mode_call(m, f'text(await tools.apply_patch({patch(m, "create")}));\ntext(await tools.apply_patch({patch(m, "modify")}));\n',
+                                           [COMPLETED, '{}']))
+        add('code mode', 'a discovery that calls tools.exec_command',
+            edit=lambda m: _code_mode_call(m, 'text(ALL_TOOLS.filter(t => tools.exec_command({cmd:"touch x"})));\n', [COMPLETED, '[]']))
+        for name in EXCLUDED_GLOBALS + ('eval', 'Function', 'globalThis', 'console', 'WebAssembly'):
+            add('code mode', f'a discovery that reads the global {name}',
+                edit=lambda m, g=name: _code_mode_call(m, f'text(ALL_TOOLS.filter(t => /w/.test({g})));\n', [COMPLETED, '[]']))
+            add('code mode', f'a discovery followed by a call of {name}',
+                edit=lambda m, g=name: _code_mode_call(m, DISCOVERY + f'{g}("k");\n', [COMPLETED, '[]', '{}']))
+        for chain in ('t.name.constructor', 't.description.replace("a", "b")', 't["name"]'):
+            add('code mode', f'a near-miss discovery chain: {chain}',
+                edit=lambda m, ch=chain: _code_mode_call(m, f'text(ALL_TOOLS.filter(t => /w/.test({ch})));\n', [COMPLETED, '[]']))
+        add('code mode', 'a near-miss discovery chain: ALL_TOOLS.forEach',
+            edit=lambda m: _code_mode_call(m, 'text(ALL_TOOLS.forEach(t => /w/.test(t.name)));\n', [COMPLETED, '[]']))
+        add('code mode', 'a near-miss discovery chain: .length',
+            edit=lambda m: _code_mode_call(m, 'text(ALL_TOOLS.filter(t => /w/.test(t.name)).length);\n', [COMPLETED, '0']))
+        driver = lambda m: json.dumps(f"sh {m.paths['T']}/cells.sh")
+        for label, source in (
+                ('a const passed to text() twice', lambda m: f'const r = await tools.exec_command({{cmd:{driver(m)}}});\ntext(r);\ntext(r);\n'),
+                ('a const never passed to text()', lambda m: f'const r = await tools.exec_command({{cmd:{driver(m)}}});\n'),
+                ('a const passed to text() under another name', lambda m: f'const r = await tools.exec_command({{cmd:{driver(m)}}});\ntext(s);\n'),
+                ('an exec_command with another key', lambda m: f'text(await tools.exec_command({{cmd:{driver(m)},max_output_tokens:5,yield_time_ms:9}}));\n'),
+                ('the driver call then a store() call', lambda m: f'text(await tools.exec_command({{cmd:{driver(m)}}}));\nstore("k", 1);\n')):
+            add('code mode', label, edit=lambda m, src=source: _code_mode_call(m, src(m), [COMPLETED, '{}']))
         add('item default-deny', 'a killed driver run whose command has a trailing space', edit=_odd_driver_command)
         add('item default-deny', 'a commandExecution of another command', edit=_other_command)
         add('item default-deny', 'an item of an unknown type', edit=_unknown_item)
@@ -1998,7 +2413,7 @@ def run(excerpts: Path, root: Path) -> dict:
 
 
 def markdown(report: dict) -> str:
-    out = ['# judge_check.py output (ADR-032 design corrections 4 to 7; a format prototype, not authoritative)', '',
+    out = ['# judge_check.py output (ADR-032 design corrections 4 to 8; a format prototype, not authoritative)', '',
            'Generated by `python3 tests/fixtures/commander-readonly/judge_check.py`. Each cell is the verdict on the committed',
            'excerpt; "= raw" means the same verdict on the raw recording it was cut from (checked on the recording machine),',
            '"raw: …" says why the raw one was not judged. A different verdict on the raw recording, a generated mutant that',

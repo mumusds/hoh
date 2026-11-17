@@ -1,4 +1,4 @@
-//! The read-only judge of TEST-021-07 (docs/adr/ADR-032.md decision 8, design corrections 5 to 7): the evidence table's
+//! The read-only judge of TEST-021-07 (docs/adr/ADR-032.md decision 8, design corrections 5 to 8): the evidence table's
 //! rules on the product adapters' replay of a recorded turn. It never parses an agent's stream for scope, request
 //! correlation, terminal state, final message or the turn's items: those are the adapter's `replay_facts`. It reads
 //! itself only the codex rollout (no adapter reads it), enumerated default-deny, and the evidence rows' frames of the
@@ -613,24 +613,337 @@ fn js_string(s: &str) -> Option<String> {
         .flatten()
 }
 
-/// `text(await tools.apply_patch("<patch>"));` exactly (an optional final newline): the patch.
-fn apply_patch_call(input: &str) -> Option<String> {
-    let body = input.strip_suffix('\n').unwrap_or(input);
-    let inner = body
-        .strip_prefix("text(await tools.apply_patch(")?
-        .strip_suffix("));")?;
-    js_string(inner)
+// ------------------------------------------------------------------- codex code mode (design correction 8)
+
+/// The code-mode globals that act (codex 0.166.0's `exec` description and codex-code-mode-host): never in a
+/// discovery, never a binding's name.
+pub const EXCLUDED_GLOBALS: [&str; 13] = [
+    "tools",
+    "store",
+    "load",
+    "notify",
+    "setTimeout",
+    "clearTimeout",
+    "yield_control",
+    "exit",
+    "image",
+    "audio",
+    "generatedImage",
+    "as_settled",
+    "stream_settled",
+];
+
+/// The properties of an ALL_TOOLS element (`{name, description}`).
+const TOOL_FIELDS: [&str; 2] = ["name", "description"];
+
+/// One statement of a code-mode script: a command, a patch, or a discovery (it reads ALL_TOOLS only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stmt {
+    Exec(String),
+    Patch(String),
+    Discovery,
 }
 
-/// `text(await tools.exec_command({cmd:"<cmd>",max_output_tokens:<n>}));` exactly: the command.
-fn exec_command_call(input: &str) -> Option<String> {
-    let body = input.strip_suffix('\n').unwrap_or(input);
-    let inner = body
-        .strip_prefix("text(await tools.exec_command({cmd:")?
-        .strip_suffix("}));")?;
-    let (cmd, tokens) = inner.rsplit_once(",max_output_tokens:")?;
-    (!tokens.is_empty() && tokens.chars().all(|ch| ch.is_ascii_digit())).then_some(())?;
-    js_string(cmd)
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    Str(String),
+    Regex,
+    Int,
+    Id(String),
+    Punct(&'static str),
+}
+
+/// The tokens of `src`, or `None`: whitespace separates; a "/" begins a regex literal only where an operand starts
+/// (after "(", "=>", "||", "&&", "!", ","); anything else is not a script of the grammar.
+fn tokens(src: &str) -> Option<Vec<Tok>> {
+    const PUNCT: [&str; 14] = [
+        "=>", "||", "&&", "(", ")", "{", "}", ".", ",", ";", ":", "=", "+", "!",
+    ];
+    let b = src.as_bytes();
+    let (mut out, mut i) = (Vec::new(), 0usize);
+    while i < b.len() {
+        let ch = b[i];
+        if matches!(ch, b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        } else if ch == b'"' {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                if b[j] == b'\n' {
+                    return None;
+                }
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            if j >= b.len() {
+                return None;
+            }
+            out.push(Tok::Str(js_string(&src[i..=j])?));
+            i = j + 1;
+        } else if ch == b'/' {
+            let operand = matches!(
+                out.last(),
+                Some(Tok::Punct("(" | "=>" | "||" | "&&" | "!" | ","))
+            );
+            if !operand {
+                return None;
+            }
+            let (mut j, mut class) = (i + 1, false);
+            while j < b.len() && (class || b[j] != b'/') {
+                if b[j] == b'\n' {
+                    return None;
+                }
+                if b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                class = if class { b[j] != b']' } else { b[j] == b'[' };
+                j += 1;
+            }
+            if j >= b.len() || j == i + 1 {
+                return None;
+            }
+            j += 1;
+            while j < b.len() && b"gimsuy".contains(&b[j]) {
+                j += 1;
+            }
+            out.push(Tok::Regex);
+            i = j;
+        } else if ch.is_ascii_digit() {
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            out.push(Tok::Int);
+        } else if ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$' {
+            let j0 = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            out.push(Tok::Id(src[j0..i].to_owned()));
+        } else {
+            let p = PUNCT.iter().find(|p| src[i..].starts_with(**p))?;
+            out.push(Tok::Punct(p));
+            i += p.len();
+        }
+    }
+    Some(out)
+}
+
+/// Design correction 8's grammar of a code-mode script (judge_check.py `_Parser` gives it in full); any other token
+/// is not a script.
+struct Script {
+    t: Vec<Tok>,
+    i: usize,
+}
+
+impl Script {
+    fn peek(&self, k: usize) -> Option<&Tok> {
+        self.t.get(self.i + k)
+    }
+    fn at(&self, tok: &Tok) -> bool {
+        self.peek(0) == Some(tok)
+    }
+    fn punct(&mut self, p: &'static str) -> Option<()> {
+        (self.peek(0) == Some(&Tok::Punct(p))).then(|| self.i += 1)
+    }
+    fn word(&mut self, w: &str) -> Option<()> {
+        matches!(self.peek(0), Some(Tok::Id(x)) if x == w).then(|| self.i += 1)
+    }
+    fn id(&mut self) -> Option<String> {
+        let Some(Tok::Id(x)) = self.peek(0).cloned() else {
+            return None;
+        };
+        self.i += 1;
+        Some(x)
+    }
+    fn string(&mut self) -> Option<String> {
+        let Some(Tok::Str(x)) = self.peek(0).cloned() else {
+            return None;
+        };
+        self.i += 1;
+        Some(x)
+    }
+    fn int(&mut self) -> Option<()> {
+        (self.peek(0) == Some(&Tok::Int)).then(|| self.i += 1)
+    }
+    /// A name a binding may take: none of the globals the grammar or the exclusions name.
+    fn fresh(name: &str) -> bool {
+        !["text", "ALL_TOOLS", "await", "const"].contains(&name)
+            && !EXCLUDED_GLOBALS.contains(&name)
+    }
+
+    fn script(&mut self) -> Option<Vec<Stmt>> {
+        let mut out = Vec::new();
+        while self.peek(0).is_some() {
+            out.push(self.stmt()?);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn stmt(&mut self) -> Option<Stmt> {
+        if self.word("const").is_some() {
+            let name = self.id().filter(|n| Script::fresh(n))?;
+            self.punct("=")?;
+            self.word("await")?;
+            let call = self.call()?;
+            self.punct(";")?;
+            self.word("text")?;
+            self.punct("(")?;
+            (self.id()? == name).then_some(())?;
+            self.punct(")")?;
+            self.punct(";")?;
+            return Some(call);
+        }
+        self.word("text")?;
+        self.punct("(")?;
+        let out = if self.word("await").is_some() {
+            self.call()?
+        } else {
+            self.disc()?;
+            Stmt::Discovery
+        };
+        self.punct(")")?;
+        self.punct(";")?;
+        Some(out)
+    }
+
+    fn call(&mut self) -> Option<Stmt> {
+        self.word("tools")?;
+        self.punct(".")?;
+        let tool = self.id()?;
+        self.punct("(")?;
+        let out = match tool.as_str() {
+            "exec_command" => {
+                self.punct("{")?;
+                self.word("cmd")?;
+                self.punct(":")?;
+                let cmd = self.string()?;
+                if self.punct(",").is_some() {
+                    self.word("max_output_tokens")?;
+                    self.punct(":")?;
+                    self.int()?;
+                }
+                self.punct("}")?;
+                Stmt::Exec(cmd)
+            }
+            "apply_patch" => Stmt::Patch(self.string()?),
+            _ => return None,
+        };
+        self.punct(")")?;
+        Some(out)
+    }
+
+    fn disc(&mut self) -> Option<()> {
+        self.word("ALL_TOOLS")?;
+        while self.punct(".").is_some() {
+            let method = self.id()?;
+            self.punct("(")?;
+            let p = self.param()?;
+            match method.as_str() {
+                "filter" | "some" => self.boolean(&p)?,
+                "map" => self.object(&p)?,
+                _ => return None,
+            }
+            self.punct(")")?;
+        }
+        Some(())
+    }
+
+    fn param(&mut self) -> Option<String> {
+        let paren = self.punct("(").is_some();
+        let name = self.id().filter(|n| Script::fresh(n))?;
+        if paren {
+            self.punct(")")?;
+        }
+        self.punct("=>")?;
+        Some(name)
+    }
+
+    fn object(&mut self, p: &str) -> Option<()> {
+        self.punct("(")?;
+        self.punct("{")?;
+        loop {
+            TOOL_FIELDS.contains(&self.id()?.as_str()).then_some(())?;
+            self.punct(":")?;
+            self.sexpr(p)?;
+            if self.punct(",").is_none() {
+                break;
+            }
+        }
+        self.punct("}")?;
+        self.punct(")")
+    }
+
+    fn boolean(&mut self, p: &str) -> Option<()> {
+        self.term(p)?;
+        while self.punct("||").is_some() || self.punct("&&").is_some() {
+            self.term(p)?;
+        }
+        Some(())
+    }
+
+    fn term(&mut self, p: &str) -> Option<()> {
+        let _ = self.punct("!");
+        if self.at(&Tok::Regex) {
+            self.i += 1;
+            self.punct(".")?;
+            self.word("test")?;
+            self.punct("(")?;
+            self.sexpr(p)?;
+            self.punct(")")
+        } else if self.punct("(").is_some() {
+            self.boolean(p)?;
+            self.punct(")")
+        } else {
+            self.sexpr(p)?;
+            self.punct(".")?;
+            self.word("includes")?;
+            self.punct("(")?;
+            self.string()?;
+            self.punct(")")
+        }
+    }
+
+    fn sexpr(&mut self, p: &str) -> Option<()> {
+        self.satom(p)?;
+        while self.punct("+").is_some() {
+            self.satom(p)?;
+        }
+        Some(())
+    }
+
+    fn satom(&mut self, p: &str) -> Option<()> {
+        if self.string().is_some() {
+            return Some(());
+        }
+        (self.id()? == p).then_some(())?;
+        self.punct(".")?;
+        TOOL_FIELDS.contains(&self.id()?.as_str()).then_some(())?;
+        while self.at(&Tok::Punct("."))
+            && matches!(self.peek(1), Some(Tok::Id(m)) if m == "toLowerCase" || m == "slice")
+        {
+            self.i += 1;
+            if self.id()? == "toLowerCase" {
+                self.punct("(")?;
+            } else {
+                self.punct("(")?;
+                self.int()?;
+                if self.punct(",").is_some() {
+                    self.int()?;
+                }
+            }
+            self.punct(")")?;
+        }
+        Some(())
+    }
+}
+
+/// A code-mode `exec` input as design correction 8's statements, in order; `None` when it is not a script of the
+/// grammar.
+pub fn code_mode_script(src: &str) -> Option<Vec<Stmt>> {
+    Script {
+        t: tokens(src)?,
+        i: 0,
+    }
+    .script()
 }
 
 /// `Script (completed|failed)\nWall time <n> seconds\nOutput:\n` exactly.
@@ -664,6 +977,128 @@ fn patch_headers(patch: &str) -> Vec<String> {
                 .map(str::to_owned)
         })
         .collect()
+}
+
+/// The driver's command: `sh <T>/cells.sh`.
+fn driver_call(c: &Case) -> String {
+    format!("sh {}/cells.sh", c.region("T"))
+}
+
+/// An exec_command's item: a JSON object with an integer exit_code and a string output; its output.
+fn exec_body(text: Option<&str>) -> Option<String> {
+    let b: Value = serde_json::from_str(text?).ok()?;
+    (b["exit_code"].is_i64() || b["exit_code"].is_u64()).then_some(())?;
+    b["output"].as_str().map(str::to_owned)
+}
+
+/// One output `o` of a code-mode call whose statements are `entries` (in order): each statement's outcome added to
+/// it; the problems. One statement: as S0 recorded (a patch: success when some item starts "Script completed\n",
+/// refused when the output is exactly the "Script failed" header and the refusal; a command: the "Script completed"
+/// header and its JSON body; a discovery: a "Script completed" header and one item). Several (design correction 8):
+/// after the header every statement that ran added exactly one item, in order; a completed script has one item per
+/// statement; a failed one ends with the "Script error:" item of the statement that threw, and the statements after it
+/// did not run (no outcome). A patch's item in the run is a success, its error a refusal only when it is exactly the
+/// refusal; a command's item its body; a discovery's item is not read. Anything else is an unknown outcome.
+fn script_outcomes(entries: &mut [Call], o: &Value) -> Vec<String> {
+    let items = o["output"].as_array().cloned().unwrap_or_default();
+    let texts: Vec<Option<String>> = items
+        .iter()
+        .filter(|e| e["type"] == "input_text")
+        .map(|e| e["text"].as_str().map(str::to_owned))
+        .collect();
+    let header = texts
+        .first()
+        .cloned()
+        .flatten()
+        .filter(|t| script_header(t));
+    let completed = header
+        .as_deref()
+        .is_some_and(|h| h.starts_with(SCRIPT_COMPLETED));
+    let mut problems = Vec::new();
+    if entries.len() == 1 {
+        let e = &mut entries[0];
+        match e.kind {
+            "patch" => {
+                if texts
+                    .iter()
+                    .flatten()
+                    .any(|t| t.starts_with(SCRIPT_COMPLETED))
+                {
+                    e.outcomes.push("success".into());
+                } else if items.len() == 2
+                    && texts.len() == 2
+                    && header
+                        .as_deref()
+                        .is_some_and(|h| h.starts_with("Script failed"))
+                    && texts[1].as_deref() == Some(PATCH_REFUSAL)
+                {
+                    e.outcomes.push("refused".into());
+                } else {
+                    e.outcomes.push("unknown".into());
+                    problems.push("a patch call with an output of unknown outcome".to_owned());
+                }
+            }
+            "driver" | "read" => {
+                match (texts.len() == 2 && completed)
+                    .then(|| exec_body(texts[1].as_deref()))
+                    .flatten()
+                {
+                    Some(out) => e.outcomes.push(out),
+                    None => problems
+                        .push("an exec_command call with an output of unknown outcome".to_owned()),
+                }
+            }
+            _ => {
+                if !(texts.len() == 2 && items.len() == 2 && completed) {
+                    problems.push("a discovery call with an output of unknown outcome".to_owned());
+                }
+            }
+        }
+        return problems;
+    }
+    let unknown = "a code-mode script with an output of unknown outcome".to_owned();
+    if header.is_none() || items.len() != texts.len() {
+        return vec![unknown];
+    }
+    let mut ran: Vec<Option<String>> = texts[1..].to_vec();
+    let failed = if completed {
+        if ran.len() != entries.len() {
+            return vec![unknown];
+        }
+        None
+    } else {
+        let ends_in_error = ran
+            .last()
+            .cloned()
+            .flatten()
+            .is_some_and(|t| t.starts_with("Script error:\n"));
+        if !(1..=entries.len()).contains(&ran.len()) || !ends_in_error {
+            return vec![unknown];
+        }
+        ran.pop().flatten()
+    };
+    for (e, t) in entries.iter_mut().zip(&ran) {
+        match e.kind {
+            "patch" => e.outcomes.push("success".into()),
+            "driver" | "read" => match exec_body(t.as_deref()) {
+                Some(out) => e.outcomes.push(out),
+                None => problems.push(unknown.clone()),
+            },
+            _ => {}
+        }
+    }
+    if let Some(error) = failed {
+        let e = &mut entries[ran.len()];
+        if e.kind == "patch" && error == PATCH_REFUSAL {
+            e.outcomes.push("refused".into());
+        } else {
+            if e.kind == "patch" {
+                e.outcomes.push("unknown".into());
+            }
+            problems.push(unknown);
+        }
+    }
+    problems
 }
 
 #[derive(Debug)]
@@ -725,92 +1160,50 @@ fn rollout_calls(c: &Case) -> (Vec<Call>, Vec<String>) {
         let input = (p["type"] == "custom_tool_call" && p["name"] == "exec")
             .then(|| p["input"].as_str())
             .flatten();
-        let texts_of = |o: &Value| -> (usize, Vec<Option<String>>) {
-            let items = o["output"].as_array().cloned().unwrap_or_default();
-            let texts = items
-                .iter()
-                .filter(|e| e["type"] == "input_text")
-                .map(|e| e["text"].as_str().map(str::to_owned))
-                .collect();
-            (items.len(), texts)
-        };
-        let patch = input.and_then(apply_patch_call).filter(|patch| {
-            patch.matches("*** Begin Patch").count() == 1 && patch_headers(patch).len() == 1
-        });
-        let command = input.and_then(exec_command_call);
-        if let Some(patch) = patch {
-            let target = patch_headers(&patch).remove(0);
-            let mut call = Call {
-                kind: "patch",
-                patch: patch.trim_end_matches('\n').to_owned(),
-                target,
-                outcomes: Vec::new(),
-            };
-            for o in &outs {
-                let (n, texts) = texts_of(o);
-                if texts
-                    .iter()
-                    .flatten()
-                    .any(|t| t.starts_with(SCRIPT_COMPLETED))
-                {
-                    call.outcomes.push("success".into());
-                } else if n == 2
-                    && texts.len() == 2
-                    && texts[0]
-                        .as_deref()
-                        .is_some_and(|t| script_header(t) && t.starts_with("Script failed"))
-                    && texts[1].as_deref() == Some(PATCH_REFUSAL)
-                {
-                    call.outcomes.push("refused".into());
-                } else {
-                    call.outcomes.push("unknown".into());
-                    problems.push("a patch call with an output of unknown outcome".to_owned());
-                }
-            }
-            classified.push(call);
-        } else if let Some(cmd) = command.filter(|cmd| {
-            *cmd == format!("sh {}/cells.sh", c.region("T"))
-                || *cmd == format!("cat {}/TOKEN.txt", c.region("P"))
-        }) {
-            let mut call = Call {
-                kind: if cmd.starts_with("sh ") {
-                    "driver"
-                } else {
-                    "read"
-                },
-                patch: String::new(),
-                target: String::new(),
-                outcomes: Vec::new(),
-            };
-            for o in &outs {
-                let (_, texts) = texts_of(o);
-                let body = (texts.len() == 2
-                    && texts[0]
-                        .as_deref()
-                        .is_some_and(|t| script_header(t) && t.starts_with(SCRIPT_COMPLETED)))
-                .then(|| {
-                    texts[1]
-                        .as_deref()
-                        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-                })
-                .flatten();
-                match body {
-                    Some(b) if b["exit_code"].is_i64() && b["output"].is_string() => {
-                        call.outcomes
-                            .push(b["output"].as_str().unwrap_or_default().to_owned());
+        let (drive, read) = (driver_call(c), format!("cat {}/TOKEN.txt", c.region("P")));
+        let entries: Option<Vec<Call>> = input.and_then(code_mode_script).and_then(|stmts| {
+            stmts
+                .into_iter()
+                .map(|st| match st {
+                    Stmt::Patch(patch)
+                        if patch.matches("*** Begin Patch").count() == 1
+                            && patch_headers(&patch).len() == 1 =>
+                    {
+                        Some(Call {
+                            kind: "patch",
+                            target: patch_headers(&patch).remove(0),
+                            patch: patch.trim_end_matches('\n').to_owned(),
+                            outcomes: Vec::new(),
+                        })
                     }
-                    _ => problems
-                        .push("an exec_command call with an output of unknown outcome".to_owned()),
-                }
-            }
-            classified.push(call);
-        } else {
+                    Stmt::Exec(cmd) if cmd == drive || cmd == read => Some(Call {
+                        kind: if cmd == drive { "driver" } else { "read" },
+                        patch: String::new(),
+                        target: String::new(),
+                        outcomes: Vec::new(),
+                    }),
+                    Stmt::Discovery => Some(Call {
+                        kind: "discovery",
+                        patch: String::new(),
+                        target: String::new(),
+                        outcomes: Vec::new(),
+                    }),
+                    _ => None,
+                })
+                .collect()
+        });
+        let Some(mut entries) = entries else {
             problems.push(format!(
                 "an unclassified call ({} {})",
                 p["type"].as_str().unwrap_or_default(),
                 p["name"].as_str().unwrap_or("None")
             ));
+            continue;
+        };
+        for o in &outs {
+            problems.extend(script_outcomes(&mut entries, o));
         }
+        classified.extend(entries.into_iter().filter(|e| e.kind != "discovery"));
     }
     let known: BTreeSet<String> = calls.iter().map(|p| p["call_id"].to_string()).collect();
     problems.extend(
