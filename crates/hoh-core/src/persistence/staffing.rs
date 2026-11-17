@@ -888,6 +888,48 @@ pub(super) fn vacancy(
     }))
 }
 
+/// Whether run `run_id`'s `role` is not staffed yet and staffing waits for a candidate (docs/adr/ADR-030.md decision 4's
+/// start-up row, the note of 2026-11-17 under decision 11): its binding ACTIVE and never granted a session, its agent
+/// permanently unusable in the tick's snapshot and a later candidate of its order waiting there (not looked at yet, its
+/// compat pending, its probe failed), so staffing writes nothing until that candidate is judged. What the registry saw
+/// of the bound agent is then not yet the role's. Never without the tick's snapshot (a host with no registry).
+pub(super) fn waits_to_staff(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    context: &crate::decision::Context,
+) -> Result<bool, PersistError> {
+    use crate::staffing::{Kind, select, verdict};
+    let Some(snapshot) = &context.staffing else {
+        return Ok(false);
+    };
+    let Some(project_id): Option<String> = conn
+        .query_row(
+            "SELECT project_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(binding) = staffed(conn, &project_id)?
+        .into_iter()
+        .find(|s| s.run_id == run_id && s.role == role)
+    else {
+        return Ok(false);
+    };
+    let facts = &snapshot.facts;
+    Ok(binding.state == BindingState::Active
+        && binding.session.is_none()
+        && verdict(&binding.agent, &binding.required, facts, &binding.excluded).kind()
+            == Kind::Permanent
+        && select(&binding.order, &binding.required, facts, &binding.excluded)
+            .waiting_on
+            .is_some())
+}
+
 /// Whether a task of run `run_id`'s `role` blocked for `reason` (of V) is dispatchable again (decision 7): the binding
 /// active as `decide::load_binding` says (ACTIVE, its session, nothing pending, its first input delivered), its session
 /// granting what the role requires, and, with the tick's snapshot, the bound agent's fact usable and verified with the

@@ -661,6 +661,22 @@ impl Fakes {
         )
     }
 
+    /// [`Fakes::claude`] whose answer to `--version` (the registry's look begins with it) waits while
+    /// `claude.d/hold-look` exists until `claude.d/release-look` does.
+    fn claude_slow_to_look(&self, note: &str) -> R {
+        let d = self.bin().join("claude.d");
+        self.script(
+            "claude",
+            &format!(
+                "# {note}\nf='{PROTOCOL}/claude/2.1.318'; d='{d}'\n\
+                 [ \"$1\" = --version ] && [ -e \"$d/hold-look\" ] && python3 -c 'import os, sys, time\nwhile not os.path.exists(sys.argv[1]): time.sleep(0.02)' \"$d/release-look\"\n\
+                 case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+                 echo $$ > \"$d/pid.$$\"; cat > /dev/null\ncat \"$f/success/stdout.jsonl\"\n",
+                d = d.display()
+            ),
+        )
+    }
+
     /// A fake `pi` 1.5.0 whose model is not there: the probe's answers from the recording; a turn's get_state is
     /// answered as recorded and its prompt refused `Model not found: …` (pi.rs's MODEL_UNAVAILABLE).
     fn pi_without_its_model(&self) -> R {
@@ -919,20 +935,50 @@ fn commander_claims(project: &Path, run_id: &str) -> R<Value> {
 
 /// docs/adr/ADR-030.md decision 11 (its test plan's "Commander"): a world with only claude installed, the commander
 /// configured codex falling back to claude: staffing switches the commander to claude at epoch 2 (the other roles'
-/// blocks wake it), its turns answer, and the run is never claimed COMMANDER_UNAVAILABLE.
+/// blocks wake it), its turns answer, and the run is never claimed COMMANDER_UNAVAILABLE. The registry looks at codex
+/// before claude (the agents' order); here claude's first look is held until the supervisor has judged the run with
+/// codex looked at (not installed) and claude not yet: staffing waits for claude then (decision 4's start-up row), and
+/// so does the Commander's availability (the note of 2026-11-17): its wakes wait, not yet known, never claimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commander_not_installed_falls_back_and_its_run_is_not_blocked_for_it() -> R {
     let fakes = Fakes::new()?;
-    fakes.claude("A")?;
+    fakes.claude_slow_to_look("A")?;
     fakes.team(
         "config_version = \"1.0\"\n[team.commander]\nagent = \"codex\"\nfallback = [\"claude\"]\n",
     )?;
     fakes.register(hoh_agents::compat::Agent::Claude)?;
+    let looks = fakes.bin().join("claude.d");
+    std::fs::write(looks.join("hold-look"), "")?;
     let host = start_when_free(fakes.config()).await?;
     let project = fakes.project();
     let outcome = async {
         approved(&project)?;
         let run_id = started(&host).await?;
+        // The supervisor's allocation, with codex looked at and claude not, has deferred the run's owed wakes (the
+        // adoption of its specification and the reviewer's block, codex having no fallback there) for the
+        // Commander's missing session.
+        until(
+            &project,
+            &format!(
+                "SELECT 1 FROM events WHERE run_id = '{run_id}' AND kind = 'supervisor.deferred' \
+                 AND json_extract(payload_json, '$.reason') = 'NO_SESSION'"
+            ),
+            Duration::from_secs(60),
+            &some,
+        )
+        .await?;
+        assert_eq!(
+            rows(
+                &db(&project),
+                &format!(
+                    "SELECT agent, role_epoch, state FROM role_bindings WHERE run_id = '{run_id}' AND role = 'commander'"
+                ),
+            )?,
+            json!([{"agent": "codex", "role_epoch": 1, "state": "ACTIVE"}]),
+            "staffing waits for claude"
+        );
+        assert_eq!(commander_claims(&project, &run_id)?, json!(0), "while claude is not looked at");
+        std::fs::write(looks.join("release-look"), "")?;
         supervised(&project, &run_id, "fp-1").await?;
         let commander = rows(
             &db(&project),
@@ -976,6 +1022,7 @@ async fn a_commander_not_installed_falls_back_and_its_run_is_not_blocked_for_it(
         R::Ok(())
     }
     .await;
+    let _ = std::fs::write(looks.join("release-look"), "");
     host.shutdown().await;
     fakes.stop_fakes();
     outcome

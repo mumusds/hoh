@@ -1256,6 +1256,14 @@ fn registry_reason(
         Some((reason, r.observation.clone()))
     });
     let identity = |o: &crate::decision::Observation| json!({"agent": agent, "host_epoch": o.host_epoch, "n": o.n});
+    // At the run's start, while staffing waits for a candidate of the order (its agent permanently unusable, a later one
+    // not looked at yet: docs/adr/ADR-030.md decision 4's start-up row), what the registry saw of the bound agent is not
+    // yet the Commander's: not known yet, no reason (decision 11, the note of 2026-11-17); its wakes wait for its
+    // session, uncounted, and the candidate's judgment decides.
+    let said = look.is_some_and(|o| !o.available || !o.logged_in) || before.is_some();
+    if said && super::staffing::waits_to_staff(tx, run_id, COMMANDER, context)? {
+        return Ok((None, look.map_or(Value::Null, |o| identity(&o))));
+    }
     Ok(match (look, before) {
         (Some(o), _) if !o.available => (Some("agent_unavailable"), identity(&o)),
         (Some(o), _) if !o.logged_in => (Some("login_missing"), identity(&o)),
