@@ -18,11 +18,13 @@ pub(super) const RESCAN: Duration = Duration::from_millis(100);
 /// How often a stop looks again.
 const LOOK_EVERY: Duration = Duration::from_millis(10);
 
-/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22).
+/// A process as `/proc/<pid>/stat` shows it: its parent and its start time (fields 4 and 22), and whether it is a zombie
+/// (field 3, Z or X).
 pub(super) struct Proc {
     pub(super) pid: u32,
     pub(super) ppid: u32,
     pub(super) start: u64,
+    pub(super) zombie: bool,
 }
 
 /// What reading one process's `stat` gave.
@@ -64,6 +66,7 @@ fn parse_stat(pid: u32, bytes: &[u8]) -> Option<Proc> {
         pid,
         ppid: u32::try_from(number(1)?).ok()?,
         start: number(19)?,
+        zombie: fields.first().is_some_and(|f| matches!(f, [b'Z' | b'X'])),
     })
 }
 
@@ -173,6 +176,41 @@ fn marked_threads(root: &Path, pid: u32, marker: &[u8]) -> bool {
         std::fs::read(task.path().join("environ"))
             .is_ok_and(|env| env.split(|b| *b == 0).any(|entry| entry == marker))
     })
+}
+
+/// Whether a process of an attempt other than its leader runs, a tool (docs/adr/ADR-022.md decision 19 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tools {
+    Running,
+    Absent,
+    /// A process could not be read and none was found: whether one runs cannot be told.
+    Unknown,
+}
+
+/// Whether a process of the attempt marked `marker` other than its leader (`leader`, pid and start time) runs, as `root`
+/// (/proc) shows them now: a child of the leader, or a process with the marker in its environment; a zombie does not
+/// run. Read only: nothing is pinned or signalled (docs/adr/ADR-022.md decision 19 item 4).
+pub(super) fn tools(root: &Path, leader: (u32, Option<u64>), marker: &str) -> Tools {
+    let (all, mut complete) = processes(root);
+    let is_leader = |p: &Proc| p.pid == leader.0 && leader.1.is_none_or(|start| start == p.start);
+    // A child of the leader that runs is one; a zombie's children were given to another parent and are found below by
+    // the marker.
+    if all.iter().any(is_leader) && all.iter().any(|p| p.ppid == leader.0 && !p.zombie) {
+        return Tools::Running;
+    }
+    let marker = format!("{ATTEMPT_ENV}={marker}").into_bytes();
+    for process in all.iter().filter(|p| !p.zombie && !is_leader(p)) {
+        match marked(root, process.pid, &marker) {
+            Some(true) => return Tools::Running,
+            Some(false) => {}
+            None => complete = false,
+        }
+    }
+    if complete {
+        Tools::Absent
+    } else {
+        Tools::Unknown
+    }
 }
 
 /// A process of an attempt outside its group, pinned by a pidfd.
@@ -756,6 +794,77 @@ mod tests {
         assert_eq!(
             marked(root.path(), 500, b"HOH_ATTEMPT_ID=other/A9"),
             Some(false)
+        );
+        Ok(())
+    }
+
+    /// A /proc tree of its own: `(pid, stat after the pid, environment)` each.
+    fn tree(processes: &[(u32, &str, &[u8])]) -> std::io::Result<tempfile::TempDir> {
+        let root = tempfile::tempdir()?;
+        for (pid, stat, environ) in processes {
+            let dir = root.path().join(pid.to_string());
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("stat"), format!("{pid} {stat}"))?;
+            std::fs::write(dir.join("environ"), environ)?;
+        }
+        Ok(root)
+    }
+
+    const MARKED: &[u8] = b"PATH=/bin\0HOH_ATTEMPT_ID=p/A1\0";
+    const LEADER: &str = "(agent) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0";
+
+    #[test]
+    fn a_child_of_the_leader_is_a_tool_and_the_leader_alone_is_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Decision 19 item 4: the leader (pid 100, started at 500) carries the marker itself; a child of it runs.
+        let alone = tree(&[
+            (100, LEADER, MARKED),
+            (7, "(init) S 0 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0", b""),
+        ])?;
+        assert_eq!(tools(alone.path(), (100, Some(500)), "p/A1"), Tools::Absent);
+        let child = "(sleep) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 0";
+        let with = tree(&[(100, LEADER, MARKED), (101, child, b"PATH=/bin\0")])?;
+        assert_eq!(tools(with.path(), (100, Some(500)), "p/A1"), Tools::Running);
+        // A pid reused: the process at 100 is not the leader recorded, so its child is no tool of the attempt.
+        assert_eq!(tools(with.path(), (100, Some(499)), "p/A2"), Tools::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn a_marked_process_outside_the_leaders_tree_is_a_tool_and_a_zombie_is_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let moved = "(tool) S 1 300 300 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 800 0";
+        let away = tree(&[(100, LEADER, MARKED), (300, moved, MARKED)])?;
+        assert_eq!(tools(away.path(), (100, Some(500)), "p/A1"), Tools::Running);
+        // Another attempt's marker is not this one's.
+        assert_eq!(tools(away.path(), (100, Some(500)), "p/A11"), Tools::Absent);
+        let zombie = "(sleep) Z 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 0";
+        let dead = tree(&[
+            (100, LEADER, MARKED),
+            (101, zombie, b""),
+            (102, &zombie.replace("100 100 100", "1 102 102"), MARKED),
+        ])?;
+        assert_eq!(tools(dead.path(), (100, Some(500)), "p/A1"), Tools::Absent);
+        Ok(())
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_leaves_the_tools_unknown_unless_one_was_found()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unread = tree(&[(100, LEADER, MARKED), (200, "garbage", b"")])?;
+        assert_eq!(
+            tools(unread.path(), (100, Some(500)), "p/A1"),
+            Tools::Unknown
+        );
+        let child = "(sleep) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 0";
+        let found = tree(&[
+            (100, LEADER, MARKED),
+            (101, child, b""),
+            (200, "garbage", b""),
+        ])?;
+        assert_eq!(
+            tools(found.path(), (100, Some(500)), "p/A1"),
+            Tools::Running
         );
         Ok(())
     }

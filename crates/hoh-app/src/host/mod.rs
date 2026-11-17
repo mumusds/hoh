@@ -26,9 +26,11 @@ mod runner;
 mod suites;
 #[cfg(test)]
 mod tests;
+mod watchdog;
 pub use processes::ATTEMPT_ENV;
 pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, Started, Work};
+pub use watchdog::Watchdog;
 
 /// Set by the client on a host it starts directly, not in a delegated scope: why (docs/adr/ADR-021.md decision 2). The
 /// host records it in host.json, so `hoh doctor` reports a running host's actual reason (CR-012, CR12-03).
@@ -83,6 +85,9 @@ pub struct HostConfig {
     /// How long [`Host::shutdown`] waits for what the host started to end after aborting what it can (docs/adr/
     /// ADR-031.md, implementation review round 4, correction 4): past it the stop says so and is not clean.
     pub stop_bound: std::time::Duration,
+    /// The inactivity watchdog of the attempts its runner runs (docs/adr/ADR-022.md decision 19): a host constant,
+    /// not a configuration key; tests shorten it.
+    pub watchdog: Watchdog,
 }
 
 /// The stop's bound unless another is configured: what is left to wait for is bounded work (file system, git with its
@@ -121,6 +126,7 @@ impl HostConfig {
             cancel: hoh_core::cancel::GRACES,
             config: hoh_core::config::Config::default(),
             stop_bound: STOP_BOUND,
+            watchdog: Watchdog::default(),
         }
     }
 
@@ -525,6 +531,7 @@ impl Host {
                     host_epoch: started.host_epoch,
                     jitter: jitter.clone(),
                     inflight: inflight.clone(),
+                    watchdog: config.watchdog,
                 },
                 stopped.clone(),
             ))));

@@ -26,6 +26,8 @@
 
 Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进入Focus；Timeline按项目/轮次/角色筛选。点击任务、diff、测试或证据查看来源。长日志默认折叠，不挤占对话。
 
+**长时间没有输出的 Agent**：一个 Attempt 连续 15 分钟既没有输出、也没有它启动的工具进程在运行时，HoH 记一条 `attempt.inactive` 事件（`attach`、TUI 与 `--output stream-json` 都能看到），之后它再有输出时记 `attempt.inactive_cleared`。这只是提示：HoH 不会因此终止它，也不重试、不改状态；跑着长测试的 Agent 不算无输出。确认它卡住了再取消 Run。
+
 “已验收18/25”只统计当前规格有效验收。新需求导致分母变化会显示规格版本；回归使已验收变少但保留历史。模型/上下文属于选中Agent，不显示虚假的全团队上下文百分比。
 
 ## 与团队交流

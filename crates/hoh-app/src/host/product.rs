@@ -968,10 +968,34 @@ impl Executor for ProductExecutor {
         }
         held.is_some()
     }
+
+    fn output_bytes(&self, work: &Work) -> Option<u64> {
+        output_bytes(&attempt_logs(&self.project, &work.attempt_id))
+    }
 }
 
 /// The bridge file of a turn, in its attempt's directory (a Commander turn's outputs, a work turn's TaskResult and messages).
 const BRIDGE: &str = "messages.jsonl";
+
+/// How many bytes a turn's process has output so far: the sizes of the raw stdout and stderr copies the adapters keep in
+/// its attempt's directory `logs` (`*stdout.jsonl`, `*stderr.log`, written as the bytes come; docs/adr/ADR-022.md
+/// decision 19 item 3). `None` when the directory or one of them cannot be read, or it holds none.
+fn output_bytes(logs: &Path) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for entry in std::fs::read_dir(logs).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with("stdout.jsonl") || name.ends_with("stderr.log") {
+            total = Some(
+                total
+                    .unwrap_or(0)
+                    .saturating_add(entry.metadata().ok()?.len()),
+            );
+        }
+    }
+    total
+}
 
 /// Where the raw logs of attempt `attempt_id` go in the project at `project`.
 /// Every regular file of an attempt's log directory `logs` kept as an object of the project at `project`, by name

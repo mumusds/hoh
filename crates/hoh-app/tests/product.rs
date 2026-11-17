@@ -90,6 +90,28 @@ end = time.monotonic() + 30
 for info in iter(lambda: signal.sigtimedwait(wanted, max(0.0, end - time.monotonic())), None): f = open(os.path.join(d, \"signals\"), \"a\"); f.write((\"INT\" if info.si_signo == signal.SIGINT else \"TERM\") + \" \" + str(time.time_ns()) + chr(10)); f.close(); info.si_signo == signal.SIGTERM and sys.exit(143)
 ";
 
+/// The WATCH turn (docs/adr/ADR-022.md decision 19): a "tool" (`sleep 600`, its pid `argv[3]`) runs from before the
+/// recorded turn's first frame; once `claude.d/watch-tool-end` exists it is killed and reaped and `claude.d/watch-alone`
+/// is made; then nothing runs and nothing is printed until `claude.d/watch-speak` exists; then its second frame, and the
+/// rest of the turn once `claude.d/watch-end` exists.
+const WATCH_STAND_IN: &str = "import os, signal, sys, time
+d, frames, tool = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def wait(name):
+    while not os.path.exists(os.path.join(d, name)):
+        time.sleep(0.02)
+wait(\"watch-tool-end\")
+os.kill(tool, signal.SIGKILL)
+os.waitpid(tool, 0)
+open(os.path.join(d, \"watch-alone\"), \"w\").close()
+lines = open(frames).readlines()
+wait(\"watch-speak\")
+sys.stdout.write(lines[1])
+sys.stdout.flush()
+wait(\"watch-end\")
+sys.stdout.write(\"\".join(lines[2:]))
+sys.stdout.flush()
+";
+
 fn probe() -> ProbeCommand {
     ProbeCommand {
         program: env!("CARGO_BIN_EXE_hoh").into(),
@@ -260,7 +282,8 @@ impl World {
     /// A fake `claude` 2.1.318: the probe's answers from the recording (`--version` 3 s late while `claude.d/slow`
     /// exists, 120 s with its pid in `claude.d/probe-pid` while `claude.d/hang` does); a turn reads its prompt, then replays the recorded `success` turn (once `hold` exists, if given), or, for
     /// an attempt whose marker names HUGE, its first frame and then 8 MiB with no LF, or, for one whose marker names
-    /// CANCEL, [`CANCEL_STAND_IN`]; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
+    /// CANCEL, [`CANCEL_STAND_IN`]; for one whose marker names WATCH, [`WATCH_STAND_IN`] with its tool started before its
+    /// first frame; one whose marker names RESULT first writes a COMPLETED TaskResult by its prompt's
     /// identity header ([`RESULT_FAKE`]; with the self-test record `claude.d/self-test` while it exists), then prints
     /// `claude.d/big-log` while it exists (its raw log's extra lines); one whose marker names NATIVE-<code> replays the
     /// recorded turn with its `result` frame's subtype `<code>` (COMPAT_UNVERIFIED, MODEL_UNAVAILABLE, BLOCKED_AUTH); one whose
@@ -320,6 +343,7 @@ impl World {
                  case \"$HOH_ATTEMPT_ID\" in\n\
                   *HUGE*) head -n 1 \"$f/success/stdout.jsonl\"; head -c {HUGE} /dev/zero | tr '\\0' x; sleep 20; exit 0;;\n\
                   *CANCEL*) exec python3 -c '{CANCEL_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\";;\n\
+                  *WATCH*) sleep 600 & t=$!; echo $t > \"$d/watch-tool\"; head -n 1 \"$f/success/stdout.jsonl\"; exec python3 -c '{WATCH_STAND_IN}' \"$d\" \"$f/success/stdout.jsonl\" \"$t\";;\n\
                   *RESULT*) python3 \"$d/result.py\" \"$d/stdin.$$\" COMPLETED \"$d/self-test\" || exit 1; [ -f \"$d/big-log\" ] && cat \"$d/big-log\";;\n\
                   *NATIVE-*) code=${{HOH_ATTEMPT_ID#*NATIVE-}}; cat \"$d/native-${{code%%/*}}.jsonl\"; exit 0;;\n\
                   *LIMIT*) cat \"$d/limit.jsonl\"; exit 1;;\n\
@@ -6406,6 +6430,220 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
     .await;
     let _ = std::fs::write(world.bin().join("codex.d/release"), "");
     host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+/// The host of `world` with an inactivity watchdog of 2 s, looked at every 100 ms (docs/adr/ADR-022.md decision 19).
+fn watched(world: &World) -> HostConfig {
+    let mut config = world.config();
+    config.watchdog = hoh_app::host::Watchdog {
+        quiet: Duration::from_secs(2),
+        every: Duration::from_millis(100),
+    };
+    config
+}
+
+/// The query of how many events of `kind` attempt `attempt` has.
+fn watchdog_events(attempt: &str, kind: &str) -> String {
+    format!(
+        "SELECT count(*) FROM events WHERE kind = '{kind}' AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+    )
+}
+
+/// The payload of attempt `attempt`'s event of `kind`.
+fn watchdog_event(project: &Path, attempt: &str, kind: &str) -> R<Value> {
+    Ok(serde_json::from_str(&query(
+        project,
+        &format!(
+            "SELECT payload_json FROM events WHERE kind = '{kind}' \
+             AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+        ),
+    )?)?)
+}
+
+/// Wait until `path` exists, for at most `limit`.
+async fn until_file(path: &Path, limit: Duration) -> R {
+    let end = Instant::now() + limit;
+    while !path.exists() {
+        if Instant::now() > end {
+            return Err(format!("no {}", path.display()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Kill the WATCH turn's tool if it still runs (it is not the fakes' to stop: its command line is `sleep 600`).
+fn stop_watch_tool(world: &World) {
+    let Ok(pid) = std::fs::read_to_string(world.bin().join("claude.d/watch-tool")) else {
+        return;
+    };
+    let pid = pid.trim();
+    if std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == b"sleep\x00600\x00") {
+        let _ = Command::new("kill").args(["-KILL", pid]).status();
+    }
+}
+
+#[tokio::test]
+async fn a_silent_turn_is_inactive_once_only_with_no_tool_running_and_its_output_clears_it() -> R {
+    // REQ-042 behaviour 8 (docs/adr/ADR-022.md decision 19): silent past the quiet time while its tool runs, nothing;
+    // silent with no tool, one attempt.inactive and the attempt runs on; its output then clears it.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.bind_installed()?;
+    let host = start_when_free(watched(&world)).await?;
+    let project = world.project();
+    let d = world.bin().join("claude.d");
+    let attempt = "T-WATCH/attempt-1";
+    let outcome = async {
+        let run_id = started(&host, &project, "s1").await?;
+        ready(&project, &run_id, &[("T-WATCH", "developer")])?;
+        until_file(&d.join("watch-tool"), Duration::from_secs(60)).await?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let inactive = watchdog_events(attempt, "attempt.inactive");
+        let cleared = watchdog_events(attempt, "attempt.inactive_cleared");
+        assert_eq!(
+            query(&project, &inactive)?,
+            "0",
+            "inactive while its tool ran"
+        );
+        std::fs::write(d.join("watch-tool-end"), "")?;
+        until_file(&d.join("watch-alone"), Duration::from_secs(30)).await?;
+        until(&project, &inactive, "1", Duration::from_secs(30)).await?;
+        let event = watchdog_event(&project, attempt, "attempt.inactive")?;
+        assert_eq!(
+            (
+                &event["episode"],
+                &event["tool_running"],
+                &event["quiet_ms"]
+            ),
+            (&json!(1), &json!(false), &json!(2000)),
+            "{event}"
+        );
+        let since = event["since_ms"].as_u64().ok_or("no since_ms")?;
+        // Its first frame came before its tool's 5 s and the quiet 2 s after them, less a look or so.
+        assert!(since >= 6000, "{event}");
+        // Once per episode, and nothing is killed: the attempt runs on, its agent alive.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(query(&project, &inactive)?, "1");
+        assert_eq!(query(&project, &cleared)?, "0");
+        assert_eq!(
+            query(
+                &project,
+                &format!("SELECT state FROM attempts WHERE attempt_id = '{attempt}'")
+            )?,
+            "RUNNING"
+        );
+        // Its output clears it while it runs on, and the turn then ends as it would have.
+        std::fs::write(d.join("watch-speak"), "")?;
+        until(&project, &cleared, "1", Duration::from_secs(30)).await?;
+        assert_eq!(
+            query(
+                &project,
+                &format!("SELECT state FROM attempts WHERE attempt_id = '{attempt}'")
+            )?,
+            "RUNNING"
+        );
+        std::fs::write(d.join("watch-end"), "")?;
+        until(
+            &project,
+            &ended(attempt),
+            "SETTLED/",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let clear = watchdog_event(&project, attempt, "attempt.inactive_cleared")?;
+        assert_eq!(clear["episode"], json!(1), "{clear}");
+        assert!(
+            clear["inactive_ms"].as_u64().ok_or("no inactive_ms")? >= 5000,
+            "{clear}"
+        );
+        let ids = query(
+            &project,
+            &format!(
+                "SELECT group_concat(event_id, ' ') FROM (SELECT event_id FROM events \
+                 WHERE event_id LIKE '{attempt}/watchdog/%' ORDER BY seq)"
+            ),
+        )?;
+        assert_eq!(
+            ids,
+            format!("{attempt}/watchdog/1/inactive {attempt}/watchdog/1/cleared")
+        );
+        keep(
+            "watchdog-episode",
+            &json!({"inactive": event, "cleared": clear, "ids": ids}),
+        )?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    stop_watch_tool(&world);
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn an_episode_open_when_its_host_stops_is_neither_repeated_nor_cleared_by_the_next_host() -> R
+{
+    // Decision 19 item 9: the watch lives in its host. The next host's start reconcile ends the attempt (decision 17);
+    // it writes no watchdog event for it, the open episode ends with the attempt.
+    let world = World::new()?;
+    world.claude(None)?;
+    world.bind_installed()?;
+    let d = world.bin().join("claude.d");
+    // Its tool ends at once: the turn is silent with no tool from its first frame on.
+    std::fs::write(d.join("watch-tool-end"), "")?;
+    let project = world.project();
+    let attempt = "T-WATCH/attempt-1";
+    let inactive = watchdog_events(attempt, "attempt.inactive");
+    let first = start_when_free(watched(&world)).await?;
+    let outcome = async {
+        let run_id = started(&first, &project, "s1").await?;
+        ready(&project, &run_id, &[("T-WATCH", "developer")])?;
+        until(&project, &inactive, "1", Duration::from_secs(60)).await
+    }
+    .await;
+    first.shutdown().await;
+    let outcome = match outcome {
+        Ok(()) => {
+            let stopped_at = query(&project, "SELECT max(seq) FROM events")?;
+            let second = start_when_free(watched(&world)).await?;
+            let outcome = async {
+                until(
+                    &project,
+                    &format!("SELECT state <> 'RUNNING' FROM attempts WHERE attempt_id = '{attempt}'"),
+                    "1",
+                    Duration::from_secs(60),
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert_eq!(
+                    query(
+                        &project,
+                        &format!("SELECT group_concat(event_id) FROM events WHERE event_id LIKE '{attempt}/watchdog/%'")
+                    )?,
+                    format!("{attempt}/watchdog/1/inactive")
+                );
+                assert_eq!(
+                    query(
+                        &project,
+                        &format!(
+                            "SELECT count(*) FROM events WHERE seq > {stopped_at} AND kind LIKE 'attempt.inactive%' \
+                             AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+                        )
+                    )?,
+                    "0"
+                );
+                R::Ok(())
+            }
+            .await;
+            second.shutdown().await;
+            outcome
+        }
+        Err(e) => Err(e),
+    };
+    stop_watch_tool(&world);
     world.stop_fakes()?;
     outcome
 }
