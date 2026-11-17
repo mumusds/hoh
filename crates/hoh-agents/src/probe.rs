@@ -5995,12 +5995,36 @@ mod tests {
     /// number of file descriptors; released, it does nothing more to the output past the step in progress, and lets
     /// every thread and file descriptor go; a second round leaves no more than the first; and a reading that ends in
     /// time has let everything go when the probe returns.
+    /// Removes, when dropped, every entry of the temporary directory this process's probes made (`hoh-probe-<pid>-…`,
+    /// their quarantines included), however the test leaves. A test whose readings are given up on purpose leaves their
+    /// output, and an assertion that failed before the test's own cleanup used to leave it in /tmp (48 entries found,
+    /// each with the test's stall markers or an empty quarantine). While this process runs, only it makes names with
+    /// its pid.
+    struct OwnProbeDirs;
+
+    impl Drop for OwnProbeDirs {
+        fn drop(&mut self) {
+            let mine = format!("hoh-probe-{}-", std::process::id());
+            for entry in std::fs::read_dir(std::env::temp_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                if entry.file_name().to_string_lossy().starts_with(&mine) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "run by a_reading_given_up_stops_and_lets_everything_go in a process of its own"]
     fn reading_given_up_child() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var_os(LIFECYCLE).is_none() {
             return Ok(());
         }
+        // The given-up readings' output removed on every exit, a failed assertion included.
+        let _own = OwnProbeDirs;
         let count = |dir: &str| std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0);
         let listing = |dir: &Path| -> std::collections::BTreeSet<PathBuf> {
             let mut seen = std::collections::BTreeSet::new();
