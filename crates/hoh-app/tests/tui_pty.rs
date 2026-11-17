@@ -896,9 +896,11 @@ impl WriteLock {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()?;
-        let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+        // Held before anything can fail, so its drop reaps the child on every path (CLT-152).
+        let stdout = child.stdout.take();
         let lock = WriteLock(child);
+        let mut line = String::new();
+        std::io::BufReader::new(stdout.ok_or("no stdout")?).read_line(&mut line)?;
         if line.trim() != "locked" {
             return Err(format!("the write lock was not taken: {line:?}").into());
         }
