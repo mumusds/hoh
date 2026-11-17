@@ -10,7 +10,7 @@
 4. Plan/Build/Auto 是 HoH 行为模式；`/plan` 与 Shift+Tab 在 TUI 切换；Plan 对话、生成规格、不自动实施产品代码。非交互自动规划不是跳过规格。
 5. 默认 Codex Commander/Reviewer、Claude CTO/Developer、Pi QA/Research；职位、运行时、模型、会话分离；用户可配置角色、模型、提示词与团队。更换在 checkpoint 交接。
 6. Commander 事件驱动持续监督和决策；Rust 决定性运行时控制状态、派发、恢复与证据。常规阶段自动流转，不让 Commander 转发每条工具日志。
-7. 单一主写者；候选版本冻结；QA 与独立 Reviewer 对同版本并行；新版本不得沿用旧版本验收。YOLO VM 不要求额外权限沙箱或隐私专项；仍保留版本完整性与证据约束。
+7. 单一主写者；候选版本冻结；QA 与独立 Reviewer 对同版本并行；新版本不得沿用旧版本验收。YOLO VM 不要求额外权限沙箱或隐私专项；仍保留版本完整性与证据约束。Commander 不写工作区：它的每个 turn 以只读工作区档启动，只用各底座原生的只读机制（HoH 不自建沙箱），决策经最终消息交付；底座进程写它自己的、被 gitignore 的会话目录不算 Commander 的写入；没有操作系统级只读机制之处如实记为余项（CR-024）。
 8. Workspace 默认单主视图；Team 可选分屏；Focus 与三级 Timeline；可展开块、可点击证据、丰富响应式 statusline；进度基于已验收需求而非模型估计百分比。
 9. 上下文采用四层 Prompt + 按需引用；Prompt/Skill/模板可编辑、版本化、内置、锁定；不全量互传会话。
 10. 内置文档规范和原创可运行等效 Skill；不要求用户额外手工安装文档 Skill。三个 Pi 插件属于 v1 范围，自动解析/安装/诊断；不可偷偷省略或伪称兼容。插件真实集成（REQ-048/049/050）的发布类为 degradable：上游不可用或不兼容时，以带诊断证据与上游引用的 DEGRADED 交付，发布状态为 `COMPLETED_DEGRADED`；安装、诊断与显式降级本身（REQ-051）仍是 required（CR-001）。

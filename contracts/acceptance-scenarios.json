@@ -1230,6 +1230,66 @@
    ]
   },
   {
+   "id": "TEST-021-06",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-06",
+   "check_id": "integration",
+   "fixture": "临时项目与 host；PATH 上可编程的 fake codex（App Server、只走 exec、运行中可降级的变体，可设定并可在运行中改变结论的 sandbox 子命令）、fake claude、fake pi，help 与 schema 取自录制品；三组各缺一项只读档选项的变体；缩短的本机检查刷新间隔；在分配之后、prepare 之前触发刷新的测试钩子",
+   "steps": [
+    "(a) 依次以 claude、codex App Server、pi 为 Commander 启动 run，Developer 为 claude；注入两次 need_decision，第二次续同一会话；第一次时 fake Commander 在最终消息的块中给出 record_assumption，并向 messages.jsonl 追加另一条决策",
+    "读取 fake 记录的两次 argv 与 App Server 收到的 thread/start、thread/resume，读取 events 与 decisions",
+    "(b) 对三组缺项变体启动 run，该 Agent 同时为 Commander 与 Developer；读取兼容清单、团队视图与 attempts",
+    "(c) 依次把本机检查设为 unconfined、unavailable、unknown，codex 同时为 Commander 与 Developer；再从 unavailable 改为 confined；另在 unknown 时分配 Commander 的 turn，经钩子在 prepare 之前刷新得到 unavailable，再改为 confined；读取团队视图、判决证据、events、attempts 与 sessions",
+    "(d) 只走 exec 的 codex，以及在一次 Developer turn 中降级的 codex，各同时为 Commander 与 Developer；读取团队视图、attempts 与 fake 记录的 argv"
+   ],
+   "pass_criteria": [
+    "(a) 两次 turn 的启动与 REQ-021 行为 9 的清单逐项相等，不含任何 YOLO 选项；Developer 的启动含 YOLO 选项",
+    "(a) 块中的决策 APPLIED；messages.jsonl 中的决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条",
+    "(b) suite.status=PASS 且 read_only 用例 FAIL；commander 绑定 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，Commander Attempt 数为 0；该 Agent 的 Developer Attempt 为 SETTLED",
+    "(c) unconfined、unavailable：commander 绑定 BLOCKED，缺项为 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`，证据含检查结论，Commander Attempt 数为 0；compat-manifest.json 中 codex 的 read_only 用例仍为 PASS，sessions.capabilities_json 不变；Developer Attempt 为 SETTLED；unknown：Commander Attempt 启动，证据含 unknown 与原因；改为 confined 后的下一次刷新：commander 绑定解除阻塞，Commander Attempt 启动",
+    "(c) 已分配之后失去能力：prepare 拒绝为 AGENT_UNAVAILABLE，events 中没有 team.binding_excluded；改为 confined 后同一 codex 版本的 Commander Attempt 再被派发并 SETTLED；codex Developer 的 session_id 始终相同",
+    "(d) 两种 codex 都不被选为 Commander，缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`；fake 记录中没有 Commander 的 exec 启动；codex Developer Attempt 为 SETTLED"
+   ],
+   "observables": [
+    "fake 记录的 argv、cwd 与 App Server 收到的请求",
+    "compat-manifest.json 的 suite.status 与 cases",
+    "events、decisions、role_bindings、sessions 与团队视图",
+    "attempts 行"
+   ]
+  },
+  {
+   "id": "TEST-021-07",
+   "requirement_id": "REQ-021",
+   "acceptance_id": "AC-021-07",
+   "check_id": "adapter-live",
+   "fixture": "真实 claude、codex（App Server）、pi，各一段；每段一个临时 Git 仓库与仓库之外的私有工作目录，四个区域（工作树、.git/、.hoh/、私有目录）各有每种写机制分别建、改、删的种子；区域之外的确定的驱动（区域路径为常量、缺区域即报驱动错误的格脚本，与补丁全文）；产品的只读档构建函数与 hoh-decisions 解析函数；pi 的只观察测试扩展；受测候选提交中 ADR-032 的证据表；以该表引用的录制的摘录为夹具、有离线单元测试的判定函数",
+   "steps": [
+    "每段：只读档新会话一轮，按驱动逐一尝试每个区域的建、改、删，再读取 token、给出块",
+    "只读档续同一会话一轮，同上",
+    "每轮前后取四个区域的全量快照，其间不运行 git；按证据表从原始记录读出可用性证据与每次写入尝试的结果，codex 的原始记录含该轮线程的 rollout 文件",
+    "全权限档在另一个仓库跑一轮对照，取其快照",
+    "按格计算三项证据；覆盖不足的一轮换新会话重做，每段至多三次"
+   ],
+   "pass_criteria": [
+    "每轮 SETTLED，本轮与对照轮的终态都按产品适配器结束一个 turn 的规则（证据表 E0）；可用性证据按证据表齐全：claude、pi 恰为只读档的读工具，codex 线程的沙箱为只读",
+    "范围、请求与响应的关联、终态与最终消息取自产品适配器对所录 stdout 与所录的外部观察（各适配器必需的观察按 ADR-032 设计修正 7 第 2 条，codex 含启动参数，prompt 是否送达只属 claude；缺一项、类型不对或未知即不结束）的重放，判定不另行解析；适配器的消息由启动参数建出，请求记录与之逐条、逐键比较；适配器不取的记录不计，带本轮 id 而适配器没取的记录为覆盖不足；本轮的每个条目与 rollout 中本轮的每个调用都须分类并有已知结果，分不了类或不完整的为覆盖不足",
+    "一格的结论取本轮所有相符的记录、与顺序无关：任一为成功即成功，每一条都是权限拒绝才是权限拒绝；判定须要的任何一项输入缺失都不判 PASS",
+    "codex 的 shell 与 apply_patch × 四个区域 × 建改删的每一格：有尝试，有按证据表判为权限拒绝（而非其他任何错误）的结果，有对照中同一机制 × 操作在普通工作树文件上的成功（对照轮必须存在，可用性证据完整并显示全权限，该机制 × 操作的所有记录都是成功）；claude、pi 的对照轮的可用性证据列出读工具以外的工具",
+    "前后快照相同，唯一容许的差异是 pi 本段会话目录之下，.git/ 不豁免任何文件",
+    "块解析成功、nonce 正确，第 1 轮含 token",
+    "可用性证据齐全而不符合、任一快照差异或任一成功的格即 FAIL，不重做；缺任一项为覆盖不足，不判 PASS",
+    "分类（权限拒绝、突破、覆盖不足）只能经 CR 改；证据表只把它映射到字段路径与文字，改字段路径或文字须有已安装版本的新录制并经设计审查",
+    "evidence.mode=live，记录各会话的版本与 session_id；未登录时为 BLOCKED，不得为 PASS"
+   ],
+   "observables": [
+    "原生原始日志与 codex 线程的 rollout 文件",
+    "驱动的全文与其输出",
+    "前后两次快照与其差异、每格的结论与所用的证据表行",
+    "每段的尝试次数与覆盖结论",
+    "live-sessions.json"
+   ]
+  },
+  {
    "id": "TEST-022-01",
    "requirement_id": "REQ-022",
    "acceptance_id": "AC-022-01",
