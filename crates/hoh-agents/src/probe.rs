@@ -33,6 +33,7 @@ pub const CAPABILITIES: &[&str] = &[
     "ui_dialogs",
     "token_usage",
     "command_execution",
+    "read_only_workspace",
 ];
 
 /// Where and how to probe.
@@ -494,6 +495,7 @@ fn probe_codex(
                     schema.notifications.contains("thread/tokenUsage/updated"),
                 );
                 caps.insert("command_execution".to_owned(), schema.command_execution);
+                caps.insert("read_only_workspace".to_owned(), schema.read_only_workspace);
                 return Ok(((Transport::AppServer, help, Some(schema.hash)), conformance));
             }
             Err(why) => no_app_server = why,
@@ -522,6 +524,8 @@ fn probe_codex(
         "command_execution".to_owned(),
         exec_runs_commands(&exec_text),
     );
+    // No read-only turn runs on exec (docs/adr/ADR-032.md decision 10 (A)).
+    set(caps, "read_only_workspace", false);
     let conformance = match exec_plan {
         Some(plan) => conform::exec(plan, launcher, env, &top_text, &exec_text)?,
         None => Conformance::default(),
@@ -540,6 +544,9 @@ pub struct CodexSchema {
     /// Whether the App Server runs commands under HoH's YOLO profile, judged on the schema as written
     /// ([`app_server_runs_commands`]); `None` when it cannot be told.
     pub command_execution: Option<bool>,
+    /// Whether the App Server takes the read-only workspace profile's thread requests, judged on the schema as written
+    /// ([`app_server_read_only`]); `None` when it cannot be told.
+    pub read_only_workspace: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1806,6 +1813,10 @@ fn read_schema_planned(
             .map(|(value, _)| value),
         work,
     );
+    let read_only_workspace = app_server_read_only(
+        parsed.get("ClientRequest.json").map(|(value, _)| value),
+        work,
+    );
     // The methods a file lists in the known form whose message can be valid: `envelope` is the message for a method,
     // checked against the file with the params left to the compat suite (M1T07R-33).
     // Each file's value is taken, opened in place and dropped once its methods are read, never copied.
@@ -1847,6 +1858,7 @@ fn read_schema_planned(
     let requests = methods("ClientRequest.json", true, &request)?;
     let schema = CodexSchema {
         command_execution,
+        read_only_workspace,
         requests,
         client_notifications: methods(
             "ClientNotification.json",
@@ -2492,6 +2504,11 @@ fn probe_claude(
         "command_execution".to_owned(),
         claude_runs_commands(&String::from_utf8_lossy(&help)),
     );
+    set(
+        caps,
+        "read_only_workspace",
+        crate::claude::read_only_missing(&String::from_utf8_lossy(&help)).is_none(),
+    );
     Ok((Transport::StreamJson, help, None))
 }
 
@@ -2583,6 +2600,31 @@ fn app_server_runs_commands(
     }
 }
 
+/// Whether the App Server takes the read-only workspace profile (docs/adr/ADR-032.md decision 4): its thread/start and
+/// thread/resume as the adapter builds them for `ReadOnly` ([`crate::codex::app_server::requests`]) are valid against
+/// the tested `ClientRequest.json` (the three-valued validator, as for `command_execution`); `None` when it cannot be
+/// told. The read-only builders and this rule are the same judgement (decision 2: no fallback).
+fn app_server_read_only(client_requests: Option<&serde_json::Value>, work: &Work) -> Option<bool> {
+    use crate::codex::app_server::requests::{thread_resume, thread_start};
+    let both = Truth::all([
+        frame_valid(
+            client_requests,
+            &thread_start(0, crate::Profile::ReadOnly, None),
+            work,
+        ),
+        frame_valid(
+            client_requests,
+            &thread_resume(0, crate::Profile::ReadOnly, None, "thread"),
+            work,
+        ),
+    ]);
+    match both {
+        Truth::Yes => Some(true),
+        Truth::No => Some(false),
+        Truth::Unknown => None,
+    }
+}
+
 /// Pi: `--mode rpc`; resume from the session options in `--help`.
 fn probe_pi(
     launcher: &Path,
@@ -2607,6 +2649,11 @@ fn probe_pi(
     caps.insert(
         "command_execution".to_owned(),
         pi_runs_commands(&String::from_utf8_lossy(&help)),
+    );
+    set(
+        caps,
+        "read_only_workspace",
+        crate::pi::read_only_missing(&String::from_utf8_lossy(&help)).is_none(),
     );
     Ok((Transport::Rpc, help, None))
 }

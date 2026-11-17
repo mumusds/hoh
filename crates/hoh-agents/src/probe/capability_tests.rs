@@ -301,3 +301,75 @@ fn each_app_server_counter_example_changes_one_fact() {
 fn every_entry_carries_command_execution() {
     assert!(CAPABILITIES.contains(&"command_execution"));
 }
+
+/// The probe's reading of `files` as the export: its `read_only_workspace` (docs/adr/ADR-032.md decision 4).
+fn read_only_of(files: &[(PathBuf, Vec<u8>)]) -> Result<Option<bool>, String> {
+    read_schema(
+        &schema_dir(),
+        files,
+        &Work::new(VALIDATION_BUDGET, None),
+        &Work::new(u64::MAX, None),
+    )
+    .map(|schema| schema.read_only_workspace)
+}
+
+#[test]
+fn the_recorded_artifacts_take_the_read_only_profile_and_each_one_change_does_not() {
+    // ADR-032 decision 4 item 1: the recorded help and schema are the positive control; each counter-example changes
+    // one fact.
+    let claude = recorded("claude/2.1.318/help.txt");
+    assert_eq!(crate::claude::read_only_missing(&claude), None);
+    for (case, help) in [
+        (
+            "--strict-mcp-config",
+            changed(
+                &claude,
+                "  --strict-mcp-config   ",
+                "  --strict-mcp-cfg      ",
+            ),
+        ),
+        ("dontAsk", changed(&claude, "\"dontAsk\", ", "")),
+    ] {
+        assert!(crate::claude::read_only_missing(&help).is_some(), "{case}");
+    }
+    let pi = recorded("pi/1.5.0/help.txt");
+    assert_eq!(crate::pi::read_only_missing(&pi), None);
+    for (case, help) in [
+        ("--no-mcp", changed(&pi, "  --no-mcp ", "  --no-mcpx")),
+        (
+            "--no-extensions",
+            changed(&pi, "  --no-extensions, -ne ", "  --no-extensionz, -nz "),
+        ),
+        (
+            "ls",
+            changed(
+                &pi,
+                "  ls         - List directory contents",
+                "  lz         - List directory contents",
+            ),
+        ),
+    ] {
+        assert!(crate::pi::read_only_missing(&help).is_some(), "{case}");
+    }
+    let files = export();
+    assert_eq!(read_only_of(&files), Ok(Some(true)));
+    let no_read_only = edited("ClientRequest.json", |v| {
+        let modes = v["definitions"]["SandboxMode"]["enum"]
+            .as_array_mut()
+            .expect("SandboxMode.enum");
+        let before = modes.len();
+        modes.retain(|m| m != "read-only");
+        assert_eq!(modes.len(), before - 1);
+    });
+    assert_eq!(read_only_of(&no_read_only), Ok(Some(false)));
+    // The YOLO judgement does not depend on it.
+    assert_eq!(read(&no_read_only), Ok(Some(true)));
+    assert_eq!(
+        app_server_read_only(
+            file(&files, "ClientRequest.json").as_ref(),
+            &Work::new(0, None)
+        ),
+        None
+    );
+    assert!(CAPABILITIES.contains(&"read_only_workspace"));
+}
