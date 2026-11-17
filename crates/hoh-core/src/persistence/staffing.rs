@@ -208,6 +208,7 @@ pub(super) fn staffed(conn: &Connection, project_id: &str) -> Result<Vec<Staffed
             .filter(|e| e.role == row.role && e.config_revision == row.config_revision)
             .map(|e| e.record.clone())
             .collect();
+        let required = crate::staffing::required(&row.role, contract.as_deref());
         found.push(Staffed {
             live: live(conn, &row.run_id, &row.role)?,
             pending: pending_change(conn, &row.run_id, &row.role, row.role_epoch)?
@@ -228,7 +229,7 @@ pub(super) fn staffed(conn: &Connection, project_id: &str) -> Result<Vec<Staffed
             missing: serde_json::from_str(&row.missing).unwrap_or_default(),
             session,
             order,
-            required: crate::staffing::required(contract.as_deref()),
+            required,
             excluded,
         });
     }

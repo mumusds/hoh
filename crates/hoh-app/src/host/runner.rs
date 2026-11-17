@@ -792,7 +792,12 @@ async fn tick(
         context.required_capabilities = waiting
             .roles
             .iter()
-            .map(|(role, contract)| (role.clone(), super::agents::required(contract.as_deref())))
+            .map(|(role, contract)| {
+                (
+                    role.clone(),
+                    super::agents::required(role, contract.as_deref()),
+                )
+            })
             .collect();
     }
     common.shared.hooks.runner(RunnerPoint::AfterStaffing);

@@ -147,21 +147,20 @@ fn developer_and_qa_require_command_execution() {
     // commander and the reviewer resume as well, the developer and qa command execution as well.
     for contract in ["developer", "qa"] {
         assert_eq!(
-            required(Some(contract)),
+            required(contract, Some(contract)),
             set(&["command_execution", "structured_events"]),
             "{contract}"
         );
     }
     for contract in ["commander", "reviewer"] {
-        assert_eq!(
-            required(Some(contract)),
-            set(&["resume", "structured_events"]),
+        assert!(
+            required(contract, Some(contract)).is_superset(&set(&["resume", "structured_events"])),
             "{contract}"
         );
     }
     for contract in [Some("cto"), Some("researcher"), None] {
         assert_eq!(
-            required(contract),
+            required("other", contract),
             set(&["structured_events"]),
             "{contract:?}"
         );
@@ -189,7 +188,8 @@ fn a_developer_fallback_without_command_execution_is_not_selected() {
     // its line is `X:CAPABILITY_UNSUPPORTED:command_execution`, and the binding is blocked with both lines. The same X
     // with command execution (one fact changed) is selected.
     let order = strings(&["claude", "X"]);
-    let lacking = json!({"structured_events": true, "resume": true, "command_execution": false});
+    let lacking = json!({"structured_events": true, "resume": true, "command_execution": false,
+                         "read_only_workspace": true});
     let mut facts = Facts::new();
     facts.insert(
         "claude".to_owned(),
@@ -197,7 +197,7 @@ fn a_developer_fallback_without_command_execution_is_not_selected() {
     );
     facts.insert("X".to_owned(), verified(lacking));
     for role in ["developer", "qa"] {
-        let required = required(Some(role));
+        let required = required(role, Some(role));
         assert_eq!(
             verdict("X", &required, &facts, &[]),
             Verdict::CapabilityUnsupported(strings(&["command_execution"]))
@@ -262,7 +262,7 @@ fn a_developer_fallback_without_command_execution_is_not_selected() {
 
     // The commander and the reviewer do not need it: the same X fills them.
     for role in ["commander", "reviewer"] {
-        let selection = select(&order, &required(Some(role)), &facts, &[]);
+        let selection = select(&order, &required(role, Some(role)), &facts, &[]);
         assert_eq!(selection.chosen.as_deref(), Some("X"), "{role}");
     }
 }
@@ -979,5 +979,45 @@ fn judge_follows_decision_four() {
         "switch to the other agent with None",
     ] {
         assert!(seen.contains(row), "{row} never judged: {seen:?}");
+    }
+}
+
+#[test]
+fn the_commander_role_needs_the_read_only_workspace_and_no_other_role_does() {
+    // docs/adr/ADR-032.md decision 4 (-155, -253): read_only_workspace by the role's name, the one judgement the
+    // Commander's read-only launch is chosen by; resume by the contract. A custom role following the commander contract
+    // neither needs it nor runs read-only (its turn writes its own TaskResult).
+    assert_eq!(
+        required("commander", Some("commander")),
+        set(&["read_only_workspace", "resume", "structured_events"])
+    );
+    assert_eq!(
+        required("reviewer", Some("reviewer")),
+        set(&["resume", "structured_events"])
+    );
+    assert_eq!(
+        required("arbiter", Some("commander")),
+        set(&["resume", "structured_events"])
+    );
+    let lacking = json!({"structured_events": true, "resume": true, "command_execution": true,
+                         "read_only_workspace": false});
+    let mut facts = Facts::new();
+    facts.insert("X".to_owned(), verified(lacking));
+    assert_eq!(
+        verdict("X", &required("commander", Some("commander")), &facts, &[]),
+        Verdict::CapabilityUnsupported(strings(&["read_only_workspace"]))
+    );
+    for (role, contract) in [
+        ("developer", "developer"),
+        ("reviewer", "reviewer"),
+        ("arbiter", "commander"),
+    ] {
+        assert!(
+            !matches!(
+                verdict("X", &required(role, Some(contract)), &facts, &[]),
+                Verdict::CapabilityUnsupported(_)
+            ),
+            "{role}"
+        );
     }
 }

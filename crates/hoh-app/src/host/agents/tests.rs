@@ -96,22 +96,22 @@ fn a_roles_needs_follow_its_contract() {
             .collect::<BTreeSet<_>>()
     };
     assert_eq!(
-        required(Some("developer")),
+        required("developer", Some("developer")),
         set(&["command_execution", "structured_events"])
     );
     assert_eq!(
-        required(Some("qa")),
+        required("qa", Some("qa")),
         set(&["command_execution", "structured_events"])
     );
     assert_eq!(
-        required(Some("reviewer")),
+        required("reviewer", Some("reviewer")),
         set(&["resume", "structured_events"])
     );
     assert_eq!(
-        required(Some("commander")),
-        set(&["resume", "structured_events"])
+        required("commander", Some("commander")),
+        set(&["read_only_workspace", "resume", "structured_events"])
     );
-    assert_eq!(required(None), set(&["structured_events"]));
+    assert_eq!(required("other", None), set(&["structured_events"]));
 }
 
 #[test]
@@ -764,7 +764,7 @@ fn qa(order: &[&str]) -> Staffed {
         session: None,
         live: false,
         order: order.iter().map(|a| (*a).to_owned()).collect(),
-        required: required(Some("qa")),
+        required: required("qa", Some("qa")),
         excluded: Vec::new(),
         pending: None,
     }
