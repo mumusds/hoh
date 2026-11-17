@@ -338,7 +338,8 @@ fn room(db: &Path) -> std::io::Result<()> {
 }
 
 /// The rule for a failed SQLite call of either process at `step`, said by `detail` (ADR-016's note, round 2): no errno
-/// read after SQLite returns, which may be a later call's. SQLITE_FULL is SQLite's own attribution: DB_FULL. A write or
+/// read after SQLite returns, which may be a later call's. A failed checkpoint is WAL's (AC-062-06), not probed, its
+/// message naming the I/O and SQLite's extended code. SQLITE_FULL is SQLite's own attribution: DB_FULL. A write or
 /// growth that failed ([`super::room::growing_write`]) is DB_FULL when `room`, seen right away, is refused for want of space or
 /// quota; otherwise, and for any other failure, it is WAL's failure at `step` (REQ-062 behaviour 7), saying what
 /// failed and what the room probe saw.
@@ -355,6 +356,15 @@ fn judge(
     let Some(extended) = failure.extended else {
         return wal(detail);
     };
+    // A failed checkpoint is WAL's (AC-062-06), whatever its I/O: not probed, said with what failed (F7-201).
+    if step == Step::Checkpoint {
+        let what = super::room::growing_write(extended)
+            .map(|what| format!("{what} failed, "))
+            .unwrap_or_default();
+        return wal(format!(
+            "{detail} ({what}SQLite extended code {extended}); a checkpoint's failure is WAL's, not probed for room"
+        ));
+    }
     if extended & 0xff == rusqlite::ffi::SQLITE_FULL {
         return PersistError::Full(format!("WAL self-test at {}: {detail}", step.name()));
     }
@@ -1246,6 +1256,42 @@ mod tests {
         }
         assert_eq!(left, Vec::<String>::new());
         Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_that_failed_is_the_wals_failure_whatever_its_io() {
+        // F7-201: AC-062-06; not probed, its message naming the I/O and SQLite's extended code.
+        use rusqlite::ffi::*;
+        for (extended, says) in [
+            (
+                SQLITE_IOERR_FSYNC,
+                "(an fsync failed, SQLite extended code 1034)",
+            ),
+            (
+                SQLITE_IOERR_TRUNCATE,
+                "(a truncate failed, SQLite extended code 1546)",
+            ),
+            (SQLITE_FULL, "(SQLite extended code 13)"),
+            (SQLITE_IOERR_SHMMAP, "(SQLite extended code 5386)"),
+        ] {
+            let failure = SqlFailure {
+                extended: Some(extended),
+                message: "disk I/O error".to_owned(),
+            };
+            let judged = judge(
+                Step::Checkpoint,
+                &failure,
+                "disk I/O error".to_owned(),
+                || panic!("probed at the checkpoint"),
+            );
+            match &judged {
+                PersistError::WalUnsupported { step, detail } => {
+                    assert_eq!(*step, Step::Checkpoint.name());
+                    assert!(detail.contains(says), "{detail}");
+                }
+                other => panic!("{extended}: {other:?}"),
+            }
+        }
     }
 
     #[test]

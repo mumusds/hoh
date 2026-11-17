@@ -248,6 +248,8 @@ struct IoFault {
     in_probe: bool,
     /// The next read after it is interrupted (EINTR) and retried by SQLite (F7_CLEANUP_ERRNO).
     interrupted_read: bool,
+    /// The first fault at the nth matching call (F7_IO_NTH).
+    nth: u32,
     exit: i32,
     says: &'static [&'static str],
 }
@@ -272,6 +274,7 @@ impl IoFault {
         if self.interrupted_read {
             env.push(("F7_CLEANUP_ERRNO", "4".into()));
         }
+        env.push(("F7_IO_NTH", self.nth.to_string().into()));
         let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
         let stderr = String::from_utf8_lossy(&out.stderr);
         let mut wrong = Vec::new();
@@ -333,6 +336,7 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
             sticky: true,
             in_probe: false,
             interrupted_read: true,
+            nth: 1,
             exit: 69,
             says: &["DB_FULL", "Disk quota exceeded"],
         },
@@ -344,6 +348,7 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
             sticky: true,
             in_probe: false,
             interrupted_read: true,
+            nth: 1,
             exit: 69,
             says: &["DB_FULL", "No space left on device"],
         },
@@ -355,6 +360,7 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
             sticky: true,
             in_probe: true,
             interrupted_read: true,
+            nth: 1,
             exit: 69,
             says: &["DB_FULL", "the probe's", "Disk quota exceeded"],
         },
@@ -366,6 +372,7 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
             sticky: false,
             in_probe: false,
             interrupted_read: true,
+            nth: 1,
             exit: 78,
             says: &["DB_WAL_UNSUPPORTED", "fsync", "not for want of room"],
         },
@@ -420,6 +427,48 @@ fn full_a_room_file_another_creator_made_after_the_claim_is_left_to_it() -> R {
 }
 
 #[test]
+fn full_a_checkpoint_that_fails_writing_is_the_wals_failure_not_probed() -> R {
+    // F7-201: AC-062-06 makes a failed checkpoint DB_WAL_UNSUPPORTED; a real I/O error of the checkpoint (here over a
+    // quota that stays) is not probed for room, and still says which I/O failed and SQLite's extended code.
+    let checkpoint = |why, op, file, nth, says| IoFault {
+        why,
+        op,
+        file,
+        errno: 122,
+        sticky: true,
+        in_probe: false,
+        interrupted_read: false,
+        nth,
+        exit: 78,
+        says,
+    };
+    check_all(&[
+        checkpoint(
+            "the checkpoint's truncate of the WAL over quota",
+            "truncate",
+            "-wal",
+            1,
+            &[
+                "DB_WAL_UNSUPPORTED",
+                "at checkpoint",
+                "a truncate failed, SQLite extended code 1546",
+            ],
+        ),
+        checkpoint(
+            "the checkpoint's fsync of the database over quota",
+            "sync",
+            ".db",
+            2,
+            &[
+                "DB_WAL_UNSUPPORTED",
+                "at checkpoint",
+                "an fsync failed, SQLite extended code 1034",
+            ],
+        ),
+    ])
+}
+
+#[test]
 fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
     // F7-101: `PRAGMA journal_mode=WAL` commits on the self-test's new database (its journal, then its header); its
     // failure came after the first row and was lost, and the host later said "no -shm file".
@@ -432,6 +481,7 @@ fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
             sticky: false,
             in_probe: false,
             interrupted_read: false,
+            nth: 1,
             exit: 69,
             says: &["DB_FULL", "enable WAL", "database or disk is full"],
         },
@@ -443,6 +493,7 @@ fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
             sticky: true,
             in_probe: false,
             interrupted_read: false,
+            nth: 1,
             exit: 69,
             says: &["DB_FULL", "enable WAL", "Disk quota exceeded"],
         },
@@ -454,6 +505,7 @@ fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
             sticky: false,
             in_probe: false,
             interrupted_read: false,
+            nth: 1,
             exit: 78,
             says: &[
                 "DB_WAL_UNSUPPORTED",
