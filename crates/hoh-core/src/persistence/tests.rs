@@ -1768,3 +1768,52 @@ async fn a_cancel_overtakes_the_writes_queued_before_it() -> R {
     assert_eq!(order, ["first", "cancel", "b", "c", "d"]);
     Ok(())
 }
+
+/// An inactivity watchdog's event is written only while its attempt runs and no cancel has begun, neither of its own
+/// nor of its run (docs/adr/ADR-022.md decision 19 items 6 and 11, WD-01, WD-52): a look taken before the attempt
+/// ended, or before a cancel, records nothing after.
+#[tokio::test]
+async fn a_watchdog_event_is_recorded_only_while_its_attempt_runs_with_no_cancel_begun() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO projects(project_id, repo_path, host_epoch, created_at) VALUES ('p1', '/repo', 1, '2026-11-04T00:00:00Z');
+         INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', 'p1', printf('%064d', 1), 1);
+         INSERT INTO runs(run_id, project_id, spec_id, state, mode, created_at) VALUES
+           ('r1', 'p1', 's1', 'RUNNING', 'AUTO', '2026-11-04T00:00:00Z'),
+           ('r2', 'p1', 's1', 'CANCEL_REQUESTED', 'AUTO', '2026-11-04T00:00:00Z');
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq) VALUES
+           ('t1', 'r1', 's1', 'RUNNING', 1, 'developer', 1), ('t2', 'r1', 's1', 'RUNNING', 1, 'developer', 2),
+           ('t3', 'r1', 's1', 'READY', 1, 'developer', 3), ('t4', 'r2', 's1', 'RUNNING', 1, 'developer', 4);
+         INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, cancel_requested) VALUES
+           ('a1', 't1', 'RUNNING', 1, 1, 1, 0), ('a2', 't2', 'RUNNING', 1, 1, 1, 1),
+           ('a3', 't3', 'SETTLED', 1, 1, 1, 0), ('a4', 't4', 'RUNNING', 1, 1, 1, 0);",
+    )?;
+    let watched = |attempt: &str, run: &str| NewEvent {
+        intent: Intent::Progress,
+        project_id: "p1".to_owned(),
+        event_id: format!("{attempt}/watchdog/1/inactive"),
+        run_id: Some(run.to_owned()),
+        kind: "attempt.inactive".to_owned(),
+        payload: json!({"attempt_id": attempt}),
+    };
+    let mut recorded = Vec::new();
+    for (attempt, run) in [("a1", "r1"), ("a2", "r1"), ("a3", "r1"), ("a4", "r2")] {
+        recorded.push((
+            attempt,
+            store.runner_watched(attempt, watched(attempt, run)).await?,
+        ));
+    }
+    assert_eq!(
+        recorded,
+        [("a1", true), ("a2", false), ("a3", false), ("a4", false)]
+    );
+    let written: Vec<String> = store.reader()?.with(|c| {
+        c.prepare("SELECT event_id FROM events WHERE kind = 'attempt.inactive' ORDER BY seq")?
+            .query_map([], |r| r.get(0))?
+            .collect()
+    })?;
+    assert_eq!(written, ["a1/watchdog/1/inactive"]);
+    Ok(())
+}

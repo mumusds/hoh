@@ -147,6 +147,11 @@ pub(super) enum RunnerJob {
     Checkpoint(String, super::team::Availability),
     /// Renew the unexpired leases these attempts hold, at `now` (REQ-041: every 30 s, for 120 s).
     Renew(Vec<String>, std::time::SystemTime),
+    /// An inactivity watchdog's event of an attempt (docs/adr/ADR-022.md decision 19).
+    Watched {
+        attempt_id: String,
+        event: Box<NewEvent>,
+    },
     /// One look at a run for a stall (docs/adr/ADR-031.md design correction C), with the tick's pending candidates.
     Stall {
         run_id: String,
@@ -412,6 +417,9 @@ pub(super) fn run(
             pending,
             context,
         } => super::stall::detect(conn, &run_id, &pending, &context, ctx).map(RunnerDone::Stall),
+        RunnerJob::Watched { attempt_id, event } => {
+            watched(conn, &attempt_id, &event, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Renew(attempts, now) => {
             let tx = writer::begin(conn, ctx)?;
             let at = crate::time::rfc3339_utc(now);
@@ -782,6 +790,34 @@ fn received(
         ctx,
     )?;
     super::writer::commit(tx, ctx)?;
+    Ok(true)
+}
+
+/// Attempt `attempt_id`'s inactivity watchdog event (docs/adr/ADR-022.md decision 19), written only while the attempt
+/// runs and no cancel has begun, of the attempt or of its run (items 6 and 11, WD-01, WD-52): a look taken before the
+/// attempt ended or a cancel began records nothing after. Whether it was written.
+fn watched(
+    conn: &mut Connection,
+    attempt_id: &str,
+    event: &NewEvent,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let running: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM attempts a JOIN tasks t ON t.task_id = a.task_id JOIN runs r ON r.run_id = t.run_id \
+             WHERE a.attempt_id = ?1 AND a.state = 'RUNNING' AND a.cancel_requested = 0 \
+             AND r.state NOT IN ('CANCEL_REQUESTED', 'CANCELLED')",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if running.is_none() {
+        return Ok(false);
+    }
+    writer::insert_event(&tx, event)?;
+    writer::commit(tx, ctx)?;
     Ok(true)
 }
 
