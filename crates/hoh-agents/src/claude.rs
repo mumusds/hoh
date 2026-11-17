@@ -93,6 +93,46 @@ pub fn interface_missing(help: &str) -> Option<String> {
     })
 }
 
+/// The read tools of the read-only workspace profile (docs/adr/ADR-032.md decision 3).
+pub const READ_TOOLS: &str = "Read,Grep,Glob";
+
+/// The read-only workspace profile's options, in place of the YOLO flag (docs/adr/ADR-032.md decision 3): only the read
+/// tools exist and are pre-approved, every other permission request is denied without a prompt, and only the MCP
+/// servers `--mcp-config` names are used (none is named).
+pub const READ_ONLY_ARGS: &[&str] = &[
+    "--tools",
+    READ_TOOLS,
+    "--allowedTools",
+    READ_TOOLS,
+    "--permission-mode",
+    "dontAsk",
+    "--strict-mcp-config",
+];
+
+/// Why this claude's help gives no read-only workspace profile, or `None`: each of its options must be declared and
+/// `dontAsk` listed among `--permission-mode`'s values (docs/adr/ADR-032.md decisions 3 and 4; the probe's rule).
+pub fn read_only_missing(help: &str) -> Option<String> {
+    if let Some(flag) = [
+        "--tools",
+        "--allowedTools",
+        "--permission-mode",
+        "--strict-mcp-config",
+    ]
+    .into_iter()
+    .find(|flag| !offers(help, flag))
+    {
+        return Some(format!(
+            "claude --help offers no {flag} for the read-only profile"
+        ));
+    }
+    (!crate::adapter::option_text(help, "--permission-mode")
+        .is_some_and(|t| crate::adapter::has_word(&t, "dontAsk")))
+    .then(|| {
+        "claude --help lists no dontAsk among --permission-mode's values for the read-only profile"
+            .to_owned()
+    })
+}
+
 /// The argv of a turn, or why it cannot start.
 pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     if let Some(why) = interface_missing(&launch.help) {
@@ -106,6 +146,16 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
         .collect::<Vec<_>>();
     if launch.partial && partial {
         args.push(PARTIAL_FLAG.to_owned());
+    }
+    let yolo_builds = offers(&launch.help, YOLO_FLAG) && !launch.root;
+    let read_only_builds = read_only_missing(&launch.help).is_none();
+    if launch.profile == crate::Profile::ReadOnly {
+        // No fallback: without one of its options the turn does not start (ADR-032 decision 2). Not refused as root:
+        // only the bypass is (REQ-025 failure mode 4).
+        if let Some(why) = read_only_missing(&launch.help) {
+            return Err(Blocked(why));
+        }
+        args.extend(READ_ONLY_ARGS.iter().map(|a| (*a).to_owned()));
     }
     if launch.profile == crate::Profile::Yolo {
         if !offers(&launch.help, YOLO_FLAG) {
@@ -137,8 +187,10 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
     Ok(Argv {
         args,
         // What this adapter implements: events, the result's token usage, resume and deltas where the help offers
-        // them, and commands under the YOLO profile (docs/adr/ADR-030.md decision 12). One prompt on stdin, then
-        // stdin closes, so no steer and no dialog (M1T04R-12, -15, -17).
+        // them, commands under the YOLO profile (docs/adr/ADR-030.md decision 12) and the read-only workspace profile
+        // where its argv builds. The row says which profiles the session can start in, whatever this turn's, so a
+        // Commander's read-only turn records what its YOLO turns would (ADR-032 decision 4). One prompt on stdin,
+        // then stdin closes, so no steer and no dialog (M1T04R-12, -15, -17).
         capabilities: crate::capabilities::of_session(
             &launch.capabilities,
             &[
@@ -146,7 +198,11 @@ pub fn argv(launch: &Launch) -> Result<Argv, Blocked> {
                 ("token_usage", true),
                 ("resume", resume),
                 ("partial_messages", partial),
-                ("command_execution", launch.profile == crate::Profile::Yolo),
+                (
+                    "command_execution",
+                    launch.profile != crate::Profile::Plain && yolo_builds,
+                ),
+                ("read_only_workspace", read_only_builds),
             ],
         ),
     })

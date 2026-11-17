@@ -184,8 +184,15 @@ pub fn exec_interface_missing(help: &str) -> Option<String> {
     (!offers(help, "--json")).then(|| "codex exec --help offers no --json".to_owned())
 }
 
-/// The arguments of `codex exec --json` (or `codex exec resume --json ... <thread>`), the prompt on stdin.
+/// The arguments of `codex exec --json` (or `codex exec resume --json ... <thread>`), the prompt on stdin. No read-only
+/// turn runs on exec (docs/adr/ADR-032.md decision 10 (A)): its patch refusals leave no trace there.
 pub fn exec_args(launch: &Launch) -> Result<Vec<String>, Blocked> {
+    if launch.profile == crate::Profile::ReadOnly {
+        return Err(Blocked(
+            "codex exec runs no read-only turn: the read-only profile needs the App Server (ADR-032 decision 10)"
+                .to_owned(),
+        ));
+    }
     let help = match &launch.resume {
         None => launch.exec_help.as_str(),
         Some(_) => launch.exec_resume_help.as_deref().ok_or_else(|| {
@@ -1003,8 +1010,10 @@ fn app_server_facts(
 /// The session row of a turn: the probed capabilities, only those this adapter implements on the transport the turn
 /// used (M1R-01, M1T04R-15). On App Server: events, resume (`thread/resume`), steer, deltas and token usage; on exec:
 /// events, token usage (`turn.completed`), and resume if a resumed exec turn can do whatever a new one can
-/// (M1T04R-11, -14, -17); on both, commands under the YOLO profile (docs/adr/ADR-030.md decision 12). Server requests
-/// are answered headless (no dialogs, no custom tools), prompts are text only, there is no browser.
+/// (M1T04R-11, -14, -17); on both, commands under the YOLO profile (docs/adr/ADR-030.md decision 12); the read-only
+/// workspace profile on the App Server only (ADR-032 decision 10). The row says which profiles the session can start
+/// in, whatever this turn's (ADR-032 decision 4). Server requests are answered headless (no dialogs, no custom tools),
+/// prompts are text only, there is no browser.
 fn session(
     attempt: &AttemptRef,
     turn: &Turn,
@@ -1023,8 +1032,9 @@ fn session(
             ("token_usage", true),
             (
                 "command_execution",
-                turn.launch.profile == crate::Profile::Yolo,
+                turn.launch.profile != crate::Profile::Plain,
             ),
+            ("read_only_workspace", true),
         ]
     } else {
         vec![
@@ -1037,8 +1047,9 @@ fn session(
             ),
             (
                 "command_execution",
-                turn.launch.profile == crate::Profile::Yolo,
+                turn.launch.profile != crate::Profile::Plain,
             ),
+            ("read_only_workspace", false),
         ]
     };
     Session {

@@ -22,10 +22,12 @@ pub mod probe;
 pub mod process;
 
 /// The launch profile of a turn (docs/adr/ADR-032.md decision 2): `Yolo` is HoH's YOLO runtime profile (CR-002),
+/// every turn's but the Commander's; `ReadOnly` the Commander's read-only workspace profile (decision 3, CR-024);
 /// `Plain` neither bypass nor restriction (only `hoh doctor --live`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Profile {
     Yolo,
+    ReadOnly,
     Plain,
 }
 

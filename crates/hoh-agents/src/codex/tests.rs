@@ -473,3 +473,94 @@ async fn the_driver_writes_what_the_request_builders_give() {
     assert_eq!(built[1..], client[1..]);
     assert_eq!(built[0]["method"], client[0]["method"]);
 }
+
+#[test]
+fn exec_never_starts_a_read_only_turn() {
+    // ADR-032 decision 10 (A): the Commander does not run over codex exec, new or resumed.
+    let mut l = launch();
+    l.profile = crate::Profile::ReadOnly;
+    assert!(
+        matches!(exec_args(&l), Err(Blocked(why)) if why.contains("read-only")),
+        "{:?}",
+        exec_args(&l)
+    );
+    l.resume = Some("thread-1".to_owned());
+    l.exec_resume_help = Some(l.exec_help.clone());
+    assert!(matches!(exec_args(&l), Err(Blocked(why)) if why.contains("read-only")));
+}
+
+#[test]
+fn the_read_only_thread_requests_are_decision_3s() {
+    // ADR-032 decision 3: approvalPolicy never and sandbox read-only, with today's model and threadId.
+    use app_server::requests::{thread_resume, thread_start};
+    let ro = crate::Profile::ReadOnly;
+    assert_eq!(
+        thread_start(1, ro, None),
+        json!({"method": "thread/start", "id": 1, "params": {"approvalPolicy": "never", "sandbox": "read-only"}})
+    );
+    assert_eq!(
+        thread_start(1, ro, Some("gpt-x")),
+        json!({"method": "thread/start", "id": 1,
+               "params": {"approvalPolicy": "never", "sandbox": "read-only", "model": "gpt-x"}})
+    );
+    assert_eq!(
+        thread_resume(1, ro, Some("gpt-x"), "t-1"),
+        json!({"method": "thread/resume", "id": 1,
+               "params": {"approvalPolicy": "never", "sandbox": "read-only", "model": "gpt-x", "threadId": "t-1"}})
+    );
+    // Yolo and Plain are today's.
+    assert_eq!(
+        thread_start(1, crate::Profile::Yolo, None)["params"],
+        json!({"approvalPolicy": "never", "sandbox": "danger-full-access"})
+    );
+    assert_eq!(
+        thread_start(1, crate::Profile::Plain, None)["params"],
+        json!({})
+    );
+}
+
+#[test]
+fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
+    // ADR-032 decision 4: the row says which profiles the session can start in, whatever the turn's; the read-only
+    // workspace profile is the App Server's only (decision 10).
+    let mut l = launch();
+    l.requests = APP_SERVER_REQUESTS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    l.client_notifications = APP_SERVER_CLIENT_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    l.known = APP_SERVER_NOTIFICATIONS
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    for (k, v) in [("command_execution", true), ("read_only_workspace", true)] {
+        l.capabilities.insert(k.to_owned(), Some(v));
+    }
+    let turn = |launch: Launch| Turn {
+        launch,
+        prompt: String::new(),
+        logs: PathBuf::from("/tmp"),
+        escalation: Turn::default_escalation(),
+        handshake_timeout: Duration::from_secs(1),
+        deadline: None,
+        observe: None,
+    };
+    let yolo = session_capabilities(&turn(l.clone())).expect("capabilities");
+    assert_eq!(yolo["read_only_workspace"], true, "{yolo}");
+    let mut ro = l.clone();
+    ro.profile = crate::Profile::ReadOnly;
+    assert_eq!(
+        session_capabilities(&turn(ro.clone())).expect("capabilities"),
+        yolo
+    );
+    // Without the App Server the session is exec's: no read-only profile, and no read-only turn starts.
+    let mut exec = l;
+    exec.app_server_help = None;
+    let caps = session_capabilities(&turn(exec.clone())).expect("capabilities");
+    assert_eq!(caps["read_only_workspace"], false, "{caps}");
+    ro.app_server_help = None;
+    assert!(session_capabilities(&turn(ro)).is_err());
+}

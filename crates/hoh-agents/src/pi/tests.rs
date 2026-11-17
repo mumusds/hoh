@@ -302,3 +302,103 @@ fn a_session_runs_commands_where_the_probe_found_it() {
         );
     }
 }
+
+/// `help` without the declaration line of `flag`.
+fn without_declaration(help: &str, flag: &str) -> String {
+    help.lines()
+        .filter(|line| crate::adapter::declared(line).is_none_or(|names| !names.contains(&flag)))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+#[test]
+fn the_read_only_args_are_decision_3s_row() {
+    // ADR-032 decision 3 (Q-pi-ext (A)): the allowlist, no MCP, no extension at all; then today's provider and model.
+    let mut l = launch();
+    l.profile = crate::Profile::ReadOnly;
+    l.provider = Some("p".to_owned());
+    l.model = Some("m".to_owned());
+    assert_eq!(
+        args(&l).expect("args"),
+        [
+            "--mode",
+            "rpc",
+            "--session-dir",
+            "/repo/.hoh/pi-sessions/S1",
+            "--session-id",
+            "sid-1",
+            "--tools",
+            "read,grep,find,ls",
+            "--no-mcp",
+            "--no-extensions",
+            "--provider",
+            "p",
+            "--model",
+            "m"
+        ]
+    );
+    assert!(!args(&l).expect("args").iter().any(|a| a == "-e"));
+    // Yolo and Plain start as today.
+    for profile in [crate::Profile::Yolo, crate::Profile::Plain] {
+        l.profile = profile;
+        assert!(
+            !args(&l)
+                .expect("args")
+                .iter()
+                .any(|a| a == "--tools" || a == "--no-extensions")
+        );
+    }
+}
+
+#[test]
+fn the_read_only_profile_is_blocked_without_any_of_its_options() {
+    let recorded = launch().help;
+    for (help, missing) in [
+        (without_declaration(&recorded, "--tools"), "--tools"),
+        (without_declaration(&recorded, "--no-mcp"), "--no-mcp"),
+        (
+            without_declaration(&recorded, "--no-extensions"),
+            "--no-extensions",
+        ),
+        (
+            recorded.replace(
+                "  ls         - List directory contents (read-only, off by default)\n",
+                "",
+            ),
+            "ls",
+        ),
+    ] {
+        let mut l = launch();
+        l.profile = crate::Profile::ReadOnly;
+        l.help = help;
+        assert!(
+            matches!(args(&l), Err(Blocked(ref why)) if why.contains(missing)),
+            "{missing}: {:?}",
+            args(&l)
+        );
+    }
+}
+
+#[test]
+fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
+    let mut l = launch();
+    l.capabilities = [
+        ("structured_events", Some(true)),
+        ("resume", Some(true)),
+        ("command_execution", Some(true)),
+        ("read_only_workspace", Some(true)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    let yolo = session_capabilities(&l).expect("capabilities");
+    l.profile = crate::Profile::ReadOnly;
+    assert_eq!(session_capabilities(&l).expect("capabilities"), yolo);
+    assert_eq!(yolo["read_only_workspace"], true, "{yolo}");
+    l.profile = crate::Profile::Yolo;
+    l.help = without_declaration(&l.help, "--no-extensions");
+    assert_eq!(
+        session_capabilities(&l).expect("capabilities")["read_only_workspace"],
+        false
+    );
+}
