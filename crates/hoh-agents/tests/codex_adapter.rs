@@ -201,6 +201,7 @@ impl Fakes for World {
             handshake_timeout: Duration::from_secs(10),
             deadline: Some(Duration::from_secs(60)),
             observe: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         })
     }
 
@@ -1763,6 +1764,7 @@ for line in sys.stdin:
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let entry = probe(Agent::Codex, &env)?;
     for absent in ["resume", "mid_turn_steer", "token_usage"] {

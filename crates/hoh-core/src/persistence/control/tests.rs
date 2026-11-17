@@ -21,7 +21,7 @@ fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
     let path = dir.path().join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }
@@ -553,7 +553,7 @@ fn open_at(
         wal_probe: Some(selftest::test_probe(None)),
         clock: Some(crate::persistence::StoreClock(clock)),
         faults,
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }

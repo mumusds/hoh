@@ -258,6 +258,7 @@ fn examine(project: &Path, live: bool) -> Report {
         // Its commands are the client's helpers: a signal stops and reaps them (docs/adr/ADR-031.md, the client-signal
         // correction's addendum, rule 5).
         cancel: crate::signals::current().map(|state| state.helpers().clone()),
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let (manifest, warning) = manifest(project);
     let mut warnings: Vec<String> = warning.into_iter().collect();

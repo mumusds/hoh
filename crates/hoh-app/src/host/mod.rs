@@ -115,7 +115,7 @@ impl HostConfig {
             port: DEFAULT_PORT,
             store: Options {
                 queue: WRITER_QUEUE,
-                ..Options::default()
+                ..Options::new(hoh_core::spawn::Direct::shared())
             },
             mountinfo: None,
             hooks: Arc::new(NoHostFaults),

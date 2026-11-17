@@ -31,7 +31,7 @@ fn open(dir: &Path) -> R<(Store, PathBuf)> {
     let path = dir.join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     let store = Store::open(&path, options)?;
     Connection::open(&path)?.execute_batch(WORLD)?;

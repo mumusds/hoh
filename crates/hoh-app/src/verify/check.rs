@@ -762,7 +762,7 @@ async fn finish(
         stdout: identity(&stdout),
         stderr: identity(&stderr),
     };
-    let (exit_code, timed_out) = match Process::spawn(command, config) {
+    let (exit_code, timed_out) = match Process::spawn(command, config, &hoh_core::spawn::Direct) {
         Ok(mut process) => {
             if let Some(adopt) = launch.adopt {
                 adopt(process.pid());

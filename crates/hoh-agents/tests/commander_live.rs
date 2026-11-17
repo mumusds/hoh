@@ -577,6 +577,7 @@ fn installed(agent: hoh_agents::compat::Agent, var: &str) -> R<Installed> {
     let program =
         PathBuf::from(std::env::var_os(var).ok_or(format!("{var} is not set"))?).canonicalize()?;
     let env = hoh_agents::probe::ProbeEnv {
+        spawner: hoh_core::spawn::Direct::shared(),
         path: std::env::var_os("PATH").ok_or("no PATH")?,
         fixture_root: None,
         timeout: std::time::Duration::from_secs(120),
@@ -687,6 +688,7 @@ async fn live_round(
         (hoh_agents::launch::Facts::Claude { help }, A::Claude) => hoh_agents::claude::start(
             &attempt,
             &hoh_agents::claude::Turn {
+                spawner: hoh_core::spawn::Direct::shared(),
                 launch: hoh_agents::claude::Launch {
                     program: inst.program.clone(),
                     help: help.clone(),
@@ -719,6 +721,7 @@ async fn live_round(
         ) => hoh_agents::codex::start(
             &attempt,
             &hoh_agents::codex::Turn {
+                spawner: hoh_core::spawn::Direct::shared(),
                 launch: hoh_agents::codex::Launch {
                     program: inst.program.clone(),
                     app_server_help: app_server_help.clone(),
@@ -745,6 +748,7 @@ async fn live_round(
         (hoh_agents::launch::Facts::Pi { help }, A::Pi) => hoh_agents::pi::start(
             &attempt,
             &hoh_agents::pi::Turn {
+                spawner: hoh_core::spawn::Direct::shared(),
                 launch: hoh_agents::pi::Launch {
                     program: inst.program.clone(),
                     help: help.clone(),

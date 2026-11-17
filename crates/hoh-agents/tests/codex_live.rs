@@ -80,6 +80,7 @@ async fn codex_live_turn_and_cancel() -> R {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         },
     )?;
     let version = entry
@@ -148,6 +149,7 @@ async fn codex_live_turn_and_cancel() -> R {
         handshake_timeout: Duration::from_secs(60),
         deadline: Some(Duration::from_secs(600)),
         observe: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let session_of = |o: &Outcome| {
         json!({

@@ -1829,7 +1829,7 @@ impl Model {
             &path,
             crate::persistence::Options {
                 wal_probe: Some(crate::persistence::selftest::test_probe(None)),
-                ..crate::persistence::Options::default()
+                ..crate::persistence::Options::new(crate::spawn::Direct::shared())
             },
         )?;
         Ok(Model {

@@ -55,7 +55,7 @@ fn open(dir: &Path) -> R<(Store, PathBuf)> {
         &path,
         Options {
             wal_probe: Some(probe()),
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         },
     )?;
     Ok((store, path))

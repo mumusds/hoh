@@ -98,6 +98,7 @@ fn systemctl(program: &Path, args: &[&str], path: &OsStr) -> Result<String, Stri
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let mut argv = vec!["--user"];
     argv.extend_from_slice(args);

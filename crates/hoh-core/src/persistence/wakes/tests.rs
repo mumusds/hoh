@@ -40,7 +40,7 @@ fn open(dir: &tempfile::TempDir, clock: &std::sync::Arc<TestClock>) -> R<(Store,
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
         clock: Some(StoreClock(clock.clone())),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }
@@ -3037,7 +3037,7 @@ async fn an_integrity_edges_woken_and_its_preempt_are_one_commit() -> R {
             wal_probe: Some(selftest::test_probe(None)),
             clock: Some(StoreClock(clock.clone())),
             faults: hooks.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     exec(&path, WORLD)?;
@@ -4198,7 +4198,7 @@ async fn a_turn_settled_after_its_steps_verdict_waits_for_the_next_step() -> R {
             wal_probe: Some(selftest::test_probe(None)),
             clock: Some(StoreClock(clock.clone())),
             faults: hooks.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?);
     exec(
@@ -5530,7 +5530,7 @@ async fn a_cancel_with_more_unread_wake_events_than_its_commit_takes_in_waits_fo
             wal_probe: Some(selftest::test_probe(None)),
             clock: Some(StoreClock(clock.clone())),
             faults: std::sync::Arc::new(UnreadLimit(1)),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     exec(&path, WORLD)?;

@@ -33,6 +33,7 @@ pub fn register(project: &Path, agent: Agent, path: &OsStr) -> Result<SuiteResul
         log: None,
         deadline: None,
         cancel: Some(stop.clone()),
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let (entry, stamp) = agents::probed_entry(agent, &env)?;
     let result = suite::run(agent, &entry, &env, &stop).map_err(|e| e.to_string())?;

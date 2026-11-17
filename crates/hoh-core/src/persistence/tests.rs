@@ -17,7 +17,7 @@ fn db_in(dir: &tempfile::TempDir) -> PathBuf {
 fn test_options() -> Options {
     Options {
         wal_probe: Some(selftest::test_probe(None)),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     }
 }
 

@@ -128,7 +128,7 @@ impl Fixture {
         let options = Options {
             wal_probe: Some(probe()),
             faults,
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         };
         let store = Store::open(&state.join("state.db"), options)?;
         let repo = root.to_string_lossy().into_owned();

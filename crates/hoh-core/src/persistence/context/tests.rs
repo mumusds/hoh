@@ -43,7 +43,7 @@ fn world() -> R<(tempfile::TempDir, Connection)> {
     let path = dir.path().join("state.db");
     let options = crate::persistence::Options {
         wal_probe: Some(crate::persistence::selftest::test_probe(None)),
-        ..crate::persistence::Options::default()
+        ..crate::persistence::Options::new(crate::spawn::Direct::shared())
     };
     drop(crate::persistence::Store::open(&path, options)?);
     let conn = Connection::open(&path)?;

@@ -211,6 +211,8 @@ pub fn error_class(error: &str) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub launch: Launch,
+    /// Who starts the agent (docs/adr/ADR-031.md, 设计修正 2): the host's direct spawner, or doctor's gate.
+    pub spawner: std::sync::Arc<dyn hoh_core::spawn::Spawner>,
     pub prompt: String,
     /// The input the prompt delivers (QUEUED in the store): DELIVERED when Pi takes it, APPLIED when its run starts
     /// (or it was handled), REJECTED when Pi refuses it.
@@ -497,7 +499,7 @@ pub async fn run(
         ..Config::default()
     };
     // The substrate reads stdout and stderr from the start: nothing Pi writes can be missed or block it.
-    let mut process = match Process::spawn(command, config) {
+    let mut process = match Process::spawn(command, config, &*turn.spawner) {
         Ok(p) => p,
         Err(e) => {
             finish(
@@ -662,8 +664,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         stderr_copy: Some(stderr),
         ..Config::default()
     };
-    let mut process =
-        Process::spawn(command, config).map_err(|e| refused("SPAWN", e.to_string()))?;
+    let mut process = Process::spawn(command, config, &*turn.spawner)
+        .map_err(|e| refused("SPAWN", e.to_string()))?;
     let pid = process.pid();
     let (open, opened) = tokio::sync::oneshot::channel::<()>();
     let cancel = Arc::new(tokio::sync::Notify::new());
@@ -1483,6 +1485,7 @@ fn replay_turn(version: &str) -> Turn {
         clock: Arc::new(crate::clock::SystemClock),
         events: None,
         observe: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     }
 }
 

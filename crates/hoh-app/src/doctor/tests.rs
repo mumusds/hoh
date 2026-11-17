@@ -294,6 +294,7 @@ fn live_pi_relies_on_agent_settled_only_for_a_recorded_version()
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     for (version, settled) in [(Some("1.5.0"), true), (Some("1.6.0"), false), (None, false)] {
         let prepared = prepare(

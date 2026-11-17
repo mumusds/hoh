@@ -126,6 +126,9 @@ pub struct Options {
     /// The second process of the WAL self-test; `None` is this executable with
     /// [`selftest::PROBE_ARG`] (the `hoh` binary).
     pub wal_probe: Option<selftest::ProbeCommand>,
+    /// Who starts the WAL self-test's second process (docs/adr/ADR-031.md, 设计修正 2): the host's direct spawner,
+    /// or a client's gate (doctor's scratch store). No default: [`Options::new`] takes it.
+    pub spawner: Arc<dyn crate::spawn::Spawner>,
     /// Fault injection points; the product's [`NoFaults`] does nothing (CR-006).
     pub faults: Arc<dyn FaultHooks>,
     /// The clock the writer stamps each commit with (docs/adr/ADR-025.md decision 2: the supervisor's debounce and
@@ -143,12 +146,14 @@ impl std::fmt::Debug for StoreClock {
     }
 }
 
-impl Default for Options {
-    fn default() -> Self {
+impl Options {
+    /// The initial values, the WAL self-test's process started by `spawner`.
+    pub fn new(spawner: Arc<dyn crate::spawn::Spawner>) -> Self {
         Self {
             busy_timeout: Duration::from_millis(5000),
             queue: 64,
             wal_probe: None,
+            spawner,
             faults: Arc::new(NoFaults),
             clock: None,
         }
@@ -916,7 +921,9 @@ impl Store {
             Some(probe) => probe.clone(),
             None => selftest::ProbeCommand::current_exe().map_err(storage)?,
         };
-        selftest::run(&dir, &probe, &|step| options.faults.before_wal_step(step))?;
+        selftest::run(&dir, &probe, &*options.spawner, &|step| {
+            options.faults.before_wal_step(step)
+        })?;
         let store = Self::open_checked(&path, options, migrations)?;
         location::check_device(&path, mountinfo).map_err(network(&path))?;
         Ok(store)

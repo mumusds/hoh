@@ -20,7 +20,7 @@ fn open(dir: &tempfile::TempDir) -> Result<(Store, PathBuf), PersistError> {
     let path = dir.path().join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }
@@ -919,7 +919,7 @@ async fn a_run_that_starts_running_queues_its_notice_with_its_event_through_ever
         Options {
             wal_probe: Some(selftest::test_probe(None)),
             faults: points.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     seed(&path, WORLD)?;
@@ -1227,7 +1227,7 @@ async fn an_end_decided_while_the_run_is_not_quiet_is_rejected_with_nothing_else
                 Options {
                     wal_probe: Some(selftest::test_probe(None)),
                     faults: std::sync::Arc::new(Limit),
-                    ..Options::default()
+                    ..Options::new(crate::spawn::Direct::shared())
                 },
             )?;
             seed(&path, WORLD)?;

@@ -56,6 +56,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         },
     )?;
     let version = entry
@@ -114,6 +115,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         }
     };
     let session_of = |o: &Outcome| {

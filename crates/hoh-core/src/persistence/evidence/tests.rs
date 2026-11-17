@@ -47,7 +47,7 @@ async fn world(dir: &Path) -> R<(Store, PathBuf, String)> {
         &path,
         Options {
             wal_probe: Some(selftest::test_probe(None)),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     Connection::open(&path)?.execute_batch(WORLD)?;

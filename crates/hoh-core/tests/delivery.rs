@@ -34,7 +34,7 @@ fn wal_probe_helper() {
 }
 
 fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
-    open_with(dir, Options::default())
+    open_with(dir, Options::new(hoh_core::spawn::Direct::shared()))
 }
 
 /// The store of `dir` with `options` and this binary as its WAL probe.
@@ -2033,7 +2033,7 @@ fn open_busy(dir: &tempfile::TempDir, busy: Duration) -> R<(Store, PathBuf)> {
         dir,
         Options {
             busy_timeout: busy,
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         },
     )
 }
@@ -2243,7 +2243,7 @@ async fn claims_left_unread_across_their_backoff_do_not_stack() -> R {
         &dir,
         Options {
             faults: held.clone(),
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         },
     )?;
     seed(&db, WORLD)?;
@@ -2321,7 +2321,7 @@ async fn a_claim_held_when_the_writer_panics_cannot_start() -> R {
         &dir,
         Options {
             faults: std::sync::Arc::new(Panicking),
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         },
     )?;
     let claim = store

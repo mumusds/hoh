@@ -151,6 +151,7 @@ fn cli(agent: Agent, path: &OsStr) -> Result<Cli, String> {
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let pi_dir = hoh_agents::login::pi_agent_dir();
     let login = hoh_agents::login::status(agent, &launcher, &env, pi_dir.as_deref())

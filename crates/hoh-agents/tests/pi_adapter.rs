@@ -173,6 +173,7 @@ impl Fakes for World {
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         })
     }
 

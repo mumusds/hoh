@@ -17,13 +17,9 @@
 //! The wall deadline here is the backstop: an inactivity watchdog is separate and does not kill (docs/13).
 
 use crate::frame::{FRAME_LIMIT, Frame, FrameReader, READ_CHUNK};
-use rustix::process::{
-    Pid, PidfdFlags, Signal as RawSignal, WaitId, WaitIdOptions, kill_process_group, pidfd_open,
-    pidfd_send_signal, test_kill_process_group, waitid,
-};
+use rustix::process::{Pid, Signal as RawSignal, test_kill_process_group};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
@@ -243,45 +239,38 @@ pub(crate) trait FakeEvents: Send + Sync + std::fmt::Debug {
 }
 
 impl Process {
-    /// Start `command` with piped stdio in a new process group. Must be called within a Tokio runtime with IO and
-    /// time enabled.
-    pub fn spawn(mut command: Command, config: Config) -> io::Result<Process> {
+    /// Start `command` with piped stdio in a new process group, through `spawner` (docs/adr/ADR-031.md, 设计修正 2:
+    /// the host's direct spawner or a client's gate). Must be called within a Tokio runtime with IO and time enabled.
+    pub fn spawn(
+        mut command: Command,
+        config: Config,
+        spawner: &dyn hoh_core::spawn::Spawner,
+    ) -> io::Result<Process> {
         // The copies exist before the child does, so a file that cannot be created starts nothing.
         let create = |path: &Option<PathBuf>| path.as_ref().map(std::fs::File::create).transpose();
         let stdout_copy = create(&config.stdout_copy)?;
         let stderr_copy = create(&config.stderr_copy)?;
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()?;
-        let pid = Pid::from_child(&child);
-        let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
-            Ok(fd) => fd,
-            Err(e) => {
-                // Without a pidfd the child cannot be supervised: end it now rather than leave it running.
-                let _ = kill_process_group(pid, RawSignal::KILL);
-                // Unreaped, its pid is still its own (M1T07R-103).
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e.into());
-            }
-        };
-        // From here on the leader is ours to reap (dropping `Leader` kills the group): until then it holds its pid
-        // and process group id.
+        // Without a pidfd the child cannot be supervised: the spawner ends it then (its group, its leader, a bounded
+        // reap: M1T07R-103, CLT-700) rather than leave it running.
+        let helper = spawner.helper(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
+        // From here on the leader is ours to reap, through its handle (dropping `Leader` kills the group): until then
+        // it holds its pid and process group id.
         let leader = Leader {
-            pid,
-            pidfd,
-            reaped: false,
+            pid: Pid::from_raw(i32::try_from(helper.shared.pid()).unwrap_or(i32::MAX))
+                .ok_or_else(|| io::Error::other("a child without a pid"))?,
+            shared: helper.shared,
         };
+        let pid = leader.pid;
         let sigchld = signal(SignalKind::child())?;
         let piped = |fd: Option<OwnedFd>| fd.ok_or_else(|| io::Error::other("stdio was not piped"));
-        let stdin = pipe::Sender::from_owned_fd(piped(child.stdin.take().map(OwnedFd::from))?)?;
-        let stdout = pipe::Receiver::from_owned_fd(piped(child.stdout.take().map(OwnedFd::from))?)?;
-        let stderr = pipe::Receiver::from_owned_fd(piped(child.stderr.take().map(OwnedFd::from))?)?;
-        // The std handle neither waits nor kills on drop; the leader is reaped through its pidfd.
-        drop(child);
+        let stdin = pipe::Sender::from_owned_fd(piped(helper.stdin.map(OwnedFd::from))?)?;
+        let stdout = pipe::Receiver::from_owned_fd(piped(helper.stdout.map(OwnedFd::from))?)?;
+        let stderr = pipe::Receiver::from_owned_fd(piped(helper.stderr.map(OwnedFd::from))?)?;
 
         let (events_tx, events) = mpsc::channel(config.queue.max(1));
         let (cancel_tx, cancel_rx) = watch::channel(None);
@@ -392,8 +381,8 @@ impl Process {
 /// The group leader, reaped only through its pidfd.
 struct Leader {
     pid: Pid,
-    pidfd: OwnedFd,
-    reaped: bool,
+    /// Its handle: the one place it is reaped, and numeric group signals only while it is not.
+    shared: std::sync::Arc<hoh_core::spawn::Shared>,
 }
 
 /// How often the leader is checked when no SIGCHLD arrives (signals coalesce; this is only a fallback).
@@ -402,12 +391,11 @@ const EXIT_POLL: Duration = Duration::from_millis(100);
 impl Leader {
     /// The exit status if the leader has exited, without reaping it.
     fn status(&self) -> io::Result<Option<Termination>> {
-        let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
-        let status = waitid(WaitId::PidFd(self.pidfd.as_fd()), options)?;
-        Ok(status.and_then(|s| {
-            s.exit_status()
+        use std::os::unix::process::ExitStatusExt as _;
+        Ok(self.shared.observe()?.and_then(|s| {
+            s.code()
                 .map(Termination::Code)
-                .or_else(|| s.terminating_signal().map(Termination::Signal))
+                .or_else(|| s.signal().map(Termination::Signal))
         }))
     }
 
@@ -426,29 +414,33 @@ impl Leader {
     }
 
     fn signal(&self, target: Target, signal: Signal) {
-        let _ = match target {
-            Target::Leader => pidfd_send_signal(&self.pidfd, signal.raw()),
+        match target {
+            Target::Leader => {
+                let _ = self.shared.signal_leader(signal.raw());
+            }
             Target::Group => {
                 // Only the group gets any signal but SIGKILL: the kernel decides membership as it delivers, so the
                 // leader gets it at most once, and not at all once it has left its group; no snapshot of its group
                 // can decide that without a race (FU-01, FU-21). SIGKILL also goes to the leader through its pidfd,
                 // which names it until it is reaped, so a leader that left its group is still killed after the
-                // grace (M1T07R-103); a second SIGKILL changes nothing.
-                let sent = kill_process_group(self.pid, signal.raw());
+                // grace (M1T07R-103); a second SIGKILL changes nothing. The group is signalled by number only while
+                // the leader is not reaped (its handle's lock), so the id is still its own.
+                self.shared.signal_group(signal.raw());
                 #[cfg(test)]
                 tests::after_group_signal(self.pid);
                 if signal == Signal::Kill {
-                    let _ = pidfd_send_signal(&self.pidfd, signal.raw());
+                    let _ = self.shared.signal_leader(signal.raw());
                 }
-                sent
             }
-        };
+        }
     }
 
+    /// Reap the leader, once it was seen to exit (`exited`).
     fn reap(&mut self) -> io::Result<()> {
-        waitid(WaitId::PidFd(self.pidfd.as_fd()), WaitIdOptions::EXITED)?;
-        self.reaped = true;
-        Ok(())
+        match self.shared.reap()? {
+            Some(_) => Ok(()),
+            None => Err(io::Error::other("the leader has not exited")),
+        }
     }
 }
 
@@ -456,20 +448,11 @@ impl Drop for Leader {
     fn drop(&mut self) {
         // The supervisor was dropped (runtime shutdown) before the leader was reaped: kill the whole group and give
         // the leader a moment to be reaped, so at most a zombie stays until this process exits.
-        if self.reaped {
+        if self.shared.reaped() {
             return;
         }
-        let _ = kill_process_group(self.pid, RawSignal::KILL);
-        // Also a leader that left its group (M1T07R-103).
-        let _ = pidfd_send_signal(&self.pidfd, RawSignal::KILL);
-        let reap = WaitIdOptions::EXITED | WaitIdOptions::NOHANG;
-        for _ in 0..50 {
-            if let Ok(Some(_)) = waitid(WaitId::PidFd(self.pidfd.as_fd()), reap) {
-                self.reaped = true;
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Its group and its leader (also one that left its group, M1T07R-103), then a bounded reap.
+        let _ = self.shared.end(Duration::from_millis(100));
     }
 }
 
@@ -772,6 +755,8 @@ async fn drain_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::process::{PidfdFlags, pidfd_open, pidfd_send_signal};
+    use std::os::fd::AsFd as _;
 
     /// Set by a test: after a group signal to this leader, wait until this file exists (the leader's handler ran).
     static AFTER_GROUP_SIGNAL: std::sync::Mutex<Option<(Pid, PathBuf)>> =
@@ -819,6 +804,7 @@ mod tests {
                 },
                 ..Config::default()
             },
+            &hoh_core::spawn::Direct,
         )?;
         let mut lines = Vec::new();
         let report = tokio::time::timeout(Duration::from_secs(10), async {
@@ -865,7 +851,7 @@ mod tests {
              while True:\n    time.sleep(1)\n",
             count = count.display()
         ));
-        let mut p = Process::spawn(command, Config::default())?;
+        let mut p = Process::spawn(command, Config::default(), &hoh_core::spawn::Direct)?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
         // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
         // and never a number the supervisor's reap has freed (CIR-103, -152).
@@ -938,7 +924,7 @@ mod tests {
             count = count.display(),
             marker = marker.display()
         ));
-        let mut p = Process::spawn(command, Config::default())?;
+        let mut p = Process::spawn(command, Config::default(), &hoh_core::spawn::Direct)?;
         let leader = Pid::from_raw(p.pid() as i32).ok_or("a pid")?;
         // Held while the leader is still unreaped (it runs until it is stopped): the cleanup below signals the process
         // and never a number the supervisor's reap has freed (CIR-103, -152).

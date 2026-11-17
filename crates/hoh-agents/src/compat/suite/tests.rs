@@ -61,6 +61,7 @@ impl Bin {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         }
     }
 

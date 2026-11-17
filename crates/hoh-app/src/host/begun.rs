@@ -505,9 +505,8 @@ mod scan {
         (
             "hoh-agents/src/probe.rs",
             "std::thread::Builder::new()",
-            2,
-            "a probe's schema worker (writes only its scratch in the system temp directory) and the reaper of a \
-             probe's child (writes nothing)",
+            1,
+            "a probe's schema worker (writes only its scratch in the system temp directory)",
         ),
         (
             "hoh-agents/src/probe.rs",
@@ -516,10 +515,17 @@ mod scan {
             "the schema worker's Builder chain",
         ),
         (
-            "hoh-agents/src/probe.rs",
-            ".spawn(move || {",
+            "hoh-core/src/spawn.rs",
+            "std::thread::Builder::new()",
             1,
-            "the child reaper's Builder chain",
+            "the reaper of a helper whose leader did not exit within its handle's bound, a probe's or the WAL \
+             self-test's (writes nothing; docs/adr/ADR-031.md, 设计修正 2, A2)",
+        ),
+        (
+            "hoh-core/src/spawn.rs",
+            ".spawn(",
+            1,
+            "that reaper's Builder chain",
         ),
     ];
 

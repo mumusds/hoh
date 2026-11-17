@@ -33,7 +33,7 @@ fn open(dir: &tempfile::TempDir, clock: &std::sync::Arc<TestClock>) -> R<(Store,
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
         clock: Some(StoreClock(clock.clone())),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }
@@ -445,7 +445,7 @@ async fn a_slow_commit_times_its_events_from_after_the_commit() -> R {
             wal_probe: Some(selftest::test_probe(None)),
             clock: Some(StoreClock(clock.clone())),
             faults: hooks.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     exec(&path, WORLD)?;
@@ -538,7 +538,7 @@ async fn a_step_takes_in_its_events_in_batches_of_at_most_ten_thousand() -> R {
             wal_probe: Some(selftest::test_probe(None)),
             clock: Some(StoreClock(clock.clone())),
             faults: hooks.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     exec(&path, WORLD)?;

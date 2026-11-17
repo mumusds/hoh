@@ -7,6 +7,7 @@ use std::time::Duration;
 
 fn env(timeout: Duration) -> ProbeEnv {
     ProbeEnv {
+        spawner: hoh_core::spawn::Direct::shared(),
         path: OsString::from("/usr/bin:/bin"),
         fixture_root: None,
         timeout,

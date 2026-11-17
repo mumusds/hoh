@@ -220,6 +220,22 @@ impl Shared {
         self.signal_group(Signal::KILL);
         self.reap().ok().flatten()
     }
+
+    /// [`Shared::end`] within `limit`; a leader that did not exit by then (a call SIGKILL does not end) is left to a
+    /// reaper thread of its own that goes on in the same order, so it is never left unreaped in a long-lived process
+    /// (CLT-702). When no such thread can be made, it stays a zombie until this process ends (stated residual).
+    pub fn end_or_reap_later(self: &Arc<Self>, limit: Duration) -> Option<ExitStatus> {
+        if let Some(status) = self.end(limit) {
+            return Some(status);
+        }
+        let shared = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("hoh-reap".to_owned())
+            .spawn(
+                move || while shared.end(Duration::from_secs(60)).is_none() && !shared.reaped() {},
+            );
+        None
+    }
 }
 
 /// A host, as its starter holds it: it can be waited for and its stderr read, nothing else; dropping it does

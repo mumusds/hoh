@@ -15,7 +15,7 @@ fn open(dir: &tempfile::TempDir) -> R<(Store, PathBuf)> {
     let path = dir.path().join(".hoh/state.db");
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     let store = Store::open(&path, options)?;
     Connection::open(&path)?.execute_batch(
@@ -1474,7 +1474,7 @@ async fn a_commander_change_writes_binding_package_and_session_start_in_one_tran
         Options {
             wal_probe: Some(selftest::test_probe(None)),
             faults: faults.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     exec(

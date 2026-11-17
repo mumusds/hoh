@@ -27,6 +27,7 @@ fn an_escaped_helper_holding_the_output_leaves_nothing_in_the_probe()
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     // The helper inherits stdout and stderr and outlives the command in a session of its own. It appends its own stat
     // line (a builtin read, while it surely runs), so the test ends it and never a process given its number later
