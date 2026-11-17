@@ -1238,17 +1238,17 @@
    "steps": [
     "(a) 依次以 claude、codex App Server、pi 为 Commander 启动 run，Developer 为 claude；注入两次 need_decision，第二次续同一会话；第一次时 fake Commander 在最终消息的块中给出 record_assumption，并向 messages.jsonl 追加另一条决策",
     "读取 fake 记录的两次 argv 与 App Server 收到的 thread/start、thread/resume，读取 events 与 decisions",
-    "(b) 对三组缺项变体启动 run，该 Agent 同时为 Commander 与 Developer；读取兼容清单、团队视图与 attempts",
-    "(c) 依次把本机检查设为 unconfined、unavailable、unknown，codex 同时为 Commander 与 Developer；再从 unavailable 改为 confined；另在 unknown 时分配 Commander 的 turn，经钩子在 prepare 之前刷新得到 unavailable，再改为 confined；读取团队视图、判决证据、events、attempts 与 sessions",
-    "(d) 只走 exec 的 codex，以及在一次 Developer turn 中降级的 codex，各同时为 Commander 与 Developer；读取团队视图、attempts 与 fake 记录的 argv"
+    "(b) 对三组缺项变体各起两个 run：run R 中该 Agent 同时为 Commander 与 Developer，run S 中 Commander 为另一个 Agent、Developer 为该 Agent；读取兼容清单、团队视图、runs 与 attempts",
+    "(c) 依次把本机检查设为 unconfined、unavailable、unknown，codex 同时为 Commander 与 Developer（unconfined、unavailable 时另起 run S：Commander 为 claude，Developer 为 codex）；再从 unavailable 改为 confined；另在 unknown 时分配 Commander 的 turn，经钩子在 prepare 之前刷新得到 unavailable，再改为 confined；读取团队视图、判决证据、events（含 Commander Attempt 的 context.packed）、attempts 与 sessions",
+    "(d) 只走 exec 的 codex（run R 与 run S，同 (b)），以及在一次 Developer turn 中降级的 codex（同一个 run），各同时为 Commander 与 Developer；读取团队视图、attempts 与 fake 记录的 argv"
    ],
    "pass_criteria": [
     "(a) 两次 turn 的启动与 REQ-021 行为 9 的清单逐项相等，不含任何 YOLO 选项；Developer 的启动含 YOLO 选项",
     "(a) 块中的决策 APPLIED；messages.jsonl 中的决策没有 supervisor.output，supervisor.bridge_ignored 恰 1 条",
-    "(b) suite.status=PASS 且 read_only 用例 FAIL；commander 绑定 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，Commander Attempt 数为 0；该 Agent 的 Developer Attempt 为 SETTLED",
-    "(c) unconfined、unavailable：commander 绑定 BLOCKED，缺项为 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`，证据含检查结论，Commander Attempt 数为 0；compat-manifest.json 中 codex 的 read_only 用例仍为 PASS，sessions.capabilities_json 不变；Developer Attempt 为 SETTLED；unknown：Commander Attempt 启动，证据含 unknown 与原因；改为 confined 后的下一次刷新：commander 绑定解除阻塞，Commander Attempt 启动",
+    "(b) suite.status=PASS 且 read_only 用例 FAIL；commander 绑定 BLOCKED，缺项为 `<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace`，Commander Attempt 数为 0；run R 为 BLOCKED（COMMANDER_UNAVAILABLE），其 Developer 绑定有会话；run S 中该 Agent 的 Developer Attempt 为 SETTLED",
+    "(c) unconfined、unavailable：commander 绑定 BLOCKED，缺项为 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`，证据含检查结论，Commander Attempt 数为 0；compat-manifest.json 中 codex 的 read_only 用例仍为 PASS，sessions.capabilities_json 不变；run S 中 codex 的 Developer Attempt 为 SETTLED；unknown：Commander Attempt 启动，其 context.packed 的 read_only.host_check 为 unknown 并带原因；改为 confined 后的下一次刷新：commander 绑定解除阻塞，Commander Attempt 启动，run R 的 Developer Attempt 在原会话中 SETTLED",
     "(c) 已分配之后失去能力：prepare 拒绝为 AGENT_UNAVAILABLE，events 中没有 team.binding_excluded；改为 confined 后同一 codex 版本的 Commander Attempt 再被派发并 SETTLED；codex Developer 的 session_id 始终相同",
-    "(d) 两种 codex 都不被选为 Commander，缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`；fake 记录中没有 Commander 的 exec 启动；codex Developer Attempt 为 SETTLED"
+    "(d) 两种 codex 都不被选为 Commander，缺项含 `codex:CAPABILITY_UNSUPPORTED:read_only_workspace`；fake 记录中没有 Commander 的 exec 启动；codex 的 Developer Attempt 为 SETTLED（只走 exec 时在 run S 中，降级时在同一个 run 中）"
    ],
    "observables": [
     "fake 记录的 argv、cwd 与 App Server 收到的请求",

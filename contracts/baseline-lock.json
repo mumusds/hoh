@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 19,
+  "revision": 20,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "067dcb20645f338b4f3afa74fc69c1543eb908b6aa2ef6e44df147d7b3d6a4e5"
+    "lock_sha256": "08a588f4b43e7e0339f1302c3ae3fc04364c676bc6d4903361358d82fd4b2cf9"
   },
   "change_requests": [
     {
@@ -97,12 +97,17 @@
       "id": "CR-024",
       "path": "docs/cr/CR-024-commander-read-only-profile.md",
       "sha256": "f8aa6ba03053262ea5d2858994bf06ceaa6e44ee0309358faeda59c9c287835e"
+    },
+    {
+      "id": "CR-027",
+      "path": "docs/cr/CR-027-ac-021-06-commander-vacancy-run.md",
+      "sha256": "31051e5b52fc51a24b303b98e4d0321ff029d67fb1dbbfe9a30c1ff7d00ab7b1"
     }
   ],
   "files": {
     "CONTRACT.md": "c6d6ef54a6bceb9fb07ed156fb12a4c029c1d1cc374a669132edc6d0c73cdc8f",
     "contracts/acceptance-observation.schema.json": "6778331658ba0d47797185f5e2d322f62020ea8747c00d2ce9f1247440c1490e",
-    "contracts/acceptance-scenarios.json": "477c77f41224196d40a8fdaae8f132a8fba72af4e60bb1ce0b2f03a0beeefdf2",
+    "contracts/acceptance-scenarios.json": "0304c4686cc73c3fe048f5809c66131ec923477b71a797ba8bbf907e17e8f885",
     "contracts/candidate.schema.json": "5965712d9f1c16e8804f3e00dbc1e2faec0b878435ba868afd637b242bb439cb",
     "contracts/check-plan.schema.json": "d4dac3c7c3ebee4356d332541035ecf9c03d12e101acb5f7c717b1598359a86a",
     "contracts/compat-manifest.schema.json": "6b4a676fc8af07bef82c7fa2d3f911ef47791026459e88419026cad565ab8de4",
@@ -114,7 +119,7 @@
     "contracts/protocol.schema.json": "6e54e1002d78290575ba0f885f8d378202325f9fb3a851d57c9026c0f9ecfa7f",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "5371a2075d328d683255792ed1ed3cf95ae420db35289c28f22b232dc469acb9",
+    "contracts/requirements.json": "520877619624a0e88178f556211a9e8e5c046970d7260dcf570b56838176bdea",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
     "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",
