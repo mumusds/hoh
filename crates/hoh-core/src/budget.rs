@@ -75,6 +75,73 @@ pub fn stop(budget: &Budget, now: SystemTime) -> Option<Stop> {
     None
 }
 
+/// The share of a limit from which a run's budget is at risk (REQ-042 behaviour 9 and decision 6, CR-025): an initial
+/// value, a warning and no guarantee.
+pub const RISK_THRESHOLD: f64 = 0.8;
+
+/// A budget past [`RISK_THRESHOLD`] of its limit whose stop does not hold yet (REQ-042 behaviour 9, CR-025).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Risk {
+    /// The stop it comes before, named as `run.incomplete` names it.
+    pub kind: Stop,
+    /// What was judged: what is used plus what is reserved; for the deadline, the wall-clock seconds since the run was
+    /// created.
+    pub used: f64,
+    /// The limit, in the same unit; for the deadline, the seconds from the run's creation to it.
+    pub limit: f64,
+}
+
+impl Risk {
+    /// Its unit: iterations, seconds or usd.
+    pub fn unit(&self) -> &'static str {
+        match self.kind {
+            Stop::Iterations => "iterations",
+            Stop::Cost => "usd",
+            Stop::Duration | Stop::Deadline => "seconds",
+        }
+    }
+}
+
+/// The risks of `budget` at the wall-clock time `wall`, for a run created at `created_at` (REQ-042 behaviour 9,
+/// CR-025), in the order of [`stop`]: each kind with a limit set that has reached [`RISK_THRESHOLD`] of it by its stop's
+/// own measure, its stop not holding yet. The iterations, the duration and a cost whose price is known by what is used
+/// plus what is reserved (a cost whose price is unknown cannot be enforced, so it has none); the deadline by the wall
+/// clock, the seconds since the run's creation against the span from it to deadline_at, not judged when that span is
+/// not positive (a wall clock behind the creation has no time passed).
+pub fn risks(budget: &Budget, created_at: SystemTime, wall: SystemTime) -> Vec<Risk> {
+    let mut out = Vec::new();
+    if let Some(deadline) = budget.deadline_at
+        && wall < deadline
+        && let Ok(span) = deadline.duration_since(created_at)
+        && !span.is_zero()
+    {
+        let (used, limit) = (
+            wall.duration_since(created_at)
+                .map_or(0.0, |d| d.as_secs_f64()),
+            span.as_secs_f64(),
+        );
+        if used >= RISK_THRESHOLD * limit {
+            out.push(Risk {
+                kind: Stop::Deadline,
+                used,
+                limit,
+            });
+        }
+    }
+    let of = |kind, ledger: Option<Ledger>| {
+        let ledger = ledger.filter(|l| !l.used_up())?;
+        let (used, limit) = (ledger.used + ledger.reserved, ledger.limit?);
+        (used >= RISK_THRESHOLD * limit).then_some(Risk { kind, used, limit })
+    };
+    out.extend(of(Stop::Iterations, budget.iterations));
+    out.extend(of(Stop::Duration, budget.wall_seconds));
+    out.extend(of(
+        Stop::Cost,
+        budget.usd.filter(|(_, known)| *known).map(|(l, _)| l),
+    ));
+    out
+}
+
 /// Whether a cost limit is set while the price is unknown: it cannot be enforced (CR-002, BUDGET_UNENFORCEABLE).
 pub fn unenforceable(budget: &Budget) -> bool {
     budget
@@ -161,6 +228,130 @@ mod tests {
         assert_eq!(stop(&cost(true), now), Some(Stop::Cost));
         // An unknown price is no stop: it blocks before any dispatch instead.
         assert_eq!(stop(&cost(false), now), None);
+    }
+
+    fn risk(kind: Stop, used: f64, limit: f64) -> Risk {
+        Risk { kind, used, limit }
+    }
+
+    #[test]
+    fn a_budget_is_at_risk_from_80_percent_of_its_limit_until_its_stop() {
+        // REQ-042 behaviour 9 (CR-025): each kind with a limit, by its stop's measure (used plus reserved): 79 % none,
+        // 80 % one, and none once its stop holds (the stop says so); a cost whose price is unknown and an unset limit
+        // have none.
+        let (created, wall) = (UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1));
+        let none: [Risk; 0] = [];
+        let iterations = |used, reserved| Budget {
+            iterations: Some(ledger(Some(100.0), used, reserved)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&iterations(79.0, 0.0), created, wall), none);
+        assert_eq!(
+            risks(&iterations(80.0, 0.0), created, wall),
+            [risk(Stop::Iterations, 80.0, 100.0)]
+        );
+        assert_eq!(
+            risks(&iterations(60.0, 20.0), created, wall),
+            [risk(Stop::Iterations, 80.0, 100.0)],
+            "what is reserved counts"
+        );
+        assert_eq!(
+            risks(&iterations(99.0, 1.0), created, wall),
+            none,
+            "its stop holds"
+        );
+        let duration = |used| Budget {
+            wall_seconds: Some(ledger(Some(3_600.0), used, 0.0)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&duration(2_879.0), created, wall), none);
+        assert_eq!(
+            risks(&duration(2_880.0), created, wall),
+            [risk(Stop::Duration, 2_880.0, 3_600.0)]
+        );
+        let cost = |used, known| Budget {
+            usd: Some((ledger(Some(5.0), used, 0.0), known)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&cost(3.9, true), created, wall), none);
+        assert_eq!(
+            risks(&cost(4.0, true), created, wall),
+            [risk(Stop::Cost, 4.0, 5.0)]
+        );
+        assert_eq!(
+            risks(&cost(4.5, false), created, wall),
+            none,
+            "an unknown price"
+        );
+        let unset = Budget {
+            iterations: Some(ledger(None, 1e9, 0.0)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&unset, created, wall), none);
+        assert_eq!(risks(&Budget::default(), created, wall), none);
+        assert_eq!(
+            [Stop::Iterations, Stop::Duration, Stop::Cost, Stop::Deadline]
+                .map(|kind| risk(kind, 0.0, 1.0).unit()),
+            ["iterations", "seconds", "usd", "seconds"]
+        );
+    }
+
+    #[test]
+    fn the_deadline_is_at_risk_by_the_wall_clock_over_the_runs_span() {
+        // REQ-042 behaviour 9 (CR-025): the seconds since the run's creation against its span to deadline_at, from
+        // 80 % until the deadline's stop; a wall clock behind the creation has no time passed; a span that is not
+        // positive is not judged. Several kinds come in the order of the stops.
+        let created = UNIX_EPOCH + Duration::from_secs(1_000);
+        let s = Duration::from_secs;
+        let none: [Risk; 0] = [];
+        let budget = Budget {
+            deadline_at: Some(created + s(100)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&budget, created, created + s(79)), none);
+        assert_eq!(
+            risks(&budget, created, created + s(80)),
+            [risk(Stop::Deadline, 80.0, 100.0)]
+        );
+        assert_eq!(
+            risks(&budget, created, created + Duration::from_millis(99_999)),
+            [risk(Stop::Deadline, 99.999, 100.0)]
+        );
+        assert_eq!(
+            risks(&budget, created, created + s(100)),
+            none,
+            "its stop holds"
+        );
+        assert_eq!(
+            risks(&budget, created, created - s(10)),
+            none,
+            "the wall clock behind"
+        );
+        let at_creation = Budget {
+            deadline_at: Some(created),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&at_creation, created, created - s(1)), none);
+        let before = Budget {
+            deadline_at: Some(created - s(50)),
+            ..Budget::default()
+        };
+        assert_eq!(risks(&before, created, created - s(60)), none);
+        let all = Budget {
+            deadline_at: Some(created + s(100)),
+            iterations: Some(ledger(Some(100.0), 80.0, 0.0)),
+            wall_seconds: Some(ledger(Some(3_600.0), 2_880.0, 0.0)),
+            usd: Some((ledger(Some(5.0), 4.0, 0.0), true)),
+        };
+        assert_eq!(
+            risks(&all, created, created + s(80)),
+            [
+                risk(Stop::Deadline, 80.0, 100.0),
+                risk(Stop::Iterations, 80.0, 100.0),
+                risk(Stop::Duration, 2_880.0, 3_600.0),
+                risk(Stop::Cost, 4.0, 5.0)
+            ]
+        );
     }
 
     #[test]

@@ -1197,3 +1197,47 @@ async fn a_source_at_its_candidates_barrier_is_not_in_flight_and_its_run_blocks_
     assert!(joined(&path, &c)?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn an_iteration_a_join_counts_is_reported_at_risk_by_the_next_pace() -> R {
+    // REQ-042 behaviour 9 (CR-025): the join counts R's iteration in its own transaction (3 of 5 before it, 4 after:
+    // 80 %); it writes no budget.risk itself, the next pace does, once.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    let c1 = freeze_d(&store, &path, 0, 'b').await?;
+    let r1 = child_id(&c1, "round/1");
+    Connection::open(&path)?.execute_batch(
+        "INSERT OR REPLACE INTO budgets(scope_kind, scope_id, kind, limit_value, used_value) VALUES ('run', 'R', 'iterations', 5, 3);",
+    )?;
+    start_all(&store, &path).await?;
+    verify(
+        &store,
+        &path,
+        (&r1, &c1, "rec-1"),
+        &["AC-1-01"],
+        ("PASS", "PASS"),
+    )
+    .await?;
+    reconcile(&store).await?;
+    assert_eq!(iterations(&path, &c1)?, ["passable"]);
+    let risks = || {
+        texts(
+            &path,
+            "SELECT payload_json FROM events WHERE kind = 'budget.risk'",
+        )
+    };
+    assert_eq!(risks()?, Vec::<String>::new(), "the join wrote a risk");
+    store.pace_run("R", verifiers()).await?;
+    store.pace_run("R", verifiers()).await?;
+    let written = risks()?
+        .iter()
+        .map(|t| serde_json::from_str(t))
+        .collect::<Result<Vec<Value>, _>>()?;
+    assert_eq!(
+        written,
+        [
+            json!({"kind": "max_iterations", "used": 4, "limit": 5, "unit": "iterations", "threshold": 0.8})
+        ]
+    );
+    Ok(())
+}
