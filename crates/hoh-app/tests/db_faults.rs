@@ -382,8 +382,9 @@ fn read_only_a_hoh_directory_the_host_cannot_write_is_named_as_such_not_taken_fo
 struct Mount {
     point: PathBuf,
     mounted: bool,
-    /// The mount point's directory, and the loop image's for an ext4 one.
-    work: tempfile::TempDir,
+    /// The mount point's directory, and the loop image's for an ext4 one; none for a bind mount over a directory of
+    /// the test's.
+    work: Option<tempfile::TempDir>,
 }
 
 impl Mount {
@@ -421,7 +422,7 @@ impl Mount {
         Ok(Mount {
             point,
             mounted: true,
-            work,
+            work: Some(work),
         })
     }
 
@@ -442,7 +443,7 @@ impl Mount {
         let mount = Mount {
             point,
             mounted: true,
-            work,
+            work: Some(work),
         };
         let owner = format!(
             "{}:{}",
@@ -461,6 +462,19 @@ impl Mount {
             .unwrap_or_default()
             .to_owned();
         Ok((mount, device))
+    }
+
+    /// `dir` bind-mounted on itself, read-only: its files open already stay writable, new opens for writing fail.
+    fn read_only_bind(dir: &Path) -> R<Mount> {
+        let path = dir.display().to_string();
+        Mount::sudo(&["mount", "--bind", &path, &path])?;
+        let mount = Mount {
+            point: dir.to_path_buf(),
+            mounted: true,
+            work: None,
+        };
+        Mount::sudo(&["mount", "-o", "remount,bind,ro", &path])?;
+        Ok(mount)
     }
 
     /// Fill it: a file grown until the file system says it is full.
@@ -516,7 +530,9 @@ impl Drop for Mount {
         if Mount::sudo(&["umount", "-l", &point]).is_ok() {
             return;
         }
-        self.work.disable_cleanup(true);
+        if let Some(work) = self.work.as_mut() {
+            work.disable_cleanup(true);
+        }
         eprintln!("db_faults: {point} is still mounted; unmount it with `sudo umount {point}`");
     }
 }
@@ -642,6 +658,37 @@ fn read_only_a_file_system_that_turns_read_only_under_its_host_fails_commands_wi
         assert_eq!(out.status.code(), Some(69), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("Read-only file system"), "{stderr}");
+        Ok(())
+    })();
+    finish(outcome, project, mount)
+}
+
+#[test]
+#[ignore = "bind-mounts the project's .hoh read-only with sudo -n (docs/09 fault matrix item 7); run with --ignored"]
+fn read_only_a_hoh_directory_bind_mounted_read_only_under_its_host_is_still_written_and_the_next_start_refuses_saying_so()
+-> R {
+    // F7-52: a read-only bind mount over .hoh takes effect at the next open, as a mode change does: the running host
+    // holds its files open for writing, so its commands are still taken; the next host cannot open its lock, says
+    // so, and writes nothing.
+    let dir = tempfile::tempdir()?;
+    let project = Project::in_dir(dir.path())?;
+    project.accepted("first")?;
+    let mount = Mount::read_only_bind(&project.hoh_dir())?;
+    // Bound again after the mount, so that a failed check drops it (its host killed and waited for) before the mount.
+    let project = project;
+    let outcome = (|| -> R {
+        project.accepted("second")?;
+        project.stop_host()?;
+        let before = project.dump()?;
+        let out = project.submit("third")?;
+        assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("host.lock") && stderr.contains("Read-only file system"),
+            "{stderr}"
+        );
+        assert_eq!(project.dump()?, before);
+        assert_eq!(project.sql("SELECT count(*) FROM runs")?, "2");
         Ok(())
     })();
     finish(outcome, project, mount)
