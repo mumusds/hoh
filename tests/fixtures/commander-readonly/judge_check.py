@@ -18,7 +18,8 @@ get_state named. The replay builds every message the adapter writes from the lau
 initialize, initialized and thread request once initialize is answered, turn/start once the thread request is, server
 requests answered by `headless_answer`; pi's get_state, the prompt once the session check passes, dialogs answered
 cancelled). The recorded request log is never read for that; `request_problems` compares it with `Replay.sent`
-exactly, except the fields `_comparable` names (initialize's clientInfo.version, the prompt's text).
+exactly as typed JSON (`_json_equal`), except the fields `_comparable` names (initialize's clientInfo.version, the
+prompt's text). Types are checked before enum tests, and `exit`'s fields are closed (M2T20D-1000, -1001).
 
 What the judge does itself, here and in M2-T20 alike:
 - the codex rollout, which no adapter reads, enumerated default-deny (`rollout_calls`): every call of the adapter's
@@ -247,6 +248,7 @@ def _file_identity(v) -> bool:
 
 
 LAUNCH_FIELDS = {'codex': {'profile', 'resume', 'model'}, 'pi': {'session_id', 'resume'}}
+EXIT_FIELDS = {'returncode', 'how'}  # closed (M2T20D-1001): `how` is the named recorder-only description
 # Recorded but read by no adapter, so not compared (named): the recorder's description of how the process ended (the
 # exit status is `exit.returncode`), and pi's `prompt_sent` (what the adapter itself decides from the get_state
 # answer) and `get_state_session_file` (the stream's own get_state answer has it). A new pi session's `noted` and
@@ -270,7 +272,7 @@ def required_observations(c: Case) -> list[tuple[tuple, object, list]]:
         req.append((('prompt_fed',), lambda v: isinstance(v, bool), [1]))
     elif c.agent == 'codex':
         req += [(('launch',), lambda v: isinstance(v, dict), ['read_only']),
-                (('launch', 'profile'), lambda v: v in CODEX_PROFILES, ['readonly', 1]),
+                (('launch', 'profile'), lambda v: isinstance(v, str) and v in CODEX_PROFILES, ['readonly', 1]),
                 (('launch', 'resume'), lambda v: v is None or _text(v), [True, '']),
                 (('launch', 'model'), lambda v: v is None or _text(v), [5])]
     elif c.agent == 'pi':
@@ -303,6 +305,8 @@ def observation_problems(c: Case) -> list[str]:
             problems.append(f"{'.'.join(path)} ill-typed")
     if c.agent in LAUNCH_FIELDS and isinstance(obs.get('launch'), dict):
         problems += [f'launch.{k} unknown' for k in obs['launch'] if k not in LAUNCH_FIELDS[c.agent]]
+    if isinstance(obs.get('exit'), dict):
+        problems += [f'exit.{k} unknown' for k in obs['exit'] if k not in EXIT_FIELDS]
     return problems
 
 
@@ -952,6 +956,19 @@ def cells(c: Case) -> dict[str, str]:
 IGNORED = '<not compared>'
 
 
+def _json_equal(a, b) -> bool:
+    """Typed JSON equality (M2T20D-1000), as serde_json's `Value` compares: the same JSON type at every level (a
+    boolean never equals a number, an integer never equals a float, null equals only null), objects with the same key
+    set and equal values, arrays element by element."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def _comparable(message) -> object:
     """The message with the fields the comparison contract does not compare replaced (M2T20D-950, -901; ADR-032
     design correction 7 item 2): initialize's `params.clientInfo.version` (a non-empty string: the hoh build that
@@ -974,8 +991,8 @@ def _comparable(message) -> object:
 
 def request_problems(c: Case) -> list[str]:
     """The recorded request log must be exactly the messages the product's adapter writes in this replay, built from
-    the recorded launch (`Replay.sent`): the same number, in the same order, each equal key for key and value for value
-    except the fields `_comparable` names. Else the recording does not show what the product would have sent (its
+    the recorded launch (`Replay.sent`): the same number, in the same order, each equal as typed JSON (`_json_equal`)
+    key for key and value for value except the fields `_comparable` names. Else the recording does not show what the product would have sent (its
     profile, its thread, its order), and the case is insufficient coverage."""
     if c.agent == 'claude' or (c.agent == 'codex' and c.name.startswith('exec')):
         return []
@@ -986,7 +1003,7 @@ def request_problems(c: Case) -> list[str]:
     if len(log) != len(sent):
         return [f"the request log is not the product's own ({len(log)} messages, the adapter sends {len(sent)})"]
     return [f"the request log is not the product's own (message {i})" for i, (a, b) in enumerate(zip(sent, log))
-            if _comparable(a) != _comparable(b)][:1]
+            if not _json_equal(_comparable(a), _comparable(b))][:1]
 
 
 def call_problems(c: Case) -> list[str]:
@@ -1263,19 +1280,41 @@ def _edit_observation(c: Case, path: tuple, value) -> None:
         c.exit_code = (c.observations.get('exit') or {}).get('returncode') if isinstance(c.observations.get('exit'), dict) else None
 
 
+JSON_SAMPLES = (None, True, False, 0, -1, 1.5, '', 'x', [], ['x'], {}, {'x': 1})  # every JSON type, containers too
+
+
 def _observation_fields(c: Case) -> list[tuple[str, object]]:
-    """Every required observation removed, and set to each ill-typed value; an unknown observation and (codex, pi) an
-    unknown launch field (M2T20D-900, -950): each must be NOT_OBSERVED."""
+    """Every required observation removed, and set to each listed wrong value and to every JSON sample its type does
+    not accept (each JSON type, the containers included); an unknown observation, an unknown exit field and (codex,
+    pi) an unknown launch field (M2T20D-900, -950, -1001): each must be NOT_OBSERVED."""
     out = []
-    for path, _, wrongs in required_observations(c):
+    for path, valid, wrongs in required_observations(c):
         name = '.'.join(path)
         out.append((f'{name} missing', lambda m, p=path: _edit_observation(m, p, UNOBSERVED)))
-        for w in wrongs:
+        values = list(wrongs) + [v for v in JSON_SAMPLES if not valid(v) and not any(_json_equal(v, w) for w in wrongs)]
+        for w in values:
             out.append((f'{name} = {json.dumps(w)}', lambda m, p=path, w=w: _edit_observation(m, p, copy.deepcopy(w))))
     out.append(('an unknown observation', lambda m: _edit_observation(m, ('sandbox',), 'read-only')))
+    out.append(('an unknown exit field', lambda m: _edit_observation(m, ('exit', 'signal'), 9)))
     if c.agent in LAUNCH_FIELDS:
         out.append(('an unknown launch field', lambda m: _edit_observation(m, ('launch', 'sandbox'), 'read-only')))
     return out
+
+
+def _typed_requests(c: Case) -> list[tuple[str, object]]:
+    """The request log's values replaced by the same value of another JSON type (M2T20D-1000): each must differ."""
+    if c.agent == 'codex':
+        return [('initialize id false', lambda m: _logged(m, 'initialize').update(id=False)),
+                ('the thread request id true', lambda m: _thread_request(m).update(id=True)),
+                ('the thread request id 1.0', lambda m: _thread_request(m).update(id=1.0)),
+                ('turn/start id "2"', lambda m: _logged(m, 'turn/start').update(id='2')),
+                ('sandbox as a list', lambda m: _thread_request(m)['params'].update(sandbox=[_thread_request(m)['params']['sandbox']])),
+                ('approvalPolicy as an object', lambda m: _thread_request(m)['params'].update(approvalPolicy={'value': 'never'})),
+                ('initialized with null params', lambda m: _logged(m, 'initialized').update(params=None)),
+                ('turn/start input as an object', lambda m: _logged(m, 'turn/start')['params'].update(input={'type': 'text', 'text': 'x'}))]
+    return [('get_state id as a list', lambda m: _logged(m, 'get_state').update(id=['hoh-state-1'])),
+            ('the prompt type as an object', lambda m: _logged(m, 'prompt').update(type={'value': 'prompt'})),
+            ('the prompt message as a list', lambda m: _logged(m, 'prompt').update(message=['x']))]
 
 
 def _thread_request(m: Case) -> dict:
@@ -1590,6 +1629,11 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         add('observation field', label, edit=edit)
     for label, edit in _observation_fields(control):
         add('control observation field', label, edit_control=edit)
+    if a != 'claude':
+        for label, edit in _typed_requests(c):
+            add('request log typed', label, edit=edit)
+        for label, edit in _typed_requests(control):
+            add('control request log typed', label, edit_control=edit)
     add('observation', 'the logs not read to their end', edit=lambda m: _observe(m, logs_complete=False))
     add('control observation', 'the control logs not read to their end', edit_control=lambda m: _observe(m, logs_complete=False))
     add('observation', 'how the process ended, as the recorder describes it (not read)', expect='same',

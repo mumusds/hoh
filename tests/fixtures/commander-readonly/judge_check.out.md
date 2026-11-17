@@ -166,8 +166,8 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | drop control | non-PASS | 2 INSUFFICIENT | 2 INSUFFICIENT | 24 INSUFFICIENT | 24 INSUFFICIENT | 2 INSUFFICIENT | 2 INSUFFICIENT |
 | control terminal | non-PASS | 4 INSUFFICIENT | 4 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT | 4 INSUFFICIENT | 4 INSUFFICIENT |
 | terminal | non-PASS | 4 INSUFFICIENT | 4 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT | 4 INSUFFICIENT | 4 INSUFFICIENT |
-| observation field | non-PASS | 11 INSUFFICIENT | 11 INSUFFICIENT | 20 INSUFFICIENT | 20 INSUFFICIENT | 19 INSUFFICIENT | 25 INSUFFICIENT |
-| control observation field | non-PASS | 11 INSUFFICIENT | 11 INSUFFICIENT | 20 INSUFFICIENT | 20 INSUFFICIENT | 19 INSUFFICIENT | 19 INSUFFICIENT |
+| observation field | non-PASS | 62 INSUFFICIENT | 62 INSUFFICIENT | 101 INSUFFICIENT | 101 INSUFFICIENT | 88 INSUFFICIENT | 114 INSUFFICIENT |
+| control observation field | non-PASS | 62 INSUFFICIENT | 62 INSUFFICIENT | 101 INSUFFICIENT | 101 INSUFFICIENT | 88 INSUFFICIENT | 88 INSUFFICIENT |
 | observation | non-PASS | 4 INSUFFICIENT | 4 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT |
 | control observation | non-PASS | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT |
 | observation | same | 1 PASS | 1 PASS | 2 PASS | 2 PASS | 3 PASS | 3 PASS |
@@ -182,6 +182,8 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | success before refusal + duplicated | non-PASS | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL |
 | duplicate | same | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS |
 | reorder | same | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS |
+| request log typed | non-PASS | — | — | 8 INSUFFICIENT | 8 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT |
+| control request log typed | non-PASS | — | — | 8 INSUFFICIENT | 8 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT |
 | initialize handshake | non-PASS | — | — | 4 INSUFFICIENT | 4 INSUFFICIENT | — | — |
 | initialize handshake | same | — | — | 1 PASS | 1 PASS | — | — |
 | request log | non-PASS | — | — | 21 INSUFFICIENT | 22 INSUFFICIENT | 4 INSUFFICIENT | 4 INSUFFICIENT |
@@ -222,26 +224,128 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | claude/ro-new | terminal | exit 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-new | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); decision block insufficient |
 | claude/ro-new | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
 | claude/ro-new | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); decision block insufficient |
 | claude/ro-new | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-new | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
 | claude/ro-new | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); decision block insufficient |
 | claude/ro-new | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
 | claude/ro-new | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); decision block insufficient |
 | claude/ro-new | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
 | claude/ro-new | observation field | prompt_fed missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed missing)); decision block insufficient |
 | claude/ro-new | observation field | prompt_fed = 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-new | observation field | prompt_fed = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
 | claude/ro-new | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); decision block insufficient |
+| claude/ro-new | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); decision block insufficient |
 | claude/ro-new | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | prompt_fed missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | prompt_fed = 1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | prompt_fed = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | claude/ro-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |
@@ -276,26 +380,128 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | claude/ro-resumed | terminal | exit 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-resumed | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); decision block insufficient |
 | claude/ro-resumed | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
 | claude/ro-resumed | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); decision block insufficient |
 | claude/ro-resumed | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| claude/ro-resumed | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
 | claude/ro-resumed | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); decision block insufficient |
 | claude/ro-resumed | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
 | claude/ro-resumed | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); decision block insufficient |
 | claude/ro-resumed | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
 | claude/ro-resumed | observation field | prompt_fed missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed missing)); decision block insufficient |
 | claude/ro-resumed | observation field | prompt_fed = 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
+| claude/ro-resumed | observation field | prompt_fed = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed)); decision block insufficient |
 | claude/ro-resumed | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); decision block insufficient |
+| claude/ro-resumed | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); decision block insufficient |
 | claude/ro-resumed | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | prompt_fed missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | prompt_fed = 1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | prompt_fed = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | claude/ro-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |
@@ -350,44 +556,222 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
 | codex/app-ro-new | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); availability insufficient |
 | codex/app-ro-new | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); availability insufficient |
 | codex/app-ro-new | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-new | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
 | codex/app-ro-new | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); availability insufficient |
 | codex/app-ro-new | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); availability insufficient |
 | codex/app-ro-new | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | launch missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
 | codex/app-ro-new | observation field | launch = "read_only" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-new | observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
 | codex/app-ro-new | observation field | launch.profile missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile missing)); availability insufficient |
 | codex/app-ro-new | observation field | launch.profile = "readonly" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | launch.profile = 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.profile = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | launch.resume missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing)); availability insufficient |
 | codex/app-ro-new | observation field | launch.resume = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | launch.model missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model missing)); availability insufficient |
 | codex/app-ro-new | observation field | launch.model = 5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-new | observation field | launch.model = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
 | codex/app-ro-new | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); availability insufficient |
+| codex/app-ro-new | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); availability insufficient |
 | codex/app-ro-new | observation field | an unknown launch field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown)); availability insufficient |
 | codex/app-ro-new | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch = "read_only" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.profile missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.profile = "readonly" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.profile = 1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.profile = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.resume missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.resume = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.model missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | launch.model = 5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | launch.model = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-new | control observation field | an unknown launch field | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-new | request log typed | initialize id false | non-PASS | INSUFFICIENT | the request log is not the product's own (message 0) |
+| codex/app-ro-new | request log typed | the thread request id true | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-new | request log typed | the thread request id 1.0 | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-new | request log typed | turn/start id "2" | non-PASS | INSUFFICIENT | the request log is not the product's own (message 3) |
+| codex/app-ro-new | request log typed | sandbox as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-new | request log typed | approvalPolicy as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-new | request log typed | initialized with null params | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| codex/app-ro-new | request log typed | turn/start input as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 3) |
+| codex/app-ro-new | control request log typed | initialize id false | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 0) |
+| codex/app-ro-new | control request log typed | the thread request id true | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-new | control request log typed | the thread request id 1.0 | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-new | control request log typed | turn/start id "2" | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 3) |
+| codex/app-ro-new | control request log typed | sandbox as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-new | control request log typed | approvalPolicy as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-new | control request log typed | initialized with null params | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
+| codex/app-ro-new | control request log typed | turn/start input as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 3) |
 | codex/app-ro-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | codex/app-ro-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | codex/app-ro-new | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |
@@ -607,44 +991,222 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
 | codex/app-ro-resumed | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch = "read_only" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.profile missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.profile = "readonly" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.profile = 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.profile = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.resume missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.resume = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.model missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model missing)); availability insufficient |
 | codex/app-ro-resumed | observation field | launch.model = 5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
+| codex/app-ro-resumed | observation field | launch.model = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed)); availability insufficient |
 | codex/app-ro-resumed | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); availability insufficient |
+| codex/app-ro-resumed | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); availability insufficient |
 | codex/app-ro-resumed | observation field | an unknown launch field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown)); availability insufficient |
 | codex/app-ro-resumed | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch = "read_only" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.profile missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.profile = "readonly" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.profile = 1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = null | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = "x" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.profile = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.resume missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.resume = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.model missing | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | launch.model = 5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = true | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = false | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = 0 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = -1 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = "" | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = [] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = {} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | launch.model = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
 | codex/app-ro-resumed | control observation field | an unknown launch field | non-PASS | INSUFFICIENT | the control turn is not settled; the control does not show full access |
+| codex/app-ro-resumed | request log typed | initialize id false | non-PASS | INSUFFICIENT | the request log is not the product's own (message 0) |
+| codex/app-ro-resumed | request log typed | the thread request id true | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | request log typed | the thread request id 1.0 | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | request log typed | turn/start id "2" | non-PASS | INSUFFICIENT | the request log is not the product's own (message 3) |
+| codex/app-ro-resumed | request log typed | sandbox as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | request log typed | approvalPolicy as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | request log typed | initialized with null params | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| codex/app-ro-resumed | request log typed | turn/start input as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 3) |
+| codex/app-ro-resumed | control request log typed | initialize id false | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 0) |
+| codex/app-ro-resumed | control request log typed | the thread request id true | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | control request log typed | the thread request id 1.0 | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | control request log typed | turn/start id "2" | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 3) |
+| codex/app-ro-resumed | control request log typed | sandbox as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | control request log typed | approvalPolicy as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 2) |
+| codex/app-ro-resumed | control request log typed | initialized with null params | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
+| codex/app-ro-resumed | control request log typed | turn/start input as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 3) |
 | codex/app-ro-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | codex/app-ro-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | codex/app-ro-resumed | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |
@@ -846,42 +1408,186 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | pi/noext-new | terminal | a provider error retried by the final message | same | PASS | — |
 | pi/noext-new | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); decision block insufficient |
 | pi/noext-new | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); decision block insufficient |
 | pi/noext-new | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-new | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
 | pi/noext-new | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); decision block insufficient |
 | pi/noext-new | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); decision block insufficient |
 | pi/noext-new | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | launch missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing)); decision block insufficient |
 | pi/noext-new | observation field | launch = "new" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-new | observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
 | pi/noext-new | observation field | launch.session_id missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id missing)); decision block insufficient |
 | pi/noext-new | observation field | launch.session_id = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | launch.session_id = 5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.session_id = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | launch.resume missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing)); decision block insufficient |
 | pi/noext-new | observation field | launch.resume = "false" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | launch.resume = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-new | observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-new | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); decision block insufficient |
+| pi/noext-new | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); decision block insufficient |
 | pi/noext-new | observation field | an unknown launch field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown)); decision block insufficient |
 | pi/noext-new | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch = "new" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.session_id missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.session_id = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.session_id = 5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.session_id = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.resume missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.resume = "false" | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.resume = null | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | control observation field | an unknown launch field | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | request log typed | get_state id as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 0) |
+| pi/noext-new | request log typed | the prompt type as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| pi/noext-new | request log typed | the prompt message as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| pi/noext-new | control request log typed | get_state id as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 0) |
+| pi/noext-new | control request log typed | the prompt type as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
+| pi/noext-new | control request log typed | the prompt message as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
 | pi/noext-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | pi/noext-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-new | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |
@@ -925,48 +1631,212 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | pi/noext-resumed | terminal | a provider error retried by the final message | same | PASS | — |
 | pi/noext-resumed | observation field | version missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing)); decision block insufficient |
 | pi/noext-resumed | observation field | version = 7 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | exit missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing)); decision block insufficient |
 | pi/noext-resumed | observation field | exit = "exited" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
+| pi/noext-resumed | observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing)); decision block insufficient |
 | pi/noext-resumed | observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing)); decision block insufficient |
 | pi/noext-resumed | observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | logs_complete missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing)); decision block insufficient |
 | pi/noext-resumed | observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | launch missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing)); decision block insufficient |
 | pi/noext-resumed | observation field | launch = "new" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
+| pi/noext-resumed | observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.session_id missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id missing)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.session_id = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.session_id = 5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.session_id = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.resume missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.resume = "false" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.resume = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | noted missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted missing)); decision block insufficient |
 | pi/noext-resumed | observation field | noted = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | noted = [["x", 1]] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = null | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | noted = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | opened missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened missing)); decision block insufficient |
 | pi/noext-resumed | observation field | opened = "x" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | opened = ["x", "1", 2] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = true | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = false | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = 0 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = -1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = 1.5 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = "" | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = [] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = ["x"] | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = {} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
+| pi/noext-resumed | observation field | opened = {"x": 1} | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed)); decision block insufficient |
 | pi/noext-resumed | observation field | an unknown observation | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown)); decision block insufficient |
+| pi/noext-resumed | observation field | an unknown exit field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.signal unknown)); decision block insufficient |
 | pi/noext-resumed | observation field | an unknown launch field | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown)); decision block insufficient |
 | pi/noext-resumed | control observation field | version missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | version = 7 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | version = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | exit missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | exit = "exited" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | exit.returncode missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | exit.returncode = "0" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | exit.returncode = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | logs_complete missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | logs_complete = "true" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | logs_complete = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch = "new" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.session_id missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.session_id = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.session_id = 5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = null | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = true | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = false | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.session_id = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.resume missing | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.resume = "false" | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.resume = null | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | launch.resume = 0 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = -1 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = 1.5 | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = "" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = "x" | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = [] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = ["x"] | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = {} | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | launch.resume = {"x": 1} | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | an unknown observation | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | control observation field | an unknown exit field | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | control observation field | an unknown launch field | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | request log typed | get_state id as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 0) |
+| pi/noext-resumed | request log typed | the prompt type as an object | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| pi/noext-resumed | request log typed | the prompt message as a list | non-PASS | INSUFFICIENT | the request log is not the product's own (message 1) |
+| pi/noext-resumed | control request log typed | get_state id as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 0) |
+| pi/noext-resumed | control request log typed | the prompt type as an object | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
+| pi/noext-resumed | control request log typed | the prompt message as a list | non-PASS | INSUFFICIENT | control: the request log is not the product's own (message 1) |
 | pi/noext-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
 | pi/noext-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
 | pi/noext-resumed | observation | how the process ended, as the recorder describes it (not read) | same | PASS | — |

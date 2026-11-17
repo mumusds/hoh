@@ -67,7 +67,10 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   `observations` where the adapters read the host's. Since round 10 (M2T20D-900, -901, -950) every required
   observation must be present and typed (`required_observations`), codex's launch included, or the replay is
   NOT_OBSERVED; the replay builds every message the adapter writes from the launch alone (`Replay.sent`), and the
-  request log must equal it exactly except initialize's `clientInfo.version` and the prompt's text (`_comparable`). A
+  request log must equal it exactly, as typed JSON (`_json_equal`: a boolean never equals a number, an integer never a
+  float; since round 11, M2T20D-1000), except initialize's `clientInfo.version` and the prompt's text (`_comparable`).
+  Each observation's type is checked before any enum test and `exit` has exactly `returncode` and the named `how`
+  (M2T20D-1001); the generator sets every required observation to every JSON type it does not accept. A
   recording without an observation the adapter needs is not settled (pi's runs before 20261117T002630Z: no launch).
   `--emit DIR` writes every generated variant with its inputs (stdout, rollout, request log, `observations.json`,
   snapshot diff, the control's too) and its frozen expected class: M2-T20's acceptance fixtures. The oracle is that
