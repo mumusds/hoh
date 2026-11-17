@@ -164,11 +164,18 @@ pub fn expected(suite: &str) -> BTreeMap<String, Replayed> {
         .unwrap_or_default()
 }
 
-/// A launch variant: HoH's YOLO launch (the product's) of a new or a resumed session, with or without a model.
+/// A launch variant: the product's launch of a new or a resumed session, with or without a model, in a profile: HoH's
+/// YOLO launch unless the table says otherwise (the read-only variants, docs/adr/ADR-032.md decision 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Variant {
     pub resume: bool,
     pub model: bool,
+    #[serde(default = "yolo")]
+    pub profile: crate::Profile,
+}
+
+fn yolo() -> crate::Profile {
+    crate::Profile::Yolo
 }
 
 /// The launch-variant table (`variants.json`): the variants by name, and the variants of each suite's cases.

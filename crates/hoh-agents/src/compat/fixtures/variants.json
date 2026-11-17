@@ -15,6 +15,26 @@
     "resumed-model": {
       "resume": true,
       "model": true
+    },
+    "new-read-only": {
+      "resume": false,
+      "model": false,
+      "profile": "read_only"
+    },
+    "new-model-read-only": {
+      "resume": false,
+      "model": true,
+      "profile": "read_only"
+    },
+    "resumed-read-only": {
+      "resume": true,
+      "model": false,
+      "profile": "read_only"
+    },
+    "resumed-model-read-only": {
+      "resume": true,
+      "model": true,
+      "profile": "read_only"
     }
   },
   "suites": {
@@ -42,6 +62,12 @@
       "unknown_fields": [
         "new",
         "new-model"
+      ],
+      "read_only": [
+        "new-read-only",
+        "new-model-read-only",
+        "resumed-read-only",
+        "resumed-model-read-only"
       ]
     },
     "codex": {
@@ -68,6 +94,12 @@
       "unknown_fields": [
         "new",
         "new-model"
+      ],
+      "read_only": [
+        "new-read-only",
+        "new-model-read-only",
+        "resumed-read-only",
+        "resumed-model-read-only"
       ]
     },
     "codex-exec": {
@@ -94,6 +126,12 @@
       "unknown_fields": [
         "new",
         "new-model"
+      ],
+      "read_only": [
+        "new-read-only",
+        "new-model-read-only",
+        "resumed-read-only",
+        "resumed-model-read-only"
       ]
     },
     "pi": {
@@ -120,6 +158,12 @@
       "unknown_fields": [
         "new",
         "new-model"
+      ],
+      "read_only": [
+        "new-read-only",
+        "new-model-read-only",
+        "resumed-read-only",
+        "resumed-model-read-only"
       ]
     }
   }

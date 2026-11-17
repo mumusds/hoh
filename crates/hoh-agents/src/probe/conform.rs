@@ -63,8 +63,10 @@ pub fn conform(
 }
 
 /// The options HoH passes with a value of its own fixing (claude `--output-format stream-json`, pi `--mode rpc`, codex
-/// `--listen stdio://`): the tested help must list the value in the option's own text.
-const FIXED_VALUE_OPTIONS: [&str; 3] = ["--output-format", "--mode", "--listen"];
+/// `--listen stdio://`, the read-only profile's claude `--permission-mode dontAsk`): the tested help must list the value
+/// in the option's own text.
+const FIXED_VALUE_OPTIONS: [&str; 4] =
+    ["--output-format", "--mode", "--listen", "--permission-mode"];
 
 /// One finding per planned launch, `judge` giving it.
 fn launches(plan: &Plan, mut judge: impl FnMut(&Planned) -> Finding) -> Conformance {

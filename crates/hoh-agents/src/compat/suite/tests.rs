@@ -164,7 +164,7 @@ fn names(result: &SuiteResult) -> Vec<&str> {
 fn the_cases() -> Vec<&'static str> {
     std::iter::once(PROBE_CASE)
         .chain(fixtures::CASES)
-        .chain([LIVE_CASE])
+        .chain([LIVE_CASE, READ_ONLY_CASE])
         .collect()
 }
 
@@ -593,5 +593,122 @@ fn a_run_whose_probe_finds_another_entry_or_that_is_stopped_is_discarded() -> R 
     let stopped = run(Agent::Pi, &looked, &bin.env(), &stop);
     assert!(matches!(stopped, Err(Discarded(_))), "{stopped:?}");
     assert!(run(Agent::Pi, &looked, &bin.env(), &ProbeStop::default()).is_ok());
+    Ok(())
+}
+
+/// The read_only case of `result` and the entry's read_only_workspace.
+fn read_only(result: &SuiteResult) -> (SuiteStatus, Option<bool>) {
+    (
+        status(result, READ_ONLY_CASE),
+        result
+            .entry
+            .capabilities
+            .get("read_only_workspace")
+            .copied()
+            .flatten(),
+    )
+}
+
+#[test]
+fn the_read_only_case_decides_read_only_workspace_and_never_the_suite() -> R {
+    // ADR-032 decision 4 ("按档的符合性"): the recorded versions take the read-only profile; codex on exec never does
+    // (decision 10 (A)); a help or schema without one read-only fact fails the read_only case alone, so the suite's
+    // status, the gate of every role, stays PASS while read_only_workspace is false.
+    let bin = Bin::new()?;
+    bin.codex(&bin.export(|_| {})?)?;
+    bin.claude(&recorded("claude/2.1.318/help.txt"))?;
+    bin.pi(&recorded("pi/1.5.0/help.txt"))?;
+    for agent in [Agent::Codex, Agent::Claude, Agent::Pi] {
+        let result = bin.suite(agent)?.1.map_err(|d| format!("{agent:?}: {d}"))?;
+        assert_eq!(result.entry.suite.status, SuiteStatus::Pass, "{agent:?}");
+        assert_eq!(
+            read_only(&result),
+            (SuiteStatus::Pass, Some(true)),
+            "{agent:?}: {:#?}",
+            result.case(READ_ONLY_CASE)
+        );
+        // Every read-only variant was built and checked.
+        assert!(
+            found(&result, READ_ONLY_CASE, Part::Requests, Truth::Yes).len() >= 4,
+            "{agent:?}"
+        );
+    }
+    let exec = Bin::new()?;
+    exec.codex_exec()?;
+    let result = exec.suite(Agent::Codex)?.1?;
+    assert_eq!(result.entry.suite.status, SuiteStatus::Pass);
+    assert_eq!(read_only(&result), (SuiteStatus::Fail, Some(false)));
+    assert!(
+        found(&result, READ_ONLY_CASE, Part::Requests, Truth::No)
+            .iter()
+            .all(|f| f.detail.contains("refuses") && f.detail.contains("read-only")),
+        "{:#?}",
+        result.case(READ_ONLY_CASE)
+    );
+    // One fact missing: not supported (the builder refuses), named.
+    for (agent, help, missing) in [
+        (
+            Agent::Claude,
+            changed(
+                &recorded("claude/2.1.318/help.txt"),
+                "  --strict-mcp-config   ",
+                "  --strict-mcp-cfg      ",
+            ),
+            "--strict-mcp-config",
+        ),
+        (
+            Agent::Pi,
+            changed(
+                &recorded("pi/1.5.0/help.txt"),
+                "  --no-extensions, -ne ",
+                "  --no-extensionz, -nz ",
+            ),
+            "--no-extensions",
+        ),
+    ] {
+        let bin = Bin::new()?;
+        match agent {
+            Agent::Claude => bin.claude(&help)?,
+            _ => bin.pi(&help)?,
+        }
+        let result = bin.suite(agent)?.1?;
+        assert_eq!(result.entry.suite.status, SuiteStatus::Pass, "{agent:?}");
+        for case in fixtures::CASES {
+            assert_eq!(status(&result, case), SuiteStatus::Pass, "{agent:?} {case}");
+        }
+        assert_eq!(
+            read_only(&result),
+            (SuiteStatus::Fail, Some(false)),
+            "{agent:?}"
+        );
+        let refused = found(&result, READ_ONLY_CASE, Part::Requests, Truth::No);
+        assert!(
+            refused.len() == 4
+                && refused
+                    .iter()
+                    .all(|f| f.detail.contains("refuses") && f.detail.contains(missing)),
+            "{agent:?}: {refused:#?}"
+        );
+    }
+    // The schema without read-only among SandboxMode's values: the read-only requests do not conform.
+    let bin = Bin::new()?;
+    bin.codex(&bin.export(|export| {
+        edit_json(export, "ClientRequest.json", |v| {
+            let modes = v["definitions"]["SandboxMode"]["enum"]
+                .as_array_mut()
+                .expect("SandboxMode.enum");
+            modes.retain(|m| m != "read-only");
+        })
+    })?)?;
+    let result = bin.suite(Agent::Codex)?.1?;
+    assert_eq!(result.entry.suite.status, SuiteStatus::Pass);
+    assert_eq!(read_only(&result), (SuiteStatus::Fail, Some(false)));
+    assert!(
+        found(&result, READ_ONLY_CASE, Part::Requests, Truth::No)
+            .iter()
+            .any(|f| f.detail.contains("thread/")),
+        "{:#?}",
+        result.case(READ_ONLY_CASE)
+    );
     Ok(())
 }

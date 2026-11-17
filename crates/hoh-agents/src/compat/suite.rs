@@ -26,6 +26,11 @@ pub const PROBE_CASE: &str = "probe";
 /// them apart (REQ-027 decision 2). Always NOT_RUN, so the manifest says PASS does not rest on it.
 pub const LIVE_CASE: &str = "live";
 
+/// The case of the read-only workspace profile (docs/adr/ADR-032.md decision 4, "按档的符合性"): the four read-only
+/// variants built by the same builders and checked against the tested binary. Like `live` it comes after the summary
+/// and never counts toward `suite.status`; its FAIL or NOT_RUN only keeps `read_only_workspace` from being true.
+pub const READ_ONLY_CASE: &str = "read_only";
+
 /// Which check of a case a finding belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Part {
@@ -106,6 +111,7 @@ pub fn plan(suite: &str) -> Plan {
     let table = fixtures::variants();
     let cases = fixtures::CASES
         .iter()
+        .chain([&READ_ONLY_CASE])
         .map(|case| PlannedCase {
             case: (*case).to_owned(),
             launches: table
@@ -284,6 +290,36 @@ pub fn run(
             Truth::Unknown,
             "a real turn is never run by the product; the adapter-live check records it apart",
         )],
+    });
+    // The read-only workspace profile's conformance: each read-only variant built and checked, none skipped. A builder
+    // that refuses the tested help is "not supported", a request the tested schema rejects "does not conform"; either
+    // keeps read_only_workspace from being true, and neither touches the suite's status (ADR-032 decision 4).
+    let mut findings = conformance.of(READ_ONLY_CASE).to_vec();
+    if !findings.iter().any(|f| f.part == Part::Requests) {
+        findings.push(Finding::new(
+            Part::Requests,
+            Truth::Unknown,
+            "the probe checked no read-only launch",
+        ));
+    }
+    let read_only = status_of(Truth::all(findings.iter().map(|f| f.truth)));
+    match read_only {
+        SuiteStatus::Pass => {}
+        SuiteStatus::Fail => {
+            entry
+                .capabilities
+                .insert("read_only_workspace".to_owned(), Some(false));
+        }
+        SuiteStatus::NotRun => {
+            entry
+                .capabilities
+                .insert("read_only_workspace".to_owned(), None);
+        }
+    }
+    cases.push(CaseResult {
+        case: READ_ONLY_CASE.to_owned(),
+        status: read_only,
+        findings,
     });
     entry.suite = Suite {
         status,
