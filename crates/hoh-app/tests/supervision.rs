@@ -1126,11 +1126,33 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
         approved(&project)?;
         let run_id = started(&host).await?;
         supervised(&project, &run_id, "fp-1").await?;
-        let settled = |r: &Value| {
-            r.as_array()
-                .is_some_and(|a| a.iter().filter(|t| t["state"] == "SETTLED").count() >= 1)
+        // Every wake owed so far answered before claude changes, each selected by its own trigger: fp-1's and the
+        // adoption wake's (spec.changed at the run's start, docs/adr/ADR-031.md decision 1), whose turn may come first
+        // or second; and no turn of the run left unfinished. "A turn settled" could be the adoption's while fp-1's turn
+        // was being allocated: the change then landed before that turn's start, which refused it (COMPAT_UNVERIFIED, a
+        // counted failure) instead of the allocation deferring the wake (ADR-031's correction for turns whose time
+        // depends on scheduling: select, exact counts).
+        let answered = |fingerprint: &str| {
+            format!(
+                "(SELECT count(*) FROM supervisor_triggers t WHERE t.run_id = '{run_id}' AND t.fingerprint = '{fingerprint}' \
+                 AND EXISTS (SELECT 1 FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, \
+                 '$.attempt_id') WHERE e.kind = 'supervisor.allocated' AND json_extract(e.payload_json, '$.wake') = \
+                 t.trigger_id AND a.state = 'SETTLED'))"
+            )
         };
-        until(&project, &turns(&run_id), Duration::from_secs(60), &settled).await?;
+        until(
+            &project,
+            &format!(
+                "SELECT {} || '/' || {} || '/' || (SELECT count(*) FROM events e JOIN attempts a ON a.attempt_id = \
+                 json_extract(e.payload_json, '$.attempt_id') WHERE e.run_id = '{run_id}' AND e.kind = \
+                 'supervisor.allocated' AND a.state NOT IN ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')) AS s",
+                answered("fp-1"),
+                answered("spec.changed/")
+            ),
+            Duration::from_secs(60),
+            &|r: &Value| r[0]["s"] == "1/1/0",
+        )
+        .await?;
         // Another implementation of claude: not verified until its suite, held here, publishes.
         fakes.claude("B")?;
         let limit = Duration::from_secs(60);
