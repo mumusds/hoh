@@ -184,6 +184,20 @@ impl Default for Verifier {
     }
 }
 
+/// A fake's recorded answers with one fact of the read-only workspace profile taken out (docs/adr/ADR-032.md's
+/// TEST-021-06 (b) and (d)): [`World::variant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// claude's help without `--strict-mcp-config`.
+    ClaudeWithoutStrictMcpConfig,
+    /// pi's help without `--no-mcp`.
+    PiWithoutNoMcp,
+    /// codex's App Server schema whose SandboxMode has no `read-only`.
+    CodexWithoutReadOnlySandbox,
+    /// codex's help without `app-server`: its turns run on exec.
+    CodexExecOnly,
+}
+
 /// What the pinned fake Commander submits.
 #[derive(Debug, Clone)]
 pub struct Commander {
@@ -196,6 +210,11 @@ pub struct Commander {
     /// The decision kinds whose first submission for a run names a revision one past the run's, so the Runtime
     /// rejects it (STALE_REVISION) and the script submits it again.
     pub stale_once: Vec<String>,
+    /// The fingerprint of the need_decision whose wake has the record_assumption, instead of the script's first batch.
+    pub assume_on: Option<String>,
+    /// Whether the batch with the record_assumption also writes another valid decision of its nonce to the attempt's
+    /// `messages.jsonl` (docs/adr/ADR-032.md decision 1: the product never registers it).
+    pub bridge_also: bool,
 }
 
 impl Default for Commander {
@@ -205,6 +224,8 @@ impl Default for Commander {
             basis: "项目的 contracts/requirements.json".to_owned(),
             tasks: vec!["develop".to_owned()],
             stale_once: Vec::new(),
+            assume_on: None,
+            bridge_also: false,
         }
     }
 }
@@ -355,11 +376,18 @@ def commander(text, wake, cfg):
         held.add(kind)
         return True
 
+    # With `assume_on`, the record_assumption waits for the wake of that need_decision fingerprint (the wake's question
+    # names it), whatever the run's state; else it opens the pinned script.
+    assume_on = c.get('assume_on')
+    fingerprint = re.search(r'本次唤醒要回答的问题：唤醒 [^（]*（种类 [^，]*，严重度 [^，]*，指纹 ([^）]*)）', text)
+    assumption = {'kind': 'record_assumption', 'statement': c.get('statement', 'fixture'),
+                  'basis': c.get('basis', 'fixture')}
     payloads = []
+    if assume_on and fingerprint and fingerprint.group(1) == assume_on and once('record_assumption'):
+        payloads.append(assumption)
     if state in ORDER[:-1]:
-        if once('record_assumption'):
-            payloads.append({'kind': 'record_assumption', 'statement': c.get('statement', 'fixture'),
-                             'basis': c.get('basis', 'fixture')})
+        if not assume_on and once('record_assumption'):
+            payloads.append(assumption)
         for target in ORDER[ORDER.index(state) + 1:]:
             if target in ('READY', 'RUNNING') and once('create_tasks'):
                 reqs = requirements(wake, c)
@@ -379,18 +407,20 @@ def commander(text, wake, cfg):
             'role_epoch': int(wake['role_epoch']), 'correlation_id': key, 'causation_id': wake.get('causation_id'),
             'idempotency_key': key + '-d' + str(i), 'expected_revision': revision + i + (1 if stale else 0),
             'spec_sha256': spec, 'candidate_id': None, 'kind': 'decision', 'payload': payload})
-    # The decisions are the final message's ```hoh-decisions block (docs/adr/ADR-032.md decision 1); `bridge_also`
-    # writes one more line to the attempt's messages.jsonl, which the product must ignore.
+    # The decisions are the final message's ```hoh-decisions block (docs/adr/ADR-032.md decision 1); with
+    # `bridge_also`, the batch that has the record_assumption also writes one more valid decision of the same nonce
+    # (another record_assumption, of its own message id) to the attempt's messages.jsonl, which the product must ignore.
     lines = [json.dumps({'nonce': wake['nonce'], 'message': message}, ensure_ascii=False) for message in messages]
-    if c.get('bridge_also') and wake.get('项目根'):
-        extra = dict(messages[0], message_id=key + '-bridge', idempotency_key=key + '-bridge') if messages else None
-        if extra:
-            attempts = os.path.join(wake['项目根'], '.hoh', 'attempts')
-            for name in os.listdir(attempts) if os.path.isdir(attempts) else []:
-                if name.endswith(attempt.replace('/', '%2F')) or name == attempt.replace('/', '%2F'):
-                    bridge_write(os.path.join(attempts, name, 'messages.jsonl'), {'nonce': wake['nonce'], 'message': extra})
+    assumed = [m for m in messages if m['payload']['kind'] == 'record_assumption']
+    if c.get('bridge_also') and assumed:
+        extra = dict(assumed[0], message_id=key + '-bridge', idempotency_key=key + '-bridge',
+                     payload=dict(assumed[0]['payload'], statement='bridge: ' + assumed[0]['payload']['statement']))
+        directory = attempt.replace('%', '%25').replace('/', '%2F')
+        bridge_write(os.path.join(root, '.hoh', 'attempts', directory, 'messages.jsonl'),
+                     {'nonce': wake['nonce'], 'message': extra})
     append('commander.jsonl', {'agent': AGENT, 'run_id': run, 'state': state, 'revision': revision,
-                               'attempt_id': attempt, 'messages': messages})
+                               'attempt_id': attempt, 'messages': messages,
+                               'fingerprint': fingerprint.group(1) if fingerprint else None})
     block = '\n```hoh-decisions\n' + '\n'.join(lines) + '\n```' if lines else ''
     return 'Run 状态 %s：提交了 %d 条决策%s' % (state, len(messages), block)
 
@@ -447,7 +477,7 @@ def turn(prompt):
         role = ident.get('role', '')
     record = {'agent': AGENT, 'pid': os.getpid(), 'role': role, 'run_id': ident.get('run_id'),
               'task_id': ident.get('task_id'), 'attempt_id': ident.get('attempt_id'),
-              'marker': os.environ.get('HOH_ATTEMPT_ID'), 'cwd': os.getcwd()}
+              'marker': os.environ.get('HOH_ATTEMPT_ID'), 'cwd': os.getcwd(), 'argv': ARGS}
     os.makedirs(os.path.join(WORLD, 'prompts'), exist_ok=True)
     with open(os.path.join(WORLD, 'prompts', '%s.%d.txt' % (AGENT, os.getpid())), 'w', encoding='utf-8') as f:
         f.write(prompt)
@@ -533,8 +563,18 @@ def codex_app_server():
         except ValueError:
             continue
         method, mid = m.get('method'), m.get('id')
-        append('codex-requests.jsonl', {'pid': os.getpid(), 'method': method, 'id': mid})
+        request = {'pid': os.getpid(), 'method': method, 'id': mid,
+                   'marker': os.environ.get('HOH_ATTEMPT_ID')}
+        if method in ('thread/start', 'thread/resume'):
+            request['params'] = m.get('params')
+        append('codex-requests.jsonl', request)
         if mid is None:
+            continue
+        if method == 'initialize' and any(d in (os.environ.get('HOH_ATTEMPT_ID') or '')
+                                          for d in settings().get('degrade', [])):
+            # An App Server that does not know initialize, for the attempts whose marker names one of `degrade`:
+            # the turn degrades to exec (docs/adr/ADR-022.md decision 15).
+            emit({'id': mid, 'error': {'code': -32601, 'message': 'Method not found'}})
             continue
         if method == 'initialize':
             response, notes = turn_rec['initialize']
@@ -603,7 +643,58 @@ def codex_exec():
     return 0
 
 
-sys.exit({'claude': claude, 'codex-app-server': codex_app_server, 'codex-exec': codex_exec}[AGENT]())
+def pi():
+    """pi --mode rpc: get_state names the session of --session-id, its file found in --session-dir as pi 1.5.0 finds it
+    (the first *.jsonl whose header has that id and this cwd) or made with its header; a prompt is answered, its turn's
+    work runs, and the recorded rpc-prompt's events follow with its final message the turn's."""
+    session = ARGS[ARGS.index('--session-id') + 1]
+    directory = ARGS[ARGS.index('--session-dir') + 1]
+    os.makedirs(directory, exist_ok=True)
+    found = None
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if not name.endswith('.jsonl') or not os.path.isfile(path):
+            continue
+        with open(path, encoding='utf-8') as f:
+            try:
+                header = json.loads(f.readline())
+            except ValueError:
+                continue
+        if isinstance(header, dict) and header.get('type') == 'session' and header.get('id') == session \
+                and header.get('cwd') == os.getcwd():
+            found = path
+            break
+    if found is None:
+        found = os.path.join(directory, '2026-11-17T00-00-00-000Z_%s.jsonl' % session)
+        with open(found, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'type': 'session', 'version': 3, 'id': session,
+                                'timestamp': '2026-11-17T00:00:00.000Z', 'cwd': os.getcwd()}) + '\n')
+    recorded = frames('pi', '1.5.0', 'rpc-prompt', 'stdout.jsonl')
+    for line in sys.stdin:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get('type') == 'get_state':
+            state = json.loads(json.dumps(recorded[0]))
+            state['id'] = m.get('id')
+            state['data']['sessionId'], state['data']['sessionFile'] = session, found
+            emit(state)
+        elif m.get('type') == 'prompt':
+            emit(dict(recorded[1], id=m.get('id')))
+            final, failure = turn(m.get('message', ''))
+            first_delta = True
+            for frame in recorded[2:]:
+                event = frame.get('assistantMessageEvent', {})
+                if final is not None and event.get('type') == 'text_delta':
+                    event['delta'], first_delta = (final if first_delta else ''), False
+                if final is not None:
+                    frame = json.loads(json.dumps(frame).replace('"HOH_SAMPLE_OK"', json.dumps(final)))
+                emit(frame)
+    return 0
+
+
+sys.exit({'claude': claude, 'codex-app-server': codex_app_server, 'codex-exec': codex_exec, 'pi': pi}[AGENT]())
 "##;
 
 /// The product binary's WAL self-test probe.
@@ -734,68 +825,168 @@ impl World {
         ]
     }
 
-    /// The fake CLIs: each answers its probe and compat suite as its recording does and runs a turn with
-    /// [`AGENT_PY`]. Written once: a fake's file never changes after (the stamps its registration was earned on).
+    /// The fake CLIs: each answers its probe and compat suite as its recording does (or as its [`Variant`] changed
+    /// it) and runs a turn with [`AGENT_PY`]. Written once, and again only by [`World::variant`] before anything is
+    /// registered: a fake's file never changes after (the stamps its registration was earned on).
     fn write_fakes(&self) -> R {
-        let (agent, w) = (
+        for agent in ["claude", "codex", "pi"] {
+            self.write_fake(agent)?;
+        }
+        Ok(())
+    }
+
+    /// The recorded answers fake `agent` gives: its [`Variant`]'s copy when [`World::variant`] made one, else the
+    /// recording.
+    fn answers(&self, agent: &str) -> String {
+        let version = match agent {
+            "claude" => "2.1.318",
+            "codex" => "0.166.0",
+            _ => "1.5.0",
+        };
+        let copy = self.fakes().join("answers").join(agent).join(version);
+        if copy.is_dir() {
+            copy.display().to_string()
+        } else {
+            format!("{PROTOCOL}/{agent}/{version}")
+        }
+    }
+
+    /// Fake `agent`'s script. codex's `sandbox` (the host's check of its read-only sandbox, docs/adr/ADR-032.md
+    /// decision 4) does as `w/sandbox` says ([`World::sandbox`]; confined when there is none), each call appended to
+    /// `w/sandbox-calls`; its `exec resume --help` is its answers' `help-exec-resume.txt`, a failure without one.
+    fn write_fake(&self, agent: &str) -> R {
+        let (py, w) = (
             self.fakes().join("agent.py").display().to_string(),
             self.fakes().display().to_string(),
         );
-        let run = |name: &str| format!("exec python3 '{agent}' '{w}' {name} '{PROTOCOL}' \"$@\"");
-        self.script(
-            "claude",
-            &format!(
-                "f='{PROTOCOL}/claude/2.1.318'\n\
-                 case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; \
-                 auth) exit 1;; esac\n{}\n",
-                run("claude")
+        let run = |name: &str| format!("exec python3 '{py}' '{w}' {name} '{PROTOCOL}' \"$@\"");
+        let f = self.answers(agent);
+        match agent {
+            "claude" => self.script(
+                "claude",
+                &format!(
+                    "f='{f}'\n\
+                     case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; \
+                     auth) exit 1;; esac\n{}\n",
+                    run("claude")
+                ),
             ),
-        )?;
-        self.script(
-            "codex",
-            &format!(
-                "f='{PROTOCOL}/codex/0.166.0'\n\
-                 case \"$1\" in\n\
-                  --version) echo 'codex-cli 0.166.0'; exit 0;;\n\
-                  --help) cat \"$f/help.txt\"; exit 0;;\n\
-                  exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}\n   {};;\n\
-                  app-server) case \"$2\" in\n\
-                    --help) cat \"$f/help-app-server.txt\"; exit 0;;\n\
-                    generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
-                   esac\n   {};;\n\
-                 esac\nexit 2\n",
-                run("codex-exec"),
-                run("codex-app-server")
+            "codex" => self.script(
+                "codex",
+                &format!(
+                    "f='{f}'; w='{w}'\n\
+                     case \"$1\" in\n\
+                      --version) echo 'codex-cli 0.166.0'; exit 0;;\n\
+                      --help) cat \"$f/help.txt\"; exit 0;;\n\
+                      sandbox) mode=$(cat \"$w/sandbox\" 2>/dev/null || echo confined); echo \"$mode $*\" >> \"$w/sandbox-calls\"\n\
+                       case \"$mode\" in\n\
+                        confined) cat \"$5/token\"; echo \"/bin/sh: 1: cannot create $5/probe: Read-only file system\" >&2; exit 2;;\n\
+                        unconfined) shift 6; exec \"$@\";;\n\
+                        unavailable) echo 'bwrap: No permissions to create a new namespace' >&2; exit 1;;\n\
+                        *) echo \"error: unrecognized subcommand 'sandbox'\" >&2; exit 2;;\n\
+                       esac;;\n\
+                      exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}\n\
+                       [ \"$2 $3\" = 'resume --help' ] && {{ cat \"$f/help-exec-resume.txt\" 2>/dev/null; exit $?; }}\n   {};;\n\
+                      app-server) case \"$2\" in\n\
+                        --help) cat \"$f/help-app-server.txt\"; exit 0;;\n\
+                        generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n\
+                       esac\n   {};;\n\
+                     esac\nexit 2\n",
+                    run("codex-exec"),
+                    run("codex-app-server")
+                ),
             ),
-        )?;
-        // pi plays no working role in the world (the researcher's, never dispatched): its turn replays the recorded
-        // rpc-prompt.
-        let pi = self.bin().join("pi.d");
-        std::fs::create_dir_all(&pi)?;
-        let mut commands = serde_json::Map::new();
-        for line in
-            std::fs::read_to_string(format!("{PROTOCOL}/pi/1.5.0/rpc-prompt/stdin.txt"))?.lines()
-        {
-            let Ok(c) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if let (Some(id), Some(kind)) = (c["id"].as_str(), c["type"].as_str()) {
-                commands.insert(id.to_owned(), json!(kind));
+            _ => self.script(
+                "pi",
+                &format!(
+                    "f='{f}'\n\
+                     case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n{}\n",
+                    run("pi")
+                ),
+            ),
+        }
+    }
+
+    /// Fake `agent`'s recorded answers changed by `variant` (docs/adr/ADR-032.md's TEST-021-06): a copy of the
+    /// recording with one fact taken out, its script rewritten to answer from it. Before anything is registered.
+    pub fn variant(&self, variant: Variant) -> R {
+        let agent = match variant {
+            Variant::ClaudeWithoutStrictMcpConfig => "claude",
+            Variant::PiWithoutNoMcp => "pi",
+            Variant::CodexWithoutReadOnlySandbox | Variant::CodexExecOnly => "codex",
+        };
+        let from = PathBuf::from(self.answers(agent));
+        let copy = self
+            .fakes()
+            .join("answers")
+            .join(agent)
+            .join(from.file_name().ok_or("no version")?);
+        copy_tree(&from, &copy)?;
+        let edit = |file: &str, change: &dyn Fn(&str) -> R<String>| -> R {
+            let path = copy.join(file);
+            let text = std::fs::read_to_string(&path)?;
+            let changed = change(&text)?;
+            if changed == text {
+                return Err(format!("{variant:?} changed nothing in {file}").into());
+            }
+            Ok(std::fs::write(path, changed)?)
+        };
+        let without_line = |needle: &'static str| {
+            move |text: &str| -> R<String> {
+                Ok(text
+                    .split_inclusive('\n')
+                    .filter(|l| !l.contains(needle))
+                    .collect())
+            }
+        };
+        match variant {
+            Variant::ClaudeWithoutStrictMcpConfig => {
+                edit("help.txt", &without_line("--strict-mcp-config"))?;
+            }
+            Variant::PiWithoutNoMcp => edit("help.txt", &without_line("--no-mcp"))?,
+            Variant::CodexExecOnly => {
+                edit("help.txt", &without_line("  app-server "))?;
+                // Its `exec resume --help` (not recorded): the exec help with resume's usage line, so a resumed exec
+                // turn builds as a new one does.
+                let exec = std::fs::read_to_string(copy.join("help-exec.txt"))?;
+                let usage = "Usage: codex exec [OPTIONS] [PROMPT]";
+                if !exec.contains(usage) {
+                    return Err("no usage line in the exec help".into());
+                }
+                std::fs::write(
+                    copy.join("help-exec-resume.txt"),
+                    exec.replace(
+                        usage,
+                        "Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]",
+                    ),
+                )?;
+            }
+            Variant::CodexWithoutReadOnlySandbox => {
+                // Every SandboxMode of the schema without its "read-only" value.
+                let mut changed = 0;
+                for file in schema_files(&copy.join("app-server-schema"))? {
+                    let mut value: Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+                    let dropped = drop_read_only(&mut value);
+                    if dropped > 0 {
+                        std::fs::write(&file, serde_json::to_string_pretty(&value)?)?;
+                        changed += dropped;
+                    }
+                }
+                if changed == 0 {
+                    return Err("no SandboxMode with read-only in the schema".into());
+                }
             }
         }
-        std::fs::write(
-            pi.join("commands.json"),
-            Value::Object(commands).to_string(),
-        )?;
-        self.script(
-            "pi",
-            &format!(
-                "f='{PROTOCOL}/pi/1.5.0'; d='{d}'\n\
-                 case \"$1\" in --version) echo '1.5.0'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
-                 exec timeout 60 python3 '{PI_RPC}' \"$f/rpc-prompt/stdout.jsonl\" \"$d/commands.json\" \"$d/log.$$\" -- \"$@\"\n",
-                d = pi.display()
-            ),
-        )
+        self.write_fake(agent)
+    }
+
+    /// What fake codex's `sandbox` does from now on: `confined`, `unconfined`, `unavailable` or anything else (a usage
+    /// error: unknown).
+    pub fn sandbox(&self, mode: &str) -> R {
+        let staged = self.fakes().join(".sandbox.new");
+        std::fs::write(&staged, mode)?;
+        std::fs::rename(staged, self.fakes().join("sandbox"))?;
+        Ok(())
     }
 
     /// The executable `name` in [`World::bin`] running `body` (bash).
@@ -1037,9 +1228,54 @@ impl World {
         Ok(config)
     }
 
+    /// A registry of the world's agents as [`World::host_config`]'s, for a test to change before its host starts.
+    pub fn registry(&self) -> hoh_app::host::agents::Registry {
+        hoh_app::host::agents::Registry::with_pi_dir(
+            self.path(),
+            Some(self.root().join("pi-agent")),
+        )
+    }
+
+    /// [`World::host_config`] with the agents of `registry`, and `preparing` called with (role, attempt id) as each
+    /// turn is about to be prepared when given (docs/adr/ADR-032.md's TEST-021-06).
+    pub fn host_config_with(
+        &self,
+        registry: std::sync::Arc<hoh_app::host::agents::Registry>,
+        preparing: Option<hoh_app::host::product::PreparingSeen>,
+    ) -> R<HostConfig> {
+        let effective = hoh_core::config::load(&self.project())?;
+        let graces = (
+            Duration::from_secs(u64::from(effective.execution.cancel_native_grace_seconds)),
+            Duration::from_secs(u64::from(effective.execution.cancel_term_grace_seconds)),
+        );
+        let mut config =
+            HostConfig::product_with(&self.project(), effective, HOH.into(), registry.clone());
+        config.port = 0;
+        config.store.wal_probe = Some(probe());
+        if let Some(runner) = config.runner.as_mut() {
+            runner.context.commander_dir = Some(self.state().join("hoh/commander"));
+            if let Some(hook) = preparing {
+                runner.executor = std::sync::Arc::new(
+                    hoh_app::host::product::ProductExecutor::new(
+                        registry,
+                        self.project(),
+                        HOH.into(),
+                        graces,
+                    )
+                    .with_preparing(hook),
+                );
+            }
+        }
+        Ok(config)
+    }
+
     /// [`World::host_config`] started (waiting while another start holds the project).
     pub async fn start_host(&self) -> R<Host> {
-        let config = self.host_config()?;
+        self.start_host_with(self.host_config()?).await
+    }
+
+    /// A host of `config` started (waiting while another start holds the project).
+    pub async fn start_host_with(&self, config: HostConfig) -> R<Host> {
         let end = Instant::now() + Duration::from_secs(5);
         loop {
             match Host::start(config.clone()).await {
@@ -1073,8 +1309,15 @@ impl World {
     pub fn commander(&self, c: &Commander) -> R {
         self.set(
             &["commander"],
-            json!({"statement": c.statement, "basis": c.basis, "tasks": c.tasks, "stale_once": c.stale_once}),
+            json!({"statement": c.statement, "basis": c.basis, "tasks": c.tasks, "stale_once": c.stale_once,
+                "assume_on": c.assume_on, "bridge_also": c.bridge_also}),
         )
+    }
+
+    /// codex App Servers of the attempts whose marker names one of `markers` answer initialize "method not found"
+    /// (their turns degrade to exec, docs/adr/ADR-022.md decision 15).
+    pub fn degrade(&self, markers: &[&str]) -> R {
+        self.set(&["degrade"], json!(markers))
     }
 
     /// The turns of `roles` on `agent` (`codex` or `claude`) fail unauthorized, doing nothing: codex's
@@ -1108,9 +1351,9 @@ impl World {
     }
 
     /// The JSON lines of the fakes' log `name`: `turns.jsonl` (each turn's start and end: agent, role, ids, marker,
-    /// cwd), `calls.jsonl` (each Developer start), `commander.jsonl` (each Commander batch with its messages),
-    /// `checks.jsonl` (each check a verifier ran), `codex-requests.jsonl` (each JSON-RPC message a codex App Server
-    /// fake read); none yet: empty.
+    /// cwd, argv), `calls.jsonl` (each Developer start), `commander.jsonl` (each Commander batch with its messages and
+    /// its wake's fingerprint), `checks.jsonl` (each check a verifier ran), `codex-requests.jsonl` (each JSON-RPC
+    /// message a codex App Server fake read, with its marker, and a thread request's params); none yet: empty.
     pub fn log(&self, name: &str) -> R<Vec<Value>> {
         match std::fs::read_to_string(self.fakes().join(name)) {
             Ok(text) => Ok(text
@@ -1863,4 +2106,60 @@ fn found(tool: &str) -> R<PathBuf> {
         .map(|d| Path::new(d).join(tool))
         .find(|p| p.exists())
         .ok_or(format!("no {tool} on this machine"))?)
+}
+
+/// `from`'s files copied under `to`, directories made.
+fn copy_tree(from: &Path, to: &Path) -> R {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `.json` files under `dir`.
+fn schema_files(dir: &Path) -> R<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            found.extend(schema_files(&path)?);
+        } else if path.extension().is_some_and(|e| e == "json") {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// Every `SandboxMode` definition in `value` without its `read-only` value; how many lost it.
+fn drop_read_only(value: &mut Value) -> usize {
+    let mut dropped = 0;
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(modes)) = map
+                .get_mut("SandboxMode")
+                .and_then(|mode| mode.get_mut("enum"))
+            {
+                let before = modes.len();
+                modes.retain(|m| m != "read-only");
+                dropped += before - modes.len();
+            }
+            for v in map.values_mut() {
+                dropped += drop_read_only(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                dropped += drop_read_only(v);
+            }
+        }
+        _ => {}
+    }
+    dropped
 }

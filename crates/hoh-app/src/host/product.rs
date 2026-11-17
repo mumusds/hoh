@@ -37,6 +37,8 @@ pub struct ProductExecutor {
     observe: Option<hoh_agents::adapter::Observe>,
     /// A test's hold as a finished turn's raw logs are kept, before they are (CR-006); the product has none.
     keeping: Option<KeepingHook>,
+    /// A test's call as each turn is about to be prepared; the product has none.
+    preparing: Option<PreparingHook>,
     /// Set once the host stops ([`Executor::stop`]): a turn that ends after it has nothing done for it here.
     stopping: tokio::sync::watch::Sender<bool>,
     /// The task that waits for each turn's end and keeps its raw logs, until the host stops.
@@ -68,6 +70,20 @@ impl std::fmt::Debug for KeepingHook {
     }
 }
 
+/// Called with (role, attempt id) as a turn is about to be prepared, before the registry is read for it (a test's:
+/// TEST-021-06 changes what the registry holds between an assignment and its prepare, docs/adr/ADR-032.md -201).
+pub type PreparingSeen = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// A [`PreparingSeen`] the executor holds.
+#[derive(Clone)]
+struct PreparingHook(PreparingSeen);
+
+impl std::fmt::Debug for PreparingHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparingHook")
+    }
+}
+
 /// A [`KeySeen`] the executor holds.
 #[derive(Clone)]
 struct KeyHook(KeySeen);
@@ -95,6 +111,7 @@ impl ProductExecutor {
             keys: None,
             observe: None,
             keeping: None,
+            preparing: None,
             stopping: tokio::sync::watch::Sender::new(false),
             watchers: Mutex::default(),
         }
@@ -113,6 +130,14 @@ impl ProductExecutor {
     #[doc(hidden)]
     pub fn with_observe(mut self, hook: DiagnosticSeen) -> ProductExecutor {
         self.observe = Some(hoh_agents::adapter::Observe(hook));
+        self
+    }
+
+    /// The executor calling `hook` with (role, attempt id) as each turn is about to be prepared, before the registry is
+    /// read for it: a test's way to change the agent's facts after the assignment (docs/adr/ADR-032.md -201).
+    #[doc(hidden)]
+    pub fn with_preparing(mut self, hook: PreparingSeen) -> ProductExecutor {
+        self.preparing = Some(PreparingHook(hook));
         self
     }
 
@@ -583,6 +608,9 @@ impl ProductExecutor {
     /// the Unavailable class (docs/adr/ADR-030.md decision 6; its task waits for its role's vacancy to end, decision
     /// 7); then [`check`] (decision 9's (a) to (d)) before anything else is prepared.
     fn prepare(&self, work: &Work) -> Result<Turn, Refusal> {
+        if let Some(PreparingHook(hook)) = &self.preparing {
+            hook(&work.role, &work.attempt_id);
+        }
         let a = &work.assignment;
         let agent = a.agent.as_deref().and_then(Agent::named).ok_or_else(|| {
             refused(
