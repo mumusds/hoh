@@ -149,6 +149,27 @@ impl Project {
             &[self.db().as_os_str()],
         )
     }
+
+    /// [`Project::dump`] once the running host has gone quiet: the same for a second (its tick is 200 ms), so that
+    /// what its last command set going (the supervisor's cursor, say) is in it and not taken for a fault's write.
+    fn quiet_dump(&self) -> R<String> {
+        const QUIET: Duration = Duration::from_secs(1);
+        let end = Instant::now() + Duration::from_secs(20);
+        let mut last = self.dump()?;
+        let mut since = Instant::now();
+        while since.elapsed() < QUIET {
+            if Instant::now() > end {
+                return Err("the host did not go quiet in 20 s".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let now = self.dump()?;
+            if now != last {
+                last = now;
+                since = Instant::now();
+            }
+        }
+        Ok(last)
+    }
 }
 
 impl Drop for Project {
@@ -465,15 +486,23 @@ impl Mount {
     }
 
     /// `dir` bind-mounted on itself, read-only: its files open already stay writable, new opens for writing fail.
+    /// Read-only from the start (one `mount --bind -o ro`; util-linux 2.39 and later set it before the mount is
+    /// attached), so that no file is opened for writing through it in between.
     fn read_only_bind(dir: &Path) -> R<Mount> {
         let path = dir.display().to_string();
-        Mount::sudo(&["mount", "--bind", &path, &path])?;
+        Mount::sudo(&["mount", "--bind", "-o", "ro", &path, &path])?;
         let mount = Mount {
             point: dir.to_path_buf(),
             mounted: true,
             work: None,
         };
-        Mount::sudo(&["mount", "-o", "remount,bind,ro", &path])?;
+        let options = Command::new("findmnt")
+            .args(["-n", "-o", "OPTIONS", "--mountpoint", &path])
+            .output()?;
+        let options = String::from_utf8(options.stdout)?;
+        if !options.split(',').any(|o| o == "ro") {
+            return Err(format!("{path} is not mounted read-only: {}", options.trim()).into());
+        }
         Ok(mount)
     }
 
@@ -564,7 +593,7 @@ fn full_a_full_file_system_is_db_full_and_retryable_writes_nothing_and_writes_re
     let outcome = (|| -> R {
         project.accepted("first")?;
         let filler = mount.fill()?;
-        let before = project.dump()?;
+        let before = project.quiet_dump()?;
         let out = project.submit("second")?;
         assert_ne!(out.status.code(), Some(0), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -641,7 +670,7 @@ fn read_only_a_file_system_that_turns_read_only_under_its_host_fails_commands_wi
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
-        let before = project.dump()?;
+        let before = project.quiet_dump()?;
         Mount::sudo(&[
             "sh",
             "-c",
@@ -673,6 +702,7 @@ fn read_only_a_hoh_directory_bind_mounted_read_only_under_its_host_is_still_writ
     let dir = tempfile::tempdir()?;
     let project = Project::in_dir(dir.path())?;
     project.accepted("first")?;
+    project.quiet_dump()?;
     let mount = Mount::read_only_bind(&project.hoh_dir())?;
     // Bound again after the mount, so that a failed check drops it (its host killed and waited for) before the mount.
     let project = project;
