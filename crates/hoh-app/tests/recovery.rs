@@ -3963,12 +3963,21 @@ impl hoh_app::host::HostHooks for SlowWritesWhileSettling {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
+
+    /// Its test is of the /proc mode's watch of a group: it stays in that mode whatever cgroup it runs in (M2T06R-452);
+    /// the cgroup mode's end of a group lost track of has tests of its own (`cgroup_lost_settle_inside`).
+    fn cgroups_allowed(&self) -> bool {
+        false
+    }
 }
 
 /// M2T05R-452: A1's lease expires; its native cancel kills its leader, which is reaped at once, while a member that
 /// ignores SIGTERM stays. Its group is looked at from the inspection to the end of the stop with no write in between,
 /// however slow the writes are, so it stays known as A1's: the member gets SIGTERM and SIGKILL, the group is seen
-/// empty, and A1 lets its slot go (UNKNOWN_EFFECT: its work cannot be confirmed).
+/// empty, and A1 lets its slot go (UNKNOWN_EFFECT: its work cannot be confirmed). In the /proc mode, whatever cgroup the
+/// test runs in. Watched, not a defect: a machine that does not run the stop's thread for longer than HELD_FOR right
+/// after the leader's reap makes the group lost track of, as ADR-019 decision 8 means it to be (unreaped, the slot
+/// kept); stopping this process 300 ms at the native cancel does so every time (docs/adr/ADR-021.md decision 8d, F2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
     let dir = tempfile::tempdir()?;
@@ -3986,6 +3995,8 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
         },
         Duration::ZERO,
     ));
+    // Its members end by their own records however the test leaves (a failed run's host still holds the executor).
+    let _members = common::Recorded(executor.0.members());
     let slow = Arc::new(SlowWritesWhileSettling::default());
     let host = runner_host_with(
         &project,
@@ -4006,6 +4017,16 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
         Duration::from_secs(10)
     )?);
     let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT json_extract(payload_json, '$.tracking') FROM events WHERE kind = 'attempt.tracking' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            )
+        )?,
+        "proc"
+    );
     let pid: u32 = query(
         &db,
         &format!("SELECT pid FROM attempts WHERE attempt_id = '{a1}'"),
