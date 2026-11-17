@@ -1158,3 +1158,135 @@ fn a_turns_output_is_its_raw_stdout_and_stderr_copies_and_nothing_else_of_its_di
     assert_eq!(executor.output_bytes(&w), Some(26));
     Ok(())
 }
+
+/// A fake codex 0.166.0 in `bin` like [`fake_codex`], its schema export without `read-only` among SandboxMode's values:
+/// the binary itself offers no read-only profile (docs/adr/ADR-032.md decision 4).
+fn fake_codex_without_read_only(bin: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let export = bin.join("schema");
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(format!("{PROTOCOL}/codex/0.166.0/app-server-schema"))
+        .arg(&export)
+        .status()?;
+    assert!(status.success());
+    let file = export.join("ClientRequest.json");
+    let mut requests: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+    requests["definitions"]["SandboxMode"]["enum"]
+        .as_array_mut()
+        .ok_or("SandboxMode.enum")?
+        .retain(|m| m != "read-only");
+    std::fs::write(&file, serde_json::to_vec(&requests)?)?;
+    let script = bin.join("codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\nf='{PROTOCOL}/codex/0.166.0'\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0'; exit 0;;\n \
+             --help) cat \"$f/help.txt\"; exit 0;;\n exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}; exit 2;;\n \
+             app-server) case \"$2\" in\n  --help) cat \"$f/help-app-server.txt\"; exit 0;;\n  generate-json-schema) \
+             [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{export}/.' \"$4/\"; exit 0;;\n esac;;\nesac\nexit 2\n",
+            export = export.display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// `w` as the Commander's supervision turn of wake W1, working in `workdir`.
+fn supervising(mut w: Work, workdir: &Path) -> Work {
+    w.role = "commander".to_owned();
+    w.assignment.supervision = Some(hoh_core::persistence::Supervision {
+        wake: "R1/trigger/1".to_owned(),
+        nonce: "n".to_owned(),
+        run_revision: 1,
+        role_epoch: 1,
+        summary: serde_json::json!({}),
+        workdir: Some(workdir.display().to_string()),
+        subject: Vec::new(),
+    });
+    w
+}
+
+#[tokio::test]
+async fn a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_by_its_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-032.md decision 2: the supervision turn, and only it, gets the read-only profile; no fallback. Decision
+    // 4 (-201): its prepare checks the granted read_only_workspace and, lacking it, refuses by the source the registry
+    // names: a host fact (here codex's degrade to exec) is AGENT_UNAVAILABLE in the Unavailable class, written as no
+    // exclusion; the binary's (a schema without read-only) BLOCKED_CAPABILITY in the Capability class.
+    let bin = tempfile::tempdir()?;
+    fake_codex(bin.path(), "B")?;
+    let project = tempfile::tempdir()?;
+    let registry = verified_codex(bin.path(), project.path())?;
+    let b = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) => *usable,
+        other => return Err(format!("not usable: {other:?}").into()),
+    };
+    assert!(b.granted.contains("read_only_workspace"), "{:?}", b.granted);
+    let executor = ProductExecutor::new(
+        registry.clone(),
+        project.path().to_owned(),
+        PathBuf::from("/bin/true"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let developer = {
+        let mut w = work(None);
+        w.assignment.agent = Some("codex".to_owned());
+        w.assignment.agent_version = Some(b.version.clone());
+        w.assignment.session_capabilities = Some(b.session.clone());
+        w.assignment.session_identity = Some(b.identity.clone());
+        w
+    };
+    let commander = supervising(developer.clone(), &project.path().join("commander-ws"));
+    let profile = |w: &Work| -> Result<hoh_agents::Profile, Box<dyn std::error::Error>> {
+        match executor.prepare(w).map_err(|r| format!("{r:?}"))?.prepared {
+            Prepared::Codex(turn) => Ok(turn.launch.profile),
+            other => Err(format!("not codex: {other:?}").into()),
+        }
+    };
+    assert_eq!(profile(&commander)?, hoh_agents::Profile::ReadOnly);
+    assert_eq!(profile(&developer)?, hoh_agents::Profile::Yolo);
+    // A host fact withholds it: the commander's turn is refused as unavailable, the developer's still runs.
+    registry.exec_degraded(Agent::Codex, b.identity.clone());
+    let refusal = executor.prepare(&commander).err().ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("AGENT_UNAVAILABLE", FailureClass::Unavailable)
+    );
+    assert!(
+        refusal
+            .detail
+            .unwrap_or_default()
+            .contains("read_only_workspace")
+    );
+    assert_eq!(profile(&developer)?, hoh_agents::Profile::Yolo);
+    // The binary lacks it: BLOCKED_CAPABILITY.
+    let bin = tempfile::tempdir()?;
+    fake_codex_without_read_only(bin.path())?;
+    let project = tempfile::tempdir()?;
+    let registry = verified_codex(bin.path(), project.path())?;
+    let c = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) => *usable,
+        other => return Err(format!("not usable: {other:?}").into()),
+    };
+    assert!(!c.granted.contains("read_only_workspace") && c.withheld.is_empty());
+    let executor = ProductExecutor::new(
+        registry,
+        project.path().to_owned(),
+        PathBuf::from("/bin/true"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let mut w = developer;
+    w.assignment.agent_version = Some(c.version.clone());
+    w.assignment.session_capabilities = Some(c.session.clone());
+    w.assignment.session_identity = Some(c.identity.clone());
+    let refusal = executor
+        .prepare(&supervising(w, &project.path().join("commander-ws")))
+        .err()
+        .ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("BLOCKED_CAPABILITY", FailureClass::Capability)
+    );
+    Ok(())
+}

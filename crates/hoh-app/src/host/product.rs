@@ -591,6 +591,14 @@ impl ProductExecutor {
             }
         };
         let usable = check(work, agent, &current)?;
+        // The supervision turn runs in the read-only workspace profile, no other (docs/adr/ADR-032.md decision 2); its
+        // agent must be granted it now, else it is refused by the source the registry names (decision 4, -201).
+        let profile = if a.supervision.is_some() {
+            read_only(agent, &usable)?;
+            hoh_agents::Profile::ReadOnly
+        } else {
+            hoh_agents::Profile::Yolo
+        };
         let Current { ready, ran, .. } = current;
         let contract = hoh_core::config::contract(&self.project, &work.role, a.prompt.as_deref())
             .map_err(|why| {
@@ -657,6 +665,7 @@ impl ProductExecutor {
             ),
             exec_only,
             graces: self.graces,
+            profile,
         };
         let prepared = ready
             .turn(agent, spec)
@@ -784,6 +793,34 @@ fn check(work: &Work, agent: Agent, current: &Current) -> Result<Box<Usable>, Re
         )));
     }
     Ok(usable)
+}
+
+/// Whether `usable` is granted the read-only workspace profile a supervision turn runs in (docs/adr/ADR-032.md decision
+/// 4, -201), refused by its source otherwise: withheld by a fact of this host (codex's host check unconfined or
+/// unavailable, its App Server degraded to exec) is AGENT_UNAVAILABLE in the Unavailable class, as for an agent that
+/// cannot run now, which writes no exclusion; missing from the session record, the binary's own, BLOCKED_CAPABILITY in
+/// the Capability class.
+fn read_only(agent: Agent, usable: &Usable) -> Result<(), Refusal> {
+    const NEEDED: &str = "read_only_workspace";
+    if usable.granted.contains(NEEDED) {
+        return Ok(());
+    }
+    let name = agent.as_str();
+    if usable.withheld.contains(NEEDED) {
+        Err(refused(
+            "AGENT_UNAVAILABLE",
+            FailureClass::Unavailable,
+            format!(
+                "{name}: this host withholds {NEEDED} now (its host check or a degrade to exec)"
+            ),
+        ))
+    } else {
+        Err(refused(
+            "BLOCKED_CAPABILITY",
+            FailureClass::Capability,
+            format!("{name}:CAPABILITY_UNSUPPORTED:{NEEDED}"),
+        ))
+    }
 }
 
 impl Executor for ProductExecutor {

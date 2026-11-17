@@ -1269,6 +1269,8 @@ pub(super) struct Spec {
     pub pi_session: (PathBuf, String),
     /// Codex's App Server is not to be used: it degraded on this implementation (decision 15).
     pub exec_only: bool,
+    /// The launch profile: `ReadOnly` for a supervision turn, `Yolo` for every other (docs/adr/ADR-032.md decision 2).
+    pub profile: hoh_agents::Profile,
     /// How long a native cancel and then SIGTERM may take before the adapter's next step (execution's
     /// cancel_native_grace_seconds and cancel_term_grace_seconds).
     pub graces: (Duration, Duration),
@@ -1283,7 +1285,7 @@ pub(super) enum Prepared {
 }
 
 impl Ready {
-    /// A turn of `agent` as `spec` says, under the YOLO profile; or why this agent's facts are not its own.
+    /// A turn of `agent` as `spec` says, under its profile; or why this agent's facts are not its own.
     pub(super) fn turn(&self, agent: Agent, spec: Spec) -> Result<Prepared, String> {
         let graced = |mut escalation: hoh_agents::process::Escalation| {
             escalation.native_grace = spec.graces.0;
@@ -1297,7 +1299,7 @@ impl Ready {
                         program: self.launcher.clone(),
                         help: help.clone(),
                         cwd: spec.cwd.clone(),
-                        profile: hoh_agents::Profile::Yolo,
+                        profile: spec.profile,
                         partial: false,
                         resume: spec.resume.clone(),
                         model: spec.model.clone(),
@@ -1328,7 +1330,7 @@ impl Ready {
                     exec_help: exec_help.clone(),
                     exec_resume_help: exec_resume_help.clone(),
                     cwd: spec.cwd.clone(),
-                    profile: hoh_agents::Profile::Yolo,
+                    profile: spec.profile,
                     resume: spec.resume.clone(),
                     model: spec.model.clone(),
                     known: known.clone(),
@@ -1357,7 +1359,7 @@ impl Ready {
                     provider: None,
                     model: spec.model.clone(),
                     settled_event: hoh_agents::pi::emits_settled(Some(&self.version)),
-                    profile: hoh_agents::Profile::Yolo,
+                    profile: spec.profile,
                     capabilities: self.capabilities.clone(),
                 },
                 prompt: spec.prompt.clone(),
@@ -1394,6 +1396,8 @@ impl Ready {
             pi_session: (cwd.join(".hoh/sessions"), String::new()),
             exec_only: false,
             graces: (Duration::from_secs(10), Duration::from_secs(5)),
+            // The session row is measured under the YOLO launch whatever a turn's profile (ADR-032 decision 4).
+            profile: hoh_agents::Profile::Yolo,
         };
         match self.turn(agent, spec)? {
             Prepared::Claude(turn) => {
