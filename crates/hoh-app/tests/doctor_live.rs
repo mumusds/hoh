@@ -34,6 +34,9 @@ fn whitelisted(args: &[String]) -> bool {
             | ["list", "--no-approve"]
             | ["app-server", "generate-json-schema", "--out", _]
             | ["auth", "check", "--provider", _, "--json", "--no-refresh"]
+            // codex's host check of its own read-only sandbox (docs/adr/ADR-032.md decision 4): a scratch directory's
+            // token read, one write tried, nothing else.
+            | ["sandbox", "-P", ":read-only", "-C", _, "--", "/bin/sh", "-c", _]
     ) || (a.len() >= 2
         && a.last() == Some(&"--help")
         && !a[..a.len() - 1].iter().any(|x| x.starts_with('-')))

@@ -4,7 +4,7 @@
 
 本包开发环境：Ubuntu 24.04/26.04非root用户，可免交互sudo装系统包；Git、Python3、Rust、Node、三Agent，网络/认证由用户提供。正式HoH运行环境：发布二进制+内置资源+可用Agent，Python不是生产Runtime依赖。
 
-用户明确选择YOLO隔离VM。本包不新增隐私/权限沙箱工程，也不改全局遥测设置。启动第三方工具使用探测后确认的YOLO参数；无需把进程以root运行。若native CLI不支持root下bypass，使用VM普通开发用户，这是工具兼容要求。
+用户明确选择YOLO隔离VM。本包不新增隐私/权限沙箱工程，也不改全局遥测设置。启动第三方工具使用探测后确认的YOLO参数（Commander 例外：它以只读工作区档启动，`execution.profile = "yolo-vm"` 即指 Commander 只读、其余职位全权限；CR-024，ADR-032）；无需把进程以root运行。若native CLI不支持root下bypass，使用VM普通开发用户，这是工具兼容要求。
 
 ## 开发初始化
 

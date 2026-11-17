@@ -4,6 +4,7 @@ config_version = "1.0"
 default_mode = "AUTO"
 document_profile = "full"   # profile selection by project size is specified in M3 (REQ-029)
 [execution]
+# yolo-vm: the Commander runs in the read-only workspace profile, every other role with full access (CR-024).
 profile = "yolo-vm"
 writer_slots = 1
 reader_slots = 2

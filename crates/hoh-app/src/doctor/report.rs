@@ -40,8 +40,44 @@ pub struct AgentItem {
     pub auth_check: Auth,
     pub capabilities: BTreeMap<String, Option<bool>>,
     pub remedy: Option<String>,
+    /// The Commander's read-only workspace profile on it; none while it is not installed or could not be probed.
+    pub read_only: Option<ReadOnly>,
     /// The live check, with `--live`.
     pub live: Option<Value>,
+}
+
+/// The Commander's read-only workspace profile on an agent (docs/adr/ADR-032.md decisions 4 and 7): whether a
+/// Commander can run on it here now, as staffing judges it, how that is enforced, what it is made of, and what the
+/// profile does not cover.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReadOnly {
+    /// Whether `granted` has `read_only_workspace`: its parts together (Kleene), `None` while one cannot be told (so
+    /// while the manifest verifies no entry of this version, which then is not staffed at all). A degrade to exec in a
+    /// host's run (codex) is that host's fact, which doctor does not see.
+    pub workspace: Option<bool>,
+    /// `os_sandbox`: codex's own sandbox; `tool_allowlist`: claude's and pi's tool lists in their own process.
+    pub enforced_by: &'static str,
+    pub parts: ReadOnlyParts,
+    /// codex only: this host's check of codex's own read-only sandbox (`confined`, `unconfined`, `unavailable`,
+    /// `unknown`).
+    pub check: Option<&'static str>,
+    /// What it means and what it does not cover (the residuals R1 to R7), in Chinese.
+    pub detail: String,
+}
+
+/// The parts of [`ReadOnly::workspace`] (docs/adr/ADR-032.md decision 4, items 1 to 4).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReadOnlyParts {
+    /// The probe rule, from the tested help or schema.
+    pub probe: Option<bool>,
+    /// The adapter's read-only launch builds on it (codex: on its App Server only).
+    pub builder: Option<bool>,
+    /// The compat manifest's read_only case for this very version; `None` while no entry of the manifest verifies it.
+    pub suite_case: Option<hoh_agents::compat::SuiteStatus>,
+    /// codex: this host's check (`check`, `reason`), the registry's function; none for the others and for codex on
+    /// exec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_check: Option<Value>,
 }
 
 impl AgentItem {
@@ -56,6 +92,7 @@ impl AgentItem {
             auth_check: Auth::Unknown,
             capabilities: BTreeMap::new(),
             remedy: Some(remedy),
+            read_only: None,
             live: None,
         }
     }
@@ -176,6 +213,20 @@ pub fn text(report: &Report) -> String {
                 })
                 .collect();
             out.push_str(&format!("        capabilities: {}\n", caps.join(" ")));
+        }
+        if let Some(read_only) = &item.read_only {
+            out.push_str(&format!(
+                "        read_only：workspace={} enforced_by={}{}\n        {}\n",
+                read_only
+                    .workspace
+                    .map_or("unknown", |b| if b { "true" } else { "false" }),
+                read_only.enforced_by,
+                read_only
+                    .check
+                    .map(|c| format!(" check={c}"))
+                    .unwrap_or_default(),
+                read_only.detail
+            ));
         }
         if let Some(live) = &item.live {
             out.push_str(&format!(
