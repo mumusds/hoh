@@ -657,13 +657,18 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             true,
             None,
         ),
-        PersistError::Full(_) => error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "DB_FULL",
-            "the database's file system is full; nothing was written",
-            true,
-            current_revision(shared, run_id).await,
-        ),
+        // The fixed text to the client (decision 6); the store's reason, with any path its room probe left
+        // (docs/09 fault matrix item 7, F7-303), to the host's log.
+        PersistError::Full(detail) => {
+            log(&detail);
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DB_FULL",
+                "the database's file system is full; nothing was written",
+                true,
+                current_revision(shared, run_id).await,
+            )
+        }
         PersistError::IntegrityViolation(detail) => {
             log(&detail);
             error(

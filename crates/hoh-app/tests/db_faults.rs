@@ -156,6 +156,47 @@ impl Project {
         )
     }
 
+    /// `POST path` with a JSON `body` to the project's host, over its socket with its token (host.json), as the
+    /// client sends it: the status and the body.
+    fn post(&self, path: &str, body: &str) -> R<(u16, String)> {
+        use std::io::Read as _;
+        let info: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(self.hoh_dir().join("host.json"))?)?;
+        let socket = info["socket"].as_str().ok_or("no socket in host.json")?;
+        let token = info["token"].as_str().ok_or("no token in host.json")?;
+        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(LIMIT))?;
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-HoH-Token: {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )?;
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply)?;
+        let (head, rest) = reply.split_once("\r\n\r\n").ok_or("no head")?;
+        let status = head.split(' ').nth(1).ok_or("no status")?.parse()?;
+        let body = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            let mut body = String::new();
+            let mut rest = rest;
+            while let Some((size, tail)) = rest.split_once("\r\n") {
+                let size = usize::from_str_radix(size.trim(), 16)?;
+                if size == 0 {
+                    break;
+                }
+                body.push_str(tail.get(..size).ok_or("short chunk")?);
+                rest = tail.get(size + 2..).unwrap_or_default();
+            }
+            body
+        } else {
+            rest.to_owned()
+        };
+        Ok((status, body))
+    }
+
     /// [`Project::dump`] once the running host has gone quiet: the same for a second (its tick is 200 ms), so that
     /// what its last command set going (the supervisor's cursor, say) is in it and not taken for a fault's write.
     fn quiet_dump(&self) -> R<String> {
@@ -762,6 +803,76 @@ fn full_a_commands_commit_that_fails_for_quota_is_db_full_and_writes_nothing() -
         project.accepted("third")?;
         assert_eq!(project.sql("SELECT count(*) FROM runs")?, "2");
         project.stop_host()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_logs_the_path() -> R {
+    // F7-303: over HTTP to the product host, a PauseRun whose commit's WAL fsync fails over a quota that stays: the
+    // room probe finds no room (DB_FULL, 503, retryable, nothing written) and its private directory cannot be removed
+    // (unlink: EIO). The response keeps its fixed text; the leftover's exact path reaches host.log.
+    let project = Project::new()?;
+    let arm = project.root.join("io-fault-arm");
+    let env = [
+        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+        ("F7_IO_MATCH", "/.hoh/state.db".into()),
+        ("F7_IO_OP", "sync".into()),
+        ("F7_IO_SUFFIX", "state.db-wal".into()),
+        ("F7_IO_ERRNO", "122".into()),
+        ("F7_IO_ARM", arm.clone().into_os_string()),
+        (
+            "F7_IO_STATE",
+            project.root.join("io-fault-state").into_os_string(),
+        ),
+        ("F7_UNLINK_ERRNO", "5".into()),
+        ("F7_UNLINK_SUFFIX", "/room".into()),
+    ];
+    let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let before = project.quiet_dump()?;
+    let run_id = project.sql("SELECT run_id FROM runs")?;
+    let revision: i64 = project.sql("SELECT revision FROM runs")?.parse()?;
+    let body = serde_json::json!({
+        "schema_version": "1.0",
+        "command_id": "f7-303",
+        "idempotency_key": "f7-303",
+        "expected_revision": revision,
+        "kind": "PauseRun",
+        "run_id": run_id,
+        "payload": {"reason": "F7-303"},
+    })
+    .to_string();
+    std::fs::write(&arm, "")?;
+    let (status, reply) = project.post("/v1/commands", &body)?;
+    let after = project.dump()?;
+    std::fs::remove_file(&arm)?;
+    let error: serde_json::Value = serde_json::from_str(&reply)?;
+    assert_eq!(status, 503, "{error}");
+    assert_eq!(
+        (&error["code"], &error["retryable"]),
+        (&serde_json::json!("DB_FULL"), &serde_json::json!(true)),
+        "{error}"
+    );
+    assert_eq!(after, before);
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir(project.hoh_dir())? {
+        let path = entry?.path();
+        if path.to_string_lossy().contains("state.db-room-") {
+            left.push(path.join("room"));
+            left.push(path);
+        }
+    }
+    project.stop_host()?;
+    let log = std::fs::read_to_string(project.hoh_dir().join("host.log"))?;
+    assert!(!left.is_empty(), "the probe's directory stays: {log}");
+    for path in &left {
+        assert!(
+            log.contains(&format!("{} is left, not removed", path.display())),
+            "{} not in host.log: {log}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path));
     }
     Ok(())
 }
