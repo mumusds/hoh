@@ -10,6 +10,7 @@
   "contracts/development-tasks.json": "task list describing the store",
   "contracts/requirements.json": "requirements describing the store",
   "contracts/sql/001_initial.sql": "the schema; embedded and run only by the Persistence module (MIGRATIONS)",
+  "crates/hoh-app/tests/support/io_fault.c": "test artefact of crates/hoh-app/tests/db_faults.rs (fault7 review round 2): an LD_PRELOAD shim the test builds with cc into its temporary directory, failing file I/O on the WAL self-test's files; its comments name SQLite, it opens no database and holds no SQL",
   "crates/hoh-core/Cargo.toml": "hoh-core's rusqlite dependency (check 1)",
   "reports/history/kit-1.0.0/round1-interrupted.txt": "archived kit review log",
   "reports/history/kit-1.0.0/tests-sql.txt": "archived kit test log",
