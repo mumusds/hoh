@@ -402,3 +402,116 @@ fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
         false
     );
 }
+
+/// A committed S0 excerpt (docs/adr/ADR-032.md): its stdout and request log without their header lines, and its
+/// observations.
+fn excerpt(case: &str) -> (Vec<u8>, Vec<Value>, Value) {
+    let base = format!(
+        "{}/../../tests/fixtures/commander-readonly/excerpts/pi/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let read = |kind: &str| std::fs::read_to_string(format!("{base}.{kind}")).expect(kind);
+    let stdout: String = read("stdout.excerpt.jsonl")
+        .lines()
+        .skip(1)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let log = read("stdin.excerpt.jsonl")
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).expect("a command"))
+        .collect();
+    let meta: Value = serde_json::from_str(&read("meta.json")).expect("meta");
+    (stdout.into_bytes(), log, meta["observations"].clone())
+}
+
+#[test]
+fn the_replay_of_a_recorded_turn_checks_the_session_file_as_live_does() {
+    // ADR-032 design correction 7 item 2 (M2T20D-801): the resumed session's file identity is the recorded one, judged
+    // by the check live and replay share; the commands come from the launch alone, compared with the request log.
+    use crate::observed::request_log_problem;
+    for case in ["noext-new", "noext-resumed", "control"] {
+        let (stdout, log, observed) = excerpt(case);
+        let facts = replay_facts(&stdout, &observed);
+        assert_eq!(
+            facts.state,
+            AttemptState::Settled,
+            "{case}: {:?}",
+            facts.failure
+        );
+        assert!(
+            facts
+                .final_text
+                .as_deref()
+                .is_some_and(|t| t.contains("```hoh-decisions")),
+            "{case}"
+        );
+        let sent = facts.sent.expect("sent");
+        assert_eq!(request_log_problem(&sent, &log), None, "{case}: {sent:?}");
+    }
+    let (stdout, log, observed) = excerpt("noext-resumed");
+    let other_inode = {
+        let mut o = observed["opened"].clone();
+        o[2] = json!(o[2].as_u64().expect("inode") + 1);
+        o
+    };
+    for (field, value) in [
+        ("opened", Value::Null),
+        ("opened", other_inode),
+        ("noted", json!([])),
+    ] {
+        let mut changed = observed.clone();
+        changed[field] = value.clone();
+        let facts = replay_facts(&stdout, &changed);
+        assert_eq!(
+            facts.failure.as_deref(),
+            Some("SESSION_MISMATCH"),
+            "{field} = {value}"
+        );
+        // No prompt is sent after a failed check: the log (with its prompt) is not the adapter's.
+        assert!(request_log_problem(&facts.sent.expect("sent"), &log).is_some());
+    }
+    // A new session's file is not checked.
+    let (stdout, _, observed) = excerpt("noext-new");
+    let mut changed = observed;
+    changed["opened"] = json!(["/elsewhere", 1, 2]);
+    assert_eq!(replay_facts(&stdout, &changed).state, AttemptState::Settled);
+    // pi's recordings before run 20261117T002630Z have no launch: not observed, never settled.
+    let (stdout, _, observed) = excerpt("ro-new");
+    let facts = replay_facts(&stdout, &observed);
+    assert!(
+        facts
+            .failure
+            .as_deref()
+            .is_some_and(|f| f.starts_with(crate::observed::NOT_OBSERVED))
+    );
+}
+
+#[test]
+fn the_session_check_is_one_function() {
+    let mut l = launch();
+    let file = (PathBuf::from("/s/a.jsonl"), 1, 2);
+    assert!(session_matches(&l, &[], Some("sid-1"), None));
+    assert!(!session_matches(&l, &[], Some("other"), None));
+    assert!(!session_matches(&l, &[], None, None));
+    l.resume = true;
+    assert!(session_matches(
+        &l,
+        std::slice::from_ref(&file),
+        Some("sid-1"),
+        Some(&file)
+    ));
+    assert!(!session_matches(
+        &l,
+        std::slice::from_ref(&file),
+        Some("sid-1"),
+        None
+    ));
+    assert!(!session_matches(
+        &l,
+        std::slice::from_ref(&file),
+        Some("sid-1"),
+        Some(&(PathBuf::from("/s/a.jsonl"), 1, 3))
+    ));
+    assert!(!session_matches(&l, &[], Some("sid-1"), Some(&file)));
+}

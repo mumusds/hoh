@@ -809,6 +809,23 @@ struct Rpc<'a> {
     expect: Option<Expect>,
     /// What that re-check found changed: no prompt was sent.
     changed: Option<Changed>,
+    /// A replay's recorded identity of the file get_state named (docs/adr/ADR-032.md design correction 7 item 2):
+    /// used instead of looking at the file, which a replay never does. `None` live.
+    opened: Option<Option<SessionFile>>,
+}
+
+/// The session check live and replay share (docs/adr/ADR-032.md design correction 7 item 2): get_state's session is
+/// the launch's, and a resumed session reopens a file noted before the start, by the identity (canonical path,
+/// device, inode) of the file get_state named as observed when its answer arrived; a file pi made anew, one gone or
+/// one not written yet is not. Live passes what it just observed ([`identity`]), a replay what was recorded.
+pub(crate) fn session_matches(
+    launch: &Launch,
+    noted: &[SessionFile],
+    answered: Option<&str>,
+    opened: Option<&SessionFile>,
+) -> bool {
+    answered == Some(launch.session_id.as_str())
+        && (!launch.resume || opened.is_some_and(|o| noted.contains(o)))
 }
 
 impl<'a> Rpc<'a> {
@@ -858,6 +875,7 @@ impl<'a> Rpc<'a> {
             closed: false,
             expect: None,
             changed: None,
+            opened: None,
         }
     }
 
@@ -1002,12 +1020,16 @@ impl<'a> Rpc<'a> {
                         self.model = record["data"]["model"]["id"].as_str().map(str::to_owned);
                         // A resumed session is one of the files noted before the start, as pi itself chose it; a
                         // file it made anew, one gone or one not written yet is not (module docs).
-                        let opened = record["data"]["sessionFile"].as_str().and_then(identity);
-                        let other_file = launch.resume
-                            && !opened.as_ref().is_some_and(|o| self.noted.contains(o));
-                        if self.native_session.as_deref() != Some(launch.session_id.as_str())
-                            || other_file
-                        {
+                        let opened = match &self.opened {
+                            Some(recorded) => recorded.clone(),
+                            None => record["data"]["sessionFile"].as_str().and_then(identity),
+                        };
+                        if !session_matches(
+                            launch,
+                            self.noted,
+                            self.native_session.as_deref(),
+                            opened.as_ref(),
+                        ) {
                             self.failure = Some("SESSION_MISMATCH".to_owned());
                             sink.attempt_event(id, "session-mismatch", "adapter.diagnostic",
                                                json!({"attempt_id": id, "reason": "SESSION_MISMATCH",
@@ -1501,6 +1523,80 @@ pub fn replay(bytes: &[u8], version: &str) -> Replayed {
         },
         Some(Err(e)) => crate::adapter::unreplayable(&e.to_string()),
         None => crate::adapter::unreplayable("the judging waited"),
+    }
+}
+
+/// The prompt a replay's prompt command carries: the recorded one is not an input of the replay, and the request log's
+/// prompt text is not compared (docs/adr/ADR-032.md design correction 7 item 2, the comparison contract).
+pub const REPLAY_PROMPT: &str = "<the prompt>";
+
+/// Replay a recorded turn (pi's stdout as it was read, to the process's exit) through this adapter's own judging with
+/// the observations recorded with it, no process started (docs/adr/ADR-032.md design correction 7): the launch they
+/// record (session id, resume) and, resumed, the noted files and the opened file's identity feed the session check
+/// live and replay share ([`session_matches`]); the version decides whether the turn waits for `agent_settled`
+/// ([`emits_settled`]); the recorded exit and log completion end it. Every message the adapter writes is collected
+/// from its own stdin (get_state; the prompt once the session check passes; dialogs cancelled). Observations the
+/// contract does not accept give NOT_OBSERVED ([`crate::observed::parse`]).
+pub fn replay_facts(stdout: &[u8], observations: &Value) -> crate::observed::ReplayFacts {
+    use crate::observed::{Agent, ReplayFacts};
+    let observed = match crate::observed::parse(Agent::Pi, observations) {
+        Ok(observed) => observed,
+        Err(why) => return ReplayFacts::failed(why),
+    };
+    let Some(launch) = observed.pi.clone() else {
+        return ReplayFacts::failed(format!("{} (launch)", crate::observed::NOT_OBSERVED));
+    };
+    let mut turn = replay_turn(&observed.version);
+    turn.launch.session_id = launch.session_id;
+    turn.launch.resume = launch.resume;
+    turn.prompt = REPLAY_PROMPT.to_owned();
+    let mut sink = Sink {
+        store: None,
+        recorded: Vec::new(),
+        observer: Observer::default(),
+    };
+    let (lines, mut written) = mpsc::unbounded_channel::<Vec<u8>>();
+    let mut r = Rpc::new(&turn, "replay", &launch.noted, lines, true, false);
+    r.opened = Some(launch.opened.clone());
+    r.open();
+    for step in crate::adapter::replay_steps(stdout) {
+        match step {
+            Replay::Cancel if !r.cancelled => {
+                r.cancelled = true;
+                let _ = r.abort();
+            }
+            Replay::Cancel => {}
+            Replay::Frame(line) => match crate::adapter::at_once(r.on_record(&mut sink, &line)) {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return ReplayFacts::failed(format!("REPLAY_INCOMPLETE: {e}")),
+                None => {
+                    return ReplayFacts::failed("REPLAY_INCOMPLETE: the judging waited".to_owned());
+                }
+            },
+        }
+    }
+    r.lines = None;
+    let driven = match crate::adapter::at_once(
+        r.conclude(&mut sink, Some(crate::observed::exit_report(&observed))),
+    ) {
+        Some(Ok(driven)) => driven,
+        Some(Err(e)) => return ReplayFacts::failed(format!("REPLAY_INCOMPLETE: {e}")),
+        None => return ReplayFacts::failed("REPLAY_INCOMPLETE: the judging waited".to_owned()),
+    };
+    let mut sent = Vec::new();
+    while let Ok(line) = written.try_recv() {
+        sent.push(serde_json::from_slice(&line).unwrap_or(Value::Null));
+    }
+    ReplayFacts {
+        state: driven.state,
+        failure: driven.failure,
+        final_text: driven.reply,
+        native_session: driven.native_session,
+        thread: None,
+        turn: None,
+        thread_result: None,
+        recorded: sink.recorded,
+        sent: Some(sent),
     }
 }
 
