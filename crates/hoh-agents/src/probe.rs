@@ -2600,6 +2600,133 @@ fn app_server_runs_commands(
     }
 }
 
+/// What the host's check of codex's own read-only sandbox found (docs/adr/ADR-032.md decision 4, "本机沙箱检查"): whether
+/// this host can set up the sandbox codex runs a read-only thread's commands in. A host fact, never the agent's probe
+/// failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxCheck {
+    /// The token was read and nothing was written.
+    Confined,
+    /// The probe file was written: no file system restriction here.
+    Unconfined,
+    /// The command never ran (the token was not read): the sandbox could not be set up, fail-closed.
+    Unavailable(String),
+    /// It could not be told: the check timed out, codex did not accept the profile, or it could not start.
+    Unknown(String),
+}
+
+impl SandboxCheck {
+    /// The check's name in evidence and doctor: confined, unconfined, unavailable or unknown.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SandboxCheck::Confined => "confined",
+            SandboxCheck::Unconfined => "unconfined",
+            SandboxCheck::Unavailable(_) => "unavailable",
+            SandboxCheck::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Why, for the two that say: what codex printed, or why the check could not tell.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            SandboxCheck::Unavailable(why) | SandboxCheck::Unknown(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// Whether this host fact withholds the read-only workspace profile from codex (unconfined, unavailable).
+    pub fn withholds(&self) -> bool {
+        matches!(
+            self,
+            SandboxCheck::Unconfined | SandboxCheck::Unavailable(_)
+        )
+    }
+}
+
+/// The permission profile the check asks for: the built-in read-only one (only the installed binary names it).
+pub const SANDBOX_PROFILE: &str = ":read-only";
+
+/// Check codex's own read-only sandbox on this host (docs/adr/ADR-032.md decision 4): in a scratch directory of its
+/// own, with a scratch `CODEX_HOME` and `HOME` (never the user's configuration or credentials), run
+/// `codex sandbox -P :read-only -C <scratch>/ws -- /bin/sh -c 'cat <scratch>/ws/token; echo x > <scratch>/ws/probe'`
+/// under the probe's limits and stop. The probe file written: unconfined; the token printed and no probe file:
+/// confined; codex refusing the profile as unknown, a timeout or a start that failed: unknown; else the command never
+/// ran: unavailable. The registry and doctor call this one function.
+pub fn codex_sandbox_check(launcher: &Path, env: &ProbeEnv) -> SandboxCheck {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let root =
+        std::env::temp_dir().join(format!("hoh-codex-sandbox-{}-{nanos}", std::process::id()));
+    let (ws, home, codex_home) = (root.join("ws"), root.join("home"), root.join("codex"));
+    let token: String = Sha256::digest(format!("{}-{nanos}", std::process::id()))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let made = [&ws, &home, &codex_home]
+        .iter()
+        .try_for_each(std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(ws.join("token"), &token));
+    let check = match made {
+        Err(e) => SandboxCheck::Unknown(format!("the check's scratch directory: {e}")),
+        Ok(()) => {
+            let ws_text = ws.display().to_string();
+            let script = format!("cat '{ws_text}/token'; echo x > '{ws_text}/probe'");
+            let args = [
+                "sandbox",
+                "-P",
+                SANDBOX_PROFILE,
+                "-C",
+                &ws_text,
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ];
+            let vars: [(&str, &OsStr); 2] = [
+                ("CODEX_HOME", codex_home.as_os_str()),
+                ("HOME", home.as_os_str()),
+            ];
+            match logged(launcher, &args, env, true, &vars) {
+                Err(ProbeError::TimedOut { .. }) => {
+                    SandboxCheck::Unknown("the check timed out".to_owned())
+                }
+                Err(e) => SandboxCheck::Unknown(e.to_string()),
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let said = |pick: &dyn Fn(&str) -> bool| {
+                        stderr
+                            .lines()
+                            .rev()
+                            .find(|l| pick(l))
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned()
+                    };
+                    if ws.join("probe").exists() {
+                        SandboxCheck::Unconfined
+                    } else if String::from_utf8_lossy(&out.stdout).contains(&token) {
+                        SandboxCheck::Confined
+                    } else if stderr.contains("unknown") && stderr.contains(SANDBOX_PROFILE) {
+                        SandboxCheck::Unknown(format!(
+                            "codex does not accept the profile {SANDBOX_PROFILE}: {}",
+                            said(&|l: &str| l.contains("unknown"))
+                        ))
+                    } else {
+                        SandboxCheck::Unavailable(format!(
+                            "the command did not run ({}): {}",
+                            out.status,
+                            said(&|l: &str| !l.trim().is_empty())
+                        ))
+                    }
+                }
+            }
+        }
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    check
+}
+
 /// Whether the App Server takes the read-only workspace profile (docs/adr/ADR-032.md decision 4): its thread/start and
 /// thread/resume as the adapter builds them for `ReadOnly` ([`crate::codex::app_server::requests`]) are valid against
 /// the tested `ClientRequest.json` (the three-valued validator, as for `command_execution`); `None` when it cannot be
@@ -3075,24 +3202,25 @@ fn run_ok(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, Pro
 
 /// Run a probe command with no stdin in its own process group; kill the group if it outlives the timeout.
 fn run(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeError> {
-    logged(program, args, env, false)
+    logged(program, args, env, false, &[])
 }
 
 /// Run a native status command (no model call) as [`run`] does, keeping stdout and stderr: some CLIs write their
 /// conclusion to stderr (`codex login status`).
 pub fn run_status(program: &Path, args: &[&str], env: &ProbeEnv) -> Result<Captured, ProbeError> {
-    logged(program, args, env, true)
+    logged(program, args, env, true, &[])
 }
 
-/// [`capture`], written down in `env.log`.
+/// [`capture`], written down in `env.log`; `vars` are set for the command on top of the probe's environment.
 fn logged(
     program: &Path,
     args: &[&str],
     env: &ProbeEnv,
     stderr: bool,
+    vars: &[(&str, &OsStr)],
 ) -> Result<Captured, ProbeError> {
     let started = Instant::now();
-    let result = capture(program, args, env, stderr);
+    let result = capture(program, args, env, stderr, vars);
     if let Some(log) = &env.log
         && let Ok(mut runs) = log.lock()
     {
@@ -3112,6 +3240,7 @@ fn capture(
     args: &[&str],
     env: &ProbeEnv,
     keep_stderr: bool,
+    vars: &[(&str, &OsStr)],
 ) -> Result<Captured, ProbeError> {
     let failed = |detail: String| ProbeError::Failed {
         argv: argv(program, args),
@@ -3136,6 +3265,7 @@ fn capture(
         Command::new(program)
             .args(args)
             .env("PATH", &env.path)
+            .envs(vars.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(if keep_stderr {
@@ -3401,6 +3531,9 @@ mod capability_tests;
 
 #[cfg(test)]
 mod compat_tests;
+
+#[cfg(test)]
+mod sandbox_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4993,7 +5126,7 @@ mod tests {
             } else {
                 beyond.clone()
             };
-            match logged(sh, &["-c", &script], &env, keep_stderr) {
+            match logged(sh, &["-c", &script], &env, keep_stderr, &[]) {
                 Err(ProbeError::Failed { detail, .. }) => {
                     assert!(detail.contains("more output"), "{detail}")
                 }
