@@ -33,6 +33,12 @@ const TRACKING_LIMITS: &str = "终结证明只覆盖 Attempt 自己的进程：�
 在自己持有 CAP_SYS_ADMIN 的命名空间里重新启动它并伪造 /proc 与 cgroup 的视图）时，无法归属，\
 可能在 Attempt 结束、写者租约释放后继续写（REQ-043 决定 3，CR-012、CR-013）";
 
+// doctor's own processes, the same kind of limit (docs/adr/ADR-031.md, 设计修正 2, B, which asks for it here): at every
+// exit doctor kills every descendant it finds alive (it is their subreaper, so one a probe or a live turn's agent set
+// apart and orphaned is found too). Not covered: work a probe or a live turn handed to a same-user service already
+// running (`systemd --user`, a tmux server started before). Conversely, a user daemon a probe happened to start
+// (gpg-agent, ssh's ControlPersist master, git credential-cache) is doctor's descendant and is killed with it.
+
 /// The compat manifest of the project, if there is a readable one (ADR-015 decision 2); a warning otherwise.
 fn manifest(project: &Path) -> (Option<CompatManifest>, Option<String>) {
     let path = project.join(".hoh/compat-manifest.json");
@@ -420,6 +426,9 @@ pub fn run(project: &Path, live: bool, json_output: bool) -> u8 {
         Ok(state) => state,
         Err(code) => return code,
     };
+    // doctor's stop also kills every process its probes and live turns set apart (docs/adr/ADR-031.md, 设计修正 2, B).
+    // Refused, the stop still finds every descendant whose parents live; one orphaned meanwhile goes to init.
+    let _ = state.adopt_descendants();
     let dir = project.to_path_buf();
     let report = match state.wait(move || examine(&dir, live)) {
         Ok(report) => report,
