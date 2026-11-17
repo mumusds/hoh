@@ -9,6 +9,13 @@ codex/app_server.rs `State::on_line`, `on_response`, `scope_of`, `on_turn_notifi
 `adapter_replay` mirrors those functions, each mirrored step naming the function it mirrors; where the two differ,
 the adapter is right and this file is the defect.
 
+The replay's input (M2T20D-800, -801) is the recorded stdout and, for what the adapter observes outside the stream,
+the recorded `observations`: the process's exit, whether both logs were read to their end, claude's prompt delivery,
+pi's launch (session id, resume), the session files noted before the start and the identity of the file get_state
+named. Requests are registered only as the adapter registers them (codex: initialize, then the thread request once
+initialize is answered, then turn/start; pi: get_state, then the prompt once the session check passes); the recorded
+request log is only compared with them, never used to pre-fill the pending map.
+
 What the judge does itself, here and in M2-T20 alike:
 - the codex rollout, which no adapter reads, enumerated default-deny (`rollout_calls`): every call of the adapter's
   turn, whatever its form, must pair by call_id with an output of known classification; anything it cannot classify
@@ -22,8 +29,9 @@ It runs on every committed excerpt and, where present locally with the recorded 
 generator (`mutants`) derives variants of every positive round with expectations fixed to the adapters' semantics:
 records the adapter ignores (an uncorrelated response, another turn's notification) are invariance variants; records
 the adapter processes (claude's later result frames whatever their session_id, pi's frames after agent_settled) are
-judged by their content. `--emit DIR` writes every variant with its expected verdict class: M2-T20's acceptance
-fixtures (design correction 7).
+judged by their content. `--emit DIR` writes every variant with its inputs and its frozen expected verdict class:
+M2-T20's acceptance fixtures (design correction 7). The oracle is that class with the adapters' replay, not this
+prototype's verdict (M2T20D-851).
 
 Usage: python3 tests/fixtures/commander-readonly/judge_check.py [--excerpts DIR] [--root REPO] [--json OUT] [--md OUT]
                                                                  [--emit DIR]
@@ -66,10 +74,13 @@ class Case:
 
     def __init__(self, agent: str, name: str, form: str, stdout: list[dict], rollout: list[dict] | None,
                  diff: dict | None, paths: dict[str, str], token_sha256: str, exit_code, requests: list[dict] | None,
-                 session_arg: str | None):
+                 session_arg: str | None, observations: dict | None = None):
         self.agent, self.name, self.form = agent, name, form
         self.stdout, self.rollout, self.diff, self.paths = stdout, rollout, diff, paths
         self.token_sha256, self.exit_code, self.requests, self.session_arg = token_sha256, exit_code, requests, session_arg
+        # The adapter's external observations (design correction 7, M2T20D-801): the process's end, whether both
+        # streams were read to their end; for pi the launch, the noted session files and the get_state file's identity.
+        self.observations = observations or {}
 
     def region(self, rel: str) -> str:  # 'P/.git' -> the case's real or placeholder path
         head, _, tail = rel.partition('/')
@@ -103,7 +114,7 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
     placeholders = {'P': '<P>', 'W': '<W>', 'T': '<T>'}
     excerpt = Case(agent, name, 'excerpt', json_lines(stdout_text), json_lines(rollout_text) if rollout_text else None,
                    meta['snapshot_diff'], placeholders, meta['token_sha256'], meta['exit_code'],
-                   json_lines(stdin_text) if stdin_text else None, _session_arg(meta['argv']))
+                   json_lines(stdin_text) if stdin_text else None, _session_arg(meta['argv']), meta.get('observations'))
     header = json.loads(stdout_text.splitlines()[0])['_excerpt']
     raw_dir = root / Path(header['source']).parent
     raw_stdout = raw_dir / 'stdout.jsonl'
@@ -122,7 +133,9 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
                json_lines((raw_dir / 'rollout.jsonl').read_text()) if rollout_text else None,
                json.loads((raw_dir / 'snapshot.json').read_text())['diff'], inverse, raw_meta['token_sha256'],
                raw_meta['exit_code'], json_lines((raw_dir / 'stdin.txt').read_text()) if stdin_text else None,
-               _session_arg(raw_meta['argv']))
+               _session_arg(raw_meta['argv']), raw_meta.get('observations') or {
+                   'exit': {'returncode': raw_meta['exit_code'], 'how': raw_meta['stopped']},
+                   'logs_complete': raw_meta['stopped'] == 'exited'})
     return excerpt, raw, ''
 
 
@@ -140,6 +153,25 @@ class Replay:
         self.thread = self.turn = None
 
 
+def _exit_code(c: Case):
+    """The process's exit code as observed (None: no exit status observed, which claude.rs `judge` fails)."""
+    return (c.observations.get('exit') or {}).get('returncode')
+
+
+def _logs_complete(c: Case) -> bool:
+    """The observation the adapters' `verdict` reads as logs_incomplete (RAW_LOG_INCOMPLETE when false)."""
+    return c.observations.get('logs_complete') is True
+
+
+def _codex_launch(c: Case):
+    """The launch the App Server adapter starts from: resumed iff the recorded request log has thread/resume (the
+    thread id it names). M2-T20 passes these launch parameters to `replay_facts`."""
+    for q in c.requests or []:
+        if q.get('method') == 'thread/resume':
+            return (q.get('params') or {}).get('threadId') or True
+    return None
+
+
 def _codex_replay(c: Case) -> Replay:
     """Mirrors codex/app_server.rs: `on_response` (a response counts only if its id is a pending request of ours;
     `error` refuses it; the thread and turn ids come from the Thread and TurnStart answers), `on_notification` with
@@ -148,7 +180,19 @@ def _codex_replay(c: Case) -> Replay:
     `on_turn_notification` (the reply is the last completed agentMessage; turn/completed sets the status), and codex.rs
     `verdict` (a failure fails; status completed settles, interrupted cancels, failed fails, none is incomplete)."""
     r = Replay()
-    pending = {q['id']: q['method'] for q in c.requests or [] if isinstance(q.get('id'), int) and isinstance(q.get('method'), str)}
+    # The adapter's own requests (codex/app_server.rs `Conn::request`: ids from 0 up), registered as it registers them:
+    # initialize at the start; the thread request only once initialize is answered; turn/start only once the thread
+    # request is answered. Nothing is pre-filled from the request log (M2T20D-800).
+    pending: dict = {}
+    next_id = 0
+
+    def request(method: str) -> None:
+        nonlocal next_id
+        pending[next_id] = method
+        next_id += 1
+
+    request('initialize')
+    resume = _codex_launch(c)
     status, early = None, []
 
     def on_turn(f: dict) -> None:
@@ -166,10 +210,15 @@ def _codex_replay(c: Case) -> Replay:
             if what is None:
                 continue  # "a response to no request of ours"
             refused = f.get('error') is not None
-            if refused and what in ('initialize', 'thread/start', 'thread/resume', 'turn/start'):
+            if refused and what == 'initialize' and (f.get('error') or {}).get('code') == -32601:
+                r.failure = r.failure or 'CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade)'
+            elif refused:
                 r.failure = r.failure or f'{what}: refused'
+            elif what == 'initialize':
+                request('thread/resume' if resume else 'thread/start')
             elif what in ('thread/start', 'thread/resume'):
                 r.thread = ((f.get('result') or {}).get('thread') or {}).get('id')
+                request('turn/start')
             elif what == 'turn/start':
                 r.turn = ((f.get('result') or {}).get('turn') or {}).get('id')
                 held, early = early, []
@@ -184,7 +233,9 @@ def _codex_replay(c: Case) -> Replay:
                 early.append(f)
             elif this_thread and _turn_of(f) == r.turn and r.turn is not None:
                 on_turn(f)
-    if r.failure:
+    if not _logs_complete(c):
+        r.state, r.failure = 'failed', 'RAW_LOG_INCOMPLETE'
+    elif r.failure:
         r.state = 'failed'
     else:
         r.state = {'completed': 'settled', 'interrupted': 'cancelled', 'failed': 'failed'}.get(status, 'incomplete')
@@ -198,18 +249,24 @@ def _turn_of(f: dict):
 
 def _claude_replay(c: Case) -> Replay:
     """Mirrors claude.rs: `Driven::on_line` takes every frame of the attempt's stdout (each result frame replaces the
-    last one, whatever its session_id), `verdict` and `judge` (no result frame is PROTOCOL_INCOMPLETE; subtype other than
-    "success" fails; is_error other than false fails; an exit code other than 0 fails; else settled). The reply is the
-    last result frame's result."""
+    last one, whatever its session_id), `verdict` and `judge` (a log not read to its end is RAW_LOG_INCOMPLETE; no
+    result frame is PROTOCOL_INCOMPLETE; subtype other than "success" fails; is_error other than false fails; an exit
+    code other than 0, a signal or no exit status fails; a settled turn whose prompt was not fed is
+    PROMPT_NOT_DELIVERED; else settled). The reply is the last result frame's result. The exit status, the log
+    completion and the prompt's delivery are the recorded observations (`observations`), not the stream."""
     r = Replay()
     r.frames = list(c.stdout)
     results = [f for f in c.stdout if f.get('type') == 'result']
-    if not results:
-        return r
-    last = results[-1]
-    r.final_text = last.get('result') if isinstance(last.get('result'), str) else None
-    if last.get('subtype') != 'success' or last.get('is_error') is not False or c.exit_code != 0:
+    last = results[-1] if results else None
+    r.final_text = last.get('result') if last and isinstance(last.get('result'), str) else None
+    if not _logs_complete(c):
+        r.state, r.failure = 'failed', 'RAW_LOG_INCOMPLETE'
+    elif last is None:
+        r.state, r.failure = 'incomplete', 'PROTOCOL_INCOMPLETE'
+    elif last.get('subtype') != 'success' or last.get('is_error') is not False or _exit_code(c) != 0:
         r.state, r.failure = 'failed', last.get('subtype') if last.get('subtype') != 'success' else 'is_error or exit'
+    elif c.observations.get('prompt_fed') is not True:
+        r.state, r.failure = 'failed', 'PROMPT_NOT_DELIVERED'
     else:
         r.state = 'settled'
     return r
@@ -225,7 +282,15 @@ def _pi_replay(c: Case) -> Replay:
     incomplete)."""
     r = Replay()
     r.frames = list(c.stdout)
-    pending = {q['id']: q['type'] for q in c.requests or [] if isinstance(q.get('id'), str) and q.get('type') in ('get_state', 'prompt')}
+    # pi.rs `open`: get_state as "hoh-state-1" (`command_id`); the prompt, "hoh-prompt-2", is registered only when the
+    # session check passes. Nothing is pre-filled from the request log (M2T20D-800).
+    pending = {'hoh-state-1': 'get_state'}
+    launch = c.observations.get('launch')
+    if not launch:
+        # The launch (its session id, whether it resumes) is the adapter's own; a recording without it cannot be
+        # replayed as the adapter would (recordings before run 20261117T002630Z).
+        r.state, r.failure = 'incomplete', 'NOT_OBSERVED (the launch)'
+        return r
     settled, aborted, error = False, False, None
     for f in c.stdout:
         t = f.get('type')
@@ -235,8 +300,23 @@ def _pi_replay(c: Case) -> Replay:
             if what == 'get_state':
                 if not ok:
                     r.failure = r.failure or 'get_state failed'
-                elif (f.get('data') or {}).get('sessionId') != c.session_arg:
+                elif (f.get('data') or {}).get('sessionId') != launch.get('session_id'):
                     r.failure = r.failure or 'SESSION_MISMATCH'
+                elif launch.get('resume'):
+                    # The resumed session must reopen a noted file: the identity (canonical path, device, inode)
+                    # of the session file get_state names, as observed when the answer arrived, is one of the files
+                    # noted before the start (pi.rs `identity`, `session_files`). Without the observations the
+                    # replay cannot judge it.
+                    if 'noted' not in c.observations or 'opened' not in c.observations:
+                        r.failure = r.failure or 'NOT_OBSERVED (the session file identity)'
+                        r.state = 'incomplete'
+                        return r
+                    if c.observations['opened'] is None or c.observations['opened'] not in c.observations['noted']:
+                        r.failure = r.failure or 'SESSION_MISMATCH'
+                    else:
+                        pending['hoh-prompt-2'] = 'prompt'
+                else:
+                    pending['hoh-prompt-2'] = 'prompt'
             elif what == 'prompt':
                 if not ok:
                     r.failure = r.failure or 'prompt refused'
@@ -251,7 +331,9 @@ def _pi_replay(c: Case) -> Replay:
             else:
                 error = None
                 r.final_text = ''.join(p.get('text', '') for p in m.get('content') or [] if isinstance(p, dict) and p.get('type') == 'text')
-    if r.failure:
+    if not _logs_complete(c):
+        r.state, r.failure = 'failed', 'RAW_LOG_INCOMPLETE'
+    elif r.failure:
         r.state = 'failed'
     elif settled and aborted:
         r.state = 'cancelled'
@@ -693,11 +775,25 @@ def cells(c: Case) -> dict[str, str]:
     return {f'shell {k}': v for k, v in e5_shell_cells(c).items()} | {f'patch {k}': v for k, v in e6_patch_cells(c).items()}
 
 
+def request_problems(c: Case) -> list[str]:
+    """The recorded requests must be the adapter's own (the same ids and methods in order): else the recording does
+    not show what the product's replay would see."""
+    if c.agent == 'codex':
+        want = [(0, 'initialize'), (1, 'thread/resume' if _codex_launch(c) else 'thread/start'), (2, 'turn/start')]
+        got = [(q.get('id'), q.get('method')) for q in c.requests or [] if 'id' in q]
+    elif c.agent == 'pi':
+        want = [('hoh-state-1', 'get_state'), ('hoh-prompt-2', 'prompt')]
+        got = [(q.get('id'), q.get('type')) for q in c.requests or [] if 'id' in q]
+    else:
+        return []
+    return [] if got == want else ['the recorded requests are not the adapter\'s own']
+
+
 def call_problems(c: Case) -> list[str]:
     """Stage 2 for the turn: codex's items (stream) and calls (rollout), claude's and pi's tool calls."""
     if c.agent == 'codex':
-        return untaken(c) + stream_items(c)[2] + rollout_calls(c)[1]
-    return tool_problems(c)
+        return request_problems(c) + untaken(c) + stream_items(c)[2] + rollout_calls(c)[1]
+    return request_problems(c) + tool_problems(c)
 
 
 def write_tool_successes(c: Case) -> list[str]:
@@ -946,6 +1042,39 @@ def _reverse_cell_evidence(c: Case) -> None:
             c.rollout[i] = l
 
 
+UNOBSERVED = object()
+
+
+def _observe(c: Case, **changes) -> None:
+    """Change the recorded external observations (UNOBSERVED removes one)."""
+    c.observations = copy.deepcopy(c.observations)
+    for key, value in changes.items():
+        if value is UNOBSERVED:
+            c.observations.pop(key, None)
+        else:
+            c.observations[key] = value
+    if 'exit' in changes:
+        c.exit_code = None if changes['exit'] is UNOBSERVED else changes['exit'].get('returncode')
+
+
+def _initialize_response(m: Case) -> dict:
+    return next(f for f in m.stdout if 'method' not in f and f.get('id') == 0)
+
+
+def _initialize_after_thread(m: Case) -> None:
+    """The initialize response arrives after the thread response: the adapter registers the thread request only once
+    initialize is answered, so the earlier thread response answers no request of its own."""
+    f = _initialize_response(m)
+    m.stdout.remove(f)
+    at = next(i for i, g in enumerate(m.stdout) if 'method' not in g and isinstance(g.get('result'), dict) and 'thread' in g['result'])
+    m.stdout.insert(at + 1, f)
+
+
+def _opened_other_inode(m: Case) -> None:
+    path, dev, ino = m.observations['opened']
+    _observe(m, opened=[path, dev, ino + 1])
+
+
 def _set_terminal(c: Case, how: str) -> None:
     """The terminal variants of each agent: 'dropped', 'failed', 'interrupted', 'exit 1' (claude), 'provider error' (pi)."""
     s = c.stdout
@@ -959,7 +1088,7 @@ def _set_terminal(c: Case, how: str) -> None:
                 elif how == 'interrupted':
                     f['subtype'] = 'error_during_execution'
         if how == 'exit 1':
-            c.exit_code = 1
+            _observe(c, exit={'returncode': 1, 'how': 'exited'})
     elif c.agent == 'codex':
         if how == 'dropped':
             c.stdout = [f for f in s if f.get('method') != 'turn/completed']
@@ -1219,6 +1348,42 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         add('terminal', how, edit=lambda m, how=how: _set_terminal(m, how))
     if a == 'pi':
         add('terminal', 'a provider error retried by the final message', expect='same', edit=_retried_error)
+    # ---- the adapters' external observations, part of the replay's input (design correction 7, M2T20D-801)
+    add('observation', 'the logs not read to their end', edit=lambda m: _observe(m, logs_complete=False))
+    add('observation', 'no log completion observed', edit=lambda m: _observe(m, logs_complete=UNOBSERVED))
+    add('control observation', 'the control logs not read to their end', edit_control=lambda m: _observe(m, logs_complete=False))
+    if a == 'claude':
+        add('observation', 'the prompt not fed (PROMPT_NOT_DELIVERED)', edit=lambda m: _observe(m, prompt_fed=False))
+        add('observation', 'no prompt delivery observed', edit=lambda m: _observe(m, prompt_fed=UNOBSERVED))
+        add('observation', 'ended by a signal', edit=lambda m: _observe(m, exit={'returncode': -9, 'how': 'SIGKILL'}))
+        add('observation', 'no exit status observed', edit=lambda m: _observe(m, exit=UNOBSERVED))
+    else:
+        # codex.rs `verdict` reads the exit only for exec (exit_matters); pi.rs `verdict` never reads it.
+        add('observation', 'exit 1 (the verdict does not read it)', expect='same', edit=lambda m: _observe(m, exit={'returncode': 1, 'how': 'exited'}))
+    if a == 'codex':
+        # codex/app_server.rs `Conn::request` and `on_response`: initialize is id 0; the thread request is registered
+        # only when initialize is answered, turn/start only when the thread request is (M2T20D-800).
+        add('initialize handshake', 'the initialize response missing', edit=lambda m: m.stdout.remove(_initialize_response(m)))
+        add('initialize handshake', 'the initialize response refused', edit=lambda m: _initialize_response(m).update(
+            error={'code': -32000, 'message': 'refused'}))
+        add('initialize handshake', 'the initialize response method-not-found (the adapter degrades to exec)',
+            edit=lambda m: _initialize_response(m).update(error={'code': -32601, 'message': 'method not found'}))
+        add('initialize handshake', 'the initialize response after the thread response', edit=_initialize_after_thread)
+        add('initialize handshake', 'the initialize response answered twice', expect='same', edit=lambda m: m.stdout.insert(
+            m.stdout.index(_initialize_response(m)) + 1, copy.deepcopy(_initialize_response(m))))
+        add('initialize handshake', 'the request log without initialize', edit=lambda m: setattr(m, 'requests', [
+            q for q in m.requests if q.get('method') != 'initialize']))
+    if a == 'pi':
+        add('observation', 'no launch observed', edit=lambda m: _observe(m, launch=UNOBSERVED))
+        if (c.observations.get('launch') or {}).get('resume'):
+            # pi.rs: a resumed session's get_state must name a file noted before the start (canonical path, device,
+            # inode), as observed when the answer arrived; else SESSION_MISMATCH.
+            add('session identity', 'the session file gone when get_state answered', edit=lambda m: _observe(m, opened=None))
+            add('session identity', 'the session file replaced (another inode)', edit=_opened_other_inode)
+            add('session identity', 'the session file not noted before the start', edit=lambda m: _observe(m, noted=[]))
+            add('session identity', 'no identity observed', edit=lambda m: _observe(m, opened=UNOBSERVED))
+        else:
+            add('session identity', "a new session's file identity is not read", expect='same', edit=lambda m: _observe(m, opened=None))
     # ---- the availability evidence, the snapshot, the decision block
     if a == 'claude':
         add('drop availability', 'init', edit=lambda m: setattr(m, 'stdout', [f for f in m.stdout if f.get('subtype') != 'init']))
@@ -1551,9 +1716,12 @@ def markdown(report: dict) -> str:
 
 def emit(excerpts: Path, root: Path, out: Path) -> None:
     """Write every generated variant of every positive round, from the committed excerpts, as M2-T20's acceptance
-    fixtures (design correction 7): <out>/<agent>/<round>/<NNN>/{stdout.jsonl, rollout.jsonl, stdin.jsonl, diff.json,
-    control.*, expect.json}. expect.json holds the variant's kind and label, its expectation ("non-PASS" or "same") and
-    this prototype's verdict; M2-T20's Rust judge must give a verdict of the expected class on the adapters' replay."""
+    fixtures (design correction 7): <out>/<agent>/<round>/<NNN>/{stdout.jsonl, rollout.jsonl, stdin.jsonl,
+    observations.json, diff.json, control.*, expect.json}. observations.json is the replay's input besides the stream
+    (M2T20D-801): what the adapter observed outside it (exit, log completion; claude's prompt delivery; pi's launch,
+    noted session files and the get_state file's identity). expect.json holds the variant's kind and label and its
+    expected class ("non-PASS" or "same"): with the adapters' replay of these inputs, that frozen class is the oracle
+    for M2-T20's Rust judge (M2T20D-851); `prototype_verdict` is this prototype's verdict, for information only."""
     for key in POSITIVE:
         a, n = key.split('/')
         c = load(excerpts, root, a, n)[0]
@@ -1569,6 +1737,7 @@ def emit(excerpts: Path, root: Path, out: Path) -> None:
                     (d / f'{prefix}rollout.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.rollout))
                 if case.requests is not None:
                     (d / f'{prefix}stdin.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.requests))
+                (d / f'{prefix}observations.json').write_text(json.dumps(case.observations, ensure_ascii=False) + '\n')
                 (d / f'{prefix}diff.json').write_text(json.dumps({'diff': case.diff, 'exit_code': case.exit_code,
                                                                   'session_arg': case.session_arg, 'token_sha256': case.token_sha256}) + '\n')
             verdict = round_verdict(m, mc)[0]

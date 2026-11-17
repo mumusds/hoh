@@ -640,9 +640,9 @@
   },
   "pi/ordinary-error": {
    "excerpt": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "nonconform",
     "E9": {
      "edit call_90f77d2938f54612bdf4c6e5": "insufficient",
@@ -650,12 +650,12 @@
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    },
    "raw": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "nonconform",
     "E9": {
      "edit call_90f77d2938f54612bdf4c6e5": "insufficient",
@@ -663,99 +663,99 @@
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    }
   },
   "pi/ro-new": {
    "excerpt": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    },
    "raw": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    }
   },
   "pi/ro-no-extensions": {
    "excerpt": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    },
    "raw": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    }
   },
   "pi/ro-plus-write": {
    "excerpt": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "nonconform",
     "E9": {
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    },
    "raw": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "nonconform",
     "E9": {
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    }
   },
   "pi/ro-resumed": {
    "excerpt": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    },
    "raw": {
-    "E0": "settled",
+    "E0": "incomplete (NOT_OBSERVED (the launch))",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
-    "E11": "conform",
+    "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
     },
-    "calls": "every item and call classified and complete"
+    "calls": "the recorded requests are not the adapter's own"
    }
   }
  },
@@ -830,7 +830,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
+      "the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE)",
       "decision block insufficient"
      ]
     },
@@ -858,6 +858,76 @@
      "expect": "non-PASS",
      "kind": "terminal",
      "label": "exit 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, is_error or exit)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no prompt delivery observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "ended by a signal",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, is_error or exit)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no exit status observed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -911,7 +981,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
+      "the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE)",
       "decision block insufficient"
      ]
     },
@@ -1017,6 +1087,13 @@
     }
    ],
    "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -1114,7 +1191,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
+      "the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE)",
       "decision block insufficient"
      ]
     },
@@ -1142,6 +1219,76 @@
      "expect": "non-PASS",
      "kind": "terminal",
      "label": "exit 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, is_error or exit)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no prompt delivery observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "ended by a signal",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, is_error or exit)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no exit status observed",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1195,7 +1342,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
+      "the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE)",
       "decision block insufficient"
      ]
     },
@@ -1301,6 +1448,13 @@
     }
    ],
    "raw": [
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -1637,6 +1791,106 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "exit 1 (the verdict does not read it)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response refused",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, initialize: refused)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response method-not-found (the adapter degrades to exec)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response after the thread response",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "initialize handshake",
+     "label": "the initialize response answered twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the request log without initialize",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the recorded requests are not the adapter's own"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop availability",
      "label": "thread response",
      "ok": true,
@@ -1868,7 +2122,7 @@
      "verdict": "INSUFFICIENT",
      "why": [
       "the adapter does not settle the turn (failed, thread/start: refused)",
-      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+      "availability insufficient"
      ]
     },
     {
@@ -3239,6 +3493,16 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -3702,6 +3966,106 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "exit 1 (the verdict does not read it)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response refused",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, initialize: refused)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response method-not-found (the adapter degrades to exec)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the initialize response after the thread response",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete)",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "initialize handshake",
+     "label": "the initialize response answered twice",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "initialize handshake",
+     "label": "the request log without initialize",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the recorded requests are not the adapter's own"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop availability",
      "label": "thread response",
      "ok": true,
@@ -3933,7 +4297,7 @@
      "verdict": "INSUFFICIENT",
      "why": [
       "the adapter does not settle the turn (failed, thread/resume: refused)",
-      "12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete"
+      "availability insufficient"
      ]
     },
     {
@@ -5308,6 +5672,16 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "FAIL",
     "FAIL",
     "INSUFFICIENT",
@@ -5571,6 +5945,63 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "exit 1 (the verdict does not read it)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no launch observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "session identity",
+     "label": "a new session's file identity is not read",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop availability",
      "label": "observer report",
      "ok": true,
@@ -5740,6 +6171,12 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "INSUFFICIENT",
     "PASS",
     "INSUFFICIENT",
@@ -5873,6 +6310,96 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "observation",
+     "label": "the logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no log completion observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation",
+     "label": "the control logs not read to their end",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "exit 1 (the verdict does not read it)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation",
+     "label": "no launch observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "session identity",
+     "label": "the session file gone when get_state answered",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "session identity",
+     "label": "the session file replaced (another inode)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "session identity",
+     "label": "the session file not noted before the start",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "session identity",
+     "label": "no identity observed",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the session file identity))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "drop availability",
      "label": "observer report",
      "ok": true,
@@ -6044,6 +6571,15 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "FAIL",
