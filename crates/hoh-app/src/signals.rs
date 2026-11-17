@@ -234,6 +234,8 @@ impl State {
         };
         // Nothing the client owns outlives it (rule 5), and the message never waits on stderr (rule 6).
         self.release();
+        // Where a test holds the exit once the stop is done (debug builds only).
+        crate::debug_hold::at("exit");
         if !self.said.swap(true, Ordering::SeqCst) {
             let run = self
                 .run
