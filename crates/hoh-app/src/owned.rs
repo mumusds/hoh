@@ -6,7 +6,8 @@
 //!
 //! The stop refuses new tickets, kills every registered helper's group and leader, waits within its bound for the
 //! helper starts in flight to end, reads the registry again (the late registrations), and reaps through the handles,
-//! as A2 orders: see the exit, clean the group, reap. What it could not confirm it reports, never claims.
+//! as A2 orders: see the exit, clean the group, reap. In doctor, which adopts its descendants, it then kills every
+//! descendant still alive ([`descendants`], B). What it could not confirm it reports, never claims.
 
 use hoh_core::spawn::{Direct, Helper, Shared, Spawner, WaitOnly};
 use rustix::process::Signal;
@@ -22,6 +23,8 @@ struct State {
     hosts_in_flight: usize,
     helpers: Vec<Arc<Shared>>,
     hosts: Vec<u32>,
+    /// Whether the stop also kills every descendant of this process (doctor, B).
+    sweeps: bool,
 }
 
 /// The start gate of a client process.
@@ -88,9 +91,20 @@ impl Gate {
         })
     }
 
+    /// Make this process its descendants' subreaper, and have the stop kill every descendant it finds (doctor's, B):
+    /// a process a helper set apart and orphaned is then re-parented here, not to init. Without the subreaper (the
+    /// call refused) the stop still finds every descendant whose parents live.
+    pub fn adopt_descendants(&self) -> std::io::Result<()> {
+        self.locked().sweeps = true;
+        Ok(rustix::process::set_child_subreaper(Some(
+            rustix::process::getpid(),
+        ))?)
+    }
+
     /// Stop: refuse new tickets, kill every registered helper (its group, then its leader), wait at most `bound` for
     /// the helper starts in flight to end, read the registry again, and reap what exited within the rest of the bound,
-    /// seeing each exit and cleaning its group first. Hosts are never signalled.
+    /// seeing each exit and cleaning its group first; with descendants adopted, kill every one still alive and scan
+    /// again within the bound. Hosts are never signalled.
     pub fn stop(&self, bound: Duration) -> Stopped {
         let end = Instant::now() + bound;
         let first = {
@@ -110,12 +124,13 @@ impl Gate {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        let (helpers, hosts, hosts_in_flight) = {
+        let (helpers, hosts, hosts_in_flight, sweeps) = {
             let state = self.locked();
             (
                 state.helpers.clone(),
                 state.hosts.clone(),
                 state.hosts_in_flight,
+                state.sweeps,
             )
         };
         let mut unconfirmed = Vec::new();
@@ -130,6 +145,13 @@ impl Gate {
                 });
             if !reaped {
                 unconfirmed.push(helper.pid());
+            }
+        }
+        if sweeps {
+            for pid in descendants::sweep(std::process::id(), end) {
+                if !unconfirmed.contains(&pid) {
+                    unconfirmed.push(pid);
+                }
             }
         }
         Stopped {
@@ -230,6 +252,8 @@ impl Spawner for Gate {
         self.host_by(command, &|command| Direct.host(command))
     }
 }
+
+mod descendants;
 
 #[cfg(test)]
 mod tests;

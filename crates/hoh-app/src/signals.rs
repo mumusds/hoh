@@ -117,6 +117,11 @@ impl State {
         self.gate.clone()
     }
 
+    /// Have the stop also kill every descendant of this process, which becomes their subreaper (doctor, 设计修正 2, B).
+    pub fn adopt_descendants(&self) -> std::io::Result<()> {
+        self.gate.adopt_descendants()
+    }
+
     /// Stop the start gate within [`HELPERS_WAIT`]: nothing is started from now on, every helper the client started is
     /// killed (its group and its leader) and reaped, and what could not be confirmed is reported (设计修正 2, A, A2,
     /// D). The host is never signalled (REQ-001 failure mode 3).
@@ -171,12 +176,13 @@ impl State {
     /// whatever ended it. Unless a stage said why, it is said: the run and how to attach again when there is one, else
     /// that the client ends `before` anything (“没有提交命令”, “没有附着”).
     pub fn exit(&self, code: u8, before: &str) -> u8 {
+        // Nothing the client owns outlives it, whatever ends it (设计修正 2, B; at a normal end its helpers have ended,
+        // so this is quick), and the message never waits on stderr (rule 6).
+        self.stop();
         let Some(signal) = self.received() else {
             return code;
         };
-        // Nothing the client owns outlives it (rule 5), and the message never waits on stderr (rule 6).
-        self.stop();
-        // Where a test holds the exit once the stop is done (debug builds only).
+        // Where a test holds a signal exit once the stop is done (debug builds only).
         crate::debug_hold::at("exit");
         if !self.said.swap(true, Ordering::SeqCst) {
             let run = self

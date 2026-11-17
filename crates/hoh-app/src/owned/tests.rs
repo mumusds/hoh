@@ -305,3 +305,88 @@ fn a_helper_started_through_the_gate_keeps_the_attempt_id_it_inherits() -> R {
     assert!(helper.shared.end(Duration::from_secs(5)).is_some());
     Ok(())
 }
+
+/// A shell (a helper of its own) that starts a child in a session of its own (`setsid`, its pid written to `apart`)
+/// and waits for it.
+fn setting_apart(apart: &std::path::Path) -> R<Helper> {
+    Ok(Direct.helper(Command::new("sh").arg("-c").arg(format!(
+        "setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 30' '{}' \
+         < /dev/null > /dev/null 2>&1 & wait",
+        apart.display()
+    )))?)
+}
+
+#[test]
+fn the_sweep_kills_a_descendant_that_left_its_group_and_ends_on_a_clean_scan() -> R {
+    // B (CLT-302): a process a helper set apart (its own session, so its group's kill does not reach it) is found by
+    // the parent links under the root, killed by pidfd, and the sweep ends once a scan finds nothing alive; the root
+    // itself is not touched.
+    let dir = tempfile::tempdir()?;
+    let apart = dir.path().join("apart");
+    let root = setting_apart(&apart)?;
+    let child = written_pid(&apart)?;
+    let at = Instant::now();
+    let left = descendants::sweep(root.shared.pid(), at + Duration::from_millis(1500));
+    assert_eq!(left, Vec::<u32>::new());
+    assert!(
+        at.elapsed() < Duration::from_millis(1000),
+        "{:?}",
+        at.elapsed()
+    );
+    assert!(ends(child), "the child set apart lived on");
+    // The root's wait returned once its child was killed and it ended by itself (exit 0): it was never signalled.
+    assert!(root.shared.exited_within(Duration::from_secs(5)));
+    assert_eq!(
+        root.shared.reap()?.and_then(|status| status.code()),
+        Some(0),
+        "the root did not end by itself"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() -> R {
+    // B: a descendant that is a zombie (its parent never reaps it) has ended: the scan skips it and ends clean at once,
+    // never killing the root. With its bound already come, one pass kills what it finds and reports it, not claimed.
+    let root = Direct.helper(
+        Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.1 & exec sleep 30"),
+    )?;
+    let end = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(format!("/proc/{}/task/{0}/children", root.shared.pid()))
+        .is_ok_and(|children| {
+            children
+                .split_whitespace()
+                .any(|c| c.parse().is_ok_and(ended))
+        })
+    {
+        assert!(Instant::now() < end, "no zombie child under the root");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let at = Instant::now();
+    assert_eq!(
+        descendants::sweep(root.shared.pid(), at + Duration::from_millis(1500)),
+        Vec::<u32>::new()
+    );
+    assert!(
+        at.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        at.elapsed()
+    );
+    assert!(!ended(root.shared.pid()), "the sweep touched its root");
+    assert!(root.shared.end(Duration::from_secs(5)).is_some());
+
+    let dir = tempfile::tempdir()?;
+    let apart = dir.path().join("apart");
+    let root = setting_apart(&apart)?;
+    let child = written_pid(&apart)?;
+    assert_eq!(
+        descendants::sweep(root.shared.pid(), Instant::now()),
+        vec![child]
+    );
+    assert!(ends(child), "the child it reported was not killed");
+    assert!(root.shared.exited_within(Duration::from_secs(5)));
+    let _ = root.shared.reap();
+    Ok(())
+}

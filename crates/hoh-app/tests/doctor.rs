@@ -949,6 +949,131 @@ fn a_signal_while_the_wal_self_test_probe_runs_leaves_it_ended() -> R {
     Ok(())
 }
 
+#[test]
+fn a_signal_during_a_live_turn_leaves_no_process_its_agent_set_apart() -> R {
+    // ADR-031, 设计修正 2, B (CLT-302; verification 5): `doctor --live` drives an exec-only codex whose turn starts a
+    // child in a session of its own (`setsid`, out of the agent's process group) and then never answers. SIGTERM ends
+    // doctor with 143, and that child, found as doctor's descendant and killed by pidfd, has ended by the time doctor
+    // has. Before, killing the agent's group left it running, orphaned.
+    let s = Sandbox::new()?;
+    let f = fixtures().join("codex/0.166.0");
+    let child_file = s.home.path().join("apart.pid");
+    s.write(
+        "codex",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) grep -v '^  app-server ' '{f}/help.txt';;\n \
+             exec) if [ \"$2\" = --help ]; then cat '{f}/help-exec.txt'; elif [ \"$2\" = resume ]; then printf 'Usage: codex exec resume\\n      --json\\n      --dangerously-bypass-approvals-and-sandbox\\n  -m, --model <MODEL>\\n'; \
+             else setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 60' '{c}' < /dev/null > /dev/null 2>&1 & sleep 60; fi;;\n \
+             login) echo 'Logged in using ChatGPT' >&2;;\n *) echo \"error: unrecognized subcommand '$1'\" >&2; exit 2;;\nesac\n",
+            f = f.display(),
+            c = child_file.display()
+        ),
+    )?;
+    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--live", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut apart = None;
+    let outcome = (|| -> R<(bool, Duration)> {
+        let end = Instant::now() + Duration::from_secs(60);
+        let pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&child_file) {
+                break text.trim().parse()?;
+            }
+            if let Some(status) = doctor.try_wait()? {
+                return Err(
+                    format!("doctor ended before its live turn's child started: {status}").into(),
+                );
+            }
+            if Instant::now() > end {
+                return Err("the live turn's child never started".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let held = apart.insert(rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?);
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&doctor),
+            rustix::process::Signal::TERM,
+        )?;
+        let at = Instant::now();
+        while doctor.try_wait()?.is_none() && at.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = at.elapsed();
+        Ok((pidfd_ended(held)?, took))
+    })();
+    // Whatever happened, doctor is ended and waited for, and the child killed if it lives on.
+    let _ = doctor.kill();
+    let out = doctor.wait_with_output()?;
+    if let Some(apart) = &apart
+        && !pidfd_ended(apart).unwrap_or(true)
+    {
+        let _ = rustix::process::pidfd_send_signal(apart, rustix::process::Signal::KILL);
+    }
+    let (gone, took) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
+    assert!(
+        gone,
+        "the child the live turn's agent set apart outlived doctor"
+    );
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    Ok(())
+}
+
+#[test]
+fn a_process_a_probe_set_apart_has_ended_when_doctor_ends_normally() -> R {
+    // ADR-031, 设计修正 2, B: the stop runs at every exit, not only a signal's. `git --version` answers at once and
+    // leaves a child in a session of its own, orphaned when the probe ends: doctor, its subreaper, finds it under
+    // itself and kills it before it ends normally. Without the subreaper it would go to init, unfound; without the
+    // stop at a normal exit it would be left running.
+    let s = Sandbox::new()?;
+    let child_file = s.home.path().join("apart.pid");
+    s.write(
+        "git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 60' '{c}' \
+             < /dev/null > /dev/null 2>&1 & while [ ! -f '{c}' ]; do sleep 0.01; done; echo 'git version 2.43.0';;\n -C) mkdir -p \"$2/.git\";;\n *) exit 1;;\nesac\n",
+            c = child_file.display()
+        ),
+    )?;
+    let (out, _) = s.doctor_in(&[], &["--output", "json"], &[])?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    let pid: i32 = std::fs::read_to_string(&child_file)
+        .map_err(|e| format!("the probe's child never started ({e}): {said}"))?
+        .trim()
+        .parse()?;
+    let alive = match rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+        rustix::process::PidfdFlags::empty(),
+    ) {
+        Ok(child) => {
+            let alive = !pidfd_ended(&child)?;
+            if alive {
+                let _ = rustix::process::pidfd_send_signal(&child, rustix::process::Signal::KILL);
+            }
+            alive
+        }
+        Err(_) => false,
+    };
+    assert!(
+        !alive,
+        "the child a probe set apart outlived doctor: {said}"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(report["runtime"]["git"]["installed"], true, "{report}");
+    Ok(())
+}
+
 /// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
 fn pidfd_ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec};
