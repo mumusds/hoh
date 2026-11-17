@@ -363,6 +363,12 @@ pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, Strin
         return Err("cgroup v2 is not mounted at /sys/fs/cgroup".to_owned());
     }
     manager_that_lingers()?;
+    scope_on(env)
+}
+
+/// `systemd-run` on `env`'s PATH and the version it gives, bounded by [`SCOPE_PROBE_LIMIT`] and `env`'s deadline: the
+/// scope it starts a host in, or why not.
+fn scope_on(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, String> {
     let systemd_run = std::env::split_paths(&env.path)
         .map(|dir| dir.join("systemd-run"))
         .find(|candidate| candidate.is_file())
@@ -372,26 +378,74 @@ pub fn delegated_scope(env: &hoh_agents::probe::ProbeEnv) -> Result<Scope, Strin
         timeout: env.timeout.min(SCOPE_PROBE_LIMIT),
         ..env.clone()
     };
-    let version = hoh_agents::probe::run_status(&systemd_run, &["--version"], &bounded)
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .nth(1)
-                .and_then(|v| v.parse::<u32>().ok())
-        })
-        .ok_or_else(|| {
-            format!(
-                "systemd-run --version gave no version within {} s ({})",
-                bounded.timeout.as_secs(),
-                systemd_run.display()
-            )
-        })?;
+    // Why there is no version names its cause (package G2): not started, timed out or failed, each with what it was.
+    let said = |why: String| format!("systemd-run --version {why} ({})", systemd_run.display());
+    let version = match hoh_agents::probe::run_status(&systemd_run, &["--version"], &bounded) {
+        Err(hoh_agents::probe::ProbeError::NotStarted { .. }) => {
+            return Err(said(
+                "was not started: the shared time limit of the checks was already used up"
+                    .to_owned(),
+            ));
+        }
+        Err(e @ hoh_agents::probe::ProbeError::Failed { .. }) if !e.started() => {
+            return Err(said(format!("was not started: {e}")));
+        }
+        Err(hoh_agents::probe::ProbeError::TimedOut {
+            after,
+            cut_by_deadline,
+            ..
+        }) => {
+            return Err(said(if cut_by_deadline {
+                format!(
+                    "timed out after the {:.1} s left of the shared time limit and was ended",
+                    after.as_secs_f64()
+                )
+            } else {
+                format!(
+                    "timed out at its {} s bound and was ended",
+                    bounded.timeout.as_secs()
+                )
+            }));
+        }
+        Err(e) => return Err(said(format!("failed: {e}"))),
+        Ok(out) if !out.status.success() => {
+            return Err(said(format!(
+                "failed: it ended with {}; stderr: {}",
+                out.status,
+                excerpt(&out.stderr)
+            )));
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| {
+                said(format!(
+                    "failed: it ended well but gave no version; stdout: {}",
+                    excerpt(&out.stdout)
+                ))
+            })?,
+    };
     Ok(Scope {
         systemd_run,
         no_expansion: version >= 254,
     })
+}
+
+/// What a command wrote, for a reason: its lines joined, at most 200 characters, `(nothing)` for none.
+fn excerpt(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    match joined.char_indices().nth(200) {
+        _ if joined.is_empty() => "(nothing)".to_owned(),
+        Some((cut, _)) => format!("{}…", &joined[..cut]),
+        None => joined,
+    }
 }
 
 /// How the installed hoh starts a project's host as its systemd unit (docs/adr/ADR-023.md decision 6).
@@ -1515,6 +1569,142 @@ pub(crate) mod tests {
         let run = call(&now, "GET", &format!("/v1/runs/{run_id}"), None)?;
         assert_eq!(run.status, 200);
         runtime.block_on(second.shutdown());
+        Ok(())
+    }
+
+    /// A stand-in `systemd-run` running the shell `body`, with `mode`, alone in a directory of its own: that directory
+    /// (the PATH to give), kept alive by the returned guard.
+    fn stand_in(body: &str, mode: u32) -> R<(tempfile::TempDir, std::ffi::OsString)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        let fake = dir.path().join("systemd-run");
+        std::fs::write(&fake, format!("#!/bin/sh\n{body}"))?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(mode))?;
+        let path = dir.path().as_os_str().to_owned();
+        Ok((dir, path))
+    }
+
+    /// The scope check's probe environment on `path`, with the shared `deadline` and a log of its commands.
+    fn scope_env(
+        path: std::ffi::OsString,
+        deadline: Option<Instant>,
+    ) -> (hoh_agents::probe::ProbeEnv, hoh_agents::probe::RunLog) {
+        let log = hoh_agents::probe::RunLog::default();
+        let env = hoh_agents::probe::ProbeEnv {
+            path,
+            fixture_root: None,
+            timeout: Duration::from_secs(20),
+            log: Some(log.clone()),
+            deadline,
+            cancel: None,
+            spawner: crate::signals::spawner(),
+        };
+        (env, log)
+    }
+
+    /// Why the scope check gave no scope.
+    fn refused(env: &hoh_agents::probe::ProbeEnv) -> R<String> {
+        match scope_on(env) {
+            Ok(_) => Err("a scope".into()),
+            Err(why) => Ok(why),
+        }
+    }
+
+    #[test]
+    fn a_scope_check_without_systemd_run_says_it_is_not_on_path() -> R {
+        // Package G2 (docs/adr/ADR-015.md note, CR-011): the cause "not started" because there is no systemd-run.
+        let empty = tempfile::tempdir()?;
+        let (env, _) = scope_env(empty.path().as_os_str().to_owned(), None);
+        assert_eq!(refused(&env)?, "systemd-run is not on PATH");
+        Ok(())
+    }
+
+    #[test]
+    fn a_scope_probe_with_none_of_the_shared_limit_left_says_it_was_not_started() -> R {
+        // Package G2: the shared limit (doctor's 20 s, a start's end) used up before `systemd-run --version` is not
+        // "no version within 2 s": it was never started, and the reason says why (item 21: 5 of 5 doctor failures).
+        let (_dir, path) = stand_in("echo 'systemd 255 (255.4-1)'\n", 0o755)?;
+        let spent = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .ok_or("no instant before now")?;
+        let (env, _) = scope_env(path, Some(spent));
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version was not started: ")
+                && why.contains("time limit")
+                && why.contains("used up"),
+            "{why}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scope_probe_that_cannot_be_run_says_it_was_not_started_and_the_error() -> R {
+        // Package G2: a systemd-run that cannot be executed (here not executable) was not started either; the reason
+        // gives the error, and doctor's record of the command says it did not start.
+        let (_dir, path) = stand_in("echo 'systemd 255'\n", 0o644)?;
+        let (env, log) = scope_env(path, None);
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version was not started: ")
+                && why.contains("Permission denied"),
+            "{why}"
+        );
+        let records = log.lock().map_err(|_| "poisoned")?.clone();
+        assert!(
+            records.runs.iter().all(|run| !run.started),
+            "{:?}",
+            records.runs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scope_probe_that_does_not_answer_says_it_timed_out_at_its_bound() -> R {
+        // Package G2: one that never answers timed out, at its own 2 s bound or at what was left of the shared limit,
+        // and the reason says which.
+        let (_dir, path) = stand_in("exec /bin/sleep 30\n", 0o755)?;
+        let (env, _) = scope_env(path.clone(), None);
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version timed out ") && why.contains("its 2 s bound"),
+            "{why}"
+        );
+        let (env, _) = scope_env(path, Some(Instant::now() + Duration::from_millis(300)));
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version timed out ")
+                && why.contains("left of the shared time limit"),
+            "{why}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scope_probe_that_fails_says_its_exit_and_what_it_wrote() -> R {
+        // Package G2: one that ends with an error says its exit status and an excerpt of its stderr; one that ends
+        // well without a version says what it answered instead.
+        let (_dir, path) = stand_in(
+            "echo 'Failed to connect to bus: No medium found' >&2\nexit 1\n",
+            0o755,
+        )?;
+        let (env, _) = scope_env(path, None);
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version failed: ")
+                && why.contains("exit status: 1")
+                && why.contains("Failed to connect to bus: No medium found"),
+            "{why}"
+        );
+        let (_dir, path) = stand_in("echo 'no version here'\n", 0o755)?;
+        let (env, _) = scope_env(path, None);
+        let why = refused(&env)?;
+        assert!(
+            why.starts_with("systemd-run --version failed: ")
+                && why.contains("no version")
+                && why.contains("no version here"),
+            "{why}"
+        );
         Ok(())
     }
 }

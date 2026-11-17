@@ -2899,6 +2899,84 @@ fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
     Ok(())
 }
 
+/// A directory with a stand-in `systemd-run` whose `--version` fails (a line on stderr, exit 1), first on PATH.
+fn failing_systemd_run(env: &Env) -> R<std::ffi::OsString> {
+    let bin = env.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let fake = bin.join("systemd-run");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'Failed to connect to bus: No medium found' >&2\nexit 1\n",
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(std::env::join_paths(std::iter::once(bin).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?)
+}
+
+#[test]
+fn doctor_and_the_hosts_record_say_how_systemd_run_failed() -> R {
+    // Package G2 (CR-011, CR12-03; docs/adr/ADR-015.md note): a `systemd-run --version` that fails is said as a
+    // failure, with its exit and its stderr, both by doctor's check before a start and in the host.json of the host the
+    // client then starts directly; not as "gave no version within 2 s", which named no cause.
+    if !manager_and_linger() || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        // Visible, not a silent pass (M2T06R-656).
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no user systemd manager, no linger or no cgroup v2 here"
+        );
+        return Ok(());
+    }
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let path = failing_systemd_run(&env)?;
+    let said = |why: &str| {
+        why.contains("systemd-run --version failed: ")
+            && why.contains("exit status: 1")
+            && why.contains("Failed to connect to bus: No medium found")
+    };
+    let out = finish(
+        with_manager(&env, &["doctor", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        Duration::from_secs(60),
+    )?;
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    let host = &report["runtime"]["host"];
+    assert_eq!(host["process_tracking"], "proc", "{host}");
+    assert!(
+        host["process_tracking_detail"].as_str().is_some_and(said),
+        "{host}"
+    );
+    let out = finish(
+        with_manager(&env, &["-p", "x", "--detach", "--output", "json"], &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+        LIMIT,
+    )?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(
+        env.project().join(".hoh/host.json"),
+    )?)?;
+    assert_eq!(record["process_tracking"], "proc", "{record}");
+    assert!(
+        record["process_tracking_reason"].as_str().is_some_and(said),
+        "{record}"
+    );
+    Ok(())
+}
+
 #[test]
 fn doctor_without_a_host_reports_what_a_start_would_have_and_warns_when_it_would_degrade() -> R {
     // M2T06R-454 (CR-011): no host runs. Without the user's manager the next host would be degraded: proc, with a

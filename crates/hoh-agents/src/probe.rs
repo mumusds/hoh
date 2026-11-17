@@ -271,12 +271,20 @@ pub struct Run {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
     pub timed_out: bool,
-    /// `false` when the shared deadline had passed before it (it was not run).
+    /// `false` when it was not run: the shared deadline had passed before it, or it could not be started
+    /// ([`ProbeError::started`]).
     pub started: bool,
 }
 
-/// The commands run so far, shared between the threads that probe.
-pub type RunLog = std::sync::Arc<std::sync::Mutex<Vec<Run>>>;
+/// What the threads that probe wrote down so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Records {
+    /// The commands run.
+    pub runs: Vec<Run>,
+}
+
+/// [`Records`], shared between the threads that probe.
+pub type RunLog = std::sync::Arc<std::sync::Mutex<Records>>;
 
 /// Why a probe failed.
 #[derive(Debug)]
@@ -344,6 +352,21 @@ impl fmt::Display for ProbeError {
 }
 
 impl std::error::Error for ProbeError {}
+
+/// What a command that could not be started is said with ([`ProbeError::Failed`]'s detail begins with it).
+pub const CANNOT_START: &str = "cannot start";
+
+impl ProbeError {
+    /// Whether the command was started: not when the shared deadline had passed before it, nor when it could not be
+    /// started (its spawn failed).
+    pub fn started(&self) -> bool {
+        match self {
+            Self::NotStarted { .. } => false,
+            Self::Failed { detail, .. } => !detail.starts_with(CANNOT_START),
+            _ => true,
+        }
+    }
+}
 
 impl From<io::Error> for ProbeError {
     fn from(e: io::Error) -> Self {
@@ -3275,14 +3298,14 @@ fn logged(
     let started = Instant::now();
     let result = capture(program, args, env, stderr, vars);
     if let Some(log) = &env.log
-        && let Ok(mut runs) = log.lock()
+        && let Ok(mut records) = log.lock()
     {
-        runs.push(Run {
+        records.runs.push(Run {
             argv: argv(program, args),
             exit_code: result.as_ref().ok().and_then(|c| c.status.code()),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             timed_out: matches!(result, Err(ProbeError::TimedOut { .. })),
-            started: !matches!(result, Err(ProbeError::NotStarted { .. })),
+            started: result.as_ref().err().is_none_or(ProbeError::started),
         });
     }
     result
@@ -3356,7 +3379,7 @@ fn capture(
                     });
                 }
             }
-            Some(other) => break other.map_err(|e| failed(format!("cannot start: {e}")))?,
+            Some(other) => break other.map_err(|e| failed(format!("{CANNOT_START}: {e}")))?,
         }
     };
     // From here on every exit, an error or a panic included, ends the command (M1T07R-53).
