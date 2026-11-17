@@ -179,6 +179,47 @@ class Judge(unittest.TestCase):
             m=copy.deepcopy(c);judge_check._observe(m,**change)
             self.assertEqual(judge_check.adapter_replay(m).failure,failure)
             self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',change)
+    def test_the_round_10_probes(self):
+        # The launch is an observation the replay builds the product's messages from; the request log is compared
+        # with them under the comparison contract; every required observation is typed (M2T20D-900, -901, -950).
+        none=Path('/nonexistent');ex=FIXTURES/'excerpts';J=judge_check
+        def verdict(m,control):return J.round_verdict(m,control)[0]
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=J.load(ex,none,'codex',name)[0];control=J.load(ex,none,'codex','app-control')[0]
+            self.assertEqual(verdict(c,control),'PASS')
+            self.assertEqual([J._comparable(q) for q in J.adapter_replay(c).sent],[J._comparable(q) for q in c.requests])
+            m=copy.deepcopy(c);m.requests=[]
+            self.assertEqual(J.adapter_replay(m).state,'settled')  # the replay never reads the request log
+            self.assertEqual(verdict(m,control),'INSUFFICIENT')
+            for edit in (lambda m:J._edit_observation(m,('launch',),J.UNOBSERVED),
+                         lambda m:J._edit_observation(m,('launch','resume'),J.UNOBSERVED),
+                         lambda m:J._edit_observation(m,('launch','profile'),'readonly')):
+                m=copy.deepcopy(c);edit(m)
+                self.assertTrue(J.adapter_replay(m).failure.startswith('NOT_OBSERVED'))
+                self.assertEqual(verdict(m,control),'INSUFFICIENT')
+            for edit in (lambda m:J._thread_request(m)['params'].update(sandbox='danger-full-access',approvalPolicy='on-request'),
+                         lambda m:m.requests.remove(J._logged(m,'initialized')),
+                         lambda m:J._thread_request(m)['params'].update(threadId='another-thread'),
+                         lambda m:J._edit_observation(m,('launch','profile'),'yolo')):
+                m=copy.deepcopy(c);edit(m)
+                self.assertEqual(verdict(m,control),'INSUFFICIENT')
+            for edit in (lambda m:J._logged(m,'initialize')['params']['clientInfo'].update(version='9.9.9'),
+                         lambda m:J._logged(m,'turn/start')['params']['input'][0].update(text='another prompt')):
+                m=copy.deepcopy(c);edit(m)
+                self.assertEqual(verdict(m,control),'PASS')  # the two fields the contract does not compare
+            mc=copy.deepcopy(control);J._edit_observation(mc,('launch','profile'),'read_only')
+            self.assertEqual(verdict(c,mc),'INSUFFICIENT')
+        c=J.load(ex,none,'pi','noext-resumed')[0];control=J.load(ex,none,'pi','control')[0]
+        m=copy.deepcopy(c);J._edit_observation(m,('launch','resume'),J.UNOBSERVED);J._observe(m,noted=J.UNOBSERVED,opened=J.UNOBSERVED)
+        self.assertEqual(verdict(m,control),'INSUFFICIENT')  # Codex's round-10 probe: never defaulted to a new session
+        for path,value in ((('launch','resume'),J.UNOBSERVED),(('launch','resume'),'true'),(('launch','session_id'),''),
+                           (('launch','session_id'),J.UNOBSERVED)):
+            m=copy.deepcopy(c);J._edit_observation(m,path,value)
+            self.assertTrue(J.adapter_replay(m).failure.startswith('NOT_OBSERVED'),(path,value))
+            mc=copy.deepcopy(control);J._edit_observation(mc,path,value)
+            self.assertEqual(verdict(c,mc),'INSUFFICIENT',(path,value))
+        m=copy.deepcopy(c);J._observe(m,prompt_sent=J.UNOBSERVED,get_state_session_file=J.UNOBSERVED)
+        self.assertEqual(verdict(m,control),'PASS')  # recorder-only, named
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)

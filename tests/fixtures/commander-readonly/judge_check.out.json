@@ -640,7 +640,7 @@
   },
   "pi/ordinary-error": {
    "excerpt": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
@@ -650,10 +650,10 @@
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    },
    "raw": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
@@ -663,34 +663,34 @@
      "read call_d732dcce8e2b4cabbdf91bd9": "success",
      "write call_077287dc6a0740b2a8ad9b0b": "insufficient"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    }
   },
   "pi/ro-new": {
    "excerpt": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    },
    "raw": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_c085ad7c3321468d8df1c21d": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    }
   },
   "pi/ro-no-extensions": {
    "excerpt": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
     "E11": "insufficient",
     "E8": "conform",
@@ -698,10 +698,10 @@
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    },
    "raw": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1",
     "E11": "insufficient",
     "E8": "conform",
@@ -709,12 +709,12 @@
      "ls call_41ae531628604978b6b03951": "success",
      "read call_62659caa47ab46d2a193cb4c": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    }
   },
   "pi/ro-plus-write": {
    "excerpt": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
@@ -722,10 +722,10 @@
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    },
    "raw": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "nonconform",
@@ -733,29 +733,29 @@
      "read call_234f5563e89f4fe4bd7a4ec8": "success",
      "write call_cbd54cf32b2049b99b92f50f": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    }
   },
   "pi/ro-resumed": {
    "excerpt": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    },
    "raw": {
-    "E0": "incomplete (NOT_OBSERVED (the launch))",
+    "E0": "incomplete (NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
     "E10": "breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log",
     "E11": "insufficient",
     "E8": "conform",
     "E9": {
      "read call_21eaaaf686664397989749a4": "success"
     },
-    "calls": "the recorded requests are not the adapter's own"
+    "calls": "every item and call classified and complete"
    }
   }
  },
@@ -866,18 +866,239 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "prompt_fed missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "prompt_fed = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "prompt_fed missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "prompt_fed = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -895,19 +1116,17 @@
      ]
     },
     {
-     "expect": "non-PASS",
+     "expect": "same",
      "kind": "observation",
-     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
+     "label": "how the process ended, as the recorder describes it (not read)",
      "ok": true,
-     "verdict": "INSUFFICIENT",
-     "why": [
-      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
-     ]
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no prompt delivery observed",
+     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -927,7 +1146,7 @@
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no exit status observed",
+     "label": "ended without an exit status",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1101,6 +1320,27 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -1227,18 +1467,239 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "prompt_fed missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "prompt_fed = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (prompt_fed ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "prompt_fed missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "prompt_fed = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1256,19 +1717,17 @@
      ]
     },
     {
-     "expect": "non-PASS",
+     "expect": "same",
      "kind": "observation",
-     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
+     "label": "how the process ended, as the recorder describes it (not read)",
      "ok": true,
-     "verdict": "INSUFFICIENT",
-     "why": [
-      "the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED)"
-     ]
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no prompt delivery observed",
+     "label": "the prompt not fed (PROMPT_NOT_DELIVERED)",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1288,7 +1747,7 @@
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no exit status observed",
+     "label": "ended without an exit status",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1462,6 +1921,27 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -1791,18 +2271,448 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.profile missing, launch.resume missing, launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch = \"read_only\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile = \"readonly\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = true",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.model missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.model = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch = \"read_only\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile = \"readonly\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = true",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.model missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.model = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -1822,6 +2732,14 @@
     {
      "expect": "same",
      "kind": "observation",
+     "label": "how the process ended, as the recorder describes it (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
      "label": "exit 1 (the verdict does not read it)",
      "ok": true,
      "verdict": "PASS",
@@ -1834,8 +2752,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -1845,8 +2763,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, initialize: refused)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (failed, initialize: refused)"
      ]
     },
     {
@@ -1856,8 +2774,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))"
      ]
     },
     {
@@ -1867,8 +2785,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -1881,13 +2799,257 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "initialize handshake",
+     "kind": "request log",
+     "label": "the launch says full access (yolo)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the launch says resume another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the launch says a model",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for danger-full-access",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for approvals on-request",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request without approvalPolicy",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for raw events",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request names a model",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the request log without initialized",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (3 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
      "label": "the request log without initialize",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the recorded requests are not the adapter's own"
+      "the request log is not the product's own (3 messages, the adapter sends 4)"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "initialize declares experimental capabilities",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "initialize names another client",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start overrides the sandbox",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start names another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start with a second input",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a second turn/start",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (5 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the request log empty",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (0 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a server request answered otherwise",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a server request not answered",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (4 messages, the adapter sends 5)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the request log resumes a thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control launch says read-only",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control thread request asks for read-only",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "initialize from another hoh version (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "turn/start with another prompt text (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "a server request answered by headless_answer",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -1896,8 +3058,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -2099,8 +3261,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -2110,8 +3272,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -2121,8 +3283,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, thread/start: refused)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (failed, thread/start: refused)"
      ]
     },
     {
@@ -3497,6 +4659,46 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -3504,6 +4706,31 @@
     "INSUFFICIENT",
     "PASS",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -3966,18 +5193,448 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.profile missing, launch.resume missing, launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch = \"read_only\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.profile missing, launch.resume missing, launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile = \"readonly\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.profile = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.profile ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = true",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.model missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model missing))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.model = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.model ill-typed))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown))",
+      "availability insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch = \"read_only\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile = \"readonly\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.profile = 1",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = true",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.model missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.model = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled",
+      "the control does not show full access"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -3997,6 +5654,14 @@
     {
      "expect": "same",
      "kind": "observation",
+     "label": "how the process ended, as the recorder describes it (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
      "label": "exit 1 (the verdict does not read it)",
      "ok": true,
      "verdict": "PASS",
@@ -4009,8 +5674,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -4020,8 +5685,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, initialize: refused)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (failed, initialize: refused)"
      ]
     },
     {
@@ -4031,8 +5696,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 1)",
+      "the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade))"
      ]
     },
     {
@@ -4042,8 +5707,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -4056,13 +5721,267 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "initialize handshake",
+     "kind": "request log",
+     "label": "the launch says full access (yolo)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the launch says resume another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the launch says a model",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for danger-full-access",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for approvals on-request",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request without approvalPolicy",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request asks for raw events",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request names a model",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the thread request with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the request log without initialized",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (3 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
      "label": "the request log without initialize",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the recorded requests are not the adapter's own"
+      "the request log is not the product's own (3 messages, the adapter sends 4)"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "initialize declares experimental capabilities",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "initialize names another client",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start overrides the sandbox",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start names another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "turn/start with a second input",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 3)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a second turn/start",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (5 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the request log empty",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (0 messages, the adapter sends 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a server request answered otherwise",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 4)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "a server request not answered",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (4 messages, the adapter sends 5)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the launch says a new thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the resume asks for another thread",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control launch says read-only",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control thread request asks for read-only",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 2)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "initialize from another hoh version (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "turn/start with another prompt text (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "a server request answered by headless_answer",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -4071,8 +5990,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -4274,8 +6193,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -4285,8 +6204,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (incomplete)"
      ]
     },
     {
@@ -4296,8 +6215,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, thread/resume: refused)",
-      "availability insufficient"
+      "the request log is not the product's own (4 messages, the adapter sends 3)",
+      "the adapter does not settle the turn (failed, thread/resume: refused)"
      ]
     },
     {
@@ -5672,6 +7591,46 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -5679,6 +7638,32 @@
     "INSUFFICIENT",
     "PASS",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -5945,18 +7930,407 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch = \"new\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = \"false\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = null",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = 0",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch = \"new\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = \"false\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = null",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = 0",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -5976,6 +8350,14 @@
     {
      "expect": "same",
      "kind": "observation",
+     "label": "how the process ended, as the recorder describes it (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
      "label": "exit 1 (the verdict does not read it)",
      "ok": true,
      "verdict": "PASS",
@@ -5983,19 +8365,82 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "no launch observed",
+     "kind": "request log",
+     "label": "the prompt with an extra field",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch))",
-      "decision block insufficient"
+      "the request log is not the product's own (message 1)"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "get_state with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the prompt missing from the request log",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (1 messages, the adapter sends 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "an abort in the request log",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (3 messages, the adapter sends 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control prompt with an extra field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 1)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "the prompt with another message text (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "pi's recorder-only observations dropped (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "same",
      "kind": "session identity",
      "label": "a new session's file identity is not read",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "session identity",
+     "label": "a new session's noted and opened files dropped (not read)",
      "ok": true,
      "verdict": "PASS",
      "why": []
@@ -6057,6 +8502,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "the request log is not the product's own (2 messages, the adapter sends 1)",
       "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
      ]
     },
@@ -6176,8 +8622,53 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "PASS",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
     "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -6310,18 +8801,473 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "the logs not read to their end",
+     "kind": "observation field",
+     "label": "version missing",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE)"
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (version ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit missing, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit ill-typed, exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (exit.returncode ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (logs_complete ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch missing, launch.session_id missing, launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch = \"new\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch ill-typed, launch.session_id missing, launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.session_id = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.session_id ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = \"false\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = null",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "launch.resume = 0",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.resume ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "noted missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "noted = \"x\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "noted = [[\"x\", 1]]",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (noted ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "opened missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened missing))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "opened = \"x\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "opened = [\"x\", \"1\", 2]",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (opened ill-typed))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (launch.sandbox unknown))",
+      "decision block insufficient"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "version = 7",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit = \"exited\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "exit.returncode = \"0\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "logs_complete = \"true\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch = \"new\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id = \"\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.session_id = 5",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume missing",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = \"false\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = null",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "launch.resume = 0",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown observation",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control observation field",
+     "label": "an unknown launch field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the control turn is not settled"
      ]
     },
     {
      "expect": "non-PASS",
      "kind": "observation",
-     "label": "no log completion observed",
+     "label": "the logs not read to their end",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -6341,6 +9287,14 @@
     {
      "expect": "same",
      "kind": "observation",
+     "label": "how the process ended, as the recorder describes it (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
      "label": "exit 1 (the verdict does not read it)",
      "ok": true,
      "verdict": "PASS",
@@ -6348,14 +9302,69 @@
     },
     {
      "expect": "non-PASS",
-     "kind": "observation",
-     "label": "no launch observed",
+     "kind": "request log",
+     "label": "the prompt with an extra field",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
-      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch))",
-      "decision block insufficient"
+      "the request log is not the product's own (message 1)"
      ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "get_state with another id",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (message 0)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "the prompt missing from the request log",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (1 messages, the adapter sends 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "request log",
+     "label": "an abort in the request log",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "the request log is not the product's own (3 messages, the adapter sends 2)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "control request log",
+     "label": "the control prompt with an extra field",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "control: the request log is not the product's own (message 1)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "request log",
+     "label": "the prompt with another message text (not compared)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "observation",
+     "label": "pi's recorder-only observations dropped (not read)",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
     },
     {
      "expect": "non-PASS",
@@ -6364,6 +9373,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "the request log is not the product's own (2 messages, the adapter sends 1)",
       "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
      ]
     },
@@ -6374,6 +9384,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "the request log is not the product's own (2 messages, the adapter sends 1)",
       "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
      ]
     },
@@ -6384,18 +9395,8 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "the request log is not the product's own (2 messages, the adapter sends 1)",
       "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
-     ]
-    },
-    {
-     "expect": "non-PASS",
-     "kind": "session identity",
-     "label": "no identity observed",
-     "ok": true,
-     "verdict": "INSUFFICIENT",
-     "why": [
-      "the adapter does not settle the turn (incomplete, NOT_OBSERVED (the session file identity))",
-      "decision block insufficient"
      ]
     },
     {
@@ -6455,6 +9456,7 @@
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
+      "the request log is not the product's own (2 messages, the adapter sends 1)",
       "the adapter does not settle the turn (failed, SESSION_MISMATCH)"
      ]
     },
@@ -6574,9 +9576,58 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
     "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
