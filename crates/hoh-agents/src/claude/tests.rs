@@ -9,7 +9,7 @@ fn launch() -> Launch {
         program: PathBuf::from("claude"),
         help: HELP.to_owned(),
         cwd: PathBuf::from("/tmp"),
-        yolo: true,
+        profile: crate::Profile::Yolo,
         partial: false,
         resume: None,
         model: None,
@@ -85,7 +85,7 @@ fn a_turn_that_cannot_run_as_asked_is_blocked() {
     });
     // Without the YOLO profile the bypass flag is neither needed nor added.
     let mut l = launch();
-    l.yolo = false;
+    l.profile = crate::Profile::Plain;
     l.root = true;
     l.help = HELP.replace("  --dangerously-skip-permissions\n", "");
     assert!(!argv(&l).expect("argv").args.iter().any(|x| x == YOLO_FLAG));
@@ -257,21 +257,21 @@ fn a_sessions_capabilities_are_those_its_argv_gives() {
 fn a_yolo_session_runs_commands_where_the_probe_found_it() {
     // docs/adr/ADR-030.md decision 12: the adapter runs commands under the YOLO profile only, and the session has
     // what the probe found (left out where it could not tell).
-    for (probed, yolo, expected) in [
-        (Some(true), true, Some(true)),
-        (Some(false), true, Some(false)),
-        (None, true, None),
-        (Some(true), false, Some(false)),
+    for (probed, profile, expected) in [
+        (Some(true), crate::Profile::Yolo, Some(true)),
+        (Some(false), crate::Profile::Yolo, Some(false)),
+        (None, crate::Profile::Yolo, None),
+        (Some(true), crate::Profile::Plain, Some(false)),
     ] {
         let mut l = launch();
         l.capabilities
             .insert("command_execution".to_owned(), probed);
-        l.yolo = yolo;
+        l.profile = profile;
         let caps = session_capabilities(&l).expect("capabilities");
         assert_eq!(
             caps.get("command_execution").and_then(Value::as_bool),
             expected,
-            "probed {probed:?}, yolo {yolo}: {caps}"
+            "probed {probed:?}, profile {profile:?}: {caps}"
         );
     }
 }

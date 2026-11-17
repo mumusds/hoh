@@ -21,5 +21,13 @@ pub mod pi;
 pub mod probe;
 pub mod process;
 
+/// The launch profile of a turn (docs/adr/ADR-032.md decision 2): `Yolo` is HoH's YOLO runtime profile (CR-002),
+/// `Plain` neither bypass nor restriction (only `hoh doctor --live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Profile {
+    Yolo,
+    Plain,
+}
+
 /// Crate version, reported by the `hoh` binary for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

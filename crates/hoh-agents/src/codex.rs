@@ -57,8 +57,8 @@ pub struct Launch {
     /// The probed `codex exec resume --help`, for a resumed turn in exec mode.
     pub exec_resume_help: Option<String>,
     pub cwd: PathBuf,
-    /// HoH's YOLO runtime profile.
-    pub yolo: bool,
+    /// The launch profile (docs/adr/ADR-032.md decision 2); `Yolo` is HoH's YOLO runtime profile.
+    pub profile: crate::Profile,
     /// The thread to continue (the session's native id).
     pub resume: Option<String>,
     /// The model asked for; `None` is codex's own default.
@@ -200,7 +200,7 @@ pub fn exec_args(launch: &Launch) -> Result<Vec<String>, Blocked> {
         args.push("resume".to_owned());
     }
     args.push("--json".to_owned());
-    if launch.yolo {
+    if launch.profile == crate::Profile::Yolo {
         if !offers(help, YOLO_FLAG) {
             return Err(Blocked(format!(
                 "codex exec --help offers no {YOLO_FLAG} for the YOLO profile"
@@ -732,7 +732,7 @@ fn replay_turn() -> Turn {
             exec_help: String::new(),
             exec_resume_help: None,
             cwd: PathBuf::from(crate::compat::SUITE_CWD),
-            yolo: true,
+            profile: crate::Profile::Yolo,
             resume: None,
             model: None,
             known,
@@ -1021,7 +1021,10 @@ fn session(
             ),
             ("partial_messages", true),
             ("token_usage", true),
-            ("command_execution", turn.launch.yolo),
+            (
+                "command_execution",
+                turn.launch.profile == crate::Profile::Yolo,
+            ),
         ]
     } else {
         vec![
@@ -1032,7 +1035,10 @@ fn session(
                 crate::adapter::lists_command(&turn.launch.exec_help, "resume")
                     && exec_resumable(&turn.launch),
             ),
-            ("command_execution", turn.launch.yolo),
+            (
+                "command_execution",
+                turn.launch.profile == crate::Profile::Yolo,
+            ),
         ]
     };
     Session {

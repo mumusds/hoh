@@ -61,6 +61,8 @@ pub struct Launch {
     pub model: Option<String>,
     /// This version emits `agent_settled` (pi 1.5.0 does); otherwise `get_state` checks for idle.
     pub settled_event: bool,
+    /// The launch profile (docs/adr/ADR-032.md decision 2); pi has no bypass, so `Yolo` and `Plain` start alike.
+    pub profile: crate::Profile,
     /// What the probe found for this pi (its compat manifest entry); the session row records them, without what this
     /// adapter does not offer (REQ-027).
     pub capabilities: crate::capabilities::Probed,
@@ -1410,6 +1412,7 @@ fn replay_turn(version: &str) -> Turn {
             provider: None,
             model: None,
             settled_event: emits_settled(Some(version)),
+            profile: crate::Profile::Yolo,
             capabilities: crate::capabilities::Probed::new(),
         },
         prompt: crate::compat::SUITE_PROMPT.to_owned(),

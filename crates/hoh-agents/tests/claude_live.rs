@@ -122,7 +122,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             program: program.clone(),
             help: help.clone(),
             cwd: repo.clone(),
-            yolo: true,
+            profile: hoh_agents::Profile::Yolo,
             partial: false,
             resume,
             model: None,

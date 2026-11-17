@@ -2571,7 +2571,7 @@ fn app_server_runs_commands(
     let both = Truth::all([
         frame_valid(
             client_requests,
-            &crate::codex::app_server::requests::thread_start(0, true, None),
+            &crate::codex::app_server::requests::thread_start(0, crate::Profile::Yolo, None),
             work,
         ),
         frame_valid(server_notifications, &command_started(), work),

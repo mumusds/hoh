@@ -381,7 +381,8 @@ fn a_pass_of_another_request_definition_is_not_verified() {
         .as_array_mut()
         .and_then(|m| m.iter_mut().find(|m| m["method"] == "thread/start"))
         .expect("the thread/start the builder gave");
-    let mut changed = crate::codex::app_server::requests::thread_start(1, true, None);
+    let mut changed =
+        crate::codex::app_server::requests::thread_start(1, crate::Profile::Yolo, None);
     changed["params"]["sandbox"] = serde_json::json!("workspace-write");
     assert_ne!(*start, changed);
     *start = changed;
@@ -476,14 +477,14 @@ fn the_request_members_are_what_the_builders_give() {
         serde_json::json!([
             requests::initialize(0),
             requests::initialized(),
-            requests::thread_start(1, true, Some(SUITE_MODEL)),
+            requests::thread_start(1, crate::Profile::Yolo, Some(SUITE_MODEL)),
             requests::turn_start(2, Some(SUITE_SESSION), SUITE_PROMPT),
         ])
     );
     let resumed = member("requests/codex/compaction/resumed");
     assert_eq!(
         resumed["messages"][2],
-        requests::thread_resume(1, true, None, SUITE_SESSION)
+        requests::thread_resume(1, crate::Profile::Yolo, None, SUITE_SESSION)
     );
     assert_eq!(
         member("requests/codex/cancel/new")["messages"][4],
