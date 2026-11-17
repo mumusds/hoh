@@ -58,12 +58,18 @@ impl FailureClass {
     /// This failure with the instant its provider said the limit lifts (`reset`; M2T07R-256) as its Retry-After, counted
     /// from `failed_at` (REQ-042 behaviour 1; the owner's decision of 2026-11-16: an exhausted quota waits for its reset,
     /// bounded by the deadline and the retry budget): only for a transient failure without one, and only for a reset
-    /// still to come. A reset already past, or none, leaves it as it was (full jitter); so does every other class.
+    /// still to come. A reset already past, or none, leaves it as it was (full jitter); so does every other class. The
+    /// wait is whole seconds from the failure's whole second, rounded up (RA-03): [`after_failure`] makes it due at the
+    /// reset, and so does a recovery from its record (milliseconds, the failure kept to the second), never before.
     pub fn with_reset(self, reset: Option<SystemTime>, failed_at: SystemTime) -> FailureClass {
-        match (self, reset.and_then(|r| r.duration_since(failed_at).ok())) {
-            (FailureClass::Transient { retry_after: None }, Some(wait)) if !wait.is_zero() => {
+        let from = whole_seconds(failed_at);
+        match (self, reset.filter(|r| *r > failed_at)) {
+            (FailureClass::Transient { retry_after: None }, Some(reset)) => {
+                let wait = reset.duration_since(from).unwrap_or_default();
                 FailureClass::Transient {
-                    retry_after: Some(wait),
+                    retry_after: Some(Duration::from_secs(
+                        wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+                    )),
                 }
             }
             _ => self,
@@ -184,7 +190,7 @@ impl SplitMix64 {
 }
 
 /// `at` cut to the second.
-fn whole_seconds(at: SystemTime) -> SystemTime {
+pub(crate) fn whole_seconds(at: SystemTime) -> SystemTime {
     let secs = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     UNIX_EPOCH + Duration::from_secs(secs)
 }
@@ -410,19 +416,30 @@ mod tests {
     }
 
     #[test]
-    fn a_providers_reset_is_a_transient_failures_retry_after() {
+    fn a_providers_reset_is_a_transient_failures_retry_after()
+    -> Result<(), Box<dyn std::error::Error>> {
         // REQ-042 behaviour 1 (M2T07R-256; owner decision 2026-11-16): the instant the provider said its limit lifts is
         // waited exactly from the failure, however far (the deadline and the retry budget bound it), and the task is
         // due at that instant, never before, whatever part of a second the failure came at.
         let reset = at(9_000, 0);
-        for failed in [at(1_800, 0), at(1_800, 1), at(1_800, 999)] {
+        let edge = at(1_800, 999) + Duration::from_micros(500);
+        for failed in [at(1_800, 0), at(1_800, 1), at(1_800, 999), edge] {
             let class = transient().with_reset(Some(reset), failed);
+            // RA-03 (M2T07R-256 review): whole seconds from the failure's whole second, so the wait survives its record
+            // (milliseconds, and a failure time kept to the second) and its recovery is due at the reset too.
             assert_eq!(
                 class,
                 FailureClass::Transient {
-                    retry_after: reset.duration_since(failed).ok()
+                    retry_after: Some(Duration::from_secs(7_200))
                 }
             );
+            let recorded = FailureClass::from_json(&class.to_json()).ok_or("no class")?;
+            let AfterFailure::Retry { next_retry_at, .. } =
+                after_failure(recorded, 1, whole_seconds(failed), u32::MAX)
+            else {
+                panic!("no wait");
+            };
+            assert_eq!(next_retry_at, reset, "{failed:?} recovered");
             let AfterFailure::Retry {
                 next_retry_at,
                 bound,
@@ -462,5 +479,6 @@ mod tests {
             ),
             AfterFailure::Exhausted
         );
+        Ok(())
     }
 }
