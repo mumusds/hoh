@@ -54,6 +54,9 @@ pub mod retry;
 pub mod schedule;
 #[forbid(clippy::disallowed_methods)]
 pub mod schema;
+/// Who starts a process and how it is owned until it is reaped (docs/adr/ADR-031.md, 设计修正 2).
+#[forbid(clippy::disallowed_methods)]
+pub mod spawn;
 #[forbid(clippy::disallowed_methods)]
 pub mod staffing;
 #[forbid(clippy::disallowed_methods)]
