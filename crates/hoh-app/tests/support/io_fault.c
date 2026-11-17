@@ -3,7 +3,8 @@
  * The test builds it with `cc -shared -fPIC` into its own temporary directory and preloads it into the product's client,
  * host and probe; it is never built into, linked with or shipped by the product.
  *
- * Only files whose path contains ".hoh-wal-selftest-" are touched; everything else passes through.
+ * Only files whose path contains F7_IO_MATCH (by default ".hoh-wal-selftest-", the self-test's) are touched; everything
+ * else passes through.
  *   F7_IO_OP       pwrite | sync | truncate: the call that fails first (pwrite64; fsync or fdatasync; ftruncate64)
  *   F7_IO_SUFFIX   which file: the end of its path (".db", "-wal", "-journal", "-shm")
  *   F7_IO_ERRNO    the errno it fails with
@@ -29,13 +30,14 @@ static int cleanup_done;
 
 static int selftest_file(int fd, char *path, size_t size) {
     char link[64];
+    const char *match = getenv("F7_IO_MATCH");
     snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
     ssize_t n = readlink(link, path, size - 1);
     if (n < 0) {
         return 0;
     }
     path[n] = 0;
-    return strstr(path, ".hoh-wal-selftest-") != NULL;
+    return strstr(path, match ? match : ".hoh-wal-selftest-") != NULL;
 }
 
 /* The errno to fail `op` on `fd` with, or 0. errno is kept when the call passes through. */
