@@ -4431,6 +4431,14 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
         assert_eq!(info["supervisor"], unit.as_str(), "{info}");
         let before = manager.show(&unit, "MainPID,NRestarts")?;
         let old_pid: i32 = before.get("MainPID").ok_or("MainPID")?.parse()?;
+        // Its identity taken now, while it is surely the host: its start time read between two of systemd's answers
+        // that name it the unit's main process. The kill later goes to that process only (CIRF-05).
+        let old_start = common::start_of(u32::try_from(old_pid)?)?;
+        assert_eq!(
+            manager.property(&unit, "MainPID")?,
+            old_pid.to_string(),
+            "the host changed while its identity was taken"
+        );
         let restarts: u32 = before.get("NRestarts").ok_or("NRestarts")?.parse()?;
         assert_eq!(Some(i64::from(old_pid)), info["pid"].as_i64(), "{info}");
         let epoch = info["host_epoch"].as_i64().ok_or("host_epoch")?;
@@ -4454,11 +4462,7 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
 
         // kill -9 of the host's main process, from the host's own environment, which also gives the kill's time by the
         // clock the host reads (CIR-803).
-        let t0_ms = kill_9(
-            &manager,
-            old_pid,
-            &common::start_of(u32::try_from(old_pid)?)?,
-        )?;
+        let t0_ms = kill_9(&manager, old_pid, &old_start)?;
         // systemd restarts it (not a client: its start would come before the restart). The first write command goes
         // to the restarted host as soon as it lets any client in (M2T14R-57): its listeners open only after its
         // reconcile (host/mod.rs), and this records that order as a client sees it.
