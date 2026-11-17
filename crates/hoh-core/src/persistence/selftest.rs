@@ -78,6 +78,12 @@ pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistErro
     run(dir, probe, &|_| Ok(()))
 }
 
+/// How many names the self-test tries for its database before it gives up (F7-03).
+const NAME_ATTEMPTS: u32 = 8;
+
+/// The files SQLite keeps beside a database.
+const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
 /// The self-test with `inject` called before each step; an `Err` from it fails that step (fault injection).
 pub(super) fn run(
     dir: &Path,
@@ -88,42 +94,90 @@ pub(super) fn run(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let db = dir.join(format!(
-        ".hoh-wal-selftest-{}-{nanos}.db",
-        std::process::id()
-    ));
-    // Its file made first, so that a directory refusing it for want of permission or room says so by the OS's error
-    // (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database. Any other
-    // failure is left to the open step, as before.
-    if let Err(e) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&db)
-    {
-        use std::io::ErrorKind::{
-            PermissionDenied, QuotaExceeded, ReadOnlyFilesystem, StorageFull,
-        };
-        match e.kind() {
-            PermissionDenied | ReadOnlyFilesystem => {
-                return Err(PersistError::NotWritable {
-                    path: dir.to_path_buf(),
-                    detail: e.to_string(),
-                });
-            }
-            StorageFull | QuotaExceeded => {
-                return Err(PersistError::Full(format!(
-                    "{} has no room: {e}",
-                    dir.display()
-                )));
-            }
-            _ => {}
-        }
-    }
+    let pid = std::process::id();
+    let names =
+        (0..NAME_ATTEMPTS).map(|n| dir.join(format!(".hoh-wal-selftest-{pid}-{nanos}-{n}.db")));
+    run_named(dir, names, probe, inject)
+}
+
+/// The self-test with its database at the first of `names` that this call can claim ([`claim`]). Only the files this
+/// call created are removed after: the database it claimed and SQLite's companions of it, which did not exist when it
+/// claimed the name (F7-03).
+pub(super) fn run_named(
+    dir: &Path,
+    names: impl IntoIterator<Item = PathBuf>,
+    probe: &ProbeCommand,
+    inject: &dyn Fn(Step) -> Result<(), String>,
+) -> Result<(), PersistError> {
+    let db = claim(dir, names)?;
     let result = steps(&db, probe, inject);
-    for suffix in ["", "-wal", "-shm", "-journal"] {
+    for suffix in std::iter::once("").chain(COMPANIONS) {
         let _ = std::fs::remove_file(with_suffix(&db, suffix));
     }
     result
+}
+
+/// Create the self-test's database file at the first name that is free: neither the file nor a companion of it
+/// exists. A name that exists is another creator's and is left to it: the next name is tried, up to the last, and
+/// the self-test fails at its open step when none is free.
+///
+/// The file is made before SQLite opens it, so that a directory refusing it for want of permission or room says so by
+/// the OS's error (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database.
+fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf, PersistError> {
+    let mut taken = None;
+    for db in names {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&db)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken = Some(db);
+                continue;
+            }
+            Err(e) => return Err(not_created(dir, &db, &e)),
+        }
+        if COMPANIONS
+            .iter()
+            .any(|suffix| std::fs::symlink_metadata(with_suffix(&db, suffix)).is_ok())
+        {
+            let _ = std::fs::remove_file(&db);
+            taken = Some(db);
+            continue;
+        }
+        return Ok(db);
+    }
+    Err(PersistError::WalUnsupported {
+        step: Step::Open.name(),
+        detail: match taken {
+            Some(db) => format!(
+                "every name tried for the self-test database exists already, the last {}",
+                db.display()
+            ),
+            None => "no name to try for the self-test database".to_owned(),
+        },
+    })
+}
+
+/// The self-test's database file could not be created at `db` in `dir`, for `e` (not that the name exists): a
+/// directory that refuses a new file is NotWritable, one without room DB_FULL, and anything else the open step's
+/// failure.
+fn not_created(dir: &Path, db: &Path, e: &std::io::Error) -> PersistError {
+    use std::io::ErrorKind::{PermissionDenied, QuotaExceeded, ReadOnlyFilesystem, StorageFull};
+    match e.kind() {
+        PermissionDenied | ReadOnlyFilesystem => PersistError::NotWritable {
+            path: dir.to_path_buf(),
+            detail: e.to_string(),
+        },
+        StorageFull | QuotaExceeded => {
+            PersistError::Full(format!("{} has no room: {e}", dir.display()))
+        }
+        _ => PersistError::WalUnsupported {
+            step: Step::Open.name(),
+            detail: format!("cannot create {}: {e}", db.display()),
+        },
+    }
 }
 
 fn with_suffix(db: &Path, suffix: &str) -> PathBuf {
@@ -941,6 +995,63 @@ mod tests {
                 other => return Err(format!("{step:?}: {other:?}").into()),
             }
             assert_eq!(leftovers(dir.path()), Vec::<String>::new(), "{step:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_another_creator_holds_is_left_to_it_and_another_is_tried()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // F7-03: a database name that exists already (another creator's file, or a companion of that name) is not
+        // this call's: the self-test takes the next name and removes only what it created.
+        let dir = tempfile::tempdir()?;
+        let names: Vec<PathBuf> = (0..3)
+            .map(|n| dir.path().join(format!("selftest-{n}.db")))
+            .collect();
+        let foreign = "owned by another creator\n";
+        std::fs::write(&names[0], foreign)?;
+        let first = run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(()));
+        assert_eq!(
+            std::fs::read_to_string(&names[0]).ok().as_deref(),
+            Some(foreign),
+            "{first:?}"
+        );
+        first?;
+        assert_eq!(leftovers(dir.path()), ["selftest-0.db"]);
+
+        // A free name whose -wal exists is taken too: neither its -wal nor any file of ours stays.
+        std::fs::write(with_suffix(&names[1], "-wal"), foreign)?;
+        run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(()))?;
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&names[1], "-wal"))?,
+            foreign
+        );
+        let mut left = leftovers(dir.path());
+        left.sort();
+        assert_eq!(left, ["selftest-0.db", "selftest-1.db-wal"]);
+
+        // Every name taken: the self-test fails at open, and deletes none of them.
+        std::fs::write(&names[2], foreign)?;
+        match run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(())) {
+            Err(PersistError::WalUnsupported { step, detail }) => {
+                assert_eq!(step, Step::Open.name(), "{detail}");
+                assert!(detail.contains("selftest-2.db"), "{detail}");
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+        let mut left = leftovers(dir.path());
+        left.sort();
+        assert_eq!(
+            left,
+            ["selftest-0.db", "selftest-1.db-wal", "selftest-2.db"]
+        );
+        for kept in [&names[0], &with_suffix(&names[1], "-wal"), &names[2]] {
+            assert_eq!(
+                std::fs::read_to_string(kept)?,
+                foreign,
+                "{}",
+                kept.display()
+            );
         }
         Ok(())
     }
