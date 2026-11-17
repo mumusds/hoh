@@ -189,6 +189,33 @@ fn every_required_observation_missing_or_ill_typed_is_not_observed() {
         &with(&base, &["exit", "returncode"], Some(json!(0.0))),
         "exit.returncode ill-typed",
     );
+    // M2T20R-03: an exit code past i32, or a negative one that is no signal number, is an input error, never a panic or
+    // a negative signal; the integer edges that are statuses parse.
+    for code in [
+        json!(i64::from(i32::MIN)),
+        json!(i64::from(i32::MIN) - 1),
+        json!(i64::from(i32::MAX) + 1),
+        json!(i64::MIN),
+        json!(u64::MAX),
+    ] {
+        refused(
+            Agent::Codex,
+            &with(&base, &["exit", "returncode"], Some(code.clone())),
+            "exit.returncode ill-typed",
+        );
+    }
+    for (code, want) in [
+        (json!(i32::MAX), Termination::Code(i32::MAX)),
+        (json!(-i64::from(i32::MAX)), Termination::Signal(i32::MAX)),
+        (json!(-1), Termination::Signal(1)),
+    ] {
+        let o = parse(
+            Agent::Codex,
+            &with(&base, &["exit", "returncode"], Some(code.clone())),
+        )
+        .unwrap_or_else(|e| panic!("{code}: {e}"));
+        assert_eq!(o.exit, Some(want), "{code}");
+    }
     refused(
         Agent::Codex,
         &with(&base, &["launch", "profile"], Some(json!(false))),

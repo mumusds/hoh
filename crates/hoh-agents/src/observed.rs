@@ -153,7 +153,8 @@ fn session_file(v: &Value) -> Option<SessionFile> {
     }
 }
 
-/// The exit status: an integer code (negative: the signal that ended the process), or null for none.
+/// The exit status: an integer code (negative: the signal that ended the process), or null for none. A code outside
+/// i32, or a negative one whose signal number is not a positive i32, is no status (M2T20R-03).
 fn exit_status(v: &Value) -> Option<Option<Termination>> {
     if v.is_null() {
         return Some(None);
@@ -161,7 +162,7 @@ fn exit_status(v: &Value) -> Option<Option<Termination>> {
     let code = v.as_i64().filter(|_| v.is_i64())?;
     let code = i32::try_from(code).ok()?;
     Some(Some(if code < 0 {
-        Termination::Signal(-code)
+        Termination::Signal(code.checked_neg()?)
     } else {
         Termination::Code(code)
     }))
