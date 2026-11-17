@@ -23,5 +23,12 @@
  "stdout_sha256": "b02a00213aa00cd526f9b63c5bec91f58511cca6229c8fbf8399bd06e4c06b4d",
  "stderr_sha256": "ca5900b89d547aa51ad046fd9d3793eea1f409cae8c74b0a73b540a9d912cbe7",
  "token_sha256": "6cd956790a47a3336f62c0ba88ad0cc522770b8926f849318319bd71477b111d",
- "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n"
+ "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
+ "observations": {
+  "exit": {
+   "returncode": 0,
+   "how": "exited"
+  },
+  "logs_complete": true
+ }
 }

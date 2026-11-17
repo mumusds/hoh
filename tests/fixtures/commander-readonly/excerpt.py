@@ -10,6 +10,8 @@ array lengths and the JSON type of every value stay the source's. Replaced value
 - every uuid becomes <uuid-N> (one numbering for all the runs given, so a resumed session keeps its placeholder);
 - every string or number under a key named like an account, user, e-mail, plan, organisation, credential, token,
   rate limit, request id, device, socket or provider base URL becomes "<redacted>" or 0;
+- the conversation pi's agent_end repeats (it carries the system prompt and the tool descriptions of the user's
+  extensions; pi.rs reads nothing of it) has its strings replaced;
 - every string under a key that lists the user's plugins, skills, slash commands, agents or memory paths becomes
   "<redacted>";
 - a string in which the model listed its tools (it names the user's connectors: `mcp__`) becomes a marker;
@@ -84,6 +86,31 @@ def observer_report(text: str) -> str:
     return json.dumps(report, separators=(',', ':'))
 
 
+TEXT_KEEP = ('type', 'id', 'role', 'status', 'phase', 'call_id', 'name')
+
+
+def hide_texts(value, keep: tuple = TEXT_KEEP):
+    """Every string under a raw message, reasoning or tool listing item (they may carry instructions and the user's
+    connectors) replaced, keys and shapes kept."""
+    if isinstance(value, dict):
+        return {k: (v if k in keep and not isinstance(v, (dict, list)) else hide_texts(v, ())) for k, v in value.items()}
+    if isinstance(value, list):
+        return [hide_texts(v, ()) for v in value]
+    return '<redacted: model or instruction text>' if isinstance(value, str) else value
+
+
+def pre_redact(f: dict) -> dict:
+    """Value redaction of codex's raw items that are no tool call: messages, reasoning and the tool listing."""
+    item = (f.get('params') or {}).get('item')
+    if f.get('method') == 'rawResponseItem/completed' and isinstance(item, dict) and item.get('type') not in RAW_TOOL_ITEMS:
+        return {**f, 'params': {**f['params'], 'item': hide_texts(item)}}
+    if f.get('type') == 'agent_end' and isinstance(f.get('messages'), list):
+        return {**f, 'messages': hide_texts(f['messages'], ())}
+    if f.get('method') == 'rawResponse/completed' and isinstance((f.get('params') or {}).get('usageMetadata'), dict):
+        return {**f, 'params': {**f['params'], 'usageMetadata': hide_texts(f['params']['usageMetadata'], ())}}
+    return f
+
+
 def redact(value, subst: list[tuple[str, str]], hidden: bool = False):
     if isinstance(value, dict):
         return {k: redact(v, subst, hidden or norm(k) in LISTS or norm(k) in SENSITIVE_EXACT
@@ -117,26 +144,52 @@ def raw_lines(path: Path) -> list[tuple[int, dict]]:
     return out
 
 
+REPO = HERE.parents[2]
+
+
+def registry(path: str, lists: list[list[str]]) -> set[str]:
+    """The keys of a frame registry, read as crates/hoh-agents/src/known.rs `Registry::parse` reads them."""
+    doc = json.loads((REPO / path).read_text())
+    keys = set()
+    for steps in lists:
+        node = doc
+        for step in steps:
+            node = node.get(step, []) if isinstance(node, dict) else []
+        keys |= {e['key'] for e in node if isinstance(e, dict) and isinstance(e.get('key'), str)}
+    return keys
+
+
+KNOWN_CLAUDE = registry('tests/fixtures/protocol/claude/2.1.318/known-frames.json', [['frames']])
+KNOWN_PI = registry('tests/fixtures/protocol/pi/1.5.0/known-frames.json', [['frames']])
+KNOWN_CODEX = registry('tests/fixtures/protocol/codex/0.166.0/known-frames.json',
+                       [['app_server', 'notifications'], ['app_server', 'requests']])
+SCOPE_OF = ('item/started', 'item/completed', 'thread/tokenUsage/updated', 'turn/started', 'turn/completed')
+
+
+# The kept lines are every frame that changes the adapter's state (ADR-032 design correction 7, M2T20D-800: derived
+# from the adapter's own dispatch, so the product's replay of an excerpt reaches the same state as of the raw), plus
+# the frames the evidence table reads. Frames the adapter only reads past (known to its registry, no branch of its
+# dispatch) are left out.
+
 def keep_claude(f: dict) -> bool:
-    if f.get('type') == 'system':
-        return f.get('subtype') in ('init', 'permission_denied')
-    if f.get('type') in ('assistant', 'user'):
-        content = (f.get('message') or {}).get('content')
-        return isinstance(content, list) and any(isinstance(c, dict) and c.get('type') in ('tool_use', 'tool_result') for c in content)
-    return f.get('type') == 'result'
+    """claude.rs `Driven::on_line`: a frame not in the registry (an unknown event), system/init, an assistant frame
+    (authentication_failed), result; and, for the evidence, user frames (tool results) and system/permission_denied."""
+    key = f'{f.get("type")}/{f.get("subtype")}' if f.get('type') in ('system', 'result') and f.get('subtype') else f.get('type')
+    if key not in KNOWN_CLAUDE:
+        return True
+    return f.get('type') in ('assistant', 'user', 'result') or key in ('system/init', 'system/permission_denied')
 
 
 def keep_codex(f: dict) -> bool:
-    if isinstance(f.get('result'), dict) and ('sandbox' in f['result'] or 'thread' in f['result'] or 'turn' in f['result']):
-        return True  # thread/start, thread/resume and turn/start responses: the round's thread and turn ids
-    item = (f.get('params') or {}).get('item') or {}
-    if f.get('method') in ('item/started', 'item/completed'):
-        return item.get('type') in ('commandExecution', 'fileChange', 'agentMessage')
-    if f.get('method') == 'rawResponseItem/completed':  # tool calls and their outputs only: messages may carry instructions
-        return item.get('type') in RAW_TOOL_ITEMS
-    if f.get('method') in ('turn/started', 'turn/completed', 'error', 'warning'):
+    """codex/app_server.rs `State::on_line`: every response (`on_response`), every server request (`on_request`), and
+    of the notifications (`on_notification`) the turn-scoped ones (`scope_of`), `error`, and every one not in the
+    registry (an unknown event). For exec (not judged): its item and turn events."""
+    if 'method' not in f:
+        return 'id' in f or f.get('type') in ('thread.started', 'item.started', 'item.completed', 'turn.completed', 'turn.failed', 'error')
+    if 'id' in f:
         return True
-    return f.get('type') in ('thread.started', 'item.started', 'item.completed', 'turn.completed', 'turn.failed', 'error')
+    method = f['method']
+    return method in SCOPE_OF or method == 'error' or method not in KNOWN_CODEX
 
 
 def keep_rollout(f: dict) -> bool:
@@ -145,17 +198,20 @@ def keep_rollout(f: dict) -> bool:
         return payload.get('type') in ('task_started', 'task_complete')
     if f.get('type') == 'turn_context':
         return True
-    return f.get('type') == 'response_item' and payload.get('type') in RAW_TOOL_ITEMS
+    return f.get('type') == 'response_item' and isinstance(payload.get('type'), str) and (
+        payload['type'].endswith('_call') or payload['type'].endswith('_call_output'))
 
 
 def keep_pi(f: dict) -> bool:
-    if f.get('type') == 'extension_ui_request':
-        return 'hoh_observer' in str(f.get('message', ''))
-    if f.get('type') in ('tool_execution_start', 'tool_execution_end', 'agent_settled'):
+    """pi.rs `Rpc::on_record`: a record not in the registry (an unknown event), response, agent_start, agent_end,
+    agent_settled, tool_execution_start, message_end, extension_ui_request; and, for the evidence,
+    tool_execution_end."""
+    if f.get('type') not in KNOWN_PI:
         return True
     if f.get('type') == 'message_end':
-        return (f.get('message') or {}).get('role') == 'assistant'  # the final one carries the hoh-decisions block
-    return f.get('type') == 'response' and f.get('command') in ('prompt', 'get_state')
+        return (f.get('message') or {}).get('role') == 'assistant'
+    return f.get('type') in ('response', 'agent_start', 'agent_end', 'agent_settled', 'tool_execution_start',
+                             'tool_execution_end', 'extension_ui_request')
 
 
 KEEP = {'claude': keep_claude, 'codex': keep_codex, 'pi': keep_pi}
@@ -165,7 +221,7 @@ def excerpt_file(source: Path, rel: str, keep, subst: list[tuple[str, str]], kep
     lines, index, skeletons = [], [], []
     for i, f in raw_lines(source):
         if keep(f):
-            r = redact(f, subst)
+            r = redact(pre_redact(f), subst)
             if skeleton(r) != skeleton(f):
                 raise SystemExit(f'redaction changed the structure of {rel} line {i}')
             lines.append(json.dumps(r, ensure_ascii=False))
@@ -203,6 +259,10 @@ def excerpt_case(case_dir: Path, agent: str, run: Path) -> dict[str, str]:
             'token_sha256': meta['token_sha256'], 'driver': redact((case_dir / 'cells.sh').read_text(), subst)}
     if 'session_dir' in meta:
         side['session_dir'] = redact(meta['session_dir'], subst)
+    # The external observations the adapter makes (design correction 7, M2T20D-801): as recorded, else from the
+    # recorder's own record of the process's end (the stream read to its end when it exited by itself).
+    side['observations'] = redact(meta.get('observations') or {
+        'exit': {'returncode': meta['exit_code'], 'how': meta['stopped']}, 'logs_complete': meta['stopped'] == 'exited'}, subst)
     out['meta.json'] = json.dumps(side, ensure_ascii=False, indent=1) + '\n'
     return out
 

@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-119>",
+  "<uuid-173>",
   "--tools",
   "read,grep,find,ls,write",
   "--no-mcp",
@@ -22,7 +22,7 @@
   "added": [
    "P/.hoh/sessions",
    "P/.hoh/sessions/s1",
-   "P/.hoh/sessions/s1/2026-11-16T18-14-17-300Z_<uuid-119>.jsonl",
+   "P/.hoh/sessions/s1/2026-11-16T18-14-17-300Z_<uuid-173>.jsonl",
    "P/hoh-tool-create",
    "W/.pi-lens-probe-home",
    "W/.pi-lens-probe-home/bus-events.log",
@@ -41,5 +41,12 @@
  "stderr_sha256": "88fb56e7d453368859f5e17a143450a4c31a7bd507142ce17d42c30a8f865249",
  "token_sha256": "d53d67d01b83b8483e6ebbcece98715c217e8b3e922910542226ed43a85a3f27",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
- "session_dir": "<P>/.hoh/sessions/s1"
+ "session_dir": "<P>/.hoh/sessions/s1",
+ "observations": {
+  "exit": {
+   "returncode": 0,
+   "how": "exited"
+  },
+  "logs_complete": true
+ }
 }
