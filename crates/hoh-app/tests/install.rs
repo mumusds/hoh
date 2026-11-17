@@ -2660,11 +2660,13 @@ impl Stopped {
     }
 }
 
-/// A strace this test started, owned from its spawn (ILF-02): dropped before it was waited for, every child of the
-/// strace is killed (the run, stopped or not, and any helper of strace's own: a child its parent has not reaped keeps
-/// its pid, and each is signalled only while it is still the process of its start time), then the strace, which ends
-/// once they did, is reaped; one that has not ended within 10 s is killed and reaped too. Neither outlives the test,
-/// whatever step failed, the run's lookup included.
+/// A strace this test started, owned from its spawn (ILF-02) and leading a process group of its own, which every
+/// process it starts joins (its run stays in it: `hoh --version` makes no session or group of its own). Dropped before
+/// it was waited for, the whole group is killed (SIGKILL, which ends a stopped run too) again and again until /proc
+/// shows no member of it but the strace's own unreaped corpse, then the strace is reaped: a run its strace starts
+/// while this ends is in the group as well, so none outlives the test, whatever step failed (ILF-100: one scan of the
+/// strace's children missed a run it started later). The group's id is the strace's pid, which stays its own until it
+/// is reaped here, so no other group is signalled. Bounded: past 10 s it is reaped as it is.
 struct Traced {
     strace: Option<std::process::Child>,
 }
@@ -2674,30 +2676,54 @@ impl Drop for Traced {
         let Some(mut strace) = self.strace.take() else {
             return;
         };
-        if !matches!(strace.try_wait(), Ok(Some(_))) {
-            let id = strace.id();
-            let children = std::fs::read_to_string(format!("/proc/{id}/task/{id}/children"))
-                .unwrap_or_default();
-            for pid in children
-                .split_whitespace()
-                .filter_map(|p| p.parse::<u32>().ok())
+        let id = strace.id();
+        let group = i32::try_from(id)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Some(group) = group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            if group_members(id).is_ok_and(|members| members.is_empty())
+                || std::time::Instant::now() > end
             {
-                if let Ok(Some(start)) = hoh_agents::identity::start_id(pid) {
-                    let _ = hoh_agents::identity::signal_if_same(
-                        pid,
-                        &start,
-                        rustix::process::Signal::KILL,
-                    );
-                }
+                break;
             }
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !matches!(strace.try_wait(), Ok(Some(_))) && std::time::Instant::now() < end {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let _ = strace.kill();
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = strace.wait();
     }
+}
+
+/// The processes of process group `group` that have not ended (a zombie or a dead one has; ADR-022 decision 10,
+/// convention v2), by their stat in /proc: a listing that fails is an error, an entry gone or unreadable meanwhile is
+/// none.
+fn group_members(group: u32) -> std::io::Result<Vec<u32>> {
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After its name (which may hold spaces or parentheses): its state, its parent, its group.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if let [state, _, pgrp, ..] = fields.as_slice()
+            && pgrp.parse::<u32>() == Ok(group)
+            && !matches!(*state, "Z" | "X" | "x")
+        {
+            members.push(pid);
+        }
+    }
+    Ok(members)
 }
 
 /// `hoh --version` from the installed command under strace with `held` (its injection), strace's log in `log`; the
@@ -2723,7 +2749,25 @@ fn trace(
     root: &Path,
     limit: std::time::Duration,
 ) -> R<(Traced, u32)> {
-    let strace = Command::new("strace")
+    trace_by(&["strace"], install, log, held, root, limit)
+}
+
+/// [`trace`] with strace run as `tracer` (its program and the arguments before strace's own; a test's stand-in that
+/// becomes strace later).
+fn trace_by(
+    tracer: &[&str],
+    install: &Install,
+    log: &Path,
+    held: &[String],
+    root: &Path,
+    limit: std::time::Duration,
+) -> R<(Traced, u32)> {
+    use std::os::unix::process::CommandExt as _;
+    let (program, before) = tracer.split_first().ok_or("no tracer")?;
+    let strace = Command::new(program)
+        // A process group of its own, which its run joins: the cleanup's reach ([`Traced`]).
+        .process_group(0)
+        .args(before)
         .args(["-f", "-qq", "-o"])
         .arg(log)
         .args(held)
@@ -2878,14 +2922,58 @@ fn a_traced_run_never_found_leaves_neither_it_nor_its_strace() -> R {
         })
     };
     assert_eq!(left()?, Vec::<u32>::new(), "processes left naming {named}");
-    // A run found and stopped, dropped unreleased (a test that fails before it lets it go): the same.
+    // A run found and stopped, dropped unreleased (a test that fails before it lets it go): the same. The run is in its
+    // strace's process group, the cleanup's reach (ILF-100).
     let held = stopped_after_exec(&install)?;
     assert!(
         !left()?.is_empty(),
         "the stopped run and its strace are there"
     );
+    let strace = held
+        .traced
+        .strace
+        .as_ref()
+        .map(std::process::Child::id)
+        .ok_or("no strace")?;
+    assert!(
+        group_members(strace)?.contains(&held.pid),
+        "hoh {} is not in its strace's group {strace}",
+        held.pid
+    );
     drop(held);
     assert_eq!(left()?, Vec::<u32>::new(), "processes left naming {named}");
+    Ok(())
+}
+
+#[test]
+fn a_tracer_that_starts_its_run_only_after_the_lookup_gave_up_leaves_nothing() -> R {
+    // ILF-100: the strace runs its command only after the run's lookup gave up and the cleanup began (here a stand-in
+    // sleeps 3 s, past a 2 s lookup, then becomes strace); the run it starts then, stopped at its first system call,
+    // is ended with it: nothing naming the installation is left once the error returns.
+    let install = Install::new()?;
+    let out = install.run("bundle", &[])?;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let log = install.root.path().join("strace-late.log");
+    let held: Vec<String> = ["-e", "trace=brk", "-e", "inject=brk:signal=SIGSTOP:when=1"]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+    let late =
+        "import os, sys, time\ntime.sleep(3)\nos.execvp('strace', ['strace'] + sys.argv[1:])";
+    let found = trace_by(
+        &["python3", "-c", late],
+        &install,
+        &log,
+        &held,
+        &std::fs::canonicalize(install.data().join("hoh"))?,
+        std::time::Duration::from_secs(2),
+    );
+    assert!(found.is_err(), "found before its strace ran");
+    let named = install.root.path().display().to_string();
+    let left = hoh_agents::identity::running_with(|cmdline| {
+        cmdline.windows(named.len()).any(|w| w == named.as_bytes())
+    })?;
+    assert_eq!(left, Vec::<u32>::new(), "processes left naming {named}");
     Ok(())
 }
 
