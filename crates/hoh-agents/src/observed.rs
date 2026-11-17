@@ -14,7 +14,7 @@ use std::path::PathBuf;
 pub const NOT_OBSERVED: &str = "NOT_OBSERVED";
 
 /// A session file as pi.rs identifies it: canonical path, device, inode.
-pub type SessionFile = (PathBuf, u64, u64);
+pub use crate::pi::SessionFile;
 
 /// The launch a codex App Server turn starts from: its profile, the thread it resumes, its model.
 #[derive(Debug, Clone, PartialEq, Eq)]
