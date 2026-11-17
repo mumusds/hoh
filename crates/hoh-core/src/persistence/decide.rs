@@ -848,25 +848,41 @@ pub(super) fn load_binding(
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
         .map(|v| crate::decision::granted_capabilities(&v))
         .unwrap_or_default();
-    // A role whose change waits for its checkpoint, or that has no session yet, is not dispatched, and its tasks are not
-    // judged by capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50); nor is a new holder whose
-    // first input, its handover package, is not delivered yet (docs/adr/ADR-024.md decision 4, M2T17R-03).
-    // Nor, while the session owes its first input, a second attempt of it (M2T17R-201). Nor while staffing holds a
-    // rebind of it pending for the attempt in flight (docs/adr/ADR-030.md decision 5: the new session is granted once
-    // it ended).
-    let pending = super::team::pending(tx, run_id, role)?
-        || super::staffing::pending_change(tx, run_id, role, epoch)?
+    // What keeps an ACTIVE binding from being dispatched now, each named (CR-025, ROLE_BINDING_PENDING): a role whose
+    // change waits for its checkpoint, or that has no session yet, is not dispatched, and its tasks are not judged by
+    // capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50); nor while staffing holds a rebind
+    // of it pending for the attempt in flight (docs/adr/ADR-030.md decision 5: the new session is granted once it
+    // ended); nor is a new holder whose first input, its handover package, is not delivered yet (docs/adr/ADR-024.md
+    // decision 4, M2T17R-03); nor, while the session owes its first input, a second attempt of it (M2T17R-201). A BLOCKED
+    // binding is not dispatched whatever else holds.
+    use crate::decision::Pending;
+    let mut pending = Vec::new();
+    if state == "ACTIVE" {
+        if super::team::pending(tx, run_id, role)? {
+            pending.push(Pending::TeamChange);
+        }
+        if super::staffing::pending_change(tx, run_id, role, epoch)?
             .is_some_and(|(change, _)| change.cause == crate::staffing::Cause::Rebind)
-        || super::handover::first_input_pending(tx, run_id, role, epoch)?
-        || match session.as_deref() {
-            Some(session) => {
-                super::handover::first_input_in_flight(tx, run_id, role, epoch, session)?
-            }
-            None => false,
-        };
+        {
+            pending.push(Pending::Rebind);
+        }
+        if session.is_none() {
+            pending.push(Pending::NoSession);
+        }
+        if super::handover::first_input_pending(tx, run_id, role, epoch)? {
+            pending.push(Pending::HandoverUndelivered);
+        }
+        if let Some(session) = session.as_deref()
+            && super::handover::first_input_in_flight(tx, run_id, role, epoch, session)?
+        {
+            pending.push(Pending::FirstInputInFlight);
+        }
+    }
     Ok(Some(BindingView {
         role_epoch: revision(epoch)?,
-        active: state == "ACTIVE" && !pending && session.is_some(),
+        active: state == "ACTIVE" && pending.is_empty(),
+        blocked: state != "ACTIVE",
+        pending,
         capabilities,
     }))
 }

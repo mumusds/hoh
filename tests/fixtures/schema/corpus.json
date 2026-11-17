@@ -64,6 +64,66 @@
    "schema": "protocol",
    "def": "Message",
    "valid": true,
+   "note": "rejected with reason_code ROLE_BINDING_PENDING (CR-025)",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": "m0",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": "C1",
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": "ROLE_BINDING_PENDING"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": false,
+   "note": "anyOf/enum: a rejection reason in the wrong case (CR-025)",
+   "instance": {
+    "schema_version": "1.0",
+    "message_id": "m1",
+    "run_id": "r1",
+    "task_id": "t1",
+    "attempt_id": "a1",
+    "sender_role": "commander",
+    "recipient_role": "developer",
+    "role_epoch": 1,
+    "correlation_id": "c1",
+    "causation_id": "m0",
+    "idempotency_key": "k1",
+    "expected_revision": 0,
+    "spec_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_id": "C1",
+    "kind": "rejected",
+    "payload": {
+     "note": "x",
+     "extra": {
+      "kept": true
+     }
+    },
+    "reason_code": "role_binding_pending"
+   }
+  },
+  {
+   "schema": "protocol",
+   "def": "Message",
+   "valid": true,
    "note": "reason_code may be null when not rejected",
    "instance": {
     "schema_version": "1.0",
