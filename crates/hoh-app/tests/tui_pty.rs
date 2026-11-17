@@ -872,6 +872,145 @@ fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     Ok(())
 }
 
+/// The parent of `pid` (`/proc/<pid>/stat` field 4).
+fn parent_of(pid: u32) -> R<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after = stat.rsplit_once(") ").ok_or("no stat")?.1;
+    Ok(after.split(' ').nth(1).ok_or("no parent")?.parse()?)
+}
+
+/// Holds the project database's write lock until dropped (a `BEGIN IMMEDIATE` of a python3 of its own): a host that
+/// starts meanwhile waits for it at its first write, within its busy timeout (5 s), as a slow start would.
+struct WriteLock(std::process::Child);
+
+impl WriteLock {
+    fn take(db: &Path) -> R<WriteLock> {
+        use std::io::BufRead as _;
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); c.execute('BEGIN IMMEDIATE'); \
+                 print('locked', flush=True); sys.stdin.readline(); c.execute('COMMIT')",
+            ])
+            .arg(db)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().ok_or("no stdout")?).read_line(&mut line)?;
+        let lock = WriteLock(child);
+        if line.trim() != "locked" {
+            return Err(format!("the write lock was not taken: {line:?}").into());
+        }
+        Ok(lock)
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        // Its own unreaped child: committed and ended, or killed.
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = stdin.write_all(b"\n");
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while matches!(self.0.try_wait(), Ok(None)) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// CLT-01 (REQ-004 failure mode 2; REQ-001 failure mode 3): `hoh attach <run>` with a terminal takes `sig` while the
+/// host it started is not ready yet (the test holds the database's write lock, so the host waits at its first write): it
+/// ends at once with `code`, the terminal as it was (the Workspace never entered), and the host goes on in the
+/// background and becomes ready once the lock goes.
+fn a_signal_while_the_attachs_host_starts_ends_it(sig: Signal, code: i32) -> R {
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let _daemons = Daemons(project.clone());
+    // A run, and its host stopped: the attach starts the next one.
+    let detach_pty = Pty::new(30, 100)?;
+    let mut detach = spawn_in(
+        &detach_pty,
+        &project,
+        &home,
+        &["-p", "x", "--detach", "--output", "json"],
+        &[],
+    )?;
+    assert_eq!(exit_within(&mut detach, WAIT)?.code(), Some(0));
+    drop(Daemons(project.clone()));
+    assert!(hosts_of(&project)?.is_empty(), "the detach's host stopped");
+    let db = project.join(".hoh/state.db");
+    let run = sqlite(
+        &db,
+        "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT run_id FROM runs').fetchone()[0])",
+        "",
+    )?;
+    let lock = WriteLock::take(&db)?;
+    let pty = Pty::new(30, 100)?;
+    let baseline = pty.stty()?;
+    let mut client = spawn_in(&pty, &project, &home, &["attach", &run], &[])?;
+    let attach = client.0.id();
+    let end = std::time::Instant::now() + WAIT;
+    let host = loop {
+        let hosts = hosts_of(&project)?;
+        if let [host] = hosts.as_slice()
+            && parent_of(*host)? == attach
+        {
+            break *host;
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("the attach started no host: {hosts:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        !project.join(".hoh/host.json").exists(),
+        "the host was ready before the signal"
+    );
+    signal(&client, sig)?;
+    let status = exit_within(&mut client, Duration::from_secs(2))?;
+    pty.drained(WAIT)?;
+    assert_eq!(status.code(), Some(code));
+    assert_eq!(
+        find(&pty.output(), ENTER_ALT, 0),
+        None,
+        "the Workspace was entered"
+    );
+    assert_eq!(pty.stty()?, baseline, "terminal attributes");
+    // The host it started goes on: ready once the lock goes.
+    drop(lock);
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let ready = std::fs::read_to_string(project.join(".hoh/host.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|h| h["pid"].as_u64());
+        if ready == Some(u64::from(host)) {
+            break;
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("the attach's host did not go on to be ready: {ready:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_sigterm_while_the_attachs_host_starts_ends_it_with_143() -> R {
+    a_signal_while_the_attachs_host_starts_ends_it(Signal::TERM, 143)
+}
+
+#[test]
+fn a_sigint_while_the_attachs_host_starts_ends_it_with_130() -> R {
+    a_signal_while_the_attachs_host_starts_ends_it(Signal::INT, 130)
+}
+
 /// POST `body` to the commands of the project's host named by its `host.json`; the response's status line.
 fn post_command(project: &Path, body: &str) -> R<String> {
     use std::io::{Read as _, Write as _};

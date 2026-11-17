@@ -314,9 +314,28 @@ fn again(project: &Path, host: &std::sync::Mutex<HostInfo>) -> Result<HostInfo, 
     Ok(found)
 }
 
-/// The signal flags of the shell: the signal that came (its number, 0 for none) and whether the window was resized;
-/// registered before anything else, so a signal is never lost; 74 when they cannot be.
-fn register() -> Result<(Arc<AtomicUsize>, Arc<AtomicBool>), u8> {
+/// The signal flags of the shell: the signal that came (its number, 0 for none) and whether the window was resized.
+/// Registered before anything else, by bare `hoh` or by `hoh attach` before it waits for its host, and kept through to
+/// the shell, so a signal is never lost (CLT-01).
+pub struct Flags {
+    signal: Arc<AtomicUsize>,
+    resized: Arc<AtomicBool>,
+}
+
+impl Flags {
+    /// The flag a wait looks at: the number of the signal that came, 0 for none.
+    pub fn signal(&self) -> &AtomicUsize {
+        &self.signal
+    }
+
+    /// The exit code of signal number `signal` (SIGTERM 143, SIGHUP 129, SIGINT 130).
+    pub fn code(signal: usize) -> u8 {
+        signal_code(signal)
+    }
+}
+
+/// [`Flags`], registered now; 74 when they cannot be.
+pub fn register() -> Result<Flags, u8> {
     let signal = Arc::new(AtomicUsize::new(0));
     for sig in [SIGTERM, SIGHUP, SIGINT] {
         let value = usize::try_from(sig).unwrap_or(usize::MAX);
@@ -330,16 +349,18 @@ fn register() -> Result<(Arc<AtomicUsize>, Arc<AtomicBool>), u8> {
         say!("hoh：无法登记信号处理：{e}");
         return Err(code(ClientEvent::TerminalIo));
     }
-    Ok((signal, resized))
+    Ok(Flags { signal, resized })
 }
 
-/// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`; the exit code. Leaving, by the
-/// choice or a signal, only closes this client (REQ-043 behaviour 6).
-pub fn attach(project: &Path, host: HostInfo, run: &Value) -> u8 {
-    let (signal, resized) = match register() {
-        Ok(flags) => flags,
-        Err(code) => return code,
-    };
+/// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`, with the `flags` the attach
+/// registered before it waited for the host; the exit code. A signal that came before ends it before the terminal
+/// changes. Leaving, by the choice or a signal, only closes this client (REQ-043 behaviour 6).
+pub fn attach(project: &Path, host: HostInfo, run: &Value, flags: Flags) -> u8 {
+    let Flags { signal, resized } = flags;
+    let sig = signal.load(Ordering::SeqCst);
+    if sig != 0 {
+        return signal_code(sig);
+    }
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
     let label = run["projection"]["label"]
         .as_str()
@@ -362,12 +383,13 @@ pub fn attach(project: &Path, host: HostInfo, run: &Value) -> u8 {
 
 /// `hoh attach` with no run named, several not ended and a terminal (docs/adr/ADR-031.md decision 12): the shell with
 /// the selector of the runs not ended among `runs` (list_runs' items, every page) open; the run chosen is attached,
-/// Esc or the Ctrl+C choice "脱离" leaves with 0.
-pub fn pick(project: &Path, host: HostInfo, runs: &[Value]) -> u8 {
-    let (signal, resized) = match register() {
-        Ok(flags) => flags,
-        Err(code) => return code,
-    };
+/// Esc or the Ctrl+C choice "脱离" leaves with 0. `flags` as [`attach`]'s.
+pub fn pick(project: &Path, host: HostInfo, runs: &[Value], flags: Flags) -> u8 {
+    let Flags { signal, resized } = flags;
+    let sig = signal.load(Ordering::SeqCst);
+    if sig != 0 {
+        return signal_code(sig);
+    }
     let conn = Conn::new(project, host);
     let mut app = App::open(project);
     app.list(runs);
@@ -377,7 +399,7 @@ pub fn pick(project: &Path, host: HostInfo, runs: &[Value]) -> u8 {
 
 /// Bare `hoh`: the shell for the project at `project`, unattached; the exit code (docs/adr/ADR-031.md decision 13).
 pub fn run(project: &Path) -> u8 {
-    let (signal, resized) = match register() {
+    let Flags { signal, resized } = match register() {
         Ok(flags) => flags,
         Err(code) => return code,
     };
