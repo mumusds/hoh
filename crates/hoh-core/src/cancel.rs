@@ -189,8 +189,13 @@ pub fn pass(
                 };
             }
             Next::Send(signal) => {
-                if control.send(signal) {
-                    sent.push((signal, now));
+                let reached = control.send(signal);
+                // The step's time is when it happened, once its send returned, not when it was decided: a slow native
+                // interrupt does not eat its grace, nor is a slow SIGTERM recorded early (docs/adr/ADR-021.md decision
+                // 8c, CIRF-01). Its event's time, the next grace's start and the progress kept across passes.
+                let at = clock.now();
+                if reached {
+                    sent.push((signal, at));
                 }
                 if signal == Signal::Term {
                     term_incomplete |= control.sigterm_incomplete();
@@ -200,10 +205,10 @@ pub fn pass(
                 // trying again at once (docs/adr/ADR-021.md decision 8d, M2T06R-201). Only what reached a process is
                 // recorded as sent.
                 match signal {
-                    Signal::Native => progress.native_at = Some(now),
-                    Signal::Term => progress.term_at = Some(now),
+                    Signal::Native => progress.native_at = Some(at),
+                    Signal::Term => progress.term_at = Some(at),
                     Signal::Kill => {
-                        progress.kill_at = Some(now);
+                        progress.kill_at = Some(at);
                         killed = true;
                     }
                 }
@@ -589,6 +594,102 @@ mod tests {
         assert_eq!(group.sent.len(), 3 + 5);
         // Looked at least every poll interval: the end is found within one of it.
         assert!(clock.0.lock().map(|d| *d).unwrap_or_default() < Duration::from_secs(45) + poll);
+    }
+
+    /// A group that lives until `empty_at` (seconds on the clock), each of whose sends takes the time `slow` gives that
+    /// signal (the clock moves on during it), and when each send began and returned.
+    struct SlowSends<'a> {
+        clock: &'a FakeClock,
+        empty_at: u64,
+        slow: fn(Signal) -> Duration,
+        sends: Vec<(Signal, u64, u64)>,
+    }
+
+    impl ProcessControl for SlowSends<'_> {
+        fn look(&mut self) -> Look {
+            if self.clock.secs() >= self.empty_at {
+                Look::Empty
+            } else {
+                Look::Held
+            }
+        }
+        fn send(&mut self, signal: Signal) -> bool {
+            let began = self.clock.secs();
+            self.clock.advance((self.slow)(signal));
+            self.sends.push((signal, began, self.clock.secs()));
+            true
+        }
+    }
+
+    #[test]
+    fn a_slow_native_interrupt_still_gets_its_whole_grace_before_sigterm() {
+        // CIRF-01: a step's time is when it happened. A native interrupt whose send takes 11 s (longer than its 10 s
+        // grace) is recorded at 11, and SIGTERM comes a whole grace after it, at 21, not at once.
+        let clock = FakeClock::default();
+        let mut group = SlowSends {
+            clock: &clock,
+            empty_at: 60,
+            slow: |s| match s {
+                Signal::Native => Duration::from_secs(11),
+                _ => Duration::ZERO,
+            },
+            sends: Vec::new(),
+        };
+        let mut wait = |d: Duration| clock.advance(d);
+        let done = pass(
+            &mut group,
+            &clock,
+            &mut wait,
+            &GRACES,
+            true,
+            Progress::default(),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            group.sends[..2],
+            [(Signal::Native, 0, 11), (Signal::Term, 21, 21)],
+            "{:?}",
+            group.sends
+        );
+        assert_eq!(
+            done.sent[..2],
+            [(Signal::Native, at(11)), (Signal::Term, at(21))]
+        );
+    }
+
+    #[test]
+    fn a_slow_sigterm_is_recorded_when_it_was_sent_and_sigkill_waits_its_grace_from_then() {
+        // CIRF-01: a SIGTERM whose send takes 9 s is recorded when it returned (10 + 9 = 19), not when it was decided
+        // (10); SIGKILL comes 5 s after that, at 24.
+        let clock = FakeClock::default();
+        let mut group = SlowSends {
+            clock: &clock,
+            empty_at: 60,
+            slow: |s| match s {
+                Signal::Term => Duration::from_secs(9),
+                _ => Duration::ZERO,
+            },
+            sends: Vec::new(),
+        };
+        let mut wait = |d: Duration| clock.advance(d);
+        let done = pass(
+            &mut group,
+            &clock,
+            &mut wait,
+            &GRACES,
+            true,
+            Progress::default(),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            done.sent,
+            vec![
+                (Signal::Native, at(0)),
+                (Signal::Term, at(19)),
+                (Signal::Kill, at(24))
+            ]
+        );
+        assert_eq!(done.progress.term_at, Some(at(19)));
     }
 
     #[test]
