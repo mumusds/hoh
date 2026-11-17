@@ -4375,16 +4375,22 @@ impl hoh_app::host::HostHooks for Points {
     }
 }
 
-/// Wait on this thread (a hook's: the tick waits with it) until `done`, for at most 60 s; whether it came.
+/// Wait on this thread (a hook's: the tick waits with it) until `done`, for at most 60 s; whether it came. What it
+/// waits for is done by the host's other tasks on the same runtime (the registry's own loop, which sleeps on the
+/// runtime's timer), so the wait first hands this worker's tasks to another thread (`block_in_place`): a worker that
+/// just blocks can leave no thread driving the runtime's timers, and nothing that `done` needs then happens before the
+/// wait's own bound (the staffing flake: one run in 517 under load; with one worker, every run).
 fn waiting(done: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(60);
-    while !done() {
-        if Instant::now() > end {
-            return false;
+    tokio::task::block_in_place(|| {
+        let end = Instant::now() + Duration::from_secs(60);
+        while !done() {
+            if Instant::now() > end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    true
+        true
+    })
 }
 
 /// The events of `kind` of attempt `attempt_id` (by their id's prefix), their payloads in order.
