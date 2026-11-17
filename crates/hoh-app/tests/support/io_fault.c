@@ -11,7 +11,7 @@
  *   F7_IO_ERRNO    the errno it fails with
  *   F7_IO_STATE    optional, a path: after the first fault it exists, and from then on every write, pwrite, sync and
  *                  truncate of a self-test file fails with the same errno, in every process (a file system that stays
- *                  full or over quota)
+ *                  full or over quota; a new file can still be made, its blocks cannot)
  *   F7_IO_PROBE    optional: the first fault only in the probe process (the one with HOH_WAL_PROBE_DB set)
  *   F7_IO_ARM      optional, a path: the first fault only while it exists (a running host's command, not its start)
  *   F7_CLEANUP_ERRNO  optional: after the first fault, the next pread of a self-test file fails once with this errno
@@ -112,7 +112,7 @@ static int fault_at(const char *path, const char *op) {
     const char *state = getenv("F7_IO_STATE");
     int result = 0;
     if (err && matching(path)) {
-        if (state && access(state, F_OK) == 0) {
+        if (state && access(state, F_OK) == 0 && strcmp(op, "open") != 0) {
             result = atoi(err);
         } else if (!fired && (!getenv("F7_IO_PROBE") || getenv("HOH_WAL_PROBE_DB")) &&
                    (!getenv("F7_IO_ARM") || access(getenv("F7_IO_ARM"), F_OK) == 0)) {
