@@ -4783,15 +4783,33 @@ fn test_019_05_a_host_killed_after_the_handover_commit_keeps_epoch_2_and_starts_
         )?,
         "REJECTED:STALE_ROLE_EPOCH,REJECTED:STALE_ROLE_EPOCH,REJECTED:STALE_ROLE_EPOCH"
     );
+    // Nothing of the old Commander's messages was dispatched: no attempt and no dispatch of T, T unchanged. The new
+    // Commander may meanwhile have been given a turn for the wakes the run owes from the first host (its stall, its
+    // developer's and reviewer's agents not installed), at a time that depends on scheduling: the attempts and
+    // dispatches are selected by task, and every other one must be such a turn, pi's at epoch 2 (exact counts, as
+    // docs/adr/ADR-031.md's design correction for turns whose time depends on scheduling asks).
     assert_eq!(
         query(
             &db(&project),
-            "SELECT (SELECT count(*) FROM attempts) || '/' || (SELECT count(*) FROM outbox \
-             WHERE json_extract(payload_json, '$.kind') = 'dispatch') || '/' || \
-             (SELECT state || revision FROM tasks WHERE task_id = 'T')"
+            "SELECT (SELECT count(*) FROM attempts WHERE task_id = 'T') || '/' || (SELECT count(*) FROM outbox \
+             WHERE json_extract(payload_json, '$.kind') = 'dispatch' AND json_extract(payload_json, '$.task_id') = 'T') \
+             || '/' || (SELECT state || revision FROM tasks WHERE task_id = 'T')"
         )?,
         "0/0/ACCEPTED1",
         "nothing dispatched, T unchanged"
+    );
+    let turn = "a.task_id LIKE 'R/trigger/%/turn/%' AND a.agent = 'pi' AND a.role_epoch = 2";
+    assert_eq!(
+        query(
+            &db(&project),
+            &format!(
+                "SELECT (SELECT count(*) FROM attempts a WHERE NOT ({turn})) || '/' || (SELECT count(*) FROM outbox o \
+                 WHERE json_extract(o.payload_json, '$.kind') = 'dispatch' AND NOT EXISTS (SELECT 1 FROM attempts a \
+                 WHERE a.attempt_id = json_extract(o.payload_json, '$.attempt_id') AND {turn}))"
+            )
+        )?,
+        "0/0",
+        "every other attempt and dispatch is a turn of the new Commander"
     );
     assert_eq!(
         query(&db(&project), commander)?,
