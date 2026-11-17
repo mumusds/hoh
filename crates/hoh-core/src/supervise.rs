@@ -203,3 +203,40 @@ pub fn due_at(severity: Severity, first: SystemTime, last: SystemTime) -> System
         (last + QUIET).min(first + CAP)
     }
 }
+
+/// How many lines and bytes of a supervision turn's decisions are read, the bridge's own bounds (docs/adr/ADR-032.md
+/// decision 1; the product executor's `BRIDGE_LINES`, `BRIDGE_BYTES`).
+pub const DECISION_LINES: usize = 1_000;
+pub const DECISION_BYTES: usize = 1 << 20;
+
+/// A supervision turn's decisions (docs/adr/ADR-032.md decision 1): the non-blank lines of the last
+/// ```` ```hoh-decisions ```` block of its final message, in order (the fence rule of a verifier's report block,
+/// `verification::report::block`: `(?s)```hoh-decisions[ \t]*\n(.*?)\n````), within [`DECISION_LINES`] and
+/// [`DECISION_BYTES`], and whether more was cut. A valid JSON line never ends the block: its own line breaks are
+/// escaped, and the block ends only at a fence at a line's start. No block: none.
+pub fn decision_lines(final_text: &str) -> (Vec<String>, bool) {
+    static FENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let fence = FENCE.get_or_init(|| {
+        regex::Regex::new(r"(?s)```hoh-decisions[ \t]*\n(.*?)\n```")
+            .unwrap_or_else(|_| unreachable!())
+    });
+    let Some(block) = fence
+        .captures_iter(final_text)
+        .last()
+        .and_then(|c| c.get(1))
+    else {
+        return (Vec::new(), false);
+    };
+    // As the bridge is read: bytes first, then lines.
+    let bytes = block.as_str().as_bytes();
+    let mut truncated = bytes.len() > DECISION_BYTES;
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(DECISION_BYTES)]);
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let kept: Vec<String> = lines
+        .by_ref()
+        .take(DECISION_LINES)
+        .map(str::to_owned)
+        .collect();
+    truncated |= lines.next().is_some();
+    (kept, truncated)
+}
