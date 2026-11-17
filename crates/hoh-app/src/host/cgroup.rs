@@ -1292,17 +1292,29 @@ mod tests {
         Ok(())
     }
 
-    /// A member list served a few bytes at a time, counting its reads.
+    /// A member list served a few bytes at a time, keeping what its reads saw.
     struct Trickle {
         data: Vec<u8>,
         at: usize,
         step: usize,
-        reads: std::rc::Rc<std::cell::Cell<usize>>,
+        seen: std::rc::Rc<Seen>,
+    }
+
+    /// What a [`Trickle`]'s reads saw (CGW-250): the length of each read's buffer, and the reads begun without a look
+    /// that found the budget unspent since the read before.
+    #[derive(Default)]
+    struct Seen {
+        lens: std::cell::RefCell<Vec<usize>>,
+        let_read: std::cell::Cell<bool>,
+        unlooked: std::cell::Cell<usize>,
     }
 
     impl std::io::Read for Trickle {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.reads.set(self.reads.get() + 1);
+            self.seen.lens.borrow_mut().push(buf.len());
+            if !self.seen.let_read.replace(false) {
+                self.seen.unlooked.set(self.seen.unlooked.get() + 1);
+            }
             let n = self.step.min(buf.len()).min(self.data.len() - self.at);
             buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
             self.at += n;
@@ -1310,15 +1322,29 @@ mod tests {
         }
     }
 
-    fn trickle(data: &str, step: usize) -> (Trickle, std::rc::Rc<std::cell::Cell<usize>>) {
-        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    fn trickle(data: &str, step: usize) -> (Trickle, std::rc::Rc<Seen>) {
+        let seen = std::rc::Rc::new(Seen::default());
         let stub = Trickle {
             data: data.as_bytes().to_vec(),
             at: 0,
             step,
-            reads: reads.clone(),
+            seen: seen.clone(),
         };
-        (stub, reads)
+        (stub, seen)
+    }
+
+    /// A budget that lasts `lasts` looks at it (it counts its own looks); each look that finds it unspent lets the
+    /// next read of `seen`'s list begin.
+    fn looked_at(seen: &std::rc::Rc<Seen>, lasts: usize) -> impl Fn() -> bool {
+        let (seen, looks) = (seen.clone(), std::cell::Cell::new(0));
+        move || {
+            looks.set(looks.get() + 1);
+            let spent = looks.get() > lasts;
+            if !spent {
+                seen.let_read.set(true);
+            }
+            spent
+        }
     }
 
     #[test]
@@ -1333,17 +1359,22 @@ mod tests {
 
     #[test]
     fn a_member_list_below_the_top_is_left_between_its_pieces_once_the_budget_is_spent() {
-        // CGW-100: a long or slow list is not read to its end before the budget is looked at: it is looked at before
-        // each piece, so the list is left at the first piece after the budget was spent (here after two reads, each
-        // too short for a whole pid).
-        let (procs, reads) = trickle(&"5000000\n".repeat(50), 2);
-        let spent = {
-            let reads = reads.clone();
-            move || reads.get() >= 2
-        };
+        // CGW-100, CGW-250: a long or slow list is not read to its end before the budget is looked at. Every piece is
+        // asked for as 4 KiB, and a read begins only after a look found the budget unspent, so the list is left at the
+        // first look that finds it spent: here the budget lasts one look, so one piece is read (2 bytes, too short for
+        // a pid). Read to its end with a budget never spent, every read still asks for 4 KiB.
+        let (procs, seen) = trickle(&"5000000\n".repeat(50), 2);
         let mut pids = Vec::new();
-        assert!(!each_member(procs, &spent, |pid| pids.push(pid)));
-        assert_eq!((reads.get(), pids), (2, Vec::new()));
+        assert!(!each_member(procs, &looked_at(&seen, 1), |pid| pids.push(pid)));
+        assert_eq!(
+            (seen.lens.borrow().clone(), seen.unlooked.get(), pids),
+            (vec![4096], 0, Vec::new())
+        );
+        let (procs, seen) = trickle(&"5000000\n".repeat(50), 64);
+        assert!(each_member(procs, &looked_at(&seen, usize::MAX), |_| {}));
+        let lens = seen.lens.borrow();
+        assert_eq!((lens.len(), seen.unlooked.get()), (8, 0), "{lens:?}");
+        assert!(lens.iter().all(|&len| len == 4096), "{lens:?}");
     }
 
     #[test]
