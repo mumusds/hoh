@@ -2646,18 +2646,25 @@ impl SandboxCheck {
 /// The permission profile the check asks for: the built-in read-only one (only the installed binary names it).
 pub const SANDBOX_PROFILE: &str = ":read-only";
 
+/// The check's command inside the sandbox: read the token, try one write; its directory is `$1`.
+const SANDBOX_SCRIPT: &str = "cat \"$1/token\"; echo x > \"$1/probe\"";
+
 /// Check codex's own read-only sandbox on this host (docs/adr/ADR-032.md decision 4): in a scratch directory of its
 /// own, with a scratch `CODEX_HOME` and `HOME` (never the user's configuration or credentials), run
-/// `codex sandbox -P :read-only -C <scratch>/ws -- /bin/sh -c 'cat <scratch>/ws/token; echo x > <scratch>/ws/probe'`
+/// `codex sandbox -P :read-only -C <scratch>/ws -- /bin/sh -c 'cat "$1/token"; echo x > "$1/probe"' hoh-sandbox-check <scratch>/ws`
 /// under the probe's limits and stop. The probe file written: unconfined; the token printed and no probe file:
 /// confined; codex refusing the profile as unknown, a timeout or a start that failed: unknown; else the command never
 /// ran: unavailable. The registry and doctor call this one function.
 pub fn codex_sandbox_check(launcher: &Path, env: &ProbeEnv) -> SandboxCheck {
+    codex_sandbox_check_in(launcher, env, &std::env::temp_dir())
+}
+
+/// [`codex_sandbox_check`] with its scratch directory made under `base` (the system's temporary directory, or a test's).
+fn codex_sandbox_check_in(launcher: &Path, env: &ProbeEnv, base: &Path) -> SandboxCheck {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let root =
-        std::env::temp_dir().join(format!("hoh-codex-sandbox-{}-{nanos}", std::process::id()));
+    let root = base.join(format!("hoh-codex-sandbox-{}-{nanos}", std::process::id()));
     let (ws, home, codex_home) = (root.join("ws"), root.join("home"), root.join("codex"));
     let token: String = Sha256::digest(format!("{}-{nanos}", std::process::id()))
         .iter()
@@ -2671,7 +2678,8 @@ pub fn codex_sandbox_check(launcher: &Path, env: &ProbeEnv) -> SandboxCheck {
         Err(e) => SandboxCheck::Unknown(format!("the check's scratch directory: {e}")),
         Ok(()) => {
             let ws_text = ws.display().to_string();
-            let script = format!("cat '{ws_text}/token'; echo x > '{ws_text}/probe'");
+            // The directory is the script's positional parameter, never part of its text: a path may hold any
+            // character, quotes included (M2T20R-02).
             let args = [
                 "sandbox",
                 "-P",
@@ -2681,7 +2689,9 @@ pub fn codex_sandbox_check(launcher: &Path, env: &ProbeEnv) -> SandboxCheck {
                 "--",
                 "/bin/sh",
                 "-c",
-                &script,
+                SANDBOX_SCRIPT,
+                "hoh-sandbox-check",
+                &ws_text,
             ];
             let vars: [(&str, &OsStr); 2] = [
                 ("CODEX_HOME", codex_home.as_os_str()),

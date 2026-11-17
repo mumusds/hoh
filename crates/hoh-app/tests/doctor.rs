@@ -1344,6 +1344,8 @@ fn the_read_only_item_is_the_registrys_judgement() -> R {
                     "--",
                     "/bin/sh",
                     "-c",
+                    _,
+                    "hoh-sandbox-check",
                     _
                 ]
             ),
