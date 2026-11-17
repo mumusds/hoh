@@ -89,14 +89,30 @@ pub(super) fn auth(agent: Agent, launcher: &Path, env: &ProbeEnv) -> (Auth, Opti
 }
 
 /// The item of an installed agent whose probe was refused or failed, with what was found before it: the version and
-/// the implementation's hash (REQ-006; M1QA-08).
+/// the implementation's hash (REQ-006; M1QA-08), or the version alone when a hash was not done within doctor's limit.
 fn not_probed(
     agent: Agent,
     env: &ProbeEnv,
     identity: Option<probe::Identity>,
+    version: Option<String>,
     e: &ProbeError,
 ) -> AgentItem {
     let (protocol, detail, remedy) = match e {
+        // A file of its identity not hashed within doctor's limit (package G2, docs/adr/ADR-015.md note): said as
+        // such, never as a command that did not end.
+        _ if let Some(path) = e.hashed() => (
+            Protocol::Unknown,
+            match e {
+                ProbeError::TimedOut { after, .. } => format!(
+                    "doctor 的总时限只剩 {:.1} s，{path} 的 sha256 没有在其中算完（见 hashes）；未能与 compat manifest 核对",
+                    after.as_secs_f64()
+                ),
+                _ => format!(
+                    "doctor 的总时限已用完，{path} 的 sha256 没有计算（见 hashes）；未能与 compat manifest 核对"
+                ),
+            },
+            "在机器较空闲时重试：doctor 要在总时限内算完该 CLI 的 sha256".to_owned(),
+        ),
         ProbeError::Unsupported { detail, .. } => (
             Protocol::Incompatible,
             format!("缺少 HoH 需要的接口：{detail}"),
@@ -119,6 +135,8 @@ fn not_probed(
     if let Some(identity) = identity {
         item.version = Some(identity.cli_version);
         item.binary_sha256 = Some(identity.implementation_sha256);
+    } else {
+        item.version = version;
     }
     item.protocol = protocol;
     item.protocol_detail = Some(detail);
@@ -127,14 +145,16 @@ fn not_probed(
 
 /// One agent's item, without `--live`.
 pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) -> AgentItem {
-    let identity = match probe::identify(agent, env) {
+    let identity = match probe::identify_versioned(agent, env) {
         Ok(identity) => identity,
-        Err(ProbeError::NotFound { .. }) => return AgentItem::missing(install(agent).to_owned()),
-        Err(e) => return not_probed(agent, env, None, &e),
+        Err((_, ProbeError::NotFound { .. })) => {
+            return AgentItem::missing(install(agent).to_owned());
+        }
+        Err((version, e)) => return not_probed(agent, env, None, version, &e),
     };
     let entry = match probe::probe_identified(agent, identity.clone(), env) {
         Ok(entry) => entry,
-        Err(e) => return not_probed(agent, env, Some(identity), &e),
+        Err(e) => return not_probed(agent, env, Some(identity), None, &e),
     };
     let (protocol, protocol_detail) = protocol(&entry, manifest, agent);
     let (auth_check, auth_note) = auth(agent, Path::new(&entry.launcher_path), env);

@@ -1,6 +1,6 @@
 //! What `hoh doctor` reports, and its two forms: one JSON object on one line, or Chinese text (ADR-015 decision 8).
 
-use hoh_agents::probe::Run;
+use hoh_agents::probe::{Hashed, Run};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -157,6 +157,9 @@ pub struct Report {
     pub summary: Summary,
     /// Every command doctor ran.
     pub probes: Vec<Run>,
+    /// Every file doctor hashed for an agent's identity, within its limit (docs/adr/ADR-015.md note of package G2):
+    /// not commands, so not among `probes` (decision 5, AC-006-03).
+    pub hashes: Vec<Hashed>,
 }
 
 /// One JSON object and one LF; U+2028 and U+2029 escaped (REQ-004), by every client output's one serializer

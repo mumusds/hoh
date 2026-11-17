@@ -251,75 +251,10 @@ fn summary(
     }
 }
 
-/// Everything, with the live checks if `live`.
-fn examine(project: &Path, live: bool) -> Report {
-    let log: RunLog = RunLog::default();
-    let env = ProbeEnv {
-        path: std::env::var_os("PATH").unwrap_or_default(),
-        fixture_root: None,
-        timeout: TIMEOUT,
-        log: Some(log.clone()),
-        // One limit for all commands, also those run one after another (M1T07R-02).
-        deadline: Some(Instant::now() + TIMEOUT),
-        // Every command it starts (its probes, the live turns' agents, the scratch store's WAL probe) goes through the
-        // client's start gate: a signal's stop kills and reaps them (docs/adr/ADR-031.md, 设计修正 2, A).
-        cancel: None,
-        spawner: crate::signals::spawner(),
-    };
-    let (manifest, warning) = manifest(project);
-    let mut warnings: Vec<String> = warning.into_iter().collect();
-    let (mut agents, git, node, pi_plugins) = std::thread::scope(|scope| {
-        let probe_agent = |agent: Agent| {
-            let env = &env;
-            let manifest = manifest.as_ref();
-            scope.spawn(move || assess::agent(agent, env, manifest))
-        };
-        let codex = probe_agent(Agent::Codex);
-        let claude = probe_agent(Agent::Claude);
-        let pi = probe_agent(Agent::Pi);
-        // Alongside pi's probe, not after it (M1T07R-02).
-        let pi_plugins = scope.spawn(|| {
-            let launcher = probe::find_on_path("pi", &env.path);
-            plugins(launcher.as_deref().and_then(Path::to_str), &env)
-        });
-        let git = scope.spawn(|| tool("git", &env, None));
-        let node = scope.spawn(|| tool("node", &env, Some((22, 19))));
-        let lost = |what: &str| AgentItem::missing(format!("{what} 的探测线程异常结束"));
-        let pi = pi.join().unwrap_or_else(|_| lost("pi"));
-        let plugins = pi_plugins.join().unwrap_or_default();
-        let gone = |name: &str| Tool {
-            installed: false,
-            path: None,
-            version: None,
-            protocol: Protocol::Unknown,
-            detail: Some(format!("{name} 的探测线程异常结束")),
-        };
-        (
-            BTreeMap::from([
-                ("codex", codex.join().unwrap_or_else(|_| lost("codex"))),
-                ("claude", claude.join().unwrap_or_else(|_| lost("claude"))),
-                ("pi", pi),
-            ]),
-            git.join().unwrap_or_else(|_| gone("git")),
-            node.join().unwrap_or_else(|_| gone("node")),
-            plugins,
-        )
-    });
-    if live {
-        // The live turns' preparation gets a limit of its own: the default probes may have used up theirs
-        // (M1T07R-07). Each turn itself is bounded by its adapter's deadline.
-        let live_env = ProbeEnv {
-            deadline: Some(Instant::now() + TIMEOUT),
-            ..env.clone()
-        };
-        match live::check(&mut agents, &live_env) {
-            Ok(dir) => warnings.push(format!(
-                "live 检查的原始日志与临时 store 保留在 {}",
-                dir.display()
-            )),
-            Err(why) => warnings.push(format!("live 检查没有完成：{why}")),
-        }
-    }
+/// The project's host (ADR-015 decision 7): running or not, how its attempts' processes are tracked and whether systemd
+/// supervises it, with the proof's limits; and the warnings that go with it.
+fn host_check(project: &Path, env: &ProbeEnv) -> (Value, Vec<String>) {
+    let mut warnings = Vec::new();
     // How the project's host tracks its attempts' processes (docs/adr/ADR-021.md decision 8d, CR-011): a running
     // host's own record; with none running, what the check before a start finds, not verified (M2T06R-402).
     let running = crate::client::running(project).and_then(|_| {
@@ -361,7 +296,7 @@ fn examine(project: &Path, live: bool) -> Report {
                 "process_tracking": mode, "process_tracking_detail": why,
                 "supervisor": record["supervisor"], "supervision_detail": supervision})
         }
-        None => match crate::client::delegated_scope(&env) {
+        None => match crate::client::delegated_scope(env) {
             Ok(_) => json!({"process_tracking": "unverified",
                 "process_tracking_detail": "没有运行中的 host；用户级 systemd 管理器可达、用户已开启 linger、有 systemd-run，下次启动的 host 预计在受委托的 cgroup 中运行（未经验证）"}),
             Err(why) => {
@@ -375,7 +310,7 @@ fn examine(project: &Path, live: bool) -> Report {
     // With no host running, whether the next one would be started as its unit (decision 6's checks, not verified).
     let tracking = match (tracking, running_record) {
         (mut tracking, false) => {
-            let supervision = match crate::client::unit_for(project, &env) {
+            let supervision = match crate::client::unit_for(project, env) {
                 Ok(unit) => json!({"supervisor": unit.name,
                     "supervision_detail": "没有运行中的 host；已安装的 hoh 将以其 systemd 用户 unit 拉起 host，崩溃后由 systemd 重启（未经验证）"}),
                 Err(why) => {
@@ -399,6 +334,89 @@ fn examine(project: &Path, live: bool) -> Report {
     if let (Some(host), Some(tracking)) = (host.as_object_mut(), tracking.as_object()) {
         host.extend(tracking.clone());
     }
+    (host, warnings)
+}
+
+/// Everything, with the live checks if `live`.
+fn examine(project: &Path, live: bool) -> Report {
+    let log: RunLog = RunLog::default();
+    let env = ProbeEnv {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        fixture_root: None,
+        timeout: TIMEOUT,
+        log: Some(log.clone()),
+        // One limit for all commands, also those run one after another (M1T07R-02).
+        deadline: Some(Instant::now() + TIMEOUT),
+        // Every command it starts (its probes, the live turns' agents, the scratch store's WAL probe) goes through the
+        // client's start gate: a signal's stop kills and reaps them (docs/adr/ADR-031.md, 设计修正 2, A).
+        cancel: None,
+        spawner: crate::signals::spawner(),
+    };
+    let (manifest, warning) = manifest(project);
+    let mut warnings: Vec<String> = warning.into_iter().collect();
+    let (mut agents, git, node, pi_plugins, (host, host_warnings)) = std::thread::scope(|scope| {
+        // The check before a host's start from the start, beside the agents: what an agent takes (a large binary's
+        // hash) cannot use up its time, and it takes at most its own bounds (package G2, docs/adr/ADR-015.md note).
+        let host = scope.spawn(|| host_check(project, &env));
+        let probe_agent = |agent: Agent| {
+            let env = &env;
+            let manifest = manifest.as_ref();
+            scope.spawn(move || assess::agent(agent, env, manifest))
+        };
+        let codex = probe_agent(Agent::Codex);
+        let claude = probe_agent(Agent::Claude);
+        let pi = probe_agent(Agent::Pi);
+        // Alongside pi's probe, not after it (M1T07R-02).
+        let pi_plugins = scope.spawn(|| {
+            let launcher = probe::find_on_path("pi", &env.path);
+            plugins(launcher.as_deref().and_then(Path::to_str), &env)
+        });
+        let git = scope.spawn(|| tool("git", &env, None));
+        let node = scope.spawn(|| tool("node", &env, Some((22, 19))));
+        let lost = |what: &str| AgentItem::missing(format!("{what} 的探测线程异常结束"));
+        let pi = pi.join().unwrap_or_else(|_| lost("pi"));
+        let plugins = pi_plugins.join().unwrap_or_default();
+        let gone = |name: &str| Tool {
+            installed: false,
+            path: None,
+            version: None,
+            protocol: Protocol::Unknown,
+            detail: Some(format!("{name} 的探测线程异常结束")),
+        };
+        (
+            BTreeMap::from([
+                ("codex", codex.join().unwrap_or_else(|_| lost("codex"))),
+                ("claude", claude.join().unwrap_or_else(|_| lost("claude"))),
+                ("pi", pi),
+            ]),
+            git.join().unwrap_or_else(|_| gone("git")),
+            node.join().unwrap_or_else(|_| gone("node")),
+            plugins,
+            host.join().unwrap_or_else(|_| {
+                (
+                    json!({"state": "unknown", "detail": "host 的检查线程异常结束",
+                        "process_tracking_limits": TRACKING_LIMITS}),
+                    Vec::new(),
+                )
+            }),
+        )
+    });
+    if live {
+        // The live turns' preparation gets a limit of its own: the default probes may have used up theirs
+        // (M1T07R-07). Each turn itself is bounded by its adapter's deadline.
+        let live_env = ProbeEnv {
+            deadline: Some(Instant::now() + TIMEOUT),
+            ..env.clone()
+        };
+        match live::check(&mut agents, &live_env) {
+            Ok(dir) => warnings.push(format!(
+                "live 检查的原始日志与临时 store 保留在 {}",
+                dir.display()
+            )),
+            Err(why) => warnings.push(format!("live 检查没有完成：{why}")),
+        }
+    }
+    warnings.extend(host_warnings);
     let runtime = Runtime {
         git,
         node,
@@ -407,9 +425,9 @@ fn examine(project: &Path, live: bool) -> Report {
         host,
     };
     let summary = summary(&agents, &runtime, warnings);
-    let probes = log
+    let records = log
         .lock()
-        .map(|records| records.runs.clone())
+        .map(|records| records.clone())
         .unwrap_or_default();
     Report {
         schema_version: "1.0",
@@ -417,7 +435,8 @@ fn examine(project: &Path, live: bool) -> Report {
         agents,
         runtime,
         summary,
-        probes,
+        probes: records.runs,
+        hashes: records.hashes,
     }
 }
 
