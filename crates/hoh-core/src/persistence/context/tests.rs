@@ -64,7 +64,7 @@ fn texts(conn: &Connection, sql: &str) -> R<Vec<String>> {
 fn test_039_02_a_work_tasks_mandatory_items_come_from_its_rows() -> R {
     let (_dir, conn) = world()?;
     let facts = facts(&conn, "R", "T1", "A1", None)?;
-    let m = crate::context::mandatory(&facts, "developer", "", None, None)?;
+    let m = crate::context::mandatory(&facts, "developer", "", None)?;
     let all = format!("{}\n{}\n{}\n{}", m.goal, m.project, m.task, m.schemas);
     // The rows themselves, read independently.
     for body in texts(
@@ -137,7 +137,7 @@ fn test_039_02_a_supervision_turn_takes_every_snapshot_tasks_acceptance() -> R {
         json!([{"seq": 9, "kind": "supervisor.retrigger", "payload": {"task_ids": ["T2"], "reason": "STALE_REVISION"}}]),
     );
     let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
-    let m = crate::context::mandatory(&facts, "commander", "", Some("/p/b"), Some("/p"))?;
+    let m = crate::context::mandatory(&facts, "commander", "", Some("/p"))?;
     for body in texts(&conn, "SELECT body FROM acceptance_criteria")? {
         assert!(m.task.contains(&body), "AC text missing: {body}");
     }
@@ -146,11 +146,15 @@ fn test_039_02_a_supervision_turn_takes_every_snapshot_tasks_acceptance() -> R {
             && m.task.contains("revision 5")
             && m.task.contains("revision 2")
     );
+    // docs/adr/ADR-032.md decision 6: the decisions are the final message's last block, never a file.
     assert!(
         m.task.contains("- nonce：n")
-            && m.task.contains("- 输出文件：/p/b")
-            && m.task.contains("- 项目根：/p")
+            && m.task.contains("- 决策块：最终消息中最后一个 ```hoh-decisions 块，每行一条 `{\"nonce\", \"message\"}`")
+            && m.task.contains("- 项目根：/p"),
+        "{}",
+        m.task
     );
+    assert!(!m.task.contains("输出文件"), "{}", m.task);
     // The turn's own identity, which its answers name (M2T09R-03).
     for id in ["- run_id：R", "- task_id：W/turn/1", "- attempt_id：A9"] {
         assert!(m.task.contains(id), "{id} missing from {}", m.task);
@@ -182,7 +186,7 @@ fn test_039_02_a_wake_about_no_task_says_so_and_lists_no_acceptance() -> R {
     let (_dir, conn) = world()?;
     let s = supervision(json!({}), &[], json!([]));
     let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
-    let m = crate::context::mandatory(&facts, "commander", "", None, None)?;
+    let m = crate::context::mandatory(&facts, "commander", "", None)?;
     assert!(m.task.contains("本唤醒不涉及具体任务"));
     assert!(m.task.contains("（无）"));
     Ok(())
@@ -298,7 +302,7 @@ fn a_large_run_state_never_pushes_the_wakes_events_out() -> R {
         .collect();
     s.summary["other_wakes"] = json!(others);
     let facts = facts(&conn, "R", "W/turn/1", "A9", Some(&s))?;
-    let m = crate::context::mandatory(&facts, "commander", "", Some("/p/b"), Some("/p"))?;
+    let m = crate::context::mandatory(&facts, "commander", "", Some("/p"))?;
     let template = crate::config::builtin_contract("commander").ok_or("commander")?;
     let budget = crate::context::required(template, &m)? + 1_000;
     let packed = crate::context::pack(template, &m, &facts.entries, budget)?;
@@ -354,7 +358,7 @@ fn test_039_02_a_verification_turns_mandatory_items_come_from_its_package_and_ro
         "output_contract": "TaskResult", "budget_tokens": 20000, "handoff_kind": "verification", "state": null
     }))?;
     let facts = verification(&conn, &package, &["T1".to_owned()])?;
-    let m = crate::context::mandatory(&facts, "qa", "", None, None)?;
+    let m = crate::context::mandatory(&facts, "qa", "", None)?;
     for body in texts(
         &conn,
         "SELECT body FROM acceptance_criteria WHERE ac_id IN ('AC-1-02', 'AC-2-01')",
