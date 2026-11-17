@@ -582,9 +582,9 @@ impl Registry {
         self
     }
 
-    /// The registry with a test's [`HOST_CHECK_EVERY`].
-    #[cfg(test)]
-    pub(crate) fn with_host_check_every(mut self, every: Duration) -> Registry {
+    /// The registry with a test's [`HOST_CHECK_EVERY`] (the integration tests' too: TEST-021-06 shortens it).
+    #[doc(hidden)]
+    pub fn with_host_check_every(mut self, every: Duration) -> Registry {
         self.host_check_every = every;
         self
     }
