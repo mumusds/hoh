@@ -790,6 +790,91 @@ fn slow_and_hung_commands_share_one_limit_and_stay_unknown() -> R {
     Ok(())
 }
 
+#[test]
+fn a_signal_ends_doctor_with_its_code_and_leaves_no_probe_behind() -> R {
+    // ADR-031's design correction, addendum rule 5 (CLT-200): doctor registers the client's signal state; SIGTERM
+    // while a probe runs (a codex whose `--version` sleeps) ends it with 143, no report on stdout, the reason said once
+    // on stderr, and the probe, in a process group of its own, has ended by the time doctor has. Before, doctor died by
+    // the default disposition and its probe ran on, orphaned, with no one to bound it.
+    let s = Sandbox::new()?;
+    let pid_file = s.home.path().join("probe.pid");
+    s.write(
+        "codex",
+        &format!(
+            "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let outcome = (|| -> R<(bool, Duration)> {
+        let end = Instant::now() + Duration::from_secs(20);
+        let pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse()?;
+            }
+            if Instant::now() > end {
+                return Err("codex --version never started".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let probe = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?;
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&doctor),
+            rustix::process::Signal::TERM,
+        )?;
+        let at = Instant::now();
+        while doctor.try_wait()?.is_none() {
+            if at.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = at.elapsed();
+        let gone = {
+            use rustix::event::{PollFd, PollFlags, Timespec};
+            let mut fds = [PollFd::new(&probe, PollFlags::IN)];
+            let none = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            rustix::event::poll(&mut fds, Some(&none))? > 0
+        };
+        if !gone {
+            let _ = rustix::process::pidfd_send_signal(&probe, rustix::process::Signal::KILL);
+        }
+        Ok((gone, took))
+    })();
+    // Whatever happened, doctor is ended and waited for here (CLT-252).
+    let _ = doctor.kill();
+    let out = doctor.wait_with_output()?;
+    let (gone, took) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
+    assert!(gone, "codex --version outlived doctor");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(said.matches("收到信号").count(), 1, "{said}");
+    Ok(())
+}
+
 /// The text form carries what the JSON carries for each agent: path, binary sha256, protocol, auth and capabilities
 /// (M1T07R-05).
 #[test]

@@ -316,6 +316,140 @@ fn send(child: &Child, signal: rustix::process::Signal) -> R {
     Ok(())
 }
 
+/// A test's own child, killed and waited for when dropped unless taken first, so a test that ends early (a `?`) leaves
+/// no process of its own behind (CLT-252).
+struct Kid(Option<Child>);
+
+impl Kid {
+    fn get(&self) -> R<&Child> {
+        Ok(self.0.as_ref().ok_or("the child was taken")?)
+    }
+
+    fn get_mut(&mut self) -> R<&mut Child> {
+        Ok(self.0.as_mut().ok_or("the child was taken")?)
+    }
+
+    fn take(mut self) -> R<Child> {
+        Ok(self.0.take().ok_or("the child was taken")?)
+    }
+}
+
+impl Drop for Kid {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// A host the test plays on the Unix socket `socket`, announced in `project`'s `.hoh/host.json`: each request's first
+/// line and the reader of the rest go to `answer`, with the flag that says the host is to stop. It accepts with a
+/// deadline (it looks at that flag every 10 ms), so its thread always ends once it is dropped (CLT-252).
+struct FakeHost {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+type Reader = std::io::BufReader<std::os::unix::net::UnixStream>;
+
+impl FakeHost {
+    fn serve(
+        project: &Path,
+        socket: &Path,
+        mut answer: impl FnMut(&str, &mut Reader, &std::sync::atomic::AtomicBool) + Send + 'static,
+    ) -> R<FakeHost> {
+        use std::io::BufRead as _;
+        let listener = std::os::unix::net::UnixListener::bind(socket)?;
+        listener.set_nonblocking(true)?;
+        let files = project.join(".hoh");
+        std::fs::create_dir_all(&files)?;
+        std::fs::write(
+            files.join("host.json"),
+            json!({"pid": std::process::id(), "socket": socket, "token": "t"}).to_string(),
+        )?;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            let mut reader = std::io::BufReader::new(stream);
+                            let mut first = String::new();
+                            if reader.read_line(&mut first).is_ok() {
+                                answer(&first, &mut reader, &stop);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        Ok(FakeHost {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for FakeHost {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The rest of a request after its first line: its body (by its Content-Length).
+fn body_of(reader: &mut Reader) -> Vec<u8> {
+    use std::io::{BufRead as _, Read as _};
+    let mut length = 0usize;
+    let mut line = String::new();
+    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap_or(0);
+        }
+        line.clear();
+    }
+    let mut body = vec![0u8; length];
+    let _ = reader.read_exact(&mut body);
+    body
+}
+
+/// Answer a request with `status` and the JSON `body`.
+fn reply(reader: &mut Reader, status: &str, body: &str) {
+    use std::io::Write as _;
+    let _ = reader.get_mut().write_all(
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
+}
+
+/// Wait until `flag` is set or `stop` is, at most `limit`.
+fn held_until(
+    flag: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+    limit: Duration,
+) {
+    let end = Instant::now() + limit;
+    while !flag.load(std::sync::atomic::Ordering::SeqCst)
+        && !stop.load(std::sync::atomic::Ordering::SeqCst)
+        && Instant::now() < end
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The two signals a client's wait must answer, with the codes they end it with (REQ-004).
 const ENDING: [(rustix::process::Signal, i32); 2] = [
     (rustix::process::Signal::TERM, 143),
@@ -331,15 +465,16 @@ fn a_signal_while_p_waits_for_its_host_ends_it_at_once_with_its_code() -> R {
     for (signal, code) in ENDING {
         let env = Env::new()?;
         let lock = StartLock::take(&env.project())?;
-        let client = env
-            .command(&["-p", "x", "--output", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        handles(client.id(), signal)?;
-        send(&client, signal)?;
+        let client = Kid(Some(
+            env.command(&["-p", "x", "--output", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ));
+        handles(client.get()?.id(), signal)?;
+        send(client.get()?, signal)?;
         let at = Instant::now();
-        let out = finish(client, LIMIT)?;
+        let out = finish(client.take()?, LIMIT)?;
         let took = at.elapsed();
         drop(lock);
         let said = String::from_utf8_lossy(&out.stderr);
@@ -387,15 +522,16 @@ fn a_signal_while_an_attach_waits_for_its_host_ends_it_at_once_with_its_code() -
         let _daemons = Daemons(env.project());
         let run = paused_run(&env)?;
         let lock = StartLock::take(&env.project())?;
-        let client = env
-            .command(&["attach", &run, "--output", "stream-json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        handles(client.id(), signal)?;
-        send(&client, signal)?;
+        let client = Kid(Some(
+            env.command(&["attach", &run, "--output", "stream-json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ));
+        handles(client.get()?.id(), signal)?;
+        send(client.get()?, signal)?;
         let at = Instant::now();
-        let out = finish(client, LIMIT)?;
+        let out = finish(client.take()?, LIMIT)?;
         let took = at.elapsed();
         drop(lock);
         let said = String::from_utf8_lossy(&out.stderr);
@@ -419,13 +555,14 @@ fn a_signal_while_the_follower_reconnects_ends_it_at_once_with_its_code() -> R {
         let env = Env::new()?;
         let _daemons = Daemons(env.project());
         let run = paused_run(&env)?;
-        let mut client = env
-            .command(&["attach", &run, "--output", "stream-json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut client = Kid(Some(
+            env.command(&["attach", &run, "--output", "stream-json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ));
         let (line, lines) = std::sync::mpsc::channel();
-        let stdout = client.stdout.take().ok_or("no stdout")?;
+        let stdout = client.get_mut()?.stdout.take().ok_or("no stdout")?;
         std::thread::spawn(move || {
             use std::io::BufRead as _;
             for read in std::io::BufReader::new(stdout)
@@ -440,7 +577,7 @@ fn a_signal_while_the_follower_reconnects_ends_it_at_once_with_its_code() -> R {
                 .recv_timeout(LIMIT)
                 .map_err(|e| format!("the attach printed nothing: {e}"))?;
             let host = match hosts_of(&env.project())?.as_slice() {
-                [host] if parent_of(*host)? == client.id() => *host,
+                [host] if parent_of(*host)? == client.get()?.id() => *host,
                 hosts => return Err(format!("the attach's host: {hosts:?}").into()),
             };
             let start = hoh_agents::identity::start_id(host)?.ok_or("the host is gone already")?;
@@ -459,9 +596,9 @@ fn a_signal_while_the_follower_reconnects_ends_it_at_once_with_its_code() -> R {
             // The follower sees its stream end (a 200 ms read) and, 200 ms later, waits for the next host behind the
             // lock: a signal well inside that wait.
             std::thread::sleep(Duration::from_secs(1));
-            send(&client, signal)?;
+            send(client.get()?, signal)?;
             let at = Instant::now();
-            let mut out = finish(client, LIMIT)?;
+            let mut out = finish(client.take()?, LIMIT)?;
             let took = at.elapsed();
             drop(lock);
             assert!(took < Duration::from_secs(2), "{took:?}");
@@ -490,60 +627,39 @@ fn a_signal_while_attach_json_reads_the_run_ends_it_with_its_code_and_no_snapsho
         std::fs::create_dir_all(&files)?;
         std::fs::File::create(files.join("state.db"))?;
         let socket = env.dir.path().join("h.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
-        std::fs::write(
-            files.join("host.json"),
-            json!({"pid": std::process::id(), "socket": socket, "token": "t"}).to_string(),
-        )?;
         let (reached, held) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let server = std::thread::spawn(move || {
-            use std::io::{BufRead as _, Write as _};
-            for stream in listener.incoming().take(2) {
-                let Ok(stream) = stream else { return };
-                let mut reader = std::io::BufReader::new(stream);
-                let mut first = String::new();
-                if reader.read_line(&mut first).is_err() {
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host = {
+            let released = released.clone();
+            FakeHost::serve(&env.project(), &socket, move |first, reader, stop| {
+                body_of(reader);
+                if first.starts_with("GET /healthz ") {
+                    reply(reader, "200 OK", "{}");
                     return;
                 }
-                let mut line = String::new();
-                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
-                    line.clear();
-                }
-                let body = if first.starts_with("GET /healthz ") {
-                    "{}".to_owned()
-                } else {
-                    let _ = reached.send(first.clone());
-                    let _ = released.recv_timeout(Duration::from_secs(10));
-                    json!({"run_id": "R", "state": "PAUSED", "revision": 1, "watermark": 1,
-                        "projection": {"result": {"run_id": "R", "state": "PAUSED", "exit_code": 6}}})
-                    .to_string()
-                };
-                let _ = reader.get_mut().write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                );
-            }
-        });
-        let client = env
-            .command(&["attach", "R", "--output", "json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let asked = held.recv_timeout(LIMIT);
+                let _ = reached.send(first.to_owned());
+                held_until(&released, stop, Duration::from_secs(10));
+                let run = json!({"run_id": "R", "state": "PAUSED", "revision": 1, "watermark": 1,
+                    "projection": {"result": {"run_id": "R", "state": "PAUSED", "exit_code": 6}}});
+                reply(reader, "200 OK", &run.to_string());
+            })?
+        };
+        let client = Kid(Some(
+            env.command(&["attach", "R", "--output", "json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ));
         let outcome = (|| -> R<Output> {
-            asked.map_err(|e| format!("the attach never read the run: {e}"))?;
-            send(&client, signal)?;
+            held.recv_timeout(LIMIT)
+                .map_err(|e| format!("the attach never read the run: {e}"))?;
+            send(client.get()?, signal)?;
             // The answer comes after the signal.
             std::thread::sleep(Duration::from_millis(150));
-            let _ = release.send(());
-            finish(client, LIMIT)
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            finish(client.take()?, LIMIT)
         })();
-        let _ = release.send(());
-        let _ = server.join();
+        drop(host);
         let out = outcome?;
         let said = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(code), "{said}");
@@ -552,8 +668,261 @@ fn a_signal_while_attach_json_reads_the_run_ends_it_with_its_code_and_no_snapsho
             "{}",
             String::from_utf8_lossy(&out.stdout)
         );
-        assert!(said.contains("收到信号"), "{said}");
+        // Rule 2's wording for an attach that attached to nothing (CLT-251).
+        assert!(said.contains("hoh: 收到信号，没有附着"), "{said}");
+        assert_eq!(said.matches("收到信号").count(), 1, "{said}");
     }
+    Ok(())
+}
+
+/// This test process's user when the machine keeps a linger record for it and has cgroup v2: what a client's check
+/// before a start needs, short of a manager, to ask `systemd-run --version` (a fake runtime directory stands in for the
+/// manager's socket).
+fn lingering_user() -> Option<String> {
+    let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;
+    (Path::new("/var/lib/systemd/linger").join(&user).is_file()
+        && Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+    .then_some(user)
+}
+
+/// The pid a stand-in wrote to `file` once it started (written to a temporary name, then renamed), waited for at most
+/// `limit` while `client` runs.
+fn started_pid(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
+    let end = Instant::now() + limit;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            return Ok(text.trim().parse()?);
+        }
+        if let Some(status) = client.get_mut()?.try_wait()? {
+            return Err(format!("the client ended first: {status}").into());
+        }
+        if Instant::now() > end {
+            return Err("the stand-in never started".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
+fn ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+    let none = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    Ok(rustix::event::poll(&mut fds, Some(&none))? > 0)
+}
+
+/// Kill the process `pidfd` holds unless it has ended (cleaning up after a test that found it alive).
+fn kill_held(pidfd: &std::os::fd::OwnedFd) {
+    if !ended(pidfd).unwrap_or(true) {
+        let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
+    }
+}
+
+#[test]
+fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
+    // ADR-031's design correction, addendum rule 5 (CLT-200): `hoh -p` whose check before a start is asking a
+    // `systemd-run --version` that does not answer (a stand-in that sleeps; a fake runtime directory stands in for the
+    // user's manager, so none is contacted) takes SIGTERM or SIGINT: it ends with 143 or 130, and the probe it started,
+    // in a process group of its own, has ended by the time the client has; no host is started after the signal. Before,
+    // the probe outlived the client, orphaned, past its 2 s bound.
+    let Some(user) = lingering_user() else {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no linger record for this user, or no cgroup v2, here"
+        );
+        return Ok(());
+    };
+    for (signal, code) in ENDING {
+        let env = Env::new()?;
+        let _daemons = Daemons(env.project());
+        let bin = env.dir.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let pid_file = env.dir.path().join("probe.pid");
+        let fake = bin.join("systemd-run");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )?;
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let runtime = env.dir.path().join("run");
+        std::fs::create_dir_all(runtime.join("systemd"))?;
+        std::fs::File::create(runtime.join("systemd/private"))?;
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))?;
+        let mut client = Kid(Some(
+            env.command(&["-p", "x", "--output", "json"])
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("USER", &user)
+                .env("PATH", env.path(&path))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        ));
+        let pid = started_pid(&pid_file, &mut client, LIMIT)?;
+        let probe = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?;
+        let outcome = (|| -> R<(Output, bool)> {
+            send(client.get()?, signal)?;
+            let out = finish(client.take()?, LIMIT)?;
+            Ok((out, ended(&probe)?))
+        })();
+        kill_held(&probe);
+        let (out, gone) = outcome?;
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{said}");
+        assert!(gone, "the systemd-run --version probe outlived the client");
+        assert!(said.contains("收到信号，没有提交命令"), "{said}");
+        assert!(
+            hosts_of(&env.project())?.is_empty(),
+            "a host was started after the signal"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_late_signal_with_stderr_full_still_ends_the_client_within_its_bound() -> R {
+    // ADR-031's design correction, addendum rule 6 (CLT-201; REQ-004 failure mode 1): `hoh -p` whose run stopped
+    // BLOCKED on a decision reads the open questions (the test plays the host and holds that getRun) while its stderr
+    // forwarder is blocked on a full stderr pipe nobody reads (10 MiB of the attempt's native stderr). SIGTERM then ends
+    // it with 143 within its bound: the signal's message goes through the one bounded path and is given up rather than
+    // waited for. Before, the message waited on the stderr lock the forwarder held, without end.
+    let env = Env::new()?;
+    let project = env.project();
+    let attempt = project.join(".hoh/attempts/A");
+    std::fs::create_dir_all(&attempt)?;
+    std::fs::write(attempt.join("native-stderr.log"), vec![b'N'; 10 << 20])?;
+    let socket = env.dir.path().join("h.sock");
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let host = {
+        let (asked, released) = (asked.clone(), released.clone());
+        let mut command_id = String::new();
+        FakeHost::serve(&project, &socket, move |first, reader, stop| {
+            use std::io::Write as _;
+            let body = body_of(reader);
+            if first.starts_with("GET /healthz ") {
+                reply(reader, "200 OK", "{}");
+            } else if first.starts_with("POST /v1/commands ") {
+                let command: Value = serde_json::from_slice(&body).unwrap_or_default();
+                command_id = command["command_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let accepted = json!({"command_id": command_id, "run_id": "R", "revision": 1,
+                    "status": "ACCEPTED"});
+                reply(reader, "202 Accepted", &accepted.to_string());
+            } else if first.starts_with("GET /v1/events?") {
+                let _ = reader
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+                for event in [
+                    json!({"seq": 1, "run_id": "R", "kind": "run.created", "attempt_id": "A",
+                        "payload": {"command_id": command_id}}),
+                    json!({"seq": 2, "run_id": "R", "kind": "run.result", "payload": {"run_id": "R",
+                        "state": "BLOCKED", "exit_code": 3, "blocked_reason": "NEED_DECISION"}}),
+                ] {
+                    let data = format!("id: {}\ndata: {event}\n\n", event["seq"]);
+                    let _ = reader
+                        .get_mut()
+                        .write_all(format!("{:x}\r\n{data}\r\n", data.len()).as_bytes());
+                }
+                let _ = reader.get_mut().write_all(b"0\r\n\r\n");
+            } else if first.starts_with("GET /v1/runs/R ") {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                held_until(&released, stop, Duration::from_secs(20));
+                reply(
+                    reader,
+                    "200 OK",
+                    &json!({"run_id": "R", "projection": {"questions": []}}).to_string(),
+                );
+            } else {
+                reply(reader, "404 Not Found", "{}");
+            }
+        })?
+    };
+    let mut client = Kid(Some(
+        env.command(&["-p", "x", "--output", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let stdout = client.get_mut()?.stdout.take().ok_or("no stdout")?;
+    let printed = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        let _ = { stdout }.read_to_end(&mut bytes);
+        bytes
+    });
+    let outcome = (|| -> R<(std::process::ExitStatus, Duration, Vec<u8>)> {
+        let end = Instant::now() + LIMIT;
+        while !asked.load(std::sync::atomic::Ordering::SeqCst) {
+            if Instant::now() > end {
+                return Err("the client never read the open questions".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The stderr pipe full: what waits in it stops growing (at its capacity, 64 KiB by default) and the forwarder
+        // blocks in its write, holding the stderr lock.
+        let stderr = client.get_mut()?.stderr.take().ok_or("no stderr")?;
+        let (mut last, mut since) = (0u64, Instant::now());
+        loop {
+            let waiting = rustix::io::ioctl_fionread(&stderr)?;
+            if waiting != last {
+                (last, since) = (waiting, Instant::now());
+            } else if waiting >= 4096 && since.elapsed() > Duration::from_millis(500) {
+                break;
+            }
+            if Instant::now() > end {
+                return Err(format!("the stderr pipe never filled ({waiting} bytes)").into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        send(client.get()?, rustix::process::Signal::TERM)?;
+        let at = Instant::now();
+        let status = loop {
+            if let Some(status) = client.get_mut()?.try_wait()? {
+                break status;
+            }
+            if at.elapsed() > Duration::from_secs(8) {
+                return Err("still running 8 s after SIGTERM with its stderr full".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let took = at.elapsed();
+        let mut said = Vec::new();
+        {
+            use std::io::Read as _;
+            let _ = { stderr }.read_to_end(&mut said);
+        }
+        Ok((status, took, said))
+    })();
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(client);
+    drop(host);
+    let (status, took, said) = outcome?;
+    let stdout = printed.join().map_err(|_| "the stdout reader panicked")?;
+    assert_eq!(status.code(), Some(143), "{status}");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    // The result was printed before the signal; the message is said at most once (given up if stderr stays full).
+    assert!(String::from_utf8_lossy(&stdout).contains("NEED_DECISION"));
+    let hints = String::from_utf8_lossy(&said)
+        .matches("hoh attach R")
+        .count();
+    assert!(hints <= 1, "{hints}");
     Ok(())
 }
 

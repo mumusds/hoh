@@ -1,17 +1,57 @@
 //! The client's one signal state (docs/adr/ADR-031.md, 设计修正（客户端信号）): a client command registers it once,
 //! before any wait ([`register`]), and every stage after uses the same one ([`current`]). Every wait the client makes
 //! looks at it while it waits ([`wait`]), and every exit consults it first ([`State::exit`]): a received SIGTERM,
-//! SIGINT or SIGHUP decides the exit code (143, 130, 129) and the message.
+//! SIGINT or SIGHUP decides the exit code (143, 130, 129) and the message. The state also owns the client's helper
+//! processes, let go of before a signal exit (addendum, rule 5), and says its messages through one bounded path
+//! (rule 6).
 
 use crate::exit::{ClientEvent, client_code};
+use hoh_agents::probe::ProbeStop;
+use hoh_core::persistence::CancelLatch;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::os::fd::AsFd as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often a wait looks at the state (the shell's tick).
 pub const LOOK: Duration = Duration::from_millis(100);
+
+/// How long a signal exit waits for the probe commands it stopped to be done with (rule 5): the stop tries its locks
+/// for 0.2 s, a probe looks at it every 10 ms, and its reap waits up to 1 s.
+pub const HELPERS_WAIT: Duration = Duration::from_millis(1500);
+
+/// How long a signal exit waits for doctor's live turns it cancelled to end (rule 5): their adapters' escalation, at
+/// most a native interrupt's 10 s grace, TERM's 5 s and KILL's 5 s, and 1 s more.
+pub const TURNS_WAIT: Duration = Duration::from_secs(21);
+
+/// How long a message waits for stderr (rule 6); not written by then, it is given up.
+pub const SAY_WAIT: Duration = Duration::from_millis(500);
+
+/// Where the bounded diagnostics path writes: the process's stderr (fd 2, never through std's lock), or a unit test's
+/// descriptor.
+#[derive(Clone)]
+enum Out {
+    Stderr,
+    #[cfg(test)]
+    Fd(Arc<std::os::fd::OwnedFd>),
+}
+
+/// A live turn of doctor's the client owns: its cancel, and whether it has ended.
+struct Turn {
+    latch: CancelLatch,
+    ended: Arc<AtomicBool>,
+}
+
+/// A live turn owned through [`State::own_turn`], ended when this is dropped (once its adapter returned).
+pub struct OwnedTurn(Arc<AtomicBool>);
+
+impl Drop for OwnedTurn {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 /// The signal state of a client process: the number of the exit signal that came (0 for none), whether the window was
 /// resized, the run the client is about (for the message), and whether a stage already said why it ended.
@@ -20,6 +60,16 @@ pub struct State {
     resized: Arc<AtomicBool>,
     run: Mutex<Option<String>>,
     said: AtomicBool,
+    /// The probe commands the client starts (its start's checks, doctor's probes): every `ProbeEnv` of the client's
+    /// carries it as its cancel (rule 5).
+    helpers: ProbeStop,
+    /// doctor's live turns (rule 5).
+    turns: Mutex<Vec<Turn>>,
+    /// Whether the helpers were let go of: a turn owned after is cancelled at once.
+    released: AtomicBool,
+    out: Out,
+    /// Messages given up since the last one written (rule 6).
+    late: AtomicU64,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -65,11 +115,70 @@ pub fn code(signal: usize) -> u8 {
 
 impl State {
     fn with(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>) -> State {
+        State::writing(signal, resized, Out::Stderr)
+    }
+
+    fn writing(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>, out: Out) -> State {
         State {
             signal,
             resized,
             run: Mutex::new(None),
             said: AtomicBool::new(false),
+            helpers: ProbeStop::default(),
+            turns: Mutex::new(Vec::new()),
+            released: AtomicBool::new(false),
+            out,
+            late: AtomicU64::new(0),
+        }
+    }
+
+    /// The cancel every probe of the client's carries (rule 5).
+    pub fn helpers(&self) -> &ProbeStop {
+        &self.helpers
+    }
+
+    /// Own the live turn cancelled through `latch` until the returned guard is dropped (rule 5): a signal exit
+    /// cancels it and waits for it to end; one owned once the helpers were let go of is cancelled at once.
+    pub fn own_turn(&self, latch: &CancelLatch) -> OwnedTurn {
+        let ended = Arc::new(AtomicBool::new(false));
+        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        turns.push(Turn {
+            latch: latch.clone(),
+            ended: ended.clone(),
+        });
+        if self.released.load(Ordering::SeqCst) {
+            latch.request();
+        }
+        OwnedTurn(ended)
+    }
+
+    /// Let go of every helper the client owns (rule 5): no probe starts from now on, every probe command is killed
+    /// (its group and its leader) and waited for until [`HELPERS_WAIT`], every live turn is cancelled and waited for
+    /// until [`TURNS_WAIT`]. Whether all were done with in time. The host is not a helper (REQ-001 failure mode 3).
+    pub fn release(&self) -> bool {
+        {
+            let turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+            self.released.store(true, Ordering::SeqCst);
+            for turn in turns.iter() {
+                turn.latch.request();
+            }
+        }
+        let began = Instant::now();
+        let probes = self.helpers.stop_within(began + HELPERS_WAIT);
+        loop {
+            let open = self
+                .turns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|turn| !turn.ended.load(Ordering::SeqCst));
+            if !open {
+                return probes;
+            }
+            if began.elapsed() >= TURNS_WAIT {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -96,10 +205,18 @@ impl State {
         *self.run.lock().unwrap_or_else(PoisonError::into_inner) = Some(run_id.to_owned());
     }
 
-    /// Say `text` on stderr as why the client ends: the exit adds nothing to it.
+    /// Say `text` on stderr, through the bounded path, as why the client ends: the exit adds nothing to it.
     pub fn say(&self, text: &str) {
-        say!("{text}");
+        self.said(text);
         self.mark_said();
+    }
+
+    /// `text` as a line through the one bounded diagnostics path (rule 6): written straight to stderr's descriptor,
+    /// never through std's stderr lock (the forwarder may hold it, blocked on a full pipe), by a thread of its own that
+    /// is waited for at most [`SAY_WAIT`]; not written by then (or with no thread for it), it is given up and counted,
+    /// and the next line said here first says how many were. Whether it was written.
+    fn said(&self, text: &str) -> bool {
+        say_on(&self.out, &self.late, text, &say_thread)
     }
 
     /// A stage said why the client ends (the follower's conclusion), or says nothing on purpose (the shell, which only
@@ -115,18 +232,20 @@ impl State {
         let Some(signal) = self.received() else {
             return code;
         };
+        // Nothing the client owns outlives it (rule 5), and the message never waits on stderr (rule 6).
+        self.release();
         if !self.said.swap(true, Ordering::SeqCst) {
-            match self
+            let run = self
                 .run
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .as_deref()
-            {
-                Some(run) => say!(
+                .clone();
+            self.said(&match run {
+                Some(run) => format!(
                     "hoh: 收到信号，已脱离 Run {run}（它在后台继续）；用 hoh attach {run} 重新附着"
                 ),
-                None => say!("hoh: 收到信号，{before}"),
-            }
+                None => format!("hoh: 收到信号，{before}"),
+            });
         }
         signal
     }
@@ -138,6 +257,57 @@ impl State {
     ) -> Result<T, u8> {
         wait_with(Some(self), &thread, op)
     }
+}
+
+/// Write all of `bytes` to `out`, straight to its descriptor; whether it all went.
+fn write_out(out: &Out, mut bytes: &[u8]) -> bool {
+    let stderr = std::io::stderr();
+    let fd = match out {
+        Out::Stderr => stderr.as_fd(),
+        #[cfg(test)]
+        Out::Fd(fd) => fd.as_fd(),
+    };
+    while !bytes.is_empty() {
+        match rustix::io::write(fd, bytes) {
+            Ok(0) => return false,
+            Ok(n) => bytes = &bytes[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// [`State::said`] on `out`, counting what is given up in `late`, with threads made by `spawn`.
+fn say_on(out: &Out, late: &AtomicU64, text: &str, spawn: Spawn<'_>) -> bool {
+    let before = late.swap(0, Ordering::SeqCst);
+    let mut line = String::new();
+    if before > 0 {
+        line.push_str(&format!(
+            "hoh: 此前有 {before} 条消息没能及时写到 stderr，已放弃\n"
+        ));
+    }
+    line.push_str(text);
+    line.push('\n');
+    let (sent, got) = std::sync::mpsc::channel();
+    let target = out.clone();
+    let written = spawn(Box::new(move || {
+        let _ = sent.send(write_out(&target, line.as_bytes()));
+    }))
+    .is_ok()
+        && got.recv_timeout(SAY_WAIT) == Ok(true);
+    if !written {
+        late.fetch_add(before + 1, Ordering::SeqCst);
+    }
+    written
+}
+
+/// [`Spawn`] of the diagnostics path's writer.
+fn say_thread(work: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("hoh-say".to_owned())
+        .spawn(work)
+        .map(drop)
 }
 
 /// A thread running `work`, or why it could not be made.
@@ -284,14 +454,91 @@ mod tests {
         );
     }
 
+    /// A state writing to one end of a socket pair; the other end, to read what it said.
+    fn captured() -> (State, std::os::unix::net::UnixStream) {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        let out = Out::Fd(Arc::new(std::os::fd::OwnedFd::from(ours)));
+        (State::writing(Arc::default(), Arc::default(), out), theirs)
+    }
+
+    /// What is waiting to be read on `from` (without waiting for more).
+    fn waiting(from: &std::os::unix::net::UnixStream) -> String {
+        use std::io::Read as _;
+        from.set_nonblocking(true).expect("nonblocking");
+        let mut said = Vec::new();
+        let mut piece = [0u8; 4096];
+        while let Ok(n) = (&*from).read(&mut piece) {
+            if n == 0 {
+                break;
+            }
+            said.extend_from_slice(&piece[..n]);
+        }
+        String::from_utf8_lossy(&said).into_owned()
+    }
+
     #[test]
     fn the_exit_takes_a_received_signals_code_and_says_why_once() {
-        let state = state();
+        // Rule 2 (CLT-251): with no signal the exit is the code and says nothing; with one it is the signal's code, said
+        // once, in rule 2's words for an attach that attached to nothing, and a second exit says nothing more.
+        let (state, said) = captured();
         assert_eq!(state.exit(69, "没有附着"), 69);
+        assert_eq!(waiting(&said), "");
         state.signal().store(SIGTERM as usize, Ordering::SeqCst);
         assert_eq!(state.exit(69, "没有附着"), 143);
+        assert_eq!(waiting(&said), "hoh: 收到信号，没有附着\n");
         assert_eq!(state.exit(0, "没有附着"), 143);
+        assert_eq!(waiting(&said), "");
+        // With a run, its id and how to attach again.
+        let (state, said) = captured();
+        state.note_run("R");
+        state.signal().store(SIGINT as usize, Ordering::SeqCst);
+        assert_eq!(state.exit(69, "没有提交命令"), 130);
+        assert_eq!(
+            waiting(&said),
+            "hoh: 收到信号，已脱离 Run R（它在后台继续）；用 hoh attach R 重新附着\n"
+        );
         assert_eq!(code(SIGHUP as usize), 129);
         assert_eq!(code(SIGINT as usize), 130);
+    }
+
+    #[test]
+    fn a_message_stderr_does_not_take_is_given_up_within_its_bound_and_counted() {
+        // Rule 6 (CLT-201): a line stderr does not take (its buffer full, nobody reading) is given up after at most
+        // SAY_WAIT, never waited for, and counted; the next line, once stderr takes it, says how many were given up.
+        // Without a thread to write it, it is given up at once.
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        ours.set_nonblocking(true).expect("nonblocking");
+        let piece = [b'N'; 4096];
+        while std::io::Write::write(&mut &ours, &piece).is_ok() {}
+        ours.set_nonblocking(false).expect("blocking");
+        let out = Out::Fd(Arc::new(std::os::fd::OwnedFd::from(ours)));
+        let late = AtomicU64::new(0);
+        let at = std::time::Instant::now();
+        assert!(!say_on(&out, &late, "hoh: 收到信号，没有附着", &say_thread));
+        let took = at.elapsed();
+        assert!(took >= SAY_WAIT && took < SAY_WAIT * 3, "{took:?}");
+        assert_eq!(late.load(Ordering::SeqCst), 1);
+        let no_thread =
+            |_: Box<dyn FnOnce() + Send + 'static>| Err(std::io::Error::from_raw_os_error(11));
+        let at = std::time::Instant::now();
+        assert!(!say_on(&out, &late, "hoh: 再一条", &no_thread));
+        assert!(at.elapsed() < SAY_WAIT, "{:?}", at.elapsed());
+        assert_eq!(late.load(Ordering::SeqCst), 2);
+        // Read from now on: the next line goes, and says the two given up before it.
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut said = Vec::new();
+            let _ = (&theirs).read_to_end(&mut said);
+            String::from_utf8_lossy(&said).into_owned()
+        });
+        assert!(say_on(&out, &late, "hoh: 第三条", &say_thread));
+        assert_eq!(late.load(Ordering::SeqCst), 0);
+        drop(out);
+        let said = reader.join().expect("the reader");
+        assert!(
+            said.contains("hoh: 此前有 2 条消息没能及时写到 stderr，已放弃\nhoh: 第三条\n"),
+            "{}",
+            said.trim_start_matches('N')
+        );
     }
 }
