@@ -195,8 +195,9 @@ pub(super) enum Tools {
 /// Whether a process of the attempt marked `marker` other than its leader (`leader`, pid and start time) runs, as `root`
 /// (/proc) shows them now: a child of the leader, or a process with the marker in its environment or in a thread's. A
 /// process runs while any of its threads does: one whose main thread ended (a zombie in its `stat`) may run on in
-/// another (WD-02); one whose every thread is a zombie or exiting is ending, no tool (decision 19's correction of
-/// 2026-11-17: an exiting process refuses its environment, and unrelated ones exit all the time). Read only: nothing is pinned or signalled. What cannot be read and cannot be shown unrelated
+/// another (WD-02); one whose every thread is a zombie or exiting, on a stable view of its threads, is ending, no tool
+/// (decision 19's corrections of 2026-11-17: an exiting process refuses its environment, unrelated ones exit all the
+/// time, and a thread's absence from a racing listing proves nothing, WDF-01). Read only: nothing is pinned or signalled. What cannot be read and cannot be shown unrelated
 /// leaves it unknown, which the watchdog takes as a tool (docs/adr/ADR-022.md decision 19 item 4, WD-03). Unrelated:
 /// a process started before the leader (all of the attempt's descend from it), or another user's (the attempt's run as
 /// the host's user, and a set-user-id tool keeps its real user).
@@ -212,7 +213,7 @@ pub(super) fn tools(root: &Path, leader: (u32, Option<u64>), marker: &str) -> To
             continue;
         }
         if process.zombie || process.exiting {
-            match thread_runs(root, process.pid) {
+            match thread_runs(root, process) {
                 Some(true) => {}
                 Some(false) => continue,
                 None => {
@@ -242,38 +243,131 @@ fn gone(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3)
 }
 
-/// Whether a thread of `pid` runs (is neither a zombie nor exiting): `None` when its threads cannot be listed or one
-/// cannot be read.
-fn thread_runs(root: &Path, pid: u32) -> Option<bool> {
-    let tasks = match std::fs::read_dir(root.join(pid.to_string()).join("task")) {
-        Ok(tasks) => tasks,
-        Err(e) if gone(&e) => return Some(false),
-        Err(_) => return None,
+/// What one view of a process's threads showed (WDF-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// One of its threads runs (is neither a zombie nor exiting).
+    Runs,
+    /// It ended: released (gone, or its pid another process's when the view began), or, on a stable view, every
+    /// thread a zombie or exiting.
+    Ended,
+    /// Not a stable view: a listed thread ended before its read, the second listing differs from the first, the
+    /// status counts other than listed, or the process's identity changed during the view.
+    Churning,
+    /// Something could not be read or understood.
+    Unknown,
+}
+
+/// How many views a churning process gets, and how far apart, before it stays unknown: an exit's threads settle in
+/// well under a millisecond.
+const VIEWS: usize = 3;
+const VIEW_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Whether a thread of `process` runs (is neither a zombie nor exiting): `Some(false)` only when it ended, `None` when
+/// that cannot be told (docs/adr/ADR-022.md decision 19, the corrections of 2026-11-17).
+fn thread_runs(root: &Path, process: &Proc) -> Option<bool> {
+    thread_runs_with(root, process, &mut || {})
+}
+
+/// [`thread_runs`], `between` called in each view between its first listing's reads and its second listing (a test's
+/// seam for threads that change meanwhile).
+fn thread_runs_with(root: &Path, process: &Proc, between: &mut dyn FnMut()) -> Option<bool> {
+    for view in 0..VIEWS {
+        if view > 0 {
+            std::thread::sleep(VIEW_PAUSE);
+        }
+        match view_of(root, process, between) {
+            View::Runs => return Some(true),
+            View::Ended => return Some(false),
+            View::Unknown => return None,
+            View::Churning => {}
+        }
+    }
+    None
+}
+
+/// One view of `process`'s threads. /proc/<pid>/task is listed by position, not as one snapshot: a thread that ended
+/// between the listing and its read may have started another first, and a listing during such churn may skip a live
+/// thread. So no thread is taken as ended by its absence: the view is stable only when the listing is the same before
+/// and after the threads' reads, each listed thread was read, and the status's thread count (the kernel's own, taken
+/// at once) equals the listing; then a thread the listing missed would have been counted. A thread read as a zombie
+/// or exiting never runs again nor starts another. A process gone, or whose pid is another's, when the view begins
+/// was released, which happens only once all its threads have ended.
+fn view_of(root: &Path, process: &Proc, between: &mut dyn FnMut()) -> View {
+    let dir = root.join(process.pid.to_string());
+    let identity = || match stat(root, process.pid) {
+        Stat::Read(p) => Some(p.start == process.start),
+        Stat::Gone => Some(false),
+        Stat::Unreadable => None,
     };
-    let mut known = true;
+    match identity() {
+        Some(true) => {}
+        Some(false) => return View::Ended,
+        None => return View::Unknown,
+    }
+    let first = match tids(&dir) {
+        Ok(Some(first)) => first,
+        Ok(None) => return View::Ended,
+        Err(()) => return View::Unknown,
+    };
+    let mut stable = true;
+    for tid in &first {
+        match std::fs::read(dir.join("task").join(tid.to_string()).join("stat")) {
+            Ok(bytes) => match parse_stat(*tid, &bytes) {
+                Some(thread) if !thread.zombie && !thread.exiting => return View::Runs,
+                Some(_) => {}
+                None => return View::Unknown,
+            },
+            Err(e) if gone(&e) => stable = false,
+            Err(_) => return View::Unknown,
+        }
+    }
+    between();
+    let counted = match std::fs::read_to_string(dir.join("status")) {
+        Ok(status) => status
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))
+            .and_then(|n| n.trim().parse::<usize>().ok()),
+        Err(e) if gone(&e) => return View::Churning,
+        Err(_) => return View::Unknown,
+    };
+    let Some(counted) = counted else {
+        return View::Unknown;
+    };
+    let second = match tids(&dir) {
+        Ok(Some(second)) => second,
+        Ok(None) => return View::Churning,
+        Err(()) => return View::Unknown,
+    };
+    if identity() != Some(true) {
+        return View::Churning;
+    }
+    if stable && second == first && counted == first.len() {
+        View::Ended
+    } else {
+        View::Churning
+    }
+}
+
+/// The thread ids `<dir>/task` lists: `None` when the process is gone, `Err` when they cannot be listed.
+fn tids(dir: &Path) -> Result<Option<std::collections::BTreeSet<u32>>, ()> {
+    let tasks = match std::fs::read_dir(dir.join("task")) {
+        Ok(tasks) => tasks,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut all = std::collections::BTreeSet::new();
     for task in tasks {
-        let Ok(task) = task else {
-            known = false;
-            continue;
-        };
-        let Some(tid) = task
+        let task = task.map_err(|_| ())?;
+        if let Some(tid) = task
             .file_name()
             .to_str()
             .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        match std::fs::read(task.path().join("stat")) {
-            Ok(bytes) => match parse_stat(tid, &bytes) {
-                Some(thread) if !thread.zombie && !thread.exiting => return Some(true),
-                Some(_) => {}
-                None => known = false,
-            },
-            Err(e) if gone(&e) => {}
-            Err(_) => known = false,
+        {
+            all.insert(tid);
         }
     }
-    known.then_some(false)
+    Ok(Some(all))
 }
 
 /// Whether `process` has `marker` in its environment or a thread's: `None` when neither can be read and it cannot be
@@ -304,9 +398,9 @@ fn marked_tri(root: &Path, process: &Proc, marker: &[u8], me: u32) -> Option<boo
         return Some(false);
     }
     // Refused because it is ending: an exiting process (past its memory, not yet a zombie) refuses its environment,
-    // so its threads' stat, read after the refusal, says whether it still runs (docs/adr/ADR-022.md decision 19, the
-    // correction of 2026-11-17).
-    if thread_runs(root, process.pid) == Some(false) {
+    // so a stable view of its threads, taken after the refusal, says whether it still runs (docs/adr/ADR-022.md
+    // decision 19, the corrections of 2026-11-17).
+    if thread_runs(root, process) == Some(false) {
         return Some(false);
     }
     match std::fs::read_to_string(dir.join("status")) {
@@ -1127,6 +1221,19 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         listed: (&str, u64),
         threads: &[(u32, (&str, u64))],
     ) -> std::io::Result<tempfile::TempDir> {
+        let listed_threads: Vec<(u32, Option<(&str, u64)>)> =
+            threads.iter().map(|(tid, t)| (*tid, Some(*t))).collect();
+        churned(listed, &listed_threads, threads.len())
+    }
+
+    /// [`refused`]'s process as a racing scan can see it: a listed thread with no `stat` (`None`) is one that ended
+    /// between the listing and its read, and `count` is the thread count its `status` gives (the kernel's own,
+    /// counted at once), which may hold a thread the listing missed.
+    fn churned(
+        listed: (&str, u64),
+        threads: &[(u32, Option<(&str, u64)>)],
+        count: usize,
+    ) -> std::io::Result<tempfile::TempDir> {
         let me = rustix::process::getuid().as_raw();
         let line = |pid: u32, (state, flags): (&str, u64)| {
             format!("{pid} (python3) {state} 1 300 300 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 900 0")
@@ -1137,13 +1244,115 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         std::fs::write(dir.join("stat"), line(300, listed))?;
         for (tid, thread) in threads {
             std::fs::create_dir_all(dir.join(format!("task/{tid}/environ")))?;
-            std::fs::write(dir.join(format!("task/{tid}/stat")), line(*tid, *thread))?;
+            if let Some(thread) = thread {
+                std::fs::write(dir.join(format!("task/{tid}/stat")), line(*tid, *thread))?;
+            }
         }
         std::fs::write(
             dir.join("status"),
-            format!("Name:\tpython3\nUid:\t{me}\t{me}\t{me}\t{me}\n"),
+            format!("Name:\tpython3\nUid:\t{me}\t{me}\t{me}\t{me}\nThreads:\t{count}\n"),
         )?;
         Ok(root)
+    }
+
+    #[test]
+    fn threads_that_change_between_two_listings_are_looked_at_again_until_the_view_is_stable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WDF-01, through the seam between a view's reads and its second listing: worker 301 starts 302 and ends
+        // while the main thread exits (Codex's case). The first view is not stable; the next one finds 302 running.
+        let exiting = ("R", 0x40_000C);
+        let running = ("S", 0x40_0000);
+        let line = |tid: u32, (state, flags): (&str, u64)| {
+            format!("{tid} (python3) {state} 1 300 300 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 900 0")
+        };
+        let process = Proc {
+            pid: 300,
+            ppid: 1,
+            start: 900,
+            zombie: false,
+            exiting: true,
+        };
+        let status = |dir: &Path, n: usize| {
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\tpython3\nThreads:\t{n}\n"),
+            )
+        };
+        let worker = churned(exiting, &[(300, Some(exiting)), (301, Some(exiting))], 2)?;
+        let dir = worker.path().join("300");
+        let mut once = true;
+        let found = thread_runs_with(worker.path(), &process, &mut || {
+            if std::mem::take(&mut once) {
+                let _ = std::fs::remove_dir_all(dir.join("task/301"));
+                let _ = std::fs::create_dir_all(dir.join("task/302"));
+                let _ = std::fs::write(dir.join("task/302/stat"), line(302, running));
+            }
+        });
+        // A thread that ended meanwhile, and then a stable view: it is ending.
+        let ended = churned(exiting, &[(300, Some(exiting)), (301, Some(exiting))], 2)?;
+        let dir = ended.path().join("300");
+        let mut once = true;
+        let settled = thread_runs_with(ended.path(), &process, &mut || {
+            if std::mem::take(&mut once) {
+                let _ = std::fs::remove_dir_all(dir.join("task/301"));
+                let _ = status(&dir, 1);
+            }
+        });
+        // Churn that never settles (a thread appears in every view): unknown, after a bounded number of views.
+        let busy = churned(exiting, &[(300, Some(exiting))], 1)?;
+        let dir = busy.path().join("300");
+        let mut views = 0u32;
+        let restless = thread_runs_with(busy.path(), &process, &mut || {
+            views += 1;
+            let tid = 400 + views;
+            let _ = std::fs::create_dir_all(dir.join(format!("task/{tid}")));
+            let _ = std::fs::write(dir.join(format!("task/{tid}/stat")), line(tid, exiting));
+        });
+        // Its pid another process's when a view begins: released, so ended.
+        let reused = churned(exiting, &[(300, Some(exiting))], 1)?;
+        std::fs::write(
+            reused.path().join("300/stat"),
+            line(300, ("S", 0)).replace(" 900 0", " 950 0"),
+        )?;
+        let other = thread_runs_with(reused.path(), &process, &mut || {});
+        assert_eq!(
+            (found, settled, restless, views as usize, other),
+            (Some(true), Some(false), None, VIEWS, Some(false))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_thread_set_that_changed_or_hides_a_thread_is_no_proof_that_a_process_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WDF-01: /proc/<pid>/task is listed by position, not as one snapshot. A thread that ended between the listing
+        // and its read may have started another before it ended, and a listing during such churn may skip a live
+        // thread; so a process is ending only on a stable view: its threads listed twice alike, each read a zombie or
+        // exiting, and as many as its status counts. Here: a zombie or exiting main thread, and a second thread that
+        // is gone by its read (a worker that started a third before it ended), or that the listing missed.
+        let exiting = ("R", 0x40_000C);
+        let zombie = ("Z", 0x40_800C);
+        let cases = [
+            churned(zombie, &[(300, Some(zombie)), (301, None)], 2)?,
+            churned(zombie, &[(300, Some(zombie))], 2)?,
+            churned(exiting, &[(300, Some(exiting)), (301, None)], 2)?,
+            churned(exiting, &[(300, Some(exiting))], 2)?,
+            // The stable view: one exiting thread, and one counted.
+            churned(exiting, &[(300, Some(exiting))], 1)?,
+        ];
+        assert_eq!(
+            cases
+                .each_ref()
+                .map(|r| tools(r.path(), (100, Some(500)), "p/A1")),
+            [
+                Tools::Unknown,
+                Tools::Unknown,
+                Tools::Unknown,
+                Tools::Unknown,
+                Tools::Absent
+            ]
+        );
+        Ok(())
     }
 
     #[test]
