@@ -620,6 +620,70 @@ async fn a_supervision_turn_failed_on_a_quota_waits_for_its_reset_even_after_a_r
 }
 
 #[tokio::test]
+async fn a_wake_failing_on_a_quota_gets_at_most_eight_retries_probes_included_even_after_a_restart()
+-> R {
+    // RA-101 (M2T07R-256 review round 2; design correction rule 2): every failure of the wake counts against one
+    // persistent budget of MAX_RETRIES retries after the first, the half-open probe's too. Codex's Store probe: a quota
+    // failure each time (its reset 7200 s on), the host restarted after the ninth; before the fix the wake was
+    // allocated 11 times, 3 of them probes. Now 9 turns (the eighth failure makes the Commander unavailable, the ninth
+    // turn is the one probe), and after the ninth failure nothing more, whenever asked and after a restart.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (mut store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    wake(&store, &clock, "R", "D", "quota-budget", 0).await?;
+    let mut ms = 3_000;
+    for count in 1..=9 {
+        store.supervise("R", context(&clock, ms)).await?;
+        let a = store
+            .allocate_supervision("p1", context(&clock, ms))
+            .await?
+            .ok_or(format!("turn {count} not allocated"))?;
+        let quota = crate::retry::FailureClass::Transient { retry_after: None }
+            .with_reset(Some(t(ms + 7_200_000)), t(ms + 500));
+        run_turn(&store, &clock, &a.attempt_id, ms, false, quota).await?;
+        store.supervise("R", context(&clock, ms + 1_000)).await?;
+        if count == 8 {
+            drop(store);
+            store = open(&dir, &clock)?.0;
+        }
+        ms += 7_200_000;
+    }
+    for later in [ms, ms + 7_200_000, ms + 86_400_000] {
+        store.supervise("R", context(&clock, later)).await?;
+        assert!(
+            store
+                .allocate_supervision("p1", context(&clock, later))
+                .await?
+                .is_none(),
+            "a tenth turn at {later} ms"
+        );
+    }
+    drop(store);
+    let (store, _) = open(&dir, &clock)?;
+    store
+        .supervise("R", context(&clock, ms + 90_000_000))
+        .await?;
+    assert!(
+        store
+            .allocate_supervision("p1", context(&clock, ms + 90_000_000))
+            .await?
+            .is_none(),
+        "a tenth turn after a restart"
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_array((SELECT count(*) FROM events WHERE kind = 'supervisor.allocated'), \
+             (SELECT count(*) FROM events WHERE kind = 'supervisor.probe'), \
+             (SELECT state FROM runs WHERE run_id = 'R'))"
+        )?,
+        json!([9, 1, "BLOCKED"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_withdrawn_turn_rearms_without_a_failure_or_a_backoff() -> R {
     // Decision 3: a PREPARED turn withdrawn by a pause: its supervision task CANCELLED (not READY), the wake rearmed
     // (withdrawn) with no failure counted, allocated at once when the run works again.
