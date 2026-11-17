@@ -6522,8 +6522,10 @@ async fn a_silent_turn_is_inactive_once_only_with_no_tool_running_and_its_output
             "{event}"
         );
         let since = event["since_ms"].as_u64().ok_or("no since_ms")?;
-        // Its first frame came before its tool's 5 s and the quiet 2 s after them, less a look or so.
-        assert!(since >= 6000, "{event}");
+        // At least the quiet time since the output was last seen, whatever the load (WD-51: a bound from the first
+        // frame's time depends on when a look saw it; that the quiet time counts from the tool's last sighting is the
+        // Watch's unit test).
+        assert!(since >= 2000, "{event}");
         // Once per episode, and nothing is killed: the attempt runs on, its agent alive.
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(query(&project, &inactive)?, "1");
