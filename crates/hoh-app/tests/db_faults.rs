@@ -547,13 +547,13 @@ fn full_a_full_file_system_is_db_full_and_retryable_writes_nothing_and_writes_re
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
-        let runs = project.sql("SELECT count(*) FROM runs")?;
         let filler = mount.fill()?;
+        let before = project.dump()?;
         let out = project.submit("second")?;
         assert_ne!(out.status.code(), Some(0), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("DB_FULL"), "{stderr}");
-        assert_eq!(project.sql("SELECT count(*) FROM runs")?, runs);
+        assert_eq!(project.dump()?, before);
         std::fs::remove_file(filler)?;
         project.accepted("third")?;
         assert_eq!(project.sql("PRAGMA integrity_check")?, "ok");
