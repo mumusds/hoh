@@ -40,6 +40,8 @@ fn snapshot() -> Snapshot {
         target: Some(BindingView {
             role_epoch: 5,
             active: true,
+            blocked: false,
+            pending: Vec::new(),
             capabilities: caps(&["structured_events", "command_exec"]),
         }),
         required_capabilities: Some(caps(&["structured_events", "command_exec"])),
@@ -239,6 +241,8 @@ fn a_dispatch_needs_accepted_dependencies_a_ready_task_capabilities_and_budget()
             s.target = Some(BindingView {
                 role_epoch: 1,
                 active: true,
+                blocked: false,
+                pending: Vec::new(),
                 capabilities: caps(&["structured_events"]),
             })
         },
@@ -260,6 +264,94 @@ fn a_dispatch_needs_accepted_dependencies_a_ready_task_capabilities_and_budget()
         t.cost_estimate = 5;
     }
     assert!(validate(&dispatch_t1(), &s).is_ok());
+}
+
+/// The snapshot with its target binding ACTIVE but held by `pending`, its session's capabilities `capabilities`.
+fn held(pending: &[Pending], capabilities: &[&str]) -> Snapshot {
+    let mut s = snapshot();
+    s.target = Some(BindingView {
+        role_epoch: 5,
+        active: pending.is_empty(),
+        blocked: false,
+        pending: pending.to_vec(),
+        capabilities: caps(capabilities),
+    });
+    s
+}
+
+#[test]
+fn a_binding_changing_by_itself_is_role_binding_pending_in_the_crs_order() {
+    // CR-025 (ROLE_BINDING_PENDING): each of the five changes alone is ROLE_BINDING_PENDING, its detail saying which; no
+    // binding, a BLOCKED one and no role contract stay ROLE_CAPABILITY_MISSING whatever is pending; a capability the
+    // session lacks beats a handover of that session (it is the one that will serve) and is not judged under a team
+    // change, a rebind or no session; no session with an undelivered handover is pending.
+    use Pending::*;
+    let all = ["structured_events", "command_exec"];
+    let lacking = ["structured_events"];
+    for one in [
+        TeamChange,
+        Rebind,
+        NoSession,
+        HandoverUndelivered,
+        FirstInputInFlight,
+    ] {
+        let rejection = validate(&dispatch_t1(), &held(&[one], &all)).err();
+        assert_eq!(
+            rejection.as_ref().map(|r| r.reason),
+            Some(RoleBindingPending),
+            "{one:?}"
+        );
+        assert!(
+            rejection.is_some_and(|r| r.detail.contains(one.describe())),
+            "{one:?}: detail"
+        );
+        let mut s = held(&[one], &all);
+        s.required_capabilities = None;
+        assert_eq!(
+            reason(&dispatch_t1(), &s),
+            RoleCapabilityMissing,
+            "{one:?} without a role contract"
+        );
+        let mut s = held(&[one], &all);
+        if let Some(b) = &mut s.target {
+            b.blocked = true;
+        }
+        assert_eq!(
+            reason(&dispatch_t1(), &s),
+            RoleCapabilityMissing,
+            "{one:?} and BLOCKED"
+        );
+    }
+    for (pending, expected) in [
+        (vec![HandoverUndelivered], RoleCapabilityMissing),
+        (vec![FirstInputInFlight], RoleCapabilityMissing),
+        (vec![TeamChange], RoleBindingPending),
+        (vec![Rebind], RoleBindingPending),
+        (vec![NoSession], RoleBindingPending),
+        (vec![TeamChange, FirstInputInFlight], RoleBindingPending),
+    ] {
+        assert_eq!(
+            reason(&dispatch_t1(), &held(&pending, &lacking)),
+            expected,
+            "{pending:?} with a capability lacking"
+        );
+    }
+    assert_eq!(
+        reason(
+            &dispatch_t1(),
+            &held(&[NoSession, HandoverUndelivered], &[])
+        ),
+        RoleBindingPending
+    );
+    let mut s = snapshot();
+    s.target = None;
+    assert_eq!(
+        reason(&dispatch_t1(), &s),
+        RoleCapabilityMissing,
+        "no binding"
+    );
+    // Nothing pending: dispatched as before.
+    assert!(validate(&dispatch_t1(), &held(&[], &all)).is_ok());
 }
 
 #[test]

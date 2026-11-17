@@ -234,11 +234,58 @@ pub struct TaskView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingView {
     pub role_epoch: u64,
-    /// `role_bindings.state` is ACTIVE, a session is bound to it, and no team change waits for its checkpoint
-    /// (docs/adr/ADR-022.md decision 8): only then is the role dispatched.
+    /// `role_bindings.state` is ACTIVE and none of [`Pending`] holds: only then is the role dispatched.
     pub active: bool,
+    /// `role_bindings.state` is BLOCKED (its only other state).
+    pub blocked: bool,
+    /// What keeps an ACTIVE binding from being dispatched now (CR-025): each [`Pending`] that holds.
+    pub pending: Vec<Pending>,
     /// The probed capabilities of the bound session (`sessions.capabilities_json` keys that are true).
     pub capabilities: BTreeSet<String>,
+}
+
+/// A change of an ACTIVE binding that keeps it from being dispatched now and ends by itself, rejected as
+/// ROLE_BINDING_PENDING (CR-025): exactly the cases that made such a binding not active before that code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// A team change of the role waits for its checkpoint (REQ-018, docs/adr/ADR-022.md decision 8).
+    TeamChange,
+    /// Staffing holds a rebind of the role pending for the attempt in flight (REQ-020, docs/adr/ADR-030.md decision 5).
+    Rebind,
+    /// The binding has no session yet.
+    NoSession,
+    /// The session.start notice of the role's epoch, which carries the handover package, is not delivered yet (REQ-019,
+    /// docs/adr/ADR-024.md decision 4).
+    HandoverUndelivered,
+    /// The role's session owes its first input and has an attempt PREPARED, STARTING or RUNNING (M2T17R-201).
+    FirstInputInFlight,
+}
+
+impl Pending {
+    /// Whether the session that will serve the role is the bound one, so a capability it lacks is a real gap: so under
+    /// a handover of it; under a team change, a rebind or with no session it is not settled, and no capability is
+    /// judged.
+    pub fn session_settled(self) -> bool {
+        matches!(
+            self,
+            Pending::HandoverUndelivered | Pending::FirstInputInFlight
+        )
+    }
+
+    /// As a rejection's detail says it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Pending::TeamChange => "a team change of it waits for its checkpoint",
+            Pending::Rebind => "staffing holds a rebind of it for the attempt in flight",
+            Pending::NoSession => "it has no session yet",
+            Pending::HandoverUndelivered => {
+                "the session.start of its epoch, its handover package, is not delivered yet"
+            }
+            Pending::FirstInputInFlight => {
+                "its session owes its first input (the handover package) and has an attempt in flight"
+            }
+        }
+    }
 }
 
 /// Acceptance evidence under the run's current specification (ADR-011 §3, the minimal fail-closed gate).
@@ -547,15 +594,22 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
             format!("{task_id} waits for its retry at {next}"),
         );
     }
-    let binding = match &snapshot.target {
-        Some(binding) if binding.active => binding,
-        _ => {
-            return reject(
-                RoleCapabilityMissing,
-                format!("role {role} has no active binding"),
-            );
-        }
+    // The binding, in CR-025's order: no binding, BLOCKED and no role contract are ROLE_CAPABILITY_MISSING whatever is
+    // pending; a change whose serving session is not settled is ROLE_BINDING_PENDING before any capability is judged; a
+    // capability the session lacks is ROLE_CAPABILITY_MISSING before a handover of that session is pending. Each case
+    // was rejected before that code; only the reason names it now.
+    let Some(binding) = &snapshot.target else {
+        return reject(RoleCapabilityMissing, format!("role {role} has no binding"));
     };
+    if binding.blocked {
+        return reject(RoleCapabilityMissing, format!("role {role} is blocked"));
+    }
+    if !binding.active && binding.pending.is_empty() {
+        return reject(
+            RoleCapabilityMissing,
+            format!("role {role} has no active binding"),
+        );
+    }
     let Some(required) = &snapshot.required_capabilities else {
         return reject(
             RoleCapabilityMissing,
@@ -565,6 +619,22 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
             ),
         );
     };
+    let pending_detail = |pending: &[Pending]| {
+        let why: Vec<&str> = pending.iter().map(|p| p.describe()).collect();
+        format!(
+            "role {role} is not dispatched while it changes: {}; {task_id} stays READY and is dispatched once that completed",
+            why.join("; ")
+        )
+    };
+    let unsettled: Vec<Pending> = binding
+        .pending
+        .iter()
+        .copied()
+        .filter(|p| !p.session_settled())
+        .collect();
+    if !unsettled.is_empty() {
+        return reject(RoleBindingPending, pending_detail(&unsettled));
+    }
     let missing: Vec<&str> = required
         .difference(&binding.capabilities)
         .map(String::as_str)
@@ -578,6 +648,9 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
                 task.role
             ),
         );
+    }
+    if !binding.pending.is_empty() {
+        return reject(RoleBindingPending, pending_detail(&binding.pending));
     }
     if let Some(stop) = &snapshot.budget_stop {
         return reject(

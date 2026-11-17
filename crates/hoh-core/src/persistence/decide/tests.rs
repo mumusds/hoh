@@ -1479,3 +1479,190 @@ async fn an_invalid_plan_is_refused_with_its_code_before_any_decision_is_written
     assert_eq!(planned_tables(&path)?, before);
     Ok(())
 }
+
+/// R's developer binding (epoch 2, session sd) held as `case` says, set up in SQL: the five changes of CR-025, and the
+/// handover owed with no attempt in flight (first, or after a failed first turn).
+fn hold_developer(path: &Path, case: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // The session.start of the developer's epoch 2 (its id as handover::first_input_pending reads it), in a state.
+    let notice = |state: &str| {
+        format!(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', 'R/session-start/developer/2', 'R', 'session.start', '{{}}', '2026-11-04T00:00:00Z');
+             INSERT INTO outbox(message_id, event_seq, run_id, recipient_role, role_epoch, payload_json, state)
+               VALUES ('R/session-start/developer/2', (SELECT seq FROM events WHERE event_id = 'R/session-start/developer/2'),
+                       'R', 'developer', 2, '{{}}', '{state}');"
+        )
+    };
+    // Delivered to session sd, with an attempt of sd in `attempt` (none when empty).
+    let delivered = |attempt: &str| {
+        let mut sql = notice("ACKED");
+        sql.push_str(
+            "INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES
+               ('runner', 'R/session-start/developer/2', '2026-11-04T00:00:01Z', '{\"session_id\": \"sd\"}');",
+        );
+        if !attempt.is_empty() {
+            sql.push_str(&format!(
+                "INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision)
+                   VALUES ('A3', 'T3', 'sd', '{attempt}', 2, 1, 1);"
+            ));
+        }
+        sql
+    };
+    let sql = match case {
+        "team change" => {
+            let mut config = super::super::team::TeamConfig::builtin();
+            let role = config
+                .team
+                .get_mut("developer")
+                .ok_or("no developer in the builtin team")?;
+            role.agent = crate::config::Agent::Pi;
+            format!(
+                "INSERT INTO team_revisions(project_id, revision, config_json, state, created_at, applied_at)
+                   VALUES ('p1', 2, '{}', 'APPLIED', '2026-11-04T00:00:01Z', '2026-11-04T00:00:01Z');",
+                serde_json::to_string(&config)?.replace('\'', "''")
+            )
+        }
+        "rebind" => {
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+                       ('p1', 'R/staffing/developer/2/1', 'R', 'team.binding_change_pending',
+                        '{\"cause\": \"rebind\", \"to\": \"claude\"}', '2026-11-04T00:00:01Z');"
+                .to_owned()
+        }
+        "no session" => {
+            "UPDATE role_bindings SET session_id = NULL WHERE role = 'developer';".to_owned()
+        }
+        "handover undelivered" => notice("PENDING"),
+        "first input in flight" => delivered("RUNNING"),
+        "first input owed" => delivered(""),
+        "first turn failed" => delivered("FAILED"),
+        other => return Err(format!("no case {other}").into()),
+    };
+    Connection::open(path)?.execute_batch(&sql)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_binding_reports_exactly_which_of_its_changes_hold() -> R {
+    // CR-025: load_binding names each of the five changes that keeps an ACTIVE binding from being dispatched, and only
+    // those: `active` is false exactly when one holds, as before. A session owing its first input with no attempt in
+    // flight (first, or after its first turn failed) holds none: it is dispatched, the turn that delivers the package.
+    use crate::decision::Pending::*;
+    for (case, pending) in [
+        ("team change", vec![TeamChange]),
+        ("rebind", vec![Rebind]),
+        ("no session", vec![NoSession]),
+        ("handover undelivered", vec![HandoverUndelivered]),
+        ("first input in flight", vec![FirstInputInFlight]),
+        ("first input owed", vec![]),
+        ("first turn failed", vec![]),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        seed(&path, WORLD)?;
+        hold_developer(&path, case)?;
+        drop(store);
+        let mut conn = Connection::open(&path)?;
+        let tx = conn.transaction()?;
+        let binding = load_binding(&tx, "R", "developer")?.ok_or("no binding")?;
+        assert_eq!(
+            (binding.pending, binding.active, binding.blocked),
+            (pending.clone(), pending.is_empty(), false),
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dispatch_to_a_role_changing_by_itself_is_role_binding_pending_and_its_handover_turn_goes()
+-> R {
+    // CR-025 against a real store: T1's dispatch to the developer is ROLE_BINDING_PENDING while it has no session, its
+    // handover is undelivered or its first input is in flight; it is APPLIED while the first input is owed with no
+    // attempt in flight, first or after a failed first turn (the positive controls: no new rejection); a role with no
+    // binding stays ROLE_CAPABILITY_MISSING. Once the handover is delivered, the scheduling round dispatches T1 with no
+    // new decision.
+    for (case, expected) in [
+        ("no session", Some(RejectionReason::RoleBindingPending)),
+        (
+            "handover undelivered",
+            Some(RejectionReason::RoleBindingPending),
+        ),
+        (
+            "first input in flight",
+            Some(RejectionReason::RoleBindingPending),
+        ),
+        ("first input owed", None),
+        ("first turn failed", None),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        seed(&path, WORLD)?;
+        hold_developer(&path, case)?;
+        let mut commander = FakeCommander {
+            sent: 0,
+            candidate: None,
+        };
+        let decided = store
+            .decide(
+                commander.decide(
+                    3,
+                    7,
+                    json!({"kind": "dispatch", "task_id": "T1", "role": "developer"}),
+                ),
+                context(),
+            )
+            .await?;
+        match (decided, expected) {
+            (Decided::Rejected { reason, .. }, Some(want)) => assert_eq!(reason, want, "{case}"),
+            (Decided::Applied { .. }, None) => {}
+            (other, _) => return Err(format!("{case}: {other:?}").into()),
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    assert!(matches!(
+        store
+            .decide(
+                commander.decide(
+                    3,
+                    7,
+                    json!({"kind": "dispatch", "task_id": "T1", "role": "reviewer"})
+                ),
+                context(),
+            )
+            .await?,
+        Decided::Rejected {
+            reason: RejectionReason::RoleCapabilityMissing,
+            ..
+        }
+    ));
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    hold_developer(&path, "handover undelivered")?;
+    assert!(
+        store
+            .schedule_round("R", context())
+            .await?
+            .dispatched
+            .is_none(),
+        "dispatched before the handover"
+    );
+    Connection::open(&path)?.execute_batch(
+        "UPDATE outbox SET state = 'ACKED' WHERE message_id = 'R/session-start/developer/2';
+         INSERT INTO receipts(consumer, message_id, applied_at, result_json) VALUES
+           ('runner', 'R/session-start/developer/2', '2026-11-04T00:00:01Z', '{\"session_id\": \"sd\"}');",
+    )?;
+    let round = store.schedule_round("R", context()).await?;
+    assert_eq!(
+        round.dispatched.map(|d| d.task_id),
+        Some("T1".to_owned()),
+        "dispatched once the handover was delivered"
+    );
+    Ok(())
+}
