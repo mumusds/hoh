@@ -4220,7 +4220,9 @@ async fn cgroup_lost_cancel_inside() -> R {
     // reaped at once, and holds the pass past HELD_FOR, so its next look finds the group lost track of. With a cgroup
     // the pass watches the group by its number from then on, as one that cannot be told apart: the cgroup's members
     // get SIGTERM and SIGKILL by membership, and the same pass ends with the cgroup's proof; no lost pass, no ladder
-    // begun again.
+    // begun again. No signal goes to the group's number (F2-50): a probe of the test's own, in that group but outside
+    // the attempt's cgroup, without its marker and not the leader's descendant, records any SIGTERM and would die of a
+    // SIGKILL; it leaves the group once T1's member has ended, so the number can free.
     if std::env::var_os(common::IN_SCOPE).is_none() {
         return Ok(());
     }
@@ -4234,6 +4236,32 @@ async fn cgroup_lost_cancel_inside() -> R {
     let _members = common::Recorded(executor.0.members());
     let t1 = common::recorded_processes(&executor.0.members());
     let db = db(&project);
+    let group: i32 = query(
+        &db,
+        &format!("SELECT pid FROM attempts WHERE attempt_id = '{a1}'"),
+    )?
+    .parse()?;
+    use std::os::unix::process::CommandExt as _;
+    let ((member, member_start), seen) = (
+        t1.first().cloned().ok_or("no member")?,
+        dir.path().join("probe"),
+    );
+    let probe = ChildGuard(
+        Command::new("/usr/bin/python3")
+            .args(["-c", GROUP_PROBE, &member.to_string(), &member_start])
+            .arg(&seen)
+            .env_clear()
+            .process_group(group)
+            .spawn()?,
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&seen).is_ok_and(|s| s.starts_with("in ")) {
+        if Instant::now() > end {
+            return Err("the probe did not join the group".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(&seen)?, format!("in {group}\n"));
     let info: Value =
         serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
     let revision = query(&db, "SELECT revision FROM runs WHERE run_id = 'R'")?;
@@ -4260,26 +4288,55 @@ async fn cgroup_lost_cancel_inside() -> R {
             ),
         )
     };
-    assert!(
-        wait_for(
-            &db,
-            "SELECT state FROM runs WHERE run_id = 'R'",
-            "CANCELLED",
-            Duration::from_secs(20)
-        )?,
-        "{}",
-        passes()?
-    );
+    // CANCELLED, the probe living all the while (a SIGKILL to the group's number would end it, and its zombie, the
+    // test's own child, would then hold the number).
+    let mut probe = probe;
+    let end = Instant::now() + Duration::from_secs(20);
+    while query(&db, "SELECT state FROM runs WHERE run_id = 'R'")? != "CANCELLED" {
+        if let Some(status) = probe.0.try_wait()? {
+            return Err(format!(
+                "the probe in the group's number was ended: {status}; {}",
+                passes()?
+            )
+            .into());
+        }
+        assert!(Instant::now() < end, "{}", passes()?);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         passes()?,
         "cancel.native_cancel,cancel.sigterm,cancel.sigkill,cancel.reaped,cancel.diagnostic:UNKNOWN_EFFECT",
         "one pass, ended by the cgroup's proof; its work's effect unknown"
     );
     assert!(all_ended(&t1)?, "T1's member lives: {t1:?}");
+    // Nothing reached the group's number: the probe got no SIGTERM, and lives.
+    assert_eq!(
+        (
+            std::fs::read_to_string(&seen)?,
+            probe.0.try_wait()?.map(|s| s.to_string())
+        ),
+        (format!("in {group}\nleft nothing\n"), None)
+    );
     host.shutdown().await;
     drop(executor);
     Ok(())
 }
+
+/// The probe of a group's number (F2-50): it records any SIGTERM it gets, waits while the process `argv[1]` started at
+/// `argv[2]` lives (at most 60 s), then leaves the group (`setpgid(0, 0)`) and records what it got in `argv[3]`; then it
+/// waits, to be ended by its test.
+const GROUP_PROBE: &str = "import os, signal, sys, time\n\
+    member, start, out = int(sys.argv[1]), sys.argv[2], sys.argv[3]\n\
+    got = []\n\
+    signal.signal(signal.SIGTERM, lambda *_: got.append('term'))\n\
+    def lives():\n    try:\n        st = open('/proc/%d/stat' % member).read().rsplit(') ', 1)[1].split()\n    \
+    except OSError:\n        return False\n    return st[19] == start and st[0] != 'Z'\n\
+    with open(out, 'w') as f:\n    f.write('in %d\\n' % os.getpgid(0))\n\
+    end = time.monotonic() + 60\n\
+    while lives() and time.monotonic() < end:\n    time.sleep(0.01)\n\
+    os.setpgid(0, 0)\n\
+    with open(out, 'a') as f:\n    f.write('left %s\\n' % (','.join(got) or 'nothing'))\n\
+    time.sleep(120)\n";
 
 /// AC-042-02's world at time `t` (whole seconds): run R WAITING_EXTERNAL (to resume RUNNING), its task T1 READY after
 /// three failed attempts with its retry at t+200 s; 7 iterations and 1234 s used of the run's budget.
