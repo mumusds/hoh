@@ -107,13 +107,21 @@ pub struct Snapshot {
     pub probes: BTreeMap<String, Value>,
 }
 
+/// The role whose turns run in the read-only workspace profile and so need `read_only_workspace` (docs/adr/ADR-032.md
+/// decisions 2 and 4): by the role's name, the one judgement the Commander's read-only launch is chosen by.
+pub const COMMANDER_ROLE: &str = "commander";
+
 /// The capabilities every role needs, and those a role following `contract`'s role contract needs too (REQ-020
 /// decision 1; docs/adr/ADR-022.md decision 10, docs/adr/ADR-030.md decision 12): structured events always, resume
-/// for the commander and the reviewer, command execution (as the probe measures it) for the developer and qa.
-/// Staffing judges a binding by them (decision 3) and the host's dispatch asks them of a session
-/// (`host::agents::required`).
-pub fn required(contract: Option<&str>) -> BTreeSet<String> {
+/// for the commander and the reviewer, command execution (as the probe measures it) for the developer and qa; and
+/// the read-only workspace profile for the role named commander (docs/adr/ADR-032.md decision 4, -155, -253; a custom
+/// role following the commander contract neither needs it nor runs read-only). Staffing judges a binding by them
+/// (decision 3) and the host's dispatch asks them of a session (`host::agents::required`).
+pub fn required(role: &str, contract: Option<&str>) -> BTreeSet<String> {
     let mut needs: BTreeSet<String> = ["structured_events".to_owned()].into();
+    if role == COMMANDER_ROLE {
+        needs.insert("read_only_workspace".to_owned());
+    }
     match contract {
         Some("commander" | "reviewer") => {
             needs.insert("resume".to_owned());

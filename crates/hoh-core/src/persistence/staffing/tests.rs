@@ -1344,7 +1344,8 @@ use std::time::{Duration, SystemTime};
 /// codex 0.166.0 and pi 1.5.0 each have it under HoH's options as their probes measure it from the recorded help and
 /// schema, and the developer and qa require it (docs/adr/ADR-030.md decision 12).
 fn caps() -> Value {
-    json!({"structured_events": true, "resume": true, "command_execution": true})
+    // Every role's needs, the commander's read-only workspace (docs/adr/ADR-032.md decision 4) included.
+    json!({"structured_events": true, "resume": true, "command_execution": true, "read_only_workspace": true})
 }
 
 /// A usable, verified fact of an agent at `version` with `identity` whose session would record [`caps`].
