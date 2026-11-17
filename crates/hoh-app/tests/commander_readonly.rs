@@ -89,6 +89,21 @@ fn commander_attempts(world: &World, run: &str) -> R<Vec<String>> {
         .collect())
 }
 
+/// The launch Commander attempt `attempt` recorded with its prompt (its `context.packed` event's `read_only`): the
+/// profile and, for codex, this host's check of its sandbox with its reason (docs/adr/ADR-032.md decision 4).
+fn read_only_record(world: &World, attempt: &str) -> R<Value> {
+    let rows = world.rows(&format!(
+        "SELECT payload_json FROM events WHERE kind = 'context.packed' \
+         AND json_extract(payload_json, '$.attempt_id') = '{attempt}'"
+    ))?;
+    let payload: Value = serde_json::from_str(
+        rows.first()
+            .and_then(|r| r["payload_json"].as_str())
+            .ok_or(format!("no context.packed of {attempt}"))?,
+    )?;
+    Ok(payload["read_only"].clone())
+}
+
 /// The read-only argv of REQ-021 behaviour 9 for `agent`'s turn (claude: resuming `resume`, without partial messages,
 /// which a Commander's turn does not want; pi: its session's directory and id), without a model.
 fn read_only_argv(agent: &str, resume: Option<&str>, pi: Option<(&str, &str)>) -> Vec<String> {
@@ -246,6 +261,10 @@ async fn read_only_launches(agent: &str) -> R {
                 }
                 _ => {}
             }
+            let record = read_only_record(&world, attempt)?;
+            assert_eq!(record["profile"], json!("read_only"), "{attempt}: {record}");
+            let check = if agent == "codex" { json!("confined") } else { Value::Null };
+            assert_eq!(record["host_check"]["check"], check, "{attempt}: {record}");
             launches.push(json!({"attempt": attempt, "argv": argv}));
         }
         if agent == "pi" {
@@ -735,14 +754,27 @@ async fn test_021_06_c_an_unknown_host_check_keeps_codex_the_commander() -> R {
                 .any(|t| t["role"] == "commander" && t["agent"] == "codex-app-server"),
             "{turns:?}"
         );
+        // The evidence of the unknown check, kept with each Commander attempt's own record: its context.packed
+        // names the profile it launched in and this host's check, with its reason.
+        for attempt in &commanders {
+            let launch = read_only_record(&world, attempt)?;
+            assert_eq!(launch["profile"], json!("read_only"), "{attempt}: {launch}");
+            assert_eq!(
+                launch["host_check"]["check"],
+                json!("unknown"),
+                "{attempt}: {launch}"
+            );
+            assert!(
+                launch["host_check"]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("sandbox")),
+                "{attempt}: {launch}"
+            );
+        }
         let snapshot = registry.snapshot(0);
-        let check = &snapshot.probes["codex"]["host_check"];
-        assert_eq!(check["check"], json!("unknown"), "{check}");
-        assert!(
-            check["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("sandbox")),
-            "{check}"
+        assert_eq!(
+            snapshot.probes["codex"]["host_check"]["check"],
+            json!("unknown")
         );
         // Not confined: looked at again while the run went on.
         let calls = std::fs::read_to_string(world.fakes().join("sandbox-calls"))?;
@@ -857,6 +889,13 @@ async fn test_021_06_c_a_check_lost_after_the_assignment_refuses_the_turn_unavai
             version
         );
         assert!(commander_attempts(&world, &run)?.iter().all(|a| a.starts_with(&first)));
+        // The attempt dispatched again keeps the check its prepare saw: confined.
+        let settled = world.query(&format!(
+            "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.run_id = '{run}' AND t.role = 'commander' AND a.state = 'SETTLED' ORDER BY a.rowid LIMIT 1"
+        ))?;
+        let record = read_only_record(&world, &settled)?;
+        assert_eq!(record["host_check"]["check"], json!("confined"), "{settled}: {record}");
         assert_eq!(
             world.query("SELECT count(*) FROM events WHERE kind = 'team.binding_excluded'")?,
             "0"

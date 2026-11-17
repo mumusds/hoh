@@ -642,7 +642,12 @@ impl ProductExecutor {
         } else {
             hoh_agents::Profile::Yolo
         };
-        let Current { ready, ran, .. } = current;
+        let Current {
+            ready,
+            ran,
+            host_check,
+            ..
+        } = current;
         let contract = hoh_core::config::contract(&self.project, &work.role, a.prompt.as_deref())
             .map_err(|why| {
             refused(
@@ -673,7 +678,18 @@ impl ProductExecutor {
             },
             _ => None,
         };
-        let (text, record) = self.pack(work, &contract, package.as_ref())?;
+        let (text, mut record) = self.pack(work, &contract, package.as_ref())?;
+        // A supervision turn's own record says what it launched in, and with codex this host's check of its sandbox
+        // with its reason as prepare saw it, so an unknown check is kept with the attempt (docs/adr/ADR-032.md
+        // decision 4, R2): in its context.packed, written in its RUNNING commit.
+        if a.supervision.is_some()
+            && let Some(Some(event)) = record.packed.as_mut().map(|p| p.event.as_object_mut())
+        {
+            event.insert(
+                "read_only".to_owned(),
+                serde_json::json!({"profile": "read_only", "host_check": host_check}),
+            );
+        }
         let session_id = a.session_id.clone().unwrap_or_default();
         let exec_only = self
             .exec_only
