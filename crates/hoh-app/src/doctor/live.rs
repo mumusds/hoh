@@ -68,7 +68,7 @@ pub(super) fn prepare(
             escalation: claude::Turn::default_escalation(),
             deadline: Some(DEADLINE),
             observe: None,
-            spawner: hoh_core::spawn::Direct::shared(),
+            spawner: env.spawner.clone(),
         }),
         Agent::Codex => {
             let launch::Facts::Codex {
@@ -103,7 +103,7 @@ pub(super) fn prepare(
                 handshake_timeout: Duration::from_secs(60),
                 deadline: Some(DEADLINE),
                 observe: None,
-                spawner: hoh_core::spawn::Direct::shared(),
+                spawner: env.spawner.clone(),
             })
         }
         Agent::Pi => Prepared::Pi(pi::Turn {
@@ -130,16 +130,15 @@ pub(super) fn prepare(
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
-            spawner: hoh_core::spawn::Direct::shared(),
+            spawner: env.spawner.clone(),
         }),
     })
 }
 
 async fn run(store: &Store, attempt: &AttemptRef, prepared: &Prepared) -> Result<Ended, String> {
+    // The turn's agent is started through the env's spawner, doctor's start gate: a signal's stop kills its process
+    // group and leader (docs/adr/ADR-031.md, 设计修正 2, A and B).
     let latch = CancelLatch::new();
-    // The turn's agent is the client's helper while it runs: a signal cancels it and waits for its end
-    // (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5).
-    let _owned = crate::signals::current().map(|state| state.own_turn(&latch));
     Ok(match prepared {
         Prepared::Claude(turn) => {
             let o = claude::run(store, attempt, turn, &latch)
@@ -295,7 +294,7 @@ pub fn check(
     runtime.block_on(async {
         let store = Store::open(
             &dir.join(".hoh/state.db"),
-            Options::new(hoh_core::spawn::Direct::shared()),
+            Options::new(env.spawner.clone()),
         )
         .map_err(|e| e.to_string())?;
         store

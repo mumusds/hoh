@@ -26,6 +26,7 @@ mod forward;
 mod help;
 mod installer;
 mod output;
+mod owned;
 mod prompt;
 mod session;
 mod signals;

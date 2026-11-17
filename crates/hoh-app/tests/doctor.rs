@@ -875,6 +875,91 @@ fn a_signal_ends_doctor_with_its_code_and_leaves_no_probe_behind() -> R {
     Ok(())
 }
 
+#[test]
+fn a_signal_while_the_wal_self_test_probe_runs_leaves_it_ended() -> R {
+    // ADR-031, 设计修正 2, A (CLT-300): `doctor --live` opens a scratch store, whose WAL self-test starts its second
+    // process (`hoh __wal-probe`) like any other helper of the client. SIGTERM while that probe runs (held at its start
+    // by the debug hold point) ends doctor with 143, and the probe has ended by the time doctor has. Before, the probe
+    // was started outside the client's stop and ran on after doctor ended.
+    let s = Sandbox::new()?;
+    let holds = s.home.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("wal-probe"), "")?;
+    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--live", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .env("HOH_DEBUG_HOLD_DIR", &holds)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut probe = None;
+    let outcome = (|| -> R<(bool, Duration)> {
+        let end = Instant::now() + Duration::from_secs(60);
+        let reached = holds.join("wal-probe.reached");
+        let pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&reached) {
+                break text.trim().parse()?;
+            }
+            if let Some(status) = doctor.try_wait()? {
+                return Err(format!("doctor ended before its WAL probe started: {status}").into());
+            }
+            if Instant::now() > end {
+                return Err("the WAL probe never started".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let held = probe.insert(rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?);
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&doctor),
+            rustix::process::Signal::TERM,
+        )?;
+        let at = Instant::now();
+        while doctor.try_wait()?.is_none() && at.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let took = at.elapsed();
+        Ok((pidfd_ended(held)?, took))
+    })();
+    // Whatever happened, doctor is ended and waited for, the hold opened and the probe killed if it lives on.
+    let _ = doctor.kill();
+    let out = doctor.wait_with_output()?;
+    let _ = std::fs::remove_file(holds.join("wal-probe"));
+    if let Some(probe) = &probe
+        && !pidfd_ended(probe).unwrap_or(true)
+    {
+        let _ = rustix::process::pidfd_send_signal(probe, rustix::process::Signal::KILL);
+    }
+    let (gone, took) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
+    assert!(gone, "the WAL self-test's probe outlived doctor");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    Ok(())
+}
+
+/// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
+fn pidfd_ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    let mut fds = [PollFd::new(pidfd, PollFlags::IN)];
+    let none = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    Ok(rustix::event::poll(&mut fds, Some(&none))? > 0)
+}
+
 /// The text form carries what the JSON carries for each agent: path, binary sha256, protocol, auth and capabilities
 /// (M1T07R-05).
 #[test]
