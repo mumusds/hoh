@@ -1802,7 +1802,9 @@ fn probe_attempts(tx: &Transaction<'_>, run_id: &str) -> Result<BTreeSet<String>
 /// Whether run `run_id`'s Commander, unavailable for `reasons`, may be probed at `now` (decision 5): only for capped
 /// failures or a failed turn's class (`model` as `capability`: docs/adr/ADR-030.md decision 11), its binding active;
 /// one probe per cooldown from the unavailability (or from the last probe's failed end), the next at once after a
-/// probe that settled. The wake to probe: the oldest capped one.
+/// probe that settled. The wake to probe: the oldest capped one with a retry left (docs/adr/ADR-022.md decision 16's
+/// design correction, rule 2: a wake's failures, its probes' included, get MAX_RETRIES retries after the first); when
+/// every capped wake has used them up, no probe: the run stays BLOCKED until a new Commander epoch.
 fn probe(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -1856,13 +1858,18 @@ fn probe(
         return Ok(None);
     }
     let cap = i64::from(crate::retry::MAX_RETRIES);
-    Ok(Some(
-        wakes
-            .iter()
-            .filter(|w| w.owed() && w.failures(epoch) >= cap)
-            .min_by_key(|w| w.woken_seq)
-            .map(|w| w.id.clone()),
-    ))
+    let capped: Vec<&Wake> = wakes
+        .iter()
+        .filter(|w| w.owed() && w.failures(epoch) >= cap)
+        .collect();
+    if capped.is_empty() {
+        return Ok(Some(None));
+    }
+    Ok(capped
+        .into_iter()
+        .filter(|w| w.failures(epoch) <= cap)
+        .min_by_key(|w| w.woken_seq)
+        .map(|w| Some(w.id.clone())))
 }
 
 /// How long a Commander may be without a session, or with its first input undelivered, while a decision is owed before
