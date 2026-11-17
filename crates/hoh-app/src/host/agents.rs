@@ -1251,7 +1251,8 @@ fn probed(agent: Agent, files: &Files, env: &ProbeEnv) -> Result<Ready, Probe> {
 
 /// The status of the read_only case (docs/adr/ADR-032.md decision 4, item 3) of `manifest`'s entry for `agent`, while
 /// that entry verifies `entry` under `suite_set` (`compat::verdict`); `None` otherwise, or when it has no such case.
-pub(crate) fn read_only_case(
+/// The session record and doctor's `read_only` item read it.
+pub fn read_only_case(
     manifest: Option<&CompatManifest>,
     agent: Agent,
     entry: &AgentEntry,

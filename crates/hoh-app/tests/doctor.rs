@@ -148,12 +148,22 @@ impl Sandbox {
                 "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0';;\n --help) cat '{f}/help.txt';;\n \
                  exec) [ \"$2\" = --help ] && cat '{exec}';;\n \
                  app-server) case \"$2\" in\n  --help) cat '{f}/help-app-server.txt';;\n  generate-json-schema) [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R '{schema}/.' \"$4/\";;\n  \
-                 *) exit 2;;\n esac;;\n login) if [ \"$2\" = status ]; then\n{answer}fi;;\n *) exit 2;;\nesac\n",
+                 *) exit 2;;\n esac;;\n login) if [ \"$2\" = status ]; then\n{answer}fi;;\n \
+                 sandbox) mode=$(cat '{mode}' 2>/dev/null)\n  case \"$mode\" in\n   confined) cat \"$5/token\"; exit 1;;\n   \
+                 unconfined) shift 6; exec \"$@\";;\n   unavailable) echo 'bwrap: No permissions to create a new namespace' >&2; exit 1;;\n   \
+                 *) echo \"error: unrecognized subcommand 'sandbox'\" >&2; exit 2;;\n  esac;;\n *) exit 2;;\nesac\n",
                 f = f.display(),
                 exec = exec_help.display(),
-                schema = schema.display()
+                schema = schema.display(),
+                mode = self.sandbox_mode().display()
             ),
         )
+    }
+
+    /// The file whose word fake codex's `sandbox` answers by (docs/adr/ADR-032.md decision 4): `confined`,
+    /// `unconfined`, `unavailable`, anything else (a usage error: unknown).
+    fn sandbox_mode(&self) -> PathBuf {
+        self.groups.path().join("sandbox-mode")
     }
 
     /// A codex that has neither app-server nor `exec --json`.
@@ -1202,5 +1212,156 @@ fn a_hung_git_init_does_not_hold_up_live() -> R {
             .is_some_and(|logs| Path::new(logs).starts_with(s.tmp.path())),
         "{live}"
     );
+    Ok(())
+}
+
+/// The Commander's read-only workspace profile on each agent (docs/adr/ADR-032.md decisions 4 and 7): doctor's
+/// `read_only` item gives `workspace` and its parts, the same as the host's registry judges them on the same binaries
+/// and manifest (whether `granted` has `read_only_workspace`), with how it is enforced and codex's host check; the exit
+/// code does not change with it. codex's check confined, unconfined, unavailable and unknown; a claude help without
+/// `--strict-mcp-config` (its compat suite passes, its read_only case fails).
+#[test]
+fn the_read_only_item_is_the_registrys_judgement() -> R {
+    let mut seen = Vec::new();
+    for (case, mode, claude_help) in [
+        ("confined", "confined", None),
+        ("unconfined", "unconfined", None),
+        ("unavailable", "unavailable", None),
+        ("unknown", "unknown", None),
+        (
+            "claude-without-strict-mcp",
+            "confined",
+            Some("--strict-mcp-config"),
+        ),
+    ] {
+        let s = Sandbox::new()?;
+        s.codex(Status::LoggedIn)?;
+        std::fs::write(s.sandbox_mode(), mode)?;
+        match claude_help {
+            Some(option) => {
+                let recorded = std::fs::read_to_string(fixtures().join("claude/2.1.318/help.txt"))?;
+                let help: String = recorded
+                    .split_inclusive('\n')
+                    .filter(|l| !l.contains(option))
+                    .collect();
+                assert_ne!(help, recorded);
+                let path = s.tmp.path().join("claude-help.txt");
+                std::fs::write(&path, help)?;
+                s.claude_with_help(Status::LoggedIn, &path)?;
+            }
+            None => s.claude(Status::LoggedIn)?,
+        }
+        s.pi(Status::LoggedIn)?;
+        s.register(&[Agent::Codex, Agent::Claude, Agent::Pi])?;
+        let (out, report, _) = s.doctor()?;
+        assert_eq!(out.status.code(), Some(0), "{case}: {report}");
+        let registry = hoh_app::host::agents::Registry::with_pi_dir(
+            s.path().into(),
+            Some(s.home.path().join(".pi/agent")),
+        );
+        registry.open_manifest(s.project.path());
+        registry.want(&["codex".to_owned(), "claude".to_owned(), "pi".to_owned()]);
+        registry.refresh();
+        for (agent, enforced_by) in [
+            (Agent::Codex, "os_sandbox"),
+            (Agent::Claude, "tool_allowlist"),
+            (Agent::Pi, "tool_allowlist"),
+        ] {
+            let name = agent.as_str();
+            let item = &report["agents"][name]["read_only"];
+            let granted = match registry.fact(agent) {
+                Some(hoh_core::staffing::Fact::Usable(usable)) => {
+                    usable.granted.contains("read_only_workspace")
+                }
+                other => return Err(format!("{case}: {name} is not usable: {other:?}").into()),
+            };
+            assert_eq!(
+                item["workspace"],
+                Value::Bool(granted),
+                "{case}: {name}: {item}"
+            );
+            assert_eq!(item["enforced_by"], enforced_by, "{case}: {name}");
+            assert!(
+                item["detail"].as_str().is_some_and(|d| !d.is_empty()),
+                "{case}: {name}: {item}"
+            );
+            let parts = &item["parts"];
+            let refused = case == "claude-without-strict-mcp" && agent == Agent::Claude;
+            let want = if refused {
+                (Value::Bool(false), Value::Bool(false), Value::from("FAIL"))
+            } else {
+                (Value::Bool(true), Value::Bool(true), Value::from("PASS"))
+            };
+            assert_eq!(
+                (
+                    parts["probe"].clone(),
+                    parts["builder"].clone(),
+                    parts["suite_case"].clone()
+                ),
+                want,
+                "{case}: {name}: {item}"
+            );
+            if agent == Agent::Codex {
+                assert_eq!(item["check"], mode, "{case}: {item}");
+                assert_eq!(parts["host_check"]["check"], mode, "{case}: {item}");
+                let snapshot = registry.snapshot(0);
+                assert_eq!(
+                    snapshot.probes["codex"]["host_check"]["check"], mode,
+                    "{case}: the registry's check"
+                );
+            } else {
+                assert!(item["check"].is_null(), "{case}: {name}: {item}");
+            }
+            seen.push(format!("{case} {name} {}", item["workspace"]));
+        }
+        // The check is one command of the shape doctor_live.rs's whitelist admits.
+        let checks: Vec<Vec<String>> = report["probes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|run| {
+                run["argv"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .skip(1)
+                    .filter_map(|a| a.as_str().map(str::to_owned))
+                    .collect::<Vec<String>>()
+            })
+            .filter(|args| args.first().map(String::as_str) == Some("sandbox"))
+            .collect();
+        assert_eq!(checks.len(), 1, "{case}: {checks:?}");
+        let check: Vec<&str> = checks[0].iter().map(String::as_str).collect();
+        assert!(
+            matches!(
+                check.as_slice(),
+                [
+                    "sandbox",
+                    "-P",
+                    ":read-only",
+                    "-C",
+                    _,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    _
+                ]
+            ),
+            "{case}: {check:?}"
+        );
+        // The text form shows it too.
+        let (out, _) = s.doctor_in(&[], &["--output", "text"], &[])?;
+        let text = String::from_utf8(out.stdout)?;
+        assert!(text.contains("read_only："), "{case}: {text}");
+    }
+    assert!(seen.contains(&"confined codex true".to_owned()), "{seen:?}");
+    for unusable in [
+        "unconfined codex false",
+        "unavailable codex false",
+        "claude-without-strict-mcp claude false",
+    ] {
+        assert!(seen.contains(&unusable.to_owned()), "{seen:?}");
+    }
+    assert!(seen.contains(&"unknown codex true".to_owned()), "{seen:?}");
     Ok(())
 }

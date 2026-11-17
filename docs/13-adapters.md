@@ -4,7 +4,7 @@
 
 probe()->Capabilities；start(ExecutionRequest)->AttemptHandle；send(Input)->DeliveryReceipt；subscribe()->EventStream；cancel()->CancelReceipt；resume(SessionRef)->AttemptHandle；inspect()->ObservedState；shutdown()->Result。
 
-能力包括structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage、command_execution（CR-021）。按版本/测试得到，不按品牌推断；判不了为 null（未知），只有 true 才算具备。Request带cwd、role、session_ref、prompt_bundle、budget、model_optional、runtime_profile。使用argv而非shell；模型字段为空即底座实际默认，执行后记录resolved model。
+能力包括structured_events、resume、mid_turn_steer、custom_tools、images、browser、ui_dialogs、token_usage、command_execution（CR-021）、read_only_workspace（CR-024）。按版本/测试得到，不按品牌推断；判不了为 null（未知），只有 true 才算具备。Request带cwd、role、session_ref、prompt_bundle、budget、model_optional、runtime_profile。使用argv而非shell；模型字段为空即底座实际默认，执行后记录resolved model。
 
 **command_execution**（ADR-030 决定 12）：适配器在 HoH 的启动选项（YOLO）下能运行命令。只由被测二进制的 help/schema 得出，每种 transport 一条解析规则，以未改动的录制品为正对照：
 
@@ -13,9 +13,11 @@ probe()->Capabilities；start(ExecutionRequest)->AttemptHandle；send(Input)->De
 - claude：help 声明 `--dangerously-skip-permissions`，且 `--tools` 的说明列出工具名 `Bash`（每个词剥去括号、引号与句末标点，按逗号拆分，逐段精确比较）；`--tools` 未声明为 null。`--restricted` 的说明不作依据。
 - pi：help 的 `Built-in Tool Names:` 段有名字恰为 `bash` 的一行（名字与说明在第一个 ` - ` 处分开，去掉首尾空白），且其说明不含 `off by default`；没有该段为 null。
 
-会话的能力是探测值与适配器在这种启动下实现的能力相与（claude、codex 在 YOLO 时，pi 总是），写进 `sessions.capabilities_json`。HoH 不传 `--tools`、`--no-tools` 之类缩小工具集的选项。离线的 true 只表示被测版本声明了运行命令的内置工具、并在 HoH 的启动选项下可用；真实 turn 里命令能否运行由 adapter-live 检查记录。
+会话的能力是探测值与适配器在这种启动下实现的能力相与（claude、codex 在 YOLO 时，pi 总是），写进 `sessions.capabilities_json`。会话记录不随职位变化：它按 YOLO 启动测量，所以 Commander 会话行上的 `command_execution` 是该适配器全权限下的能力，而 claude、pi 的 Commander turn 本身没有命令工具（ADR-032 决定 4）。除 Commander 的 turn 外，HoH 不传 `--tools`、`--no-tools` 之类缩小工具集的选项；Commander 的 turn 按只读工作区档启动（claude 为 `--tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --strict-mcp-config`，pi 为 `--tools read,grep,find,ls --no-mcp --no-extensions`，不加载任何扩展；codex 的线程为 `approvalPolicy: "never"`、`sandbox: "read-only"`；REQ-021 行为 9，ADR-032 决定 3）。
 
-**职位所需能力**（REQ-020 决定 1，ADR-030 决定 12）：所有职位要 structured_events；commander、reviewer 另要 resume；developer、qa 另要 command_execution。缺任一项的 Agent 不被选给该职位，判决行为 `<agent>:CAPABILITY_UNSUPPORTED:<缺的能力名>`（见“交接和Fallback”）。
+**read_only_workspace**（CR-024，ADR-032 决定 4）：适配器能以只读工作区档启动该 Agent。会话记录里的值是三项之与，都由被测二进制得出：探测规则（claude、pi 的 help 声明只读档的每个选项与取值；codex App Server 的只读 `thread/start`、`thread/resume` 对被测 schema 合法；codex 只有 exec 时为 false）、只读档的构建函数不拒绝、兼容清单里该版本的 `read_only` 用例为 PASS（它不计入 `suite.status`，FAIL 或 NOT_RUN 只使这一项不为 true）。选人时 codex 另看本 host 的两项事实：本机沙箱检查（`codex sandbox -P :read-only`，以临时 `CODEX_HOME` 运行）不为 unconfined 或 unavailable，App Server 没有在本 host 运行中降级为 exec；它们只从 `granted` 里去掉这项能力，不改会话记录，不使任何会话换绑。离线的 true 只表示被测版本声明了运行命令的内置工具、并在 HoH 的启动选项下可用；真实 turn 里命令能否运行由 adapter-live 检查记录。
+
+**职位所需能力**（REQ-020 决定 1，ADR-030 决定 12）：所有职位要 structured_events；commander、reviewer 另要 resume；developer、qa 另要 command_execution；commander 另要 read_only_workspace，按职位名判定，引用 commander 合同的自定义职位不要（CR-024，ADR-032 决定 4）。缺任一项的 Agent 不被选给该职位，判决行为 `<agent>:CAPABILITY_UNSUPPORTED:<缺的能力名>`（见“交接和Fallback”）。
 
 ## Codex
 
@@ -27,7 +29,7 @@ probe()->Capabilities；start(ExecutionRequest)->AttemptHandle；send(Input)->De
 
 -p + --output-format stream-json + --verbose，按需求启用include-partial-messages [S05,S06]。session元数据、消息/tool、result输出分开。error/interrupt/max-turns不等成功。stdio stream-input与resume以版本帮助和真样例确认，v1至少正确实现分轮resume与有界cancel。
 
-YOLO常见为--dangerously-skip-permissions，等价底座bypassPermissions；不将HoH Auto映射Claude permission auto。不是改掉原生system prompt，而是用官方支持的追加/Agent规则或任务上下文。保持原生工具能力。
+YOLO常见为--dangerously-skip-permissions，等价底座bypassPermissions；不将HoH Auto映射Claude permission auto。不是改掉原生system prompt，而是用官方支持的追加/Agent规则或任务上下文。非 Commander 的 turn 保持原生工具能力；Commander 的 claude 只有 Read、Grep、Glob，权限模式为 dontAsk（CR-024，ADR-032 决定 3）。
 
 ## Pi
 
