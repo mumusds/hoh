@@ -98,9 +98,9 @@ pub const TOOL_SERVER_REQUESTS: [(&str, &str); 2] = [
 
 /// The help texts the argv builders are given for the suite set: each declares every option its builder may pass, so
 /// the argv is the one the product builds wherever the tested help declares them (the suite checks the tested help).
-const CLAUDE_HELP: &str = "Usage: claude [options]\n  -p, --print\n  --output-format <format>  text, json, stream-json\n  --verbose\n  --include-partial-messages\n  --resume [sessionId]\n  --model <model>\n  --dangerously-skip-permissions\n";
+const CLAUDE_HELP: &str = "Usage: claude [options]\n  -p, --print\n  --output-format <format>  text, json, stream-json\n  --verbose\n  --include-partial-messages\n  --resume [sessionId]\n  --model <model>\n  --dangerously-skip-permissions\n  --tools <tools...>\n  --allowedTools <tools...>\n  --permission-mode <mode>  default, dontAsk\n  --strict-mcp-config\n";
 const CODEX_EXEC_HELP: &str = "Usage: codex exec [OPTIONS] [PROMPT]\n      --json\n      --dangerously-bypass-approvals-and-sandbox\n  -m, --model <MODEL>\n";
-const PI_HELP: &str = "Usage: pi [options]\n  --mode <mode>  text, json, rpc\n  --session-dir <dir>\n  --session-id <id>\n  --provider <name>\n  --model <id>\n";
+const PI_HELP: &str = "Usage: pi [options]\n  --mode <mode>  text, json, rpc\n  --session-dir <dir>\n  --session-id <id>\n  --provider <name>\n  --model <id>\n  --tools <tools>\n  --no-mcp\n  --no-extensions\n\nBuilt-in Tool Names:\n  read - Read\n  grep - Grep\n  find - Find\n  ls - List\n";
 
 /// Every embedded fixture file as a member of the suite set: `fixtures/<path>` with its bytes.
 pub fn fixture_members() -> Vec<(String, Vec<u8>)> {
@@ -139,9 +139,9 @@ pub fn built(suite: &str, case: &str, variant: fixtures::Variant) -> Value {
     match suite {
         "codex" => {
             let thread = if variant.resume {
-                requests::thread_resume(1, crate::Profile::Yolo, model, SUITE_SESSION)
+                requests::thread_resume(1, variant.profile, model, SUITE_SESSION)
             } else {
-                requests::thread_start(1, crate::Profile::Yolo, model)
+                requests::thread_start(1, variant.profile, model)
             };
             let mut messages = vec![
                 requests::initialize(0),
@@ -207,7 +207,7 @@ pub fn argv(
             exec_help: help.to_owned(),
             exec_resume_help: resume_help.map(str::to_owned),
             cwd: PathBuf::from(SUITE_CWD),
-            profile: crate::Profile::Yolo,
+            profile: variant.profile,
             resume,
             model,
             known: Default::default(),
@@ -220,7 +220,7 @@ pub fn argv(
             program: PathBuf::from("claude"),
             help: help.to_owned(),
             cwd: PathBuf::from(SUITE_CWD),
-            profile: crate::Profile::Yolo,
+            profile: variant.profile,
             partial: false,
             resume,
             model,
@@ -239,7 +239,7 @@ pub fn argv(
             provider: None,
             model,
             settled_event: true,
-            profile: crate::Profile::Yolo,
+            profile: variant.profile,
             capabilities: crate::capabilities::Probed::new(),
         })
         .map_err(|crate::pi::Blocked(why)| why),
