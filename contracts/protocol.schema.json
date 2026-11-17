@@ -996,7 +996,7 @@
       ]
     },
     "RejectionReason": {
-      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003). RETRY_NOT_DUE (CR-009): the task waits for its persisted next_retry_at (REQ-042).",
+      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003). RETRY_NOT_DUE (CR-009): the task waits for its persisted next_retry_at (REQ-042). ROLE_BINDING_PENDING (CR-025): the target role's binding is ACTIVE and cannot be dispatched now only because one of these holds: (1) a team change of the role waits for its checkpoint (REQ-018); (2) staffing holds a rebind of the role pending for the attempt in flight (REQ-020); (3) the binding has no session yet; (4) the session.start notice of the role's epoch, which carries the handover package, is not delivered yet (REQ-019); (5) the role's session owes its first input (the session.start of its epoch was delivered to it and none of its attempts is SETTLED) and has an attempt PREPARED, STARTING or RUNNING. These are exactly the cases in which an ACTIVE binding could not be dispatched before this code; it names them and adds none. A session that owes its first input with no attempt in flight is dispatched: that dispatch is the turn that delivers the package. ROLE_CAPABILITY_MISSING stays for: no binding of the role; a BLOCKED binding; no role contract stating the capabilities the task needs, which takes precedence over (1) to (5); and a session lacking a capability the task needs, which takes precedence over (4) and (5), where that session is the one that will serve, and is not judged under (1) to (3), where the serving session is not settled yet. The task is not reassigned: it stays READY, and the scheduling round dispatches it once the change has completed, with no new decision.",
       "enum": [
         "STALE_ROLE_EPOCH",
         "STALE_REVISION",
@@ -1011,7 +1011,8 @@
         "SESSION_NOT_INDEPENDENT",
         "KEY_REUSE",
         "LEASE_UNAVAILABLE",
-        "RETRY_NOT_DUE"
+        "RETRY_NOT_DUE",
+        "ROLE_BINDING_PENDING"
       ]
     },
     "ErrorCode": {

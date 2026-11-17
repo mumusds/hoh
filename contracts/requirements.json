@@ -2142,7 +2142,8 @@
     "同一问题本地修复≤3次、协议格式纠正≤2次（max_local_repairs/max_protocol_repairs）；超限即升级决策，不再派发同类修复。",
     "预算（max_iterations=100、max_duration_hours=120、可选token/费用上限）必须派发前预留并持久累计；耗尽或deadline_at到达即停止新派发，Run=INCOMPLETE并列出剩余项。",
     "价格未知时cost必须为null并标unknown；不以估算冒充账单。配置了费用上限而所用模型价格未知时，该上限无法执行，派发前即BLOCKED（BUDGET_UNENFORCEABLE）。",
-    "wall deadline与inactivity watchdog必须分别计时；无输出但工具进程仍运行不判为死机。"
+    "wall deadline与inactivity watchdog必须分别计时；无输出但工具进程仍运行不判为死机。",
+    "预算风险（REQ-021行为1的“budget 风险”）：Runtime每次推进Run（pace）判定预算停止时，在同一事务内对每种已设上限的预算也判定风险；读取预算、查重与写事件同在这一事务；其他只判定能否派发的预算检查（调度准入、派发决策、Commander turn的分配）不判定风险，它们先看到的越线在下一次pace时写。判定：max_iterations、max_duration_hours与价格已知的max_usd按停止的同一口径（已用加预留）达到上限的80%；deadline_at按墙钟，自Run创建起经过的时长达到创建至deadline_at时长的80%（该时长不为正时不判定）。成立、该预算的停止尚不成立、且该Run该种在该上限下还没有风险事件时，写一条budget.risk{kind, used, limit, unit, threshold}：threshold为0.8；used为判定所用的总量（已用加预留，deadline_at为已过去的墙钟秒数）；limit为同单位的上限（deadline_at为创建至deadline_at的秒数）。按水平判定：暂停期间越过的，在恢复后第一次判定时写。上限改变后按新上限重新判定。同一Run、同一种、同一上限只写一次，重启后不重复。它只唤醒Commander，不改变任何预算的执行：停止派发仍只在用尽或deadline到达时发生，也不计入重试次数（CR-025）。"
    ],
    "failure_modes": [
     "当host在WAITING_EXTERNAL期间重启时，attempt_count、next_retry_at、已用预算保持不变，重启后不立即重试。",
@@ -2202,6 +2203,13 @@
      "when": "两个Run各尝试派发第一个Attempt。",
      "then": "Rc在派发前进入BLOCKED、原因BUDGET_UNENFORCEABLE、attempts=0；Rd正常派发，cost_usd=null且cost_status=unknown。",
      "test_id": "TEST-042-06"
+    },
+    {
+     "id": "AC-042-07",
+     "given": "Run Re设max_iterations=100，已用迭代79；Run Rf设deadline_at=创建时刻+100 s（墙钟）；FakeClock。",
+     "when": "Re的预算判定一次；已用迭代到80后判定一次、再判定一次、重启（重新打开库）后再判定一次；Rf的墙钟到创建后79 s与80 s各判定一次。",
+     "then": "Re在79时budget.risk为0条；到80时恰好1条budget.risk{kind:max_iterations, used:80, limit:100, unit:iterations, threshold:0.8}，之后的判定与重启后的判定都不再写；Rf在79 s时0条，80 s时恰好1条{kind:deadline_at, used:80, limit:100, unit:seconds, threshold:0.8}；这些判定前后，两个Run的state、派发数与attempt_count都不变。",
+     "test_id": "TEST-042-07"
     }
    ],
    "decisions": [
@@ -2209,7 +2217,8 @@
     "已修正（CR-002）：价格未知时 cost 为 null 并显示 unknown；若用户配置了费用上限而所用模型价格未知，该上限无法执行，派发前即 BLOCKED（BUDGET_UNENFORCEABLE），不在无法核算时继续花费；未配置费用上限时照常受其他预算约束。",
     "命名已统一（CR-001）：BLOCKED_AUTH/BLOCKED_CAPABILITY 为阻塞原因，CAPABILITY_UNSUPPORTED 为错误码；runs 已含 blocked_reason 列。",
     "tasks 已含 attempt_count、next_retry_at；预算账本为 budgets 表（CR-001 SQL）。",
-    "（CR-003）费用与期限配置键：[budget] max_usd（可选，缺省表示未设费用上限）、deadline_at（可选，RFC 3339 UTC）；与 max_duration_hours、max_iterations 同属 [budget]。"
+    "（CR-003）费用与期限配置键：[budget] max_usd（可选，缺省表示未设费用上限）、deadline_at（可选，RFC 3339 UTC）；与 max_duration_hours、max_iterations 同属 [budget]。",
+    "预算风险的阈值80%为初值，是预警而不是保证：通常在停止之前还留有上限的约五分之一，供Commander重排剩余工作、向用户提出范围调整或请用户追加预算；一次迭代或一个Attempt的预留可能一步越过80%直到100%，那时只有停止，没有风险事件。更早的阈值在长Run中过早唤醒，更晚的留下的余量不够一次派发。价格未知的费用上限无法执行（BUDGET_UNENFORCEABLE），没有风险可报。kind取停止的名字（max_iterations、max_duration_hours、max_usd、deadline_at，与run.incomplete的stop相同）；unit为iterations、seconds或usd（max_duration_hours与deadline_at为seconds）。deadline_at与它的停止一样用墙钟；max_duration_hours只计Attempt的已用加预留，等待不计入（CR-025）。"
    ]
   },
   {

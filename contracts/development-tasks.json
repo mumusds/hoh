@@ -704,6 +704,27 @@
    "done_when": "REQ-020 全部 AC 与 AC-027-04 通过。绑定恢复后，BLOCKED_AUTH/BLOCKED_CAPABILITY 的验证 Task 回到可派发（ADR-028 的出口表，CR-018）。"
   },
   {
+   "id": "M2-T21",
+   "milestone": "M2",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "CR-025 细化：预算风险（budget.risk）的产生、交接期间的派发拒绝码 ROLE_BINDING_PENDING、门禁在无 date-time 校验时拒绝判定",
+   "depends_on": [
+    "M2-T13",
+    "M2-T19"
+   ],
+   "requirements": [
+    "REQ-042",
+    "REQ-035",
+    "REQ-021"
+   ],
+   "acceptance": [
+    "AC-042-07"
+   ],
+   "done_when": "AC-042-07 通过；REQ-042 行为 9 与决定 6 的其余部分（各种预算的口径、deadline_at 的墙钟与不为正的跨度、按水平判定、每个上限一条、pace 没有别的写入时也提交、WAITING_EXTERNAL 与 BLOCKED 中照写、不计入重试、经 supervise 唤醒 Commander 与提交后崩溃的恢复）由 CR-025“影响”所列的 budget.rs、pace 与唤醒测试覆盖。ROLE_BINDING_PENDING 没有自己的 AC：由 CR-025“影响”所列的单元与 decide 测试覆盖（五项各自成立、首个派发与失败后重试的正对照、交叉与优先次序、被接受与否不变、屏障解除后调度轮派发），AC-035-01（TEST-035-01）的缺能力一例仍为 ROLE_CAPABILITY_MISSING。门禁的拒绝没有 AC：由与 release_gate.py 的修改同一提交的 bundle 测试（红灯先行）与无 format 附加包 venv 的实测覆盖，仿本一半已由 tests/bundle/test_traceability.py:90 覆盖。"
+  },
+  {
    "id": "M2-T13",
    "milestone": "M2",
    "kind": "implement",
@@ -754,7 +775,8 @@
     "M2-T14",
     "M2-T15",
     "M2-T17",
-    "M2-T18"
+    "M2-T18",
+    "M2-T21"
    ],
    "requirements": [
     "REQ-001",
