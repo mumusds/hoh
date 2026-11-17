@@ -1,21 +1,30 @@
-//! A private directory (docs/adr/ADR-016.md, the note's round 4 correction): made by this call with create_dir under an
-//! unpredictable name, mode 0700, in the directory whose file system it is to use. The WAL self-test and the room probe
-//! keep all their files in one, so that removing it removes nothing outside it, and nothing another creator made in the
-//! shared directory. A same-user process that deliberately writes into it, renames or replaces it is the stated
-//! residual.
+//! A private directory (docs/adr/ADR-016.md, the note's rounds 4 and 5): made by this call with create_dir under an
+//! unpredictable name, mode 0700, in the directory whose file system it is to use, then opened at once with
+//! O_DIRECTORY|O_NOFOLLOW and held open for its whole life. The WAL self-test and the room probe keep all their files in
+//! one. Everything this code makes or removes in it goes through that handle (openat, unlinkat; a symlink in it is
+//! unlinked, never followed), so neither a symlink in it nor the directory swapped for another or for a symlink leads
+//! outside it (F7-400); the directory itself is removed by its name only while that name is still the directory held.
+//! The residual: SQLite opens its files in it by path, and a same-user process that tampers with it is not defended
+//! against.
 
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags};
+use std::ffi::{CString, OsStr};
 use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
-/// A directory this call made, removed with what is in it by [`Private::remove`].
+/// A directory this call made, held open; removed with what is in it by [`Private::remove`].
 #[derive(Debug)]
 #[must_use = "a private directory is removed by Private::remove"]
 pub(super) struct Private {
     path: PathBuf,
+    dir: OwnedFd,
+    made: rustix::fs::Stat,
 }
 
-/// A path of a private directory that could not be removed: its exact path and the OS's reason.
+/// A path of a private directory that could not be removed: its exact path and the reason.
 #[derive(Debug)]
 pub(super) struct Leftover {
     pub(super) path: PathBuf,
@@ -56,10 +65,16 @@ pub(super) fn names(base: &Path, count: usize) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 
+/// The directory flags every directory of ours is opened with: never through a symlink.
+fn directory() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
 impl Private {
-    /// Make the first of `names` that does not exist (create_dir: exclusive; mode 0700). A name that exists is
-    /// another's and is skipped. The error: the path and the OS error that refused one, or the last name with
-    /// AlreadyExists when every one exists.
+    /// Make the first of `names` that does not exist (create_dir: exclusive; mode 0700) and open it at once. A name
+    /// that exists is another's and is skipped. The error: the path and the reason one was refused (a name that is not
+    /// an empty directory of ours when opened was swapped: refused, left as it is), or the last name with AlreadyExists
+    /// when every one exists.
     pub(super) fn make_first(
         names: impl IntoIterator<Item = PathBuf>,
     ) -> Result<Private, (PathBuf, io::Error)> {
@@ -69,7 +84,9 @@ impl Private {
         );
         for path in names {
             match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Private { path }),
+                Ok(()) => {
+                    return Private::opened(&path).map_err(|e| (path, e));
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => taken = (path, e),
                 Err(e) => return Err((path, e)),
             }
@@ -77,49 +94,121 @@ impl Private {
         Err(taken)
     }
 
+    /// The directory just made at `path`, opened: it must still be a directory (O_NOFOLLOW: not a symlink), ours, and
+    /// empty, else it was swapped since it was made.
+    fn opened(path: &Path) -> io::Result<Private> {
+        let dir = rustix::fs::open(path, directory(), Mode::empty())?;
+        let made = rustix::fs::fstat(&dir)?;
+        let empty = Dir::read_from(&dir)?
+            .map(|entry| entry.map(|e| matches!(e.file_name().to_bytes(), b"." | b"..")))
+            .collect::<Result<Vec<bool>, _>>()?
+            .into_iter()
+            .all(|dot| dot);
+        if made.st_uid != rustix::process::geteuid().as_raw() || !empty {
+            return Err(io::Error::other(
+                "not the empty directory this call made: it was swapped since",
+            ));
+        }
+        Ok(Private {
+            path: path.to_owned(),
+            dir,
+            made,
+        })
+    }
+
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Remove every entry in it (a directory with what is in it), then it: every path that stays is told, with the
-    /// OS's reason (F7-302).
+    /// Make the file `name` in it (O_EXCL, O_NOFOLLOW, mode 0600), through its handle.
+    pub(super) fn create(&self, name: &str) -> io::Result<std::fs::File> {
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::openat(&self.dir, name, flags, Mode::from_raw_mode(0o600))?;
+        Ok(std::fs::File::from(fd))
+    }
+
+    /// Remove every entry in it through its handle (a directory: its entries, then it; a symlink: unlinked, never
+    /// followed), then it, by its name, while that name is still this directory. Every path that stays is told, with
+    /// the reason (F7-302, F7-400).
     pub(super) fn remove(self) -> Vec<Leftover> {
         let mut left = Vec::new();
-        remove_tree(&self.path, &mut left);
+        empty(&self.dir, &self.path, &mut left);
+        let still = rustix::fs::statat(CWD, &self.path, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|now| (now.st_dev, now.st_ino) == (self.made.st_dev, self.made.st_ino));
+        if !still {
+            left.push(Leftover {
+                path: self.path,
+                error: io::Error::other(
+                    "the name is no longer the directory this call made (that one was emptied where it is now)",
+                ),
+            });
+        } else if let Err(e) = rustix::fs::unlinkat(CWD, &self.path, AtFlags::REMOVEDIR) {
+            left.push(Leftover {
+                path: self.path,
+                error: e.into(),
+            });
+        }
         left
     }
 }
 
-fn remove_tree(dir: &Path, left: &mut Vec<Leftover>) {
-    match std::fs::read_dir(dir) {
+/// Remove every entry of the directory open as `dir` (its path for the telling: `at`), through it.
+fn empty(dir: &OwnedFd, at: &Path, left: &mut Vec<Leftover>) {
+    let entries: Vec<(CString, FileType)> = match Dir::read_from(dir) {
         Ok(entries) => {
+            let mut named = Vec::new();
             for entry in entries {
                 match entry {
-                    Ok(entry) => {
-                        let path = entry.path();
-                        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                            remove_tree(&path, left);
-                        } else if let Err(error) = std::fs::remove_file(&path) {
-                            left.push(Leftover { path, error });
-                        }
+                    Ok(entry) if !matches!(entry.file_name().to_bytes(), b"." | b"..") => {
+                        named.push((entry.file_name().to_owned(), entry.file_type()));
                     }
-                    Err(error) => left.push(Leftover {
-                        path: dir.to_owned(),
-                        error,
-                    }),
+                    Ok(_) => {}
+                    Err(e) => {
+                        left.push(Leftover {
+                            path: at.to_owned(),
+                            error: e.into(),
+                        });
+                        break;
+                    }
                 }
             }
+            named
         }
-        Err(error) => left.push(Leftover {
-            path: dir.to_owned(),
-            error,
-        }),
-    }
-    if let Err(error) = std::fs::remove_dir(dir) {
-        left.push(Leftover {
-            path: dir.to_owned(),
-            error,
-        });
+        Err(e) => {
+            left.push(Leftover {
+                path: at.to_owned(),
+                error: e.into(),
+            });
+            return;
+        }
+    };
+    for (name, kind) in entries {
+        let path = at.join(OsStr::from_bytes(name.to_bytes()));
+        let kind = match kind {
+            FileType::Unknown => {
+                rustix::fs::statat(dir, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    .map_or(FileType::Unknown, |s| FileType::from_raw_mode(s.st_mode))
+            }
+            kind => kind,
+        };
+        let removed = if kind == FileType::Directory {
+            match rustix::fs::openat(dir, name.as_c_str(), directory(), Mode::empty()) {
+                Ok(sub) => {
+                    empty(&sub, &path, left);
+                    rustix::fs::unlinkat(dir, name.as_c_str(), AtFlags::REMOVEDIR)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            rustix::fs::unlinkat(dir, name.as_c_str(), AtFlags::empty())
+        };
+        if let Err(e) = removed {
+            left.push(Leftover {
+                path,
+                error: e.into(),
+            });
+        }
     }
 }
 
@@ -180,6 +269,56 @@ mod tests {
                 [second.join("sub/file"), second.join("sub"), second.clone()]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn its_cleanup_never_follows_a_symlink_out_of_it() -> Result<(), Box<dyn std::error::Error>> {
+        // F7-400: a symlink in it is unlinked, not followed; swapped for a symlink to another directory after it was
+        // made, it is emptied where it really is and its name is left and told; the other directory keeps its files.
+        let parent = tempfile::tempdir()?;
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("sentinel"), "kept")?;
+
+        let path = names(&parent.path().join("p-"), 1)?.remove(0);
+        let private = Private::make_first([path.clone()]).map_err(|(_, e)| e)?;
+        std::os::unix::fs::symlink(&outside, path.join("link"))?;
+        drop(private.create("room")?);
+        assert!(private.remove().is_empty());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(outside.join("sentinel"))?, "kept");
+
+        let private = Private::make_first([path.clone()]).map_err(|(_, e)| e)?;
+        drop(private.create("room")?);
+        let moved = parent.path().join("moved");
+        std::fs::rename(&path, &moved)?;
+        std::os::unix::fs::symlink(&outside, &path)?;
+        let left = private.remove();
+        assert_eq!(
+            left.iter().map(|l| l.path.as_path()).collect::<Vec<_>>(),
+            [path.as_path()]
+        );
+        assert_eq!(std::fs::read_to_string(outside.join("sentinel"))?, "kept");
+        assert_eq!(std::fs::read_dir(&moved)?.count(), 0, "emptied where it is");
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&moved)?;
+
+        // Swapped for another's empty directory: that one is not removed either.
+        let private = Private::make_first([path.clone()]).map_err(|(_, e)| e)?;
+        std::fs::rename(&path, &moved)?;
+        std::fs::create_dir(&path)?;
+        assert_eq!(private.remove().len(), 1);
+        assert!(path.is_dir(), "another's directory stays");
+        std::fs::remove_dir(&path)?;
+        std::fs::remove_dir(&moved)?;
+
+        let other = parent.path().join("other");
+        std::os::unix::fs::symlink(&outside, &other)?;
+        let refused = Private::make_first([other.clone()])
+            .map(|_| ())
+            .map_err(|(p, e)| (p, e.kind()));
+        assert_eq!(refused, Err((other, io::ErrorKind::AlreadyExists)));
         Ok(())
     }
 }

@@ -17,14 +17,18 @@
  *   F7_CLEANUP_ERRNO  optional: after the first fault, the next pread of a self-test file fails once with this errno
  *                  (EINTR: SQLite retries it, and the errno of the failed call is gone when SQLite returns)
  *   F7_IO_NTH      optional: the first fault at the Nth matching call, not the first (default 1)
- *   F7_RIVAL_OP, F7_RIVAL_ON  optional: once, at the first `op` (pwrite, write, sync, truncate, pread, or close: just
- *                  after it) of a matching
- *                  file whose path ends with F7_RIVAL_ON, another creator makes a file of its own, holding
- *                  "FOREIGN-CREATOR-DATA\n": named as that file with F7_RIVAL_ON replaced by F7_RIVAL_SWAP (default: the
- *                  same name), in F7_RIVAL_IN (default: that file's directory); with F7_RIVAL_REPLACE it first removes
- *                  what is at that name (a delete and re-create). It works with the real calls, past this shim.
- *   F7_UNLINK_ERRNO, F7_UNLINK_SUFFIX  optional: every unlink of a matching file whose path ends with the suffix fails
- *                  with that errno, from the first call on
+ *   F7_RIVAL_OP, F7_RIVAL_ON  optional: once, at the first `op` (pwrite, write, sync, truncate, pread, open: just
+ *                  before it, or close, mkdir: just after it) of a matching path that ends with F7_RIVAL_ON, another
+ *                  process acts (F7_RIVAL_PARENT: not in the probe process), as F7_RIVAL_DO says:
+ *                  file (the default) makes a file of its own, holding "FOREIGN-CREATOR-DATA\n", named as that file with
+ *                  F7_RIVAL_ON replaced by F7_RIVAL_SWAP (default: the same name), in F7_RIVAL_IN (default: that file's
+ *                  directory); with F7_RIVAL_REPLACE it first removes what is at that name (a delete and re-create);
+ *                  chmod makes that file's directory 0500 (nothing in it can be removed);
+ *                  swapdir renames that file's directory to `<it>.moved` and puts a symlink to F7_RIVAL_VICTIM in its
+ *                  place; swapself does so to the path itself (a directory just made).
+ *                  It works with the real calls, past this shim.
+ * The cleanup of the self-test's private directory works through rustix's own system calls (openat, unlinkat), which this
+ * shim does not see; SQLite, std's files and the hooks above go through libc.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -34,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -53,8 +58,9 @@ static void rival(const char *path, const char *op) {
     const char *swap = getenv("F7_RIVAL_SWAP");
     const char *in = getenv("F7_RIVAL_IN");
     size_t len = strlen(path);
+    const char *act = getenv("F7_RIVAL_DO");
     if (rival_done || !kind || !on || strcmp(kind, op) != 0 || len < strlen(on) ||
-        strcmp(path + len - strlen(on), on) != 0) {
+        strcmp(path + len - strlen(on), on) != 0 || (getenv("F7_RIVAL_PARENT") && getenv("HOH_WAL_PROBE_DB"))) {
         return;
     }
     rival_done = 1;
@@ -62,6 +68,26 @@ static void rival(const char *path, const char *op) {
         real_write = dlsym(RTLD_NEXT, "write");
         real_open = dlsym(RTLD_NEXT, "open64");
         real_unlink = dlsym(RTLD_NEXT, "unlink");
+    }
+    if (act && (strcmp(act, "chmod") == 0 || strcmp(act, "swapdir") == 0 || strcmp(act, "swapself") == 0)) {
+        char dir[4096], moved[4200];
+        const char *slash = strcmp(act, "swapself") == 0 ? path + len : strrchr(path, '/');
+        if (!slash || (size_t)(slash - path) >= sizeof dir) {
+            return;
+        }
+        memcpy(dir, path, (size_t)(slash - path));
+        dir[slash - path] = 0;
+        if (strcmp(act, "chmod") == 0) {
+            chmod(dir, 0500);
+            return;
+        }
+        snprintf(moved, sizeof moved, "%s.moved", dir);
+        if (getenv("F7_RIVAL_VICTIM") && rename(dir, moved) == 0) {
+            if (symlink(getenv("F7_RIVAL_VICTIM"), dir) != 0) {
+                /* nothing to do: the directory is moved either way */
+            }
+        }
+        return;
     }
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -234,6 +260,9 @@ static int created(const char *path, int flags) {
 
 int open64(const char *path, int flags, ...) {
     REAL(int, "open64", (const char *, int, ...));
+    if (matching(path)) {
+        rival(path, "open");
+    }
     int mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap;
@@ -251,6 +280,9 @@ int open64(const char *path, int flags, ...) {
 
 int open(const char *path, int flags, ...) {
     REAL(int, "open", (const char *, int, ...));
+    if (matching(path)) {
+        rival(path, "open");
+    }
     int mode = 0;
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list ap;
@@ -266,20 +298,6 @@ int open(const char *path, int flags, ...) {
     return real(path, flags, mode);
 }
 
-int unlink(const char *path) {
-    REAL(int, "unlink", (const char *));
-    const char *err = getenv("F7_UNLINK_ERRNO");
-    const char *suffix = getenv("F7_UNLINK_SUFFIX");
-    const char *match = getenv("F7_IO_MATCH");
-    size_t len = strlen(path);
-    if (err && suffix && strstr(path, match ? match : ".hoh-wal-selftest-") && len >= strlen(suffix) &&
-        strcmp(path + len - strlen(suffix), suffix) == 0) {
-        errno = atoi(err);
-        return -1;
-    }
-    return real(path);
-}
-
 int close(int fd) {
     REAL(int, "close", (int));
     char path[4096];
@@ -293,4 +311,15 @@ int close(int fd) {
         errno = saved;
     }
     return closed;
+}
+
+int mkdir(const char *path, mode_t mode) {
+    REAL(int, "mkdir", (const char *, mode_t));
+    int made = real(path, mode);
+    if (made == 0 && matching(path)) {
+        int saved = errno;
+        rival(path, "mkdir");
+        errno = saved;
+    }
+    return made;
 }

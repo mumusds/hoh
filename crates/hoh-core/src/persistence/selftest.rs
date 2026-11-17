@@ -561,7 +561,11 @@ pub fn probe_main() -> i32 {
 pub(super) trait ProbeBehaviour {
     /// Open the database.
     fn open(&self, db: &Path) -> rusqlite::Result<Connection> {
-        Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        // As the parent opens it: no symlink on the way (SQLite refuses one, SQLITE_CANTOPEN_SYMLINK).
+        Connection::open_with_flags(
+            db,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
     }
 
     /// The row count to answer, given the count read now and the first one answered.
