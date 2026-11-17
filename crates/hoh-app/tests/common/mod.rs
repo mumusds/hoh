@@ -141,10 +141,50 @@ pub fn recorded_processes(mark: &std::path::Path) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// SIGKILL to each process the records at `mark` name, only while it is still that process ([`Recorded`]).
+/// SIGKILL to each process the records at `mark` name, only while it is still that process ([`Recorded`]); then until
+/// each has ended, and the records again, as long as a reading names a process not yet ended (at most 10 s in all). A
+/// fixture's process registers each child it forks before the child goes on, and a child never registered ends by
+/// itself (CIRF-02): with the creators outside the records ended first (the test's guards for them are dropped
+/// before this one), a recorded creator that registered a child just before its end is the only source of a new name.
 pub fn end_recorded(mark: &std::path::Path) {
-    for (pid, start) in recorded_processes(mark) {
-        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut done = std::collections::BTreeSet::new();
+    loop {
+        let fresh: Vec<(u32, String)> = recorded_processes(mark)
+            .into_iter()
+            .filter(|p| !done.contains(p))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        for (pid, start) in &fresh {
+            let _ =
+                hoh_agents::identity::signal_if_same(*pid, start, rustix::process::Signal::KILL);
+        }
+        until_ended_by(&fresh, end);
+        done.extend(fresh);
+        if std::time::Instant::now() > end {
+            return;
+        }
+    }
+}
+
+/// Wait until each process (pid and start time) has ended, by identity::ended, for at most 10 s (cleanup: a look that
+/// fails counts as ended).
+pub fn until_ended(processes: &[(u32, String)]) {
+    until_ended_by(
+        processes,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    );
+}
+
+fn until_ended_by(processes: &[(u32, String)], end: std::time::Instant) {
+    for (pid, start) in processes {
+        while !hoh_agents::identity::ended(*pid, Some(start)).unwrap_or(true)
+            && std::time::Instant::now() < end
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
