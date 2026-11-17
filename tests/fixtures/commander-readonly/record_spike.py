@@ -227,13 +227,35 @@ def session_id_of_claude(out: bytes) -> str | None:
     return next((f.get('session_id') for f in rec.frames(out) if f.get('type') == 'system' and f.get('subtype') == 'init'), None)
 
 
+class FedProc(rec.Proc):
+    """A recorder process that also observes what claude.rs observes of its stdin (`fed`): whether every byte of the
+    prompt was written before stdin closed. Input still pending when stdin closes (the CLI stopped reading: EPIPE, or
+    it ended first) was not delivered."""
+
+    undelivered = False
+
+    def close_stdin(self) -> None:
+        if self.pending:
+            self.undelivered = True
+        super().close_stdin()
+
+
 def claude_case(sp: Spike, case: str, argv: list[str], project: Project, notes: str, timeout: float = 900,
                 prompt: str | None = None) -> bytes:
+    """One claude turn, with the external observations the claude adapter makes (ADR-032 design correction 7, the
+    replay's input; claude.rs `Driven::verdict`): whether the prompt was fed (`prompt_fed`), the process's end, and
+    whether stdout and stderr were both read to their end."""
     sent = (prompt or project.prompt()).encode()
     before = project.snapshot()
-    out, err, rc, how = rec.run(argv, sent, project.w, timeout=timeout)
-    sp.save('claude', case, project, argv, sent, out, err, rc, how, before, project.snapshot(), notes)
-    return out
+    proc = FedProc(argv, project.w)
+    proc.write(sent)
+    how = proc.stop(grace=timeout)
+    observations = {'prompt_fed': not proc.undelivered and proc.p.stdin.closed,
+                    'exit': {'returncode': proc.returncode, 'how': str(how)},
+                    'logs_complete': str(how) == 'exited' and not proc.reading()}
+    sp.save('claude', case, project, argv, sent, proc.out, proc.err, proc.returncode, how, before, project.snapshot(),
+            notes, {'observations': observations})
+    return proc.out
 
 
 def claude(sp: Spike) -> None:

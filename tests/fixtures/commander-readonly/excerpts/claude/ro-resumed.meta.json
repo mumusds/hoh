@@ -15,7 +15,7 @@
   "dontAsk",
   "--strict-mcp-config",
   "--resume",
-  "<uuid-12>"
+  "<uuid-345>"
  ],
  "exit_code": 0,
  "stopped": "exited",
@@ -25,13 +25,14 @@
   "removed": [],
   "changed": []
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/claude/ro-resumed/snapshot.json",
- "snapshot_sha256": "be419753e4021c334b78f4be910dd607239c0fd98a5825f384b0fe9e8ed102dd",
- "stdout_sha256": "80a0125953a1990fbddf6a55ee7f2e65aa91128195f997f2cb2c0f9d2c1069fc",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T003759Z/claude/ro-resumed/snapshot.json",
+ "snapshot_sha256": "d9dfc6a036583f22ba7f948f1128857c51d320015e6b83d2a3c4cd1488c5ab09",
+ "stdout_sha256": "a2ea4af8ae459fd3ab0770b5deff67eee51bb61b0ff1afa6af67f4034fe507aa",
  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "token_sha256": "ca0da904c71c551cb3451b538570d5bdc4495b29e7055ec42aeaafada005b5c3",
+ "token_sha256": "ba149e76cb40ec3318bf728830e434c37469b343654a59009ef38b909c3ec247",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "observations": {
+  "prompt_fed": true,
   "exit": {
    "returncode": 0,
    "how": "exited"

@@ -7,9 +7,9 @@
     "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E2": {
-     "Bash toolu_01Fv87HwmpQRjaVWVstCo99a": "success",
-     "Read toolu_012q1zDQurRqGSSLQg3PHgrp": "success",
-     "Write toolu_01LqfJbBSRpZ8M5vcxfujrzZ": "success"
+     "Bash toolu_01TdQAYC7KPYcX2rq2a31D66": "success",
+     "Read toolu_01Kb3sHCXjF2hfbG11XQxV1z": "success",
+     "Write toolu_01QJAgDC4msiZXXgS98ozRPM": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -19,9 +19,9 @@
     "E10": "breach: P/.git/hoh-shell-create, P/.hoh/hoh-shell-create, P/hoh-shell-create, P/hoh-tool-create, W/hoh-shell-create, P/.git/hoh-shell-delete, P/.hoh/hoh-shell-delete, P/hoh-shell-delete, W/hoh-shell-delete, P/.git/hoh-shell-modify, P/.hoh/hoh-shell-modify, P/hoh-shell-modify, W/hoh-shell-modify",
     "E11": "conform",
     "E2": {
-     "Bash toolu_01Fv87HwmpQRjaVWVstCo99a": "success",
-     "Read toolu_012q1zDQurRqGSSLQg3PHgrp": "success",
-     "Write toolu_01LqfJbBSRpZ8M5vcxfujrzZ": "success"
+     "Bash toolu_01TdQAYC7KPYcX2rq2a31D66": "success",
+     "Read toolu_01Kb3sHCXjF2hfbG11XQxV1z": "success",
+     "Write toolu_01QJAgDC4msiZXXgS98ozRPM": "success"
     },
     "calls": "every item and call classified and complete"
    }
@@ -33,11 +33,11 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Bash toolu_01Miq55SNNEEneyrrPG1m5jE": "insufficient",
-     "Edit toolu_01N8aoiGVSLepM98ZjUZddQa": "insufficient",
-     "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
-     "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
-     "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
+     "Bash toolu_017xm9n5fyifYMsDyzb2Rr9M": "insufficient",
+     "Edit toolu_01T9yp3G6XYHuoY1KBwzW748": "insufficient",
+     "Read toolu_015suhvAnymnsSA1yHvma2VH": "insufficient",
+     "Read toolu_016eTXmDVZ93Jrj8ftZgcef3": "success",
+     "Write toolu_0132ayafYCTbczgm5PFzuoGk": "insufficient"
     },
     "calls": "every item and call classified and complete"
    },
@@ -47,11 +47,11 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Bash toolu_01Miq55SNNEEneyrrPG1m5jE": "insufficient",
-     "Edit toolu_01N8aoiGVSLepM98ZjUZddQa": "insufficient",
-     "Read toolu_01QaEAbpqcggPhbdJ9VNe6yb": "insufficient",
-     "Read toolu_01Sr1ffRzaFhnaEV5g5RYtBi": "success",
-     "Write toolu_013KLotPEHSbfmTz3o48BGpo": "insufficient"
+     "Bash toolu_017xm9n5fyifYMsDyzb2Rr9M": "insufficient",
+     "Edit toolu_01T9yp3G6XYHuoY1KBwzW748": "insufficient",
+     "Read toolu_015suhvAnymnsSA1yHvma2VH": "insufficient",
+     "Read toolu_016eTXmDVZ93Jrj8ftZgcef3": "success",
+     "Write toolu_0132ayafYCTbczgm5PFzuoGk": "insufficient"
     },
     "calls": "every item and call classified and complete"
    }
@@ -63,7 +63,7 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
+     "Read toolu_011ZcaaVDgByLafCDMc54iEv": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -73,7 +73,7 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_014LKLYMUaFVjnB2HQViXP5g": "success"
+     "Read toolu_011ZcaaVDgByLafCDMc54iEv": "success"
     },
     "calls": "every item and call classified and complete"
    }
@@ -85,8 +85,8 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
-     "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
+     "Read toolu_017yrEuzcP6eGardf3E4vo4g": "insufficient",
+     "Read toolu_01833voe5NtHEwdXqrn4i6J8": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -96,8 +96,8 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_019cRv3jWpeJzhNw2JfYf4zV": "success",
-     "Read toolu_01CzuHAw83S2CtbY9oFt6Cgf": "insufficient"
+     "Read toolu_017yrEuzcP6eGardf3E4vo4g": "insufficient",
+     "Read toolu_01833voe5NtHEwdXqrn4i6J8": "success"
     },
     "calls": "every item and call classified and complete"
    }
@@ -109,8 +109,8 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
-     "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
+     "Read toolu_01NtUD9Bz3Sev9XECTpAS3HK": "success",
+     "Write toolu_01EY7GsRjYMySxon1ZNf9RhQ": "refused"
     },
     "calls": "every item and call classified and complete"
    },
@@ -120,8 +120,8 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_01Y2wivMcGnVY7HWhJBgMY34": "success",
-     "Write toolu_01Q8cp6DaEWyQa1cNzHhbtQZ": "refused"
+     "Read toolu_01NtUD9Bz3Sev9XECTpAS3HK": "success",
+     "Write toolu_01EY7GsRjYMySxon1ZNf9RhQ": "refused"
     },
     "calls": "every item and call classified and complete"
    }
@@ -133,7 +133,7 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
+     "Read toolu_01GcwNCq4vwayeBRULZ9kfef": "success"
     },
     "calls": "every item and call classified and complete"
    },
@@ -143,7 +143,7 @@
     "E10": "conform",
     "E11": "conform",
     "E2": {
-     "Read toolu_01SLEAHKUca3DCiVJam2prSE": "success"
+     "Read toolu_01GcwNCq4vwayeBRULZ9kfef": "success"
     },
     "calls": "every item and call classified and complete"
    }

@@ -41,7 +41,8 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   with which the adapters correlate responses to requests (ADR-032 design correction 7).
 - Each `.meta.json` carries `observations`, the external facts the adapter observes besides the stream (design
   correction 7, M2T20D-801): the process's end (`exit`) and whether both streams were read to their end
-  (`logs_complete`); for pi also the launch (`session_id`, `resume`), the session files noted before the start
+  (`logs_complete`); for claude also whether the prompt was fed (`prompt_fed`: every byte written before stdin closed,
+  as claude.rs `fed`); for pi also the launch (`session_id`, `resume`), the session files noted before the start
   (`noted`: canonical path, device, inode, as pi.rs `session_files`) and the identity of the session file the
   get_state answer named (`opened`, as pi.rs `identity`, taken when the answer arrived).
 - `.meta.json` files are summaries, not excerpts: the case's argv, exit, notes, driver text and token hash, and the
@@ -138,3 +139,15 @@ prompt as `hoh-prompt-2`; agent_settled closes stdin. Run 20261117T001941Z had u
 (`s1`, `p1`), which pi.rs would not correlate with its own commands, so the product's replay could not judge it as the
 host does; it stays local and is not excerpted. These three cases (noext-new, noext-resumed, control) are the pi
 excerpts now; run 20261116T180821Z's pi control is no longer excerpted.
+
+## Run 20261117T003759Z (`--set cells`, then `--set errors`, claude only)
+
+The six claude cases recorded once more, this time with the claude adapter's own external observation of its input
+(claude.rs `Driven::verdict`, `prompt_undelivered`): `prompt_fed` says whether every byte of the prompt was written
+before stdin closed, and `logs_complete` now also requires both pipes read to their end. The earlier claude recordings
+(runs 20261116T180821Z and 20261116T201950Z) lack it, so the product's replay could not tell PROMPT_NOT_DELIVERED from
+a delivered prompt on them; they stay local and their claude cases are no longer excerpted. Versions as before
+(claude 2.1.325). What the recordings show is the same as in those runs: ro-new and ro-resumed read TOKEN.txt with
+Glob, Grep and Read only, snapshot unchanged; ro-plus-write's Write is refused (`permission_denied`); the control's
+driver lines are all `exit=0` and the snapshot shows every change; the ordinary-error cases end with the decision
+block and no change.
