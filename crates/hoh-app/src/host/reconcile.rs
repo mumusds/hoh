@@ -594,6 +594,7 @@ mod tests {
             work_outcome: None,
             work_class: None,
             work_ended_at: None,
+            work_retry_at: None,
             cancel_requested: false,
             workspace: None,
         };

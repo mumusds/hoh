@@ -598,12 +598,10 @@ async fn a_failure_recorded_before_a_crash_is_retried_by_its_recorded_class() ->
     Ok(())
 }
 
-#[tokio::test]
-async fn a_providers_reset_recovered_after_a_crash_is_due_at_the_reset_not_before() -> R {
-    // RA-03 (M2T07R-256 review): a turn failed at 08:00:00.9995 on a quota that resets at 10:00:00; the host recorded
-    // its OBSERVED (the class as the runner gives it, its end kept to the second) and was killed before the task's
-    // retry. The reconcile rebuilds the wait from that record: the task is due at 10:00:00, as it would have been
-    // without the crash, never at 09:59:59.
+/// The task's next_retry_at after a reconcile at `recovered` of attempt A1, failed at 08:00:00.9995 on a quota that
+/// resets at 10:00:00, its OBSERVED recorded as the runner records it (the class as the runner gives it, its end kept to
+/// the second, the absolute `retry_at`) and its work effect left `effect` (`OBSERVED` or `COMMITTED`).
+async fn recovered_retry(effect: &str, recovered: &str) -> R<String> {
     use crate::reconcile::{Disposition, Process};
     let dir = tempfile::tempdir()?;
     let (store, path) = open(&dir)?;
@@ -627,14 +625,14 @@ async fn a_providers_reset_recovered_after_a_crash_is_due_at_the_reset_not_befor
          UPDATE tasks SET state = 'RUNNING', revision = 3, attempt_count = 0 WHERE task_id = 'T1';
          INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, started_at) VALUES
            ('A1', 'T1', 'RUNNING', 1, 1, 1, '2027-01-15T07:59:00Z');
-         INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', 'COMMITTED');"
+         INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{key}', 'A1', '{effect}');"
     ))?;
     conn.execute(
         "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
          ('p1', ?1, 'R', 'effect.observed', ?2, '2027-01-15T08:00:00Z')",
         rusqlite::params![format!("{key}/effect.observed"), payload],
     )?;
-    let now = at("2027-01-15T08:05:00Z")?;
+    let now = at(recovered)?;
     let rows = store.reconcile_scan("p1", now).await?;
     let [row] = rows.as_slice() else {
         return Err(format!("unfinished: {rows:?}").into());
@@ -655,12 +653,43 @@ async fn a_providers_reset_recovered_after_a_crash_is_due_at_the_reset_not_befor
             0,
         )
         .await?;
-    let next: String = Connection::open(&path)?.query_row(
+    Ok(Connection::open(&path)?.query_row(
         "SELECT next_retry_at FROM tasks WHERE task_id = 'T1'",
         [],
         |r| r.get(0),
-    )?;
-    assert_eq!(next, "2027-01-15T10:00:00Z");
+    )?)
+}
+
+#[tokio::test]
+async fn a_providers_reset_recovered_after_a_crash_is_due_at_the_reset_not_before() -> R {
+    // RA-03 (M2T07R-256 review): its work COMMITTED, the reconcile at 08:05 rebuilds the wait from the record: due at
+    // 10:00:00, as it would have been without the crash, never at 09:59:59.
+    assert_eq!(
+        recovered_retry("COMMITTED", "2027-01-15T08:05:00Z").await?,
+        "2027-01-15T10:00:00Z"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_providers_reset_is_the_only_source_of_a_recovered_retry_whatever_the_crash_window() -> R
+{
+    // RA-102 (M2T07R-256 review round 2; design correction rule 3): the host killed after OBSERVED and before its work
+    // was COMMITTED: the reconcile ends the attempt at its own time, but the retry is due at the recorded reset, not
+    // that time plus the recorded wait (Codex's probe: 08:00:00.9995 failure, 10:00 reset, 11:00 recovery gave 13:00).
+    // A reset already past at the recovery is due at once (the recovery's whole second), its wait over.
+    assert_eq!(
+        recovered_retry("OBSERVED", "2027-01-15T08:05:00Z").await?,
+        "2027-01-15T10:00:00Z"
+    );
+    assert_eq!(
+        recovered_retry("OBSERVED", "2027-01-15T11:00:00.400Z").await?,
+        "2027-01-15T11:00:00Z"
+    );
+    assert_eq!(
+        recovered_retry("COMMITTED", "2027-01-15T11:00:00Z").await?,
+        "2027-01-15T10:00:00Z"
+    );
     Ok(())
 }
 
