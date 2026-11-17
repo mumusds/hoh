@@ -3,7 +3,9 @@
  "case": "app-ro-ordinary-error",
  "argv": [
   "codex",
-  "app-server"
+  "app-server",
+  "--listen",
+  "stdio://"
  ],
  "exit_code": 0,
  "stopped": "exited",
@@ -13,17 +15,23 @@
   "removed": [],
   "changed": []
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T201950Z/codex/app-ro-ordinary-error/snapshot.json",
- "snapshot_sha256": "cec12e1ed75d161b4f944d4e9c345dbd50a9c8ddfcf358e4a8e495bc7a4abcea",
- "stdout_sha256": "44f060885792c1e222e841596fdc133b5cce2ee2f2d205ed4eabfdc40dec3da6",
- "stderr_sha256": "b2a5779cee42cd71593febdcec694880ed3f0c4dfe6555bbb94cc25f15f5ae10",
- "token_sha256": "d082017b4cc9069b11baffe0af4d2288bf12227b544842af850d757d75bc312b",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T012650Z/codex/app-ro-ordinary-error/snapshot.json",
+ "snapshot_sha256": "0d8aff88db2dc5c6633a7802eb8d1adcc06ac9aa049c869d6d0b35510fd1e4ac",
+ "stdout_sha256": "7d3eb757769c5de53c7ab09864956a16bca4270a5e96bea360ae43836e43b2ff",
+ "stderr_sha256": "e6b52395d477aa45fae5ec229861a37195ba0559005ced75aeb25c352fca268b",
+ "token_sha256": "456c297acb6fa5aa83b57f05a0d6d7c1041a4d4db4f88e6650c9bcf1bb8318d1",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "observations": {
+  "launch": {
+   "profile": "read_only",
+   "resume": null,
+   "model": null
+  },
   "exit": {
    "returncode": 0,
    "how": "exited"
   },
-  "logs_complete": true
+  "logs_complete": true,
+  "version": "0.166.0"
  }
 }

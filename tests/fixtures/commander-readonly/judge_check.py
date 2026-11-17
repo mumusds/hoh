@@ -38,7 +38,7 @@ Usage: python3 tests/fixtures/commander-readonly/judge_check.py [--excerpts DIR]
 Exit 1 on any defect (an excerpt/raw difference, a non-PASS-expected variant that PASSes, a changed invariant).
 """
 from __future__ import annotations
-import argparse, copy, hashlib, json, re, sys
+import argparse, copy, hashlib, json, re, sys, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -65,6 +65,65 @@ TEXT_ITEMS = ('userMessage', 'agentMessage', 'reasoning', 'plan', 'agent_message
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# ------------------------------------------------------------------- the product's own messages (mirrored, M2T20D-950)
+# What the adapters write to the agent, built from the launch alone: codex/app_server/requests.rs with ADR-032 decision
+# 3's ReadOnly profile, codex.rs `headless_answer`, pi.rs `open`, the prompt and the dialog answer. record_spike.py
+# sends exactly these, and the replay compares the recorded request log with them (`request_problems`).
+
+HOH_VERSION = tomllib.loads((HERE.parents[2] / 'Cargo.toml').read_text())['workspace']['package']['version']
+CODEX_PROFILES = {'read_only': {'approvalPolicy': 'never', 'sandbox': 'read-only'},  # decision 3
+                  'yolo': {'approvalPolicy': 'never', 'sandbox': 'danger-full-access'}}  # requests.rs thread_params
+PI_DIALOGS = ('select', 'confirm', 'input', 'editor')  # pi.rs DIALOGS
+PI_SETTLED_EVENT_VERSIONS = ('1.5.0',)  # pi.rs SETTLED_EVENT_VERSIONS (`emits_settled`)
+
+
+def codex_initialize(rid: int) -> dict:
+    return {'method': 'initialize', 'id': rid, 'params': {'clientInfo': {'name': 'hoh', 'version': HOH_VERSION}}}
+
+
+def codex_initialized() -> dict:
+    return {'method': 'initialized'}
+
+
+def codex_thread(rid: int, launch: dict) -> dict:
+    """thread/start of a new thread, or thread/resume of `launch['resume']`, with the profile's parameters and the
+    model when there is one (requests.rs `thread_start`, `thread_resume`, `thread_params`)."""
+    params = dict(CODEX_PROFILES[launch['profile']])
+    if launch['model'] is not None:
+        params['model'] = launch['model']
+    if launch['resume'] is not None:
+        params['threadId'] = launch['resume']
+        return {'method': 'thread/resume', 'id': rid, 'params': params}
+    return {'method': 'thread/start', 'id': rid, 'params': params}
+
+
+def codex_turn_start(rid: int, thread, prompt: str) -> dict:
+    return {'method': 'turn/start', 'id': rid, 'params': {'threadId': thread, 'input': [{'type': 'text', 'text': prompt}]}}
+
+
+def codex_answer(rid, method: str) -> dict:
+    """codex.rs `headless_answer`: approvals declined or denied, an elicitation declined, anything else refused."""
+    if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
+        return {'id': rid, 'result': {'decision': 'decline'}}
+    if method in ('execCommandApproval', 'applyPatchApproval'):
+        return {'id': rid, 'result': {'decision': 'denied'}}
+    if method == 'mcpServer/elicitation/request':
+        return {'id': rid, 'result': {'action': 'decline'}}
+    return {'id': rid, 'error': {'code': -32000, 'message': f'HoH runs codex headless: {method} needs a person and is refused'}}
+
+
+def pi_get_state(rid: str) -> dict:
+    return {'id': rid, 'type': 'get_state'}
+
+
+def pi_prompt(rid: str, message: str) -> dict:
+    return {'id': rid, 'type': 'prompt', 'message': message}
+
+
+def pi_dialog_answer(rid) -> dict:
+    return {'type': 'extension_ui_response', 'id': rid, 'cancelled': True}
 
 
 # ---------------------------------------------------------------------------------------------------------------- input
