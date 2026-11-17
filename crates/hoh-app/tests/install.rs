@@ -2749,11 +2749,12 @@ fn trace(
     root: &Path,
     limit: std::time::Duration,
 ) -> R<(Traced, u32)> {
-    trace_by(&["strace"], install, log, held, root, limit)
+    trace_by(&["strace"], install, log, held, root, limit, &|| Ok(()))
 }
 
 /// [`trace`] with strace run as `tracer` (its program and the arguments before strace's own; a test's stand-in that
-/// becomes strace later).
+/// becomes strace later), and `gave_up` run once the lookup gave up, before the guard ends what the strace started (a
+/// test's seam: what it does there happens between the two, whatever the scheduling).
 fn trace_by(
     tracer: &[&str],
     install: &Install,
@@ -2761,6 +2762,7 @@ fn trace_by(
     held: &[String],
     root: &Path,
     limit: std::time::Duration,
+    gave_up: &dyn Fn() -> R,
 ) -> R<(Traced, u32)> {
     use std::os::unix::process::CommandExt as _;
     let (program, before) = tracer.split_first().ok_or("no tracer")?;
@@ -2799,6 +2801,7 @@ fn trace_by(
             return Ok((traced, pid));
         }
         if std::time::Instant::now() > end {
+            gave_up()?;
             return Err("strace started nothing".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2947,28 +2950,70 @@ fn a_traced_run_never_found_leaves_neither_it_nor_its_strace() -> R {
 
 #[test]
 fn a_tracer_that_starts_its_run_only_after_the_lookup_gave_up_leaves_nothing() -> R {
-    // ILF-100: the strace runs its command only after the run's lookup gave up and the cleanup began (here a stand-in
-    // sleeps 3 s, past a 2 s lookup, then becomes strace); the run it starts then, stopped at its first system call,
-    // is ended with it: nothing naming the installation is left once the error returns.
+    // ILF-100, ILF-200: the strace starts its run only after the run's lookup gave up, and that run, stopped at its first
+    // system call, is ended with the rest: nothing naming the installation is left once the error returns. The order is
+    // pinned by a handshake, not by times: the stand-in says it is ready and waits for `go` before it becomes strace;
+    // `go` is written only from the lookup's give-up (its seam), which then waits for the run to be stopped before
+    // the guard ends them. However the test and the stand-in are scheduled, the lookup cannot find a run (none is
+    // started before `go`), and the cleanup meets one it never saw. Each bound is a limit only.
     let install = Install::new()?;
     let out = install.run("bundle", &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let log = install.root.path().join("strace-late.log");
+    let (ready, go) = (
+        install.root.path().join("tracer-ready"),
+        install.root.path().join("tracer-go"),
+    );
     let held: Vec<String> = ["-e", "trace=brk", "-e", "inject=brk:signal=SIGSTOP:when=1"]
         .iter()
         .map(|a| (*a).to_owned())
         .collect();
-    let late =
-        "import os, sys, time\ntime.sleep(3)\nos.execvp('strace', ['strace'] + sys.argv[1:])";
+    let late = "import os, sys, time\nopen(sys.argv[1], 'w').close()\nend = time.monotonic() + 60\n\
+                while not os.path.exists(sys.argv[2]) and time.monotonic() < end: time.sleep(0.01)\n\
+                os.execvp('strace', ['strace'] + sys.argv[3:])";
+    let (ready_arg, go_arg) = (ready.display().to_string(), go.display().to_string());
+    let stopped = std::cell::Cell::new(false);
+    let gave_up = || -> R {
+        // The lookup gave up with nothing started: the stand-in waits (ready, no strace log yet).
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            if std::time::Instant::now() > end {
+                return Err("the stand-in tracer never said it was ready".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if log.exists() {
+            return Err("the strace ran before the lookup gave up".into());
+        }
+        std::fs::write(&go, "")?;
+        // Its run, started now, stopped before the guard ends them.
+        while !std::fs::read_to_string(&log).is_ok_and(|text| {
+            text.lines()
+                .any(|l| l.ends_with(" --- stopped by SIGSTOP ---"))
+        }) {
+            if std::time::Instant::now() > end {
+                return Err("the late run was never stopped".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        stopped.set(true);
+        Ok(())
+    };
     let found = trace_by(
-        &["python3", "-c", late],
+        &["python3", "-c", late, &ready_arg, &go_arg],
         &install,
         &log,
         &held,
         &std::fs::canonicalize(install.data().join("hoh"))?,
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(1),
+        &gave_up,
     );
-    assert!(found.is_err(), "found before its strace ran");
+    assert!(
+        matches!(&found, Err(e) if e.to_string() == "strace started nothing"),
+        "{:?}",
+        found.map(|(_, pid)| pid)
+    );
+    assert!(stopped.get(), "the run started after the lookup gave up");
     let named = install.root.path().display().to_string();
     let left = hoh_agents::identity::running_with(|cmdline| {
         cmdline.windows(named.len()).any(|w| w == named.as_bytes())
