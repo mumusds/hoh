@@ -2322,6 +2322,64 @@ fn a_host_the_client_starts_runs_in_a_delegated_scope_when_it_can_and_records_it
 }
 
 #[test]
+fn a_host_started_in_a_scope_lives_on_when_its_client_takes_a_signal() -> R {
+    // ADR-031, 设计修正 2, A (CLT-754; verification 12): the `systemd-run --scope … __host` process is a host start,
+    // not a helper: `hoh -p` takes SIGTERM just after it spawned it (the debug marker after the spawn), ends with 143,
+    // and that very process (systemd-run execs the host, keeping its pid) lives on and becomes the project's host.
+    if !scope_available() {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no user manager with linger and systemd-run here"
+        );
+        return Ok(());
+    }
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut client = Kid(Some(
+        with_manager(&env, &["-p", "x", "--output", "json"], &path)
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let tried = reached(&holds.join("launch-tried"), &mut client, LIMIT)?;
+    let pid: u32 = tried
+        .strip_prefix("launched ")
+        .ok_or_else(|| format!("the host was not started: {tried}"))?
+        .parse()?;
+    send(client.get()?, rustix::process::Signal::TERM)?;
+    let out = finish(client.take()?, LIMIT)?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{said}");
+    // The process it spawned becomes the project's host after the client has ended.
+    let end = Instant::now() + LIMIT;
+    loop {
+        let record = std::fs::read_to_string(env.project().join(".hoh/host.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        if record.as_ref().and_then(|r| r["pid"].as_u64()) == Some(u64::from(pid)) {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "the host started in a scope never became ready: {record:?} ({said})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        hosts_of(&env.project())?.contains(&pid),
+        "the host started in a scope is not running"
+    );
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    assert!(cgroup.trim_end().ends_with(".scope"), "{cgroup}");
+    Ok(())
+}
+
+#[test]
 fn a_host_whose_scope_is_refused_is_started_directly_and_records_the_proc_scan() -> R {
     // M2T06R-454 (decision 2): systemd-run fails (here a stand-in that knows only --version); the client starts the
     // host directly, which records the degraded tracking; the detach still succeeds.
