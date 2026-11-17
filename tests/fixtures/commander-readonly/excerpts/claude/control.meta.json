@@ -33,13 +33,14 @@
    "W/hoh-shell-modify"
   ]
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T180821Z/claude/control/snapshot.json",
- "snapshot_sha256": "19f98bae317b4500b4dbcff27691dda789159a6bf3d6025523ed0a71b0e8f996",
- "stdout_sha256": "68d8498f15e89fe093d8e3593ac87cc9a77977a18d0384dab5f0bf300d3b67eb",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T003759Z/claude/control/snapshot.json",
+ "snapshot_sha256": "83e4a002c237b7e1cbd7c1f0f74436da8cdcc84fb2ff305363df9d5a64d9fb09",
+ "stdout_sha256": "614eb94de3d5816045779b1ea73c495951648524e70f657400f21f63df9009c7",
  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "token_sha256": "f6599ac4a87884a6fa86c7814e857fa1f098bf5ab71e39d9f0a3f9cd07116a97",
+ "token_sha256": "85e134914a2a55f216d338a045db5b02578bec43646ff75ff8dd15eb56495dbf",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
  "observations": {
+  "prompt_fed": true,
   "exit": {
    "returncode": 0,
    "how": "exited"
