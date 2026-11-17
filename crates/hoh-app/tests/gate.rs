@@ -179,3 +179,34 @@ fn output_within_leaves_nothing_reading_its_pipes_once_it_returns() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn output_within_names_the_bound_that_ended_its_wait() -> R {
+    // CIRF-100: the child ends at once, leaving a writer on its stdout (it ends once a write fails); with a limit of
+    // 200 ms, shorter than the 5 s its pipes may stay open after its end, the error names that limit, not the 5 s.
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "(trap '' PIPE; i=0; while [ $i -lt 400 ]; do echo x 2>/dev/null || exit 0; i=$((i+1)); \
+             sleep 0.05; done) & exit 0",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let begun = std::time::Instant::now();
+    let said = common::output_within(child, std::time::Duration::from_millis(200))
+        .err()
+        .ok_or("the output still held open was taken for an end")?
+        .to_string();
+    assert!(
+        begun.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert!(
+        said.contains("its limit of 200ms") && !said.contains("5s"),
+        "{said}"
+    );
+    Ok(())
+}

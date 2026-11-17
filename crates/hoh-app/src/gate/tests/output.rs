@@ -30,13 +30,17 @@ pub fn output_within(
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let mut end = Instant::now() + limit;
     let mut status = None;
+    // When it ended, and whether the bound in force is then the time its pipes may stay open after that.
+    let mut ended: Option<(Instant, bool)> = None;
     loop {
         drain(&mut out, &mut stdout)?;
         drain(&mut err, &mut stderr)?;
         if status.is_none() {
             status = child.try_wait()?;
             if status.is_some() {
-                end = end.min(Instant::now() + HELD_AFTER_END);
+                let now = Instant::now();
+                ended = Some((now, now + HELD_AFTER_END < end));
+                end = end.min(now + HELD_AFTER_END);
             }
         }
         if let Some(status) = status
@@ -53,10 +57,16 @@ pub fn output_within(
         if now >= end {
             let _ = child.kill();
             let _ = child.wait();
-            let what = match status {
-                Some(_) => {
-                    format!("its output was still held open {HELD_AFTER_END:?} after it ended")
-                }
+            // The bound that ran out, and how long the output was held open after the end (CIRF-100).
+            let what = match ended {
+                Some((at, true)) => format!(
+                    "its output was still held open {:?} after it ended, {HELD_AFTER_END:?} allowed",
+                    at.elapsed()
+                ),
+                Some((at, false)) => format!(
+                    "its output was still held open {:?} after it ended, when its limit of {limit:?} ran out",
+                    at.elapsed()
+                ),
                 None => format!("still running after {limit:?}, so killed"),
             };
             return Err(format!("{what}; its stderr: {}", String::from_utf8_lossy(&stderr)).into());
