@@ -1074,6 +1074,47 @@ fn a_process_a_probe_set_apart_has_ended_when_doctor_ends_normally() -> R {
     Ok(())
 }
 
+#[test]
+fn a_probe_whose_leader_ends_first_leaves_no_member_of_its_group_while_doctor_runs() -> R {
+    // ADR-031, 设计修正 2, A2 (CLT-600; verification 4, doctor's half): `git --version` answers and ends, leaving a
+    // member of its process group running. The probe's handle sees the leader's exit, kills what is left of the group
+    // while the zombie leader still holds its number, and only then reaps it: the member is gone while doctor still
+    // runs, not only at its exit. `node --version`, probed alongside, waits for the member and looks at it for 2 s.
+    let s = Sandbox::new()?;
+    let member = s.home.path().join("member.pid");
+    let seen = s.home.path().join("member.seen");
+    s.write(
+        "git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) sleep 60 < /dev/null > /dev/null 2>&1 & echo $! > '{m}.tmp' && mv '{m}.tmp' '{m}'; \
+             echo 'git version 2.43.0';;\n -C) mkdir -p \"$2/.git\";;\n *) exit 1;;\nesac\n",
+            m = member.display()
+        ),
+    )?;
+    s.write(
+        "node",
+        &format!(
+            "#!/bin/sh\nalive() {{ s=$(awk '/^State:/{{print $2}}' /proc/$1/status 2>/dev/null); [ -n \"$s\" ] && [ \"$s\" != Z ]; }}\n\
+             while [ ! -f '{m}' ]; do sleep 0.01; done\nm=$(cat '{m}'); i=0\n\
+             while alive $m && [ $i -lt 200 ]; do sleep 0.01; i=$((i+1)); done\n\
+             if alive $m; then echo alive > '{r}'; else echo gone > '{r}'; fi\necho v22.19.0\n",
+            m = member.display(),
+            r = seen.display()
+        ),
+    )?;
+    let (out, report, _) = s.doctor()?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&seen)
+            .map_err(|e| format!("node never looked ({e}): {said}"))?
+            .trim(),
+        "gone",
+        "a member of the probe's group outlived its probe: {said}"
+    );
+    assert_eq!(report["runtime"]["git"]["installed"], true, "{report}");
+    Ok(())
+}
+
 /// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
 fn pidfd_ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec};
