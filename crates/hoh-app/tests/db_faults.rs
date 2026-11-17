@@ -379,62 +379,159 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
     ])
 }
 
-/// The WAL self-test's files in `.hoh` (`.hoh-wal-selftest-…`), by name, with their bytes.
-fn selftest_files(project: &Project) -> R<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
+/// What another creator writes (tests/support/io_fault.c, F7_RIVAL_*).
+const FOREIGN: &[u8] = b"FOREIGN-CREATOR-DATA\n";
+
+/// Every path the WAL self-test left in `.hoh` (`.hoh-wal-selftest-…`, and what is inside), but another creator's
+/// files.
+fn selftest_paths(project: &Project) -> R<Vec<PathBuf>> {
+    fn walk(path: &Path, into: &mut Vec<PathBuf>) -> R {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                walk(&entry?.path(), into)?;
+            }
+        } else if std::fs::read(path)? == FOREIGN {
+            return Ok(());
+        }
+        into.push(path.to_owned());
+        Ok(())
+    }
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(project.hoh_dir())? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(".hoh-wal-selftest-") {
-            files.push((name, std::fs::read(entry.path())?));
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".hoh-wal-selftest-")
+        {
+            walk(&entry.path(), &mut paths)?;
         }
     }
-    files.sort();
-    Ok(files)
+    paths.sort();
+    Ok(paths)
 }
+
+/// Another creator's files in `.hoh`, by name.
+fn foreign_files(project: &Project) -> R<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(project.hoh_dir())? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && std::fs::read(entry.path())? == FOREIGN {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// Another creator acting in `.hoh` on the names the self-test's own files have (F7_RIVAL_*: `on` is the end of the
+/// file whose `op` triggers it, `swap` what replaces that end in its file's name, `replace` a delete first): its file
+/// stays as it made it, nothing of the self-test's stays, and the client says `exit`.
+fn rival_left_alone(
+    why: &str,
+    rival: [(&str, &str); 3],
+    replace: bool,
+    fault: bool,
+    exit: i32,
+) -> R {
+    let (project, before) = made()?;
+    let mut env = vec![
+        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+        ("F7_RIVAL_IN", project.hoh_dir().into_os_string()),
+    ];
+    env.extend(rival.map(|(k, v)| (k, v.into())));
+    if replace {
+        env.push(("F7_RIVAL_REPLACE", "1".into()));
+    }
+    if fault {
+        env.extend([
+            ("F7_IO_OP", "sync".into()),
+            ("F7_IO_SUFFIX", "-wal".into()),
+            ("F7_IO_ERRNO", "122".into()),
+        ]);
+    }
+    let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
+    let foreign = foreign_files(&project)?;
+    let left = selftest_paths(&project)?;
+    project.stop_host()?;
+    assert_eq!(
+        foreign.len(),
+        1,
+        "{why}: the other creator's file: {foreign:?}; {}",
+        text(&out)
+    );
+    assert_eq!(left, Vec::<PathBuf>::new(), "{why}");
+    assert_eq!(out.status.code(), Some(exit), "{why}: {}", text(&out));
+    if exit != 0 {
+        assert_eq!(project.dump()?, before, "{why}");
+    }
+    Ok(())
+}
+
+// Another creator in `.hoh` makes, or deletes and makes again, a file named as one of the self-test's. The self-test's
+// files are in a private directory of its own, so the other's file is never taken for one of them.
 
 #[test]
 fn full_a_room_file_another_creator_made_after_the_claim_is_left_to_it() -> R {
-    // F7-200: the room probe's `-room` name is made by another creator after the self-test claimed its database's
-    // names (here when the WAL's fsync fails); the probe's create_new finds it, so it is not the self-test's: room is
-    // not known, and the file stays, its bytes as they were.
-    let (project, before) = made()?;
-    let env = [
-        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
-        ("F7_IO_OP", "sync".into()),
-        ("F7_IO_SUFFIX", "-wal".into()),
-        ("F7_IO_ERRNO", "122".into()),
-        ("F7_IO_PLANT", "-room".into()),
-    ];
-    let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let left = selftest_files(&project)?;
-    assert_eq!(
-        left.iter()
-            .map(|(name, bytes)| (name.ends_with(".db-room"), bytes.as_slice()))
-            .collect::<Vec<_>>(),
-        [(true, b"FOREIGN-CREATOR-DATA\n".as_slice())],
-        "the other creator's file: {}",
-        text(&out)
-    );
-    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
-    assert!(
-        stderr.contains("room not known") && stderr.contains("File exists"),
-        "{stderr}"
-    );
-    assert_eq!(project.dump()?, before);
-    Ok(())
+    // F7-200: a -room made after the claim, when the WAL's fsync fails.
+    rival_left_alone(
+        "a -room made after the claim",
+        [
+            ("F7_RIVAL_OP", "sync"),
+            ("F7_RIVAL_ON", "-wal"),
+            ("F7_RIVAL_SWAP", "-room"),
+        ],
+        false,
+        true,
+        78,
+    )
+}
+
+#[test]
+fn full_a_room_file_deleted_and_made_again_by_another_creator_is_left_to_it() -> R {
+    // F7-300: the room file, written, synced and closed, deleted and made again by another; on ext4 the new file gets
+    // the same inode (a /tmp on tmpfs does not show it).
+    rival_left_alone(
+        "the room file deleted and made again",
+        [
+            ("F7_RIVAL_OP", "close"),
+            ("F7_RIVAL_ON", "room"),
+            ("F7_RIVAL_SWAP", "room"),
+        ],
+        true,
+        true,
+        78,
+    )
+}
+
+#[test]
+fn full_a_journal_swapped_before_sqlite_opens_the_database_is_left_to_its_maker() -> R {
+    // F7-301: the -journal replaced by another's file once it is closed (the claim made it before SQLite opens the
+    // database), which SQLite itself would delete by its path.
+    rival_left_alone(
+        "the -journal swapped before SQLite opens the database",
+        [
+            ("F7_RIVAL_OP", "close"),
+            ("F7_RIVAL_ON", "-journal"),
+            ("F7_RIVAL_SWAP", "-journal"),
+        ],
+        true,
+        false,
+        0,
+    )
 }
 
 #[test]
 fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path() -> R {
-    // F7-202: a removal of the self-test's own file that fails (unlink: EIO) is not dropped. The original failure
-    // stays and the leftover's exact path is told; a self-test that passed fails at its cleanup, naming it.
-    for (why, unlink, fault, says) in [
+    // F7-202, F7-302: removals of the self-test's own files that fail (unlink: EIO) are not dropped: every path left
+    // is told, and the original failure keeps its class (a full file system stays DB_FULL); a self-test that passed
+    // fails at its cleanup, naming them.
+    for (why, unlink, fault, exit, says) in [
         (
             "the room probe's file, after one fsync over quota with room",
-            "-room",
-            true,
+            "room",
+            [("F7_IO_OP", "sync"), ("F7_IO_SUFFIX", "-wal")].as_slice(),
+            78,
             [
                 "DB_WAL_UNSUPPORTED",
                 "not for want of room",
@@ -445,8 +542,16 @@ fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path
         (
             "the database, after a self-test that passed",
             ".db",
-            false,
+            [].as_slice(),
+            78,
             ["DB_WAL_UNSUPPORTED", "at cleanup", "Input/output error"].as_slice(),
+        ),
+        (
+            "the database, after the -journal could not be made for want of space that stays",
+            ".db",
+            [("F7_IO_OP", "open"), ("F7_IO_SUFFIX", "-journal")].as_slice(),
+            69,
+            ["DB_FULL", "No space left on device", "Input/output error"].as_slice(),
         ),
     ] {
         let (project, before) = made()?;
@@ -455,29 +560,36 @@ fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path
             ("F7_UNLINK_ERRNO", "5".into()),
             ("F7_UNLINK_SUFFIX", unlink.into()),
         ];
-        if fault {
-            env.extend([
-                ("F7_IO_OP", "sync".into()),
-                ("F7_IO_SUFFIX", "-wal".into()),
-                ("F7_IO_ERRNO", "122".into()),
-            ]);
+        env.extend(fault.iter().map(|&(k, v)| (k, v.into())));
+        if !fault.is_empty() {
+            let errno = if exit == 69 { "28" } else { "122" };
+            env.push(("F7_IO_ERRNO", errno.into()));
+            if exit == 69 {
+                env.push((
+                    "F7_IO_STATE",
+                    project.root.join("io-fault-state").into_os_string(),
+                ));
+            }
         }
         let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(78), "{why}: {}", text(&out));
+        assert_eq!(out.status.code(), Some(exit), "{why}: {}", text(&out));
         for words in says {
             assert!(stderr.contains(words), "{why}: `{words}` not in {stderr}");
         }
-        let left = selftest_files(&project)?;
-        assert_eq!(left.len(), 1, "{why}: {left:?}");
-        let path = project.hoh_dir().join(&left[0].0);
+        let left = selftest_paths(&project)?;
         assert!(
-            left[0].0.ends_with(unlink)
-                && stderr.contains(&format!("{} is left, not removed", path.display())),
-            "{why}: {} not told in {stderr}",
-            path.display()
+            left.iter()
+                .any(|path| path.to_string_lossy().ends_with(unlink)),
+            "{why}: {left:?}"
         );
-        std::fs::remove_file(&path)?;
+        for path in &left {
+            assert!(
+                stderr.contains(&path.display().to_string()),
+                "{why}: {} left but not told in {stderr}",
+                path.display()
+            );
+        }
         assert_eq!(project.dump()?, before, "{why}");
     }
     Ok(())
