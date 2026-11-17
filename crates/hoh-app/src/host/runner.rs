@@ -16,6 +16,7 @@
 
 use super::cgroup::{AttemptGroup, Tracking};
 use super::processes::{Outside, Proof};
+use super::watchdog::{Change, Watch};
 use super::{HostHooks, ReconcileSettings, http::Shared, reconcile};
 use hoh_agents::identity;
 use hoh_core::decision::Context;
@@ -204,6 +205,12 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// How many bytes `work`'s turn has output so far, its stdout and stderr as kept raw, read on a blocking thread
+    /// for the inactivity watchdog (docs/adr/ADR-022.md decision 19 item 3). The default cannot tell (`None`): its
+    /// attempts are never found inactive.
+    fn output_bytes(&self, _work: &Work) -> Option<u64> {
+        None
+    }
     /// The host stops (called once, last in the runner's stop, after its attempts' tasks): end what this executor runs
     /// inside the host for the turns it started, waiting for a write it has begun; once this has returned, nothing of
     /// it writes the project. The turns' processes run on (an agent outlives its host); the next host's reconcile
@@ -284,6 +291,8 @@ struct Common {
     unsupervised: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Where verifiers' run directories go (docs/adr/ADR-028.md decision 6).
     runs: std::path::PathBuf,
+    /// The inactivity watchdog of its attempts (docs/adr/ADR-022.md decision 19).
+    watchdog: super::Watchdog,
 }
 
 impl Common {
@@ -310,6 +319,7 @@ pub(super) struct Setup {
     pub(super) jitter: Arc<Jitter>,
     /// Shared with the pause and cancel loop, which stops a cancelled run's attempts first.
     pub(super) inflight: super::control::Inflight,
+    pub(super) watchdog: super::Watchdog,
 }
 
 /// The runner of `shared`'s project until `stop`.
@@ -325,6 +335,7 @@ pub(super) async fn run(
         host_epoch,
         jitter,
         inflight,
+        watchdog,
     } = setup;
     let mut watermark = shared.store.watermark();
     let common = Arc::new(Common {
@@ -339,6 +350,7 @@ pub(super) async fn run(
         undelivered: std::sync::Mutex::default(),
         unsupervised: std::sync::Mutex::default(),
         runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
+        watchdog,
     });
     let registry = config.executor.registry();
     // The project's compat manifest into the registry, the leftovers of a publication that crashed deleted, before the
@@ -1077,6 +1089,85 @@ async fn tick(
     Ok(())
 }
 
+/// One look of `work`'s inactivity watchdog (docs/adr/ADR-022.md decision 19), its leader `leader` (pid and start
+/// time): its output and, when it had none since the last look, its tool processes, read on a blocking thread; what
+/// changed recorded as an event of its run. The watch for the next look, or none once it no longer watches: its run
+/// stopped, or the look was lost.
+async fn inactivity(
+    common: &Arc<Common>,
+    work: &Work,
+    watch: Option<Watch>,
+    leader: (u32, Option<u64>),
+) -> Option<Watch> {
+    let mut watch = watch?;
+    let executor = common.executor.clone();
+    let held = work.clone();
+    let root = common
+        .shared
+        .hooks
+        .proc_root()
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc"));
+    let (mut watch, change, at) = super::begun::spawn_blocking(move || {
+        let at = Instant::now();
+        let bytes = executor.output_bytes(&held);
+        let change = watch.look(at, bytes, || {
+            super::processes::tools(&root, leader, &held.marker())
+        });
+        (watch, change, at)
+    })
+    .await
+    .ok()?;
+    let Some(change) = change else {
+        return Some(watch);
+    };
+    let id = &work.attempt_id;
+    let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let (name, kind, payload) = match change {
+        Change::Inactive { episode, since } => (
+            format!("watchdog/{episode}/inactive"),
+            "attempt.inactive",
+            json!({"attempt_id": id, "episode": episode, "since_ms": millis(since),
+                "quiet_ms": millis(common.watchdog.quiet), "tool_running": false}),
+        ),
+        Change::Cleared { episode, after } => (
+            format!("watchdog/{episode}/cleared"),
+            "attempt.inactive_cleared",
+            json!({"attempt_id": id, "episode": episode, "inactive_ms": millis(after)}),
+        ),
+    };
+    let written = common
+        .shared
+        .store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: common.shared.project_id.clone(),
+                event_id: hoh_core::ids::child_id(id, &name),
+                run_id: Some(work.run_id.clone()),
+                kind: kind.to_owned(),
+                payload,
+            }],
+            ..Commit::default()
+        })
+        .await;
+    match written {
+        Ok(_) => {
+            watch.recorded(change, at);
+            Some(watch)
+        }
+        // Its run stopped: nothing of it is recorded any more.
+        Err(PersistError::Held { .. } | PersistError::RunStopped { .. }) => None,
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: the inactivity watchdog of {id}: {e}"
+            );
+            Some(watch)
+        }
+    }
+}
+
 /// One attempt from its dispatch to its end.
 async fn attempt(
     common: &Arc<Common>,
@@ -1290,17 +1381,27 @@ async fn attempt(
     }
     hooks.runner_of(RunnerPoint::AfterEffectStarted, &id);
     // While a verifier runs, its requests are taken in order, one at a time; once its process has ended none is taken
-    // (a request is never cut off: its check and record end before the end is looked at; decision 7).
+    // (a request is never cut off: its check and record end before the end is looked at; decision 7). Its inactivity
+    // watchdog looks at it meanwhile, on its own clock, and only records (docs/adr/ADR-022.md decision 19).
     let mut ended = started.ended;
     let mut served = 0;
+    // (An interval of zero would panic; the product's is 15 s.)
+    let every = common.watchdog.every.max(Duration::from_millis(1));
+    let mut looks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watch = Some(Watch::new(common.watchdog.quiet, Instant::now()));
+    let leader = (pid, who.start_id.parse::<u64>().ok());
     let end = loop {
-        let (Some(v), Some(helpers)) = (&verifier, &helpers) else {
-            break (&mut ended).await;
-        };
+        let serving = verifier.as_ref().zip(helpers.as_ref());
         tokio::select! {
             outcome = &mut ended => break outcome,
-            () = tokio::time::sleep(Duration::from_millis(200)) => {
-                served += serve_request(common, &work, v, helpers, served + 1).await?;
+            () = tokio::time::sleep(Duration::from_millis(200)), if serving.is_some() => {
+                if let Some((v, helpers)) = serving {
+                    served += serve_request(common, &work, v, helpers, served + 1).await?;
+                }
+            }
+            _ = looks.tick(), if watch.is_some() => {
+                watch = inactivity(common, &work, watch.take(), leader).await;
             }
         }
     };

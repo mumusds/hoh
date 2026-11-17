@@ -1131,3 +1131,30 @@ fn a_typed_gate_refusal_is_compat_unless_only_its_stamps_differed()
     }
     Ok(())
 }
+
+#[test]
+fn a_turns_output_is_its_raw_stdout_and_stderr_copies_and_nothing_else_of_its_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/adr/ADR-022.md decision 19 item 3: every adapter's copies (claude's and pi's, codex exec's and App
+    // Server's names), not the gate's record, the bridge file or the diagnostics.
+    let project = tempfile::tempdir()?;
+    let executor = executor(project.path());
+    let w = work(None);
+    assert_eq!(executor.output_bytes(&w), None, "no directory yet");
+    let logs = attempt_logs(project.path(), &w.attempt_id);
+    std::fs::create_dir_all(&logs)?;
+    assert_eq!(executor.output_bytes(&w), None, "no copy yet");
+    for (name, bytes) in [
+        ("stdout.jsonl", 3),
+        ("stderr.log", 5),
+        ("app-server.stdout.jsonl", 7),
+        ("exec.stderr.log", 11),
+        (GATE_RECORD, 100),
+        (BRIDGE, 200),
+        ("diagnostics.jsonl", 400),
+    ] {
+        std::fs::write(logs.join(name), vec![b'x'; bytes])?;
+    }
+    assert_eq!(executor.output_bytes(&w), Some(26));
+    Ok(())
+}
