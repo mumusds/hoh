@@ -99,6 +99,29 @@ fn each_outcome_of_the_check() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_scratch_path_with_a_quote_keeps_the_verdict() {
+    // M2T20R-02: the scratch directory comes from TMPDIR, which may hold any character; a single quote in it must not
+    // change the check's script, so the same codex gives the same verdict as in a plain directory.
+    let dir = tempfile_dir();
+    let quick = env(Duration::from_secs(20));
+    for base in [dir.join("plain"), dir.join("it's \"quoted\" $HOME")] {
+        std::fs::create_dir_all(&base).expect("mkdir");
+        for (body, want) in [
+            ("shift 6; exec \"$@\"", "unconfined"),
+            (
+                "cat \"$5/token\"; echo \"/bin/sh: cannot create: Read-only file system\" >&2; exit 1",
+                "confined",
+            ),
+        ] {
+            let launcher = fake(&dir, body);
+            let check = codex_sandbox_check_in(&launcher, &quick, &base);
+            assert_eq!(check.name(), want, "{}: {check:?}", base.display());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A fresh directory of this test's own (the crate has no tempfile at run time).
 fn tempfile_dir() -> PathBuf {
     let nanos = SystemTime::now()
