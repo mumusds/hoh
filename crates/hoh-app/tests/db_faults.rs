@@ -427,6 +427,63 @@ fn full_a_room_file_another_creator_made_after_the_claim_is_left_to_it() -> R {
 }
 
 #[test]
+fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path() -> R {
+    // F7-202: a removal of the self-test's own file that fails (unlink: EIO) is not dropped. The original failure
+    // stays and the leftover's exact path is told; a self-test that passed fails at its cleanup, naming it.
+    for (why, unlink, fault, says) in [
+        (
+            "the room probe's file, after one fsync over quota with room",
+            "-room",
+            true,
+            [
+                "DB_WAL_UNSUPPORTED",
+                "not for want of room",
+                "Input/output error",
+            ]
+            .as_slice(),
+        ),
+        (
+            "the database, after a self-test that passed",
+            ".db",
+            false,
+            ["DB_WAL_UNSUPPORTED", "at cleanup", "Input/output error"].as_slice(),
+        ),
+    ] {
+        let (project, before) = made()?;
+        let mut env = vec![
+            ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+            ("F7_UNLINK_ERRNO", "5".into()),
+            ("F7_UNLINK_SUFFIX", unlink.into()),
+        ];
+        if fault {
+            env.extend([
+                ("F7_IO_OP", "sync".into()),
+                ("F7_IO_SUFFIX", "-wal".into()),
+                ("F7_IO_ERRNO", "122".into()),
+            ]);
+        }
+        let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{why}: {}", text(&out));
+        for words in says {
+            assert!(stderr.contains(words), "{why}: `{words}` not in {stderr}");
+        }
+        let left = selftest_files(&project)?;
+        assert_eq!(left.len(), 1, "{why}: {left:?}");
+        let path = project.hoh_dir().join(&left[0].0);
+        assert!(
+            left[0].0.ends_with(unlink)
+                && stderr.contains(&format!("{} is left, not removed", path.display())),
+            "{why}: {} not told in {stderr}",
+            path.display()
+        );
+        std::fs::remove_file(&path)?;
+        assert_eq!(project.dump()?, before, "{why}");
+    }
+    Ok(())
+}
+
+#[test]
 fn full_a_checkpoint_that_fails_writing_is_the_wals_failure_not_probed() -> R {
     // F7-201: AC-062-06 makes a failed checkpoint DB_WAL_UNSUPPORTED; a real I/O error of the checkpoint (here over a
     // quota that stays) is not probed for room, and still says which I/O failed and SQLite's extended code.

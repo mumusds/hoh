@@ -539,15 +539,17 @@ pub(super) fn commit_error(e: rusqlite::Error, db: Option<&Path>) -> PersistErro
     let mut name = db.as_os_str().to_owned();
     name.push(format!("-room-{}-{nanos}", std::process::id()));
     let kib = room::BYTES >> 10;
-    match room::probe(Path::new(&name)) {
+    let seen = room::probe(Path::new(&name));
+    let left = seen.left_told();
+    match seen.written {
         Err(r) if room::none(&r) => PersistError::Full(format!(
-            "{e} ({what}); the store's directory has no room: a {kib} KiB write and fsync failed: {r}"
+            "{e} ({what}); the store's directory has no room: a {kib} KiB write and fsync failed: {r}{left}"
         )),
         Ok(()) => PersistError::Storage(format!(
-            "{e} ({what}); not for want of room: the store's directory took a {kib} KiB write and fsync"
+            "{e} ({what}); not for want of room: the store's directory took a {kib} KiB write and fsync{left}"
         )),
         Err(r) => PersistError::Storage(format!(
-            "{e} ({what}); room not known: a {kib} KiB write and fsync in the store's directory failed: {r}"
+            "{e} ({what}); room not known: a {kib} KiB write and fsync in the store's directory failed: {r}{left}"
         )),
     }
 }

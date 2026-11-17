@@ -3,7 +3,7 @@
 //! SQLite returns (SQLite does more I/O inside the call that failed, a rollback's, so that errno may be a later
 //! call's). The WAL self-test and the store's commits judge by it.
 
-use super::created::Created;
+use super::created::{Created, Leftover};
 use std::io::Write as _;
 use std::path::Path;
 
@@ -24,12 +24,37 @@ pub(super) fn growing_write(extended: i32) -> Option<&'static str> {
     }
 }
 
+/// What the probe saw: whether its write and fsync went through (the OS error that refused them, if one did), and its
+/// own file, if that could not be removed (F7-202).
+#[derive(Debug)]
+pub(super) struct Seen {
+    pub(super) written: std::io::Result<()>,
+    pub(super) left: Option<Leftover>,
+}
+
+impl Seen {
+    /// The probe's leftover, to follow the rest of a message: `; and <path> is left, not removed: <error>`, or nothing.
+    pub(super) fn left_told(&self) -> String {
+        self.left
+            .as_ref()
+            .map(|left| format!("; and {left}"))
+            .unwrap_or_default()
+    }
+}
+
 /// Whether the directory of `path` has room now, seen directly: `path`, a new file (made with create_new, so never
 /// another's: an existing one is left as it is), takes [`BYTES`] of non-repeating bytes (a compressing file system must
-/// allocate them too) and an fsync, and is removed through its token ([`Created`]). The OS error that refused it, if
-/// one did.
-pub(super) fn probe(path: &Path) -> std::io::Result<()> {
-    let (made, mut file) = Created::new(path)?;
+/// allocate them too) and an fsync, and is removed through its token ([`Created`]); a removal that fails is told.
+pub(super) fn probe(path: &Path) -> Seen {
+    let (made, mut file) = match Created::new(path) {
+        Ok(made) => made,
+        Err(e) => {
+            return Seen {
+                written: Err(e),
+                left: None,
+            };
+        }
+    };
     let mut bytes = vec![0u8; BYTES];
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     for chunk in bytes.chunks_mut(8) {
@@ -40,8 +65,10 @@ pub(super) fn probe(path: &Path) -> std::io::Result<()> {
     }
     let written = file.write_all(&bytes).and_then(|()| file.sync_all());
     drop(file);
-    let _ = made.remove();
-    written
+    Seen {
+        written,
+        left: made.remove().err(),
+    }
 }
 
 /// Whether `e`, from [`probe`], says there is no room: no space left, or the quota exceeded.
