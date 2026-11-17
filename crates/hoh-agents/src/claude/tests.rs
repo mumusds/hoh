@@ -403,6 +403,36 @@ fn only_a_turn_that_failed_on_the_limit_carries_its_reset() {
 }
 
 #[test]
+fn a_rejected_event_counts_only_for_the_failure_it_came_with() {
+    // RA-04 (M2T07R-256 review): a successful message after a rejected rate_limit_event shows the limit no longer held;
+    // a later untyped 429 is a new failure that event says nothing about (Codex's replay: rejected, success, untyped
+    // 429, failed result). A subagent's success shows the same. A rejected event after the success does count.
+    let event = limit_event("rejected", json!(1_000));
+    let untyped = limit_error("rate_limit", None);
+    let reply = json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid",
+                       "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}});
+    let mut sub_reply = reply.clone();
+    sub_reply["parent_tool_use_id"] = json!("toolu_1");
+    for success in [reply.clone(), sub_reply] {
+        assert_eq!(
+            retry_at(&[
+                init(),
+                event.clone(),
+                success.clone(),
+                untyped.clone(),
+                failed_result()
+            ]),
+            None,
+            "{success}"
+        );
+    }
+    assert_eq!(
+        retry_at(&[init(), reply, event, untyped, failed_result()]),
+        at(1_000)
+    );
+}
+
+#[test]
 fn a_reset_that_is_no_instant_is_none() {
     for resets_at in [
         json!(0),
