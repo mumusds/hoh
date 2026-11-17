@@ -6291,11 +6291,14 @@ async fn test_027_04_a_new_codex_waits_for_the_suite_outside_the_write_lease() -
                 adoption_b.push(attempt);
                 continue;
             };
+            // The registry's looks only: the probe's commands, the login check and this host's check of codex's own
+            // read-only sandbox (docs/adr/ADR-032.md decision 4), none of them a turn.
             assert!(
                 args == "--version"
                     || args == "login status"
                     || args.ends_with("--help")
-                    || args.starts_with("app-server generate-json-schema"),
+                    || args.starts_with("app-server generate-json-schema")
+                    || args.starts_with("sandbox -P :read-only -C "),
                 "{call}"
             );
         }

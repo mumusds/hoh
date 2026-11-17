@@ -868,6 +868,10 @@ impl Executor for ProductExecutor {
         let cancels = self.cancels.clone();
         let exec_only = self.exec_only.clone();
         let implementation = (ready.launcher.clone(), ready.version.clone());
+        // A degrade withholds the read-only profile from this identity in the registry too (docs/adr/ADR-032.md
+        // decision 10 (A)): a host fact, so staffing moves the commander and prepare refuses it as unavailable.
+        let registry = self.registry.clone();
+        let identity = ready.entry.identity();
         let turn = held.ended;
         // Every turn's bridge lines are read at its end, however it ended (docs/adr/ADR-028.md decision 2).
         let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
@@ -889,11 +893,11 @@ impl Executor for ProductExecutor {
             let Ok(facts) = facts else {
                 return;
             };
-            if agent == Agent::Codex
-                && facts.degraded.is_some()
-                && let Ok(mut e) = exec_only.lock()
-            {
-                e.insert(implementation);
+            if agent == Agent::Codex && facts.degraded.is_some() {
+                if let Ok(mut e) = exec_only.lock() {
+                    e.insert(implementation);
+                }
+                registry.exec_degraded(Agent::Codex, identity);
             }
             let mut outcome = outcome(facts);
             (

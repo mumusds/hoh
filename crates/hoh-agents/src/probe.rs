@@ -2712,6 +2712,14 @@ pub fn codex_sandbox_check(launcher: &Path, env: &ProbeEnv) -> SandboxCheck {
                             "codex does not accept the profile {SANDBOX_PROFILE}: {}",
                             said(&|l: &str| l.contains("unknown"))
                         ))
+                    } else if out.status.code() == Some(2) {
+                        // A usage error (codex's command line parser exits 2): the check's command line was not
+                        // taken, so nothing was tried (a codex without `sandbox`, an option it does not know).
+                        SandboxCheck::Unknown(format!(
+                            "codex did not take the check's command line ({}): {}",
+                            out.status,
+                            said(&|l: &str| !l.trim().is_empty())
+                        ))
                     } else {
                         SandboxCheck::Unavailable(format!(
                             "the command did not run ({}): {}",

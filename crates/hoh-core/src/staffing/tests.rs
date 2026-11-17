@@ -78,6 +78,7 @@ fn usable(version: &str, identity: AgentIdentity, granted: &[&str], compat: Comp
         generation: (1, 1),
         session,
         granted,
+        withheld: Default::default(),
         compat,
     }))
 }
@@ -177,6 +178,7 @@ fn verified(session: Value) -> Fact {
         generation: (1, 1),
         session,
         granted,
+        withheld: Default::default(),
         compat: Compat::Verified,
     }))
 }

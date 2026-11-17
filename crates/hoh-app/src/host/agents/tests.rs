@@ -803,6 +803,7 @@ fn pi_gone_claude_verified() -> Snapshot {
             generation: (EPOCH, 1),
             granted: hoh_core::decision::granted_capabilities(&session),
             session,
+            withheld: Default::default(),
             compat: Compat::Verified,
         })),
     );
@@ -1244,5 +1245,116 @@ fn the_supervisors_looks_keep_an_agent_verified_only_while_the_registry_still_ha
     registry.open_manifest(project.path());
     assert!(usable(registry.fact(Agent::Claude))?.compat == Compat::Verified);
     assert!(!verified_now(&registry, &pending), "not made verified");
+    Ok(())
+}
+
+const PROTOCOL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/protocol");
+
+/// A fake codex 0.166.0 in `bin` answering the probe from its recording, whose `codex sandbox` acts out what the file
+/// `bin/sandbox-mode` says (confined, unconfined, else unavailable), counting its checks in `bin/checks`.
+fn fake_codex_sandbox(bin: &Path, mode: &str) -> R {
+    std::fs::write(bin.join("sandbox-mode"), mode)?;
+    let script = bin.join("codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\nf='{PROTOCOL}/codex/0.166.0'\nb='{bin}'\ncase \"$1\" in\n --version) echo 'codex-cli 0.166.0'; exit 0;;\n \
+             --help) cat \"$f/help.txt\"; exit 0;;\n exec) [ \"$2\" = --help ] && {{ cat \"$f/help-exec.txt\"; exit 0; }}; exit 2;;\n \
+             app-server) case \"$2\" in\n  --help) cat \"$f/help-app-server.txt\"; exit 0;;\n  generate-json-schema) \
+             [ \"$3\" = --out ] && mkdir -p \"$4\" && cp -R \"$f/app-server-schema/.\" \"$4/\"; exit 0;;\n esac;;\n \
+             sandbox) echo x >> \"$b/checks\"; case \"$(cat \"$b/sandbox-mode\")\" in\n  confined) cat \"$5/token\"; exit 1;;\n  \
+             unconfined) shift 6; exec \"$@\";;\n  *) echo 'bwrap: unshare user ns: Operation not permitted' >&2; exit 1;;\n esac;;\n\
+             esac\nexit 2\n",
+            bin = bin.display()
+        ),
+    )?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn checks(bin: &Path) -> usize {
+    std::fs::read_to_string(bin.join("checks"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn codexs_host_check_takes_the_read_only_profile_from_granted_only() -> R {
+    // docs/adr/ADR-032.md decision 4 (-101, -201) and decision 10 (A): an unavailable (or unconfined) host check, or a
+    // degrade to exec, withholds read_only_workspace from what is granted, with the host named as its source; the
+    // session record keeps it, so a session stays fresh. Not confined, the check runs again after its interval and a
+    // recovery shows; confined, it is not run again until codex's files change.
+    let bin = tempfile::tempdir()?;
+    let project = tempfile::tempdir()?;
+    fake_codex_sandbox(bin.path(), "unavailable")?;
+    let registry =
+        Registry::with_pi_dir(path_of(bin.path()), None).with_host_check_every(Duration::ZERO);
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["codex"]));
+    registry.refresh();
+    let codex = usable(registry.fact(Agent::Codex))?;
+    assert_eq!(
+        codex.session[READ_ONLY_WORKSPACE], true,
+        "{}",
+        codex.session
+    );
+    assert!(
+        !codex.granted.contains(READ_ONLY_WORKSPACE),
+        "{:?}",
+        codex.granted
+    );
+    assert_eq!(codex.withheld, [READ_ONLY_WORKSPACE.to_owned()].into());
+    let probes = registry.snapshot(EPOCH).probes.clone();
+    assert_eq!(
+        probes["codex"]["host_check"]["check"], "unavailable",
+        "{}",
+        probes["codex"]
+    );
+    assert_eq!(checks(bin.path()), 1);
+    // The host fixed: the next refresh past the interval finds it, and the profile is granted again.
+    std::fs::write(bin.path().join("sandbox-mode"), "confined")?;
+    registry.refresh();
+    let codex = usable(registry.fact(Agent::Codex))?;
+    assert!(codex.granted.contains(READ_ONLY_WORKSPACE));
+    assert!(codex.withheld.is_empty());
+    assert_eq!(checks(bin.path()), 2);
+    // Confined is not run again by time.
+    std::fs::write(bin.path().join("sandbox-mode"), "unavailable")?;
+    registry.refresh();
+    assert_eq!(checks(bin.path()), 2);
+    assert!(
+        usable(registry.fact(Agent::Codex))?
+            .granted
+            .contains(READ_ONLY_WORKSPACE)
+    );
+    // A degrade to exec of this identity withholds it, as a host fact; one of another identity does nothing.
+    let mut other = codex.identity.clone();
+    other.implementation_sha256 = "0".repeat(64);
+    registry.exec_degraded(Agent::Codex, other);
+    assert!(
+        usable(registry.fact(Agent::Codex))?
+            .granted
+            .contains(READ_ONLY_WORKSPACE)
+    );
+    registry.exec_degraded(Agent::Codex, codex.identity.clone());
+    let degraded = usable(registry.fact(Agent::Codex))?;
+    assert_eq!(degraded.withheld, [READ_ONLY_WORKSPACE.to_owned()].into());
+    assert_eq!(
+        degraded.session, codex.session,
+        "the session record is unchanged"
+    );
+    assert_eq!(
+        registry.snapshot(EPOCH).probes["codex"]["exec_degraded"],
+        true
+    );
+    // Unconfined from the start: withheld too.
+    let bin = tempfile::tempdir()?;
+    fake_codex_sandbox(bin.path(), "unconfined")?;
+    let registry = Registry::with_pi_dir(path_of(bin.path()), None);
+    registry.open_manifest(project.path());
+    registry.want(&wanted(&["codex"]));
+    registry.refresh();
+    let codex = usable(registry.fact(Agent::Codex))?;
+    assert_eq!(codex.withheld, [READ_ONLY_WORKSPACE.to_owned()].into());
     Ok(())
 }

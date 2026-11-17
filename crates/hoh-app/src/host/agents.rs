@@ -27,6 +27,13 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// soon a temporary probe failure is probed again though its files did not change (docs/adr/ADR-030.md decision 2).
 const AUTH_EVERY: Duration = Duration::from_secs(30);
 
+/// How often a codex host check that did not find confined runs again (docs/adr/ADR-032.md decision 4, -101): a
+/// recovery (the host fixed) shows within it; a confined one runs again only when codex's files change.
+const HOST_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// The capability codex's host facts can withhold (docs/adr/ADR-032.md decision 4).
+const READ_ONLY_WORKSPACE: &str = "read_only_workspace";
+
 /// The diagnostic of a compat manifest that cannot be read or is not schema-valid (docs/adr/ADR-030.md decision 10).
 pub const MANIFEST_UNREADABLE: &str = "compat.manifest_unreadable";
 
@@ -349,6 +356,30 @@ struct Known {
     recovered_at: u64,
     /// A turn's BLOCKED_AUTH, its fact until the next recovery (docs/adr/ADR-030.md decision 2).
     latched: Option<String>,
+    /// codex: this host's check of its own read-only sandbox, and when (docs/adr/ADR-032.md decision 4). Kept on the
+    /// agent, not on one look, with its own refresh ([`HOST_CHECK_EVERY`]).
+    host_check: Option<(probe::SandboxCheck, Instant)>,
+    /// codex: its App Server degraded to exec in this host's run, as the executor said, for the identity it said it of
+    /// (docs/adr/ADR-032.md decision 10 (A)); cleared by another identity, and by the host's restart.
+    exec_degraded: Option<AgentIdentity>,
+}
+
+impl Known {
+    /// The capabilities this host's facts withhold from the agent now (docs/adr/ADR-032.md decision 4): codex's read-only
+    /// workspace while its host check is unconfined or unavailable, or its App Server degraded to exec under its current
+    /// identity.
+    fn withheld(&self) -> BTreeSet<String> {
+        let checked = self
+            .host_check
+            .as_ref()
+            .is_some_and(|(check, _)| check.withholds());
+        let degraded = self.exec_degraded.is_some() && self.exec_degraded == self.identity;
+        if checked || degraded {
+            [READ_ONLY_WORKSPACE.to_owned()].into()
+        } else {
+            BTreeSet::new()
+        }
+    }
 }
 
 /// The registry's state, under its one lock.
@@ -409,14 +440,24 @@ impl State {
                     _ => None,
                 };
                 let entry = &ready.entry;
-                serde_json::json!({
+                let mut evidence = serde_json::json!({
                     "class": null, "detail": detail, "cli_version": entry.cli_version,
                     "launcher_path": entry.launcher_path, "implementation_sha256": entry.implementation_sha256,
                     "help_sha256": entry.help_sha256, "schema_sha256": entry.schema_sha256,
                     "capabilities": entry.capabilities,
                     "compat": self.compat(agent, seen, ready, basis),
                     "observation": observation,
-                })
+                });
+                // codex: this host's facts on its read-only profile, which a Block or Switch for them must show
+                // (docs/adr/ADR-032.md decision 4).
+                if let Some((check, _)) = &known.host_check {
+                    evidence["host_check"] =
+                        serde_json::json!({"check": check.name(), "reason": check.reason()});
+                }
+                if known.exec_degraded.is_some() && known.exec_degraded == known.identity {
+                    evidence["exec_degraded"] = serde_json::json!(true);
+                }
+                evidence
             }
         })
     }
@@ -442,13 +483,18 @@ impl State {
         {
             return Some(Fact::LoginMissing(why.clone()));
         }
+        // The session record is the binary's; a host fact only takes from what is granted now (decision 4).
+        let recorded = hoh_core::decision::granted_capabilities(session);
+        let withheld: BTreeSet<String> =
+            known.withheld().intersection(&recorded).cloned().collect();
         Some(Fact::Usable(Box::new(Usable {
             version: ready.version.clone(),
             identity: ready.entry.identity(),
             stamp: ready.stamp,
             generation: (self.host_epoch, ready.look),
             session: session.clone(),
-            granted: hoh_core::decision::granted_capabilities(session),
+            granted: recorded.difference(&withheld).cloned().collect(),
+            withheld,
             compat: self.compat(agent, seen, ready, basis),
         })))
     }
@@ -494,6 +540,8 @@ pub struct Registry {
     /// [`PROBE_TIMEOUT`] and [`AUTH_EVERY`], shorter in the tests.
     probe_timeout: Duration,
     every: Duration,
+    /// [`HOST_CHECK_EVERY`], shorter in the tests.
+    host_check_every: Duration,
     /// This build's suite set ([`compat::SUITE_SET_SHA256`]); the tests verify against one of their own.
     suite_set: String,
     /// The stop of the compat suite running, if one is: stopped with the registry's (docs/adr/ADR-030.md decision 10,
@@ -519,6 +567,7 @@ impl Registry {
             pi_dir,
             probe_timeout: PROBE_TIMEOUT,
             every: AUTH_EVERY,
+            host_check_every: HOST_CHECK_EVERY,
             suite_set: compat::SUITE_SET_SHA256.as_str().to_owned(),
             suite_stop: Mutex::new(None),
             reads: std::sync::atomic::AtomicU64::new(0),
@@ -530,6 +579,13 @@ impl Registry {
     fn with_timings(mut self, probe_timeout: Duration, every: Duration) -> Registry {
         self.probe_timeout = probe_timeout;
         self.every = every;
+        self
+    }
+
+    /// The registry with a test's [`HOST_CHECK_EVERY`].
+    #[cfg(test)]
+    pub(crate) fn with_host_check_every(mut self, every: Duration) -> Registry {
+        self.host_check_every = every;
         self
     }
 
@@ -814,6 +870,10 @@ impl Registry {
             if self.stopping.is_stopped() {
                 return outcome.map_err(|probe| probe.detail);
             }
+            self.look_at_sandbox(agent, ready, looked);
+            if self.stopping.is_stopped() {
+                return outcome.map_err(|probe| probe.detail);
+            }
         }
         let outcome = if looked {
             self.record(agent, files, outcome)
@@ -821,6 +881,47 @@ impl Registry {
             outcome
         };
         outcome.map_err(|probe| probe.detail)
+    }
+
+    /// codex on its App Server: this host's check of its own read-only sandbox ([`probe::codex_sandbox_check`],
+    /// docs/adr/ADR-032.md decision 4, -101), under the host's stop like every probe command. Run at the first look of
+    /// this host, on an actual look (its files changed), and while it is not confined at most every
+    /// [`HOST_CHECK_EVERY`]; never in a tick (the registry looks off it). A check the stop ended says nothing.
+    fn look_at_sandbox(&self, agent: Agent, ready: &Ready, probed: bool) {
+        if agent != Agent::Codex
+            || ready.entry.transport != hoh_agents::compat::Transport::AppServer
+        {
+            return;
+        }
+        let due = self
+            .state()
+            .agents
+            .get(&agent)
+            .and_then(|known| known.host_check.as_ref())
+            .is_none_or(|(check, at)| {
+                probed
+                    || (*check != probe::SandboxCheck::Confined
+                        && at.elapsed() >= self.host_check_every)
+            });
+        if !due {
+            return;
+        }
+        let check = probe::codex_sandbox_check(&ready.launcher, &self.env());
+        if self.stopping.is_stopped() {
+            return;
+        }
+        self.state().agents.entry(agent).or_default().host_check = Some((check, Instant::now()));
+    }
+
+    /// The executor's word that `agent`'s App Server degraded to exec in this host's run (docs/adr/ADR-032.md decision
+    /// 10 (A)): for the identity `identity` it ran as, the read-only profile is withheld from it until another identity
+    /// is found or the host restarts. A word for an older identity does nothing.
+    pub fn exec_degraded(&self, agent: Agent, identity: AgentIdentity) {
+        let mut state = self.state();
+        let known = state.agents.entry(agent).or_default();
+        if known.identity.as_ref() == Some(&identity) {
+            known.exec_degraded = Some(identity);
+        }
     }
 
     /// What a look at `agent` does now, on `path` (the registry's PATH): what was last seen of it while it is what that
