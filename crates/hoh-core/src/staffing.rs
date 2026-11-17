@@ -87,8 +87,12 @@ pub struct Usable {
     pub generation: (i64, u64),
     /// The session capabilities a session granted now would record (`sessions.capabilities_json`).
     pub session: Value,
-    /// `decision::granted_capabilities(session)`.
+    /// `decision::granted_capabilities(session)` but what a host fact withholds now ([`Usable::withheld`]).
     pub granted: BTreeSet<String>,
+    /// The session's capabilities a fact of this host withholds now (docs/adr/ADR-032.md decision 4: codex's host
+    /// check unconfined or unavailable, or its App Server degraded to exec in this host's run): not granted, though the
+    /// session record has them, so a session stays fresh; a refusal for one of them names the host, not the binary.
+    pub withheld: BTreeSet<String>,
     pub compat: Compat,
 }
 

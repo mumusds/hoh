@@ -81,6 +81,13 @@ fn each_outcome_of_the_check() {
             "{case}: the scratch directory is removed"
         );
     }
+    // A codex that does not take the command line (a usage error, exit 2): unknown, nothing was tried.
+    let launcher = fake(
+        &dir,
+        "echo \"error: unrecognized subcommand '$1'\" >&2; exit 2",
+    );
+    let check = codex_sandbox_check(&launcher, &quick);
+    assert_eq!(check.name(), "unknown", "{check:?}");
     // No answer within the limit: unknown, never an agent failure.
     let launcher = fake(&dir, "sleep 30");
     let check = codex_sandbox_check(&launcher, &env(Duration::from_millis(500)));

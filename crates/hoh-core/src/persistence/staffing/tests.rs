@@ -1366,6 +1366,7 @@ fn usable(version: &str, identity: AgentIdentity) -> Fact {
         generation: (1, 1),
         session: caps(),
         granted: crate::decision::granted_capabilities(&caps()),
+        withheld: Default::default(),
         compat: Compat::Verified,
     }))
 }
