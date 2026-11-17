@@ -1257,6 +1257,60 @@ mod tests {
     }
 
     #[test]
+    fn a_database_file_that_cannot_be_created_is_judged_by_the_os_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // F7-55: no room (ENOSPC, EDQUOT) is DB_FULL; a directory that refuses a new file (EACCES, EPERM, EROFS) is
+        // NotWritable, neither WAL's nor full; anything else (a missing directory, no file descriptor left) stays the
+        // open step's failure, as before the file was made first.
+        use rustix::io::Errno;
+        let dir = Path::new("/srv/store");
+        let db = dir.join(".hoh-wal-selftest-1-2-0.db");
+        for (errno, want) in [
+            (Errno::NOSPC, "full"),
+            (Errno::DQUOT, "full"),
+            (Errno::ACCESS, "not writable"),
+            (Errno::PERM, "not writable"),
+            (Errno::ROFS, "not writable"),
+            (Errno::NOENT, "open"),
+            (Errno::MFILE, "open"),
+        ] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            let got = match not_created(dir, &db, &e) {
+                PersistError::Full(detail) => {
+                    assert!(detail.contains(&e.to_string()), "{detail}");
+                    "full"
+                }
+                PersistError::NotWritable { path, detail } => {
+                    assert_eq!((path.as_path(), detail), (dir, e.to_string()));
+                    "not writable"
+                }
+                PersistError::WalUnsupported { step, detail } => {
+                    assert_eq!(step, Step::Open.name(), "{detail}");
+                    assert!(detail.contains(&db.display().to_string()), "{detail}");
+                    "open"
+                }
+                other => return Err(format!("{e}: {other:?}").into()),
+            };
+            assert_eq!(got, want, "{e}");
+        }
+
+        // For real: a directory its user may not write (when that user is not root, whom permissions do not stop).
+        if !rustix::process::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir()?;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))?;
+            let result = wal_self_test(dir.path(), &test_probe(None));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
+            match result {
+                Err(PersistError::NotWritable { path, .. }) => assert_eq!(path, dir.path()),
+                other => return Err(format!("{other:?}").into()),
+            }
+            assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_directory_that_cannot_hold_a_database_fails_the_open_step()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
