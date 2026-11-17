@@ -644,6 +644,23 @@ impl Fakes {
         )
     }
 
+    /// [`Fakes::claude`] whose turn (not its `auth status` login check), once it read its prompt, waits while
+    /// `claude.d/hold` exists until `claude.d/release` does.
+    fn claude_holding(&self, note: &str) -> R {
+        let d = self.bin().join("claude.d");
+        self.script(
+            "claude",
+            &format!(
+                "# {note}\nf='{PROTOCOL}/claude/2.1.318'; d='{d}'\n\
+                 case \"$1\" in --version) echo '2.1.318 (Claude Code)'; exit 0;; --help) cat \"$f/help.txt\"; exit 0;; esac\n\
+                 echo $$ > \"$d/pid.$$\"; cat > /dev/null\n\
+                 [ \"$1\" != auth ] && [ -e \"$d/hold\" ] && python3 -c 'import os, sys, time\nwhile not os.path.exists(sys.argv[1]): time.sleep(0.02)' \"$d/release\"\n\
+                 cat \"$f/success/stdout.jsonl\"\n",
+                d = d.display()
+            ),
+        )
+    }
+
     /// A fake `pi` 1.5.0 whose model is not there: the probe's answers from the recording; a turn's get_state is
     /// answered as recorded and its prompt refused `Model not found: …` (pi.rs's MODEL_UNAVAILABLE).
     fn pi_without_its_model(&self) -> R {
@@ -744,6 +761,35 @@ impl hoh_app::host::HostHooks for HoldSuite {
         let end = Instant::now() + Duration::from_secs(120);
         while self.0.exists() && !self.0.join("release").exists() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// [`HoldSuite`] on `suite`, and one tick held just after its staffing (`RunnerPoint::AfterStaffing`, its snapshot of the
+/// registry taken) once `<gate>/arm` exists: the hold takes the arm, says so in `<gate>/held-tick` and waits for
+/// `<gate>/go`, at most 60 s (its worker's other tasks handed on, block_in_place).
+#[derive(Debug)]
+struct HoldTick {
+    suite: PathBuf,
+    gate: PathBuf,
+}
+
+impl hoh_app::host::HostHooks for HoldTick {
+    fn suite_ran(&self, agent: &str) {
+        hoh_app::host::HostHooks::suite_ran(&HoldSuite(self.suite.clone()), agent);
+    }
+
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::AfterStaffing
+            && std::fs::remove_file(self.gate.join("arm")).is_ok()
+        {
+            let _ = std::fs::write(self.gate.join("held-tick"), "");
+            tokio::task::block_in_place(|| {
+                let end = Instant::now() + Duration::from_secs(60);
+                while !self.gate.join("go").exists() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
         }
     }
 }
@@ -1223,6 +1269,175 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
         R::Ok(())
     }
     .await;
+    let _ = std::fs::write(hold.join("release"), "");
+    host.shutdown().await;
+    fakes.stop_fakes();
+    outcome
+}
+
+/// docs/adr/ADR-030.md decision 11 (-53) at the allocation's own look: a wake is owed while the Commander's turn runs;
+/// the turn ends while a tick is held just after its snapshot was taken (claude A verified in it), and before that
+/// tick goes on to its allocation, the Commander's agent changes (claude B) and the registry looks at it (its suite,
+/// held here, admitted). The owed wake is deferred (supervisor.deferred{COMPAT_UNVERIFIED}), never given a turn while
+/// the agent awaits its suite; once the suite published PASS the Commander is bound again and the wake answered at its
+/// first turn, never failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_owed_when_the_commanders_agent_changed_within_a_tick_waits_uncounted() -> R {
+    let fakes = Fakes::new()?;
+    fakes.claude_holding("A")?;
+    fakes.team(
+        "config_version = \"1.0\"\n[team.commander]\nagent = \"claude\"\n[team.qa]\nagent = \"claude\"\n\
+         [team.researcher]\nagent = \"claude\"\n[team.reviewer]\nagent = \"claude\"\n",
+    )?;
+    fakes.register(hoh_agents::compat::Agent::Claude)?;
+    let hold = fakes.dir.path().join("hold");
+    let gate = fakes.dir.path().join("gate");
+    std::fs::create_dir_all(&hold)?;
+    std::fs::create_dir_all(&gate)?;
+    let mut config = fakes.config();
+    config.hooks = Arc::new(HoldTick {
+        suite: hold.clone(),
+        gate: gate.clone(),
+    });
+    let host = start_when_free(config).await?;
+    let project = fakes.project();
+    let held_turns = fakes.bin().join("claude.d");
+    let outcome = async {
+        approved(&project)?;
+        let run_id = started(&host).await?;
+        supervised(&project, &run_id, "fp-1").await?;
+        let limit = Duration::from_secs(60);
+        // The state of the turn of the wake of fingerprint `fp`'s trigger, if it has one; and whether that wake is
+        // woken (owed).
+        let turn_of = |fp: &str| {
+            format!(
+                "SELECT a.state FROM supervisor_triggers t JOIN events e ON e.kind = 'supervisor.allocated' AND \
+                 json_extract(e.payload_json, '$.wake') = t.trigger_id JOIN attempts a ON a.attempt_id = \
+                 json_extract(e.payload_json, '$.attempt_id') WHERE t.run_id = '{run_id}' AND t.fingerprint = '{fp}'"
+            )
+        };
+        let state_is = |want: &'static str| move |r: &Value| r[0]["state"] == want;
+        // Every wake owed so far (fp-1's and the run's adoption of its specification, docs/adr/ADR-031.md decision 1)
+        // answered and no turn of the run unfinished.
+        until(&project, &turn_of("fp-1"), limit, &state_is("SETTLED")).await?;
+        until(&project, &turn_of("spec.changed/"), limit, &state_is("SETTLED")).await?;
+        until(
+            &project,
+            &format!(
+                "SELECT count(*) AS n FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, \
+                 '$.attempt_id') WHERE e.run_id = '{run_id}' AND e.kind = 'supervisor.allocated' AND a.state NOT IN \
+                 ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')"
+            ),
+            limit,
+            &|r: &Value| r[0]["n"] == 0,
+        )
+        .await?;
+        // A turn of the Commander runs, held by the fake (fp-2's, or another wake's that came first, such as the
+        // stall detector's retrigger); fp-3's wake is owed meanwhile (woken), waiting for that turn.
+        let unfinished = format!(
+            "SELECT count(*) AS n FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, \
+             '$.attempt_id') WHERE e.run_id = '{run_id}' AND e.kind = 'supervisor.allocated' AND a.state NOT IN \
+             ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')"
+        );
+        std::fs::write(held_turns.join("hold"), "")?;
+        need_decision(&project, &run_id, "fp-2")?;
+        until(
+            &project,
+            &format!(
+                "SELECT 1 FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, '$.attempt_id') \
+                 WHERE e.run_id = '{run_id}' AND e.kind = 'supervisor.allocated' AND a.state = 'RUNNING'"
+            ),
+            limit,
+            &some,
+        )
+        .await?;
+        need_decision(&project, &run_id, "fp-3")?;
+        until(
+            &project,
+            &format!(
+                "SELECT t.trigger_id AS wake FROM supervisor_triggers t JOIN events e ON e.kind = 'supervisor.woken' \
+                 AND e.event_id = t.trigger_id || '/woken' WHERE t.run_id = '{run_id}' AND t.fingerprint = 'fp-3'"
+            ),
+            limit,
+            &some,
+        )
+        .await?;
+        // A tick held once its snapshot is taken; the held turn ends meanwhile; then claude B, looked at by the
+        // registry (its suite admitted and held), before the tick goes on to its allocation.
+        std::fs::write(gate.join("arm"), "")?;
+        let end = Instant::now() + limit;
+        while !gate.join("held-tick").exists() {
+            if Instant::now() > end {
+                return Err("no tick was held after its staffing".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_file(held_turns.join("hold"))?;
+        std::fs::write(held_turns.join("release"), "")?;
+        until(&project, &unfinished, limit, &|r: &Value| r[0]["n"] == 0).await?;
+        let before = rows(&db(&project), &turns(&run_id))?;
+        fakes.claude("B")?;
+        while !hold.join("held").exists() {
+            if Instant::now() > end {
+                return Err("claude's suite never ran".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::write(gate.join("go"), "")?;
+        let deferred = until(
+            &project,
+            &format!(
+                "SELECT json_extract(payload_json, '$.wakes') AS wakes FROM events WHERE run_id = '{run_id}' \
+                 AND kind = 'supervisor.deferred' AND json_extract(payload_json, '$.reason') = 'COMPAT_UNVERIFIED'"
+            ),
+            limit,
+            &some,
+        )
+        .await?;
+        // Ticks go on meanwhile (one each 200 ms): no turn while unverified.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(rows(&db(&project), &turns(&run_id))?, before, "no turn while unverified");
+        let wakes: Vec<Value> = serde_json::from_str(deferred[0]["wakes"].as_str().unwrap_or("[]"))?;
+        if wakes.is_empty() {
+            return Err(format!("no owed wake: {deferred}").into());
+        }
+        std::fs::write(hold.join("release"), "")?;
+        let answered = until(
+            &project,
+            &turns(&run_id),
+            limit,
+            &|r: &Value| {
+                r.as_array().is_some_and(|a| {
+                    wakes.iter().all(|w| a.iter().any(|t| t["wake"] == *w && t["state"] == "SETTLED"))
+                })
+            },
+        )
+        .await?;
+        for wake in &wakes {
+            let of_wake: Vec<&Value> = answered
+                .as_array()
+                .map(|a| a.iter().filter(|t| t["wake"] == *wake).collect())
+                .unwrap_or_default();
+            assert_eq!(of_wake.len(), 1, "{wake} answered at its first turn: {answered}");
+            assert_eq!(
+                (&of_wake[0]["agent"], &of_wake[0]["role_epoch"]),
+                (&json!("claude"), &json!(2)),
+                "bound again to the verified implementation: {answered}"
+            );
+        }
+        let failures = rows(
+            &db(&project),
+            &format!(
+                "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'supervisor.rearmed' \
+                 AND json_extract(payload_json, '$.reason') = 'failure'"
+            ),
+        )?;
+        assert_eq!(failures, json!([{"n": 0}]));
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(held_turns.join("release"), "");
+    let _ = std::fs::write(gate.join("go"), "");
     let _ = std::fs::write(hold.join("release"), "");
     host.shutdown().await;
     fakes.stop_fakes();
