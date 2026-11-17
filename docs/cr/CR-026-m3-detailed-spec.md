@@ -2,9 +2,9 @@
 
 ID：CR-026
 状态：DRAFT
-批准人：（待定。C22 是所有者问题，见“需所有者决定的项”：所有者答复之前不批准、不 relock；答复之后连同设计审查 PASS 由所有者批准，或由所有者指定的方式批准）
-日期：2026-11-17（第 3 稿：设计审查第 2 轮之后，见文末“审查记录”；M3-T01 的准备稿，领取时按当时的 main 重新核对）
-基线：改受锁文件 `contracts/requirements.json`（M3 的 16 项需求由 outline 细化为 detailed；REQ-018 的配置键表增加三项）、`contracts/acceptance-scenarios.json`（这 16 项的场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode`、`$defs.RejectionReason`、`$defs.BlockedReason` 补齐 8 个原因码）；新增受锁文件 `contracts/spec-review-report.schema.json`（独立规格审查的报告，CR26D-101）与 `contracts/sql/002_spec_drafting.sql`（C22 取 (a) 时：起草 Task 可以没有规格）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M3 实现任务的拆分）、`scripts/product/persistence-whitelist.json`（迁移 002 的条目）。`config/hoh.example.toml` 不在本 CR 中改（CR26D-103：三个新键随加载器的支持在 M3-T06、M3-T09、M3-T10 中加入）。`python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md --add contracts/spec-review-report.schema.json --add contracts/sql/002_spec_drafting.sql`
+批准人：（待定。预期为“CTO 依 CR-003 D1 预授权与所有者 2026-11-17 对 C22 的决定 (a)（独立设计审查会话 …）”；见“所有者的决定”与“是否属于 CR-003 D1”）
+日期：2026-11-17（第 3 稿：设计审查第 2 轮之后，并记入所有者 2026-11-17 对 C22 的决定 (a)，见文末“审查记录”；M3-T01 的准备稿，领取时按当时的 main 重新核对）
+基线：改受锁文件 `contracts/requirements.json`（M3 的 16 项需求由 outline 细化为 detailed；REQ-018 的配置键表增加三项）、`contracts/acceptance-scenarios.json`（这 16 项的场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode`、`$defs.RejectionReason`、`$defs.BlockedReason` 补齐 8 个原因码）；新增受锁文件 `contracts/spec-review-report.schema.json`（独立规格审查的报告，CR26D-101）与 `contracts/sql/002_spec_drafting.sql`（C22 的决定 (a)：首次批准之前的起草 Task 可以没有规格）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M3 实现任务的拆分）、`scripts/product/persistence-whitelist.json`（迁移 002 的条目）。`config/hoh.example.toml` 不在本 CR 中改（CR26D-103：三个新键随加载器的支持在 M3-T06、M3-T09、M3-T10 中加入）。`python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md --add contracts/spec-review-report.schema.json --add contracts/sql/002_spec_drafting.sql`
 
 本 CR 是 M3-T01（“细化 M3 需求为 detailed：每项 2–5 条可判定 AC 与场景，写 CR 并 relock 基线”）的准备稿。M3-T01 依赖 V01-T02，尚未领取；本稿不改任何受锁文件，下文的片段已在仓库之外的副本上应用并通过 `tools/validate_bundle.py` 与 bundle 自检，并在同一副本上运行了 TEST-018-01 与迁移 002 的探针（见“验证方式”）。依据是 M3 准备清单 `.hoh-dev/evidence/m3-prep/inventory.md`（写于 16ff3e1），已按 main 715e2d0 复核，更正见附录 A；本稿引用的源文件在 715e2d0 与 main c874460 之间只有 `crates/hoh-core/src/persistence/mod.rs` 第 1371 行之后新增了 `runner_watched`，引用的行号不变。
 
@@ -16,7 +16,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 
 ## 所有者已定的事项（2026-11-17，照录，不再讨论）
 
-准备清单 §4 的六个所有者问题，所有者于 2026-11-17 都选了保守默认。本 CR 按下表写入需求：
+准备清单 §4 的六个所有者问题，所有者于 2026-11-17 都选了保守默认；第 2 稿之后提出的 C22（首次批准之前的起草），所有者于 2026-11-17 选了 (a)。本 CR 按下表写入需求：
 
 | ID | 决定 | 写入 |
 |---|---|---|
@@ -26,6 +26,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 | O4 | 用户规格是 docs/spec/ 下的 Markdown，固定标题与 id 行；HoH 生成 JSON 索引 | REQ-034 行为 1–5 与 AC-034-01；REQ-029 行为 6 |
 | O5 | Skill 不写进原生 Agent 的用户目录，只注入或写进会话自己的目录 | REQ-046 行为 1、失败模式 3 与 AC-046-02 |
 | O6 | 任何规格修订使全部验收失效，在新的候选上重验 | REQ-033 行为 4 与 AC-033-03；REQ-032 行为 5 与 AC-032-03 |
+| C22 | 首次批准之前的起草取 (a)：Plan 对话、由 Agent 起草，起草 Task 的 spec_id 为空，经一个受守护的 SQL 迁移（只有起草 Task 可以为空）；草稿只经用户的 ApproveSpec 成为修订 1；Q1(a) 与 `-p` 停在 no_spec 不变 | 第 2 节；迁移 002；REQ-008 行为 2–4 与 AC-008-02、-05；REQ-028 行为 1、5 与 AC-028-04；REQ-029 行为 7 与 AC-029-03 |
 
 ## 决定
 
@@ -33,14 +34,14 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 
 - **规格根与格式**（O4）：用户项目的规格是 `docs/spec/*.md`；固定一级标题为用户、范围、非目标、决策、开放问题、需求；需求为 `## REQ-<id> <标题>`（可带 class 行：required 或 degradable，缺省 required），验收为 `### AC-<req>-<nn>`，带 given、when、then、check 四个 id 行；决策条目带来源（question_id、input_id 或假设的事件 id），开放问题条目带“阻塞：是/否”。精确语法在 M3-T02 的 ADR 中定，内置模板（REQ-029）给出实例。
 - **冻结形式与规格摘要**（CR26D-02、-102）：多份 Markdown 的冻结形式是 HoH 生成并提交的 `docs/spec/index.json`：规范 JSON（UTF-8、LF、键按字典序、两空格缩进、末尾一个换行），含 `generated` 标记、`files`（每份 Markdown 的路径与 sha256，按路径排序）、`requirements`（与 `contracts/requirements.json` 的需求对象同形；每条 AC 带 `test_id`；`release_class` 取 class 行，`release_targets` 恒为 `["project"]`：用户项目只有一个发布目标）与 `scenarios`（每条 AC 一项 `{id, requirement_id, acceptance_id, check_id}`，`check_id` 取该 AC 的 check 行）。**规格摘要就是 index.json 字节的 sha256**：任一 Markdown 文件的任一字节变化都改变它，scenarios 也在其中。`specs.sha256`、ApproveSpec 与 ProposeSpecChange 的 `spec_sha256`、`candidate.spec_sha256` 都是这个值；`candidate.spec` 是指向 index.json 的单个 FileRef；`acceptance_criteria.check_id` 与追踪的 TEST→check 都取自 scenarios（REQ-032 行为 6）。冻结时 HoH 从该提交的 Markdown 重新生成索引，要求与提交中的 index.json 逐字节相同。用户项目不需要 `contracts/` 目录；受锁的候选契约不改：`contracts/candidate.schema.json` 的 `spec` 本就是单个 FileRef。
-- **已批准修订**：经用户批准（ApproveSpec，或以同一判定处理的批准问题答复，O1）、sha256 为该修订规格摘要的 specs 行；specs 只有已批准修订（M2T13D-59，ADR-031 决定 1，所有者 2026-11-16 的 Q1(a)），只有已批准修订被采用、派发、冻结与验收引用。项目的首个规格经批准成为修订 1（`spec.changed{cause:"approved"}`），之后的修订经 CR（REQ-033，`spec.changed{cause:"changed", cr_id}`）。受锁的 ApproveSpec 载荷照旧（`spec_sha256`、`decision`、`note`），ProposeSpecChange 照旧（`reason`、`spec_sha256`）；`decision` 的三值语义见 REQ-008 行为 1。
+- **已批准修订**：经用户的 ApproveSpec 批准（批准问题的 AnswerQuestion approve 经同一对端判定后转为 ApproveSpec，O1）、sha256 为该修订规格摘要的 specs 行；specs 只有已批准修订（M2T13D-59，ADR-031 决定 1，所有者 2026-11-16 的 Q1(a)），只有已批准修订被采用、派发、冻结与验收引用。项目的首个规格经批准成为修订 1（`spec.changed{cause:"approved"}`），之后的修订经 CR（REQ-033，`spec.changed{cause:"changed", cr_id}`）。受锁的 ApproveSpec 载荷照旧（`spec_sha256`、`decision`、`note`），ProposeSpecChange 照旧（`reason`、`spec_sha256`）；`decision` 的三值语义见 REQ-008 行为 1。
 - **只由用户批准**（O1，CR26D-06、-105、-152）：host 按连接对端的进程身份判定，对端或它的任一祖先带 Attempt 标记、对端在任一 Attempt 的 cgroup 中、或对端无法确认，都以 403 SPEC_APPROVAL_NOT_USER 拒绝（REQ-008 行为 1）。Commander 的 DecisionPayload 没有批准一类，它的输出永远不产生修订。剩余风险（同用户进程脱掉标记、离开 cgroup 并脱离 Attempt 的祖先链）与 CR-024 的 R1–R7 一样写入 docs/12。
 - **独立规格审查**（CR26D-05、-101）：对象是已批准修订而不是候选。报告用新的受锁契约 `contracts/spec-review-report.schema.json`（第 5 节），审查的开启与收取是事件 `spec_review.opened`、`spec_review.reported`；不进 `independent_reports`（`candidate_id` 必填、外键到 candidates），不开验证轮次（`reports::intake` 经 `round_of_task` 找候选），也不为规格造候选（REQ-031 行为 3）。
 - **新事件**（`$defs.Event.kind` 是开放的字符串，不需 CR；名称以 M3 各任务的 ADR 为准，AC 中出现的为定名）：`spec.index_failed`、`spec.generated_drift`、`spec.drafting`、`spec_review.opened`、`spec_review.reported`、`plan.write_violation`、`task.migrated`、`task.replaced`、`readiness.passed`、`run.baseline`、`run.mode_change_pending`、`run.mode_changed`、`input.delivered`、`no_progress`（ADR-025 决定 1 已列为唤醒种类，产生方在 M3-T10）。新的 Run 级问题原因：`spec_approval`（REQ-008 行为 4）。
 - **check**：AC 只用 v1 档已运行、且由 M3 实现任务的祖先交付的检查：unit、integration、tui-pty、recovery、deployment、adapter-live、traceability（M0-T03、M1-T03、M1-T08、M2-T05、M2-T10、M2-T14 交付）。没有 AC 用 web-e2e、plugin-live、soak（它们由 M5–M7 的任务交付）。
 - **可配置性照旧兑现**（CR26D-10、-56、-103）：docs/03 的“Shift+Tab 循环（配置可改）”与 docs/06 的“MOA 最多两轮……为默认可调上限”都保留：REQ-018 的键表增加 `[ui] mode_cycle` 与 `[supervision] max_discussion_rounds`，AC-007-01 与 AC-023-03 各覆盖一个非缺省值。三个新键（含 `[assumptions]`）进入 `config/hoh.example.toml` 的时间，是加载器接受它们的同一提交（第 4 节）。
 
-### 2. 首次批准之前的起草（C22，所有者问题；CR26D-01、-50、-100、-150、-151）
+### 2. 首次批准之前的起草（C22：所有者 2026-11-17 选 (a)；CR26D-01、-50、-100、-150、-151）
 
 **要解决的**：一个还没有已批准规格的项目里，Plan 的首次起草在哪里发生——由谁起草、怎样派发、完成、取消与恢复，Run 在起草与批准前后处于什么状态，第一次批准时身份怎样移动——同时守住 StartRun 的 `runtime:no_spec`（所有者 2026-11-16 的 Q1(a)）、O1（只有用户批准）、M2T13D-59（specs 只有已批准修订）与 CONTRACT 第 4 条（Plan 对话、生成规格，用户批准的是这份规格）。
 
@@ -51,27 +52,22 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 - 没有规格的 Run 不被监督：监督步骤把到期的触发器延后为 `supervisor.deferred{NO_SPEC}`（persistence/supervise.rs:913-929），唤醒分配只选 `spec_id IS NOT NULL` 的 Run（persistence/wakes.rs:849），停滞探测也只看有规格的 Run（persistence/runner.rs:563-567）。调度轮只在 RUNNING、VERIFYING 派发（persistence/rounds.rs:40）。运行器的派发通知接受 SPECIFYING 中的 PREPARED Attempt（persistence/runner.rs:445-462）。
 - Run 的边是 CREATED→DISCOVERING→SPECIFYING（lifecycle.rs:157-183），没有 SPECIFYING 回到 DISCOVERING 的边；今天没有代码把 Run 推进到 DISCOVERING；no_spec 的 adopt 出口在仍没有规格时保持问题、Run 留在 BLOCKED（questions.rs:672-679）。
 
-**备选**：
+**所有者的决定**（2026-11-17）：取 (a)。首次批准之前的起草作为 spec_id 为空的 Task 运行，经一个受守护的 SQL 迁移，只有起草 Task 可以没有规格；Plan 对话，由 Agent 起草规格；草稿只经用户的 ApproveSpec 成为修订 1；Q1(a) 与 `-p` 停在 no_spec 不变。
 
-| 做法 | 怎样运行 | 改的受锁文本 | 需要所有者吗 |
-|---|---|---|---|
-| (a) 起草是 spec_id 为空的 Task（**推荐**） | 见下；迁移 002 使只有起草 Task 可以没有规格，且只在项目还没有已批准修订时 | 新增 `contracts/sql/002_spec_drafting.sql`（受锁 SQL 的语义：没有规格的 Task） | 是：改受锁 SQL 的语义 |
-| (b) 起草不是 Task（例如 Commander 的监督 turn） | 不可行：runner 的每个 Attempt 都要 Task（`attempts.task_id NOT NULL`），监督 turn 的 Task 同样要 `spec_id`；绕过 runner 直接起 Agent 则失去租约、取消阶梯、终结证明与 kill -9 恢复（REQ-041、REQ-043） | — | 否（不可行） |
-| (c) 不经 Agent 的模板骨架，用户先批准为修订 1，内容随后经 CR | 第 2 稿的推荐；修订 1 是任何 Plan 对话之前由 Runtime 写出的无 REQ 骨架 | 无 | 是：改 CONTRACT 第 4 条的交互（用户在 Plan 对话之前批准骨架；ADR-031 交给 M3 的路径是“/plan 生成规格后 adopt”），CR26D-150；它的批准前写入还缺租约与效果台账的归属（CR26D-100，见附录 B） |
-| (d) 首个规格由用户自己写 | HoH 在首次批准之前不做任何起草 | 无 | 是：空项目里 Plan 不能“生成规格”（CONTRACT 第 4 条），是范围缩减 |
+**未采用**：(b) 起草不是 Task（例如 Commander 的监督 turn）——不可行：runner 的每个 Attempt 都要 Task，绕过 runner 则失去租约、取消阶梯、终结证明与 kill -9 恢复；(c) 不经 Agent 的模板骨架先由用户批准为修订 1（第 2 稿的推荐）——改 CONTRACT 第 4 条的交互（CR26D-150），批准前的写入也没有租约与效果台账的归属（CR26D-100）；(d) 首个规格由用户自己写——空项目里 Plan 不能生成规格，是范围缩减。
 
-**(a) 端到端**（推荐；下文的需求片段按它写，取 (c) 或 (d) 时替换的条目见附录 B）：
+**(a) 端到端**：
 
 1. **没有已批准规格**（阶段一）：StartRun（任何模式）照旧以 `runtime:no_spec` 阻塞：BLOCKED(NEED_DECISION)、resume_state=CREATED、`runs.spec_id` 为空，没有 Task 与 Attempt；`-p` 以 3 退出（Q1(a) 不变）。no_spec 问题的选项从 `[adopt]` 变为 `[adopt, draft]`。
 2. **draft**（阶段二）：用户以 `draft` 答复（TUI，或 `hoh -p draft --resume <run_id>`）。项目此时已有已批准修订，则 draft 与 adopt 相同（采用最新修订）；否则答复释放 no_spec 声明，Run 回到 CREATED（resume_state），`runs.spec_id` 仍为空。Runtime 推进常规阶段（CONTRACT 第 6 条“常规阶段自动流转”，ADR-031 交给 M3 的 :497）：CREATED→DISCOVERING，做只读的项目发现并写 `run.baseline`（REQ-028 行为 1：先于该 Run 的任何写入），再 DISCOVERING→SPECIFYING；进入 SPECIFYING 的同一事务建首个起草 Task 并写 `spec.drafting{run_id, task_id}`。
 3. **起草 Task**：`kind='spec_draft'`、职位 cto、writer、`spec_id` 为空、没有 `task_requirements`（不经 `create_tasks` 与 `plan::check`）。它按 Runtime 规则类派发，与监督 Task 同形（persistence/wakes.rs:1041 的 LEASED Task 加 PREPARED Attempt 与运行器通知），但持项目的**写者**租约：同一项目的两个起草 Run 由写者租约串行。首个起草 Attempt 的准备阶段在非 git 目录中本地 `git init`（无远程，REQ-028 行为 5），随后实例化规格骨架与有效档的模板（REQ-029 行为 7，M3-T08），都记为该 Attempt 的 effect（效果台账，REQ-041）。取消阶梯、终结证明、工作区记录与 kill -9 之后的 reconcile 同其他写 Task。首次批准之前 Run 没有规格，Commander 不被唤醒、停滞探测不看它（上面的约束照旧），起草由看门狗（ADR-022 决定 19）与墙钟期限约束；起草 Agent 需要用户回答时以 NEED_DECISION 的问题停下（Run 为 BLOCKED、resume_state=SPECIFYING）。
 4. **完成**：起草 Task 的完成不冻结候选、不要求 AC（host 的完成按 kind 分支，先于写 Task 的“没有 AC 即 no_acceptance_criteria”，persistence/completion.rs:560）。Runtime 先以 Git 核对写集（REQ-008 行为 5：docs/spec/、docs/、.hoh/），再要求起草结果已提交（未提交时与冻结拒绝一样请它更正），并从该提交的 Markdown 重新生成索引、与提交中的 index.json 逐字节相同。通过后 Task 为 IMPLEMENTED，Runtime 以 Run 级问题 `spec_approval{spec_sha256, git_commit}` 请用户批准：Run 为 BLOCKED(NEED_DECISION)、resume_state=SPECIFYING；此时 specs 仍没有行。
-5. **批准**（阶段三）：用户以 ApproveSpec（或以 AnswerQuestion 答复 `approve`，受同一对端判定）批准。项目还没有已批准修订时，一个事务写修订 1（`spec.changed{cause:"approved"}`、requirements 与 acceptance_criteria 行）、使该 Run 采用它（`runs.spec_id`）、起草 Task 为 ACCEPTED、释放问题、Run 回到 SPECIFYING；此后 Commander 被唤醒，独立规格审查、readiness 与任务 DAG 照 REQ-031 进行。项目已有已批准修订时（例如另一个起草 Run 先被批准），该 Run 先采用当前修订，起草结果以 CR 提出（REQ-033，base 为当前修订）。REJECT（或其他答复）使起草 Task 回到 READY，下一个 Attempt 以 note 为输入继续起草。之后的起草 Task（PLAN、AUTO 中改规格）的 `spec_id` 为当前已批准修订，完成时提出 CR。
-6. **无人值守**：`hoh -p` 在阶段一以 3 退出；`hoh -p draft --resume <run_id>` 跟随起草直到 `spec_approval` 问题，以 3 退出，永不自批；用户随后在 TUI 中批准，或以 `hoh -p approve --resume <run_id>` 答复（对端判定照旧：从 Attempt 内运行的这条命令被拒）。
+5. **批准**（阶段三）：修订只经用户的 ApproveSpec 产生。用户在 TUI 或经 API 提交 ApproveSpec；以 AnswerQuestion 答复 `approve` 时，host 先做同一对端判定，再把它转为该用户的 ApproveSpec 命令（commands 中记为 ApproveSpec，spec_sha256 取问题中的值，幂等键由答复命令派生）。项目还没有已批准修订时，一个事务写修订 1（`spec.changed{cause:"approved"}`、requirements 与 acceptance_criteria 行）、使该 Run 采用它（`runs.spec_id`）、起草 Task 为 ACCEPTED、释放问题、Run 回到 SPECIFYING；此后 Commander 被唤醒，独立规格审查、readiness 与任务 DAG 照 REQ-031 进行。项目已有已批准修订时（例如另一个起草 Run 先被批准），该 Run 先采用当前修订，起草结果以 CR 提出（REQ-033，base 为当前修订）。REJECT（或其他答复）使起草 Task 回到 READY，下一个 Attempt 以 note 为输入继续起草。之后的起草 Task（PLAN、AUTO 中改规格）的 `spec_id` 为当前已批准修订，完成时提出 CR。
+6. **无人值守**：`hoh -p` 在阶段一以 3 退出；`hoh -p draft --resume <run_id>` 跟随起草直到 `spec_approval` 问题，以 3 退出，永不自批；用户随后在 TUI 中批准，或以 `hoh -p approve --resume <run_id>` 答复（转为 ApproveSpec；对端判定照旧：从 Attempt 内运行的这条命令被拒）。
 7. **取消与恢复**：CancelRun 走起草 Attempt 的取消阶梯，起草 Task 为 CANCELLED、Run 为 CANCELLED，已写的规格文件留在工作树与提交中，不还原。host 被 kill -9 时，重启后起草 Attempt 照 REQ-041 reconcile：不重复建起草 Task（`spec.drafting` 按 run 去重），已记录的 effect（git init、模板实例化）不重复执行；批准问题与 specs 都是持久的，重启前后不变。
 8. **保证**：Q1(a) 的 no_spec 与 `-p` 的 3 不变；没有 specs 行先于用户批准（M2T13D-59）；只有用户批准（O1）；规格由 Plan 的起草 Agent 在对话中生成、用户批准的就是它（CONTRACT 第 4 条）；没有规格的 Task 只能是起草 Task，且只在项目还没有已批准修订时（迁移 002 的 CHECK 与触发器）。AC-008-02 端到端观察三个阶段与 kill -9；AC-008-05 观察 O1 的反例与正例；AC-028-04 观察基线先于写入与首个提交的路径边界；AC-029-03 观察离线实例化与 `-p` 停在批准问题。
 
-**迁移 002**（`contracts/sql/002_spec_drafting.sql`，(a) 时新增并受锁）：
+**迁移 002**（`contracts/sql/002_spec_drafting.sql`，新增并受锁）：
 
 ```sql
 -- Migration 2 (CR-026, C22 (a)): before a project's first approved specification revision, its drafting Task has no
@@ -111,17 +107,17 @@ COMMIT;
 | `persistence/mod.rs:629-647` `allowed_values`（取第一个含 `CREATE TABLE tasks(` 的迁移） | 只有迁移 1 | 迁移 002 建的是 `tasks_new`，取到的仍是 001 的 state 列表，与 002 相同；不变 |
 | `persistence/mod.rs:653-689` `migrate` | 外键开启的事务内执行 | 按上文改；`persistence/tests.rs` 中按 user_version=1 断言的测试（:109、:178、:207 等）随最新版本变为 2 而更新 |
 
-**与所有者否决的 Q1(b) 的关系**（Q1(b) 原文与所有者的取舍见 `.hoh-dev/evidence/m3-prep/cr026/draft2/q1b.md`）：
+**与 2026-11-16 未采用的 Q1(b) 的区别**（Q1(b) 原文与所有者的取舍见 `.hoh-dev/evidence/m3-prep/cr026/draft2/q1b.md`）：
 
-| 方面 | Q1(b)（2026-11-16 未采用） | C22 (a) | C22 (c) |
-|---|---|---|---|
-| 谁触发 | host，每个 Run（含 `-p`）自动 | 用户在 no_spec 问题上答复 `draft` | 用户答复 `draft` |
-| 何时有 specs 行 | 立即（host 写） | 只在用户批准起草结果之后 | 只在用户批准骨架之后 |
-| `-p` | 不再停在 no_spec | 照旧以 3 停在 no_spec；draft 之后停在批准问题 | 照旧停在 no_spec |
-| 修订 1 的内容 | 目标摘要、无需求 | Plan 起草 Agent 生成的规格（有 REQ 与 AC） | 无 REQ 的模板骨架 |
-| 修订 1 有无 AC | 无（completion 以 no_acceptance_criteria 阻塞） | 由起草与用户的批准决定；readiness 照常判定（缺 AC 即不就绪） | 无（实施要等修订 2） |
-| 经 Agent 生成吗 | 否 | 是（Plan 对话） | 否 |
-| 受锁 SQL | 不改 | 迁移 002 | 不改 |
+| 方面 | Q1(b)（2026-11-16 未采用） | C22 (a) |
+|---|---|---|
+| 谁触发 | host，每个 Run（含 `-p`）自动 | 用户在 no_spec 问题上答复 `draft` |
+| 何时有 specs 行 | 立即（host 写） | 只在用户以 ApproveSpec 批准起草结果之后 |
+| `-p` | 不再停在 no_spec | 照旧以 3 停在 no_spec；draft 之后停在批准问题 |
+| 修订 1 的内容 | 目标摘要、无需求 | Plan 起草 Agent 生成、用户批准的规格 |
+| 修订 1 有无 AC | 无（completion 以 no_acceptance_criteria 阻塞） | 由起草与用户的批准决定；readiness 照常判定（缺 AC 即不就绪） |
+| 经 Agent 生成吗 | 否 | 是（Plan 对话） |
+| 受锁 SQL | 不改 | 迁移 002 |
 
 ### 3. 补齐的原因码（`contracts/protocol.schema.json`，CR-003 D1 第 1 条）
 
@@ -308,7 +304,7 @@ COMMIT;
 ```
 
 
-2. `contracts/sql/002_spec_drafting.sql`（C22 取 (a) 时；全文见第 2 节；`relock --add`）。取 (c) 或 (d) 时不加这个文件，relock 命令去掉对应的 `--add`。
+2. `contracts/sql/002_spec_drafting.sql`（C22 的决定 (a)；全文见第 2 节；`relock --add`）。
 3. `scripts/product/persistence-whitelist.json`（不在锁内）：迁移 002 含 SQL 写语句，persistence_scan 的第 6 项要求它在白名单中，与 001 的条目同理：
 
 `files` 中加入（按键排序插入）：
@@ -2143,9 +2139,9 @@ COMMIT;
   "summary": "产生版本化规格，允许提问，未批准实施不修改产品源码",
   "behavior": [
     "规格只经用户批准成为修订（O1）：ApproveSpec 只接受来自用户客户端的请求。host 以连接对端的进程身份判定（Unix socket 的对端凭据；TCP 由本机连接表找到对端进程）：对端进程或它的任一祖先带任何 Attempt 的标记（HOH_ATTEMPT_ID），或对端处于任何 Attempt 的 cgroup 中，即以 403 SPEC_APPROVAL_NOT_USER 拒绝（details.reason 依次为 marker、ancestor_marker、attempt_cgroup），什么也不写；Agent 工具调用里开的 shell 是 Attempt 的后代，同样被拒。对端无法确认（找不到对端进程、/proc 不可读、对端属于另一个 uid）时同样拒绝（details.reason=origin_unknown）：同用户的服务或端口转发来的请求不被当作用户批准。Commander 没有批准规格的决策（DecisionPayload 不含此类），它的任何输出都不产生修订。剩余风险（脱掉标记、离开 cgroup 并脱离 Attempt 祖先链的同用户进程）写入 docs/12。ApproveSpec 的 decision：APPROVE_ONLY 批准、模式不变；APPROVE_AND_BUILD 批准并把该 Run 的模式置为 BUILD（同 SetMode，在安全点生效，REQ-007）；REJECT 不产生修订。",
-    "没有已批准规格时（C22 的做法 (a)，见 CR-026 第 2 节）：StartRun 照旧以 runtime:no_spec 阻塞（BLOCKED(NEED_DECISION)，resume_state=CREATED），runs.spec_id 为空，没有 Task 与 Attempt，-p 以 3 退出（所有者 2026-11-16 的 Q1(a)）。no_spec 问题在 adopt 之外另有选项 draft：项目此时已有已批准修订，则 draft 与 adopt 相同；否则答复释放 no_spec 声明，Run 回到 CREATED，由 Runtime 经只读的 DISCOVERING（REQ-028：run.baseline 先于任何写入）进入 SPECIFYING，spec_id 仍为空，并在进入 SPECIFYING 的同一事务建首个起草 Task。",
+    "没有已批准规格时（所有者 2026-11-17 对 C22 的决定 (a)，见 CR-026 第 2 节）：StartRun 照旧以 runtime:no_spec 阻塞（BLOCKED(NEED_DECISION)，resume_state=CREATED），runs.spec_id 为空，没有 Task 与 Attempt，-p 以 3 退出（所有者 2026-11-16 的 Q1(a)）。no_spec 问题在 adopt 之外另有选项 draft：项目此时已有已批准修订，则 draft 与 adopt 相同；否则答复释放 no_spec 声明，Run 回到 CREATED，由 Runtime 经只读的 DISCOVERING（REQ-028：run.baseline 先于任何写入）进入 SPECIFYING，spec_id 仍为空，并在进入 SPECIFYING 的同一事务建首个起草 Task。",
     "起草 Task：由 Runtime 建，kind=spec_draft，职位 cto，writer，不引用 REQ（没有 task_requirements，不经 create_tasks 与 plan::check），以 spec.drafting{run_id, task_id} 标记；项目还没有任何已批准修订时它的 spec_id 为空（迁移 002：只有起草 Task 可以没有规格，且只在项目还没有已批准修订时），之后建的起草 Task 的 spec_id 为当前已批准修订。它在 SPECIFYING 中按 Runtime 规则类派发（不经调度轮；与监督 Task 同形：LEASED 的 Task、PREPARED 的 Attempt 与运行器通知），持项目的写者租约，所以同一项目的两个起草 Run 依次进行；取消阶梯、终结证明、工作区记录、效果台账与 kill -9 之后的 reconcile 同其他写 Task（REQ-041、REQ-043、REQ-019 行为 6）。首个起草 Attempt 的准备阶段在非 git 目录中本地 git init（REQ-028），记为该 Attempt 的 effect。首次批准之前 Run 没有规格，Commander 不被唤醒（监督照旧以 NO_SPEC 延后），起草由 Runtime 规则、看门狗（ADR-022 决定 19）与墙钟期限约束；起草 Agent 需要用户回答时以 NEED_DECISION 的问题停下（Run 为 BLOCKED、resume_state=SPECIFYING）。",
-    "起草 Task 的完成不冻结候选、不要求 AC：Runtime 先核对写集（行为 5），再要求起草结果已提交（未提交时与写 Task 的冻结拒绝一样请它更正），并从该提交的 Markdown 重新生成索引、与提交中的 index.json 逐字节相同（REQ-034）。通过后 Task 为 IMPLEMENTED，Runtime 以 Run 级问题 spec_approval{spec_sha256, git_commit} 请用户批准（Run 为 BLOCKED(NEED_DECISION)、resume_state=SPECIFYING；选项 approve，其他答复为 REJECT，答复文本为 note）；以 AnswerQuestion 答复它与 ApproveSpec 同一处理，受同一对端判定。项目还没有已批准修订时，批准在一个事务里写修订 1（spec.changed{cause:\"approved\"}）、使该 Run 采用它（runs.spec_id）、起草 Task 为 ACCEPTED、Run 回到 SPECIFYING，此后 Commander 照常被唤醒；项目已有已批准修订时（例如另一个起草 Run 先得到批准），该 Run 先采用当前修订，起草结果以 CR 提出（REQ-033，base 为当前修订）。REJECT 使起草 Task 回到 READY，下一个 Attempt 以 note 为输入继续起草。无人值守的 -p 停在这个问题并以 3 退出，永不自批。",
+    "起草 Task 的完成不冻结候选、不要求 AC：Runtime 先核对写集（行为 5），再要求起草结果已提交（未提交时与写 Task 的冻结拒绝一样请它更正），并从该提交的 Markdown 重新生成索引、与提交中的 index.json 逐字节相同（REQ-034）。通过后 Task 为 IMPLEMENTED，Runtime 以 Run 级问题 spec_approval{spec_sha256, git_commit} 请用户批准（Run 为 BLOCKED(NEED_DECISION)、resume_state=SPECIFYING；选项 approve，其他答复为 REJECT，答复文本为 note）。修订只经用户的 ApproveSpec 产生：以 AnswerQuestion 答复 approve 时，host 先做同一对端判定，再把它转为该用户的 ApproveSpec 命令（commands 中记为 ApproveSpec，spec_sha256 取问题中的值，幂等键由答复命令派生），由它写修订。项目还没有已批准修订时，批准在一个事务里写修订 1（spec.changed{cause:\"approved\"}）、使该 Run 采用它（runs.spec_id）、起草 Task 为 ACCEPTED、Run 回到 SPECIFYING，此后 Commander 照常被唤醒；项目已有已批准修订时（例如另一个起草 Run 先得到批准），该 Run 先采用当前修订，起草结果以 CR 提出（REQ-033，base 为当前修订）。REJECT 使起草 Task 回到 READY，下一个 Attempt 以 note 为输入继续起草。无人值守的 -p 停在这个问题并以 3 退出，永不自批。",
     "Plan 的写集是 docs/spec/、docs/ 与 .hoh/：起草 Task 完成时 Runtime 以 Git 核对它开始以来的写集（Attempt 开始时的提交到完成时的提交之间的改动，加上已跟踪的修改与删除、未跟踪的新文件）；任一路径在写集之外时，写 plan.write_violation{task_id, paths}，不送批也不提出 CR，Task 为 BLOCKED（NEED_DECISION）并以问题列出这些路径；HoH 不替用户还原它们。PLAN 中 Commander 计划写产品源文件的 Task（writer 且不是起草 Task）被拒（ILLEGAL_TRANSITION，details 写“PLAN 不实施”）。",
     "有已批准修订后，PLAN 与 AUTO 中的起草同样由起草 Task 承担（spec_id 为当前已批准修订），由 Commander 照常监督；完成时以工作树中的规格提出 CR（change_requests PROPOSED，REQ-033），并以问题请用户批准。",
     "Plan 中允许提问：Commander 的 request_user_decision 成为 question.asked，TUI 显示选项；待答期间 Run 为 BLOCKED（NEED_DECISION）、resume_state=SPECIFYING，答复后回到 SPECIFYING；答复按 question_id 记录，不被记成假设。",
@@ -2207,9 +2203,9 @@ COMMIT;
   ],
   "decisions": [
     "批准权取所有者 2026-11-17 的决定 O1：只有用户批准规格；对端进程判定（标记、祖先标记、cgroup，无法确认即拒）是 host 能做到的执行，剩余风险写入用户指南（CR-026，CR26D-06、-105、-152）。",
-    "首次批准之前的起草取 CR-026 的 C22 做法 (a)（所有者问题，见 CR-026“需所有者决定的项”）：起草是 spec_id 为空的起草 Task，受锁 SQL 增加迁移 002（只有起草 Task 可以没有规格，且只在项目还没有已批准修订时）；不改 Q1(a) 与 M2T13D-59（CR-026，CR26D-01、-50、-100、-150、-151）。",
+    "首次批准之前的起草取所有者 2026-11-17 对 C22 的决定 (a)：Plan 对话、由 Agent 起草，起草是 spec_id 为空的起草 Task，受锁 SQL 增加迁移 002（只有起草 Task 可以没有规格，且只在项目还没有已批准修订时）；草稿只经用户的 ApproveSpec 成为修订 1；Q1(a) 与 M2T13D-59 不变（CR-026，CR26D-01、-50、-100、-150、-151）。",
     "Plan 的写集为 docs/spec/、docs/ 与 .hoh/；原型工件也只能放在 docs/ 下（CR-026，C23）。",
-    "ApproveSpec 的 APPROVE_AND_BUILD 等于批准加 SetMode(BUILD)；批准问题的 AnswerQuestion 与 ApproveSpec 同一处理（CR-026）。",
+    "ApproveSpec 的 APPROVE_AND_BUILD 等于批准加 SetMode(BUILD)；批准问题的 AnswerQuestion approve 经同一对端判定后转为用户的 ApproveSpec 命令（CR-026）。",
     "新码 SPEC_APPROVAL_NOT_USER（ErrorCode，403）（CR-026）。"
   ]
 }
@@ -3113,7 +3109,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-008",
       "REQ-009"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。C22 的做法 (a) 在本任务实现（CR-026 第 2 节）：迁移 002（contracts/sql/002_spec_drafting.sql，persistence 白名单的条目已由 M3-T01 加入）加入 MIGRATIONS；迁移运行器对每个迁移在 BEGIN IMMEDIATE 之前关闭 foreign_keys，COMMIT 之前执行 PRAGMA foreign_key_check 且必须无行，之后无论成败恢复 foreign_keys=ON 并核对；迁移的往返与回滚测试（受锁 SQL 的“Evolution”注释）：有数据的 v1 库迁到 v2 后各表行数与值不变、foreign_key_check 为空、两个索引与两个触发器都在，迁移中途失败回滚到 v1，旧二进制拒绝 v2 库（SchemaTooNew）；SQL 层的负例：kind=work 而 spec_id 为空被 CHECK 拒，项目已有已批准修订时插入 spec_id 为空的 Task 被触发器拒，spec_id 在空与非空之间变化或 kind 变化被触发器拒。CR-026 第 2 节清单中按 tasks.spec_id 非空写的代码路径在本任务改为处理空值。起草 Task（Runtime 建、SPECIFYING 中派发、完成即送批或提出 CR）、Runtime 推进 CREATED→DISCOVERING→SPECIFYING（发现的内容 run.baseline 与离开 DISCOVERING 的条件由 M3-T07 补上）、首个起草 Attempt 准备阶段的 git init、批准问题 spec_approval、Plan 写集的核对与 ApproveSpec 的对端进程判定在本任务实现（CR26D-06、-11、-105）；对端判定另有单元测试：找不到对端、/proc 不可读、对端属于另一个 uid 都拒绝为 origin_unknown。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。所有者 2026-11-17 对 C22 的决定 (a) 在本任务实现（CR-026 第 2 节）：迁移 002（contracts/sql/002_spec_drafting.sql，persistence 白名单的条目已由 M3-T01 加入）加入 MIGRATIONS；迁移运行器对每个迁移在 BEGIN IMMEDIATE 之前关闭 foreign_keys，COMMIT 之前执行 PRAGMA foreign_key_check 且必须无行，之后无论成败恢复 foreign_keys=ON 并核对；迁移的往返与回滚测试（受锁 SQL 的“Evolution”注释）：有数据的 v1 库迁到 v2 后各表行数与值不变、foreign_key_check 为空、两个索引与两个触发器都在，迁移中途失败回滚到 v1，旧二进制拒绝 v2 库（SchemaTooNew）；SQL 层的负例：kind=work 而 spec_id 为空被 CHECK 拒，项目已有已批准修订时插入 spec_id 为空的 Task 被触发器拒，spec_id 在空与非空之间变化或 kind 变化被触发器拒。CR-026 第 2 节清单中按 tasks.spec_id 非空写的代码路径在本任务改为处理空值。起草 Task（Runtime 建、SPECIFYING 中派发、完成即送批或提出 CR）、Runtime 推进 CREATED→DISCOVERING→SPECIFYING（发现的内容 run.baseline 与离开 DISCOVERING 的条件由 M3-T07 补上）、首个起草 Attempt 准备阶段的 git init、批准问题 spec_approval、Plan 写集的核对与 ApproveSpec 的对端进程判定在本任务实现（CR26D-06、-11、-105）；对端判定另有单元测试：找不到对端、/proc 不可读、对端属于另一个 uid 都拒绝为 origin_unknown。"
   },
   {
     "id": "M3-T08",
@@ -3130,7 +3126,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-029",
       "REQ-046"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。Skill 正文按需加载与短索引（REQ-039 行为 7 的前半，ADR-026）在本任务实现。首个起草 Attempt 开始之前的模板实例化（规格骨架与有效档的全部模板，记为该 Attempt 的 effect，不覆盖已有文件）在本任务实现（CR-026 的 C22 (a)，CR26D-154）。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。Skill 正文按需加载与短索引（REQ-039 行为 7 的前半，ADR-026）在本任务实现。首个起草 Attempt 开始之前的模板实例化（规格骨架与有效档的全部模板，记为该 Attempt 的 effect，不覆盖已有文件）在本任务实现（CR-026 的 C22 决定 (a)，CR26D-154）。"
   },
   {
     "id": "M3-T07",
@@ -3256,7 +3252,7 @@ M3-T05 的 `depends_on`：
 
 ## CTO 的问题（C1–C35）：提议与理由，**待 CTO 决定**
 
-下列提议已按“推荐”写进上文的需求；CTO 改变任一项时，相应需求的文字随之修改后再送设计审查。第 2 稿改了 C16、C21、C28；第 3 稿改了 C22（成为所有者问题），新增 C30–C35（标“第 3 稿”）。
+下列提议已按“推荐”写进上文的需求；CTO 改变任一项时，相应需求的文字随之修改后再送设计审查。第 2 稿改了 C16、C21、C28；第 3 稿记入所有者对 C22 的决定，新增 C30–C35（标“第 3 稿”）。
 
 | ID | 问题 | 提议 | 理由 |
 |---|---|---|---|
@@ -3281,7 +3277,7 @@ M3-T05 的 `depends_on`：
 | C19 | 转给底座的斜杠语法 | `/agent <role> <text>` | 目标显式；/plan 等 HoH 命令永不转发 |
 | C20 | 未附着时 `/plan` 的作用对象 | 只改下一个由 TUI 启动的 Run，不改 project.default_mode | 不让一次按键改项目配置 |
 | C21（第 2 稿） | Shift+Tab 的顺序 | `[ui] mode_cycle` 配置，缺省 PLAN→BUILD→AUTO，合法值为 2–3 个互不相同的模式；AC-007-01 覆盖非缺省顺序 | docs/03 写“配置可改”；第 1 稿钉死顺序是静默的范围缩减（CR26D-56） |
-| C22（第 3 稿） | 没有已批准规格时 Plan 的首次起草 | **所有者问题**（见下节）；推荐 (a)：起草是 spec_id 为空的 Task，迁移 002 守护；需求片段按 (a) 写，附录 B 给出取 (c) 或 (d) 时替换的条目 | (a) 保留 CONTRACT 第 4 条的交互、Q1(a)、M2T13D-59 与 O1，并让起草得到 Task 的全部执行保证；(c) 改交互（CR26D-150）且缺执行保证（CR26D-100）；(d) 是范围缩减 |
+| C22（第 3 稿） | 没有已批准规格时 Plan 的首次起草 | **所有者 2026-11-17 已决定：(a)**（起草是 spec_id 为空的 Task，迁移 002 守护） | 不再由 CTO 决定；(a) 保留 CONTRACT 第 4 条的交互、Q1(a)、M2T13D-59 与 O1，并让起草得到 Task 的全部执行保证 |
 | C23 | 原型工件的允许路径 | 只在 docs/ 下（与 docs/spec/、.hoh/ 共同构成 Plan 的写集） | 写集可由 Git 核对 |
 | C24 | BUILD 缺规格时 | 阻塞（READINESS_NOT_MET），问题提示可切到 AUTO 或 PLAN，不自动转 AUTO | 模式由用户选；不越过 readiness |
 | C25 | ASK 是否打断运行中的 turn | 不打断；在下一个安全点或经只读查询回答 | docs/12：问进度不会打断编码 |
@@ -3292,29 +3288,15 @@ M3-T05 的 `depends_on`：
 | C30（第 3 稿） | 独立规格审查的报告走哪条路 | 新受锁契约 spec-review-report.schema.json，事件 spec_review.opened / reported；不用 independent_reports、不开验证轮次、不造候选 | 对象是规格修订；independent_reports 的候选外键与 round_of_task 只适用于候选；“规格候选”还要 test plan 与环境，新项目在首次批准时没有，也会被当成产品候选参与 STALE 与发布（CR26D-101） |
 | C31（第 3 稿） | 用户项目的 TEST→check 与发布目标 | index.json 带 scenarios；release_targets 恒为 ["project"]，release_class 取 class 行（缺省 required） | 一个 FileRef 冻结全部追踪输入；用户项目不需要 contracts/ 目录（CR26D-102） |
 | C32（第 3 稿） | 新配置键何时进入 example | 与加载器的支持同一提交，在用它的任务中，并重跑 TEST-018-01 | 先进 example 会使 AC-018-01 失败（CR26D-103） |
-| C33（第 3 稿） | 批准问题能否以 AnswerQuestion 答复 | 能，与 ApproveSpec 同一处理与同一对端判定；approve 之外的答复为 REJECT | 用户在 `-p` 与 TUI 中都有一条答复路径；判定不因入口而异，不留绕过 O1 的口子 |
+| C33（第 3 稿） | 批准问题能否以 AnswerQuestion 答复 | 能：approve 经同一对端判定后转为该用户的 ApproveSpec 命令，修订仍只由 ApproveSpec 写；approve 之外的答复为 REJECT | 用户在 `-p` 与 TUI 中都有一条答复路径；判定不因入口而异，不留绕过 O1 的口子；守住所有者“只经用户的 ApproveSpec 成为修订 1” |
 | C34（第 3 稿） | CREATED→DISCOVERING→SPECIFYING 由谁推进 | Runtime（常规阶段自动流转），run.baseline 之前不离开 DISCOVERING；Commander 的 transition_run 受同一条件 | CONTRACT 第 6 条与 ADR-031 的移交；首次批准之前没有 Commander 可以推进（CR26D-151） |
 | C35（第 3 稿） | 对端无法确认时 | 拒绝（origin_unknown），不当作用户批准 | O1 是“只有用户”；无法确认的请求不能证明来自用户（CR26D-105） |
 
-## 需所有者决定的项
+## 所有者的决定（C22）
 
-**OWNER 问题 C22：没有已批准规格的项目，Plan 怎样生成第一份规格？**（2026-11-17 由 CTO 提出；所有者答复之前，本 CR 不批准、不 relock，M3-T01 不合入）
+2026-11-17，CTO 向所有者提出 C22（“没有已批准规格的项目，Plan 怎样生成第一份规格？”，备选 (a) 起草作为 Task 运行、(c) 先批准模板骨架、(d) 第一份规格由用户自己写；附 Q1(b) 原文与对照），所有者选 **(a)**：首次批准之前的起草作为 spec_id 为空的 Task 运行，经一个受守护的 SQL 迁移，只有起草 Task 可以没有规格；Plan 对话，由 Agent 起草规格；草稿只经用户的 ApproveSpec 成为修订 1；Q1(a) 与 `-p` 停在 no_spec 不变。本 CR 的第 2 节、迁移 002、REQ-008 行为 2–4 与 AC-008-02、-05 按此写成。
 
-下面三个做法都保留你 2026-11-16 确认的 Q1(a)：没有已批准规格时 StartRun 以 `runtime:no_spec` 阻塞、`hoh -p` 以 3 退出；规格只由你批准（O1）；草稿不是 specs 行（M2T13D-59）。区别在第一份规格怎样产生：
-
-- **(a)【推荐】起草作为 Task 运行。** 你在 no_spec 问题上答复 `draft`；Runtime 做只读的项目发现后，派一个 cto 职位的起草 Task（Plan 对话：它可以向你提问），它写出 docs/spec/ 下的规格并提交；你批准后这份规格成为修订 1，Run 采用它并继续。代价：受锁 SQL 加一个迁移（`contracts/sql/002_spec_drafting.sql`），让“首次批准之前的起草 Task”可以没有规格（`tasks.spec_id` 可空），由 CHECK 与触发器守护：只有起草 Task 可以没有规格，且只在项目还没有任何已批准修订时。起草因此有其他写 Task 的全部保证（写者租约、取消、kill -9 恢复、效果台账）。
-- **(c) 先批准模板骨架。** 你答复 `draft` 后，Runtime 不经 Agent 写出一份没有需求的模板骨架，你先批准它为修订 1；Plan 对话与有内容的规格随后经变更（CR）产生。不改受锁 SQL，但改了 CONTRACT 第 4 条的交互（你批准的第一份规格产生在任何 Plan 对话之前），并且骨架的写入还需要另设恢复与互斥（附录 B）。
-- **(d) 第一份规格由你自己写。** HoH 在首次批准之前不起草；你在 docs/spec/ 写好并批准修订 1，之后 Plan 才起草变更。不改受锁文件，但空项目里 Plan 不能“生成规格”，是范围缩减。
-
-与 2026-11-16 未采用的 Q1(b) 的关系。Q1(b) 原文（`docs/adr/ADR-031.md` 第 11 行）：
-
-> (b) host 为每个 Run 造一个“临时 spec”（目标摘要、无需求）：占用项目的 spec revision、没有需求就没有 AC（completion 会以 no_acceptance_criteria 阻塞，验证不可能），等于自动生成规格——与 ADR-024 决定 10 相违，可能触及 CONTRACT 第 4 条。
-
-你当时的答复是“按你的建议都选 (a)”（2026-11-16T13:12:55Z），没有另述理由；记录在案的理由是 ADR-031 写下的五点（占用 revision、没有 AC、自动生成规格、可能触及 CONTRACT 第 4 条、选它之后 AC-042-04 等仍做不到）。(a) 与 Q1(b) 不同：它不为每个 Run 自动造规格，没有你的批准就没有 specs 行，`-p` 照旧停下，修订 1 由 Plan 起草并带需求与 AC。(c) 与 Q1(b) 的共同点是“一个没有需求的修订占用修订号”，不同点是它要你的请求与批准。对照表见第 2 节末。
-
-保守默认：所有者答复之前，本 CR 停在这里；不以 (d) 或 (c) 代替答复（(d) 是范围缩减，(c) 改交互，都要所有者）。
-
-**一并请所有者确认（CTO 认为在 CR-003 D1 之内）**：新增受锁契约 `contracts/spec-review-report.schema.json`（第 5 节；只增不改，不放宽任何检查，使 docs/06 的独立规格审查有合法的报告路径）。
+CTO 认为在 CR-003 D1 之内、未另请所有者确认的一项：新增受锁契约 `contracts/spec-review-report.schema.json`（第 5 节；只增不改，不放宽任何检查，使 docs/06 的独立规格审查有合法的报告路径）。
 
 ## 不变的部分
 
@@ -3341,7 +3323,7 @@ M3-T05 的 `depends_on`：
 | REQ-047 | 按序覆盖 → 047-01；显示 diff → 047-02；运行锁定旧版本直到 checkpoint → 047-03 |
 
 - 十六个 TEST-xxx-01 中有十四个的 check 不变。改了的两个都是换到更完整的检查，不是放宽：TEST-045-01 与 TEST-040-01 由 unit 改为 integration（它们现在要经 host 记录与重放 Prompt、要重启 host），这两项需求的其余 AC 仍有 unit 检查。integration 与 unit 同在 v1 与 v0.1 档的必跑检查中。
-- 不改：CONTRACT、`docs/10-acceptance.md`（第 17 行要求观察绑定当前 spec，与 O6 一致）、`docs/03-ux.md` 与 `docs/06-orchestration.md`（它们的可配置承诺由新键兑现）、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`contracts/openapi.json`、`contracts/sql/001_initial.sql`（(a) 只新增迁移 002）、`contracts/candidate.schema.json`、`contracts/independent-report.schema.json`、各 schema 中除三个原因码枚举之外的部分、`config/hoh.example.toml`。没有门禁阈值、检查或证据规则被放宽；O6 使证据规则更严；独立规格审查成为 readiness 的输入（加严）。
+- 不改：CONTRACT、`docs/10-acceptance.md`（第 17 行要求观察绑定当前 spec，与 O6 一致）、`docs/03-ux.md` 与 `docs/06-orchestration.md`（它们的可配置承诺由新键兑现）、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`contracts/openapi.json`、`contracts/sql/001_initial.sql`（只新增迁移 002）、`contracts/candidate.schema.json`、`contracts/independent-report.schema.json`、各 schema 中除三个原因码枚举之外的部分、`config/hoh.example.toml`。没有门禁阈值、检查或证据规则被放宽；O6 使证据规则更严；独立规格审查成为 readiness 的输入（加严）。
 - 非 M3 的需求只有 REQ-018 增加三条决定（三个配置键），它的行为与 AC 不变；`project.document_profile` 的缺省仍为 full。
 
 ## 是否属于 CR-003 D1
@@ -3349,15 +3331,15 @@ M3-T05 的 `depends_on`：
 1. 把 16 项 outline 细化为 detailed，补齐 8 个原因码与 REQ-018 键表中缺的三项，新增独立规格审查的报告契约（第 1 条；新契约只增不改）。
 2. 不删需求或 AC；required、release_class、release_targets 不变；docs/03、docs/06 承诺的可配置性保留（第 2 条）。
 3. 不放宽任何门禁、检查或证据规则；两个 TEST 换到更完整的检查；O6 加严；独立规格审查成为 readiness 的输入（加严）（第 3 条）。
-4. C22 不在 D1 之内：(a) 改受锁 SQL 的语义（没有规格的 Task），(c) 改 CONTRACT 第 4 条的交互（CR26D-150），(d) 是范围缩减；按 docs/21 第 4 条与“拿不准时按需要用户批准”，C22 由所有者决定。其余部分不改 CONTRACT 的架构与交互决定：/plan、Shift+Tab、Plan/Build/Auto、`-p` 与 attach 照 CONTRACT 第 3、4 条；规格批准权（O1）与证据失效（O6）是所有者的决定。CR-024（Commander 只读，所有者 2026-11-17 批准）已改 CONTRACT 决定 7，本 CR 与之一致：起草由 cto 职位的写 Task 承担，Commander 不写文件。
+4. C22 不在 D1 之内（(a) 改受锁 SQL 的语义：没有规格的 Task），已由所有者于 2026-11-17 决定取 (a)；迁移 002 是这一决定的执行。其余部分不改 CONTRACT 的架构与交互决定：/plan、Shift+Tab、Plan/Build/Auto、`-p` 与 attach 照 CONTRACT 第 3、4 条；规格批准权（O1）与证据失效（O6）是所有者的决定。CR-024（Commander 只读，所有者 2026-11-17 批准）已改 CONTRACT 决定 7，本 CR 与之一致：起草由 cto 职位的写 Task 承担，Commander 不写文件。
 
-故本 CR 须在所有者答复 C22 之后批准；未答复之前不 relock。
+故本 CR 在设计审查 PASS 后可由 CTO 依 D1 批准，C22 与迁移 002 以所有者 2026-11-17 的决定为据。
 
 ## 验证方式
 
 本稿的片段由一份数据源生成，并在仓库之外的副本上机械验证（不改工作树的受锁文件）：
 
-1. `git archive` 取本稿所在提交的树到副本，按本稿应用：替换 16 项需求与它们的场景，追加 REQ-018 的三条决定与 8 个原因码，写入 `contracts/spec-review-report.schema.json` 与 `contracts/sql/002_spec_drafting.sql`（按 (a)），在 persistence 白名单中加入迁移 002，替换 M3 的任务并改 M3-T05 的依赖；`config/hoh.example.toml` 不动。
+1. `git archive` 取本稿所在提交的树到副本，按本稿应用：替换 16 项需求与它们的场景，追加 REQ-018 的三条决定与 8 个原因码，写入 `contracts/spec-review-report.schema.json` 与 `contracts/sql/002_spec_drafting.sql`，在 persistence 白名单中加入迁移 002，替换 M3 的任务并改 M3-T05 的依赖；`config/hoh.example.toml` 不动。
 2. 在副本中运行 `python3 tools/gen_spec_views.py`、以本 CR（副本中标为 APPROVED）运行 `python3 tools/baseline.py relock --add contracts/spec-review-report.schema.json --add contracts/sql/002_spec_drafting.sql`，再运行 `python3 tools/validate_bundle.py` 与 `bash scripts/check.sh --bundle`。
 3. 生成器另核对第 8 节表中点名的每个 M3 任务都是该 AC 所属任务本身或其祖先。
 4. 在同一副本上运行 TEST-018-01（`cargo test -p hoh-core --locked test_018_01`，bundle 自检不运行它），与 persistence_scan。
@@ -3376,7 +3358,7 @@ M3-T05 的 `depends_on`：
 - 迁移 002 的探针（`migration_probe.py`，SQLite 3.46.1）：退出码 0；今天的运行器：failed and rolled back: FOREIGN KEY constraint failed（user_version 仍为 1）；指定的运行器：user_version 2、各表行与值不变 True、integrity ok、foreign_key_check 0 行、索引 tasks_retry、tasks_run_state、触发器 tasks_spec_draft_insert、tasks_spec_draft_update；守护：work_task_without_spec refused；draft_without_spec_project_has_revision refused；draft_reader refused；draft_without_spec_project_without_revision accepted；attempt_of_draft_task accepted；writer_lease_of_draft_attempt accepted；effect_of_draft_attempt accepted；draft_null_to_spec refused；draft_kind_change refused；work_spec_to_null refused；work_kind_change refused；work_spec_to_newer_revision accepted；draft_with_spec accepted；fk_still_enforced refused
 
 
-批准时的步骤（M3-T01，所有者答复 C22 之后）：按 docs/21 的“基线变更的机械步骤”在工作树中应用同样的片段（取 (c) 或 (d) 时先按附录 B 替换），`gen_spec_views`、`baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`（(a) 时带上述两个 `--add`）、`bash scripts/check.sh --bundle`、TEST-018-01，提交。
+批准时的步骤（M3-T01）：按 docs/21 的“基线变更的机械步骤”在工作树中应用同样的片段（含 persistence 白名单的条目），`gen_spec_views`、`baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md` 带上述两个 `--add`、`bash scripts/check.sh --bundle`、TEST-018-01，提交。
 
 ## 审查记录
 
@@ -3384,7 +3366,7 @@ M3-T05 的 `depends_on`：
 
 | ID | 级别 | 摘要 | 处置 |
 |---|---|---|---|
-| CR26D-01、-50 | high | C22 的零摘要锚没有闭合的起草路径，并且会被采用为规格，改写 Q1(a) 与 M2T13D-59 | 锚撤回；第 2 节给出端到端设计与 (a)–(d) 备选；第 2 稿推荐 (c)，第 3 稿改为所有者问题、推荐 (a)（见第 2 轮） |
+| CR26D-01、-50 | high | C22 的零摘要锚没有闭合的起草路径，并且会被采用为规格，改写 Q1(a) 与 M2T13D-59 | 锚撤回；第 2 稿推荐 (c)；第 3 稿：所有者 2026-11-17 选 (a)，第 2 节给出端到端设计（见第 2 轮） |
 | CR26D-02 | high | 多文件规格没有冻结形式 | 冻结形式为生成并提交的 index.json，规格摘要为它的 sha256，candidate.spec 为单个 FileRef（共同约定、REQ-034 行为 2、5）；AC-034-01 观察冻结，AC-033-03 观察一个字符的变化改变摘要并使全部证据 STALE，AC-034-04 观察 index.json 与 Markdown 不一致时拒绝冻结 |
 | CR26D-03 | high | AC-033-02 在验证进程仍运行时关轮 | 分为批准事务内的失效与取消请求、进程结束证明之后恰一次 superseded 关轮；场景改为 recovery：运行中的 run-check、取消后的迟到报告、批准后崩溃再恢复 |
 | CR26D-04 | high | M3-T07 缺 M3-T06 的路径范围 | M3-T07 依赖 M3-T06；第 8 节按每条 AC 实际用到的能力重列提供者，生成器核对它们都是祖先 |
@@ -3406,8 +3388,8 @@ M3-T05 的 `depends_on`：
 
 | ID | 级别 | 摘要 | 处置 |
 |---|---|---|---|
-| CR26D-150 | high | (c) 改 CONTRACT 第 4 条的交互，是所有者问题 | C22 改为所有者问题（“需所有者决定的项”写明问题、Q1(b) 原文与对照），推荐 (a)，(c)、(d) 为备选；答复之前不批准、不 relock；D1 一节第 4 条改写 |
-| CR26D-100 | high | (c) 的批准前写入没有租约与效果台账的归属，崩溃、重复答复、跨 Run 互斥未定义 | (a) 下起草是 Task：写者租约（跨 Run 串行）、git init 与模板实例化记为 Attempt 的 effect、取消与 reconcile 同其他写 Task，`spec.drafting` 按 run 去重；AC-008-02 在起草 Attempt 中 kill -9 并断言不重复建 Task、不重复 effect；(c) 若被选中，附录 B 写明它还要补的命令级动作身份、互斥与恢复 |
+| CR26D-150 | high | (c) 改 CONTRACT 第 4 条的交互，是所有者问题 | C22 交所有者决定（问题附 Q1(b) 原文与对照）；所有者 2026-11-17 选 (a)，(c)、(d) 记为未采用；“所有者的决定”一节与 D1 一节第 4 条照录 |
+| CR26D-100 | high | (c) 的批准前写入没有租约与效果台账的归属，崩溃、重复答复、跨 Run 互斥未定义 | (a) 下起草是 Task：写者租约（跨 Run 串行）、git init 与模板实例化记为 Attempt 的 effect、取消与 reconcile 同其他写 Task，`spec.drafting` 按 run 去重；AC-008-02 在起草 Attempt 中 kill -9 并断言不重复建 Task、不重复 effect；(c) 未采用 |
 | CR26D-151 | high | draft 前后的 Run 状态，DISCOVERING 与基线 | 第 2 节第 1–5 步：draft 之前 BLOCKED(no_spec)；draft 之后 Runtime 推进 CREATED→DISCOVERING（run.baseline 先于任何写入，REQ-028 行为 1，C34）→SPECIFYING（spec_id 空）；批准问题期间 BLOCKED、resume_state=SPECIFYING；批准后采用并回到 SPECIFYING。AC-008-02 观察三段，AC-028-04 观察基线先于 Attempt 与 effect |
 | CR26D-101 | high | 独立规格审查没有合法的报告路径 | 新受锁契约 spec-review-report.schema.json（第 5 节）；事件 spec_review.opened / reported；不进 independent_reports、不开验证轮次、不造候选（REQ-031 行为 3、决定 3，C30）；AC-031-04 观察收取，且 independent_reports 与 candidates 无新行 |
 | CR26D-102 | high | 追踪的 TEST→check 输入 | index.json 带 scenarios（REQ-034 行为 2、决定 3）；acceptance_criteria.check_id 与追踪都从它读，contracts/acceptance-scenarios.json 只用于没有 scenarios 键的 spec 文件（REQ-032 行为 6、失败模式 3、决定 3，C31）；新 AC-032-04：没有 contracts/ 目录的项目批准→冻结→追踪；归属 M3-T07（读取）与 M3-T02（索引） |
@@ -3452,15 +3434,3 @@ M3-T05 的 `depends_on`：
 - §2 中“ADR-024 决定 4；M2T17R-153、-154、-254”与“ADR-031 移交 :497、:498”的内容在 715e2d0 上不变。
 
 
-## 附录 B：C22 取 (c) 或 (d) 时替换的条目
-
-本稿的需求片段按 (a) 写。所有者取 (c) 或 (d) 时，下列条目在 M3-T01 应用之前替换，替换后的全文再送设计审查（(c) 的全文以第 2 稿 `dbc76fe` 的第 2 节与 REQ-008 为底）：
-
-| 条目 | (a)（本稿） | 取 (c) | 取 (d) |
-|---|---|---|---|
-| 受锁文件 | 新增迁移 002 与 kind 列，REQ-008 的 doc_refs 引用它，persistence 白名单有它的条目 | 不加迁移，去掉该 doc_ref 与白名单条目；起草 Task 的 spec_id 恒为当前修订 | 同 (c) |
-| REQ-008 行为 2–4、失败模式 3–4、决定 2；AC-008-02 | draft → DISCOVERING → SPECIFYING（spec_id 空）→ 起草 Task → spec_approval → 修订 1 | draft 由 Runtime 写模板骨架（不经 Agent），Run 保持 BLOCKED 直到用户批准骨架为修订 1；之后 adopt 回到 CREATED，经 DISCOVERING（基线先于下一次写入）进入 SPECIFYING 才建起草 Task。还须补（CR26D-100）：骨架写入是命令级的确定性动作，以答复命令的 command_id 为身份，结果中先记预期的树摘要，崩溃后按树摘要确认或重做；项目写者租约被持有时 draft 被拒（与写 Task 互斥）；第二次 draft 答复按 command_id 重放；AC-008-02 加提交前后的崩溃与重复答复 | 没有 draft 选项；no_spec 问题请用户在 docs/spec/ 写首个规格并批准；起草 Task 只在有修订之后；AC-008-02 改为用户手写、批准修订 1、adopt、起草 CR |
-| REQ-028 行为 5、AC-028-04 | git init 在首个起草 Attempt 的准备阶段 | git init 在 draft 命令中（同上的命令级动作） | HoH 不 git init：空目录须由用户先初始化；AC-028-04 只观察已有仓库与首个起草提交的路径边界 |
-| REQ-029 行为 7、AC-029-03 | 模板在首个起草 Attempt 开始前实例化 | 模板在 draft 命令中实例化 | 模板在首个起草 Attempt（有修订 1 之后）开始前实例化，或由 no_spec 问题的说明请用户按模板手写 |
-| 任务依赖 | M3-T04 ← M3-T06、M3-T09；M3-T08、M3-T07 ← M3-T04 | M3-T08 承担 draft 命令；M3-T04 ← M3-T06、M3-T08、M3-T09；M3-T07 ← M3-T06、M3-T08（第 2 稿） | 同 (a)，M3-T04 的 done_when 去掉迁移 |
-| D1 | 所有者（受锁 SQL 语义） | 所有者（CONTRACT 第 4 条的交互） | 所有者（范围缩减） |
