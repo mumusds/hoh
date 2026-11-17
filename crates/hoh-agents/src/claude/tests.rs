@@ -697,3 +697,68 @@ fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
     let caps = session_capabilities(&without).expect("capabilities");
     assert_eq!(caps["read_only_workspace"], false, "{caps}");
 }
+
+/// A committed S0 excerpt (docs/adr/ADR-032.md): its stdout without the header line, and its observations.
+fn excerpt(case: &str) -> (Vec<u8>, Value) {
+    let base = format!(
+        "{}/../../tests/fixtures/commander-readonly/excerpts/claude/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let stdout = std::fs::read_to_string(format!("{base}.stdout.excerpt.jsonl")).expect("excerpt");
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{base}.meta.json")).expect("meta"))
+            .expect("JSON");
+    let frames: String = stdout.lines().skip(1).map(|l| format!("{l}\n")).collect();
+    (frames.into_bytes(), meta["observations"].clone())
+}
+
+#[test]
+fn the_replay_of_a_recorded_read_only_turn_settles_with_its_decision_block() {
+    // ADR-032 design correction 7: the judge's facts are this adapter's replay of the recording, with the observations
+    // recorded with it.
+    for case in ["ro-new", "ro-resumed", "control"] {
+        let (stdout, observed) = excerpt(case);
+        let facts = replay_facts(&stdout, &observed);
+        assert_eq!(
+            facts.state,
+            AttemptState::Settled,
+            "{case}: {:?}",
+            facts.failure
+        );
+        assert!(
+            facts
+                .final_text
+                .as_deref()
+                .is_some_and(|t| t.contains("```hoh-decisions")),
+            "{case}"
+        );
+        assert!(facts.native_session.is_some(), "{case}");
+        assert_eq!(facts.sent, None);
+    }
+    let (stdout, observed) = excerpt("ro-new");
+    let mut changed = observed.clone();
+    changed["prompt_fed"] = json!(false);
+    let facts = replay_facts(&stdout, &changed);
+    assert_eq!(
+        (facts.state, facts.failure.as_deref()),
+        (AttemptState::Failed, Some("PROMPT_NOT_DELIVERED"))
+    );
+    let mut changed = observed.clone();
+    changed["logs_complete"] = json!(false);
+    assert_eq!(
+        replay_facts(&stdout, &changed).failure.as_deref(),
+        Some("RAW_LOG_INCOMPLETE")
+    );
+    let mut changed = observed.clone();
+    changed["exit"]["returncode"] = json!(1);
+    assert_eq!(replay_facts(&stdout, &changed).state, AttemptState::Failed);
+    let mut changed = observed;
+    changed.as_object_mut().expect("object").remove("version");
+    let facts = replay_facts(&stdout, &changed);
+    assert!(
+        facts
+            .failure
+            .as_deref()
+            .is_some_and(|f| f.starts_with(crate::observed::NOT_OBSERVED))
+    );
+}

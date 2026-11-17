@@ -1031,6 +1031,57 @@ pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
     }
 }
 
+/// Replay a recorded turn (claude's stdout as it was read) through this adapter's own judging with the observations
+/// recorded with it, no process started (docs/adr/ADR-032.md design correction 7): `Driven::on_line` over every frame,
+/// then `verdict` and `judge` with the recorded prompt delivery, exit status and log completion. Observations the
+/// contract does not accept give NOT_OBSERVED ([`crate::observed::parse`]).
+pub fn replay_facts(stdout: &[u8], observations: &Value) -> crate::observed::ReplayFacts {
+    use crate::observed::{Agent, ReplayFacts};
+    let observed = match crate::observed::parse(Agent::Claude, observations) {
+        Ok(observed) => observed,
+        Err(why) => return ReplayFacts::failed(why),
+    };
+    let mut recorder = Recorder::Collect(Vec::new(), Observer::default());
+    let mut driven = Driven::new(false);
+    driven.fed = Some(if observed.prompt_fed == Some(true) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("the prompt was not fed"))
+    });
+    for step in crate::adapter::replay_steps(stdout) {
+        match step {
+            Replay::Cancel => driven.cancelled = true,
+            Replay::Frame(line) => {
+                match crate::adapter::at_once(driven.on_line(&mut recorder, "replay", &line)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => return ReplayFacts::failed(format!("REPLAY_INCOMPLETE: {e}")),
+                    None => {
+                        return ReplayFacts::failed(
+                            "REPLAY_INCOMPLETE: the judging waited".to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    driven.report = Some(crate::observed::exit_report(&observed));
+    let (state, failure) = driven.verdict();
+    ReplayFacts {
+        state,
+        failure,
+        final_text: driven.result.as_ref().and_then(|r| r.text.clone()),
+        native_session: driven.native_session.clone(),
+        thread: None,
+        turn: None,
+        thread_result: None,
+        recorded: match recorder {
+            Recorder::Collect(recorded, _) => recorded,
+            Recorder::Store { .. } => Vec::new(),
+        },
+        sent: None,
+    }
+}
+
 /// `bytes` through this adapter's own judging, no process started, ended as a replay ends: what the turn showed and
 /// recorded, or the replay's answer when it could not be judged.
 fn judged(bytes: &[u8]) -> Result<(Driven, Vec<Recorded>), Replayed> {
