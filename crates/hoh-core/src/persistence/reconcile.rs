@@ -51,6 +51,10 @@ pub struct UnfinishedRow {
     pub work_class: Option<crate::retry::FailureClass>,
     /// When its work ended, as that event recorded it (M2T19R-03).
     pub work_ended_at: Option<std::time::SystemTime>,
+    /// The instant its provider said the limit its work failed on lifts, as that event recorded it (`retry_at`):
+    /// the only source of its retry's time on every recovery path (docs/adr/ADR-022.md decision 16's design correction,
+    /// rule 3).
+    pub work_retry_at: Option<std::time::SystemTime>,
     /// Its run is being cancelled: it ends CANCELLED, whatever else is found (docs/adr/ADR-021.md decision 8e).
     pub cancel_requested: bool,
     /// The workspace's record its end carries: none from the scan; the host adds it, taken after its stop, when the
@@ -204,6 +208,11 @@ fn scan(
                 .as_str()
                 .and_then(crate::time::parse_rfc3339)
         });
+        let work_retry_at = detail.as_ref().and_then(|d| {
+            d.get("retry_at")?
+                .as_str()
+                .and_then(crate::time::parse_rfc3339)
+        });
         let cancel_requested: bool = conn
             .query_row(
                 "SELECT cancel_requested FROM attempts WHERE attempt_id = ?1",
@@ -233,6 +242,7 @@ fn scan(
             work_outcome,
             work_class,
             work_ended_at,
+            work_retry_at,
             cancel_requested,
             workspace: None,
         });
@@ -452,9 +462,7 @@ fn apply(
             },
             &row.attempt_id,
             &super::retry::Failure {
-                class: row
-                    .work_class
-                    .unwrap_or(crate::retry::FailureClass::Transient { retry_after: None }),
+                class: recovered_class(row.work_class, row.work_retry_at, *at),
                 at: *at,
                 draw: *draw,
             },
@@ -549,4 +557,35 @@ fn apply(
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
     ))
+}
+
+/// The class a recovered failure is retried by, its end taken at `at` (the work's recorded end, or the reconcile's own
+/// time when its work was not committed): the recorded class, except that a wait which was its provider's reset (the
+/// recorded `retry_at`, the class's Retry-After) is made again from that instant, never from `at` plus the recorded
+/// wait (docs/adr/ADR-022.md decision 16's design correction, rule 3): due at the reset, or at once when it is past.
+fn recovered_class(
+    class: Option<crate::retry::FailureClass>,
+    retry_at: Option<std::time::SystemTime>,
+    at: std::time::SystemTime,
+) -> crate::retry::FailureClass {
+    use crate::retry::FailureClass;
+    match (class, retry_at) {
+        (
+            Some(FailureClass::Transient {
+                retry_after: Some(_),
+            }),
+            Some(reset),
+        ) if reset > at => {
+            FailureClass::Transient { retry_after: None }.with_reset(Some(reset), at)
+        }
+        (
+            Some(FailureClass::Transient {
+                retry_after: Some(_),
+            }),
+            Some(_),
+        ) => FailureClass::Transient {
+            retry_after: Some(std::time::Duration::ZERO),
+        },
+        (class, _) => class.unwrap_or(FailureClass::Transient { retry_after: None }),
+    }
 }
