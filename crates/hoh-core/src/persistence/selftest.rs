@@ -213,6 +213,47 @@ impl Drop for Probe {
     }
 }
 
+/// The OS error of the call that just failed: rusqlite exposes no `sqlite3_system_errno`, so it is read right after the
+/// failing call returns, before anything else runs (a failing call sets it; the calls in between succeed and keep it).
+fn errno() -> Option<i32> {
+    std::io::Error::last_os_error().raw_os_error()
+}
+
+/// Whether a failed SQLite call of the self-test, by its extended result code and the OS error of the failing call, is
+/// the file system out of room (DB_FULL) and not WAL's failure: SQLITE_FULL whatever its errno; an I/O error of a call
+/// that grows or writes a store file (the -shm wal-index, a write, a truncate, a sync) only with ENOSPC or EDQUOT as its
+/// OS error. Any other I/O error stays WAL's: an I/O error alone is never taken for a full file system (F7-01). The
+/// probe's errors are judged by the same rule (F7-02).
+pub(super) fn out_of_room(extended: i32, errno: Option<i32>) -> bool {
+    use rusqlite::ffi;
+    let room = [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT].map(|e| e.raw_os_error());
+    extended & 0xff == ffi::SQLITE_FULL
+        || (matches!(
+            extended,
+            ffi::SQLITE_IOERR_SHMSIZE
+                | ffi::SQLITE_IOERR_WRITE
+                | ffi::SQLITE_IOERR_TRUNCATE
+                | ffi::SQLITE_IOERR_FSYNC
+        ) && errno.is_some_and(|e| room.contains(&e)))
+}
+
+/// A failed SQLite call of the self-test at `step`, with the OS error of the failing call: DB_FULL when
+/// [`out_of_room`], else WAL's failure at that step.
+fn judged(step: Step, e: &rusqlite::Error, errno: Option<i32>) -> PersistError {
+    match e.sqlite_extended_error_code() {
+        Some(extended) if out_of_room(extended, errno) => {
+            let os = errno
+                .map(|n| format!(" ({})", std::io::Error::from_raw_os_error(n)))
+                .unwrap_or_default();
+            PersistError::Full(format!("WAL self-test at {}: {e}{os}", step.name()))
+        }
+        _ => PersistError::WalUnsupported {
+            step: step.name(),
+            detail: e.to_string(),
+        },
+    }
+}
+
 fn count(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0))
 }
@@ -227,13 +268,11 @@ fn steps(
         detail,
     };
     let at = |step: Step| inject(step).map_err(|d| failed(step, d));
-    // A full file system is not WAL's failure.
+    // A full file system is not WAL's failure ([`out_of_room`]); the OS error is read first, before anything else.
     let sql = |step: Step| {
-        move |e: rusqlite::Error| match e.sqlite_error_code() {
-            Some(ErrorCode::DiskFull) => {
-                PersistError::Full(format!("WAL self-test at {}: {e}", step.name()))
-            }
-            _ => failed(step, e.to_string()),
+        move |e: rusqlite::Error| {
+            let errno = errno();
+            judged(step, &e, errno)
         }
     };
 
@@ -288,7 +327,7 @@ fn steps(
     other.expect("hold", "held").map_err(locking)?;
     match ours.execute_batch("BEGIN IMMEDIATE") {
         Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {}
-        Err(e) => return Err(locking(e.to_string())),
+        Err(e) => return Err(sql(Step::Locking)(e)),
         Ok(()) => {
             let _ = ours.execute_batch("ROLLBACK");
             return Err(locking("we got the write lock the probe held".to_owned()));
@@ -707,6 +746,36 @@ mod tests {
             assert_eq!(leftovers(dir.path()), Vec::<String>::new(), "{step:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn only_sqlite_full_or_a_growing_write_out_of_room_is_db_full() {
+        // F7-01: SQLITE_FULL whatever its errno; the -shm growth, a write, a truncate or a sync only with ENOSPC or
+        // EDQUOT; never another I/O error, the plain one, a read, or a growing call that failed for another reason.
+        use rusqlite::ffi::*;
+        use rustix::io::Errno;
+        let (nospc, dquot, eio) = (
+            Some(Errno::NOSPC.raw_os_error()),
+            Some(Errno::DQUOT.raw_os_error()),
+            Some(Errno::IO.raw_os_error()),
+        );
+        for (extended, errno, full) in [
+            (SQLITE_FULL, None, true),
+            (SQLITE_FULL, eio, true),
+            (SQLITE_IOERR_SHMSIZE, nospc, true),
+            (SQLITE_IOERR_SHMSIZE, dquot, true),
+            (SQLITE_IOERR_WRITE, nospc, true),
+            (SQLITE_IOERR_TRUNCATE, nospc, true),
+            (SQLITE_IOERR_FSYNC, dquot, true),
+            (SQLITE_IOERR_SHMSIZE, eio, false),
+            (SQLITE_IOERR_SHMSIZE, None, false),
+            (SQLITE_IOERR, nospc, false),
+            (SQLITE_IOERR_READ, nospc, false),
+            (SQLITE_IOERR_SHMMAP, nospc, false),
+            (SQLITE_CANTOPEN, nospc, false),
+        ] {
+            assert_eq!(out_of_room(extended, errno), full, "{extended} {errno:?}");
+        }
     }
 
     #[test]

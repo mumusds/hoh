@@ -460,6 +460,17 @@ impl Mount {
     }
 }
 
+impl Mount {
+    /// Fill it but `room` bytes: the filler grown until the file system is full, then cut back by `room`.
+    fn fill_leaving(&self, room: u64) -> R<PathBuf> {
+        let filler = self.fill()?;
+        let file = std::fs::OpenOptions::new().write(true).open(&filler)?;
+        let len = file.metadata()?.len();
+        file.set_len(len.saturating_sub(room))?;
+        Ok(filler)
+    }
+}
+
 impl Drop for Mount {
     fn drop(&mut self) {
         let _ = Command::new("sudo")
@@ -507,6 +518,36 @@ fn full_a_host_started_on_a_full_file_system_says_db_full_not_wal() -> R {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert_eq!(out.status.code(), Some(69), "{}", text(&out));
         assert!(stderr.contains("DB_FULL"), "{stderr}");
+        assert!(!stderr.contains("DB_WAL_UNSUPPORTED"), "{stderr}");
+        assert_eq!(project.dump()?, before);
+        std::fs::remove_file(filler)?;
+        project.accepted("third")?;
+        project.stop_host()
+    })();
+    let _ = project.stop_host();
+    outcome
+}
+
+#[test]
+#[ignore = "mounts a tmpfs with sudo -n (docs/09 fault matrix item 7); run with --ignored"]
+fn full_a_host_started_with_a_few_kib_left_says_db_full_not_wal() -> R {
+    // F7-01: with 16 KiB left the WAL self-test can make its files, but SQLite cannot grow the -shm wal-index: the
+    // pwrite that grows it fails with ENOSPC, which SQLite reports as SQLITE_IOERR_SHMSIZE ("disk I/O error"). That is
+    // the file system out of room, DB_FULL (the client 69), not DB_WAL_UNSUPPORTED (78); nothing is written.
+    let mount = Mount::tmpfs("16m")?;
+    let project = Project::in_dir(&mount.point)?;
+    let outcome = (|| -> R {
+        project.accepted("first")?;
+        project.stop_host()?;
+        let before = project.dump()?;
+        let filler = mount.fill_leaving(16 << 10)?;
+        let out = project.submit("second")?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(69), "{}", text(&out));
+        assert!(
+            stderr.contains("DB_FULL") && stderr.contains("No space left on device"),
+            "{stderr}"
+        );
         assert!(!stderr.contains("DB_WAL_UNSUPPORTED"), "{stderr}");
         assert_eq!(project.dump()?, before);
         std::fs::remove_file(filler)?;
