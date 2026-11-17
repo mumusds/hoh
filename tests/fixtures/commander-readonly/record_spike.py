@@ -362,21 +362,30 @@ def pi_case(sp: Spike, case: str, project: Project, tools: list[str], session_id
     noted = session_files(session_dir)
     argv = ['pi', '--mode', 'rpc', '--session-dir', str(session_dir), '--session-id', session_id,
             *tools, '-e', str(project.observer)]
-    msgs = [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': prompt or project.prompt()}]
+    # The recorder speaks as pi.rs does, so that the product's replay correlates the answers with its own commands:
+    # `open` sends get_state as "hoh-state-1"; its answer, when it succeeds for the launch's session (and, resumed, for
+    # a noted file), sends the prompt as "hoh-prompt-2"; agent_settled closes stdin (`close`).
     proc = rec.Proc(argv, project.w)
-    proc.write(b''.join(json.dumps(m).encode() + b'\n' for m in msgs))
-    opened, state_file, deadline = None, None, time.monotonic() + timeout
+    proc.write(json.dumps({'id': 'hoh-state-1', 'type': 'get_state'}).encode() + b'\n')
+    opened, state_file, prompted, deadline = None, None, False, time.monotonic() + timeout
     while time.monotonic() < deadline and proc.pump(1.0):
         frames = proc.frames()
         if state_file is None:
-            answer = next((f for f in frames if f.get('type') == 'response' and f.get('id') == 's1'), None)
+            answer = next((f for f in frames if f.get('type') == 'response' and f.get('id') == 'hoh-state-1'), None)
             if answer is not None:
                 state_file = (answer.get('data') or {}).get('sessionFile') or ''
                 opened = file_identity(state_file)  # as the adapter does when it handles the answer
+                if (answer.get('success') is True and (answer.get('data') or {}).get('sessionId') == session_id
+                        and (not resume or opened in noted)):
+                    proc.write(json.dumps({'id': 'hoh-prompt-2', 'type': 'prompt',
+                                           'message': prompt or project.prompt()}).encode() + b'\n')
+                    prompted = True
+                else:
+                    break
         if any(f.get('type') == 'agent_settled' for f in frames):
             break
     how = proc.stop(grace=20)
-    observations = {'launch': {'session_id': session_id, 'resume': resume}, 'noted': noted,
+    observations = {'launch': {'session_id': session_id, 'resume': resume}, 'noted': noted, 'prompt_sent': prompted,
                     'get_state_session_file': state_file, 'opened': opened,
                     'exit': {'returncode': proc.returncode, 'how': str(how)}, 'logs_complete': str(how) == 'exited'}
     sp.save('pi', case, project, argv, proc.sent, proc.out, proc.err, proc.returncode, how, before, project.snapshot(), notes,
@@ -422,6 +431,7 @@ def pi_noext(sp: Spike) -> None:
     pi_case(sp, 'noext-new', project, argv, sid, 'the read-only profile of ADR-032 v5 (--no-extensions), new session; '
             'the session directory is created before the baseline snapshot, as the product does')
     pi_case(sp, 'noext-resumed', project, argv, sid, 'the same, the same session id in a new process', resume=True)
+    pi_case(sp, 'control', Project(), [], str(uuid.uuid4()), 'full-access control: pi with its default tools')
 
 
 AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
