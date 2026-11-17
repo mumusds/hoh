@@ -3,6 +3,7 @@
 //! SQLite returns (SQLite does more I/O inside the call that failed, a rollback's, so that errno may be a later
 //! call's). The WAL self-test and the store's commits judge by it.
 
+use super::created::Created;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -24,13 +25,11 @@ pub(super) fn growing_write(extended: i32) -> Option<&'static str> {
 }
 
 /// Whether the directory of `path` has room now, seen directly: `path`, a new file (made with create_new, so never
-/// another's), takes [`BYTES`] of non-repeating bytes (a compressing file system must allocate them too) and an fsync,
-/// and is removed. The OS error that refused it, if one did.
+/// another's: an existing one is left as it is), takes [`BYTES`] of non-repeating bytes (a compressing file system must
+/// allocate them too) and an fsync, and is removed through its token ([`Created`]). The OS error that refused it, if
+/// one did.
 pub(super) fn probe(path: &Path) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let (made, mut file) = Created::new(path)?;
     let mut bytes = vec![0u8; BYTES];
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     for chunk in bytes.chunks_mut(8) {
@@ -41,7 +40,7 @@ pub(super) fn probe(path: &Path) -> std::io::Result<()> {
     }
     let written = file.write_all(&bytes).and_then(|()| file.sync_all());
     drop(file);
-    let _ = std::fs::remove_file(path);
+    let _ = made.remove();
     written
 }
 

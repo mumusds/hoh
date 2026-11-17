@@ -372,6 +372,53 @@ fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errn
     ])
 }
 
+/// The WAL self-test's files in `.hoh` (`.hoh-wal-selftest-…`), by name, with their bytes.
+fn selftest_files(project: &Project) -> R<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(project.hoh_dir())? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".hoh-wal-selftest-") {
+            files.push((name, std::fs::read(entry.path())?));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[test]
+fn full_a_room_file_another_creator_made_after_the_claim_is_left_to_it() -> R {
+    // F7-200: the room probe's `-room` name is made by another creator after the self-test claimed its database's
+    // names (here when the WAL's fsync fails); the probe's create_new finds it, so it is not the self-test's: room is
+    // not known, and the file stays, its bytes as they were.
+    let (project, before) = made()?;
+    let env = [
+        ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+        ("F7_IO_OP", "sync".into()),
+        ("F7_IO_SUFFIX", "-wal".into()),
+        ("F7_IO_ERRNO", "122".into()),
+        ("F7_IO_PLANT", "-room".into()),
+    ];
+    let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let left = selftest_files(&project)?;
+    assert_eq!(
+        left.iter()
+            .map(|(name, bytes)| (name.ends_with(".db-room"), bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        [(true, b"FOREIGN-CREATOR-DATA\n".as_slice())],
+        "the other creator's file: {}",
+        text(&out)
+    );
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(
+        stderr.contains("room not known") && stderr.contains("File exists"),
+        "{stderr}"
+    );
+    assert_eq!(project.dump()?, before);
+    Ok(())
+}
+
 #[test]
 fn full_the_commit_of_the_switch_to_wal_is_not_lost() -> R {
     // F7-101: `PRAGMA journal_mode=WAL` commits on the self-test's new database (its journal, then its header); its

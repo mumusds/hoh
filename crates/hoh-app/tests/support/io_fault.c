@@ -15,6 +15,11 @@
  *   F7_IO_ARM      optional, a path: the first fault only while it exists (a running host's command, not its start)
  *   F7_CLEANUP_ERRNO  optional: after the first fault, the next pread of a self-test file fails once with this errno
  *                  (EINTR: SQLite retries it, and the errno of the failed call is gone when SQLite returns)
+ *   F7_IO_NTH      optional: the first fault at the Nth matching call, not the first (default 1)
+ *   F7_IO_PLANT    optional, a suffix: when the first fault fires, another creator makes the file named as the faulted
+ *                  one with F7_IO_SUFFIX replaced by this suffix (O_EXCL), holding "FOREIGN-CREATOR-DATA\n"
+ *   F7_UNLINK_ERRNO, F7_UNLINK_SUFFIX  optional: every unlink of a matching file whose path ends with the suffix fails
+ *                  with that errno, from the first call on
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -27,7 +32,31 @@
 #include <unistd.h>
 
 static int fired;
+static int seen;
 static int cleanup_done;
+
+/* Another creator's file: `path` with its last `cut` bytes replaced by `suffix`. */
+static void plant(const char *path, size_t cut, const char *suffix) {
+    static ssize_t (*real_write)(int, const void *, size_t);
+    char name[4096];
+    size_t keep = strlen(path) - cut;
+    if (!real_write) {
+        real_write = dlsym(RTLD_NEXT, "write");
+    }
+    if (keep + strlen(suffix) + 1 > sizeof name) {
+        return;
+    }
+    memcpy(name, path, keep);
+    strcpy(name + keep, suffix);
+    int fd = open(name, O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (fd >= 0) {
+        const char data[] = "FOREIGN-CREATOR-DATA\n";
+        if (real_write(fd, data, sizeof data - 1) < 0) {
+            /* nothing to do: the file stands as another's either way */
+        }
+        close(fd);
+    }
+}
 
 static int selftest_file(int fd, char *path, size_t size) {
     char link[64];
@@ -56,10 +85,14 @@ static int fault(int fd, const char *op) {
             const char *kind = getenv("F7_IO_OP");
             const char *suffix = getenv("F7_IO_SUFFIX");
             size_t len = strlen(path);
+            const char *nth = getenv("F7_IO_NTH");
             if (kind && suffix && strcmp(kind, op) == 0 && len >= strlen(suffix) &&
-                strcmp(path + len - strlen(suffix), suffix) == 0) {
+                strcmp(path + len - strlen(suffix), suffix) == 0 && ++seen >= (nth ? atoi(nth) : 1)) {
                 fired = 1;
                 result = atoi(err);
+                if (getenv("F7_IO_PLANT")) {
+                    plant(path, strlen(suffix), getenv("F7_IO_PLANT"));
+                }
                 if (state) {
                     int made = open(state, O_CREAT | O_WRONLY, 0600);
                     if (made >= 0) {
@@ -139,4 +172,18 @@ ssize_t pread64(int fd, void *buf, size_t n, off64_t off) {
         return -1;
     }
     return real(fd, buf, n, off);
+}
+
+int unlink(const char *path) {
+    REAL(int, "unlink", (const char *));
+    const char *err = getenv("F7_UNLINK_ERRNO");
+    const char *suffix = getenv("F7_UNLINK_SUFFIX");
+    const char *match = getenv("F7_IO_MATCH");
+    size_t len = strlen(path);
+    if (err && suffix && strstr(path, match ? match : ".hoh-wal-selftest-") && len >= strlen(suffix) &&
+        strcmp(path + len - strlen(suffix), suffix) == 0) {
+        errno = atoi(err);
+        return -1;
+    }
+    return real(path);
 }
