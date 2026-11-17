@@ -169,6 +169,9 @@ struct State<'a> {
     running: bool,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    /// The thread request's answer (its `result`), as correlated: the thread's effective sandbox for the judge
+    /// (docs/adr/ADR-032.md decision 8, E3).
+    thread_result: Option<Value>,
     model: Option<String>,
     usage: Option<Value>,
     status: Option<String>,
@@ -426,13 +429,20 @@ impl State<'_> {
                 let n = self.next("item");
                 let item = &params["item"];
                 let kind = item["type"].as_str().unwrap_or_default();
-                self.event(
-                    &format!("item-{n}"),
-                    "adapter.item",
-                    json!({"method": method, "threadId": params["threadId"], "turnId": params["turnId"],
-                           "itemId": item["id"], "itemType": kind}),
-                )
-                .await?;
+                let mut payload = json!({"method": method, "threadId": params["threadId"], "turnId": params["turnId"],
+                                         "itemId": item["id"], "itemType": kind});
+                // The item's own facts, from which the read-only judge enumerates the turn's driver runs and writes
+                // (docs/adr/ADR-032.md design correction 7 item 2): never a regex over the stream.
+                let facts: &[&str] = match kind {
+                    "commandExecution" => &["command", "status", "exitCode", "aggregatedOutput"],
+                    "fileChange" => &["status", "changes"],
+                    _ => &[],
+                };
+                for key in facts {
+                    payload[*key] = item[*key].clone();
+                }
+                self.event(&format!("item-{n}"), "adapter.item", payload)
+                    .await?;
                 if method == "item/completed" && kind == "agentMessage" {
                     self.reply = item["text"].as_str().map(str::to_owned);
                 }
@@ -651,6 +661,7 @@ impl State<'_> {
                 }
                 None => {
                     let result = &frame["result"];
+                    self.thread_result = Some(result.clone());
                     self.thread_id = result["thread"]["id"].as_str().map(str::to_owned);
                     self.model = result["model"].as_str().map(str::to_owned);
                     match (self.store, &self.thread_id) {
@@ -789,6 +800,7 @@ impl<'a> State<'a> {
             running: false,
             thread_id: None,
             turn_id: None,
+            thread_result: None,
             model: None,
             usage: None,
             status: None,
@@ -1290,6 +1302,77 @@ pub(super) fn replay(bytes: &[u8], turn: &Turn) -> Replayed {
             unknown_events: 0,
         },
         Err(why) => crate::adapter::unreplayable(&why),
+    }
+}
+
+/// Replay a recorded App Server turn as the runner's mode drives `turn` (its launch from the recorded observations,
+/// docs/adr/ADR-032.md design correction 7 item 2), the process's end as `observed` recorded it: the adapter's facts
+/// and every message it wrote, built from the launch alone (initialize; `initialized` and the thread request once
+/// initialize is answered; turn/start once the thread request is; server requests answered headless).
+pub(super) fn replay_facts(
+    bytes: &[u8],
+    turn: &Turn,
+    observed: &crate::observed::Observed,
+) -> crate::observed::ReplayFacts {
+    use crate::observed::ReplayFacts;
+    let attempt = AttemptRef {
+        attempt_id: "replay".to_owned(),
+        session_id: "replay".to_owned(),
+        role: String::new(),
+        agent_version: String::new(),
+    };
+    let (lines, mut written) = mpsc::unbounded_channel::<Vec<u8>>();
+    let mut s = State::new(None, &attempt, turn, lines, 0, true, false);
+    s.conn.request(Pending::Initialize, requests::initialize);
+    let mut held = Vec::new();
+    for step in crate::adapter::replay_steps(bytes) {
+        match step {
+            Replay::Cancel if !s.cancelled => {
+                s.cancelled = true;
+                s.begin_stop(None);
+            }
+            Replay::Cancel => {}
+            Replay::Frame(line) => match crate::adapter::at_once(s.on_line(None, &mut held, &line))
+            {
+                Some(Ok(())) => {}
+                Some(Err(e)) => return ReplayFacts::failed(format!("REPLAY_INCOMPLETE: {e}")),
+                None => {
+                    return ReplayFacts::failed("REPLAY_INCOMPLETE: the judging waited".to_owned());
+                }
+            },
+        }
+    }
+    let thread_result = s.thread_result.clone();
+    s.conn.close();
+    let drove = match crate::adapter::at_once(
+        s.conclude(Some(crate::observed::exit_report(observed)), &mut held),
+    ) {
+        Some(Ok(drove)) => drove,
+        Some(Err(e)) => return ReplayFacts::failed(format!("REPLAY_INCOMPLETE: {e}")),
+        None => return ReplayFacts::failed("REPLAY_INCOMPLETE: the judging waited".to_owned()),
+    };
+    let mut sent = Vec::new();
+    while let Ok(line) = written.try_recv() {
+        sent.push(serde_json::from_slice(&line).unwrap_or(Value::Null));
+    }
+    match drove {
+        Drove::Ended(driven) => ReplayFacts {
+            state: driven.state,
+            failure: driven.failure,
+            final_text: driven.reply,
+            native_session: driven.thread_id.clone(),
+            thread: driven.thread_id,
+            turn: driven.turn_id,
+            thread_result,
+            recorded: driven.recorded,
+            sent: Some(sent),
+        },
+        // The runner's mode ends a degraded turn FAILED (CAPABILITY_UNSUPPORTED): no second process within it.
+        Drove::Degrade(degraded) => ReplayFacts {
+            recorded: degraded.recorded,
+            sent: Some(sent),
+            ..ReplayFacts::failed(format!("CAPABILITY_UNSUPPORTED: {}", degraded.reason))
+        },
     }
 }
 

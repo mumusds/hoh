@@ -605,6 +605,32 @@ pub fn replay(bytes: &[u8], _version: &str) -> Replayed {
     app_server::replay(bytes, &replay_turn())
 }
 
+/// The prompt a replay's turn/start carries: the recorded one is not an input of the replay, and the request log's
+/// prompt text is not compared (docs/adr/ADR-032.md design correction 7 item 2, the comparison contract).
+pub const REPLAY_PROMPT: &str = "<the prompt>";
+
+/// Replay a recorded App Server turn (codex's stdout as it was read) through the App Server adapter's own judging with
+/// the observations recorded with it, no process started (docs/adr/ADR-032.md design correction 7): the launch they
+/// record (profile, resumed thread, model) is the only source of what the adapter sends, the recorded exit status and
+/// log completion end it. Observations the contract does not accept give NOT_OBSERVED ([`crate::observed::parse`]).
+/// Every codex version is judged alike (the frame registry built in).
+pub fn replay_facts(stdout: &[u8], observations: &Value) -> crate::observed::ReplayFacts {
+    use crate::observed::{Agent, ReplayFacts};
+    let observed = match crate::observed::parse(Agent::Codex, observations) {
+        Ok(observed) => observed,
+        Err(why) => return ReplayFacts::failed(why),
+    };
+    let Some(launch) = observed.codex.clone() else {
+        return ReplayFacts::failed(format!("{} (launch)", crate::observed::NOT_OBSERVED));
+    };
+    let mut turn = replay_turn();
+    turn.launch.profile = launch.profile;
+    turn.launch.resume = launch.resume;
+    turn.launch.model = launch.model;
+    turn.prompt = REPLAY_PROMPT.to_owned();
+    app_server::replay_facts(stdout, &turn, &observed)
+}
+
 /// Replay `bytes` (`codex exec --json`'s stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands)
 /// through the exec transport's own judging, no process started (docs/adr/ADR-030.md decision 10): see [`Replayed`].
 /// Every codex version is judged alike (the exec registry built in, [`crate::known::codex_exec`]); `_version` is the
