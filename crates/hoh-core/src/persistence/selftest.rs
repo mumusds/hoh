@@ -81,8 +81,8 @@ pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistErro
 /// How many names the self-test tries for its database before it gives up (F7-03).
 const NAME_ATTEMPTS: u32 = 8;
 
-/// The files SQLite keeps beside a database.
-const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
+/// The files kept beside the self-test's database: SQLite's, and the room probe's ([`room`]).
+const COMPANIONS: [&str; 4] = ["-wal", "-shm", "-journal", "-room"];
 
 /// The self-test with `inject` called before each step; an `Err` from it fails that step (fault injection).
 pub(super) fn run(
@@ -276,12 +276,12 @@ impl ProbeError {
         }
     }
 
-    /// Judged at `step` by the same rule as our own failed calls ([`SqlFailure::judged`]).
-    fn judged(self, step: Step) -> PersistError {
+    /// Judged at `step` by the same rule as our own failed calls ([`judge`]), the room seen beside `db`.
+    fn judged(self, step: Step, db: &Path) -> PersistError {
         match self {
             ProbeError::Sql { command, failure } => {
                 let detail = format!("the probe's `{command}` failed: {}", failure.message);
-                failure.judged(step, detail)
+                judge(step, &failure, detail, || room(db))
             }
             ProbeError::Other(detail) => PersistError::WalUnsupported {
                 step: step.name(),
@@ -305,60 +305,114 @@ impl Drop for Probe {
     }
 }
 
-/// The OS error of the call that just failed: rusqlite exposes no `sqlite3_system_errno`, so it is read right after the
-/// failing call returns, before anything else runs (a failing call sets it; the calls in between succeed and keep it).
-fn errno() -> Option<i32> {
-    std::io::Error::last_os_error().raw_os_error()
-}
+/// Bytes the room probe writes ([`room`]): twice the largest single allocation of the self-test (the -shm's 32 KiB).
+const ROOM_BYTES: usize = 64 << 10;
 
-/// Whether a failed SQLite call of the self-test, by its extended result code and the OS error of the failing call, is
-/// the file system out of room (DB_FULL) and not WAL's failure: SQLITE_FULL whatever its errno; an I/O error of a call
-/// that grows or writes a store file (the -shm wal-index, a write, a truncate, a sync) only with ENOSPC or EDQUOT as its
-/// OS error. Any other I/O error stays WAL's: an I/O error alone is never taken for a full file system (F7-01). The
-/// probe's errors are judged by the same rule (F7-02).
-pub(super) fn out_of_room(extended: i32, errno: Option<i32>) -> bool {
+/// What an I/O error of a call that writes or grows a store file did, by its extended result code; `None` for any
+/// other code. Besides SQLITE_FULL these are the failures a full file system or an exceeded quota gives, and the room
+/// probe settles which they are ([`judge`]). The -shm's mapping (SQLITE_IOERR_SHMMAP) is not one: it is WAL's
+/// (AC-062-06).
+fn growing_write(extended: i32) -> Option<&'static str> {
     use rusqlite::ffi;
-    let room = [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT].map(|e| e.raw_os_error());
-    extended & 0xff == ffi::SQLITE_FULL
-        || (matches!(
-            extended,
-            ffi::SQLITE_IOERR_SHMSIZE
-                | ffi::SQLITE_IOERR_WRITE
-                | ffi::SQLITE_IOERR_TRUNCATE
-                | ffi::SQLITE_IOERR_FSYNC
-        ) && errno.is_some_and(|e| room.contains(&e)))
+    match extended {
+        ffi::SQLITE_IOERR_WRITE => Some("a write"),
+        ffi::SQLITE_IOERR_FSYNC => Some("an fsync"),
+        ffi::SQLITE_IOERR_TRUNCATE => Some("a truncate"),
+        ffi::SQLITE_IOERR_SHMSIZE => Some("the -shm's growth"),
+        _ => None,
+    }
 }
 
-/// A failed SQLite call of either process, as [`out_of_room`] judges it: its extended result code (none for an error
-/// that is not SQLite's), the OS error of the failing call and SQLite's message. The probe sends it in its error answer
-/// ([`SqlFailure::answer`]) and we read it back ([`SqlFailure::parse`]), so one rule judges both processes' calls
-/// (F7-02).
+/// Whether the directory of `db` has room now, seen directly: a new file of this call's (`<db>-room`, which [`claim`]
+/// found free) takes [`ROOM_BYTES`] of non-repeating bytes (a compressing file system must allocate them too) and an
+/// fsync, and is removed. The OS error that refused it, if one did.
+fn room(db: &Path) -> std::io::Result<()> {
+    let path = with_suffix(db, "-room");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let mut bytes = vec![0u8; ROOM_BYTES];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for chunk in bytes.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
+    }
+    let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+    written
+}
+
+/// The rule for a failed SQLite call of either process at `step`, said by `detail` (ADR-016's note, round 2): no errno
+/// read after SQLite returns, which may be a later call's. SQLITE_FULL is SQLite's own attribution: DB_FULL. A write or
+/// growth that failed ([`growing_write`]) is DB_FULL when `room`, seen right away, is refused for want of space or
+/// quota; otherwise, and for any other failure, it is WAL's failure at `step` (REQ-062 behaviour 7), saying what
+/// failed and what the room probe saw.
+fn judge(
+    step: Step,
+    failure: &SqlFailure,
+    detail: String,
+    room: impl FnOnce() -> std::io::Result<()>,
+) -> PersistError {
+    use std::io::ErrorKind::{QuotaExceeded, StorageFull};
+    let wal = |detail: String| PersistError::WalUnsupported {
+        step: step.name(),
+        detail,
+    };
+    let Some(extended) = failure.extended else {
+        return wal(detail);
+    };
+    if extended & 0xff == rusqlite::ffi::SQLITE_FULL {
+        return PersistError::Full(format!("WAL self-test at {}: {detail}", step.name()));
+    }
+    let Some(what) = growing_write(extended) else {
+        return wal(detail);
+    };
+    let what = format!("{what} failed, SQLite extended code {extended}");
+    let kib = ROOM_BYTES >> 10;
+    match room() {
+        Err(e) if matches!(e.kind(), StorageFull | QuotaExceeded) => PersistError::Full(format!(
+            "WAL self-test at {}: {detail} ({what}); its directory has no room: a {kib} KiB write and fsync \
+             failed: {e}",
+            step.name()
+        )),
+        Ok(()) => wal(format!(
+            "{detail} ({what}); not for want of room: its directory took a {kib} KiB write and fsync"
+        )),
+        Err(e) => wal(format!(
+            "{detail} ({what}); room not known: a {kib} KiB write and fsync in its directory failed: {e}"
+        )),
+    }
+}
+
+/// A failed SQLite call of either process, as [`judge`] takes it: its extended result code (none for an error that is
+/// not SQLite's) and SQLite's message. The probe sends it in its error answer ([`SqlFailure::answer`]) and we read it
+/// back ([`SqlFailure::parse`]), so one rule judges both processes' calls (F7-02).
 #[derive(Debug, PartialEq)]
 pub(super) struct SqlFailure {
     extended: Option<i32>,
-    errno: Option<i32>,
     message: String,
 }
 
 impl SqlFailure {
-    /// `e`, which just failed, with the OS error read right after it ([`errno`]).
-    fn of(e: &rusqlite::Error, errno: Option<i32>) -> SqlFailure {
+    fn of(e: &rusqlite::Error) -> SqlFailure {
         SqlFailure {
             extended: e.sqlite_extended_error_code(),
-            errno,
             message: e.to_string(),
         }
     }
 
-    /// The probe's answer: `error code=<primary> extended=<extended> errno=<OS error> <message>`, `-` for a value it
-    /// does not have; the message on one line.
+    /// The probe's answer: `error code=<primary> extended=<extended> <message>`, `-` for a code it does not have; the
+    /// message on one line.
     fn answer(&self) -> String {
         let value = |v: Option<i32>| v.map_or_else(|| "-".to_owned(), |n| n.to_string());
         format!(
-            "error code={} extended={} errno={} {}",
+            "error code={} extended={} {}",
             value(self.extended.map(|x| x & 0xff)),
             value(self.extended),
-            value(self.errno),
             self.message.replace(['\r', '\n'], " ")
         )
     }
@@ -373,8 +427,7 @@ impl SqlFailure {
         };
         let rest = answer.strip_prefix("error ")?;
         let (code, rest) = rest.split_once(' ')?;
-        let (extended, rest) = rest.split_once(' ')?;
-        let (errno, message) = rest.split_once(' ')?;
+        let (extended, message) = rest.split_once(' ')?;
         let code = value(code, "code=")?;
         let extended = value(extended, "extended=")?;
         if code != extended.map(|x| x & 0xff) {
@@ -382,32 +435,9 @@ impl SqlFailure {
         }
         Some(SqlFailure {
             extended,
-            errno: value(errno, "errno=")?,
             message: message.to_owned(),
         })
     }
-
-    /// The failure at `step`, said by `detail`: DB_FULL when [`out_of_room`], else WAL's failure at that step.
-    fn judged(&self, step: Step, detail: String) -> PersistError {
-        match self.extended {
-            Some(extended) if out_of_room(extended, self.errno) => {
-                let os = self
-                    .errno
-                    .map(|n| format!(" ({})", std::io::Error::from_raw_os_error(n)))
-                    .unwrap_or_default();
-                PersistError::Full(format!("WAL self-test at {}: {detail}{os}", step.name()))
-            }
-            _ => PersistError::WalUnsupported {
-                step: step.name(),
-                detail,
-            },
-        }
-    }
-}
-
-/// One of our own failed SQLite calls at `step`, with the OS error of the failing call.
-fn judged(step: Step, e: &rusqlite::Error, errno: Option<i32>) -> PersistError {
-    SqlFailure::of(e, errno).judged(step, e.to_string())
 }
 
 fn count(conn: &Connection) -> rusqlite::Result<i64> {
@@ -424,12 +454,9 @@ fn steps(
         detail,
     };
     let at = |step: Step| inject(step).map_err(|d| failed(step, d));
-    // A full file system is not WAL's failure ([`out_of_room`]); the OS error is read first, before anything else.
+    // A full file system is not WAL's failure ([`judge`]): the room beside the database is seen at once.
     let sql = |step: Step| {
-        move |e: rusqlite::Error| {
-            let errno = errno();
-            judged(step, &e, errno)
-        }
+        move |e: rusqlite::Error| judge(step, &SqlFailure::of(&e), e.to_string(), || room(db))
     };
 
     at(Step::Open)?;
@@ -452,7 +479,7 @@ fn steps(
     // after it opened, which only a shared (not private or per-process) wal-index shows.
     at(Step::SharedMemory)?;
     let shared = |d: String| failed(Step::SharedMemory, d);
-    let from_probe = |step: Step| move |e: ProbeError| e.judged(step);
+    let from_probe = |step: Step| move |e: ProbeError| e.judged(step, db);
     let mut other =
         Probe::start(probe, db).map_err(|e| shared(format!("cannot start the probe: {e}")))?;
     other
@@ -485,7 +512,7 @@ fn steps(
             return Err(ProbeError::of("try-lock", answer, || {
                 format!("the probe got the write lock we held ({answer})")
             })
-            .judged(Step::Locking));
+            .judged(Step::Locking, db));
         }
     }
     other
@@ -577,9 +604,9 @@ pub(super) struct NormalProbe;
 
 impl ProbeBehaviour for NormalProbe {}
 
-/// The probe's answer for a failed SQLite call, with the OS error of the failing call ([`SqlFailure::answer`]).
-pub(super) fn error_answer(e: &rusqlite::Error, errno: Option<i32>) -> String {
-    SqlFailure::of(e, errno).answer()
+/// The probe's answer for a failed SQLite call ([`SqlFailure::answer`]).
+pub(super) fn error_answer(e: &rusqlite::Error) -> String {
+    SqlFailure::of(e).answer()
 }
 
 /// The probe's side of the protocol.
@@ -603,10 +630,7 @@ pub(super) fn probe_child(
                     conn = Some(c);
                     "ok".to_owned()
                 }
-                Err(e) => {
-                    let errno = errno();
-                    error_answer(&e, errno)
-                }
+                Err(e) => error_answer(&e),
             }
         } else if command == "quit" {
             writeln!(output, "{REPLY}bye").map_err(|e| e.to_string())?;
@@ -624,10 +648,7 @@ pub(super) fn probe_child(
                             let first = *first_count.get_or_insert(n);
                             format!("count {}", behaviour.count(n, first))
                         }
-                        Err(e) => {
-                            let errno = errno();
-                            error_answer(&e, errno)
-                        }
+                        Err(e) => error_answer(&e),
                     },
                     "try-lock" => match c.execute_batch("BEGIN IMMEDIATE") {
                         Ok(()) => {
@@ -637,24 +658,15 @@ pub(super) fn probe_child(
                         Err(e) if e.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
                             "busy".to_owned()
                         }
-                        Err(e) => {
-                            let errno = errno();
-                            error_answer(&e, errno)
-                        }
+                        Err(e) => error_answer(&e),
                     },
                     "hold" => match c.execute_batch("BEGIN IMMEDIATE") {
                         Ok(()) => "held".to_owned(),
-                        Err(e) => {
-                            let errno = errno();
-                            error_answer(&e, errno)
-                        }
+                        Err(e) => error_answer(&e),
                     },
                     "insert-commit" => match c.execute_batch("INSERT INTO t VALUES (3); COMMIT;") {
                         Ok(()) => "committed".to_owned(),
-                        Err(e) => {
-                            let errno = errno();
-                            error_answer(&e, errno)
-                        }
+                        Err(e) => error_answer(&e),
                     },
                     other => format!("error unknown command `{other}`"),
                 }
@@ -725,10 +737,7 @@ mod tests {
                 "hold" => Some("held".to_owned()),
                 "insert-commit" => Some(match conn.execute_batch("INSERT INTO t VALUES (3);") {
                     Ok(()) => "committed".to_owned(),
-                    Err(e) => {
-                        let errno = errno();
-                        error_answer(&e, errno)
-                    }
+                    Err(e) => error_answer(&e),
                 }),
                 _ => None,
             }
@@ -761,10 +770,7 @@ mod tests {
                     });
                 match full {
                     Ok(()) => "committed".to_owned(),
-                    Err(e) => {
-                        let errno = errno();
-                        error_answer(&e, errno)
-                    }
+                    Err(e) => error_answer(&e),
                 }
             })
         }
@@ -1077,51 +1083,47 @@ mod tests {
     }
 
     #[test]
-    fn the_probes_error_answer_carries_its_codes_and_errno_and_is_judged_by_the_same_rule() {
-        // F7-02: the protocol carries the failed call's code, extended code and OS error, and the parent judges the
-        // probe's failure with the rule it uses for its own (out_of_room).
+    fn the_probes_error_answer_carries_its_codes_and_is_judged_by_the_same_rule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // F7-02, F7-100: the protocol carries the failed call's code and extended code, no errno (one read after
+        // SQLite returns may be a later call's), and the parent judges the probe's failure by the rule for its own
+        // ([`judge`]), the room seen in the store's directory.
         let shm = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_SHMSIZE),
             Some("disk I/O error\nat -shm".to_owned()),
         );
-        let answer = error_answer(&shm, Some(rustix::io::Errno::NOSPC.raw_os_error()));
+        let answer = error_answer(&shm);
+        assert_eq!(answer, "error code=10 extended=4874 disk I/O error at -shm");
         assert_eq!(
-            answer,
-            "error code=10 extended=4874 errno=28 disk I/O error at -shm"
-        );
-        let failure = SqlFailure::parse(&answer);
-        assert_eq!(
-            failure,
+            SqlFailure::parse(&answer),
             Some(SqlFailure {
                 extended: Some(rusqlite::ffi::SQLITE_IOERR_SHMSIZE),
-                errno: Some(28),
                 message: "disk I/O error at -shm".to_owned(),
             })
         );
-        let not_sqlites = error_answer(&rusqlite::Error::InvalidQuery, None);
+        let not_sqlites = error_answer(&rusqlite::Error::InvalidQuery);
         assert_eq!(
-            SqlFailure::parse(&not_sqlites).map(|f| (f.extended, f.errno)),
-            Some((None, None))
+            SqlFailure::parse(&not_sqlites).map(|f| f.extended),
+            Some(None)
         );
         for text in [
             "error database is locked",
-            "error code=13 extended=14 errno=- inconsistent codes",
-            "error code=13 extended=13 errno=x not a number",
+            "error code=13 extended=14 inconsistent codes",
+            "error code=13 extended=x not a number",
             "busy",
         ] {
             assert_eq!(SqlFailure::parse(text), None, "{text}");
         }
 
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("selftest.db");
         for (answer, full) in [
-            ("error code=10 extended=4874 errno=28 disk I/O error", true),
-            ("error code=10 extended=4874 errno=5 disk I/O error", false),
-            (
-                "error code=13 extended=13 errno=- database or disk is full",
-                true,
-            ),
-            ("error code=- extended=- errno=28 not sqlite's", false),
+            ("error code=13 extended=13 database or disk is full", true),
+            ("error code=10 extended=4874 disk I/O error", false),
+            ("error code=- extended=- not sqlite's", false),
         ] {
-            let judged = ProbeError::of("insert-commit", answer, String::new).judged(Step::Locking);
+            let judged =
+                ProbeError::of("insert-commit", answer, String::new).judged(Step::Locking, &db);
             assert_eq!(
                 matches!(judged, PersistError::Full(_)),
                 full,
@@ -1129,11 +1131,13 @@ mod tests {
             );
         }
         let text = ProbeError::of("hold", "held twice", || "said otherwise".to_owned())
-            .judged(Step::Locking);
+            .judged(Step::Locking, &db);
         assert!(
             matches!(&text, PersistError::WalUnsupported { detail, .. } if detail == "said otherwise"),
             "{text:?}"
         );
+        assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+        Ok(())
     }
 
     /// A tmpfs of the test's own (`sudo -n`): unmounted by [`Tmpfs::unmount`], whose failure fails the test; dropped
@@ -1227,33 +1231,93 @@ mod tests {
     }
 
     #[test]
-    fn only_sqlite_full_or_a_growing_write_out_of_room_is_db_full() {
-        // F7-01: SQLITE_FULL whatever its errno; the -shm growth, a write, a truncate or a sync only with ENOSPC or
-        // EDQUOT; never another I/O error, the plain one, a read, or a growing call that failed for another reason.
+    fn a_failed_write_is_db_full_only_when_its_directory_has_no_room_now() {
+        // F7-100: SQLITE_FULL is DB_FULL, unprobed; a write, fsync, truncate or -shm growth that failed is DB_FULL
+        // only when the room probe is refused for space or quota, and otherwise WAL's, saying what failed and what the
+        // probe saw; any other code (the plain I/O error, a read, the -shm's mapping, an open) is WAL's, unprobed.
         use rusqlite::ffi::*;
-        use rustix::io::Errno;
-        let (nospc, dquot, eio) = (
-            Some(Errno::NOSPC.raw_os_error()),
-            Some(Errno::DQUOT.raw_os_error()),
-            Some(Errno::IO.raw_os_error()),
-        );
-        for (extended, errno, full) in [
-            (SQLITE_FULL, None, true),
-            (SQLITE_FULL, eio, true),
-            (SQLITE_IOERR_SHMSIZE, nospc, true),
-            (SQLITE_IOERR_SHMSIZE, dquot, true),
-            (SQLITE_IOERR_WRITE, nospc, true),
-            (SQLITE_IOERR_TRUNCATE, nospc, true),
-            (SQLITE_IOERR_FSYNC, dquot, true),
-            (SQLITE_IOERR_SHMSIZE, eio, false),
-            (SQLITE_IOERR_SHMSIZE, None, false),
-            (SQLITE_IOERR, nospc, false),
-            (SQLITE_IOERR_READ, nospc, false),
-            (SQLITE_IOERR_SHMMAP, nospc, false),
-            (SQLITE_CANTOPEN, nospc, false),
+        use std::io::{Error, ErrorKind};
+        let nospc = || Err(Error::from(ErrorKind::StorageFull));
+        let dquot = || Err(Error::from(ErrorKind::QuotaExceeded));
+        let eio = || Err(Error::other("I/O error"));
+        let ok = || Ok(());
+        type Room = fn() -> std::io::Result<()>;
+        for (extended, room, want, probed) in [
+            (Some(SQLITE_FULL), ok as Room, "full", false),
+            (Some(SQLITE_IOERR_SHMSIZE), nospc, "full", true),
+            (Some(SQLITE_IOERR_WRITE), dquot, "full", true),
+            (Some(SQLITE_IOERR_FSYNC), dquot, "full", true),
+            (Some(SQLITE_IOERR_TRUNCATE), nospc, "full", true),
+            (Some(SQLITE_IOERR_FSYNC), ok, "not for want of room", true),
+            (Some(SQLITE_IOERR_WRITE), eio, "room not known", true),
+            (Some(SQLITE_IOERR_SHMMAP), nospc, "wal", false),
+            (Some(SQLITE_IOERR), nospc, "wal", false),
+            (Some(SQLITE_IOERR_READ), nospc, "wal", false),
+            (Some(SQLITE_CANTOPEN), nospc, "wal", false),
+            (None, nospc, "wal", false),
         ] {
-            assert_eq!(out_of_room(extended, errno), full, "{extended} {errno:?}");
+            let failure = SqlFailure {
+                extended,
+                message: "disk I/O error".to_owned(),
+            };
+            let seen = std::cell::Cell::new(false);
+            let judged = judge(Step::Write, &failure, "disk I/O error".to_owned(), || {
+                seen.set(true);
+                room()
+            });
+            assert_eq!(seen.get(), probed, "{extended:?}: {judged:?}");
+            let got = match &judged {
+                PersistError::Full(_) => "full",
+                PersistError::WalUnsupported { detail, .. }
+                    if detail.contains("not for want of room") =>
+                {
+                    "not for want of room"
+                }
+                PersistError::WalUnsupported { detail, .. }
+                    if detail.contains("room not known") =>
+                {
+                    "room not known"
+                }
+                PersistError::WalUnsupported { detail, .. } => {
+                    assert_eq!(detail, "disk I/O error");
+                    "wal"
+                }
+                other => panic!("{extended:?}: {other:?}"),
+            };
+            assert_eq!(got, want, "{extended:?}: {judged:?}");
+            if probed {
+                let x = extended.unwrap_or_default();
+                assert!(
+                    judged
+                        .to_string()
+                        .contains(&format!("SQLite extended code {x}")),
+                    "{judged}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_room_probe_writes_and_syncs_in_the_directory_and_leaves_nothing_of_another()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // F7-100: the room probe is a file of this call's beside the database, removed after; a file of that name
+        // that exists already is another's: the probe fails and leaves it.
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("selftest.db");
+        room(&db)?;
+        assert_eq!(leftovers(dir.path()), Vec::<String>::new());
+        std::fs::write(with_suffix(&db, "-room"), "another's")?;
+        let taken = room(&db);
+        assert_eq!(
+            taken.as_ref().map_err(std::io::Error::kind).err(),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{taken:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&db, "-room"))?,
+            "another's"
+        );
+        Ok(())
     }
 
     #[test]

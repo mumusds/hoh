@@ -64,6 +64,11 @@ impl Project {
 
     /// `hoh args…` in the project with the test's environment only, to its end (killed after [`LIMIT`]).
     fn hoh(&self, args: &[&str]) -> R<Output> {
+        self.hoh_with(args, &[])
+    }
+
+    /// [`Project::hoh`] with `env` added (the client passes it on to the host it starts, and the host to its probe).
+    fn hoh_with(&self, args: &[&str], env: &[(&str, std::ffi::OsString)]) -> R<Output> {
         let home = self.root.join("home");
         let child = Command::new(HOH)
             .args(args)
@@ -73,6 +78,7 @@ impl Project {
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", home.join("run"))
             .env("LANG", "C.UTF-8")
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -208,6 +214,162 @@ fn text(out: &Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// tests/support/io_fault.c, built with `cc` into `dir`: an LD_PRELOAD shim that fails I/O on the WAL self-test's
+/// files (after Codex's injector, fault7 review round 2). A test artefact: never built into or shipped with the product.
+fn io_fault_shim(dir: &Path) -> R<PathBuf> {
+    let so = dir.join("io_fault.so");
+    let out = Command::new("cc")
+        .args(["-shared", "-fPIC", "-O1", "-Wall", "-Werror", "-o"])
+        .arg(&so)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/io_fault.c"
+        ))
+        .arg("-ldl")
+        .output()?;
+    if !out.status.success() {
+        return Err(format!("cc io_fault.c: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(so)
+}
+
+/// One I/O fault of [`io_fault_shim`] on the WAL self-test's files at a host's start, and what the client must say.
+struct IoFault {
+    why: &'static str,
+    /// F7_IO_OP, F7_IO_SUFFIX, F7_IO_ERRNO.
+    op: &'static str,
+    file: &'static str,
+    errno: i32,
+    /// The file system stays full or over quota after the first fault (F7_IO_STATE).
+    sticky: bool,
+    /// The first fault in the probe process only (F7_IO_PROBE).
+    in_probe: bool,
+    /// The next read after it is interrupted (EINTR) and retried by SQLite (F7_CLEANUP_ERRNO).
+    interrupted_read: bool,
+    exit: i32,
+    says: &'static [&'static str],
+}
+
+impl IoFault {
+    /// A made project's next start under the fault: the client's exit and words, nothing written, nothing left. What
+    /// differs, as text.
+    fn check(&self) -> R<Vec<String>> {
+        let (project, before) = made()?;
+        let mut env = vec![
+            ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
+            ("F7_IO_OP", self.op.into()),
+            ("F7_IO_SUFFIX", self.file.into()),
+            ("F7_IO_ERRNO", self.errno.to_string().into()),
+        ];
+        if self.sticky {
+            env.push(("F7_IO_STATE", project.root.join("io-fault-state").into()));
+        }
+        if self.in_probe {
+            env.push(("F7_IO_PROBE", "1".into()));
+        }
+        if self.interrupted_read {
+            env.push(("F7_CLEANUP_ERRNO", "4".into()));
+        }
+        let out = project.hoh_with(&["-p", "second", "--detach", "--output", "json"], &env)?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut wrong = Vec::new();
+        if out.status.code() != Some(self.exit) {
+            wrong.push(format!("exit {:?}, not {}", out.status.code(), self.exit));
+        }
+        for words in self.says {
+            if !stderr.contains(words) {
+                wrong.push(format!("no `{words}`"));
+            }
+        }
+        if project.dump()? != before {
+            wrong.push("the database changed".to_owned());
+        }
+        let left: Vec<String> = std::fs::read_dir(project.hoh_dir())?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".hoh-wal-selftest-"))
+            .collect();
+        if !left.is_empty() {
+            wrong.push(format!("left {left:?}"));
+        }
+        if !wrong.is_empty() {
+            wrong.push(format!("stderr: {}", stderr.trim()));
+        }
+        Ok(wrong)
+    }
+}
+
+/// Every fault checked; all that differs from what each must give, case by case.
+fn check_all(faults: &[IoFault]) -> R {
+    let mut failed = Vec::new();
+    for fault in faults {
+        let wrong = fault.check()?;
+        if !wrong.is_empty() {
+            failed.push(format!("{}:\n  {}", fault.why, wrong.join("\n  ")));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("\n").into())
+    }
+}
+
+#[test]
+fn full_a_full_disk_or_quota_is_db_full_however_sqlites_own_rollback_leaves_errno() -> R {
+    // F7-100: SQLite does rollback I/O inside the call that failed, so the errno read after it returns may be a later
+    // call's (an interrupted read, EINTR). The cause is observed directly instead: a write-family I/O error makes the
+    // self-test try 64 KiB in the store's directory, and a file system that stays full or over quota refuses it.
+    let quota = 122;
+    let no_space = 28;
+    check_all(&[
+        IoFault {
+            why: "the WAL's fsync over quota, then an interrupted rollback read",
+            op: "sync",
+            file: "-wal",
+            errno: quota,
+            sticky: true,
+            in_probe: false,
+            interrupted_read: true,
+            exit: 69,
+            says: &["DB_FULL", "Disk quota exceeded"],
+        },
+        IoFault {
+            why: "the WAL's fsync without space, then an interrupted rollback read",
+            op: "sync",
+            file: "-wal",
+            errno: no_space,
+            sticky: true,
+            in_probe: false,
+            interrupted_read: true,
+            exit: 69,
+            says: &["DB_FULL", "No space left on device"],
+        },
+        IoFault {
+            why: "the probe's WAL fsync over quota, then an interrupted rollback read",
+            op: "sync",
+            file: "-wal",
+            errno: quota,
+            sticky: true,
+            in_probe: true,
+            interrupted_read: true,
+            exit: 69,
+            says: &["DB_FULL", "the probe's", "Disk quota exceeded"],
+        },
+        IoFault {
+            why: "one fsync over quota, the directory with room after it",
+            op: "sync",
+            file: "-wal",
+            errno: quota,
+            sticky: false,
+            in_probe: false,
+            interrupted_read: true,
+            exit: 78,
+            says: &["DB_WAL_UNSUPPORTED", "fsync", "not for want of room"],
+        },
+    ])
 }
 
 /// Another process's write lock on a database (`BEGIN IMMEDIATE`), held until released.
@@ -636,23 +798,39 @@ fn full_a_host_started_with_a_few_kib_left_says_db_full_not_wal() -> R {
     // F7-01: with 16 KiB left the WAL self-test can make its files, but SQLite cannot grow the -shm wal-index: the
     // pwrite that grows it fails with ENOSPC, which SQLite reports as SQLITE_IOERR_SHMSIZE ("disk I/O error"). That is
     // the file system out of room, DB_FULL (the client 69), not DB_WAL_UNSUPPORTED (78); nothing is written.
+    // F7-100: the same for other amounts left, up to where the self-test passes and the start's first write fails
+    // instead; with 32 KiB or less the -shm's growth fails, and the room probe (64 KiB) is refused for want of space.
     let mount = Mount::tmpfs("16m")?;
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
         project.stop_host()?;
         let before = project.dump()?;
-        let filler = mount.fill_leaving(16 << 10)?;
-        let out = project.submit("second")?;
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        assert_eq!(out.status.code(), Some(69), "{}", text(&out));
-        assert!(
-            stderr.contains("DB_FULL") && stderr.contains("No space left on device"),
-            "{stderr}"
-        );
-        assert!(!stderr.contains("DB_WAL_UNSUPPORTED"), "{stderr}");
-        assert_eq!(project.dump()?, before);
-        std::fs::remove_file(filler)?;
+        for kib in [8, 16, 24, 32, 40, 56] {
+            let filler = mount.fill_leaving(kib << 10)?;
+            let out = project.submit("second")?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert_eq!(
+                out.status.code(),
+                Some(69),
+                "{kib} KiB left: {}",
+                text(&out)
+            );
+            assert!(stderr.contains("DB_FULL"), "{kib} KiB left: {stderr}");
+            if kib <= 32 {
+                assert!(
+                    stderr.contains("No space left on device"),
+                    "{kib} KiB left: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("DB_WAL_UNSUPPORTED"),
+                "{kib} KiB left: {stderr}"
+            );
+            project.stop_host()?;
+            assert_eq!(project.dump()?, before, "{kib} KiB left");
+            std::fs::remove_file(filler)?;
+        }
         project.accepted("third")?;
         project.stop_host()
     })();
