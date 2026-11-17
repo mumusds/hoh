@@ -141,6 +141,9 @@ pub struct Current {
     /// Why the agent is not what its last look found (the registry's one predicate of that, which F's compat is
     /// `Pending` by too), `None` while it is: prepare's (a) (docs/adr/ADR-030.md decision 9, M2T15R-01).
     pub changed: Option<String>,
+    /// codex: this host's check of its read-only sandbox as the registry keeps it (`{check, reason}`), read in the
+    /// same look as F (docs/adr/ADR-032.md decision 4); `None` for the others and before any check.
+    pub host_check: Option<serde_json::Value>,
 }
 
 /// What a turn ran as (docs/adr/ADR-030.md decision 2, M2T15D-07): its agent, the identity of the fact its prepare
@@ -1174,6 +1177,9 @@ impl Registry {
             fact,
             compat,
             changed,
+            host_check: known.host_check.as_ref().map(
+                |(check, _)| serde_json::json!({"check": check.name(), "reason": check.reason()}),
+            ),
         }))
     }
 
