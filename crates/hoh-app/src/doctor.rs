@@ -255,7 +255,9 @@ fn examine(project: &Path, live: bool) -> Report {
         log: Some(log.clone()),
         // One limit for all commands, also those run one after another (M1T07R-02).
         deadline: Some(Instant::now() + TIMEOUT),
-        cancel: None,
+        // Its commands are the client's helpers: a signal stops and reaps them (docs/adr/ADR-031.md, the client-signal
+        // correction's addendum, rule 5).
+        cancel: crate::signals::current().map(|state| state.helpers().clone()),
     };
     let (manifest, warning) = manifest(project);
     let mut warnings: Vec<String> = warning.into_iter().collect();
@@ -409,14 +411,24 @@ fn examine(project: &Path, live: bool) -> Report {
     }
 }
 
-/// Run doctor for `project`; the exit code.
+/// Run doctor for `project`; the exit code. Its signal state is registered first and its examination waited for
+/// through it: a signal stops and reaps every command and live turn it started and ends it with 143, 130 or 129, no
+/// report written (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5).
 pub fn run(project: &Path, live: bool, json_output: bool) -> u8 {
-    let report = examine(project, live);
+    let state = match crate::signals::register() {
+        Ok(state) => state,
+        Err(code) => return code,
+    };
+    let dir = project.to_path_buf();
+    let report = match state.wait(move || examine(&dir, live)) {
+        Ok(report) => report,
+        Err(code) => return state.exit(code, "doctor 已停止它启动的命令，没有输出报告"),
+    };
     let text = if json_output {
         report::json(&report)
     } else {
         report::text(&report)
     };
     let _ = std::io::stdout().lock().write_all(text.as_bytes());
-    report.summary.exit_code
+    state.exit(report.summary.exit_code, "报告已经写出")
 }

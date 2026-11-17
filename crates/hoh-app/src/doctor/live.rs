@@ -134,6 +134,9 @@ pub(super) fn prepare(
 
 async fn run(store: &Store, attempt: &AttemptRef, prepared: &Prepared) -> Result<Ended, String> {
     let latch = CancelLatch::new();
+    // The turn's agent is the client's helper while it runs: a signal cancels it and waits for its end
+    // (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5).
+    let _owned = crate::signals::current().map(|state| state.own_turn(&latch));
     Ok(match prepared {
         Prepared::Claude(turn) => {
             let o = claude::run(store, attempt, turn, &latch)

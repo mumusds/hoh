@@ -84,18 +84,46 @@ impl ProbeStop {
     /// to the probes' own looks at the stop, as [`ProbeStop`] says (decision 10 v6, M2T07R-700, -853). A command still
     /// being spawned is killed by its starter as it puts it in its slot.
     pub fn stop(&self) {
+        drop(self.halt());
+    }
+
+    /// [`ProbeStop::stop`], then wait until `until` for the probing thread of every command the stop found to be done
+    /// with it (it ended and reaped it, or gave it up): whether all were. A client's signal exit lets go of its probes
+    /// so (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5). One not done by then was already
+    /// SIGKILLed with its group; its starter reaps it if it runs again, else init once the process has gone. `false`
+    /// too when the stop could not have the table of commands (decision 10 v6).
+    pub fn stop_within(&self, until: Instant) -> bool {
+        let Some(found) = self.halt() else {
+            return false;
+        };
+        loop {
+            if found
+                .iter()
+                .all(|slot| std::sync::Arc::strong_count(slot) == 1)
+            {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The stop's work: the flag, then every command found in its slot and not reaped killed; the slots found (none
+    /// when the table's lock was not had in time).
+    fn halt(&self) -> Option<Vec<Slot>> {
         let until = Instant::now() + STOP_WAIT;
         // The flag first, whatever lock below the stop does not get: a starter looks at it in its put, a probe at each
         // pass of its wait.
         self.0
             .stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let Some(mut commands) = tried(&self.0.commands, until) else {
-            return;
-        };
-        for command in commands.drain(..).filter_map(|c| c.upgrade()) {
+        let mut commands = tried(&self.0.commands, until)?;
+        let found: Vec<Slot> = commands.drain(..).filter_map(|c| c.upgrade()).collect();
+        for command in &found {
             // Its leader not reaped (whoever reaps it takes it out first), the number is still its own.
-            if let Some(held) = tried(&command, until)
+            if let Some(held) = tried(command, until)
                 && let Some(child) = held.as_ref()
             {
                 let pid = Pid::from_child(child);
@@ -105,6 +133,8 @@ impl ProbeStop {
             // Where a test holds the stop once it tried a slot (by its thread's hook, see [`between`]).
             between("slot-tried", Path::new(""));
         }
+        drop(commands);
+        Some(found)
     }
 
     /// Whether [`ProbeStop::stop`] was called.
