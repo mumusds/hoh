@@ -13,6 +13,7 @@
 //! line per command on stdout after the marker `hoh-wal-probe: ` (other output is ignored).
 
 use super::PersistError;
+use super::created::{Created, Leftover};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
@@ -81,8 +82,9 @@ pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistErro
 /// How many names the self-test tries for its database before it gives up (F7-03).
 const NAME_ATTEMPTS: u32 = 8;
 
-/// The files kept beside the self-test's database: SQLite's, and the room probe's ([`room`]).
-const COMPANIONS: [&str; 4] = ["-wal", "-shm", "-journal", "-room"];
+/// SQLite's files beside the self-test's database, which [`claim`] makes with it (the room probe's `-room` is the
+/// probe's own: [`room`]).
+const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// The self-test with `inject` called before each step; an `Err` from it fails that step (fault injection).
 pub(super) fn run(
@@ -100,79 +102,84 @@ pub(super) fn run(
     run_named(dir, names, probe, inject)
 }
 
-/// The self-test with its database at the first of `names` that this call can claim ([`claim`]). Only the files this
-/// call created are removed after: the database it claimed and SQLite's companions of it, which did not exist when it
-/// claimed the name (F7-03).
+/// The self-test with its database at the first of `names` that this call can claim ([`claim`]). After it, the files
+/// the claim made are removed through their tokens, and nothing else (ADR-016's note, round 3: F7-200).
 pub(super) fn run_named(
     dir: &Path,
     names: impl IntoIterator<Item = PathBuf>,
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
-    let db = claim(dir, names)?;
-    let result = steps(&db, probe, inject);
-    for suffix in std::iter::once("").chain(COMPANIONS) {
-        let _ = std::fs::remove_file(with_suffix(&db, suffix));
+    let claimed = claim(dir, names)?;
+    let result = steps(claimed.db.path(), probe, inject);
+    for made in claimed.companions.into_iter().chain([claimed.db]) {
+        let _ = made.remove();
     }
     result
 }
 
-/// Create the self-test's database file at the first name that is free: neither the file nor a companion of it
-/// exists. A name that exists is another creator's and is left to it: the next name is tried, up to the last, and
-/// the self-test fails at its open step when none is free. A file it made for a name whose companion exists is removed
-/// before the next is tried; when it cannot be, the open step fails naming it.
+/// The files a [`claim`] made: the database and its companions, each with its token.
+#[derive(Debug)]
+struct Claimed {
+    db: Created,
+    companions: Vec<Created>,
+}
+
+/// Make the self-test's database file and its companions' ([`COMPANIONS`], empty: SQLite uses them as they are) with
+/// create_new, at the first name where all of them are new. A name where any exists is another creator's and is left to
+/// it: the files this call made for it are removed through their tokens and the next name is tried, up to the last; the
+/// self-test fails at its open step when none is free, or when a file it made and gave up cannot be removed (named).
 ///
-/// The file is made before SQLite opens it, so that a directory refusing it for want of permission or room says so by
-/// the OS's error (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database.
-fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<PathBuf, PersistError> {
-    claim_with(dir, names, &|path| std::fs::remove_file(path))
+/// The files are made before SQLite opens them, so that a directory refusing them for want of permission or room says
+/// so by the OS's error (SQLite says only that it cannot open the file); SQLite opens the empty file as a new database.
+fn claim(dir: &Path, names: impl IntoIterator<Item = PathBuf>) -> Result<Claimed, PersistError> {
+    claim_with(dir, names, &Created::remove)
 }
 
 /// [`claim`], with `remove` removing a file this call made and gave up.
 fn claim_with(
     dir: &Path,
     names: impl IntoIterator<Item = PathBuf>,
-    remove: &dyn Fn(&Path) -> std::io::Result<()>,
-) -> Result<PathBuf, PersistError> {
+    remove: &dyn Fn(Created) -> Result<(), Leftover>,
+) -> Result<Claimed, PersistError> {
     let mut taken = None;
-    for db in names {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&db)
+    'names: for db in names {
+        let mut made: Vec<Created> = Vec::new();
+        for path in
+            std::iter::once(db.clone()).chain(COMPANIONS.map(|suffix| with_suffix(&db, suffix)))
         {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                taken = Some(db);
-                continue;
+            match Created::new(&path) {
+                Ok((file, _)) => made.push(file),
+                Err(e) => {
+                    // Given up: what this call made for the name goes, or the self-test stops here naming it (F7-150).
+                    for file in made {
+                        remove(file).map_err(|left| PersistError::WalUnsupported {
+                            step: Step::Open.name(),
+                            detail: format!("a file made for the self-test and given up: {left}"),
+                        })?;
+                    }
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        taken = Some(path);
+                        continue 'names;
+                    }
+                    return Err(not_created(dir, &path, &e));
+                }
             }
-            Err(e) => return Err(not_created(dir, &db, &e)),
         }
-        if COMPANIONS
-            .iter()
-            .any(|suffix| std::fs::symlink_metadata(with_suffix(&db, suffix)).is_ok())
-        {
-            // Given up: the file this call made goes, or the self-test stops here and names it (F7-150).
-            if let Err(e) = remove(&db) {
-                return Err(PersistError::WalUnsupported {
-                    step: Step::Open.name(),
-                    detail: format!(
-                        "cannot remove {}, made for the self-test and given up for a taken companion: {e}",
-                        db.display()
-                    ),
-                });
-            }
-            taken = Some(db);
-            continue;
+        let mut made = made.into_iter();
+        if let Some(db) = made.next() {
+            return Ok(Claimed {
+                db,
+                companions: made.collect(),
+            });
         }
-        return Ok(db);
     }
     Err(PersistError::WalUnsupported {
         step: Step::Open.name(),
         detail: match taken {
-            Some(db) => format!(
-                "every name tried for the self-test database exists already, the last {}",
-                db.display()
+            Some(path) => format!(
+                "every name tried for the self-test database is taken, the last by {}",
+                path.display()
             ),
             None => "no name to try for the self-test database".to_owned(),
         },
@@ -476,8 +483,9 @@ fn steps(
     other
         .expect("count", "count 2")
         .map_err(from_probe(Step::SharedMemory))?;
-    if !with_suffix(db, "-shm").exists() {
-        return Err(shared("no -shm file".to_owned()));
+    // The claim made the -shm empty; SQLite grows the one it shares to 32 KiB.
+    if std::fs::metadata(with_suffix(db, "-shm")).map_or(true, |m| m.len() == 0) {
+        return Err(shared("no -shm file in use (missing or empty)".to_owned()));
     }
 
     // Each process must be refused the write lock while the other holds it, and see the other's commit.
@@ -1055,7 +1063,12 @@ mod tests {
             .map(|n| dir.path().join(format!("selftest-{n}.db")))
             .collect();
         std::fs::write(with_suffix(&names[0], "-wal"), "another's")?;
-        let refused = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let refused = |made: Created| {
+            Err(Leftover {
+                path: made.path().to_owned(),
+                error: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            })
+        };
         match claim_with(dir.path(), names.clone(), &refused) {
             Err(PersistError::WalUnsupported { step, detail }) => {
                 assert_eq!(step, Step::Open.name(), "{detail}");
