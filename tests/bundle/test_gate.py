@@ -1,4 +1,5 @@
 import copy,json,shutil,unittest
+from pathlib import Path
 from datetime import timedelta
 from helpers import ReleaseFixture,load_json,json_file,ref_for,sha256
 from release_gate import validate_manifest,GateError
@@ -151,6 +152,30 @@ class ReleaseGate(unittest.TestCase):
         p=self.f.root/'contracts/release-policy.json';d=load_json(p);d['minimum_soak_seconds']=0;p.write_text(json.dumps(d));self.reject('baseline contract changed')
     def test_gate_tool_changed(self):
         p=self.f.root/'tools/release_gate.py';p.write_text(p.read_text()+'\n# weakened\n');self.reject('baseline contract changed')
+    def test_the_gate_refuses_to_judge_without_a_date_time_checker(self):
+        # CR-025 (M2T10R-750), as test_traceability.py's replica test: a jsonschema without requirements-dev.txt's format
+        # extras would accept any string as a date-time. The gate refuses to judge then, exit 1 and its one JSON line on
+        # stderr, before the baseline or any evidence is read (here the gate tool itself is changed too); with the
+        # checker it judges as before.
+        import contextlib,io,tempfile
+        import release_gate as rg
+        out=tempfile.TemporaryDirectory();self.addCleanup(out.cleanup);path=Path(out.name)/'manifest.json'
+        path.write_text(json.dumps(self.m))
+        class NoDateTime(rg.FormatChecker):
+            def __init__(self):super().__init__();self.checkers.pop('date-time',None)
+        def gate():
+            err=io.StringIO()
+            with contextlib.redirect_stderr(err),contextlib.redirect_stdout(io.StringIO()):rc=rg.main(['--manifest',str(path)])
+            return rc,err.getvalue()
+        refusal=json.dumps({'status':'FAIL','error':'jsonschema cannot check date-time: install requirements-dev.txt'},ensure_ascii=False)+'\n'
+        root,checker=rg.ROOT,rg.FormatChecker;rg.ROOT=self.f.root
+        try:
+            self.assertEqual(gate(),(0,''),'with the checker')
+            rg.FormatChecker=NoDateTime
+            self.assertEqual(gate(),(1,refusal),'without it')
+            p=self.f.root/'tools/release_gate.py';p.write_text(p.read_text()+'\n# weakened\n')
+            self.assertEqual(gate(),(1,refusal),'before the baseline is read')
+        finally:rg.ROOT,rg.FormatChecker=root,checker
     def test_change_request_tampered(self):
         lock=load_json(self.f.root/'contracts/baseline-lock.json');p=self.f.root/lock['change_requests'][0]['path'];p.write_text(p.read_text()+'x');self.reject('change request record')
     def test_wrong_baseline_id(self):self.m['baseline_id']='HOH-BASELINE-9.9';self.reject('wrong baseline')

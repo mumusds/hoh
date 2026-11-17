@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 17,
+  "revision": 18,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "f846ec1b28dfed9bcc228361a21cfb00657f9a33e0ac36c326f0bf8075c63471"
+    "lock_sha256": "3b5901f5645140a55b9ba47e4b4b0b43299531dcf7c8f03aa5e407a74cfc842c"
   },
   "change_requests": [
     {
@@ -87,12 +87,17 @@
       "id": "CR-023",
       "path": "docs/cr/CR-023-resume-from-stop-states.md",
       "sha256": "19fa362074dde24c02ab5a9ddd920fcb8057ee739c9748d98b21b10090a34412"
+    },
+    {
+      "id": "CR-025",
+      "path": "docs/cr/CR-025-budget-risk-role-binding-pending-gate-date-time.md",
+      "sha256": "8e7eb1408043f1e4ee889c013208da94b3fef1a5ca5c3c3aea6213639b073c8d"
     }
   ],
   "files": {
     "CONTRACT.md": "39e15a3ed45fc60026386c7df2522eb895cd8fef07aa45bd923ded5f3f0df8a6",
     "contracts/acceptance-observation.schema.json": "6778331658ba0d47797185f5e2d322f62020ea8747c00d2ce9f1247440c1490e",
-    "contracts/acceptance-scenarios.json": "8ecd58e99e54d66ff3a2ddd306b623c6d5d622e51dc95d8604e763ce2543589a",
+    "contracts/acceptance-scenarios.json": "03b6aa4224e638cec4a6df09d40ca4dcb4d8588d5be3e33a2ac6da66514f4a8c",
     "contracts/candidate.schema.json": "5965712d9f1c16e8804f3e00dbc1e2faec0b878435ba868afd637b242bb439cb",
     "contracts/check-plan.schema.json": "d4dac3c7c3ebee4356d332541035ecf9c03d12e101acb5f7c717b1598359a86a",
     "contracts/compat-manifest.schema.json": "6b4a676fc8af07bef82c7fa2d3f911ef47791026459e88419026cad565ab8de4",
@@ -101,10 +106,10 @@
     "contracts/live-session.schema.json": "06ee125373701d6569477be0396e6e11e6b28b7f89903a020f0f241e3ce32793",
     "contracts/native-attempt.schema.json": "34fce4de57f4dcf79a9023d66f546ef75f96a0bbccd569c982e8a4c300a25220",
     "contracts/openapi.json": "3159572fd5dc18f4f32a91c754b607223a085aca2c76d5f7ce28696a0417ffd7",
-    "contracts/protocol.schema.json": "e6c875b992a24a8c48a9fc5382900960eadfb119b90dac1198defbf7d5623613",
+    "contracts/protocol.schema.json": "6e54e1002d78290575ba0f885f8d378202325f9fb3a851d57c9026c0f9ecfa7f",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "db8c7e36a9e563ea7728782074f65f1c4e9764999d425bc3058b5885758fe3a8",
+    "contracts/requirements.json": "2e57ed982cd25f4984ed6542bc13811c159fcbfc6da31222b9dd671965af0207",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/sql/001_initial.sql": "286f56252a4f113ff121fd57935909617a30b849628aecfb5fb1c9bae407c36b",
     "contracts/test-result.schema.json": "9bffa29e3bd9ed19c6b40de93bc15394c87d55d43f668b4e0083b5b6a1f8ed51",
@@ -112,7 +117,7 @@
     "tools/baseline.py": "2a402141ba6e810eb85613947be508a1e066a27de2f736cd15ef5891bb9380c2",
     "tools/candidate.py": "83682c51735bcc84c1ac81217111f6eecd63ef660a57a9c4f182394d4001b98c",
     "tools/common.py": "e0df9f5e3208342b72670dcbc458229cf898a57b02b79615d723707645e7e44a",
-    "tools/release_gate.py": "a9dd44beca4e56e8744b456f02a766f8898189dbe1ddf62189cffbd90f1555d0",
+    "tools/release_gate.py": "c2baa7126f9b73800f43fd4a7c8089d5f1327be3b44abad9bbf5bdca604f79c3",
     "tools/run_check.py": "d155bf2f31c87133a0a8be426c85f301147fc785d4da5b8d48bc59a2ee3d99bf"
   }
 }

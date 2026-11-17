@@ -115,6 +115,9 @@ def produced_ref(execution: dict, name: str) -> dict|None:
     return {'path':ref['path'],'sha256':ref['sha256']} if ref else None
 
 def validate_manifest(root: Path, manifest: dict) -> dict:
+    # Its schemas' times are date-time formats: a jsonschema without requirements-dev.txt's format extras would accept
+    # any string there, so the gate refuses to judge rather than trust it (CR-025, M2T10R-750; as traceability.py does).
+    need('date-time' in FormatChecker().checkers,'jsonschema cannot check date-time: install requirements-dev.txt')
     root=root.resolve();lock=verify_baseline(root)
     validate_schema(root,'release.schema.json',manifest)
     policy=load_json(root/'contracts/release-policy.json')

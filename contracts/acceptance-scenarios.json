@@ -2686,6 +2686,29 @@
    ]
   },
   {
+   "id": "TEST-042-07",
+   "requirement_id": "REQ-042",
+   "acceptance_id": "AC-042-07",
+   "check_id": "unit",
+   "fixture": "hoh-core预算判定（pace）+临时SQLite+FakeClock（含墙钟）+重启模拟（重新打开库）",
+   "steps": [
+    "建Re（max_iterations=100，已用79）并判定一次",
+    "已用到80，判定两次",
+    "重新打开库再判定一次",
+    "建Rf（deadline_at=创建+100 s），墙钟到+79 s与+80 s各判定一次"
+   ],
+   "pass_criteria": [
+    "Re：79时budget.risk为0条，80时恰好1条且载荷为{kind:max_iterations, used:80, limit:100, unit:iterations, threshold:0.8}，再判定与重启后仍为1条",
+    "Rf：+79 s为0条，+80 s恰好1条且载荷为{kind:deadline_at, used:80, limit:100, unit:seconds, threshold:0.8}",
+    "每次判定前后两个Run的state、outbox派发数与attempt_count不变"
+   ],
+   "observables": [
+    "events导出（budget.risk的完整载荷）",
+    "runs与tasks行",
+    "FakeClock日志"
+   ]
+  },
+  {
    "id": "TEST-043-01",
    "requirement_id": "REQ-043",
    "acceptance_id": "AC-043-01",
