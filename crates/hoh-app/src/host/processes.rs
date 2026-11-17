@@ -188,28 +188,127 @@ pub(super) enum Tools {
 }
 
 /// Whether a process of the attempt marked `marker` other than its leader (`leader`, pid and start time) runs, as `root`
-/// (/proc) shows them now: a child of the leader, or a process with the marker in its environment; a zombie does not
-/// run. Read only: nothing is pinned or signalled (docs/adr/ADR-022.md decision 19 item 4).
+/// (/proc) shows them now: a child of the leader, or a process with the marker in its environment or in a thread's. A
+/// process runs while any of its threads does: one whose main thread ended (a zombie in its `stat`) may run on in
+/// another (WD-02). Read only: nothing is pinned or signalled. What cannot be read and cannot be shown unrelated
+/// leaves it unknown, which the watchdog takes as a tool (docs/adr/ADR-022.md decision 19 item 4, WD-03). Unrelated:
+/// a process started before the leader (all of the attempt's descend from it), or another user's (the attempt's run as
+/// the host's user, and a set-user-id tool keeps its real user).
 pub(super) fn tools(root: &Path, leader: (u32, Option<u64>), marker: &str) -> Tools {
-    let (all, mut complete) = processes(root);
+    let (all, complete) = processes(root);
+    let mut unknown = !complete;
     let is_leader = |p: &Proc| p.pid == leader.0 && leader.1.is_none_or(|start| start == p.start);
-    // A child of the leader that runs is one; a zombie's children were given to another parent and are found below by
-    // the marker.
-    if all.iter().any(is_leader) && all.iter().any(|p| p.ppid == leader.0 && !p.zombie) {
-        return Tools::Running;
-    }
+    let leads = all.iter().any(is_leader);
     let marker = format!("{ATTEMPT_ENV}={marker}").into_bytes();
-    for process in all.iter().filter(|p| !p.zombie && !is_leader(p)) {
-        match marked(root, process.pid, &marker) {
+    let me = rustix::process::getuid().as_raw();
+    for process in all.iter().filter(|p| !is_leader(p)) {
+        if leader.1.is_some_and(|start| process.start < start) {
+            continue;
+        }
+        if process.zombie {
+            match thread_runs(root, process.pid) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    unknown = true;
+                    continue;
+                }
+            }
+        }
+        if leads && process.ppid == leader.0 {
+            return Tools::Running;
+        }
+        match marked_tri(root, process, &marker, me) {
             Some(true) => return Tools::Running,
             Some(false) => {}
-            None => complete = false,
+            None => unknown = true,
         }
     }
-    if complete {
-        Tools::Absent
-    } else {
+    if unknown {
         Tools::Unknown
+    } else {
+        Tools::Absent
+    }
+}
+
+/// Whether a read failed because what it read is gone (the process or thread exited).
+fn gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3)
+}
+
+/// Whether a thread of `pid` runs (is no zombie): `None` when its threads cannot be listed or one cannot be read.
+fn thread_runs(root: &Path, pid: u32) -> Option<bool> {
+    let tasks = match std::fs::read_dir(root.join(pid.to_string()).join("task")) {
+        Ok(tasks) => tasks,
+        Err(e) if gone(&e) => return Some(false),
+        Err(_) => return None,
+    };
+    let mut known = true;
+    for task in tasks {
+        let Ok(task) = task else {
+            known = false;
+            continue;
+        };
+        let Some(tid) = task
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match std::fs::read(task.path().join("stat")) {
+            Ok(bytes) => match parse_stat(tid, &bytes) {
+                Some(thread) if !thread.zombie => return Some(true),
+                Some(_) => {}
+                None => known = false,
+            },
+            Err(e) if gone(&e) => {}
+            Err(_) => known = false,
+        }
+    }
+    known.then_some(false)
+}
+
+/// Whether `process` has `marker` in its environment or a thread's: `None` when neither can be read and it cannot be
+/// shown to be another user's (`me` is the host's user).
+fn marked_tri(root: &Path, process: &Proc, marker: &[u8], me: u32) -> Option<bool> {
+    let has = |env: &[u8]| env.split(|b| *b == 0).any(|entry| entry == marker);
+    let dir = root.join(process.pid.to_string());
+    match std::fs::read(dir.join("environ")) {
+        Ok(env) if has(&env) => return Some(true),
+        // Readable and without it; a zombie main thread's may say nothing of its threads.
+        Ok(_) if !process.zombie => return Some(false),
+        Err(e) if gone(&e) => return Some(false),
+        Ok(_) | Err(_) => {}
+    }
+    // Its threads' environments (the main thread's may have ended, or be refused): one readable settles it.
+    let mut readable = false;
+    if let Ok(tasks) = std::fs::read_dir(dir.join("task")) {
+        for task in tasks.flatten() {
+            if let Ok(env) = std::fs::read(task.path().join("environ")) {
+                if has(&env) {
+                    return Some(true);
+                }
+                readable = true;
+            }
+        }
+    }
+    if readable {
+        return Some(false);
+    }
+    match std::fs::read_to_string(dir.join("status")) {
+        Ok(status) => {
+            let uid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|v| v.split_whitespace().next()?.parse::<u32>().ok());
+            match uid {
+                Some(uid) if uid != me => Some(false),
+                _ => None,
+            }
+        }
+        Err(e) if gone(&e) => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -865,6 +964,146 @@ mod tests {
         assert_eq!(
             tools(found.path(), (100, Some(500)), "p/A1"),
             Tools::Running
+        );
+        Ok(())
+    }
+
+    /// A python3 process with `marker` (if any) in its environment running `code`, once it printed its first line.
+    fn python(code: &str, marker: Option<&str>) -> std::io::Result<(std::process::Child, String)> {
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", code]).env_remove(ATTEMPT_ENV);
+        if let Some(marker) = marker {
+            command.env(ATTEMPT_ENV, marker);
+        }
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()?;
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(out), &mut line)?;
+        }
+        Ok((child, line.trim().to_owned()))
+    }
+
+    /// A tool whose main thread has ended (a raw `exit` of that thread alone) while another of its threads runs; it
+    /// says `running` once the main thread is gone.
+    const THREAD_LIVES_ON: &str = "import ctypes, platform, threading, time
+def work():
+    time.sleep(0.3)
+    print('running', flush=True)
+    time.sleep(60)
+threading.Thread(target=work).start()
+ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.machine()]), ctypes.c_long(0))";
+
+    fn leader_of(pid: u32) -> (u32, Option<u64>) {
+        match stat(Path::new("/proc"), pid) {
+            Stat::Read(p) => (pid, Some(p.start)),
+            _ => (pid, None),
+        }
+    }
+
+    fn zombie(pid: u32) -> bool {
+        matches!(stat(Path::new("/proc"), pid), Stat::Read(p) if p.zombie)
+    }
+
+    #[test]
+    fn a_tool_whose_main_thread_ended_while_another_thread_runs_is_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WD-02: its thread group's leader is a zombie, its other thread runs the tool; found by its marker (it left
+        // the leader's tree) and as a child of the leader.
+        let marker = format!("p/WD02-{}", std::process::id());
+        let (mut leader, _) = python(
+            "print('up', flush=True); import time; time.sleep(60)",
+            Some(&marker),
+        )?;
+        let (mut tool, said) = python(THREAD_LIVES_ON, Some(&marker))?;
+        let marked = (
+            said.clone(),
+            zombie(tool.id()),
+            tools(Path::new("/proc"), leader_of(leader.id()), &marker),
+        );
+        let _ = tool.kill();
+        let _ = tool.wait();
+        let spawn = format!(
+            "import subprocess, sys; c = subprocess.Popen([sys.executable, '-c', {THREAD_LIVES_ON:?}], \
+             stdout=subprocess.PIPE, text=True); print(c.stdout.readline().strip(), c.pid, flush=True); c.wait()"
+        );
+        let (mut parent, said) = python(&spawn, None)?;
+        let child: u32 = said.split(' ').nth(1).unwrap_or_default().parse()?;
+        let as_child = (
+            said.split(' ').next().unwrap_or_default().to_owned(),
+            zombie(child),
+            tools(Path::new("/proc"), leader_of(parent.id()), &marker),
+        );
+        if let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(child)?) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        let _ = parent.kill();
+        let _ = parent.wait();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert_eq!(marked, ("running".to_owned(), true, Tools::Running));
+        assert_eq!(as_child, ("running".to_owned(), true, Tools::Running));
+        Ok(())
+    }
+
+    #[test]
+    fn a_tool_of_the_same_user_whose_environment_cannot_be_read_is_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WD-03: PR_SET_DUMPABLE 0 makes its environment unreadable (EACCES); started after the leader by the same
+        // user, it cannot be shown not to be the attempt's.
+        let marker = format!("p/WD03-{}", std::process::id());
+        let (mut leader, _) = python(
+            "print('up', flush=True); import time; time.sleep(60)",
+            Some(&marker),
+        )?;
+        let (mut tool, said) = python(
+            "import ctypes, time; assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0; print('hidden', flush=True); \
+             time.sleep(60)",
+            Some(&marker),
+        )?;
+        let unreadable = std::fs::read(format!("/proc/{}/environ", tool.id()))
+            .err()
+            .map(|e| e.kind());
+        let found = tools(Path::new("/proc"), leader_of(leader.id()), &marker);
+        let _ = tool.kill();
+        let _ = tool.wait();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert_eq!(said, "hidden");
+        assert_eq!(unreadable, Some(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(found, Tools::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_process_is_not_the_attempts_when_older_than_its_leader_or_another_users()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WD-03: what shows an unreadable process unrelated: it started before the leader (every process of the
+        // attempt descends from it), or its real user is another (the attempt's run as the host's user; a set-user-id
+        // tool keeps it). Else it is unknown. Its environment here is a directory: a read that fails.
+        let me = rustix::process::getuid().as_raw();
+        let unreadable = |start: u32, uid: u32| -> std::io::Result<tempfile::TempDir> {
+            let root = tree(&[(100, LEADER, MARKED)])?;
+            let dir = root.path().join("300");
+            std::fs::create_dir_all(dir.join("environ"))?;
+            std::fs::create_dir_all(dir.join("task/300/environ"))?;
+            let stat = format!("300 (tool) S 1 300 300 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0");
+            std::fs::write(dir.join("stat"), &stat)?;
+            std::fs::write(dir.join("task/300/stat"), &stat)?;
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\ttool\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            )?;
+            Ok(root)
+        };
+        let older = unreadable(400, me)?;
+        let other = unreadable(900, me.wrapping_add(1))?;
+        let same = unreadable(900, me)?;
+        assert_eq!(
+            [older.path(), other.path(), same.path()].map(|r| tools(r, (100, Some(500)), "p/A1")),
+            [Tools::Absent, Tools::Absent, Tools::Unknown]
         );
         Ok(())
     }
