@@ -625,15 +625,34 @@ struct Driven {
     limit: Limit,
 }
 
-/// What a turn's frames said about a rate or usage limit (M2T07R-256; docs/adr/ADR-012.md, 注记 of 2026-11-16): the
-/// reset of the last `rate_limit_event` whose status was `rejected` (a later event that is not rejected clears it, and so
-/// does a successful assistant message, the main thread's or a subagent's: the limit no longer held, RA-04), and the
-/// rate limit of the turn's last main-thread assistant frame.
+/// What a turn's frames said about a rate or usage limit (M2T07R-256; docs/adr/ADR-022.md decision 16's design
+/// correction, rules 1 and 4): the main thread's model, the last rejected `rate_limit_event` of the turn with its scope,
+/// and the rate limit of the turn's last main-thread assistant frame. Subagents' frames say nothing about the main
+/// thread's limit, either way.
 #[derive(Debug, Default)]
 struct Limit {
-    rejected_reset: Option<Value>,
+    /// The init frame's model, then each main-thread assistant message's.
+    main_model: Option<String>,
+    rejected: Option<Rejected>,
     last: Option<LimitError>,
 }
+
+/// A rejected `rate_limit_event`: its reset, and the model it was recorded under (none for an account-wide limit:
+/// five hours, seven days, overage), which only a main-thread success of the same limit clears.
+#[derive(Debug)]
+struct Rejected {
+    reset: Value,
+    account: bool,
+    model: Option<String>,
+}
+
+/// Limit types of the whole account (rate_limit_info.rateLimitType); any other, or none, is taken as a model's.
+const ACCOUNT_LIMITS: [&str; 4] = [
+    "five_hour",
+    "seven_day",
+    "overage",
+    "seven_day_overage_included",
+];
 
 /// A main-thread assistant frame's `error: "rate_limit"`: whether it has a typed kind (`api_error`, a field Claude
 /// marks internal) and, for a usage limit, that kind's own record of when it resets.
@@ -646,17 +665,37 @@ struct LimitError {
 impl Limit {
     fn see(&mut self, frame: &Value) {
         match frame["type"].as_str() {
+            Some("system") if frame["subtype"] == "init" => {
+                self.main_model = frame["model"].as_str().map(str::to_owned);
+            }
             Some("rate_limit_event") => {
                 let info = &frame["rate_limit_info"];
-                self.rejected_reset =
-                    (info["status"] == "rejected").then(|| info["resetsAt"].clone());
+                self.rejected = (info["status"] == "rejected").then(|| {
+                    let account = info["rateLimitType"]
+                        .as_str()
+                        .is_some_and(|t| ACCOUNT_LIMITS.contains(&t));
+                    Rejected {
+                        reset: info["resetsAt"].clone(),
+                        account,
+                        model: self.main_model.clone().filter(|_| !account),
+                    }
+                });
             }
-            Some("assistant") => {
+            Some("assistant") if frame["parent_tool_use_id"].is_null() => {
                 if frame["error"].is_null() {
-                    self.rejected_reset = None;
-                }
-                if !frame["parent_tool_use_id"].is_null() {
-                    return;
+                    let model = frame["message"]["model"]
+                        .as_str()
+                        .filter(|m| *m != "<synthetic>");
+                    // A success clears evidence of the limit it shows lifted: an account-wide one, or the one recorded
+                    // under this model (rule 4).
+                    if self.rejected.as_ref().is_some_and(|r| {
+                        r.account || (r.model.is_some() && r.model.as_deref() == model)
+                    }) {
+                        self.rejected = None;
+                    }
+                    if let Some(model) = model {
+                        self.main_model = Some(model.to_owned());
+                    }
                 }
                 self.last = (frame["error"] == "rate_limit").then(|| {
                     let info = &frame["api_error_params"]["rate_limit_info"];
@@ -677,7 +716,7 @@ impl Limit {
     fn lifts(&self) -> Option<std::time::SystemTime> {
         let reset = match self.last.as_ref()? {
             LimitError { typed: true, reset } => reset.as_ref()?,
-            LimitError { typed: false, .. } => self.rejected_reset.as_ref()?,
+            LimitError { typed: false, .. } => &self.rejected.as_ref()?.reset,
         };
         crate::adapter::unix_seconds(reset)
     }
