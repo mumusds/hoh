@@ -1444,6 +1444,12 @@ async fn a_wake_owed_when_the_commanders_agent_changed_within_a_tick_waits_uncou
         // Ticks go on meanwhile (one each 200 ms): no turn while unverified.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(rows(&db(&project), &turns(&run_id))?, before, "no turn while unverified");
+        // Deferred, not judged unavailable: the agent's availability and login are the snapshot's (SVW-52).
+        assert_eq!(
+            commander_claims(&project, &run_id)?,
+            json!(0),
+            "no COMMANDER_UNAVAILABLE while the agent awaits its suite"
+        );
         let wakes: Vec<Value> = serde_json::from_str(deferred[0]["wakes"].as_str().unwrap_or("[]"))?;
         if wakes.is_empty() {
             return Err(format!("no owed wake: {deferred}").into());
