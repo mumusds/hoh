@@ -142,3 +142,40 @@ fn an_opened_gate_gives_the_agent_default_signals_whatever_it_inherited() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn output_within_leaves_nothing_reading_its_pipes_once_it_returns() -> R {
+    // CIRF-04 (common::output_within, ADR-022 decision 10): the child ends at once, leaving a process that holds its
+    // stdout and writes to it every 50 ms (for at most 20 s, then it ends by itself). output_within gives up a bounded
+    // while after the child's end and closes its read ends: nothing of it keeps reading, so the next write fails.
+    let dir = tempfile::tempdir()?;
+    let closed = dir.path().join("closed");
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "(trap '' PIPE; i=0; while [ $i -lt 400 ]; do echo x 2>/dev/null || {{ : > {}; exit 0; }}; \
+             i=$((i+1)); sleep 0.05; done) & exit 0",
+            closed.display()
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let begun = std::time::Instant::now();
+    let got = common::output_within(child, std::time::Duration::from_secs(60));
+    assert!(got.is_err(), "the output still held open: {got:?}");
+    assert!(
+        begun.elapsed() < std::time::Duration::from_secs(15),
+        "{:?}",
+        begun.elapsed()
+    );
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !closed.exists() {
+        assert!(
+            std::time::Instant::now() < end,
+            "the pipe is still read 2 s after output_within returned"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
