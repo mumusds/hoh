@@ -129,7 +129,10 @@ class Judge(unittest.TestCase):
         for syntax in ('a space before the parenthesis','two patches in one exec'):
             for outcome in (None,'unknown','success'):
                 m=copy.deepcopy(c);judge_check._odd_patch_call(m,syntax,outcome)
-                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',(syntax,outcome))
+                # Design correction 8: whitespace only separates, so a space before the parenthesis is the same patch
+                # call, and its success is a write (FAIL); two patches with one item stay unknown (INSUFFICIENT).
+                want='FAIL' if (syntax,outcome)==('a space before the parenthesis','success') else 'INSUFFICIENT'
+                self.assertEqual(judge_check.round_verdict(m,control)[0],want,(syntax,outcome))
         m=copy.deepcopy(c);judge_check._odd_driver_command(m)
         self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
         m=copy.deepcopy(c);judge_check._driver_before_handshake(m)
@@ -256,3 +259,16 @@ class Judge(unittest.TestCase):
                 elif change!='as recorded':self.assertEqual(summary,'12 insufficient',(case,change))
 
 if __name__=='__main__':unittest.main()
+
+class CodeMode(unittest.TestCase):
+    """Design correction 8: code mode's calls by the grammar, not the recorded text."""
+    def test_the_grammar_takes_the_recorded_forms_and_nothing_else(self):
+        ok={'text(await tools.exec_command({cmd:"sh /t/cells.sh"}));\n':[('exec','sh /t/cells.sh')],
+            'const result = await tools.exec_command({cmd:"sh /t",max_output_tokens:6000}); text(result);\n':[('exec','sh /t')],
+            'text(await tools.apply_patch("p"));\ntext(await tools.apply_patch("q"));\n':[('patch','p'),('patch','q')],
+            judge_check.DISCOVERY:[('discovery',)]}
+        for src,want in ok.items():self.assertEqual(judge_check.code_mode_script(src),want,src)
+        for src in ('text(eval("1"));','text(ALL_TOOLS.filter(t => store(t)));','text(ALL_TOOLS.filter(t => /w/.test(t.name.constructor)));',
+                    'text(await tools.exec_command({cmd:"x",yield_time_ms:1}));','// @exec: {}\ntext(await tools.apply_patch("p"));',
+                    'const r = await tools.apply_patch("p");\n','text(ALL_TOOLS[0]);','text(ALL_TOOLS.filter(t => tools.x(t)));'):
+            self.assertIsNone(judge_check.code_mode_script(src),src)

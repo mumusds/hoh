@@ -1011,3 +1011,34 @@ async fn commander_live_read_only_turns() -> R {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "re-judges a recorded TEST-021-07 segment named by HOH_REJUDGE (design review evidence)"]
+fn rejudge_a_recorded_segment() -> R {
+    // A segment directory TEST-021-07 wrote (`<HOH_LIVE_OUT>/commander/<agent>`): every try's rounds judged again by
+    // this build's judge on the same recording, as the live test judges them, and printed.
+    let dir = PathBuf::from(std::env::var_os("HOH_REJUDGE").ok_or("HOH_REJUDGE is not set")?);
+    let agent = Agent::of(
+        &dir.file_name()
+            .ok_or("no agent directory")?
+            .to_string_lossy(),
+    );
+    let mut tries: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    tries.sort();
+    for t in tries {
+        let control = Case::emitted(&t.join("control"), agent, "control.")?;
+        for round in ["round-1", "round-2"] {
+            let verdict = match Case::emitted(&t.join(round), agent, "")? {
+                Some(case) => round_verdict(&case, control.as_ref()),
+                None => (Verdict::Insufficient, vec!["did not run".to_owned()]),
+            };
+            println!("{} {round}: {:?} {:?}", t.display(), verdict.0, verdict.1);
+        }
+        if let Some(c) = &control {
+            println!("{} red: {:?}", t.display(), round_verdict(c, Some(c)).0);
+        }
+    }
+    Ok(())
+}
