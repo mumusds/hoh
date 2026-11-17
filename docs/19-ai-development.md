@@ -46,6 +46,7 @@ python3 tools/taskboard.py set M1-T01 done --owner main-dev --note ".hoh-dev/evi
 
 - 始终只有一个主写者。需要时最多并行 2～3 个只读助手，分别负责规格/影响分析、最小复现与测试设计、独立审查；每个子任务写明范围、输入版本（冻结的 commit 或 worktree）、输出与停止条件，不递归启动顶层会话。等待审查时主会话只做不修改受审候选的工作；下一版本若在另一 worktree 开发，必须独立冻结并取得自己的检查与审查证据。不为额度利用率制造任务。
 - 验证分层：先最小复现与受影响测试，再计划内的完整检查，最后正式候选的 QA/Review。变异测试用来核实关键断言能变红，不为杀死率无限加变异。检查全部通过、版本未变且无新证据时，不机械重跑整套检查。新候选绝不沿用旧候选的验收（恢复时的核对见下一节）。
+- 审查、QA 与实验用的仓库副本、worktree 和 `CARGO_TARGET_DIR` 放在 `/home/ai/dev` 下（`mktemp -d /home/ai/dev/<任务>-XXXXXX`），不放在 `/tmp` 或会话的 scratchpad（它也在 `/tmp` 里）。`/tmp` 是 tmpfs，每个用户的配额约 25 GiB（tmpfs 的 80%），由该用户的所有会话共用，一两个 cargo target 目录就能用完；此后各会话的测试与检查都以 EDQUOT（errno 122）失败、git 以 128 退出，看起来像随机失败（2026-11-17 包自测的 6 项失败即此，复现见 `.hoh-dev/evidence/bundleflake/edquot-repro.log`）。用完即删；派发审查、QA 或实验时把这一条写进 prompt。
 
 ## 恢复
 
