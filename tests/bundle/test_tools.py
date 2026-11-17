@@ -350,6 +350,46 @@ class TestResultsConverter(unittest.TestCase):
             from jsonschema import Draft202012Validator
             for line in out.read_text().splitlines():Draft202012Validator(schema).validate(json.loads(line))
 
+# A stand-in cargo for scripts/product/cargo-tests.sh: `cargo test` over two test binaries, the first with a failing test,
+# as cargo runs them (`cargo test --help`: "--no-fail-fast  Run all tests regardless of failure"): without the flag it
+# stops after the first binary that failed; with it it runs the second too; either way it exits 101. `--doc` passes.
+STAND_IN_CARGO=r"""#!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/argv"
+summary() { echo "test result: $1. $2 passed; $3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"; echo; }
+if [[ " $* " == *" --doc "* ]]; then
+  printf '   Doc-tests hoh_core\n\nrunning 1 test\ntest src/lib.rs - doc_test_003_01 (line 1) ... ok\n\n'; summary ok 1 0; exit 0
+fi
+printf '     Running tests/a.rs (target/debug/deps/a-0)\n\nrunning 1 test\ntest test_001_01_first ... FAILED\n\n'
+summary FAILED 0 1
+if [[ " $* " != *" --no-fail-fast "* ]]; then echo 'error: test failed, to rerun pass `--test a`'; exit 101; fi
+printf '     Running tests/b.rs (target/debug/deps/b-0)\n\nrunning 1 test\ntest test_002_01_second ... ok\n\n'
+summary ok 1 0
+printf 'error: 1 target failed:\n    `--test a`\n'; exit 101
+"""
+
+class CargoTestsScript(unittest.TestCase):
+    """scripts/product/cargo-tests.sh runs every test binary even when one fails (QA-C-006): the results of the binaries
+    after a failing one are evidence too, and its exit status stays the failure's."""
+    def run_check(self,kind):
+        with tempfile.TemporaryDirectory() as d:
+            d=Path(d);product=d/'repo/scripts/product';product.mkdir(parents=True)
+            for name in ('cargo-tests.sh','test_results.py'):shutil.copy(ROOT/'scripts/product'/name,product/name)
+            bin_=d/'bin';bin_.mkdir();cargo=bin_/'cargo';cargo.write_text(STAND_IN_CARGO);cargo.chmod(0o755)
+            evidence=d/'evidence';evidence.mkdir()
+            env={**os.environ,'PATH':f'{bin_}:{os.environ["PATH"]}','HOH_EVIDENCE_DIR':str(evidence)}
+            r=subprocess.run(['bash',str(product/'cargo-tests.sh'),kind],capture_output=True,text=True,env=env,timeout=60)
+            results=[(x['test_id'],x['status']) for x in map(json.loads,(evidence/'test-results.jsonl').read_text().splitlines())]
+            return r,results
+    def test_integration_reports_the_binaries_after_a_failing_one(self):
+        r,results=self.run_check('integration')
+        self.assertEqual(r.returncode,101,r.stderr)
+        self.assertEqual(results,[('TEST-001-01','FAIL'),('TEST-002-01','PASS')])
+        self.assertIn('test result: ok. 1 passed',r.stdout)
+    def test_unit_reports_the_binaries_after_a_failing_one_and_its_doctests(self):
+        r,results=self.run_check('unit')
+        self.assertEqual(r.returncode,101,r.stderr)
+        self.assertEqual(results,[('TEST-001-01','FAIL'),('TEST-002-01','PASS'),('TEST-003-01','PASS')])
+
 def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=(),target_dir=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
     workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
