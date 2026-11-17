@@ -6510,7 +6510,11 @@ fn stop_watch_tool(world: &World) {
 #[tokio::test]
 async fn a_silent_turn_is_inactive_once_only_with_no_tool_running_and_its_output_clears_it() -> R {
     // REQ-042 behaviour 8 (docs/adr/ADR-022.md decision 19): silent past the quiet time while its tool runs, nothing;
-    // silent with no tool, one attempt.inactive and the attempt runs on; its output then clears it.
+    // silent with no tool, one attempt.inactive and the attempt runs on; its output then clears it. A residual
+    // (decision 19 item 12, WDF-50): a live process of this user started after the agent whose environment cannot be
+    // read (PR_SET_DUMPABLE=0, such as the bundle self-test's "hidden" child) counts as a tool however unrelated, so
+    // while one runs on this machine the quiet time never completes and this test fails; processes that are only
+    // exiting no longer count (the correction of 2026-11-17).
     let world = World::new()?;
     world.claude(None)?;
     world.bind_installed()?;
