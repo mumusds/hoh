@@ -2355,3 +2355,28 @@ async fn codex_runner_mode_reports_when_a_recorded_usage_limit_lifts() -> R {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn codex_exec_reports_no_reset_for_a_recorded_usage_limit() -> R {
+    // RA-51 (M2T07R-256 review): exec's stream carries a usage limit's reset only as text ("try again at 8:18 AM", local
+    // time with no zone): it is not read, so the turn reports no reset and the host uses full jitter.
+    let world = World::new()?;
+    let case = "../../_provider-faults/codex/0.166.0/exec-fault-usage-limit";
+    let recorded = read(format!("{FIXTURES}/{case}/stdout.jsonl"))?;
+    assert!(recorded.contains("try again at"), "{recorded}");
+    let fake = world.fake("exec-limit", None, case, false)?;
+    let mut turn = world.turn(&fake, "logs-exec-limit")?;
+    turn.launch.app_server_help = None;
+    let held = codex::start(&world.attempt("A1").await?, &turn, &gate(&world)?)?;
+    held.open.send(()).map_err(|()| "gate closed")?;
+    let facts = tokio::time::timeout(Duration::from_secs(30), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Failed, "{facts:?}");
+    assert_eq!(facts.retry_at, None, "{facts:?}");
+    assert!(
+        argvs(&fake)?
+            .iter()
+            .any(|a| a.first().is_some_and(|c| c == "exec")),
+        "the turn did not run exec"
+    );
+    Ok(())
+}
