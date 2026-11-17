@@ -897,6 +897,59 @@ class PersistenceScan(unittest.TestCase):
             from jsonschema import Draft202012Validator
             Draft202012Validator(load_json(ROOT/'contracts/test-result.schema.json')).validate(line)
 
+class SpawnScan(unittest.TestCase):
+    """scripts/product/spawn_scan.py: docs/adr/ADR-031.md 设计修正 2, E (the judging over clippy's places; the clippy run
+    itself is static.sh's)."""
+    def scan(self):
+        sys.path.insert(0,str(ROOT/'scripts/product'))
+        import spawn_scan
+        return spawn_scan
+    def manifest(self,sites=(),host_only=('hoh_app::gate::main',)):
+        return {'client_files':['crates/hoh-app/src/client.rs','crates/hoh-app/src/doctor/','crates/hoh-app/src/owned.rs'],
+                'host_only_functions':list(host_only),
+                'sites':[dict(zip(('file','item','count','owner','reason'),site)) for site in sites]}
+    GATE=('crates/hoh-app/src/owned.rs','hoh_core::spawn::Direct',1,'gate','the gate')
+    def test_listed_places_pass_and_any_difference_fails(self):
+        s=self.scan();gate=self.GATE
+        self.assertEqual(s.judge([gate[:2]],self.manifest([gate])),[])
+        self.assertIn('is listed x1 but found x2',' '.join(s.judge([gate[:2]]*2,self.manifest([gate]))))
+        self.assertIn('is listed but no longer found',' '.join(s.judge([],self.manifest([gate]))))
+        host=('crates/hoh-app/src/host/control.rs','std::process::Command::spawn')
+        self.assertIn('is not listed',' '.join(s.judge([gate[:2],host],self.manifest([gate]))))
+        self.assertIn('without a reason',' '.join(s.judge([host],self.manifest([(*host,1,'host-only',' ')]))))
+        self.assertIn('no known owner',' '.join(s.judge([host],self.manifest([(*host,1,'helper','x')]))))
+    def test_no_client_file_but_the_gate_starts_a_process_or_calls_a_host_only_function(self):
+        s=self.scan()
+        doctor=('crates/hoh-app/src/doctor/live.rs','hoh_core::spawn::Direct')
+        # Unlisted, or listed under any owner: refused in a client file outside the gate.
+        self.assertIn('outside the gate',' '.join(s.judge([doctor],self.manifest())))
+        self.assertIn('outside the gate',' '.join(s.judge([doctor],self.manifest([(*doctor,1,'host-only','x')]))))
+        # The gate's owner only for the gate's file, the plain spawner's only for hoh-core's spawn.rs.
+        self.assertIn('only for',' '.join(s.judge([doctor],self.manifest([(*doctor,1,'gate','x')]))))
+        client=('crates/hoh-app/src/client.rs','hoh_app::gate::main')
+        self.assertIn('calls the host-only function',' '.join(s.judge([client],self.manifest())))
+        self.assertEqual(s.judge([('crates/hoh-app/src/main.rs','hoh_app::gate::main')],self.manifest()),[])
+    def test_places_are_read_from_clippy_by_lint_once_each_and_an_unresolved_entry_is_a_problem(self):
+        s=self.scan()
+        def message(code,text,file='crates/hoh-app/src/client.rs',line=3):
+            return json.dumps({'reason':'compiler-message','message':{'code':{'code':code} if code else None,'message':text,
+                               'spans':[{'is_primary':True,'file_name':file,'line_start':line,'column_start':5}]}})
+        lines=[message('clippy::disallowed_methods','use of a disallowed method `std::os::unix::process::CommandExt::exec`'),
+               message('clippy::disallowed_methods','use of a disallowed method `std::os::unix::process::CommandExt::exec`'),
+               message('clippy::disallowed_types','use of a disallowed type `hoh_core::spawn::Direct`',line=9),
+               message('clippy::needless_return','unneeded `return` statement'),
+               message(None,'`hoh_app::gate::mainx` does not refer to a reachable function'),'not json']
+        found,problems=s.found_in('\n'.join(lines))
+        self.assertEqual(found,[('crates/hoh-app/src/client.rs','std::os::unix::process::CommandExt::exec'),
+                                ('crates/hoh-app/src/client.rs','hoh_core::spawn::Direct')])
+        self.assertEqual(len(problems),1)
+        self.assertIn('does not refer to a reachable function',problems[0])
+    def test_the_shipped_list_names_known_owners_with_reasons(self):
+        s=self.scan();manifest=json.loads((ROOT/'scripts/product/spawn-sites.json').read_text())
+        found=[(e['file'],e['item']) for e in manifest['sites'] for _ in range(e['count'])]
+        self.assertEqual(s.judge(found,manifest),[])
+        self.assertIn('crates/hoh-app/src/doctor/',manifest['client_files'])
+
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):
         with tempfile.TemporaryDirectory() as d:

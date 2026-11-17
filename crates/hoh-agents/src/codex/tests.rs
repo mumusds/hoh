@@ -413,7 +413,7 @@ async fn the_driver_writes_what_the_request_builders_give() {
     let mut process = crate::process::Process::spawn(
         command,
         crate::process::Config::default(),
-        &hoh_core::spawn::Direct,
+        &hoh_core::spawn::Direct::plain(),
     )
     .expect("fake");
     let prompt = client[3]["params"]["input"][0]["text"]

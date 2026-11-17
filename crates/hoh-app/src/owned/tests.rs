@@ -115,7 +115,7 @@ fn a_start_in_flight_when_the_stop_begins_is_killed_at_its_hand_off() -> R {
         let (gate, member) = (gate.clone(), member.clone());
         std::thread::spawn(move || {
             gate.helper_by(&mut with_member(&member), &|command| {
-                let helper = Direct.helper(command);
+                let helper = Direct::plain().helper(command);
                 let _ = spawned.send(());
                 let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
                 helper
@@ -154,7 +154,7 @@ fn a_start_still_in_flight_at_the_bound_is_reported_not_claimed() -> R {
         let gate = gate.clone();
         std::thread::spawn(move || {
             gate.helper_by(Command::new("sleep").arg("30"), &|command| {
-                let helper = Direct.helper(command)?;
+                let helper = Direct::plain().helper(command)?;
                 let _ = spawned.send(helper.shared.pid());
                 let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
                 Ok(helper)
@@ -202,7 +202,7 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
     let started = Mutex::new(None);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut ticket = gate.take(Kind::Helper)?;
-        let helper = Direct.helper(Command::new("sleep").arg("30"))?;
+        let helper = Direct::plain().helper(Command::new("sleep").arg("30"))?;
         ticket.stage = Stage::SpawnedHelper(helper.shared.clone());
         if let Ok(mut started) = started.lock() {
             *started = Some(helper.shared.clone());
@@ -264,7 +264,7 @@ fn a_host_start_in_flight_when_the_stop_begins_completes_and_is_handed_off() -> 
             gate.host_by(Command::new("sleep").arg("30"), &|command| {
                 let _ = taken.send(());
                 let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
-                Direct.host(command)
+                Direct::plain().host(command)
             })
         })
     };
@@ -309,11 +309,13 @@ fn a_helper_started_through_the_gate_keeps_the_attempt_id_it_inherits() -> R {
 /// A shell (a helper of its own) that starts a child in a session of its own (`setsid`, its pid written to `apart`)
 /// and waits for it.
 fn setting_apart(apart: &std::path::Path) -> R<Helper> {
-    Ok(Direct.helper(Command::new("sh").arg("-c").arg(format!(
-        "setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 30' '{}' \
+    Ok(
+        Direct::plain().helper(Command::new("sh").arg("-c").arg(format!(
+            "setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 30' '{}' \
          < /dev/null > /dev/null 2>&1 & wait",
-        apart.display()
-    )))?)
+            apart.display()
+        )))?,
+    )
 }
 
 #[test]
@@ -348,7 +350,7 @@ fn the_sweep_kills_a_descendant_that_left_its_group_and_ends_on_a_clean_scan() -
 fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() -> R {
     // B: a descendant that is a zombie (its parent never reaps it) has ended: the scan skips it and ends clean at once,
     // never killing the root. With its bound already come, one pass kills what it finds and reports it, not claimed.
-    let root = Direct.helper(
+    let root = Direct::plain().helper(
         Command::new("sh")
             .arg("-c")
             .arg("sleep 0.1 & exec sleep 30"),

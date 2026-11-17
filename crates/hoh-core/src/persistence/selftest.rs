@@ -871,7 +871,11 @@ mod tests {
     fn the_self_test_passes_on_a_local_directory_and_leaves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        wal_self_test(dir.path(), &test_probe(None), &crate::spawn::Direct)?;
+        wal_self_test(
+            dir.path(),
+            &test_probe(None),
+            &crate::spawn::Direct::plain(),
+        )?;
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
         Ok(())
     }
@@ -890,7 +894,11 @@ mod tests {
             ("stale", &[Step::SharedMemory]),
         ] {
             let dir = tempfile::tempdir()?;
-            match wal_self_test(dir.path(), &test_probe(Some(fault)), &crate::spawn::Direct) {
+            match wal_self_test(
+                dir.path(),
+                &test_probe(Some(fault)),
+                &crate::spawn::Direct::plain(),
+            ) {
                 Err(PersistError::WalUnsupported { step: name, detail }) => {
                     assert!(
                         steps.iter().any(|s| s.name() == name),
@@ -920,7 +928,7 @@ mod tests {
             ..missing.clone()
         };
         for probe in [missing, silent] {
-            match wal_self_test(dir.path(), &probe, &crate::spawn::Direct) {
+            match wal_self_test(dir.path(), &probe, &crate::spawn::Direct::plain()) {
                 Err(PersistError::WalUnsupported { step, .. }) => {
                     assert_eq!(step, Step::SharedMemory.name())
                 }
@@ -952,7 +960,7 @@ mod tests {
         };
         let work = dir.path().join("work");
         std::fs::create_dir(&work)?;
-        assert!(wal_self_test(&work, &probe, &crate::spawn::Direct).is_err());
+        assert!(wal_self_test(&work, &probe, &crate::spawn::Direct::plain()).is_err());
         let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
         // Reaped only when /proc has no entry for it; any other failed look is an error, never "reaped" (ADR-022
         // decision 10, convention v2; this crate cannot use hoh_agents::identity::reaped).
@@ -989,7 +997,12 @@ mod tests {
                     Ok(())
                 }
             };
-            match run(dir.path(), &test_probe(None), &crate::spawn::Direct, &fault) {
+            match run(
+                dir.path(),
+                &test_probe(None),
+                &crate::spawn::Direct::plain(),
+                &fault,
+            ) {
                 Err(PersistError::WalUnsupported { step: name, detail }) => {
                     assert_eq!(name, step.name());
                     assert_eq!(detail, "injected");
@@ -1016,7 +1029,7 @@ mod tests {
             dir.path(),
             names.clone(),
             &test_probe(None),
-            &crate::spawn::Direct,
+            &crate::spawn::Direct::plain(),
             &|_| Ok(()),
         )?;
         assert_eq!(std::fs::read_to_string(&names[0])?, foreign);
@@ -1029,7 +1042,7 @@ mod tests {
             dir.path(),
             names.clone(),
             &test_probe(None),
-            &crate::spawn::Direct,
+            &crate::spawn::Direct::plain(),
             &|_| Ok(()),
         ) {
             Err(PersistError::WalUnsupported { step, detail }) => {
@@ -1060,7 +1073,7 @@ mod tests {
         match wal_self_test(
             dir.path(),
             &test_probe(Some("page-limit")),
-            &crate::spawn::Direct,
+            &crate::spawn::Direct::plain(),
         ) {
             Err(e @ PersistError::Full(_)) => {
                 assert!(e.retryable(), "{e}");
@@ -1209,7 +1222,7 @@ mod tests {
         let result = wal_self_test(
             &mount.point,
             &test_probe(Some("fill-before-commit")),
-            &crate::spawn::Direct,
+            &crate::spawn::Direct::plain(),
         );
         let _ = std::fs::remove_file(mount.point.join("filler"));
         let left = leftovers(&mount.point);
@@ -1392,7 +1405,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let dir = tempfile::tempdir()?;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))?;
-            let result = wal_self_test(dir.path(), &test_probe(None), &crate::spawn::Direct);
+            let result = wal_self_test(
+                dir.path(),
+                &test_probe(None),
+                &crate::spawn::Direct::plain(),
+            );
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
             match result {
                 Err(PersistError::NotWritable { path, .. }) => assert_eq!(path, dir.path()),
@@ -1408,7 +1425,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let missing = dir.path().join("missing");
-        match wal_self_test(&missing, &test_probe(None), &crate::spawn::Direct) {
+        match wal_self_test(&missing, &test_probe(None), &crate::spawn::Direct::plain()) {
             Err(PersistError::WalUnsupported { step, .. }) => assert_eq!(step, "open"),
             other => return Err(format!("{other:?}").into()),
         }

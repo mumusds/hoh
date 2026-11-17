@@ -1485,7 +1485,7 @@ fn replay_turn(version: &str) -> Turn {
         clock: Arc::new(crate::clock::SystemClock),
         events: None,
         observe: None,
-        spawner: hoh_core::spawn::Direct::shared(),
+        spawner: hoh_core::spawn::NoStart::shared(),
     }
 }
 
