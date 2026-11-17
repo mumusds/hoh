@@ -1212,6 +1212,86 @@ fn supervising(mut w: Work, workdir: &Path) -> Work {
 }
 
 #[tokio::test]
+async fn one_degradation_fact_decides_both_the_read_only_profile_and_the_transport()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M2T20R-01: codex's degrade to exec is one fact, the registry's, keyed by the whole identity it was seen of, and a
+    // prepare reads it once with the agent's fact: the Developer's turn goes to exec exactly when the Commander is
+    // refused the read-only profile for it (AGENT_UNAVAILABLE, Unavailable), and never otherwise. Before, the executor
+    // kept its own (launcher, version) set beside the registry's, read apart from it.
+    let bin = tempfile::tempdir()?;
+    fake_codex(bin.path(), "B")?;
+    let project = tempfile::tempdir()?;
+    let registry = verified_codex(bin.path(), project.path())?;
+    let b = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) => *usable,
+        other => return Err(format!("not usable: {other:?}").into()),
+    };
+    let executor = ProductExecutor::new(
+        registry.clone(),
+        project.path().to_owned(),
+        PathBuf::from("/bin/true"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let developer = {
+        let mut w = work(None);
+        w.assignment.agent = Some("codex".to_owned());
+        w.assignment.agent_version = Some(b.version.clone());
+        w.assignment.session_capabilities = Some(b.session.clone());
+        w.assignment.session_identity = Some(b.identity.clone());
+        w
+    };
+    let commander = supervising(developer.clone(), &project.path().join("commander-ws"));
+    let on_exec = |w: &Work| -> Result<bool, Box<dyn std::error::Error>> {
+        match executor.prepare(w).map_err(|r| format!("{r:?}"))?.prepared {
+            Prepared::Codex(turn) => Ok(turn.launch.app_server_help.is_none()),
+            other => Err(format!("not codex: {other:?}").into()),
+        }
+    };
+    assert!(!on_exec(&developer)?);
+    assert!(!on_exec(&commander)?);
+    // The degrade, as the executor reports it, for B's identity: both follow at once.
+    registry.exec_degraded(Agent::Codex, b.identity.clone());
+    assert!(on_exec(&developer)?, "the Developer's turn uses exec");
+    let refusal = executor.prepare(&commander).err().ok_or("prepared")?;
+    assert_eq!(
+        (refusal.reason.as_str(), refusal.class),
+        ("AGENT_UNAVAILABLE", FailureClass::Unavailable)
+    );
+    // A degrade reported of another identity (an implementation since replaced) moves neither.
+    let bin = tempfile::tempdir()?;
+    fake_codex(bin.path(), "C")?;
+    let project = tempfile::tempdir()?;
+    let registry = verified_codex(bin.path(), project.path())?;
+    let c = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) => *usable,
+        other => return Err(format!("not usable: {other:?}").into()),
+    };
+    registry.exec_degraded(Agent::Codex, b.identity.clone());
+    let executor = ProductExecutor::new(
+        registry,
+        project.path().to_owned(),
+        PathBuf::from("/bin/true"),
+        (Duration::from_secs(10), Duration::from_secs(5)),
+    );
+    let mut w = developer;
+    w.assignment.agent_version = Some(c.version.clone());
+    w.assignment.session_capabilities = Some(c.session.clone());
+    w.assignment.session_identity = Some(c.identity.clone());
+    let commander = supervising(w.clone(), &project.path().join("commander-ws"));
+    for (name, work) in [("developer", &w), ("commander", &commander)] {
+        match executor
+            .prepare(work)
+            .map_err(|r| format!("{name}: {r:?}"))?
+            .prepared
+        {
+            Prepared::Codex(turn) => assert!(turn.launch.app_server_help.is_some(), "{name}"),
+            other => return Err(format!("not codex: {other:?}").into()),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_by_its_source()
 -> Result<(), Box<dyn std::error::Error>> {
     // docs/adr/ADR-032.md decision 2: the supervision turn, and only it, gets the read-only profile; no fallback. Decision

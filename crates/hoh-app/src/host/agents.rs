@@ -144,6 +144,9 @@ pub struct Current {
     /// codex: this host's check of its read-only sandbox as the registry keeps it (`{check, reason}`), read in the
     /// same look as F (docs/adr/ADR-032.md decision 4); `None` for the others and before any check.
     pub host_check: Option<serde_json::Value>,
+    /// codex: its App Server degraded to exec under the identity it has now, so this turn uses exec; read in the same
+    /// look as F, whose `withheld` the same fact decides (M2T20R-01).
+    pub exec_only: bool,
 }
 
 /// What a turn ran as (docs/adr/ADR-030.md decision 2, M2T15D-07): its agent, the identity of the fact its prepare
@@ -368,6 +371,13 @@ struct Known {
 }
 
 impl Known {
+    /// Whether codex's App Server degraded to exec in this host's run under the identity it has now: the one fact that
+    /// both sends its turns to exec and withholds the read-only profile (docs/adr/ADR-022.md decision 15,
+    /// docs/adr/ADR-032.md decision 10 (A), M2T20R-01).
+    fn degraded(&self) -> bool {
+        self.exec_degraded.is_some() && self.exec_degraded == self.identity
+    }
+
     /// The capabilities this host's facts withhold from the agent now (docs/adr/ADR-032.md decision 4): codex's read-only
     /// workspace while its host check is unconfined or unavailable, or its App Server degraded to exec under its current
     /// identity.
@@ -376,8 +386,7 @@ impl Known {
             .host_check
             .as_ref()
             .is_some_and(|(check, _)| check.withholds());
-        let degraded = self.exec_degraded.is_some() && self.exec_degraded == self.identity;
-        if checked || degraded {
+        if checked || self.degraded() {
             [READ_ONLY_WORKSPACE.to_owned()].into()
         } else {
             BTreeSet::new()
@@ -478,7 +487,7 @@ impl State {
                     evidence["host_check"] =
                         serde_json::json!({"check": check.name(), "reason": check.reason()});
                 }
-                if known.exec_degraded.is_some() && known.exec_degraded == known.identity {
+                if known.degraded() {
                     evidence["exec_degraded"] = serde_json::json!(true);
                 }
                 evidence
@@ -1180,6 +1189,7 @@ impl Registry {
             host_check: known.host_check.as_ref().map(
                 |(check, _)| serde_json::json!({"check": check.name(), "reason": check.reason()}),
             ),
+            exec_only: known.degraded(),
         }))
     }
 
