@@ -680,6 +680,8 @@ fn read_only_a_file_system_that_turns_read_only_under_its_host_fails_commands_wi
         assert_ne!(out.status.code(), Some(0), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("disk I/O error"), "{stderr}");
+        // The store's reason, not SQLite's symbols (ADR-016 decision 6).
+        assert!(!stderr.contains("SQLITE_"), "{stderr}");
         assert_eq!(project.dump()?, before);
         assert_eq!(project.sql("PRAGMA quick_check")?, "ok");
         project.stop_host()?;
