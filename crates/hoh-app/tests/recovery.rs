@@ -4452,11 +4452,12 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
             json!({"show": before, "host": info, "db": export(&project)?}),
         );
 
-        // kill -9 of the host's main process.
-        let t0 = std::time::SystemTime::now();
-        rustix::process::kill_process(
-            rustix::process::Pid::from_raw(old_pid).ok_or("pid")?,
-            rustix::process::Signal::KILL,
+        // kill -9 of the host's main process, from the host's own environment, which also gives the kill's time by the
+        // clock the host reads (CIR-803).
+        let t0_ms = kill_9(
+            &manager,
+            old_pid,
+            &common::start_of(u32::try_from(old_pid)?)?,
         )?;
         // systemd restarts it (not a client: its start would come before the restart). The first write command goes
         // to the restarted host as soon as it lets any client in (M2T14R-57): its listeners open only after its
@@ -4515,8 +4516,7 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
         let db_after = export(&project)?;
         seen.insert(
             "after".into(),
-            json!({"show": after, "host": info, "t0_unix_ms":
-            t0.duration_since(std::time::UNIX_EPOCH)?.as_millis(), "db": db_after.clone()}),
+            json!({"show": after, "host": info, "t0_unix_ms": t0_ms, "db": db_after.clone()}),
         );
 
         // systemd restarted it: NRestarts + 1, another pid; host_epoch + 1.
@@ -4581,10 +4581,15 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
                 "{judged}"
             );
         }
-        // From the kill to the reconcile's start (its own time in ms): at most 30 s.
-        let at = std::time::UNIX_EPOCH
-            + Duration::from_millis(started["payload"]["at_ms"].as_u64().ok_or("at_ms")?);
-        let delay = at.duration_since(t0).unwrap_or_default();
+        // From the kill to the reconcile's start (its own time in ms): at most 30 s. Both ends are read from the clock
+        // of the host's environment, never one from the test's: under a faked clock the test's is not the host's
+        // (CIR-803). A reconcile started before the kill by that one clock is an error, never a zero.
+        let at_ms = started["payload"]["at_ms"].as_u64().ok_or("at_ms")?;
+        let delay = Duration::from_millis(at_ms.checked_sub(t0_ms).ok_or_else(|| {
+            format!(
+                "reconcile.started at {at_ms} ms, before the kill at {t0_ms} ms by the same clock"
+            )
+        })?);
         seen.insert("kill_to_reconcile_ms".into(), json!(delay.as_millis()));
         assert!(delay <= Duration::from_secs(30), "{delay:?}");
         // The old T2 ended by its cgroup: tracked by one, and judged with its processes gone or stopped.
@@ -4611,6 +4616,34 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
     seen.insert("manager_log".into(), json!(manager.log()));
     keep("TEST-005-04.json", &Value::Object(seen))?;
     outcome
+}
+
+/// SIGKILL to process `pid` while it is still the one started at `start`, sent by a python in `manager`'s environment,
+/// the one the manager gives the host: the pidfd is opened first and the start time read after it, so the signal goes
+/// only to the process checked (ADR-022 decision 10). The python reads its clock the moment before the signal and
+/// returns it, in ms since the epoch: the same clock as the host's `at_ms`, whatever clock the test itself is given
+/// (CIR-803). Fails if the process is another or gone.
+fn kill_9(manager: &installed::Manager, pid: i32, start: &str) -> R<u64> {
+    const KILL: &str = "import os, signal, sys, time\n\
+        pid, start = int(sys.argv[1]), sys.argv[2]\n\
+        fd = os.pidfd_open(pid)\n\
+        with open(f'/proc/{pid}/stat') as f:\n    now = f.read().rsplit(')', 1)[1].split()[19]\n\
+        if now != start:\n    sys.exit(f'{pid} is not the process started at {start}: {now}')\n\
+        at = time.time_ns() // 1_000_000\n\
+        signal.pidfd_send_signal(fd, signal.SIGKILL)\n\
+        print(at)\n";
+    let child = manager
+        .command("python3")
+        .args(["-c", KILL, &pid.to_string(), start])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let out = common::output_within(child, Duration::from_secs(60))?;
+    if !out.status.success() {
+        return Err(format!("kill -9 of {pid}: {}", String::from_utf8_lossy(&out.stderr)).into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().parse()?)
 }
 
 /// When the stuck agent marked its first SIGTERM: its file's modification time, in ns since the epoch.
