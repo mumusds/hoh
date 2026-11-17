@@ -682,7 +682,17 @@ async fn host_check_blocks(mode: &str, recover: bool) -> R {
             assert_eq!(used, session);
             assert_eq!(developer_session(&world, "R")?, session);
         } else {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Once the supervisor has woken for the block (the wake it owes), and one more QUIET of the host's steps:
+            // still no Commander attempt (M2T20R-51's pattern).
+            world
+                .until(
+                    "SELECT count(*) > 0 FROM events WHERE run_id = 'R' AND kind = 'supervisor.woken' \
+                     AND instr(payload_json, 'team.binding_blocked/commander') > 0",
+                    "1",
+                    WAIT,
+                )
+                .await?;
+            tokio::time::sleep(hoh_core::supervise::QUIET * 2).await;
             assert!(commander_attempts(&world, "R")?.is_empty());
         }
         assert_eq!(
@@ -969,7 +979,18 @@ async fn on_exec(variant: Option<world::Variant>) -> R {
                 "{evidence}"
             );
             need_decision(&world, "R", "fp-exec")?;
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // M2T20R-51: not a sleep of QUIET, at which the wake falls due, but until the supervisor has woken for this
+            // need_decision (its trigger past QUIET and taken), and then one more QUIET of the host's steps: still no
+            // Commander attempt.
+            world
+                .until(
+                    "SELECT count(*) > 0 FROM events WHERE run_id = 'R' AND kind = 'supervisor.woken' \
+                     AND instr(payload_json, 'fp-exec') > 0",
+                    "1",
+                    WAIT,
+                )
+                .await?;
+            tokio::time::sleep(hoh_core::supervise::QUIET * 2).await;
             assert!(commander_attempts(&world, "R")?.is_empty());
         }
         let turns = world.log("turns.jsonl")?;
