@@ -1331,7 +1331,8 @@ pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistEr
     tx.commit().map_err(|e| commit_error(e, db.as_deref()))
 }
 
-/// [`commit`] for the transactions that never were a point of the fault hooks (CR-006): their behaviour unchanged.
+/// [`commit`] for the transactions that never were a point of the fault hooks (CR-006): no `before_commit` hook; a failed
+/// commit is mapped as [`commit`] maps it ([`commit_error`]).
 pub(super) fn commit_unhooked(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     finish(&tx, ctx)?;
     let db = tx.path().map(std::path::PathBuf::from);
