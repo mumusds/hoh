@@ -1,11 +1,35 @@
 """Session alert hooks (scripts/dev/session-alert.sh, session-context.sh): a main session's API failure or end is written
 down with a recovery point and shown once at the next session start; delegated sessions are left alone."""
-import json,os,shutil,subprocess,tempfile,unittest
+import json,os,shutil,subprocess,sys,tempfile,unittest
 from pathlib import Path
 from helpers import ROOT
 
+# The alert hook names background work from the whole machine's process table (ps -e), where other sessions' work,
+# a concurrent bundle run's decoys among it, is no part of a test: ten newer ones pushed a test's own processes out of
+# the ten kept. The hooks a test runs find this ps first on their PATH: the machine's own ps, listing only the
+# descendants of the test process, so what a test starts is all the background work there is.
+PS_VIEW='''#!PYTHON
+import subprocess,sys
+REAL,ROOT=REAL_PS,TEST_PID
+parent={}
+for line in subprocess.run([REAL,'-eo','pid=,ppid='],capture_output=True,text=True).stdout.splitlines():
+    if line.split():pid,ppid=map(int,line.split());parent[pid]=ppid
+def mine(pid):
+    while pid>1:
+        if pid==ROOT:return True
+        pid=parent.get(pid,0)
+    return False
+out=subprocess.run([REAL,*sys.argv[1:]],capture_output=True,text=True)
+lines=out.stdout.splitlines(True)
+sys.stdout.write(''.join(lines[:1]+[l for l in lines[1:] if l.split() and l.split()[0].isdigit() and mine(int(l.split()[0]))]))
+sys.stderr.write(out.stderr);sys.exit(out.returncode)
+'''
+
 class SessionAlerts(unittest.TestCase):
     def setUp(self):
+        self.bin=tempfile.TemporaryDirectory();self.addCleanup(self.bin.cleanup);ps=Path(self.bin.name)/'ps'
+        ps.write_text(PS_VIEW.replace('PYTHON',sys.executable).replace('REAL_PS',repr(shutil.which('ps'))).replace('TEST_PID',str(os.getpid())))
+        ps.chmod(0o755)
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
         (self.root/'scripts/dev').mkdir(parents=True)
         for name in ('session-alert.sh','session_alert.py','session-context.sh'):
@@ -16,6 +40,7 @@ class SessionAlerts(unittest.TestCase):
         (self.root/'.hoh-dev/PROGRESS.md').write_text('# x\n## Next\n- freeze the candidate\n- run round 17\n## Environment facts\n- n/a\n')
         (self.root/'.hoh-dev/evidence/m1t07-r4-018').mkdir(parents=True)
         self.env={k:v for k,v in os.environ.items() if k not in ('HOH_BOOTSTRAP_PARENT','HOH_DELEGATED_TASK','HOH_TOP_LEVEL_SESSION')}
+        self.env['PATH']=self.bin.name+os.pathsep+self.env.get('PATH','')
     def tearDown(self): self.tmp.cleanup()
     def hook(self,name,payload,env=None):
         return subprocess.run(['bash',str(self.root/'scripts/dev'/name)],input=payload,capture_output=True,text=True,env=env or self.env,timeout=30)
