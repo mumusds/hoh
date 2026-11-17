@@ -2427,6 +2427,8 @@ struct Setup {
     observer: Option<Arc<dyn hoh_core::reconcile::Observer>>,
     retry: Option<Duration>,
     hooks: Option<Arc<dyn hoh_app::host::HostHooks>>,
+    /// The cancel ladder's graces (the default's are REQ-043's 10 s and 5 s).
+    cancel: Option<hoh_core::cancel::Graces>,
 }
 
 /// [`runner_host`] with what `setup` adds.
@@ -2445,6 +2447,9 @@ async fn runner_host_with(
     }
     if let Some(hooks) = setup.hooks {
         config.hooks = hooks;
+    }
+    if let Some(cancel) = setup.cancel {
+        config.cancel = cancel;
     }
     config.clock = hoh_app::host::HostClock(clock);
     config.reconcile.native_grace = Duration::from_millis(300);
@@ -3887,9 +3892,12 @@ async fn a_holder_ended_by_its_native_cancel_gets_no_signal() -> R {
 }
 
 /// A stuck agent whose native cancel kills only its leader, and whose executor reaps that leader at once without
-/// emptying its group, so the leader is gone while a member that ignores SIGTERM is left (M2T05R-452).
+/// emptying its group, so the leader is gone while a member that ignores SIGTERM is left (M2T05R-452). The native
+/// cancel then holds the thread that called it (a settle's stop, a cancel's pass) for the time given: past `HELD_FOR`,
+/// that thread's next look at the group comes too late for it to stay known (ADR-019 decision 8), as on a machine that
+/// did not run the thread for so long.
 #[derive(Debug)]
-struct LeaderOnlyCancel(StuckExecutor);
+struct LeaderOnlyCancel(StuckExecutor, Duration);
 
 impl hoh_app::host::Executor for LeaderOnlyCancel {
     fn deliver(
@@ -3929,6 +3937,7 @@ impl hoh_app::host::Executor for LeaderOnlyCancel {
     fn cancel(&self, work: &hoh_app::host::Work) -> bool {
         let held = self.0.cancel(work);
         self.0.kill_leaders();
+        std::thread::sleep(self.1);
         held
     }
 }
@@ -3969,11 +3978,14 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
     assert_eq!(code, 0, "{stderr}");
     seed(&project, WRITERS)?;
     let clock = Arc::new(FakeClock::default());
-    let executor = Arc::new(LeaderOnlyCancel(StuckExecutor {
-        cancels: dir.path().join("cancels"),
-        started: std::sync::Mutex::new(Vec::new()),
-        holds: true,
-    }));
+    let executor = Arc::new(LeaderOnlyCancel(
+        StuckExecutor {
+            cancels: dir.path().join("cancels"),
+            started: std::sync::Mutex::new(Vec::new()),
+            holds: true,
+        },
+        Duration::ZERO,
+    ));
     let slow = Arc::new(SlowWritesWhileSettling::default());
     let host = runner_host_with(
         &project,
@@ -4025,6 +4037,224 @@ async fn a_group_is_watched_through_its_settle_however_slow_the_writes() -> R {
         "lease.inspected,lease.native_cancel,lease.sigterm,lease.sigkill,lease.reaped"
     );
     assert_eq!(group_now(pid), nothing_left());
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+/// A stuck agent's world for the cgroup mode's end of a group lost track of (F2): its host in this process, its
+/// project with R's writers T1 and T2 (one writer slot), T1 RUNNING under [`LeaderOnlyCancel`] whose native cancel
+/// holds its caller 300 ms, its member recorded, its attempt tracked by a cgroup. The runner's retry is far beyond the
+/// tests, so only a stop's own proof lets T1 go.
+async fn lost_in_a_cgroup(
+    dir: &Path,
+    cancel: Option<hoh_core::cancel::Graces>,
+) -> R<(PathBuf, Arc<LeaderOnlyCancel>, Arc<FakeClock>, Host, String)> {
+    let project = dir.join("p");
+    std::fs::create_dir_all(&project)?;
+    let (code, stderr) = serve_and_stop(&project)?;
+    assert_eq!(code, 0, "{stderr}");
+    seed(&project, WRITERS)?;
+    let clock = Arc::new(FakeClock::default());
+    let executor = Arc::new(LeaderOnlyCancel(
+        StuckExecutor {
+            cancels: dir.join("cancels"),
+            started: std::sync::Mutex::new(Vec::new()),
+            holds: true,
+        },
+        Duration::from_millis(300),
+    ));
+    let host = runner_host_with(
+        &project,
+        executor.clone(),
+        clock.clone(),
+        Setup {
+            retry: Some(Duration::from_secs(600)),
+            cancel,
+            ..Setup::default()
+        },
+    )
+    .await?;
+    let db = db(&project);
+    assert!(wait_for(
+        &db,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10)
+    )?);
+    let a1 = query(&db, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT json_extract(payload_json, '$.tracking') FROM events WHERE kind = 'attempt.tracking' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            )
+        )?,
+        "cgroup",
+        "not in a delegated scope"
+    );
+    // Its member, which ignores SIGTERM, recorded itself: it is what the group keeps once the leader is reaped.
+    let end = Instant::now() + Duration::from_secs(10);
+    while common::recorded_processes(&executor.0.members()).is_empty() {
+        if Instant::now() > end {
+            return Err("the member did not start".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok((project, executor, clock, host, a1))
+}
+
+/// Whether every process of `members` (pid and start time) has ended, by its identity.
+fn all_ended(members: &[(u32, String)]) -> R<bool> {
+    for (pid, start) in members {
+        if !hoh_agents::identity::ended(*pid, Some(start))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_settle_that_lost_track_of_its_group_ends_by_the_cgroups_proof() -> R {
+    common::in_delegated_scope("cgroup_lost_settle_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_settle_that_lost_track_of_its_group_ends_by_the_cgroups_proof"]
+async fn cgroup_lost_settle_inside() -> R {
+    // docs/adr/ADR-021.md decision 8d (M2T06R-401; F2): A1's lease expires. Its native cancel kills its leader, reaped
+    // at once, and holds the settle's stop past HELD_FOR, so the group, a member that ignores SIGTERM left in it, is
+    // lost track of: no signal may go to it. Its cgroup holds the member: stopped by membership, the group looked at
+    // again, and A1 ends with the cgroup's proof at once (UNKNOWN_EFFECT), its writer slot to T2; not unreaped until
+    // the runner's next look.
+    if std::env::var_os(common::IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let (project, executor, clock, host, a1) = lost_in_a_cgroup(dir.path(), None).await?;
+    let _members = common::Recorded(executor.0.members());
+    // T1's member: T2, which records its own in the same file, cannot start while T1 holds the writer slot.
+    let t1 = common::recorded_processes(&executor.0.members());
+    let db = db(&project);
+    clock.advance(Duration::from_secs(300));
+    let lease = || {
+        query(
+            &db,
+            &format!(
+                "SELECT group_concat(kind, ',') FROM (SELECT kind FROM events WHERE kind LIKE 'lease.%' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{a1}' ORDER BY seq)"
+            ),
+        )
+    };
+    assert!(
+        wait_for(
+            &db,
+            &format!("SELECT state FROM attempts WHERE attempt_id = '{a1}'"),
+            "UNKNOWN_EFFECT",
+            Duration::from_secs(20)
+        )?,
+        "{}",
+        lease()?
+    );
+    assert_eq!(
+        lease()?,
+        "lease.inspected,lease.native_cancel,lease.lost_track,lease.cgroup_sigterm,lease.cgroup_kill,\
+         lease.cgroup_reaped"
+    );
+    assert_eq!(
+        query(
+            &db,
+            &format!(
+                "SELECT json_extract(payload_json, '$.process.reaped') || '/' || \
+                 json_extract(payload_json, '$.disposition') FROM events WHERE kind = 'reconcile.attempt' \
+                 AND json_extract(payload_json, '$.attempt_id') = '{a1}'"
+            )
+        )?,
+        "1/unknown_effect"
+    );
+    assert!(all_ended(&t1)?, "T1's member lives: {t1:?}");
+    // The writer slot went with it: T2 runs.
+    assert!(wait_for(
+        &db,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T2'",
+        "1",
+        Duration::from_secs(10)
+    )?);
+    host.shutdown().await;
+    drop(executor);
+    Ok(())
+}
+
+#[test]
+fn in_a_delegated_cgroup_a_cancel_that_lost_track_of_its_group_ends_by_the_cgroups_proof_in_its_pass()
+-> R {
+    common::in_delegated_scope("cgroup_lost_cancel_inside")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs inside a delegated scope, started by in_a_delegated_cgroup_a_cancel_that_lost_track_of_its_group_ends_by_the_cgroups_proof_in_its_pass"]
+async fn cgroup_lost_cancel_inside() -> R {
+    // docs/adr/ADR-021.md decision 8d (M2T06R-401; F2): R is cancelled. The pass's native cancel kills A1's leader,
+    // reaped at once, and holds the pass past HELD_FOR, so its next look finds the group lost track of. With a cgroup
+    // the pass watches the group by its number from then on, as one that cannot be told apart: the cgroup's members
+    // get SIGTERM and SIGKILL by membership, and the same pass ends with the cgroup's proof; no lost pass, no ladder
+    // begun again.
+    if std::env::var_os(common::IN_SCOPE).is_none() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let graces = hoh_core::cancel::Graces {
+        native: Duration::from_millis(300),
+        term: Duration::from_millis(300),
+        kill_every: Duration::from_secs(2),
+    };
+    let (project, executor, _clock, host, a1) = lost_in_a_cgroup(dir.path(), Some(graces)).await?;
+    let _members = common::Recorded(executor.0.members());
+    let t1 = common::recorded_processes(&executor.0.members());
+    let db = db(&project);
+    let info: Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join(".hoh/host.json"))?)?;
+    let revision = query(&db, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+    let (status, body) = common::fresh_blocking(json!(revision.parse::<i64>()?), |revision| {
+        let cancel = json!({
+            "schema_version": "1.0", "command_id": "c-cancel", "idempotency_key": "cancel",
+            "expected_revision": revision, "kind": "CancelRun", "run_id": "R",
+            "payload": {"reason": "F2"},
+        });
+        let (status, body) = http(&info, "POST", "/v1/commands", Some(&cancel.to_string()))?;
+        Ok((
+            status,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        ))
+    })?;
+    assert_eq!(status, 202, "{body}");
+    let passes = || {
+        query(
+            &db,
+            &format!(
+                "SELECT group_concat(name, ',') FROM (SELECT kind || coalesce(':' || json_extract(payload_json, \
+                 '$.code'), '') AS name FROM events WHERE kind LIKE 'cancel.%' AND json_extract(payload_json, \
+                 '$.attempt_id') = '{a1}' ORDER BY seq)"
+            ),
+        )
+    };
+    assert!(
+        wait_for(
+            &db,
+            "SELECT state FROM runs WHERE run_id = 'R'",
+            "CANCELLED",
+            Duration::from_secs(20)
+        )?,
+        "{}",
+        passes()?
+    );
+    assert_eq!(
+        passes()?,
+        "cancel.native_cancel,cancel.sigterm,cancel.sigkill,cancel.reaped,cancel.diagnostic:UNKNOWN_EFFECT",
+        "one pass, ended by the cgroup's proof; its work's effect unknown"
+    );
+    assert!(all_ended(&t1)?, "T1's member lives: {t1:?}");
     host.shutdown().await;
     drop(executor);
     Ok(())

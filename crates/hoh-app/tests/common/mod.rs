@@ -164,3 +164,46 @@ pub fn start_of(pid: u32) -> R<String> {
     Ok(hoh_agents::identity::start_id(pid)?
         .ok_or_else(|| format!("process {pid} is not running"))?)
 }
+
+/// Set in a test process started inside a delegated scope ([`in_delegated_scope`]).
+pub const IN_SCOPE: &str = "HOH_TEST_IN_DELEGATED_SCOPE";
+
+/// Run this binary's ignored test `name` inside a delegated scope of the user's systemd manager
+/// (`systemd-run --user --scope -p Delegate=yes`), where an in-process host tracks its attempts by cgroups of their own
+/// (docs/adr/ADR-021.md decision 8d v5, CR-011). It must have run and passed.
+pub fn in_delegated_scope(name: &str) -> R {
+    let exe = std::env::current_exe()?;
+    let out = std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "-p",
+            "Delegate=yes",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+            "--",
+        ])
+        .arg(&exe)
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(IN_SCOPE, "1")
+        .output()?;
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    if !out.status.success() || !stdout.contains("1 passed") {
+        return Err(format!(
+            "{name} in a delegated scope: {}\n{stdout}\n{stderr}",
+            out.status
+        )
+        .into());
+    }
+    Ok(())
+}

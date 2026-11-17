@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod common;
+use common::{IN_SCOPE, in_delegated_scope};
 
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::decision::Context;
@@ -1925,49 +1926,6 @@ async fn a_cancel_ends_what_a_pinned_process_without_the_marker_starts_after_the
     let guard = common::Recorded(established_mark(&file));
     cancel_with_a_writer_outside(dir.path(), &script, &file, Created::AtOrAfterTheSigterm).await?;
     drop(guard);
-    Ok(())
-}
-
-/// Set in a test process started inside a delegated scope.
-const IN_SCOPE: &str = "HOH_TEST_IN_DELEGATED_SCOPE";
-
-/// Run this binary's ignored test `name` inside a delegated scope of the user's systemd manager
-/// (`systemd-run --user --scope -p Delegate=yes`), where an in-process host tracks its attempts by cgroups of their own
-/// (docs/adr/ADR-021.md decision 8d v5, CR-011). It must have run and passed.
-fn in_delegated_scope(name: &str) -> R {
-    let exe = std::env::current_exe()?;
-    let out = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--scope",
-            "-p",
-            "Delegate=yes",
-            "--quiet",
-            "--collect",
-            "--expand-environment=no",
-            "--",
-        ])
-        .arg(&exe)
-        .args([
-            name,
-            "--exact",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(IN_SCOPE, "1")
-        .output()?;
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() || !stdout.contains("1 passed") {
-        return Err(format!(
-            "{name} in a delegated scope: {}\n{stdout}\n{stderr}",
-            out.status
-        )
-        .into());
-    }
     Ok(())
 }
 

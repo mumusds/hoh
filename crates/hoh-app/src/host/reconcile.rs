@@ -163,21 +163,29 @@ pub(super) fn end(
             let Some(cgroup) = cgroup else {
                 return Process::Uncertain { basis };
             };
-            let (mut steps, in_cgroup) = cgroup.stop(term, kill);
-            let (left, outside) = outside.stop(term, kill);
-            steps.extend(left);
-            let emptied = matches!(inspect(row), Seen::Gone(_) | Seen::NotStarted);
-            return Process::Stopped {
-                steps,
-                reaped: emptied && both(in_cgroup, outside) == Proof::Done,
-            };
+            return by_cgroup(&cgroup, &mut outside, row, (term, kill), Vec::new());
         }
         Seen::NotStarted => Process::NotStarted,
         Seen::Ours(found) => {
             // Its descendants are pinned while its leader still ties them to it; then the group is stopped.
             outside.set_leader(row.pid, row.process_start_id.as_deref());
             let _ = outside.scan();
-            stopped(&found.stop(term, kill))
+            let stop = found.stop(term, kill);
+            // Lost track of during its stop (its leader reaped and its group not looked at within HELD_FOR, ADR-019
+            // decision 8): from then on it is a group that cannot be told apart, and with a cgroup it ends as one
+            // (decision 8d v6, M2T06R-401; F2: it was left unreaped, its slot waiting for the runner's next look).
+            if let Some(cgroup) = &cgroup
+                && stop.steps.last() == Some(&StopStep::Lost)
+            {
+                return by_cgroup(
+                    cgroup,
+                    &mut outside,
+                    row,
+                    (term, kill),
+                    step_names(&stop.steps),
+                );
+            }
+            stopped(&stop)
         }
         Seen::Gone(basis) => Process::Gone { basis },
     };
@@ -192,6 +200,28 @@ pub(super) fn end(
         None => outside.stop(term, kill),
     };
     with_outside(group, steps, proof)
+}
+
+/// The end of a group that cannot be told apart, by its cgroup (decision 8d v6, M2T06R-401): no signal goes to the
+/// group; the cgroup is stopped by membership, then what left it with its marker, and the group is looked at once more.
+/// Reaped only when that look finds it gone (or never started) and both proofs are done; `steps`, the group's own stop
+/// before (one that lost track of it), come first.
+fn by_cgroup(
+    cgroup: &super::cgroup::AttemptGroup,
+    outside: &mut Outside,
+    row: &UnfinishedRow,
+    (term, kill): (Duration, Duration),
+    mut steps: Vec<String>,
+) -> Process {
+    let (in_steps, in_cgroup) = cgroup.stop(term, kill);
+    steps.extend(in_steps);
+    let (left, outside) = outside.stop(term, kill);
+    steps.extend(left);
+    let emptied = matches!(inspect(row), Seen::Gone(_) | Seen::NotStarted);
+    Process::Stopped {
+        steps,
+        reaped: emptied && both(in_cgroup, outside) == Proof::Done,
+    }
 }
 
 /// The process as recorded once its processes outside the group were stopped: unchanged when there were none.
@@ -224,21 +254,25 @@ fn process_of(
 /// A stop as the reconcile records it.
 pub(super) fn stopped(stopped: &identity::Stopped) -> Process {
     Process::Stopped {
-        steps: stopped
-            .steps
-            .iter()
-            .map(|s| {
-                match s {
-                    StopStep::Term => "sigterm",
-                    StopStep::Kill => "sigkill",
-                    StopStep::Reaped => "reaped",
-                    StopStep::Lost => "lost_track",
-                }
-                .to_owned()
-            })
-            .collect(),
+        steps: step_names(&stopped.steps),
         reaped: stopped.reaped,
     }
+}
+
+/// A stop's steps as the reconcile records them.
+fn step_names(steps: &[StopStep]) -> Vec<String> {
+    steps
+        .iter()
+        .map(|s| {
+            match s {
+                StopStep::Term => "sigterm",
+                StopStep::Kill => "sigkill",
+                StopStep::Reaped => "reaped",
+                StopStep::Lost => "lost_track",
+            }
+            .to_owned()
+        })
+        .collect()
 }
 
 /// `row`'s disposition and the process found applied in one transaction (`Store::reconcile_apply`), after its stop:

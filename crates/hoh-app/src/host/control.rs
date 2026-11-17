@@ -351,15 +351,31 @@ fn group_lives(pgid: u32) -> bool {
 
 impl ProcessControl for AttemptControl {
     fn look(&mut self) -> Look {
-        let group = match &self.group {
-            Watch::Found(found) => match found.look() {
-                identity::Group::Held => Look::Held,
-                identity::Group::Lost => return Look::Lost,
-                identity::Group::Empty => Look::Empty,
-            },
-            Watch::Gone => Look::Empty,
-            Watch::Number(pgid) if group_lives(*pgid) => Look::Held,
-            Watch::Number(_) => Look::Empty,
+        // One look at a group watched by its leader's identity.
+        let found = match &self.group {
+            Watch::Found(found) => Some((found.look(), found.identity.pid)),
+            Watch::Gone | Watch::Number(_) => None,
+        };
+        // Lost track of (its leader reaped, and the group not looked at within HELD_FOR, ADR-019 decision 8): no signal
+        // may go to the group from now on. Without a cgroup the look is Lost. With one, the group is watched by its
+        // number from this look on, in this pass, as one that cannot be told apart: its members are the cgroup's,
+        // stopped by membership (decision 8d v6, M2T06R-401; v7: empty only once the kernel says no process uses the
+        // number). F2: the pass ended Lost, and the next began the ladder again.
+        if let Some((identity::Group::Lost, pid)) = found
+            && self.cgroup.is_some()
+        {
+            self.group = Watch::Number(pid);
+            if let Ok(mut outside) = self.outside.lock() {
+                outside.set_leader(None, None);
+            }
+        }
+        let group = match (&self.group, found) {
+            (Watch::Found(_), Some((identity::Group::Held, _))) => Look::Held,
+            (Watch::Found(_), Some((identity::Group::Empty, _))) => Look::Empty,
+            (Watch::Found(_), _) => return Look::Lost,
+            (Watch::Gone, _) => Look::Empty,
+            (Watch::Number(pgid), _) if group_lives(*pgid) => Look::Held,
+            (Watch::Number(_), _) => Look::Empty,
         };
         let Ok(mut outside) = self.outside.lock() else {
             return Look::Held;
