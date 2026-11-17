@@ -4309,7 +4309,19 @@ async fn cgroup_lost_cancel_inside() -> R {
         "one pass, ended by the cgroup's proof; its work's effect unknown"
     );
     assert!(all_ended(&t1)?, "T1's member lives: {t1:?}");
-    // Nothing reached the group's number: the probe got no SIGTERM, and lives.
+    // Nothing reached the group's number: the probe got no SIGTERM, and lives. Its final record comes after it left the
+    // group, which CANCELLED may precede: waited for (at most 10 s), the probe watched meanwhile (F2-110).
+    let end = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&seen)?.contains("\nleft ") {
+        if let Some(status) = probe.0.try_wait()? {
+            return Err(format!("the probe in the group's number was ended: {status}").into());
+        }
+        assert!(
+            Instant::now() < end,
+            "the probe never recorded leaving the group"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         (
             std::fs::read_to_string(&seen)?,
