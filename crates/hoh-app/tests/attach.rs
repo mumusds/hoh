@@ -793,6 +793,68 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
     Ok(())
 }
 
+/// Wait at most `limit` for `file` to exist while `client` runs: its text.
+fn reached(file: &Path, client: &mut Kid, limit: Duration) -> R<String> {
+    let end = Instant::now() + limit;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            return Ok(text);
+        }
+        if let Some(status) = client.get_mut()?.try_wait()? {
+            return Err(format!("the client ended before {}: {status}", file.display()).into());
+        }
+        if Instant::now() > end {
+            return Err(format!("{} never written", file.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_host_start_that_comes_after_the_stop_starts_no_host() -> R {
+    // ADR-031, 设计修正 2, A (CLT-303): `hoh -p`'s start is held just before it spawns the host; SIGTERM; the client's
+    // stop runs and its exit is held once the stop is done; only then does the start go on. The gate refuses it (the
+    // stop began before it asked for its ticket), so no host is started, and the client ends with 143. Before, the
+    // start's own check had passed before the stop, so it spawned a host after the client let go of its helpers.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("before-launch"), "")?;
+    std::fs::write(holds.join("exit"), "")?;
+    let mut client = Kid(Some(
+        env.isolated(&["-p", "x", "--output", "json"])?
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let outcome = (|| -> R<(String, Output)> {
+        reached(&holds.join("before-launch.reached"), &mut client, LIMIT)?;
+        send(client.get()?, rustix::process::Signal::TERM)?;
+        reached(&holds.join("exit.reached"), &mut client, LIMIT)?;
+        std::fs::remove_file(holds.join("before-launch"))?;
+        let tried = reached(&holds.join("launch-tried"), &mut client, LIMIT)?;
+        std::fs::remove_file(holds.join("exit"))?;
+        Ok((tried, finish(client.take()?, LIMIT)?))
+    })();
+    // Whatever happened, nothing stays held.
+    let _ = std::fs::remove_file(holds.join("before-launch"));
+    let _ = std::fs::remove_file(holds.join("exit"));
+    let (tried, out) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{said}");
+    assert!(
+        tried.starts_with("refused"),
+        "the start went on after the stop: {tried}"
+    );
+    assert!(
+        hosts_of(&env.project())?.is_empty(),
+        "a host was started after the stop"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_late_signal_with_stderr_full_still_ends_the_client_within_its_bound() -> R {
     // ADR-031's design correction, addendum rule 6 (CLT-201; REQ-004 failure mode 1): `hoh -p` whose run stopped

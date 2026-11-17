@@ -1,30 +1,26 @@
 //! The client's one signal state (docs/adr/ADR-031.md, 设计修正（客户端信号）): a client command registers it once,
 //! before any wait ([`register`]), and every stage after uses the same one ([`current`]). Every wait the client makes
 //! looks at it while it waits ([`wait`]), and every exit consults it first ([`State::exit`]): a received SIGTERM,
-//! SIGINT or SIGHUP decides the exit code (143, 130, 129) and the message. The state also owns the client's helper
-//! processes, let go of before a signal exit (addendum, rule 5), and says its messages through one bounded path
-//! (rule 6).
+//! SIGINT or SIGHUP decides the exit code (143, 130, 129) and the message. The state also holds the client's one start
+//! gate, which every process the client starts goes through and which a signal exit stops (设计修正 2, A), and says
+//! its messages through one bounded path (rule 6).
 
 use crate::exit::{ClientEvent, client_code};
-use hoh_agents::probe::ProbeStop;
-use hoh_core::persistence::CancelLatch;
+use crate::owned::{Gate, Stopped};
+use hoh_core::spawn::Spawner;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use std::os::fd::AsFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How often a wait looks at the state (the shell's tick).
 pub const LOOK: Duration = Duration::from_millis(100);
 
-/// How long a signal exit waits for the probe commands it stopped to be done with (rule 5): the stop tries its locks
-/// for 0.2 s, a probe looks at it every 10 ms, and its reap waits up to 1 s.
+/// How long a signal exit's stop takes at most, from its start, for the helper starts in flight to end and the
+/// helpers it killed to be reaped (设计修正 2, D: the first two rows share it).
 pub const HELPERS_WAIT: Duration = Duration::from_millis(1500);
-
-/// How long a signal exit waits for doctor's live turns it cancelled to end (rule 5): their adapters' escalation, at
-/// most a native interrupt's 10 s grace, TERM's 5 s and KILL's 5 s, and 1 s more.
-pub const TURNS_WAIT: Duration = Duration::from_secs(21);
 
 /// How long a message waits for stderr (rule 6); not written by then, it is given up.
 pub const SAY_WAIT: Duration = Duration::from_millis(500);
@@ -38,21 +34,6 @@ enum Out {
     Fd(Arc<std::os::fd::OwnedFd>),
 }
 
-/// A live turn of doctor's the client owns: its cancel, and whether it has ended.
-struct Turn {
-    latch: CancelLatch,
-    ended: Arc<AtomicBool>,
-}
-
-/// A live turn owned through [`State::own_turn`], ended when this is dropped (once its adapter returned).
-pub struct OwnedTurn(Arc<AtomicBool>);
-
-impl Drop for OwnedTurn {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
 /// The signal state of a client process: the number of the exit signal that came (0 for none), whether the window was
 /// resized, the run the client is about (for the message), and whether a stage already said why it ended.
 pub struct State {
@@ -60,13 +41,8 @@ pub struct State {
     resized: Arc<AtomicBool>,
     run: Mutex<Option<String>>,
     said: AtomicBool,
-    /// The probe commands the client starts (its start's checks, doctor's probes): every `ProbeEnv` of the client's
-    /// carries it as its cancel (rule 5).
-    helpers: ProbeStop,
-    /// doctor's live turns (rule 5).
-    turns: Mutex<Vec<Turn>>,
-    /// Whether the helpers were let go of: a turn owned after is cancelled at once.
-    released: AtomicBool,
+    /// The start gate every process the client starts goes through (设计修正 2, A).
+    gate: Arc<Gate>,
     out: Out,
     /// Messages given up since the last one written (rule 6).
     late: AtomicU64,
@@ -104,6 +80,12 @@ pub fn current() -> Option<&'static State> {
     STATE.get()
 }
 
+/// The spawner of a client's processes: its registered signal state's start gate; with none registered (a unit test of
+/// another part), a gate of its own, which nothing stops (设计修正 2, A: library code is always given one).
+pub fn spawner() -> Arc<dyn Spawner> {
+    current().map_or_else(|| Arc::new(Gate::default()), State::spawner)
+}
+
 /// The exit code of signal number `signal`: SIGTERM 143, SIGHUP 129, SIGINT 130 (REQ-004).
 pub fn code(signal: usize) -> u8 {
     match i32::try_from(signal) {
@@ -124,62 +106,22 @@ impl State {
             resized,
             run: Mutex::new(None),
             said: AtomicBool::new(false),
-            helpers: ProbeStop::default(),
-            turns: Mutex::new(Vec::new()),
-            released: AtomicBool::new(false),
+            gate: Arc::default(),
             out,
             late: AtomicU64::new(0),
         }
     }
 
-    /// The cancel every probe of the client's carries (rule 5).
-    pub fn helpers(&self) -> &ProbeStop {
-        &self.helpers
+    /// The spawner of everything the client starts: its start gate (设计修正 2, A).
+    pub fn spawner(&self) -> Arc<dyn Spawner> {
+        self.gate.clone()
     }
 
-    /// Own the live turn cancelled through `latch` until the returned guard is dropped (rule 5): a signal exit
-    /// cancels it and waits for it to end; one owned once the helpers were let go of is cancelled at once.
-    pub fn own_turn(&self, latch: &CancelLatch) -> OwnedTurn {
-        let ended = Arc::new(AtomicBool::new(false));
-        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
-        turns.push(Turn {
-            latch: latch.clone(),
-            ended: ended.clone(),
-        });
-        if self.released.load(Ordering::SeqCst) {
-            latch.request();
-        }
-        OwnedTurn(ended)
-    }
-
-    /// Let go of every helper the client owns (rule 5): no probe starts from now on, every probe command is killed
-    /// (its group and its leader) and waited for until [`HELPERS_WAIT`], every live turn is cancelled and waited for
-    /// until [`TURNS_WAIT`]. Whether all were done with in time. The host is not a helper (REQ-001 failure mode 3).
-    pub fn release(&self) -> bool {
-        {
-            let turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
-            self.released.store(true, Ordering::SeqCst);
-            for turn in turns.iter() {
-                turn.latch.request();
-            }
-        }
-        let began = Instant::now();
-        let probes = self.helpers.stop_within(began + HELPERS_WAIT);
-        loop {
-            let open = self
-                .turns
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|turn| !turn.ended.load(Ordering::SeqCst));
-            if !open {
-                return probes;
-            }
-            if began.elapsed() >= TURNS_WAIT {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    /// Stop the start gate within [`HELPERS_WAIT`]: nothing is started from now on, every helper the client started is
+    /// killed (its group and its leader) and reaped, and what could not be confirmed is reported (设计修正 2, A, A2,
+    /// D). The host is never signalled (REQ-001 failure mode 3).
+    pub fn stop(&self) -> Stopped {
+        self.gate.stop(HELPERS_WAIT)
     }
 
     /// The flag the shell's loop looks at: the number of the signal that came, 0 for none.
@@ -233,7 +175,7 @@ impl State {
             return code;
         };
         // Nothing the client owns outlives it (rule 5), and the message never waits on stderr (rule 6).
-        self.release();
+        self.stop();
         // Where a test holds the exit once the stop is done (debug builds only).
         crate::debug_hold::at("exit");
         if !self.said.swap(true, Ordering::SeqCst) {

@@ -255,10 +255,10 @@ fn examine(project: &Path, live: bool) -> Report {
         log: Some(log.clone()),
         // One limit for all commands, also those run one after another (M1T07R-02).
         deadline: Some(Instant::now() + TIMEOUT),
-        // Its commands are the client's helpers: a signal stops and reaps them (docs/adr/ADR-031.md, the client-signal
-        // correction's addendum, rule 5).
-        cancel: crate::signals::current().map(|state| state.helpers().clone()),
-        spawner: hoh_core::spawn::Direct::shared(),
+        // Every command it starts (its probes, the live turns' agents, the scratch store's WAL probe) goes through the
+        // client's start gate: a signal's stop kills and reaps them (docs/adr/ADR-031.md, 设计修正 2, A).
+        cancel: None,
+        spawner: crate::signals::spawner(),
     };
     let (manifest, warning) = manifest(project);
     let mut warnings: Vec<String> = warning.into_iter().collect();

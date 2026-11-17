@@ -494,28 +494,18 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
 /// scope of the user's systemd manager when there is one, so its attempts are tracked by cgroups of their own; directly
 /// otherwise, or when the scope cannot be had (ADR-021 decision 2). A host not started as its unit is told why.
 fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
-    // Its probes are the client's helpers: a signal exit stops and reaps them (docs/adr/ADR-031.md, the client-signal
-    // correction's addendum, rule 5).
+    // Its probes and the host are started through the client's start gate: once a signal's stop began, nothing more is
+    // started, and the probes are killed and reaped (docs/adr/ADR-031.md, 设计修正 2, A).
     let env = hoh_agents::probe::ProbeEnv {
         path: std::env::var_os("PATH").unwrap_or_default(),
         fixture_root: None,
         timeout: SCOPE_PROBE_LIMIT,
         log: None,
         deadline: Some(end),
-        cancel: crate::signals::current().map(|state| state.helpers().clone()),
-        spawner: hoh_core::spawn::Direct::shared(),
-    };
-    // A start whose client is ending (its helpers let go of) starts no host.
-    let ending = || {
-        env.cancel
-            .as_ref()
-            .is_some_and(hoh_agents::probe::ProbeStop::is_stopped)
-            .then(|| {
-                Failure::unreachable("the client is ending (a signal came): no host is started")
-            })
+        cancel: None,
+        spawner: crate::signals::spawner(),
     };
     let unsupervised = match unit_for(project, &env) {
-        _ if let Some(failure) = ending() => return Err(failure),
         // Under the project's lock, with no host running: the file the manager reads before it starts the host.
         Ok(unit) => match hoh_app::unit::write_environment(&unit.file, project, &unit.text) {
             Ok(()) => return supervised(project, end, &unit, &env),
@@ -523,11 +513,7 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
         },
         Err(why) => why,
     };
-    let scope = delegated_scope(&env);
-    if let Some(failure) = ending() {
-        return Err(failure);
-    }
-    let why = match scope {
+    let why = match delegated_scope(&env) {
         Ok(scope) => match launch(project, end, Some(&scope), None, &unsupervised) {
             Err(failure) if failure.exit != 78 && Instant::now() < end => {
                 // The scope was refused (or the host ended for another reason): once more, directly.
@@ -814,9 +800,9 @@ fn launch_with(
     command.env(hoh_app::host::UNSUPERVISED_ENV, unsupervised);
     // Where a test holds the start just before the host is spawned, and sees what came of it (debug builds only).
     crate::debug_hold::at("before-launch");
-    // A host is wait-only from its spawn: nothing of this client ever signals it (docs/adr/ADR-031.md, 设计修正 2, A).
-    let started = hoh_core::spawn::Spawner::host(
-        &hoh_core::spawn::Direct,
+    // A host is wait-only from its spawn: nothing of this client ever signals it; its start takes a ticket at the
+    // client's start gate, refused once a signal's stop began (docs/adr/ADR-031.md, 设计修正 2, A).
+    let started = crate::signals::spawner().host(
         command
             .arg("__host")
             .arg(project)
