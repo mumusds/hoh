@@ -626,8 +626,9 @@ struct Driven {
 }
 
 /// What a turn's frames said about a rate or usage limit (M2T07R-256; docs/adr/ADR-012.md, 注记 of 2026-11-16): the
-/// reset of the last `rate_limit_event` whose status was `rejected` (a later event that is not rejected clears it), and
-/// the rate limit of the turn's last main-thread assistant frame.
+/// reset of the last `rate_limit_event` whose status was `rejected` (a later event that is not rejected clears it, and so
+/// does a successful assistant message, the main thread's or a subagent's: the limit no longer held, RA-04), and the
+/// rate limit of the turn's last main-thread assistant frame.
 #[derive(Debug, Default)]
 struct Limit {
     rejected_reset: Option<Value>,
@@ -650,7 +651,13 @@ impl Limit {
                 self.rejected_reset =
                     (info["status"] == "rejected").then(|| info["resetsAt"].clone());
             }
-            Some("assistant") if frame["parent_tool_use_id"].is_null() => {
+            Some("assistant") => {
+                if frame["error"].is_null() {
+                    self.rejected_reset = None;
+                }
+                if !frame["parent_tool_use_id"].is_null() {
+                    return;
+                }
                 self.last = (frame["error"] == "rate_limit").then(|| {
                     let info = &frame["api_error_params"]["rate_limit_info"];
                     LimitError {

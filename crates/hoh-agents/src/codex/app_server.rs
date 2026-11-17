@@ -196,11 +196,19 @@ struct State<'a> {
     limits: RateLimits,
 }
 
-/// The rate-limit windows codex reported during a turn (`account/rateLimits/updated`; M2T07R-256, docs/adr/ADR-012.md,
-/// 注记 of 2026-11-16): by limit id and window (primary, secondary), the used percentage and the reset (unix seconds).
-/// A sparse update keeps what an earlier one said: a window or a reset it leaves out or sends as null clears nothing.
+/// The quotas codex reported during a turn (`account/rateLimits/updated`; M2T07R-256, docs/adr/ADR-012.md, 注记 of
+/// 2026-11-16): by limit id, the model the quota is for (`normalModelSlug`; none for the account's own) and its windows
+/// (primary, secondary), each with its used percentage and reset (unix seconds). A sparse update keeps what an earlier
+/// one said: a slug, window or reset it leaves out or sends as null clears nothing.
 #[derive(Debug, Default)]
-struct RateLimits(BTreeMap<(String, &'static str), Window>);
+struct RateLimits(BTreeMap<String, Quota>);
+
+/// One quota as codex last reported it.
+#[derive(Debug, Default)]
+struct Quota {
+    model: Option<String>,
+    windows: BTreeMap<&'static str, Window>,
+}
 
 /// One rate-limit window as codex last reported it.
 #[derive(Debug, Default)]
@@ -209,16 +217,28 @@ struct Window {
     resets_at: Option<Value>,
 }
 
+impl Window {
+    fn used_up(&self) -> bool {
+        self.used_percent.is_some_and(|percent| percent >= 100)
+    }
+}
+
 impl RateLimits {
     fn see(&mut self, params: &Value) {
         let limits = &params["rateLimits"];
-        let id = limits["limitId"].as_str().unwrap_or_default();
+        let quota = self
+            .0
+            .entry(limits["limitId"].as_str().unwrap_or_default().to_owned())
+            .or_default();
+        if let Some(model) = limits["normalModelSlug"].as_str() {
+            quota.model = Some(model.to_owned());
+        }
         for side in ["primary", "secondary"] {
             let window = &limits[side];
             if !window.is_object() {
                 continue;
             }
-            let seen = self.0.entry((id.to_owned(), side)).or_default();
+            let seen = quota.windows.entry(side).or_default();
             if let Some(percent) = window["usedPercent"].as_i64() {
                 seen.used_percent = Some(percent);
             }
@@ -228,15 +248,40 @@ impl RateLimits {
         }
     }
 
-    /// When every used-up window lifts: the latest reset among them; none when no window is used up, or when one of
-    /// them has no reset that is an instant.
-    fn lifts(&self) -> Option<std::time::SystemTime> {
-        let mut latest = None;
-        for window in self.0.values() {
-            if window.used_percent.is_some_and(|percent| percent >= 100) {
-                let at = crate::adapter::unix_seconds(window.resets_at.as_ref()?)?;
-                latest = latest.max(Some(at));
+    /// When the quota a turn on `model` (the thread's) failed on lifts (RA-01): only the used-up quotas that apply to
+    /// it count, the account's own (no model) and the ones for `model`; another model's is unrelated. When that cannot
+    /// be told (a used-up model quota with the thread's model unknown, or more than one used-up quota of the account's
+    /// own), or nothing applies, none. Otherwise the latest reset of their used-up windows, all of which have to lift;
+    /// none when one of them has no reset that is an instant.
+    fn lifts(&self, model: Option<&str>) -> Option<std::time::SystemTime> {
+        let mut applying = Vec::new();
+        let mut accounts = 0;
+        for quota in self
+            .0
+            .values()
+            .filter(|q| q.windows.values().any(Window::used_up))
+        {
+            match (quota.model.as_deref(), model) {
+                (None, _) => {
+                    accounts += 1;
+                    applying.push(quota);
+                }
+                (Some(its), Some(model)) if its == model => applying.push(quota),
+                (Some(_), Some(_)) => {}
+                (Some(_), None) => return None,
             }
+        }
+        if accounts > 1 {
+            return None;
+        }
+        let mut latest = None;
+        for window in applying
+            .iter()
+            .flat_map(|q| q.windows.values())
+            .filter(|w| w.used_up())
+        {
+            let at = crate::adapter::unix_seconds(window.resets_at.as_ref()?)?;
+            latest = latest.max(Some(at));
         }
         latest
     }
@@ -902,7 +947,7 @@ impl<'a> State<'a> {
             && self.status.as_deref() == Some("failed")
             && limited
         {
-            self.limits.lifts()
+            self.limits.lifts(self.model.as_deref())
         } else {
             None
         };
@@ -1443,12 +1488,15 @@ mod tests {
             .1,
             at(2_000)
         );
-        // Every exhausted window has to lift: the latest reset of them, whatever limit they belong to.
+        // Every used-up window of the failing quota has to lift: the latest reset of them.
         let both = json!({"limitId": "codex", "primary": window(100, json!(2_000)),
                           "secondary": window(100, json!(9_000))});
-        let other = json!({"limitId": "codex_other", "primary": window(100, json!(5_000))});
         assert_eq!(
-            judged(&usage_limit_with(&[both, other], limit.clone())).1,
+            judged(&usage_limit_with(
+                std::slice::from_ref(&both),
+                limit.clone()
+            ))
+            .1,
             at(9_000)
         );
         // A window that is not used up, or no update at all, says nothing.
@@ -1470,6 +1518,88 @@ mod tests {
             ))
             .1,
             None
+        );
+    }
+
+    /// The recorded usage-limit turn as [`usage_limit_with`], its thread's model (thread/start's answer) taken away.
+    fn without_model(mut frames: Vec<Value>) -> Vec<Value> {
+        for f in &mut frames {
+            if f["id"] == 1 && f["result"].get("model").is_some() {
+                f["result"]["model"] = Value::Null;
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn the_reset_is_that_of_the_quota_the_turn_failed_on() {
+        // RA-01 (M2T07R-256 review): only the quotas that apply to the turn count: the account's own (no model slug)
+        // and one whose normalModelSlug is the thread's model (gpt-fake-5 in the recording); another model's quota is
+        // unrelated, whatever it says. Where the failing quota cannot be told, there is no reset (full jitter).
+        let limit = json!("usageLimitExceeded");
+        let account = json!({"limitId": "codex", "primary": window(100, json!(120))});
+        let other_model = |reset: Value| json!({"limitId": "codex_other", "normalModelSlug": "gpt-other", "primary": window(100, reset)});
+        // An unrelated model's later reset does not win (Codex's probe: T+120 against T+86400) ...
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[account.clone(), other_model(json!(86_400))],
+                limit.clone()
+            ))
+            .1,
+            at(120)
+        );
+        // ... nor does its used-up window without a reset suppress the account's.
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[account.clone(), other_model(Value::Null)],
+                limit.clone()
+            ))
+            .1,
+            at(120)
+        );
+        // Another model's quota alone says nothing about this turn.
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[other_model(json!(86_400))],
+                limit.clone()
+            ))
+            .1,
+            None
+        );
+        // The thread's own model quota and the account's both apply: both have to lift.
+        let own_model = json!({"limitId": "codex_fake", "normalModelSlug": "gpt-fake-5",
+                               "primary": window(100, json!(500))});
+        assert_eq!(
+            judged(&usage_limit_with(
+                &[account.clone(), own_model.clone()],
+                limit.clone()
+            ))
+            .1,
+            at(500)
+        );
+        // Two quotas of the account's own kind used up: which one failed the turn cannot be told.
+        let second = json!({"limitId": "codex_second", "primary": window(100, json!(86_400))});
+        assert_eq!(
+            judged(&usage_limit_with(&[account.clone(), second], limit.clone())).1,
+            None
+        );
+        // With the thread's model unknown, a model quota used up cannot be placed: no reset; the account's alone
+        // still applies.
+        assert_eq!(
+            judged(&without_model(usage_limit_with(
+                &[account.clone(), own_model],
+                limit.clone()
+            )))
+            .1,
+            None
+        );
+        assert_eq!(
+            judged(&without_model(usage_limit_with(
+                std::slice::from_ref(&account),
+                limit
+            )))
+            .1,
+            at(120)
         );
     }
 
