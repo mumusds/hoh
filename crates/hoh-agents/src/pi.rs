@@ -120,7 +120,29 @@ pub fn builtin_tools(help: &str) -> Option<std::collections::BTreeMap<String, St
     Some(tools)
 }
 
-/// The arguments of `pi --mode rpc` on the session (never `--no-session`).
+/// The read tools of the read-only workspace profile (docs/adr/ADR-032.md decision 3).
+pub const READ_TOOLS: &[&str] = &["read", "grep", "find", "ls"];
+
+/// Why this pi's help gives no read-only workspace profile, or `None`: `--tools`, `--no-mcp` and `--no-extensions`
+/// declared, and each read tool among its built-in tools (docs/adr/ADR-032.md decisions 3, 4 and 11; the probe's rule).
+pub fn read_only_missing(help: &str) -> Option<String> {
+    if let Some(flag) = ["--tools", "--no-mcp", "--no-extensions"]
+        .into_iter()
+        .find(|flag| !offers(help, flag))
+    {
+        return Some(format!(
+            "pi --help offers no {flag} for the read-only profile"
+        ));
+    }
+    let builtin = builtin_tools(help).unwrap_or_default();
+    READ_TOOLS
+        .iter()
+        .find(|tool| !builtin.contains_key(**tool))
+        .map(|tool| format!("pi --help lists no built-in tool {tool} for the read-only profile"))
+}
+
+/// The arguments of `pi --mode rpc` on the session (never `--no-session`); under the read-only workspace profile the
+/// allowlist of the read tools, no MCP and no extension at all (docs/adr/ADR-032.md decisions 3 and 11).
 pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
     if let Some(why) = interface_missing(&launch.help) {
         return Err(Blocked(why));
@@ -133,6 +155,17 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
         "--session-id".to_owned(),
         launch.session_id.clone(),
     ];
+    if launch.profile == crate::Profile::ReadOnly {
+        if let Some(why) = read_only_missing(&launch.help) {
+            return Err(Blocked(why));
+        }
+        args.extend([
+            "--tools".to_owned(),
+            READ_TOOLS.join(","),
+            "--no-mcp".to_owned(),
+            "--no-extensions".to_owned(),
+        ]);
+    }
     for (flag, value) in [("--provider", &launch.provider), ("--model", &launch.model)] {
         if let Some(value) = value {
             if !offers(&launch.help, flag) {
@@ -430,17 +463,11 @@ pub async fn run(
             native_id: Some(launch.session_id.clone()),
             native_path: Some(launch.session_dir.to_string_lossy().into_owned()),
             agent_version: attempt.agent_version.clone(),
-            // The probed capabilities this adapter implements: events, resume and commands (M1R-01, docs/adr/ADR-030.md
-            // decision 12). It takes no steer, answers no dialog and records no token usage (M1T04R-16); whether pi
-            // emits agent_settled is the adapter's setting, not a capability of the session (M1T04R-13).
-            capabilities: crate::capabilities::of_session(
-                &launch.capabilities,
-                &[
-                    ("structured_events", true),
-                    ("resume", true),
-                    ("command_execution", true),
-                ],
-            ),
+            // The probed capabilities this adapter implements: events, resume, commands (M1R-01, docs/adr/ADR-030.md
+            // decision 12) and the read-only workspace profile (docs/adr/ADR-032.md decision 4). It takes no steer,
+            // answers no dialog and records no token usage (M1T04R-16); whether pi emits agent_settled is the
+            // adapter's setting, not a capability of the session (M1T04R-13).
+            capabilities: session_row(launch),
         })
         .await?;
     step(
@@ -557,17 +584,28 @@ pub async fn run(
 }
 
 /// The capabilities a session of this launch has (docs/adr/ADR-022.md decision 9), as [`run`] records them: events,
-/// resume and commands (no steer, no dialog, no token usage); or why no turn can start.
+/// resume, commands and the read-only workspace profile where its args build (no steer, no dialog, no token usage);
+/// or why no turn can start. The row says which profiles the session can start in, whatever this turn's
+/// (docs/adr/ADR-032.md decision 4).
 pub fn session_capabilities(launch: &Launch) -> Result<Value, Blocked> {
     args(launch)?;
-    Ok(crate::capabilities::of_session(
+    Ok(session_row(launch))
+}
+
+/// [`session_capabilities`] of a launch whose args build.
+fn session_row(launch: &Launch) -> Value {
+    crate::capabilities::of_session(
         &launch.capabilities,
         &[
             ("structured_events", true),
             ("resume", true),
             ("command_execution", true),
+            (
+                "read_only_workspace",
+                read_only_missing(&launch.help).is_none(),
+            ),
         ],
-    ))
+    )
 }
 
 /// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 14): checked as [`run`] checks it, then

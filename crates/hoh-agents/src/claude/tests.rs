@@ -550,3 +550,150 @@ fn the_recorded_usage_limit_says_when_it_lifts_and_a_recorded_retry_after_does_n
         assert_eq!(driven.retry_at(), None, "{case}");
     }
 }
+
+/// The recorded claude 2.1.318 help (the read-only profile's declarations, docs/adr/ADR-032.md decision 3).
+const RECORDED_HELP: &str =
+    include_str!("../../../../tests/fixtures/protocol/claude/2.1.318/help.txt");
+
+fn read_only_launch() -> Launch {
+    Launch {
+        help: RECORDED_HELP.to_owned(),
+        profile: crate::Profile::ReadOnly,
+        ..launch()
+    }
+}
+
+/// `help` without the declaration line of `flag` (its description lines stay, as another option's text).
+fn without_declaration(help: &str, flag: &str) -> String {
+    help.lines()
+        .filter(|line| crate::adapter::declared(line).is_none_or(|names| !names.contains(&flag)))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+#[test]
+fn the_read_only_argv_is_decision_3s_row() {
+    // ADR-032 decision 3: the read-only profile replaces only where the YOLO flag stands; the rest is today's rules.
+    let a = argv(&read_only_launch()).expect("argv");
+    assert_eq!(
+        a.args,
+        [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--tools",
+            "Read,Grep,Glob",
+            "--allowedTools",
+            "Read,Grep,Glob",
+            "--permission-mode",
+            "dontAsk",
+            "--strict-mcp-config"
+        ]
+    );
+    let mut l = read_only_launch();
+    l.partial = true;
+    l.resume = Some("9fcce4a1".to_owned());
+    l.model = Some("opus".to_owned());
+    assert_eq!(
+        argv(&l).expect("argv").args,
+        [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            PARTIAL_FLAG,
+            "--tools",
+            "Read,Grep,Glob",
+            "--allowedTools",
+            "Read,Grep,Glob",
+            "--permission-mode",
+            "dontAsk",
+            "--strict-mcp-config",
+            "--resume",
+            "9fcce4a1",
+            "--model",
+            "opus"
+        ]
+    );
+    assert!(!argv(&l).expect("argv").args.iter().any(|x| x == YOLO_FLAG));
+}
+
+#[test]
+fn the_read_only_profile_is_blocked_without_any_of_its_options() {
+    // ADR-032 decision 2: no fallback; each missing declaration (one change to the recorded help) blocks, naming it.
+    for (help, missing) in [
+        (without_declaration(RECORDED_HELP, "--tools"), "--tools"),
+        (
+            without_declaration(RECORDED_HELP, "--allowedTools"),
+            "--allowedTools",
+        ),
+        (
+            without_declaration(RECORDED_HELP, "--strict-mcp-config"),
+            "--strict-mcp-config",
+        ),
+        (
+            without_declaration(RECORDED_HELP, "--permission-mode"),
+            "--permission-mode",
+        ),
+        (RECORDED_HELP.replace("\"dontAsk\", ", ""), "dontAsk"),
+    ] {
+        let l = Launch {
+            help,
+            ..read_only_launch()
+        };
+        assert!(
+            matches!(argv(&l), Err(Blocked(ref why)) if why.contains(missing)),
+            "{missing}: {:?}",
+            argv(&l)
+        );
+    }
+}
+
+#[test]
+fn the_read_only_profile_runs_as_root_and_the_yolo_profile_does_not() {
+    let l = Launch {
+        root: true,
+        ..read_only_launch()
+    };
+    assert!(argv(&l).is_ok());
+    let l = Launch {
+        profile: crate::Profile::Yolo,
+        ..l
+    };
+    assert!(matches!(argv(&l), Err(Blocked(why)) if why.contains("root")));
+}
+
+#[test]
+fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
+    // ADR-032 decision 4: the session row says which profiles the session can start in, whatever the turn's profile,
+    // so a Commander's session stays fresh; read_only_workspace is what the probe found, where the read-only argv
+    // builds for this help.
+    let probed: crate::capabilities::Probed = [
+        ("structured_events", Some(true)),
+        ("resume", Some(true)),
+        ("command_execution", Some(true)),
+        ("read_only_workspace", Some(true)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    let read_only = Launch {
+        capabilities: probed.clone(),
+        ..read_only_launch()
+    };
+    let yolo = Launch {
+        profile: crate::Profile::Yolo,
+        ..read_only.clone()
+    };
+    let caps = session_capabilities(&read_only).expect("capabilities");
+    assert_eq!(caps, session_capabilities(&yolo).expect("capabilities"));
+    assert_eq!(caps["read_only_workspace"], true, "{caps}");
+    assert_eq!(caps["command_execution"], true, "{caps}");
+    let without = Launch {
+        help: without_declaration(RECORDED_HELP, "--strict-mcp-config"),
+        ..yolo
+    };
+    let caps = session_capabilities(&without).expect("capabilities");
+    assert_eq!(caps["read_only_workspace"], false, "{caps}");
+}

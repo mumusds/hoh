@@ -1072,7 +1072,7 @@ const DECLARATION_INDENT: usize = 8;
 /// `[value]`, `VALUE`, each maybe ending in `...`), up to two spaces or a tab before its description, or the end of
 /// the line. Anything else is text: a continuation line, a list item `- x`, a mention like
 /// `--output-format=stream-json)` or `--mode[=rpc]` (M1R-03, M1T07R-18).
-fn declared(line: &str) -> Option<Vec<&str>> {
+pub(crate) fn declared(line: &str) -> Option<Vec<&str>> {
     declaration(line).map(|(names, _)| names)
 }
 

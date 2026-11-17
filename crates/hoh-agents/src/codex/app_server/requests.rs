@@ -26,10 +26,12 @@ pub fn initialized() -> Value {
 }
 
 /// The profile and model of a thread: HoH's YOLO profile is `approvalPolicy=never`, `sandbox=danger-full-access`
-/// (CR-002); no model leaves codex its own default.
+/// (CR-002); the read-only workspace profile `approvalPolicy=never`, `sandbox=read-only` (docs/adr/ADR-032.md decision
+/// 3); no model leaves codex its own default.
 fn thread_params(profile: Profile, model: Option<&str>) -> Value {
     let mut params = match profile {
         Profile::Yolo => json!({"approvalPolicy": "never", "sandbox": "danger-full-access"}),
+        Profile::ReadOnly => json!({"approvalPolicy": "never", "sandbox": "read-only"}),
         Profile::Plain => json!({}),
     };
     if let Some(model) = model {
