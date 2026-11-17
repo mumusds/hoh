@@ -1267,6 +1267,46 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
     }
 
     #[test]
+    fn too_many_processes_to_let_end_or_a_look_already_unknown_waits_for_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // WDF-250: the settle set's bound and its skip are pinned. One more exiting, unreadable process of the host's
+        // user than SETTLE_AT_MOST is unknown at once, with no wait; and a look already unknown (here a live process
+        // that cannot be read) does not wait for the exiting one beside it.
+        let me = rustix::process::getuid().as_raw();
+        let exiting = |root: &Path, pid: u32, state: &str, flags: u64| -> std::io::Result<()> {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(dir.join("environ"))?;
+            std::fs::write(
+                dir.join("stat"),
+                format!(
+                    "{pid} (probe) {state} 1 {pid} {pid} 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 900 0"
+                ),
+            )?;
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\tprobe\nUid:\t{me}\t{me}\t{me}\t{me}\n"),
+            )
+        };
+        let many = tree(&[(100, LEADER, MARKED)])?;
+        for i in 0..=SETTLE_AT_MOST {
+            exiting(many.path(), 300 + u32::try_from(i)?, "R", 0x40_000C)?;
+        }
+        let beside = tree(&[(100, LEADER, MARKED)])?;
+        exiting(beside.path(), 300, "R", 0x40_000C)?;
+        exiting(beside.path(), 301, "S", 0x40_0000)?;
+        let count = |root: &Path| {
+            let mut waits = 0;
+            let found = tools_with(root, (100, Some(500)), "p/A1", &mut |_| waits += 1);
+            (found, waits)
+        };
+        assert_eq!(
+            (count(many.path()), count(beside.path())),
+            ((Tools::Unknown, 0), (Tools::Unknown, 0))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_zombie_whose_worker_takes_it_over_by_exec_is_never_taken_for_ended()
     -> Result<(), Box<dyn std::error::Error>> {
         // WDF-100, Codex's two phases through the settle seam. Phase one, the listing: the main thread has exited (a
