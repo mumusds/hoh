@@ -407,7 +407,10 @@ fn examine(project: &Path, live: bool) -> Report {
         host,
     };
     let summary = summary(&agents, &runtime, warnings);
-    let probes = log.lock().map(|runs| runs.clone()).unwrap_or_default();
+    let probes = log
+        .lock()
+        .map(|records| records.runs.clone())
+        .unwrap_or_default();
     Report {
         schema_version: "1.0",
         mode: if live { "live" } else { "default" },

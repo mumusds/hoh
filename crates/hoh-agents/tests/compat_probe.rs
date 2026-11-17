@@ -1850,7 +1850,7 @@ fn the_run_log_lists_every_command_a_probe_ran() -> R {
     let mut env = env_for(&dir);
     env.log = Some(log.clone());
     probe(Agent::Codex, &env)?;
-    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let runs = log.lock().map_err(|_| "poisoned")?.runs.clone();
     let argv: Vec<Vec<String>> = runs.iter().map(|r| r.argv.clone()).collect();
     let program = path.display().to_string();
     assert_eq!(
@@ -1927,7 +1927,7 @@ fn a_status_command_is_captured_on_both_streams_and_bounded() -> R {
         hoh_agents::identity::reaped(child)?,
         "the hung command's child {child} is still there"
     );
-    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let runs = log.lock().map_err(|_| "poisoned")?.runs.clone();
     assert_eq!(runs.len(), 2);
     assert_eq!((runs[0].exit_code, runs[0].timed_out), (Some(1), false));
     assert_eq!((runs[1].exit_code, runs[1].timed_out), (None, true));
@@ -1988,7 +1988,7 @@ fn output_held_open_past_the_limit_by_an_escaped_helper_times_out() -> R {
     );
     assert!(took < Duration::from_millis(2400), "{took:?}");
     assert!(exited.exists(), "the launcher did not exit");
-    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let runs = log.lock().map_err(|_| "poisoned")?.runs.clone();
     assert_eq!(runs.len(), 1);
     assert_eq!((runs[0].exit_code, runs[0].timed_out), (None, true));
     Ok(())
@@ -2050,7 +2050,7 @@ fn a_shared_deadline_bounds_commands_run_one_after_another() -> R {
         "{:?}",
         started.elapsed()
     );
-    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let runs = log.lock().map_err(|_| "poisoned")?.runs.clone();
     assert_eq!(
         runs.iter()
             .map(|r| (r.started, r.timed_out))
@@ -2087,7 +2087,7 @@ fn a_busy_launcher_is_not_started_past_the_shared_deadline() -> R {
         took < Duration::from_millis(700),
         "retried past the deadline: {took:?}"
     );
-    let runs = log.lock().map_err(|_| "poisoned")?.clone();
+    let runs = log.lock().map_err(|_| "poisoned")?.runs.clone();
     assert_eq!(runs.iter().map(|r| r.started).collect::<Vec<_>>(), [false]);
     Ok(())
 }
