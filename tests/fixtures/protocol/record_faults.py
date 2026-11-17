@@ -296,7 +296,8 @@ def v_codex_app_503(fs, rc, meta, sent, ctx):
     codex_retried(fs, out, {'responseStreamDisconnected': {'httpStatusCode': None}})
     error = codex_failed_turn(fs, out)
     expect(out, error.get('codexErrorInfo') == 'serverOverloaded', f'codexErrorInfo {error.get("codexErrorInfo")}')
-    expect(out, len(statuses(meta)) >= 6 and set(statuses(meta)) == {503}, f'the fake provider answered {statuses(meta)}')
+    # 30 requests: each of codex's 5 stream retries made 6 (RA-250: pinned as the 429 case pins its 6).
+    expect(out, statuses(meta) == [503] * 30, f'the fake provider answered {len(statuses(meta))} requests {sorted(set(statuses(meta)))}, not 30 503s')
     expect(out, all(g >= 1.9 for g in gaps(meta)), f'requests {gaps(meta)} s apart: Retry-After not waited')
     return out
 

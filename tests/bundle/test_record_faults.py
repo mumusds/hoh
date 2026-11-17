@@ -70,6 +70,13 @@ class Validators(unittest.TestCase):
         fs,meta,sent=load('codex','app-server-fault-429-retry-after')
         other=copy.deepcopy(meta);other['provider']['requests']=other['provider']['requests'][:1]
         self.assertTrue(check('codex','app-server-fault-429-retry-after',fs,other,sent))
+    def test_codex_503_needs_its_thirty_requests(self):
+        # RA-250 (M2T07R-256 review round 3): the recorded 503 case made 30 requests (5 stream retries of 6 each); a
+        # recording that stopped after 6 must not pass as it.
+        fs,meta,sent=load('codex','app-server-fault-503-retry-after')
+        self.assertEqual(check('codex','app-server-fault-503-retry-after',fs,meta,sent),[])
+        six=copy.deepcopy(meta);six['provider']['requests']=six['provider']['requests'][:6]
+        self.assertTrue(any('30' in p for p in check('codex','app-server-fault-503-retry-after',fs,six,sent)))
 
 class FakeProvider(unittest.TestCase):
     def test_answers_its_scenario_in_turn_and_logs_no_key(self):
