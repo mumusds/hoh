@@ -1047,7 +1047,7 @@ fn a_work_turn_starts_with_its_identity_header_and_a_verifier_also_names_its_sou
         }),
         ..Facts::default()
     };
-    let m = super::mandatory(&developer, "developer", "", None, None)?;
+    let m = super::mandatory(&developer, "developer", "", None)?;
     assert!(m.task.starts_with("#### 本次 Attempt"), "{}", m.task);
     for want in [
         "- run_id：R",
@@ -1083,7 +1083,7 @@ fn a_work_turn_starts_with_its_identity_header_and_a_verifier_also_names_its_sou
         }),
         ..Facts::default()
     };
-    let m = super::mandatory(&qa, "qa", "", None, None)?;
+    let m = super::mandatory(&qa, "qa", "", None)?;
     let header = &m.task[..m.task.find("#### 作用域").ok_or("no scope")?];
     for want in [
         "- task_id：V1",
@@ -1102,7 +1102,7 @@ fn a_work_turn_starts_with_its_identity_header_and_a_verifier_also_names_its_sou
 #[test]
 fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R {
     let none = Facts::default();
-    let m = super::mandatory(&none, "developer", "", None, None)?;
+    let m = super::mandatory(&none, "developer", "", None)?;
     assert_eq!(m.goal, "Run 目标：（未给出）");
     assert_eq!(m.project, "spec：尚无 spec");
     assert!(
@@ -1124,13 +1124,7 @@ fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R 
         header: vec![("nonce".to_owned(), "n-1".to_owned())],
         ..Facts::default()
     };
-    let m = super::mandatory(
-        &facts,
-        "commander",
-        "LEAD",
-        Some("/p/.hoh/attempts/A/messages.jsonl"),
-        Some("/p"),
-    )?;
+    let m = super::mandatory(&facts, "commander", "LEAD", Some("/p"))?;
     assert_eq!(
         m.goal,
         "Run 目标：交付 v1\n本次唤醒要回答的问题：唤醒 W（high）"
@@ -1143,11 +1137,13 @@ fn a_turns_mandatory_items_say_what_is_missing_instead_of_leaving_it_out() -> R 
         &"a".repeat(40),
         &"b".repeat(40),
         "- nonce：n-1",
-        "- 输出文件：/p/.hoh/attempts/A/messages.jsonl",
+        "- 决策块：最终消息中最后一个 ```hoh-decisions 块，每行一条 `{\"nonce\", \"message\"}`",
         "- 项目根：/p",
     ] {
         assert!(m.task.contains(want), "{want} missing from {}", m.task);
     }
+    // docs/adr/ADR-032.md decision 6: no output file for a Commander turn.
+    assert!(!m.task.contains("输出文件"), "{}", m.task);
     assert_eq!(m.lead, "LEAD");
     assert!(m.schemas.contains("DecisionPayload"));
     // Its acceptance text stays a value: packed whole, never read as a placeholder.
@@ -1305,7 +1301,7 @@ fn each_built_in_roles_mandatory_items_leave_most_of_the_default_budget() -> R {
         let template = crate::config::builtin_contract(role).ok_or(role)?;
         let m = required(
             template,
-            &super::mandatory(&facts(5), role, "", Some("/p/b"), Some("/p"))?,
+            &super::mandatory(&facts(5), role, "", Some("/p"))?,
         )?;
         assert!(m < CONTEXT_V1.budget_tokens / 4, "{role}: M = {m}");
         // The number of such criteria at which the mandatory items no longer fit.
@@ -1314,7 +1310,7 @@ fn each_built_in_roles_mandatory_items_leave_most_of_the_default_budget() -> R {
             let mid = (lo + hi) / 2;
             let need = required(
                 template,
-                &super::mandatory(&facts(mid), role, "", Some("/p/b"), Some("/p"))?,
+                &super::mandatory(&facts(mid), role, "", Some("/p"))?,
             )?;
             if need > CONTEXT_V1.budget_tokens {
                 hi = mid

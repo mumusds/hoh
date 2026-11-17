@@ -204,13 +204,17 @@ impl Facts {
     }
 }
 
+/// Where a Commander turn gives its decisions, as its wake header says (docs/adr/ADR-032.md decision 6; read by
+/// `supervise::decision_lines`).
+pub const DECISION_BLOCK: &str =
+    "最终消息中最后一个 ```hoh-decisions 块，每行一条 `{\"nonce\", \"message\"}`";
+
 /// The mandatory items of `role`'s turn from `facts`, with `lead` (a first input owed, already rendered) and, for a
-/// Commander turn, the file its answers go to and the project's root.
+/// Commander turn, the project's root.
 pub fn mandatory(
     facts: &Facts,
     role: &str,
     lead: &str,
-    bridge: Option<&str>,
     project: Option<&str>,
 ) -> Result<Mandatory, String> {
     let goal = facts
@@ -288,14 +292,13 @@ pub fn mandatory(
         )),
         None => task.push_str("尚无候选\n"),
     }
-    if !facts.header.is_empty() || bridge.is_some() {
+    if !facts.header.is_empty() {
         task.push_str("\n#### 本次唤醒\n");
         for (key, value) in &facts.header {
             task.push_str(&format!("- {key}：{value}\n"));
         }
-        if let Some(bridge) = bridge {
-            task.push_str(&format!("- 输出文件：{bridge}\n"));
-        }
+        // Its decisions are its final message's last block, never a file (docs/adr/ADR-032.md decision 6).
+        task.push_str(&format!("- 决策块：{DECISION_BLOCK}\n"));
         if let Some(project) = project {
             task.push_str(&format!("- 项目根：{project}\n"));
         }

@@ -663,6 +663,7 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_decisi
         format!("项目根：{}", dir.path().display()),
         "DecisionPayload".to_owned(),
         "```hoh-decisions".to_owned(),
+        format!("决策块：{}", hoh_core::context::DECISION_BLOCK),
     ] {
         assert!(text.contains(&part), "{part}: {text}");
     }

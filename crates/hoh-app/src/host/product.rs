@@ -533,7 +533,7 @@ impl ProductExecutor {
             .map(|_| self.project.display().to_string());
         let deterministic =
             |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
-        let mandatory = context::mandatory(&facts, &work.role, &lead, None, project.as_deref())
+        let mandatory = context::mandatory(&facts, &work.role, &lead, project.as_deref())
             .map_err(deterministic)?;
         let version = hoh_core::objects::resource_bundle_version();
         let mut recorded = context::record(
