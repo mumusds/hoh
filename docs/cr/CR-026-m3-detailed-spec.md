@@ -2,11 +2,11 @@
 
 ID：CR-026
 状态：DRAFT
-批准人：（待定。预期为“CTO 依 CR-003 D1 预授权（独立设计审查会话 …）”；见“是否属于 CR-003 D1”）
-日期：2026-11-17（草稿，M3-T01 的准备稿；M3-T01 领取时按当时的 main 重新核对）
-基线：改受锁文件 `contracts/requirements.json`（M3 的 16 项需求由 outline 细化为 detailed；REQ-018 的配置键表增加 `[assumptions]`）、`contracts/acceptance-scenarios.json`（这 16 项的场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode`、`$defs.RejectionReason`、`$defs.BlockedReason` 补齐 7 个原因码）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M3 实现任务的拆分）；`python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`
+批准人：（待定。预期为“CTO 依 CR-003 D1 预授权（独立设计审查会话 …）”；见“是否属于 CR-003 D1”与“需所有者决定的项”）
+日期：2026-11-17（第 2 稿：设计审查第 1 轮之后，见文末“审查记录”；M3-T01 的准备稿，领取时按当时的 main 重新核对）
+基线：改受锁文件 `contracts/requirements.json`（M3 的 16 项需求由 outline 细化为 detailed；REQ-018 的配置键表增加三项）、`contracts/acceptance-scenarios.json`（这 16 项的场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode`、`$defs.RejectionReason`、`$defs.BlockedReason` 补齐 8 个原因码）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M3 实现任务的拆分）、`config/hoh.example.toml`（三个新键的缺省值，与 REQ-018 的“无配置等于 example”同步）；`python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`
 
-本 CR 是 M3-T01（“细化 M3 需求为 detailed：每项 2–5 条可判定 AC 与场景，写 CR 并 relock 基线”）的准备稿。M3-T01 依赖 V01-T02，尚未领取；本稿不改任何受锁文件，下文的 JSON 片段已在仓库之外的副本上应用并通过 `tools/validate_bundle.py`（见“验证方式”）。依据是 M3 准备清单 `.hoh-dev/evidence/m3-prep/inventory.md`（写于 16ff3e1），已按 main 715e2d0 复核，更正见附录 A。
+本 CR 是 M3-T01（“细化 M3 需求为 detailed：每项 2–5 条可判定 AC 与场景，写 CR 并 relock 基线”）的准备稿。M3-T01 依赖 V01-T02，尚未领取；本稿不改任何受锁文件，下文的 JSON 片段已在仓库之外的副本上应用并通过 `tools/validate_bundle.py` 与 bundle 自检（见“验证方式”）。依据是 M3 准备清单 `.hoh-dev/evidence/m3-prep/inventory.md`（写于 16ff3e1），已按 main 715e2d0 复核，更正见附录 A。
 
 ## 背景
 
@@ -20,24 +20,58 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 
 | ID | 决定 | 写入 |
 |---|---|---|
-| O1 | 只有用户批准规格，HoH 从不代用户批准；无人值守的 Run 停在批准之前 | REQ-008 行为 2、REQ-009 行为 2 与失败模式 3、REQ-030 决定 2、REQ-034 行为 4 |
-| O2 | 无人值守只假设项目配置中列出的默认值；产品方向、范围、非目标一律阻塞 | REQ-030 行为 4 与决定 1；REQ-018 的配置键表加 `[assumptions]` |
-| O3 | 已有仓库：碰到用户未提交的文件先阻塞询问；发现不自动运行项目的构建与测试 | REQ-028 行为 3、4 与决定 1 |
-| O4 | 用户规格是 docs/spec/ 下的 Markdown，固定标题与 id 行；HoH 生成 JSON 索引 | REQ-034 行为 1–3 与决定 1；REQ-029 行为 6 |
-| O5 | Skill 不写进原生 Agent 的用户目录，只注入或写进会话自己的目录 | REQ-046 行为 1、失败模式 3 与决定 1 |
-| O6 | 任何规格修订使全部验收失效，在新的候选上重验 | REQ-033 行为 4、失败模式 2 与决定 1；REQ-032 行为 5 |
+| O1 | 只有用户批准规格，HoH 从不代用户批准；无人值守的 Run 停在批准之前 | REQ-008 行为 1、2 与 AC-008-02、-05；REQ-009 行为 2 与 AC-009-02；REQ-030 决定 2；REQ-034 行为 3、4 |
+| O2 | 无人值守只假设项目配置中列出的默认值；产品方向、范围、非目标一律阻塞 | REQ-030 行为 4 与 AC-030-02；REQ-018 的配置键表加 `[assumptions]`（三类为保留名） |
+| O3 | 已有仓库：碰到用户未提交的文件先阻塞询问；发现不自动运行项目的构建与测试 | REQ-028 行为 3、4 与 AC-028-02、-03 |
+| O4 | 用户规格是 docs/spec/ 下的 Markdown，固定标题与 id 行；HoH 生成 JSON 索引 | REQ-034 行为 1–5 与 AC-034-01；REQ-029 行为 6 |
+| O5 | Skill 不写进原生 Agent 的用户目录，只注入或写进会话自己的目录 | REQ-046 行为 1、失败模式 3 与 AC-046-02 |
+| O6 | 任何规格修订使全部验收失效，在新的候选上重验 | REQ-033 行为 4 与 AC-033-03；REQ-032 行为 5 与 AC-032-03 |
 
 ## 决定
 
 ### 1. 共同约定（16 项共用，各需求的行为里引用）
 
-- **规格根与格式**（O4）：用户项目的规格是 `docs/spec/*.md`；固定一级标题为用户、范围、非目标、决策、开放问题、需求；需求为 `## REQ-<id> <标题>`，验收为 `### AC-<req>-<nn>`，带 given、when、then、check 四个 id 行；决策条目带来源（question_id、input_id 或假设的事件 id），开放问题条目带“阻塞：是/否”。精确语法在 M3-T02 的 ADR 中定，内置模板（REQ-029）给出实例。`docs/spec/index.json` 是生成的 JSON 索引，带“生成，勿改”标记与来源摘要，不是事实源（REQ-034 行为 6）。
-- **规格摘要**：规格根内全部规格文件按路径排序的 `<路径> <sha256>` 行的 sha256，与探测的树摘要同一算法。
-- **已批准修订**：经 ApproveSpec（只由用户，O1）批准、sha256 为该修订规格摘要的 specs 行。只有已批准修订被采用、派发、冻结与验收引用。项目的首个规格经 ApproveSpec 成为修订 1（`spec.changed{cause:"approved"}`），之后的修订经 CR（REQ-033，`spec.changed{cause:"changed", cr_id}`）。受锁的 ApproveSpec 载荷照旧（`spec_sha256`、`decision`、`note`），ProposeSpecChange 照旧（`reason`、`spec_sha256`）。
-- **新事件**（`$defs.Event.kind` 是开放的字符串，不需 CR；名称以 M3 各任务的 ADR 为准，AC 中出现的为定名）：`spec.index_failed`、`spec.generated_drift`、`task.migrated`、`task.replaced`、`readiness.passed`、`run.baseline`、`run.mode_change_pending`、`run.mode_changed`、`input.delivered`、`no_progress`（ADR-025 决定 1 已列为唤醒种类，产生方在 M3-T10）。
+- **规格根与格式**（O4）：用户项目的规格是 `docs/spec/*.md`；固定一级标题为用户、范围、非目标、决策、开放问题、需求；需求为 `## REQ-<id> <标题>`，验收为 `### AC-<req>-<nn>`，带 given、when、then、check 四个 id 行；决策条目带来源（question_id、input_id 或假设的事件 id），开放问题条目带“阻塞：是/否”。精确语法在 M3-T02 的 ADR 中定，内置模板（REQ-029）给出实例。
+- **冻结形式与规格摘要**（CR26D-02）：多份 Markdown 的冻结形式是 HoH 生成并提交的 `docs/spec/index.json`：规范 JSON（UTF-8、LF、键按字典序、两空格缩进、末尾一个换行），含 `generated` 标记、`files`（每份 Markdown 的路径与 sha256，按路径排序）与 `requirements`（与 `contracts/requirements.json` 的需求对象同形）。**规格摘要就是 index.json 字节的 sha256**：任一 Markdown 文件的任一字节变化都改变它。`specs.sha256`、ApproveSpec 与 ProposeSpecChange 的 `spec_sha256`、`candidate.spec_sha256` 都是这个值；`candidate.spec` 是指向 index.json 的单个 FileRef；traceability 从它的 `requirements` 读需求。冻结时 HoH 从该提交的 Markdown 重新生成索引，要求与提交中的 index.json 逐字节相同。受锁的候选、验证与追踪契约因此都不需要改：`contracts/candidate.schema.json` 的 `spec` 本就是单个 FileRef，`scripts/product/traceability.py` 本就读 `spec.path` 的 `requirements`。
+- **已批准修订**：经 ApproveSpec（只由用户，O1）批准、sha256 为该修订规格摘要的 specs 行；specs 只有已批准修订（M2T13D-59，ADR-031 决定 1，所有者 2026-11-16 的 Q1(a)），只有已批准修订被采用、派发、冻结与验收引用。项目的首个规格经 ApproveSpec 成为修订 1（`spec.changed{cause:"approved"}`），之后的修订经 CR（REQ-033，`spec.changed{cause:"changed", cr_id}`）。受锁的 ApproveSpec 载荷照旧（`spec_sha256`、`decision`、`note`），ProposeSpecChange 照旧（`reason`、`spec_sha256`）。
+- **只由用户批准**（O1，CR26D-06）：ApproveSpec 只接受来自用户客户端的请求；host 按连接对端的进程身份判定，Attempt 的进程或其子孙（带 Attempt 标记或在 Attempt 的 cgroup 中）提交的以 403 SPEC_APPROVAL_NOT_USER 拒绝（REQ-008 行为 1）。Commander 的 DecisionPayload 没有批准一类，它的输出永远不产生修订。剩余风险（同用户进程脱掉标记又离开 cgroup）与 CR-024 的 R1–R7 一样写入 docs/12。
+- **新事件**（`$defs.Event.kind` 是开放的字符串，不需 CR；名称以 M3 各任务的 ADR 为准，AC 中出现的为定名）：`spec.index_failed`、`spec.generated_drift`、`spec.drafting`、`plan.write_violation`、`task.migrated`、`task.replaced`、`readiness.passed`、`run.baseline`、`run.mode_change_pending`、`run.mode_changed`、`input.delivered`、`no_progress`（ADR-025 决定 1 已列为唤醒种类，产生方在 M3-T10）。
 - **check**：AC 只用 v1 档已运行、且由 M3 实现任务的祖先交付的检查：unit、integration、tui-pty、recovery、deployment、adapter-live、traceability（M0-T03、M1-T03、M1-T08、M2-T05、M2-T10、M2-T14 交付）。没有 AC 用 web-e2e、plugin-live、soak（它们由 M5–M7 的任务交付）。
+- **可配置性照旧兑现**（CR26D-10、-56）：docs/03 的“Shift+Tab 循环（配置可改）”与 docs/06 的“MOA 最多两轮……为默认可调上限”都保留：REQ-018 的键表增加 `[ui] mode_cycle` 与 `[supervision] max_discussion_rounds`，AC-007-01 与 AC-023-03 各覆盖一个非缺省值。
 
-### 2. 补齐的原因码（`contracts/protocol.schema.json`，CR-003 D1 第 1 条）
+### 2. 首次批准之前的起草（C22，设计；CR26D-01、CR26D-50）
+
+**要解决的**：一个还没有已批准规格的项目里，Plan 的起草在哪里发生——由谁起草、怎样被监督、派发、完成、取消与恢复，第一次批准时身份怎样移动——同时守住 StartRun 的 `runtime:no_spec`（所有者 2026-11-16 的 Q1(a)）、O1（只有用户批准）、M2T13D-59（specs 只有已批准修订）。
+
+**受锁与已确认的约束**（715e2d0）：
+
+- `contracts/sql/001_initial.sql`：`specs` 没有批准列，`revision>0`、`UNIQUE(project_id, revision)`；`runs.spec_id` 可空（受锁注释：“NULL until SPECIFYING produces the first spec revision”）；`tasks.spec_id NOT NULL`、`attempts.task_id NOT NULL`；`change_requests.base_spec_id NOT NULL`。
+- 采用取最新一行（persistence/adoption.rs:32，`ORDER BY revision DESC LIMIT 1`），所以任何 specs 行都会被当成已批准规格采用——第 1 稿的零摘要“起草锚”因此撤回。
+- 没有规格的 Run 不被监督：监督步骤把到期的触发器延后为 `supervisor.deferred{NO_SPEC}`（persistence/supervise.rs:913-929），唤醒分配只选 `spec_id IS NOT NULL` 的 Run（persistence/wakes.rs:849）；监督 Task 也要 `tasks.spec_id`。调度轮只在 RUNNING、VERIFYING 派发（persistence/rounds.rs:40），`plan::check` 拒绝未知 REQ；写 Task 的完成会冻结候选并要求非空 AC（host/completion.rs、persistence/completion.rs）。doctor 的 `scratch_task` 只用于一个空的临时库（persistence/mod.rs:1811-1814，`NotScratch`），不是项目库里的先例。
+
+**备选**：
+
+| 做法 | 怎样运行 | 改的受锁文本 | 改所有者已确认的决定吗 |
+|---|---|---|---|
+| (a) 起草 Task 的 `tasks.spec_id` 可空 | 迁移 002 重建 tasks 表；起草 Task 与它的监督 Task 不带规格；监督、分配、完成、冻结的每个读者都要处理空值；首次批准后起草 Task 改指修订 1 | `contracts/sql/001_initial.sql`（新迁移）与它的语义：没有规格的 Task | 不改 Q1(a) 与 M2T13D-59，但改受锁 SQL 的语义 → **需要所有者** |
+| (b) 起草不是 Task（例如 Commander 的监督 turn） | 不可行：runner 的每个 Attempt 都要 Task（`attempts.task_id NOT NULL`），监督 turn 的 Task 同样要 `spec_id`；绕过 runner 直接起 Agent 则失去租约、取消阶梯、终结证明与 kill -9 恢复（REQ-041、REQ-043） | — | — |
+| (c) 不经 Agent 的模板骨架，用户批准为修订 1（**推荐**） | 见下 | 无 | 不改：no_spec 照旧；骨架是用户亲自批准的修订，不是草稿行 |
+| (d) 首个规格由用户自己写（HoH 在首次批准前不做任何起草） | 用户手写 docs/spec/ 后批准，Plan 只在有修订之后起草 | 无 | 不改，但空项目里 Plan 不能“生成规格”（CONTRACT 第 4 条），是范围缩减 → 需要所有者 |
+
+**推荐 (c)，端到端**：
+
+1. **没有已批准规格**：StartRun（任何模式）照旧以 `runtime:no_spec` 阻塞（BLOCKED NEED_DECISION），`runs.spec_id` 为空，不派发任何 Agent turn；`-p` 以 3 退出（Q1(a) 不变）。no_spec 问题在 `adopt` 之外另有选项 `draft`。
+2. **draft（不经 Agent）**：用户以 `draft` 答复（TUI，或 `hoh -p draft --resume <run_id>`），Runtime 在 host 内确定性地把内置规格模板（REQ-029）以 Run 的目标文本实例化到 docs/spec/（目标写入“范围”，其余各节写“待起草”，没有 REQ）、生成 index.json，必要时本地 `git init`，提交只含 docs/spec/、docs/ 与 .hoh/ 的路径（REQ-028），然后以问题请用户批准这一骨架。此时 specs 仍没有行，另一次 StartRun 仍阻塞在 no_spec。
+3. **第一次批准**：用户的 ApproveSpec（只有用户，O1）使骨架成为修订 1（`spec.changed{cause:"approved"}`）；用户以 `adopt` 答复，Run 采用修订 1、`runs.spec_id` 为它，离开 BLOCKED 回到 SPECIFYING（resume_state）。修订 1 有已批准规格的一切性质（可被监督、可被引用），但没有 REQ，所以不可能有实施派发（readiness 无从通过）。
+4. **起草**：在 SPECIFYING 且模式为 PLAN 或 AUTO 时，Runtime 建起草 Task：职位 cto、writer、`spec_id` 为当前已批准修订、不引用 REQ（不经 `create_tasks`，`plan::check` 不涉及），以 `spec.drafting{task_id}` 标记；它按 Runtime 规则类在 SPECIFYING 中派发（与 ADR-025 决定 3 的监督唤醒同类，不经调度轮）；Commander 照常监督（Run 有 spec_id，监督不再延后）。
+5. **完成**：起草 Task 的完成不冻结候选，不要求 AC；Runtime 以 Git 核对它的写集（REQ-008 行为 4），在写集内时以工作树中的规格提出 CR（change_requests PROPOSED，base 为当前已批准修订，REQ-033），并以问题请用户批准；越界时写 `plan.write_violation`，不提出 CR。
+6. **取消、租约与恢复**：起草 Task 是普通的写 Task：写者租约、取消阶梯（REQ-043）、工作区记录（REQ-019 行为 6）、kill -9 之后的 reconcile（REQ-041）都照旧；它的终态之后，若 Run 仍在起草中而没有待批的 CR，Runtime 再建一个（以 `spec.drafting` 事件按身份去重）。
+7. **后续批准**：用户批准 CR 得到修订 2（`spec.changed{cause:"changed", cr_id}`），Run 的 spec_id 改为修订 2（REQ-033），之后是独立规格审查、readiness 与任务 DAG（REQ-031）。重启前后 specs、change_requests、runs 与 tasks 都持久，无需补写。
+8. **无人值守**：第 1 步即以 3 退出；有已批准修订而需要补规格时，第 5 步的 CR 待用户批准，Run 以 NEED_DECISION 停下，`-p` 以 3 退出（AC-009-02）。
+
+(c) 与所有者在 Q1 否决的 (b)（“host 为每个 Run 造一个临时 spec”）不同：(b) 是 host 不经用户就为每个 Run 生成并采用的规格；(c) 的骨架是项目级的文件，只在用户以 `draft` 要求之后生成，并且只有用户的 ApproveSpec 才使它成为修订，`-p` 照旧停在 no_spec。AC-008-02 端到端观察这条路径（含 no_spec、骨架未批准时 specs 没有行、批准、起草、CR、重启、第二次批准），AC-008-05 观察 O1 的反例与正对照，AC-028-04 观察首个提交的路径边界，AC-029-03 观察安装包离线实例化。
+
+### 3. 补齐的原因码（`contracts/protocol.schema.json`，CR-003 D1 第 1 条）
 
 追加到各自的 `enum` 末尾（旧：无），`$defs.BlockedReason.description` 末尾追加一句（旧：无）：
 
@@ -46,6 +80,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "ErrorCode": [
     "SPEC_CONFLICT",
     "SPEC_INVALID",
+    "SPEC_APPROVAL_NOT_USER",
     "PROMPT_VARIABLE_MISSING",
     "PROMPT_TOO_LONG"
   ],
@@ -66,21 +101,78 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 
 | 码 | 枚举 | 用处 |
 |---|---|---|
-| SPEC_CONFLICT | ErrorCode（409） | ApproveSpec 的摘要与工作树不同，或 CR 的 base 不是当前已批准修订（REQ-034、REQ-033） |
-| SPEC_INVALID | ErrorCode（422） | 送批规格无法解析，或标为用户决定的条目没有来源（REQ-034、REQ-030） |
+| SPEC_CONFLICT | ErrorCode（409） | ApproveSpec 的摘要与重新生成的索引不同，或 CR 的 base 不是当前已批准修订（REQ-034、REQ-033） |
+| SPEC_INVALID | ErrorCode（422） | 提议或送批的规格无法解析、index.json 与 Markdown 不一致（冻结时），或标为用户决定的条目没有来源（REQ-034、REQ-030） |
+| SPEC_APPROVAL_NOT_USER | ErrorCode（403） | ApproveSpec 来自 Attempt 的进程或其子孙（REQ-008，O1） |
 | PROMPT_VARIABLE_MISSING | ErrorCode | 模板引用白名单之外的变量，Attempt 不启动（REQ-045） |
 | PROMPT_TOO_LONG | ErrorCode | 职位契约覆盖超过 32 KiB，保存即拒（REQ-045） |
 | CONSULT_CYCLE | RejectionReason | 角色间咨询成环（REQ-023） |
-| DISCUSSION_LIMIT | RejectionReason | 第三轮讨论（REQ-023） |
+| DISCUSSION_LIMIT | RejectionReason | 超过讨论轮数上限（REQ-023） |
 | READINESS_NOT_MET | BlockedReason（只用于 Task） | Task 的需求或依赖闭包不就绪（REQ-031、REQ-009） |
 
-### 3. REQ-018 的配置键表（O2）
+### 4. REQ-018 的配置键表
 
-`contracts/requirements.json` 的 REQ-018，`decisions` 末尾追加一条（旧：无；REQ-018 的“完整配置键表（未知键一律拒绝）”由 CR-003、CR-007 给出，本条只增加一张表）：
+`contracts/requirements.json` 的 REQ-018，`decisions` 末尾追加三条（旧：无；REQ-018 的“完整配置键表（未知键一律拒绝）”由 CR-003、CR-007 给出，本条只增加键，不改已有键与缺省值；`project.document_profile` 的缺省仍为 full）。`config/hoh.example.toml` 随之加入这三项的缺省值（空的 `[assumptions]`、`mode_cycle`、`max_discussion_rounds = 2`），使 AC-018-01 的“无配置等于 example”照旧成立：
 
-> （CR-026）[assumptions] 表：键为决定类名（ASCII 小写字母、数字与下划线），值为字符串或字符串数组，是无人值守时允许假设的默认值（REQ-030，所有者 2026-11-17 的决定 O2）；表中键的个数与名称由项目自定，表外的未知键照旧拒绝。
+> （CR-026）[assumptions] 表：键为决定类名（ASCII 小写字母、数字与下划线），值为字符串或字符串数组，是无人值守时允许假设的默认值（REQ-030，所有者 2026-11-17 的决定 O2）；product_direction、scope、non_goals 为保留名，出现即配置被拒（这三类永不假设）；example 中为空表，空表不产生任何假设；表外的未知键照旧拒绝。
+>
+> （CR-026）[ui] mode_cycle：Shift+Tab 循环的模式顺序（docs/03 的“配置可改”），缺省 ["PLAN", "BUILD", "AUTO"]，合法值为 2 或 3 个互不相同的 PLAN、BUILD、AUTO 组成的数组，其他值使配置被拒（REQ-007）。
+>
+> （CR-026）[supervision] max_discussion_rounds：同一争议的意见轮数上限（docs/06 的“默认可调上限”），缺省 2，合法值为 1–5 的整数，其他值使配置被拒（REQ-023）。
 
-### 4. 各需求的细化
+`config/hoh.example.toml` 的三处改动（不在锁内）：
+
+- 旧：
+
+```toml
+[supervision]
+policy = "balanced"
+```
+
+  新：
+
+```toml
+[supervision]
+policy = "balanced"
+# Opinion rounds on one dispute before the Commander decides (REQ-023; docs/06: default 2, adjustable 1-5).
+max_discussion_rounds = 2
+```
+
+- 旧：
+
+```toml
+[ui]
+view = "workspace"
+```
+
+  新：
+
+```toml
+[ui]
+view = "workspace"
+# Shift+Tab cycles these modes in this order (REQ-007; 2 or 3 distinct of PLAN, BUILD, AUTO).
+mode_cycle = ["PLAN", "BUILD", "AUTO"]
+```
+
+- 旧：
+
+```toml
+[web]
+```
+
+  新：
+
+```toml
+# Defaults an unattended run may assume (REQ-030, O2): decision class = value. product_direction, scope and
+# non_goals are never assumed and are refused here. Empty: nothing is assumed.
+[assumptions]
+
+[web]
+```
+
+
+
+### 5. 各需求的细化
 
 每项给出替换后的整个需求对象与它的全部场景。AC 的 id 与 TEST 的 id 按 validate_bundle 的规则依次编号；每项原有的 AC-xxx-01 保留 id、改写为可判定的内容（原文的覆盖关系见“不变的部分”）。
 
@@ -104,18 +196,18 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "summary": "文件是语义事实源，DB是索引/状态；冲突可检测；生成页不产生第二权威源",
   "behavior": [
     "用户项目的规格是 Git 工作树中规格根 docs/spec/ 下的 Markdown 文件（O4）：固定一级标题（用户、范围、非目标、决策、开放问题、需求），需求为“## REQ-<id> <标题>”，验收为“### AC-<req>-<nn>”并带 given、when、then、check 四个 id 行；精确语法由 M3-T02 的 ADR 规定，HoH 内置模板给出（REQ-029）。",
-    "规格摘要是规格根内全部规格文件（docs/spec/*.md，不含生成的索引）按路径排序的“<路径> <sha256>”行的 sha256；specs 行的 sha256 恒为它所在修订的规格摘要。",
-    "DB 只是索引与状态：已批准修订的 requirements、acceptance_criteria 行由 HoH 从该修订的规格文件解析写入；运行时只读索引，任何派发、冻结与验收都引用 specs 行与其摘要，不读工作树中尚未批准的文件。",
-    "修订只经批准产生（REQ-008，O1）：已批准修订是经 ApproveSpec 批准、sha256 为该修订规格摘要的 specs 行，只有已批准修订被采用、派发、冻结与验收引用；ApproveSpec 的 spec_sha256 必须等于提交时工作树的规格摘要，不等即冲突，什么也不写。",
-    "索引在批准时从规格文件构建；文件无法解析时批准返回 422 SPEC_INVALID，索引构建失败，保留上一已批准修订的索引与快照，写 spec.index_failed{path, line, error}，派发依据仍是上一已批准修订，禁止基于半更新的索引派发；修好并重新批准后重建。",
-    "生成页（docs/spec/index.json 等由规格派生的文件）带“生成，勿改”标记与来源规格摘要；它们不是事实源，任何读取以规格文件为准；生成时发现生成页被人工修改，写 spec.generated_drift{path} 并按规格重新生成。",
-    "冻结与验证从 specs 行对应的规格文件取规格，替换 M2 的约定路径 contracts/requirements.json（ADR-028 决定 4，CR-018）。"
+    "规格的冻结形式是生成的规格索引 docs/spec/index.json（随规格一起提交、被 Git 跟踪）：由 HoH 从规格根的 Markdown 文件确定性生成的规范 JSON（UTF-8、LF、键按字典序、两空格缩进、末尾一个换行），含 generated 标记、files（每份 Markdown 文件的路径与 sha256，按路径排序）与 requirements（与 contracts/requirements.json 中需求对象同形的需求与验收）。规格摘要就是这个文件字节的 sha256；任一 Markdown 文件的任一字节变化都改变 files 中的摘要，从而改变规格摘要。",
+    "已批准修订是经 ApproveSpec 批准、sha256 为该修订规格摘要的 specs 行；specs 只有已批准修订（M2T13D-59，ADR-031 决定 1），只有已批准修订被采用、派发、冻结与验收引用。DB 只是索引与状态：已批准修订的 requirements、acceptance_criteria 行由 HoH 从该修订的索引写入。",
+    "ApproveSpec 的 spec_sha256 必须等于 HoH 在提交时从工作树重新生成的索引的 sha256，且工作树中已跟踪的 index.json 与之逐字节相同；不等即冲突（SPEC_CONFLICT），什么也不写。",
+    "冻结与验证以 index.json 为候选的 spec 文件（candidate.spec 为单个 FileRef，candidate.spec_sha256 为它的 sha256）：冻结时 HoH 从该提交的 Markdown 重新生成索引并要求与提交中的 index.json 逐字节相同，否则拒绝冻结（SPEC_INVALID）；traceability 从它的 requirements 读需求。它替换 M2 的约定路径 contracts/requirements.json（ADR-028 决定 4，CR-018）。",
+    "索引在提议与批准时构建；Markdown 无法解析时返回 422 SPEC_INVALID 并写 spec.index_failed{path, line, error}，不写 change_requests 也不写新修订，派发依据仍是上一已批准修订，禁止基于半更新的索引派发。",
+    "index.json 等生成页带“生成，勿改”标记与来源摘要，不是事实源（Markdown 才是）；生成时发现它被人工修改，写 spec.generated_drift{path} 并按 Markdown 重新生成。"
   ],
   "failure_modes": [
-    "ApproveSpec 的 spec_sha256 与提交时工作树的规格摘要不同时，返回 409 SPEC_CONFLICT，details 含 expected 与 actual 两个摘要，specs、requirements、acceptance_criteria 与 runs 都不变。",
-    "规格文件无法解析时，索引不变（仍为上一已批准修订），写 spec.index_failed，不派发依据未批准内容的任务。",
-    "生成页被人工修改时，规格与索引不变，下一次生成写 spec.generated_drift 并覆盖生成页。",
-    "规格根不存在或为空时，项目视为没有规格（StartRun 以 runtime:no_spec 阻塞，ADR-031 决定 1），不读任何约定路径。"
+    "ApproveSpec 的 spec_sha256 与重新生成的索引不同，或已跟踪的 index.json 与之不同，返回 409 SPEC_CONFLICT，details 含 expected 与 actual 两个摘要，specs、requirements、acceptance_criteria 与 runs 都不变。",
+    "Markdown 无法解析时，索引不变（仍为上一已批准修订），写 spec.index_failed，不派发依据未批准内容的任务。",
+    "提交中的 index.json 与其 Markdown 不一致时拒绝冻结（SPEC_INVALID），没有候选。",
+    "规格根不存在或没有已批准修订时，项目视为没有规格（StartRun 以 runtime:no_spec 阻塞，runs.spec_id 为空，ADR-031 决定 1），不读任何约定路径。"
   ],
   "doc_refs": [
     "docs/05-data-api.md",
@@ -123,42 +215,44 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "docs/15-prompts-skills-memory.md",
     "docs/adr/ADR-028.md",
     "docs/adr/ADR-031.md",
+    "contracts/candidate.schema.json",
     "contracts/sql/001_initial.sql"
   ],
   "acceptance": [
     {
       "id": "AC-034-01",
-      "given": "夹具项目 docs/spec/ 下两份规格文件共 3 条 REQ、7 条 AC，提交于 C1；用户以 ApproveSpec{spec_sha256=该规格摘要, decision:APPROVE_ONLY} 批准",
-      "when": "批准后冻结一个候选",
-      "then": "specs 中有 revision=1 的已批准修订，sha256 等于按“<路径> <sha256>”行计算的规格摘要；requirements 3 行、acceptance_criteria 7 行且 id 与文件一致；candidate.frozen 引用该 spec_id 与摘要；冻结读取的规格路径在 docs/spec/ 下，进程未打开 contracts/requirements.json",
+      "given": "夹具项目 docs/spec/ 下两份 Markdown 规格共 3 条 REQ、7 条 AC，与 HoH 生成的 docs/spec/index.json 一起提交于 C1；项目尚无已批准修订",
+      "when": "用户以 ApproveSpec{spec_sha256=index.json 的 sha256, decision:APPROVE_ONLY} 批准，随后冻结一个候选",
+      "then": "specs 中有 revision=1 的已批准修订，sha256 等于 index.json 字节的 sha256，index.json 的 files 列出两份 Markdown 的路径与 sha256；requirements 3 行、acceptance_criteria 7 行且 id 与文件一致；candidate.spec 为 {path:docs/spec/index.json, sha256} 且 candidate.spec_sha256 与之相同；冻结进程未打开 contracts/requirements.json",
       "test_id": "TEST-034-01"
     },
     {
       "id": "AC-034-02",
-      "given": "已批准修订 1（摘要 S1）；用户把工作树的规格改为摘要 S2，未提交批准",
+      "given": "已批准修订 1（摘要 S1）；用户把一份 Markdown 改动后重新生成索引（摘要 S2），未提出变更",
       "when": "以 ApproveSpec{spec_sha256=S1} 提交批准",
       "then": "返回 409，code=SPEC_CONFLICT，details 含 expected=S1 与 actual=S2；specs、requirements、acceptance_criteria 与 runs 行逐值不变；工作树文件不变",
       "test_id": "TEST-034-02"
     },
     {
       "id": "AC-034-03",
-      "given": "已批准修订 1 的 Run R 处于 RUNNING、有 READY 的 Task；用户把一份规格文件改坏（AC 缺 then 行）后批准",
-      "when": "调度轮再运行三轮，随后修好文件并再次批准",
-      "then": "坏文件的批准返回 422 SPEC_INVALID、写 spec.index_failed{path, line, error}，没有新的已批准修订，三轮内派发依据仍是修订 1；修好并批准后有修订 2 的已批准修订与重建的索引",
+      "given": "已批准修订 1 的 Run R 处于 RUNNING、有 READY 的 Task；用户把一份规格文件改坏（AC 缺 then 行）",
+      "when": "以 ProposeSpecChange 提议，调度轮再运行三轮；随后修好文件，经 ProposeSpecChange 与 ApproveSpec 批准",
+      "then": "坏文件的提议返回 422 SPEC_INVALID、写 spec.index_failed{path, line, error}，没有 change_requests 行与新的已批准修订，三轮内派发依据仍是修订 1；修好后经 CR 得到修订 2 的已批准修订与重建的索引",
       "test_id": "TEST-034-03"
     },
     {
       "id": "AC-034-04",
-      "given": "已批准修订 1，HoH 生成了 docs/spec/index.json（含“生成，勿改”标记与来源摘要）",
-      "when": "用户手工改 index.json 中一条 AC 的文字，随后触发生成",
-      "then": "specs、requirements、acceptance_criteria 不变；生成时写 spec.generated_drift{path}，index.json 恢复为按规格生成的内容并带来源摘要",
+      "given": "已批准修订 1，已跟踪的 docs/spec/index.json 带“生成，勿改”标记与来源摘要",
+      "when": "用户手工改 index.json 中一条 AC 的文字并提交，随后先冻结一个候选、再触发生成",
+      "then": "冻结被拒（SPEC_INVALID，details 指出 index.json 与 Markdown 不一致），没有候选；生成时写 spec.generated_drift{path}，index.json 恢复为按 Markdown 生成的内容；specs、requirements、acceptance_criteria 不变",
       "test_id": "TEST-034-04"
     }
   ],
   "decisions": [
     "规格格式与位置取所有者 2026-11-17 的决定 O4：Markdown 放 docs/spec/，固定标题与 id 行，HoH 生成 JSON 索引（CR-026）。",
-    "冲突以新码 SPEC_CONFLICT（409）报告，不复用 CONFLICT：后者指命令 id 冲突，含义不同（CR-026，C1）。",
-    "生成页漂移时以规格为准覆盖并记录，不尝试合并人工修改（CR-026）。"
+    "冻结形式取生成的 index.json：多份 Markdown 在候选中由一个 FileRef 表示，候选、验证与追踪的受锁契约都不需要改（candidate.schema.json 的 spec 仍是单个 FileRef；索引的 requirements 与 contracts/requirements.json 同形）（CR-026，CR26D-02）。",
+    "冲突以新码 SPEC_CONFLICT（409）报告，不复用 CONFLICT：后者指命令 id 冲突（CR-026，C1）。",
+    "生成页漂移时以 Markdown 为准覆盖并记录，不尝试合并人工修改（CR-026）。"
   ]
 }
 ```
@@ -172,21 +266,23 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-034",
     "acceptance_id": "AC-034-01",
     "check_id": "integration",
-    "fixture": "临时 git 项目（docs/spec/ 两份规格文件）+ 产品 host + ApproveSpec + 冻结",
+    "fixture": "临时 git 项目（docs/spec/ 两份 Markdown 与生成的 index.json）+ 产品 host + ApproveSpec + 冻结",
     "steps": [
-      "提交规格文件",
-      "ApproveSpec{spec_sha256=规格摘要, decision:APPROVE_ONLY}",
+      "提交规格文件与索引",
+      "ApproveSpec{spec_sha256=索引摘要, decision:APPROVE_ONLY}",
       "冻结候选",
       "记录冻结进程打开的文件"
     ],
     "pass_criteria": [
-      "specs 1 行且 sha256 等于独立计算的规格摘要",
-      "requirements 3 行、acceptance_criteria 7 行，id 与文件一致",
-      "candidate.frozen 的 spec 引用为该行",
+      "specs 1 行且 sha256 等于 index.json 的 sha256",
+      "index.json 的 files 列出两份 Markdown",
+      "requirements 3 行、acceptance_criteria 7 行",
+      "candidate.spec 与 spec_sha256 指向 index.json",
       "未打开 contracts/requirements.json"
     ],
     "observables": [
       "specs/requirements/acceptance_criteria 导出",
+      "index.json 内容",
       "candidate.frozen 载荷",
       "冻结进程的文件访问记录",
       "判定结果"
@@ -199,7 +295,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "check_id": "integration",
     "fixture": "临时 git 项目 + 产品 host，已批准修订 1",
     "steps": [
-      "改工作树规格为摘要 S2",
+      "改一份 Markdown 并重新生成索引",
       "ApproveSpec{spec_sha256=S1}"
     ],
     "pass_criteria": [
@@ -220,20 +316,21 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "check_id": "integration",
     "fixture": "临时 git 项目 + 产品 host + FakeAgent，Run R RUNNING、Task READY",
     "steps": [
-      "改坏一份规格文件并批准",
+      "改坏一份规格文件并 ProposeSpecChange",
       "运行三轮调度",
-      "修好并再次批准"
+      "修好并经 CR 批准"
     ],
     "pass_criteria": [
-      "批准返回 422 SPEC_INVALID",
+      "提议返回 422 SPEC_INVALID",
       "spec.index_failed 一条且载荷含 path、line、error",
-      "坏文件批准后没有新的已批准修订",
-      "三轮派发依据的 spec_id 为修订 1",
+      "无 change_requests 行与新修订",
+      "三轮派发依据为修订 1",
       "修好后修订 2 与新索引"
     ],
     "observables": [
+      "HTTP 状态与错误体",
       "events导出",
-      "specs 与索引行",
+      "specs 与 change_requests 行",
       "调度轮派发记录",
       "判定结果"
     ]
@@ -243,18 +340,20 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-034",
     "acceptance_id": "AC-034-04",
     "check_id": "unit",
-    "fixture": "规格生成器 + 临时目录",
+    "fixture": "规格生成器与冻结校验 + 临时 git 项目",
     "steps": [
-      "按修订 1 生成 index.json",
-      "手工改一条 AC 文字",
-      "再次生成"
+      "手工改 index.json 并提交",
+      "冻结",
+      "生成"
     ],
     "pass_criteria": [
-      "规格与索引不变",
+      "冻结被拒为 SPEC_INVALID 且无候选",
       "spec.generated_drift 一条",
-      "index.json 恢复且带来源摘要与标记"
+      "index.json 恢复并带来源摘要与标记",
+      "三张表不变"
     ],
     "observables": [
+      "冻结结果",
       "生成文件内容",
       "漂移诊断",
       "判定结果"
@@ -282,17 +381,18 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "spec_maturity": "detailed",
   "summary": "生成 CR、revision、影响闭包；受影响验收过期，不静默沿用旧PASS",
   "behavior": [
-    "规格变更都走 CR：ProposeSpecChange（或 CHANGE 输入，REQ-017）以当前已批准修订为 base，写一条 change_requests 行（PROPOSED），reason 为提议理由，impact_json 列出影响闭包；批准之前规格、Run 的 spec_id 与任务都不变。",
+    "规格变更都走 CR：ProposeSpecChange（或 CHANGE 输入、或起草 Task 的完成，见 REQ-008）以当前已批准修订为 base，写一条 change_requests 行（PROPOSED），reason 为提议理由，impact_json 列出影响闭包；批准之前规格、Run 的 spec_id 与任务都不变。",
     "影响闭包按显式映射计算：被改动的 REQ（增删改）→ 其 AC → 其 TEST/check → 以 task_requirements 关联的 Task；不按文件路径猜测（C2）。",
     "批准（ApproveSpec，只由用户，O1）写新修订（revision+1）、CR 为 APPLIED、result_spec_id 指向新行，写 spec.changed{cause:\"changed\", from, to, cr_id}；REJECT 把 CR 置为 REJECTED，什么也不改。",
-    "任何修订都使该 Run 全部验收结果失效（O6）：新修订下没有任何 accepted，直到在新冻结的候选上重新验收；旧结果保留为历史，显示为 STALE，不计入当前进度与门禁。",
-    "验证进行中规格变化时，验证中的候选写 candidate.stale{candidate_id, reason:\"spec_changed\"}，其轮次以 superseded 关闭，验证 Task 取消，独立报告翻转为 STALE（REQ-053 行为 7，ADR-028 决定 11）。",
+    "任何修订都使该 Run 全部验收结果失效（O6）：新修订下没有任何 accepted，直到在新冻结的候选上重新验收；旧结果保留为历史，显示为 STALE，不计入当前进度与完成门禁。规格摘要是 index.json 的 sha256（REQ-034），任一 Markdown 文件的任一字节变化都产生新修订与新摘要。",
+    "验证进行中规格变化时分两步：批准事务内，验证中的候选写 candidate.stale{candidate_id, reason:\"spec_changed\"}、它的独立报告翻转为 STALE，并对其验证 Attempt 请求取消（cancel_requested）；轮次只在这些验证进程（含其 run-check 子进程）经取消阶梯证明已结束之后，以 superseded 关闭恰好一次（ADR-028 决定 11，closing.rs 的关轮规则）。取消之后到达的验证输出只记录为迟到，不计入任何结果；host 在其间崩溃时，重启的 reconcile 先证明进程已结束，再恰好一次关轮。",
     "影响闭包内、以 SPEC_MISMATCH 阻塞的写 Task，批准后迁移：仍有对应 REQ 的，task_requirements 改映射到新修订的 REQ 并写 task.migrated；对应 REQ 被删除的，Task 取消、由 Commander 计划的替代 Task 承接并写 task.replaced{from, to}。任何 Task 都不再在旧修订下派发。"
   ],
   "failure_modes": [
     "批准前，规格、runs.spec_id、tasks 与 acceptance_results 不变。",
     "以修订 n 的证据判修订 n+1 的 AC 时，投影与完成门禁（EVIDENCE_GATE_UNMET）都不计为 accepted，显示 STALE；已验收计数的分母随修订变化并显示 spec revision。",
     "CR 的 base 不是当前已批准修订时（期间已有别的批准），ApproveSpec 返回 409 SPEC_CONFLICT，CR 保持 PROPOSED。",
+    "验证进程尚未证明结束时轮次不关闭；它们的迟到输出不改变任何验收结果。",
     "被删 REQ 的写 Task 没有替代时，它保持 CANCELLED，不在旧修订下重新派发。"
   ],
   "doc_refs": [
@@ -301,6 +401,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "docs/06-orchestration.md",
     "docs/03-ux.md",
     "docs/adr/ADR-028.md",
+    "docs/adr/ADR-021.md",
     "docs/10-acceptance.md",
     "contracts/sql/001_initial.sql"
   ],
@@ -314,16 +415,16 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-033-02",
-      "given": "Run R 的候选 C 在修订 1 下 VERIFYING，QA 与 Review 的验证 Task 运行中",
-      "when": "批准修订 2",
-      "then": "同一事务写 candidate.stale{candidate_id:C, reason:\"spec_changed\"}，C 的轮次以 superseded 关闭，两个验证 Task 为 CANCELLED，C 的独立报告为 STALE；修订 2 下 accepted AC 数为 0",
+      "given": "Run R 的候选 C 在修订 1 下 VERIFYING：QA 的验证 Attempt 正在跑一个需时 60 s 的 run-check，Review 的验证 Attempt 正在运行",
+      "when": "批准修订 2；QA 的假 Agent 在取消之后仍写出一份 PASS 报告；再在另一次运行中，于批准提交之后、验证进程结束之前 kill -9 host 并重启",
+      "then": "批准事务内写 candidate.stale{candidate_id:C, reason:\"spec_changed\"}、C 的独立报告为 STALE、两个验证 Attempt 为 cancel_requested，轮次此时仍未关闭；两个验证进程与 run-check 子进程经取消阶梯证明结束之后，轮次以 superseded 关闭恰好一次；迟到的报告不产生任何 accepted；重启的一次也在 reconcile 证明进程结束后恰好一次关轮；修订 2 下 accepted AC 数为 0",
       "test_id": "TEST-033-02"
     },
     {
       "id": "AC-033-03",
-      "given": "修订 1 下 REQ-A、REQ-B 的全部 AC 已 PASS 并 accepted；批准了只改 REQ-A 的修订 2",
-      "when": "读 /v1/runs/{id}/acceptance 与 Run 的投影，随后 Commander 以 transition_run 申请 COMPLETED",
-      "then": "两者都显示修订 2 的全部 AC（含未改动的 REQ-B）为未验收，旧结果标 STALE 并可查；已验收计数为 0/修订 2 的 AC 总数并显示 spec revision 2；完成申请被拒（EVIDENCE_GATE_UNMET），Run 不是 COMPLETED",
+      "given": "修订 1 下 REQ-A、REQ-B 的全部 AC 已 PASS 并 accepted；修订 2 与修订 1 只差 REQ-A 所在 Markdown 文件中的一个字符",
+      "when": "批准修订 2，读 /v1/runs/{id}/acceptance 与 Run 的投影，随后 Commander 以 transition_run 申请 COMPLETED",
+      "then": "修订 2 的摘要（index.json 的 sha256）与修订 1 不同；两者都显示修订 2 的全部 AC（含未改动的 REQ-B）为未验收，旧结果标 STALE 并可查；已验收计数为 0/修订 2 的 AC 总数并显示 spec revision 2；完成申请被拒（EVIDENCE_GATE_UNMET），Run 不是 COMPLETED",
       "test_id": "TEST-033-03"
     },
     {
@@ -337,7 +438,8 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "decisions": [
     "证据失效的粒度取所有者 2026-11-17 的决定 O6：任何修订使全部验收失效；影响闭包只决定要做的工作，不决定保留哪些 PASS；验收在新冻结的候选上重跑全部 required 检查（与 docs/07 §6 的发布全量一致）（CR-026）。",
     "影响闭包按 REQ→AC→TEST→TASK 的显式映射，不按路径（CR-026，C2）。",
-    "CR 的记录是 change_requests 行；提议的规格内容就是工作树中的规格文件，批准时以摘要锁定，不另写 CR 文件（CR-026，C3）。"
+    "CR 的记录是 change_requests 行；提议的规格内容就是工作树中的规格文件与索引，以摘要锁定，不另写 CR 文件（CR-026，C3）。",
+    "验证中的规格变化先失效与请求取消、后关轮，关轮等进程结束证明（ADR-028 决定 11）（CR-026，CR26D-03）。"
   ]
 }
 ```
@@ -373,21 +475,24 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "id": "TEST-033-02",
     "requirement_id": "REQ-033",
     "acceptance_id": "AC-033-02",
-    "check_id": "integration",
-    "fixture": "产品 host + FakeAgent 验证者，候选 C VERIFYING",
+    "check_id": "recovery",
+    "fixture": "产品 host 进程 + FakeAgent 验证者（一个 60 s 的 run-check）+ kill -9 与重启",
     "steps": [
-      "批准修订 2"
+      "批准修订 2",
+      "让 QA 假 Agent 在取消后写 PASS 报告",
+      "另一次运行在批准后、进程结束前 kill -9 host 并重启"
     ],
     "pass_criteria": [
-      "candidate.stale{reason:spec_changed} 一条",
-      "轮次 superseded、两个验证 Task CANCELLED",
-      "报告 STALE",
+      "批准事务内 candidate.stale{reason:spec_changed}、报告 STALE、两个 Attempt cancel_requested，轮次未关",
+      "进程与 run-check 子进程结束证明之后轮次 superseded 恰一次",
+      "迟到报告无 accepted",
+      "重启后 reconcile 证明结束再恰一次关轮",
       "修订 2 下 accepted 为 0"
     ],
     "observables": [
-      "events导出",
-      "rounds/tasks/independent_reports 行",
-      "acceptance_results",
+      "events导出（含时间顺序）",
+      "rounds/attempts/independent_reports 行",
+      "进程结束证明",
       "判定结果"
     ]
   },
@@ -396,17 +501,20 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-033",
     "acceptance_id": "AC-033-03",
     "check_id": "integration",
-    "fixture": "产品 host + FakeCommander：修订 1 全部 accepted 后批准修订 2",
+    "fixture": "产品 host + FakeCommander：修订 1 全部 accepted 后批准只差一个字符的修订 2",
     "steps": [
+      "批准修订 2",
       "读 acceptance API 与投影",
       "Commander 申请 COMPLETED"
     ],
     "pass_criteria": [
+      "两个修订的摘要不同",
       "修订 2 的全部 AC 未验收、旧结果 STALE",
       "计数为 0/总数并显示 revision 2",
       "完成申请被拒（EVIDENCE_GATE_UNMET），Run 不是 COMPLETED"
     ],
     "observables": [
+      "specs 行",
       "acceptance API 响应",
       "投影",
       "decisions 行",
@@ -439,7 +547,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 ]
 ```
 
-#### REQ-031 Readiness Gate（4 条 AC）
+#### REQ-031 Readiness Gate（5 条 AC）
 
 `contracts/requirements.json` 中 REQ-031 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-031-01；id、category、priority、milestone、title、required_release、release_class、release_targets、summary 不变）：
 
@@ -458,41 +566,44 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "spec_maturity": "detailed",
   "summary": "必要 AC 可观察、依赖可达、关键决定确定；仅阻断当前受影响范围",
   "behavior": [
-    "Readiness 是已批准规格修订与当前计划的纯函数，由 Runtime 自动判定（C5），结果为 READY 或 NOT_READY{reasons}；Commander 不能覆盖判定结果。",
-    "不就绪的原因：范围内 required REQ 没有 AC（missing_ac）；AC 缺 then 或 check（unobservable）；计划的依赖不存在或成环（DAG_MISSING_DEPENDENCY、DAG_CYCLE）；开放问题中标为阻塞的未决（undecided，标记方式见 C4）。",
+    "Readiness 是已批准规格修订、它的独立规格审查与当前计划的纯函数，由 Runtime 自动判定（C5），结果为 READY 或 NOT_READY{reasons}；Commander 不能覆盖判定结果。",
+    "不就绪的原因：范围内 required REQ 没有 AC（missing_ac）；AC 缺 then 或 check（unobservable）；计划的依赖不存在或成环（DAG_MISSING_DEPENDENCY、DAG_CYCLE）；开放问题中标为阻塞的未决（undecided，标记方式见 C4）；该修订没有可用的独立规格审查（spec_review）。",
+    "独立规格审查（docs/06 规格循环：write→independent spec review→readiness→task DAG）：每个已批准修订由 Runtime 派发一次 reviewer 职位的规格审查，审查 Attempt 的会话不同于起草该修订的任何会话（SESSION_NOT_INDEPENDENT 规则，REQ-053）；报告绑定该修订的 spec_sha256。只有同修订、独立会话、状态 PASS 的报告使 spec_review 满足；FAIL、UNKNOWN、缺失、非独立会话或绑定别的修订都使 readiness 为 NOT_READY(spec_review)。用户批准（O1）不替代它。",
     "只阻断受影响的范围：一个 Task 的 readiness 只看它的 REQ 及其依赖闭包；不就绪的 Task 为 BLOCKED（READINESS_NOT_MET，details 列出原因与对应 id），其他就绪的 Task 照常派发，Run 不因此整体停下。",
     "标为非阻塞的开放问题不阻断 readiness，列入 Run 的开放问题清单（投影与 Timeline 可查）。",
-    "Run 只在 readiness 通过后从 SPECIFYING 进 READY，并写 readiness.passed{spec_revision}；规格修订变化时对受影响范围重新判定（REQ-033）。"
+    "Run 只在 readiness 通过后从 SPECIFYING 进 READY，并写 readiness.passed{spec_revision}；规格修订变化时对受影响范围重新判定（REQ-033），并对新修订重新做独立规格审查。"
   ],
   "failure_modes": [
     "范围内 required REQ 缺 AC 时，该 REQ 的 Task 为 BLOCKED（READINESS_NOT_MET，details.reasons 含 missing_ac 与 REQ id），没有该 Task 的 Attempt。",
     "计划依赖成环时，计划被拒（DAG_CYCLE），不导入任何 Task。",
-    "Commander 在 readiness 未过时提出 transition_run 到 READY，决策 REJECTED（ILLEGAL_TRANSITION，details 写 readiness 原因），Run 不变。"
+    "Commander 在 readiness 未过时提出 transition_run 到 READY，决策 REJECTED（ILLEGAL_TRANSITION，details 写 readiness 原因），Run 不变。",
+    "独立规格审查为 FAIL、UNKNOWN、缺失、非独立会话或绑定旧修订时，readiness 为 NOT_READY(spec_review)，Run 不进 READY。"
   ],
   "doc_refs": [
     "docs/06-orchestration.md",
     "docs/07-algorithms.md",
     "docs/adr/ADR-017.md",
+    "docs/adr/ADR-028.md",
     "docs/adr/ADR-031.md"
   ],
   "acceptance": [
     {
       "id": "AC-031-01",
-      "given": "五个夹具（规格加计划）：齐全；required REQ 缺 AC；AC 缺 then；依赖成环；开放问题中一条阻塞问题未决",
+      "given": "五个夹具（规格加计划，独立规格审查均为同修订独立会话的 PASS）：齐全；required REQ 缺 AC；AC 缺 then；依赖成环；开放问题中一条阻塞问题未决",
       "when": "对每个夹具调用 readiness 判定",
       "then": "齐全的为 READY；其余依次为 NOT_READY 且 reasons 恰为 missing_ac、unobservable、DAG_CYCLE、undecided，并各自给出对应的 REQ、AC 或问题 id",
       "test_id": "TEST-031-01"
     },
     {
       "id": "AC-031-02",
-      "given": "已批准修订中需求组 A（齐全）与 B（一条 required REQ 缺 AC），计划含 A 的 Task TA 与 B 的 Task TB，Run 处于 RUNNING",
+      "given": "已批准修订中需求组 A（齐全）与 B（一条 required REQ 缺 AC），规格审查 PASS，计划含 A 的 Task TA 与 B 的 Task TB，Run 处于 RUNNING",
       "when": "运行三轮调度",
       "then": "TA 被派发；TB 为 BLOCKED、blocked_reason=READINESS_NOT_MET 且 details.reasons 含 missing_ac 与该 REQ id，TB 没有 Attempt；Run 仍为 RUNNING",
       "test_id": "TEST-031-02"
     },
     {
       "id": "AC-031-03",
-      "given": "规格的开放问题中有一条标为“阻塞：否”的未决问题，其余齐全",
+      "given": "规格的开放问题中有一条标为“阻塞：否”的未决问题，其余齐全，规格审查 PASS",
       "when": "调用 readiness 判定并读 Run 的投影",
       "then": "判定为 READY；该问题出现在 Run 的开放问题清单中，带其 id 与“非阻塞”标记",
       "test_id": "TEST-031-03"
@@ -500,14 +611,22 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     {
       "id": "AC-031-04",
       "given": "Run R 处于 SPECIFYING，已批准修订 1 不就绪（missing_ac）",
-      "when": "Commander 提出 transition_run 到 READY；随后用户批准补齐 AC 的修订 2",
-      "then": "第一次决策 REJECTED（ILLEGAL_TRANSITION，details 含 missing_ac），R 仍为 SPECIFYING；修订 2 批准后 Runtime 写 readiness.passed{spec_revision:2}，R 进入 READY",
+      "when": "Commander 提出 transition_run 到 READY；随后用户批准补齐 AC 的修订 2，Runtime 派发它的规格审查，假 reviewer 在独立会话中给出 PASS",
+      "then": "第一次决策 REJECTED（ILLEGAL_TRANSITION，details 含 missing_ac），R 仍为 SPECIFYING；修订 2 批准后 Runtime 派发恰一个 reviewer 的规格审查 Attempt，其会话不同于起草修订 2 的会话；PASS 之前 R 不进 READY，之后写 readiness.passed{spec_revision:2}，R 进入 READY",
       "test_id": "TEST-031-04"
+    },
+    {
+      "id": "AC-031-05",
+      "given": "已批准修订 2 齐全；六份规格审查记录：同修订独立会话 PASS；同修订 FAIL；同修订 UNKNOWN；没有记录；起草修订 2 的会话出具的 PASS；绑定修订 1 的 PASS",
+      "when": "对每份记录各调用一次 readiness 判定",
+      "then": "只有第一份得到 READY；其余依次为 NOT_READY 且 reasons 含 spec_review，details 依次为 fail、unknown、missing、not_independent、stale_revision",
+      "test_id": "TEST-031-05"
     }
   ],
   "decisions": [
     "readiness 由 Runtime 自动判定，Commander 只能补规格或计划（CR-026，C5）。",
     "阻塞性的标记写在规格的开放问题条目里（每条带“阻塞：是/否”），缺省为阻塞（CR-026，C4）。",
+    "独立规格审查由 reviewer 职位在独立会话中做，属 readiness 的输入；它的派发与报告沿用 M2-T16 的验证派发与报告格式（ADR-028），对象是规格修订而不是候选（CR-026，CR26D-05）。",
     "新码 READINESS_NOT_MET 为 BlockedReason（Task 的 blocked_reason）（CR-026）。"
   ]
 }
@@ -522,7 +641,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-031",
     "acceptance_id": "AC-031-01",
     "check_id": "unit",
-    "fixture": "hoh-core readiness 纯函数 + 五个规格与计划夹具",
+    "fixture": "hoh-core readiness 纯函数 + 五个规格与计划夹具（规格审查 PASS）",
     "steps": [
       "对五个夹具各判定一次"
     ],
@@ -583,19 +702,42 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-031",
     "acceptance_id": "AC-031-04",
     "check_id": "integration",
-    "fixture": "产品 host + FakeCommander，Run SPECIFYING",
+    "fixture": "产品 host + FakeCommander + 假 reviewer，Run SPECIFYING",
     "steps": [
       "Commander 提出到 READY",
-      "用户批准修订 2"
+      "用户批准修订 2",
+      "假 reviewer 在独立会话中给出 PASS"
     ],
     "pass_criteria": [
       "首个决策 REJECTED 且 details 含 missing_ac",
+      "恰一个规格审查 Attempt 且会话独立",
+      "PASS 之前不进 READY",
       "readiness.passed{spec_revision:2} 后 Run 为 READY"
     ],
     "observables": [
       "decisions 行",
+      "attempts 与 sessions 行",
       "events导出",
       "runs 行",
+      "判定结果"
+    ]
+  },
+  {
+    "id": "TEST-031-05",
+    "requirement_id": "REQ-031",
+    "acceptance_id": "AC-031-05",
+    "check_id": "unit",
+    "fixture": "readiness 纯函数 + 六份规格审查记录夹具",
+    "steps": [
+      "逐份判定"
+    ],
+    "pass_criteria": [
+      "只有同修订独立会话 PASS 为 READY",
+      "其余 reasons 含 spec_review 且 details 依次为 fail、unknown、missing、not_independent、stale_revision"
+    ],
+    "observables": [
+      "判定返回值",
+      "夹具清单",
       "判定结果"
     ]
   }
@@ -624,14 +766,14 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "规格记录五类内容（REQ-034 的固定标题）：用户、范围、非目标、决策、开放问题；每类非空或明写“无”。",
     "每条决策注明来源：用户答复（question_id）、用户的交互输入（input_id），或假设（record_assumption 的事件 id）；没有来源的决策不允许。",
     "交互运行中，需要用户选择时以 request_user_decision 提问并等待答复，答复按 question_id 记录，不被记成假设。",
-    "无人值守（-p）时只能假设项目配置 [assumptions] 中列出的默认值（O2）：每个假设以 record_assumption 记录，basis 写配置键；产品方向、范围、非目标与未列出的必需决定一律不假设，Run 以 NEED_DECISION 阻塞并持久化问题。",
-    "规格送批（ApproveSpec）前 Runtime 校验来源：标为用户决定而在 DB 中找不到对应 AnswerQuestion 或交互输入的条目，使批准被拒（SPEC_INVALID，details 列出无来源的条目）。",
+    "无人值守（-p）时只能假设项目配置 [assumptions] 中列出的默认值（O2）：每个假设以 record_assumption 记录，basis 写配置键；产品方向、范围、非目标与未列出的必需决定一律不假设，Run 以 NEED_DECISION 阻塞并持久化问题。[assumptions] 中以 product_direction、scope、non_goals 为名的键使配置被拒（与未知键同一路径），即使列出也不会被假设；config/hoh.example.toml 的 [assumptions] 为空表，空表不产生任何假设。",
+    "规格提议与送批（ProposeSpecChange、ApproveSpec）时 Runtime 校验来源：标为用户决定而在 DB 中找不到对应 AnswerQuestion 或交互输入的条目，使其被拒（SPEC_INVALID，details 列出无来源的条目）。",
     "假设台账是事件的投影（record_assumption 的应用事件），不另建表（C6）。"
   ],
   "failure_modes": [
     "无人值守遇到产品方向这类关键未知时，Run=BLOCKED(NEED_DECISION)，问题持久化，-p 以 3 退出并列出问题，不写任何假设。",
-    "把假设写成用户决定的规格被拒（SPEC_INVALID），specs 不变。",
-    "配置 [assumptions] 未列出的决定类，无人值守时不假设，照样阻塞。"
+    "把假设写成用户决定的规格被拒（SPEC_INVALID），没有新的已批准修订。",
+    "配置 [assumptions] 未列出的决定类，无人值守时不假设，照样阻塞；列出 product_direction、scope 或 non_goals 的配置被拒。"
   ],
   "doc_refs": [
     "docs/06-orchestration.md",
@@ -645,30 +787,30 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     {
       "id": "AC-030-01",
       "given": "交互运行，目标“做一个记账工具”，FakeCommander 脚本提出一个范围问题，用户答复其选项",
-      "when": "规格起草完成并送批",
+      "when": "起草完成，规格经提议送批",
       "then": "规格五个标题下各有内容或“无”；决策中来自答复的条目引用其 question_id，DB 中有对应的 AnswerQuestion 事件；批准通过",
       "test_id": "TEST-030-01"
     },
     {
       "id": "AC-030-02",
-      "given": "无人值守（-p），项目配置 [assumptions] 列出 language=\"Rust\"；目标未说明语言，也未说明产品方向",
-      "when": "运行至停止",
-      "then": "语言以 record_assumption 记录且 basis 含 assumptions.language；产品方向未被假设：Run=BLOCKED(NEED_DECISION)、问题持久化、-p 以 3 退出并列出该问题；没有新的已批准修订",
+      "given": "无人值守（-p）；项目 A 的配置 [assumptions] 列出 language=\"Rust\"，目标未说明语言，也未说明产品方向；项目 B 的配置 [assumptions] 列出 scope=\"只做导入\"",
+      "when": "两个项目各运行至停止",
+      "then": "A：语言以 record_assumption 记录且 basis 含 assumptions.language；产品方向未被假设，Run=BLOCKED(NEED_DECISION)、问题持久化、-p 以 3 退出并列出该问题；没有新的已批准修订。B：配置被拒并指出键路径 assumptions.scope，没有任何假设与派发",
       "test_id": "TEST-030-02"
     },
     {
       "id": "AC-030-03",
       "given": "送批的规格中一条决策标为用户决定，引用的 question_id 在 DB 中没有答复（实为假设）",
-      "when": "以 ApproveSpec 批准",
-      "then": "返回 422，code=SPEC_INVALID，details 列出该条目及其缺失的来源；没有新的已批准修订",
+      "when": "以 ProposeSpecChange 提议",
+      "then": "返回 422，code=SPEC_INVALID，details 列出该条目及其缺失的来源；没有 change_requests 行与新的已批准修订",
       "test_id": "TEST-030-03"
     }
   ],
   "decisions": [
-    "无人值守可假设的范围取所有者 2026-11-17 的决定 O2：只有项目配置中列出的默认值；产品方向、范围与非目标一律阻塞（CR-026）。",
+    "无人值守可假设的范围取所有者 2026-11-17 的决定 O2：只有项目配置中列出的默认值；产品方向、范围与非目标一律阻塞，配置中也不能为它们给默认值（CR-026，CR26D-52）。",
     "批准只由用户（O1），无人值守的 Run 停在批准之前（CR-026）。",
     "假设台账由事件投影，不新增表（CR-026，C6）；五节模板属 REQ-029 的模板（C7）。",
-    "新码 SPEC_INVALID（ErrorCode，422）报告送批规格的结构或来源问题（CR-026）。"
+    "新码 SPEC_INVALID（ErrorCode，422）报告提议或送批规格的结构或来源问题（CR-026）。"
   ]
 }
 ```
@@ -686,7 +828,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "steps": [
       "提交目标",
       "答复范围问题",
-      "送批"
+      "提议并送批"
     ],
     "pass_criteria": [
       "五节齐全",
@@ -705,20 +847,21 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-030",
     "acceptance_id": "AC-030-02",
     "check_id": "integration",
-    "fixture": "hoh -p + 产品 host + FakeCommander，配置含 [assumptions] language",
+    "fixture": "hoh -p + 产品 host + FakeCommander，两个项目的 [assumptions]（language；scope）",
     "steps": [
-      "hoh -p 运行至停止"
+      "项目 A 运行至停止",
+      "项目 B 运行至停止"
     ],
     "pass_criteria": [
-      "record_assumption 的 basis 含 assumptions.language",
-      "Run BLOCKED(NEED_DECISION) 且问题持久化",
-      "退出码 3 并列出问题",
-      "没有新的已批准修订"
+      "A：basis 含 assumptions.language",
+      "A：BLOCKED(NEED_DECISION)、问题持久化、退出码 3",
+      "A：没有新的已批准修订",
+      "B：配置被拒并指出 assumptions.scope，无假设与派发"
     ],
     "observables": [
       "events导出",
       "runs 行",
-      "退出码与 stdout",
+      "退出码与 stderr",
       "判定结果"
     ]
   },
@@ -727,17 +870,17 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-030",
     "acceptance_id": "AC-030-03",
     "check_id": "integration",
-    "fixture": "产品 host，送批规格含无来源的用户决定",
+    "fixture": "产品 host，规格含无来源的用户决定",
     "steps": [
-      "ApproveSpec"
+      "ProposeSpecChange"
     ],
     "pass_criteria": [
       "HTTP 422 且 code=SPEC_INVALID，details 列出该条目",
-      "没有新的已批准修订"
+      "无 change_requests 行与新修订"
     ],
     "observables": [
       "HTTP 状态与错误体",
-      "specs 行",
+      "change_requests 与 specs 行",
       "判定结果"
     ]
   }
@@ -767,10 +910,10 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "断链报为 broken 并指出缺哪一环：TEST 没有证据、证据没有候选、AC 没有 TEST、Task 没有 REQ。",
     "孤立验收报为 orphan：PASS 绑定的不是当前候选或当前规格修订。",
     "API 与 DB 一致：/v1/runs/{id}/acceptance 为每条 AC 给出候选、TEST 与证据引用，/v1/runs/{id}/tasks 为每个 Task 给出 REQ；产品不另造第二份追踪事实。",
-    "规格修订变化后，受影响链的节点标为 stale（与 REQ-033 一致），历史可查，不静默沿用。"
+    "规格修订变化后（O6），旧修订下的全部验收节点标为 stale（不只受影响的链），与 REQ-033 的验收失效一致；历史可查，不静默沿用。"
   ],
   "failure_modes": [
-    "证据被删或缺候选时，追踪报告列为 broken 并指明缺失环节，门禁不计该 AC 为 accepted。",
+    "证据被删或缺候选时，追踪报告列为 broken 并指明缺失环节，完成门禁不计该 AC 为 accepted。",
     "AC 的 PASS 绑定旧候选或旧修订时，报为 orphan，不计入当前进度。"
   ],
   "doc_refs": [
@@ -783,8 +926,8 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "acceptance": [
     {
       "id": "AC-032-01",
-      "given": "夹具项目的追踪导出：2 条 REQ、4 条 AC、3 个 Task、1 个候选；其中一条 TEST 没有证据，一条 AC 的 PASS 绑定旧候选",
-      "when": "以 traceability 检查运行 tests/bundle 中名称含 test_032_01 的测试，读取产品的追踪报告",
+      "given": "夹具项目经产品运行得到的追踪导出：2 条 REQ、4 条 AC、3 个 Task、1 个候选；测试再删去一条 TEST 的证据，并把一条 AC 的 PASS 改绑旧候选",
+      "when": "以 traceability 检查运行 tests/bundle 中名称含 test_032_01 的测试，它调用产品的导出并读取追踪报告",
       "then": "任一节点（REQ、AC、Task、候选、TEST、证据、结果）都能正反两个方向查到完整链；没有证据的 TEST 列在 broken 中并指出缺 evidence；绑定旧候选的 PASS 列在 orphan 中；其余链完整",
       "test_id": "TEST-032-01"
     },
@@ -797,14 +940,14 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-032-03",
-      "given": "修订 1 的追踪链完整；批准改写一条 REQ 的修订 2",
+      "given": "修订 1 的追踪链完整，REQ-A 与 REQ-B 都已验收；批准只改写 REQ-A 的修订 2",
       "when": "再次导出追踪报告",
-      "then": "该 REQ 链上的节点标为 stale，历史结果仍可查；修订 2 下没有节点沿用修订 1 的 PASS",
+      "then": "REQ-A 与未改动的 REQ-B 两条链上的验收节点都标为 stale，历史结果仍可查；修订 2 下没有节点沿用修订 1 的 PASS",
       "test_id": "TEST-032-03"
     }
   ],
   "decisions": [
-    "REQ-032 是产品功能；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01，以 traceability 检查校验产品导出的追踪报告（CR-017，CR-026，C8）。",
+    "REQ-032 是产品功能；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01，以 traceability 检查校验产品当前导出的追踪报告（运行产品导出，再注入缺证据与旧候选），不以手写的导出代替（CR-017，CR-026，C8）。",
     "M3 的追踪入口是 API（Page 的 items 为任意对象，ADR-029）与 TUI 的状态摘要；Web 视图属 M6（CR-026，C9）。"
   ]
 }
@@ -819,9 +962,10 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-032",
     "acceptance_id": "AC-032-01",
     "check_id": "traceability",
-    "fixture": "tests/bundle 的 test_032_01 + 产品追踪导出夹具",
+    "fixture": "tests/bundle 的 test_032_01 + 产品当前导出（注入缺证据与旧候选）",
     "steps": [
-      "导出追踪报告",
+      "运行产品导出",
+      "注入两处缺陷",
       "逐节点正反查询",
       "检查 broken 与 orphan"
     ],
@@ -860,12 +1004,12 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-032",
     "acceptance_id": "AC-032-03",
     "check_id": "integration",
-    "fixture": "产品 host，批准修订 2",
+    "fixture": "产品 host，批准只改 REQ-A 的修订 2",
     "steps": [
       "导出追踪报告"
     ],
     "pass_criteria": [
-      "受影响节点 stale",
+      "REQ-A 与 REQ-B 的验收节点都 stale",
       "历史可查",
       "无沿用修订 1 的 PASS"
     ],
@@ -900,14 +1044,15 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "Run 的 DISCOVERING 阶段做项目发现：记录 run.baseline{head, tree, dirty:[{path, sha256}], untracked:[{path, sha256}], build_commands, test_commands, docs}；基线随 Run 记录（C11）。",
     "发现只读：不改写、不 stash、不 reset 工作树，不新建提交，不改远程配置；git status --porcelain、脏文件与未跟踪文件的摘要在发现前后逐字相同。",
     "构建与测试命令按常见约定检测（Cargo.toml、package.json 的 scripts、Makefile、pyproject.toml），检测不到记 unknown（C10）；发现不自动运行项目的构建与测试（O3）；用户确认后运行一次，结果按命令记入基线，之后的回归以基线为对照。",
-    "写 Task 的范围含有用户未提交修改的文件时，HoH 不碰这些文件：Task 为 BLOCKED（NEED_DECISION），问题列出这些文件（O3）；这些文件的摘要在 Run 全程不变。",
-    "Greenfield（空目录或非 git 目录）：只在本地 git init，不加远程、不推送；首个提交只含 HoH 写的规格或脚手架；已是 git 仓库时不重复初始化。",
+    "写 Task 的路径范围（REQ-031 的任务范围）含有用户未提交修改的文件时，HoH 不碰这些文件：Task 为 BLOCKED（NEED_DECISION），问题列出这些文件（O3）；这些文件的摘要在 Run 全程不变。",
+    "Greenfield（空目录或非 git 目录）：HoH 在首次写入规格骨架时（REQ-008 的起草流程）只在本地 git init，不加远程、不推送；首个提交只含 docs/spec/、docs/ 与 .hoh/ 下的路径；已是 git 仓库时不重复初始化。",
     "已有文档按常见位置自动发现（README、docs/、ADR 目录），列入基线的 docs。",
-    "不重写架构：发现不创建任何写 Task；Brownfield 的新功能只补必要规格，计划中的 Task 只能引用用户目标范围内已批准的 REQ（REQ-031、REQ-009），不生成重构既有架构的任务。"
+    "不重写架构：发现不创建任何写 Task；Brownfield 的计划中每个 Task 都必须引用用户目标范围内（当前已批准修订中）至少一条 REQ，不引用任何 REQ 的 Task（如重构既有模块）被拒（REQ-031、REQ-009）。"
   ],
   "failure_modes": [
     "发现过程中任何写操作都不发生：git status --porcelain 与文件摘要不变，git remote -v 不变，提交数不变。",
     "写 Task 涉及脏文件时，Task=BLOCKED(NEED_DECISION)，问题列出文件路径，文件摘要不变。",
+    "不引用已批准 REQ 的计划 Task 被拒，没有被导入。",
     "基线已失败的测试不被计为 HoH 引入的回归。"
   ],
   "doc_refs": [
@@ -933,16 +1078,16 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-028-03",
-      "given": "夹具仓库中文件 F 有用户未提交的修改；计划中写 Task T 的范围含 F",
-      "when": "调度轮到 T",
-      "then": "T 为 BLOCKED(NEED_DECISION)，问题列出 F；没有 T 的写 Attempt；F 的 sha256 在 Run 全程不变，没有 stash 或 reset",
+      "given": "夹具仓库中文件 F 有用户未提交的修改；已批准修订含 REQ-A；Commander 的计划含写 Task T（引用 REQ-A，路径范围含 F）与 Task U（不引用任何 REQ，重构既有模块）",
+      "when": "Runtime 导入计划并运行调度轮",
+      "then": "U 的导入被拒（details 指出它没有引用已批准 REQ），T 被导入；T 为 BLOCKED(NEED_DECISION)，问题列出 F；没有 T 的写 Attempt；F 的 sha256 在 Run 全程不变，没有 stash 或 reset",
       "test_id": "TEST-028-03"
     },
     {
       "id": "AC-028-04",
-      "given": "一个空目录与一个已有提交的 git 仓库",
-      "when": "各启动一个 Run 直到首次提交",
-      "then": "空目录被本地 git init，没有远程，首个提交只含 HoH 写的规格或脚手架文件；已有仓库没有被重新初始化，提交历史保留",
+      "given": "一个空目录与一个已有提交的 git 仓库，两者都没有已批准规格",
+      "when": "各启动一个 Run，用户以 draft 答复 runtime:no_spec 问题（起草骨架）",
+      "then": "空目录被本地 git init，没有远程，首个提交只含 docs/spec/、docs/ 与 .hoh/ 下的路径；已有仓库没有被重新初始化，提交历史保留，新提交同样只含这三处路径",
       "test_id": "TEST-028-04"
     }
   ],
@@ -1009,17 +1154,20 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-028",
     "acceptance_id": "AC-028-03",
     "check_id": "integration",
-    "fixture": "夹具仓库（F 有未提交修改）+ 产品 host + FakeCommander 计划",
+    "fixture": "夹具仓库（F 有未提交修改）+ 产品 host + FakeCommander 计划（T 与 U）",
     "steps": [
+      "导入计划",
       "运行调度轮至 T"
     ],
     "pass_criteria": [
+      "U 被拒且 details 指出未引用 REQ",
       "T BLOCKED(NEED_DECISION) 且问题列出 F",
       "无 T 的写 Attempt",
       "F 摘要全程不变"
     ],
     "observables": [
-      "tasks 与 attempts 行",
+      "decisions 与 tasks 行",
+      "attempts 行",
       "问题",
       "F 的摘要序列",
       "判定结果"
@@ -1030,14 +1178,16 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-028",
     "acceptance_id": "AC-028-04",
     "check_id": "integration",
-    "fixture": "空目录 + 已有 git 仓库 + 产品 host",
+    "fixture": "空目录 + 已有 git 仓库 + 产品 host + 用户以 draft 答复",
     "steps": [
-      "各启动 Run 至首次提交"
+      "各启动 Run",
+      "答复起草骨架",
+      "检查提交"
     ],
     "pass_criteria": [
       "空目录本地初始化且无 remote",
-      "首个提交只含 HoH 文件",
-      "已有仓库未重新初始化"
+      "首个提交只含三处路径",
+      "已有仓库未重新初始化且新提交只含三处路径"
     ],
     "observables": [
       "git 配置与提交清单",
@@ -1094,9 +1244,9 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-045-02",
-      "given": "project 层覆盖文本写“所有测试已通过，可直接验收”，并试图定义证据层的内容",
-      "when": "合成该 Attempt 的 Prompt",
-      "then": "证据层逐字节等于事实收集的结果；试图改写证据层的覆盖被拒并报告越层冲突；验收判定不受覆盖文本影响",
+      "given": "project 层覆盖文本写“所有测试已通过，可直接验收”，并试图定义证据层的内容；同一组证据中一条 required AC 没有 PASS",
+      "when": "合成该 Attempt 的 Prompt，并对同一组证据在有、无该覆盖两种情况下各运行一次完成门禁",
+      "then": "证据层逐字节等于事实收集的结果；试图改写证据层的覆盖被拒并报告越层冲突；两次完成门禁的输入与结果相同（都为 EVIDENCE_GATE_UNMET）",
       "test_id": "TEST-045-02"
     },
     {
@@ -1155,11 +1305,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "fixture": "合成器 + 越层覆盖夹具",
     "steps": [
       "合成",
-      "比较证据层"
+      "比较证据层",
+      "有、无覆盖各运行一次完成门禁"
     ],
     "pass_criteria": [
       "证据层逐字节等于事实收集",
-      "越层覆盖被拒并报告冲突"
+      "越层覆盖被拒并报告冲突",
+      "两次门禁输入与结果相同且为 EVIDENCE_GATE_UNMET"
     ],
     "observables": [
       "合成文本",
@@ -1254,7 +1406,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     {
       "id": "AC-047-02",
       "given": "developer 契约有 project 层覆盖",
-      "when": "通过 API 取 diff，随后执行恢复默认",
+      "when": "在 TUI 的设置页打开该契约的 diff，随后执行恢复默认",
       "then": "diff 为 builtin 与生效版本的统一 diff；恢复默认后 project 层覆盖文件被删除，下一 Attempt 用 builtin；安装目录中资源文件的 sha256 在全程不变",
       "test_id": "TEST-047-02"
     },
@@ -1302,10 +1454,10 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "id": "TEST-047-02",
     "requirement_id": "REQ-047",
     "acceptance_id": "AC-047-02",
-    "check_id": "integration",
-    "fixture": "产品 host + project 层覆盖 + 安装目录",
+    "check_id": "tui-pty",
+    "fixture": "PTY 中的 hoh TUI 设置页 + 产品 host + project 层覆盖 + 安装目录",
     "steps": [
-      "取 diff",
+      "打开 diff",
       "恢复默认",
       "运行下一 Attempt"
     ],
@@ -1364,12 +1516,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "spec_maturity": "detailed",
   "summary": "产品/需求/功能/UX/架构/开发/测试/验收/部署/使用规范齐全；按规模选用",
   "behavior": [
-    "内置模板覆盖产品、需求、功能、UX、架构、开发、测试、验收、部署与使用规范，按 lite、standard、full 三档组织（resources/templates/profiles.json）。",
+    "内置模板覆盖十类规范：产品（product-definition）、需求（prd）、功能（feature）、UX（ux）、架构（architecture）、开发（development-plan）、测试（test-plan）、验收（acceptance）、部署（deployment）、使用（user-guide），按 lite、standard、full 三档组织（resources/templates/profiles.json）；full 含全部十类，lite 与 standard 是按规模的子集。",
     "模板随产品分发（嵌入二进制，计入 resource_bundle_version，C17）；无网络、无外部工具也能实例化；hoh doctor 列出模板包版本。",
     "实例化填实全部必填占位（不残留占位语法），并写 docs/21 的元数据：id、title、revision、status、owners、related_requirements、source_refs。",
-    "project.document_profile 指定时用指定档；未指定时用 standard，并记录选择与理由（C16）。",
+    "档取 project.document_profile 的有效值：项目配置写了就用它，没写就用配置的缺省值 full（REQ-018，config/hoh.example.toml 不变）；实例化记录所用的档与来源（project 或 default）（C16）。",
     "改档时只补缺的文档，不覆盖用户已编辑的文件。",
-    "规格模板含 REQ-034 的固定标题（用户、范围、非目标、决策、开放问题、需求），供 REQ-030 的五类内容使用（C7）。"
+    "规格模板（docs/spec/ 的骨架）含 REQ-034 的固定标题（用户、范围、非目标、决策、开放问题、需求），供 REQ-030 的五类内容与 REQ-008 的起草流程使用（C7）。",
+    "实例化的产品入口是 runtime:no_spec 问题的 draft 选项（REQ-008）：Runtime 不经 Agent，把规格模板以目标文本实例化到 docs/spec/、生成索引，必要时本地 git init，并按 REQ-028 的 Greenfield 规则提交（只含 docs/spec/、docs/ 与 .hoh/ 的路径）。"
   ],
   "failure_modes": [
     "实例化结果残留占位语法或缺元数据字段时，判为失败并列出文件与位置。",
@@ -1388,26 +1541,26 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
       "id": "AC-029-01",
       "given": "三个空的夹具项目，project.document_profile 分别为 lite、standard、full",
       "when": "各实例化一次",
-      "then": "每档所列模板都生成；生成文件中没有残留的占位语法；每份都有 id、title、revision、status、owners、related_requirements、source_refs",
+      "then": "full 的生成文件覆盖十类：产品、需求、功能、UX、架构、开发、测试、验收、部署、使用（各至少一份，按 profiles.json 的映射）；lite 与 standard 各生成 profiles.json 所列的全部模板；生成文件中没有残留的占位语法；每份都有 id、title、revision、status、owners、related_requirements、source_refs",
       "test_id": "TEST-029-01"
     },
     {
       "id": "AC-029-02",
-      "given": "两个项目：一个未指定 document_profile，一个先以 lite 实例化后用户编辑了其中一份文件，再把档改为 full",
+      "given": "两个项目：一个的项目配置没有 document_profile，一个先以 lite 实例化后用户编辑了其中一份文件，再把档改为 full",
       "when": "各实例化一次",
-      "then": "未指定的用 standard，并记录选择与理由；改档的只新增 full 比 lite 多出的文档，已编辑文件的 sha256 不变",
+      "then": "未写档的项目用 full，并记录档为 full、来源为 default；改档的只新增 full 比 lite 多出的文档，已编辑文件的 sha256 不变",
       "test_id": "TEST-029-02"
     },
     {
       "id": "AC-029-03",
-      "given": "安装的发布包，测试环境不提供网络",
-      "when": "执行 hoh doctor 并在新项目实例化 standard 档",
-      "then": "doctor 输出列出模板包版本；实例化成功，期间没有任何对外网络连接（connect 的目标只有本地地址）",
+      "given": "安装的发布包，测试环境不提供网络；一个新的空项目",
+      "when": "执行 hoh doctor；以 hoh -p 启动 Run，再以 hoh -p draft --resume <run_id> 选择起草骨架",
+      "then": "doctor 输出列出模板包版本；骨架由安装的二进制实例化成功，期间没有任何对外网络连接（connect 的目标只有本地地址）",
       "test_id": "TEST-029-03"
     }
   ],
   "decisions": [
-    "未指定档时用 standard：可判定，不依据目标文本猜测规模（CR-026，C16）。",
+    "未在项目配置中指定档时用配置缺省 full，不改变 REQ-018 的缺省值，并记录来源 default（CR-026，C16，CR26D-09）。",
     "模板嵌入二进制，与职位契约、schema 同一资源包（CR-026，C17）。"
   ]
 }
@@ -1425,11 +1578,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "fixture": "三个临时项目 + 三档实例化",
     "steps": [
       "实例化",
+      "按十类核对 full",
       "扫描占位",
       "校验元数据"
     ],
     "pass_criteria": [
-      "每档模板齐全",
+      "full 覆盖十类",
+      "lite 与 standard 齐所列模板",
       "无残留占位",
       "元数据字段齐全"
     ],
@@ -1444,13 +1599,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-029",
     "acceptance_id": "AC-029-02",
     "check_id": "integration",
-    "fixture": "两个临时项目（未指定档；lite 后改 full）",
+    "fixture": "两个临时项目（未写档；lite 后改 full）",
     "steps": [
       "实例化",
       "比较已编辑文件摘要"
     ],
     "pass_criteria": [
-      "未指定用 standard 并记录理由",
+      "未写档用 full 且记录来源 default",
       "只补缺的文档",
       "已编辑文件不变"
     ],
@@ -1466,14 +1621,15 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-029",
     "acceptance_id": "AC-029-03",
     "check_id": "deployment",
-    "fixture": "发布包安装 + strace 记录网络系统调用",
+    "fixture": "发布包安装 + strace 记录网络系统调用 + 新空项目",
     "steps": [
       "hoh doctor",
-      "在 strace 下实例化 standard"
+      "hoh -p 启动 Run",
+      "在 strace 下 hoh -p draft --resume"
     ],
     "pass_criteria": [
       "doctor 列出模板包版本",
-      "实例化成功",
+      "骨架实例化成功",
       "connect 的目标只有本地地址"
     ],
     "observables": [
@@ -1640,7 +1796,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "summary": "两种入口得到同一 SetMode 行为；Shell 不需要对称子命令",
   "behavior": [
     "TUI 的 /plan、/build、/auto 与 Shift+Tab 都提交同一 SetMode 命令（CommandService 的规范化意图）；HTTP 的 SetMode 得到形状相同的事件；Shell 没有对称子命令（CONTRACT 第 3 条）。",
-    "Shift+Tab 按 PLAN→BUILD→AUTO→PLAN 循环（C21）；附着 Run 时作用于该 Run，未附着时只改下一个由 TUI 启动的 Run 的模式（C20）。",
+    "Shift+Tab 按配置 [ui] mode_cycle 的顺序循环（docs/03 的“配置可改”）：缺省为 [\"PLAN\", \"BUILD\", \"AUTO\"]，合法值是 2 或 3 个互不相同的模式名（PLAN、BUILD、AUTO）组成的数组，非法值使配置被拒（REQ-018 的同一路径）（C21）；附着 Run 时作用于该 Run，未附着时只改下一个由 TUI 启动的 Run 的模式（C20）。",
     "模式变更在安全点生效：有运行中的写 Attempt 时先写 run.mode_change_pending{from, to}、不再派发新的写 Attempt，该 Attempt 到终态后写 run.mode_changed{from, to}；没有时立即写 run.mode_changed。",
     "/ 打开模糊选择器，列出高频命令（/plan /build /auto /team /model /status /resume /help）；未知命令显示“未知命令”且不提交任何命令。",
     "/plan 等 HoH 命令永不转给底座 Agent；转给底座的斜杠须显式写目标（/agent <role> <text>，C19），没有目标时不转。"
@@ -1659,16 +1815,16 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "acceptance": [
     {
       "id": "AC-007-01",
-      "given": "TUI（PTY）附着一个 AUTO 的 Run，另一个客户端经 HTTP 可提交命令",
-      "when": "TUI 中依次输入 /plan、按两次 Shift+Tab，随后经 HTTP 提交 SetMode{mode:PLAN}",
-      "then": "四次各产生恰好一条 SetMode 命令与一条 run.mode_changed{from, to}，依次为 AUTO→PLAN、PLAN→BUILD、BUILD→AUTO、AUTO→PLAN；/plan 与 HTTP 的两条命令除 id 外 payload 相同；顶栏显示当前模式",
+      "given": "TUI（PTY）附着一个 AUTO 的 Run，另一个客户端经 HTTP 可提交命令；另一个项目的配置为 [ui] mode_cycle = [\"PLAN\", \"AUTO\"]",
+      "when": "第一个项目的 TUI 中依次输入 /plan、按两次 Shift+Tab，随后经 HTTP 提交 SetMode{mode:PLAN}；第二个项目的 TUI 附着一个 PLAN 的 Run 后按两次 Shift+Tab",
+      "then": "第一个项目四次各产生恰好一条 SetMode 命令与一条 run.mode_changed{from, to}，依次为 AUTO→PLAN、PLAN→BUILD、BUILD→AUTO、AUTO→PLAN；/plan 与 HTTP 的两条命令除 id 外 payload 相同；顶栏显示当前模式；第二个项目依次为 PLAN→AUTO、AUTO→PLAN，没有经过 BUILD",
       "test_id": "TEST-007-01"
     },
     {
       "id": "AC-007-02",
       "given": "BUILD 的 Run 中一个写 Attempt 正在运行，另有 READY 的写 Task",
       "when": "TUI 中输入 /plan，随后该 Attempt 结束",
-      "then": "/plan 返回 202 并写 run.mode_change_pending{from:BUILD, to:PLAN}，状态栏显示待生效；Attempt 结束前没有新的写派发；结束后写 run.mode_changed 且 runs.mode=PLAN",
+      "then": "/plan 返回 202 并写 run.mode_change_pending{from:BUILD, to:PLAN}；Attempt 结束前没有新的写派发；结束后写 run.mode_changed 且 runs.mode=PLAN",
       "test_id": "TEST-007-02"
     },
     {
@@ -1680,7 +1836,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     }
   ],
   "decisions": [
-    "Shift+Tab 的顺序 PLAN→BUILD→AUTO（CR-026，C21）。",
+    "Shift+Tab 的顺序由 [ui] mode_cycle 配置，缺省 PLAN→BUILD→AUTO（CR-026，C21，CR26D-56）。",
     "未附着时 /plan 不改项目默认（project.default_mode），只改下一个 Run（CR-026，C20）。",
     "转给底座的语法为 /agent <role> <text>（CR-026，C19）。"
   ]
@@ -1700,12 +1856,14 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "steps": [
       "/plan",
       "两次 Shift+Tab",
-      "HTTP SetMode"
+      "HTTP SetMode",
+      "第二个项目（mode_cycle 为 PLAN、AUTO）两次 Shift+Tab"
     ],
     "pass_criteria": [
       "四条 SetMode 与四条 run.mode_changed 依次为 AUTO→PLAN、PLAN→BUILD、BUILD→AUTO、AUTO→PLAN",
       "/plan 与 HTTP 的 payload 相同",
-      "顶栏模式正确"
+      "顶栏模式正确",
+      "第二个项目依次为 PLAN→AUTO、AUTO→PLAN"
     ],
     "observables": [
       "命令记录",
@@ -1764,7 +1922,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 ]
 ```
 
-#### REQ-008 Plan 互动与文档（4 条 AC）
+#### REQ-008 Plan 互动与文档（5 条 AC）
 
 `contracts/requirements.json` 中 REQ-008 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-008-01；id、category、priority、milestone、title、required_release、release_class、release_targets、summary 不变）：
 
@@ -1783,59 +1941,70 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "spec_maturity": "detailed",
   "summary": "产生版本化规格，允许提问，未批准实施不修改产品源码",
   "behavior": [
-    "PLAN 中对话产出规格：cto 职位的写 Task 只写规格根 docs/spec/、docs/ 与 .hoh/；不派发写产品源文件的 Task，产品源文件在批准前不变（CONTRACT 第 4 条）。",
-    "规格只经用户批准成为修订（O1）：项目的首个规格经 ApproveSpec 成为修订 1（sha256 为批准时的规格摘要），写 spec.changed{cause:\"approved\"}；之后的修订经 CR（REQ-033），旧修订保留；HoH 的任何职位都不能批准。",
-    "没有已批准规格的 Run 停在 runtime:no_spec，规格批准后以 adopt 答复即采用最新修订（ADR-031 决定 1）。",
-    "Plan 中允许提问：Commander 的 request_user_decision 成为 question.asked，TUI 显示选项；答复前 Run 不越过 SPECIFYING；答复按 question_id 记录，不被记成假设。",
-    "未批准不实施：ProposeSpecChange 未批准时 Run 的 spec_id 不变；切到 BUILD 也无写派发（readiness 未过，REQ-031），既有阻塞不被清空。",
-    "Plan 起草规格的写 Task 不以已批准规格为前提；它们引用的 specs 行与锚定方式由 M3-T02 的 ADR 按 CR-026 的 C22 决定，不改受锁的 SQL；起草 Task 之外，批准前不派发任何写 Task。"
+    "规格只经用户批准成为修订（O1）：ApproveSpec 只接受来自用户客户端的请求。host 以连接对端的进程身份判定（Unix socket 的对端凭据；TCP 由本机连接表找到对端进程）：对端进程或其祖先带任何 Attempt 的标记（HOH_ATTEMPT_ID），或处于任何 Attempt 的 cgroup 中，即以 403 SPEC_APPROVAL_NOT_USER 拒绝，什么也不写。Commander 没有批准规格的决策（DecisionPayload 不含此类），它的任何输出都不产生修订。剩余风险（脱掉标记又离开 cgroup 的同用户进程）写入 docs/12。",
+    "没有已批准规格时（C22 的推荐做法，见 CR-026“首次批准之前的起草”）：StartRun 照旧以 runtime:no_spec 阻塞，runs.spec_id 为空，不派发任何 Agent turn（所有者 2026-11-16 的 Q1(a)）；no_spec 问题在 adopt 之外另有选项 draft：Runtime 不经 Agent，把内置规格模板（REQ-029）以目标文本实例化到 docs/spec/ 并生成索引，必要时本地 git init，提交只含 docs/spec/、docs/ 与 .hoh/ 的路径（REQ-028），然后提问请用户批准这一骨架。用户的 ApproveSpec 使它成为修订 1（spec.changed{cause:\"approved\"}），以 adopt 答复后 Run 采用它。在此之前 specs 没有行，另一次 StartRun 同样阻塞在 runtime:no_spec。",
+    "有已批准修订后，PLAN 与 AUTO 中的起草由 Runtime 建的起草 Task 承担：职位 cto、writer、spec_id 为当前已批准修订、不引用 REQ，以 spec.drafting{task_id} 标记，在 SPECIFYING 中照 Runtime 规则类派发（与监督唤醒同类，ADR-025 决定 3），由 Commander 照常监督；它的完成不冻结候选，而以工作树中的规格提出 CR（REQ-033，change_requests PROPOSED），并提问请用户批准；它的取消、租约、工作区记录与崩溃恢复同其他写 Task（REQ-041、REQ-043）。",
+    "Plan 的写集是 docs/spec/、docs/ 与 .hoh/：起草 Task 完成时 Runtime 以 Git 核对它开始以来的写集（已跟踪的修改与删除、未跟踪的新文件）；任一路径在写集之外时，写 plan.write_violation{task_id, paths}，不提出 CR，Task 为 BLOCKED（NEED_DECISION）并以问题列出这些路径；HoH 不替用户还原它们。PLAN 中 Commander 计划写产品源文件的 Task（writer 且不是起草 Task）被拒（ILLEGAL_TRANSITION，details 写“PLAN 不实施”）。",
+    "Plan 中允许提问：Commander 的 request_user_decision 成为 question.asked，TUI 显示选项；待答期间 Run 为 BLOCKED（NEED_DECISION）、resume_state=SPECIFYING，答复后回到 SPECIFYING；答复按 question_id 记录，不被记成假设。",
+    "未批准不实施：ProposeSpecChange 未批准时 Run 的 spec_id 不变；切到 BUILD 也无写派发（readiness 未过，REQ-031、REQ-009），既有阻塞不被清空。"
   ],
   "failure_modes": [
-    "PLAN 的 Run 中出现写产品源文件的派发或产品源文件变化时，判为失败（写集核对以 git 为准，不依 Agent 自述）。",
-    "HoH 职位试图批准规格时被拒，specs 不变。",
-    "答复前 Run 停在 SPECIFYING，不进入 READY。"
+    "Attempt 进程或其子孙调用 ApproveSpec 时返回 403 SPEC_APPROVAL_NOT_USER，没有新修订、没有采用、没有产品写派发。",
+    "起草 Task 写了写集之外的路径（已跟踪的修改、删除或未跟踪的新文件）时，写 plan.write_violation，不提出 CR，Task 不前进。",
+    "没有已批准规格时 StartRun 阻塞在 runtime:no_spec，runs.spec_id 为空，没有 Attempt；用户批准骨架之前不派发任何 Agent turn。",
+    "答复前 Run 为 BLOCKED(NEED_DECISION)，resume_state=SPECIFYING，不进入 READY。"
   ],
   "doc_refs": [
     "CONTRACT.md",
     "docs/03-ux.md",
     "docs/06-orchestration.md",
     "docs/15-prompts-skills-memory.md",
-    "docs/adr/ADR-031.md"
+    "docs/12-user-guide.md",
+    "docs/adr/ADR-031.md",
+    "docs/adr/ADR-025.md"
   ],
   "acceptance": [
     {
       "id": "AC-008-01",
-      "given": "PLAN 的 Run，FakeCommander 与 cto 的假 Agent 脚本起草规格，用户经 TUI 交互答复",
-      "when": "从 StartRun 运行到用户批准",
-      "then": "git 记录的写集只含 docs/spec/、docs/ 与 .hoh/ 下的路径；没有写产品源文件的派发；产品源文件的摘要不变",
+      "given": "PLAN 的 Run 采用了骨架修订 1；cto 的假 Agent 起草规格，用户经 TUI 交互答复 Commander 的问题",
+      "when": "从起草 Task 派发运行到 CR 提出、用户在 TUI 中批准",
+      "then": "Git 记录的写集（含未跟踪与删除）只含 docs/spec/、docs/ 与 .hoh/ 下的路径；没有写产品源文件的派发；产品源文件的摘要不变；批准后有修订 2",
       "test_id": "TEST-008-01"
     },
     {
       "id": "AC-008-02",
-      "given": "项目没有已批准规格，Run R2 以 runtime:no_spec 阻塞；用户在 docs/spec/ 写好规格并提交",
-      "when": "用户以 ApproveSpec{decision:APPROVE_ONLY} 批准，随后以 adopt 答复 R2 的问题",
-      "then": "specs 中有 revision=1、sha256 为批准时规格摘要的已批准修订，写 spec.changed{cause:\"approved\"}；R2 采用修订 1 并离开 BLOCKED",
+      "given": "一个空目录，没有已批准规格",
+      "when": "StartRun（PLAN）；再启动第二个 Run；用户以 draft 答复，随后以 ApproveSpec 批准骨架并以 adopt 答复；起草 Task 完成并提出 CR 后停止并重启 host；用户批准该 CR",
+      "then": "两个 Run 都阻塞在 runtime:no_spec，runs.spec_id 为空，没有 Attempt；draft 之后 docs/spec/ 有骨架与索引、specs 仍没有行；批准后有 revision=1 的已批准修订（spec.changed{cause:\"approved\"}），采用后 Run 的 spec_id 为它并回到 SPECIFYING；起草 Task 由 Runtime 建且标 spec.drafting，完成时没有候选、有一条 PROPOSED 的 change_requests；重启后 CR 与 Run 状态不变，批准后有修订 2，Run 的 spec_id 为修订 2",
       "test_id": "TEST-008-02"
     },
     {
       "id": "AC-008-03",
       "given": "PLAN 的 Run 在 SPECIFYING，Commander 发出 request_user_decision（两个选项）",
       "when": "TUI 显示后等待 10 s，随后用户选择第二个选项",
-      "then": "TUI 显示问题与两个选项；等待期间 Run 仍为 SPECIFYING；答复后 AnswerQuestion 事件带 question_id 与 choice，假设台账中没有该条",
+      "then": "TUI 显示问题与两个选项；等待期间 Run 为 BLOCKED(NEED_DECISION) 且 resume_state=SPECIFYING；答复后 Run 回到 SPECIFYING，AnswerQuestion 事件带 question_id 与 choice，假设台账中没有该条",
       "test_id": "TEST-008-03"
     },
     {
       "id": "AC-008-04",
-      "given": "PLAN 的 Run 有一个未批准的 ProposeSpecChange 与一个 NEED_DECISION 阻塞",
-      "when": "用户执行 /build",
-      "then": "Run 的 spec_id 不变；没有写派发；阻塞集合仍含原阻塞",
+      "given": "PLAN 的 Run 采用了修订 1；Commander 的计划含一个 developer 的写 Task；cto 的起草假 Agent 修改一个已跟踪的产品源文件、新建一个未跟踪的产品源文件、删除一个产品源文件",
+      "when": "Runtime 处理该计划，起草 Task 完成",
+      "then": "计划被拒（ILLEGAL_TRANSITION，details 含“PLAN 不实施”），没有导入 Task；起草 Task 的完成写 plan.write_violation，paths 恰为这三个路径，不提出 CR，Task 为 BLOCKED(NEED_DECISION) 且问题列出这三个路径；没有新的已批准修订",
       "test_id": "TEST-008-04"
+    },
+    {
+      "id": "AC-008-05",
+      "given": "PLAN 的 Run 有待批的骨架；cto 的假 Agent 进程（带 Attempt 标记）读到 host.json 的 token；FakeCommander 在输出中要求批准",
+      "when": "假 Agent 经 TCP 与 Unix socket 各提交一次 ApproveSpec；随后用户客户端批准骨架；再在 CR 待批时假 Agent 又提交一次，用户随后批准该 CR",
+      "then": "假 Agent 的三次提交都返回 403 SPEC_APPROVAL_NOT_USER，此时没有新的已批准修订、没有采用、没有产品写派发；FakeCommander 的输出没有产生任何修订；用户的两次批准分别产生修订 1 与修订 2",
+      "test_id": "TEST-008-05"
     }
   ],
   "decisions": [
-    "批准权取所有者 2026-11-17 的决定 O1：只有用户批准规格（CR-026）。",
+    "批准权取所有者 2026-11-17 的决定 O1：只有用户批准规格；对端进程判定是 host 能做到的执行，剩余风险写入用户指南（CR-026，CR26D-06）。",
+    "首次批准之前的起草取 CR-026 的 C22 推荐做法：不经 Agent 的模板骨架加用户批准，不改受锁 SQL，不改 Q1(a) 与 M2T13D-59（CR-026，CR26D-01、-50）。",
     "Plan 的写集为 docs/spec/、docs/ 与 .hoh/；原型工件也只能放在 docs/ 下（CR-026，C23）。",
-    "无已批准规格时的起草依据见 CR-026 的 C22 决定。"
+    "新码 SPEC_APPROVAL_NOT_USER（ErrorCode，403）（CR-026）。"
   ]
 }
 ```
@@ -1851,18 +2020,19 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "check_id": "tui-pty",
     "fixture": "PTY 中的 hoh TUI + 产品 host + FakeCommander + cto 假 Agent（交互答复）",
     "steps": [
-      "StartRun(PLAN)",
+      "派发起草 Task",
       "交互答复",
-      "批准",
-      "比较 git 写集与文件摘要"
+      "TUI 批准 CR",
+      "比较 Git 写集与文件摘要"
     ],
     "pass_criteria": [
-      "写集只含 docs/spec/、docs/、.hoh/",
+      "写集（含未跟踪与删除）只含 docs/spec/、docs/、.hoh/",
       "无写产品源文件的派发",
-      "产品源文件摘要不变"
+      "产品源文件摘要不变",
+      "批准后有修订 2"
     ],
     "observables": [
-      "git diff 路径集合",
+      "git status 与 diff 的路径集合",
       "attempts 行",
       "文件摘要",
       "判定结果"
@@ -1873,21 +2043,26 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-008",
     "acceptance_id": "AC-008-02",
     "check_id": "integration",
-    "fixture": "产品 host，项目无已批准规格，R2 以 no_spec 阻塞",
+    "fixture": "空目录 + 产品 host（停止与重启）+ cto 假 Agent + 用户答复与批准",
     "steps": [
-      "提交规格文件",
-      "ApproveSpec{decision:APPROVE_ONLY}",
-      "以 adopt 答复 R2"
+      "StartRun 两次",
+      "draft 答复",
+      "ApproveSpec 骨架并 adopt",
+      "起草 Task 完成后重启 host",
+      "批准 CR"
     ],
     "pass_criteria": [
-      "已批准修订 1 且 sha256 为规格摘要",
-      "spec.changed{cause:approved}",
-      "R2 采用修订 1 并离开 BLOCKED"
+      "两个 Run 阻塞在 runtime:no_spec 且 spec_id 为空、无 Attempt",
+      "draft 后有骨架与索引而 specs 无行",
+      "修订 1 与 spec.changed{cause:approved}，Run 采用并回到 SPECIFYING",
+      "起草 Task 标 spec.drafting，完成时无候选、有 PROPOSED 的 CR",
+      "重启后状态不变",
+      "批准后修订 2 且 Run 的 spec_id 为修订 2"
     ],
     "observables": [
-      "specs 行",
+      "specs、change_requests、runs、tasks 行",
       "events导出",
-      "runs 行",
+      "git 提交清单",
       "判定结果"
     ]
   },
@@ -1904,8 +2079,8 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     ],
     "pass_criteria": [
       "TUI 显示问题与选项",
-      "等待期间 SPECIFYING",
-      "答复记录 question_id 与 choice",
+      "等待期间 BLOCKED(NEED_DECISION) 且 resume_state=SPECIFYING",
+      "答复后回到 SPECIFYING 且记录 question_id 与 choice",
       "台账无该条"
     ],
     "observables": [
@@ -1920,19 +2095,46 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-008",
     "acceptance_id": "AC-008-04",
     "check_id": "integration",
-    "fixture": "产品 host，PLAN 的 Run 有未批准提议与阻塞",
+    "fixture": "产品 host + FakeCommander 计划 + 越界写的 cto 假 Agent",
     "steps": [
-      "SetMode{mode:BUILD}"
+      "提交含 developer 写 Task 的计划",
+      "起草 Task 修改、新建、删除产品源文件后完成"
     ],
     "pass_criteria": [
-      "spec_id 不变",
-      "无写派发",
-      "阻塞集合含原阻塞"
+      "计划被拒且 details 含“PLAN 不实施”",
+      "plan.write_violation 的 paths 恰为三个路径",
+      "不提出 CR，Task BLOCKED(NEED_DECISION) 且问题列出路径",
+      "没有新的已批准修订"
     ],
     "observables": [
-      "runs 行",
-      "调度轮派发记录",
-      "阻塞集合",
+      "decisions 与 tasks 行",
+      "events导出",
+      "change_requests 行",
+      "判定结果"
+    ]
+  },
+  {
+    "id": "TEST-008-05",
+    "requirement_id": "REQ-008",
+    "acceptance_id": "AC-008-05",
+    "check_id": "integration",
+    "fixture": "产品 host + 带 Attempt 标记的假 Agent 进程 + FakeCommander + 用户客户端",
+    "steps": [
+      "假 Agent 经 TCP 与 Unix socket 提交 ApproveSpec",
+      "用户批准骨架",
+      "CR 待批时假 Agent 再提交",
+      "用户批准 CR"
+    ],
+    "pass_criteria": [
+      "三次假 Agent 提交都是 403 SPEC_APPROVAL_NOT_USER",
+      "此时无新修订、无采用、无产品写派发",
+      "FakeCommander 输出不产生修订",
+      "用户两次批准产生修订 1 与 2"
+    ],
+    "observables": [
+      "HTTP 状态与错误体",
+      "specs 与 runs 行",
+      "attempts 行",
       "判定结果"
     ]
   }
@@ -1959,13 +2161,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "summary": "Build 遵守既定规格；Auto 可补规划；缺必需规格均不越过 readiness",
   "behavior": [
     "BUILD 遵守既定规格：Commander 的 create_tasks 只能引用当前已批准修订中的 REQ；BUILD 中不起草规格，需要改规格时提示用户切到 PLAN 或提 CR。",
-    "AUTO 可补规划：规格缺必需项时 Commander 可安排起草补充（cto 的写 Task，写集同 PLAN），但补充只经用户批准生效（O1），批准前无写产品源文件的派发。",
+    "AUTO 可补规划：规格缺必需项时 Runtime 派发起草 Task（REQ-008，写集同 PLAN），补充只经用户批准生效（O1）：交互时以问题请用户批准，无人值守时 Run 以 NEED_DECISION 停在批准前（-p 以 3 退出）；批准前无写产品源文件的派发，也没有新的已批准修订。",
     "BUILD 在缺必需规格时不自行补规格，相关 Task 为 BLOCKED（READINESS_NOT_MET）并在问题中提示可切到 AUTO 或 PLAN（C24）。",
     "模式与生命周期正交：PAUSED、BLOCKED 中可改模式，恢复时按新模式；PLAN→BUILD 只在规格已批准且 readiness 已过时才有写派发；BUILD/AUTO→PLAN 在安全点生效（REQ-007）。"
   ],
   "failure_modes": [
     "BUILD 中引用未批准 REQ 的 create_tasks 被拒（ILLEGAL_TRANSITION，details 写“BUILD 不改规格，用 /plan 或 CR”），task_requirements 不变。",
-    "AUTO 的补充未批准时，没有写产品源文件的派发。",
+    "AUTO 的补充未批准时，没有写产品源文件的派发，也没有新的已批准修订。",
     "无人值守的 AUTO 缺规格时停在批准前（NEED_DECISION），不自批。"
   ],
   "doc_refs": [
@@ -1977,16 +2179,16 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "acceptance": [
     {
       "id": "AC-009-01",
-      "given": "BUILD 的 Run，已批准修订含 REQ-A；Commander 提出 create_tasks，一个 Task 引用 REQ-A，另一个引用不存在于修订的 REQ-Z",
-      "when": "Runtime 处理该决策",
-      "then": "决策 REJECTED（ILLEGAL_TRANSITION，details 含“BUILD 不改规格，用 /plan 或 CR”与 REQ-Z）；没有导入任何 Task，task_requirements 不变",
+      "given": "BUILD 的 Run，已批准修订含 REQ-A；Commander 先提出 create_tasks，一个 Task 引用 REQ-A，另一个引用不存在于修订的 REQ-Z；再提出只含引用 REQ-A 的 Task 的 create_tasks",
+      "when": "Runtime 依次处理这两个决策",
+      "then": "第一个决策 REJECTED（ILLEGAL_TRANSITION，details 含“BUILD 不改规格，用 /plan 或 CR”与 REQ-Z），没有导入任何 Task；第二个决策 APPLIED，导入引用 REQ-A 的 Task 且 task_requirements 恰为 REQ-A",
       "test_id": "TEST-009-01"
     },
     {
       "id": "AC-009-02",
-      "given": "两个 Run 在同一缺 AC 的已批准修订上，一个 AUTO、一个 BUILD",
-      "when": "两者各运行至停止派发",
-      "then": "AUTO 的 Run 派发 cto 起草补充的写 Task 并以问题请用户批准，批准前没有写产品源文件的派发；BUILD 的 Run 不起草，相关 Task 为 BLOCKED(READINESS_NOT_MET) 且问题提示可切到 AUTO 或 PLAN",
+      "given": "三个 Run 在同一缺 AC 的已批准修订上：一个交互的 AUTO、一个无人值守（-p）的 AUTO、一个 BUILD",
+      "when": "三者各运行至停止派发",
+      "then": "两个 AUTO 都派发起草 Task 并提出 CR，没有新的已批准修订、没有写产品源文件的派发；交互的以问题请用户批准；无人值守的 Run=BLOCKED(NEED_DECISION) 且 -p 以 3 退出；BUILD 不起草，相关 Task 为 BLOCKED(READINESS_NOT_MET) 且问题提示可切到 AUTO 或 PLAN",
       "test_id": "TEST-009-02"
     },
     {
@@ -2015,12 +2217,12 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "check_id": "integration",
     "fixture": "产品 host + FakeCommander，BUILD 的 Run",
     "steps": [
-      "提交含 REQ-Z 的 create_tasks"
+      "提交含 REQ-Z 的 create_tasks",
+      "提交只含 REQ-A 的 create_tasks"
     ],
     "pass_criteria": [
-      "决策 REJECTED 且 details 含提示与 REQ-Z",
-      "无 Task 导入",
-      "task_requirements 不变"
+      "第一个 REJECTED 且 details 含提示与 REQ-Z，无 Task 导入",
+      "第二个 APPLIED 且 task_requirements 恰为 REQ-A"
     ],
     "observables": [
       "decisions 行",
@@ -2033,18 +2235,20 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-009",
     "acceptance_id": "AC-009-02",
     "check_id": "integration",
-    "fixture": "产品 host + FakeCommander + cto 假 Agent，同一缺 AC 的修订",
+    "fixture": "产品 host + FakeCommander + cto 假 Agent + hoh -p，同一缺 AC 的修订",
     "steps": [
-      "AUTO 与 BUILD 各运行至停止派发"
+      "交互 AUTO、无人值守 AUTO 与 BUILD 各运行至停止派发"
     ],
     "pass_criteria": [
-      "AUTO 派发起草 Task 并请求批准，批准前无产品写派发",
+      "两个 AUTO 派发起草 Task 并提出 CR，无新修订、无产品写派发",
+      "交互的请用户批准",
+      "无人值守的 BLOCKED(NEED_DECISION) 且退出码 3",
       "BUILD 的 Task BLOCKED(READINESS_NOT_MET) 且问题提示切换"
     ],
     "observables": [
-      "attempts 与 tasks 行",
+      "attempts、tasks 与 change_requests 行",
       "问题",
-      "events导出",
+      "退出码",
       "判定结果"
     ]
   },
@@ -2119,9 +2323,9 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-017-02",
-      "given": "developer 的 Attempt 运行中；一个绑定为支持 mid_turn_steer 的 Codex App Server 夹具，另一个为不支持的假 Agent",
-      "when": "各向 developer 发 STEER",
-      "then": "支持者在当前 turn 内收到引导、写 input.delivered{boundary:\"turn\"}；不支持者在下一个 Attempt 的输入中收到、写 input.delivered{boundary:\"next_attempt\"}；两者都只投递一次",
+      "given": "两个 Run 的 developer Attempt 运行中：一个绑定真实的 Codex CLI（App Server，支持 mid_turn_steer），另一个绑定不支持的假 Agent",
+      "when": "各经产品 host 的 SendInput{input_kind:STEER, target_role:developer} 发一条引导",
+      "then": "Codex 的一条经 host 的投递链在当前 turn 内到达（适配器的 steer 请求在该 turn 结束前发出），写 input.delivered{boundary:\"turn\"}；假 Agent 的一条在下一个 Attempt 的输入中收到，写 input.delivered{boundary:\"next_attempt\"}；两者都只投递一次",
       "test_id": "TEST-017-02"
     },
     {
@@ -2140,9 +2344,9 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-017-05",
-      "given": "投递循环接入 host；三条 QUEUED 输入，其中一条的 consume 会以 KeyReuse 失败；outbox 中有一条验证交接",
-      "when": "投递一轮；在一条已投递未 ACK 时 kill -9 host 并重启",
-      "then": "每条输入恰应用一次（以 consumer+message_id 去重）；KeyReuse 的一条计一次拒绝，不进死信；验证交接没有被领取；重启后未 ACK 的被重投并只应用一次",
+      "given": "投递循环接入 host；三条 QUEUED 输入 M1、M2、M3，其中 M3 的 consume 会以 KeyReuse 失败；outbox 中有一条验证交接",
+      "when": "投递一轮，在 M2 已投递、未 ACK 时 kill -9 host 并重启",
+      "then": "按 message_id 逐条：M1 应用 1 次；M2 的传输投递 2 次（重启前后）而业务应用 1 次（receipts 中 (consumer, M2) 恰一行）；M3 应用 0 次、记一次拒绝且不进死信；验证交接没有被领取",
       "test_id": "TEST-017-05"
     }
   ],
@@ -2183,13 +2387,13 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-017",
     "acceptance_id": "AC-017-02",
     "check_id": "adapter-live",
-    "fixture": "Codex App Server（真实 CLI，mid_turn_steer）+ 不支持的假 Agent",
+    "fixture": "产品 host + 真实 Codex CLI（App Server，mid_turn_steer）+ 不支持的假 Agent（标为 fallback 夹具）",
     "steps": [
-      "各发 STEER"
+      "经 SendInput 各发 STEER"
     ],
     "pass_criteria": [
-      "支持者 boundary=turn",
-      "不支持者 boundary=next_attempt",
+      "Codex 的经 host 投递链在当前 turn 内到达，boundary=turn",
+      "假 Agent 的 boundary=next_attempt",
       "各只投递一次"
     ],
     "observables": [
@@ -2255,10 +2459,10 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
       "重启"
     ],
     "pass_criteria": [
-      "每条恰应用一次",
-      "KeyReuse 计一次拒绝且无死信",
-      "验证交接未被领取",
-      "重启后重投只应用一次"
+      "M1 应用 1 次",
+      "M2 传输 2 次、应用 1 次",
+      "M3 应用 0 次、拒绝 1 次、无死信",
+      "验证交接未被领取"
     ],
     "observables": [
       "outbox 与 input_queue",
@@ -2291,7 +2495,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   "behavior": [
     "角色间咨询经 Router 成为全局账本中的子 Task（parent、role、预算、deadline），出现在 /v1/runs/{id}/tasks，结果回到请求方；没有账本之外的工作。",
     "wait-for 图检测环：A 等 B 的回答时 B 向 A 提问，后一请求被拒（CONSULT_CYCLE，details 列出环成员）；QA 请 Developer 改当前候选被拒并转为 Issue（ADR-028 决定 13）。",
-    "讨论有轮数上限：同一争议最多两轮意见（MOA），第三轮请求被拒（DISCUSSION_LIMIT），Commander 以 need_decision 被唤醒；没有新证据时提前停止；结论产出 Decision 或 ADR 引用。",
+    "讨论有轮数上限：同一争议的意见轮数上限取配置 [supervision] max_discussion_rounds（缺省 2，合法值 1–5 的整数，非法值使配置被拒；docs/06 的“默认可调上限”），超过上限的请求被拒（DISCUSSION_LIMIT），Commander 以 need_decision 被唤醒；没有新证据时提前停止；结论产出 Decision 或 ADR 引用。",
     "重大决定升级：咨询结论触及规格、ADR、公开接口或门禁时（C27），参与职位不自行应用，升级为 Commander 的 need_decision；规格变更再走 CR（REQ-033）。"
   ],
   "failure_modes": [
@@ -2322,9 +2526,9 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-023-03",
-      "given": "架构争议已进行两轮意见",
-      "when": "参与者发起第三轮讨论请求",
-      "then": "请求被拒（DISCUSSION_LIMIT）；Commander 以 need_decision 被唤醒恰一次，唤醒摘要含两轮意见的引用；之后的结论记录为 Decision 或 ADR 引用",
+      "given": "两个项目中各有一个架构争议：项目 A 用缺省配置，项目 B 配置 [supervision] max_discussion_rounds = 3",
+      "when": "A 的参与者在两轮意见之后发起第三轮；B 的参与者发起第三轮，之后发起第四轮",
+      "then": "A 的第三轮被拒（DISCUSSION_LIMIT），Commander 以 need_decision 被唤醒恰一次，唤醒摘要含两轮意见的引用，之后的结论记录为 Decision 或 ADR 引用；B 的第三轮被接受，第四轮被拒（DISCUSSION_LIMIT）并唤醒恰一次",
       "test_id": "TEST-023-03"
     },
     {
@@ -2337,7 +2541,7 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
   ],
   "decisions": [
     "重大决定为触及规格、ADR、公开接口或门禁者（CR-026，C27）。",
-    "讨论上限两轮为初值，固定写在 Runtime，不新增配置键；要调整另写 CR（CR-026，C28）。",
+    "讨论轮数上限由 [supervision] max_discussion_rounds 配置，缺省 2（docs/06 的默认可调上限）（CR-026，C28，CR26D-10）。",
     "新码 CONSULT_CYCLE、DISCUSSION_LIMIT 为 RejectionReason（CR-026）。"
   ]
 }
@@ -2395,14 +2599,15 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-023",
     "acceptance_id": "AC-023-03",
     "check_id": "integration",
-    "fixture": "产品 host + FakeCommander，两轮意见",
+    "fixture": "产品 host + FakeCommander，两个项目（缺省；max_discussion_rounds=3）",
     "steps": [
-      "第三轮请求"
+      "A 发起第三轮",
+      "B 发起第三轮与第四轮"
     ],
     "pass_criteria": [
-      "DISCUSSION_LIMIT",
-      "need_decision 唤醒恰一次且摘要含两轮引用",
-      "结论为 Decision 或 ADR 引用"
+      "A 第三轮 DISCUSSION_LIMIT 且唤醒恰一次、摘要含两轮引用",
+      "结论为 Decision 或 ADR 引用",
+      "B 第三轮接受、第四轮 DISCUSSION_LIMIT 且唤醒恰一次"
     ],
     "observables": [
       "轮次计数",
@@ -2495,9 +2700,9 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     },
     {
       "id": "AC-040-04",
-      "given": "no_progress 已唤醒 Commander，FakeCommander 的回答建一个研究 Task",
-      "when": "Commander 处理该唤醒",
-      "then": "唤醒摘要含重复的 fingerprint、最后一次进展的 seq 与建议；之后出现 role=researcher 的新 Task；Runtime 没有自行派发“继续”的 Commander turn",
+      "given": "两个 Run 各有一次 no_progress 唤醒 Commander：Run X 的 FakeCommander 以改计划回答（取消重复失败的 Task、以 create_tasks 建替代 Task），Run Y 的以建研究 Task 回答",
+      "when": "两个 Commander 各处理其唤醒",
+      "then": "两份唤醒摘要都含重复的 fingerprint、最后一次进展的 seq，以及升级、研究、改计划三项建议；X 中原 Task 为 CANCELLED、替代 Task 被导入；Y 中出现 role=researcher 的新 Task；两个 Run 中 Runtime 都没有自行派发“继续”的 Commander turn",
       "test_id": "TEST-040-04"
     }
   ],
@@ -2577,13 +2782,14 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
     "requirement_id": "REQ-040",
     "acceptance_id": "AC-040-04",
     "check_id": "integration",
-    "fixture": "产品 host + FakeCommander 回答建研究 Task",
+    "fixture": "产品 host + 两个 FakeCommander（改计划；建研究 Task）",
     "steps": [
-      "处理唤醒"
+      "两个 Run 各处理唤醒"
     ],
     "pass_criteria": [
-      "摘要含诊断三项",
-      "出现 researcher 的新 Task",
+      "摘要含 fingerprint、最后进展 seq 与三项建议",
+      "X 的原 Task CANCELLED 且替代 Task 导入",
+      "Y 出现 researcher 的新 Task",
       "无自动“继续” turn"
     ],
     "observables": [
@@ -2597,21 +2803,21 @@ M3-T01 的 done_when 还要求：按每个实现任务至多 2 项需求、8 条
 ```
 
 
-### 5. M3 实现任务的拆分（`contracts/development-tasks.json`）
+### 6. M3 实现任务的拆分（`contracts/development-tasks.json`）
 
 M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T06 至 M3-T10；M3-T01（spec）与 M3-T05（verify）不变，只是 M3-T05 的 `depends_on` 改为全部八个实现任务。每个实现任务至多 2 项需求、8 条 AC：
 
 | 任务 | 需求（AC 数） | AC | depends_on |
 |---|---|---|---|
 | M3-T02 | REQ-034（4）、REQ-033（4） | 8 | M3-T01 |
-| M3-T06 | REQ-031（4）、REQ-030（3） | 7 | M3-T02 |
-| M3-T07 | REQ-032（3）、REQ-028（4） | 7 | M3-T02 |
+| M3-T06 | REQ-031（5）、REQ-030（3） | 8 | M3-T02 |
 | M3-T03 | REQ-045（4）、REQ-047（3） | 7 | M3-T02 |
 | M3-T08 | REQ-029（3）、REQ-046（3） | 6 | M3-T06、M3-T03 |
-| M3-T04 | REQ-008（4）、REQ-009（3） | 7 | M3-T06、M3-T08、M3-T09 |
+| M3-T07 | REQ-032（3）、REQ-028（4） | 7 | M3-T06、M3-T08 |
 | M3-T09 | REQ-007（3）、REQ-017（5） | 8 | M3-T02 |
+| M3-T04 | REQ-008（5）、REQ-009（3） | 8 | M3-T06、M3-T08、M3-T09 |
 | M3-T10 | REQ-023（4）、REQ-040（4） | 8 | M3-T09 |
-| 合计 | 16 项 | 58 |  |
+| 合计 | 16 项 | 60 |  |
 
 
 替换后的八个任务（M3-T02、M3-T03、M3-T04 的旧条目由下文取代；新条目插在 M3-T05 之前）：
@@ -2624,7 +2830,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
     "kind": "implement",
     "owner_role": "developer",
     "writer": true,
-    "title": "文档事实源与规格变更（规格位置、索引、CR、影响闭包、证据失效）",
+    "title": "文档事实源与规格变更（规格位置与冻结形式、索引、CR、影响闭包、证据失效）",
     "depends_on": [
       "M3-T01"
     ],
@@ -2632,7 +2838,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-034",
       "REQ-033"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。规格变化置 STALE 时写 candidate.stale{candidate_id, reason}（ADR-028 决定 11 的持久取代事实）；规格事实源的位置替换 M2-T16 冻结使用的约定路径（ADR-028 决定 4）；以 SPEC_MISMATCH 被挡住的写 Task 经规格变更流程放行；spec.changed 的产生，并把验证中的候选按 REQ-053 行为 7 置 STALE；旧规格下的开发 Task 的迁移或替代（含 task_requirements 的需求映射，使它们在新规格下可派发）（CR-018）。规格位置不再指向 contracts/requirements.json 后，删去 persistence_scan 的对应条目（CR-019）。C22 的起草依据（CR-026）在本任务的 ADR 中定稿。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。规格变化置 STALE 时写 candidate.stale{candidate_id, reason}（ADR-028 决定 11 的持久取代事实）；规格事实源的位置替换 M2-T16 冻结使用的约定路径（ADR-028 决定 4），冻结形式为 docs/spec/index.json（CR-026）；以 SPEC_MISMATCH 被挡住的写 Task 经规格变更流程放行；spec.changed 的产生，并把验证中的候选按 REQ-053 行为 7 置 STALE；旧规格下的开发 Task 的迁移或替代（含 task_requirements 的需求映射，使它们在新规格下可派发）（CR-018）。规格位置不再指向 contracts/requirements.json 后，删去 persistence_scan 的对应条目（CR-019）。"
   },
   {
     "id": "M3-T06",
@@ -2640,7 +2846,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
     "kind": "implement",
     "owner_role": "developer",
     "writer": true,
-    "title": "Readiness Gate 与规格收敛（假设台账、来源校验）",
+    "title": "Readiness Gate（含独立规格审查）与规格收敛（假设台账、来源校验）",
     "depends_on": [
       "M3-T02"
     ],
@@ -2648,23 +2854,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-031",
       "REQ-030"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。按任务范围选代码的上下文来源（REQ-039，ADR-026 决定 12）在本任务实现：Task 的路径范围随计划与 readiness 出现（CR-016）。"
-  },
-  {
-    "id": "M3-T07",
-    "milestone": "M3",
-    "kind": "implement",
-    "owner_role": "developer",
-    "writer": true,
-    "title": "需求追踪与项目发现",
-    "depends_on": [
-      "M3-T02"
-    ],
-    "requirements": [
-      "REQ-032",
-      "REQ-028"
-    ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）（CR-017，ADR-027 的移交）。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。按任务范围选代码的上下文来源（REQ-039，ADR-026 决定 12）在本任务实现：Task 的路径范围随计划与 readiness 出现（CR-016），M3-T07 的脏文件判定使用它。独立规格审查的派发（reviewer 职位、独立会话、绑定规格修订）在本任务实现（CR-026，CR26D-05）。"
   },
   {
     "id": "M3-T03",
@@ -2688,7 +2878,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
     "kind": "implement",
     "owner_role": "developer",
     "writer": true,
-    "title": "内置模板与内置Skill",
+    "title": "内置模板与内置Skill（含 no_spec 的 draft 实例化入口）",
     "depends_on": [
       "M3-T06",
       "M3-T03"
@@ -2697,25 +2887,24 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-029",
       "REQ-046"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。Skill 正文按需加载与短索引（REQ-039 行为 7 的前半，ADR-026）在本任务实现。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。Skill 正文按需加载与短索引（REQ-039 行为 7 的前半，ADR-026）在本任务实现。runtime:no_spec 问题的 draft 选项（不经 Agent 实例化规格骨架，必要时本地 git init 并按 REQ-028 的规则提交）在本任务实现（CR-026 的 C22）。"
   },
   {
-    "id": "M3-T04",
+    "id": "M3-T07",
     "milestone": "M3",
     "kind": "implement",
     "owner_role": "developer",
     "writer": true,
-    "title": "Plan 与 Build/Auto",
+    "title": "需求追踪与项目发现",
     "depends_on": [
       "M3-T06",
-      "M3-T08",
-      "M3-T09"
+      "M3-T08"
     ],
     "requirements": [
-      "REQ-008",
-      "REQ-009"
+      "REQ-032",
+      "REQ-028"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位），运行产品当前的导出（CR-017，ADR-027 的移交，CR-026）。"
   },
   {
     "id": "M3-T09",
@@ -2734,6 +2923,24 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
     "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。steer/query 的产品路由与投递：ADR-018 决定 4 的投递循环接入 host 与它的消费者（领取永不取验证交接，ADR-028 决定 9），当前 epoch 的路由，M2T17R-153（新持有者首个输入之前不投递）、M2T17R-154（哪些 Commander 消息还要核对接收方的 epoch）、M2T17R-254（KeyReuse 计为一次拒绝、不重试到死信）（ADR-025 决定 10）；接管之后的 query/steer 路由（取代 M2-T16 的 deferred 回应），历史上 deferred 的消息不补投（ADR-028 决定 13）（CR-018）。用户输入交给 Commander（ADR-025 决定 1）。改动进程与并发，按 docs/19 由两名互补审查者审查。"
   },
   {
+    "id": "M3-T04",
+    "milestone": "M3",
+    "kind": "implement",
+    "owner_role": "developer",
+    "writer": true,
+    "title": "Plan 与 Build/Auto（首次批准之前的起草、起草 Task、批准者判定）",
+    "depends_on": [
+      "M3-T06",
+      "M3-T08",
+      "M3-T09"
+    ],
+    "requirements": [
+      "REQ-008",
+      "REQ-009"
+    ],
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。起草 Task（Runtime 建、SPECIFYING 中派发、完成即提出 CR）、Plan 写集的核对与 ApproveSpec 的对端进程判定在本任务实现（CR-026 的 C22，CR26D-06、-11）。"
+  },
+  {
     "id": "M3-T10",
     "milestone": "M3",
     "kind": "implement",
@@ -2747,7 +2954,7 @@ M3-T02、M3-T03、M3-T04 保留 id 作为各组的第一个任务，新增 M3-T0
       "REQ-023",
       "REQ-040"
     ],
-    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。角色间咨询的 wait-for 环检测（CR-018）；no_progress、milestone_ready 与 release_request 的产生方（ADR-025 决定 1；后两者没有 M3 的 AC，其定义在本任务的 ADR 中给出，不早于它们的需求所在里程碑的细化而改变 REQ-021 的唤醒集合）。"
+    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。角色间咨询的 wait-for 环检测（CR-018）；no_progress、milestone_ready 与 release_request 的产生方（ADR-025 决定 1；后两者没有 M3 的 AC，其定义在本任务的 ADR 中给出，不改变 REQ-021 的唤醒集合）。"
   }
 ]
 ```
@@ -2760,138 +2967,146 @@ M3-T05 的 `depends_on`：
 
 拆分的理由：
 
-- M3-T02 先行：规格的位置、索引与修订是其余各组的前提（准备清单 §6 第 1 条）。它承接 CR-018 给 M3-T02 的全部项与 CR-019 的条目删除，并在它的 ADR 中定 C22。
-- M3-T06（readiness 与收敛）承接 REQ-039 按任务范围选代码（CR-016）：Task 的路径范围随计划与 readiness 出现。
-- M3-T07（追踪与发现）承接 CR-017 的 TEST-032-01 位置。
+- M3-T02 先行：规格的位置、冻结形式、索引与修订是其余各组的前提。它承接 CR-018 给 M3-T02 的全部项与 CR-019 的条目删除。
+- M3-T06（readiness、独立规格审查与收敛）承接 REQ-039 按任务范围选代码（CR-016）：Task 的路径范围随计划与 readiness 出现；独立规格审查的派发也在这里（CR26D-05）。
 - M3-T03（四层 Prompt 与覆盖）依赖 M3-T02：项目层引用已批准规格。
-- M3-T08（模板与 Skill）依赖 M3-T06（规格模板的五节，C7）与 M3-T03（模板与 Skill 也按四层覆盖）；承接 ADR-026 的 Skill 短索引。
-- M3-T09（SetMode、斜杠与运行中对话）依赖 M3-T02（CHANGE 写 CR）；承接 CR-018 给 M3-T04 的投递项。它把投递循环接入 host，是进程与并发改动，按 docs/19 用两名互补审查者。
-- M3-T04（Plan 与 Build/Auto）依赖 M3-T06（readiness）、M3-T08（Plan 用的模板与 Skill）与 M3-T09（SetMode 的安全点）。
-- M3-T10（咨询与停滞诊断）依赖 M3-T09（咨询经投递循环路由）；承接 wait-for 环检测与 no_progress 的产生方。
+- M3-T08（模板与 Skill）依赖 M3-T06（规格模板的五节，C7）与 M3-T03（模板与 Skill 也按四层覆盖）；承接 ADR-026 的 Skill 短索引与 no_spec 的 draft 实例化入口（C22 的第 2 步）。
+- M3-T07（追踪与发现）依赖 M3-T06（AC-028-03 的脏文件判定用 Task 的路径范围，CR26D-04）与 M3-T08（AC-028-04 经 draft 入口做首个提交）；承接 CR-017 的 TEST-032-01 位置。
+- M3-T09（SetMode、斜杠与运行中对话）依赖 M3-T02（CHANGE 写 CR）；承接 CR-018 给 M3-T04 的投递项，是进程与并发改动，按 docs/19 用两名互补审查者。
+- M3-T04（Plan 与 Build/Auto）依赖 M3-T06（readiness 与规格审查）、M3-T08（draft 入口与模板）与 M3-T09（SetMode 的安全点）；起草 Task、写集核对与批准者判定在这里（C22 的第 4–6 步，CR26D-06、-11）。
+- M3-T10（咨询与停滞诊断）依赖 M3-T09（咨询经投递循环路由）；承接 wait-for 环检测与 no_progress 等的产生方。
 
-### 6. 每条 AC 的依赖闭包（CR3R-02）
+### 7. 每条 AC 的依赖闭包（CR3R-02，CR26D-04）
 
-每条 AC 所需的能力都由它的任务或其祖先提供。所需检查的交付者（validate_bundle 的归属规则）全在 M3-T01 的祖先中；下表列出各 AC 的检查与它依赖的能力：
+下表按每条 AC 实际用到的能力列出提供者（“本任务”或它的祖先），不再只写通用的 host 与 FakeAgent。表中点名的每个 M3 任务都已由生成器核对为该 AC 所属任务本身或其祖先；所需检查的交付者（validate_bundle 的归属规则）全在 M3-T01 的祖先中：
 
-| 任务 | AC | 检查 | 所需能力与提供者（任务或其祖先） |
+| 任务 | AC | 检查 | 实际用到的能力与提供者（“本任务”或其祖先） |
 |---|---|---|---|
-| M3-T02 | AC-034-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-034-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-034-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-034-04 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T02 | AC-033-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-033-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-033-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T02 | AC-033-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T06 | AC-031-01 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T06 | AC-031-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T06 | AC-031-03 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T06 | AC-031-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T06 | AC-030-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T06 | AC-030-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T06 | AC-030-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-032-01 | traceability | traceability 检查与 release_gate 仿本（M2-T10） |
-| M3-T07 | AC-032-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-032-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-028-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-028-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-028-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T07 | AC-028-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T03 | AC-045-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T03 | AC-045-02 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T03 | AC-045-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T03 | AC-045-04 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T03 | AC-047-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T03 | AC-047-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T03 | AC-047-03 | deployment | 发布包、安装器与 deployment 检查（M2-T14） |
-| M3-T08 | AC-029-01 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T08 | AC-029-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T08 | AC-029-03 | deployment | 发布包、安装器与 deployment 检查（M2-T14） |
-| M3-T08 | AC-046-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T08 | AC-046-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T08 | AC-046-03 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T04 | AC-008-01 | tui-pty | TUI 外壳与 PTY 检查（M1-T08）、host 与 attach（M2-T06、M2-T13） |
-| M3-T04 | AC-008-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T04 | AC-008-03 | tui-pty | TUI 外壳与 PTY 检查（M1-T08）、host 与 attach（M2-T06、M2-T13） |
-| M3-T04 | AC-008-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T04 | AC-009-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T04 | AC-009-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T04 | AC-009-03 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T09 | AC-007-01 | tui-pty | TUI 外壳与 PTY 检查（M1-T08）、host 与 attach（M2-T06、M2-T13） |
-| M3-T09 | AC-007-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T09 | AC-007-03 | tui-pty | TUI 外壳与 PTY 检查（M1-T08）、host 与 attach（M2-T06、M2-T13） |
-| M3-T09 | AC-017-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T09 | AC-017-02 | adapter-live | Codex App Server 适配器与 adapter-live 检查（M1-T03、M2-T07） |
-| M3-T09 | AC-017-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T09 | AC-017-04 | tui-pty | TUI 外壳与 PTY 检查（M1-T08）、host 与 attach（M2-T06、M2-T13） |
-| M3-T09 | AC-017-05 | recovery | kill -9 恢复矩阵与 recovery 检查（M2-T05） |
-| M3-T10 | AC-023-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T10 | AC-023-02 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T10 | AC-023-03 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T10 | AC-023-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T10 | AC-040-01 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
-| M3-T10 | AC-040-02 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T10 | AC-040-03 | unit | hoh-core 的纯函数与临时 SQLite（M0-T03 起） |
-| M3-T10 | AC-040-04 | integration | host、HTTP API、FakeAgent/FakeCommander 的测试世界（M2-T12、M2-T07、M2-T13） |
+| M3-T02 | AC-034-01 | integration | ApproveSpec 的受理与 index.json 的生成（本任务）；冻结（M2-T10、M2-T16）；产品 host 与 HTTP（M2-T12） |
+| M3-T02 | AC-034-02 | integration | ApproveSpec 的摘要核对（本任务）；HTTP 错误体（M2-T12） |
+| M3-T02 | AC-034-03 | integration | ProposeSpecChange 与索引构建（本任务）；调度轮与 FakeAgent（M2-T03、M2-T07） |
+| M3-T02 | AC-034-04 | unit | 索引生成器与冻结校验（本任务） |
+| M3-T02 | AC-033-01 | integration | change_requests 与影响闭包、ApproveSpec（本任务） |
+| M3-T02 | AC-033-02 | recovery | 验证派发、报告与关轮（M2-T16、M2-T18）；取消阶梯与终结证明（M2-T06）；kill -9 恢复（M2-T05）；规格变化的失效（本任务） |
+| M3-T02 | AC-033-03 | integration | acceptance API 与投影（M2-T18）；完成门禁（M2-T13）；规格修订与失效（本任务） |
+| M3-T02 | AC-033-04 | integration | task_requirements 与 SPEC_MISMATCH（M2-T16）；Commander 的 create_tasks（M2-T13）；迁移（本任务） |
+| M3-T06 | AC-031-01 | unit | readiness 纯函数（本任务）；dag::validate（M2-T03） |
+| M3-T06 | AC-031-02 | integration | 调度轮（M2-T03）；Task 的 BLOCKED 声明（M2-T19）；readiness（本任务） |
+| M3-T06 | AC-031-03 | unit | readiness 与 Run 投影（本任务、M2-T18） |
+| M3-T06 | AC-031-04 | integration | Commander 决策（M2-T08、M2-T13）；规格批准（M3-T02）；规格审查的派发与独立会话（本任务，基于 M2-T16 的验证派发与 REQ-053 的会话规则） |
+| M3-T06 | AC-031-05 | unit | readiness 的规格审查判定（本任务） |
+| M3-T06 | AC-030-01 | integration | 问题与答复（M2-T13）；规格提议与批准（M3-T02）；来源校验（本任务） |
+| M3-T06 | AC-030-02 | integration | hoh -p 的退出码（M2-T13）；配置加载与 [assumptions]（本任务，REQ-018 的加载器 M2-T07） |
+| M3-T06 | AC-030-03 | integration | ProposeSpecChange（M3-T02）；来源校验（本任务） |
+| M3-T03 | AC-045-01 | integration | 装箱与 prompt_revisions（M2-T09）；四层来源记录（本任务） |
+| M3-T03 | AC-045-02 | unit | 合成器（本任务）；完成门禁（M2-T13） |
+| M3-T03 | AC-045-03 | integration | 产品执行器的启动拒绝（M2-T07）；变量白名单（本任务） |
+| M3-T03 | AC-045-04 | unit | 覆盖保存校验（本任务） |
+| M3-T03 | AC-047-01 | integration | 覆盖链与 global 层（本任务）；产品执行器（M2-T07） |
+| M3-T03 | AC-047-02 | tui-pty | TUI 设置页（M1-T08、M2-T13）；diff 与恢复默认（本任务） |
+| M3-T03 | AC-047-03 | deployment | 发布包与安装（M2-T14）；职位 checkpoint（M2-T07）；资源包版本与漂移（本任务） |
+| M3-T08 | AC-029-01 | unit | 模板包（本任务） |
+| M3-T08 | AC-029-02 | integration | 配置的 document_profile 与其来源（本任务，M2-T07 的加载器） |
+| M3-T08 | AC-029-03 | deployment | 发布包、安装与 doctor（M2-T14、M1-T07）；hoh -p --resume 的答复（M2-T13）；draft 入口（本任务） |
+| M3-T08 | AC-046-01 | integration | Prompt 装箱与知识份额（M2-T09）；Skill 短索引与注入（本任务） |
+| M3-T08 | AC-046-02 | integration | 四层合成与修订记录（M3-T03）；Skill 注入（本任务） |
+| M3-T08 | AC-046-03 | unit | registry 校验（本任务） |
+| M3-T07 | AC-032-01 | traceability | traceability 检查（M2-T10）；产品追踪导出（本任务）；验收结果（M2-T18） |
+| M3-T07 | AC-032-02 | integration | acceptance 与 tasks API（M2-T18）；导出（本任务） |
+| M3-T07 | AC-032-03 | integration | 规格修订与失效（M3-T02）；导出（本任务） |
+| M3-T07 | AC-028-01 | integration | Run 的 DISCOVERING 与只读 git 帮手（M2-T13、M2-T06）；基线（本任务） |
+| M3-T07 | AC-028-02 | integration | 用户确认（M2-T13 的问题与答复）；基线（本任务） |
+| M3-T07 | AC-028-03 | integration | Task 的路径范围（M3-T06）；计划导入（M2-T13）；脏文件判定（本任务） |
+| M3-T07 | AC-028-04 | integration | no_spec 的 draft 入口（M3-T08）；Greenfield 的 git 规则（本任务） |
+| M3-T09 | AC-007-01 | tui-pty | TUI 与 PTY（M1-T08、M2-T13）；SetMode 的受理（本任务）；配置加载器（M2-T07） |
+| M3-T09 | AC-007-02 | integration | 调度轮与运行中的写 Attempt（M2-T03、M2-T07）；模式的安全点（本任务） |
+| M3-T09 | AC-007-03 | tui-pty | TUI 的斜杠与选择器（M2-T13）；投递（本任务） |
+| M3-T09 | AC-017-01 | integration | SendInput 与 input_queue（M2-T13）；投递循环（本任务） |
+| M3-T09 | AC-017-02 | adapter-live | Codex App Server 的 steer（M1-T04，runner 模式 M2-T07）；adapter-live 检查（M1-T03）；投递链（本任务） |
+| M3-T09 | AC-017-03 | integration | change_requests（M3-T02）；控制面（M2-T06）；CONTROL 的转换（本任务） |
+| M3-T09 | AC-017-04 | tui-pty | TUI（M2-T13）；role_epoch 与换绑（M2-T07、M2-T17）；@role 解析（本任务） |
+| M3-T09 | AC-017-05 | recovery | outbox、receipts 与恢复（M2-T04、M2-T05）；投递循环接入 host（本任务） |
+| M3-T04 | AC-008-01 | tui-pty | TUI（M2-T13）；起草 Task 与写集核对（本任务）；CR 与批准（M3-T02） |
+| M3-T04 | AC-008-02 | integration | runtime:no_spec（M2-T13）；draft 入口（M3-T08）；ApproveSpec 与 CR（M3-T02）；起草 Task（本任务）；host 的停止与重启（M2-T06） |
+| M3-T04 | AC-008-03 | tui-pty | 问题与答复、BLOCKED 声明（M2-T13、M2-T19）；TUI（M2-T13） |
+| M3-T04 | AC-008-04 | integration | Commander 计划（M2-T13）；起草 Task 的写集核对（本任务） |
+| M3-T04 | AC-008-05 | integration | ApproveSpec（M3-T02）；对端进程判定（本任务）；Attempt 标记与 cgroup（M2-T06） |
+| M3-T04 | AC-009-01 | integration | Commander 的 create_tasks（M2-T13）；BUILD 的规格约束（本任务） |
+| M3-T04 | AC-009-02 | integration | 起草 Task（本任务）；readiness（M3-T06）；hoh -p 的退出码（M2-T13） |
+| M3-T04 | AC-009-03 | unit | 模式迁移判定（本任务，SetMode 来自 M3-T09） |
+| M3-T10 | AC-023-01 | integration | 子 Task 与 Router（本任务）；投递（M3-T09） |
+| M3-T10 | AC-023-02 | integration | wait-for 图（本任务，Reader::wait_for 来自 M2-T16）；验证者请求的拒绝与 Issue（M2-T16） |
+| M3-T10 | AC-023-03 | integration | 讨论轮数与配置键（本任务）；Commander 唤醒（M2-T08） |
+| M3-T10 | AC-023-04 | integration | 升级为 need_decision（本任务、M2-T08） |
+| M3-T10 | AC-040-01 | integration | 验证结果与指纹（M2-T18）；no_progress（本任务）；唤醒（M2-T08）；重启（M2-T06） |
+| M3-T10 | AC-040-02 | unit | 进展向量（本任务） |
+| M3-T10 | AC-040-03 | unit | 进展判定（本任务）；规格修订（M3-T02） |
+| M3-T10 | AC-040-04 | integration | Commander 的取消与 create_tasks（M2-T13）；唤醒摘要（本任务） |
 
 
 ## CTO 的问题（C1–C29）：提议与理由，**待 CTO 决定**
 
-下列提议已按“推荐”写进上文的需求；CTO 改变任一项时，相应需求的文字随之修改后再送设计审查。
+下列提议已按“推荐”写进上文的需求；CTO 改变任一项时，相应需求的文字随之修改后再送设计审查。第 2 稿改了 C16、C21、C22、C28（标“第 2 稿”）。
 
 | ID | 问题 | 提议 | 理由 |
 |---|---|---|---|
 | C1 | SPEC_CONFLICT 是新码还是 CONFLICT 的 details | 新码，409 | CONFLICT 已指命令 id 冲突；同码两义会让客户端误判 |
-| C2 | 影响闭包的算法 | 按 REQ→AC→TEST→TASK 的显式映射，不按路径 | 映射都在库中（requirements、acceptance_criteria、task_requirements），可判定；路径猜测不可判定 |
-| C3 | CR 是否另写文件进规格根 | 不另写；CR 是 change_requests 行，提议的内容就是工作树中的规格，批准时以摘要锁定 | 避免规格之外的第二份文本，符合 REQ-034 |
+| C2 | 影响闭包的算法 | 按 REQ→AC→TEST→TASK 的显式映射，不按路径 | 映射都在库中（requirements、acceptance_criteria、task_requirements），可判定 |
+| C3 | CR 是否另写文件进规格根 | 不另写；CR 是 change_requests 行，提议的内容就是工作树中的规格与索引，以摘要锁定 | 避免规格之外的第二份文本，符合 REQ-034 |
 | C4 | 关键决定与非阻塞未知的标记 | 规格开放问题条目带“阻塞：是/否”，缺省为阻塞 | 写在事实源里，readiness 是纯函数；缺省阻塞是保守的一侧 |
-| C5 | readiness 由谁判定 | Runtime 自动判定，Commander 不能覆盖 | docs/06 的固定工程约束；可测 |
+| C5 | readiness 由谁判定 | Runtime 自动判定，Commander 不能覆盖；独立规格审查是它的输入 | docs/06 的固定工程约束与规格循环；可测 |
 | C6 | 假设台账的载体 | record_assumption 事件的投影，不新增表 | 不改受锁 SQL；事件已有 basis |
 | C7 | 五节的模板归属 | REQ-029 的规格模板 | 模板是 REQ-029 的产物，REQ-030 只校验内容 |
-| C8 | REQ-032 是产品功能还是本仓库的工具 | 产品功能；tests/bundle 的 test_032_01 以 traceability 检查校验产品导出 | 同时满足 summary 与 CR-017 的测试位置 |
+| C8 | REQ-032 是产品功能还是本仓库的工具 | 产品功能；tests/bundle 的 test_032_01 运行产品当前导出并以 traceability 检查校验 | 同时满足 summary 与 CR-017 的测试位置 |
 | C9 | 追踪的产品入口 | M3 为 API 与 TUI 的状态摘要；Web 视图属 M6 | M3 的任务闭包里没有 web-e2e |
 | C10 | 构建与测试命令的检测 | 按 Cargo.toml、package.json 的 scripts、Makefile、pyproject.toml 等约定；检测不到为 unknown | 不猜；unknown 如实显示 |
-| C11 | 基线随 Run 还是随项目 | 随 Run（run.baseline） | 工作树在 Run 之间会变；对照应是本 Run 开始时 |
+| C11 | 基线随 Run 还是随项目 | 随 Run（run.baseline） | 工作树在 Run 之间会变 |
 | C12 | 契约长度上限 | 32 KiB（UTF-8 字节） | 内置六份为 4.4–7.5 KB，留四倍余量；字节可判定 |
 | C13 | 模板变量 | 白名单只有 GOAL、PROJECT_CONTEXT、TASK_CONTEXT、EVIDENCE_CONTEXT | 与 validate_bundle 对内置契约的检查一致 |
-| C14 | 资源升级的生效点 | ADR-022 决定 8 的职位 checkpoint | 与团队变更同一机制，已有测试的语义 |
+| C14 | 资源升级的生效点 | ADR-022 决定 8 的职位 checkpoint | 与团队变更同一机制 |
 | C15 | global 层位置 | `$XDG_CONFIG_HOME/hoh/`（缺省 `~/.config/hoh/`） | 用户级配置的惯例；不在项目里 |
-| C16 | 未指定档时的选档 | standard，记录“未指定，用 standard” | 可判定；按目标文本猜规模不可判定 |
-| C17 | 模板的分发方式 | 嵌入二进制，计入 resource_bundle_version | 与职位契约、schema 同一资源包；离线可用 |
+| C16（第 2 稿） | 未指定档时的选档 | 用配置缺省 full（REQ-018 与 example 不变），记录档与来源（project 或 default） | 第 1 稿的“缺省 standard”会改 REQ-018 的缺省与 AC-018-01（CR26D-09）；保持缺省不变是不改行为的一侧 |
+| C17 | 模板的分发方式 | 嵌入二进制，计入 resource_bundle_version | 离线可用 |
 | C18 | Skill 正文的注入时机 | 按阶段与任务注入，不由 Agent 自行请求 | 可判定、可复现；记入 prompt 修订 |
 | C19 | 转给底座的斜杠语法 | `/agent <role> <text>` | 目标显式；/plan 等 HoH 命令永不转发 |
 | C20 | 未附着时 `/plan` 的作用对象 | 只改下一个由 TUI 启动的 Run，不改 project.default_mode | 不让一次按键改项目配置 |
-| C21 | Shift+Tab 的顺序 | PLAN→BUILD→AUTO→PLAN | 与 docs/03 的列举顺序一致 |
-| C22 | 没有已批准规格时 Plan 的起草（tasks.spec_id NOT NULL，受锁 SQL） | 推荐“起草锚”：项目还没有已批准规格时，HoH 建一行 sha256 为 64 个 0 的 specs 行作为起草锚（与 doctor 的 scratch_task 同一约定），起草 Task 引用它；它不被采用、不建索引、不冻结；首个 ApproveSpec 把规格摘要写进这一行，使它成为修订 1。ADR-031 决定 1 的采用规则改为“最新的已批准修订”（M3-T02 的 ADR，ADR 不受锁）。有已批准规格时，起草 Task 引用它（CR 流程）。不改受锁的 SQL | 守住 tasks.spec_id 非空与 specs 的唯一性；修订号连续；no_spec 的阻塞照旧（所有者 2026-11-16 的 Q1(a)）。另一做法（让监督与起草 Task 的 spec_id 可空）要改受锁 SQL，见下节 |
-| C23 | 原型工件的允许路径 | 只在 docs/ 下（与 docs/spec/、.hoh/ 共同构成 Plan 的写集） | 写集可由 git 核对 |
+| C21（第 2 稿） | Shift+Tab 的顺序 | `[ui] mode_cycle` 配置，缺省 PLAN→BUILD→AUTO，合法值为 2–3 个互不相同的模式；AC-007-01 覆盖非缺省顺序 | docs/03 写“配置可改”；第 1 稿钉死顺序是静默的范围缩减（CR26D-56） |
+| C22（第 2 稿） | 没有已批准规格时 Plan 的起草 | 采用上文第 2 节的 (c)：不经 Agent 的模板骨架，用户批准为修订 1，之后起草 Task 经 CR | 不改受锁 SQL、不改 Q1(a) 与 M2T13D-59；第 1 稿的零摘要锚会被采用为规格（CR26D-01、-50），已撤回 |
+| C23 | 原型工件的允许路径 | 只在 docs/ 下（与 docs/spec/、.hoh/ 共同构成 Plan 的写集） | 写集可由 Git 核对 |
 | C24 | BUILD 缺规格时 | 阻塞（READINESS_NOT_MET），问题提示可切到 AUTO 或 PLAN，不自动转 AUTO | 模式由用户选；不越过 readiness |
 | C25 | ASK 是否打断运行中的 turn | 不打断；在下一个安全点或经只读查询回答 | docs/12：问进度不会打断编码 |
 | C26 | CONTROL 输入与控制命令 | CONTROL 即转为 PauseRun、ResumeRun 或 CancelRun，不经模型 | 控制面独立于模型（AC-043-04 已判） |
 | C27 | 何为重大决定 | 触及规格、ADR、公开接口或门禁者 | 可判定，覆盖会改变用户可见行为的决定 |
-| C28 | MOA 轮数是否可配置 | 两轮固定在 Runtime，不新增配置键；要调整另写 CR | docs/06 的“可调”留到有需要时；不扩大 REQ-018 的键表 |
-| C29 | no_progress 与 STALLED 的分工 | STALLED 管“没有任何推进”，no_progress 管“有推进而无净进展”；同一状况只唤醒一次 | 避免两套探测对同一状况两次唤醒（准备清单风险 7） |
+| C28（第 2 稿） | MOA 轮数是否可配置 | `[supervision] max_discussion_rounds`，缺省 2，合法值 1–5；AC-023-03 覆盖非缺省值 | docs/06 写“默认可调上限”；第 1 稿固定两轮并留给以后是范围缩减（CR26D-10） |
+| C29 | no_progress 与 STALLED 的分工 | STALLED 管“没有任何推进”，no_progress 管“有推进而无净进展”；同一状况只唤醒一次 | 避免两套探测对同一状况两次唤醒 |
 
 ## 需所有者决定的项（超出 CR-003 D1 时）
 
-按本稿的推荐，没有一项超出 CR-003 D1（见下节）。只有 C22 的另一做法会超出：若 CTO 或设计审查认为“起草锚”不可取，而改为让监督与起草 Task 的 `tasks.spec_id` 可空，就要改受锁的 `contracts/sql/001_initial.sql`，这不是细化，须所有者批准另一份 CR。保守默认：采用起草锚，不改 SQL。
+按本稿的推荐，没有一项需要所有者：C22 的 (c) 不改受锁 SQL，也不改 Q1(a) 与 M2T13D-59；可配置性按 docs/03、docs/06 兑现，没有范围缩减。
+
+只有 CTO 不取 (c) 时才需要所有者：
+
+- **C22 取 (a)**（起草 Task 的 `tasks.spec_id` 可空）：改受锁 SQL 的语义，**OWNER 问题**；保守默认为 (c)。
+- **C22 取 (d)**（首个规格只能由用户手写）：空项目里 Plan 不能生成规格，是范围缩减，**OWNER 问题**；保守默认为 (c)。
+- 若 CTO 或设计审查认为 (c) 的骨架与 Q1 否决的 (b) 同类，**OWNER 问题**：“空项目中，HoH 能否应用户的 draft 要求不经 Agent 写出模板骨架，供用户批准为修订 1？”保守默认为 (d)。
 
 ## 不变的部分
 
 - 16 项需求的 id、category、priority、milestone、title、summary、required_release、release_class（required）与 release_targets（v1）都不变；没有删除任何需求或 AC。
-- 每项原有的 AC-xxx-01 保留 id，改写为可判定的内容。原 AC 的 then 照抄 summary，summary 的每一项仍由该需求的 AC 判定，没有被缩小：
+- 每项原有的 AC-xxx-01 保留 id，改写为可判定的内容。原 AC 的 then 照抄 summary；除下表点名由既有 AC 承接的条款外，summary 的每一项仍由该需求自己的 AC 判定，没有被缩小：
 
 | 需求 | summary 的各项 → 判定它的 AC |
 |---|---|
-| REQ-007 | 两种入口得到同一 SetMode 行为 → 007-01；Shell 不需要对称子命令 → 行为 1（`hoh plan`、`hoh mode` 已被 cli 拒绝，M1 的测试） |
-| REQ-008 | 版本化规格 → 008-02；允许提问 → 008-03；未批准实施不修改产品源码 → 008-01、008-04 |
+| REQ-007 | 两种入口得到同一 SetMode 行为 → 007-01；Shell 不需要对称子命令 → 由既有 AC 承接（REQ-001：`hoh plan`、`hoh mode` 以 64 退出，M1-T06） |
+| REQ-008 | 版本化规格 → 008-02；允许提问 → 008-03；未批准实施不修改产品源码 → 008-01、008-04、008-05 |
 | REQ-009 | Build 遵守既定规格 → 009-01；Auto 可补规划 → 009-02；缺必需规格均不越过 readiness → 009-02、009-03 |
 | REQ-017 | Ask 不改任务 → 017-01；steer 有生效边界 → 017-02；CR 改规格、控制可独立于模型执行 → 017-03 |
-| REQ-023 | 不绕过全局任务账本 → 023-01；重大决定升级 → 023-04；讨论有轮数上限 → 023-03（环检测 023-02） |
-| REQ-028 | 建立基线 → 028-01、028-02；保留脏文件 → 028-01、028-03；不重写架构 → 行为 7 与 028-01；不强制初始化远程 → 028-04 |
-| REQ-029 | 规范齐全 → 029-01；按规模选用 → 029-02（离线 029-03） |
+| REQ-023 | 不绕过全局任务账本 → 023-01；重大决定升级 → 023-04；讨论有轮数上限（含可调）→ 023-03（环检测 023-02） |
+| REQ-028 | 建立基线 → 028-01、028-02；保留脏文件 → 028-01、028-03；不重写架构 → 028-03（不引用 REQ 的计划 Task 被拒）与 028-01；不强制初始化远程 → 028-04 |
+| REQ-029 | 十类规范齐全 → 029-01（逐类点名）；按规模选用 → 029-02（离线 029-03） |
 | REQ-030 | 记录五类 → 030-01；不伪造用户答案 → 030-02、030-03 |
-| REQ-031 | AC 可观察、依赖可达、关键决定确定 → 031-01；仅阻断受影响范围 → 031-02 |
-| REQ-032 | 双向查找 → 032-01、032-02（修订后 stale 032-03） |
+| REQ-031 | AC 可观察、依赖可达、关键决定确定 → 031-01；仅阻断受影响范围 → 031-02；（独立规格审查 031-04、031-05） |
+| REQ-032 | 双向查找 → 032-01、032-02（修订后全部 stale 032-03） |
 | REQ-033 | CR、revision、影响闭包 → 033-01；受影响验收过期、不沿用旧 PASS → 033-02、033-03 |
 | REQ-034 | 文件为事实源、DB 为索引 → 034-01；冲突可检测 → 034-02；生成页不是第二权威源 → 034-04 |
 | REQ-040 | 按指纹与状态变化、不按 commit 计数 → 040-01、040-02；升级、研究、改计划 → 040-04 |
@@ -2900,35 +3115,63 @@ M3-T05 的 `depends_on`：
 | REQ-047 | 按序覆盖 → 047-01；显示 diff → 047-02；运行锁定旧版本直到 checkpoint → 047-03 |
 
 - 十六个 TEST-xxx-01 中有十四个的 check 不变。改了的两个都是换到更完整的检查，不是放宽：TEST-045-01 与 TEST-040-01 由 unit 改为 integration（它们现在要经 host 记录与重放 Prompt、要重启 host），这两项需求的其余 AC 仍有 unit 检查。integration 与 unit 同在 v1 与 v0.1 档的必跑检查中。
-- 不改：CONTRACT、`docs/10-acceptance.md`（第 17 行要求观察绑定当前 spec，与 O6 一致）、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`contracts/openapi.json`、`contracts/sql/001_initial.sql`、各 schema 中除三个原因码枚举之外的部分。没有门禁阈值、检查或证据规则被放宽；O6 使证据规则更严。
-- 非 M3 的需求只有 REQ-018 增加一条决定（配置键表加 `[assumptions]`），它的行为与 AC 不变。
+- 不改：CONTRACT、`docs/10-acceptance.md`（第 17 行要求观察绑定当前 spec，与 O6 一致）、`docs/03-ux.md` 与 `docs/06-orchestration.md`（它们的可配置承诺由新键兑现）、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`contracts/openapi.json`、`contracts/sql/001_initial.sql`、`contracts/candidate.schema.json`、各 schema 中除三个原因码枚举之外的部分。没有门禁阈值、检查或证据规则被放宽；O6 使证据规则更严。
+- 非 M3 的需求只有 REQ-018 增加三条决定（三个配置键），它的行为与 AC 不变；`project.document_profile` 的缺省仍为 full。
 
 ## 是否属于 CR-003 D1
 
-1. 只把 16 项 outline 细化为 detailed，补齐 7 个原因码与 REQ-018 键表中缺的一张表（第 1 条）。
-2. 不删需求或 AC；required、release_class、release_targets 不变（第 2 条）。
-3. 不放宽任何门禁、检查或证据规则；两个 TEST 换到更完整的检查；O6 加严（第 3 条）。
-4. 不改 CONTRACT 的架构与交互决定：/plan、Shift+Tab、Plan/Build/Auto、`-p` 与 attach 照 CONTRACT 第 3、4 条；规格批准权（O1）与证据失效（O6）是所有者的决定（第 4 条）。CR-024（Commander 只读，所有者 2026-11-17 批准）已改 CONTRACT 决定 7，本 CR 与之一致：Plan 的规格由 cto 职位的写 Task 起草，Commander 不写文件。
+1. 只把 16 项 outline 细化为 detailed，补齐 8 个原因码与 REQ-018 键表中缺的三项（第 1 条）。
+2. 不删需求或 AC；required、release_class、release_targets 不变；docs/03、docs/06 承诺的可配置性保留（第 2 条）。
+3. 不放宽任何门禁、检查或证据规则；两个 TEST 换到更完整的检查；O6 加严；独立规格审查成为 readiness 的输入（加严）（第 3 条）。
+4. 不改 CONTRACT 的架构与交互决定：/plan、Shift+Tab、Plan/Build/Auto、`-p` 与 attach 照 CONTRACT 第 3、4 条；规格批准权（O1）与证据失效（O6）是所有者的决定；C22 的推荐做法不改 Q1(a)（第 4 条）。CR-024（Commander 只读，所有者 2026-11-17 批准）已改 CONTRACT 决定 7，本 CR 与之一致：起草由 cto 职位的写 Task 承担，Commander 不写文件。
 
-故本 CR 在设计审查 PASS 后可由 CTO 依 D1 批准；若采用 C22 的另一做法，则不在 D1 之内（见上节）。
+故本 CR 在设计审查 PASS 后可由 CTO 依 D1 批准；若 C22 不取 (c)，则见上节的所有者问题。
 
 ## 验证方式
 
 本稿的片段由一份数据源生成，并在仓库之外的副本上机械验证（不改工作树的受锁文件）：
 
-1. `git archive` 取 715e2d0 的树到副本，按本稿应用：替换 16 项需求与它们的场景，追加 REQ-018 的决定与 7 个原因码，替换 M3 的任务并改 M3-T05 的依赖。
-2. 在副本中运行 `python3 tools/gen_spec_views.py`、以本 CR（副本中标为 APPROVED）运行 `python3 tools/baseline.py relock`，再运行 `python3 tools/validate_bundle.py`。
+1. `git archive` 取 715e2d0 的树到副本，按本稿应用：替换 16 项需求与它们的场景，追加 REQ-018 的三条决定与 8 个原因码，替换 M3 的任务并改 M3-T05 的依赖。
+2. 在副本中运行 `python3 tools/gen_spec_views.py`、以本 CR（副本中标为 APPROVED）运行 `python3 tools/baseline.py relock`，再运行 `python3 tools/validate_bundle.py` 与 `bash scripts/check.sh --bundle`。
+3. 生成器另核对第 7 节表中点名的每个 M3 任务都是该 AC 所属任务本身或其祖先。
 
 结果（本稿提交前的最后一次运行）：
 
 - `python3 tools/gen_spec_views.py`：退出码 0
 - `python3 tools/baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`：退出码 0
 - `python3 tools/validate_bundle.py`：退出码 0
-- validate_bundle：status=PASS，errors=0；counts：requirements=70、detailed_requirements=43（原 27）、acceptance=209（原 167）、development_tasks=64（原 59）
-- 在同一副本上运行 `bash scripts/check.sh --bundle`：Ran 502 tests in 217.148s；OK (skipped=2)（第一次运行有 3 项失败：TEST-033-03 原用 traceability 检查，而 tests/bundle/test_traceability.py 把 traceability 检查的 TEST 固定为 TEST-032-01、TEST-052-05、TEST-069-01 三项；本稿据此把 AC-033-03 改为以产品的完成门禁判定、用 integration 检查，不改该测试）
+- validate_bundle：status=PASS，errors=0；counts：requirements=70、detailed_requirements=43（原 27）、acceptance=211（原 167）、development_tasks=64（原 59）
+- 在同一副本上运行 `bash scripts/check.sh --bundle`：Ran 502 tests in 115.268s；OK (skipped=2)
+- 第 7 节的闭包核对：0 处不符
 
 
-批准时的步骤（M3-T01）：按 docs/21 的“基线变更的机械步骤”在工作树中应用同样的片段，`gen_spec_views`、`baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`、`bash scripts/check.sh --bundle`，提交；`config/hoh.example.toml` 的 `[assumptions]` 示例随 M3-T06 的实现加入。
+批准时的步骤（M3-T01）：按 docs/21 的“基线变更的机械步骤”在工作树中应用同样的片段，`config/hoh.example.toml` 加入三个新键的缺省值，`gen_spec_views`、`baseline.py relock --cr docs/cr/CR-026-m3-detailed-spec.md`、`bash scripts/check.sh --bundle`，提交。
+
+## 审查记录
+
+设计审查第 1 轮，在 `ef0b174`（第 1 稿）：Codex 判 FAIL（CR26D-01..06 high，-07..-11 medium），Grok 判 FAIL（CR26D-50 high，-51..-56 medium，-57、-58 low）。文本：`.hoh-dev/evidence/m3-prep/cr026/review-cr026-d1-codex.md`、`review-cr026-d1-grok.md`。第 2 稿的处置：
+
+| ID | 级别 | 摘要 | 处置 |
+|---|---|---|---|
+| CR26D-01、-50 | high | C22 的零摘要锚没有闭合的起草路径，并且会被采用为规格，改写 Q1(a) 与 M2T13D-59 | 锚撤回；第 2 节给出端到端设计与 (a)–(d) 备选，推荐 (c)；AC-008-02 端到端观察 no_spec、骨架未批准时 specs 无行、批准、起草、CR、重启与第二次批准；需所有者的情形列在专节 |
+| CR26D-02 | high | 多文件规格没有冻结形式 | 冻结形式为生成并提交的 index.json，规格摘要为它的 sha256，candidate.spec 为单个 FileRef（共同约定、REQ-034 行为 2、5）；AC-034-01 观察冻结，AC-033-03 观察一个字符的变化改变摘要并使全部证据 STALE，AC-034-04 观察 index.json 与 Markdown 不一致时拒绝冻结 |
+| CR26D-03 | high | AC-033-02 在验证进程仍运行时关轮 | 分为批准事务内的失效与取消请求、进程结束证明之后恰一次 superseded 关轮；场景改为 recovery：运行中的 run-check、取消后的迟到报告、批准后崩溃再恢复 |
+| CR26D-04 | high | M3-T07 缺 M3-T06 的路径范围 | M3-T07 依赖 M3-T06 与 M3-T08；第 7 节按每条 AC 实际用到的能力重列提供者，生成器核对它们都是祖先 |
+| CR26D-05 | high | 缺独立规格审查 | REQ-031 行为 3、AC-031-04（派发与独立会话）、AC-031-05（FAIL、UNKNOWN、缺失、非独立、旧修订都阻止 readiness）；由 M3-T06 承担；用户批准不替代它 |
+| CR26D-06、-51 | high、medium | O1 没有反例 | AC-008-05：带 Attempt 标记的进程经 TCP 与 Unix socket 提交 ApproveSpec 都被拒（SPEC_APPROVAL_NOT_USER），Commander 输出不产生修订，用户批准首版与 CR 修订为正对照；AC-009-02：无人值守的 AUTO 起草并提出 CR 之后仍没有已批准修订、-p 以 3 退出 |
+| CR26D-07 | medium | 待答问题期间的生命周期 | REQ-008 行为 5 与 AC-008-03：BLOCKED(NEED_DECISION)、resume_state=SPECIFYING，答复后回到 SPECIFYING |
+| CR26D-08 | medium | AC-017-05 的应用次数自相矛盾 | 按 message_id 逐条：M1 应用 1；M2 传输 2、应用 1；M3 应用 0、拒绝 1、无死信 |
+| CR26D-09 | medium | 缺省档与 REQ-018 的 full 冲突 | 缺省仍为 full（REQ-018 与 example 不变），记录档与来源（C16 第 2 稿，AC-029-02） |
+| CR26D-10、-56 | medium | 可配置承诺被移出 | `[supervision] max_discussion_rounds` 与 `[ui] mode_cycle` 进入 REQ-018 键表与 example；AC-023-03、AC-007-01 覆盖非缺省值 |
+| CR26D-11 | medium | Plan 写集没有负例 | REQ-008 行为 4 与 AC-008-04：计划请求产品写 Task 被拒；起草 Agent 修改、新建、删除产品文件被诊断为 plan.write_violation，不提出 CR、Task 不前进 |
+| CR26D-52 | medium | [assumptions] 可为三类保留决定给默认 | product_direction、scope、non_goals 为保留名，出现即配置被拒；example 为空表；AC-030-02 加项目 B |
+| CR26D-53 | medium | AC-029-01 没点名十类 | AC-029-01 与 TEST-029-01 逐类点名 |
+| CR26D-54 | medium | “不重写架构”与首提交路径无边界 | AC-028-03：不引用已批准 REQ 的计划 Task 被拒；AC-028-04：首个提交只含 docs/spec/、docs/、.hoh/ |
+| CR26D-55 | medium | AC-040-04 的建议未限定 | 摘要须列出升级、研究、改计划三项，并分别观察改计划与研究两条路径 |
+| CR26D-57 | low | REQ-032 的 stale 只限受影响链 | REQ-032 行为 5 与 AC-032-03 改为全部 stale（与 O6 一致） |
+| CR26D-58 | low | “不变”一节的措辞 | 改为“除下表点名由既有 AC 承接的条款外”，REQ-007 的一项指向 REQ-001 的既有 AC |
+
+Codex 的逐 AC 备注也已吸收：AC-034-03 的修订 2 走 CR；AC-028-04 的首提交由产品经 draft 入口产生；AC-045-02 对完成门禁的输入与结果作有、无覆盖的对照；AC-047-02 经 TUI 设置页（openapi 不改）；AC-047-03、AC-029-03 用安装的发布包；AC-007-02 去掉无场景观察的状态栏一句；AC-009-01 加合法计划的正对照；AC-017-02 经产品 host 的 SendInput 投递链并标出 fallback 夹具；AC-032-01 运行产品当前导出。
 
 ## 附录 A：准备清单的复核（按 main 715e2d0）
 
