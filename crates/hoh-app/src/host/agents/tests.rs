@@ -1167,3 +1167,70 @@ fn a_file_changed_since_the_last_look_makes_its_fact_pending() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn the_supervisors_looks_keep_an_agent_verified_only_while_the_registry_still_has_the_snapshots_fact()
+-> R {
+    // docs/adr/ADR-030.md decision 11 (the note of 2026-11-17): the supervisor and its allocation judge by the tick's
+    // snapshot, which staffing judged the bindings by, as the registry still holds it when they run. An agent verified
+    // in the snapshot stays so only while its fact now is the snapshot's identity, usable and verified: another file
+    // on its path (not looked at yet), another identity looked at (its suite pending), or another identity verified
+    // since (its binding not yet rebound) make it unverified there. Nothing unverified in the snapshot is made verified.
+    let renamed = |bin: &Path| -> R {
+        let launcher = bin.join("claude");
+        let other = bin.join(".claude-B");
+        let mut text = std::fs::read_to_string(&launcher)?;
+        text.push_str("# B\n");
+        std::fs::write(&other, text)?;
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(&other, &launcher)?;
+        Ok(())
+    };
+    let verified_now = |registry: &Registry, snapshot: &Snapshot| -> bool {
+        registry.still_verified(snapshot)["claude"].verified
+    };
+    // Unchanged: verified, as in the snapshot (the same observation otherwise).
+    let (_bin, _project, registry) = verified_claude("unchanged")?;
+    let snapshot = registry.snapshot(EPOCH);
+    assert!(snapshot.observations["claude"].verified);
+    let still = registry.still_verified(&snapshot);
+    assert_eq!(still["claude"], snapshot.observations["claude"]);
+    // Another file on the path, not looked at yet; then looked at, its suite not run.
+    let (bin, _project, registry) = verified_claude("changed")?;
+    let snapshot = registry.snapshot(EPOCH);
+    renamed(bin.path())?;
+    assert!(
+        !verified_now(&registry, &snapshot),
+        "another file, not looked at"
+    );
+    registry.refresh();
+    assert!(
+        !verified_now(&registry, &snapshot),
+        "another identity looked at, pending"
+    );
+    // Another identity looked at and verified since the snapshot: its binding is still the snapshot's identity's.
+    let (bin, project, registry) = verified_claude("verified")?;
+    let snapshot = registry.snapshot(EPOCH);
+    renamed(bin.path())?;
+    registry.refresh();
+    record(project.path(), &registry, SuiteStatus::Pass)?;
+    registry.open_manifest(project.path());
+    assert!(usable(registry.fact(Agent::Claude))?.compat == Compat::Verified);
+    assert!(
+        !verified_now(&registry, &snapshot),
+        "another identity, verified since"
+    );
+    // Never more than the snapshot: unverified there, verified now, still unverified.
+    let later = registry.snapshot(EPOCH);
+    assert!(later.observations["claude"].verified);
+    let (bin, project, registry) = verified_claude("pending")?;
+    renamed(bin.path())?;
+    registry.refresh();
+    let pending = registry.snapshot(EPOCH);
+    assert!(!pending.observations["claude"].verified);
+    record(project.path(), &registry, SuiteStatus::Pass)?;
+    registry.open_manifest(project.path());
+    assert!(usable(registry.fact(Agent::Claude))?.compat == Compat::Verified);
+    assert!(!verified_now(&registry, &pending), "not made verified");
+    Ok(())
+}

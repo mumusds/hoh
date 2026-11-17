@@ -926,7 +926,16 @@ async fn tick(
     // The supervisor (docs/adr/ADR-025.md decisions 2, 3, 5 and 8): each run's step (its triggers, its Commander's
     // availability, its turns' outputs), a Commander turn for an owed wake, then the turns to stop now. The registry's
     // looks, by their identity, judge whether a Commander's agent is there (decision 5): the tick's snapshot's
-    // (docs/adr/ADR-030.md decision 1), in `at()`.
+    // (docs/adr/ADR-030.md decision 1), whose `verified` holds only while the registry still has the snapshot's fact
+    // as each step begins (decision 11, the note of 2026-11-17): a Commander's agent that changed since the snapshot,
+    // the steps between them taking their while, has its owed wakes deferred and given no turn its start would refuse.
+    let supervising = || {
+        let mut now = at();
+        if let (Some(registry), Some(snapshot)) = (&registry, &context.staffing) {
+            now.observations = Some(registry.still_verified(snapshot));
+        }
+        now
+    };
     for run in &waiting.supervised {
         if held.contains(run) {
             continue;
@@ -934,7 +943,7 @@ async fn tick(
         // A run's failing step is its own: said once, and the tick goes on with the other runs, the allocation and
         // the dispatches; a store that cannot write ends the tick (v13 decision 5, M2T08R-51). A stopped run's step is
         // no failure (Held, docs/adr/ADR-031.md correction D): not recorded, not said.
-        match held.item(store.supervise(run, at()).await) {
+        match held.item(store.supervise(run, supervising()).await) {
             Ok(_) => {}
             Err(e) if e.ends_the_tick() => return Err(e),
             Err(e) => {
@@ -964,11 +973,11 @@ async fn tick(
         }
     }
     // The allocation judges by the same looks (docs/adr/ADR-025.md v14 decision 5).
-    held.item(store.allocate_supervision(&project_id, at()).await)?;
+    held.item(store.allocate_supervision(&project_id, supervising()).await)?;
     // The turns to stop: one transaction, which writes the stopped turns' events (a run that stopped meanwhile is
     // Held, the others' stops come at the next tick).
     let stops = held
-        .item(store.supervision_stops(&project_id, at()).await)?
+        .item(store.supervision_stops(&project_id, supervising()).await)?
         .unwrap_or_default();
     for stop in stops {
         if stop.state == "PREPARED" {

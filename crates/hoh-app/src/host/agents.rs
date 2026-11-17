@@ -933,6 +933,34 @@ impl Registry {
         Arc::new(snapshot)
     }
 
+    /// The tick's `snapshot`'s observations as the supervisor and its allocation judge by them (docs/adr/ADR-030.md
+    /// decision 11, the note of 2026-11-17), read under the registry's lock in one go: an agent verified in the
+    /// snapshot stays so only while its fact now (the same constructor, its files' stamps read again) is still usable,
+    /// verified and of the snapshot's identity. Another file on its path, another identity looked at, or another
+    /// identity verified since (its binding not yet rebound by staffing, which judged by the snapshot) make it not
+    /// verified here, so a wake owed meanwhile is deferred rather than given a turn its start refuses. Nothing the
+    /// snapshot did not find verified is made so; the other fields are the snapshot's.
+    pub fn still_verified(&self, snapshot: &Snapshot) -> BTreeMap<String, Observation> {
+        let state = self.state();
+        snapshot
+            .observations
+            .iter()
+            .map(|(name, observation)| {
+                let mut observation = *observation;
+                if observation.verified {
+                    let now =
+                        Agent::named(name).and_then(|agent| state.item(agent, self.basis()).0);
+                    observation.verified = matches!(
+                        (&now, snapshot.facts.get(name)),
+                        (Some(Fact::Usable(now)), Some(Fact::Usable(then)))
+                            if now.compat == Compat::Verified && now.identity == then.identity
+                    );
+                }
+                (name.clone(), observation)
+            })
+            .collect()
+    }
+
     /// `agent`'s fact now, as a snapshot taken now would have it (the same constructor, M2T15D-100); `None` while it
     /// was not looked at.
     pub fn fact(&self, agent: Agent) -> Option<Fact> {
