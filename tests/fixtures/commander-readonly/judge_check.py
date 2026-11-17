@@ -9,12 +9,16 @@ codex/app_server.rs `State::on_line`, `on_response`, `scope_of`, `on_turn_notifi
 `adapter_replay` mirrors those functions, each mirrored step naming the function it mirrors; where the two differ,
 the adapter is right and this file is the defect.
 
-The replay's input (M2T20D-800, -801) is the recorded stdout and, for what the adapter observes outside the stream,
-the recorded `observations`: the process's exit, whether both logs were read to their end, claude's prompt delivery,
-pi's launch (session id, resume), the session files noted before the start and the identity of the file get_state
-named. Requests are registered only as the adapter registers them (codex: initialize, then the thread request once
-initialize is answered, then turn/start; pi: get_state, then the prompt once the session check passes); the recorded
-request log is only compared with them, never used to pre-fill the pending map.
+The replay's input (M2T20D-800, -801, -900, -950) is the recorded stdout and, for what the adapter observes outside
+the stream, the recorded `observations`, each required one present and typed (`required_observations`; else
+NOT_OBSERVED, never a default): for all three the probed version, the exit status and whether both logs were read to
+their end; claude's prompt delivery; codex's launch (profile, resumed thread or null, model or null); pi's launch
+(non-empty session id, resume as a boolean) and, resumed, the noted session files and the identity of the file
+get_state named. The replay builds every message the adapter writes from the launch alone (`Replay.sent`: codex's
+initialize, initialized and thread request once initialize is answered, turn/start once the thread request is, server
+requests answered by `headless_answer`; pi's get_state, the prompt once the session check passes, dialogs answered
+cancelled). The recorded request log is never read for that; `request_problems` compares it with `Replay.sent`
+exactly, except the fields `_comparable` names (initialize's clientInfo.version, the prompt's text).
 
 What the judge does itself, here and in M2-T20 alike:
 - the codex rollout, which no adapter reads, enumerated default-deny (`rollout_calls`): every call of the adapter's
@@ -162,6 +166,16 @@ def _session_arg(argv: list) -> str | None:
     return next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == '--session-id'), None)
 
 
+def _raw_observations(raw_dir: Path, raw_meta: dict, agent: str) -> dict:
+    """The raw recording's observations, completed as excerpt.py completes them (the recorder's record of the
+    process's end for runs before the observations were recorded; the version from the run's summary.json)."""
+    observations = raw_meta.get('observations') or {
+        'exit': {'returncode': raw_meta['exit_code'], 'how': raw_meta['stopped']}, 'logs_complete': raw_meta['stopped'] == 'exited'}
+    if 'version' not in observations:
+        observations = {**observations, 'version': json.loads((raw_dir.parents[1] / 'summary.json').read_text())['versions'][agent]}
+    return observations
+
+
 def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case | None, str]:
     """The case from its excerpts, and from its raw source when present with the recorded sha256 (else None, why)."""
     base = excerpts / agent
@@ -192,9 +206,7 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
                json_lines((raw_dir / 'rollout.jsonl').read_text()) if rollout_text else None,
                json.loads((raw_dir / 'snapshot.json').read_text())['diff'], inverse, raw_meta['token_sha256'],
                raw_meta['exit_code'], json_lines((raw_dir / 'stdin.txt').read_text()) if stdin_text else None,
-               _session_arg(raw_meta['argv']), raw_meta.get('observations') or {
-                   'exit': {'returncode': raw_meta['exit_code'], 'how': raw_meta['stopped']},
-                   'logs_complete': raw_meta['stopped'] == 'exited'})
+               _session_arg(raw_meta['argv']), _raw_observations(raw_dir, raw_meta, agent))
     return excerpt, raw, ''
 
 
@@ -210,25 +222,105 @@ class Replay:
         self.state, self.failure, self.final_text = 'incomplete', None, None
         self.frames: list[dict] = []
         self.thread = self.turn = None
+        self.thread_result: dict | None = None  # codex: the result of the thread response the adapter correlated
+        # Every message the adapter writes to the agent in this replay, in order, built from the launch alone; None
+        # when the observations do not allow a replay (M2T20D-950, -901).
+        self.sent: list[dict] | None = None
+
+
+# The replay's input besides the stream: the recorded external observations (design correction 7 item 2). Each
+# required one must be there with its type, else the replay gives NOT_OBSERVED and never settles (M2T20D-900, -950).
+UNOBSERVED = object()
+PROMPT = '<the prompt>'  # the turn's prompt as the replay builds its messages; its text is not compared (below)
+
+
+def _int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _text(v) -> bool:
+    return isinstance(v, str) and v != ''
+
+
+def _file_identity(v) -> bool:
+    return isinstance(v, list) and len(v) == 3 and _text(v[0]) and _int(v[1]) and _int(v[2])
+
+
+LAUNCH_FIELDS = {'codex': {'profile', 'resume', 'model'}, 'pi': {'session_id', 'resume'}}
+# Recorded but read by no adapter, so not compared (named): the recorder's description of how the process ended (the
+# exit status is `exit.returncode`), and pi's `prompt_sent` (what the adapter itself decides from the get_state
+# answer) and `get_state_session_file` (the stream's own get_state answer has it). A new pi session's `noted` and
+# `opened` are not read either (pi.rs checks the file only when it resumes).
+OBSERVATION_KEYS = {'claude': {'version', 'exit', 'logs_complete', 'prompt_fed'},
+                    'codex': {'version', 'exit', 'logs_complete', 'launch'},
+                    'pi': {'version', 'exit', 'logs_complete', 'launch', 'noted', 'opened', 'prompt_sent',
+                           'get_state_session_file'}}
+
+
+def required_observations(c: Case) -> list[tuple[tuple, object, list]]:
+    """(path, valid, wrong values) of every observation the adapter's replay needs (design correction 7 item 2): for
+    all three the probed version, the exit status (code, or null for none) and whether the logs were read to their
+    end; claude's prompt delivery; codex's launch (profile, resumed thread id or null, model or null); pi's launch
+    (non-empty session id, resume as an explicit boolean) and, resumed, the noted files and the opened file's
+    identity. The wrong values are the generator's ill-typed variants."""
+    req = [(('version',), _text, [7]), (('exit',), lambda v: isinstance(v, dict), ['exited']),
+           (('exit', 'returncode'), lambda v: v is None or _int(v), ['0']),
+           (('logs_complete',), lambda v: isinstance(v, bool), ['true'])]
+    if c.agent == 'claude':
+        req.append((('prompt_fed',), lambda v: isinstance(v, bool), [1]))
+    elif c.agent == 'codex':
+        req += [(('launch',), lambda v: isinstance(v, dict), ['read_only']),
+                (('launch', 'profile'), lambda v: v in CODEX_PROFILES, ['readonly', 1]),
+                (('launch', 'resume'), lambda v: v is None or _text(v), [True, '']),
+                (('launch', 'model'), lambda v: v is None or _text(v), [5])]
+    elif c.agent == 'pi':
+        req += [(('launch',), lambda v: isinstance(v, dict), ['new']),
+                (('launch', 'session_id'), _text, ['', 5]),
+                (('launch', 'resume'), lambda v: isinstance(v, bool), ['false', None, 0])]
+        if _at(c.observations, ('launch', 'resume')) is True:
+            req += [(('noted',), lambda v: isinstance(v, list) and all(_file_identity(x) for x in v), ['x', [['x', 1]]]),
+                    (('opened',), lambda v: v is None or _file_identity(v), ['x', ['x', '1', 2]])]
+    return req
+
+
+def _at(obj, path: tuple):
+    for key in path:
+        if not isinstance(obj, dict) or key not in obj:
+            return UNOBSERVED
+        obj = obj[key]
+    return obj
+
+
+def observation_problems(c: Case) -> list[str]:
+    """What is missing, ill-typed or unknown in the case's observations (each one: NOT_OBSERVED)."""
+    obs = c.observations
+    problems = [f'{k} unknown' for k in obs if k not in OBSERVATION_KEYS[c.agent]]
+    for path, valid, _ in required_observations(c):
+        v = _at(obs, path)
+        if v is UNOBSERVED:
+            problems.append(f"{'.'.join(path)} missing")
+        elif not valid(v):
+            problems.append(f"{'.'.join(path)} ill-typed")
+    if c.agent in LAUNCH_FIELDS and isinstance(obs.get('launch'), dict):
+        problems += [f'launch.{k} unknown' for k in obs['launch'] if k not in LAUNCH_FIELDS[c.agent]]
+    return problems
+
+
+def _not_observed(r: Replay, c: Case) -> bool:
+    problems = observation_problems(c)
+    if problems:
+        r.state, r.failure = 'incomplete', 'NOT_OBSERVED (' + ', '.join(problems) + ')'
+    return bool(problems)
 
 
 def _exit_code(c: Case):
-    """The process's exit code as observed (None: no exit status observed, which claude.rs `judge` fails)."""
-    return (c.observations.get('exit') or {}).get('returncode')
+    """The process's exit code as observed (None: the process ended without one, which claude.rs `judge` fails)."""
+    return c.observations['exit']['returncode']
 
 
 def _logs_complete(c: Case) -> bool:
     """The observation the adapters' `verdict` reads as logs_incomplete (RAW_LOG_INCOMPLETE when false)."""
-    return c.observations.get('logs_complete') is True
-
-
-def _codex_launch(c: Case):
-    """The launch the App Server adapter starts from: resumed iff the recorded request log has thread/resume (the
-    thread id it names). M2-T20 passes these launch parameters to `replay_facts`."""
-    for q in c.requests or []:
-        if q.get('method') == 'thread/resume':
-            return (q.get('params') or {}).get('threadId') or True
-    return None
+    return c.observations['logs_complete'] is True
 
 
 def _codex_replay(c: Case) -> Replay:
@@ -239,31 +331,44 @@ def _codex_replay(c: Case) -> Replay:
     `on_turn_notification` (the reply is the last completed agentMessage; turn/completed sets the status), and codex.rs
     `verdict` (a failure fails; status completed settles, interrupted cancels, failed fails, none is incomplete)."""
     r = Replay()
-    # The adapter's own requests (codex/app_server.rs `Conn::request`: ids from 0 up), registered as it registers them:
-    # initialize at the start; the thread request only once initialize is answered; turn/start only once the thread
-    # request is answered. Nothing is pre-filled from the request log (M2T20D-800).
+    if _not_observed(r, c):
+        return r
+    # The adapter's own requests (codex/app_server.rs `Conn::request`: ids from 0 up), registered and built as it
+    # registers and builds them, from the recorded launch alone (M2T20D-950): initialize at the start; once it is
+    # answered, `initialized` and thread/start or thread/resume (launch.resume) with the launch's profile; turn/start
+    # once the thread request is answered; every server request answered by `headless_answer` while the connection is
+    # open (turn/completed and a refusal close it). Nothing comes from the request log (M2T20D-800); `request_problems`
+    # compares the log with `r.sent`.
+    launch = c.observations['launch']
     pending: dict = {}
     next_id = 0
+    r.sent = []
+    open_conn = True
 
-    def request(method: str) -> None:
+    def request(method: str, build) -> None:
         nonlocal next_id
         pending[next_id] = method
+        r.sent.append(build(next_id))
         next_id += 1
 
-    request('initialize')
-    resume = _codex_launch(c)
+    request('initialize', codex_initialize)
     status, early = None, []
 
     def on_turn(f: dict) -> None:
-        nonlocal status
+        nonlocal status, open_conn
         r.frames.append(f)
         item = (f.get('params') or {}).get('item') or {}
         if f.get('method') == 'item/completed' and item.get('type') == 'agentMessage':
             r.final_text = item.get('text') if isinstance(item.get('text'), str) else None
         if f.get('method') == 'turn/completed':
             status = ((f.get('params') or {}).get('turn') or {}).get('status')
+            open_conn = False  # `close_gently`
 
     for f in c.stdout:
+        if 'method' in f and 'id' in f:
+            if open_conn:
+                r.sent.append(codex_answer(f['id'], f['method']))  # `on_request`
+            continue
         if 'method' not in f and 'id' in f:
             what = pending.pop(f['id'], None) if isinstance(f.get('id'), int) and not isinstance(f.get('id'), bool) else None
             if what is None:
@@ -271,13 +376,19 @@ def _codex_replay(c: Case) -> Replay:
             refused = f.get('error') is not None
             if refused and what == 'initialize' and (f.get('error') or {}).get('code') == -32601:
                 r.failure = r.failure or 'CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade)'
+                open_conn = False
             elif refused:
                 r.failure = r.failure or f'{what}: refused'
+                open_conn = False
+            elif not open_conn:
+                continue  # "an answer after the turn stopped"
             elif what == 'initialize':
-                request('thread/resume' if resume else 'thread/start')
+                r.sent.append(codex_initialized())
+                request('thread/resume' if launch['resume'] is not None else 'thread/start', lambda rid: codex_thread(rid, launch))
             elif what in ('thread/start', 'thread/resume'):
+                r.thread_result = f.get('result') if isinstance(f.get('result'), dict) else None
                 r.thread = ((f.get('result') or {}).get('thread') or {}).get('id')
-                request('turn/start')
+                request('turn/start', lambda rid: codex_turn_start(rid, r.thread, PROMPT))
             elif what == 'turn/start':
                 r.turn = ((f.get('result') or {}).get('turn') or {}).get('id')
                 held, early = early, []
@@ -315,6 +426,8 @@ def _claude_replay(c: Case) -> Replay:
     completion and the prompt's delivery are the recorded observations (`observations`), not the stream."""
     r = Replay()
     r.frames = list(c.stdout)
+    if _not_observed(r, c):
+        return r
     results = [f for f in c.stdout if f.get('type') == 'result']
     last = results[-1] if results else None
     r.final_text = last.get('result') if last and isinstance(last.get('result'), str) else None
@@ -341,41 +454,44 @@ def _pi_replay(c: Case) -> Replay:
     incomplete)."""
     r = Replay()
     r.frames = list(c.stdout)
-    # pi.rs `open`: get_state as "hoh-state-1" (`command_id`); the prompt, "hoh-prompt-2", is registered only when the
-    # session check passes. Nothing is pre-filled from the request log (M2T20D-800).
-    pending = {'hoh-state-1': 'get_state'}
-    launch = c.observations.get('launch')
-    if not launch:
-        # The launch (its session id, whether it resumes) is the adapter's own; a recording without it cannot be
-        # replayed as the adapter would (recordings before run 20261117T002630Z).
-        r.state, r.failure = 'incomplete', 'NOT_OBSERVED (the launch)'
+    # The launch (its session id, whether it resumes) is the adapter's own; a recording without it cannot be replayed
+    # as the adapter would (recordings before run 20261117T002630Z), nor one whose fields are missing or ill-typed.
+    if _not_observed(r, c):
         return r
+    if c.observations['version'] not in PI_SETTLED_EVENT_VERSIONS:
+        # pi.rs `emits_settled`: other versions check for idle with get_state, which this prototype does not mirror.
+        r.state, r.failure = 'incomplete', 'a pi version without agent_settled (not mirrored)'
+        return r
+    launch = c.observations['launch']
+    # pi.rs `open`: get_state as "hoh-state-1" (`command_id`); the prompt, "hoh-prompt-2", is registered and sent only
+    # when the session check passes; a dialog is answered cancelled while stdin is open (agent_settled and a failed
+    # check close it). Nothing comes from the request log (M2T20D-800); `request_problems` compares it with `r.sent`.
+    pending = {'hoh-state-1': 'get_state'}
+    r.sent = [pi_get_state('hoh-state-1')]
+    open_stdin = True
     settled, aborted, error = False, False, None
     for f in c.stdout:
         t = f.get('type')
+        if t == 'extension_ui_request' and f.get('method') in PI_DIALOGS and open_stdin:
+            r.sent.append(pi_dialog_answer(f.get('id')))
         if t == 'response':
             what = pending.pop(f.get('id'), None)
             ok = f.get('success') is True
             if what == 'get_state':
+                # The session check (the function live and replay share): the answer's session is the launch's, and
+                # a resumed session reopens a noted file, by the identity (canonical path, device, inode) of the
+                # file get_state names as observed when the answer arrived (pi.rs `identity`, `session_files`).
                 if not ok:
                     r.failure = r.failure or 'get_state failed'
-                elif (f.get('data') or {}).get('sessionId') != launch.get('session_id'):
+                elif (f.get('data') or {}).get('sessionId') != launch['session_id']:
                     r.failure = r.failure or 'SESSION_MISMATCH'
-                elif launch.get('resume'):
-                    # The resumed session must reopen a noted file: the identity (canonical path, device, inode)
-                    # of the session file get_state names, as observed when the answer arrived, is one of the files
-                    # noted before the start (pi.rs `identity`, `session_files`). Without the observations the
-                    # replay cannot judge it.
-                    if 'noted' not in c.observations or 'opened' not in c.observations:
-                        r.failure = r.failure or 'NOT_OBSERVED (the session file identity)'
-                        r.state = 'incomplete'
-                        return r
-                    if c.observations['opened'] is None or c.observations['opened'] not in c.observations['noted']:
-                        r.failure = r.failure or 'SESSION_MISMATCH'
-                    else:
-                        pending['hoh-prompt-2'] = 'prompt'
+                elif launch['resume'] and (c.observations['opened'] is None or c.observations['opened'] not in c.observations['noted']):
+                    r.failure = r.failure or 'SESSION_MISMATCH'
                 else:
                     pending['hoh-prompt-2'] = 'prompt'
+                    r.sent.append(pi_prompt('hoh-prompt-2', PROMPT))
+                if r.failure:
+                    open_stdin = False
             elif what == 'prompt':
                 if not ok:
                     r.failure = r.failure or 'prompt refused'
@@ -383,6 +499,7 @@ def _pi_replay(c: Case) -> Replay:
                     settled = True
         elif t == 'agent_settled' and not settled:
             settled, aborted = True, f.get('aborted') is True
+            open_stdin = False
         elif t == 'message_end' and (f.get('message') or {}).get('role') == 'assistant':
             m = f['message']
             if m.get('stopReason') == 'error':
@@ -478,9 +595,7 @@ def e3_codex_availability(c: Case) -> str:
     of the adapter's turn: payload.sandbox_policy.type == "read-only" and payload.approval_policy == "never". Any with
     another value: nonconform; at least one of each and all right: conform; otherwise: insufficient."""
     r = _codex_replay(c)
-    thread_ids = {q['id'] for q in c.requests or [] if q.get('method') in ('thread/start', 'thread/resume')}
-    responses = [f['result'] for f in c.stdout if 'method' not in f and f.get('id') in thread_ids
-                 and isinstance(f.get('result'), dict) and 'sandbox' in f['result']]
+    responses = [r.thread_result] if r.thread_result is not None and 'sandbox' in r.thread_result else []
     ctxs = [l['payload'] for l in c.rollout or [] if l.get('type') == 'turn_context' and r.turn is not None
             and (l.get('payload') or {}).get('turn_id') == r.turn]
     if any((x.get('sandbox') or {}).get('type') != 'readOnly' for x in responses) or any(
@@ -834,18 +949,44 @@ def cells(c: Case) -> dict[str, str]:
     return {f'shell {k}': v for k, v in e5_shell_cells(c).items()} | {f'patch {k}': v for k, v in e6_patch_cells(c).items()}
 
 
+IGNORED = '<not compared>'
+
+
+def _comparable(message) -> object:
+    """The message with the fields the comparison contract does not compare replaced (M2T20D-950, -901; ADR-032
+    design correction 7 item 2): initialize's `params.clientInfo.version` (a non-empty string: the hoh build that
+    sent it), turn/start's `params.input[0].text` and pi's prompt `message` (a string: the turn's prompt). Each is
+    replaced only where it has that type; everything else is compared exactly, keys and values."""
+    m = copy.deepcopy(message)
+    if not isinstance(m, dict):
+        return m
+    p = m.get('params')
+    if m.get('method') == 'initialize' and isinstance(p, dict) and isinstance(p.get('clientInfo'), dict) \
+            and _text(p['clientInfo'].get('version')):
+        p['clientInfo']['version'] = IGNORED
+    if m.get('method') == 'turn/start' and isinstance(p, dict) and isinstance(p.get('input'), list) and len(p['input']) == 1 \
+            and isinstance(p['input'][0], dict) and isinstance(p['input'][0].get('text'), str):
+        p['input'][0]['text'] = IGNORED
+    if m.get('type') == 'prompt' and isinstance(m.get('message'), str):
+        m['message'] = IGNORED
+    return m
+
+
 def request_problems(c: Case) -> list[str]:
-    """The recorded requests must be the adapter's own (the same ids and methods in order): else the recording does
-    not show what the product's replay would see."""
-    if c.agent == 'codex':
-        want = [(0, 'initialize'), (1, 'thread/resume' if _codex_launch(c) else 'thread/start'), (2, 'turn/start')]
-        got = [(q.get('id'), q.get('method')) for q in c.requests or [] if 'id' in q]
-    elif c.agent == 'pi':
-        want = [('hoh-state-1', 'get_state'), ('hoh-prompt-2', 'prompt')]
-        got = [(q.get('id'), q.get('type')) for q in c.requests or [] if 'id' in q]
-    else:
+    """The recorded request log must be exactly the messages the product's adapter writes in this replay, built from
+    the recorded launch (`Replay.sent`): the same number, in the same order, each equal key for key and value for value
+    except the fields `_comparable` names. Else the recording does not show what the product would have sent (its
+    profile, its thread, its order), and the case is insufficient coverage."""
+    if c.agent == 'claude' or (c.agent == 'codex' and c.name.startswith('exec')):
         return []
-    return [] if got == want else ['the recorded requests are not the adapter\'s own']
+    sent = adapter_replay(c).sent
+    if sent is None:
+        return []  # not replayed: the observations are missing (NOT_OBSERVED)
+    log = c.requests or []
+    if len(log) != len(sent):
+        return [f"the request log is not the product's own ({len(log)} messages, the adapter sends {len(sent)})"]
+    return [f"the request log is not the product's own (message {i})" for i, (a, b) in enumerate(zip(sent, log))
+            if _comparable(a) != _comparable(b)][:1]
 
 
 def call_problems(c: Case) -> list[str]:
@@ -873,8 +1014,7 @@ def full_access(control: Case) -> bool:
         return bool(inits) and all({'Bash', 'Write'} <= set(f.get('tools') or []) for f in inits)
     if control.agent == 'codex':
         r = _codex_replay(control)
-        thread_ids = {q['id'] for q in control.requests or [] if q.get('method') in ('thread/start', 'thread/resume')}
-        responses = [f['result'] for f in s if 'method' not in f and f.get('id') in thread_ids and isinstance(f.get('result'), dict) and 'sandbox' in f['result']]
+        responses = [r.thread_result] if r.thread_result is not None and 'sandbox' in r.thread_result else []
         ctxs = [l['payload'] for l in control.rollout or [] if l.get('type') == 'turn_context' and r.turn is not None
                 and (l.get('payload') or {}).get('turn_id') == r.turn]
         return (bool(responses) and all((x.get('sandbox') or {}).get('type') == 'dangerFullAccess' for x in responses)
@@ -916,6 +1056,8 @@ def control_gaps(control: Case | None, agent: str) -> list[str]:
     if agent == 'codex':
         gaps += [f'control: {p}' for p in call_problems(control)]
         gaps += [f'control {mech} {op}' for mech in MECHANISMS for op in OPS if not control_cell_written(control, mech, op)]
+    else:
+        gaps += [f'control: {p}' for p in request_problems(control)]
     return gaps
 
 
@@ -1101,19 +1243,55 @@ def _reverse_cell_evidence(c: Case) -> None:
             c.rollout[i] = l
 
 
-UNOBSERVED = object()
-
-
 def _observe(c: Case, **changes) -> None:
     """Change the recorded external observations (UNOBSERVED removes one)."""
-    c.observations = copy.deepcopy(c.observations)
     for key, value in changes.items():
-        if value is UNOBSERVED:
-            c.observations.pop(key, None)
-        else:
-            c.observations[key] = value
-    if 'exit' in changes:
-        c.exit_code = None if changes['exit'] is UNOBSERVED else changes['exit'].get('returncode')
+        _edit_observation(c, (key,), value)
+
+
+def _edit_observation(c: Case, path: tuple, value) -> None:
+    """Set (or, with UNOBSERVED, remove) the observation at `path`."""
+    c.observations = copy.deepcopy(c.observations)
+    d = c.observations
+    for key in path[:-1]:
+        d = d[key]
+    if value is UNOBSERVED:
+        d.pop(path[-1], None)
+    else:
+        d[path[-1]] = value
+    if path[0] == 'exit':
+        c.exit_code = (c.observations.get('exit') or {}).get('returncode') if isinstance(c.observations.get('exit'), dict) else None
+
+
+def _observation_fields(c: Case) -> list[tuple[str, object]]:
+    """Every required observation removed, and set to each ill-typed value; an unknown observation and (codex, pi) an
+    unknown launch field (M2T20D-900, -950): each must be NOT_OBSERVED."""
+    out = []
+    for path, _, wrongs in required_observations(c):
+        name = '.'.join(path)
+        out.append((f'{name} missing', lambda m, p=path: _edit_observation(m, p, UNOBSERVED)))
+        for w in wrongs:
+            out.append((f'{name} = {json.dumps(w)}', lambda m, p=path, w=w: _edit_observation(m, p, copy.deepcopy(w))))
+    out.append(('an unknown observation', lambda m: _edit_observation(m, ('sandbox',), 'read-only')))
+    if c.agent in LAUNCH_FIELDS:
+        out.append(('an unknown launch field', lambda m: _edit_observation(m, ('launch', 'sandbox'), 'read-only')))
+    return out
+
+
+def _thread_request(m: Case) -> dict:
+    return next(q for q in m.requests if q.get('method') in ('thread/start', 'thread/resume'))
+
+
+def _logged(m: Case, key: str) -> dict:
+    return next(q for q in m.requests if q.get('method') == key or q.get('type') == key)
+
+
+def _server_request(m: Case, answer) -> None:
+    """A server request after the turn/start answer, and the given answer to it in the request log."""
+    at = next(i for i, f in enumerate(m.stdout) if 'method' not in f and isinstance(f.get('result'), dict) and 'turn' in f['result'])
+    m.stdout.insert(at + 1, {'method': 'item/commandExecution/requestApproval', 'id': 900,
+                             'params': {'threadId': scope(m)[0].thread, 'turnId': scope(m)[0].turn, 'itemId': 'mutant-item'}})
+    m.requests.append(answer)
 
 
 def _initialize_response(m: Case) -> dict:
@@ -1407,15 +1585,19 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         add('terminal', how, edit=lambda m, how=how: _set_terminal(m, how))
     if a == 'pi':
         add('terminal', 'a provider error retried by the final message', expect='same', edit=_retried_error)
-    # ---- the adapters' external observations, part of the replay's input (design correction 7, M2T20D-801)
+    # ---- the adapters' external observations, part of the replay's input (design correction 7, M2T20D-801, -900)
+    for label, edit in _observation_fields(c):
+        add('observation field', label, edit=edit)
+    for label, edit in _observation_fields(control):
+        add('control observation field', label, edit_control=edit)
     add('observation', 'the logs not read to their end', edit=lambda m: _observe(m, logs_complete=False))
-    add('observation', 'no log completion observed', edit=lambda m: _observe(m, logs_complete=UNOBSERVED))
     add('control observation', 'the control logs not read to their end', edit_control=lambda m: _observe(m, logs_complete=False))
+    add('observation', 'how the process ended, as the recorder describes it (not read)', expect='same',
+        edit=lambda m: _edit_observation(m, ('exit', 'how'), 'described otherwise'))
     if a == 'claude':
         add('observation', 'the prompt not fed (PROMPT_NOT_DELIVERED)', edit=lambda m: _observe(m, prompt_fed=False))
-        add('observation', 'no prompt delivery observed', edit=lambda m: _observe(m, prompt_fed=UNOBSERVED))
         add('observation', 'ended by a signal', edit=lambda m: _observe(m, exit={'returncode': -9, 'how': 'SIGKILL'}))
-        add('observation', 'no exit status observed', edit=lambda m: _observe(m, exit=UNOBSERVED))
+        add('observation', 'ended without an exit status', edit=lambda m: _observe(m, exit={'returncode': None, 'how': 'exited'}))
     else:
         # codex.rs `verdict` reads the exit only for exec (exit_matters); pi.rs `verdict` never reads it.
         add('observation', 'exit 1 (the verdict does not read it)', expect='same', edit=lambda m: _observe(m, exit={'returncode': 1, 'how': 'exited'}))
@@ -1430,19 +1612,68 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         add('initialize handshake', 'the initialize response after the thread response', edit=_initialize_after_thread)
         add('initialize handshake', 'the initialize response answered twice', expect='same', edit=lambda m: m.stdout.insert(
             m.stdout.index(_initialize_response(m)) + 1, copy.deepcopy(_initialize_response(m))))
-        add('initialize handshake', 'the request log without initialize', edit=lambda m: setattr(m, 'requests', [
-            q for q in m.requests if q.get('method') != 'initialize']))
+        # The request log against the messages the product builds from the recorded launch (M2T20D-950, -901): every
+        # difference in method, order, id, thread, profile or model, or an extra field or message, is insufficient;
+        # only initialize's clientInfo.version and the prompt's text are not compared.
+        resumed = c.observations['launch']['resume'] is not None
+        for label, edit in (
+                ('the launch says full access (yolo)', lambda m: _edit_observation(m, ('launch', 'profile'), 'yolo')),
+                ('the launch says resume another thread', lambda m: _edit_observation(m, ('launch', 'resume'), 'another-thread')),
+                ('the launch says a model', lambda m: _edit_observation(m, ('launch', 'model'), 'another-model')),
+                ('the thread request asks for danger-full-access', lambda m: _thread_request(m)['params'].update(sandbox='danger-full-access')),
+                ('the thread request asks for approvals on-request', lambda m: _thread_request(m)['params'].update(approvalPolicy='on-request')),
+                ('the thread request without approvalPolicy', lambda m: _thread_request(m)['params'].pop('approvalPolicy')),
+                ('the thread request asks for raw events', lambda m: _thread_request(m)['params'].update(experimentalRawEvents=True)),
+                ('the thread request names a model', lambda m: _thread_request(m)['params'].update(model='another-model')),
+                ('the thread request with another id', lambda m: _thread_request(m).update(id=5)),
+                ('the request log without initialized', lambda m: m.requests.remove(_logged(m, 'initialized'))),
+                ('the request log without initialize', lambda m: m.requests.remove(_logged(m, 'initialize'))),
+                ('initialize declares experimental capabilities', lambda m: _logged(m, 'initialize')['params'].update(
+                    capabilities={'experimentalApi': True})),
+                ('initialize names another client', lambda m: _logged(m, 'initialize')['params']['clientInfo'].update(name='hoh-recorder')),
+                ('turn/start overrides the sandbox', lambda m: _logged(m, 'turn/start')['params'].update(sandboxPolicy={'type': 'dangerFullAccess'})),
+                ('turn/start names another thread', lambda m: _logged(m, 'turn/start')['params'].update(threadId='another-thread')),
+                ('turn/start with a second input', lambda m: _logged(m, 'turn/start')['params']['input'].append({'type': 'text', 'text': 'x'})),
+                ('a second turn/start', lambda m: m.requests.append(dict(copy.deepcopy(_logged(m, 'turn/start')), id=3))),
+                ('the request log empty', lambda m: setattr(m, 'requests', [])),
+                ('a server request answered otherwise', lambda m: _server_request(m, {'id': 900, 'result': {'decision': 'accept'}})),
+                ('a server request not answered', lambda m: _server_request(m, None) or m.requests.pop())):
+            add('request log', label, edit=edit)
+        if resumed:
+            add('request log', 'the launch says a new thread', edit=lambda m: _edit_observation(m, ('launch', 'resume'), None))
+            add('request log', 'the resume asks for another thread', edit=lambda m: _thread_request(m)['params'].update(threadId='another-thread'))
+        else:
+            add('request log', 'the request log resumes a thread', edit=lambda m: _thread_request(m).update(method='thread/resume'))
+        add('control request log', 'the control launch says read-only', edit_control=lambda m: _edit_observation(m, ('launch', 'profile'), 'read_only'))
+        add('control request log', 'the control thread request asks for read-only', edit_control=lambda m: _thread_request(m)['params'].update(sandbox='read-only'))
+        add('request log', 'initialize from another hoh version (not compared)', expect='same',
+            edit=lambda m: _logged(m, 'initialize')['params']['clientInfo'].update(version='9.9.9'))
+        add('request log', 'turn/start with another prompt text (not compared)', expect='same',
+            edit=lambda m: _logged(m, 'turn/start')['params']['input'][0].update(text='another prompt'))
+        add('request log', 'a server request answered by headless_answer', expect='same',
+            edit=lambda m: _server_request(m, codex_answer(900, 'item/commandExecution/requestApproval')))
     if a == 'pi':
-        add('observation', 'no launch observed', edit=lambda m: _observe(m, launch=UNOBSERVED))
-        if (c.observations.get('launch') or {}).get('resume'):
+        for label, edit in (
+                ('the prompt with an extra field', lambda m: _logged(m, 'prompt').update(images=[])),
+                ('get_state with another id', lambda m: _logged(m, 'get_state').update(id='state-1')),
+                ('the prompt missing from the request log', lambda m: m.requests.remove(_logged(m, 'prompt'))),
+                ('an abort in the request log', lambda m: m.requests.append({'id': 'hoh-abort-3', 'type': 'abort'}))):
+            add('request log', label, edit=edit)
+        add('control request log', 'the control prompt with an extra field', edit_control=lambda m: _logged(m, 'prompt').update(images=[]))
+        add('request log', 'the prompt with another message text (not compared)', expect='same',
+            edit=lambda m: _logged(m, 'prompt').update(message='another prompt'))
+        add('observation', "pi's recorder-only observations dropped (not read)", expect='same',
+            edit=lambda m: _observe(m, prompt_sent=UNOBSERVED, get_state_session_file=UNOBSERVED))
+        if c.observations['launch']['resume'] is True:
             # pi.rs: a resumed session's get_state must name a file noted before the start (canonical path, device,
             # inode), as observed when the answer arrived; else SESSION_MISMATCH.
             add('session identity', 'the session file gone when get_state answered', edit=lambda m: _observe(m, opened=None))
             add('session identity', 'the session file replaced (another inode)', edit=_opened_other_inode)
             add('session identity', 'the session file not noted before the start', edit=lambda m: _observe(m, noted=[]))
-            add('session identity', 'no identity observed', edit=lambda m: _observe(m, opened=UNOBSERVED))
         else:
             add('session identity', "a new session's file identity is not read", expect='same', edit=lambda m: _observe(m, opened=None))
+            add('session identity', "a new session's noted and opened files dropped (not read)", expect='same',
+                edit=lambda m: _observe(m, noted=UNOBSERVED, opened=UNOBSERVED))
     # ---- the availability evidence, the snapshot, the decision block
     if a == 'claude':
         add('drop availability', 'init', edit=lambda m: setattr(m, 'stdout', [f for f in m.stdout if f.get('subtype') != 'init']))

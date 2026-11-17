@@ -63,11 +63,12 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   turn's items default-deny. The authoritative judge is M2-T20's Rust judge on the adapters' `replay_facts`.
   Since round 9 (M2T20D-800, -801) it registers requests only as the adapters do (codex: initialize as id 0, the
   thread request once initialize is answered, turn/start once the thread request is; pi: get_state as `hoh-state-1`,
-  the prompt as `hoh-prompt-2` once the session check passes), never from the request log, which it only compares
-  with the adapter's own requests; and it reads the recorded `observations` (exit, log completion, claude's prompt
-  delivery, pi's launch and session file identity) where the adapters read the host's. A recording without an
-  observation the adapter needs is judged as the adapter would judge it without it (pi's runs before
-  20261117T002630Z: no launch, so not settled).
+  the prompt as `hoh-prompt-2` once the session check passes), never from the request log; and it reads the recorded
+  `observations` where the adapters read the host's. Since round 10 (M2T20D-900, -901, -950) every required
+  observation must be present and typed (`required_observations`), codex's launch included, or the replay is
+  NOT_OBSERVED; the replay builds every message the adapter writes from the launch alone (`Replay.sent`), and the
+  request log must equal it exactly except initialize's `clientInfo.version` and the prompt's text (`_comparable`). A
+  recording without an observation the adapter needs is not settled (pi's runs before 20261117T002630Z: no launch).
   `--emit DIR` writes every generated variant with its inputs (stdout, rollout, request log, `observations.json`,
   snapshot diff, the control's too) and its frozen expected class: M2-T20's acceptance fixtures. The oracle is that
   class with the adapters' replay of these inputs, not this prototype's verdict (M2T20D-851).
