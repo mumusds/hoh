@@ -1186,8 +1186,20 @@ fn the_supervisors_looks_keep_an_agent_verified_only_while_the_registry_still_ha
         std::fs::rename(&other, &launcher)?;
         Ok(())
     };
+    // Whether claude is still verified for the supervisor; whatever it says, the rest of its observation is the
+    // snapshot's (its availability and login stay the snapshot's, SVW-52).
     let verified_now = |registry: &Registry, snapshot: &Snapshot| -> bool {
-        registry.still_verified(snapshot)["claude"].verified
+        let now = registry.still_verified(snapshot)["claude"];
+        let then = snapshot.observations["claude"];
+        assert_eq!(
+            Observation {
+                verified: then.verified,
+                ..now
+            },
+            then,
+            "only `verified` may differ"
+        );
+        now.verified
     };
     // Unchanged: verified, as in the snapshot (the same observation otherwise).
     let (_bin, _project, registry) = verified_claude("unchanged")?;
