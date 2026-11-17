@@ -234,6 +234,7 @@ fn the_json_form_is_one_line_with_line_separators_escaped() {
             exit_code: 0,
         },
         probes: Vec::new(),
+        hashes: Vec::new(),
     };
     let line = json(&report);
     assert!(line.ends_with('\n') && line.matches('\n').count() == 1);

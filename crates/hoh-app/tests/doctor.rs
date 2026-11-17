@@ -1424,6 +1424,112 @@ fn pidfd_ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
     Ok(rustix::event::poll(&mut fds, Some(&none))? > 0)
 }
 
+#[test]
+fn a_hash_that_does_not_fit_doctors_limit_is_given_up_said_and_recorded() -> R {
+    // Package G2 (REQ-006 behaviour 6; docs/adr/ADR-015.md note): doctor's identity hashing is inside its 20 s limit
+    // and in its records. A claude 64 GiB long (sparse: its script exits before the zeros) cannot be hashed in 20 s:
+    // doctor still ends in time, says the hash was not done and why, still shows the version, and records the hash
+    // with how much it read, beside its commands, not among them. The check before a host's start runs from doctor's
+    // start, beside the agents, so the hash does not starve it of its time.
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let help = fixtures().join("claude/2.1.318/help.txt");
+    s.write(
+        "claude",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) echo '2.1.318 (Claude Code)';;\n --help) cat '{}';;\n \
+             auth) echo '{{\"loggedIn\": true}}';;\nesac\nexit\n",
+            help.display()
+        ),
+    )?;
+    let claude = s.bin.path().join("claude");
+    let size: u64 = 64 << 30;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&claude)?
+        .set_len(size)?;
+    s.write("systemd-run", "#!/bin/sh\necho 'systemd 255 (255.4-1)'\n")?;
+    let manager: Vec<(&str, String)> = ["XDG_RUNTIME_DIR", "USER"]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k, v)))
+        .collect();
+    let pairs: Vec<(&str, &str)> = manager.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    // Bounded here too: a doctor that hashed all of it would take minutes.
+    let (out, took) = s.doctor_in(&["timeout", "60"], &["--output", "json"], &pairs)?;
+    let report: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+        format!(
+            "{e} after {took:?} (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })?;
+    assert!(took <= Duration::from_secs(25), "doctor took {took:?}");
+    let item = &report["agents"]["claude"];
+    assert_eq!(item["installed"], true, "{item}");
+    assert_eq!(item["version"], "2.1.318 (Claude Code)", "{item}");
+    assert_eq!(item["protocol"], "unknown", "{item}");
+    assert!(item["binary_sha256"].is_null(), "{item}");
+    let detail = item["protocol_detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("sha256") && detail.contains("总时限"),
+        "{detail}"
+    );
+    let hashes = report["hashes"].as_array().ok_or("no hashes")?;
+    let cut = hashes
+        .iter()
+        .find(|h| h["path"] == claude.display().to_string().as_str())
+        .ok_or_else(|| format!("claude's hash is not recorded: {hashes:?}"))?;
+    assert_eq!(cut["done"], false, "{cut}");
+    assert_eq!(cut["size"], size, "{cut}");
+    assert!(
+        cut["read"].as_u64().is_some_and(|read| read < size),
+        "{cut}"
+    );
+    assert!(
+        cut["duration_ms"].as_u64().is_some_and(|ms| ms <= 21_000),
+        "{cut}"
+    );
+    assert!(
+        cut["reason"].as_str().is_some_and(|r| r.contains("limit")),
+        "{cut}"
+    );
+    // The others were hashed in full, each recorded with its duration.
+    for agent in ["codex", "pi"] {
+        let launcher = report["agents"][agent]["path"].as_str().unwrap_or_default();
+        assert!(
+            hashes
+                .iter()
+                .any(|h| h["path"] == launcher && h["done"] == true && h["duration_ms"].is_u64()),
+            "{agent}: {hashes:?}"
+        );
+    }
+    // probes lists the commands doctor started, and only those (ADR-015 decision 5, AC-006-03).
+    assert!(
+        report["probes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|p| p["argv"][0].as_str().is_some_and(|a| a.starts_with('/'))),
+        "{}",
+        report["probes"]
+    );
+    // The check before a start was not starved: never "not started" for want of time.
+    let host = &report["runtime"]["host"];
+    let tracking = host["process_tracking_detail"].as_str().unwrap_or_default();
+    assert!(!tracking.contains("not started"), "{host}");
+    let user = std::env::var("USER").unwrap_or_default();
+    if std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|run| Path::new(&run).join("systemd/private").exists())
+        && !user.is_empty()
+        && Path::new("/var/lib/systemd/linger").join(&user).is_file()
+        && Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+    {
+        assert_eq!(host["process_tracking"], "unverified", "{host}");
+    }
+    Ok(())
+}
+
 /// The text form carries what the JSON carries for each agent: path, binary sha256, protocol, auth and capabilities
 /// (M1T07R-05).
 #[test]

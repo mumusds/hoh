@@ -276,11 +276,29 @@ pub struct Run {
     pub started: bool,
 }
 
+/// One file a probe hashed for a CLI's identity (its launcher, its implementation; docs/adr/ADR-015.md note of
+/// package G2): within the shared deadline when there is one, so a slow hash is given up there and said, never left
+/// out of the account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Hashed {
+    pub path: String,
+    /// Its size when it was opened (`None` when it could not be opened).
+    pub size: Option<u64>,
+    /// How much of it was read.
+    pub read: u64,
+    pub duration_ms: u64,
+    /// Whether its sha256 was found; why not (`reason`) otherwise.
+    pub done: bool,
+    pub reason: Option<String>,
+}
+
 /// What the threads that probe wrote down so far.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Records {
     /// The commands run.
     pub runs: Vec<Run>,
+    /// The files hashed (not commands: doctor lists them apart, ADR-015 decision 5).
+    pub hashes: Vec<Hashed>,
 }
 
 /// [`Records`], shared between the threads that probe.
@@ -356,6 +374,9 @@ impl std::error::Error for ProbeError {}
 /// What a command that could not be started is said with ([`ProbeError::Failed`]'s detail begins with it).
 pub const CANNOT_START: &str = "cannot start";
 
+/// The first word of a hash's `argv` in a [`ProbeError`] ([`ProbeError::hashed`]): hashing is not a command.
+pub const HASH: &str = "sha256";
+
 impl ProbeError {
     /// Whether the command was started: not when the shared deadline had passed before it, nor when it could not be
     /// started (its spawn failed).
@@ -364,6 +385,18 @@ impl ProbeError {
             Self::NotStarted { .. } => false,
             Self::Failed { detail, .. } => !detail.starts_with(CANNOT_START),
             _ => true,
+        }
+    }
+
+    /// The file whose hash this is the failure of (not begun or not finished within the shared deadline), if it is
+    /// one.
+    pub fn hashed(&self) -> Option<&str> {
+        match self {
+            Self::TimedOut { argv, .. } | Self::NotStarted { argv } => match argv.as_slice() {
+                [hash, path] if hash == HASH => Some(path),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -387,17 +420,96 @@ pub struct Identity {
 
 /// Find the agent's CLI and identify it: launcher, implementation, `--version`.
 pub fn identify(agent: Agent, env: &ProbeEnv) -> Result<Identity, ProbeError> {
+    identify_versioned(agent, env).map_err(|(_, e)| e)
+}
+
+/// [`identify`]; when it fails after `--version` answered (a hash not done within the shared deadline), the version
+/// line with the error, so doctor still shows it (ADR-015 decision 2, M1QA-08).
+pub fn identify_versioned(
+    agent: Agent,
+    env: &ProbeEnv,
+) -> Result<Identity, (Option<String>, ProbeError)> {
     let launcher =
-        find_on_path(agent.command(), &env.path).ok_or(ProbeError::NotFound { agent })?;
-    let implementation = resolve_implementation(agent, &launcher)?;
-    let cli_version = version_line(&launcher, env)?;
+        find_on_path(agent.command(), &env.path).ok_or((None, ProbeError::NotFound { agent }))?;
+    let implementation = resolve_implementation(agent, &launcher).map_err(|e| (None, e))?;
+    let cli_version = version_line(&launcher, env).map_err(|e| (None, e))?;
+    let hashed = |path: &Path| {
+        identity_sha256(path, env, &Instant::now).map_err(|e| (Some(cli_version.clone()), e))
+    };
     Ok(Identity {
-        launcher_sha256: file_sha256(&launcher)?,
-        implementation_sha256: file_sha256(&implementation)?,
+        launcher_sha256: hashed(&launcher)?,
+        implementation_sha256: hashed(&implementation)?,
         launcher,
         implementation,
         cli_version,
     })
+}
+
+/// The sha256 of `path`, a file of a CLI's identity, within `env`'s shared deadline when it has one (doctor's 20 s,
+/// REQ-006 behaviour 6), by the clock `now`: not begun once none of it is left ([`ProbeError::NotStarted`]), given up
+/// when it runs out between two pieces ([`ProbeError::TimedOut`], cut by the deadline); written down in `env.log` with
+/// how long it took and how much it read (docs/adr/ADR-015.md note of package G2).
+fn identity_sha256(
+    path: &Path,
+    env: &ProbeEnv,
+    now: &dyn Fn() -> Instant,
+) -> Result<String, ProbeError> {
+    let began = now();
+    let argv = || vec![HASH.to_owned(), path.display().to_string()];
+    let over = |at: Instant| env.deadline.is_some_and(|end| at >= end);
+    let mut size = None;
+    let mut read = 0u64;
+    let result = if over(began) {
+        Err(ProbeError::NotStarted { argv: argv() })
+    } else {
+        (|| {
+            let mut file = std::fs::File::open(path)?;
+            size = Some(file.metadata()?.len());
+            let mut hasher = Sha256::new();
+            let mut piece = vec![0u8; 1 << 16];
+            loop {
+                if over(now()) {
+                    return Err(ProbeError::TimedOut {
+                        argv: argv(),
+                        after: now().saturating_duration_since(began),
+                        cut_by_deadline: true,
+                    });
+                }
+                match file.read(&mut piece) {
+                    Ok(0) => return Ok(hex(&hasher.finalize())),
+                    Ok(n) => {
+                        hasher.update(&piece[..n]);
+                        read += n as u64;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(ProbeError::Io(e)),
+                }
+            }
+        })()
+    };
+    if let Some(log) = &env.log
+        && let Ok(mut records) = log.lock()
+    {
+        records.hashes.push(Hashed {
+            path: path.display().to_string(),
+            size,
+            read,
+            duration_ms: u64::try_from(now().saturating_duration_since(began).as_millis())
+                .unwrap_or(u64::MAX),
+            done: result.is_ok(),
+            reason: result.as_ref().err().map(|e| match e {
+                ProbeError::NotStarted { .. } => {
+                    "not begun: the shared limit was used up".to_owned()
+                }
+                ProbeError::TimedOut { .. } => format!(
+                    "not finished: the shared limit ran out after {read} of {} bytes",
+                    size.unwrap_or_default()
+                ),
+                other => other.to_string(),
+            }),
+        });
+    }
+    result
 }
 
 /// Probe one agent: the entry it would get in the compat manifest (suite not run).
@@ -3597,6 +3709,117 @@ mod sandbox_tests;
 mod tests {
     use super::*;
     use rustix::process::Pid;
+
+    /// A clock that reads `start` for its first `fresh` reads and `start + late` after them.
+    fn clock(start: Instant, fresh: usize, late: Duration) -> impl Fn() -> Instant {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        move || {
+            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < fresh {
+                start
+            } else {
+                start + late
+            }
+        }
+    }
+
+    /// A probe environment with the shared `deadline` and a log.
+    fn hashing_env(deadline: Option<Instant>) -> (ProbeEnv, RunLog) {
+        let log = RunLog::default();
+        let env = ProbeEnv {
+            path: OsString::new(),
+            fixture_root: None,
+            timeout: Duration::from_secs(20),
+            log: Some(log.clone()),
+            deadline,
+            cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
+        };
+        (env, log)
+    }
+
+    #[test]
+    fn an_identitys_hash_is_within_the_shared_deadline_and_in_the_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Package G2 (docs/adr/ADR-015.md note, REQ-006 behaviour 6): a CLI's identity hash, by the clock it is given,
+        // is done and recorded with what it read; not begun when none of the deadline is left; given up between two
+        // pieces when it runs out, with how much it read; never past the deadline, never left out of the records.
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("cli");
+        let bytes = vec![7u8; 3 * (1 << 16) + 5];
+        std::fs::write(&file, &bytes)?;
+        let path = file.display().to_string();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(1);
+        // Done: the same sha256 the adapters take, recorded in full.
+        let (env, log) = hashing_env(Some(end));
+        let done = identity_sha256(&file, &env, &clock(start, usize::MAX, Duration::ZERO))?;
+        assert_eq!(done, file_sha256(&file)?);
+        let records = log.lock().map_err(|_| "poisoned")?.clone();
+        assert!(records.runs.is_empty(), "a hash is not a command");
+        assert_eq!(
+            records.hashes,
+            vec![Hashed {
+                path: path.clone(),
+                size: Some(bytes.len() as u64),
+                read: bytes.len() as u64,
+                duration_ms: 0,
+                done: true,
+                reason: None,
+            }]
+        );
+        // Not begun: the deadline had passed.
+        let (env, log) = hashing_env(Some(start));
+        let refused = identity_sha256(&file, &env, &clock(start, usize::MAX, Duration::ZERO));
+        assert!(
+            matches!(&refused, Err(e @ ProbeError::NotStarted { .. }) if e.hashed() == Some(path.as_str())),
+            "{refused:?}"
+        );
+        let records = log.lock().map_err(|_| "poisoned")?.clone();
+        assert_eq!(records.hashes.len(), 1);
+        let hash = &records.hashes[0];
+        assert!(
+            !hash.done && hash.read == 0 && hash.size.is_none(),
+            "{hash:?}"
+        );
+        assert!(
+            hash.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not begun")),
+            "{hash:?}"
+        );
+        // Given up: the clock passes the deadline after two pieces were read (the begin, then a look before each
+        // piece: three reads on time).
+        let (env, log) = hashing_env(Some(end));
+        let cut = identity_sha256(&file, &env, &clock(start, 3, Duration::from_secs(2)));
+        assert!(
+            matches!(
+                &cut,
+                Err(e @ ProbeError::TimedOut { cut_by_deadline: true, .. }) if e.hashed() == Some(path.as_str())
+            ),
+            "{cut:?}"
+        );
+        let records = log.lock().map_err(|_| "poisoned")?.clone();
+        let hash = &records.hashes[0];
+        assert_eq!(
+            (hash.done, hash.read, hash.size, hash.duration_ms),
+            (false, 2 << 16, Some(bytes.len() as u64), 2000),
+            "{hash:?}"
+        );
+        assert!(
+            hash.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not finished")
+                    && r.contains(&format!("{} of {}", 2 << 16, bytes.len()))),
+            "{hash:?}"
+        );
+        // No deadline (the host's probes): done, whatever the clock says.
+        let (env, _) = hashing_env(None);
+        assert_eq!(
+            identity_sha256(&file, &env, &clock(start, 0, Duration::from_secs(3600)))?,
+            done
+        );
+        Ok(())
+    }
 
     /// `dir` held open, as the probe holds the scratch directory it made.
     fn held(dir: &Path) -> std::os::fd::OwnedFd {
