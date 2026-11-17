@@ -152,10 +152,18 @@ impl Project {
 }
 
 impl Drop for Project {
-    /// A host the test's commands started is killed however the test ends.
+    /// A host the test's commands started is killed however the test ends, and waited for (a while): a test on a
+    /// mount of its own unmounts it next, which a host still there would keep busy.
     fn drop(&mut self) {
-        if let Some(pid) = self.host_pid().and_then(rustix::process::Pid::from_raw) {
+        let Some(pid) = self.host_pid() else {
+            return;
+        };
+        if let Some(pid) = rustix::process::Pid::from_raw(pid) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        let end = Instant::now() + Duration::from_secs(10);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -369,11 +377,13 @@ fn read_only_a_hoh_directory_the_host_cannot_write_is_named_as_such_not_taken_fo
     project.stop_host()
 }
 
-/// A file system of the test's own, mounted with `sudo -n` and unmounted however the test ends.
+/// A file system of the test's own, mounted with `sudo -n`. A test unmounts it by [`finish`], checked; one that ends
+/// otherwise (a failed assertion) leaves it to `Drop`, the fallback.
 struct Mount {
     point: PathBuf,
-    /// The loop image's directory, for an ext4 one.
-    _work: tempfile::TempDir,
+    mounted: bool,
+    /// The mount point's directory, and the loop image's for an ext4 one.
+    work: tempfile::TempDir,
 }
 
 impl Mount {
@@ -382,7 +392,7 @@ impl Mount {
         if !out.status.success() {
             return Err(format!(
                 "sudo -n {args:?}: {} (this test needs sudo -n)",
-                String::from_utf8_lossy(&out.stderr)
+                String::from_utf8_lossy(&out.stderr).trim()
             )
             .into());
         }
@@ -408,7 +418,11 @@ impl Mount {
             "tmpfs",
             &point.display().to_string(),
         ])?;
-        Ok(Mount { point, _work: work })
+        Ok(Mount {
+            point,
+            mounted: true,
+            work,
+        })
     }
 
     /// An ext4 image mounted with errors=remount-ro, owned by the test's user; its loop device's name.
@@ -425,7 +439,11 @@ impl Mount {
         assert!(made.success(), "mkfs.ext4");
         let (image_s, point_s) = (image.display().to_string(), point.display().to_string());
         Mount::sudo(&["mount", "-o", "loop,errors=remount-ro", &image_s, &point_s])?;
-        let mount = Mount { point, _work: work };
+        let mount = Mount {
+            point,
+            mounted: true,
+            work,
+        };
         let owner = format!(
             "{}:{}",
             rustix::process::getuid().as_raw(),
@@ -471,13 +489,54 @@ impl Mount {
     }
 }
 
-impl Drop for Mount {
-    fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .args(["-n", "umount"])
-            .arg(&self.point)
-            .status();
+impl Mount {
+    /// Unmount it, checked: its failure is the test's.
+    fn unmount(mut self) -> R {
+        Mount::sudo(&["umount", &self.point.display().to_string()])?;
+        self.mounted = false;
+        Ok(())
     }
+}
+
+impl Drop for Mount {
+    /// The fallback, for a test that ended without unmounting it or failed to: unmount, retried for a while (a host
+    /// just killed may hold it), then lazily; a mount that stays is named, and its directory kept.
+    fn drop(&mut self) {
+        if !self.mounted {
+            return;
+        }
+        let point = self.point.display().to_string();
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if Mount::sudo(&["umount", &point]).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if Mount::sudo(&["umount", "-l", &point]).is_ok() {
+            return;
+        }
+        self.work.disable_cleanup(true);
+        eprintln!("db_faults: {point} is still mounted; unmount it with `sudo umount {point}`");
+    }
+}
+
+/// The end of a test on a mount of its own, checked: its host stopped and waited for, then the mount unmounted. A host
+/// that does not stop or a mount that stays fails the test even when its checks passed (F7-04); when they failed,
+/// theirs is the error returned and the cleanup's is told on stderr.
+fn finish(outcome: R, project: Project, mount: Mount) -> R {
+    let stopped = project.stop_host();
+    drop(project);
+    let unmounted = mount.unmount();
+    if outcome.is_err() {
+        for e in [&stopped, &unmounted]
+            .into_iter()
+            .filter_map(|r| r.as_ref().err())
+        {
+            eprintln!("db_faults: cleanup after a failed test: {e}");
+        }
+    }
+    outcome.and(stopped).and(unmounted)
 }
 
 #[test]
@@ -500,8 +559,7 @@ fn full_a_full_file_system_is_db_full_and_retryable_writes_nothing_and_writes_re
         assert_eq!(project.sql("PRAGMA integrity_check")?, "ok");
         project.stop_host()
     })();
-    let _ = project.stop_host();
-    outcome
+    finish(outcome, project, mount)
 }
 
 #[test]
@@ -524,8 +582,7 @@ fn full_a_host_started_on_a_full_file_system_says_db_full_not_wal() -> R {
         project.accepted("third")?;
         project.stop_host()
     })();
-    let _ = project.stop_host();
-    outcome
+    finish(outcome, project, mount)
 }
 
 #[test]
@@ -554,8 +611,7 @@ fn full_a_host_started_with_a_few_kib_left_says_db_full_not_wal() -> R {
         project.accepted("third")?;
         project.stop_host()
     })();
-    let _ = project.stop_host();
-    outcome
+    finish(outcome, project, mount)
 }
 
 #[test]
@@ -588,6 +644,5 @@ fn read_only_a_file_system_that_turns_read_only_under_its_host_fails_commands_wi
         assert!(stderr.contains("Read-only file system"), "{stderr}");
         Ok(())
     })();
-    let _ = project.stop_host();
-    outcome
+    finish(outcome, project, mount)
 }
