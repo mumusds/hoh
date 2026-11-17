@@ -142,6 +142,43 @@ class Judge(unittest.TestCase):
         self.assertEqual(judge_check.round_verdict(m,control)[0],'FAIL')  # pi.rs reads to the process's exit
         m=copy.deepcopy(c);judge_check._late_recovery(m)
         self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')
+    def test_the_round_9_probes(self):
+        # The replay registers requests as the adapters do (no pre-fill from the request log) and reads the recorded
+        # external observations (M2T20D-800, -801).
+        none=Path('/nonexistent');ex=FIXTURES/'excerpts'
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=judge_check.load(ex,none,'codex',name)[0];control=judge_check.load(ex,none,'codex','app-control')[0]
+            m=copy.deepcopy(c);m.requests=[]
+            self.assertEqual(judge_check.adapter_replay(m).state,'settled')  # the pending map is the adapter's own
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')  # but the log must be the adapter's
+            for edit in (lambda m:m.stdout.remove(judge_check._initialize_response(m)),
+                         lambda m:judge_check._initialize_response(m).update(error={'code':-32000,'message':'x'}),
+                         lambda m:judge_check._initialize_response(m).update(error={'code':-32601,'message':'x'}),
+                         judge_check._initialize_after_thread):
+                m=copy.deepcopy(c);edit(m)
+                self.assertNotEqual(judge_check.adapter_replay(m).state,'settled',name)
+                self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',name)
+            m=copy.deepcopy(c);judge_check._observe(m,exit={'returncode':1,'how':'exited'})
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')  # the App Server's exit does not matter
+        c=judge_check.load(ex,none,'pi','noext-resumed')[0];control=judge_check.load(ex,none,'pi','control')[0]
+        self.assertEqual(judge_check.round_verdict(c,control)[0],'PASS')
+        self.assertEqual(c.observations['opened'],c.observations['noted'][0])  # the same file, recorded live
+        for change in ({'opened':None},{'noted':[]}):
+            m=copy.deepcopy(c);judge_check._observe(m,**change)
+            self.assertEqual(judge_check.adapter_replay(m).failure,'SESSION_MISMATCH',change)
+        m=copy.deepcopy(c);judge_check._opened_other_inode(m)
+        self.assertEqual(judge_check.adapter_replay(m).failure,'SESSION_MISMATCH')
+        m=copy.deepcopy(c);judge_check._observe(m,opened=judge_check.UNOBSERVED)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT')
+        c=judge_check.load(ex,none,'pi','noext-new')[0]
+        m=copy.deepcopy(c);judge_check._observe(m,opened=None)
+        self.assertEqual(judge_check.round_verdict(m,control)[0],'PASS')  # a new session's file is not checked
+        c=judge_check.load(ex,none,'claude','ro-new')[0];control=judge_check.load(ex,none,'claude','control')[0]
+        for change,failure in (({'prompt_fed':False},'PROMPT_NOT_DELIVERED'),({'logs_complete':False},'RAW_LOG_INCOMPLETE'),
+                               ({'exit':{'returncode':1,'how':'exited'}},'is_error or exit')):
+            m=copy.deepcopy(c);judge_check._observe(m,**change)
+            self.assertEqual(judge_check.adapter_replay(m).failure,failure)
+            self.assertEqual(judge_check.round_verdict(m,control)[0],'INSUFFICIENT',change)
     def test_every_one_value_change_of_a_refusal_is_not_a_refusal(self):
         for case,m in self.report['mutations'].items():
             self.assertEqual(m['excerpt']['as recorded'],'12 refused',case)

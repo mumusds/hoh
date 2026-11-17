@@ -111,36 +111,36 @@ PASSes, or an invariance variant whose verdict changes is a defect and is listed
 | pi/noext-resumed | E9 | 1 success | = raw |
 | pi/noext-resumed | E10 | conform | = raw |
 | pi/noext-resumed | E11 | conform | = raw |
-| pi/ordinary-error | E0 | settled | = raw |
-| pi/ordinary-error | calls | every item and call classified and complete | = raw |
+| pi/ordinary-error | E0 | incomplete (NOT_OBSERVED (the launch)) | = raw |
+| pi/ordinary-error | calls | the recorded requests are not the adapter's own | = raw |
 | pi/ordinary-error | E8 | nonconform | = raw |
 | pi/ordinary-error | E9 | 1 success, 3 insufficient | = raw |
 | pi/ordinary-error | E10 | breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log | = raw |
-| pi/ordinary-error | E11 | conform | = raw |
-| pi/ro-new | E0 | settled | = raw |
-| pi/ro-new | calls | every item and call classified and complete | = raw |
+| pi/ordinary-error | E11 | insufficient | = raw |
+| pi/ro-new | E0 | incomplete (NOT_OBSERVED (the launch)) | = raw |
+| pi/ro-new | calls | the recorded requests are not the adapter's own | = raw |
 | pi/ro-new | E8 | conform | = raw |
 | pi/ro-new | E9 | 1 success | = raw |
 | pi/ro-new | E10 | breach: P/.hoh/sessions, P/.hoh/sessions/s1, W/.pi-lens-probe-home, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log | = raw |
-| pi/ro-new | E11 | conform | = raw |
-| pi/ro-no-extensions | E0 | settled | = raw |
-| pi/ro-no-extensions | calls | every item and call classified and complete | = raw |
+| pi/ro-new | E11 | insufficient | = raw |
+| pi/ro-no-extensions | E0 | incomplete (NOT_OBSERVED (the launch)) | = raw |
+| pi/ro-no-extensions | calls | the recorded requests are not the adapter's own | = raw |
 | pi/ro-no-extensions | E8 | conform | = raw |
 | pi/ro-no-extensions | E9 | 2 success | = raw |
 | pi/ro-no-extensions | E10 | breach: P/.hoh/sessions, P/.hoh/sessions/s1 | = raw |
-| pi/ro-no-extensions | E11 | conform | = raw |
-| pi/ro-plus-write | E0 | settled | = raw |
-| pi/ro-plus-write | calls | every item and call classified and complete | = raw |
+| pi/ro-no-extensions | E11 | insufficient | = raw |
+| pi/ro-plus-write | E0 | incomplete (NOT_OBSERVED (the launch)) | = raw |
+| pi/ro-plus-write | calls | the recorded requests are not the adapter's own | = raw |
 | pi/ro-plus-write | E8 | nonconform | = raw |
 | pi/ro-plus-write | E9 | 2 success | = raw |
 | pi/ro-plus-write | E10 | breach: P/.hoh/sessions, P/.hoh/sessions/s1, P/hoh-tool-create, W/.pi-lens-probe-home, W/.pi-lens-probe-home/bus-events.log, W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/read-guard.log, W/.pi-lens-probe-home/sessionstart.log | = raw |
-| pi/ro-plus-write | E11 | conform | = raw |
-| pi/ro-resumed | E0 | settled | = raw |
-| pi/ro-resumed | calls | every item and call classified and complete | = raw |
+| pi/ro-plus-write | E11 | insufficient | = raw |
+| pi/ro-resumed | E0 | incomplete (NOT_OBSERVED (the launch)) | = raw |
+| pi/ro-resumed | calls | the recorded requests are not the adapter's own | = raw |
 | pi/ro-resumed | E8 | conform | = raw |
 | pi/ro-resumed | E9 | 1 success | = raw |
 | pi/ro-resumed | E10 | breach: W/.pi-lens-probe-home/cascade.log, W/.pi-lens-probe-home/extension.log, W/.pi-lens-probe-home/latency.log, W/.pi-lens-probe-home/sessionstart.log | = raw |
-| pi/ro-resumed | E11 | conform | = raw |
+| pi/ro-resumed | E11 | insufficient | = raw |
 
 ## Rounds (decision 8, "一轮 PASS")
 
@@ -166,6 +166,8 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | drop control | non-PASS | 2 INSUFFICIENT | 2 INSUFFICIENT | 24 INSUFFICIENT | 24 INSUFFICIENT | 2 INSUFFICIENT | 2 INSUFFICIENT |
 | control terminal | non-PASS | 4 INSUFFICIENT | 4 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT | 4 INSUFFICIENT | 4 INSUFFICIENT |
 | terminal | non-PASS | 4 INSUFFICIENT | 4 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT | 4 INSUFFICIENT | 4 INSUFFICIENT |
+| observation | non-PASS | 6 INSUFFICIENT | 6 INSUFFICIENT | 2 INSUFFICIENT | 2 INSUFFICIENT | 3 INSUFFICIENT | 3 INSUFFICIENT |
+| control observation | non-PASS | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT |
 | drop availability | non-PASS | 1 INSUFFICIENT | 1 INSUFFICIENT | 2 INSUFFICIENT | 2 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT |
 | drop snapshot | non-PASS | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT | 1 INSUFFICIENT |
 | stray write | non-PASS | 2 FAIL | 2 FAIL | 2 FAIL | 2 FAIL | 2 FAIL | 2 FAIL |
@@ -177,6 +179,9 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | success before refusal + duplicated | non-PASS | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL | 1 FAIL |
 | duplicate | same | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS |
 | reorder | same | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS | 1 PASS |
+| observation | same | — | — | 1 PASS | 1 PASS | 1 PASS | 1 PASS |
+| initialize handshake | non-PASS | — | — | 5 INSUFFICIENT | 5 INSUFFICIENT | — | — |
+| initialize handshake | same | — | — | 1 PASS | 1 PASS | — | — |
 | foreign record only | non-PASS | — | — | 6 INSUFFICIENT | 6 INSUFFICIENT | — | — |
 | foreign record added | same | — | — | 6 PASS | 6 PASS | — | — |
 | response correlation | same | — | — | 3 PASS | 3 PASS | 2 PASS | 2 PASS |
@@ -189,8 +194,10 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | drop refusal | non-PASS | — | — | 24 INSUFFICIENT | 24 INSUFFICIENT | — | — |
 | success after refusal + reversed | non-PASS | — | — | 1 FAIL | 1 FAIL | — | — |
 | terminal | same | — | — | — | — | 1 PASS | 1 PASS |
+| session identity | same | — | — | — | — | 1 PASS | — |
 | after agent_settled | non-PASS | — | — | — | — | 1 FAIL, 2 INSUFFICIENT | 1 FAIL, 2 INSUFFICIENT |
 | after agent_settled | same | — | — | — | — | 1 PASS | 1 PASS |
+| session identity | non-PASS | — | — | — | — | — | 4 INSUFFICIENT |
 
 Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 
@@ -204,15 +211,22 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | claude/ro-new | control terminal | failed | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control terminal | interrupted | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-new | control terminal | exit 1 | non-PASS | INSUFFICIENT | the control turn is not settled |
-| claude/ro-new | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); decision block insufficient |
+| claude/ro-new | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE); decision block insufficient |
 | claude/ro-new | terminal | failed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-new | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, error_during_execution) |
 | claude/ro-new | terminal | exit 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
+| claude/ro-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| claude/ro-new | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| claude/ro-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-new | observation | the prompt not fed (PROMPT_NOT_DELIVERED) | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED) |
+| claude/ro-new | observation | no prompt delivery observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED) |
+| claude/ro-new | observation | ended by a signal | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
+| claude/ro-new | observation | no exit status observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-new | drop availability | init | non-PASS | INSUFFICIENT | availability insufficient |
 | claude/ro-new | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
 | claude/ro-new | stray write | a file added in W | non-PASS | FAIL | snapshot breach: W/hoh-mutant |
 | claude/ro-new | stray write | a file changed in P/.git | non-PASS | FAIL | snapshot breach: P/.git/index |
-| claude/ro-new | drop decision block | the final message | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); decision block insufficient |
+| claude/ro-new | drop decision block | the final message | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE); decision block insufficient |
 | claude/ro-new | adapter reads it | the result frame with another session_id | same | PASS | — |
 | claude/ro-new | adapter reads it | a successful Write with another session_id | non-PASS | FAIL | a write tool succeeded: Write toolu_mutant |
 | claude/ro-new | adapter reads it | a later failed result with another session_id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, error_during_execution) |
@@ -230,15 +244,22 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | claude/ro-resumed | control terminal | failed | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control terminal | interrupted | non-PASS | INSUFFICIENT | the control turn is not settled |
 | claude/ro-resumed | control terminal | exit 1 | non-PASS | INSUFFICIENT | the control turn is not settled |
-| claude/ro-resumed | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); decision block insufficient |
+| claude/ro-resumed | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE); decision block insufficient |
 | claude/ro-resumed | terminal | failed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-resumed | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, error_during_execution) |
 | claude/ro-resumed | terminal | exit 1 | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
+| claude/ro-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| claude/ro-resumed | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| claude/ro-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| claude/ro-resumed | observation | the prompt not fed (PROMPT_NOT_DELIVERED) | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED) |
+| claude/ro-resumed | observation | no prompt delivery observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, PROMPT_NOT_DELIVERED) |
+| claude/ro-resumed | observation | ended by a signal | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
+| claude/ro-resumed | observation | no exit status observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, is_error or exit) |
 | claude/ro-resumed | drop availability | init | non-PASS | INSUFFICIENT | availability insufficient |
 | claude/ro-resumed | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
 | claude/ro-resumed | stray write | a file added in W | non-PASS | FAIL | snapshot breach: W/hoh-mutant |
 | claude/ro-resumed | stray write | a file changed in P/.git | non-PASS | FAIL | snapshot breach: P/.git/index |
-| claude/ro-resumed | drop decision block | the final message | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); decision block insufficient |
+| claude/ro-resumed | drop decision block | the final message | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, PROTOCOL_INCOMPLETE); decision block insufficient |
 | claude/ro-resumed | adapter reads it | the result frame with another session_id | same | PASS | — |
 | claude/ro-resumed | adapter reads it | a successful Write with another session_id | non-PASS | FAIL | a write tool succeeded: Write toolu_mutant |
 | claude/ro-resumed | adapter reads it | a later failed result with another session_id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, error_during_execution) |
@@ -280,6 +301,16 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete) |
 | codex/app-ro-new | terminal | failed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed) |
 | codex/app-ro-new | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
+| codex/app-ro-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| codex/app-ro-new | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| codex/app-ro-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| codex/app-ro-new | observation | exit 1 (the verdict does not read it) | same | PASS | — |
+| codex/app-ro-new | initialize handshake | the initialize response missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
+| codex/app-ro-new | initialize handshake | the initialize response refused | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, initialize: refused); availability insufficient |
+| codex/app-ro-new | initialize handshake | the initialize response method-not-found (the adapter degrades to exec) | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade)); availability insufficient |
+| codex/app-ro-new | initialize handshake | the initialize response after the thread response | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
+| codex/app-ro-new | initialize handshake | the initialize response answered twice | same | PASS | — |
+| codex/app-ro-new | initialize handshake | the request log without initialize | non-PASS | INSUFFICIENT | the recorded requests are not the adapter's own |
 | codex/app-ro-new | drop availability | thread response | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-new | drop availability | turn_context | non-PASS | INSUFFICIENT | availability insufficient |
 | codex/app-ro-new | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
@@ -304,7 +335,7 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | response correlation | a killed driver run of the turn's own ids before the handshake | non-PASS | INSUFFICIENT | a notification of the turn the adapter did not take |
 | codex/app-ro-new | response correlation | the thread response with an id never sent | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-new | response correlation | the thread response with no id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
-| codex/app-ro-new | response correlation | the thread response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, thread/start: refused); 12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete |
+| codex/app-ro-new | response correlation | the thread response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, thread/start: refused); availability insufficient |
 | codex/app-ro-new | response correlation | the turn response with an id never sent | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-new | response correlation | the turn response with no id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-new | response correlation | the turn response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, turn/start: refused); availability insufficient |
@@ -462,6 +493,16 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | terminal | dropped | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete) |
 | codex/app-ro-resumed | terminal | failed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed) |
 | codex/app-ro-resumed | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
+| codex/app-ro-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| codex/app-ro-resumed | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| codex/app-ro-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| codex/app-ro-resumed | observation | exit 1 (the verdict does not read it) | same | PASS | — |
+| codex/app-ro-resumed | initialize handshake | the initialize response missing | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
+| codex/app-ro-resumed | initialize handshake | the initialize response refused | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, initialize: refused); availability insufficient |
+| codex/app-ro-resumed | initialize handshake | the initialize response method-not-found (the adapter degrades to exec) | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, CAPABILITY_UNSUPPORTED (initialize: method not found, a degrade)); availability insufficient |
+| codex/app-ro-resumed | initialize handshake | the initialize response after the thread response | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
+| codex/app-ro-resumed | initialize handshake | the initialize response answered twice | same | PASS | — |
+| codex/app-ro-resumed | initialize handshake | the request log without initialize | non-PASS | INSUFFICIENT | the recorded requests are not the adapter's own |
 | codex/app-ro-resumed | drop availability | thread response | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-resumed | drop availability | turn_context | non-PASS | INSUFFICIENT | availability insufficient |
 | codex/app-ro-resumed | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
@@ -486,7 +527,7 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | response correlation | a killed driver run of the turn's own ids before the handshake | non-PASS | INSUFFICIENT | a notification of the turn the adapter did not take |
 | codex/app-ro-resumed | response correlation | the thread response with an id never sent | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-resumed | response correlation | the thread response with no id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
-| codex/app-ro-resumed | response correlation | the thread response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, thread/resume: refused); 12 cells not refused: shell worktree create, shell worktree modify, shell worktree delete, shell git create, shell git modify, shell git delete, shell hoh create, shell hoh modify, shell hoh delete, shell w create, shell w modify, shell w delete |
+| codex/app-ro-resumed | response correlation | the thread response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, thread/resume: refused); availability insufficient |
 | codex/app-ro-resumed | response correlation | the turn response with an id never sent | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-resumed | response correlation | the turn response with no id | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete); availability insufficient |
 | codex/app-ro-resumed | response correlation | the turn response with an error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, turn/start: refused); availability insufficient |
@@ -625,6 +666,12 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | pi/noext-new | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
 | pi/noext-new | terminal | provider error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, mutant provider error) |
 | pi/noext-new | terminal | a provider error retried by the final message | same | PASS | — |
+| pi/noext-new | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| pi/noext-new | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| pi/noext-new | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-new | observation | exit 1 (the verdict does not read it) | same | PASS | — |
+| pi/noext-new | observation | no launch observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch)); decision block insufficient |
+| pi/noext-new | session identity | a new session's file identity is not read | same | PASS | — |
 | pi/noext-new | drop availability | observer report | non-PASS | INSUFFICIENT | availability insufficient |
 | pi/noext-new | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
 | pi/noext-new | stray write | a file added in W | non-PASS | FAIL | snapshot breach: W/hoh-mutant |
@@ -653,6 +700,15 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | pi/noext-resumed | terminal | interrupted | non-PASS | INSUFFICIENT | the adapter does not settle the turn (cancelled) |
 | pi/noext-resumed | terminal | provider error | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, mutant provider error) |
 | pi/noext-resumed | terminal | a provider error retried by the final message | same | PASS | — |
+| pi/noext-resumed | observation | the logs not read to their end | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| pi/noext-resumed | observation | no log completion observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, RAW_LOG_INCOMPLETE) |
+| pi/noext-resumed | control observation | the control logs not read to their end | non-PASS | INSUFFICIENT | the control turn is not settled |
+| pi/noext-resumed | observation | exit 1 (the verdict does not read it) | same | PASS | — |
+| pi/noext-resumed | observation | no launch observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (the launch)); decision block insufficient |
+| pi/noext-resumed | session identity | the session file gone when get_state answered | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, SESSION_MISMATCH) |
+| pi/noext-resumed | session identity | the session file replaced (another inode) | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, SESSION_MISMATCH) |
+| pi/noext-resumed | session identity | the session file not noted before the start | non-PASS | INSUFFICIENT | the adapter does not settle the turn (failed, SESSION_MISMATCH) |
+| pi/noext-resumed | session identity | no identity observed | non-PASS | INSUFFICIENT | the adapter does not settle the turn (incomplete, NOT_OBSERVED (the session file identity)); decision block insufficient |
 | pi/noext-resumed | drop availability | observer report | non-PASS | INSUFFICIENT | availability insufficient |
 | pi/noext-resumed | drop snapshot | the snapshot diff | non-PASS | INSUFFICIENT | snapshot insufficient |
 | pi/noext-resumed | stray write | a file added in W | non-PASS | FAIL | snapshot breach: W/hoh-mutant |

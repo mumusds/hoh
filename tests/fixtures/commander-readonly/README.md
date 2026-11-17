@@ -56,7 +56,16 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   its pending map, `scope_of`, `on_turn_notification`, codex.rs `verdict`; pi.rs `Rpc::on_record` to the process's
   exit, `note_message`, `verdict`), names the function each step mirrors, and enumerates the codex rollout and the
   turn's items default-deny. The authoritative judge is M2-T20's Rust judge on the adapters' `replay_facts`.
-  `--emit DIR` writes every generated variant with its expected verdict class: M2-T20's acceptance fixtures.
+  Since round 9 (M2T20D-800, -801) it registers requests only as the adapters do (codex: initialize as id 0, the
+  thread request once initialize is answered, turn/start once the thread request is; pi: get_state as `hoh-state-1`,
+  the prompt as `hoh-prompt-2` once the session check passes), never from the request log, which it only compares
+  with the adapter's own requests; and it reads the recorded `observations` (exit, log completion, claude's prompt
+  delivery, pi's launch and session file identity) where the adapters read the host's. A recording without an
+  observation the adapter needs is judged as the adapter would judge it without it (pi's runs before
+  20261117T002630Z: no launch, so not settled).
+  `--emit DIR` writes every generated variant with its inputs (stdout, rollout, request log, `observations.json`,
+  snapshot diff, the control's too) and its frozen expected class: M2-T20's acceptance fixtures. The oracle is that
+  class with the adapters' replay of these inputs, not this prototype's verdict (M2T20D-851).
 - Before that (design corrections 4 to 6) it was the evidence table of ADR-032 decision 8 executed: each row's rule is a
   function whose docstring is the rule, run on every committed excerpt and, where present locally with the recorded
   sha256, on the raw recording it was cut from. A verdict that differs between the two is a defect (exit 1). It also
@@ -73,8 +82,8 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   a family per stage: foreign-scope copies of each record kind both ways, ambiguous scopes, incomplete driver and
   patch calls, control terminal variants for every agent, and pi provider errors (failing, and retried). Its output is
   committed as `judge_check.out.md` and `judge_check.out.json` (made on the recording machine, so the raw column is
-  filled); the bundle self-test reruns it on the excerpts and requires the committed verdicts. M2-T20's judge must give
-  the same verdicts on the same fixtures.
+  filled); the bundle self-test reruns it on the excerpts and requires the committed verdicts, which pins the
+  prototype, not M2-T20's judge: that one must give each emitted variant a verdict of its expected class.
 
 ## Run 20261116T180821Z
 
