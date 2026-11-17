@@ -49,7 +49,7 @@ fn open_with(
         wal_probe: Some(selftest::test_probe(None)),
         clock: Some(StoreClock(clock.clone())),
         faults,
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }

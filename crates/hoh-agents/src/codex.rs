@@ -248,6 +248,8 @@ pub fn headless_answer(method: &str) -> Result<Value, (i64, String)> {
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub launch: Launch,
+    /// Who starts the agent (docs/adr/ADR-031.md, 设计修正 2): the host's direct spawner, or doctor's gate.
+    pub spawner: std::sync::Arc<dyn hoh_core::spawn::Spawner>,
     pub prompt: String,
     /// Directory for the raw logs (created if needed): `app-server.stdout.jsonl`/`.stderr.log`, `exec.…`.
     pub logs: PathBuf,
@@ -780,6 +782,7 @@ fn replay_turn() -> Turn {
         handshake_timeout: Duration::from_secs(60),
         deadline: None,
         observe: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     }
 }
 
@@ -868,10 +871,11 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         .args(&args)
         .envs(gate.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&turn.launch.cwd);
-    let mut process = crate::process::Process::spawn(command, config).map_err(|e| Refused {
-        code: "SPAWN".to_owned(),
-        detail: e.to_string(),
-    })?;
+    let mut process =
+        crate::process::Process::spawn(command, config, &*turn.spawner).map_err(|e| Refused {
+            code: "SPAWN".to_owned(),
+            detail: e.to_string(),
+        })?;
     let pid = process.pid();
     let (open, opened) = oneshot::channel::<()>();
     let cancel = std::sync::Arc::new(tokio::sync::Notify::new());

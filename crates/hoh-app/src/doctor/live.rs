@@ -68,6 +68,7 @@ pub(super) fn prepare(
             escalation: claude::Turn::default_escalation(),
             deadline: Some(DEADLINE),
             observe: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         }),
         Agent::Codex => {
             let launch::Facts::Codex {
@@ -102,6 +103,7 @@ pub(super) fn prepare(
                 handshake_timeout: Duration::from_secs(60),
                 deadline: Some(DEADLINE),
                 observe: None,
+                spawner: hoh_core::spawn::Direct::shared(),
             })
         }
         Agent::Pi => Prepared::Pi(pi::Turn {
@@ -128,6 +130,7 @@ pub(super) fn prepare(
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         }),
     })
 }
@@ -290,8 +293,11 @@ pub fn check(
         .build()
         .map_err(|e| format!("无法启动运行时：{e}"))?;
     runtime.block_on(async {
-        let store = Store::open(&dir.join(".hoh/state.db"), Options::default())
-            .map_err(|e| e.to_string())?;
+        let store = Store::open(
+            &dir.join(".hoh/state.db"),
+            Options::new(hoh_core::spawn::Direct::shared()),
+        )
+        .map_err(|e| e.to_string())?;
         store
             .scratch_task("doctor", &dir.display().to_string(), "doctor", "doctor")
             .await

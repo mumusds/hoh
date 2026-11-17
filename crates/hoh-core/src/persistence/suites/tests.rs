@@ -43,7 +43,7 @@ async fn a_commit_failing_after_the_rename_keeps_the_suite_open_until_it_is_ende
         Options {
             wal_probe: Some(selftest::test_probe(None)),
             faults: faults.clone(),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     let project = store.begin_host("p1", "/repo").await?.project_id;
@@ -155,7 +155,7 @@ async fn failing_at(
                 step,
                 failed: AtomicBool::new(false),
             }),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?;
     let project = store.begin_host("p1", "/repo").await?.project_id;

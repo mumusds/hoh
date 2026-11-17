@@ -45,7 +45,7 @@ impl World {
             &db,
             Options {
                 wal_probe: Some(probe),
-                ..Options::default()
+                ..Options::new(hoh_core::spawn::Direct::shared())
             },
         )?;
         let seed = "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-04T00:00:00Z');

@@ -75,7 +75,7 @@ fn open_with(dir: &tempfile::TempDir, faults: Arc<dyn FaultHooks>) -> R<(Store, 
     let options = Options {
         wal_probe: Some(selftest::test_probe(None)),
         faults,
-        ..Options::default()
+        ..Options::new(crate::spawn::Direct::shared())
     };
     Ok((Store::open(&path, options)?, path))
 }
@@ -2434,7 +2434,7 @@ mod scale {
             &path,
             Options {
                 wal_probe: Some(selftest::test_probe(None)),
-                ..Options::default()
+                ..Options::new(crate::spawn::Direct::shared())
             },
         )?);
         let conn = Connection::open(&path)?;

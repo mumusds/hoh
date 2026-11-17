@@ -18,7 +18,6 @@ use super::private::{Private, names, told};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -76,8 +75,12 @@ impl Step {
 }
 
 /// Run the self-test in `dir` (which must exist), with `probe` as the second process.
-pub fn wal_self_test(dir: &Path, probe: &ProbeCommand) -> Result<(), PersistError> {
-    run(dir, probe, &|_| Ok(()))
+pub fn wal_self_test(
+    dir: &Path,
+    probe: &ProbeCommand,
+    spawner: &dyn crate::spawn::Spawner,
+) -> Result<(), PersistError> {
+    run(dir, probe, spawner, &|_| Ok(()))
 }
 
 /// How many names the self-test tries for its private directory before it gives up (F7-03).
@@ -90,6 +93,7 @@ const DB_NAME: &str = "selftest.db";
 pub(super) fn run(
     dir: &Path,
     probe: &ProbeCommand,
+    spawner: &dyn crate::spawn::Spawner,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
     let names = names(&dir.join(".hoh-wal-selftest-"), NAME_ATTEMPTS).map_err(|e| {
@@ -98,7 +102,7 @@ pub(super) fn run(
             detail: format!("no random name for the self-test's directory: {e}"),
         }
     })?;
-    run_named(dir, names, probe, inject)
+    run_named(dir, names, probe, spawner, inject)
 }
 
 /// The self-test in the first of `names` it can make as its private directory ([`Private`]; a name that exists is
@@ -110,6 +114,7 @@ pub(super) fn run_named(
     dir: &Path,
     names: impl IntoIterator<Item = PathBuf>,
     probe: &ProbeCommand,
+    spawner: &dyn crate::spawn::Spawner,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
     let private = Private::make_first(names).map_err(|not| {
@@ -135,7 +140,7 @@ pub(super) fn run_named(
             not_created(dir, &not.path, &not.error)
         }
     })?;
-    let result = steps(&private.path().join(DB_NAME), probe, inject);
+    let result = steps(&private.path().join(DB_NAME), probe, spawner, inject);
     let left = private.remove();
     let cleanup = (!left.is_empty()).then(|| told(&left));
     match (result, cleanup) {
@@ -205,29 +210,33 @@ fn with_suffix(db: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The probe process; killed and reaped when dropped.
+/// The probe process; killed and reaped when dropped, through its handle (docs/adr/ADR-031.md, 设计修正 2, A2).
 struct Probe {
-    process: std::process::Child,
+    shared: std::sync::Arc<crate::spawn::Shared>,
     stdin: Option<std::process::ChildStdin>,
     answers: mpsc::Receiver<String>,
     timeout: Duration,
 }
 
 impl Probe {
-    fn start(command: &ProbeCommand, db: &Path) -> std::io::Result<Probe> {
-        // Its own process group, so that whatever it starts goes with it (M2T01R-11).
-        let mut process = std::process::Command::new(&command.program)
-            .process_group(0)
-            .args(&command.args)
-            .envs(command.env.iter().map(|(k, v)| (k, v)))
-            .env(PROBE_DB_ENV, db)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+    fn start(
+        command: &ProbeCommand,
+        db: &Path,
+        spawner: &dyn crate::spawn::Spawner,
+    ) -> std::io::Result<Probe> {
+        // Its own process group (the spawner's helper), so that whatever it starts goes with it (M2T01R-11).
+        let process = spawner.helper(
+            std::process::Command::new(&command.program)
+                .args(&command.args)
+                .envs(command.env.iter().map(|(k, v)| (k, v)))
+                .env(PROBE_DB_ENV, db)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null()),
+        )?;
         let missing = || std::io::Error::other("probe stdio was not piped");
-        let stdin = process.stdin.take().ok_or_else(missing)?;
-        let stdout = process.stdout.take().ok_or_else(missing)?;
+        let stdin = process.stdin.ok_or_else(missing)?;
+        let stdout = process.stdout.ok_or_else(missing)?;
         let (tx, answers) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -240,7 +249,7 @@ impl Probe {
             }
         });
         Ok(Probe {
-            process,
+            shared: process.shared,
             stdin: Some(stdin),
             answers,
             timeout: command.answer_timeout,
@@ -309,15 +318,11 @@ impl ProbeError {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        // The group id stays valid until the leader is reaped, so the group is killed first. Its members holding
-        // the stdout pipe die with it, which ends the reading thread. The leader is also killed on its own and its
-        // stdin closed, so the wait below cannot hang even if the group kill failed.
-        if let Some(pid) = rustix::process::Pid::from_raw(self.process.id() as i32) {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
-        let _ = self.process.kill();
+        // Its stdin closed, its group and its leader killed (the group by number only while the leader is unreaped,
+        // so the id is still its own; its members holding the stdout pipe die with it, which ends the reading
+        // thread), then reaped, within a bound; one that does not exit by then is reaped by a thread of its own.
         drop(self.stdin.take());
-        let _ = self.process.wait();
+        let _ = self.shared.end_or_reap_later(crate::spawn::END_WAIT);
     }
 }
 
@@ -435,6 +440,7 @@ fn count(conn: &Connection) -> rusqlite::Result<i64> {
 fn steps(
     db: &Path,
     probe: &ProbeCommand,
+    spawner: &dyn crate::spawn::Spawner,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), Failed> {
     let failed = Failed::wal;
@@ -465,8 +471,8 @@ fn steps(
     at(Step::SharedMemory)?;
     let shared = |d: String| failed(Step::SharedMemory, d);
     let from_probe = |step: Step| move |e: ProbeError| e.judged(step, db);
-    let mut other =
-        Probe::start(probe, db).map_err(|e| shared(format!("cannot start the probe: {e}")))?;
+    let mut other = Probe::start(probe, db, spawner)
+        .map_err(|e| shared(format!("cannot start the probe: {e}")))?;
     other
         .expect("open", "ok")
         .map_err(from_probe(Step::SharedMemory))?;
@@ -865,7 +871,7 @@ mod tests {
     fn the_self_test_passes_on_a_local_directory_and_leaves_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
-        wal_self_test(dir.path(), &test_probe(None))?;
+        wal_self_test(dir.path(), &test_probe(None), &crate::spawn::Direct)?;
         assert_eq!(leftovers(dir.path()), Vec::<String>::new());
         Ok(())
     }
@@ -884,7 +890,7 @@ mod tests {
             ("stale", &[Step::SharedMemory]),
         ] {
             let dir = tempfile::tempdir()?;
-            match wal_self_test(dir.path(), &test_probe(Some(fault))) {
+            match wal_self_test(dir.path(), &test_probe(Some(fault)), &crate::spawn::Direct) {
                 Err(PersistError::WalUnsupported { step: name, detail }) => {
                     assert!(
                         steps.iter().any(|s| s.name() == name),
@@ -914,7 +920,7 @@ mod tests {
             ..missing.clone()
         };
         for probe in [missing, silent] {
-            match wal_self_test(dir.path(), &probe) {
+            match wal_self_test(dir.path(), &probe, &crate::spawn::Direct) {
                 Err(PersistError::WalUnsupported { step, .. }) => {
                     assert_eq!(step, Step::SharedMemory.name())
                 }
@@ -946,7 +952,7 @@ mod tests {
         };
         let work = dir.path().join("work");
         std::fs::create_dir(&work)?;
-        assert!(wal_self_test(&work, &probe).is_err());
+        assert!(wal_self_test(&work, &probe, &crate::spawn::Direct).is_err());
         let pid: u32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
         // Reaped only when /proc has no entry for it; any other failed look is an error, never "reaped" (ADR-022
         // decision 10, convention v2; this crate cannot use hoh_agents::identity::reaped).
@@ -983,7 +989,7 @@ mod tests {
                     Ok(())
                 }
             };
-            match run(dir.path(), &test_probe(None), &fault) {
+            match run(dir.path(), &test_probe(None), &crate::spawn::Direct, &fault) {
                 Err(PersistError::WalUnsupported { step: name, detail }) => {
                     assert_eq!(name, step.name());
                     assert_eq!(detail, "injected");
@@ -1006,14 +1012,26 @@ mod tests {
             .collect();
         let foreign = "owned by another creator\n";
         std::fs::write(&names[0], foreign)?;
-        run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(()))?;
+        run_named(
+            dir.path(),
+            names.clone(),
+            &test_probe(None),
+            &crate::spawn::Direct,
+            &|_| Ok(()),
+        )?;
         assert_eq!(std::fs::read_to_string(&names[0])?, foreign);
         assert_eq!(leftovers(dir.path()), ["selftest-0"]);
 
         std::fs::create_dir(&names[1])?;
         std::fs::write(names[1].join("selftest.db-journal"), foreign)?;
         std::fs::write(&names[2], foreign)?;
-        match run_named(dir.path(), names.clone(), &test_probe(None), &|_| Ok(())) {
+        match run_named(
+            dir.path(),
+            names.clone(),
+            &test_probe(None),
+            &crate::spawn::Direct,
+            &|_| Ok(()),
+        ) {
             Err(PersistError::WalUnsupported { step, detail }) => {
                 assert_eq!(step, Step::Open.name(), "{detail}");
                 assert!(detail.contains("selftest-2"), "{detail}");
@@ -1039,7 +1057,11 @@ mod tests {
         // F7-02: a SQLITE_FULL in the probe process (its database may not grow) is judged as the self-test's own: DB_FULL,
         // retryable, not WAL's failure at the locking step.
         let dir = tempfile::tempdir()?;
-        match wal_self_test(dir.path(), &test_probe(Some("page-limit"))) {
+        match wal_self_test(
+            dir.path(),
+            &test_probe(Some("page-limit")),
+            &crate::spawn::Direct,
+        ) {
             Err(e @ PersistError::Full(_)) => {
                 assert!(e.retryable(), "{e}");
                 assert!(
@@ -1184,7 +1206,11 @@ mod tests {
         // F7-02 on a real file system: the probe's insert-commit finds it full (Codex's case: SQLITE_FULL in the
         // probe was DB_WAL_UNSUPPORTED, not retryable).
         let mount = Tmpfs::new("4m")?;
-        let result = wal_self_test(&mount.point, &test_probe(Some("fill-before-commit")));
+        let result = wal_self_test(
+            &mount.point,
+            &test_probe(Some("fill-before-commit")),
+            &crate::spawn::Direct,
+        );
         let _ = std::fs::remove_file(mount.point.join("filler"));
         let left = leftovers(&mount.point);
         mount.unmount()?;
@@ -1366,7 +1392,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             let dir = tempfile::tempdir()?;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))?;
-            let result = wal_self_test(dir.path(), &test_probe(None));
+            let result = wal_self_test(dir.path(), &test_probe(None), &crate::spawn::Direct);
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
             match result {
                 Err(PersistError::NotWritable { path, .. }) => assert_eq!(path, dir.path()),
@@ -1382,7 +1408,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let missing = dir.path().join("missing");
-        match wal_self_test(&missing, &test_probe(None)) {
+        match wal_self_test(&missing, &test_probe(None), &crate::spawn::Direct) {
             Err(PersistError::WalUnsupported { step, .. }) => assert_eq!(step, "open"),
             other => return Err(format!("{other:?}").into()),
         }

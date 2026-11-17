@@ -4,9 +4,7 @@
 //! with a timeout, in their own process group, which is killed on timeout (the full process substrate is M1-T02).
 
 use crate::compat::{Agent, AgentEntry, Suite, SuiteStatus, Transport};
-use rustix::process::{
-    Pid, Signal, WaitId, WaitIdOptions, kill_process, kill_process_group, waitid,
-};
+use rustix::process::Signal;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -15,7 +13,6 @@ use std::io::{self, Read};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -55,6 +52,8 @@ pub struct ProbeEnv {
     /// that is not run leaves alive is stated in docs/adr/ADR-022.md decision 10 v6 (M2T07R-202, -300, -450, -500,
     /// -600, -700).
     pub cancel: Option<ProbeStop>,
+    /// Who starts the commands (docs/adr/ADR-031.md, 设计修正 2, A): the host's direct spawner, or a client's gate.
+    pub spawner: std::sync::Arc<dyn hoh_core::spawn::Spawner>,
 }
 
 /// The stop of whoever probes (docs/adr/ADR-022.md decision 10 v6, M2T07R-300, -450, -500, -600, -700):
@@ -75,7 +74,7 @@ struct Stopping {
     /// Set by the stop before it tries any lock; read without one (decision 10 v6).
     stopped: std::sync::atomic::AtomicBool,
     /// The commands started, each held until it is reaped.
-    commands: std::sync::Mutex<Vec<std::sync::Weak<std::sync::Mutex<Option<std::process::Child>>>>>,
+    commands: std::sync::Mutex<Vec<std::sync::Weak<InSlot>>>,
 }
 
 impl ProbeStop {
@@ -124,11 +123,10 @@ impl ProbeStop {
         for command in &found {
             // Its leader not reaped (whoever reaps it takes it out first), the number is still its own.
             if let Some(held) = tried(command, until)
-                && let Some(child) = held.as_ref()
+                && let Some(shared) = held.as_ref()
             {
-                let pid = Pid::from_child(child);
-                let _ = kill_process_group(pid, Signal::KILL);
-                let _ = kill_process(pid, Signal::KILL);
+                shared.signal_group(Signal::KILL);
+                shared.kill();
             }
             // Where a test holds the stop once it tried a slot (by its thread's hook, see [`between`]).
             between("slot-tried", Path::new(""));
@@ -149,7 +147,7 @@ impl ProbeStop {
     fn start(
         &self,
         at: &Path,
-        spawn: impl FnOnce() -> io::Result<std::process::Child>,
+        spawn: impl FnOnce() -> io::Result<hoh_core::spawn::Helper>,
     ) -> Option<io::Result<Started>> {
         let slot: Slot = std::sync::Arc::default();
         {
@@ -161,15 +159,18 @@ impl ProbeStop {
             commands.push(std::sync::Arc::downgrade(&slot));
             between("registering", at);
         }
-        Some(spawn().map(|child| {
+        Some(spawn().map(|helper| {
             between("spawned", at);
-            Started::new(slot, child, Some(self), at)
+            Started::new(slot, helper, Some(self), at)
         }))
     }
 }
 
-/// A started command's child, until whoever reaps it takes it out (a stop signals it only while it is there).
-type Slot = std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>;
+/// A started command's handle, until whoever reaps it takes it out (a stop signals it only while it is there).
+type InSlot = std::sync::Mutex<Option<std::sync::Arc<hoh_core::spawn::Shared>>>;
+
+/// [`InSlot`], shared by the probe and the stop.
+type Slot = std::sync::Arc<InSlot>;
 
 /// How long a stop tries, in all, the locks a probing thread may hold, before it leaves their commands to their
 /// threads (decision 10 v6, M2T07R-700): a lock is held for a few steps, so only a thread that is not run holds it
@@ -194,7 +195,7 @@ fn tried<T>(mutex: &std::sync::Mutex<T>, until: Instant) -> Option<std::sync::Mu
 /// The put's hold of a slot's lock. Let go, it lets a test hold the starter right after (`placed`, see [`between`]),
 /// so whatever a starter did once it let the lock go comes after that moment (M2T07R-751).
 struct PutHold<'a> {
-    guard: Option<std::sync::MutexGuard<'a, Option<std::process::Child>>>,
+    guard: Option<std::sync::MutexGuard<'a, Option<std::sync::Arc<hoh_core::spawn::Shared>>>>,
     at: &'a Path,
 }
 
@@ -205,10 +206,10 @@ impl Drop for PutHold<'_> {
     }
 }
 
-/// A command just started: its child in its slot, its pid and its outputs.
+/// A command just started: its handle in its slot, and its outputs.
 struct Started {
     slot: Slot,
-    pid: Pid,
+    shared: std::sync::Arc<hoh_core::spawn::Shared>,
     stdout: Option<std::process::ChildStdout>,
     stderr: Option<std::process::ChildStderr>,
 }
@@ -222,29 +223,33 @@ impl Started {
     /// M2T07R-500, -600, -700, -800, -901).
     fn new(
         slot: Slot,
-        mut child: std::process::Child,
+        helper: hoh_core::spawn::Helper,
         stop: Option<&ProbeStop>,
         at: &Path,
     ) -> Started {
-        let pid = Pid::from_child(&child);
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+        let hoh_core::spawn::Helper {
+            stdout,
+            stderr,
+            shared,
+            ..
+        } = helper;
         let mut guard = locked(&slot);
-        *guard = Some(child);
+        *guard = Some(shared.clone());
         let hold = PutHold {
             guard: Some(guard),
             at,
         };
         between("putting", at);
         if stop.is_some_and(ProbeStop::is_stopped) {
-            let _ = kill_process_group(pid, Signal::KILL);
-            let _ = kill_process(pid, Signal::KILL);
+            shared.signal_group(Signal::KILL);
+            shared.kill();
         }
         between("looked", at);
         // Let go only now, after the look (M2T07R-751).
         drop(hold);
         Started {
             slot,
-            pid,
+            shared,
             stdout,
             stderr,
         }
@@ -3310,19 +3315,19 @@ fn capture(
     let at = program.parent().unwrap_or(program);
     let spawn = || {
         between("spawning", at);
-        Command::new(program)
-            .args(args)
-            .env("PATH", &env.path)
-            .envs(vars.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(if keep_stderr {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .process_group(0)
-            .spawn()
+        env.spawner.helper(
+            Command::new(program)
+                .args(args)
+                .env("PATH", &env.path)
+                .envs(vars.iter().copied())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(if keep_stderr {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                }),
+        )
     };
     // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
     // it execs (a known Linux race when files are written and executed concurrently). Retry a few times.
@@ -3330,7 +3335,7 @@ fn capture(
     // Registered for the stop before it starts: none starts once whoever probes stopped (M2T07R-300, -450).
     let start = || match &env.cancel {
         Some(stop) => stop.start(at, spawn),
-        None => Some(spawn().map(|child| Started::new(Slot::default(), child, None, at))),
+        None => Some(spawn().map(|helper| Started::new(Slot::default(), helper, None, at))),
     };
     let mut attempt = 0;
     let started = loop {
@@ -3358,7 +3363,7 @@ fn capture(
     let (stdout, stderr) = (started.stdout, started.stderr);
     let mut owned = Owned {
         slot: started.slot,
-        pid: started.pid,
+        shared: started.shared,
         at: at.to_path_buf(),
     };
     between("started", at);
@@ -3374,8 +3379,6 @@ fn capture(
         after: limit,
         cut_by_deadline: limit < env.timeout,
     };
-    let pid = owned.pid;
-    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
     let mut status = None;
     loop {
         if status.is_some() && outputs.iter().all(|o| o.file.is_none()) {
@@ -3403,11 +3406,7 @@ fn capture(
                 .map_err(|e| failed(format!("reading output: {e}")))?;
         }
         // Observe the exit without reaping: while the leader is a zombie its process group id cannot be reused.
-        if status.is_none()
-            && waitid(WaitId::Pid(pid), exited)
-                .map_err(io::Error::from)?
-                .is_some()
-        {
+        if status.is_none() && owned.shared.observe()?.is_some() {
             // Whatever the command left running in its group goes with it (M1T01R-03), then the leader is reaped.
             status = Some(
                 owned
@@ -3442,9 +3441,10 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 /// A command the probe started, owned from the moment it started: ended ([`Owned::end`]) when dropped, so no exit
 /// of [`capture`] leaves it running (M1T07R-53).
 struct Owned {
-    /// Its child, `None` once ended; a stop signals it while it is there (M2T07R-300).
+    /// Its handle while it is in the slot, `None` once ended; a stop signals it while it is there (M2T07R-300).
     slot: Slot,
-    pid: Pid,
+    /// Its handle: the one place it is reaped.
+    shared: std::sync::Arc<hoh_core::spawn::Shared>,
     /// Where a test holds its end (see [`between`]).
     at: PathBuf,
 }
@@ -3455,29 +3455,16 @@ impl Owned {
     /// is killed on its own too, as it may have moved itself into another group (M1T07R-80). A leader that does not
     /// die by then (a call SIGKILL does not end) is reaped by a thread of its own.
     fn end(&mut self) -> Option<ExitStatus> {
-        // Taken out and signalled under the slot's lock: a stop never signals a number once it may be reaped.
-        let mut child = {
+        // Taken out of the slot first: a stop then no longer signals it. Its group is signalled by number only while
+        // its handle has not reaped it (the handle's lock), so the id is still its own.
+        {
             let mut held = locked(&self.slot);
-            let child = held.take()?;
+            held.take()?;
             between("ending", &self.at);
-            let _ = kill_process_group(self.pid, Signal::KILL);
-            let _ = kill_process(self.pid, Signal::KILL);
-            child
-        };
-        let until = Instant::now() + REAP_WAIT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(2)),
-                _ => break,
-            }
         }
-        let _ = std::thread::Builder::new()
-            .name("hoh-reap".to_owned())
-            .spawn(move || {
-                let _ = child.wait();
-            });
-        None
+        // A leader that does not die in time (a call SIGKILL does not end) is reaped by a thread of its own, in the
+        // same order (docs/adr/ADR-031.md, 设计修正 2, A2).
+        self.shared.end_or_reap_later(REAP_WAIT)
     }
 }
 
@@ -3586,6 +3573,7 @@ mod sandbox_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::process::Pid;
 
     /// `dir` held open, as the probe holds the scratch directory it made.
     fn held(dir: &Path) -> std::os::fd::OwnedFd {
@@ -3655,6 +3643,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probing = {
             let (launcher, env) = (launcher.clone(), env.clone());
@@ -3939,6 +3928,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probing = probing_as(&name, move || {
             run(&launcher, &["--version"], &env).map(|_| ())
@@ -4080,6 +4070,7 @@ mod tests {
                 log: None,
                 deadline: None,
                 cancel: Some(stop.clone()),
+                spawner: hoh_core::spawn::Direct::shared(),
             };
             probes.push(std::thread::spawn(move || {
                 run(&launcher, &["--version"], &env).map(|_| ())
@@ -4164,6 +4155,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probing = probing_as("hslflag", move || {
             run(&launcher, &["--version"], &env).map(|_| ())
@@ -4244,6 +4236,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probe = |launcher: PathBuf, name: &str| {
             let env = env.clone();
@@ -4327,6 +4320,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probing = probing_as(&name, move || {
             run(&launcher, &["--version"], &env).map(|_| ())
@@ -4427,6 +4421,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let probing = std::thread::spawn(move || run(&launcher, &["--version"], &env).map(|_| ()));
         let until = Instant::now() + Duration::from_secs(10);
@@ -4482,6 +4477,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: Some(stop.clone()),
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let reading = std::thread::spawn(move || codex_schema(&launcher, &env).map(|_| ()));
         let until = Instant::now() + Duration::from_secs(10);
@@ -5016,6 +5012,7 @@ mod tests {
             log: None,
             deadline,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         assert_eq!(
             reading_deadline(&env(None), now),
@@ -5160,6 +5157,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let sh = Path::new("/bin/sh");
         let within = format!("head -c {MAX_OUTPUT} /dev/zero");
@@ -5669,6 +5667,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let started = Instant::now();
         let release = std::thread::spawn(move || {
@@ -5894,6 +5893,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let caller = std::thread::spawn(move || codex_schema(&launcher, &env));
         let until = Instant::now() + Duration::from_secs(10);
@@ -6293,6 +6293,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let baseline = (count("/proc/self/fd"), count("/proc/self/task"));
         // This process's threads: id, name and state, for a count that fails.
@@ -6518,6 +6519,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         for n in 0..3 {
             let pidfile = tmp.path().join(format!("pid-{n}"));
@@ -6573,6 +6575,7 @@ mod tests {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         };
         let result = run_status(&launcher, &[], &env);
         let pid = std::fs::read_to_string(&pidfile)?.trim().parse::<u32>()?;

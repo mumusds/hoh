@@ -1029,7 +1029,7 @@ pub(super) async fn run(
     };
     let mut command = Command::new(&turn.launch.program);
     command.args(&args).current_dir(&turn.launch.cwd);
-    let mut process = match Process::spawn(command, config(turn)) {
+    let mut process = match Process::spawn(command, config(turn), &*turn.spawner) {
         Ok(p) => p,
         Err(e) => {
             finish(

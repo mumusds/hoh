@@ -37,7 +37,7 @@ fn fixture(project: &Path) -> R {
                 env: Vec::new(),
                 answer_timeout: Duration::from_secs(10),
             }),
-            ..Options::default()
+            ..Options::new(hoh_core::spawn::Direct::shared())
         },
     )?;
     drop(store);

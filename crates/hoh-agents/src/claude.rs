@@ -218,6 +218,8 @@ pub fn session_capabilities(launch: &Launch) -> Result<Value, Blocked> {
 #[derive(Debug, Clone)]
 pub struct Turn {
     pub launch: Launch,
+    /// Who starts the agent (docs/adr/ADR-031.md, 设计修正 2): the host's direct spawner, or doctor's gate.
+    pub spawner: std::sync::Arc<dyn hoh_core::spawn::Spawner>,
     pub prompt: Vec<u8>,
     /// Directory for stdout.jsonl and stderr.log (created if needed).
     pub logs: PathBuf,
@@ -444,7 +446,8 @@ pub async fn run(
     command
         .args(argv.args.iter().map(OsString::from))
         .current_dir(&turn.launch.cwd);
-    let mut process = match Process::spawn(command, config(turn, &stdout, &stderr)) {
+    let mut process = match Process::spawn(command, config(turn, &stdout, &stderr), &*turn.spawner)
+    {
         Ok(p) => p,
         Err(e) => {
             finish(
@@ -564,7 +567,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         deadline: None,
         ..config(turn, &stdout, &stderr)
     };
-    let mut process = Process::spawn(command, config).map_err(|e| Refused {
+    let mut process = Process::spawn(command, config, &*turn.spawner).map_err(|e| Refused {
         code: "SPAWN".to_owned(),
         detail: e.to_string(),
     })?;

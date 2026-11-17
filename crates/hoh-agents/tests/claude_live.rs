@@ -80,6 +80,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
             log: None,
             deadline: None,
             cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
         },
     )?;
     if PathBuf::from(&entry.launcher_path).canonicalize()? != program {
@@ -134,6 +135,7 @@ async fn claude_live_turns_resume_and_cancel() -> R {
         escalation: Turn::default_escalation(),
         deadline: Some(Duration::from_secs(600)),
         observe: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let mut sessions = Vec::new();
     let session_of = |o: &Outcome| {

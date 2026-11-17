@@ -503,6 +503,7 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
         log: None,
         deadline: Some(end),
         cancel: crate::signals::current().map(|state| state.helpers().clone()),
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     // A start whose client is ending (its helpers let go of) starts no host.
     let ending = || {
@@ -772,7 +773,7 @@ fn launch_with(
             "cannot start the host: no thread to read its start errors: {e}"
         ))
     })?;
-    let (give_child, take_child) = std::sync::mpsc::channel::<std::process::Child>();
+    let (give_child, take_child) = std::sync::mpsc::channel::<hoh_core::spawn::WaitOnly>();
     spawn(
         "hoh-reap",
         Box::new(move || {
@@ -811,22 +812,25 @@ fn launch_with(
         None => command.env_remove(hoh_app::host::UNSCOPED_ENV),
     };
     command.env(hoh_app::host::UNSUPERVISED_ENV, unsupervised);
-    let mut child = command
-        .arg("__host")
-        .arg(project)
-        .current_dir(project)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| Failure::unreachable(format!("cannot start the host: {e}")))?;
+    // A host is wait-only from its spawn: nothing of this client ever signals it (docs/adr/ADR-031.md, 设计修正 2, A).
+    let mut child = hoh_core::spawn::Spawner::host(
+        &hoh_core::spawn::Direct,
+        command
+            .arg("__host")
+            .arg(project)
+            .current_dir(project)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .map_err(|e| Failure::unreachable(format!("cannot start the host: {e}")))?;
     let pid = child.id();
     // Its start errors come on its stderr until it is ready (then it writes .hoh/host.log).
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = child.take_stderr() {
         let _ = give_stderr.send(stderr);
     }
     // The waiter takes it: it receives until it gets one, so it is there for the send.
-    let hand_over = |child: std::process::Child| {
+    let hand_over = |child: hoh_core::spawn::WaitOnly| {
         let _ = give_child.send(child);
     };
     loop {

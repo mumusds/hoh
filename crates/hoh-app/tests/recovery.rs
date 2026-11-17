@@ -2219,7 +2219,7 @@ print(json.dumps({{"steps": steps, "grant": list(grant), "disposed": disposed,
         &db,
         hoh_core::persistence::Options {
             wal_probe: Some(probe()),
-            ..hoh_core::persistence::Options::default()
+            ..hoh_core::persistence::Options::new(hoh_core::spawn::Direct::shared())
         },
     )?;
     let repo = std::fs::canonicalize(&project)?;

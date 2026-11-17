@@ -15,7 +15,7 @@ fn world(
         &path,
         Options {
             wal_probe: Some(selftest::test_probe(None)),
-            ..Options::default()
+            ..Options::new(crate::spawn::Direct::shared())
         },
     )?);
     let conn = Connection::open(&path)?;

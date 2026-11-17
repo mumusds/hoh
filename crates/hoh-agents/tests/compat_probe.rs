@@ -58,6 +58,7 @@ fn env_for(dir: &Path) -> ProbeEnv {
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     }
 }
 
@@ -926,6 +927,7 @@ fn probe_fails_cleanly_when_the_cli_is_missing() -> R {
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     assert!(probe(Agent::Pi, &env).is_err());
     Ok(())
@@ -942,6 +944,7 @@ fn probe_is_bounded_by_its_timeout() -> R {
         log: None,
         deadline: None,
         cancel: None,
+        spawner: hoh_core::spawn::Direct::shared(),
     };
     let started = std::time::Instant::now();
     assert!(probe(Agent::Claude, &env).is_err());
