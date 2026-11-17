@@ -17,13 +17,13 @@ mod tests;
 
 use crate::client::{Failure, HostInfo};
 use crate::exit::{ClientEvent, Ending, exit_code};
+use crate::signals::State;
 use app::{App, Exit, Request};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{Event, KeyEventKind};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use serde_json::{Value, json};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use std::io::Stdin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,11 +52,13 @@ fn code(event: ClientEvent) -> u8 {
 }
 
 fn signal_code(signal: usize) -> u8 {
-    match i32::try_from(signal) {
-        Ok(SIGTERM) => code(ClientEvent::Sigterm),
-        Ok(SIGHUP) => code(ClientEvent::Sighup),
-        _ => code(ClientEvent::Sigint),
-    }
+    crate::signals::code(signal)
+}
+
+/// What a wait of the shell answered, or that a signal ended it (docs/adr/ADR-031.md, 设计修正（客户端信号）, rule 3):
+/// the loop then ends at its next look.
+fn waited<T>(answer: Result<Result<T, String>, u8>) -> Result<T, String> {
+    answer.unwrap_or_else(|code| Err(format!("收到信号（{code}）")))
 }
 
 /// The project's host as the shell talks to it: the one found last, which a host started again (another token)
@@ -78,14 +80,20 @@ impl Conn {
         current(&self.host)
     }
 
-    /// GET `path`, once more from the host found again when it does not answer or no longer knows the token.
+    /// GET `path`, once more from the host found again when it does not answer or no longer knows the token; the
+    /// client's signal state looked at while it waits.
     fn get(&self, path: &str) -> Result<crate::client::Reply, String> {
-        get_from(&self.project, &self.host, path)
+        let (project, host, path) = (self.project.clone(), self.host.clone(), path.to_owned());
+        waited(crate::signals::wait(move || {
+            get_from(&project, &host, &path)
+        }))
     }
 
-    /// Every run of the host (every page).
+    /// Every run of the host (every page); the client's signal state looked at while it waits.
     fn runs(&self) -> Result<Vec<Value>, Failure> {
-        crate::client::runs(&self.host())
+        let host = self.host();
+        crate::signals::wait(move || crate::client::runs(&host))
+            .unwrap_or_else(|code| Err(Failure::unreachable(format!("收到信号（{code}）"))))
     }
 
     fn submit(&self, command: Value) -> Result<Value, Failure> {
@@ -180,9 +188,12 @@ impl Link {
     }
 
     /// GET `path` from the run's host; once more from the host found again when it does not answer or no longer
-    /// knows the token.
+    /// knows the token; the client's signal state looked at while it waits.
     fn get(&self, path: &str) -> Result<crate::client::Reply, String> {
-        get_from(&self.project, &self.host, path)
+        let (project, host, path) = (self.project.clone(), self.host.clone(), path.to_owned());
+        waited(crate::signals::wait(move || {
+            get_from(&project, &host, &path)
+        }))
     }
 }
 
@@ -314,52 +325,12 @@ fn again(project: &Path, host: &std::sync::Mutex<HostInfo>) -> Result<HostInfo, 
     Ok(found)
 }
 
-/// The signal flags of the shell: the signal that came (its number, 0 for none) and whether the window was resized.
-/// Registered before anything else, by bare `hoh` or by `hoh attach` before it waits for its host, and kept through to
-/// the shell, so a signal is never lost (CLT-01).
-pub struct Flags {
-    signal: Arc<AtomicUsize>,
-    resized: Arc<AtomicBool>,
-}
-
-impl Flags {
-    /// The flag a wait looks at: the number of the signal that came, 0 for none.
-    pub fn signal(&self) -> &AtomicUsize {
-        &self.signal
-    }
-
-    /// The exit code of signal number `signal` (SIGTERM 143, SIGHUP 129, SIGINT 130).
-    pub fn code(signal: usize) -> u8 {
-        signal_code(signal)
-    }
-}
-
-/// [`Flags`], registered now; 74 when they cannot be.
-pub fn register() -> Result<Flags, u8> {
-    let signal = Arc::new(AtomicUsize::new(0));
-    for sig in [SIGTERM, SIGHUP, SIGINT] {
-        let value = usize::try_from(sig).unwrap_or(usize::MAX);
-        if let Err(e) = signal_hook::flag::register_usize(sig, Arc::clone(&signal), value) {
-            say!("hoh：无法登记信号处理：{e}");
-            return Err(code(ClientEvent::TerminalIo));
-        }
-    }
-    let resized = Arc::new(AtomicBool::new(false));
-    if let Err(e) = signal_hook::flag::register(SIGWINCH, Arc::clone(&resized)) {
-        say!("hoh：无法登记信号处理：{e}");
-        return Err(code(ClientEvent::TerminalIo));
-    }
-    Ok(Flags { signal, resized })
-}
-
-/// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`, with the `flags` the attach
-/// registered before it waited for the host; the exit code. A signal that came before ends it before the terminal
-/// changes. Leaving, by the choice or a signal, only closes this client (REQ-043 behaviour 6).
-pub fn attach(project: &Path, host: HostInfo, run: &Value, flags: Flags) -> u8 {
-    let Flags { signal, resized } = flags;
-    let sig = signal.load(Ordering::SeqCst);
-    if sig != 0 {
-        return signal_code(sig);
+/// `hoh attach` with a terminal: the shell bound to `run` (getRun's answer) of `host`, with the signal `state` the
+/// attach registered before it waited for the host; the exit code. A signal that came before ends it before the
+/// terminal changes. Leaving, by the choice or a signal, only closes this client (REQ-043 behaviour 6).
+pub fn attach(project: &Path, host: HostInfo, run: &Value, state: &State) -> u8 {
+    if let Some(code) = state.received() {
+        return code;
     }
     let run_id = run["run_id"].as_str().unwrap_or_default().to_owned();
     let label = run["projection"]["label"]
@@ -368,97 +339,87 @@ pub fn attach(project: &Path, host: HostInfo, run: &Value, flags: Flags) -> u8 {
         .unwrap_or_default()
         .to_owned();
     let conn = Conn::new(project, host);
-    // The runs for the top bar's baseline (docs/adr/ADR-031.md decision 13).
+    // The runs for the top bar's baseline (docs/adr/ADR-031.md decision 13); a signal while they are read ends it
+    // with its code.
     let runs = match conn.runs() {
         Ok(runs) => runs,
-        Err(failure) => return crate::session::fail(&failure),
+        Err(failure) => {
+            return state
+                .received()
+                .unwrap_or_else(|| crate::session::fail(&failure));
+        }
     };
     let mut app = App::open(project);
     app.list(&runs);
     let link = conn.link(&run_id);
     app.attach(&run_id, &label);
     app.tracking(&run["projection"]["degraded_tracking"]);
-    run_with(app, &signal, &resized, &conn, Some(link))
+    run_with(app, state, &conn, Some(link))
 }
 
 /// `hoh attach` with no run named, several not ended and a terminal (docs/adr/ADR-031.md decision 12): the shell with
 /// the selector of the runs not ended among `runs` (list_runs' items, every page) open; the run chosen is attached,
-/// Esc or the Ctrl+C choice "脱离" leaves with 0. `flags` as [`attach`]'s.
-pub fn pick(project: &Path, host: HostInfo, runs: &[Value], flags: Flags) -> u8 {
-    let Flags { signal, resized } = flags;
-    let sig = signal.load(Ordering::SeqCst);
-    if sig != 0 {
-        return signal_code(sig);
+/// Esc or the Ctrl+C choice "脱离" leaves with 0. `state` as [`attach`]'s.
+pub fn pick(project: &Path, host: HostInfo, runs: &[Value], state: &State) -> u8 {
+    if let Some(code) = state.received() {
+        return code;
     }
     let conn = Conn::new(project, host);
     let mut app = App::open(project);
     app.list(runs);
     app.pick();
-    run_with(app, &signal, &resized, &conn, None)
+    run_with(app, state, &conn, None)
 }
 
 /// Bare `hoh`: the shell for the project at `project`, unattached; the exit code (docs/adr/ADR-031.md decision 13).
+/// Its signal state is registered before anything else and its exit consults it (the design correction, rules 1 and
+/// 2); being the shell from the start, it ends on a signal without a word, as the shell does.
 pub fn run(project: &Path) -> u8 {
-    let Flags { signal, resized } = match register() {
-        Ok(flags) => flags,
+    let state = match crate::signals::register() {
+        Ok(state) => state,
         Err(code) => return code,
     };
+    state.mark_said();
+    let code = open(state, project);
+    state.exit(code, "")
+}
+
+fn open(state: &State, project: &Path) -> u8 {
     // Before the terminal changes and before any host (REQ-001 failure mode 4).
     if let Err(e) = hoh_core::config::load(project) {
         say!("hoh：配置无效，没有连接或启动 host：{e}");
         return code(ClientEvent::Config);
     }
-    let (host, runs) = match connect(project, &signal) {
+    let (host, runs) = match connect(project, state) {
         Ok(found) => found,
         Err(code) => return code,
     };
     // A signal that came while the runs were read ends it before the terminal changes.
-    let sig = signal.load(Ordering::SeqCst);
-    if sig != 0 {
-        return signal_code(sig);
+    if let Some(code) = state.received() {
+        return code;
     }
     let conn = Conn::new(project, host);
     let mut app = App::open(project);
     app.list(&runs);
-    run_with(app, &signal, &resized, &conn, None)
+    run_with(app, state, &conn, None)
 }
 
-/// The project's host (ensured: found, or started and waited for) and every run of it, on a worker thread while this
-/// one looks at the signal flags every [`TICK`]: a signal ends the wait with its code and the terminal untouched; a
+/// The project's host (ensured: found, or started and waited for) and every run of it, while the client looks at its
+/// signal `state` (the design correction, rule 3): a signal ends the wait with its code and the terminal untouched; a
 /// host that cannot be had or read is said on stderr, with its code (69; 78 for a refused location).
-fn connect(project: &Path, signal: &AtomicUsize) -> Result<(HostInfo, Vec<Value>), u8> {
-    let (send, got) = std::sync::mpsc::channel();
+fn connect(project: &Path, state: &State) -> Result<(HostInfo, Vec<Value>), u8> {
     let dir = project.to_path_buf();
-    std::thread::spawn(move || {
-        let found = crate::client::ensure(&dir)
-            .and_then(|host| crate::client::runs(&host).map(|runs| (host, runs)));
-        let _ = send.send(found);
-    });
-    loop {
-        let sig = signal.load(Ordering::SeqCst);
-        if sig != 0 {
-            return Err(signal_code(sig));
-        }
-        match got.recv_timeout(TICK) {
-            Ok(Ok(found)) => return Ok(found),
-            Ok(Err(failure)) => return Err(crate::session::fail(&failure)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(crate::session::fail(&Failure::unreachable(
-                    "the host could not be found or started",
-                )));
-            }
-        }
-    }
+    let found = state.wait(move || {
+        crate::client::ensure(&dir)
+            .and_then(|host| crate::client::runs(&host).map(|runs| (host, runs)))
+    })?;
+    found.map_err(|failure| crate::session::fail(&failure))
 }
 
-fn run_with(
-    mut app: App,
-    signal: &Arc<AtomicUsize>,
-    resized: &Arc<AtomicBool>,
-    conn: &Conn,
-    mut link: Option<Link>,
-) -> u8 {
+fn run_with(mut app: App, state: &State, conn: &Conn, mut link: Option<Link>) -> u8 {
+    // The shell only restores the terminal: nothing else says a signal (the design correction, rule 2).
+    state.mark_said();
+    let (signal, resized) = (state.signal(), state.resized());
     terminal::restore_on_panic();
     let (guard, entered) = terminal::enter();
     let end = entered.and_then(|()| event_loop(&mut app, signal, resized, conn, &mut link));

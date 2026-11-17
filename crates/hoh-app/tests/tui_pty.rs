@@ -1011,6 +1011,81 @@ fn a_sigint_while_the_attachs_host_starts_ends_it_with_130() -> R {
     a_signal_while_the_attachs_host_starts_ends_it(Signal::INT, 130)
 }
 
+/// Wait until process `pid` has a handler for `signal` (its /proc status's SigCgt).
+fn handles(pid: u32, signal: Signal) -> R {
+    let bit = 1u64 << (signal.as_raw() - 1);
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let caught = status
+            .lines()
+            .find_map(|l| l.strip_prefix("SigCgt:"))
+            .ok_or("no SigCgt")?;
+        if u64::from_str_radix(caught.trim(), 16)? & bit != 0 {
+            return Ok(());
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("{pid} installed no handler for {signal:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_signal_while_the_attach_waits_behind_the_start_lock_ends_it_with_the_terminal_untouched() -> R
+{
+    // ADR-031's design correction (client signals), rules 2 and 3 (CLT-100): `hoh attach <run>` with a terminal, its
+    // host's start held behind the project's start lock another client holds, takes SIGTERM: 143 within 2 s, said as
+    // REQ-004 says it (nothing was attached), the Workspace never entered, the terminal's attributes as they were.
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let (project, home) = (dir.path().join("p"), dir.path().join("home"));
+    std::fs::create_dir_all(&project)?;
+    std::fs::create_dir_all(&home)?;
+    let _daemons = Daemons(project.clone());
+    let detach_pty = Pty::new(30, 100)?;
+    let mut detach = spawn_in(
+        &detach_pty,
+        &project,
+        &home,
+        &["-p", "x", "--detach", "--output", "json"],
+        &[],
+    )?;
+    assert_eq!(exit_within(&mut detach, WAIT)?.code(), Some(0));
+    drop(Daemons(project.clone()));
+    let run = sqlite(
+        &project.join(".hoh/state.db"),
+        "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('SELECT run_id FROM runs').fetchone()[0])",
+        "",
+    )?;
+    let lock = std::fs::File::open(&project)?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    let pty = Pty::new(30, 100)?;
+    let baseline = pty.stty()?;
+    let mut client = spawn_in(&pty, &project, &home, &["attach", &run], &[])?;
+    let outcome = (|| -> R {
+        handles(client.0.id(), Signal::TERM)?;
+        signal(&client, Signal::TERM)?;
+        let status = exit_within(&mut client, Duration::from_secs(2))?;
+        pty.drained(WAIT)?;
+        assert_eq!(status.code(), Some(143));
+        let shown = pty.output();
+        assert_eq!(
+            find(&shown, ENTER_ALT, 0),
+            None,
+            "the Workspace was entered"
+        );
+        let said = String::from_utf8_lossy(&shown);
+        assert!(
+            said.contains("收到信号") && said.contains("没有附着"),
+            "{said}"
+        );
+        assert_eq!(pty.stty()?, baseline, "terminal attributes");
+        Ok(())
+    })();
+    let _ = rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock);
+    outcome
+}
+
 /// POST `body` to the commands of the project's host named by its `host.json`; the response's status line.
 fn post_command(project: &Path, body: &str) -> R<String> {
     use std::io::{Read as _, Write as _};

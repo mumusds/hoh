@@ -27,6 +27,7 @@ mod installer;
 mod output;
 mod prompt;
 mod session;
+mod signals;
 mod tui;
 
 use cli::Invocation;

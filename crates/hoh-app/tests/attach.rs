@@ -270,6 +270,293 @@ fn session_and_tty(pid: u32) -> R<(u32, i64)> {
     Ok((fields[3].parse()?, fields[4].parse()?))
 }
 
+/// Holds the project directory's start lock (the flock a client takes while it finds or starts the host,
+/// `client::ensure`) until dropped, unlocked explicitly (ADR-022 decision 10): a client that needs a host meanwhile
+/// waits for it, as it would behind another client's start, and gives up after its 10 s.
+struct StartLock(std::fs::File);
+
+impl StartLock {
+    fn take(project: &Path) -> R<StartLock> {
+        let file = std::fs::File::open(project)?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(StartLock(file))
+    }
+}
+
+impl Drop for StartLock {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Wait until process `pid` has a handler for `signal` (its /proc status's SigCgt): the client has registered its
+/// signal state, so a signal now is its to answer (ADR-031's design correction, client signals).
+fn handles(pid: u32, signal: rustix::process::Signal) -> R {
+    let bit = 1u64 << (signal.as_raw() - 1);
+    let end = Instant::now() + LIMIT;
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        let caught = status
+            .lines()
+            .find_map(|l| l.strip_prefix("SigCgt:"))
+            .ok_or("no SigCgt")?;
+        if u64::from_str_radix(caught.trim(), 16)? & bit != 0 {
+            return Ok(());
+        }
+        if Instant::now() > end {
+            return Err(format!("{pid} installed no handler for {signal:?}").into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Send `signal` to the test's own unreaped child `child`.
+fn send(child: &Child, signal: rustix::process::Signal) -> R {
+    rustix::process::kill_process(rustix::process::Pid::from_child(child), signal)?;
+    Ok(())
+}
+
+/// The two signals a client's wait must answer, with the codes they end it with (REQ-004).
+const ENDING: [(rustix::process::Signal, i32); 2] = [
+    (rustix::process::Signal::TERM, 143),
+    (rustix::process::Signal::INT, 130),
+];
+
+#[test]
+fn a_signal_while_p_waits_for_its_host_ends_it_at_once_with_its_code() -> R {
+    // ADR-031's design correction (client signals), rules 2 and 3 (CLT-100; REQ-004 failure mode 2): `hoh -p` waiting
+    // for its host, here behind the project's start lock another client holds, takes SIGTERM or SIGINT: it ends at once
+    // with 143 or 130, says it submitted nothing, writes nothing to stdout and leaves the project as it was. Before, it
+    // waited its 10 s out and ended 69 with the start's error, the signal lost.
+    for (signal, code) in ENDING {
+        let env = Env::new()?;
+        let lock = StartLock::take(&env.project())?;
+        let client = env
+            .command(&["-p", "x", "--output", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        handles(client.id(), signal)?;
+        send(&client, signal)?;
+        let at = Instant::now();
+        let out = finish(client, LIMIT)?;
+        let took = at.elapsed();
+        drop(lock);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{said}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+        assert!(
+            said.contains("收到信号") && said.contains("没有提交命令"),
+            "{said}"
+        );
+        assert!(!env.project().join(".hoh").exists(), "the project changed");
+    }
+    Ok(())
+}
+
+/// A run whose host was stopped, PAUSED so that nothing moves it (test_005_02's setup): its id.
+fn paused_run(env: &Env) -> R<String> {
+    let out = env.hoh(&["-p", "x", "--detach", "--output", "json"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run: Value = serde_json::from_slice(&out.stdout)?;
+    let run_id = run["run_id"].as_str().ok_or("no run_id")?.to_owned();
+    drop(Daemons(env.project()));
+    assert!(hosts_of(&env.project())?.is_empty(), "the host stopped");
+    execute(
+        &env.project(),
+        &format!(
+            "UPDATE runs SET state = 'PAUSED', resume_state = 'CREATED', revision = revision + 1 WHERE run_id = '{run_id}';"
+        ),
+    )?;
+    Ok(run_id)
+}
+
+#[test]
+fn a_signal_while_an_attach_waits_for_its_host_ends_it_at_once_with_its_code() -> R {
+    // ADR-031's design correction (client signals), rules 2 and 3 (CLT-100): `hoh attach <run>` without a terminal,
+    // waiting for its host behind the project's start lock, takes SIGTERM or SIGINT: 143 or 130 at once, saying it did
+    // not attach, nothing on stdout.
+    for (signal, code) in ENDING {
+        let env = Env::new()?;
+        let _daemons = Daemons(env.project());
+        let run = paused_run(&env)?;
+        let lock = StartLock::take(&env.project())?;
+        let client = env
+            .command(&["attach", &run, "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        handles(client.id(), signal)?;
+        send(&client, signal)?;
+        let at = Instant::now();
+        let out = finish(client, LIMIT)?;
+        let took = at.elapsed();
+        drop(lock);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{said}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+        assert!(
+            said.contains("收到信号") && said.contains("没有附着"),
+            "{said}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_signal_while_the_follower_reconnects_ends_it_at_once_with_its_code() -> R {
+    // ADR-031's design correction (client signals), rules 2 and 3 (CLT-100): an attach following R loses its host and
+    // reconnects, the next host's start held behind the project's start lock; SIGTERM or SIGINT then ends it at once
+    // with 143 or 130 and the REQ-004 hint naming R. Before, the reconnect's error after its 10 s ended it 69.
+    for (signal, code) in ENDING {
+        let env = Env::new()?;
+        let _daemons = Daemons(env.project());
+        let run = paused_run(&env)?;
+        let mut client = env
+            .command(&["attach", &run, "--output", "stream-json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let (line, lines) = std::sync::mpsc::channel();
+        let stdout = client.stdout.take().ok_or("no stdout")?;
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for read in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = line.send(read);
+            }
+        });
+        let outcome = (|| -> R<Output> {
+            lines
+                .recv_timeout(LIMIT)
+                .map_err(|e| format!("the attach printed nothing: {e}"))?;
+            let host = match hosts_of(&env.project())?.as_slice() {
+                [host] if parent_of(*host)? == client.id() => *host,
+                hosts => return Err(format!("the attach's host: {hosts:?}").into()),
+            };
+            let start = hoh_agents::identity::start_id(host)?.ok_or("the host is gone already")?;
+            let lock = StartLock::take(&env.project())?;
+            assert!(
+                hoh_agents::identity::signal_if_same(host, &start, rustix::process::Signal::KILL)?,
+                "the host was not signalled"
+            );
+            let end = Instant::now() + LIMIT;
+            while !hoh_agents::identity::reaped(host)? {
+                if Instant::now() > end {
+                    return Err("the killed host was not reaped".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // The follower sees its stream end (a 200 ms read) and, 200 ms later, waits for the next host behind the
+            // lock: a signal well inside that wait.
+            std::thread::sleep(Duration::from_secs(1));
+            send(&client, signal)?;
+            let at = Instant::now();
+            let mut out = finish(client, LIMIT)?;
+            let took = at.elapsed();
+            drop(lock);
+            assert!(took < Duration::from_secs(2), "{took:?}");
+            out.stdout.clear();
+            Ok(out)
+        })()?;
+        let said = String::from_utf8_lossy(&outcome.stderr);
+        assert_eq!(outcome.status.code(), Some(code), "{said}");
+        assert!(
+            said.contains(&format!("已脱离 Run {run}"))
+                && said.contains(&format!("hoh attach {run}")),
+            "{said}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_signal_while_attach_json_reads_the_run_ends_it_with_its_code_and_no_snapshot() -> R {
+    // ADR-031's design correction (client signals), rules 2 and 3 (CLT-101): `hoh attach R --output json` whose getRun
+    // the host holds (the test plays the host: /healthz answers, the run's GET waits) takes SIGTERM or SIGINT: it ends
+    // with 143 or 130 and prints no snapshot, even once the answer comes. Before, it printed the snapshot and ended 0.
+    for (signal, code) in ENDING {
+        let env = Env::new()?;
+        let files = env.project().join(".hoh");
+        std::fs::create_dir_all(&files)?;
+        std::fs::File::create(files.join("state.db"))?;
+        let socket = env.dir.path().join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        std::fs::write(
+            files.join("host.json"),
+            json!({"pid": std::process::id(), "socket": socket, "token": "t"}).to_string(),
+        )?;
+        let (reached, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead as _, Write as _};
+            for stream in listener.incoming().take(2) {
+                let Ok(stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    return;
+                }
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let body = if first.starts_with("GET /healthz ") {
+                    "{}".to_owned()
+                } else {
+                    let _ = reached.send(first.clone());
+                    let _ = released.recv_timeout(Duration::from_secs(10));
+                    json!({"run_id": "R", "state": "PAUSED", "revision": 1, "watermark": 1,
+                        "projection": {"result": {"run_id": "R", "state": "PAUSED", "exit_code": 6}}})
+                    .to_string()
+                };
+                let _ = reader.get_mut().write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let client = env
+            .command(&["attach", "R", "--output", "json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let asked = held.recv_timeout(LIMIT);
+        let outcome = (|| -> R<Output> {
+            asked.map_err(|e| format!("the attach never read the run: {e}"))?;
+            send(&client, signal)?;
+            // The answer comes after the signal.
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = release.send(());
+            finish(client, LIMIT)
+        })();
+        let _ = release.send(());
+        let _ = server.join();
+        let out = outcome?;
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{said}");
+        assert!(
+            out.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(said.contains("收到信号"), "{said}");
+    }
+    Ok(())
+}
+
 /// The parent of `pid` (`/proc/<pid>/stat` field 4).
 fn parent_of(pid: u32) -> R<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;

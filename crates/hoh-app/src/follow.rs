@@ -5,10 +5,10 @@ use crate::cli::Output;
 use crate::client::{self, HostInfo};
 use crate::exit::{ClientEvent, client_code};
 use crate::forward::Stderr;
+use crate::signals::State;
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The terminal run states: no way out of them (REQ-036 behaviour 3).
@@ -166,7 +166,9 @@ pub struct Follower<'a> {
     pub project: &'a Path,
     pub run_id: &'a str,
     pub output: Output,
-    pub signals: &'a AtomicUsize,
+    /// The client's one signal state (docs/adr/ADR-031.md, 设计修正（客户端信号）): looked at between reads and
+    /// while the stream is opened, the host found again or the run read.
+    pub state: &'a State,
     pub stderr: &'a Stderr,
     /// Whether a run that shows no `run.result` ends when it is found ended after [`QUIET`] (attach only).
     pub quiet: bool,
@@ -181,28 +183,40 @@ impl Follower<'_> {
         let mut checked = Instant::now();
         let mut quiet_since = Instant::now();
         loop {
-            let signal = self.signals.load(Ordering::SeqCst);
-            if signal != 0 {
-                return Outcome::Code(u8::try_from(signal).unwrap_or(1));
+            if let Some(code) = self.state.received() {
+                return Outcome::Code(code);
             }
             let events = match stream.as_mut() {
                 Some(events) => events,
-                None => match client::Events::open(&host, self.run_id, watch.last()) {
-                    Ok(events) => stream.insert(events),
-                    Err(_) => {
-                        // The host went: the next one is found or started, and the stream goes on after the last.
-                        std::thread::sleep(Duration::from_millis(200));
-                        match client::ensure(self.project) {
-                            Ok(again) => host = again,
-                            Err(failure) => {
-                                self.stderr
-                                    .say(&format!("hoh: {}: {}", failure.code, failure.message));
-                                return Outcome::Code(failure.exit);
+                None => {
+                    let opened = {
+                        let (host, run_id, after) =
+                            (host.clone(), self.run_id.to_owned(), watch.last());
+                        self.state
+                            .wait(move || client::Events::open(&host, &run_id, after))
+                    };
+                    match opened {
+                        Err(code) => return Outcome::Code(code),
+                        Ok(Ok(events)) => stream.insert(events),
+                        Ok(Err(_)) => {
+                            // The host went: the next one is found or started, and the stream goes on after the last.
+                            std::thread::sleep(Duration::from_millis(200));
+                            let dir = self.project.to_path_buf();
+                            match self.state.wait(move || client::ensure(&dir)) {
+                                Err(code) => return Outcome::Code(code),
+                                Ok(Ok(again)) => host = again,
+                                Ok(Err(failure)) => {
+                                    self.stderr.say(&format!(
+                                        "hoh: {}: {}",
+                                        failure.code, failure.message
+                                    ));
+                                    return Outcome::Code(failure.exit);
+                                }
                             }
+                            continue;
                         }
-                        continue;
                     }
-                },
+                }
             };
             match events.next() {
                 Ok(Some(event)) => {
@@ -230,11 +244,20 @@ impl Follower<'_> {
                         && checked.elapsed() >= Duration::from_secs(1)
                     {
                         checked = Instant::now();
-                        if let Ok(Some(run)) = client::get_run(&host, self.run_id)
-                            && let Some(state) = run["state"].as_str()
-                            && TERMINAL.contains(&state)
-                        {
-                            return Outcome::Ended(state.to_owned());
+                        let read = {
+                            let (host, run_id) = (host.clone(), self.run_id.to_owned());
+                            self.state.wait(move || client::get_run(&host, &run_id))
+                        };
+                        match read {
+                            Err(code) => return Outcome::Code(code),
+                            Ok(Ok(Some(run))) => {
+                                if let Some(state) = run["state"].as_str()
+                                    && TERMINAL.contains(&state)
+                                {
+                                    return Outcome::Ended(state.to_owned());
+                                }
+                            }
+                            Ok(_) => {}
                         }
                     }
                 }
@@ -292,8 +315,14 @@ impl Follower<'_> {
 
 /// The exit code a follow's outcome ends the client with, once its result is printed as `output` says (json: the
 /// result object; text: [`crate::output::text_line`]; stream-json: already shown). A signal is said with the run and
-/// how to attach again: nothing was sent (E8).
-pub fn conclude(outcome: &Outcome, output: Output, run_id: &str, stderr: &Stderr) -> u8 {
+/// how to attach again: nothing was sent (E8); `state`'s exit says nothing more.
+pub fn conclude(
+    outcome: &Outcome,
+    output: Output,
+    run_id: &str,
+    stderr: &Stderr,
+    state: &State,
+) -> u8 {
     let printed = |text: String| match emit(&text) {
         Ok(()) => None,
         Err(e) => {
@@ -333,6 +362,7 @@ pub fn conclude(outcome: &Outcome, output: Output, run_id: &str, stderr: &Stderr
             stderr.say(&format!(
                 "hoh: 已脱离 Run {run_id}（它在后台继续，没有发出任何命令）；用 hoh attach {run_id} 重新附着"
             ));
+            state.mark_said();
             *code
         }
         Outcome::Code(code) => *code,

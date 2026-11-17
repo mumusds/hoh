@@ -9,14 +9,31 @@ use crate::client::{self, Failure, HostInfo};
 use crate::exit::{ClientEvent, client_code};
 use crate::follow::{End, Follower, Outcome, Replay, TERMINAL, Watch};
 use crate::forward::Stderr;
-use crate::session::{fail, signals};
+use crate::session::fail;
+use crate::signals::State;
 use serde_json::{Value, json};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// `hoh -p <text> [--resume <run>] [--detach] [--output …]` in `project`.
+/// `hoh -p <text> [--resume <run>] [--detach] [--output …]` in `project`: its signal state registered before anything
+/// else, and its exit consulting it (docs/adr/ADR-031.md, 设计修正（客户端信号）, rules 1 and 2): a signal before a
+/// command was accepted is said with “没有提交命令”, one after with the run and how to attach to it.
 pub fn run(project: &Path, text: &str, output: Output, detach: bool, resume: Option<&str>) -> u8 {
-    let got = signals();
+    let state = match crate::signals::register() {
+        Ok(state) => state,
+        Err(code) => return code,
+    };
+    let code = prompt(state, project, text, output, detach, resume);
+    state.exit(code, "没有提交命令")
+}
+
+fn prompt(
+    state: &State,
+    project: &Path,
+    text: &str,
+    output: Output,
+    detach: bool,
+    resume: Option<&str>,
+) -> u8 {
     // Before any connection: an invalid configuration starts nothing (REQ-001 failure mode 4, REQ-004 failure mode 4).
     let config = match hoh_core::config::load(project) {
         Ok(config) => config,
@@ -32,18 +49,16 @@ pub fn run(project: &Path, text: &str, output: Output, detach: bool, resume: Opt
             output,
             detach,
             &config.project.default_mode,
-            &got,
+            state,
         ),
-        Some(run_id) => answer(project, text, output, detach, run_id, &got),
+        Some(run_id) => answer(project, text, output, detach, run_id, state),
     }
 }
 
-/// The exit code of a signal that came before anything was accepted, said as such.
-fn early(got: &AtomicUsize, what: &str) -> Option<u8> {
-    let signal = got.load(Ordering::SeqCst);
-    (signal != 0).then(|| {
-        say!("hoh: 收到信号，{what}");
-        u8::try_from(signal).unwrap_or(1)
+/// The exit code of a signal that came before what comes next, said as `what`.
+fn early(state: &State, what: &str) -> Option<u8> {
+    state.received().inspect(|_| {
+        state.say(&format!("hoh: 收到信号，{what}"));
     })
 }
 
@@ -77,13 +92,13 @@ fn start(
     output: Output,
     detach: bool,
     mode: &str,
-    got: &AtomicUsize,
+    state: &State,
 ) -> u8 {
-    let host = match client::ensure(project) {
+    let host = match crate::session::host(state, project) {
         Ok(host) => host,
-        Err(failure) => return fail(&failure),
+        Err(code) => return code,
     };
-    if let Some(code) = early(got, "没有提交命令") {
+    if let Some(code) = early(state, "没有提交命令") {
         return code;
     }
     let command = json!({
@@ -96,10 +111,11 @@ fn start(
         Ok(accepted) => accepted,
         Err(failure) => return fail(&failure),
     };
+    let run_id = accepted["run_id"].as_str().unwrap_or_default().to_owned();
+    state.note_run(&run_id);
     if detach {
         return detached(&accepted, output);
     }
-    let run_id = accepted["run_id"].as_str().unwrap_or_default().to_owned();
     let command_id = accepted["command_id"]
         .as_str()
         .unwrap_or_default()
@@ -113,15 +129,15 @@ fn start(
         project,
         run_id: &run_id,
         output,
-        signals: got,
+        state,
         stderr: &stderr,
         quiet: false,
     };
     let mut watch = Watch::new(End::Accepted { command_id }, replay, 0);
     let outcome = follower.follow(host, &mut watch);
-    let code = crate::follow::conclude(&outcome, output, &run_id, &stderr);
+    let code = crate::follow::conclude(&outcome, output, &run_id, &stderr, state);
     if let Outcome::Result(result) = &outcome {
-        questions(&client::running(project), &run_id, result, &stderr);
+        questions(state, project, &run_id, result, &stderr);
     }
     stderr.finish();
     code
@@ -190,28 +206,28 @@ fn answer(
     output: Output,
     detach: bool,
     run_id: &str,
-    got: &AtomicUsize,
+    state: &State,
 ) -> u8 {
     // No database: no run, and nothing is started for none.
     if !project.join(".hoh/state.db").exists() {
         say!("hoh: RUN_NOT_FOUND: 没有 Run {run_id}");
         return client_code(ClientEvent::Usage);
     }
-    let host = match client::ensure(project) {
+    let host = match crate::session::host(state, project) {
         Ok(host) => host,
-        Err(failure) => return fail(&failure),
+        Err(code) => return code,
     };
-    if let Some(code) = early(got, "没有提交命令") {
+    if let Some(code) = early(state, "没有提交命令") {
         return code;
     }
-    let run = match crate::session::run_of(&host, run_id) {
+    let run = match crate::session::run_of(state, &host, run_id) {
         Ok(run) => run,
         Err(code) => return code,
     };
     // 64 only from the state read, never from a message (M2T13D-54).
-    let state = run["state"].as_str().unwrap_or_default().to_owned();
-    if TERMINAL.contains(&state.as_str()) {
-        return ended(run_id, &state);
+    let run_state = run["state"].as_str().unwrap_or_default().to_owned();
+    if TERMINAL.contains(&run_state.as_str()) {
+        return ended(run_id, &run_state);
     }
     let watermark = run["watermark"].as_i64().unwrap_or_default();
     let input = match fresh(
@@ -235,9 +251,10 @@ fn answer(
     // not make the resume land in BLOCKED.
     let mut last = input.clone();
     let mut stopped: Option<Failure> = None;
+    state.note_run(run_id);
     // A signal after the input was accepted sends nothing more (E8).
     if let Some(code) = early(
-        got,
+        state,
         &format!(
             "输入已受理（命令 {}），没有再提交命令；用 hoh attach {run_id} 附着",
             input["command_id"].as_str().unwrap_or_default()
@@ -245,7 +262,7 @@ fn answer(
     ) {
         return code;
     }
-    if state == "INCOMPLETE" {
+    if run_state == "INCOMPLETE" {
         match fresh(
             project,
             &host,
@@ -297,7 +314,7 @@ fn answer(
         project,
         run_id,
         output,
-        signals: got,
+        state,
         stderr: &stderr,
         quiet: false,
     };
@@ -316,7 +333,7 @@ fn answer(
             None => stderr.say("hoh: 输入已排队，待 M3-T04 投递"),
         }
     }
-    let code = crate::follow::conclude(&outcome, output, run_id, &stderr);
+    let code = crate::follow::conclude(&outcome, output, run_id, &stderr, state);
     if let Outcome::Result(result) = &outcome {
         if let Some(failure) = &stopped {
             stderr.say(&refused_resume(failure));
@@ -328,21 +345,28 @@ fn answer(
                 .collect();
             stderr.say(&format!("hoh: 剩余需求：{}", remaining.join(", ")));
         }
-        questions(&client::running(project), run_id, result, &stderr);
+        questions(state, project, run_id, result, &stderr);
     }
     stderr.finish();
     code
 }
 
-/// A run that stopped BLOCKED on NEED_DECISION: its open questions (getRun's `projection.questions`) and how to answer
-/// one (decision 9).
-fn questions(host: &Option<HostInfo>, run_id: &str, result: &Value, stderr: &Stderr) {
+/// A run that stopped BLOCKED on NEED_DECISION: its open questions (getRun's `projection.questions`, read from the
+/// project's running host while the client looks at `state`) and how to answer one (decision 9). A signal ends the
+/// read: nothing more is said here.
+fn questions(state: &State, project: &Path, run_id: &str, result: &Value, stderr: &Stderr) {
     if result["state"] != "BLOCKED" || result["blocked_reason"] != "NEED_DECISION" {
         return;
     }
-    let run = host
-        .as_ref()
-        .and_then(|host| client::get_run(host, run_id).ok().flatten());
+    let read = {
+        let (dir, run_id) = (project.to_path_buf(), run_id.to_owned());
+        state.wait(move || {
+            client::running(&dir).and_then(|host| client::get_run(&host, &run_id).ok().flatten())
+        })
+    };
+    let Ok(run) = read else {
+        return;
+    };
     match run.as_ref().map(|r| &r["projection"]["questions"]) {
         Some(Value::Array(questions)) => {
             stderr.say(&format!(
