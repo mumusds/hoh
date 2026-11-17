@@ -564,3 +564,132 @@ fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
     ro.app_server_help = None;
     assert!(session_capabilities(&turn(ro)).is_err());
 }
+
+/// A committed S0 excerpt (docs/adr/ADR-032.md): its stdout and request log without their header lines, and its
+/// observations.
+fn excerpt(case: &str) -> (Vec<u8>, Vec<Value>, Value) {
+    let base = format!(
+        "{}/../../tests/fixtures/commander-readonly/excerpts/codex/{case}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let read = |kind: &str| std::fs::read_to_string(format!("{base}.{kind}")).expect(kind);
+    let stdout: String = read("stdout.excerpt.jsonl")
+        .lines()
+        .skip(1)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let log = read("stdin.excerpt.jsonl")
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).expect("a request"))
+        .collect();
+    let meta: Value = serde_json::from_str(&read("meta.json")).expect("meta");
+    (stdout.into_bytes(), log, meta["observations"].clone())
+}
+
+#[test]
+fn the_replay_of_a_recorded_turn_builds_the_product_messages_from_the_launch() {
+    // ADR-032 design correction 7 item 2 (M2T20D-800, -950): the replay registers and builds every message from the
+    // recorded launch alone; the recorded request log is only compared with them, under the comparison contract.
+    use crate::observed::request_log_problem;
+    for (case, sandbox) in [
+        ("app-ro-new", "readOnly"),
+        ("app-ro-resumed", "readOnly"),
+        ("app-control", "dangerFullAccess"),
+    ] {
+        let (stdout, log, observed) = excerpt(case);
+        let facts = replay_facts(&stdout, &observed);
+        assert_eq!(
+            facts.state,
+            AttemptState::Settled,
+            "{case}: {:?}",
+            facts.failure
+        );
+        assert!(
+            facts
+                .final_text
+                .as_deref()
+                .is_some_and(|t| t.contains("```hoh-decisions")),
+            "{case}"
+        );
+        assert!(facts.thread.is_some() && facts.turn.is_some(), "{case}");
+        assert_eq!(
+            facts
+                .thread_result
+                .as_ref()
+                .map(|r| r["sandbox"]["type"].clone()),
+            Some(json!(sandbox)),
+            "{case}"
+        );
+        let sent = facts.sent.clone().expect("sent");
+        assert_eq!(request_log_problem(&sent, &log), None, "{case}: {sent:?}");
+        // The turn's driver run is in the recorded items with its own facts.
+        assert!(
+            facts.recorded.iter().any(
+                |r| matches!(r, crate::adapter::Recorded::Event { kind, payload, .. }
+                if kind == "adapter.item" && payload["itemType"] == "commandExecution"
+                    && payload["command"].as_str().is_some_and(|c| c.ends_with("cells.sh'"))
+                    && payload["aggregatedOutput"].is_string())
+            ),
+            "{case}"
+        );
+    }
+    let (stdout, log, observed) = excerpt("app-ro-new");
+    // The comparison is typed and closed: a boolean id, a full-access thread request, a missing `initialized`.
+    for (i, edit) in [
+        (0usize, json!({"id": false})),
+        (
+            2,
+            json!({"params": {"approvalPolicy": "never", "sandbox": "danger-full-access"}}),
+        ),
+    ] {
+        let mut changed = log.clone();
+        for (k, v) in edit.as_object().expect("edit") {
+            changed[i][k] = v.clone();
+        }
+        let sent = replay_facts(&stdout, &observed).sent.expect("sent");
+        assert!(request_log_problem(&sent, &changed).is_some(), "{edit}");
+    }
+    let without_initialized: Vec<Value> = log
+        .iter()
+        .filter(|q| q["method"] != "initialized")
+        .cloned()
+        .collect();
+    let sent = replay_facts(&stdout, &observed).sent.expect("sent");
+    assert!(request_log_problem(&sent, &without_initialized).is_some());
+    let mut other_version = log.clone();
+    other_version[0]["params"]["clientInfo"]["version"] = json!("9.9.9");
+    assert_eq!(
+        request_log_problem(&sent, &other_version),
+        None,
+        "not compared"
+    );
+    // The launch decides what is sent: one that says full access does not match the read-only log.
+    let mut yolo = observed.clone();
+    yolo["launch"]["profile"] = json!("yolo");
+    let sent = replay_facts(&stdout, &yolo).sent.expect("sent");
+    assert!(request_log_problem(&sent, &log).is_some());
+    // Without the initialize answer the thread request is never sent, and the turn never settles.
+    let without_initialize: String = String::from_utf8(stdout.clone())
+        .expect("utf-8")
+        .lines()
+        .filter(|l| {
+            let f: Value = serde_json::from_str(l).expect("frame");
+            !(f.get("method").is_none() && f["id"] == 0)
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let facts = replay_facts(without_initialize.as_bytes(), &observed);
+    assert_ne!(facts.state, AttemptState::Settled);
+    assert_eq!(facts.sent.map(|s| s.len()), Some(1));
+    // Without the launch: not observed.
+    let mut no_launch = observed;
+    no_launch.as_object_mut().expect("object").remove("launch");
+    let facts = replay_facts(&stdout, &no_launch);
+    assert!(
+        facts
+            .failure
+            .as_deref()
+            .is_some_and(|f| f.starts_with(crate::observed::NOT_OBSERVED))
+    );
+}

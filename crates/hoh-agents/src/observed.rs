@@ -293,6 +293,53 @@ impl ReplayFacts {
     }
 }
 
+/// The value the comparison contract puts in place of a field it does not compare.
+const NOT_COMPARED: &str = "<not compared>";
+
+/// `message` with the fields the comparison contract does not compare replaced (docs/adr/ADR-032.md design correction 7
+/// item 2): initialize's `params.clientInfo.version` (a non-empty string: the hoh build that sent it), turn/start's
+/// `params.input[0].text` and pi's prompt `message` (a string: the turn's prompt). Each only where it has that type.
+fn comparable(message: &Value) -> Value {
+    let mut m = message.clone();
+    if m["method"] == "initialize"
+        && m["params"]["clientInfo"]["version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty())
+    {
+        m["params"]["clientInfo"]["version"] = Value::from(NOT_COMPARED);
+    }
+    if m["method"] == "turn/start"
+        && m["params"]["input"]
+            .as_array()
+            .is_some_and(|i| i.len() == 1)
+        && m["params"]["input"][0]["text"].is_string()
+    {
+        m["params"]["input"][0]["text"] = Value::from(NOT_COMPARED);
+    }
+    if m["type"] == "prompt" && m["message"].is_string() {
+        m["message"] = Value::from(NOT_COMPARED);
+    }
+    m
+}
+
+/// Why the recorded request log is not the messages the adapter wrote in its replay, or `None` (docs/adr/ADR-032.md
+/// design correction 7 item 2, the comparison contract): the same number, in the same order, each equal as typed JSON
+/// (serde_json's `Value`: a boolean never equals a number, an integer never a float) key for key and value for value,
+/// but for the two fields [`comparable`] names.
+pub fn request_log_problem(sent: &[Value], log: &[Value]) -> Option<String> {
+    if sent.len() != log.len() {
+        return Some(format!(
+            "the request log is not the product's own ({} messages, the adapter sends {})",
+            log.len(),
+            sent.len()
+        ));
+    }
+    sent.iter()
+        .zip(log)
+        .position(|(a, b)| comparable(a) != comparable(b))
+        .map(|i| format!("the request log is not the product's own (message {i})"))
+}
+
 /// The process's end as the replay injects it: `exit`, and both streams read to their end or not.
 pub(crate) fn exit_report(observed: &Observed) -> crate::process::ExitReport {
     let stream = crate::process::StreamReport {
