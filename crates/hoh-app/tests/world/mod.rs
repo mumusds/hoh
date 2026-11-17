@@ -379,11 +379,20 @@ def commander(text, wake, cfg):
             'role_epoch': int(wake['role_epoch']), 'correlation_id': key, 'causation_id': wake.get('causation_id'),
             'idempotency_key': key + '-d' + str(i), 'expected_revision': revision + i + (1 if stale else 0),
             'spec_sha256': spec, 'candidate_id': None, 'kind': 'decision', 'payload': payload})
-    for message in messages:
-        bridge_write(wake['输出文件'], {'nonce': wake['nonce'], 'message': message})
+    # The decisions are the final message's ```hoh-decisions block (docs/adr/ADR-032.md decision 1); `bridge_also`
+    # writes one more line to the attempt's messages.jsonl, which the product must ignore.
+    lines = [json.dumps({'nonce': wake['nonce'], 'message': message}, ensure_ascii=False) for message in messages]
+    if c.get('bridge_also') and wake.get('项目根'):
+        extra = dict(messages[0], message_id=key + '-bridge', idempotency_key=key + '-bridge') if messages else None
+        if extra:
+            attempts = os.path.join(wake['项目根'], '.hoh', 'attempts')
+            for name in os.listdir(attempts) if os.path.isdir(attempts) else []:
+                if name.endswith(attempt.replace('/', '%2F')) or name == attempt.replace('/', '%2F'):
+                    bridge_write(os.path.join(attempts, name, 'messages.jsonl'), {'nonce': wake['nonce'], 'message': extra})
     append('commander.jsonl', {'agent': AGENT, 'run_id': run, 'state': state, 'revision': revision,
                                'attempt_id': attempt, 'messages': messages})
-    return 'Run 状态 %s：提交了 %d 条决策' % (state, len(messages))
+    block = '\n```hoh-decisions\n' + '\n'.join(lines) + '\n```' if lines else ''
+    return 'Run 状态 %s：提交了 %d 条决策%s' % (state, len(messages), block)
 
 
 def developer(ident, cfg):

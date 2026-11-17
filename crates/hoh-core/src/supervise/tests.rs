@@ -338,3 +338,43 @@ fn an_ordinary_fingerprint_is_escaped_so_only_the_runtimes_suffixes_carry_hash_a
         Some("fp%23x@r9#retrigger".to_owned())
     );
 }
+
+#[test]
+fn the_decisions_are_the_last_blocks_non_blank_lines() {
+    // docs/adr/ADR-032.md decision 1: the supervision turn's output is the last ```hoh-decisions block of its final
+    // message, its non-blank lines in order, within the bridge's bounds; the fence rule is the report's.
+    let one = "{\"nonce\": \"n\", \"message\": {\"a\": 1}}";
+    let two = "{\"nonce\": \"n\", \"message\": {\"b\": 2}}";
+    let text = format!(
+        "Before.\n```hoh-decisions\n{one}\n```\nThen.\n```hoh-decisions  \n\n{one}\n\n{two}\n```\nAfter."
+    );
+    assert_eq!(
+        decision_lines(&text),
+        (vec![one.to_owned(), two.to_owned()], false)
+    );
+    assert_eq!(
+        decision_lines("No block here."),
+        (Vec::<String>::new(), false)
+    );
+    assert_eq!(
+        decision_lines("```hoh-report\n{}\n```"),
+        (Vec::<String>::new(), false)
+    );
+    // A JSON line that names a fence does not end the block: the end is a fence at a line's start.
+    let fenced = "{\"nonce\": \"n\", \"message\": {\"text\": \"see ``` here\"}}";
+    assert_eq!(
+        decision_lines(&format!("```hoh-decisions\n{fenced}\n{one}\n```")),
+        (vec![fenced.to_owned(), one.to_owned()], false)
+    );
+    // The bridge's bounds: 1 000 lines, 1 MiB, and whether more was cut.
+    let many: String = (0..1_001).map(|i| format!("{{\"n\": {i}}}\n")).collect();
+    let (lines, truncated) = decision_lines(&format!("```hoh-decisions\n{many}```"));
+    assert_eq!((lines.len(), truncated), (DECISION_LINES, true));
+    let long = "x".repeat(DECISION_BYTES + 10);
+    let (lines, truncated) = decision_lines(&format!("```hoh-decisions\n{long}\n```"));
+    assert!(truncated && lines.iter().map(String::len).sum::<usize>() <= DECISION_BYTES);
+    let exact: String = (0..DECISION_LINES)
+        .map(|i| format!("{{\"n\": {i}}}\n"))
+        .collect();
+    assert!(!decision_lines(&format!("```hoh-decisions\n{exact}```")).1);
+}

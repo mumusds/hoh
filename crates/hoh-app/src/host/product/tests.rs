@@ -616,7 +616,7 @@ fn a_first_input_is_kept_once_whole_and_another_is_refused()
 }
 
 #[test]
-fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge()
+fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_decision_block()
 -> Result<(), Box<dyn std::error::Error>> {
     // docs/adr/ADR-025.md decisions 7 and 8, docs/adr/ADR-026.md decision 3: the wake it answers (its causation), the
     // run's revision and the Commander's epoch its decision names, the nonce, the bridge file and the project's root,
@@ -654,22 +654,22 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_bridge
     let (text, _) = executor(dir.path())
         .pack(&work, &builtin, None)
         .map_err(|r| format!("{r:?}"))?;
-    let bridge = dir
-        .path()
-        .join(".hoh/attempts")
-        .join(component("R1/T1/a1"))
-        .join("messages.jsonl");
+    // docs/adr/ADR-032.md decision 1: the decisions are the final message's block, and no output file is named.
     for part in [
         "causation_id：R1/trigger/3".to_owned(),
         "expected_revision（Run 的 revision）：7".to_owned(),
         "role_epoch：2".to_owned(),
         "nonce：n0nce".to_owned(),
-        format!("输出文件：{}", bridge.display()),
         format!("项目根：{}", dir.path().display()),
         "DecisionPayload".to_owned(),
+        "```hoh-decisions".to_owned(),
     ] {
         assert!(text.contains(&part), "{part}: {text}");
     }
+    assert!(
+        !text.contains("输出文件") && !text.contains("messages.jsonl"),
+        "{text}"
+    );
     assert!(!text.contains("{{"), "{text}");
     Ok(())
 }

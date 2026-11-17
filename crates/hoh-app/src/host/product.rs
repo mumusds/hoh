@@ -268,8 +268,8 @@ fn first_input(project: &Path, session_id: &str) -> Result<Option<serde_json::Va
 }
 
 /// At most this many lines and bytes of a Commander turn's bridge are taken (docs/adr/ADR-025.md decision 8).
-pub(super) const BRIDGE_LINES: usize = 1_000;
-pub(super) const BRIDGE_BYTES: usize = 1 << 20;
+pub(super) const BRIDGE_LINES: usize = hoh_core::supervise::DECISION_LINES;
+pub(super) const BRIDGE_BYTES: usize = hoh_core::supervise::DECISION_BYTES;
 
 /// The non-empty lines of the bridge file `path`, in order, within [`BRIDGE_LINES`] and [`BRIDGE_BYTES`], and whether the
 /// read was cut at either limit (its last lines may be lost, docs/adr/ADR-028.md decision 2, M2T16D-456); none when it is
@@ -296,6 +296,27 @@ pub(super) fn read_bridge(path: &Path) -> (Vec<String>, bool) {
         .collect();
     truncated |= lines.next().is_some();
     (kept, truncated)
+}
+
+/// The size and sha256 of the regular file at `path`, or `None` when there is none (or it cannot be read).
+fn digest_of(path: &Path) -> Option<(u64, String)> {
+    use std::io::Read as _;
+    let mut file = hoh_core::objects::open_regular(path).ok()?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer).ok()?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        hash.update(&buffer[..n]);
+    }
+    Some((
+        bytes,
+        hash.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+    ))
 }
 
 /// How a turn's facts fail its attempt (decision 16, ADR-020 decision 1; docs/adr/ADR-030.md decision 6): a typed
@@ -438,9 +459,9 @@ impl ProductExecutor {
             facts.add_code(code_files(&self.project, &source));
         }
         let lead = package.map(context::lead).unwrap_or_default();
-        // Every turn has a bridge file in its attempt's directory (docs/adr/ADR-025.md decision 8, docs/adr/ADR-028.md
-        // decision 2): a Commander turn is told it with where the project is (it runs outside it); a work turn in its
-        // identity header, the values its every output must repeat.
+        // A work turn has a bridge file in its attempt's directory (docs/adr/ADR-028.md decision 2), told in its identity
+        // header, the values its every output must repeat. A Commander turn is told where the project is (it runs
+        // outside it) and no file: its decisions are its final message's block (docs/adr/ADR-032.md decision 1).
         let bridge = bridge_of(&self.project, &work.attempt_id);
         let _ = std::fs::create_dir_all(attempt_logs(&self.project, &work.attempt_id));
         if a.supervision.is_none() {
@@ -480,21 +501,15 @@ impl ProductExecutor {
                     ),
                 });
         }
-        let bridge_text = a.supervision.as_ref().map(|_| bridge.display().to_string());
+
         let project = a
             .supervision
             .as_ref()
             .map(|_| self.project.display().to_string());
         let deterministic =
             |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
-        let mandatory = context::mandatory(
-            &facts,
-            &work.role,
-            &lead,
-            bridge_text.as_deref(),
-            project.as_deref(),
-        )
-        .map_err(deterministic)?;
+        let mandatory = context::mandatory(&facts, &work.role, &lead, None, project.as_deref())
+            .map_err(deterministic)?;
         let version = hoh_core::objects::resource_bundle_version();
         let mut recorded = context::record(
             context::Contract {
@@ -910,7 +925,9 @@ impl Executor for ProductExecutor {
         let registry = self.registry.clone();
         let identity = ready.entry.identity();
         let turn = held.ended;
-        // Every turn's bridge lines are read at its end, however it ended (docs/adr/ADR-028.md decision 2).
+        let supervision = work.assignment.supervision.is_some();
+        // Every work turn's bridge lines are read at its end, however it ended (docs/adr/ADR-028.md decision 2); a
+        // supervision turn's decisions are its final message's block (docs/adr/ADR-032.md decision 1).
         let bridge = attempt_logs(&self.project, &work.attempt_id).join(BRIDGE);
         let logs = attempt_logs(&self.project, &work.attempt_id);
         let project = self.project.clone();
@@ -937,10 +954,28 @@ impl Executor for ProductExecutor {
                 registry.exec_degraded(Agent::Codex, identity);
             }
             let mut outcome = outcome(facts);
-            (
-                outcome.observed.messages,
-                outcome.observed.messages_truncated,
-            ) = read_bridge(&bridge);
+            if supervision {
+                (
+                    outcome.observed.messages,
+                    outcome.observed.messages_truncated,
+                ) = hoh_core::supervise::decision_lines(
+                    outcome.observed.final_text.as_deref().unwrap_or_default(),
+                );
+                // Lines in its bridge file can only come from a write past the read-only profile or another process of
+                // the same user: never registered, recorded as such in the turn's end (docs/adr/ADR-032.md decision 1).
+                if let Some((bytes, sha256)) = digest_of(&bridge) {
+                    outcome.observed.events.push((
+                        "bridge-ignored".to_owned(),
+                        "supervisor.bridge_ignored".to_owned(),
+                        serde_json::json!({"attempt_id": id, "bytes": bytes, "sha256": sha256}),
+                    ));
+                }
+            } else {
+                (
+                    outcome.observed.messages,
+                    outcome.observed.messages_truncated,
+                ) = read_bridge(&bridge);
+            }
             // Its raw logs kept as objects, on a blocking thread (docs/adr/ADR-026.md decision 10): one that cannot be
             // kept as an object is registered in place; one that cannot be read is a recorded failure.
             let (logs, kept_in, keeping, kept_for) =
