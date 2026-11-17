@@ -8,7 +8,7 @@
   "--session-dir",
   "<P>/.hoh/sessions/s1",
   "--session-id",
-  "<uuid-171>",
+  "<uuid-293>",
   "--tools",
   "read,grep,find,ls",
   "--no-mcp",
@@ -23,14 +23,38 @@
   "added": [],
   "removed": [],
   "changed": [
-   "P/.hoh/sessions/s1/2026-11-16T21-28-08-895Z_<uuid-171>.jsonl"
+   "P/.hoh/sessions/s1/2026-11-17T00-19-41-917Z_<uuid-293>.jsonl"
   ]
  },
- "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261116T212808Z/pi/noext-resumed/snapshot.json",
- "snapshot_sha256": "c36168ae558888427308dcd6bb4b96616e48c9c98ecc5aae13faea3159af5c14",
- "stdout_sha256": "eb1322f55e241afdbad02ced5fd50ae8886a93790122745f7c7e09f2c43c79fc",
+ "snapshot_source": ".hoh-dev/evidence/commander-readonly/spike/20261117T001941Z/pi/noext-resumed/snapshot.json",
+ "snapshot_sha256": "0f188455272c07e63d3a2c8d65a21a938e29f3a830ba9a788d272f3aaac351a1",
+ "stdout_sha256": "c2f351f21da4a5bff756247b3848ceac7ce5ad47a024bee9749e2bc8a798c879",
  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
- "token_sha256": "790fd8c25b5f7322f3be07e76312e46dc31823aa6e8bf77aa286232d7b34a6c4",
+ "token_sha256": "4b0eb7520fb0ae2b8a6a40c59a8ff273d1abd750fed57c4b9d96d2d584f91ae1",
  "driver": "#!/bin/sh\n# HoH ADR-032 shell cell driver (generated: the region paths are constants; it needs no input).\nP='<P>'\nW='<W>'\nfor d in \"$P\" \"$P/.git\" \"$P/.hoh\" \"$W\"; do [ -d \"$d\" ] || { echo \"HOH-CELL-DRIVER-ERROR missing region $d\"; exit 64; }; done\ncell() { region=$1; op=$2; target=$3; shift 3\n  err=$( ( \"$@\" ) 2>&1 >/dev/null ); rc=$?\n  printf 'HOH-CELL %s %s %s exit=%s err=%s\\n' \"$region\" \"$op\" \"$target\" \"$rc\" \"$(printf '%s' \"$err\" | head -n 1)\"\n}\nfor spec in \"worktree <P>\" \"git <P>/.git\" \"hoh <P>/.hoh\" \"w <W>\"; do\n  set -- $spec; region=$1; R=$2\n  cell \"$region\" create \"$R/hoh-shell-create\" sh -c 'printf \"hoh-cell\\n\" > \"$0\"' \"$R/hoh-shell-create\"\n  cell \"$region\" modify \"$R/hoh-shell-modify\" sh -c 'printf \"hoh-cell\\n\" >> \"$0\"' \"$R/hoh-shell-modify\"\n  cell \"$region\" delete \"$R/hoh-shell-delete\" rm \"$R/hoh-shell-delete\"\ndone\nexit 0\n",
- "session_dir": "<P>/.hoh/sessions/s1"
+ "session_dir": "<P>/.hoh/sessions/s1",
+ "observations": {
+  "launch": {
+   "session_id": "<uuid-293>",
+   "resume": true
+  },
+  "noted": [
+   [
+    "<P>/.hoh/sessions/s1/2026-11-17T00-19-41-917Z_<uuid-293>.jsonl",
+    38,
+    144187464
+   ]
+  ],
+  "get_state_session_file": "<P>/.hoh/sessions/s1/2026-11-17T00-19-41-917Z_<uuid-293>.jsonl",
+  "opened": [
+   "<P>/.hoh/sessions/s1/2026-11-17T00-19-41-917Z_<uuid-293>.jsonl",
+   38,
+   144187464
+  ],
+  "exit": {
+   "returncode": 0,
+   "how": "exited"
+  },
+  "logs_complete": true
+ }
 }

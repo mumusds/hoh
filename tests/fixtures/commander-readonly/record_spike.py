@@ -332,18 +332,55 @@ def codex(sp: Spike) -> None:
     collect_rollout(sp.out / 'codex' / 'exec-ro-new')
 
 
+def file_identity(path: str | None) -> list | None:
+    """pi.rs `identity`: the canonical path, device and inode of a regular file; None when there is none."""
+    try:
+        canonical = os.path.realpath(path, strict=True) if path else None
+        st = os.stat(canonical) if canonical else None
+    except OSError:
+        return None
+    return [canonical, st.st_dev, st.st_ino] if st and os.path.isfile(canonical) else None
+
+
+def session_files(directory: Path) -> list[list]:
+    """pi.rs `session_files`: the identity of every *.jsonl regular file of the session directory, sorted."""
+    if not directory.is_dir():
+        return []
+    return sorted(i for e in directory.iterdir() if e.name.endswith('.jsonl') and (i := file_identity(str(e))))
+
+
 def pi_case(sp: Spike, case: str, project: Project, tools: list[str], session_id: str, notes: str, timeout: float = 900,
-            prompt: str | None = None) -> None:
+            prompt: str | None = None, resume: bool = False) -> None:
+    """One pi turn, with the external observations the pi adapter makes (ADR-032 design correction 7, the replay's
+    input): before the start, the session directory's files (`session_files`, noted for a resumed session); when the
+    get_state answer arrives, the identity of the session file it names (`identity`); the process's end."""
     # The product's pi adapter creates the session directory and its parents before it starts pi (crates/hoh-agents
     # src/pi.rs, create_dir_all of the launch's session_dir); so does the recorder, before the baseline snapshot.
-    (project.p / '.hoh/sessions/s1').mkdir(parents=True, exist_ok=True)
+    session_dir = project.p / '.hoh/sessions/s1'
+    session_dir.mkdir(parents=True, exist_ok=True)
     before = project.snapshot()
-    argv = ['pi', '--mode', 'rpc', '--session-dir', str(project.p / '.hoh/sessions/s1'), '--session-id', session_id,
+    noted = session_files(session_dir)
+    argv = ['pi', '--mode', 'rpc', '--session-dir', str(session_dir), '--session-id', session_id,
             *tools, '-e', str(project.observer)]
     msgs = [{'id': 's1', 'type': 'get_state'}, {'id': 'p1', 'type': 'prompt', 'message': prompt or project.prompt()}]
-    p, how = rec.pi_session(argv, project.w, msgs, until='agent_settled', timeout=timeout)
-    sp.save('pi', case, project, argv, p.sent, p.out, p.err, p.returncode, how, before, project.snapshot(), notes,
-            {'session_dir': str(project.p / '.hoh/sessions/s1')})
+    proc = rec.Proc(argv, project.w)
+    proc.write(b''.join(json.dumps(m).encode() + b'\n' for m in msgs))
+    opened, state_file, deadline = None, None, time.monotonic() + timeout
+    while time.monotonic() < deadline and proc.pump(1.0):
+        frames = proc.frames()
+        if state_file is None:
+            answer = next((f for f in frames if f.get('type') == 'response' and f.get('id') == 's1'), None)
+            if answer is not None:
+                state_file = (answer.get('data') or {}).get('sessionFile') or ''
+                opened = file_identity(state_file)  # as the adapter does when it handles the answer
+        if any(f.get('type') == 'agent_settled' for f in frames):
+            break
+    how = proc.stop(grace=20)
+    observations = {'launch': {'session_id': session_id, 'resume': resume}, 'noted': noted,
+                    'get_state_session_file': state_file, 'opened': opened,
+                    'exit': {'returncode': proc.returncode, 'how': str(how)}, 'logs_complete': str(how) == 'exited'}
+    sp.save('pi', case, project, argv, proc.sent, proc.out, proc.err, proc.returncode, how, before, project.snapshot(), notes,
+            {'session_dir': str(session_dir), 'observations': observations})
 
 
 def pi(sp: Spike) -> None:
@@ -384,7 +421,7 @@ def pi_noext(sp: Spike) -> None:
     argv = PI_RO_TOOLS + ['--no-extensions']
     pi_case(sp, 'noext-new', project, argv, sid, 'the read-only profile of ADR-032 v5 (--no-extensions), new session; '
             'the session directory is created before the baseline snapshot, as the product does')
-    pi_case(sp, 'noext-resumed', project, argv, sid, 'the same, the same session id in a new process')
+    pi_case(sp, 'noext-resumed', project, argv, sid, 'the same, the same session id in a new process', resume=True)
 
 
 AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}

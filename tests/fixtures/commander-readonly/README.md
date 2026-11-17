@@ -17,8 +17,12 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   app-ro-new copy already holds the resumed turn too).
 - The raw recordings stay local, under `.hoh-dev/evidence/commander-readonly/spike/<run>/`: they carry local paths,
   plugin lists, rate-limit and plan metadata, and the rollout files account identifiers. They are never committed.
-- `excerpt.py` makes the committed `excerpts/` (ADR-032 design correction 4). It keeps only the lines the evidence
-  table reads, and **every kept line is the raw line with some values replaced**: keys, nesting, array lengths and the
+- `excerpt.py` makes the committed `excerpts/` (ADR-032 design corrections 4 and 7). It keeps **every frame that
+  changes the adapter's state**, derived from the adapter's own dispatch and frame registry (claude.rs
+  `Driven::on_line`, codex/app_server.rs `State::on_line`, pi.rs `Rpc::on_record`; the initialize response and every
+  other response included), so that the product's replay of an excerpt reaches the state it reaches on the raw
+  recording (M2T20D-800), plus the frames the evidence table reads; it leaves out only frames the adapter reads past.
+  **Every kept line is the raw line with some values replaced**: keys, nesting, array lengths and the
   JSON type of every value are the source's. It replaces the run's temporary paths with `<P>`, `<W>`, `<T>` and the
   home directory with `<HOME>`, every uuid with `<uuid-N>` (one numbering for all the runs given, so a resumed session
   keeps its placeholder), every value under a key named like an account, user, e-mail, plan, organisation, credential,
@@ -35,6 +39,11 @@ the TEST-021-07 judge is written. A row of ADR-032's evidence table is valid onl
   it on the recorded skeletons (tests/bundle/test_commander_readonly.py).
 - For codex's App Server and pi, `<case>.stdin.excerpt.jsonl` is the request log (every JSON line the recorder sent),
   with which the adapters correlate responses to requests (ADR-032 design correction 7).
+- Each `.meta.json` carries `observations`, the external facts the adapter observes besides the stream (design
+  correction 7, M2T20D-801): the process's end (`exit`) and whether both streams were read to their end
+  (`logs_complete`); for pi also the launch (`session_id`, `resume`), the session files noted before the start
+  (`noted`: canonical path, device, inode, as pi.rs `session_files`) and the identity of the session file the
+  get_state answer named (`opened`, as pi.rs `identity`, taken when the answer arrived).
 - `.meta.json` files are summaries, not excerpts: the case's argv, exit, notes, driver text and token hash, and the
   raw snapshot's `diff` object (values redacted) with the snapshot's sha256.
 - Regenerate with `python3 tests/fixtures/commander-readonly/excerpt.py` followed by every run directory under
@@ -112,3 +121,11 @@ without that step, so their snapshots also show the new `P/.hoh/sessions` and `P
 |---|---|---|
 | pi | noext-new | the observer reports exactly read, grep, find, ls, all builtin; one read of TOKEN.txt; the final message has the decision block with the token; the snapshot shows only pi's session file inside `P/.hoh/sessions/s1/` |
 | pi | noext-resumed | the same report; the same session file changed, nothing else |
+
+## Run 20261117T001941Z (`--set noext`, again)
+
+pi's read-only profile of ADR-032 v5 (`--no-extensions`), new and resumed, recorded again with the observations pi.rs
+makes besides the stream: the resumed session's files noted before the start, and the identity of the session file
+the get_state answer names, taken when the answer arrived (M2T20D-801). The resumed session's get_state names the
+noted file (same canonical path, device and inode). These cases replace run 20261116T212808Z's in the excerpts; that
+run stays local and is no longer excerpted (its session files are gone, so their identity cannot be observed now).
