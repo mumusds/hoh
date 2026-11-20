@@ -757,6 +757,14 @@ class PersistenceScan(unittest.TestCase):
                           ('Cargo.toml','profile','profile.release.panic'),('embed.rs','included-file','an include macro imported under another name'),
                           ('main.rs','named-file','scripts/db_helper.py: mentions SQLite or holds a SQL write'),
                           ('mod.rs','persistence-macro','macro_rules! in persistence'),('tool.rs','product-root-outside-src',"a product target root outside its member's src/")])
+    def test_a_literal_too_long_for_a_file_name_in_bytes_is_no_named_file_and_no_crash(self):
+        # PR #70's CI (Python 3.12): a Rust literal of fewer than 256 characters but more than 255 UTF-8 bytes (a
+        # Chinese sentence) was probed as a path; Path.is_file raised ENAMETOOLONG before Python 3.14 and the whole scan
+        # failed. A literal that cannot name a file is no named file, on every supported Python.
+        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+        long='只读'*60
+        rc,res=self.run_scan({'crates/hoh-app/src/main.rs':F+'fn main(){ let _ = ("'+long+'", "'+long+'/x"); }'})
+        self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]),res)
     def test_a_listed_data_file_read_as_data_is_no_named_file_hit_and_nothing_else_is(self):
         # CR-019: a member literal may name a file of the whitelist's read_as_data list, a JSON or Markdown file that
         # mentions SQLite in prose and holds no SQL write (the specification the freeze reads); a listed file holding a
