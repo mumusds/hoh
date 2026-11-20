@@ -929,8 +929,14 @@ def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int
         if not value or len(value) > 255 or '\n' in value or '\0' in value:
             continue
         for base in bases:
-            candidate = (base / value).resolve()
-            if candidate.is_relative_to(root) and candidate.is_file():
+            # A literal that cannot name a file (a component over NAME_MAX bytes, say) is no named file; before
+            # Python 3.14 Path.is_file raises ENAMETOOLONG instead of answering False.
+            try:
+                candidate = (base / value).resolve()
+                named = candidate.is_relative_to(root) and candidate.is_file()
+            except OSError:
+                named = False
+            if named:
                 try:
                     out.append((value, rel_to(candidate, root), candidate.read_bytes().decode('utf-8', errors='replace')))
                 except OSError:
