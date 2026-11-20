@@ -22,11 +22,34 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+/// Where a helper's stderr goes: every start names it, and the spawner sets it before the spawn, so a helper never
+/// inherits its starter's fd 2 (docs/adr/ADR-031.md, 设计修正 2, C and round 3: in a client only the writer writes fd 2,
+/// CLT-1400).
+#[derive(Debug)]
+pub enum HelperStderr {
+    /// The null device.
+    Null,
+    /// A pipe of its own, handed over in [`Helper::stderr`].
+    Piped,
+    /// A file it is given.
+    File(std::fs::File),
+}
+
+impl HelperStderr {
+    fn stdio(self) -> std::process::Stdio {
+        match self {
+            HelperStderr::Null => std::process::Stdio::null(),
+            HelperStderr::Piped => std::process::Stdio::piped(),
+            HelperStderr::File(file) => std::process::Stdio::from(file),
+        }
+    }
+}
+
 /// Who starts the processes of some code (docs/adr/ADR-031.md, 设计修正 2, A).
 pub trait Spawner: Send + Sync + fmt::Debug {
-    /// Start `command` as a helper, in a process group of its own: its managed handle, or why not (a client's gate
-    /// refuses once its client stops).
-    fn helper(&self, command: &mut Command) -> io::Result<Helper>;
+    /// Start `command` as a helper, in a process group of its own, its stderr as `stderr` says (whatever `command`
+    /// was left with): its managed handle, or why not (a client's gate refuses once its client stops).
+    fn helper(&self, command: &mut Command, stderr: HelperStderr) -> io::Result<Helper>;
 
     /// Start `command` as a host: an object that can only be waited for, never signalled.
     fn host(&self, command: &mut Command) -> io::Result<WaitOnly>;
@@ -54,8 +77,8 @@ impl Direct {
 }
 
 impl Spawner for Direct {
-    fn helper(&self, command: &mut Command) -> io::Result<Helper> {
-        Helper::spawn(command)
+    fn helper(&self, command: &mut Command, stderr: HelperStderr) -> io::Result<Helper> {
+        Helper::spawn(command.stderr(stderr.stdio()))
     }
 
     fn host(&self, command: &mut Command) -> io::Result<WaitOnly> {
@@ -75,7 +98,7 @@ impl NoStart {
 }
 
 impl Spawner for NoStart {
-    fn helper(&self, _command: &mut Command) -> io::Result<Helper> {
+    fn helper(&self, _command: &mut Command, _stderr: HelperStderr) -> io::Result<Helper> {
         Err(io::Error::other("this code starts no process"))
     }
 

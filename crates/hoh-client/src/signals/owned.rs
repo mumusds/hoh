@@ -9,7 +9,7 @@
 //! as A2 orders: see the exit, clean the group, reap. In doctor, which adopts its descendants, it then kills every
 //! descendant still alive ([`descendants`], B). What it could not confirm it reports, never claims.
 
-use hoh_core::spawn::{Direct, Helper, Shared, Spawner, WaitOnly};
+use hoh_core::spawn::{Direct, Helper, HelperStderr, Shared, Spawner, WaitOnly};
 use rustix::process::Signal;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -279,42 +279,20 @@ impl Gate {
     }
 }
 
-/// Whether process `pid`'s fd 2 is the client's own fd 2 (the same file; both the null device is no sharing): a helper
-/// that inherited it would write fd 2 around the client's one writer (CLT-1352).
-fn shares_our_stderr(pid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    let Ok(ours) = rustix::fs::fstat(std::io::stderr()) else {
-        return false;
-    };
-    let null = rustix::fs::FileType::from_raw_mode(ours.st_mode)
-        == rustix::fs::FileType::CharacterDevice
-        && rustix::fs::major(ours.st_rdev) == 1
-        && rustix::fs::minor(ours.st_rdev) == 3;
-    !null
-        && std::fs::metadata(format!("/proc/{pid}/fd/2"))
-            .is_ok_and(|theirs| theirs.dev() == ours.st_dev && theirs.ino() == ours.st_ino)
-}
-
 impl Spawner for Gate {
-    /// A helper through the gate (A). Its stderr must be a pipe or null, never the client's fd 2, which only the writer
-    /// writes (C, CLT-1352): one that inherited it is ended at once (it is registered, so the stop reaps it if this does
-    /// not) and the start fails.
-    fn helper(&self, command: &mut Command) -> std::io::Result<Helper> {
-        let helper = self.helper_by(command, &|command| {
+    /// A helper through the gate (A), its stderr as `stderr` says: a pipe, null or a file, set before the spawn, never
+    /// the client's fd 2, which only the writer writes (C, CLT-1400).
+    fn helper(&self, command: &mut Command, stderr: HelperStderr) -> std::io::Result<Helper> {
+        let stderr = std::cell::Cell::new(Some(stderr));
+        self.helper_by(command, &|command| {
             // Where a test holds a helper start with its ticket taken, before its spawn; and once its spawn returned,
             // before its hand-off (debug builds only).
             crate::debug_hold::at("helper-before-spawn");
-            let spawned = Direct::plain().helper(command);
+            let policy = stderr.take().unwrap_or(HelperStderr::Null);
+            let spawned = Direct::plain().helper(command, policy);
             crate::debug_hold::at("helper-spawned");
             spawned
-        })?;
-        if shares_our_stderr(helper.shared.pid()) {
-            let _ = helper.shared.end(hoh_core::spawn::END_WAIT);
-            return Err(std::io::Error::other(
-                "a helper may not inherit the client's stderr (only its writer writes fd 2): give it a pipe or null",
-            ));
-        }
-        Ok(helper)
+        })
     }
 
     fn host(&self, command: &mut Command) -> std::io::Result<WaitOnly> {

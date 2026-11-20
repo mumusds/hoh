@@ -231,8 +231,8 @@ impl Probe {
                 .envs(command.env.iter().map(|(k, v)| (k, v)))
                 .env(PROBE_DB_ENV, db)
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null()),
+                .stdout(std::process::Stdio::piped()),
+            crate::spawn::HelperStderr::Null,
         )?;
         let missing = || std::io::Error::other("probe stdio was not piped");
         let stdin = process.stdin.ok_or_else(missing)?;

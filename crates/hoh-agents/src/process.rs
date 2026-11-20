@@ -253,10 +253,8 @@ impl Process {
         // Without a pidfd the child cannot be supervised: the spawner ends it then (its group, its leader, a bounded
         // reap: M1T07R-103, CLT-700) rather than leave it running.
         let helper = spawner.helper(
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped()),
+            command.stdin(Stdio::piped()).stdout(Stdio::piped()),
+            hoh_core::spawn::HelperStderr::Piped,
         )?;
         // From here on the leader is ours to reap, through its handle (dropping `Leader` kills the group): until then
         // it holds its pid and process group id.

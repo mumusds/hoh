@@ -51,7 +51,7 @@ fn a_helper_that_exits_by_itself_has_its_group_cleaned_before_it_is_reaped() -> 
         "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exit 0",
         member.display()
     ));
-    let helper = Direct::plain().helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command, HelperStderr::Null)?;
     let member = written_pid(&member)?;
     let shared = &helper.shared;
     assert!(
@@ -80,7 +80,7 @@ fn a_helper_is_reaped_once_and_its_status_is_shared() -> R {
     // A2: only `reap` consumes the status; observing before it and asking after it read the same published status.
     let mut command = Command::new("sh");
     command.arg("-c").arg("exit 3");
-    let helper = Direct::plain().helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command, HelperStderr::Null)?;
     let shared = helper.shared.clone();
     assert!(shared.exited_within(Duration::from_secs(5)));
     assert_eq!(shared.observe()?.and_then(|s| s.code()), Some(3));
@@ -101,7 +101,7 @@ fn ending_a_helper_kills_it_and_its_group_and_reaps_it() -> R {
         "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exec sleep 30",
         member.display()
     ));
-    let helper = Direct::plain().helper(&mut command)?;
+    let helper = Direct::plain().helper(&mut command, HelperStderr::Null)?;
     let member = written_pid(&member)?;
     let status = helper.shared.end(END_WAIT).ok_or("not reaped")?;
     assert_eq!(status.signal(), Some(9), "{status:?}");
@@ -169,5 +169,52 @@ fn a_helper_whose_pidfd_cannot_be_had_has_its_group_killed_and_is_reaped() -> R 
         !std::path::Path::new(&format!("/proc/{leader}")).exists(),
         "the leader was not reaped"
     );
+    Ok(())
+}
+
+#[test]
+fn a_helpers_stderr_is_its_policys_never_the_spawners_own() -> R {
+    // docs/adr/ADR-031.md, 设计修正 2, round 3 (CLT-1400): a helper's stderr is set by the policy every start names, before
+    // the spawn, whatever the command was left with: null, a pipe of its own, or a file it is given. Never the
+    // spawner's own fd 2, which in a client only its writer writes (C).
+    // fd 2's own link, its path joined at run time (a literal naming it would name whatever file fd 2 is now).
+    let ours = std::fs::read_link(std::path::Path::new("/proc/self/fd").join("2"))?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("helper.stderr");
+    for (policy, want) in [
+        (
+            HelperStderr::Null,
+            Some(std::path::PathBuf::from("/dev/null")),
+        ),
+        (HelperStderr::Piped, None),
+        (
+            HelperStderr::File(std::fs::File::create(&file)?),
+            Some(file.clone()),
+        ),
+    ] {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("readlink /proc/self/fd/2")
+            .stdout(std::process::Stdio::piped());
+        let mut helper = Direct::plain().helper(&mut command, policy)?;
+        let mut seen = String::new();
+        std::io::Read::read_to_string(helper.stdout.as_mut().ok_or("stdout")?, &mut seen)?;
+        let seen = std::path::PathBuf::from(seen.trim());
+        assert!(helper.shared.end(Duration::from_secs(5)).is_some());
+        match want {
+            Some(want) => assert_eq!(seen, want),
+            None => {
+                assert!(seen.to_string_lossy().starts_with("pipe:"), "{seen:?}");
+                assert!(
+                    helper.stderr.is_some(),
+                    "a piped helper hands its stderr over"
+                );
+            }
+        }
+        if !ours.starts_with("/dev/null") {
+            assert_ne!(seen, ours, "the helper has the spawner's own stderr");
+        }
+    }
     Ok(())
 }

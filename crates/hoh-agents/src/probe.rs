@@ -3321,12 +3321,12 @@ fn capture(
                 .env("PATH", &env.path)
                 .envs(vars.iter().copied())
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(if keep_stderr {
-                    Stdio::piped()
-                } else {
-                    Stdio::null()
-                }),
+                .stdout(Stdio::piped()),
+            if keep_stderr {
+                hoh_core::spawn::HelperStderr::Piped
+            } else {
+                hoh_core::spawn::HelperStderr::Null
+            },
         )
     };
     // ETXTBSY is transient: a process forked elsewhere still holds a just-written executable open for writing until
