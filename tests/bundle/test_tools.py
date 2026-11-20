@@ -1044,6 +1044,21 @@ mod tests { use hoh_app::host::HostConfig; fn g() { if true { } } }
         self.assertIn('nix::unistd::fork',s.configuration([],[]))
         self.assertIn('hoh::stderr::fd2',s.configuration([],['hoh::stderr::fd2']))
 
+class ReleaseSeams(unittest.TestCase):
+    """scripts/product/release_seams.sh (CLT-1256): the build check reads the release binary, or fails."""
+    def run_on(self,path):
+        return subprocess.run(['bash',str(ROOT/'scripts/product/release_seams.sh'),str(path)],capture_output=True,text=True)
+    def test_a_missing_or_unreadable_binary_fails_and_only_a_clean_one_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            r=Path(d)
+            self.assertEqual(self.run_on(r/'missing').returncode,1)
+            (r/'clean').write_bytes(b'\x7fELF no seams here')
+            self.assertEqual(self.run_on(r/'clean').returncode,0)
+            (r/'held').write_bytes(b'\x7fELF ... HOH_DEBUG_HOLD_DIR ...')
+            self.assertEqual(self.run_on(r/'held').returncode,1)
+            (r/'dir').mkdir()
+            self.assertEqual(self.run_on(r/'dir').returncode,1)
+
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):
         with tempfile.TemporaryDirectory() as d:
