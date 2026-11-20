@@ -793,6 +793,78 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
     Ok(())
 }
 
+/// `client`, its stderr writer held from its first line until its exit began, then let go: its output.
+fn with_the_writer_held(holds: &Path, client: Child) -> R<Output> {
+    let mut client = Kid(Some(client));
+    let outcome = (|| -> R<Output> {
+        reached(&holds.join("stderr-writer.reached"), &mut client, LIMIT)?;
+        reached(&holds.join("stderr-exit"), &mut client, LIMIT)?;
+        std::fs::remove_file(holds.join("stderr-writer"))?;
+        finish(client.take()?, LIMIT)
+    })();
+    let _ = std::fs::remove_file(holds.join("stderr-writer"));
+    outcome
+}
+
+#[test]
+fn an_error_exit_says_its_whole_diagnostic_when_its_writer_was_held_until_the_exit() -> R {
+    // ADR-031, 设计修正 2, C (CLT-800; verification 7): the client's stderr writer is held with the first line in hand
+    // until the exit began; then let go, it writes the client's own words, whole, within the exit's bound: a run not
+    // found (64), an invalid configuration's place (78), and the detach's hint to attach again. The design before C
+    // dropped them at the exit (its red is shown by a writer that drops its own words at the exit).
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    let held = |args: &[&str]| -> R<Output> {
+        std::fs::write(holds.join("stderr-writer"), "")?;
+        for mark in ["stderr-writer.reached", "stderr-exit"] {
+            let _ = std::fs::remove_file(holds.join(mark));
+        }
+        let client = env
+            .isolated(args)?
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        with_the_writer_held(&holds, client)
+    };
+    let out = held(&["attach", "NOPE"])?;
+    assert_eq!(out.status.code(), Some(64));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "hoh: RUN_NOT_FOUND: 没有 Run NOPE\n"
+    );
+    let out = held(&["-p", "x", "--detach"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = String::from_utf8(out.stdout)?.trim().to_owned();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("hoh: 已脱离，Run 在后台运行；用 hoh attach {run} 重新附着\n")
+    );
+    std::fs::write(
+        env.project().join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[project]\ndefault_mode = \"auto\"\n",
+    )?;
+    let out = held(&["-p", "x"])?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{said}");
+    assert!(
+        said.starts_with("hoh: 配置无效，没有连接或启动 host：")
+            && said.contains("config.toml")
+            && said.contains("project.default_mode")
+            && said.ends_with('\n')
+            && said.lines().count() == 1,
+        "{said}"
+    );
+    Ok(())
+}
+
 /// A `systemd-run` stand-in on a PATH of its own that writes its pid to `<dir>/probe.pid` and sleeps, and a fake
 /// runtime directory that stands in for the user's manager (so none is contacted): the PATH, the runtime directory and
 /// the pid file.
