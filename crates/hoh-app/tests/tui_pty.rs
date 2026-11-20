@@ -1101,6 +1101,17 @@ fn test_001_01_the_workspace_shows_the_runs_and_a_sigterm_changes_nothing() -> R
     let team = world::Team::new(|_| Vec::new());
     let host = runtime.block_on(world.team_host(team.clone(), None))?;
     let outcome = (|| -> R {
+        // Host readiness precedes the runner's first checkpoint, which brings even PAUSED runs up to the project's
+        // team revision. Observe that commit before the baseline: only the TUI and SIGTERM must leave it unchanged.
+        let current_revision = world.query(&format!(
+            "SELECT max(revision) FROM team_revisions WHERE project_id = '{}' AND state = 'APPLIED'",
+            host.project_id
+        ))?;
+        world.wait(
+            &format!("SELECT config_revision FROM runs WHERE run_id = '{RUN_A}'"),
+            &current_revision,
+            WAIT,
+        )?;
         let counts = world.query(COUNTS)?;
         let runs = world.rows("SELECT * FROM runs ORDER BY run_id")?;
         let seq: i64 = world
