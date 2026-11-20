@@ -129,7 +129,8 @@ impl Drop for Restore {
     }
 }
 
-/// A private `systemd --user` in a scope of its own, under a short temporary root (a socket path has 107 bytes):
+/// A private `systemd --user` in a scope of its own, under a short temporary root (a socket path has 107 bytes).
+/// Set TMPDIR to a short directory on the development disk (docs/19), including for deployment checks:
 /// `h/` the HOME with its XDG directories, `r/` the runtime directory, `bin/` the test's stand-ins.
 pub struct Manager {
     root: PathBuf,
@@ -163,10 +164,7 @@ impl Manager {
         if !systemd.is_file() {
             return Err("precondition: /usr/lib/systemd/systemd is missing".into());
         }
-        let root = tempfile::Builder::new()
-            .prefix("hohsd.")
-            .tempdir_in("/tmp")?
-            .keep();
+        let root = tempfile::Builder::new().prefix("hohsd.").tempdir()?.keep();
         let scope = format!(
             "hoh-test-{}-{}",
             std::process::id(),
@@ -363,7 +361,7 @@ impl Manager {
 impl Manager {
     /// Kill every process of this user whose command line names this manager's root, until none is left (at most
     /// 5 s): a host a test started directly for a project under the root, or one its unit left, whatever became of the
-    /// test. Test code: nothing else of the user's names a /tmp/hohsd.* directory.
+    /// test. Test code: nothing else of the user's names this test's hohsd.* directory.
     fn kill_strays(&self) {
         use std::os::unix::fs::MetadataExt as _;
         let root = self.root.as_os_str().as_encoded_bytes().to_vec();
