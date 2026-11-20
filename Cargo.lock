@@ -483,6 +483,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hoh-agents",
+ "hoh-client",
  "hoh-core",
  "httparse",
  "hyper",
@@ -499,6 +500,25 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "vt100",
+]
+
+[[package]]
+name = "hoh-client"
+version = "0.0.0"
+dependencies = [
+ "hoh-agents",
+ "hoh-app",
+ "hoh-core",
+ "httparse",
+ "ratatui",
+ "rustix",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

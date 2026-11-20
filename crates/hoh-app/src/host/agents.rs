@@ -1266,28 +1266,9 @@ fn probed(agent: Agent, files: &Files, env: &ProbeEnv) -> Result<Ready, Probe> {
     })
 }
 
-/// The status of the read_only case (docs/adr/ADR-032.md decision 4, item 3) of `manifest`'s entry for `agent`, while
-/// that entry verifies `entry` under `suite_set` (`compat::verdict`); `None` otherwise, or when it has no such case.
-/// The session record and doctor's `read_only` item read it.
-pub fn read_only_case(
-    manifest: Option<&CompatManifest>,
-    agent: Agent,
-    entry: &AgentEntry,
-    suite_set: &str,
-) -> Option<compat::SuiteStatus> {
-    if compat::verdict(manifest, agent.as_str(), entry, suite_set) != Compat::Verified {
-        return None;
-    }
-    manifest?
-        .agents
-        .get(&agent)?
-        .suite
-        .cases
-        .as_ref()?
-        .iter()
-        .find(|c| c.case == compat::suite::READ_ONLY_CASE)
-        .map(|c| c.status)
-}
+// The read_only case's status: hoh-agents', which the client's doctor reads too without naming the host (ADR-031,
+// 设计修正 2, the client's crate boundary).
+pub use hoh_agents::compat::read_only_case;
 
 /// The compat manifest at `path`: `None` when there is none; why when it cannot be read or is not valid against the
 /// locked schema.

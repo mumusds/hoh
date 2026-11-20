@@ -330,7 +330,7 @@ fn user_name() -> Option<String> {
 /// Whether the user's systemd manager can keep a host running after the user's last session: it answers on
 /// `$XDG_RUNTIME_DIR/systemd/private` and the user lingers (else it stops soon after the last session ends, and a host
 /// it runs with it, which would end accepted work at an SSH disconnect, REQ-005 behaviour 2; M2T06R-453). Why not.
-pub(crate) fn manager_that_lingers() -> Result<(), String> {
+pub fn manager_that_lingers() -> Result<(), String> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| "XDG_RUNTIME_DIR is not set: no user systemd manager to ask".to_owned())?;
     if !Path::new(&runtime).join("systemd/private").exists() {
@@ -435,11 +435,11 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
     // The instance's file is the installation's, found from where this binary is (ADR-023 design correction 1).
     let root = this
         .ok()
-        .and_then(|exe| hoh_app::unit::installation_root(&exe))
+        .and_then(|exe| hoh_core::unit::installation_root(&exe))
         .ok_or_else(|| format!("{} is not in an installation's version", command.display()))?;
-    let instance = hoh_app::unit::instance(project);
-    let file = hoh_app::unit::instance_file(&root, &instance);
-    let name = hoh_app::unit::unit_name(&instance);
+    let instance = hoh_core::unit::instance(project);
+    let file = hoh_core::unit::instance_file(&root, &instance);
+    let name = hoh_core::unit::unit_name(&instance);
     let bounded = hoh_agents::probe::ProbeEnv {
         timeout: env.timeout.min(SCOPE_PROBE_LIMIT),
         ..env.clone()
@@ -457,8 +457,8 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
     )
     .map_err(|e| format!("systemctl --user show {name}: {e}"))?;
     let text = String::from_utf8_lossy(&shown.stdout).into_owned();
-    let listed = hoh_app::unit::lists_environment_file(&text, &file);
-    let shown = hoh_app::unit::show(&text);
+    let listed = hoh_core::unit::lists_environment_file(&text, &file);
+    let shown = hoh_core::unit::show(&text);
     let get = |key: &str| shown.get(key).map(String::as_str).unwrap_or_default();
     if get("LoadState") != "loaded" {
         return Err(format!(
@@ -466,7 +466,7 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
             get("LoadState")
         ));
     }
-    if !hoh_app::unit::runs(get("ExecStart"), &command) {
+    if !hoh_core::unit::runs(get("ExecStart"), &command) {
         return Err(format!(
             "{name} does not run {} __host (a drop-in changed it?)",
             command.display()
@@ -480,7 +480,7 @@ pub fn unit_for(project: &Path, env: &hoh_agents::probe::ProbeEnv) -> Result<Uni
             file.display()
         ));
     }
-    let text = hoh_app::unit::environment(project, &env.path).map_err(|e| e.to_string())?;
+    let text = hoh_core::unit::environment(project, &env.path).map_err(|e| e.to_string())?;
     Ok(Unit {
         systemctl,
         name,
@@ -507,7 +507,7 @@ fn start(project: &Path, end: Instant) -> Result<HostInfo, Failure> {
     };
     let unsupervised = match unit_for(project, &env) {
         // Under the project's lock, with no host running: the file the manager reads before it starts the host.
-        Ok(unit) => match hoh_app::unit::write_environment(&unit.file, project, &unit.text) {
+        Ok(unit) => match hoh_core::unit::write_environment(&unit.file, project, &unit.text) {
             Ok(()) => return supervised(project, end, &unit, &env),
             Err(e) => format!("its unit's environment file was not written ({e})"),
         },
@@ -585,7 +585,7 @@ fn supervised(
     };
     let show = |props: &str| {
         systemctl(&["show", "-p", props, &unit.name])
-            .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
+            .map(|out| hoh_core::unit::show(&String::from_utf8_lossy(&out.stdout)))
             .unwrap_or_default()
     };
     // A stop that begins while the start runs says it was interrupted, its result unknown (设计修正 2, A and D).
@@ -620,7 +620,7 @@ fn supervised(
             )
             .ok()
             .filter(|out| out.status.success())
-            .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
+            .map(|out| hoh_core::unit::show(&String::from_utf8_lossy(&out.stdout)))
             .filter(|state| state.contains_key("ActiveState"));
             let found = match answer {
                 Some(state) => {
@@ -797,10 +797,10 @@ fn launch_with(
         None => std::process::Command::new(&program),
     };
     match unscoped {
-        Some(why) => command.env(hoh_app::layout::UNSCOPED_ENV, why),
-        None => command.env_remove(hoh_app::layout::UNSCOPED_ENV),
+        Some(why) => command.env(hoh_core::layout::UNSCOPED_ENV, why),
+        None => command.env_remove(hoh_core::layout::UNSCOPED_ENV),
     };
-    command.env(hoh_app::layout::UNSUPERVISED_ENV, unsupervised);
+    command.env(hoh_core::layout::UNSUPERVISED_ENV, unsupervised);
     // Where a test holds the start just before the host is spawned, and sees what came of it (debug builds only).
     crate::debug_hold::at("before-launch");
     // A host is wait-only from its spawn: nothing of this client ever signals it; its start takes a ticket at the

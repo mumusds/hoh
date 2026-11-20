@@ -80,7 +80,7 @@ impl Stderr {
         if added {
             self.writer.forwarding(
                 attempt_id,
-                hoh_app::layout::attempt_logs(&self.project, attempt_id),
+                hoh_core::layout::attempt_logs(&self.project, attempt_id),
             );
             wake.notify_one();
         }
@@ -133,7 +133,7 @@ fn forward_all(shared: &Shared, project: &Path, writer: &Writer) {
 
 /// Attempt `attempt`'s `*stderr.log` files, in order.
 fn logs(project: &Path, attempt: &str) -> Vec<PathBuf> {
-    let dir = hoh_app::layout::attempt_logs(project, attempt);
+    let dir = hoh_core::layout::attempt_logs(project, attempt);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };

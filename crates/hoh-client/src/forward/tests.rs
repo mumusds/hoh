@@ -50,7 +50,7 @@ impl Kept {
 fn every_stderr_log_of_the_runs_attempts_is_forwarded_as_it_grows() -> R {
     let project = tempfile::tempdir()?;
     let attempt = "R/a1";
-    let logs = hoh_app::layout::attempt_logs(project.path(), attempt);
+    let logs = hoh_core::layout::attempt_logs(project.path(), attempt);
     std::fs::create_dir_all(&logs)?;
     std::fs::write(logs.join("exec.stderr.log"), "first\n")?;
     std::fs::write(logs.join("stdout.jsonl"), "not stderr\n")?;
@@ -96,7 +96,7 @@ fn native_stderr_not_shown_is_said_with_its_directory_and_a_stuck_stderr_never_h
     // project's absolute path), and the progress lines not shown.
     let project = tempfile::tempdir()?;
     let attempt = "R/a%1";
-    let logs = hoh_app::layout::attempt_logs(project.path(), attempt);
+    let logs = hoh_core::layout::attempt_logs(project.path(), attempt);
     std::fs::create_dir_all(&logs)?;
     let native = 3 * (1 << 20);
     std::fs::write(logs.join("stderr.log"), vec![b'n'; native])?;

@@ -8,6 +8,8 @@
 pub mod compat;
 pub mod gate;
 pub mod host;
-pub mod layout;
-pub mod unit;
 pub mod verify;
+
+// The names the client shares with the host, and the systemd unit: in hoh-core, which both depend on (ADR-031, 设计修正 2,
+// the corrections after its second implementation review).
+pub use hoh_core::{layout, unit};

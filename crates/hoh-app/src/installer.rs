@@ -4,8 +4,8 @@
 //! project's instance where the user's systemd manager reads it, and enables the instance. Not a user command and in
 //! no help text.
 
-use crate::exit::{ClientEvent, Ending, exit_code};
 use hoh_app::unit;
+use hoh_client::exit::{ClientEvent, Ending, exit_code};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -126,7 +126,7 @@ fn enable(given: &Path) -> u8 {
         }
     };
     // Enabled without lingering, the instance would stop with the user's last session (REQ-005 behaviour 2).
-    if let Err(why) = crate::client::manager_that_lingers() {
+    if let Err(why) = hoh_client::manager_that_lingers() {
         return fail(ClientEvent::HostUnavailable, why);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();

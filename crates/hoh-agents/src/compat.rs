@@ -463,3 +463,26 @@ impl CompatManifest {
         }
     }
 }
+
+/// The status of the read_only case (docs/adr/ADR-032.md decision 4, item 3) of `manifest`'s entry for `agent`, while
+/// that entry verifies `entry` under `suite_set` (`compat::verdict`); `None` otherwise, or when it has no such case.
+/// The host's session record and doctor's `read_only` item read it.
+pub fn read_only_case(
+    manifest: Option<&CompatManifest>,
+    agent: Agent,
+    entry: &AgentEntry,
+    suite_set: &str,
+) -> Option<SuiteStatus> {
+    if verdict(manifest, agent.as_str(), entry, suite_set) != Compat::Verified {
+        return None;
+    }
+    manifest?
+        .agents
+        .get(&agent)?
+        .suite
+        .cases
+        .as_ref()?
+        .iter()
+        .find(|c| c.case == suite::READ_ONLY_CASE)
+        .map(|c| c.status)
+}

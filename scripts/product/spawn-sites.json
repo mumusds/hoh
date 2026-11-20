@@ -1,38 +1,17 @@
 {
-  "_doc": "docs/adr/ADR-031.md, 设计修正 2, E and its corrections after the implementation review: every non-test source file in one class; every place in non-test code that starts or replaces a process or makes the plain spawner, with its owner; the host-only modules where the plain spawner may be made; the functions only the host's entries call; and each place a client or entry file writes stderr other than through its writer (scripts/product/spawn_scan.py).",
+  "_doc": "docs/adr/ADR-031.md, 设计修正 2, E as its corrections after the second implementation review leave it: every source file in one class (the client crate hoh-client, which must not depend on hoh-app; hoh-app's host-only files and its entry main.rs; the libraries); every place in non-test code that starts or replaces a process or makes the plain spawner, with its owner; the functions only the host's entries call; and each place a client, entry or library file writes stderr other than through the client's writer (scripts/product/spawn_scan.py).",
   "client_files": [
-    "crates/hoh-app/src/cli.rs",
-    "crates/hoh-app/src/client.rs",
-    "crates/hoh-app/src/debug_hold.rs",
-    "crates/hoh-app/src/doctor.rs",
-    "crates/hoh-app/src/doctor/",
-    "crates/hoh-app/src/exit.rs",
-    "crates/hoh-app/src/follow.rs",
-    "crates/hoh-app/src/forward.rs",
-    "crates/hoh-app/src/help.rs",
-    "crates/hoh-app/src/output.rs",
-    "crates/hoh-app/src/owned.rs",
-    "crates/hoh-app/src/owned/",
-    "crates/hoh-app/src/prompt.rs",
-    "crates/hoh-app/src/session.rs",
-    "crates/hoh-app/src/signals.rs",
-    "crates/hoh-app/src/stderr.rs",
-    "crates/hoh-app/src/stderr/",
-    "crates/hoh-app/src/tui.rs",
-    "crates/hoh-app/src/tui/"
+    "crates/hoh-client/src/"
   ],
   "host_only_files": [
     "crates/hoh-app/src/compat.rs",
     "crates/hoh-app/src/gate.rs",
+    "crates/hoh-app/src/gate/",
     "crates/hoh-app/src/host/",
     "crates/hoh-app/src/installer.rs",
+    "crates/hoh-app/src/lib.rs",
     "crates/hoh-app/src/verify.rs",
     "crates/hoh-app/src/verify/"
-  ],
-  "shared_files": [
-    "crates/hoh-app/src/layout.rs",
-    "crates/hoh-app/src/lib.rs",
-    "crates/hoh-app/src/unit.rs"
   ],
   "entry_files": [
     "crates/hoh-app/src/main.rs"
@@ -51,8 +30,8 @@
     "hoh_app::verify::check::run_with"
   ],
   "stderr_functions": [
-    "hoh::stderr::fd2",
-    "hoh::stderr::panicking"
+    "hoh_client::stderr::fd2",
+    "hoh_client::stderr::panicking"
   ],
   "sites": [
     {
@@ -70,7 +49,7 @@
       "reason": "Direct::host's wait-only spawn and Helper::spawn (process group of its own, pidfd at once)"
     },
     {
-      "file": "crates/hoh-app/src/owned.rs",
+      "file": "crates/hoh-client/src/signals/owned.rs",
       "item": "hoh_core::spawn::Direct",
       "count": 3,
       "owner": "gate",
@@ -128,22 +107,40 @@
   ],
   "stderr_sites": [
     {
-      "file": "crates/hoh-app/src/stderr.rs",
+      "file": "crates/hoh-client/src/stderr.rs",
       "item": "std::io::stderr",
       "count": 1,
       "reason": "fd 2's one descriptor (Fd2): the writer thread's, the direct write before the signal state is registered, the exit's bounded direct write after the writer ended, and the panic hook's words (ADR-031, 设计修正 2, C)"
     },
     {
-      "file": "crates/hoh-app/src/signals.rs",
-      "item": "hoh::stderr::fd2",
+      "file": "crates/hoh-client/src/signals.rs",
+      "item": "hoh_client::stderr::fd2",
       "count": 1,
       "reason": "the writer's sink, made once as the signal state is registered (ADR-031, 设计修正 2, C)"
     },
     {
-      "file": "crates/hoh-app/src/tui/terminal.rs",
-      "item": "hoh::stderr::panicking",
+      "file": "crates/hoh-client/src/tui/terminal.rs",
+      "item": "hoh_client::stderr::panicking",
       "count": 1,
       "reason": "the panic hook's words after the terminal's restore failed: the second written exception (C)"
+    },
+    {
+      "file": "crates/hoh-app/src/main.rs",
+      "item": "rustix::stdio::dup2_stderr",
+      "count": 1,
+      "reason": "`hoh __host` moves its own stderr to .hoh/host.log once it is ready: the host's process, which has no client writer"
+    },
+    {
+      "file": "crates/hoh-core/src/persistence/selftest.rs",
+      "item": "std::eprintln",
+      "count": 2,
+      "reason": "probe_main, the `hoh __wal-probe` process's own diagnostics: a process of its own, which has no client writer"
+    },
+    {
+      "file": "crates/hoh-client/src/signals/owned.rs",
+      "item": "std::io::stderr",
+      "count": 1,
+      "reason": "the gate reads (fstat) the client's fd 2 to tell a helper that would inherit it; it writes nothing (CLT-1352)"
     }
   ]
 }
