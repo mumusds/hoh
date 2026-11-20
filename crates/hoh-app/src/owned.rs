@@ -45,6 +45,8 @@ pub struct Stopped {
     pub unconfirmed: Vec<u32>,
     pub hosts: Vec<u32>,
     pub hosts_in_flight: usize,
+    /// doctor's last scan of its descendants was incomplete at the bound (CLT-1200).
+    pub sweep_incomplete: bool,
 }
 
 /// What a ticket is for.
@@ -168,14 +170,18 @@ impl Gate {
                 unconfirmed.push(helper.pid());
             }
         }
+        let mut sweep_incomplete = false;
         if sweeps {
-            for pid in descendants::sweep(std::process::id(), end) {
+            let swept = descendants::sweep(std::process::id(), end);
+            sweep_incomplete = swept.incomplete;
+            for pid in swept.alive {
                 if !unconfirmed.contains(&pid) {
                     unconfirmed.push(pid);
                 }
             }
         }
         Stopped {
+            sweep_incomplete,
             helpers_in_flight: in_flight,
             unconfirmed,
             hosts,

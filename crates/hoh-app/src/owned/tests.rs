@@ -342,7 +342,7 @@ fn the_sweep_kills_a_descendant_that_left_its_group_and_ends_on_a_clean_scan() -
     let child = written_pid(&apart)?;
     let at = Instant::now();
     let left = descendants::sweep(root.shared.pid(), at + Duration::from_millis(1500));
-    assert_eq!(left, Vec::<u32>::new());
+    assert_eq!(left, descendants::Swept::default());
     assert!(
         at.elapsed() < Duration::from_millis(1000),
         "{:?}",
@@ -382,7 +382,7 @@ fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() ->
     let at = Instant::now();
     assert_eq!(
         descendants::sweep(root.shared.pid(), at + Duration::from_millis(1500)),
-        Vec::<u32>::new()
+        descendants::Swept::default()
     );
     assert!(
         at.elapsed() < Duration::from_millis(500),
@@ -397,7 +397,7 @@ fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() ->
     let root = setting_apart(&apart)?;
     let child = written_pid(&apart)?;
     assert_eq!(
-        descendants::sweep(root.shared.pid(), Instant::now()),
+        descendants::sweep(root.shared.pid(), Instant::now()).alive,
         vec![child]
     );
     assert!(ends(child), "the child it reported was not killed");

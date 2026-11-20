@@ -1120,6 +1120,69 @@ fn a_probe_whose_leader_ends_first_leaves_no_member_of_its_group_while_doctor_ru
 }
 
 #[test]
+fn doctors_stop_ends_more_descendants_than_it_has_descriptors_for() -> R {
+    // ADR-031, 设计修正 2, corrections after its implementation review, 3 (CLT-1200): `git --version` sets 120 sleepers
+    // apart (each in a session of its own, so only doctor's sweep reaches them once git ends) and doctor runs with 64
+    // file descriptors at most, fewer than it would hold pidfds for them all. Its stop at the end must still end every
+    // one, or say it could not: a pidfd it cannot open makes a scan incomplete, never clean, and the pidfds of those
+    // that ended are let go. Before, a failed pidfd_open was skipped, the scan counted clean, and sleepers lived on.
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let pids = s.home.path().join("sleepers");
+    s.write(
+        "git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) i=0; while [ $i -lt 120 ]; do setsid sh -c 'read -r s < /proc/$$/stat; \
+             echo \"$s\" >> \"$0\"; exec sleep 60' '{p}' < /dev/null > /dev/null 2>&1 & i=$((i+1)); done; \
+             while [ \"$(wc -l < '{p}' 2>/dev/null)\" != 120 ]; do sleep 0.01; done; echo 'git version 2.43.0';;\n \
+             -C) mkdir -p \"$2/.git\";;\n *) exit 1;;\nesac\n",
+            p = pids.display()
+        ),
+    )?;
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -n 64 && exec \"$0\" \"$@\""])
+        .arg(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .output()?;
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Every sleeper by its stat line (pid and start time), so a number taken again is never mistaken for it.
+    let text = std::fs::read_to_string(&pids)?;
+    let mut alive = Vec::new();
+    for line in text.lines() {
+        let pid: u32 = line.split_whitespace().next().ok_or("pid")?.parse()?;
+        let start = hoh_agents::identity::after_command_name(line.as_bytes())
+            .and_then(|rest| rest.split_whitespace().nth(19))
+            .ok_or("start")?
+            .to_owned();
+        if !hoh_agents::identity::ended(pid, Some(&start))? {
+            alive.push((pid, start));
+        }
+    }
+    for (pid, start) in &alive {
+        let _ = hoh_agents::identity::signal_if_same(*pid, start, rustix::process::Signal::KILL);
+    }
+    assert_eq!(text.lines().count(), 120, "{said}");
+    assert!(
+        alive.is_empty() || said.contains("没能"),
+        "{} sleepers outlived doctor and it said nothing: {said}",
+        alive.len()
+    );
+    assert!(
+        alive.is_empty(),
+        "{} sleepers outlived doctor: {said}",
+        alive.len()
+    );
+    Ok(())
+}
+
+#[test]
 fn a_signal_after_doctors_report_is_written_says_it_was_written() -> R {
     // ADR-031, 设计修正 2, D (CLT-902, CLT-952, CLT-1050; verification 16): doctor is held once its report is on
     // stdout; SIGTERM then ends it with 143, the whole report stays on stdout, and its exit says the report was

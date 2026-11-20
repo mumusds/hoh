@@ -289,6 +289,9 @@ fn unfinished(stopped: &Stopped, unit: Option<&str>) -> Vec<String> {
             pids.join(", ")
         ));
     }
+    if stopped.sweep_incomplete && stopped.unconfirmed.is_empty() {
+        said.push("hoh: 没能确认 doctor 的后代都已结束（扫描不完整）".to_owned());
+    }
     if let Some(unit) = unit {
         said.push(format!(
             "hoh: unit {unit} 的启动被打断，结果未知；见 systemctl --user status {unit}"
@@ -528,6 +531,7 @@ mod tests {
             unconfirmed: (1..=10).collect(),
             hosts: vec![77],
             hosts_in_flight: 1,
+            sweep_incomplete: true,
         };
         assert_eq!(
             unfinished(&stopped, Some("hoh-host@abc.service")),
@@ -536,6 +540,15 @@ mod tests {
                 "hoh: 有 10 个辅助进程没能在 1.5 s 内确认结束（pid 1, 2, 3, 4, 5, 6, 7, 8, …）",
                 "hoh: unit hoh-host@abc.service 的启动被打断，结果未知；见 systemctl --user status hoh-host@abc.service",
             ]
+        );
+        // doctor's sweep incomplete with no pid to name (CLT-1200).
+        let incomplete = Stopped {
+            sweep_incomplete: true,
+            ..Stopped::default()
+        };
+        assert_eq!(
+            unfinished(&incomplete, None),
+            ["hoh: 没能确认 doctor 的后代都已结束（扫描不完整）"]
         );
     }
 
