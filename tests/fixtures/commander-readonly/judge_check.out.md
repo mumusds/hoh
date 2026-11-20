@@ -196,6 +196,7 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | rollout default-deny | non-PASS | — | — | 1 FAIL, 11 INSUFFICIENT | 1 FAIL, 11 INSUFFICIENT | — | — |
 | code mode | same | — | — | 6 PASS | 6 PASS | — | — |
 | code mode | non-PASS | — | — | 1 FAIL, 48 INSUFFICIENT | 1 FAIL, 48 INSUFFICIENT | — | — |
+| code mode mismatch | non-PASS | — | — | 2 FAIL, 12 INSUFFICIENT | 2 FAIL, 12 INSUFFICIENT | — | — |
 | item default-deny | non-PASS | — | — | 3 INSUFFICIENT | 3 INSUFFICIENT | — | — |
 | incomplete driver run | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
 | incomplete patch call | non-PASS | — | — | 2 INSUFFICIENT | 2 INSUFFICIENT | — | — |
@@ -904,6 +905,20 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | code mode | a const passed to text() under another name | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode | an exec_command with another key | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode | the driver call then a store() call | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode mismatch | a failed script, one item fewer: the refusal in the discovery's place | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | a failed script, more items than statements | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | a failed script whose last item is not its error | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | a failed script whose error is not the refusal | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome; 1 cells not refused: patch worktree create |
+| codex/app-ro-new | code mode mismatch | the items without a header | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | a failed script, the refusal in a command's place | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | an unknown tool after a refused patch | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode mismatch | another command after a discovery | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode mismatch | a refused patch whose result is not passed to text() | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode mismatch | a completed script with the refusal as a patch's item | non-PASS | FAIL | cells written: patch worktree create; writes recorded: patch <P>/hoh-patch-create |
+| codex/app-ro-new | code mode mismatch | a failed script, the refused patch's item before the discovery's | non-PASS | FAIL | cells written: patch worktree create; writes recorded: patch <P>/hoh-patch-create |
+| codex/app-ro-new | code mode mismatch | the driver then a discovery, one item fewer | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | the driver then a discovery, one item more | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode mismatch | a discovery then the driver, the items in the driver's order | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-new | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |
@@ -1395,6 +1410,20 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | code mode | a const passed to text() under another name | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode | an exec_command with another key | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode | the driver call then a store() call | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode mismatch | a failed script, one item fewer: the refusal in the discovery's place | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | a failed script, more items than statements | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | a failed script whose last item is not its error | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | a failed script whose error is not the refusal | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome; 1 cells not refused: patch worktree create |
+| codex/app-ro-resumed | code mode mismatch | the items without a header | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | a failed script, the refusal in a command's place | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | an unknown tool after a refused patch | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode mismatch | another command after a discovery | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode mismatch | a refused patch whose result is not passed to text() | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode mismatch | a completed script with the refusal as a patch's item | non-PASS | FAIL | cells written: patch worktree create; writes recorded: patch <P>/hoh-patch-create |
+| codex/app-ro-resumed | code mode mismatch | a failed script, the refused patch's item before the discovery's | non-PASS | FAIL | cells written: patch worktree create; writes recorded: patch <P>/hoh-patch-create |
+| codex/app-ro-resumed | code mode mismatch | the driver then a discovery, one item fewer | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | the driver then a discovery, one item more | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode mismatch | a discovery then the driver, the items in the driver's order | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-resumed | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |
