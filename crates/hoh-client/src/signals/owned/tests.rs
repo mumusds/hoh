@@ -56,6 +56,8 @@ fn written_pid(file: &std::path::Path) -> R<u32> {
 /// A shell that leaves a member of its group (its pid written to `member`) and then sleeps.
 fn with_member(member: &std::path::Path) -> Command {
     let mut command = Command::new("sh");
+    // A helper's stderr is never the client's (CLT-1352).
+    command.stderr(std::process::Stdio::null());
     command.arg("-c").arg(format!(
         "sleep 30 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exec sleep 30",
         member.display()
@@ -78,7 +80,7 @@ fn reap_host(mut host: WaitOnly) {
 #[test]
 fn a_start_after_the_stop_is_refused_and_starts_nothing() {
     // 设计修正 2, A: once the stop began the gate gives no ticket, for a helper or a host.
-    let gate = Gate::default();
+    let gate = Gate::unwatched();
     assert_eq!(gate.stop(Duration::from_millis(100)), Stopped::default());
     assert!(gate.helper(&mut Command::new("true")).is_err());
     assert!(gate.host(&mut Command::new("true")).is_err());
@@ -99,11 +101,41 @@ fn a_start_after_a_signal_is_refused_before_any_stop() {
 }
 
 #[test]
+fn a_helper_that_would_inherit_the_clients_stderr_is_ended_and_refused() -> R {
+    // 设计修正 2, corrections after its second implementation review, 5 (CLT-1352): a helper's stderr is a pipe or
+    // null, never the client's fd 2; one that inherits it is ended and its start fails. (This test process's own fd 2
+    // stands for the client's; when it is the null device there is nothing to tell apart.)
+    let ours = rustix::fs::fstat(std::io::stderr())?;
+    if rustix::fs::FileType::from_raw_mode(ours.st_mode) == rustix::fs::FileType::CharacterDevice {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: this test's stderr is a character device"
+        );
+        return Ok(());
+    }
+    let gate = Gate::unwatched();
+    let refused = gate.helper(Command::new("sleep").arg("30"));
+    assert!(refused.is_err(), "a helper inheriting fd 2 was started");
+    let helpers = gate.locked().helpers.clone();
+    assert_eq!(helpers.len(), 1);
+    assert!(
+        helpers[0].reaped(),
+        "the refused helper was not ended and reaped"
+    );
+    for stderr in [std::process::Stdio::null(), std::process::Stdio::piped()] {
+        let helper = gate.helper(Command::new("true").stderr(stderr))?;
+        assert!(helper.shared.end(Duration::from_secs(5)).is_some());
+    }
+    Ok(())
+}
+
+#[test]
 fn the_stop_kills_every_registered_helper_and_its_group_and_reaps_it() -> R {
     // A and A2: a registered helper's group and leader are killed, then it is reaped through its handle.
     let dir = tempfile::tempdir()?;
     let member = dir.path().join("member");
-    let gate = Gate::default();
+    let gate = Gate::unwatched();
     let helper = gate.helper(&mut with_member(&member))?;
     let member = written_pid(&member)?;
     let stopped = gate.stop(Duration::from_millis(1500));
@@ -120,7 +152,7 @@ fn a_start_in_flight_when_the_stop_begins_is_killed_at_its_hand_off() -> R {
     // flight, whose hand-off kills it; then the stop reaps it. Nothing is left.
     let dir = tempfile::tempdir()?;
     let member = dir.path().join("member");
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::unwatched());
     let (spawned, held) = std::sync::mpsc::channel::<()>();
     let (release, go) = std::sync::mpsc::channel::<()>();
     let go = Mutex::new(go);
@@ -159,7 +191,7 @@ fn a_start_in_flight_when_the_stop_begins_is_killed_at_its_hand_off() -> R {
 fn a_start_still_in_flight_at_the_bound_is_reported_not_claimed() -> R {
     // A (CLT-400): a start held past the stop's bound is reported as in flight; when it hands off later (the process
     // still alive here) it kills what it started.
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::unwatched());
     let (spawned, held) = std::sync::mpsc::channel::<u32>();
     let (release, go) = std::sync::mpsc::channel::<()>();
     let go = Mutex::new(go);
@@ -197,7 +229,7 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
     // A (CLT-504, CLT-651, CLT-750): a spawn that fails, a spawn that panics before it returns, a spawn that panics
     // after it started its process, and a spawn that succeeds each count their start down exactly once (another
     // start held in flight throughout, so a second count-down would show); only a spawned helper registers.
-    let gate = Gate::default();
+    let gate = Gate::unwatched();
     let held_helper = gate.take(Kind::Helper)?;
     let held_host = gate.take(Kind::Host)?;
     let failed = gate.helper_by(&mut Command::new("true"), &|_| {
@@ -235,7 +267,11 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
     });
     assert!(host_failed.is_err());
     assert_eq!(gate.counts(), (1, 1, 1, 0));
-    let helper = gate.helper(Command::new("sleep").arg("30"))?;
+    let helper = gate.helper(
+        Command::new("sleep")
+            .arg("30")
+            .stderr(std::process::Stdio::null()),
+    )?;
     assert_eq!(gate.counts(), (1, 1, 2, 0));
     drop((held_helper, held_host));
     assert_eq!(gate.counts(), (0, 0, 2, 0));
@@ -251,7 +287,7 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
 fn a_host_is_handed_off_and_never_signalled_by_the_stop() -> R {
     // A (CLT-502, CLT-650): a host started through the gate is recorded, not registered as a helper; the stop and
     // dropping its object leave it running.
-    let gate = Gate::default();
+    let gate = Gate::unwatched();
     let host = gate.host(Command::new("sleep").arg("30"))?;
     let pid = host.id();
     let stopped = gate.stop(Duration::from_millis(300));
@@ -267,7 +303,7 @@ fn a_host_is_handed_off_and_never_signalled_by_the_stop() -> R {
 fn a_host_start_in_flight_when_the_stop_begins_completes_and_is_handed_off() -> R {
     // A (S1, CLT-502): a host whose ticket was taken before the stop completes and lives on; the stop counts it as a
     // host start, never as a helper.
-    let gate = Arc::new(Gate::default());
+    let gate = Arc::new(Gate::unwatched());
     let (taken, held) = std::sync::mpsc::channel::<()>();
     let (release, go) = std::sync::mpsc::channel::<()>();
     let go = Mutex::new(go);
@@ -300,13 +336,14 @@ fn a_helper_started_through_the_gate_keeps_the_attempt_id_it_inherits() -> R {
     // helpers unchanged, so the outer host's REQ-043 tracking still finds them; the gate neither removes nor replaces
     // it (nor clears the environment).
     use std::io::Read as _;
-    let gate = Gate::default();
+    let gate = Gate::unwatched();
     let mut helper = gate.helper(
         Command::new("sh")
             .arg("-c")
             .arg("printf %s \"$HOH_ATTEMPT_ID\"")
             .env("HOH_ATTEMPT_ID", "R-1/T-2/A-954")
-            .stdout(std::process::Stdio::piped()),
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
     )?;
     let mut said = String::new();
     helper
@@ -361,8 +398,8 @@ fn the_sweep_kills_a_descendant_that_left_its_group_and_ends_on_a_clean_scan() -
 
 #[test]
 fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() -> R {
-    // B: a descendant that is a zombie (its parent never reaps it) has ended: the scan skips it and ends clean at once,
-    // never killing the root. With its bound already come, one pass kills what it finds and reports it, not claimed.
+    // B: a descendant that is a zombie with no thread left (its parent never reaps it; its pidfd readable) has ended:
+    // the scan confirms it and ends clean at once, never killing the root (CLT-1300: by its pidfd, not by its Z). With its bound already come, one pass kills what it finds and reports it, not claimed.
     let root = Direct::plain().helper(
         Command::new("sh")
             .arg("-c")

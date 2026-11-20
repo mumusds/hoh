@@ -37,6 +37,9 @@ pub mod handoff;
 pub mod ids;
 #[forbid(clippy::disallowed_methods)]
 pub mod integer;
+/// The names the client and the host share (docs/adr/ADR-031.md, 设计修正 2).
+#[forbid(clippy::disallowed_methods)]
+pub mod layout;
 #[forbid(clippy::disallowed_methods)]
 pub mod lifecycle;
 #[forbid(clippy::disallowed_methods)]
@@ -65,6 +68,9 @@ pub mod state_dir;
 pub mod supervise;
 #[forbid(clippy::disallowed_methods)]
 pub mod time;
+/// The host's systemd user unit and the installation a running hoh holds (docs/adr/ADR-023.md).
+#[forbid(clippy::disallowed_methods)]
+pub mod unit;
 #[forbid(clippy::disallowed_methods)]
 pub mod verification;
 

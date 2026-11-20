@@ -1,0 +1,35 @@
+[package]
+name = "hoh-client"
+description = "HoH client: the TUI, -p, attach and doctor, with no dependency on the host's crate (docs/adr/ADR-031.md)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hoh_client"
+path = "src/lib.rs"
+
+[dependencies]
+hoh-core = { path = "../hoh-core" }
+hoh-agents = { path = "../hoh-agents" }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "process", "rand", "stdio"] }
+httparse = "1.10.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+signal-hook = "0.3.18"
+unicode-segmentation = "1.13.3"
+tokio = { version = "1.53.3", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "time", "io-util", "signal"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Only the unit tests that start an in-process host; never a normal dependency (docs/adr/ADR-031.md, the client's
+# crate boundary).
+hoh-app = { path = "../hoh-app" }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "fs", "process", "pty", "termios"] }
+tempfile = "3.27.0"
+unicode-width = "0.2.3"

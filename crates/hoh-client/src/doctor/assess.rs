@@ -164,7 +164,7 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
 /// The Commander's read-only workspace profile on `agent`, probed as `entry` (docs/adr/ADR-032.md decisions 4 and 7):
 /// the parts the registry judges it by, each by the registry's own function — the probe rule (the entry's), the
 /// read-only builder on the tested help (`claude::read_only_missing`, `pi::read_only_missing`; codex's builds on its
-/// App Server only), the compat manifest's read_only case for this version (`agents::read_only_case`) and, for codex on
+/// App Server only), the compat manifest's read_only case for this version (`hoh_agents::compat::read_only_case`) and, for codex on
 /// its App Server, this host's check of its sandbox (`probe::codex_sandbox_check`) — and `workspace` their Kleene
 /// conjunction, as `granted` has it.
 pub(super) fn read_only(
@@ -182,7 +182,7 @@ pub(super) fn read_only(
         Agent::Claude => help().map(|h| hoh_agents::claude::read_only_missing(&h).is_none()),
         Agent::Pi => help().map(|h| hoh_agents::pi::read_only_missing(&h).is_none()),
     };
-    let suite_case = hoh_app::host::agents::read_only_case(
+    let suite_case = hoh_agents::compat::read_only_case(
         manifest,
         agent,
         entry,

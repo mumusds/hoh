@@ -6,9 +6,12 @@
 //! client's one stderr writer, made as the state is registered (设计修正 2, C; rule 6).
 
 use crate::exit::{ClientEvent, client_code};
-use crate::owned::{Gate, Stopped};
+/// The one start gate (A): a module of the signal state's, so only the signal state makes it (CLT-1301).
+mod owned;
+
 use crate::stderr::{MakeSink, Writer};
 use hoh_core::spawn::Spawner;
+use owned::{Gate, Stopped};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -96,10 +99,18 @@ pub fn current() -> Option<&'static State> {
     STATE.get()
 }
 
-/// The spawner of a client's processes: its registered signal state's start gate; with none registered (a unit test of
-/// another part), a gate of its own, which nothing stops (设计修正 2, A: library code is always given one).
+/// The spawner of a client's processes: its registered signal state's start gate, the one gate there is; with none
+/// registered, a spawner that starts nothing (in a unit test of another part, a gate of its own: 设计修正 2, A, CLT-1301).
 pub fn spawner() -> Arc<dyn Spawner> {
-    current().map_or_else(|| Arc::new(Gate::default()), State::spawner)
+    match current() {
+        Some(state) => state.spawner(),
+        // The one gate is the signal state's (CLT-1301): with none registered nothing is started, but in a unit test
+        // of another part.
+        #[cfg(not(test))]
+        None => hoh_core::spawn::NoStart::shared(),
+        #[cfg(test)]
+        None => Arc::new(Gate::unwatched()),
+    }
 }
 
 /// The exit code of signal number `signal`: SIGTERM 143, SIGHUP 129, SIGINT 130 (REQ-004).

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hoh-core", "crates/hoh-agents", "crates/hoh-app"]
+members = ["crates/hoh-core", "crates/hoh-agents", "crates/hoh-client", "crates/hoh-app"]
 
 [workspace.package]
 version = "0.0.0"

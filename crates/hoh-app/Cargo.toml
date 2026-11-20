@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 hoh-core = { path = "../hoh-core" }
 hoh-agents = { path = "../hoh-agents" }
+hoh-client = { path = "../hoh-client" }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
