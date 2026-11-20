@@ -234,10 +234,10 @@ fn the_exit_ends_within_its_bound_when_stderr_takes_nothing() {
 }
 
 #[test]
-fn a_writer_that_ended_leaves_what_it_did_not_write_to_the_exits_direct_write() {
+fn a_writer_that_ended_leaves_what_it_did_not_write_to_the_exits_replacement() {
     // C (CLT-1203): stderr breaks under the writer partway through the client's first line (a short write, then
     // EPIPE). The writer ends; the line stays queued from where it stopped, so the exit, finding the writer gone,
-    // writes the rest of it and the client's later words from a short-lived thread of its own (the first written
+    // writes the rest of it and the client's later words with a replacement writer of its own (the first written
     // exception), dropping progress as any exit does. Before, the line the writer had taken was lost.
     let kept = Kept::default();
     *kept
@@ -326,6 +326,57 @@ fn a_late_sentence_during_the_exits_wait_goes_next_and_is_written() {
     assert_eq!(
         kept.text(),
         "hoh: first\nhoh: 收到信号，没有提交命令\nhoh: second\n"
+    );
+}
+
+#[test]
+fn a_late_signal_while_the_replacement_writer_writes_goes_after_its_unit() {
+    // C (CLT-1302): the writer ended on its first write (EPIPE); at the exit its replacement is held in the first
+    // 4 KiB unit of a 10000-byte line when a signal comes: the wait still looks at it, and the sentence comes right
+    // after that unit, before the rest of the line.
+    let kept = Kept::default();
+    *kept
+        .breaks_after
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(0);
+    let writer = kept.writer();
+    let long = "L".repeat(10_000);
+    writer.own(&long);
+    let end = Instant::now() + Duration::from_secs(5);
+    while !writer.locked().ended && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(writer.locked().ended, "the writer ended");
+    kept.broken.store(false, Ordering::SeqCst);
+    kept.held.store(true, Ordering::SeqCst);
+    writer.close(&[]);
+    let came = Arc::new(AtomicBool::new(false));
+    let once = AtomicBool::new(false);
+    let done = {
+        let (writer, came) = (writer.clone(), came.clone());
+        std::thread::spawn(move || {
+            writer.wait(Instant::now() + Duration::from_secs(5), &|| {
+                (came.load(Ordering::SeqCst) && !once.swap(true, Ordering::SeqCst))
+                    .then(|| "hoh: SIGNAL_FRONT".to_owned())
+            });
+        })
+    };
+    while writer.locked().unit_end.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    came.store(true, Ordering::SeqCst);
+    while writer.locked().entries.len() < 3 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    kept.held.store(false, Ordering::SeqCst);
+    done.join().expect("the wait");
+    assert_eq!(
+        kept.text(),
+        format!(
+            "{}hoh: SIGNAL_FRONT\n{}\n",
+            "L".repeat(UNIT),
+            "L".repeat(10_000 - UNIT)
+        )
     );
 }
 
