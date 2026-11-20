@@ -112,17 +112,27 @@ pub(super) fn run_named(
     probe: &ProbeCommand,
     inject: &dyn Fn(Step) -> Result<(), String>,
 ) -> Result<(), PersistError> {
-    let private = Private::make_first(names).map_err(|(path, e)| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
+    let private = Private::make_first(names).map_err(|not| {
+        if let Some(left) = not.leftover() {
+            // Made, then not usable: not "cannot create"; it stays, told (F7-501).
+            PersistError::WalUnsupported {
+                step: Step::Open.name(),
+                detail: format!(
+                    "cannot use {}, the self-test's directory made just now: {}; {left}",
+                    not.path.display(),
+                    not.error
+                ),
+            }
+        } else if not.error.kind() == std::io::ErrorKind::AlreadyExists {
             PersistError::WalUnsupported {
                 step: Step::Open.name(),
                 detail: format!(
                     "every name tried for the self-test's directory exists already, the last {}",
-                    path.display()
+                    not.path.display()
                 ),
             }
         } else {
-            not_created(dir, &path, &e)
+            not_created(dir, &not.path, &not.error)
         }
     })?;
     let result = steps(&private.path().join(DB_NAME), probe, inject);

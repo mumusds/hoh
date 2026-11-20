@@ -655,7 +655,7 @@ fn full_a_file_of_the_self_test_that_cannot_be_removed_is_reported_with_its_path
         );
         for path in &left {
             assert!(
-                stderr.contains(&path.display().to_string()),
+                stderr.contains(&format!("{} is left, not removed", path.display())),
                 "{why}: {} left but not told in {stderr}",
                 path.display()
             );
@@ -687,9 +687,11 @@ fn swap_leaves_the_outside_alone(
     std::fs::create_dir(&victim)?;
     std::fs::write(victim.join("sentinel"), "SENTINEL\n")?;
     let arm = project.root.join("io-fault-arm");
+    let swapped = project.root.join("swapped-path");
     let mut env = vec![
         ("LD_PRELOAD", io_fault_shim(&project.root)?.into_os_string()),
         ("F7_RIVAL_VICTIM", victim.clone().into_os_string()),
+        ("F7_RIVAL_RECORD", swapped.clone().into_os_string()),
         ("F7_RIVAL_PARENT", "1".into()),
     ];
     env.extend(rival.map(|(k, v)| (k, v.into())));
@@ -708,6 +710,17 @@ fn swap_leaves_the_outside_alone(
     };
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     project.stop_host()?;
+    if rival.contains(&("F7_RIVAL_OP", "mkdir")) {
+        let path = std::fs::read_to_string(&swapped)?;
+        assert!(
+            !path.is_empty(),
+            "the shim must record the swapped directory"
+        );
+        assert!(
+            stderr.contains(&format!("{path} is left, not removed")),
+            "{why}: {path} not reported as a leftover in {stderr}"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(victim.join("sentinel"))
             .ok()
@@ -716,6 +729,23 @@ fn swap_leaves_the_outside_alone(
         "{why}: the file outside the private directory: {}",
         text(&out)
     );
+    // The name swapped in `.hoh`, no longer a directory of the call's, is told as left (F7-501, F7-504).
+    for entry in std::fs::read_dir(project.hoh_dir())? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if (name.starts_with(".hoh-wal-selftest-") || name.starts_with("state.db-room-"))
+            && path.is_symlink()
+        {
+            assert!(
+                stderr.contains(&format!("{} is left, not removed", path.display())),
+                "{why}: {} not told in {stderr}",
+                path.display()
+            );
+        }
+    }
     assert_ne!(out.status.code(), Some(0), "{why}: {}", text(&out));
     for words in says {
         assert!(stderr.contains(words), "{why}: `{words}` not in {stderr}");
@@ -740,7 +770,38 @@ fn full_a_private_directory_swapped_for_a_symlink_right_after_it_is_made_takes_n
         ],
         &[],
         false,
-        &["DB_WAL_UNSUPPORTED", "at open"],
+        &[
+            "DB_WAL_UNSUPPORTED",
+            "at open",
+            "the self-test's directory made just now",
+        ],
+    )
+}
+
+#[test]
+fn full_a_room_probes_directory_swapped_for_a_symlink_right_after_it_is_made_is_told() -> R {
+    // F7-501: the room probe's directory, swapped right after its mkdir, cannot be used; it is told with its path,
+    // and room is not known.
+    swap_leaves_the_outside_alone(
+        "the self-test's room probe, right after mkdir",
+        [
+            ("F7_RIVAL_OP", "mkdir"),
+            ("F7_RIVAL_ON", ""),
+            ("F7_RIVAL_DO", "swapself"),
+        ],
+        &[
+            ("F7_RIVAL_HAS", ".db-room-"),
+            ("F7_IO_OP", "sync"),
+            ("F7_IO_SUFFIX", "-wal"),
+            ("F7_IO_ERRNO", "122"),
+        ],
+        false,
+        &[
+            "DB_WAL_UNSUPPORTED",
+            "room not known",
+            ".db-room-",
+            "is left, not removed",
+        ],
     )
 }
 

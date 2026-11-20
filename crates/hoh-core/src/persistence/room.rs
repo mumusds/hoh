@@ -51,16 +51,28 @@ impl Seen {
 /// compressing file system must allocate them too) and an fsync, and the directory is removed with it; what cannot be
 /// removed is told.
 pub(super) fn probe(base: &Path) -> Seen {
-    let private =
-        match names(base, 8).and_then(|names| Private::make_first(names).map_err(|(_, e)| e)) {
-            Ok(private) => private,
-            Err(e) => {
-                return Seen {
-                    written: Err(e),
-                    left: Vec::new(),
-                };
-            }
-        };
+    let private = match names(base, 8) {
+        Ok(names) => Private::make_first(names),
+        Err(error) => {
+            return Seen {
+                written: Err(error),
+                left: Vec::new(),
+            };
+        }
+    };
+    let private = match private {
+        Ok(private) => private,
+        // A directory made and not usable is left and told, with its path (F7-501).
+        Err(not) => {
+            return Seen {
+                left: not.leftover().into_iter().collect(),
+                written: Err(std::io::Error::new(
+                    not.error.kind(),
+                    format!("{}: {}", not.path.display(), not.error),
+                )),
+            };
+        }
+    };
     let mut bytes = vec![0u8; BYTES];
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
     for chunk in bytes.chunks_mut(8) {

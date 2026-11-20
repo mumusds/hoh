@@ -18,8 +18,9 @@
  *                  (EINTR: SQLite retries it, and the errno of the failed call is gone when SQLite returns)
  *   F7_IO_NTH      optional: the first fault at the Nth matching call, not the first (default 1)
  *   F7_RIVAL_OP, F7_RIVAL_ON  optional: once, at the first `op` (pwrite, write, sync, truncate, pread, open: just
- *                  before it, or close, mkdir: just after it) of a matching path that ends with F7_RIVAL_ON, another
- *                  process acts (F7_RIVAL_PARENT: not in the probe process), as F7_RIVAL_DO says:
+ *                  before it, or close, mkdir: just after it) of a matching path that ends with F7_RIVAL_ON (and holds
+ *                  F7_RIVAL_HAS, if set), another process acts (F7_RIVAL_PARENT: not in the probe process), as F7_RIVAL_DO
+ *                  says:
  *                  file (the default) makes a file of its own, holding "FOREIGN-CREATOR-DATA\n", named as that file with
  *                  F7_RIVAL_ON replaced by F7_RIVAL_SWAP (default: the same name), in F7_RIVAL_IN (default: that file's
  *                  directory); with F7_RIVAL_REPLACE it first removes what is at that name (a delete and re-create);
@@ -60,7 +61,8 @@ static void rival(const char *path, const char *op) {
     size_t len = strlen(path);
     const char *act = getenv("F7_RIVAL_DO");
     if (rival_done || !kind || !on || strcmp(kind, op) != 0 || len < strlen(on) ||
-        strcmp(path + len - strlen(on), on) != 0 || (getenv("F7_RIVAL_PARENT") && getenv("HOH_WAL_PROBE_DB"))) {
+        strcmp(path + len - strlen(on), on) != 0 || (getenv("F7_RIVAL_PARENT") && getenv("HOH_WAL_PROBE_DB")) ||
+        (getenv("F7_RIVAL_HAS") && !strstr(path, getenv("F7_RIVAL_HAS")))) {
         return;
     }
     rival_done = 1;
@@ -77,6 +79,17 @@ static void rival(const char *path, const char *op) {
         }
         memcpy(dir, path, (size_t)(slash - path));
         dir[slash - path] = 0;
+        /* Keep the exact swapped path for assertions, even if an outer cleanup removes its name. */
+        const char *record = getenv("F7_RIVAL_RECORD");
+        if (record) {
+            int fd = real_open(record, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+            if (fd >= 0) {
+                if (real_write(fd, dir, strlen(dir)) < 0) {
+                    /* The test will fail if the record is missing or incomplete. */
+                }
+                close(fd);
+            }
+        }
         if (strcmp(act, "chmod") == 0) {
             chmod(dir, 0500);
             return;
