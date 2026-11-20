@@ -1,0 +1,43 @@
+{
+ "paths": {
+  "P": "<P>",
+  "T": "<T>",
+  "W": "<W>"
+ },
+ "diff": {
+  "added": [
+   "P/.git/hoh-patch-create",
+   "P/.git/hoh-shell-create",
+   "P/.hoh/hoh-patch-create",
+   "P/.hoh/hoh-shell-create",
+   "P/hoh-patch-create",
+   "P/hoh-shell-create",
+   "P/hoh-tool-create",
+   "W/hoh-patch-create",
+   "W/hoh-shell-create"
+  ],
+  "changed": [
+   "P/.git/hoh-patch-modify",
+   "P/.git/hoh-shell-modify",
+   "P/.hoh/hoh-patch-modify",
+   "P/.hoh/hoh-shell-modify",
+   "P/hoh-patch-modify",
+   "P/hoh-shell-modify",
+   "W/hoh-patch-modify",
+   "W/hoh-shell-modify"
+  ],
+  "removed": [
+   "P/.git/hoh-patch-delete",
+   "P/.git/hoh-shell-delete",
+   "P/.hoh/hoh-patch-delete",
+   "P/.hoh/hoh-shell-delete",
+   "P/hoh-patch-delete",
+   "P/hoh-shell-delete",
+   "W/hoh-patch-delete",
+   "W/hoh-shell-delete"
+  ]
+ },
+ "token_sha256": "c536b48b4ce22aee7fcc734a15c62564b35e580793d4009180dfc029444f7dae",
+ "nonce": "hoh-wake-a61d3a5149ef9860",
+ "source": ".hoh-dev/evidence/commander-readonly/live-20261117T101410Z/commander/codex/try-1/control/control.diff.json"
+}

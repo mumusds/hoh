@@ -184,3 +184,18 @@ carries raw response items; the patch refusals are read from the rollout as befo
 same as in runs 20261116T180821Z and 20261116T201950Z: the read-only threads report `sandbox.type` readOnly, the
 driver's twelve lines are `Read-only file system`, every patch is refused in the rollout, the snapshot is unchanged;
 the control writes every cell. These codex cases are the codex excerpts now; the earlier codex recordings stay local.
+
+## TEST-021-07's codex recordings (`excerpts/codex-live/`, design correction 8)
+
+Not spike runs: the codex segment of TEST-021-07 as the product recorded it (`commander_live_read_only_turns`, the
+judge's layout `try-N/{round-1,round-2,control}/`), from the two adapter-live runs of candidate m2t20-001
+(`.hoh-dev/evidence/m2t20-001-d9bcbf9/` and `m2t20-001/`, `adapter-live/artifacts/commander/codex`, three tries each)
+and a local run (`.hoh-dev/evidence/commander-readonly/live-20261117T101410Z/commander/codex`, one try): codex
+0.166.0's code mode writing the same calls in four forms the S0 recording did not have (exec_command without
+max_output_tokens, a discovery over ALL_TOOLS, `const` then `text()`, several statements in one script). Written by
+`excerpt.py --live <label>=<segment dir>...` (label = the run directory's name), every JSON-lines file excerpted and
+redacted as above with the header's source relative to the repository, observations.json redacted, diff.json's paths
+replaced by `<P>`, `<W>`, `<T>`; `excerpt_check.py` checks them with the others. commander_live.rs
+`the_read_only_judge_on_the_code_mode_recording` judges every try from the tree: both read-only rounds PASS, the
+full-access control judged as a read-only round FAILs (the same verdicts as on the raw recordings), every code-mode
+call is a script of the grammar, and each of the four forms occurs (12, 7, 4 and 4 calls).

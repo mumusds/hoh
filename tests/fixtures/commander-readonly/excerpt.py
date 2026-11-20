@@ -24,7 +24,16 @@ The first line of an excerpt is a header: the source file and its sha256, and fo
 index in the source and the sha256 of its key skeleton (excerpt_check.py checks both). Every excerpt is scanned for
 e-mail addresses, keys and tokens before anything is written; a hit writes nothing (exit 1).
 
+With --live, the directories given are TEST-021-07 segments (`<HOH_LIVE_OUT>/commander/<agent>`, the judge's
+layout: each try-N/{round-1,round-2,control}/ with stdout.jsonl, rollout.jsonl, stdin.jsonl, observations.json and
+diff.json, the control's prefixed "control.") and are written in the same layout under
+<out>/<agent>-live/<label>/try-N/..., each file excerpted and redacted as above (the paths of diff.json become <P>,
+<W>, <T>; a header's source is the raw file's path relative to the repository): ADR-032 design correction 8's
+recording of codex's code mode, judged by the Rust judge from the tree (commander_live.rs
+`the_read_only_judge_on_the_code_mode_recording`).
+
 Usage: python3 tests/fixtures/commander-readonly/excerpt.py <spike run dir>... [--out tests/fixtures/commander-readonly/excerpts]
+       python3 tests/fixtures/commander-readonly/excerpt.py --live <label>=<segment dir>... [--out …]
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sys
@@ -272,13 +281,48 @@ def excerpt_case(case_dir: Path, agent: str, run: Path) -> dict[str, str]:
     return out
 
 
+def excerpt_live_round(round_dir: Path, agent: str, prefix: str, source: str) -> dict[str, str]:
+    """One round of a TEST-021-07 segment in the judge's layout, excerpted file by file (see the module's head)."""
+    side = json.loads((round_dir / f'{prefix}diff.json').read_text())
+    subst = sorted(((v, f'<{k}>') for k, v in side['paths'].items()), key=lambda kv: -len(kv[0]))
+    subst += [(os.path.expanduser('~'), '<HOME>')]
+    out = {}
+    for name, keep, kept in (('stdout.jsonl', KEEP[agent], 'the lines the ADR-032 evidence table reads'),
+                             ('rollout.jsonl', keep_rollout, "the thread's rollout: turn boundaries, contexts, tool calls and outputs"),
+                             ('stdin.jsonl', lambda f: True, 'every request and notification the adapter wrote')):
+        path = round_dir / f'{prefix}{name}'
+        if path.is_file():
+            out[f'{prefix}{name}'] = excerpt_file(path, f'{source}/{prefix}{name}', keep, subst, kept)
+    observations = json.loads((round_dir / f'{prefix}observations.json').read_text())
+    out[f'{prefix}observations.json'] = json.dumps(redact(observations, subst), ensure_ascii=False, indent=1) + '\n'
+    out[f'{prefix}diff.json'] = json.dumps({'paths': {k: f'<{k}>' for k in side['paths']},
+                                           'diff': redact(side['diff'], subst), 'token_sha256': side['token_sha256'],
+                                           'nonce': side.get('nonce'), 'source': f'{source}/{prefix}diff.json'},
+                                          ensure_ascii=False, indent=1) + '\n'
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('runs', type=Path, nargs='+')
+    ap.add_argument('runs', nargs='+')
     ap.add_argument('--out', type=Path, default=HERE / 'excerpts')
+    ap.add_argument('--live', action='store_true', help='the arguments are <label>=<TEST-021-07 segment dir>')
     args = ap.parse_args()
     staged: dict[Path, str] = {}
-    cases = [(run, agent, case_dir) for run in args.runs for agent in KEEP
+    if args.live:
+        for spec in args.runs:
+            label, _, segment = spec.partition('=')
+            segment = Path(segment).resolve()
+            agent = segment.name
+            for attempt in sorted(segment.glob('try-*')):
+                for name, prefix in (('round-1', ''), ('round-2', ''), ('control', 'control.')):
+                    if (attempt / name).is_dir():
+                        # The source as excerpt_check.py finds it: relative to the repository (the recordings are local).
+                        source = os.path.relpath(attempt / name, REPO)
+                        for file, text in excerpt_live_round(attempt / name, agent, prefix, source).items():
+                            staged[args.out / f'{agent}-live' / label / attempt.name / name / file] = text
+    runs = [] if args.live else [Path(r) for r in args.runs]
+    cases = [(run, agent, case_dir) for run in runs for agent in KEEP
              for case_dir in (sorted((run / agent).glob('*')) if (run / agent).is_dir() else [])]
     for run, agent, case_dir in cases:
         for kind, text in excerpt_case(case_dir, agent, run).items():

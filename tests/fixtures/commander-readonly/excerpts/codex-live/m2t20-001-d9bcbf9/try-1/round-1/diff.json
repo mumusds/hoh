@@ -1,0 +1,15 @@
+{
+ "paths": {
+  "P": "<P>",
+  "T": "<T>",
+  "W": "<W>"
+ },
+ "diff": {
+  "added": [],
+  "changed": [],
+  "removed": []
+ },
+ "token_sha256": "c9b40f3d3886b342aa0d4446b537e1cfc6b9c4a3e150f2cff7ea8632aedf604d",
+ "nonce": "hoh-wake-010af459449bdef4",
+ "source": ".hoh-dev/evidence/m2t20-001-d9bcbf9/adapter-live/artifacts/commander/codex/try-1/round-1/diff.json"
+}

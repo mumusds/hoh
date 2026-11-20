@@ -1,0 +1,13 @@
+{
+ "exit": {
+  "how": "exited",
+  "returncode": 0
+ },
+ "launch": {
+  "model": null,
+  "profile": "read_only",
+  "resume": "<uuid-350>"
+ },
+ "logs_complete": true,
+ "version": "0.166.0"
+}

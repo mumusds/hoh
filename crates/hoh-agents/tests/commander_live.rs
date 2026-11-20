@@ -175,6 +175,67 @@ fn the_read_only_judge_on_every_generated_variant() -> R {
     Ok(())
 }
 
+#[test]
+fn the_read_only_judge_on_the_code_mode_recording() -> R {
+    // ADR-032 design correction 8: codex 0.166.0's code mode as TEST-021-07 recorded it (three runs, seven tries),
+    // committed as redacted excerpts in the judge's layout (excerpt.py --live). Each try's two read-only rounds PASS
+    // and its full-access control judged as a read-only round FAILs, as on the raw recording; every code-mode call
+    // of every round and control is a script of the grammar, and the recording has each of the four forms.
+    let dir = excerpts().join("codex-live");
+    let mut tries = Vec::new();
+    for run in std::fs::read_dir(&dir)? {
+        for t in std::fs::read_dir(run?.path())? {
+            tries.push(t?.path());
+        }
+    }
+    tries.sort();
+    assert_eq!(tries.len(), 7, "{tries:?}");
+    let (mut no_max, mut discovery, mut constant, mut several) = (0, 0, 0, 0);
+    for t in &tries {
+        let control =
+            Case::emitted(&t.join("control"), Agent::Codex, "control.")?.ok_or("no control")?;
+        for round in ["round-1", "round-2"] {
+            let case = Case::emitted(&t.join(round), Agent::Codex, "")?.ok_or("no round")?;
+            let (verdict, why) = round_verdict(&case, Some(&control));
+            assert_eq!(verdict, Verdict::Pass, "{} {round}: {why:?}", t.display());
+        }
+        assert_eq!(
+            round_verdict(&control, Some(&control)).0,
+            Verdict::Fail,
+            "{} red",
+            t.display()
+        );
+        for (round, file) in [
+            ("round-1", "rollout.jsonl"),
+            ("round-2", "rollout.jsonl"),
+            ("control", "control.rollout.jsonl"),
+        ] {
+            for line in std::fs::read_to_string(t.join(round).join(file))?.lines() {
+                let v: Value = serde_json::from_str(line)?;
+                let p = &v["payload"];
+                if p["type"] != "custom_tool_call" {
+                    continue;
+                }
+                let src = p["input"].as_str().ok_or("an exec call without input")?;
+                let stmts = readonly::code_mode_script(src)
+                    .ok_or_else(|| format!("{} {round}: not a script: {src}", t.display()))?;
+                no_max += usize::from(
+                    src.contains("tools.exec_command(") && !src.contains("max_output_tokens"),
+                );
+                discovery += usize::from(stmts.contains(&readonly::Stmt::Discovery));
+                constant += usize::from(src.trim_start().starts_with("const "));
+                several += usize::from(stmts.len() > 1);
+            }
+        }
+    }
+    println!("forms: (i) {no_max}, (ii) {discovery}, (iii) {constant}, (iv) {several}");
+    assert!(
+        no_max > 0 && discovery > 0 && constant > 0 && several > 0,
+        "forms: (i) {no_max}, (ii) {discovery}, (iii) {constant}, (iv) {several}"
+    );
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------------------ live (S6)
 
 /// The observer in the start gate's place (adapter.rs `GateCommand`): one line from stdin, `go` starts the agent,
