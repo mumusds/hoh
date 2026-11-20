@@ -166,7 +166,8 @@ pub fn panicking(text: &str) {
 }
 
 /// Wait until the client's writer has written everything queued, `bound` at most (a debug seam that aborts right
-/// after it says why).
+/// after it says why; debug builds only).
+#[cfg(debug_assertions)]
 pub fn settle(bound: Duration) {
     if let Some(state) = crate::signals::current() {
         state.writer().drained(Instant::now() + bound);
@@ -329,7 +330,8 @@ impl Writer {
         }
     }
 
-    /// Wait until nothing is queued or being written, until `until` at most: whether so.
+    /// Wait until nothing is queued or being written, until `until` at most: whether so (debug builds only).
+    #[cfg(debug_assertions)]
     pub fn drained(&self, until: Instant) -> bool {
         let mut queue = self.locked();
         loop {

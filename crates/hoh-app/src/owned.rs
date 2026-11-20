@@ -250,7 +250,14 @@ impl Gate {
 
 impl Spawner for Gate {
     fn helper(&self, command: &mut Command) -> std::io::Result<Helper> {
-        self.helper_by(command, &|command| Direct::plain().helper(command))
+        self.helper_by(command, &|command| {
+            // Where a test holds a helper start with its ticket taken, before its spawn; and once its spawn returned,
+            // before its hand-off (debug builds only).
+            crate::debug_hold::at("helper-before-spawn");
+            let spawned = Direct::plain().helper(command);
+            crate::debug_hold::at("helper-spawned");
+            spawned
+        })
     }
 
     fn host(&self, command: &mut Command) -> std::io::Result<WaitOnly> {

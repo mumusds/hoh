@@ -539,6 +539,111 @@ fn sigint_from_outside_restores_the_terminal_and_exits_130() -> R {
 }
 
 #[test]
+fn the_tui_restores_the_terminal_before_it_says_what_its_stop_left_unfinished() -> R {
+    // ADR-031, 设计修正 2, D, the TTY order (CLT-454, CLT-955; verification 9): bare `hoh` starts a run and is attached
+    // to it; its host is killed, so the link's reader finds the host again and the start probes `systemd-run --version`
+    // (a stand-in; a fake runtime directory stands in for the user's manager), held with its ticket taken. SIGTERM: the
+    // TUI restores the terminal (attributes, alternate screen), then stops; its exit, held once the stop is done, has
+    // written nothing yet; released, it says only that a start had not returned (the TUI never writes rule 2's
+    // sentence), after the terminal was restored, and ends with 143.
+    let Some(user) = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .filter(|u| Path::new("/var/lib/systemd/linger").join(u).is_file())
+        .filter(|_| Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
+    else {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no linger record for this user, or no cgroup v2, here"
+        );
+        return Ok(());
+    };
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let _daemons = Daemons(project.path().to_path_buf());
+    // On the isolated PATH (`<home>/agents`): it knows only --version, so a scope is refused and the host is started
+    // directly; the isolated XDG_RUNTIME_DIR (`<home>/run`) gets the manager's socket path.
+    let agents = home.path().join("agents");
+    std::fs::create_dir_all(&agents)?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake = agents.join("systemd-run");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n[ \"$1\" = --version ] && echo 'systemd 259 (stand-in)' && exit 0\nexit 1\n",
+        )?;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::create_dir_all(home.path().join("run/systemd"))?;
+    std::fs::File::create(home.path().join("run/systemd/private"))?;
+    let holds = home.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    let holds_env = holds.to_str().ok_or("holds path")?;
+    let mut s = open(
+        project.path(),
+        home.path(),
+        &[("USER", &user), ("HOH_DEBUG_HOLD_DIR", holds_env)],
+    )?;
+    let outcome = (|| -> R<(usize, usize)> {
+        let from = s.pty.output().len();
+        s.pty.send(b"x\r")?;
+        s.pty.wait_for("已附着", from, WAIT)?;
+        // The next helper start is held with its ticket taken; the host goes, and the link's reader starts another.
+        std::fs::write(holds.join("helper-before-spawn"), "")?;
+        std::fs::write(holds.join("exit"), "")?;
+        let info: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            project.path().join(".hoh/host.json"),
+        )?)?;
+        let host = info["pid"]
+            .as_i64()
+            .and_then(|p| i32::try_from(p).ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("no host pid")?;
+        rustix::process::kill_process(host, Signal::KILL)?;
+        let end = std::time::Instant::now() + Duration::from_secs(30);
+        while !holds.join("helper-before-spawn.reached").exists() {
+            if std::time::Instant::now() > end {
+                return Err("the link's reader never started a helper".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        signal(&s.child, Signal::TERM)?;
+        while !holds.join("exit.reached").exists() {
+            if std::time::Instant::now() > end {
+                return Err("the TUI's exit was never reached".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Held once the stop is done: the terminal is restored, and nothing is said yet.
+        s.pty.drained(WAIT)?;
+        let out = s.pty.output();
+        let left = find(&out, LEAVE_ALT, 0).ok_or("the alternate screen was not left")?;
+        assert_eq!(s.pty.stty()?, s.baseline, "terminal attributes at the exit");
+        assert_eq!(
+            find(&out, "一次启动仍未返回".as_bytes(), 0),
+            None,
+            "said before the exit"
+        );
+        std::fs::remove_file(holds.join("exit"))?;
+        let said = s.pty.wait_for("一次启动仍未返回", left, WAIT)?;
+        Ok((left, said))
+    })();
+    // Whatever happened, nothing stays held.
+    let _ = std::fs::remove_file(holds.join("helper-before-spawn"));
+    let _ = std::fs::remove_file(holds.join("exit"));
+    let (left, said) = outcome?;
+    assert!(left < said, "said before the terminal was restored");
+    let out = s.pty.output();
+    assert_eq!(
+        find(&out, "收到信号".as_bytes(), 0),
+        None,
+        "rule 2's sentence"
+    );
+    assert_eq!(s.ended()?, Some(143));
+    Ok(())
+}
+
+#[test]
 fn a_test_that_fails_early_leaves_no_hoh_behind() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
     // Bare `hoh` starts the project's host if none runs: stopped however the test ends.

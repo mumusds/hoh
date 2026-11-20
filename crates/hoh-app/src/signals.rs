@@ -158,6 +158,8 @@ impl State {
             self.gate.refuse();
             unit.clone()
         };
+        // Where a test sees that the stop began (debug builds only).
+        crate::debug_hold::mark("stopping", "");
         (self.gate.stop(HELPERS_WAIT), unit)
     }
 

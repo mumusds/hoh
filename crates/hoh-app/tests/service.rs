@@ -931,6 +931,60 @@ fn a_start_still_running_at_the_clients_deadline_is_reported_as_such_and_goes_on
 }
 
 #[test]
+fn a_signal_while_the_unit_start_runs_says_it_was_interrupted_and_leaves_the_unit_to_its_manager()
+-> R {
+    // ADR-031, 设计修正 2, A and D (CLT-753, CLT-754, CLT-1008; verification 13): the installed client's
+    // `systemctl --user start` is a helper; SIGTERM while it runs (a drop-in makes the start take 3 s, and the test
+    // waits for the unit to be activating) ends the client with 143, its exit saying the unit's start was interrupted
+    // and its result unknown, pointing at `systemctl --user status`. The client stops only its own `systemctl`: the
+    // unit is not stopped, and the start goes on in the manager until the host is ready under it.
+    let (mut manager, project) = installed(true)?;
+    let unit = unit_of(&project);
+    dropin(
+        &manager,
+        "slow.conf",
+        "[Service]\nExecStartPre=/bin/sleep 3\n",
+    )?;
+    let mut client = manager
+        .command(manager.home().join(".local/bin/hoh"))
+        .args(["-p", "x", "--detach", "--output", "json"])
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let activating = manager.wait_until(
+        "the client's start of the unit to run",
+        Duration::from_secs(10),
+        |m| Ok(m.property(&unit, "ActiveState")? == "activating"),
+    );
+    if let Err(e) = activating {
+        let _ = client.kill();
+        let _ = client.wait();
+        return Err(e);
+    }
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&client),
+        rustix::process::Signal::TERM,
+    )?;
+    let started = std::time::Instant::now();
+    let out = output_within(client, Duration::from_secs(10))?;
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(143), "{}", text(&out));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert!(out.stdout.is_empty(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8(out.stderr)?,
+        format!(
+            "hoh: 收到信号，没有提交命令\nhoh: unit {unit} 的启动被打断，结果未知；见 systemctl --user status {unit}\n"
+        )
+    );
+    // Not stopped by the client: the manager's start goes on and the host is ready under the unit.
+    ready_under_the_unit(&mut manager, &unit, &project)?;
+    Ok(())
+}
+
+#[test]
 fn a_host_its_unit_ends_with_a_refusal_ends_the_client_with_78_and_the_hosts_line() -> R {
     // M2T14R-53 (ADR-023 decision 6, M2T06R-60): a host that refuses its database (here newer than it knows: 78, not
     // restarted) ends the client with 78 and its line, as a host started directly does; a client that judged the

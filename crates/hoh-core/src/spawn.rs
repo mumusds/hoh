@@ -101,9 +101,17 @@ impl Helper {
     /// as the adapters' supervisor has always ended it (M1T07R-103): its group killed, then its leader, then reaped
     /// within [`END_WAIT`], its pid and group id fixed until then because it is not reaped (CLT-700).
     pub fn spawn(command: &mut Command) -> io::Result<Helper> {
+        Helper::spawn_by(command, &|pid| Ok(pidfd_open(pid, PidfdFlags::empty())?))
+    }
+
+    /// [`Helper::spawn`] with `open` opening the child's pidfd (a test's seam for its failure).
+    fn spawn_by(
+        command: &mut Command,
+        open: &dyn Fn(Pid) -> io::Result<OwnedFd>,
+    ) -> io::Result<Helper> {
         let mut child = command.process_group(0).spawn()?;
         let pid = Pid::from_child(&child);
-        let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        let pidfd = match open(pid) {
             Ok(fd) => fd,
             Err(e) => {
                 let _ = kill_process_group(pid, Signal::KILL);
@@ -112,7 +120,7 @@ impl Helper {
                 while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
         Ok(Helper::own(&mut child, pid, pidfd))

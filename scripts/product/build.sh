@@ -5,6 +5,14 @@ cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 # shellcheck source=scripts/product/build-commit.sh
 source scripts/product/build-commit.sh
 executable="$(bash scripts/product/release-exe.sh)"
+# The debug-only test seams (docs/adr/ADR-031.md, 设计修正 2, verification: hold points that wait on marker files;
+# ADR-014 decision 8: the TUI's panic and restore gates) are not in the release binary: none of their names is in it.
+for seam in HOH_DEBUG_HOLD_DIR HOH_DEBUG_TUI_PANIC HOH_DEBUG_TUI_RESTORE_GATE; do
+  if grep -aq "$seam" "$executable"; then
+    echo "build: the release binary holds the debug-only seam $seam" >&2
+    exit 1
+  fi
+done
 if [[ -f web/package.json ]]; then
   npm ci --prefix web
   npm run build --prefix web

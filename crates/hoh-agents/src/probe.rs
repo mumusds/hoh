@@ -3613,6 +3613,52 @@ mod tests {
     }
 
     #[test]
+    fn a_command_whose_leader_ends_first_loses_its_groups_member_before_it_is_reaped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // docs/adr/ADR-031.md, 设计修正 2, A2 (CLT-600; verification 4, the host's half): with the plain spawner the
+        // host runs its probes with, a command answers and its leader exits 0, leaving a member of its process group
+        // running. The probe sees the exit without consuming it, kills what is left of the group while the zombie
+        // leader holds its number, and only then reaps it: the member has ended by the time the probe returns.
+        let dir = tempfile::tempdir()?;
+        let member = dir.path().join("member");
+        let env = ProbeEnv {
+            path: std::env::var_os("PATH").unwrap_or_default(),
+            fixture_root: None,
+            timeout: Duration::from_secs(10),
+            log: None,
+            deadline: None,
+            cancel: None,
+            spawner: hoh_core::spawn::Direct::shared(),
+        };
+        let script = format!(
+            "sleep 30 < /dev/null > /dev/null 2>&1 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; echo v",
+            member.display()
+        );
+        let out = run_status(Path::new("/bin/sh"), &["-c", &script], &env)?;
+        assert!(out.status.success(), "{:?}", out.status);
+        let pid: i32 = std::fs::read_to_string(&member)?.trim().parse()?;
+        // Gone, or a zombie its new parent has not reaped yet: its exit is done either way.
+        let state = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+                })
+        };
+        let end = Instant::now() + Duration::from_secs(2);
+        while state().is_some_and(|s| s != "Z" && s != "X") && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let alive = state().is_some_and(|s| s != "Z" && s != "X");
+        if alive && let Some(pid) = Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        assert!(!alive, "a member of the command's group outlived its probe");
+        Ok(())
+    }
+
+    #[test]
     fn a_stop_kills_the_commands_a_stalled_probe_started_and_starts_none()
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T07R-300 (docs/adr/ADR-022.md decision 10 v4): the stop itself kills every command a probe started, its

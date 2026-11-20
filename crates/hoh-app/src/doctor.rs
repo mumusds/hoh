@@ -419,8 +419,10 @@ fn examine(project: &Path, live: bool) -> Report {
 }
 
 /// Run doctor for `project`; the exit code. Its signal state is registered first and its examination waited for
-/// through it: a signal stops and reaps every command and live turn it started and ends it with 143, 130 or 129, no
-/// report written (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5).
+/// through it: a signal stops and reaps every command and live turn it started and ends it with 143, 130 or 129
+/// (docs/adr/ADR-031.md, the client-signal correction's addendum, rule 5). Its exit says only whether the report was
+/// written (设计修正 2, D): all of it, none of it (the examination ended by the signal), or not all of it (stdout
+/// failed); never rule 2's sentence, never that it stopped anything.
 pub fn run(project: &Path, live: bool, json_output: bool) -> u8 {
     let state = match crate::signals::register() {
         Ok(state) => state,
@@ -432,13 +434,27 @@ pub fn run(project: &Path, live: bool, json_output: bool) -> u8 {
     let dir = project.to_path_buf();
     let report = match state.wait(move || examine(&dir, live)) {
         Ok(report) => report,
-        Err(code) => return state.exit(code, "doctor 已停止它启动的命令，没有输出报告"),
+        Err(code) => return state.exit(code, "doctor 没有输出报告"),
     };
     let text = if json_output {
         report::json(&report)
     } else {
         report::text(&report)
     };
-    let _ = std::io::stdout().lock().write_all(text.as_bytes());
-    state.exit(report.summary.exit_code, "报告已经写出")
+    let written = {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| stdout.flush())
+    };
+    // Where a test holds doctor once its report is written (debug builds only).
+    crate::debug_hold::at("doctor-written");
+    state.exit(
+        report.summary.exit_code,
+        if written.is_ok() {
+            "报告已经写出"
+        } else {
+            "报告没有完整写出"
+        },
+    )
 }
