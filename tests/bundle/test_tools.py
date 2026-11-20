@@ -995,8 +995,54 @@ mod tests { use hoh_app::host::HostConfig; fn g() { if true { } } }
         s=self.scan();manifest=json.loads((ROOT/'scripts/product/spawn-sites.json').read_text())
         found=[(e['file'],e['item']) for e in manifest['sites']+manifest['stderr_sites'] for _ in range(e['count'])]
         self.assertEqual(s.judge(found,manifest),[])
-        self.assertEqual([p for path,source in s.client_sources(manifest) for p in s.boundary_problems(path,source)],[])
+        files,problems=s.sources(manifest)
+        self.assertEqual(problems,[])
+        self.assertEqual([p for path,cls,source in files for p in s.boundary_problems(path,source,cls)],[])
         self.assertIn('crates/hoh-app/src/doctor/',manifest['client_files'])
+    def test_every_source_file_is_in_one_class(self):
+        # Corrections after the implementation review (CLT-1251): a file in no class, or in two, fails the scan.
+        s=self.scan()
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            for f in ['crates/hoh-app/src/client.rs','crates/hoh-app/src/client/extra.rs','crates/hoh-app/src/client/tests.rs',
+                      'crates/hoh-app/src/main.rs','crates/hoh-core/src/lib.rs']:
+                (root/f).parent.mkdir(parents=True,exist_ok=True);(root/f).write_text('')
+            manifest={'client_files':['crates/hoh-app/src/client.rs'],'entry_files':['crates/hoh-app/src/main.rs'],
+                      'library_dirs':['crates/hoh-core/src/'],'host_only_files':[],'shared_files':[]}
+            classes,problems=s.classify(manifest,root)
+            self.assertEqual(classes['crates/hoh-app/src/client.rs'],'client_files')
+            self.assertNotIn('crates/hoh-app/src/client/tests.rs',classes)
+            self.assertEqual(len(problems),1);self.assertIn('client/extra.rs: in no class',problems[0])
+            manifest['shared_files']=['crates/hoh-app/src/main.rs']
+            self.assertIn('more than one class',' '.join(s.classify(manifest,root)[1]))
+    def test_the_boundary_reads_use_trees_and_refuses_what_would_hide_a_path(self):
+        # CLT-1252..1254: compat, nested groups, raw identifiers, macro-built paths, #[path] modules, byte and raw
+        # strings that would hide code, the installer's module and stderr by its path.
+        s=self.scan();f='crates/hoh-app/src/forward.rs'
+        for bad,why in [('use hoh_app::compat::x;','hoh_app::compat'),
+                        ('use hoh_app::{{host}};','hoh_app::host'),
+                        ('use hoh_app::{unit, {layout, {verify}}};','hoh_app::verify'),
+                        ('use hoh_app::r#host;','hoh_app::host'),
+                        ('macro_rules! m { ($x:ident) => { use hoh_app::$x; }; }','in a macro'),
+                        ('#[path = "x/tests/h.rs"] mod h;','#[path]'),
+                        ('const S: &[u8] = br"\\";\nuse hoh_app::host;\nconst T: &str = "";','hoh_app::host'),
+                        ('fn f() { let _ = crate::installer::main; }','installer'),
+                        ('fn f() { let _ = std::fs::File::open("/dev/stderr"); }','by its path')]:
+            self.assertIn(why,' '.join(s.boundary_problems(f,bad)),bad)
+        self.assertEqual(s.boundary_problems(f,'const A: &[u8] = br#"hoh_app::host"#; const B: &str = "/dev/stderr is only words here";'.replace('/dev/stderr is only words here','words')),[])
+        # Entry and shared files: a full path is the entry's own; bringing the module in with use would re-export it.
+        self.assertEqual(s.boundary_problems('crates/hoh-app/src/main.rs','fn h() { hoh_app::host::run_ready(); }','entry_files'),[])
+        self.assertIn('re-export',' '.join(s.boundary_problems('crates/hoh-app/src/main.rs','pub use hoh_app::host;','entry_files')))
+        self.assertIn('re-export',' '.join(s.boundary_problems('crates/hoh-app/src/layout.rs','pub use crate::{host::Host};','shared_files')))
+        self.assertEqual(s.boundary_problems('crates/hoh-app/src/layout.rs','use std::path::Path;','shared_files'),[])
+    def test_the_functions_that_write_stderr_and_nix_starts_are_counted(self):
+        # CLT-1253, CLT-1254: fd2/panicking count as direct stderr writes in client and entry files; nix's exec is a start.
+        s=self.scan();m=self.manifest();m['stderr_functions']=['hoh::stderr::fd2'];m['entry_files']=['crates/hoh-app/src/main.rs']
+        self.assertIn('writes stderr directly',' '.join(s.judge([('crates/hoh-app/src/client.rs','hoh::stderr::fd2')],m)))
+        self.assertIn('writes stderr directly',' '.join(s.judge([('crates/hoh-app/src/main.rs','std::eprintln')],m)))
+        self.assertIn('outside the gate',' '.join(s.judge([('crates/hoh-app/src/client.rs','nix::unistd::execvp')],m)))
+        self.assertIn('nix::unistd::fork',s.configuration([],[]))
+        self.assertIn('hoh::stderr::fd2',s.configuration([],['hoh::stderr::fd2']))
 
 class ProcessLifecycle(unittest.TestCase):
     def test_stdout_stderr_backpressure(self):
