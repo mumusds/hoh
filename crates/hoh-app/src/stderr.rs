@@ -220,15 +220,9 @@ impl Writer {
     fn write(&self) {
         let mut sink = (self.make)();
         loop {
-            let entry = {
+            {
                 let mut queue = self.locked();
-                loop {
-                    if let Some(entry) = queue.entries.pop_front() {
-                        queue.budgeted -= entry.budgeted();
-                        queue.writing = true;
-                        queue.writing_budgeted = entry.budgeted() > 0;
-                        break entry;
-                    }
+                while queue.entries.is_empty() {
                     queue.writing = false;
                     queue.writing_budgeted = false;
                     self.changed.notify_all();
@@ -237,6 +231,18 @@ impl Writer {
                         .wait(queue)
                         .unwrap_or_else(PoisonError::into_inner);
                 }
+            }
+            // Where a test holds the writer with entries queued, none in hand (debug builds only).
+            crate::debug_hold::at("stderr-writer");
+            let entry = {
+                let mut queue = self.locked();
+                let Some(entry) = queue.entries.pop_front() else {
+                    continue;
+                };
+                queue.budgeted -= entry.budgeted();
+                queue.writing = true;
+                queue.writing_budgeted = entry.budgeted() > 0;
+                entry
             };
             // Room was made for the forwarder.
             self.changed.notify_all();
@@ -377,6 +383,8 @@ impl Writer {
     /// the same bound. Whatever is not written by then is not (the process ends; there is no other channel).
     pub fn exit(&self, tail: &[String], bound: Duration) {
         let end = Instant::now() + bound;
+        // Where a test sees that the exit began (debug builds only).
+        crate::debug_hold::mark("stderr-exit", "");
         let ended = {
             let mut queue = self.locked();
             queue.closed = true;

@@ -941,6 +941,8 @@ fn a_signal_while_the_wal_self_test_probe_runs_leaves_it_ended() -> R {
     assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
     assert!(gone, "the WAL self-test's probe outlived doctor");
     assert!(took < Duration::from_secs(4), "{took:?}");
+    // Verification 5 (CLT-1000): everything confirmed ended, so the exit says nothing unconfirmed.
+    assert_eq!(said, "hoh: 收到信号，doctor 没有输出报告\n");
     assert!(
         out.stdout.is_empty(),
         "{}",
@@ -1027,6 +1029,8 @@ fn a_signal_during_a_live_turn_leaves_no_process_its_agent_set_apart() -> R {
         "the child the live turn's agent set apart outlived doctor"
     );
     assert!(took < Duration::from_secs(4), "{took:?}");
+    // Verification 5 (CLT-1000): everything confirmed ended, so the exit says nothing unconfirmed.
+    assert_eq!(said, "hoh: 收到信号，doctor 没有输出报告\n");
     Ok(())
 }
 
