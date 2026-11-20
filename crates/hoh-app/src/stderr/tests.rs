@@ -11,6 +11,8 @@ struct Kept {
     writes: Arc<Mutex<Vec<usize>>>,
     held: Arc<AtomicBool>,
     broken: Arc<AtomicBool>,
+    /// While set: how many more bytes are taken before the sink breaks (a short write, then EPIPE).
+    breaks_after: Arc<Mutex<Option<usize>>>,
 }
 
 impl Write for Kept {
@@ -20,6 +22,22 @@ impl Write for Kept {
         }
         if self.broken.load(Ordering::SeqCst) {
             return Err(std::io::Error::from_raw_os_error(32));
+        }
+        let mut buf = buf;
+        {
+            let mut left = self
+                .breaks_after
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(n) = left.as_mut() {
+                if *n == 0 {
+                    self.broken.store(true, Ordering::SeqCst);
+                    *left = None;
+                    return Err(std::io::Error::from_raw_os_error(32));
+                }
+                buf = &buf[..buf.len().min(*n)];
+                *n -= buf.len();
+            }
         }
         self.bytes
             .lock()
@@ -160,7 +178,7 @@ fn the_exit_says_rule_twos_sentence_first_then_its_own_words_then_what_was_not_s
     writer.own("hoh: first");
     // The writer takes the first line and is held writing it.
     let end = Instant::now() + Duration::from_secs(5);
-    while !writer.locked().writing && Instant::now() < end {
+    while writer.locked().unit_end.is_none() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
     }
     let dir = PathBuf::from("/p/.hoh/attempts/R%2Fa1");
@@ -216,13 +234,18 @@ fn the_exit_ends_within_its_bound_when_stderr_takes_nothing() {
 }
 
 #[test]
-fn a_writer_that_ended_has_the_exit_write_its_own_words_directly_within_the_bound() {
-    // C: the writer ended (stderr could not be written); the exit finds it gone and writes the client's own words
-    // from a short-lived thread of its own (the first written exception), dropping progress as any exit does.
+fn a_writer_that_ended_leaves_what_it_did_not_write_to_the_exits_direct_write() {
+    // C (CLT-1203): stderr breaks under the writer partway through the client's first line (a short write, then
+    // EPIPE). The writer ends; the line stays queued from where it stopped, so the exit, finding the writer gone,
+    // writes the rest of it and the client's later words from a short-lived thread of its own (the first written
+    // exception), dropping progress as any exit does. Before, the line the writer had taken was lost.
     let kept = Kept::default();
+    *kept
+        .breaks_after
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(10);
     let writer = kept.writer();
-    kept.broken.store(true, Ordering::SeqCst);
-    writer.own("hoh: lost to a broken stderr");
+    writer.own("hoh: OWN_DIAGNOSTIC the first of the client's words");
     let end = Instant::now() + Duration::from_secs(5);
     while !writer.locked().ended && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(1));
@@ -234,7 +257,75 @@ fn a_writer_that_ended_has_the_exit_write_its_own_words_directly_within_the_boun
     writer.exit(&["hoh: tail".to_owned()], EXIT_WAIT);
     assert_eq!(
         kept.text(),
-        "hoh: an error\nhoh: tail\nhoh: 1 行进度未显示\n"
+        "hoh: OWN_DIAGNOSTIC the first of the client's words\nhoh: an error\nhoh: tail\nhoh: 1 行进度未显示\n"
+    );
+}
+
+#[test]
+fn rule_twos_sentence_comes_right_after_the_unit_being_written_of_a_long_line() {
+    // C (CLT-1204): the writer is in the first 4 KiB unit of a 10000-byte line of the client's own when the exit
+    // begins with rule 2's sentence queued: the unit is finished, then the sentence, then the rest of the line.
+    let kept = Kept::default();
+    kept.held.store(true, Ordering::SeqCst);
+    let writer = kept.writer();
+    let long = "L".repeat(10_000);
+    writer.own(&long);
+    let end = Instant::now() + Duration::from_secs(5);
+    while writer.locked().unit_end.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    writer.front("hoh: SIGNAL_FRONT");
+    let done = {
+        let writer = writer.clone();
+        std::thread::spawn(move || writer.exit(&[], Duration::from_secs(5)))
+    };
+    while !writer.locked().closed {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    kept.held.store(false, Ordering::SeqCst);
+    done.join().expect("the exit");
+    assert_eq!(
+        kept.text(),
+        format!(
+            "{}hoh: SIGNAL_FRONT\n{}\n",
+            "L".repeat(UNIT),
+            "L".repeat(10_000 - UNIT)
+        )
+    );
+}
+
+#[test]
+fn a_late_sentence_during_the_exits_wait_goes_next_and_is_written() {
+    // C and D (CLT-1201): while the exit waits for stderr, a signal comes; the sentence the wait is given goes right
+    // after the unit being written, before the client's other words, and is written within the bound.
+    let kept = Kept::default();
+    kept.held.store(true, Ordering::SeqCst);
+    let writer = kept.writer();
+    writer.own("hoh: first");
+    writer.own("hoh: second");
+    let end = Instant::now() + Duration::from_secs(5);
+    while writer.locked().unit_end.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    writer.close(&[]);
+    let came = Arc::new(AtomicBool::new(false));
+    let once = AtomicBool::new(false);
+    let done = {
+        let (writer, came) = (writer.clone(), came.clone());
+        std::thread::spawn(move || {
+            writer.wait(Instant::now() + Duration::from_secs(5), &|| {
+                (came.load(Ordering::SeqCst) && !once.swap(true, Ordering::SeqCst))
+                    .then(|| "hoh: 收到信号，没有提交命令".to_owned())
+            });
+        })
+    };
+    came.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(50));
+    kept.held.store(false, Ordering::SeqCst);
+    done.join().expect("the wait");
+    assert_eq!(
+        kept.text(),
+        "hoh: first\nhoh: 收到信号，没有提交命令\nhoh: second\n"
     );
 }
 

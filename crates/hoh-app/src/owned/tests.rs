@@ -86,6 +86,19 @@ fn a_start_after_the_stop_is_refused_and_starts_nothing() {
 }
 
 #[test]
+fn a_start_after_a_signal_is_refused_before_any_stop() {
+    // 设计修正 2, corrections after its implementation review, 2 (CLT-1255): once the client's signal flag is set the
+    // gate gives no ticket, for a helper or a host, with no stop begun yet (a follow finishing its stderr, a
+    // reconnect's worker still starting a host).
+    let signal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = Gate::watching(signal.clone());
+    signal.store(15, std::sync::atomic::Ordering::SeqCst);
+    assert!(gate.helper(&mut Command::new("true")).is_err());
+    assert!(gate.host(&mut Command::new("true")).is_err());
+    assert_eq!(gate.counts(), (0, 0, 0, 0));
+}
+
+#[test]
 fn the_stop_kills_every_registered_helper_and_its_group_and_reaps_it() -> R {
     // A and A2: a registered helper's group and leader are killed, then it is reaped through its handle.
     let dir = tempfile::tempdir()?;

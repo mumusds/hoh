@@ -8,10 +8,12 @@
 //! Two kinds of content: the client's own words (diagnostics, conclusions, rule 2's sentence, the exit's sentences) are
 //! never dropped and have no byte budget; the follow's per-event progress and the native stderr share [`BUDGET`]: a
 //! progress line that does not fit is dropped and counted as it is queued, native stderr waits for room on the
-//! forwarder's own thread. At the exit ([`Writer::exit`]) progress and native stderr are no longer taken and what of
-//! them is queued is dropped; rule 2's sentence goes first, then the client's own words in the order said, then what
-//! the exit adds (what was not shown, and the stop's unfinished items); they are written within [`EXIT_WAIT`] of the
-//! exit, and the process ends either way.
+//! forwarder's own thread. At the exit ([`Writer::close`], [`Writer::wait`]) progress and native stderr are no longer
+//! taken and what of them is queued is dropped; the unit being written is finished, then rule 2's sentence (also one
+//! for a signal that comes while the exit writes), then the client's own words in the order said, then what the exit
+//! adds (what was not shown, and the stop's unfinished items); they are written within [`EXIT_WAIT`] of the exit, and
+//! the process ends either way. The entry being written stays queued with how much of it was written, so a writer that
+//! ends leaves the rest to the exit.
 //!
 //! The two written exceptions to "only the writer writes fd 2": a writer that ended (a panic, or fd 2 that can never
 //! be written: EBADF, EPIPE, EIO) has the exit write the client's own words from a short-lived thread of its own,
@@ -31,6 +33,8 @@ pub const UNIT: usize = 4096;
 pub const BUDGET: usize = 1 << 20;
 /// How long the exit writes the unit being written and the client's own words, from its start.
 pub const EXIT_WAIT: Duration = Duration::from_millis(500);
+/// How often the exit's wait looks for a signal that came meanwhile.
+const LOOK: Duration = Duration::from_millis(10);
 
 /// What is queued.
 #[derive(Debug)]
@@ -55,6 +59,19 @@ impl Entry {
         }
     }
 
+    /// The same kind of entry holding `bytes`.
+    fn with(&self, bytes: Vec<u8>) -> Entry {
+        match self {
+            Entry::Own(_) => Entry::Own(bytes),
+            Entry::Front(_) => Entry::Front(bytes),
+            Entry::Progress(_) => Entry::Progress(bytes),
+            Entry::Native { attempt, .. } => Entry::Native {
+                attempt: attempt.clone(),
+                bytes,
+            },
+        }
+    }
+
     fn budgeted(&self) -> usize {
         match self {
             Entry::Progress(bytes) | Entry::Native { bytes, .. } => bytes.len(),
@@ -73,10 +90,11 @@ struct Queue {
     progress_dropped: u64,
     /// The exit began: progress and native stderr are no longer taken.
     closed: bool,
-    /// The writer holds an entry outside the lock, writing it.
-    writing: bool,
-    /// What it holds is progress or native stderr.
-    writing_budgeted: bool,
+    /// How many bytes of the first entry are written: the entry being written stays first in the queue until it is
+    /// all written (CLT-1203), so a writer that ended leaves what it did not write to the exit.
+    offset: usize,
+    /// Where the unit the writer is writing ends in the first entry, while it writes one.
+    unit_end: Option<usize>,
     /// The writer's thread ended (a panic, or fd 2 that cannot be written).
     ended: bool,
     /// Each forwarded attempt's directory and the bytes of its `*stderr.log` files the forwarder did not read.
@@ -189,8 +207,7 @@ impl Drop for Ending {
     fn drop(&mut self) {
         let mut queue = self.0.locked();
         queue.ended = true;
-        queue.writing = false;
-        queue.writing_budgeted = false;
+        queue.unit_end = None;
         drop(queue);
         self.0.changed.notify_all();
     }
@@ -216,41 +233,64 @@ impl Writer {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The thread: each entry as it comes, in units of at most [`UNIT`]; it returns when stderr cannot be written.
+    /// The thread: the first entry, one unit of at most [`UNIT`] at a time from where it was written to, each unit
+    /// finished before the order is looked at again (the exit may have put rule 2's sentence next, CLT-1204); it
+    /// returns when stderr cannot be written, leaving what it did not write queued.
     fn write(&self) {
         let mut sink = (self.make)();
         loop {
-            {
+            let fresh = {
                 let mut queue = self.locked();
                 while queue.entries.is_empty() {
-                    queue.writing = false;
-                    queue.writing_budgeted = false;
+                    queue.unit_end = None;
                     self.changed.notify_all();
                     queue = self
                         .changed
                         .wait(queue)
                         .unwrap_or_else(PoisonError::into_inner);
                 }
+                queue.offset == 0
+            };
+            if fresh {
+                // Where a test holds the writer with entries queued, none begun (debug builds only).
+                crate::debug_hold::at("stderr-writer");
             }
-            // Where a test holds the writer with entries queued, none in hand (debug builds only).
-            crate::debug_hold::at("stderr-writer");
-            let entry = {
+            let unit = {
                 let mut queue = self.locked();
-                let Some(entry) = queue.entries.pop_front() else {
+                let start = queue.offset;
+                let Some(first) = queue.entries.front() else {
                     continue;
                 };
-                queue.budgeted -= entry.budgeted();
-                queue.writing = true;
-                queue.writing_budgeted = entry.budgeted() > 0;
-                entry
+                let end = first.bytes().len().min(start + UNIT);
+                let unit = first.bytes()[start..end].to_vec();
+                queue.unit_end = Some(end);
+                unit
             };
-            // Room was made for the forwarder.
-            self.changed.notify_all();
-            for unit in entry.bytes().chunks(UNIT) {
-                if sink.write_all(unit).is_err() {
-                    return;
+            let mut done = 0;
+            while done < unit.len() {
+                match sink.write(&unit[done..]) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        done += n;
+                        self.locked().offset += n;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
                 }
             }
+            let mut queue = self.locked();
+            queue.unit_end = None;
+            let all = queue
+                .entries
+                .front()
+                .is_some_and(|first| queue.offset >= first.bytes().len());
+            if all && let Some(first) = queue.entries.pop_front() {
+                queue.budgeted -= first.budgeted();
+                queue.offset = 0;
+            }
+            drop(queue);
+            // Room was made for the forwarder; the exit may be waiting for the end.
+            self.changed.notify_all();
         }
     }
 
@@ -341,7 +381,7 @@ impl Writer {
     pub fn drained(&self, until: Instant) -> bool {
         let mut queue = self.locked();
         loop {
-            if queue.entries.is_empty() && !queue.writing {
+            if queue.entries.is_empty() {
                 return true;
             }
             let left = until.saturating_duration_since(Instant::now());
@@ -360,7 +400,7 @@ impl Writer {
     pub fn flushed(&self, until: Instant) -> bool {
         let mut queue = self.locked();
         loop {
-            let budgeted_left = queue.budgeted > 0 || queue.writing_budgeted;
+            let budgeted_left = queue.budgeted > 0;
             if !budgeted_left || queue.ended {
                 return !budgeted_left;
             }
@@ -376,61 +416,122 @@ impl Writer {
         }
     }
 
+    /// The first entry split where the writer stands: what it has begun and not finished (the unit it writes, or
+    /// nothing between units), which stays first; and the rest of that entry, not begun. The queue keeps neither.
+    fn split_first(queue: &mut Queue) -> (Option<Entry>, Option<Entry>) {
+        if queue.offset == 0 && queue.unit_end.is_none() {
+            return (None, None);
+        }
+        let Some(first) = queue.entries.pop_front() else {
+            return (None, None);
+        };
+        queue.budgeted -= first.budgeted();
+        let keep = queue.unit_end.unwrap_or(queue.offset);
+        let bytes = first.bytes();
+        let head = (keep > queue.offset).then(|| first.with(bytes[..keep].to_vec()));
+        let rest = (keep < bytes.len()).then(|| first.with(bytes[keep..].to_vec()));
+        if head.is_none() {
+            queue.offset = 0;
+        }
+        (head, rest)
+    }
+
     /// The exit (each one the same): progress and native stderr are no longer taken and what of them is queued is
-    /// dropped; rule 2's sentence goes first, then the client's own words in the order said, then `tail`, then what
-    /// was not shown (each forwarded attempt whose native stderr was not all shown, and the progress lines dropped).
-    /// They are written within `bound` (from now); a writer that ended has them written from a thread of its own, within
-    /// the same bound. Whatever is not written by then is not (the process ends; there is no other channel).
-    pub fn exit(&self, tail: &[String], bound: Duration) {
-        let end = Instant::now() + bound;
+    /// dropped; the unit being written is finished, then rule 2's sentence, then the rest of the entry that unit was
+    /// part of, then the client's own words in the order said, then `tail`, then what was not shown (each forwarded
+    /// attempt whose native stderr was not all shown, and the progress lines dropped). [`Writer::wait`] then writes
+    /// them within the exit's bound.
+    pub fn close(&self, tail: &[String]) {
         // Where a test sees that the exit began (debug builds only).
         crate::debug_hold::mark("stderr-exit", "");
-        let ended = {
-            let mut queue = self.locked();
-            queue.closed = true;
-            let mut dropped: BTreeMap<String, u64> = BTreeMap::new();
-            let mut fronts = VecDeque::new();
-            let mut own = VecDeque::new();
-            for entry in std::mem::take(&mut queue.entries) {
-                match entry {
-                    Entry::Progress(_) => queue.progress_dropped += 1,
-                    Entry::Native { attempt, bytes } => {
-                        *dropped.entry(attempt).or_default() +=
-                            u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    }
-                    Entry::Front(_) => fronts.push_back(entry),
-                    Entry::Own(_) => own.push_back(entry),
-                }
-            }
-            queue.budgeted = 0;
-            fronts.append(&mut own);
-            for text in tail {
-                fronts.push_back(Entry::Own(line(text)));
-            }
-            for (attempt, (dir, unread)) in std::mem::take(&mut queue.unshown) {
-                let left = unread + dropped.get(&attempt).copied().unwrap_or_default();
-                if left > 0 {
-                    fronts.push_back(Entry::Own(line(&format!(
-                        "hoh: 至少 {left} 字节原生 stderr 未显示，见 {}/",
-                        dir.display()
-                    ))));
-                }
-            }
-            let lines = std::mem::take(&mut queue.progress_dropped);
-            if lines > 0 {
-                fronts.push_back(Entry::Own(line(&format!("hoh: {lines} 行进度未显示"))));
-            }
-            queue.entries = fronts;
-            queue.ended
-        };
-        self.changed.notify_all();
-        if ended {
-            self.direct(end);
-            return;
-        }
         let mut queue = self.locked();
+        queue.closed = true;
+        let mut dropped: BTreeMap<String, u64> = BTreeMap::new();
+        let mut drop_entry = |queue: &mut Queue, entry: Entry| match entry {
+            Entry::Progress(_) => {
+                queue.progress_dropped += 1;
+                None
+            }
+            Entry::Native { attempt, bytes } => {
+                *dropped.entry(attempt).or_default() +=
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                None
+            }
+            own => Some(own),
+        };
+        let (head, rest) = Writer::split_first(&mut queue);
+        let mut fronts = VecDeque::new();
+        let mut own = VecDeque::new();
+        if let Some(rest) = rest.and_then(|rest| drop_entry(&mut queue, rest)) {
+            match rest {
+                Entry::Front(_) => fronts.push_back(rest),
+                _ => own.push_back(rest),
+            }
+        }
+        for entry in std::mem::take(&mut queue.entries) {
+            match drop_entry(&mut queue, entry) {
+                Some(entry @ Entry::Front(_)) => fronts.push_back(entry),
+                Some(entry) => own.push_back(entry),
+                None => {}
+            }
+        }
+        fronts.append(&mut own);
+        for text in tail {
+            fronts.push_back(Entry::Own(line(text)));
+        }
+        for (attempt, (dir, unread)) in std::mem::take(&mut queue.unshown) {
+            let left = unread + dropped.get(&attempt).copied().unwrap_or_default();
+            if left > 0 {
+                fronts.push_back(Entry::Own(line(&format!(
+                    "hoh: 至少 {left} 字节原生 stderr 未显示，见 {}/",
+                    dir.display()
+                ))));
+            }
+        }
+        let lines = std::mem::take(&mut queue.progress_dropped);
+        if lines > 0 {
+            fronts.push_back(Entry::Own(line(&format!("hoh: {lines} 行进度未显示"))));
+        }
+        if let Some(head) = head {
+            queue.budgeted = head.budgeted();
+            fronts.push_front(head);
+        } else {
+            queue.budgeted = 0;
+        }
+        queue.entries = fronts;
+        drop(queue);
+        self.changed.notify_all();
+    }
+
+    /// Rule 2's sentence `text` said during the exit: next after the unit being written, before the rest of the
+    /// client's words.
+    pub fn put_front(&self, text: &str) {
+        let mut queue = self.locked();
+        let (head, rest) = Writer::split_first(&mut queue);
+        if let Some(rest) = rest {
+            queue.budgeted += rest.budgeted();
+            queue.entries.push_front(rest);
+        }
+        queue.entries.push_front(Entry::Front(line(text)));
+        if let Some(head) = head {
+            queue.budgeted += head.budgeted();
+            queue.entries.push_front(head);
+        }
+        drop(queue);
+        self.changed.notify_all();
+    }
+
+    /// Wait until everything queued is written, until `end` at most, looking at `late` while it waits: a sentence it
+    /// gives (rule 2's, for a signal that came meanwhile) goes next ([`Writer::put_front`]). A writer that ended has
+    /// what is left written from a thread of its own, within the same bound. Whatever is not written by then is not
+    /// (the process ends; there is no other channel).
+    pub fn wait(&self, end: Instant, late: &dyn Fn() -> Option<String>) {
         loop {
-            if queue.entries.is_empty() && !queue.writing {
+            if let Some(text) = late() {
+                self.put_front(&text);
+            }
+            let queue = self.locked();
+            if queue.entries.is_empty() {
                 return;
             }
             if queue.ended {
@@ -442,23 +543,34 @@ impl Writer {
             if left.is_zero() {
                 return;
             }
-            queue = self
+            let _ = self
                 .changed
-                .wait_timeout(queue, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+                .wait_timeout(queue, left.min(LOOK))
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
-    /// The writer ended: what is queued, written from a short-lived thread of its own, waited for until `end` at most
-    /// (nothing when no thread can be made).
+    /// [`Writer::close`] and [`Writer::wait`] for `bound` from now, nothing late.
+    #[cfg(test)]
+    pub fn exit(&self, tail: &[String], bound: Duration) {
+        let end = Instant::now() + bound;
+        self.close(tail);
+        self.wait(end, &|| None);
+    }
+
+    /// The writer ended: what is queued and not written (the first entry from where it stopped), written from a
+    /// short-lived thread of its own, waited for until `end` at most (nothing when no thread can be made).
     fn direct(&self, end: Instant) {
-        let entries: Vec<Vec<u8>> = self
-            .locked()
-            .entries
-            .drain(..)
-            .map(|entry| entry.bytes().to_vec())
-            .collect();
+        let entries: Vec<Vec<u8>> = {
+            let mut queue = self.locked();
+            let offset = std::mem::take(&mut queue.offset);
+            queue
+                .entries
+                .drain(..)
+                .enumerate()
+                .map(|(i, entry)| entry.bytes()[if i == 0 { offset } else { 0 }..].to_vec())
+                .collect()
+        };
         if entries.is_empty() {
             return;
         }

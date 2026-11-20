@@ -865,6 +865,68 @@ fn an_error_exit_says_its_whole_diagnostic_when_its_writer_was_held_until_the_ex
     Ok(())
 }
 
+#[test]
+fn a_signal_while_the_exit_writes_to_a_full_stderr_decides_the_code_and_is_said() -> R {
+    // ADR-031, 设计修正 2, corrections after its implementation review, 2 (CLT-1201): `hoh -p` with an invalid
+    // configuration ends with 78, its stderr a pipe already full that nobody reads, so its exit waits on stderr; a
+    // SIGTERM, SIGINT or SIGHUP that comes then (once the exit began, by its debug mark) decides the exit code, 143,
+    // 130 or 129, and its sentence is written after the configuration's diagnostic once the pipe is read. Before, the
+    // exit read the signal state once, before it wrote, and ended with 78 and no sentence.
+    for (signal, code) in [
+        (rustix::process::Signal::TERM, 143),
+        (rustix::process::Signal::INT, 130),
+        (rustix::process::Signal::HUP, 129),
+    ] {
+        let env = Env::new()?;
+        std::fs::create_dir_all(env.project().join(".hoh"))?;
+        std::fs::write(
+            env.project().join(".hoh/config.toml"),
+            "config_version = \"1.0\"\n[project]\ndefault_mode = \"auto\"\n",
+        )?;
+        let holds = env.dir.path().join("holds");
+        std::fs::create_dir_all(&holds)?;
+        let (mut reader, writer) = std::io::pipe()?;
+        // Full: nonblocking only while it is filled, then blocking again, as a stderr nobody reads.
+        let flags = rustix::fs::fcntl_getfl(&writer)?;
+        rustix::fs::fcntl_setfl(&writer, flags | rustix::fs::OFlags::NONBLOCK)?;
+        let filler = [b'x'; 4096];
+        let mut filled = 0usize;
+        while let Ok(n) = std::io::Write::write(&mut &writer, &filler) {
+            filled += n;
+        }
+        rustix::fs::fcntl_setfl(&writer, flags)?;
+        let mut client = Kid(Some(
+            env.isolated(&["-p", "x"])?
+                .env("HOH_DEBUG_HOLD_DIR", &holds)
+                .stdout(Stdio::null())
+                .stderr(writer)
+                .spawn()?,
+        ));
+        let outcome = (|| -> R<(String, std::process::ExitStatus)> {
+            reached(&holds.join("stderr-exit"), &mut client, LIMIT)?;
+            send(client.get()?, signal)?;
+            let mut said = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut said)?;
+            let status = client.get_mut()?.wait()?;
+            let _ = client.take();
+            Ok((
+                String::from_utf8_lossy(&said[filled..]).into_owned(),
+                status,
+            ))
+        })();
+        let (said, status) = outcome?;
+        assert_eq!(status.code(), Some(code), "{signal:?}: {said}");
+        let config = said
+            .find("hoh: 配置无效，没有连接或启动 host：")
+            .ok_or_else(|| format!("{signal:?}: no diagnostic: {said}"))?;
+        let sentence = said
+            .find("hoh: 收到信号，没有提交命令\n")
+            .ok_or_else(|| format!("{signal:?}: no sentence: {said}"))?;
+        assert!(config < sentence, "{signal:?}: {said}");
+    }
+    Ok(())
+}
+
 /// A `systemd-run` stand-in on a PATH of its own that writes its pid to `<dir>/probe.pid` and sleeps, and a fake
 /// runtime directory that stands in for the user's manager (so none is contacted): the PATH, the runtime directory and
 /// the pid file.

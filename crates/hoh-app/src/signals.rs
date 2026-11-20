@@ -114,11 +114,11 @@ pub fn code(signal: usize) -> u8 {
 impl State {
     fn writing(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>, writer: Arc<Writer>) -> State {
         State {
+            gate: Arc::new(Gate::watching(signal.clone())),
             signal,
             resized,
             run: Mutex::new(None),
             said: AtomicBool::new(false),
-            gate: Arc::default(),
             writer,
             unit: Mutex::new(None),
         }
@@ -208,29 +208,38 @@ impl State {
         // Nothing the client owns outlives it, whatever ends it (设计修正 2, B; at a normal end its helpers have ended,
         // so this is quick).
         let (stopped, unit) = self.stop();
-        let signal = self.received();
-        if signal.is_some() {
+        if self.received().is_some() {
             // Where a test holds a signal exit once the stop is done (debug builds only).
             crate::debug_hold::at("exit");
-            if !self.said.swap(true, Ordering::SeqCst) {
+        }
+        // Rule 2's sentence, once, for a signal that came by now; looked for again while the exit writes (CLT-1201).
+        let sentence = || {
+            (self.received().is_some() && !self.said.swap(true, Ordering::SeqCst)).then(|| {
                 let run = self
                     .run
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
-                self.writer.front(&match run {
+                match run {
                     Some(run) => format!(
                         "hoh: 收到信号，已脱离 Run {run}（它在后台继续）；用 hoh attach {run} 重新附着"
                     ),
                     None => format!("hoh: 收到信号，{before}"),
-                });
-            }
+                }
+            })
+        };
+        if let Some(text) = sentence() {
+            self.writer.front(&text);
         }
-        self.writer.exit(
-            &unfinished(&stopped, unit.as_deref()),
-            crate::stderr::EXIT_WAIT,
-        );
-        signal.unwrap_or(code)
+        let end = std::time::Instant::now() + crate::stderr::EXIT_WAIT;
+        self.writer.close(&unfinished(&stopped, unit.as_deref()));
+        self.writer.wait(end, &sentence);
+        // A signal that came as the writing ended: its sentence in what is left of the bound, and its code.
+        if let Some(text) = sentence() {
+            self.writer.put_front(&text);
+            self.writer.wait(end, &sentence);
+        }
+        self.received().unwrap_or(code)
     }
 
     /// [`wait`] with this state.
