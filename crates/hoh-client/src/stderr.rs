@@ -16,8 +16,9 @@
 //! ends leaves the rest to the exit.
 //!
 //! The two written exceptions to "only the writer writes fd 2": a writer that ended (a panic, or fd 2 that can never
-//! be written: EBADF, EPIPE, EIO) has the exit write the client's own words from a short-lived thread of its own,
-//! within the same bound (nothing when no thread can be made); and the panic hook. Before the signal state is
+//! be written: EBADF, EPIPE, EIO) is replaced at the exit, once, by a thread that writes the same queue the same way
+//! while the exit still looks for late signals, within the same bound (nothing when no thread can be made; one writer
+//! at a time, CLT-1302); and the panic hook. Before the signal state is
 //! registered (a usage error before any wait) there is no writer and [`say`] writes directly.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -97,6 +98,8 @@ struct Queue {
     unit_end: Option<usize>,
     /// The writer's thread ended (a panic, or fd 2 that cannot be written).
     ended: bool,
+    /// The exit replaced an ended writer with one of its own (once).
+    replaced: bool,
     /// Each forwarded attempt's directory and the bytes of its `*stderr.log` files the forwarder did not read.
     unshown: BTreeMap<String, (PathBuf, u64)>,
 }
@@ -266,6 +269,8 @@ impl Writer {
                 queue.unit_end = Some(end);
                 unit
             };
+            // Where a test sees that a unit is being written (debug builds only).
+            crate::debug_hold::mark("stderr-unit", "");
             let mut done = 0;
             while done < unit.len() {
                 match sink.write(&unit[done..]) {
@@ -522,22 +527,39 @@ impl Writer {
     }
 
     /// Wait until everything queued is written, until `end` at most, looking at `late` while it waits: a sentence it
-    /// gives (rule 2's, for a signal that came meanwhile) goes next ([`Writer::put_front`]). A writer that ended has
-    /// what is left written from a thread of its own, within the same bound. Whatever is not written by then is not
-    /// (the process ends; there is no other channel).
-    pub fn wait(&self, end: Instant, late: &dyn Fn() -> Option<String>) {
+    /// gives (rule 2's, for a signal that came meanwhile) goes next ([`Writer::put_front`]). A writer that ended is
+    /// replaced, once, by a thread of its own that writes the same queue the same way (from the offset reached, a unit
+    /// at a time, the order looked at again at each unit), while this wait goes on looking at `late` (CLT-1302): one
+    /// writer writes at any time. Whatever is not written by `end` is not (the process ends; there is no other
+    /// channel).
+    pub fn wait(self: &Arc<Self>, end: Instant, late: &dyn Fn() -> Option<String>) {
         loop {
             if let Some(text) = late() {
                 self.put_front(&text);
             }
-            let queue = self.locked();
+            let mut queue = self.locked();
             if queue.entries.is_empty() {
                 return;
             }
             if queue.ended {
+                // The replacement ended too: nothing more is written.
+                if queue.replaced {
+                    return;
+                }
+                queue.replaced = true;
+                queue.ended = false;
                 drop(queue);
-                self.direct(end);
-                return;
+                let theirs = self.clone();
+                let made = std::thread::Builder::new()
+                    .name("hoh-stderr-exit".to_owned())
+                    .spawn(move || {
+                        let ending = Ending(theirs);
+                        ending.0.write();
+                    });
+                if made.is_err() {
+                    return;
+                }
+                continue;
             }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -552,46 +574,10 @@ impl Writer {
 
     /// [`Writer::close`] and [`Writer::wait`] for `bound` from now, nothing late.
     #[cfg(test)]
-    pub fn exit(&self, tail: &[String], bound: Duration) {
+    pub fn exit(self: &Arc<Self>, tail: &[String], bound: Duration) {
         let end = Instant::now() + bound;
         self.close(tail);
         self.wait(end, &|| None);
-    }
-
-    /// The writer ended: what is queued and not written (the first entry from where it stopped), written from a
-    /// short-lived thread of its own, waited for until `end` at most (nothing when no thread can be made).
-    fn direct(&self, end: Instant) {
-        let entries: Vec<Vec<u8>> = {
-            let mut queue = self.locked();
-            let offset = std::mem::take(&mut queue.offset);
-            queue
-                .entries
-                .drain(..)
-                .enumerate()
-                .map(|(i, entry)| entry.bytes()[if i == 0 { offset } else { 0 }..].to_vec())
-                .collect()
-        };
-        if entries.is_empty() {
-            return;
-        }
-        let make = self.make.clone();
-        let (done, written) = std::sync::mpsc::channel();
-        let made = std::thread::Builder::new()
-            .name("hoh-stderr-exit".to_owned())
-            .spawn(move || {
-                let mut sink = make();
-                for entry in entries {
-                    for unit in entry.chunks(UNIT) {
-                        if sink.write_all(unit).is_err() {
-                            return;
-                        }
-                    }
-                }
-                let _ = done.send(());
-            });
-        if made.is_ok() {
-            let _ = written.recv_timeout(end.saturating_duration_since(Instant::now()));
-        }
     }
 }
 

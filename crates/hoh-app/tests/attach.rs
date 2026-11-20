@@ -903,7 +903,10 @@ fn a_signal_while_the_exit_writes_to_a_full_stderr_decides_the_code_and_is_said(
                 .spawn()?,
         ));
         let outcome = (|| -> R<(String, std::process::ExitStatus)> {
+            // The exit began, and the writer is in a unit (the diagnostic's, the only line), so the sentence comes
+            // after it (CLT-1303: no order assumed without it).
             reached(&holds.join("stderr-exit"), &mut client, LIMIT)?;
+            reached(&holds.join("stderr-unit"), &mut client, LIMIT)?;
             send(client.get()?, signal)?;
             let mut said = Vec::new();
             std::io::Read::read_to_end(&mut reader, &mut said)?;
