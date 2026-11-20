@@ -1249,6 +1249,111 @@ fn doctors_stop_ends_a_descendant_whose_leader_exited_while_a_thread_runs() -> R
 }
 
 #[test]
+fn doctors_stop_sees_what_a_descendant_forked_as_it_exited() -> R {
+    // ADR-031, 设计修正 2, round 3 (CLT-1451): doctor's stop reads its scan's table while a descendant P (set apart by
+    // `git --version`) is alive; held there, P forks a daemon-like grandchild in a session of its own and exits, so its
+    // pidfd is readable when the scan first looks at it, and the grandchild, re-parented to doctor, is in no table yet.
+    // A process is confirmed ended only on a later scan than the one it was first seen in, so that scan sees the
+    // grandchild and ends it. Before, P was confirmed at once, the scan was clean, and the grandchild outlived doctor.
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let (go, parent, grand) = (
+        s.home.path().join("go"),
+        s.home.path().join("parent"),
+        s.home.path().join("grand"),
+    );
+    let forker = format!(
+        "read -r st < /proc/$$/stat; echo \"$st\" > '{p}.tmp' && mv '{p}.tmp' '{p}'; \
+         while [ ! -f '{go}' ]; do sleep 0.01; done; \
+         setsid sh -c 'read -r st < /proc/$$/stat; echo \"$st\" > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 60' '{g}' \
+         < /dev/null > /dev/null 2>&1 & \
+         while [ ! -f '{g}' ]; do sleep 0.01; done; exit 0",
+        p = parent.display(),
+        go = go.display(),
+        g = grand.display()
+    );
+    let script = s.home.path().join("forker.sh");
+    std::fs::write(&script, forker)?;
+    s.write(
+        "git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) setsid sh '{f}' < /dev/null > /dev/null 2>&1 & \
+             while [ ! -f '{p}' ]; do sleep 0.01; done; echo 'git version 2.43.0';;\n -C) mkdir -p \"$2/.git\";;\n \
+             *) exit 1;;\nesac\n",
+            f = script.display(),
+            p = parent.display()
+        ),
+    )?;
+    let holds = s.home.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("sweep-scanned"), "")?;
+    let doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .env("HOH_DEBUG_HOLD_DIR", &holds)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stat_of = |file: &Path| -> R<(u32, String)> {
+        let line = std::fs::read_to_string(file)?;
+        let pid: u32 = line.split_whitespace().next().ok_or("pid")?.parse()?;
+        let start = hoh_agents::identity::after_command_name(line.as_bytes())
+            .and_then(|rest| rest.split_whitespace().nth(19))
+            .ok_or("start")?
+            .to_owned();
+        Ok((pid, start))
+    };
+    let outcome = (|| -> R<(u32, String)> {
+        let end = Instant::now() + Duration::from_secs(60);
+        let wait = |what: &dyn Fn() -> bool, why: &str| -> R {
+            while !what() {
+                if Instant::now() > end {
+                    return Err(why.to_owned().into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        };
+        wait(
+            &|| holds.join("sweep-scanned.reached").exists(),
+            "the stop's scan was never held",
+        )?;
+        let (p, p_start) = stat_of(&parent)?;
+        std::fs::write(&go, "")?;
+        wait(&|| grand.exists(), "the grandchild never started")?;
+        wait(
+            &|| hoh_agents::identity::ended(p, Some(&p_start)).unwrap_or(false),
+            "the descendant never exited",
+        )?;
+        std::fs::remove_file(holds.join("sweep-scanned"))?;
+        stat_of(&grand)
+    })();
+    let _ = std::fs::remove_file(holds.join("sweep-scanned"));
+    let out = doctor.wait_with_output()?;
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    let (g, g_start) = outcome?;
+    let alive = !hoh_agents::identity::ended(g, Some(&g_start))?;
+    if alive {
+        let _ = hoh_agents::identity::signal_if_same(g, &g_start, rustix::process::Signal::KILL);
+    }
+    assert!(
+        !alive || said.contains("没能"),
+        "what a descendant forked as it exited outlived doctor, and it said nothing: {said}"
+    );
+    assert!(
+        !alive,
+        "what a descendant forked as it exited outlived doctor: {said}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_signal_after_doctors_report_is_written_says_it_was_written() -> R {
     // ADR-031, 设计修正 2, D (CLT-902, CLT-952, CLT-1050; verification 16): doctor is held once its report is on
     // stdout; SIGTERM then ends it with 143, the whole report stays on stdout, and its exit says the report was

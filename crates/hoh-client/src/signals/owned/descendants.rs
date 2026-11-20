@@ -3,8 +3,10 @@
 //! process doctor's helpers started is found by /proc's parent links from doctor down. The stop kills each one found
 //! alive, by pidfd once its start time showed the pidfd holds the process seen, and scans again until one whole and
 //! complete scan finds none alive (a /proc read or a pidfd that fails leaves a scan incomplete, never clean): a process
-//! has ended only when its pidfd is readable, its whole thread group gone (a Z in /proc is no proof: CLT-1300). Nothing is reaped here (no `P_ALL`, no ECHILD taken for proof): a
-//! registered helper is reaped through its handle, an adopted orphan by init once doctor has ended.
+//! has ended only when its pidfd is readable, its whole thread group gone (a Z in /proc is no proof: CLT-1300), and only
+//! on a scan after the one that first saw it, whose table shows what it forked as it exited (CLT-1451). Nothing is
+//! reaped here (no `P_ALL`, no ECHILD taken for proof): a registered helper is reaped through its handle, an adopted
+//! orphan by init once doctor has ended.
 
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use std::os::fd::OwnedFd;
@@ -112,6 +114,8 @@ pub fn sweep(root: u32, end: Instant) -> Swept {
             }
         }
         let (table, mut complete) = table();
+        // Where a test holds a scan between its table and its looks at the processes in it (debug builds only).
+        crate::debug_hold::at("sweep-scanned");
         let mut alive = Vec::new();
         let mut opened = 0;
         for seen in under(root, &table) {
@@ -160,12 +164,9 @@ pub fn sweep(root: u32, end: Instant) -> Swept {
                     continue;
                 }
             }
-            // Ended as a whole already (a zombie whose threads are all gone): confirmed, nothing to kill.
-            if exited(&pidfd) {
-                killed.push((seen.pid, seen.start.clone(), None));
-                continue;
-            }
-            // SIGKILL ends the whole thread group.
+            // Never confirmed on the scan that first saw it, even when its pidfd is readable already: it may have
+            // forked as it exited (a daemonizing double fork), and only a later scan's table shows that child, re-parented
+            // here (CLT-1451). SIGKILL ends the whole thread group (on one that ended it does nothing).
             let _ = pidfd_send_signal(&pidfd, Signal::KILL);
             alive.push(seen.pid);
             killed.push((seen.pid, seen.start.clone(), Some(pidfd)));
