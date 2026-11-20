@@ -97,10 +97,11 @@ pub struct Helper {
 }
 
 impl Helper {
-    /// Spawn `command` in a process group of its own and own it. When its pidfd cannot be had, the child is ended
-    /// as the adapters' supervisor has always ended it (M1T07R-103): its group killed, then its leader, then reaped
-    /// within [`END_WAIT`], its pid and group id fixed until then because it is not reaped (CLT-700).
-    pub fn spawn(command: &mut Command) -> io::Result<Helper> {
+    /// Spawn `command` in a process group of its own and own it: private to this module, so only [`Direct`] starts a
+    /// helper this way and every other start goes through a [`Spawner`] (CLT-1202). When its pidfd cannot be had, the
+    /// child is ended as the adapters' supervisor has always ended it (M1T07R-103): its group killed, then its leader,
+    /// then reaped within [`END_WAIT`], its pid and group id fixed until then because it is not reaped (CLT-700).
+    fn spawn(command: &mut Command) -> io::Result<Helper> {
         Helper::spawn_by(command, &|pid| Ok(pidfd_open(pid, PidfdFlags::empty())?))
     }
 
