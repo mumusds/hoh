@@ -14,6 +14,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 2. `.hoh-dev/PROGRESS.md` and `python3 tools/taskboard.py list` — where work stands (the SessionStart hook prints a summary).
 3. `contracts/requirements.json` (AC per task: the task's `acceptance` field, else all ACs of its `requirements`) and the docs its `doc_refs` name. `docs/02` and `docs/18` are generated views.
 4. `docs/19-ai-development.md` (process), `docs/22-tooling.md` (tools), `docs/23-pre-m1-audit.md` (known risks), `docs/cr/` (approved changes).
+5. `docs/24-dev-lessons-to-product.md`: lessons from how HoH is being built (goal, multi-agent, context, compaction, handover, memory) to fold into the product. Add an entry when a lesson appears; every milestone's spec task (M3-T01..M7-T01) reads it before writing its CR.
 
 ## Commands
 
