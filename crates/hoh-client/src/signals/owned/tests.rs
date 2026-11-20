@@ -82,7 +82,10 @@ fn a_start_after_the_stop_is_refused_and_starts_nothing() {
     // 设计修正 2, A: once the stop began the gate gives no ticket, for a helper or a host.
     let gate = Gate::unwatched();
     assert_eq!(gate.stop(Duration::from_millis(100)), Stopped::default());
-    assert!(gate.helper(&mut Command::new("true")).is_err());
+    assert!(
+        gate.helper(&mut Command::new("true"), HelperStderr::Null)
+            .is_err()
+    );
     assert!(gate.host(&mut Command::new("true")).is_err());
     assert_eq!(gate.counts(), (0, 0, 0, 0));
 }
@@ -95,38 +98,31 @@ fn a_start_after_a_signal_is_refused_before_any_stop() {
     let signal = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = Gate::watching(signal.clone());
     signal.store(15, std::sync::atomic::Ordering::SeqCst);
-    assert!(gate.helper(&mut Command::new("true")).is_err());
+    assert!(
+        gate.helper(&mut Command::new("true"), HelperStderr::Null)
+            .is_err()
+    );
     assert!(gate.host(&mut Command::new("true")).is_err());
     assert_eq!(gate.counts(), (0, 0, 0, 0));
 }
 
 #[test]
-fn a_helper_that_would_inherit_the_clients_stderr_is_ended_and_refused() -> R {
-    // 设计修正 2, corrections after its second implementation review, 5 (CLT-1352): a helper's stderr is a pipe or
-    // null, never the client's fd 2; one that inherits it is ended and its start fails. (This test process's own fd 2
-    // stands for the client's; when it is the null device there is nothing to tell apart.)
-    let ours = rustix::fs::fstat(std::io::stderr())?;
-    if rustix::fs::FileType::from_raw_mode(ours.st_mode) == rustix::fs::FileType::CharacterDevice {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: this test's stderr is a character device"
-        );
-        return Ok(());
-    }
+fn a_helper_that_writes_stderr_at_once_and_exits_writes_into_its_own_pipe() -> R {
+    // 设计修正 2, round 3 (CLT-1400): the reviewer's interleaving. A helper writes on its fd 2 at once and exits before
+    // anything could look at it; its stderr is the pipe its start named, set before the spawn, so what it wrote is in
+    // that pipe and never on the client's fd 2. Before, a helper left to inherit fd 2 wrote there and its start
+    // returned Ok, a /proc look after the fact finding nothing.
     let gate = Gate::unwatched();
-    let refused = gate.helper(Command::new("sleep").arg("30"));
-    assert!(refused.is_err(), "a helper inheriting fd 2 was started");
-    let helpers = gate.locked().helpers.clone();
-    assert_eq!(helpers.len(), 1);
-    assert!(
-        helpers[0].reaped(),
-        "the refused helper was not ended and reaped"
-    );
-    for stderr in [std::process::Stdio::null(), std::process::Stdio::piped()] {
-        let helper = gate.helper(Command::new("true").stderr(stderr))?;
-        assert!(helper.shared.end(Duration::from_secs(5)).is_some());
-    }
+    let mut helper = gate.helper(
+        Command::new("sh")
+            .arg("-c")
+            .arg("echo HELPER_DIRECT_FD2 >&2"),
+        HelperStderr::Piped,
+    )?;
+    let mut said = String::new();
+    std::io::Read::read_to_string(helper.stderr.as_mut().ok_or("no stderr pipe")?, &mut said)?;
+    assert_eq!(said, "HELPER_DIRECT_FD2\n");
+    assert!(helper.shared.end(Duration::from_secs(5)).is_some());
     Ok(())
 }
 
@@ -136,7 +132,7 @@ fn the_stop_kills_every_registered_helper_and_its_group_and_reaps_it() -> R {
     let dir = tempfile::tempdir()?;
     let member = dir.path().join("member");
     let gate = Gate::unwatched();
-    let helper = gate.helper(&mut with_member(&member))?;
+    let helper = gate.helper(&mut with_member(&member), HelperStderr::Null)?;
     let member = written_pid(&member)?;
     let stopped = gate.stop(Duration::from_millis(1500));
     assert_eq!(stopped.unconfirmed, Vec::<u32>::new());
@@ -160,7 +156,7 @@ fn a_start_in_flight_when_the_stop_begins_is_killed_at_its_hand_off() -> R {
         let (gate, member) = (gate.clone(), member.clone());
         std::thread::spawn(move || {
             gate.helper_by(&mut with_member(&member), &|command| {
-                let helper = Direct::plain().helper(command);
+                let helper = Direct::plain().helper(command, HelperStderr::Null);
                 let _ = spawned.send(());
                 let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
                 helper
@@ -199,7 +195,7 @@ fn a_start_still_in_flight_at_the_bound_is_reported_not_claimed() -> R {
         let gate = gate.clone();
         std::thread::spawn(move || {
             gate.helper_by(Command::new("sleep").arg("30"), &|command| {
-                let helper = Direct::plain().helper(command)?;
+                let helper = Direct::plain().helper(command, HelperStderr::Null)?;
                 let _ = spawned.send(helper.shared.pid());
                 let _ = go.lock().map(|go| go.recv_timeout(Duration::from_secs(10)));
                 Ok(helper)
@@ -247,7 +243,7 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
     let started = Mutex::new(None);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut ticket = gate.take(Kind::Helper)?;
-        let helper = Direct::plain().helper(Command::new("sleep").arg("30"))?;
+        let helper = Direct::plain().helper(Command::new("sleep").arg("30"), HelperStderr::Null)?;
         ticket.stage = Stage::SpawnedHelper(helper.shared.clone());
         if let Ok(mut started) = started.lock() {
             *started = Some(helper.shared.clone());
@@ -271,6 +267,7 @@ fn a_ticket_is_counted_down_exactly_once_whatever_the_start_does() -> R {
         Command::new("sleep")
             .arg("30")
             .stderr(std::process::Stdio::null()),
+        HelperStderr::Null,
     )?;
     assert_eq!(gate.counts(), (1, 1, 2, 0));
     drop((held_helper, held_host));
@@ -344,6 +341,7 @@ fn a_helper_started_through_the_gate_keeps_the_attempt_id_it_inherits() -> R {
             .env("HOH_ATTEMPT_ID", "R-1/T-2/A-954")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
+        HelperStderr::Null,
     )?;
     let mut said = String::new();
     helper
@@ -359,13 +357,14 @@ fn a_helper_started_through_the_gate_keeps_the_attempt_id_it_inherits() -> R {
 /// A shell (a helper of its own) that starts a child in a session of its own (`setsid`, its pid written to `apart`)
 /// and waits for it.
 fn setting_apart(apart: &std::path::Path) -> R<Helper> {
-    Ok(
-        Direct::plain().helper(Command::new("sh").arg("-c").arg(format!(
+    Ok(Direct::plain().helper(
+        Command::new("sh").arg("-c").arg(format!(
             "setsid sh -c 'echo $$ > \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; exec sleep 30' '{}' \
          < /dev/null > /dev/null 2>&1 & wait",
             apart.display()
-        )))?,
-    )
+        )),
+        HelperStderr::Null,
+    )?)
 }
 
 #[test]
@@ -404,6 +403,7 @@ fn the_sweep_counts_a_zombie_as_ended_and_reports_what_its_bound_left_alive() ->
         Command::new("sh")
             .arg("-c")
             .arg("sleep 0.1 & exec sleep 30"),
+        HelperStderr::Null,
     )?;
     let end = Instant::now() + Duration::from_secs(5);
     while !std::fs::read_to_string(format!("/proc/{}/task/{0}/children", root.shared.pid()))

@@ -135,12 +135,6 @@
       "item": "std::eprintln",
       "count": 2,
       "reason": "probe_main, the `hoh __wal-probe` process's own diagnostics: a process of its own, which has no client writer"
-    },
-    {
-      "file": "crates/hoh-client/src/signals/owned.rs",
-      "item": "std::io::stderr",
-      "count": 1,
-      "reason": "the gate reads (fstat) the client's fd 2 to tell a helper that would inherit it; it writes nothing (CLT-1352)"
     }
   ]
 }
