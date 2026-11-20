@@ -8416,6 +8416,126 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment taken for a regex hides an exec_command (the reviewer's M2T20D-1100)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment \"/*/\" after \"!\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment \"/*/\" in parentheses",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "an empty block comment \"/**/\" as a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a line comment after the statement",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a line comment as the last line",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a string with a URL (\"//\" anywhere)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a CR line ending",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a U+2028 in a string",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a U+2029 in a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex with a flag outside gimsuy",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex with a repeated flag",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -9986,6 +10106,18 @@
     "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -14220,6 +14352,126 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment taken for a regex hides an exec_command (the reviewer's M2T20D-1100)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment \"/*/\" after \"!\"",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a block comment \"/*/\" in parentheses",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "an empty block comment \"/**/\" as a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a line comment after the statement",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a line comment as the last line",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a string with a URL (\"//\" anywhere)",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a CR line ending",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a U+2028 in a string",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a U+2029 in a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex with a flag outside gimsuy",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex with a repeated flag",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -15791,6 +16043,18 @@
     "INSUFFICIENT",
     "FAIL",
     "FAIL",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",

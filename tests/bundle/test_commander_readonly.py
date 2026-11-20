@@ -287,5 +287,24 @@ class CodeMode(unittest.TestCase):
             m=copy.deepcopy(c);J._code_mode_call(m,J.DISCOVERY+f'text(await tools.apply_patch({json.dumps(J.patch_text(m,"P","create"))}));\n',
                                                  ['Script failed\nWall time 0.0 seconds\nOutput:\n','[]',J.PATCH_REFUSAL])
             self.assertEqual(J.round_verdict(m,control)[0],'PASS',name)
+    def test_lexis_outside_the_grammar_is_unclassifiable(self):
+        # M2T20D-1100..1102: a comment opener or a line terminator other than "\n" anywhere, a regex body starting with
+        # "*", flags outside gimsuy or repeated, a regex at the script's start and a lone surrogate are no script; the
+        # generated "code mode lexis" variants are all INSUFFICIENT.
+        J=judge_check
+        for src in ('text(ALL_TOOLS.filter(t => /*/.test("*/") || t.name.includes(")); await tools.exec_command({cmd:\'touch /x\'}); //")));',
+                    'text(ALL_TOOLS.filter(t => t.description.includes("https://x")));','text(ALL_TOOLS.filter(t => /w/.test(t.name)));\r\n',
+                    'text(ALL_TOOLS.filter(t => t.name.includes("a\u2028b")));','text(ALL_TOOLS.filter(t => /w/gg.test(t.name)));',
+                    'text(ALL_TOOLS.filter(t => /w/x.test(t.name)));','text(ALL_TOOLS.filter(t => /a\\\nb/.test(t.name)));',
+                    '/w/.test("x");','text(await tools.exec_command({cmd:"\\ud800"}));'):
+            self.assertIsNone(J.code_mode_script(src),src)
+        self.assertEqual(J.code_mode_script('text(ALL_TOOLS.filter(t => /w/gi.test(t.name)));'),[('discovery',)])
+        self.assertEqual(J.code_mode_script('text(await tools.exec_command({cmd:"\\ud83d\\ude00"}));'),[('exec','\U0001F600')])
+        none=Path('/nonexistent')
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=J.load(FIXTURES/'excerpts',none,'codex',name)[0];control=J.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
+            rows=[r for r in J.run_mutants(c,control) if r['kind']=='code mode lexis']
+            self.assertEqual(len(rows),12,name)
+            for r in rows:self.assertEqual(r['verdict'],'INSUFFICIENT',(name,r['label']))
 
 if __name__=='__main__':unittest.main()
