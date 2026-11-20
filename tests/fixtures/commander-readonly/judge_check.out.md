@@ -197,6 +197,7 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | code mode | same | — | — | 6 PASS | 6 PASS | — | — |
 | code mode | non-PASS | — | — | 1 FAIL, 48 INSUFFICIENT | 1 FAIL, 48 INSUFFICIENT | — | — |
 | code mode mismatch | non-PASS | — | — | 2 FAIL, 12 INSUFFICIENT | 2 FAIL, 12 INSUFFICIENT | — | — |
+| code mode lexis | non-PASS | — | — | 12 INSUFFICIENT | 12 INSUFFICIENT | — | — |
 | item default-deny | non-PASS | — | — | 3 INSUFFICIENT | 3 INSUFFICIENT | — | — |
 | incomplete driver run | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
 | incomplete patch call | non-PASS | — | — | 2 INSUFFICIENT | 2 INSUFFICIENT | — | — |
@@ -919,6 +920,18 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | code mode mismatch | the driver then a discovery, one item fewer | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-new | code mode mismatch | the driver then a discovery, one item more | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-new | code mode mismatch | a discovery then the driver, the items in the driver's order | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-new | code mode lexis | a block comment taken for a regex hides an exec_command (the reviewer's M2T20D-1100) | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a block comment "/*/" after "!" | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a block comment "/*/" in parentheses | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | an empty block comment "/**/" as a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a line comment after the statement | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a line comment as the last line | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a string with a URL ("//" anywhere) | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a CR line ending | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a U+2028 in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a U+2029 in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |
@@ -1424,6 +1437,18 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | code mode mismatch | the driver then a discovery, one item fewer | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-resumed | code mode mismatch | the driver then a discovery, one item more | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
 | codex/app-ro-resumed | code mode mismatch | a discovery then the driver, the items in the driver's order | non-PASS | INSUFFICIENT | a code-mode script with an output of unknown outcome |
+| codex/app-ro-resumed | code mode lexis | a block comment taken for a regex hides an exec_command (the reviewer's M2T20D-1100) | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a block comment "/*/" after "!" | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a block comment "/*/" in parentheses | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | an empty block comment "/**/" as a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a line comment after the statement | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a line comment as the last line | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a string with a URL ("//" anywhere) | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a CR line ending | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a U+2028 in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a U+2029 in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |

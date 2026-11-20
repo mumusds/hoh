@@ -653,17 +653,24 @@ enum Tok {
     Punct(&'static str),
 }
 
-/// The tokens of `src`, or `None`: whitespace separates; a "/" begins a regex literal only where an operand starts
-/// (after "(", "=>", "||", "&&", "!", ","); anything else is not a script of the grammar.
+/// The tokens of `src`, or `None`. Fail closed on lexis outside the grammar (design correction 8, M2T20D-1100): a
+/// script with "/*" or "//" anywhere (a comment, or text a comment could hide; inside a string too) or with a CR,
+/// U+2028 or U+2029 anywhere is not a script. Space, tab and "\n" separate; a "/" begins a regex literal only where an
+/// operand starts (after "(", "=>", "||", "&&", "!", ","), its body has no line terminator and does not start with
+/// "*", and its flags are distinct letters of "gimsuy" with no identifier character after them; a string decodes as
+/// JSON. Anything else is not a script of the grammar.
 fn tokens(src: &str) -> Option<Vec<Tok>> {
     const PUNCT: [&str; 14] = [
         "=>", "||", "&&", "(", ")", "{", "}", ".", ",", ";", ":", "=", "+", "!",
     ];
+    if src.contains("/*") || src.contains("//") || src.contains(['\r', '\u{2028}', '\u{2029}']) {
+        return None;
+    }
     let b = src.as_bytes();
     let (mut out, mut i) = (Vec::new(), 0usize);
     while i < b.len() {
         let ch = b[i];
-        if matches!(ch, b' ' | b'\t' | b'\r' | b'\n') {
+        if matches!(ch, b' ' | b'\t' | b'\n') {
             i += 1;
         } else if ch == b'"' {
             let mut j = i + 1;
@@ -683,12 +690,12 @@ fn tokens(src: &str) -> Option<Vec<Tok>> {
                 out.last(),
                 Some(Tok::Punct("(" | "=>" | "||" | "&&" | "!" | ","))
             );
-            if !operand {
+            if !operand || b.get(i + 1) == Some(&b'*') {
                 return None;
             }
             let (mut j, mut class) = (i + 1, false);
             while j < b.len() && (class || b[j] != b'/') {
-                if b[j] == b'\n' {
+                if b[j] == b'\n' || (b[j] == b'\\' && b.get(j + 1) == Some(&b'\n')) {
                     return None;
                 }
                 if b[j] == b'\\' {
@@ -702,8 +709,17 @@ fn tokens(src: &str) -> Option<Vec<Tok>> {
                 return None;
             }
             j += 1;
+            let flags = j;
             while j < b.len() && b"gimsuy".contains(&b[j]) {
+                if b[flags..j].contains(&b[j]) {
+                    return None;
+                }
                 j += 1;
+            }
+            if b.get(j).is_some_and(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'\\') || !c.is_ascii()
+            }) {
+                return None;
             }
             out.push(Tok::Regex);
             i = j;

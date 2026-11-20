@@ -681,6 +681,15 @@ def _decode(js: str) -> str | None:
     return v if isinstance(v, str) else None
 
 
+def _scalar_text(text: str) -> bool:
+    """Text of Unicode scalar values only (no lone surrogate), as the Rust judge's serde decoding requires (M2T20D-1102)."""
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 # ------------------------------------------------------------------------- codex code mode (design correction 8)
 
 class _NotScript(Exception):
@@ -695,13 +704,21 @@ EXCLUDED_GLOBALS = ('tools', 'store', 'load', 'notify', 'setTimeout', 'clearTime
 
 
 def _tokens(src: str) -> list[tuple[str, str]]:
-    """The tokens of `src`: (kind, text), kind one of str, regex, int, id, punct. Whitespace separates; a "/" begins a
-    regex literal only where an operand starts (after "(", "=>", "||", "&&", "!", "," or at the start); anything else
-    is not a script of the grammar."""
+    """The tokens of `src`: (kind, text), kind one of str, regex, int, id, punct. Fail closed on lexis outside the
+    grammar (design correction 8, M2T20D-1100): a script with "/*" or "//" anywhere (a comment, or text a comment could
+    hide; inside a string too) or with a CR, U+2028 or U+2029 anywhere is not a script. Space, tab and "\\n" separate;
+    a "/" begins a regex literal only where an operand starts (after "(", "=>", "||", "&&", "!", ","), its body has no
+    line terminator and does not start with "*", and its flags are distinct letters of "gimsuy" with no identifier
+    character after them; a string decodes as JSON to text without a lone surrogate. Anything else is not a script of
+    the grammar."""
+    if '/*' in src or '//' in src:
+        raise _NotScript('a comment opener ("/*" or "//")')
+    if any(c in src for c in ('\r', '\u2028', '\u2029')):
+        raise _NotScript('a line terminator other than "\\n"')
     out, i, n = [], 0, len(src)
     while i < n:
         ch = src[i]
-        if ch in ' \t\r\n':
+        if ch in ' \t\n':
             i += 1
             continue
         if ch == '"':
@@ -710,16 +727,18 @@ def _tokens(src: str) -> list[tuple[str, str]]:
                 if src[j] == '\n':
                     raise _NotScript('a newline in a string')
                 j += 2 if src[j] == '\\' else 1
-            if j >= n or _decode(src[i:j + 1]) is None:
+            if j >= n or _decode(src[i:j + 1]) is None or not _scalar_text(_decode(src[i:j + 1])):
                 raise _NotScript('an unterminated string, or one that does not decode')
             out.append(('str', src[i:j + 1]))
             i = j + 1
         elif ch == '/':
-            if out and out[-1] not in (('punct', '('), ('punct', '=>'), ('punct', '||'), ('punct', '&&'), ('punct', '!'), ('punct', ',')):
+            if not out or out[-1] not in (('punct', '('), ('punct', '=>'), ('punct', '||'), ('punct', '&&'), ('punct', '!'), ('punct', ',')):
                 raise _NotScript('a "/" that is no regex literal')
+            if src[i + 1:i + 2] == '*':
+                raise _NotScript('a regex body that starts with "*"')
             j, klass = i + 1, False
             while j < n and (klass or src[j] != '/'):
-                if src[j] == '\n':
+                if src[j] == '\n' or src[j:j + 2] == '\\\n':
                     raise _NotScript('a newline in a regex')
                 if src[j] == '\\':
                     j += 2
@@ -729,8 +748,11 @@ def _tokens(src: str) -> list[tuple[str, str]]:
             if j >= n or j == i + 1:
                 raise _NotScript('an unterminated regex')
             j += 1
+            flags = j
             while j < n and src[j] in 'gimsuy':
                 j += 1
+            if len(set(src[flags:j])) != j - flags or (j < n and (src[j].isalnum() or src[j] in '_$\\' or not src[j].isascii())):
+                raise _NotScript('regex flags outside "gimsuy", or repeated')
             out.append(('regex', src[i:j]))
             i = j
         elif ch in '0123456789':
@@ -2229,6 +2251,26 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
                 ('the driver then a discovery, one item more', lambda s: s + DISCOVERY, lambda t: t + ['[]', '[]']),
                 ('a discovery then the driver, the items in the driver\'s order', lambda s: DISCOVERY + s, lambda t: t + ['[]'])):
             add('code mode mismatch', label, edit=lambda m, src=source, t=texts: _driver_script(m, src, t))
+        # M2T20D-1100: JavaScript lexis outside the grammar (a comment, a line terminator other than "\n"), each a
+        # discovery a lexer that took "/*" for a regex, or CR and U+2028 for whitespace or string text, would classify:
+        # unclassifiable, never PASS. The first hides an exec_command from such a lexer (V8 runs it).
+        hidden = '; await tools.exec_command({cmd:\'touch /x\'}); //'
+        for label, source in (
+                ('a block comment taken for a regex hides an exec_command (the reviewer\'s M2T20D-1100)',
+                 f'text(ALL_TOOLS.filter(t => /*/.test("*/") || t.name.includes("){hidden}")));\n'),
+                ('a block comment "/*/" after "!"', f'text(ALL_TOOLS.filter(t => !/*/.test("*/") || t.name.includes("){hidden}")));\n'),
+                ('a block comment "/*/" in parentheses',
+                 f'text(ALL_TOOLS.filter(t => (/*/.test("*/") || t.name.includes(")){hidden}"))));\n'),
+                ('an empty block comment "/**/" as a regex', 'text(ALL_TOOLS.filter(t => /**/.test(t.name)));\n'),
+                ('a line comment after the statement', 'text(ALL_TOOLS.filter(t => /w/.test(t.name))); // tail\n'),
+                ('a line comment as the last line', 'text(ALL_TOOLS.filter(t => /w/.test(t.name)));\n//'),
+                ('a string with a URL ("//" anywhere)', 'text(ALL_TOOLS.filter(t => t.description.includes("https://example.com")));\n'),
+                ('a CR line ending', 'text(ALL_TOOLS.filter(t => /w/.test(t.name)));\r\n'),
+                ('a U+2028 in a string', 'text(ALL_TOOLS.filter(t => t.name.includes("a\u2028b")));\n'),
+                ('a U+2029 in a regex', 'text(ALL_TOOLS.filter(t => /a\u2029b/.test(t.name)));\n'),
+                ('a regex with a flag outside gimsuy', 'text(ALL_TOOLS.filter(t => /w/x.test(t.name)));\n'),
+                ('a regex with a repeated flag', 'text(ALL_TOOLS.filter(t => /w/ii.test(t.name)));\n')):
+            add('code mode lexis', label, edit=lambda m, src=source: _code_mode_call(m, src, [COMPLETED, '[]']))
         add('item default-deny', 'a killed driver run whose command has a trailing space', edit=_odd_driver_command)
         add('item default-deny', 'a commandExecution of another command', edit=_other_command)
         add('item default-deny', 'an item of an unknown type', edit=_unknown_item)
