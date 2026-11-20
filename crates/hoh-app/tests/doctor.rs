@@ -1115,6 +1115,66 @@ fn a_probe_whose_leader_ends_first_leaves_no_member_of_its_group_while_doctor_ru
     Ok(())
 }
 
+#[test]
+fn a_signal_after_doctors_report_is_written_says_it_was_written() -> R {
+    // ADR-031, 设计修正 2, D (CLT-902, CLT-952, CLT-1050; verification 16): doctor is held once its report is on
+    // stdout; SIGTERM then ends it with 143, the whole report stays on stdout, and its exit says the report was
+    // written, once, and nothing else (not "没有输出报告", not rule 2's sentence, no positive statement of a stop).
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let holds = s.home.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("doctor-written"), "")?;
+    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", s.path())
+        .env("HOH_DEBUG_HOLD_DIR", &holds)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let outcome = (|| -> R<Duration> {
+        let end = Instant::now() + Duration::from_secs(60);
+        let reached = holds.join("doctor-written.reached");
+        while !reached.exists() {
+            if let Some(status) = doctor.try_wait()? {
+                return Err(format!("doctor ended before its report was written: {status}").into());
+            }
+            if Instant::now() > end {
+                return Err("doctor never wrote its report".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(&doctor),
+            rustix::process::Signal::TERM,
+        )?;
+        std::fs::remove_file(holds.join("doctor-written"))?;
+        let at = Instant::now();
+        while doctor.try_wait()?.is_none() && at.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(at.elapsed())
+    })();
+    // Whatever happened, doctor is ended and waited for here (CLT-252).
+    let _ = doctor.kill();
+    let _ = std::fs::remove_file(holds.join("doctor-written"));
+    let out = doctor.wait_with_output()?;
+    let took = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    let report: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(report["schema_version"], "1.0", "{report}");
+    assert_eq!(said, "hoh: 收到信号，报告已经写出\n");
+    Ok(())
+}
+
 /// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
 fn pidfd_ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec};

@@ -125,3 +125,49 @@ fn a_host_can_only_be_waited_for_and_dropping_it_leaves_it_running() -> R {
     let _ = waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED);
     Ok(())
 }
+
+#[test]
+fn a_helper_whose_pidfd_cannot_be_had_has_its_group_killed_and_is_reaped() -> R {
+    // docs/adr/ADR-031.md, 设计修正 2, A2, the wrapping failure (CLT-700; verification 4): the spawn succeeded but the
+    // pidfd cannot be opened. The child is ended as the adapters' supervisor has always ended it: its process group is
+    // killed first (a member in it goes too), then its leader, and the leader is reaped within END_WAIT, its pid and
+    // group id fixed until then because it is not yet reaped.
+    let dir = tempfile::tempdir()?;
+    let member = dir.path().join("member");
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(format!(
+        "sleep 30 < /dev/null > /dev/null 2>&1 & echo $! > '{0}.tmp' && mv '{0}.tmp' '{0}'; exec sleep 30",
+        member.display()
+    ));
+    let leader = std::sync::Mutex::new(None);
+    let member_pid = std::sync::Mutex::new(None);
+    let refused = Helper::spawn_by(&mut command, &|pid| {
+        *leader.lock().unwrap_or_else(PoisonError::into_inner) = Some(pid.as_raw_pid());
+        *member_pid.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(written_pid(&member).map_err(|e| io::Error::other(e.to_string()))?);
+        Err(io::Error::from_raw_os_error(24))
+    });
+    assert_eq!(refused.err().and_then(|e| e.raw_os_error()), Some(24));
+    let member = member_pid
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .ok_or("the member's pid")?;
+    let leader = leader
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .ok_or("the leader's pid")?;
+    let member_gone = ends(member);
+    if !member_gone {
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(member).ok_or("pid")?,
+            Signal::KILL,
+        );
+    }
+    assert!(member_gone, "the member outlived the wrapping failure");
+    // Reaped by the spawn's error path: this test process, its parent, sees no child of that number any more.
+    assert!(
+        !std::path::Path::new(&format!("/proc/{leader}")).exists(),
+        "the leader was not reaped"
+    );
+    Ok(())
+}

@@ -793,6 +793,148 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
     Ok(())
 }
 
+/// A `systemd-run` stand-in on a PATH of its own that writes its pid to `<dir>/probe.pid` and sleeps, and a fake
+/// runtime directory that stands in for the user's manager (so none is contacted): the PATH, the runtime directory and
+/// the pid file.
+fn sleeping_systemd_run(env: &Env) -> R<(std::ffi::OsString, PathBuf, PathBuf)> {
+    let bin = env.dir.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let pid_file = env.dir.path().join("probe.pid");
+    let fake = bin.join("systemd-run");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            pid_file.display()
+        ),
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let runtime = env.dir.path().join("run");
+    std::fs::create_dir_all(runtime.join("systemd"))?;
+    std::fs::File::create(runtime.join("systemd/private"))?;
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+    Ok((path, runtime, pid_file))
+}
+
+#[test]
+fn a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended() -> R {
+    // ADR-031, 设计修正 2, A (CLT-301; verification 1): `hoh -p`'s `systemd-run --version` probe is held once its spawn
+    // returned, before the gate registers it; SIGTERM; once the stop began the hold opens: the hand-off finds the stop
+    // and kills the probe's group and leader, the stop reaps it, and the client ends with 143 saying only rule 2's
+    // sentence (nothing unconfirmed, nothing in flight). The probe has ended by the time the client has.
+    let Some(user) = lingering_user() else {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no linger record for this user, or no cgroup v2, here"
+        );
+        return Ok(());
+    };
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let (path, runtime, pid_file) = sleeping_systemd_run(&env)?;
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("helper-spawned"), "")?;
+    let mut client = Kid(Some(
+        env.command(&["-p", "x", "--output", "json"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("USER", &user)
+            .env("PATH", env.path(&path))
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let mut probe = None;
+    let outcome = (|| -> R<(Output, bool)> {
+        reached(&holds.join("helper-spawned.reached"), &mut client, LIMIT)?;
+        let pid = started_pid(&pid_file, &mut client, LIMIT)?;
+        let held = probe.insert(rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+            rustix::process::PidfdFlags::empty(),
+        )?);
+        send(client.get()?, rustix::process::Signal::TERM)?;
+        reached(&holds.join("stopping"), &mut client, LIMIT)?;
+        std::fs::remove_file(holds.join("helper-spawned"))?;
+        let out = finish(client.take()?, LIMIT)?;
+        Ok((out, ended(held)?))
+    })();
+    // Whatever happened, nothing stays held and the probe does not live on.
+    let _ = std::fs::remove_file(holds.join("helper-spawned"));
+    if let Some(probe) = &probe {
+        kill_held(probe);
+    }
+    let (out, gone) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(143), "{said}");
+    assert!(
+        gone,
+        "the probe spawned before its registration outlived the client"
+    );
+    assert_eq!(said, "hoh: 收到信号，没有提交命令\n");
+    Ok(())
+}
+
+#[test]
+fn a_helper_start_in_flight_past_the_stops_bound_is_said_and_the_client_ends() -> R {
+    // ADR-031, 设计修正 2, A and D (CLT-400; verification 2): `hoh -p`'s probe start is held with its ticket taken,
+    // before its spawn, past the stop's 1.5 s bound; SIGINT ends the client with 130 within its bounds, and its exit
+    // says, after rule 2's sentence, that a start had not returned and a process may appear after it (pid unknown).
+    // Whether that process exists is not asserted.
+    let Some(user) = lingering_user() else {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: no linger record for this user, or no cgroup v2, here"
+        );
+        return Ok(());
+    };
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let (path, runtime, _) = sleeping_systemd_run(&env)?;
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    std::fs::write(holds.join("helper-before-spawn"), "")?;
+    let mut client = Kid(Some(
+        env.command(&["-p", "x", "--output", "json"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("USER", &user)
+            .env("PATH", env.path(&path))
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let outcome = (|| -> R<(Output, Duration)> {
+        reached(
+            &holds.join("helper-before-spawn.reached"),
+            &mut client,
+            LIMIT,
+        )?;
+        send(client.get()?, rustix::process::Signal::INT)?;
+        let at = Instant::now();
+        let out = finish(client.take()?, LIMIT)?;
+        Ok((out, at.elapsed()))
+    })();
+    let _ = std::fs::remove_file(holds.join("helper-before-spawn"));
+    let (out, took) = outcome?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(130), "{said}");
+    // The look (100 ms), the stop's bound (1.5 s) and the exit's (0.5 s), with room.
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert_eq!(
+        said,
+        "hoh: 收到信号，没有提交命令\nhoh: 一次启动仍未返回，退出后可能出现进程（pid 未知）\n"
+    );
+    Ok(())
+}
+
 /// Wait at most `limit` for `file` to exist while `client` runs: its text.
 fn reached(file: &Path, client: &mut Kid, limit: Duration) -> R<String> {
     let end = Instant::now() + limit;
