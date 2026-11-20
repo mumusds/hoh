@@ -335,3 +335,14 @@ class ProductBundle(unittest.TestCase):
     def test_btd50_quoted_build_target(self):
         self.assert_target_build(self.root / ".cargo/config.toml", '[build]\n"target" = "TRIPLE"\n')
 
+    def test_the_bundle_has_the_umask_mode_not_mktemps_0600(self):
+        # BTD-100: the archive is written to a mktemp file (0600) and renamed; the bundle must be readable as a plain
+        # redirect would have made it under the caller's umask.
+        env = self.build()
+        exe = self.executable
+        p = subprocess.run(["bash", "-c", "umask 0022 && exec bash scripts/product/bundle.sh \"$0\" \"$1\"",
+                            str(self.out), str(exe)], cwd=self.root, env=env, capture_output=True, text=True,
+                           timeout=30)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.out.stat().st_mode & 0o777, 0o644)
+

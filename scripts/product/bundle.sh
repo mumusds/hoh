@@ -48,4 +48,6 @@ cp LICENSE THIRD_PARTY_NOTICES.md "$stage/hoh/"
 # Keep any existing bundle intact even if tar/gzip fails; rename on the output filesystem.
 archive="$(mktemp "$out.XXXXXX")"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$stage" -cf - hoh | gzip -n >"$archive"
+# mktemp makes 0600; the bundle gets the mode a plain redirect would have had under this umask (BTD-100).
+chmod "$(printf '%o' $((0666 & ~$(umask))))" "$archive"
 mv -fT -- "$archive" "$out"
