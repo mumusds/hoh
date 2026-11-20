@@ -12,6 +12,7 @@
 use hoh_core::spawn::{Direct, Helper, Shared, Spawner, WaitOnly};
 use rustix::process::Signal;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,9 @@ struct State {
 #[derive(Debug, Default)]
 pub struct Gate {
     state: Mutex<State>,
+    /// The client's signal flag (the number of the signal that came, 0 for none): once it is set, no ticket is given,
+    /// as once the stop began (CLT-1255).
+    signal: Option<Arc<AtomicUsize>>,
 }
 
 /// What a stop found: whether helper starts were still in flight at its bound, the registered helpers it could not
@@ -68,6 +72,14 @@ struct Ticket<'a> {
 }
 
 impl Gate {
+    /// The gate of a client whose signal flag is `signal`.
+    pub fn watching(signal: Arc<AtomicUsize>) -> Gate {
+        Gate {
+            state: Mutex::default(),
+            signal: Some(signal),
+        }
+    }
+
     fn locked(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -75,7 +87,11 @@ impl Gate {
     /// A ticket for a start of `kind`, or why not: refused once the stop began.
     fn take(&self, kind: Kind) -> std::io::Result<Ticket<'_>> {
         let mut state = self.locked();
-        if state.stopping {
+        let signalled = self
+            .signal
+            .as_ref()
+            .is_some_and(|signal| signal.load(Ordering::SeqCst) != 0);
+        if state.stopping || signalled {
             return Err(std::io::Error::other(
                 "the client is ending (a signal came): nothing more is started",
             ));
