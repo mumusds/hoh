@@ -1183,6 +1183,72 @@ fn doctors_stop_ends_more_descendants_than_it_has_descriptors_for() -> R {
 }
 
 #[test]
+fn doctors_stop_ends_a_descendant_whose_leader_exited_while_a_thread_runs() -> R {
+    // ADR-031, 设计修正 2, corrections after its second implementation review, 6 (CLT-1300): `git --version` sets apart
+    // a process (a session of its own) whose main thread calls pthread_exit while a worker thread runs on: /proc shows
+    // the leader Z, yet the thread group lives. doctor's stop at its end must end it (its pidfd only readable once every
+    // thread is gone), or say it could not. Before, the sweep took the Z for proof and left it running, saying nothing.
+    let s = Sandbox::new()?;
+    s.codex(Status::LoggedIn)?;
+    s.claude(Status::LoggedIn)?;
+    s.pi(Status::LoggedIn)?;
+    let stat = s.home.path().join("threaded");
+    let script = format!(
+        "import ctypes, os, threading, time\n\
+         threading.Thread(target=time.sleep, args=(60,)).start()\n\
+         line = open('/proc/self/stat').read().strip()\n\
+         open('{0}.tmp', 'w').write(line)\n\
+         os.rename('{0}.tmp', '{0}')\n\
+         ctypes.CDLL(None).pthread_exit(None)\n",
+        stat.display()
+    );
+    let program = s.home.path().join("threaded.py");
+    std::fs::write(&program, script)?;
+    s.write(
+        "git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n --version) setsid python3 '{p}' < /dev/null > /dev/null 2>&1 & \
+             while [ ! -f '{s}' ]; do sleep 0.01; done; \
+             i=0; while [ $i -lt 200 ] && [ \"$(awk '{{print $3}}' /proc/$(cut -d' ' -f1 '{s}')/stat 2>/dev/null)\" != Z ]; do sleep 0.01; i=$((i+1)); done; \
+             echo 'git version 2.43.0';;\n -C) mkdir -p \"$2/.git\";;\n *) exit 1;;\nesac\n",
+            p = program.display(),
+            s = stat.display()
+        ),
+    )?;
+    let mut path = s.path();
+    path.push_str(":/usr/local/bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_hoh"))
+        .args(["doctor", "--output", "json"])
+        .current_dir(s.project.path())
+        .env_clear()
+        .env("HOME", s.home.path())
+        .env("TMPDIR", s.tmp.path())
+        .env("PATH", &path)
+        .output()?;
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    let line = std::fs::read_to_string(&stat)
+        .map_err(|e| format!("the threaded process never started ({e}): {said}"))?;
+    let pid: u32 = line.split_whitespace().next().ok_or("pid")?.parse()?;
+    let start = hoh_agents::identity::after_command_name(line.as_bytes())
+        .and_then(|rest| rest.split_whitespace().nth(19))
+        .ok_or("start")?
+        .to_owned();
+    let alive = !hoh_agents::identity::ended(pid, Some(&start))?;
+    if alive {
+        let _ = hoh_agents::identity::signal_if_same(pid, &start, rustix::process::Signal::KILL);
+    }
+    assert!(
+        !alive || said.contains("没能"),
+        "a descendant whose leader is Z while a thread runs outlived doctor, and it said nothing: {said}"
+    );
+    assert!(
+        !alive,
+        "a descendant whose leader is Z while a thread runs outlived doctor: {said}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_signal_after_doctors_report_is_written_says_it_was_written() -> R {
     // ADR-031, 设计修正 2, D (CLT-902, CLT-952, CLT-1050; verification 16): doctor is held once its report is on
     // stdout; SIGTERM then ends it with 143, the whole report stays on stdout, and its exit says the report was

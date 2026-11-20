@@ -2,8 +2,8 @@
 //! its helpers set apart (left its process group, `setsid`) and then orphaned is re-parented to doctor, and every
 //! process doctor's helpers started is found by /proc's parent links from doctor down. The stop kills each one found
 //! alive, by pidfd once its start time showed the pidfd holds the process seen, and scans again until one whole and
-//! complete scan finds none alive (a /proc read or a pidfd that fails leaves a scan incomplete, never clean): a zombie,
-//! or a process whose pidfd is readable, has ended. Nothing is reaped here (no `P_ALL`, no ECHILD taken for proof): a
+//! complete scan finds none alive (a /proc read or a pidfd that fails leaves a scan incomplete, never clean): a process
+//! has ended only when its pidfd is readable, its whole thread group gone (a Z in /proc is no proof: CLT-1300). Nothing is reaped here (no `P_ALL`, no ECHILD taken for proof): a
 //! registered helper is reaped through its handle, an adopted orphan by init once doctor has ended.
 
 use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 struct Seen {
     pid: u32,
     parent: u32,
-    /// Its state letter: `Z` (zombie) or `X` (being released) has ended.
-    state: char,
     start: String,
 }
 
@@ -55,7 +53,6 @@ fn table() -> (Vec<Seen>, bool) {
         let parsed = fields.and_then(|fields| {
             Some(Seen {
                 pid,
-                state: fields.first()?.chars().next()?,
                 parent: fields.get(1)?.parse().ok()?,
                 start: (*fields.get(19)?).to_owned(),
             })
@@ -118,9 +115,8 @@ pub fn sweep(root: u32, end: Instant) -> Swept {
         let mut alive = Vec::new();
         let mut opened = 0;
         for seen in under(root, &table) {
-            if matches!(seen.state, 'Z' | 'X') {
-                continue;
-            }
+            // A Z or X in /proc is no proof: a thread-group leader that called pthread_exit shows Z while its other
+            // threads run (CLT-1300). Only its pidfd, readable once the whole thread group has exited, is.
             if let Some((_, _, pidfd)) = killed
                 .iter_mut()
                 .find(|(pid, start, _)| *pid == seen.pid && *start == seen.start)
@@ -164,6 +160,12 @@ pub fn sweep(root: u32, end: Instant) -> Swept {
                     continue;
                 }
             }
+            // Ended as a whole already (a zombie whose threads are all gone): confirmed, nothing to kill.
+            if exited(&pidfd) {
+                killed.push((seen.pid, seen.start.clone(), None));
+                continue;
+            }
+            // SIGKILL ends the whole thread group.
             let _ = pidfd_send_signal(&pidfd, Signal::KILL);
             alive.push(seen.pid);
             killed.push((seen.pid, seen.start.clone(), Some(pidfd)));
