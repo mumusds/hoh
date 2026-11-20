@@ -3,8 +3,8 @@
 ID：CR-028
 状态：DRAFT
 批准人：待 CTO 决定与独立设计审查；本稿没有批准或应用基线变更
-日期：2026-11-20（第 3 稿；设计审查第 2 轮处置稿，仍为 DRAFT）
-输入基线：第 2 稿 `50e9fc7b12e9a23e30c6b64a6f809b2d8cd579df`，分支 `prep/M4-T01-spec`；产品来源基线仍为 `067c241ed7dd1aaba0dd5ee1b0f6aa844414e5e2`
+日期：2026-11-20（第 4 稿；设计审查第 3 轮处置稿，仍为 DRAFT）
+输入基线：第 3 稿 `ebaf570efc98675ad1a6d8597f7aeff05e2b294c`，分支 `prep/M4-T01-spec`；产品来源基线仍为 `067c241ed7dd1aaba0dd5ee1b0f6aa844414e5e2`
 适用任务：M4-T01 的准备工作；正式应用仍须等 M3-T05 完成并领取 M4-T01
 
 本次只修订此文件。拟把 REQ-010、011、012、013、014、015、016、064 从 outline 细化为 detailed，保留全部旧 AC/TEST 标识并扩展为 37 条 AC。需求、场景、OpenAPI、SQL、配置键表、生成视图及任务图的修改均是下文的**应用提案**，本次不修改它们，不 relock、不领取任务、不推进全局台账。下节已绑定的 CTO 指令不再提问；文中的 D1–D12 仅保留尚未决定的细化选择；引用这些提案的 AC 是拟议验收标准，不能在批准前当作已经采纳的产品决定。
@@ -25,7 +25,7 @@ ID：CR-028
 | `docs/19-ai-development.md`、`docs/21-spec-governance.md`、CR-003 D1 | 委派边界、审查与预授权条件；草案不代表批准 |
 | CR-026，读取自 `/home/ai/dev/hoh-wt/m3-spec/docs/cr/CR-026-m3-detailed-spec.md`，该工作树 HEAD=`8cd7b715cc9b78c0178c7c1ce29540eb6f1dd3a5` | M3 已批准、尚未实施；下节逐项列出 M4 必须等待的契约 |
 | CR-025，`docs/cr/CR-025-budget-risk-role-binding-pending-gate-date-time.md` | `budget.risk`、`ROLE_BINDING_PENDING` 的真实含义；沿用“背景→决定→AC/场景→影响→验证”的格式 |
-| CR-024，读取自 `/home/ai/dev/hoh-wt/cmdro/docs/cr/CR-024-commander-read-only-profile.md`，批准提交 `fa7dbca2` | Commander 只读档与公开最终消息决策；输入基线/main 中没有该文件，不能声称已经合入或实施 |
+| CR-024，第4稿从 `/home/ai/dev/hoh` 的 main=`4a1f1c1236f04952f4d657e5db217d46446217b3` 读取 `docs/cr/CR-024-commander-read-only-profile.md`；原 cmdro 工作树已不存在 | Commander 只读档与公开最终消息决策；本工作树输入基线未含该文件，main 已有后续修订（含 supervisor.bridge_ignored）；正式应用时按最终 main 重核，不把 main 的实现状态借给本分支 |
 
 参考 `/home/ai/dev/hoh/.hoh-dev/evidence/hermes-study/report.md` §4–5（来源树 `514e2cb`），只借鉴无光标副作用的启动模式复位、虚拟列表、状态栏字段预算、字素宽度与诊断日志轮换的机制；下文明确哪些是 HoH 提案。没有运行 hermes 代码，也不采用其退出时杀 gateway、丢弃监控队列或按会话条数截断历史的策略。
 
@@ -47,11 +47,23 @@ CTO 在第2稿委派中已决定：性能测量在本 VM 可执行、release/串
 第二轮在 `50e9fc7` 上仍为 FAIL；终端恢复与输入保护连续两轮出现同类问题，按 docs/19 先重述完整不变量，再修订相关 AC，而不是继续给旧表述加例外：
 
 1. **屏幕和光标的所有权**：启动只关闭 1000/1002/1003/1006、2004 等无光标恢复副作用的模式；从不在启动复位发送 `CSI ?1049l`。本稿选择不复位遗留 alternate screen，不采用尚无 xterm/VTE/tmux 三方无光标恢复证据的 `?1047l`。teardown 只撤销本实例完整开启的序列，保持 ADR-014 决定 2。AC-015-04 用干净主屏与旧 DECSC 保存光标两个正常往返断言原有行/光标行不变。
-2. **宽度的观察来源**：四条路径逐条绑定外层终端及版本，终端实际光标列是 oracle；不规定 ZWJ/VS16 恒宽 2，不用 wcwidth 求和或 HoH 的 CellWidth 自证。D10 提案用可预测的 ASCII 字素表示处理歧义簇，AC 断言不漂列、不留半字、HoH 光标与终端一致。
+2. **宽度的观察来源**：四条路径逐条绑定外层终端及版本，终端实际光标列是 oracle；不规定 ZWJ/VS16 恒宽 2，不用 wcwidth 求和或 HoH 的 CellWidth 自证。第3稿把 ASCII 回退扩大到 East Asian Ambiguous 是错误修法，已由下节第4稿指令和§4的有限例外策略取代；AC 仍断言不漂列、不留半字、HoH 光标与终端一致。
 3. **恢复的观察位置**：SSH 在远程 shell、tmux 在 pane shell、SSH 内 tmux 在远程 pane shell，均在 HoH 退出后且包装器仍存活时读取 stty/modes；HoH 自己 PTY 的流中逐项核对其开启模式的关闭字节。包装器退出后的外层 tty 仅补查泄漏。
 4. **提交防护**：任何独立 Esc（无临时层也一样）撤销提交武装；同一 write 的 `\x1b\r` 与间隔小于 30 ms 的 Esc/Enter 均不得 SendInput、改草稿或加换行。Alt+Enter 与 Enter 共用 submit guard；只有 Ctrl+J 是换行键，移除第 2 稿的 Shift+Enter 换行提案，粘贴文本自身的 LF 不受影响。
 
 本节是本次 CTO 指令的照录与设计边界；其余未定实现选择仍以 D1–D12 提问。启动限制不宣称 SIGKILL 后能够恢复上一次进程的屏幕/termios。
+
+## 第 4 稿的绑定指令与设计修正
+
+第3轮在 `ebaf570e` 上仍为 FAIL：Claude 2 high/4 medium/6 low，Grok 1 high/6 medium/2 low。宽度、测量归属和生产事件覆盖连续出现，先按 docs/19 修正不变量。以下来自本次 CTO 委派，不重新提问；具体尚未批准的实现选择仍列 D1–D12：
+
+1. **原字符与列宽**：East Asian Ambiguous 不作码点串回退。HoH 按 grapheme 编辑与绘制，M4 路径采用 unicode-width 非 CJK 模型；“”—…├─│αβ→★✓ 原样显示、各占1列，中文宽字符与普通 emoji 占2列。仅路径实测有分歧的具体簇可采用明确的特殊策略。§4 保留 ZWJ/VS16 的有证据例外，不以字符类别或“不明”扩大回退。
+2. **测量服从生产生命周期**：`main.rs::host` 的 setsid、`client.rs::start` 的 hoh-host@.service/委派 scope、每 Attempt 的 cgroup 均保留；禁止要求它们留在 runner 的 pgid。进程以 boot_id+pid+start_time/pidfd 固定，测量其实际 unit/scope 与 Attempt cgroup；资源限制施加到产品实际创建的这些对象，清理靠 unit stop、既有 Attempt 所有权证明及 cgroup populated=0。§5.1 明确测试接入与外部收尾，不改 SSH 脱线存活语义。
+3. **required 不可降级**：非参考环境逐 TEST 为 SKIPPED、detail含 `reason=REFERENCE_ENV_MISMATCH`，整次检查退出78。DEGRADED 不得用于这些 required 检查。
+4. **分类从生产者闭合**：补全 cancel 五种结果、effect.committed 等；T03 将生产写入类型化，分类从同一注册定义穷举，源码守卫和负例拦下绕过注册的生产者，不能拿两份手写名单互证。
+5. **中等级别发现全部进入判定**：低空间 SendInput 唯一状态/码且保草稿；T05/T07/T10 重测并强制阶段时限；Ctrl+C 两种上下文分开，Esc 从不 Pause/Cancel；同 Agent 多职位必须选择；未知费用/上下文不显示0；Ctrl+R 与 /resume 有独立子例；轮次绑定真实终结/暂停/恢复事件与快照。
+
+本轮只修订 DRAFT 文本，不声明上述生产行为已实施或被独立验收。
 
 ## 已确定的决定与 M3 契约
 
@@ -109,8 +121,9 @@ M3-T05 未完成时不领取本稿的实现任务。M4-T01 应用时逐项重查
 | ARTIFACT_NOT_TEXT | 422 | 新 search 路由：未通过完整 UTF-8 文本分类 |
 | ARTIFACT_RANGE_INVALID | 416 | artifact 的新增 Range 功能：无效、多个或越界 Range，带 `Content-Range: bytes */<size>`；不复用 QUERY_INVALID |
 | ARTIFACT_UNREADABLE | 503 | 对象 EACCES/I/O 错误；details.reason=permission/io，不冒充认证 403 |
+| STORAGE_LOW_SPACE | 503 | 既有 SendInput 的新增对象写入预检拒绝，沿原 Error 体；details.reason=STORAGE_LOW_SPACE，含 available_bytes/required_bytes/min_free_bytes；不返回202（§5，D6） |
 
-所有新码只用于此处点名的新增路由/新增功能，使用原 Error 的字段，不发明第二套通用错误体；403 的 token/Host/Origin 语义不变。DB_BUSY/DB_FULL 仍 503；本地 UI_CLIPBOARD_UNAVAILABLE、UI_INPUT_TOO_LARGE、UI_KEY_CONFLICT、UI_UNKNOWN_EVENT 不加入 Run 状态。低空间的调度拒绝另在 `$defs.RejectionReason` 追加 `STORAGE_LOW_SPACE`（§5），不改 BlockedReason。
+所有新码只用于此处点名的新增路由/新增功能（包括既有 SendInput 的对象写入预检），使用原 Error 的字段，不发明第二套通用错误体；403 的 token/Host/Origin 语义不变。DB_BUSY/DB_FULL 仍 503；本地 UI_CLIPBOARD_UNAVAILABLE、UI_INPUT_TOO_LARGE、UI_KEY_CONFLICT、UI_UNKNOWN_EVENT 不加入 Run 状态。同名 `STORAGE_LOW_SPACE` 还在 `$defs.RejectionReason` 追加，用于调度拒绝（§5）；ErrorCode用于HTTP、RejectionReason用于派发，各守自己的字段，不改 BlockedReason。
 
 **查询文本规则（D7）**：登记不可变对象时流式校验全文件 UTF-8、拒 NUL，将 text/binary 分类与内容摘要一同登记；未封口或未分类对象不能搜索。Range 以字节为单位，UI 保留最多 3 个未完成 UTF-8 字节到下一页。搜索每次消费至多 8 MiB 新字节，保留最多 query_bytes−1 个尾字节给下一窗口；按匹配起点去重（允许重叠匹配），cursor 绑定 sha256/query/下一个未报告起点/扫描 offset，limit 命中时从最后已报告起点+1 恢复，不能跳过本窗口余下匹配。上下文截在字素边界且≤256 字节。二进制只显示 metadata 与下载动作，正文控制字节不进入终端。
 
@@ -120,7 +133,18 @@ M3-T05 未完成时不领取本稿的实现任务。M4-T01 应用时逐项重查
 
 ### 2.1 M4 迭代归属生产者（D3，M4-T09）
 
-提案采用**已提交关轮边界**，避免为 UI 改工程关轮/预算语义：Run R 的第 N 轮是该 Run 的事件序列 `(close(N−1), close(N)]`，第一轮下界为 0；最后一次 close 之后仅在该 Run 尚未终结时为开放的 N+1。终结后不展示开放轮；最后一次 close 后尚无关轮的尾部事件仍保留 seq/run，但 iteration=null、只入 P，不制造假轮次。该边界是按查询快照 H 确定的派生成员关系（不是修改 events）：Run 终结/恢复事实按seq登记；旧H仍按H以内的终结/恢复事件计算，不读取当前runs.state替代历史，也不覆盖旧边界；历史/回填使用相同规则；INCOMPLETE 恢复时依原 close 边界重开该暂存区间，不增加关轮计数。项目 seq 中别的 Run 的事件不属于 R。稳定 `iteration_key` 使用现有 `child_id(run_id,"iteration/N")` 算法（展示名 I1 等只为夹具别名）；`iteration.completed` 自身属于关闭的那轮。在线写事件时在同一 writer 事务读取上次 close 并登记归属，关闭后 key 不变，重放依同一边界还原。run_id=null 的项目事件 iteration=null；未关闭轮次也可过滤，不伪造 iterations 已关行、不增加预算、不触发一次额外 accepted。
+提案采用**已提交关轮边界**，避免为 UI 改工程关轮/预算语义：Run R 的第 N 轮是该 Run 的事件序列 `(close(N−1), close(N)]`，第一轮下界为 0；最后一次 close 之后仅在该 Run 尚未终结时为开放的 N+1。终结后不展示开放轮；最后一次 close 后尚无关轮的尾部事件仍保留 seq/run，但 iteration=null、只入 P，不制造假轮次。该边界是按查询快照 H 确定的派生成员关系（不是修改 events）：Run 终结/恢复事实按下表的真实生产载荷和seq登记；旧H仍按H以内的终结/恢复事件计算，不读取当前runs.state替代历史，也不覆盖旧边界；历史/回填使用相同规则；INCOMPLETE 恢复时依原 close 边界重开该暂存区间，不增加关轮计数。项目 seq 中别的 Run 的事件不属于 R。稳定 `iteration_key` 使用现有 `child_id(run_id,"iteration/N")` 算法（展示名 I1 等只为夹具别名）；`iteration.completed` 自身属于关闭的那轮。在线写事件时在同一 writer 事务读取上次 close 并登记归属，关闭后 key 不变，重放依同一边界还原。run_id=null 的项目事件 iteration=null；未关闭轮次也可过滤，不伪造 iterations 已关行、不增加预算、不触发一次额外 accepted。
+
+**终结边界的事件与状态（D3）**：由 `writer.rs::append_result` 的 `RunResult.state`、`control.rs::finish_cancel`、`retry.rs` 的 incomplete/resumed 及 `reconcile.run` 已提交载荷派生，不把“收到 run.result”直接等同终结。每次查询只折叠 seq≤H 的完整已提交事实；同事务以末尾 run.result 的 state 为最终状态。
+
+| 已提交事实 | H 下的轮次尾部规则 |
+|---|---|
+| `run.result` 且 `payload.state` 为 COMPLETED、FAILED、CANCELLED；`run.cancelled` 的 state=CANCELLED | Run 真正终结；不显示开放 N+1，末 close 之后尚无关闭边界的事件 iteration=null/只P。FAILED由真实状态迁移后writer产生run.result，不虚构run.failed。相同状态重复结果幂等 |
+| `run.incomplete`（stop/from/remaining）及 `run.result.state=INCOMPLETE` | 可恢复停止；隐藏暂存的 N+1，尾部iteration=null/只P，保留原下界，不新增close |
+| `run.paused`、`run.pause_requested`、`run.cancel_requested`；`run.result.state=PAUSED/BLOCKED`；WAITING_EXTERNAL、BLOCKED等非终态 | 尚未终结，原开放轮保留，不能因CLI已有退出结果或暂停而制造关轮/隐藏轮次；cancel_requested要等真实取消完成 |
+| 显式ResumeRun的同事务 `reconcile.run{from,command_id,...}` 与 `run.resumed{command_id,reason}` 配对，from=INCOMPLETE；调度器的run.resumed另有from/to/due，按其真实字段识别。reconcile.run本身没有to，不从缺字段猜状态；同事务若再写run.result则以其state为准 | H2重开原close之后的同一N+1，不增加计数；恢复前H1保持隐藏。同一尾事件e在H1为null、H2属于N+1；H1已发出的page/cursor不漂移 |
+
+`milestone_ready/release_request` 自身不终结Run；生产者若依 ADR-031 将停止后的Record写成run_id=null，UI保持该null，不按payload里的Run名称补归属。异常/缺失状态载荷只给诊断和index_ready=false，不猜终态。上述规则只改变读模型，不能绕开既有终态不可重开的Run迁移守卫。
 
 这是 UI 事件成员关系；Task 可跨轮重试，不能把其全部事件都归到 tasks.iteration_id 的单值。保留该旧列，不把它充作事实；同 Task 新 Attempt 在下一轮的事件属于下一轮。M3 CR-026 只把该列原样迁移，拥有规格起草/审查/SendInput/关轮规则；未承担此归属生产者。本任务不改变 M3 的 Task/Attempt 生命周期、iteration.completed 触发点或 REQ-040 净进展公式。旧库回填用真实关轮事件，缺关轮/异常重复关轮保留诊断且拒称完整；不从文本或时钟猜。
 
@@ -138,7 +162,7 @@ M4-T09 必须为每个受支持模式建立版本+fixture sha256+JSON 字段路�
 
 每 Attempt 规范化队列≤256 项且总正文≤1 MiB，单公开事件正文≤16 KiB，其余分段外置；活动/工具/决策/验收事实不能丢弃。消费落后时对原生管道背压，控制信号独立；公开文本合并最长 50 ms/16 KiB（先到即提交），渲染合并最多 50 ms，不能合并掉工具边界。段上限 1 MiB，未知长度预检按该上限预留；封口 fsync→rename→登记后才发含 ArtifactRef 的事件；未封口增量仍是已提交的小事件，不能当验收工件。重复通知按 native id/offset 幂等，无原生 id 的帧使用一次已持久的接收 offset；不能用文本去重。重启/EOF/取消保留已提交块及缺口标记，不把半段当完整结果；旧 epoch 只能落到旧 Attempt 历史，不能改当前活动。TEST-011-05 从每个适配器兼容 fixture 经**真实 runner 与存储接线**验证，TEST-014-05 在 adapter-live 补三家真实公共消息/工具/可提供用量的落库观察。M3-T09 继续独占 SendInput 路由、四态与安全点；M4 只提供传输字节预算/文件正文与观察投影，不能再写一套投递循环。
 
-**用户正文生产者（D11）**：M4-T09 在 M3 既有 SendInput 接受事务接入公开消息登记，以 input_id 为幂等键；记录的是 CR/LF 规范化后的已接受原文，而不是 adapter 后续的文件引用提示。超过 16 KiB 的正文先经同一对象写入流程封口，再在 input.accepted 同事务写 public.message 的引用；失败不返回 202，重放不多一块。尚未选定 Attempt 时 attempt/session 可空，按已解析 target role/epoch 显示在 Workspace 的用户对话；投递后用 input_id 关联到真实 Attempt/Focus，不伪造用户为 Agent 或从未来绑定猜身份。被拒输入仍是草稿/拒绝诊断，不造接受消息。adapter 的 user 回显若有 input_id 则关联原块，不能重复；无法核对的回显注明来源，不能冒充新用户提交。AC-011-05 从Persistence核对正文/hash，AC-015-03 再核对Workspace/Focus展开/导出逐字节和hash，四态由 M3 继续决定。
+**用户正文生产者（D11）**：M4-T09 在 M3 既有 SendInput 接受事务接入公开消息登记，以 input_id 为幂等键；记录的是 CR/LF 规范化后的已接受原文，而不是 adapter 后续的文件引用提示。超过 16 KiB 的正文先经同一对象写入流程封口，再在 input.accepted 同事务写 public.message 的引用；低空间失败按§5唯一503 STORAGE_LOW_SPACE返回，保留草稿且不写input.accepted/public.message，重放不多一块。尚未选定 Attempt 时 attempt/session 可空，按已解析 target role/epoch 显示在 Workspace 的用户对话；投递后用 input_id 关联到真实 Attempt/Focus，不伪造用户为 Agent 或从未来绑定猜身份。被拒输入仍是草稿/拒绝诊断，不造接受消息。adapter 的 user 回显若有 input_id 则关联原块，不能重复；无法核对的回显注明来源，不能冒充新用户提交。AC-011-05 从Persistence核对正文/hash，AC-015-03 再核对Workspace/Focus展开/导出逐字节和hash，四态由 M3 继续决定。
 
 **背压与不活跃（D11）**：当前 host/runner.rs::inactivity 从 executor.output_bytes 及工具进程观测判断静默，并非以 public.message 提交时间计时；但管道停读仍会停止字节计数。提案由 T09 给该观测增加规范化队列阻塞标记：仅暂停这段本地背压时间的 inactivity 计时，解除后接续已有静默时长，不无限重置；记录本地存储阻塞诊断而非 Agent 活动/进展。Cancel/进程终结/deadline/总预算仍照常，不能因本地背压阻断。AC-011-05 用可控时钟覆盖 DB_BUSY 持续超过 quiet、解除后无输出的真正静默和显式取消，回归 REQ-042/ADR-022 决定 19。
 
@@ -155,23 +179,36 @@ M4-T09 必须为每个受支持模式建立版本+fixture sha256+JSON 字段路�
 
 ### 4. 布局、动作、输入与配置提案（D7–D10）
 
-Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配置职位的状态卡，不把六职位误做六个常驻进程。Focus 以 `(run_id,role,role_epoch,attempt_id,session_id)` 定位历史公开会话，换绑后不自动把旧消息换成新持有者。布局阈值保持 docs/03：<100 列单区/标签，100–159 列主区加一个详情区，≥160 列允许三列，分屏必须由用户选择。80/120/180 是必测宽度，另测 99/100/159/160 边界；<80 列或高度<12 行显示紧凑提示与可操作的输入/退出入口，允许省略可从状态页读取的信息，不丢草稿。
+Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配置职位的状态卡，不把六职位误做六个常驻进程。Focus 的身份包含 `(run_id,role,role_epoch,attempt_id,session_id)`，其中role/epoch视图可不带attempt，session只在明确选择时过滤；Attempt视图必须带attempt_id。没有attempt_id的handoff只出现在H13可匹配的role/epoch/session视图，Attempt过滤返回空；不从session猜某次Attempt。换绑后不自动把旧消息换成新持有者。布局阈值保持 docs/03：<100 列单区/标签，100–159 列主区加一个详情区，≥160 列允许三列，分屏必须由用户选择。80/120/180 是必测宽度，另测 99/100/159/160 边界；<80 列或高度<12 行显示紧凑提示与可操作的输入/退出入口，允许省略可从状态页读取的信息，不丢草稿。
 
-动作使用稳定 action ID，不新增 Shell 命令。拟定公共操作：workspace/team/focus/timeline、task/issue/evidence 抽屉、选择角色/会话、展开/折叠、复制、搜索/下一处/上一处、全屏/返回、状态详情、设置、命令面板、历史搜索、模式切换、提交、暂停/恢复/取消/脱离。Enter 在编辑器提交、列表展开；Esc 只退一层；Ctrl+R 保留历史搜索；`?` 在编辑器是文字；Ctrl+P 命令面板。列表默认 `Space` 折叠、`f` 全屏、`y` 复制、`/` 搜索、`n/N` 下一/上一处；这些只在列表 scope 生效，命令面板提供相同动作。鼠标单击选择、双击展开、滚轮滚动，动作按钮可单击；禁用鼠标后所有动作仍可键盘执行。
+动作使用稳定 action ID，不新增 Shell 命令。拟定公共操作：workspace/team/focus/timeline、task/issue/evidence 抽屉、选择角色/会话、展开/折叠、复制、搜索/下一处/上一处、全屏/返回、状态详情、设置、命令面板、历史搜索、`/resume`历史Run选择、模式切换、提交、暂停/恢复/取消/脱离。Enter 在编辑器提交、列表展开；Esc 只退一层；Ctrl+R 保留历史搜索；`?` 在编辑器是文字；Ctrl+P 命令面板。列表默认 `Space` 折叠、`f` 全屏、`y` 复制、`/` 搜索、`n/N` 下一/上一处；这些只在列表 scope 生效，命令面板提供相同动作。鼠标单击选择、双击展开、滚轮滚动，动作按钮可单击；禁用鼠标后所有动作仍可键盘执行。
+
+历史与恢复沿 ADR-014 决定7、ADR-031和现有 `tui/app.rs`：Ctrl+R缩小匹配，再按Ctrl+R取更早条；检索中的Enter只接受匹配到编辑器、结束检索，不调用submit或SendInput；Esc恢复检索前草稿并解除武装。Up/Down的已确认历史替换也只是编辑动作。`/resume`打开当前项目可附着Run的选择器，未选择前当前附着身份/草稿不变，POST、ResumeRun、PauseRun、CancelRun均为0；Esc只关闭选择器。选定Run才读取快照/接续SSE，附着本身不发ResumeRun、不创建Task/Attempt；选中INCOMPLETE也保持该状态，之后显式恢复沿既有控制/SendInput语义。它与Ctrl+R输入历史不是同一动作，不新增Shell子命令。
 
 复制提案（D7，默认文件已由 CTO 指定）：把选定公开块的全部纯文本流式写入客户端项目的 `.hoh/exports/<sha256>.txt`（临时文件→fsync→rename），在 ADR-027 冻结守卫中追加 exports/ 并核对实际忽略有效，忽略被用户移除时拒绝导出并解释，不悄悄造成工作区污染；不自动清理用户显式导出，按 exports 单列占用并可从文件管理删除，返回可复制路径和 sha256；不包含边框、颜色码或隐藏字段。这是明确的“复制到文件”，不是谎称已进入系统剪贴板。OSC 52 **延期，不在 M4**，不增加 osc52 配置值；ADR-014 的 CSI-only 约束保留。未来若引入，必须另有修订规定原子写出/截断恢复，不能依靠 CAN 终止 OSC。本稿不再把它列为 CTO 选择。读取仍经 host 的 Artifact API，UI 不写 host 状态表。导出错误显示路径与原因，不记成功。默认不自动启动外部编辑器、浏览器或 shell。
 
-多行输入把 CRLF/孤立 CR 规范成 LF；键盘换行只认 Ctrl+J，粘贴中的 LF 保留；Shift+Enter 不再定义为换行。取消 Esc+Enter 多行别名。任何独立 Esc（30 ms 超时，包括编辑器已有焦点且无临时层）先按原语义退一层（如有），再设 `submit_armed=false`。解码为 Alt+Enter 的 ESC CR（同批或 <30 ms）无论原 armed 值都先解除武装，经同一 guard 拒绝提交；不插入换行、不改草稿。false 状态的普通 Enter 只回编辑焦点并提示“已返回编辑，未发送”，仍保持 false，连按 Enter/Alt+Enter 均不发送；只有实际改变草稿的普通编辑键或 Ctrl+J 重新武装，随后显式普通 Enter 才提交。Alt+Enter 永远不是提交或换行的捷径；能辨认的 Shift+Enter 无动作且不重武装。50/100/500 ms 的独立 Esc、单 write `\x1b\r`、两 write 间隔 10/20 ms 均逐例测试。此规则同时补 docs/03/ADR-014，不改变 Esc 为取消 Run。
+多行输入把 CRLF/孤立 CR 规范成 LF；键盘换行只认 Ctrl+J，粘贴中的 LF 保留；Shift+Enter 不再定义为换行。取消 Esc+Enter 多行别名。任何独立 Esc（30 ms 超时，包括编辑器已有焦点且无临时层）先按原语义退一层（如有），再设 `submit_armed=false`。解码为 Alt+Enter 的 ESC CR（同批或 <30 ms）无论原 armed 值都先解除武装，经同一 guard 拒绝提交；不插入换行、不改草稿。false 状态的普通 Enter 只回编辑焦点并提示“已返回编辑，未发送；修改草稿（可粘贴或接受历史），或按 Ctrl+J 换行后，再按 Enter 发送”，仍保持 false，连按 Enter/Alt+Enter 均不发送。重新武装只由已确认的本地草稿内容变化触发：普通插入/删除、Ctrl+J、成功括号粘贴、Up/Down替换历史、Ctrl+R接受不同的匹配、Ctrl+C清空、面板插入文字；无变化/被拒的插入、光标移动、历史预览不重武装。取消临时层（包括Esc恢复旧草稿）总以false结束；空草稿Enter不发送。历史确认Enter被检索层消费，即使该内容变化重武装也要下一次显式普通Enter才提交。Alt+Enter 永远不是提交或换行的捷径；能辨认的 Shift+Enter 无动作且不重武装。50/100/500 ms 的独立 Esc、单 write `\x1b\r`、两 write 间隔 10/20 ms 均逐例测试。此规则同时补 docs/03/ADR-014；Esc从不发PauseRun/CancelRun、不改变Run状态或Attempt进程。
 
 编辑器 UTF-8 正文限 1 MiB；超限拒绝整次插入/粘贴，原草稿不变。未完成 paste 最多保留 1 MiB 正文+结束标记的 6 字节状态，超过即丢弃到结束标记/信号；不得把余字节解释成命令。64 MiB 未结束粘贴相对 idle 的 TUI RSS 增量≤16 MiB。完整 paste 不提交，仍需显式 Enter；粘贴内 Ctrl+C 是数据，外部 SIGINT/SIGTERM/SIGHUP 仍立即进入退出路径。
 
-**adapter 帧预算（M4-T07）**：1 MiB 是编辑/SendInput 的正文限，不是原生 inline 限。只有正文≤256 KiB 且按该 adapter 的实际 JSON 编码、包装和最坏回显预算≤768 KiB 时 inline；其余在同一投递链中写不可变正文文件，给该 Attempt 已声明可读根内的路径、字节数、sha256 与“读取该文件作为用户输入”的短引用，最多16 KiB。不把大正文再附回 prompt；原生单帧仍≤1 MiB。文件位置遵守该底座和职位的读取根（含 CR-024 Commander 只读档），fixture 从底座可见路径核对可读性；APPLIED 仍仅指 M3 安全点投递已应用，不声称 Agent 已读取或理解文件。全转义输入即使≤256 KiB 也走文件。文件与 input_id/Attempt 绑定、重试复用摘要、未确认投递不标 APPLIED；失败保留草稿/QUEUED 或显式 REJECTED 原因，不静默截断。D10同时提案在SendInput受理路径支持最多8MiB的JSON请求（解码正文仍≤1MiB，包装后的实际请求也须≤8MiB），使最坏JSON转义仍能到达文件引用分支；不能只测adapter函数而绕过HTTP默认body限制。超上界沿host/http.rs::submit_command的既有400 BAD_REQUEST/Error体（too large or broken）、保留草稿且不返回202；其他命令的大小准入不放宽，不新造413或错误体。每个 adapter 的 fixture 必测从HTTP受理到adapter的最大1 MiB、256 KiB边界、NUL/引号/反斜杠最坏转义、文件不可读/摘要不符；此扩展沿 M3 SendInput 的四态和幂等，不改 route/安全点。
+**adapter 帧预算（M4-T07）**：1 MiB 是编辑/SendInput 的正文限，不是原生 inline 限。只有正文≤256 KiB 且按该 adapter 的实际 JSON 编码、包装和最坏回显预算≤768 KiB 时 inline；其余在同一投递链中写不可变正文文件，给该 Attempt 已声明可读根内的路径、字节数、sha256 与“读取该文件作为用户输入”的短引用，最多16 KiB。不把大正文再附回 prompt；原生单帧仍≤1 MiB。文件位置遵守该底座和职位的读取根（含 CR-024 Commander 只读档），fixture 从底座可见路径核对可读性；APPLIED 仍仅指 M3 安全点投递已应用，不声称 Agent 已读取或理解文件。全转义输入即使≤256 KiB 也走文件。文件与 input_id/Attempt 绑定、重试复用摘要、未确认投递不标 APPLIED；受理前失败保留草稿；已受理的文件正文在投递阶段遇低空间保持QUEUED并记录§5的STORAGE_LOW_SPACE，不写DELIVERED/APPLIED，不另开投递循环；其他不可读/摘要不符仍明确REJECTED，不静默截断。D10同时提案在SendInput受理路径支持最多8MiB的JSON请求（解码正文仍≤1MiB，包装后的实际请求也须≤8MiB），使最坏JSON转义仍能到达文件引用分支；不能只测adapter函数而绕过HTTP默认body限制。超上界沿host/http.rs::submit_command的既有400 BAD_REQUEST/Error体（too large or broken）、保留草稿且不返回202；其他命令保留现有2 MiB（2097152字节）JSON请求上限：路由读取上限8 MiB后，在解码命令种类并执行任何写入前再校验原始body长度，非SendInput超过2 MiB为400 BAD_REQUEST；不新造413或错误体。每个 adapter 的 fixture 必测从HTTP受理到adapter的最大1 MiB、256 KiB边界、NUL/引号/反斜杠最坏转义、文件不可读/摘要不符；此扩展沿 M3 SendInput 的四态和幂等，不改 route/安全点。
 
 鼠标：在 ADR-014 自有 poll 解码器中解析 SGR 1006 的 M/m，坐标可>223，完整序列后紧接 Enter/UTF-8 字符不吞下一键；残缺/非法序列有≤500 ms 和≤64字节界限，超限丢该序列且不进入无限吞键；遇不属于SGR参数/终止字节的Enter或UTF-8起始字节，立即终止残缺序列并将该字节交还正常键解码，不消费下一键。X10 仍整段跳过。正常仅开启1000/1002/1006（不开任意移动1003），退出逐一关闭实际开启项；启动仍关闭可能遗留的1003。tmux占用鼠标时四路径键盘测试照常，原始SGR必测子例直接注入应用PTY，不能把发往tmux客户端却被拦截的字节算作已送达。docs/12说明终端支持时可Shift拖选，tmux拦截时可关ui.mouse并用终端选择；文件复制动作仍全路径可用。
 
 启动复位：安装信号/恢复守卫后，进入 raw/alternate/paste/mouse 之前，只发送 CSI 关闭 1000/1002/1003/1006、2004，并显示光标。**启动阶段从不发送 `CSI ?1049l`，也不发送 `?1047l` 或其他屏幕切换/恢复光标序列**；不以 DECRQM 显示 alternate 已启用为发送 1049l 的理由。保持 ADR-014“未进入不发送退出”，teardown 只对本实例完整开启的 1049h 配对一次 1049l。分段写失败仍依 CSI/CAN 和原恢复守卫处理，复位完成前不接收输入。SIGKILL 留下的 alternate screen 与原 termios 不在下次启动的修复保证内：该变体只证明 mouse/paste 复位，不要求恢复上次主屏/光标/termios，也不宣称恢复成功；用户需在 shell 恢复终端后重开。hermes 的无条件 1049 复位不采用。
 
-**终端宽度策略（D10）**：编辑、选择、删除以原始 grapheme 为单位。提案对含 ZWJ、VS15/VS16、emoji modifier/旗帜组合、East Asian Ambiguous 或外层宽度不明的簇，显示可逆 ASCII 码点串（例如 `<U+1F469 U+200D U+1F4BB>`），不把实际簇写到终端；正文/提交/复制仍保留原字素。表示串可按 ASCII 列换行，编辑光标只能位于原字素前后，横向裁剪不产生半个原始宽字；状态详情说明回退原因。普通中文/已验证单码点 emoji/组合重音直接显示。M4-T07 以锁定 Unicode 数据版本列出判定规则并记录渲染策略；无法确认的终端使用此回退，不猜终端支持。AC 的 oracle 是所列终端解析实际绘制流后的光标列/行与单元格，不能用 HoH CellWidth 或 libc wcwidth 求和替代。
+**终端宽度策略（D10）**：编辑、选择、删除与原文索引以 grapheme 为单位；绘制、裁剪和逻辑光标共用 unicode-width 非 CJK 列宽模型（随Cargo.lock记录版本）。East Asian Ambiguous 不触发ASCII码点回退：“”‘’—…·├─│αβ→★✓等保持原字符、各1列，CJK宽字符（含中文全角标点）与普通emoji为2列，组合重音按完整字素显示。UI自绘边框/图标也走相同模型；ui.icons=ascii只是用户选图标样式，不能替换正文的标点/希腊字母/箭头。
+
+只有**逐簇、逐路径有实际宽度分歧证据**的条目允许回退。第3轮审查的观察来源为两份报告（见本轮处置）与vt100 0.18.1的 `screen.rs::calculate_width`：该仿真器按字符的non-CJK宽度累积；tmux 3.6有不同的簇处理。下表是已有证据的最小例外，数字是审查观察/源码核对，不是本轮新跑产品矩阵的结果：
+
+| 原始grapheme | 直连/SSH的vt100宽度 | tmux 3.6 pane宽度 | D10拟议呈现 |
+|---|---|---|---|
+| 👩‍💻（U+1F469 U+200D U+1F4BB） | 4 | 2 | 此具体簇使用可逆ASCII `<U+1F469 U+200D U+1F4BB>` |
+| ✈️（U+2708 U+FE0F） | 1 | 2 | 此具体簇使用可逆ASCII `<U+2708 U+FE0F>` |
+
+T07将例外表作为版本绑定的测试数据，每项记录原始码点、四路径实际cursor/cells、原始字节工件与回退原因；先不经HoH绘制该簇作宽度探针，再检验HoH实际绘制。已知分歧簇在四路径统一使用其ASCII表示，避免tmux内外模型不同；表示串可按ASCII列换行，编辑光标只位于原字素前后，提交/复制/导出仍为原文。**没有证据不得添加例外**：不把全部ZWJ、VS15/VS16、肤色、旗帜或“外层不明”整类回退；T07对拟支持的额外簇逐个测量，只有出现实际分歧且附原始证据才可加入有限表，否则仍原样显示。现有一致宽度的字符绝不能因属于Ambiguous而回退。更宽的CJK ambiguous设置或未验证终端在docs/12明确列兼容限制，不声称已测、不自动把正文换成码点。软件升级后重测表中各项和正常样本，不沿用旧版本数字。
+
+AC的oracle仍是所列终端解析实际绘制流后的光标列/行与单元格；unicode-width是实现模型，不是验收oracle；不能用HoH CellWidth或libc wcwidth求和自证。AC明确核对中文标点、框线、希腊字母和箭头的单元格为原字符，并核对不漂列、不留半字和光标相同。
 
 | 路径 | 外层终端/版本与宽度观察 | 恢复观察点 |
 |---|---|---|
@@ -206,17 +243,33 @@ Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配�
 
 大对象写入前需要 `available_bytes >= object_write_bytes + min_free_bytes`；流式未知长度按1 MiB segment 上限预留。低于门槛只拒绝新对象写入和新写 Attempt（包括新写重试），不打断已有执行/读取/控制。新增 `$defs.RejectionReason=STORAGE_LOW_SPACE`：Commander dispatch 的 decisions.reason_code 与自动调度 `schedule.round` 的 rejected 条目都记录该码及 available/required/min_free；不创建新的 Run BlockedReason，不伪称 DB 事务已失败。释放空间后原 READY Task 可按原调度重试，不制造新 Task。回归 REQ-035/036/037 的调度/租约、REQ-042预算/重试、REQ-043控制及 CR-025 ROLE_BINDING_PENDING 优先级。
 
+**SendInput的唯一低空间结果（D6，CR28D-204）**：正文超过16 KiB需先封口对象，预检不足时HTTP唯一为 **503 STORAGE_LOW_SPACE**，沿既有Error体，`details={reason:"STORAGE_LOW_SPACE",available_bytes,required_bytes,min_free_bytes}`，required_bytes为本次object_write_bytes+min_free_bytes；无202、command/input接受行、input.accepted或public.message，客户端逐字保留草稿/目标并显示“未接受”，空间恢复后仅用户显式重试、同幂等键最多接受一次。此处不是DB_FULL：后者只在状态事务实际ENOSPC/EDQUOT时使用。若HTTP已经202而投递阶段（含>256 KiB短文件引用的物化）低空间，既有输入保持QUEUED，在同一M3投递链持久化input_id+STORAGE_LOW_SPACE及上述字节数诊断，绝不先标DELIVERED/APPLIED；空间恢复后由既有投递重试/安全点重用原input_id与正文摘要，不再新增用户块。状态事务本身也无法写入时保留最后已提交QUEUED、报告DB_FULL，不能声称诊断已落库。T03负责对象写入和受理前子例，T07在AC-015-03补文件投递子例，不要求T03提前交付T07的传输包装。
+
 **两种独立路径**：低空间预检触发但状态事务可提交，PauseRun/CancelRun 仍202且各有持久事件，UI显示已接受；只有状态事务自身 ENOSPC/EDQUOT 才503 DB_FULL且无202/无乐观状态。读取旧已提交事实与终端脱离仍可用。SQLite writer busy 则503 DB_BUSY，保留最后快照/stale，客户端不得被 busy_timeout 阻塞绘制和脱离。实际受限文件系统 ENOSPC 由 `scripts/dev/test-infra.sh` 在基础设施阶段用已授权 sudo -n 准备隔离 loop/ext4 与开发用户权限，记录 test-infra.json（路径、容量、挂载、清理）；检查本身非root。EDQUOT 用现有可注入文件系统 seam 覆盖并标注 fault injection，不伪称启用了真实配额。缺 ENOSPC 设施为检查 FAIL/非零、阶段 BLOCKED，不跳过。临时文件/fdatasync/rename/登记各故障点均保留首次失败；完整文件登记前崩溃为48h孤立对象，登记后已有引用始终保护。
 
 ### 5.1 唯一性能测量入口与环境（D4，CR28D-01/-69）
 
-选择**既有 integration 检查的串行 release 测量阶段**，不新增 perf check、不更改14项检查的归属/mode/门槛/超时。M4-T01 不提前声明尚无生产者的工件；在 M4-T03 交付测量驱动的同一提交，按本 CR 的批准范围/relock 才在 tests/check-plan.json 的 integration.artifacts 追加 `m4-measurements.json`、`m4-environment.json`、`m4-samples.jsonl`；argv 仍 `bash scripts/product/cargo-tests.sh integration`。实现时在其既有测试全部收取后，串行构建 release HoH 与独立 example 测量驱动（不放 `tests/` 的自动 libtest target），再单进程依次运行本节列出的场景，所有被测子进程在同一受限 systemd user scope（不是由 user manager 另派生的 service）；禁止并行 cargo/其他测量。采集 `/proc/<pid>/status` 的 VmRSS（KiB→MiB），分别记录 host/TUI，并断言 idle **host+TUI 总和≤150 MiB**，因此两者各自也≤150 MiB；活动峰值 host≤256 MiB、TUI≤256 MiB。Agent/浏览器不计，测量驱动单列不计核心。REQ-068 的4vCPU/8GiB、至少1000样本与原门槛全部保留，M4不签收M7。
+选择**既有 integration 检查的串行 release 测量阶段**，不新增perf check、不更改14项检查的归属/mode/门槛/超时。M4-T01不提前声明尚无生产者的工件；M4-T03交付驱动时按本CR批准范围/relock在integration.artifacts追加 `m4-measurements.json`、`m4-environment.json`、`m4-samples.jsonl`；argv仍为 `bash scripts/product/cargo-tests.sh integration`。既有debug测试全部收取后，串行构建release HoH与独立example测量驱动（非自动libtest target），依次运行场景。禁止并行cargo/另一测量。HoH二进制为冻结源码的普通release构建，不启用debug故障钩子，不改变setsid、后台存活或Attempt隔离逻辑。
 
-第2稿记录的 VM 是 Ubuntu 26.04.1 x86_64、Intel Core Ultra 9 285K、12 vCPU、MemTotal=67396161536 B、无swap、项目盘 `/dev/sda2` ext4。虚拟盘 rotational=1，不能据此声称物理后端是SSD；本 M4 **参考环境**提案取本VM这一盘且不放宽预算，M7仍需核验 docs/01 的本地SSD条件。测量将全部被测进程约束到 CPU 0–3（由taskset设置，逐进程核对有效CPU affinity）、MemoryMax=8589934592、MemorySwapMax=0、CPUQuota=400%，禁止其他本次检查工作并行，记录是否施加成功。第2稿的资源探针（m4-spec-d2/resource-envelope-03.json）记录user service unit只有cpu/memory/pids控制器，AllowedCPUs不会施加cpuset限制；taskset继承的affinity为[0,1,2,3]，memory.max=8589934592、memory.swap.max=0、cpu.max=400000 100000曾实际读回；这不是第3稿scope生命周期已验证的证据，不能把未生效的AllowedCPUs当证据。它是本VM上的4CPU/8GiB资源包络，不虚称整台VM只有4CPU。`scripts/dev/test-infra.sh` 准备可用的 user systemd scope，以taskset把测量driver及其host/TUI子进程设为CPU 0–3；检查逐进程读取实际affinity和cgroup的memory.max/cpu.max，不靠 argv 声称约束有效；记录任一被测子进程扩宽affinity为环境不符，不静默放行。
+**测试如何施加资源包络（D4，提案）**：T03使用检查专属的systemd user slice，产品host仍由客户端的真实service/scope两条路径启动；不要求host、TUI、driver或Attempt同pgid。外部测试启动器及配置只在检查临时根中，发行包不包含、不读取这些设置：
 
-**检查进程生命周期（D4）**：T03 使用 `systemd-run --user --scope` 原地 exec 的路径，将 driver 与前台 host/TUI 放在 run_check 已建立的同一 pgid，不能用 service 启动、setsid、daemon 自动拉起或后台脱离逃出该组。检查在每次 spawn 后读回 PID/start_time/pgid/cgroup/unit，资源观测仍逐进程核对。退出 trap 停止本检查唯一命名 scope，关闭驱动与 PTY，再回收子进程和隔离 DB；不碰其他 unit。T03 先验证正常/驱动失败/外层 run_check 超时/取消四个实验，外部观察者在检查结束后≤30 s 确认 scope 无活跃进程且 PID 身份已消失，保存记录；SIGKILL 不依赖 trap，必须证明所有被测进程都随原进程组终止。任一进程不能保持此归属则该 runner 未交付，不用清理承诺代替验证。生命周期修改按 docs/19 取得两份独立审查。
+1. `test-infra.sh`先按M2-T14安装/单元机制准备隔离的测试安装与可用user manager，不替换用户现有安装/共享模板。由正常安装路径运行冻结release，真实 `client::unit_for` 必须认出它（current_exe=安装的hoh、ExecStart/EnvironmentFile吻合）；不能用伪systemctl响应欺骗它。隔离安装和用户服务条件无法准备则设施FAIL，不用直接启动__host代替。每轮唯一project路径→`unit::instance(project)`确定service实例；环境记录实际安装路径、二进制hash、manager与unit身份。
+2. 启动前建立唯一 `hoh-m4-<execution>.slice`，将MemoryMax=8589934592、MemorySwapMax=0、CPUQuota=400%施加在这个**共同父slice**，限制合计而非每进程各8GiB。为本次 `hoh-host@<instance>.service` 写实例级runtime drop-in：Slice指向该slice，CPU/Memory限制不宽于父级，CPUAffinity=0 1 2 3；不改ExecStart、EnvironmentFile、Delegate、Restart或KillMode。不写全模板drop-in。TUI/driver在该slice下的独立scope中，由taskset设CPU 0–3；外部监护者在slice外，不计核心。
+3. scope分支由同一release从非安装路径启动，真实 `unit_for` 拒绝service而进入 `client::delegated_scope/launch`。测试PATH只给systemd-run放一个**透明转发启动器**：探测/--help原样转真实工具；唯一允许扩展的是本次项目的真实host启动argv，添加唯一unit名、同父slice及MemoryMax/MemorySwapMax/CPUQuota属性，并用taskset exec原hoh argv。保留--user/--scope/Delegate=yes及其余参数、环境和pid连续性，记录转发前后argv与真实工具hash；systemctl不替换。设置仅属外部测量设施，发行release无新flag/env入口。若scope创建失败而产品走direct降级，记录该行为但该测量FAIL，不能把无约束进程纳入参考PASS。
+4. 每Attempt仍由产品在host委派树内创建独立 `attempt-<digest>` cgroup（当前源码的“Attempt scope”是此子cgroup，并非每个都有systemd unit名），用其既有Witness/启动门机制登记与继承父限制。若未来实际创建独立unit/scope，必须在其start gate打开前同样放入本slice并核对限制，不能从父子PID推断继承。不能为了测量禁止Attempt；生命周期夹具至少经真实派发路径启动一个有后代的受控fixture Attempt（product+synthetic，不称live），另单列Agent开销。
+5. 启动与每次重启后从host.json、manager MainPID/ControlGroup及Attempt登记交叉核对，记录boot_id、PID、/proc stat start_time、pidfd、pgid、unit/InvocationID、cgroup路径及inode链；pgid只作观察。逐个PID读回有效affinity，逐cgroup记录祖先链的memory.max/memory.swap.max/cpu.max及有效最严限制。AllowedCPUs仅在cpuset实际可用且读回生效时作证；当前VM没有委派cpuset时用service CPUAffinity和scope taskset，不能声称未生效的AllowedCPUs已约束。任一子进程扩宽affinity、逃出slice或单位不受限制均为环境不符，相关TEST SKIPPED/退出78，不静默放行。
 
-冻结前 `.hoh-dev/environment.json` 增加 `m4_reference`（随 candidate.environment 摘要绑定）：profile_id、硬匹配键、版本观察值、fixture 与预算。**硬匹配键仅为** CPU family/model/可见拓扑、物理内存、项目盘 mount source/FSType 与已声明后端类别、允许 CPU/逐进程 affinity、MemoryMax/MemorySwapMax/CPUQuota 实际值、构建 profile/release 优化选项。OS 架构与 UTF-8 locale 可用是执行前提；内核/Rust/终端仿真器/locale 名称与版本/tmux/ssh/OS 补丁版本、boot_id/可用空间/rotational 是记录项，不逐字匹配，不能因补丁升级把所有 integration 标为环境不符。release binary hash 在检查内生成，记 m4-environment.json 并绑定冻结源码/构建输入，不事后改冻结 environment。补丁升级时在新候选冻结前记录新观察值，做一次同 fixture/同预算的对照测量并保留原始样本/上次引用；软件升级本身无需重开 CR，不沿用旧 PASS。改变硬件/profile 或降低预算须修订并复审 D4；不通过重写 reference 把另一机器冒充同 profile。
+第2稿记录的VM是Ubuntu26.04.1 x86_64、Intel Core Ultra 9 285K、12vCPU、MemTotal=67396161536B、无swap、项目盘/dev/sda2 ext4。rotational=1不能证明物理SSD；M4参考profile仍提案使用该盘且不放宽预算，M7独立核验docs/01本地SSD。旧资源探针只证明当时service的memory.max=8589934592、memory.swap.max=0、cpu.max=400000 100000及taskset [0,1,2,3]，不是本稿整套slice/service/scope已验证的证据。本包络不声称整台VM只有4CPU/8GiB。
+
+**观测与计数**：通过实际host unit/scope、TUI scope和每Attempt cgroup枚举进程，核对每次样本的内核身份；从各自cgroup的cpu.stat、memory.current/memory.stat读CPU/内存计量，从成员 `/proc/<pid>/status` 的VmRSS得到逐进程RSS。cgroup内存包含页缓存，不能把memory.current冒称RSS；父子cgroup累计也不重复求和。host与TUI的RSS分别记录，idle **host+TUI总和≤150MiB**，因此各自≤150MiB；活动峰值各≤256MiB。Attempt/Agent/driver/监护者另列、不能算进核心或藏掉其资源包络。host重启换PID时结束旧区间、登记新身份，不沿用PID数值。REQ-068的4CPU/8GiB、至少1000样本及原阈值全部保留，M4不签M7。
+
+**检查进程生命周期（D4）**：T03在debug_integration开始前、slice外启动由user manager托管的独立监护者，截止时间基于本次检查起点（工作最晚3000s停止、清理最晚3300s完成，保留外层3600s内至少300s余量），在任何被测进程启动前持久保存本次slice/unit/project/Attempt所有权清单，持有runner/driver的pidfd并监测死亡或截止时间。driver的正常finally/trap可请求清理；driver/run_check被SIGKILL或超时也由独立监护者执行同一收尾，不能依赖死者trap或“同pgid会一起死”。服务Restart=on-failure保持原值，以显式unit stop撤销重启；只停止登记的实例/scope，不按hoh名字杀进程，不停止整个用户slice。
+
+清理先用产品已有Attempt取消/回收机制与身份守卫，核对Witness、进程组/marker、cgroup.kill及populated=0，再stop已登记host unit/scope与TUI/driver scope；host已死则由监护者按已登记cgroup Witness清理，不对复用PID或新cgroup发信号。监护者保留本检查slice到核验结束：仍存在的每个被测cgroup必须populated=0；已由manager移除的子cgroup须有其Witness的移除证明，且这个尚存的共同父slice最终populated=0（覆盖已移除子树），所有已登记pidfd均终结。随后才移除本次runtime drop-in/slice、隔离数据库和测试安装。停止/退出时间、逐unit结果、PID身份、cgroup样本与删除证明写入声明的三份工件；清理失败/未知不PASS，保留未释放对象供诊断。
+
+T03在**service与scope两条真实路径**各做正常结束、driver失败、外层run_check超时/取消、直接SIGKILL driver/runner的实验；至少一组带有真实cgroup的fixture Attempt及其setsid后代。每例在检查结束/故障触发后≤30s由外部监护者证明上述空树/身份终结，不能以客户端退出代替后台结束。正式测量开始前确认本次没有未知旧host，前后核对非本次unit未被停止；清理预算在总时限中预留。此设施仍待T03实测，生命周期修改按docs/19双独立审查。
+
+冻结前 `.hoh-dev/environment.json` 增加 `m4_reference`（随 candidate.environment 摘要绑定）：profile_id、硬匹配键、版本观察值、fixture 与预算。**硬匹配键仅为** CPU family/model/可见拓扑、物理内存、项目盘 mount source/FSType 与已声明后端类别、允许CPU/逐进程affinity、共同slice及产品unit/Attempt树的有效MemoryMax/MemorySwapMax/CPUQuota实际值、构建 profile/release 优化选项。OS 架构与 UTF-8 locale 可用是执行前提；内核/Rust/终端仿真器/locale 名称与版本/tmux/ssh/OS 补丁版本、boot_id/可用空间/rotational 是记录项，不逐字匹配，不能因补丁升级把所有 integration 标为环境不符。release binary hash 在检查内生成，记 m4-environment.json 并绑定冻结源码/构建输入，不事后改冻结 environment。补丁升级时在新候选冻结前记录新观察值，做一次同 fixture/同预算的对照测量并保留原始样本/上次引用；软件升级本身无需重开 CR，不沿用旧 PASS。改变硬件/profile 或降低预算须修订并复审 D4；不通过重写 reference 把另一机器冒充同 profile。
 
 | 测量 | 数字预算（参考环境） | 采样/执行 |
 |---|---|---|
@@ -227,7 +280,11 @@ Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配�
 | 绘制/文本增量合并 | 最长50 ms或16 KiB先到 | 调度探针记录窗口；工具/决定/验收事件完整计数 |
 | idle 核心与活动峰值 | idle总和≤150 MiB；活动host/TUI各≤256 MiB | 活动60s、idle10s，100ms采样；包含后台索引完成后的稳态 |
 | 百万事件夹具、迁移回填 | 构建≤600s；回填≤600s；kill→reconcile/host-ready各≤30s | 单writer产品批提交≤500行/1MiB，ACK/fsync不绕过；不改PRAGMA降低持久性 |
-| 本检查总预算 | 仍≤3600s；工作阶段合计≤3000s，至少600s余量 | T03先实测既有integration、release构建、造库、回填、测量各阶段并记录duration/环境；据此填写阶段预算与预计合计。保留构建/回填各600s上界，其余预算不得填一个刚好3600s的无余量分配；剩余600s中清理≤300s、调度余量≥300s。无法满足则D4升级CTO，不放宽总超时或删场景 |
+| 本检查总预算 | 仍≤3600s；工作阶段合计≤3000s，至少600s余量 | T03先实测既有integration（含debug tui_pty）、release构建、造库、回填、测量各阶段并记录duration/环境；在冻结m4_reference内为每阶段写数值时限及预计合计，runner逐阶段强制截止。保留造库/回填各600s上界，其余预算与两者合计≤3000s，不得分配满3600s；剩余600s中清理≤300s、调度余量≥300s。无法满足则D4升级CTO，不放宽总超时或删场景 |
+
+**阶段时限与重测（CR28D-205）**：保留 `cargo-tests.sh integration` 的 `--test '*'` 选择器，debug阶段包含普通tui_pty测试（busy_timeout、信号/故障、布局和输入），不能漏算它们。冻结前的m4_reference必须给出debug_integration、release_build、fixture_build、backfill、measure五个正整数秒时限；各工作阶段串行、单调时钟独立计时并由监护者强制截止，限额总和≤3000s、fixture_build/backfill各≤600s。值缺失/总和不合规在启动前FAIL；阶段超过自己的冻结时限立即记录 `reason=PHASE_TIMEOUT,phase,limit_seconds,elapsed_seconds`、受影响TEST为FAIL并非零退出、进入清理，剩余阶段不得借用余量掩盖首失败；run_check外层3600s照旧。清理≤300s、另留≥300s调度余量，单个生命周期证明仍≤30s。这里不编造尚未执行的阶段耗时/分配值：T03的done_when以实测填齐可执行预算为交付条件，缺此条件runner未交付。
+
+T05、T07、T10每次加入场景后都必须在各自冻结候选上重测**全integration五阶段**，在m4-measurements保存每阶段原始起止/elapsed/limit、选择器及实际测试清单、总耗时和余量，不能复用T03时长。T05涵盖新增块/PTY，T07涵盖busy/信号/输入/adapter与RSS，T10涵盖最终百万库组合；debug与release每段都受限。任一超过阶段/3000s工作总额，或清理后不足300s调度余量，均FAIL并交D4重规划；不删tui_pty、放宽3600s或修改失败记录。调整阶段分配也须在下一候选冻结前记录，不在检查中动态挪预算。
 
 百万库只在这次 integration 执行中构建一次；在同一 candidate/spec/environment/fixture哈希下，以产品一致性备份克隆给各场景，克隆恢复后校验水位和对象hash；不跨候选借证据。100 Run×10 iteration，生产批写产生1,000,000事件与10,000×16KiB段；可验证关轮与引用，不能直接写伪造host投影。小规模功能测试在普通 debug integration libtest 调用同一产品接口，保持其真实存储语义。
 
@@ -235,7 +292,7 @@ Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配�
 
 `cargo test --workspace` 与 `--test '*'` 不发现 example，CI 不跑百万测量；正式 integration 的三个声明文件从 T03 驱动交付时才同步生效，连提前失败也由 EXIT 收取器保存 summary/environment 与空 samples，明确未执行原因，不补造样本。后续 T05/T07/T10 增加各自必需场景；尚未交付的义务写 NOT_RUN 的 detail/非 PASS 行，不能把子集声称全 AC 通过。
 
-**非参考环境与检查出口（D4）**：M4–M7/v1 的正式 integration PASS 只收自本节同一参考 profile；Ubuntu24.04 矩阵收取 tui-pty，普通功能回归用 cargo test，不在其上运行/申报正式 integration PASS。显式试跑非参考 integration 时，受影响 TEST 逐项写 schema 合法 DEGRADED，detail 为 reason=REFERENCE_ENV_MISMATCH，stderr 同标记，脚本退出 **78**；其余已运行功能原始 PASS 行保留，但整次 execution 非零，不作任何正式 integration 验收。退出3继续专指原脚本 NO_TESTS，不再承担环境不符。test-result 无 BLOCKED/NOT_RUN 枚举，不写进去；DEGRADED 仅是未测诊断，required AC 仍不通过，不能据此发布 COMPLETED_DEGRADED。缺必跑设施/路径、环境符合但预算超限为 FAIL/非零。该限制及每次 integration 的成本必须在 D4 批准时确认；T03 实测若不能在3600s内留600s余量，停止启用测量并交 CTO 重新规划（可提专用 required check，但需另审修订，本稿不自行加检查/放宽超时）。p95 取全部样本升序第 ceil(0.95×N) 项，冷启动和慢样本都保留。
+**非参考环境与检查出口（D4）**：M4–M7/v1 的正式 integration PASS 只收自本节同一参考 profile；Ubuntu24.04 矩阵收取 tui-pty，普通功能回归用 cargo test，不在其上运行/申报正式 integration PASS。显式试跑非参考 integration 时，受影响 TEST 逐项写 schema 合法 SKIPPED，detail 为 reason=REFERENCE_ENV_MISMATCH，stderr 同标记，脚本退出 **78**；其余已运行功能原始 PASS 行保留，但整次 execution 非零，不作任何正式 integration 验收。退出3继续专指原脚本 NO_TESTS，不再承担环境不符。test-result 无 BLOCKED/NOT_RUN 枚举，不写进去；SKIPPED仅是未测诊断，required AC仍不通过；这些检查绝不写DEGRADED，不能据此发布COMPLETED_DEGRADED。缺必跑设施/路径、环境符合但预算超限为 FAIL/非零。该限制及每次 integration 的成本必须在 D4 批准时确认；T03 实测若不能在3600s内留600s余量，停止启用测量并交 CTO 重新规划（可提专用 required check，但需另审修订，本稿不自行加检查/放宽超时）。p95 取全部样本升序第 ceil(0.95×N) 项，冷启动和慢样本都保留。
 
 ## 各需求的细化与 AC→测试映射
 
@@ -264,9 +321,9 @@ doc_refs：`docs/03-ux.md`、`docs/04-architecture.md`、`docs/adr/ADR-022.md`�
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-011-01 / TEST-011-01 | tui-pty | 默认 Workspace；六职位，cto/developer 同为 claude；选 developer，块 K 的 offset=12，草稿“尚未发送” | 依次 resize 为 80/99/100/120/159/160/180 列、32 行，选择 Team 分屏，再返回 Workspace | 80/99 为单区标签；100–159 最多主区+1 详情；160/180 用户选择后最多三列；默认 Workspace 不强制三窗；选择身份、K/12 与草稿保持；无 POST，所有行显示宽度≤窗口 |
+| AC-011-01 / TEST-011-01 | tui-pty | 默认Workspace、无预选角色；六职位，cto/developer同为claude，各有不同会话；后选developer，块K的offset=12，草稿“尚未发送” | 先未预选打开Team，再从claude进入Focus；在选择器等待，显式选developer；依次resize80/99/100/120/159/160/180列、32行，选择Team分屏再返回Workspace | 选择器同时列cto与developer及真实epoch/session，选定前Focus内容为空、无默认落入任一职位；选后只显示developer；整个导航无POST/派发/Task或Attempt新增。80/99为单区标签；100–159最多主区+1详情；160/180用户选择后最多三列；默认Workspace不强制三窗；选择身份、K/12与草稿保持，所有行显示宽度≤窗口 |
 | AC-011-02 / TEST-011-02 | tui-pty | 七职位含security_reviewer；developer epoch1 A1在途，READY developer Task T2待派，codex换绑待checkpoint | Team/Focus A1；对T2派发一次得到拒绝，再结束A1、生效epoch2并派A2 | 七职位可达；ROLE_BINDING_PENDING确由拒绝派发产生；pending保留claude/A1与待codex；历史Focus仍A1/epoch1，选择当前才A2/epoch2；内容不混；重用session时按Attempt边界显示，session过滤跨Attempt时逐块仍带attempt_id |
-| AC-011-03 / TEST-011-03 | integration | 同一 agent 的两个 role、三个 session，A1 有公开 message/tool/handoff/error 及一项非公开内部字段；一段公开日志缺文件 | 按 A1 查询 Focus 各页，再查询另一 role；请求缺失 artifact | A1 的所有公开记录按 offset/seq 可遍历且不混入其他 role/session；内部字段不在响应；缺失段返回 ARTIFACT_NOT_FOUND，descriptor 保留身份和缺失提示，不显示为空成功；无 spawn/任务写入 |
+| AC-011-03 / TEST-011-03 | integration | 同agent两role、三个session；A1有公开message/tool/error及非公开内部字段；H13真实handoff无attempt_id；一段公开日志缺文件 | 按A1遍历Focus；分别切到H13的role/epoch视图、session视图，再加attempt_id=A1过滤；查询另一role与缺失artifact | A1的公开message/tool/error按offset/seq完整且不混role/session；role/epoch/session视图的handoff集合逐项等于H13，任何Attempt过滤的handoff子集为空，不从session推断Attempt；内部字段不在响应；缺段ARTIFACT_NOT_FOUND，descriptor保留身份与缺失提示，不为空成功；无spawn/任务写入 |
 | AC-011-04 / TEST-011-04 | tui-pty | 80×24、角色选择与草稿状态；可访问状态页 | resize40×8、1×1再120×32；每个小尺寸输入字素“a”、打开状态页、关闭，再选择历史已移除角色 | 40×8显示“窗口过小”及“输入 / Ctrl+C退出”；1×1仅显示ASCII !，Ctrl+P面板提供可逐字符滚动的ASCII诊断 small terminal/input/Ctrl+C exit 与状态字段英文键和值（不用一格截断宽字）；各尺寸接受a且不提交，Ctrl+C选择/脱离仍可达；被省略的四组事实在可滚动状态页逐字段可读；恢复后草稿新增两个a、锚点保持，历史角色有标记；无panic/越界/Run修订变化 |
 | AC-011-05 / TEST-011-05 | integration | 每个codex App Server/受支持exec、claude、pi模式的版本绑定兼容fixture；含public message/tool开始结束、compact/wait/usage有与无、secret标记、两role/epoch；真实runner与Persistence，非直接注入UI事件 | 经SendInput接受事务与native frame入口逐帧/重复/超大正文输入，队列背压；在提交前后kill/reopen、取消、EOF；从持久公开块读出 | 三家按§2.2白名单输出逐字段/顺序/身份相同；另经SendInput受理普通/大正文后从Persistence读用户块，正文/hash等于规范化原文（非文件引用提示），重放input_id与可关联的native回显不重复；DB_BUSY背压超过quiet不产生attempt.inactive，解除后真正静默到余下quiet才产生，取消仍可达；启动和结束工具均可查、未知能力显式null，secret/隐藏字段不入供API消费的公开读模型或公开对象；未结束Attempt即可读到已提交消息/活动；队列≤256/1MiB、段≤1MiB；重复无重块、旧epoch不更新当前活动；已提交块重启不丢，未提交尾段有缺口而非完整成功；fixture标product+synthetic/recorded来源，不称live |
 
@@ -278,7 +335,7 @@ doc_refs：`docs/03-ux.md`、`docs/05-data-api.md`、`docs/07-algorithms.md`、`
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-012-01 / TEST-012-01 | integration | §5.1参考环境/release串行阶段；八类块各一，首尾标记X，Tool20MiB；Evidence C1；父锚点K/200 | 各以键盘与SGR鼠标展开→分页→全文搜索X→全屏→Esc返回→复制文件，追加另一块；真实PTY采≥100次首屏 | 八类动作均可达且不执行工具/测试；返回K/200、首尾可达、导出字节/hash等于公开纯文本；首屏p95≤500ms且缓存有界；键鼠指向相同身份；环境不符DEGRADED诊断/退出78、AC不通过，禁止静默PASS |
+| AC-012-01 / TEST-012-01 | integration | §5.1参考环境/release串行阶段；八类块各一，首尾标记X，Tool20MiB；Evidence C1；父锚点K/200 | 每类先SGR单击选择、双击展开、滚轮滚动，再键盘展开→分页→全文搜索X→全屏→Esc返回→复制文件，追加另一块；真实PTY采≥100次首屏 | 单击只改选中项且保持折叠，双击恰一次展开，滚轮改变视窗锚点但不改所选块身份/不执行动作；八类键盘动作均可达且不执行工具/测试；返回K/200、首尾可达、导出字节/hash等于公开纯文本；首屏p95≤500ms且缓存有界；键鼠指向相同身份；环境不符SKIPPED诊断/退出78、AC不通过，禁止静默PASS |
 | AC-012-02 / TEST-012-02 | integration | 20MiB+17字节完整UTF-8对象；“中文X”跨256KiB与8MiB边界各一处、末尾一处，连续重叠匹配aaa；NUL/无效UTF-8二进制B含唯一ESC/OSC标记 | 分Range拼全文；search limit=1续扫到结束、重复cursor；无匹配；请求B搜索并用PTY打开B | 拼接hash正确无缺重字；每个匹配的byte_offset精确、跨窗口不漏不重、上下文合法UTF-8≤256B；无匹配完成为空；B为422 ARTIFACT_NOT_TEXT；PTY只含metadata/下载动作，捕获中B原始控制标记字节为0 |
 | AC-012-03 / TEST-012-03 | tui-pty | Evidence缺文件、摘要不符；独立认证403变体在隔离host重启后由旧token客户端请求（旧SSE断开、新请求均被拒）；对象chmod造成EACCES、DB_BUSY；旧C1与新C2同文件名；65KiB公开文本 | 打开/重试/返回；文件复制成功与不可写目录失败；尝试设置osc52；移除exports忽略规则再复制 | 分别显示404 ARTIFACT_NOT_FOUND、409 ARTIFACT_INVALID、原403、503 ARTIFACT_UNREADABLE(permission)、503 DB_BUSY；403使整个连接标stale/认证失效、保草稿/最后快照、停止重试旧token；显式重新连接读取新凭证并取快照后才恢复，不冒充单对象权限；无PASS/空成功；C1不换C2；65KiB文件复制完整，失败无成功消息；osc52配置拒绝、无OSC/DCS输出；忽略失效拒绝导出且不产生未跟踪文件；草稿锚点不变 |
 | AC-012-04 / TEST-012-04 | unit | 八类块、100 次追加、10 次 resize，焦点为第三块；正文含中文/组合字符；选中块被过滤或其对象回收 | 对展开/折叠/全屏/返回/搜索状态作纯动作序列；重复同一提交事件 | block_id 与 grapheme_offset 不因前插/重复事件漂移；offset 超过新正文时钳到最后字素边界并提示；被过滤保留隐藏锚点，取消过滤可返回；不可恢复块明确提示并选 seq 最近的前驱（无前驱选后继），不跳到无关 Run |
@@ -291,13 +348,15 @@ doc_refs：`docs/03-ux.md`、`docs/05-data-api.md`、`docs/07-algorithms.md`、`
 
 #### 分类表与完整集合（D3）
 
-分类由kind白名单决定，**带attempt_id不意味着Agent层**。下表是完整分类规则，P=Project、I=Iteration、A=Agent；I还要求run/iteration归属，A通常要求明确role/epoch/attempt；以下明确的handoff/session与已接受用户消息允许尚无Attempt，但只匹配其真实role/epoch，不能因此进入任意Attempt过滤。项目级null身份不猜补。多层事件只在所列层出现。具体名字从当前生产者和CR-026提取；新kind若未列入则走最后一行诊断，不靠前缀自动解释为成功。M4-T03实现集中kind注册表及查询时分类，M4-T06消费，M4-T09只负责归属和public事实、不存class。注册表穷举生产者常量及动态format!分支的有限kind集合（adapter模式也逐项枚举）；test_013_04_kind_registry比较生产可发出集合与分类集合，漏项即失败。未知分支只留给未来/损坏数据，不把已知生产kind当UI_UNKNOWN_EVENT；新增生产kind必须同时更新注册与分类，不依赖grep字面量证明完整。
+分类由kind白名单决定，**带attempt_id不意味着Agent层**。下表是完整分类规则，P=Project、I=Iteration、A=Agent；I还要求run/iteration归属，A通常要求明确role/epoch/attempt；以下明确的handoff/session与已接受用户消息允许尚无Attempt，但只匹配其真实role/epoch，不能因此进入任意Attempt过滤。项目级null身份不猜补。多层事件只在所列层出现。具体名字从当前生产者、CR-026及显式标注的CR-024后续main提取；读取历史/未来版本的新kind若未列入则走最后一行诊断，不靠前缀自动解释为成功。M4-T03实现集中kind注册表及查询时分类，M4-T06消费，M4-T09只负责归属和public事实、不存class。注册机制必须约束写入本身：T03把所有生产 `NewEvent.kind` 及通向唯一 `writer::insert` 的构造参数改为封闭的 `ProducedEventKind` 类型；公开协议/持久读取的Event.kind仍为开放字符串，旧未知数据继续可读。类型不提供任意String的生产构造器；每个有限动态分支（cancel信号/PassEnd、effect目标状态、runner的prefix/name、adapter模式）必须先匹配为枚举variant，未知原生种类写已注册的adapter.unknown_event并把原名作为去敏payload。历史/损坏数据的Unknown只存在读取类型；F13等未知写入fixture通过debug专有的测试入口调用同一writer（与§5.1故障seam同编译边界，release不编译），生产调用图不得引用该helper，源码守卫同时核对这一点；不能为夹具给正常生产类型增加任意字符串旁路。
+
+分类和 `ProducedEventKind::ALL/as_str` 由同一枚举定义生成，分类match无通配兜底；新增variant未分类必须编译失败。`test_013_04_kind_registry`枚举该生产类型的全部variant，逐项核对唯一名字/显式层，并调用每种动态生产分支验证其返回variant；另用源码/AST守卫枚举整个生产crate的NewEvent构造与唯一SQL插入入口，禁止新的原始字符串写入、format!绕行或另开INSERT路径，无法分析的宏/构造需显式失败并列source位置，不能跳过。负例必须证明新增未分类variant、把cancel/effect分支改回字符串、增加旁路INSERT三种变异分别被编译或守卫拒绝；不能仅比较两份手工数组。应用时从该生产注册定义生成完整kind清单供审查对照下表，不以grep带点字面量代表全覆盖。当前补全项依据control.rs的Signal/PassEnd、runner.rs的EffectState与host/runner.rs实际调用；除报告点名五项cancel结果，还包含Signal::Native产生的cancel.native_cancel。host/runner.rs::settle的prefix仅lease或runner，后缀来自inspected/native_cancel、StopStep四值、cgroup五值、outside四值，完整30种列在下表；hold.rs中的integrity_violation虽不含点也登记。这次沿生产调用链补全，T03仍须用类型/守卫机械保证后续不再遗漏。新增生产kind须同时有类型与分类，未来/损坏数据才走Unknown。
 
 | kind（同格逗号分隔为独立名字） | 层 | 规则 |
 |---|---|---|
 | spec.changed, spec.index_failed, spec.generated_drift, spec.drafting, spec_review.opened, spec_review.reported, run.created, run.started, run.result, run.incomplete, run.cancel_requested, run.cancelled, run.pause_requested, run.paused, run.resumed, run.waiting, run.blocked, run.blocker_claimed, run.blocker_released, run.control, run.baseline, run.mode_change_pending, run.mode_changed | P | 规格/Run里程碑；不因在轮内发生而塞进I |
 | candidate.frozen, candidate.accepted, candidate.rejected, candidate.stale, candidate.reconcile_failed, candidate.reconcile_recovered, issue.opened, issue.reopened, issue.resolved, issue.consumed_by_rework, issue.observation, decision.applied, decision.rejected, iteration.completed, budget.risk, no_progress, milestone_ready, release_request | P,I | 有Run时进入该轮；无Run只P |
-| task.accepted, task.blocked, task.cancelled, task.implemented, task.protocol_correction, task.retry_scheduled, task.reverify, task.rework, task.superseded, task.unblocked, task.migrated, task.replaced, attempt.created, attempt.start_refused, attempt.artifacts, attempt.outputs, attempt.workspace, attempt.workspace_start, attempt.tracking, attempt.moved, attempt.inactive, attempt.inactive_cleared, attempt.provider_reset, schedule.round, plan.imported, plan.write_violation, readiness.passed, context.packed, evidence.recorded, effect.started, effect.observed, repair.local, repair.protocol, repair.refusal_cleared, repair.reverify | I | 派发/执行/证据工程事实，attempt.created不进A |
+| task.accepted, task.blocked, task.cancelled, task.implemented, task.protocol_correction, task.retry_scheduled, task.reverify, task.rework, task.superseded, task.unblocked, task.migrated, task.replaced, attempt.created, attempt.start_refused, attempt.artifacts, attempt.outputs, attempt.workspace, attempt.workspace_start, attempt.tracking, attempt.moved, attempt.inactive, attempt.inactive_cleared, attempt.provider_reset, schedule.round, plan.imported, plan.write_violation, readiness.passed, context.packed, evidence.recorded, effect.started, effect.observed, effect.committed, repair.local, repair.protocol, repair.refusal_cleared, repair.reverify | I | 派发/执行/证据工程事实，attempt.created不进A |
 | verification.attempt_started, verification.candidate_ready_for_join, verification.check_refused, verification.confirmations_dropped, verification.failures, verification.failures_abandoned, verification.failures_attached, verification.failures_consumed, verification.handoff_reissued, verification.joined, verification.output_invalid, verification.report, verification.result, verification.round_closed, verification.round_opened, verification.tree_checked, report.rejected, report.stale, task_result.rejected | I | 验证生命周期，不把report自述当accepted |
 | config.invalid | P | 配置拒绝/诊断，不伪称已生效 |
 | compat.suite_deferred, compat.suite_opened, compat.suite_started, compat.suite_ended, compat.suite_completed, compat.manifest_unreadable | P；有Run另I | 兼容检查生命周期/清单读取诊断，suite完成不等于产品验收 |
@@ -307,8 +366,10 @@ doc_refs：`docs/03-ux.md`、`docs/05-data-api.md`、`docs/07-algorithms.md`、`
 | handoff.prepared, handoff.delivered, handoff.superseded, handoff.undelivered, session.start（若持久事件） | I,A | A精确成员规则见下文H13；session.start目前是outbox notice，不凭名字伪造一条events事实 |
 | public.message, public.tool_started, public.tool_completed, public.segment_sealed, public.activity, public.usage, public.gap（M4新增） | A | §2.2公开规范化输出及input_id用户原文；未投递用户块按真实target role/epoch匹配，attempt/session过滤为空；segment更新同block不重复正文 |
 | adapter.agent_start, adapter.blocked, adapter.degraded, adapter.diagnostic, adapter.error, adapter.item, adapter.prompt_refused, adapter.result, adapter.server_request, adapter.turn, adapter.turn_failed, adapter.ui_data, adapter.ui_request, adapter.unknown_event（若生产落库） | A | 只显示去敏后的诊断/公开白名单；已映射的native item不二次渲染成消息；原始帧不是UI事实 |
-| supervisor.allocated, supervisor.available, supervisor.blocked, supervisor.closed, supervisor.deferred, supervisor.horizon, supervisor.output, supervisor.output_discarded, supervisor.output_disposed, supervisor.output_failed, supervisor.preempt, supervisor.probe, supervisor.rearmed, supervisor.retrigger, supervisor.step_failed, supervisor.superseded, supervisor.turn_failed, supervisor.turn_limit, supervisor.unavailable, supervisor.withdrawn, supervisor.woken | I | 调度监督事实，不假称正在推理 |
-| reconcile.attempt, reconcile.completed, reconcile.diagnostic, reconcile.run, reconcile.started, runner.diagnostic, runner.outside, runner.received, runner.refused, runner.unreaped, cancel.diagnostic, cancel.workspace, bridge.rejected, registry.turn_auth_ignored | I | 恢复诊断；无Run的host诊断改入P |
+| supervisor.allocated, supervisor.available, supervisor.blocked, supervisor.bridge_ignored（CR-024后续main）, supervisor.closed, supervisor.deferred, supervisor.horizon, supervisor.output, supervisor.output_discarded, supervisor.output_disposed, supervisor.output_failed, supervisor.preempt, supervisor.probe, supervisor.rearmed, supervisor.retrigger, supervisor.step_failed, supervisor.superseded, supervisor.turn_failed, supervisor.turn_limit, supervisor.unavailable, supervisor.withdrawn, supervisor.woken | I | 调度监督事实，不假称正在推理 |
+| reconcile.attempt, reconcile.completed, reconcile.diagnostic, reconcile.run, reconcile.started, runner.diagnostic, runner.outside, runner.received, runner.refused, runner.unreaped, cancel.diagnostic, cancel.workspace, cancel.native_cancel, cancel.sigterm, cancel.sigkill, cancel.reaped, cancel.lost, cancel.unreaped, integrity_violation, bridge.rejected, registry.turn_auth_ignored | I | 恢复诊断；无Run的host诊断改入P |
+| lease.inspected, lease.native_cancel, lease.sigterm, lease.sigkill, lease.reaped, lease.lost_track, lease.cgroup_sigterm, lease.cgroup_sigterm_incomplete, lease.cgroup_kill, lease.cgroup_reaped, lease.cgroup_unreadable, lease.outside_sigterm, lease.outside_sigkill, lease.outside_reaped, lease.outside_unreadable | I | host/runner.rs::settle的lease_expired分支；同样为工程回收事实，不因Attempt身份进入A |
+| runner.inspected, runner.native_cancel, runner.sigterm, runner.sigkill, runner.reaped, runner.lost_track, runner.cgroup_sigterm, runner.cgroup_sigterm_incomplete, runner.cgroup_kill, runner.cgroup_reaped, runner.cgroup_unreadable, runner.outside_sigterm, runner.outside_sigkill, runner.outside_reaped, runner.outside_unreadable | I | 同一settle其余cause分支；后缀由reconcile.rs::step_names、cgroup.rs::stop、processes.rs::stop的有限返回集产生，不是接受任意runner前缀 |
 | 未列kind（包括未来扩展） | P；有Run另I；有明确Attempt另A | 恰一UI_UNKNOWN_EVENT块/seq，保留身份、经去敏的摘要和refs；不推导任务成功 |
 
 **交接成员 H13（D3）**：`handoff.prepared` 的职位取 `payload.role`；发送身份为 `(role, payload.from.role_epoch, payload.from.session_id)`，接收身份为 `(role, payload.to.role_epoch, payload.to.session_id)`，from/to=null 不构成成员，缺 session 只能匹配 role/epoch，不能匹配 session。顶层 role_epoch 是目标 epoch，不覆盖 from 的旧 epoch。`handoff.delivered/undelivered/superseded` 与 `session.start` 按各自 `payload.role/role_epoch` 匹配；session_id 仅在明确提供时匹配，缺 attempt_id 不按 session 推断某一 Attempt。session.start 当前只为 outbox notice：分类单元测试覆盖其字段，将来若新增持久事件亦遵守此规则，不在产品测试注入一个不存在的生产事件。
@@ -353,8 +414,8 @@ F13 仍用12条事件，但把每条成员关系写全。I1=`R1/iteration/1`、I
 | AC-013-01 / TEST-013-01 | tui-pty | F13，另有 REQ/issue/decision/commit/evidence 的完整追踪引用；120×32 | 依次选择 Project、R1/I1、A1；打开五类引用再返回；seq=8 后断线，补到 12 | Project 可见 [1,5,7,8,9,10,12]；I1 可见 [2,5,6,7,8,9]；A1 可见 [3,4]；五类详情的 ID/spec/candidate/hash 与来源一致；断线前后最终列表、过滤条件和锚点与连续读取相同 |
 | AC-013-02 / TEST-013-02 | integration | F13含重复/逆序timestamp；limit2、H12，之后追加13；所有合法过滤值与明确空集 | 按本节F13与H13完整期望集合翻页、重复cursor、改过滤/H、重建generation、试跨Run iteration/attempt | 严格seq序、每个并集精确等于表，无13混入；重复cursor同页；新/v1/timeline非法为400 QUERY_INVALID，旧Run路由非法仍404 BAD_REQUEST；两页路由generation过期410且顶层snapshot_watermark；SSE矛盾409为真实HTTP；410仅静态核对OpenAPI顶层形状、不伪造产品过期；H13各handoff完整成员集亦精确相同；合法空items=[]/next_cursor=null |
 | AC-013-03 / TEST-013-03 | integration | 四条独立链：TEST缺evidence；当前修订中PASS绑定旧候选而非当前候选；批准新修订后旧修订验收节点；当前完整合法链 | 经refs往返详情，在新修订前后各查一次 | 标签唯一：broken（缺evidence）、orphan（当前修订的旧候选PASS）、stale（旧修订全部验收节点）、current（合法链）；先做新修订失效再判旧PASS，stale不另写orphan/历史；身份/原seq保留、非current不计accepted；不生成证据/执行检查 |
-| AC-013-04 / TEST-013-04 | unit | F13 的持久事件、重复 4/9、未知 12；两种交付分批及同一 H 快照 | 比较全量折叠、快照+增量、断线补历史三种规范化投影；切过滤再切回；枚举集中kind注册表与全部生产分支，另核H13/notice身份 | 块序列/refs/身份/诊断一致；所有生产kind均有显式分类（包括config.invalid、compat.suite_*、compat.manifest_unreadable、session.native），漏项测试失败；H13 role/epoch/session集合与表完全一致；12 恰一诊断；切过滤不改变事件真值；无以 timestamp 排序、以 Agent 名合并 role 或从模型摘要创建状态的行为 |
-| AC-013-05 / TEST-013-05 | integration | 两Run的事件交错；R1关轮前开放I1，R2开放I2；同Task重试跨R1两轮，含run_id=null事件；R1末轮后终结并写run.result/milestone_ready/release_request；带既有iteration.completed的旧库 | 经单writer逐事务追加、关闭I1、在事务边界kill/reopen、重复通知并回填旧库 | 开放轮与关闭后key相同；每条事件严格按§2.1的Run+close区间归属，close归被关闭轮、未终结Run下一条归下一轮；终结R1不展示开放N+1，末close后尾事件iteration=null/只P，重放集合一致；项目事件iteration=null；跨轮Task不被旧tasks.iteration_id吞并；重启/回填/在线集合相同、预算/关轮数不增；缺损边界诊断index_ready=false，不伪造完整结果 |
+| AC-013-04 / TEST-013-04 | unit | F13 的持久事件、重复 4/9、未知 12；两种交付分批及同一 H 快照 | 比较全量折叠、快照+增量、断线补历史三种规范化投影；切过滤再切回；枚举生成的ProducedEventKind::ALL并调用所有动态生产分支；运行生产构造/唯一INSERT的源码守卫与三种旁路负例；另核H13/notice身份 | 块序列/refs/身份/诊断一致；所有生产kind均有显式分类，含cancel.native_cancel/sigterm/sigkill/reaped/lost/unreaped、effect.committed、完整lease/runner收尾30种、integrity_violation及原config/compat/session集合；动态分支输出与登记一致；未分类variant不能编译、原始字符串和旁路INSERT被守卫拒绝，任一绕过负例未被检出则测试失败；H13 role/epoch/session集合与表完全一致；12 恰一诊断；切过滤不改变事件真值；无以 timestamp 排序、以 Agent 名合并 role 或从模型摘要创建状态的行为 |
+| AC-013-05 / TEST-013-05 | integration | 两Run事件交错；R1关轮前开放I1、同Task跨两轮重试，含run_id=null项目事件；分别准备COMPLETED、FAILED、CANCELLED、PAUSED、INCOMPLETE五个独立Run变体及真实既有iteration.completed旧库 | 经产品单writer/CAS与真实控制或预算路径逐事务追加/关轮、kill/reopen并回填；完成变体观察run.result(state=COMPLETED)，失败变体观察run.result(state=FAILED)，取消变体先cancel_requested再cancelled及result，暂停变体观察paused及result；INCOMPLETE前后取H1，显式ResumeRun生效后取H2，重查相同尾事件e与旧H1页；核对milestone_ready/release_request | 每事件按§2.1状态表与Run+close区间归属；close属被关轮、开放/关闭key一致，跨轮Task不被tasks.iteration_id吞并。COMPLETED/FAILED/CANCELLED及INCOMPLETE在对应H不展示N+1，未关闭尾段iteration=null/只P；cancel_requested、PAUSED（含run.result.state=PAUSED）仍保留原开放轮，BLOCKED亦不因result而终结；milestone_ready/release_request不改变终结判断。INCOMPLETE恢复H2重开原N+1，e由H1的null变为H2的该轮；H1重查逐字段/成员不变，无新close/预算计数。项目null事件不从payload补Run；重启/回填/在线集合相同；缺损边界index_ready=false且诊断，不伪造完整 |
 
 ### REQ-014 · 真实进度状态栏（5 条）
 
@@ -362,7 +423,7 @@ F13 仍用12条事件，但把每条成员关系写全。I1=`R1/iteration/1`、I
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-014-01 / TEST-014-01 | tui-pty | r1有RQ1(2AC)、RQ2(1AC)、RQ3(1AC)；C1范围仅RQ1/2且ACCEPTED，RQ3不在该Run任何Task中；C1接受后新增两个仅关联RQ1/2的blocked Task，现有5个done/共7个Task；OPEN2/REOPENED1/RESOLVED1；qa/pi配置模型requested-X、实际resolved-Y，未知费用/上下文 | 打开status/Focus；新C2与budget.risk；批准r2新增RQ4并删除RQ3（fixture模拟用户批准，不由UI擅删） | 先2/3 accepted、blocked=2/open=2/reopened=1；分子不取Task/AC数，blocked按Task唯一ID且Run级reason单列不双计；Focus显示resolved-Y，requested-X仅配置详情；费用/上下文未知带qa/pi；C2为0/3；r2为0/3、revision2/added1/removed1；旧计数仅历史；预算原因/上限可查 |
+| AC-014-01 / TEST-014-01 | tui-pty | r1有RQ1(2AC)、RQ2(1AC)、RQ3(1AC)；C1范围仅RQ1/2且ACCEPTED，RQ3不在该Run任何Task中；C1接受后新增两个仅关联RQ1/2的blocked Task，现有5个done/共7个Task；OPEN2/REOPENED1/RESOLVED1；qa/pi配置模型requested-X、实际resolved-Y，未知费用/上下文 | 打开status/Focus；新C2与budget.risk；批准r2新增RQ4并删除RQ3（fixture模拟用户批准，不由UI擅删） | 先2/3 accepted、blocked=2/open=2/reopened=1；分子不取Task/AC数，blocked按Task唯一ID且Run级reason单列不双计；Focus显示resolved-Y，requested-X仅配置详情；费用与上下文值明确显示“未知（qa/pi，原因）”，字段不得显示0、$0或0%来代替未知；C2为0/3；r2为0/3、revision2/added1/removed1；旧计数仅历史；预算原因/上限可查 |
 | AC-014-02 / TEST-014-02 | unit | 无spec、零AC、某AC FAIL、FROZEN/STALE/INVALID、旧spec PASS、spec_review PASS、TaskResult COMPLETED；另spec共3需求：同一ACCEPTED候选范围内一个全PASS、一个合规DEGRADED，另一个未纳入该Run任务范围的需求未满足 | 与host共用聚合函数，重复验收事实 | 不满足者分子0，无spec为0/0且未完成；3需求例为accepted=1/3、degraded=1，DEGRADED不进分子且在分母；只有当前spec+候选ACCEPTED且该需求所有AC PASS才加1；重复不增计 |
 | AC-014-03 / TEST-014-03 | tui-pty | 80/120/180×32；三档，custom=[budget,candidate]；可识别H1/H2响应与独立Timeline seq | 切档重开，Focus/离开，候选更新和Issue重开并发 | minimal仅mode/阶段任务/n-m/blocked-issues四组；standard依次四组+git/candidate/elapsed/budget；custom四组+budget/candidate严格按序；窄屏可换行、超出可选项进状态页；保存后重开保持差异；Focus上下文只用该身份；状态栏/进度同帧只来自一个完整getRun响应H（探针可查），Timeline另显last_applied_seq不强称同H；非法数组拒绝保旧档 |
 | AC-014-04 / TEST-014-04 | integration | 明确的工具开始/结束及已知最后活动时间t1/t2、服务等待、压缩、排队、空闲/进程 alive，另含与工具事实冲突的模型摘要“任务已完成”，及 context used=25/limit=100、used 缺失、limit 缺失三例；两个 Agent 只有一个可计美元 | 查询 progress/ui 活动与用量，并在真实PTY观察Focus/状态详情，再换 role_epoch | 状态分别为工具运行/等待服务/压缩/排队/空闲；最后活动时间由对应已提交事实从t1更新t2并可见（UTC时间或可核对相对时间），未知明确显示未知；摘要标“分析”，与工具运行并列而不覆盖它/不变更确定状态或accepted；仅 alive 为活动未知，Commander 无 turn 为事件监测中；25/100=25%，缺任一数值为 null；成本标已知部分并列缺项身份，不能当总额；换绑不沿用旧 epoch 的用量 |
@@ -376,13 +437,15 @@ doc_refs：`docs/03-ux.md`、`docs/01-prd.md`、`docs/09-testing.md`、`docs/adr
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-015-01 / TEST-015-01 | tui-pty | §4四路径及逐项终端/包装器版本，真实外层PTY；80/120/180；A中🙂é、末列中、👩‍💻(ZWJ)、✈️(VS16)、两行CRLF粘贴；§4宽度回退策略 | 捕获实际绘制流和各层终端光标列/换行；插入后续标尺，移动删除、resize、paste再Enter；各路径debug panic；在会话内shell取stty/modes与哨兵，最后才退出包装器补查外层 | 按该路径终端实际光标/单元格判定：后续标尺不漂列、末列宽字换行不留半字、HoH逻辑光标等于终端；歧义簇用ASCII回退且原文/提交不变，不硬编码簇宽、不以wcwidth/CellWidth自证；Backspace删完整原字素；paste前命令0、Enter后恰1且LF两行；panic101；直连shell/远程shell/pane/远程pane各在包装器存活时stty与进入前相同，HoH PTY中每项开启模式有对应关闭字节，哨兵完整；外层无泄漏仅附加，四路径任缺FAIL非零 |
-| AC-015-02 / TEST-015-02 | tui-pty | 无增强协议四路径，草稿甲；分别无临时层且编辑器有焦点/列表/临时层；独立原始SGR应用PTY子例及tmux占用鼠标变体 | 键盘组：Ctrl+J输入乙、Ctrl+J输入丙后普通Enter；各焦点分别Esc后50/100/500ms再Enter，单write \x1b\r，两write间隔10/20ms；连续Enter/Alt+Enter，普通编辑后再Enter；列表Enter、编辑器?、非空/空Ctrl+C；可辨认Shift+Enter。鼠标组：直接向HoH应用PTY注入坐标300的SGR后立即Enter/中文键、残缺SGR/X10；另走tmux占用鼠标的键盘组 | 首例甲\n乙\n丙恰1 SendInput；全部慢/快/同批Esc-Enter无SendInput、原稿逐字不变且不新增LF；无层Esc也解除armed，Alt+Enter/Enter共用guard，连续双键不绕过，编辑后普通Enter才发送；只有Ctrl+J为换行键，Shift+Enter无动作；列表Enter仅展开，?为文字，Ctrl+C清空或选择、未选无控制命令；SGR直接送达应用PTY且后键不吞，X10跳过，畸形有界；tmux拦截鼠标不要求点击成功但键盘全测、退出关闭本应用开启模式 |
-| AC-015-03 / TEST-015-03 | integration | PTY按UTF-8/CRLF/起止标记边界分块（不声称内核保留单字节write）；草稿保留；合法最终1MiB与+1B；64MiB无结束paste；三家adapter编码/回显fixture | 合法/超限paste，结束后普通键；未结束时SIGTERM；从HTTP受理经真实投递链对每adapter测试§4的256KiB/1MiB/最坏转义与不可读文件，另测超8MiB请求被400 BAD_REQUEST拒绝 | 完整paste不自动提交，超限原稿不变且UI_INPUT_TOO_LARGE；残缺保留≤1MiB+6B，丢尾到结束或信号，RSS增≤16MiB（RSS子例由本TEST在§5.1串行release阶段运行）；后续键正常、无斜杠执行；每adapter inline≤256KiB且编码≤768KiB、否则短文件引用≤16KiB，文件位于Attempt可读根且底座fixture可读取、字节/hash精确；Workspace/Focus展开的用户块等于已接受原文（不是短引用）、同input_id恰一块；每帧≤1MiB不触发PROTOCOL_FRAME_TOO_LARGE；超8MiB请求400 BAD_REQUEST、无202且草稿保留，文件错误不APPLIED；fixture标product，非live；环境不符RSS子例DEGRADED/退出78、整AC不通过 |
+| AC-015-01 / TEST-015-01 | tui-pty | §4四路径及终端/包装器版本、外层PTY；80/120/180列；中文全角标点“，。、《》”、Ambiguous样本“”—…├─│αβ→★✓、A中🙂é、末列中、👩‍💻与✈️及两行CRLF粘贴；§4有限例外表 | 先在各路径直接输出原始样本记录宽度分歧，后捕获HoH实际绘制流/cells/cursor；插后续标尺、移动删除、resize、paste再Enter；各路径debug panic；在会话内shell取stty/modes/哨兵，最后退出包装器补查外层 | 中文标点/框线/希腊字母/箭头在单元格中都是原字符，非码点串；Ambiguous样本1列、中文宽字符和普通emoji2列且与终端实际光标一致；只有表中已证分歧簇用ASCII回退，原文/提交/复制不变，不能因类别或不明扩大。后续标尺不漂列、末列宽字不留半字、HoH光标等于终端；不以wcwidth/CellWidth自证；Backspace删完整原字素；paste前命令0、Enter后恰1且LF两行；panic101；各shell/pane在包装器存活时stty与进入前相同，本实例模式配对关闭、哨兵完整；外层无泄漏仅附加，四路径任缺FAIL非零 |
+| AC-015-02 / TEST-015-02 | tui-pty | 无增强协议四路径，草稿甲、带可观测身份的受控后台Attempt；分别无层编辑器/列表/临时层；输入历史有“旧稿乙”；独立原始SGR应用PTY及tmux占用鼠标变体 | 键盘：Ctrl+J输入乙、Ctrl+J输入丙后Enter；各焦点Esc后50/100/500ms再Enter、单write \x1b\r、两write间隔10/20ms、连续Enter/Alt+Enter；Esc→编辑→Enter、Esc→粘贴→Enter、Esc→Ctrl+R接受历史→另一次Enter；列表Enter、编辑器?、非空Ctrl+C；空编辑器Ctrl+C打开后分别取消菜单、选脱离/暂停/取消；可辨认Shift+Enter。鼠标：向应用PTY注入坐标300的SGR紧接Enter/中文键、残缺SGR/X10；tmux占用时仍全跑键盘 | 首例甲\n乙\n丙恰1 SendInput（正文中的换行按LF）；所有慢/快/同批Esc-Enter无SendInput、原稿不变/零新LF；有层Esc只退一层、无层也解除armed，所有Esc子例PauseRun=CancelRun=0、Run状态及原Attempt身份/存活不变。连续Enter/Alt+Enter不绕guard；编辑/成功粘贴/接受不同历史才重武装，历史确认Enter本身发送0，随后显式Enter才恰1；只有Ctrl+J换行，Shift+Enter无动作。非空编辑器Ctrl+C：草稿变空，SendInput=PauseRun=CancelRun=0。空编辑器Ctrl+C：显示脱离/暂停/取消三项，未选和Esc关闭时控制命令0；选脱离仅客户端退出/控制0，选暂停恰1 PauseRun，选取消恰1 CancelRun且不附带其他命令。列表Enter仅展开，?为文字；SGR后键不吞/X10跳过/畸形有界；tmux拦截鼠标只豁免被拦点击、不豁免键盘/退出配对 |
+| AC-015-03 / TEST-015-03 | integration | PTY按UTF-8/CRLF/起止标记边界分块（不声称内核保留单字节write）；草稿保留；合法最终1MiB与+1B；64MiB无结束paste；三家adapter编码/回显fixture | 合法/超限paste，结束后普通键；未结束时SIGTERM；从HTTP受理经真实投递链对每adapter测试§4的256KiB/1MiB/最坏转义与不可读文件，另测超8MiB请求，以及合法非SendInput命令用JSON空白补到3MiB；对已202的大正文在物化Attempt可读根文件前制造低空间、再释放重试 | 完整paste不自动提交，超限原稿不变且UI_INPUT_TOO_LARGE；残缺保留≤1MiB+6B，丢尾到结束或信号，RSS增≤16MiB（RSS子例由本TEST在§5.1串行release阶段运行）；后续键正常、无斜杠执行；每adapter inline≤256KiB且编码≤768KiB、否则短文件引用≤16KiB，文件位于Attempt可读根且底座fixture可读取、字节/hash精确；Workspace/Focus展开的用户块等于已接受原文（不是短引用）、同input_id恰一块；每帧≤1MiB不触发PROTOCOL_FRAME_TOO_LARGE；超8MiB以及3MiB非SendInput均400 BAD_REQUEST、无202/commands或events写入、草稿保留；已202输入投递文件低空间时保持QUEUED并记STORAGE_LOW_SPACE及available/required/min_free，未DELIVERED/APPLIED；释放后原input_id仅投递/用户块各一次，不可读/摘要错明确REJECTED；fixture标product，非live；环境不符RSS子例SKIPPED/退出78、整AC不通过 |
 | AC-015-04 / TEST-015-04 | tui-pty | 独立后台Run与外层shell；三类起始态：干净主屏、主屏已用DECSC在另一行保存旧光标、前进程遗留mouse/paste/alternate；前两类预写多行唯一标记并把当前光标置于第r行且r不同于旧保存行，记录基线stty/单元格/光标；mouse=true、debug故障点 | 干净/旧DECSC各做正常启动脱离往返，在teardown完成且任何诊断/shell新提示输出前取外层buffer；残留态单独启动；再各测SIGINT/SIGTERM/SIGHUP、panic、alt后初始化失败、部分输出失败、信号与I/O同时失败；退出后读哨兵 | 所有启动复位仅关闭1000/1002/1003/1006/2004，不含1049l/1047l；本实例完整1049h后仅teardown配对一次1049l；干净与旧DECSC往返原有行的文本/位置及光标行r（并核列）与基线一致；残留alt只检查mouse/paste复位，不承诺旧屏/旧termios恢复。可写PTY退出stty等于本次进入前、实际开启模式逐项关闭/光标显示；正常0、信号130/143/129、panic101、I/O74、并发信号码优先；恢复一次且不吞哨兵，后台无Pause/Cancel、新客户端可查 |
-| AC-015-05 / TEST-015-05 | integration | §5.1参考VM、release串行，百万库；80×24与180×40各≥1000样本，50ms增量合并负载 | 并发提交事件并编辑/滚动/resize，记录输入→外层屏幕、commit→seq可见；插入tool/decision/acceptance边界 | 各尺寸输入p95≤100ms、事件p95≤500ms；每个合并窗口≤50ms或16KiB先到，关键事件计数完整；无丢键/重复提交，非renderer独立计时；环境不符DEGRADED/退出78不通过，真实超限FAIL保留样本 |
+| AC-015-05 / TEST-015-05 | integration | §5.1参考VM、release串行，百万库；80×24与180×40各≥1000样本，50ms增量合并负载 | 并发提交事件并编辑/滚动/resize，记录输入→外层屏幕、commit→seq可见；插入tool/decision/acceptance边界 | 各尺寸输入p95≤100ms、事件p95≤500ms；每个合并窗口≤50ms或16KiB先到，关键事件计数完整；无丢键/重复提交，非renderer独立计时；环境不符SKIPPED/退出78不通过，真实超限FAIL保留样本 |
 
-兼容矩阵 D10：正式 M4 tui-pty 在本 VM Ubuntu26.04.1 x86_64 四路径每次完整执行，TERM=xterm-256color/tmux内tmux-256color，UTF-8 locale，逐路径终端与版本按§4。缺ssh/tmux/locale直接FAIL非零。T07 提案增加仅编译正式矩阵测试注册的非默认 `tui-acceptance` feature（不改变产品行为）；`tui-pty.sh` 在 `HOH_CHECK_ID=tui-pty` 下启用该feature运行 `tui_pty` target，test_015_01/test_015_02矩阵入口先校验检查身份与平台。普通CI的cargo test --workspace不启用该feature，调用无TEST id的功能/恢复冒烟助手；不把条件不满足的formal test return ok，也不生成同ID SKIPPED占位。矩阵包装层仅注册/调用共用助手，默认CI仍真实覆盖解码、绘制与恢复逻辑；正式脚本核对所需TEST实际执行数与四路径manifest，缺项即失败，不能因过滤掉矩阵绿灯。debug功能与正式证据边界明确，CI不冒充26.04性能或正式矩阵验收。
+兼容矩阵 D10：正式 M4 tui-pty 在本 VM Ubuntu26.04.1 x86_64 四路径每次完整执行，TERM=xterm-256color/tmux内tmux-256color，UTF-8 locale，逐路径终端与版本按§4。缺ssh/tmux/locale直接FAIL非零。T07提案增加仅用于正式矩阵测试注册的非默认 `tui-acceptance` feature（不改变产品行为）；`tui-pty.sh` 在 `HOH_CHECK_ID=tui-pty` 下启用该feature运行 `tui_pty` target，test_015_01/test_015_02矩阵入口先校验检查身份与平台。普通CI的cargo test --workspace不启用该feature，调用无TEST id的功能/恢复冒烟助手；不把条件不满足的formal test return ok，也不生成同ID SKIPPED占位。矩阵包装层仅注册/调用共用助手，默认CI仍真实覆盖解码、绘制与恢复逻辑；正式脚本核对所需TEST实际执行数与四路径manifest，缺项即失败，不能因过滤掉矩阵绿灯。debug功能与正式证据边界明确，CI不冒充26.04性能或正式矩阵验收。
+
+非默认注册也必须进入CI静态编译：T07在现有流程追加启用tui-acceptance的hoh-app全target Clippy（保留--locked与-D warnings），只编译/lint、不执行带TEST id的矩阵、不产出正式test-results；具体命令随T07实际运行后记入CI/文档。本次未执行该未来feature的命令，不声称它已存在。普通无feature构建与正式矩阵执行检查仍都保留（CR28D-207）。
 
 Ubuntu24.04四路径仍由docs/23的M6-T03/M7-T04承担；不把本次M4结果声称为24.04证据。两任务done_when追加：M6-T03准备隔离24.04实例与版本记录；M7-T04在最终候选的**一次正式tui-pty检查**收集26.04/24.04两套四路径，冻结environment预先列两平台描述，向24.04工作目录分发同commit/tree/spec/test-plan并在运行前后校验摘要。原始PTY、会话内stty、逐模式配对与光标断言、每路径退出码按平台子目录收取到该检查evidence目录；同一TEST的两平台子例均PASS才形成总PASS，不引用M4旧候选或把另一次检查的PASS拼入。T07交付平台manifest格式，M7-T04的最终runner对两平台×四路径逐项缺失/不符非零，独立QA核对，Reviewer核对版本与来源；无需让release_gate猜平台维度，缺任一平台使其输入检查失败。此收取方案属D10待审提案，应用清单记入M7-T04，不在本轮修改门禁。所有sshd端口/tmux会话独立且结束清理。
 
@@ -394,7 +457,7 @@ doc_refs：`docs/03-ux.md`、`docs/01-prd.md`、`docs/09-testing.md`、`config/h
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-016-01 / TEST-016-01 | tui-pty | NO_COLOR=1、ui.mouse=false、ui.icons=ascii，80×32；有效新键 `list.copy=c`，另有冲突配置 | 不用鼠标遍历共同动作清单：四视图、角色/会话、三抽屉、块操作、模式、历史、设置、提交及暂停/恢复/取消/脱离；保存冲突后恢复默认 | 清单每项均产生指定界面或对应唯一命令，证据逐项记录；无颜色 SGR/鼠标启用序列，状态有中文文字和 ASCII 标记；c 可复制，冲突整体拒绝；恢复后 y 可复制、c 只是未绑定键；后台控制只发生于显式选择 |
+| AC-016-01 / TEST-016-01 | tui-pty | NO_COLOR=1、ui.mouse=false、ui.icons=ascii，80×32；list.copy=c与冲突配置；历史“旧稿乙”、当前草稿甲，当前Run A与可选INCOMPLETE Run B | 键盘遍历四视图/角色会话/三抽屉/块/模式/设置/提交/控制；Ctrl+R检索并Enter接受旧稿，另一次检索Esc取消；/resume打开选择器、Esc退出、重开并选B；保存冲突后恢复默认 | 每动作有逐项界面/命令记录；Ctrl+R确认只将旧稿乙放编辑器、SendInput=0，下一显式Enter才可提交；取消检索恢复原草稿且不提交。/resume未选前A与草稿不变、选项列B、无POST/控制；Esc只关选择器；选择B才附着其快照/SSE，B仍INCOMPLETE且ResumeRun/PauseRun/CancelRun/Task/Attempt新增均0。无颜色SGR/鼠标启用，状态有文字和ASCII；c复制、冲突整体拒绝，恢复后y复制/c未绑定；显式后台控制每次仅对应一条命令 |
 | AC-016-02 / TEST-016-02 | unit | keybinding 表：同 list 同 key 两动作；global 与 editor 重叠；editor/list 同 key；未知 key/action/scope；覆盖 Ctrl+C/Esc/Enter/Ctrl+J；将面板重绑为未占用 Ctrl+O，以及使面板无有效入口的配置 | 校验各表，分别试保存；读取错误 details | 前两种冲突与未知/保留覆盖/无面板入口均拒绝，给出准确 action/scope/key；互斥 editor/list 同 key 及合法 Ctrl+O 重绑允许；失败后有效映射逐字段不变；所有默认动作仍可从命令面板到达 |
 | AC-016-03 / TEST-016-03 | tui-pty | editor/list/dialog 各 scope，草稿含 `? / f y n`；重绑 list.search 为 Ctrl+F，面板改为 Ctrl+O | Tab 移焦，Ctrl+O 打开面板，Esc 返回；使用重绑键，保存并重开客户端，在面板恢复默认 | 编辑器文字不被列表/帮助热键吞掉；焦点可见且 Esc 回到原草稿/锚点；重开后绑定仍有效；恢复后 Ctrl+P 再次打开面板；只清键覆盖，team/budget/Prompt/mode_cycle、配置注释与其他键均不变；ui-only保存不产生ConfigureTeam/新team_revision，CAS冲突拒绝且原文件不变；mode.cycle重绑后顺序仍遵守ui.mode_cycle |
 | AC-016-04 / TEST-016-04 | unit | 同一投影包含 PASS/FAIL/BLOCKED/UNKNOWN/STALE/DEGRADED/REOPENED、选中和未选中项；80/120/180 列 | 以彩色与 NO_COLOR+ASCII 两套样式渲染 TestBackend | 每种状态在去样式后的文字中仍可区分，选中项有 ASCII 焦点标记；禁色不含前景/背景色，保留必要非颜色属性；无超过显示宽度、无必需动作只有图标无标签 |
@@ -407,11 +470,11 @@ doc_refs：`docs/01-prd.md`、`docs/04-architecture.md`、`docs/05-data-api.md`�
 
 | AC / TEST | check_id | 输入（Given） | 操作（When） | 可判定输出（Then） |
 |---|---|---|---|---|
-| AC-064-01 / TEST-064-01 | integration | §5.1参考环境release百万事件/段与最终TUI、100Run×10轮、受限ENOSPC；另debug integration小旧库/迁移故障seam/旧binary | 先debug运行迁移失败回滚/旧binary拒读；再release串行正常升级/回填、按Run/iteration/attempt各查100页，limit100/500/非法0/501；Range首尾/缺文件/416；同夹具磁盘失败/慢客户端/轮换/引用保护/虚拟列表子例 | 新/v1/timeline非法400 QUERY_INVALID、旧Run timeline非法404 BAD_REQUEST，416仅ARTIFACT_RANGE_INVALID与Content-Range组合；分页≤limit、seq完整、H固定，查询p95≤500ms；EXPLAIN用指定索引、每页描述反序列化≤500/正文≤256KiB，无全库加载；kill→reconcile和ready≤30s、构建/回填各≤600s；release升级权威行/hash不变；debug子例失败回滚/旧binary拒读；两阶段缺一不通过；子例包括日志≤8MiB×5、引用对象hash不变、描述≤1000/正文≤4MiB、磁盘无半登记、慢读不阻塞快读；环境不符DEGRADED/退出78，不PASS |
-| AC-064-02 / TEST-064-02 | integration | §5.1同次百万库克隆，单块100MiB，首/中/尾唯一标记；release真实PTY | 开Workspace/Focus，末页/搜索/往返滚动60s，每种尺寸输入≥1000次，idle10s采RSS | 描述≤1000/正文≤4MiB/在途页≤2，初始不回放百万正文；所有标记可达/锚点稳定；输入p95≤100ms；idle host+TUI总RSS≤150MiB且分别记录/各≤150MiB，活动各≤256MiB；不含Agent/浏览器，不排除TUI；环境不符DEGRADED/退出78，不通过 |
+| AC-064-01 / TEST-064-01 | integration | §5.1参考环境release百万事件/段与最终TUI、100Run×10轮、受限ENOSPC；另debug integration小旧库/迁移故障seam/旧binary | 先debug运行迁移失败回滚/旧binary拒读；再release串行正常升级/回填、按Run/iteration/attempt各查100页，limit100/500/非法0/501；Range首尾/缺文件/416；同夹具磁盘失败/慢客户端/轮换/引用保护/虚拟列表子例 | 新/v1/timeline非法400 QUERY_INVALID、旧Run timeline非法404 BAD_REQUEST，416仅ARTIFACT_RANGE_INVALID与Content-Range组合；分页≤limit、seq完整、H固定，查询p95≤500ms；EXPLAIN用指定索引、每页描述反序列化≤500/正文≤256KiB，无全库加载；kill→reconcile和ready≤30s、构建/回填各≤600s；release升级权威行/hash不变；debug子例失败回滚/旧binary拒读；两阶段缺一不通过；子例包括日志≤8MiB×5、引用对象hash不变、描述≤1000/正文≤4MiB、磁盘无半登记、慢读不阻塞快读；环境不符SKIPPED/退出78，不PASS |
+| AC-064-02 / TEST-064-02 | integration | §5.1同次百万库克隆，单块100MiB，首/中/尾唯一标记；release真实PTY | 开Workspace/Focus，末页/搜索/往返滚动60s，每种尺寸输入≥1000次，idle10s采RSS | 描述≤1000/正文≤4MiB/在途页≤2，初始不回放百万正文；所有标记可达/锚点稳定；输入p95≤100ms；idle host+TUI总RSS≤150MiB且分别记录/各≤150MiB，活动各≤256MiB；不含Agent/浏览器，不排除TUI；环境不符SKIPPED/退出78，不通过 |
 | AC-064-03 / TEST-064-03 | integration | 6×8MiB+1诊断字节；§5每一引用根各一对象、仅登记无引用对象、未登记临时文件；时钟47/48/49h | 轮换/GC；扫描后加引用、打开pin并发GC；引用解析故障；GC登记tombstone前后kill/reopen | 诊断最多5段/每段≤8MiB；全部引用/活动/pin对象hash不变；47h孤立保留、≥48h且复查无引用才删；collected对象404 ARTIFACT_NOT_FOUND reason=collected，未知ID/丢文件原因不同；解析失败保留诊断；重复GC幂等；events/evidence/acceptance删除0 |
-| AC-064-04 / TEST-064-04 | recovery | 已有E/待写N、min_free32MiB、1MiB流段；真实ENOSPC与注入EDQUOT；临时写/fsync/rename/登记故障 | 逐点失败或kill/reconcile；低空间但状态事务有余量时分别Pause/Cancel；状态事务自身满盘再试；释放空间重试 | E可读hash不变、N不留引用缺正文；低空间新对象/新写Attempt为STORAGE_LOW_SPACE、带available/required，状态事务能提交时Pause/Cancel均202且持久；事务真失败503 DB_FULL无202，UI未接受仍可脱离；释放后原Task可重试、只登记一次；48h孤立策略；缺真实ENOSPC设施FAIL非零，EDQUOT明确注入 |
-| AC-064-05 / TEST-064-05 | integration | §5.1参考环境release；快/慢SSE各1，100events/s共10000条8KiB公开正文，含tool/decision/acceptance；单流应用pending≤500项且序列化字节≤1MiB；另debug integration通过writer seam暂挂未提交事务X（独立小库） | 慢客户端停读30s直至TCP背压后恢复；独立断线后按last seq重连；查询矛盾after/Last-Event-ID；debug libtest在X提交前后分别观察，release测量不用该钩子 | 唯一背压行为为停止拉取/填pending（不因满队列主动丢弃或断开），批读取先按字节限界，探针含pending与当前序列化项、不含另报的内核/TCP缓冲；快流每条提交完整且p95≤500ms；慢流恢复/去重并集完整；冲突409 CONFLICT；X提交前对任一SSE不可见、提交后可见；202对应已提交事件缺失0；环境不符DEGRADED/退出78、AC不通过 |
+| AC-064-04 / TEST-064-04 | recovery | 已有E/待写N、min_free32MiB、1MiB流段；32KiB SendInput需封口原文对象与未提交草稿；真实ENOSPC与注入EDQUOT；临时写/fsync/rename/登记故障 | 逐点失败或kill/reconcile；低空间但状态事务可提交时提交32KiB输入、分别Pause/Cancel；状态事务本身满盘再试；释放后显式同幂等键重试 | E可读hash不变、N不留引用缺正文；新对象/新写Attempt为STORAGE_LOW_SPACE，含available/required/min_free；32KiB SendInput唯一HTTP503 code=STORAGE_LOW_SPACE、details.reason相同且字节数可核对，无202/接受行/input.accepted/public.message，UI保原草稿与目标、显示未接受；恢复后显式重试最多一次接受/用户块。低空间但状态事务可提交时Pause/Cancel仍202且持久；事务真失败503 DB_FULL无202，仍可脱离；原Task可重试、孤立48h策略不变；缺真实ENOSPC设施FAIL非零，EDQUOT明确注入；投递文件阶段子例由015-03覆盖 |
+| AC-064-05 / TEST-064-05 | integration | §5.1参考环境release；快/慢SSE各1，100events/s共10000条8KiB公开正文，含tool/decision/acceptance；单流应用pending≤500项且序列化字节≤1MiB；另debug integration通过writer seam暂挂未提交事务X（独立小库） | 慢客户端停读30s直至TCP背压后恢复；独立断线后按last seq重连；查询矛盾after/Last-Event-ID；debug libtest在X提交前后分别观察，release测量不用该钩子 | 唯一背压行为为停止拉取/填pending（不因满队列主动丢弃或断开），批读取先按字节限界，探针含pending与当前序列化项、不含另报的内核/TCP缓冲；快流每条提交完整且p95≤500ms；慢流恢复/去重并集完整；冲突409 CONFLICT；X提交前对任一SSE不可见、提交后可见；202对应已提交事件缺失0；环境不符SKIPPED/退出78、AC不通过 |
 
 AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引用保护/分页虚拟列表”组合，故移到最终UI之后的M4-T10；子例复用 -02/-03/-04/-05 驱动，仍在同次integration中为TEST-064-01记录全部独立断言；-04 的完整崩溃矩阵独立归 recovery，不能借 integration 的日志当 recovery 通过。旧 AC-012-01、AC-015-01 的组合范围同样保留，新增 AC 负责补足边界，不删除旧 AC 的含义。
 
@@ -455,7 +518,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-011-05",
       "AC-013-05"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2.1/2.2生产接线、迁移003运行器/回填断点与public段登记；每个native模式的版本字段映射、真实runner fixture、重复/取消/恢复/旧epoch/去敏与有界队列；接入M3接受事务的用户原文块与input_id去重，背压不误报inactivity；索引不存class；不改M3投递或关轮算法。回归REQ-017/024/025/026/027/036/041/042/062和CR-026迁移002。生命周期与并发按docs/19双独立审查。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2.1/2.2生产接线、迁移003运行器/回填断点与public段登记；每个native模式的版本字段映射、真实runner fixture、重复/取消/恢复/旧epoch/去敏与有界队列；接入M3接受事务的用户原文块与input_id去重，背压不误报inactivity；索引不存class；不改M3投递或关轮算法。回归REQ-017/024/025/026/027/036/041/042/062和CR-026迁移002。生命周期与并发按docs/19双独立审查。 明确§2.1的COMPLETED/FAILED/CANCELLED、PAUSED与INCOMPLETE/ResumeRun快照边界；T09仅写身份，生产kind类型由后续T03统一接入。"
   },
   {
     "id": "M4-T03",
@@ -475,7 +538,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-064-04",
       "AC-064-05"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2错误与Range/search/evidence/timeline路由、查询时集中kind分类及完整性测试、引用/GC/tombstone/低空间原因；交付§5.1唯一release测量基础设施/runner与ENOSPC设施，三个工件声明只随可产出驱动同提交/relock生效；先实测阶段耗时并留600s总余量，否则提交D4重规划；scope/pgid归属、正常/失败/超时/取消无残留证据齐全；debug故障子例与release计量分开，SSE按字节限界。新配置与example同提交，回归TEST-018-01、REQ-005/035/036/037/042/043/058/062。对象与测量进程生命周期并发按docs/19双独立审查。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2错误与Range/search/evidence/timeline路由、查询时集中kind分类及完整性测试、引用/GC/tombstone/低空间原因；交付§5.1唯一release测量基础设施/runner与ENOSPC设施，三个工件声明只随可产出驱动同提交/relock生效；先实测阶段耗时并留600s总余量，否则提交D4重规划；PID/start_time/pidfd与实际unit/Attempt cgroup归属、正常/失败/超时/取消/SIGKILL无残留证据齐全；debug故障子例与release计量分开，SSE按字节限界。新配置与example同提交，回归TEST-018-01、REQ-005/035/036/037/042/043/058/062。对象与测量进程生命周期并发按docs/19双独立审查。 NewEvent.kind类型化与唯一INSERT守卫覆盖全部生产者/动态分支，不能用手写清单自证；503 STORAGE_LOW_SPACE受理错误/草稿与QUEUED投递诊断按§5，T07再接文件包装。冻结环境填齐五阶段正整数时限，runner/监护者强制执行；service/scope两真实启动路径、每Attempt身份/资源核对及SIGKILL外部收尾通过后才交付。"
   },
   {
     "id": "M4-T02",
@@ -501,7 +564,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-011-03",
       "AC-011-04"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付快照增量、断线/DB_BUSY、布局/身份/小屏、Ctrl+P动作注册表与Task/Issue/Evidence抽屉；自有poll SGR鼠标解码与ADR-014修订。保留M3模式/输入/批准/历史入口，不直接写host状态造测试。回归REQ-001/005/007/017/018。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付快照增量、断线/DB_BUSY、布局/身份/小屏、Ctrl+P动作注册表与Task/Issue/Evidence抽屉；自有poll SGR鼠标解码与ADR-014修订。保留M3模式/输入/批准/历史入口，不直接写host状态造测试。回归REQ-001/005/007/017/018。 未预选同Agent多职位必须选择，Focus区分role/epoch/session与Attempt级handoff可见范围；保留/resume选择后仅附着。"
   },
   {
     "id": "M4-T05",
@@ -522,7 +585,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-012-03",
       "AC-012-04"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。八类同一动作、Range装配/搜索边界、纯文本文件复制、引用错误和锚点；正文缓存与虚拟列表实现以小夹具回归，最终百万容量归T10；ui.clipboard/file加载与example同提交、exports守卫与占用诊断。不发OSC/DCS。TEST-012-01在既有integration的release阶段完整含PTY测量。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。八类同一动作、Range装配/搜索边界、纯文本文件复制、引用错误和锚点；正文缓存与虚拟列表实现以小夹具回归，最终百万容量归T10；ui.clipboard/file加载与example同提交、exports守卫与占用诊断。不发OSC/DCS。TEST-012-01在既有integration的release阶段完整含PTY测量。 逐类断言鼠标单击选择/双击展开/滚轮滚动；新增场景后按§5.1重测全integration五阶段（含debug tui_pty），保存各段elapsed/limit和总余量，任何阶段超时FAIL。"
   },
   {
     "id": "M4-T06",
@@ -548,7 +611,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-014-03",
       "AC-014-04"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。消费T09归属/公开活动与T03分类API，F13全过滤/引用，progress聚合、三档字段/水位探针；配置与example同提交；保留M3追踪标签、规格全量失效与旧acceptance的AC计数。回归TEST-018-01、REQ-032/033/053，不把adapter活动来源写成M2已提供。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。消费T09归属/公开活动与T03分类API，F13全过滤/引用，progress聚合、三档字段/水位探针；配置与example同提交；保留M3追踪标签、规格全量失效与旧acceptance的AC计数。回归TEST-018-01、REQ-032/033/053，不把adapter活动来源写成M2已提供。 013-04从受约束的生产类型穷举并证明旁路负例可检出；未知成本/上下文明确未知而非0。"
   },
   {
     "id": "M4-T07",
@@ -569,7 +632,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-015-03",
       "AC-015-04"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付编辑器/有界paste、每adapter inline/frame预算与文件引用、启动复位/teardown/外层宽度四路径；只扩展M3投递的传输，不改变四态。§5.1收取TEST-015-03的debug功能与release RSS两个阶段；功能PTY的panic入口仍debug专用。准备CI的tmux/sshd/locale；回归REQ-004/017/024/025/026/043；生命周期双独立审查。同时交付§4终端版本/oracle与歧义簇回退、会话内恢复和原屏往返；§5.1中test_015_03功能子例为debug libtest、RSS为release；REQ-015兼容矩阵的非默认测试注册/HOH_CHECK_ID门槛、无TEST id CI冒烟和平台manifest格式。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付编辑器/有界paste、每adapter inline/frame预算与文件引用、启动复位/teardown/外层宽度四路径；只扩展M3投递的传输，不改变四态。§5.1收取TEST-015-03的debug功能与release RSS两个阶段；功能PTY的panic入口仍debug专用。准备CI的tmux/sshd/locale；回归REQ-004/017/024/025/026/043；生命周期双独立审查。同时交付§4终端版本/oracle与逐簇实测有限例外（Ambiguous原样）、会话内恢复和原屏往返；§5.1中test_015_03功能子例为debug libtest、RSS为release；REQ-015兼容矩阵的非默认测试注册/HOH_CHECK_ID门槛、无TEST id CI冒烟和平台manifest格式。 新增场景后按§5.1重测全integration五阶段（含debug tui_pty的busy/信号/布局/输入），记录elapsed/limit/总余量并强制阶段截止；CI编译/lint非默认tui-acceptance注册；015-02含Ctrl+C双Then、Esc零控制、粘贴/历史重新武装，015-03含3MiB非SendInput拒绝与已202输入低空间QUEUED。"
   },
   {
     "id": "M4-T08",
@@ -590,7 +653,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-016-03",
       "AC-016-04"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。键盘遍历所有动作、NO_COLOR/ASCII、scope冲突、项目ui配置CAS原子写保注释、ui-only重载、恢复默认；mode.cycle可重绑但不改ui.mode_cycle。配置/example同提交、回归TEST-018-01与输入teardown。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。键盘遍历所有动作、NO_COLOR/ASCII、scope冲突、项目ui配置CAS原子写保注释、ui-only重载、恢复默认；mode.cycle可重绑但不改ui.mode_cycle。配置/example同提交、回归TEST-018-01与输入teardown。 016-01明确Ctrl+R只召回、/resume未选零控制及选后仅附着，不用动作清单的一般断言代替。"
   },
   {
     "id": "M4-T10",
@@ -611,7 +674,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
       "AC-064-01",
       "AC-064-02"
     ],
-    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。完成最终UI+百万库组合、迁移/回填30s与600s上界、首中尾日志/虚拟列表/轮换/保护/慢读/磁盘失败、核心总RSS和1000样本交互测量；性能/规模经integration release串行阶段、故障子例经同检查debug阶段，参考环境不匹配不PASS；REQ-068/M7仍独立验收原门槛。AC-064-01必须同时收debug迁移故障和release规模证据；参考测量含writer忙时脱离≤1s，普通debug不以1s抖动判失败。"
+    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。完成最终UI+百万库组合、迁移/回填30s与600s上界、首中尾日志/虚拟列表/轮换/保护/慢读/磁盘失败、核心总RSS和1000样本交互测量；性能/规模经integration release串行阶段、故障子例经同检查debug阶段，参考环境不匹配不PASS；REQ-068/M7仍独立验收原门槛。AC-064-01必须同时收debug迁移故障和release规模证据；参考测量含writer忙时脱离≤1s，普通debug不以1s抖动判失败。 最终新增场景后重测全integration五阶段，含全部debug tui_pty成本；逐段elapsed/limit/总余量与强制截止证据齐全，超阶段/工作3000s或余量不足FAIL，不能复用T03/T05/T07时长。"
   },
   {
     "id": "M4-T11",
@@ -687,25 +750,25 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
 | AC-013-02 | M4-T06 / integration | T06完整过滤；T03 H/generation/错误API；T09归属；M2-T12 SSE |
 | AC-013-03 | M4-T06 / integration | T06 refs；M3-T02规格/全失效、M3-T07 broken/orphan/stale；T03工件错误 |
 | AC-013-04 | M4-T06 / unit | T06投影；T03分类表；T09身份；T02增量状态 |
-| AC-013-05 | M4-T09 / integration | T09关轮区间与在线/回填索引；M2-T18关轮事件；M2-T01/05事务恢复；M3保留原关轮语义 |
+| AC-013-05 | M4-T09 / integration | T09关轮区间与在线/回填索引；M2-T18关轮事件；M2-T01/05事务恢复；M2-T06取消/暂停、M2-T13 ResumeRun与停止守卫；M3保留原关轮语义 |
 | AC-014-01 | M4-T06 / tui-pty | T06需求/阻塞计数；T09活动身份；M2-T18验收、M2-T21预算、M3-T02规格、M3-T07追踪 |
 | AC-014-02 | M4-T06 / unit | T06聚合；M2-T18有效验收；M3-T02修订、M3-T06规格审查独立身份 |
 | AC-014-03 | M4-T06 / tui-pty | T06三档/状态水位；T03单快照；T02 Focus；M2-T07配置 |
 | AC-014-04 | M4-T06 / integration | T09规范化与持续activity/usage生产者；T06活动时间/分析标记与活动投影；M2-T17 epoch、M2-T21预算、M3-T10 no_progress；M2-T07只提供runner |
 | AC-014-05 | M4-T11 / adapter-live | T09真实规范化接线；T03 API；T06活动投影；M1-T03 adapter-live及三适配器；M2-T06取消；需要真实认证 |
-| AC-015-01 | M4-T07 / tui-pty | T07多行/终端版本/宽度回退/会话内恢复/四路径；T02/05布局；M1-T08解码/PTY；M3-T09提交；test-infra ssh/tmux |
-| AC-015-02 | M4-T07 / tui-pty | T07编辑器scope/Esc保护；T02面板/SGR；M3-T09模式命令（不声称M3有Ctrl+P）；M2-T06控制 |
-| AC-015-03 | M4-T07 / integration | T07边界/帧编码/可读文件/原文投影（debug功能+release RSS）；T09段对象；T03测量runner；M1适配器fixtures；M3-T09投递/四态 |
+| AC-015-01 | M4-T07 / tui-pty | T07多行/终端版本/正常字符与有限例外/会话内恢复/四路径；T02/05布局；M1-T08解码/PTY；M3-T09提交；test-infra ssh/tmux |
+| AC-015-02 | M4-T07 / tui-pty | T07编辑器scope/Esc保护；M1-T08输入历史；T02面板/SGR；M3-T09模式命令（不声称M3有Ctrl+P）；M2-T06控制 |
+| AC-015-03 | M4-T07 / integration | T07边界/帧编码/可读文件/原文投影（debug功能+release RSS）；T09段对象；T03低空间/测量runner；M1适配器fixtures；M3-T09投递/四态 |
 | AC-015-04 | M4-T07 / tui-pty | T07无光标恢复的启动复位/退出码/teardown/原屏往返；M1-T08恢复Guard；T02鼠标；M2-T06后台控制 |
 | AC-015-05 | M4-T10 / integration | T10百万库最终测量；T07输入；T03参考runner/背压；T05虚拟化、T06状态栏、T08最终键位 |
-| AC-016-01 | M4-T08 / tui-pty | T08无障碍；T02面板/抽屉/视图、T05块、T06Timeline/status、T07编辑器；M3-T09命令 |
+| AC-016-01 | M4-T08 / tui-pty | T08无障碍及历史/Run选择AC；T02面板/抽屉/视图、T05块、T06Timeline/status、T07历史guard；M1-T08 Ctrl+R、M2-T13 /resume、M3-T09命令 |
 | AC-016-02 | M4-T08 / unit | T08 scope/冲突；M2-T07配置；M3-T09 mode_cycle |
 | AC-016-03 | M4-T08 / tui-pty | T08 ui-only保存/恢复/CAS；T02面板；T07输入；M3-T03覆盖设置/M2-T07配置监听 |
 | AC-016-04 | M4-T08 / unit | T08样式；T06真实状态；T02布局 |
 | AC-064-01 | M4-T10 / integration | T10完整组合；T09迁移/回填；T03索引/GC/ENOSPC/慢流与测量；T05虚拟列表；T07终端；M3-T04迁移运行器 |
 | AC-064-02 | M4-T10 / integration | T10大库/RSS；T03 Range/search/测量；T05缓存；T02 Workspace/Focus；T07最终输入 |
 | AC-064-03 | M4-T03 / integration | T03引用/GC/pin/tombstone；T09段登记；M2-T16冻结/M2-T18证据与历史；M3-T02失效；已有release manifest根 |
-| AC-064-04 | M4-T03 / recovery | T03对象/空间与STORAGE_LOW_SPACE；T09段上限；M2-T01 DB_FULL、M2-T05/06恢复控制；test-infra ENOSPC设施 |
+| AC-064-04 | M4-T03 / recovery | T03对象/空间/SendInput受理503 STORAGE_LOW_SPACE；T09原文对象；M3-T09接受事务；M2-T01 DB_FULL、M2-T05/06恢复控制；test-infra ENOSPC设施 |
 | AC-064-05 | M4-T03 / integration | T03字节背压/release测量及debug事务隔离；M2-T12 SSE与M2-T01单writer；T09公开事实 |
 
 ### 批准后拟应用的文件
@@ -714,15 +777,15 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
 |---|---|
 | `contracts/requirements.json` | 八项detailed、37 AC、behavior/failure_modes/decisions/doc_refs；REQ-018补ui键、ui-only监听区分与字节单位；不删除旧AC |
 | `contracts/acceptance-scenarios.json` | 保留八个旧TEST、增加29个；各行given/when/then转fixture/steps/pass_criteria，check_id按表；新增的观测路径全部在指定check内 |
-| `contracts/openapi.json` | §2 typed字段/路由/Range/search/明确错误，§4 SendInput编码/解码大小限制；既有404 BAD_REQUEST与SSE409/410保持；page expiry扩展410顶层水位 |
-| `contracts/protocol.schema.json` | §2六个ErrorCode、RejectionReason追加STORAGE_LOW_SPACE及description；不改Run/TaskResult/Gate状态 |
+| `contracts/openapi.json` | §2 typed字段/路由/Range/search/明确错误，§5 SendInput唯一503 STORAGE_LOW_SPACE及details、§4 SendInput编码/解码大小限制与非SendInput 2MiB复核；既有404 BAD_REQUEST与SSE409/410保持；page expiry扩展410顶层水位 |
+| `contracts/protocol.schema.json` | §2七个ErrorCode（含HTTP STORAGE_LOW_SPACE）、RejectionReason追加同名STORAGE_LOW_SPACE及description；不改Run/TaskResult/Gate状态 |
 | 下一顺序`contracts/sql/*_ui_observability.sql`与`scripts/product/persistence-whitelist.json` | §2迁移/索引/段/去重/引用/tombstone；T09运行器+异步回填，T03查询GC；加入扫描白名单与baseline --add |
 | `contracts/development-tasks.json` | 上述九implement/T04片段；M4-T01前置保留；M6-T03/M7-T04 done_when追加两平台同候选/同次tui-pty原始证据、缺项失败及QA核对，不转AC或check归属 |
-| `tests/check-plan.json`、`scripts/product/cargo-tests.sh`、测量example与结果写入器 | T03交付驱动时既有integration才同步追加三个声明产物与串行release阶段；debug故障/libtest及release必要子场景清单、schema合法DEGRADED诊断/退出78；不改14项check/mode/超时、release-policy或gate |
-| `scripts/dev/test-infra.sh`、`.github/workflows/bundle-ci.yml` | T03隔离ENOSPC和有效taskset+systemd scope 4CPU/8GiB、pgid/清理检查；T07非默认矩阵feature/HOH_CHECK_ID检查与普通CI无TEST id冒烟；缺设施失败；不用生产用户目录/共享端口 |
+| `tests/check-plan.json`、`scripts/product/cargo-tests.sh`、测量example与结果写入器 | T03交付驱动时既有integration才同步追加三个声明产物与串行release阶段；debug故障/libtest及release必要子场景清单、五阶段强制时限与T05/T07/T10重测、schema合法SKIPPED诊断（reason=REFERENCE_ENV_MISMATCH）/退出78；不改14项check/mode/超时、release-policy或gate |
+| `scripts/dev/test-infra.sh`、`.github/workflows/bundle-ci.yml` | T03隔离ENOSPC/安装与§5.1外部启动器、共同slice和产品service/scope/Attempt的实际4CPU/8GiB、内核身份及独立清理/阶段时限；T07非默认矩阵feature的全target编译/lint、HOH_CHECK_ID检查与普通CI无TEST id冒烟；缺设施失败；不用生产用户目录/共享端口 |
 | `.hoh-dev/environment.json`（冻结前） | 记录本VM参考profile、限制/预算/构建输入；检查实际值另写m4-environment，不修改已冻结环境 |
 | `docs/02-functional-spec.md`、`docs/18-traceability.md` | 只由生成器更新 |
-| `docs/03-ux.md`、`docs/05-data-api.md`、`docs/12-user-guide.md`、`docs/adr/ADR-014.md`、`docs/adr/ADR-027.md`与实现ADR | 实现时记已验证行为；ADR-014明确SGR/Esc与Alt+Enter保护、仅Ctrl+J换行、启动不退出备用屏/原屏往返及CSI-only，ADR-027 exports守卫；不把本稿当已实施说明 |
+| `docs/03-ux.md`、`docs/05-data-api.md`、`docs/12-user-guide.md`、`docs/adr/ADR-014.md`、`docs/adr/ADR-027.md`与实现ADR | 正式应用点名修改docs/03“使用Ctrl+J或Esc+Enter多行”为“仅Ctrl+J换行；Esc后Enter不提交”，授权来源为第2/3稿已记CTO绑定指令、本次委派继续要求Esc保护（不是作者自行删交互）；若CTO判定超出CR-003 D1则按docs/21转所有者，不在本DRAFT自行批准。ADR-014同步guard/历史重新武装/恢复所有权，docs/12列逐簇宽度例外/未验证终端限制，ADR-027 exports守卫；实现时另补实际执行证据，不把本稿当已实施说明 |
 | `config/hoh.example.toml`、Rust与fixtures | 随所属实现任务同提交支持配置/字段，全部回归TEST-018-01；现阶段不提前改example |
 
 正式M4-T01应用先重核最终main/M3、独立复审并决定下文剩余提案，再按docs/21应用/生成/relock/bundle。当前只改DRAFT文件；不relock、不改台账、不推送，不以bundle代替新AC的product验收。
@@ -739,14 +802,14 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
 |---|---|---|
 | D1 | additive读模型/API与迁移形状 | 采用§1/2的H+generation/typed refs及003；旧路由错误保留，新路由才定义新码；最终迁移编号随M3确认 |
 | D2 | 当前进度分母与历史呈现 | 当前批准spec全部需求为m，当前Run最新ACCEPTED候选全PASS需求为n，DEGRADED单列；旧计数只在标候选的历史详情，未附着显示未知，避免借旧验收 |
-| D3 | 轮次成员、终结尾部与事件分类 | Run内close区间，终结尾部只P、不造开放轮；查询时集中kind表/生产者覆盖、H13交接字段成员；不改关轮/预算，不依赖tasks.iteration_id |
-| D4 | 本VM参考profile、全integration成本与预算 | 保持既有integration唯一串行release、4CPU/8GiB/原门槛；硬件/限制为匹配键，软件补丁仅记录并对照测量；正式integration PASS只收此profile，非参考退出78；T03先量成本、总3600s内留600s，不能满足则CTO重规划是否另加required check（本稿不添加）。scope/pgid清理、debug故障与release计量分层；M7仍核验原SSD/REQ-068 |
+| D3 | 轮次成员、终结尾部与事件分类 | Run内close区间，按真实state区分终结/暂停/INCOMPLETE恢复；H1/H2尾部不漂移；ProducedEventKind写入约束+穷举分类/旁路负例、H13与Focus层级；不改关轮/预算，不依赖tasks.iteration_id |
+| D4 | 本VM参考profile、全integration成本与预算 | 保持既有integration唯一串行release、4CPU/8GiB/原门槛；硬件/限制为匹配键，软件补丁仅记录并对照测量；正式integration PASS只收此profile，非参考退出78；T03先量成本、总3600s内留600s，不能满足则CTO重规划是否另加required check（本稿不添加）。§5.1外部测试启动器/隔离安装、共同slice约束产品service/scope/Attempt，内核身份+独立监护者清理，T05/T07/T10全阶段重测/强制时限；debug故障与release计量分层；M7仍核验原SSD/REQ-068 |
 | D5 | 日志/孤立对象/导出保留 | 8MiB×5未引用诊断、48h孤立宽限、所有明确引用与pin保护、tombstone；显式exports不自动删且单列占用 |
-| D6 | 低空间数字阈值 | min_free=32MiB、未知流段预留1MiB；STORAGE_LOW_SPACE仅拒新对象/新写Attempt，控制202/DB_FULL分界已由CTO绑定 |
+| D6 | 低空间阈值与输入错误/重试形状 | min_free=32MiB、流段预留1MiB；受理前唯一503 STORAGE_LOW_SPACE+details/保草稿；已202投递遇低空间保持QUEUED，既有安全点重试；控制202/DB_FULL分界已绑定 |
 | D7 | 搜索/复制细节 | 完整UTF-8分类、8MiB续扫含尾重叠、file复制到受守卫exports；OSC52已决定延期，不是待选项 |
 | D8 | 状态档与ui-only保存 | 采用三档明确字段表与项目配置原子CAS保注释、ui-only不触发ConfigureTeam，保持执行配置冻结语义 |
-| D9 | 键位覆盖与防护恢复细节 | Esc/Alt+Enter不发送且仅Ctrl+J换行已绑定，不重问；提案普通Enter在false时保持false，只有实际编辑/Ctrl+J重新武装；scope/action/key、保留键、面板可达、mode_cycle不变 |
-| D10 | 宽度回退、输入上限与平台收取 | 提案歧义簇可逆ASCII表示/按原字素编辑，终端版本与光标oracle明确；编辑1MiB/HTTP8MiB/inline256KiB且编码768KiB，否则可读根文件；M4的26.04正式矩阵与无TEST id CI分离，M7一次检查收齐两平台原始记录/缺项失败，支持范围不减 |
+| D9 | 键位覆盖与防护恢复细节 | Esc/Alt+Enter不发送且仅Ctrl+J换行已绑定，不重问；提案普通Enter在false时保持false，确认改变草稿的编辑/粘贴/历史接受才重新武装，历史确认键不发送；scope/action/key、保留键、面板可达、mode_cycle不变 |
+| D10 | 宽度回退、输入上限与平台收取 | Ambiguous原样/非CJK模型已绑定；提案仅逐簇实测分歧表用可逆ASCII，T07补原始证据，终端版本与光标oracle明确；编辑1MiB/HTTP8MiB/inline256KiB且编码768KiB，否则可读根文件；M4的26.04正式矩阵与无TEST id CI分离，M7一次检查收齐两平台原始记录/缺项失败，支持范围不减 |
 | D11 | 公开事实/用户正文与背压计时 | 白名单public块+activity/usage、native id/offset去重、未知null、有界队列；SendInput接受事务写input_id原文块，引用提示不替原文；仅本地队列背压暂停inactivity（不暂停deadline/取消），三家fixture/live分别补证 |
 | D12 | 九实现任务分工 | 先T09生产者、T03查询/容量，再T02/05/06/07/08；T10最终组合、T11三家live，T04独立收口；均≤2REQ/8AC，检查owner不变 |
 
@@ -817,7 +880,7 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
 
 ## 设计审查第 2 轮的处置
 
-输入为第2稿 `50e9fc7b12e9a23e30c6b64a6f809b2d8cd579df`。逐项读取 `/home/ai/dev/hoh/.hoh-dev/review-cr028-d2-claude.md` 与 `review-cr028-d2-grok.md` 的最后一个 hoh-report JSON：Claude 18项（2 high/7 medium/9 low），Grok 11项（3 high/7 medium/1 low），合计29项（5 high/14 medium/10 low）。严重级别保持原报告值；本表“修订”只表示文本已有可审查回应，不代表独立审查已认可或产品实现已通过。所有 high/medium 均在本稿修订，未延期 medium；10项 low 一并处理。第3稿仍 DRAFT，等待第3轮设计复审。
+输入为第2稿 `50e9fc7b12e9a23e30c6b64a6f809b2d8cd579df`。逐项读取 `/home/ai/dev/hoh/.hoh-dev/review-cr028-d2-claude.md` 与 `review-cr028-d2-grok.md` 的最后一个 hoh-report JSON：Claude 18项（2 high/7 medium/9 low），Grok 11项（3 high/7 medium/1 low），合计29项（5 high/14 medium/10 low）。严重级别保持原报告值；本表“修订”只表示文本已有可审查回应，不代表独立审查已认可或产品实现已通过。本表记录第3稿当时的文本回应，未延期medium；10项low当时一并处理。第3轮已判FAIL；其中宽度、pgid、分类和DEGRADED等修法被下节第3轮处置取代，不能把此历史表当作现行规范或已闭合证据。
 
 | ID | severity | disposition | where |
 |---|---|---|---|
@@ -851,14 +914,42 @@ AC-064-01 完整保留原“百万事件/磁盘满/慢客户端/日志轮换/引
 | CR28D-159 | medium | 明确正式integration PASS只收参考profile，24.04矩阵仅tui-pty/普通cargo功能；环境不符退出78且整检查非PASS，保留已跑诊断，不借DEGRADED通过required | §5.1出口；REQ-015矩阵；D4 |
 | CR28D-160 | low | debug用锁生命周期探针断言脱离先于writer释放/超时、不等busy_timeout；1s绝对界限移到参考测量 | AC-010-03；§5.1预算表 |
 
+## 设计审查第 3 轮的处置
+
+输入为第3稿 `ebaf570efc98675ad1a6d8597f7aeff05e2b294c`。逐项读取两份报告的全部发现及最后hoh-report：Claude `/home/ai/dev/hoh/.hoh-dev/review-cr028-d3-claude.md`，会话 `03677589-bb23-4dbd-9252-8e95c45ee69f`，12项（2 high/4 medium/6 low）；Grok `/home/ai/dev/hoh/.hoh-dev/review-cr028-d3-grok.md`，会话 `13d6a4c6-8f0b-4f8a-a3ab-c2b973c6a24a`，9项（1 high/6 medium/2 low）。合计21项（3 high/10 medium/8 low），均在第4稿回应，没有延期high/medium，原级别不改。下表“修订”是可审查文本，独立复审尚NOT_RUN，不能等同发现已被审查者关闭或产品PASS。
+
+| ID | severity | disposition | where |
+|---|---|---|---|
+| CR28D-200 | high | 按本次CTO指令保留真实setsid/service/scope/Attempt cgroup；撤销同pgid禁脱离。资源限制落到共同slice与实际unit，逐PID/start_time/pidfd/own cgroup测量；独立监护者在SIGKILL后unit stop+populated=0证明清理。未采用审查建议中的“测量不派Attempt”限制 | 第4稿指令；§5.1测试接入/生命周期；T03；D4 |
+| CR28D-201 | high | Ambiguous正常显示，不再码点回退；只对有路径分歧证据的具体簇作有限例外；保留原文与终端oracle | §4宽度/例外表；AC-015-01；D10 |
+| CR28D-202 | medium | required环境不符统一SKIPPED/detail reason=REFERENCE_ENV_MISMATCH，退出78，禁止DEGRADED；六条计量AC与应用清单同步 | §5.1出口；012-01、015-03/05、064-01/02/05 |
+| CR28D-203 | medium | 补cancel六项/effect.committed、沿生产链补lease/runner收尾30种与不带点的integrity_violation；生产写入封闭类型、生成ALL、分类无通配、动态分支穷举及唯一INSERT/AST守卫；三类旁路负例证明漏项可检出 | REQ-013分类表；AC-013-04；T03/T06 |
+| CR28D-204 | medium | 唯一503 STORAGE_LOW_SPACE+字节details；受理失败保草稿/无接受消息；已202投递写文件低空间保持QUEUED，沿原链重试 | §2码表、§2.2、§4帧预算、§5；AC-064-04/015-03；D6 |
+| CR28D-205 | medium | 保留integration的--test '*'，明确计入debug tui_pty；冻结五阶段时限且强制截止，T05/T07/T10逐段重测全套/记录余量，超限FAIL不挪预算 | §5.1阶段限额；T03/T05/T07/T10 done_when；D4 |
+| CR28D-206 | low | 明确粘贴、历史接受、清空、面板文字等已确认内容变化重武装；无变化/预览不重武装，提示可操作方法；历史确认Enter消费而不发送 | §4输入；AC-015-02；D9 |
+| CR28D-207 | low | T07在CI编译/lint非默认tui-acceptance全target，仍不执行正式矩阵或伪造TEST行 | REQ-015矩阵；T07；CI应用清单 |
+| CR28D-208 | low | INCOMPLETE→ResumeRun对同尾事件在H1/H2核对归属，旧H1页不变；恢复重开同区间不新增关轮 | §2.1状态表；AC-013-05 |
+| CR28D-209 | low | Focus可选role/epoch/session级；无attempt_id的交接只在可匹配级出现，Attempt过滤交接为空 | §4 Focus；H13；AC-011-03 |
+| CR28D-210 | low | 应用清单点名替换docs/03的Esc+Enter原句并注明已有CTO绑定来源；本DRAFT不自行批准交互变更 | §4；docs/03/ADR-014应用清单与授权边界 |
+| CR28D-211 | low | 路由8MiB后按命令种类保留非SendInput 2MiB限制；合法命令加JSON空白至3MiB为400 BAD_REQUEST、零写入 | §4帧预算；AC-015-03 |
+| CR28D-250 | high | 与201同根因：正常标点/框线/希腊/箭头单元格必须仍为自身，逐簇实测例外不能扩大为字符类别 | 第4稿指令；§4；AC-015-01 |
+| CR28D-251 | medium | Ctrl+C非空先清空且零输入/控制；空稿显示三选项，未选零控制，选择暂停/取消仅对应一条，脱离零控制 | AC-015-02 |
+| CR28D-252 | medium | 有层/无层Esc均零Pause/Cancel，受控Run状态与原Attempt身份/存活不变 | §4；AC-015-02 |
+| CR28D-253 | medium | 未预选打开Team/Focus，同claude的cto/developer都列在选择器，选前Focus空/无派发，不自动选职位 | AC-011-01；T02 |
+| CR28D-254 | medium | 费用与上下文必须显示“未知（qa/pi，原因）”，不能以0/$0/0%代未知 | AC-014-01；T06 |
+| CR28D-255 | medium | Ctrl+R接受只召回草稿、确认键不提交；/resume选择前不换附着/不发控制，选后仅附着（INCOMPLETE不自动ResumeRun） | §4历史；AC-015-02/016-01；T02/T07/T08及闭包 |
+| CR28D-256 | medium | 真终结按RunResult.state=COMPLETED/FAILED/CANCELLED及run.cancelled；PAUSED/BLOCKED的run.result不终结，INCOMPLETE单列恢复规则；五状态子例 | §2.1；AC-013-05 |
+| CR28D-257 | low | 八类块分别单击仅选、双击展开、滚轮改视窗；键盘照测，tmux拦截只豁免被拦点击 | AC-012-01；T05 |
+| CR28D-258 | low | 与210一并点名docs/03旧句替换、仅Ctrl+J换行、Esc后Enter不提交与授权来源 | 应用清单；§4 |
+
 ## 验证记录与交付边界
 
-本任务是DRAFT规格修订；未改生产代码/受锁契约/检查计划、未领取任务/推进全局台账、未relock。无Runtime run_id/task_id/attempt_id/role_epoch身份头、TaskResult输出文件与指定自测目录，因此不编造TaskResult/candidate ID；依委派要求交付本地文档commit。起始分支prep/M4-T01-spec、HEAD=50e9fc7b12e9a23e30c6b64a6f809b2d8cd579df、工作树干净，唯一写权限由本次输入授予。
+本任务是DRAFT规格修订；只改本文件，未改生产代码/受锁契约/检查计划、未领取任务/推进全局台账、未relock。无Runtime run_id/task_id/attempt_id/role_epoch身份头、TaskResult输出文件与指定自测目录，因此不编造TaskResult/candidate ID；依委派要求交付本地文档commit。起始分支prep/M4-T01-spec、HEAD=ebaf570efc98675ad1a6d8597f7aeff05e2b294c、工作树干净，唯一写权限由本次输入授予。
 
-第2稿历史诊断保留在 `.hoh-dev/evidence/m4-spec-d2/`，不重写资源探针的首次失败，不借其结果证明本稿产品行为。第3稿本地验证记录在 `.hoh-dev/evidence/m4-spec-d3/`；临时根用 `mktemp -d /home/ai/dev/m4spec-XXXXXX` 并令 TMPDIR 指向它，每个shell加载指定env.sh，原审查报告与M3来源只读。
+前稿诊断保留在 `.hoh-dev/evidence/m4-spec-d2/`、`m4-spec-d3/`，不重写其首次失败或借它们证明本稿产品行为。第4稿本地记录在 `.hoh-dev/evidence/m4-spec-d4/`；临时根由 `mktemp -d /home/ai/dev/m4spec-XXXXXX`创建，TMPDIR指向它，每个shell加载指定env.sh，外部审查报告/main/M3均只读。来源身份与摘要记source-bindings.json。
 
-已执行修订前启动的 `bash scripts/check.sh --bundle`：退出0，504 tests，581.579s，1项既有skip，记录 `bundle-before.log`/`bundle-before.exit`。第3稿 `probe.py` 沿第2稿方法解析CR-026的16项需求/8实现任务与本稿任务JSON，合并当前任务图调用真实 `validate_bundle.ownership_problems`：37 AC、9实现任务、归属/闭包错误0；核对两轮87条处置的ID/原severity；记录 `probe-final.json`。`review-coverage.json`另核第二轮29项（5 high/14 medium/10 low）与H13同一成员身份组合。`python3 tools/validate_bundle.py` 对当前契约树PASS，product_accepted=false；这不是提案已应用后的整套校验，也不是37条新AC的产品通过。输入文件摘要见 `source-bindings.json`。
+修订前已运行现有ownership探针与 `python3 tools/validate_bundle.py`：37 AC/9实现任务、归属和闭包错误0，当前契约校验PASS（ownership-before.json、validate-before.json）；不是产品验收。第4稿ownership探针解析CR-026的16项需求/8实现任务及本稿JSON，合并当前任务图调用真实validate_bundle.ownership_problems：37 AC、9实现任务、归属/闭包错误0（ownership-final.json）。逐项核对三轮108条处置的ID与原severity，本轮21条为3 high/10 medium/8 low（review-coverage.json）；只是文本覆盖，不是独立关闭发现。纯文档任务按resources/skills/tdd/SKILL.md不运行生产红绿循环。
 
-提交前 `bash scripts/check.sh --bundle` 再执行退出0：504 tests，395.975s，1项既有skip（`test_repository_packages_verified`：Pi packages未安装），记录 `bundle-after.log`/`bundle-after.exit`。写入本段实测结果后，再运行 `python3 tools/validate_bundle.py`、同一ownership探针与 `git diff --check`，最终记录 `validate-final.json`、`probe-final.json`；只有这些自检通过才提交。未修改既有skip或将它计作产品PASS。
+提交前已执行 `bash scripts/check.sh --bundle`：退出0，504 tests，测试耗时412.740s、命令总耗时414.306s，1项既有skip（test_repository_packages_verified：Pi packages未安装）；完整记录为bundle.log、bundle.exit和bundle-result.json。未删改skip或将其计作产品PASS。写入实测结果后再次执行 `python3 tools/validate_bundle.py`、ownership探针与 `git diff --check`，全部通过；当前契约校验product_accepted=false，并非本提案已经应用后的整套验证。scope-check.json核对只有CR-028受跟踪文件变化、无未跟踪源码。临时根在bundle结束后清理，诊断保留在被忽略的证据目录。
 
-本稿生产红/绿、三native fixture/live、平台矩阵、性能/资源生命周期、低空间与第3轮独立设计复审均 **NOT_RUN**；本稿预算和修订不是本次产品测量结果。这是**自测，非验收**，不报告v1 COMPLETED，也不以本次commit代表CR已批准。下一步由CTO决定D1–D12剩余选择并送第3轮设计复审；M4-T01正式应用仍等待M3-T05。
+本稿拟议37条AC的产品红/绿、三native fixture/live、平台矩阵、性能/资源生命周期和低空间场景均 **NOT_RUN**；第4轮独立设计复审亦NOT_RUN。本稿预算、例外表与修订不是本次产品测量结果。这是**自测，非验收**，不报告v1 COMPLETED，也不以本次commit代表CR已批准。下一步由CTO审定D1–D12剩余提案并送第4轮设计复审；M4-T01正式应用仍等待M3-T05。
