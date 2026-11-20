@@ -1897,6 +1897,17 @@ def _driver_then(m: Case, extra: str, extra_texts: list[str]) -> None:
     out['output'] = out['output'] + [{'type': 'input_text', 'text': t} for t in extra_texts]
 
 
+def _driver_script(m: Case, source, texts) -> None:
+    """The turn's first driver call's script and its output's items rewritten: `source(input)` is the new script,
+    `texts(items)` the new input_text items from the recorded ones (header first); design correction 8 item 3's
+    mismatches of a script of several statements and its items."""
+    p = next(p for p in _exec_calls(m) if '/cells.sh' in p['input'])
+    out = next(l['payload'] for l in _turn_lines(m) if (l.get('payload') or {}).get('type') == 'custom_tool_call_output'
+               and l['payload'].get('call_id') == p['call_id'])
+    p['input'] = source(p['input'])
+    out['output'] = [{'type': 'input_text', 'text': t} for t in texts([e['text'] for e in out['output']])]
+
+
 def _odd_call(m: Case, payload: dict) -> None:
     turn = scope(m)[0].turn
     m.rollout.append({'type': 'response_item', 'payload': {**payload, 'call_id': 'mutant-odd-call',
@@ -2183,6 +2194,41 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
                 ('an exec_command with another key', lambda m: f'text(await tools.exec_command({{cmd:{driver(m)},max_output_tokens:5,yield_time_ms:9}}));\n'),
                 ('the driver call then a store() call', lambda m: f'text(await tools.exec_command({{cmd:{driver(m)}}}));\nstore("k", 1);\n')):
             add('code mode', label, edit=lambda m, src=source: _code_mode_call(m, src(m), [COMPLETED, '{}']))
+        # Design correction 8 item 3, form (iv): a script of several statements is attributed strictly by order and
+        # count; every mismatch, and every statement outside the grammar, is unknown (never PASS). Each variant is one
+        # a lenient attribution would PASS: the refusal given to the patch wherever it sits, the command's body found
+        # wherever it sits, the items zipped without their count, an unknown statement skipped.
+        failed = 'Script failed\nWall time 0.0 seconds\nOutput:\n'
+        two = lambda m, first, second: f'{first}text(await tools.apply_patch({patch(m, second)}));\n'
+        for label, source, texts in (
+                ('a failed script, one item fewer: the refusal in the discovery\'s place',
+                 lambda m: two(m, DISCOVERY, 'create'), [failed, PATCH_REFUSAL]),
+                ('a failed script, more items than statements', lambda m: two(m, DISCOVERY, 'create'), [failed, '[]', '[]', PATCH_REFUSAL]),
+                ('a failed script whose last item is not its error',
+                 lambda m: two(m, f'text(await tools.apply_patch({patch(m, "create")}));\n', 'modify'), [failed, PATCH_REFUSAL, '{}']),
+                ('a failed script whose error is not the refusal',
+                 lambda m: two(m, DISCOVERY, 'create'), [failed, '[]', 'Script error:\npatch rejected: unknown reason']),
+                ('the items without a header', lambda m: two(m, DISCOVERY, 'create'), ['[]', PATCH_REFUSAL]),
+                ('a failed script, the refusal in a command\'s place',
+                 lambda m: f'{DISCOVERY}text(await tools.exec_command({{cmd:{json.dumps("cat " + m.paths["P"] + "/TOKEN.txt")}}}));\n',
+                 [failed, '[]', PATCH_REFUSAL]),
+                ('an unknown tool after a refused patch',
+                 lambda m: f'text(await tools.apply_patch({patch(m, "create")}));\ntext(await tools.view_image({{path:"x"}}));\n',
+                 [failed, PATCH_REFUSAL]),
+                ('another command after a discovery', lambda m: f'{DISCOVERY}text(await tools.exec_command({{cmd:"touch x"}}));\n',
+                 [COMPLETED, '[]', '{"exit_code":0,"output":""}']),
+                ('a refused patch whose result is not passed to text()',
+                 lambda m: f'await tools.apply_patch({patch(m, "create")});\n{DISCOVERY}', [failed, PATCH_REFUSAL]),
+                ('a completed script with the refusal as a patch\'s item', lambda m: two(m, DISCOVERY, 'create'),
+                 [COMPLETED, '[]', PATCH_REFUSAL]),
+                ('a failed script, the refused patch\'s item before the discovery\'s',
+                 lambda m: f'text(await tools.apply_patch({patch(m, "create")}));\n{DISCOVERY}', [failed, '[]', PATCH_REFUSAL])):
+            add('code mode mismatch', label, edit=lambda m, src=source, t=texts: _code_mode_call(m, src(m), t))
+        for label, source, texts in (
+                ('the driver then a discovery, one item fewer', lambda s: s + DISCOVERY, lambda t: t),
+                ('the driver then a discovery, one item more', lambda s: s + DISCOVERY, lambda t: t + ['[]', '[]']),
+                ('a discovery then the driver, the items in the driver\'s order', lambda s: DISCOVERY + s, lambda t: t + ['[]'])):
+            add('code mode mismatch', label, edit=lambda m, src=source, t=texts: _driver_script(m, src, t))
         add('item default-deny', 'a killed driver run whose command has a trailing space', edit=_odd_driver_command)
         add('item default-deny', 'a commandExecution of another command', edit=_other_command)
         add('item default-deny', 'an item of an unknown type', edit=_unknown_item)

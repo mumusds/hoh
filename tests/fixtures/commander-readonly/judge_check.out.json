@@ -8273,6 +8273,149 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, one item fewer: the refusal in the discovery's place",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, more items than statements",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script whose last item is not its error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script whose error is not the refusal",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the items without a header",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, the refusal in a command's place",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "an unknown tool after a refused patch",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "another command after a discovery",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a refused patch whose result is not passed to text()",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a completed script with the refusal as a patch's item",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create",
+      "writes recorded: patch <P>/hoh-patch-create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, the refused patch's item before the discovery's",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create",
+      "writes recorded: patch <P>/hoh-patch-create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the driver then a discovery, one item fewer",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the driver then a discovery, one item more",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a discovery then the driver, the items in the driver's order",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -9829,6 +9972,20 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -13920,6 +14077,149 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, one item fewer: the refusal in the discovery's place",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, more items than statements",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script whose last item is not its error",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script whose error is not the refusal",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome",
+      "1 cells not refused: patch worktree create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the items without a header",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, the refusal in a command's place",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "an unknown tool after a refused patch",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "another command after a discovery",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a refused patch whose result is not passed to text()",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a completed script with the refusal as a patch's item",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create",
+      "writes recorded: patch <P>/hoh-patch-create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a failed script, the refused patch's item before the discovery's",
+     "ok": true,
+     "verdict": "FAIL",
+     "why": [
+      "cells written: patch worktree create",
+      "writes recorded: patch <P>/hoh-patch-create"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the driver then a discovery, one item fewer",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "the driver then a discovery, one item more",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode mismatch",
+     "label": "a discovery then the driver, the items in the driver's order",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "a code-mode script with an output of unknown outcome"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -15477,6 +15777,20 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "FAIL",
+    "FAIL",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",

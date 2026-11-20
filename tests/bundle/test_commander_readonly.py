@@ -258,7 +258,6 @@ class Judge(unittest.TestCase):
                 if change.startswith('patches changed'):self.assertEqual(summary,'8 insufficient, 4 refused')
                 elif change!='as recorded':self.assertEqual(summary,'12 insufficient',(case,change))
 
-if __name__=='__main__':unittest.main()
 
 class CodeMode(unittest.TestCase):
     """Design correction 8: code mode's calls by the grammar, not the recorded text."""
@@ -272,3 +271,21 @@ class CodeMode(unittest.TestCase):
                     'text(await tools.exec_command({cmd:"x",yield_time_ms:1}));','// @exec: {}\ntext(await tools.apply_patch("p"));',
                     'const r = await tools.apply_patch("p");\n','text(ALL_TOOLS[0]);','text(ALL_TOOLS.filter(t => tools.x(t)));'):
             self.assertIsNone(judge_check.code_mode_script(src),src)
+    def test_a_script_of_several_statements_is_attributed_strictly_by_order_and_count(self):
+        # Design correction 8 item 3, form (iv): every mismatch of statements and items, and every statement outside the
+        # grammar, is an unknown outcome (INSUFFICIENT); a patch that ran by its position is a write (FAIL). Never PASS.
+        none=Path('/nonexistent');J=judge_check
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=J.load(FIXTURES/'excerpts',none,'codex',name)[0];control=J.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
+            rows=[r for r in J.run_mutants(c,control) if r['kind']=='code mode mismatch']
+            self.assertEqual(len(rows),14,name)
+            for r in rows:
+                want='FAIL' if r['label'] in ("a completed script with the refusal as a patch's item",
+                                              "a failed script, the refused patch's item before the discovery's") else 'INSUFFICIENT'
+                self.assertEqual(r['verdict'],want,(name,r['label']))
+            # The same script with its items in order and in number is the invariance variant (the first refused).
+            m=copy.deepcopy(c);J._code_mode_call(m,J.DISCOVERY+f'text(await tools.apply_patch({json.dumps(J.patch_text(m,"P","create"))}));\n',
+                                                 ['Script failed\nWall time 0.0 seconds\nOutput:\n','[]',J.PATCH_REFUSAL])
+            self.assertEqual(J.round_verdict(m,control)[0],'PASS',name)
+
+if __name__=='__main__':unittest.main()
