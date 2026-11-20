@@ -2955,7 +2955,8 @@ fn a_tracer_that_starts_its_run_only_after_the_lookup_gave_up_leaves_nothing() -
     // pinned by a handshake, not by times: the stand-in says it is ready and waits for `go` before it becomes strace;
     // `go` is written only from the lookup's give-up (its seam), which then waits for the run to be stopped before
     // the guard ends them. However the test and the stand-in are scheduled, the lookup cannot find a run (none is
-    // started before `go`), and the cleanup meets one it never saw. Each bound is a limit only.
+    // started before `go`; a stand-in whose `go` never came exits without starting strace), and the cleanup meets
+    // one it never saw. Each bound is a limit only: when one runs out the test fails, it never passes.
     let install = Install::new()?;
     let out = install.run("bundle", &[])?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -2970,6 +2971,7 @@ fn a_tracer_that_starts_its_run_only_after_the_lookup_gave_up_leaves_nothing() -
         .collect();
     let late = "import os, sys, time\nopen(sys.argv[1], 'w').close()\nend = time.monotonic() + 60\n\
                 while not os.path.exists(sys.argv[2]) and time.monotonic() < end: time.sleep(0.01)\n\
+                if not os.path.exists(sys.argv[2]): sys.exit(3)\n\
                 os.execvp('strace', ['strace'] + sys.argv[3:])";
     let (ready_arg, go_arg) = (ready.display().to_string(), go.display().to_string());
     let stopped = std::cell::Cell::new(false);
