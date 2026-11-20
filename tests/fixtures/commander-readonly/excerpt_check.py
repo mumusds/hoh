@@ -2,8 +2,10 @@
 """Check that the committed excerpts keep the structure of the recordings they were cut from (ADR-032 design
 correction 4).
 
-Every excerpt's header names its source file, the source's sha256, the source line index of every following line and
-the sha256 of every line's key skeleton (keys, nesting, array lengths, value types). For every excerpt this checks:
+Every excerpt (the S0 runs' `<agent>/*.excerpt.jsonl`, and every JSON-lines file of the TEST-021-07 recordings
+under `<agent>-live/`) has a header that names its source file, the source's sha256, the source line index of every
+following line and the sha256 of every line's key skeleton (keys, nesting, array lengths, value types). For every
+excerpt this checks:
 
 - the header lists exactly one index and one skeleton hash per line, and each line's skeleton hash is the recorded one;
 - when the raw source is present locally and still has the recorded sha256, each excerpt line has the same skeleton
@@ -28,7 +30,8 @@ _spec.loader.exec_module(excerpt)
 def check(excerpts: Path, root: Path, recorded_only: bool) -> tuple[list[str], dict]:
     problems: list[str] = []
     stats = {'files': 0, 'lines': 0, 'against_raw': 0, 'against_recorded_only': 0, 'meta_against_raw': 0}
-    for path in sorted(excerpts.glob('*/*.excerpt.jsonl')):
+    # The S0 excerpts, and the TEST-021-07 recordings in the judge's layout (excerpt.py --live, design correction 8).
+    for path in sorted([*excerpts.glob('*/*.excerpt.jsonl'), *excerpts.glob('*-live/**/*.jsonl')]):
         stats['files'] += 1
         rel = path.relative_to(excerpts)
         text = path.read_text().splitlines()
