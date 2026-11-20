@@ -76,7 +76,7 @@ class ProductBundle(unittest.TestCase):
             else:
                 self.assertEqual(self.out.read_bytes(), previous)
 
-    def test_005_06_env_target_packs_fresh_binary_instead_of_stale_default(self):
+    def test_env_target_packs_fresh_binary_instead_of_stale_default(self):
         self.build(OLD_COMMIT)
         target = self.root / "fresh target 中文"
         env = self.build(target=target)
@@ -165,3 +165,31 @@ class ProductBundle(unittest.TestCase):
         env["CARGO_TARGET_DIR"] = str(self.root / "missing target")
         env["HOH_BUILD_COMMIT"] = NEW_COMMIT
         self.assert_refused(env, "missing target")
+
+    def test_a_build_target_triple_packs_cargos_binary_not_the_host_default(self):
+        # BTD-01: the same commit built for the host default and for an explicit triple; the triple's bytes differ
+        # (a marker in the source), and only Cargo's answer for this build may be packed.
+        triple = subprocess.run(["rustc", "-vV"], capture_output=True, text=True, check=True).stdout
+        triple = next(l.split(": ", 1)[1] for l in triple.splitlines() if l.startswith("host: "))
+        self.build()
+        stale = self.root / "target/release/hoh"
+        (self.root / "src/main.rs").write_text((self.root / "src/main.rs").read_text() + "// triple build\n"
+                                               "#[used] static MARK: [u8; 5] = *b\"tripl\";\n")
+        env = self.env.copy()
+        env["HOH_BUILD_COMMIT"] = NEW_COMMIT
+        env["CARGO_BUILD_TARGET"] = triple
+        p = subprocess.run(["cargo", "build", "--release", "--offline"], cwd=self.root, env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        fresh = self.root / "target" / triple / "release/hoh"
+        self.assertNotEqual(fresh.read_bytes(), stale.read_bytes())
+        p = self.bundle(env)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_binary(fresh)
+
+    def test_a_build_target_in_cargo_config_is_refused_not_guessed(self):
+        env = self.build()
+        (self.root / ".cargo").mkdir()
+        (self.root / ".cargo/config.toml").write_text('[build]\ntarget = "x86_64-unknown-linux-gnu"\n')
+        self.assert_refused(env, "build target in .cargo/config")
+

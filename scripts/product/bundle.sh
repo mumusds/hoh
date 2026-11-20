@@ -18,17 +18,35 @@ elif [[ "$expected" == *-dirty ]]; then
 fi
 # Cargo resolves both CARGO_TARGET_DIR and build.target-dir, including relative paths.
 # A metadata failure must not fall back to a possibly stale default target directory.
-target="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c '
+if ! metadata="$(cargo metadata --format-version 1 --no-deps --locked)"; then
+  echo 'bundle: cargo metadata failed; refusing to pack.' >&2
+  exit 1
+fi
+if ! target="$(printf '%s\n' "$metadata" | python3 -c '
 import json, os, sys
-target = json.load(sys.stdin)["target_directory"]
+try:
+    target = json.load(sys.stdin)["target_directory"]
+except (ValueError, KeyError, TypeError):
+    sys.exit(1)
 if not isinstance(target, str) or not os.path.isabs(target):
-    sys.exit("bundle: Cargo target_directory must be an absolute path")
+    sys.exit(1)
 print(target)
-')"
+' 2>/dev/null)"; then
+  echo 'bundle: Cargo gave no absolute target_directory; refusing to pack.' >&2
+  exit 1
+fi
+# A build target triple puts the binary under <target>/<triple>/release (BTD-01). The product scripts never set one;
+# CARGO_BUILD_TARGET is honoured, and a build.target in the repository's Cargo configuration is refused rather than
+# guessed at.
+if grep -Eqs '^[[:space:]]*target[[:space:]]*=' .cargo/config.toml .cargo/config; then
+  echo 'bundle: a build target in .cargo/config is not supported; refusing to pack.' >&2
+  exit 1
+fi
+release="$target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release"
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/hoh/bin"
-install -m 0755 "$target/release/hoh" "$stage/hoh/bin/hoh"
+install -m 0755 "$release/hoh" "$stage/hoh/bin/hoh"
 # Verify the staged bytes that will enter the archive, before opening the output file.
 if ! version="$("$stage/hoh/bin/hoh" --version)"; then
   echo 'bundle: staged hoh --version failed; refusing to pack it.' >&2
