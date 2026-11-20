@@ -178,7 +178,7 @@ fn attach_with(state: &State, project: &Path, run_id: Option<&str>, output: Outp
     // follow ends at a result past W0 or one in a terminal state (decision 12).
     let w0 = run["watermark"].as_i64().unwrap_or_default();
     state.note_run(&run_id);
-    let stderr = crate::forward::Stderr::start(project);
+    let stderr = crate::forward::Stderr::start(project, state.writer().clone());
     let follower = Follower {
         project,
         run_id: &run_id,

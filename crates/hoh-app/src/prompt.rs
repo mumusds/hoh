@@ -124,7 +124,7 @@ fn start(
     let replay = Replay::Before {
         command_id: command_id.clone(),
     };
-    let stderr = Stderr::start(project);
+    let stderr = Stderr::start(project, state.writer().clone());
     let follower = Follower {
         project,
         run_id: &run_id,
@@ -309,7 +309,7 @@ fn answer(
     let replay = Replay::Before {
         command_id: input["command_id"].as_str().unwrap_or_default().to_owned(),
     };
-    let stderr = Stderr::start(project);
+    let stderr = Stderr::start(project, state.writer().clone());
     let follower = Follower {
         project,
         run_id,

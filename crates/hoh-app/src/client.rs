@@ -588,6 +588,8 @@ fn supervised(
             .map(|out| hoh_app::unit::show(&String::from_utf8_lossy(&out.stdout)))
             .unwrap_or_default()
     };
+    // A stop that begins while the start runs says it was interrupted, its result unknown (设计修正 2, A and D).
+    let starting = crate::signals::current().map(|state| state.unit_starting(&unit.name));
     let started = hoh_agents::probe::run_status(
         &unit.systemctl,
         &["--user", "start", &unit.name],
@@ -596,6 +598,7 @@ fn supervised(
             ..env.clone()
         },
     );
+    drop(starting);
     let refused = match started {
         Ok(out) if out.status.success() => None,
         Ok(out) => Some(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
@@ -794,10 +797,10 @@ fn launch_with(
         None => std::process::Command::new(&program),
     };
     match unscoped {
-        Some(why) => command.env(hoh_app::host::UNSCOPED_ENV, why),
-        None => command.env_remove(hoh_app::host::UNSCOPED_ENV),
+        Some(why) => command.env(hoh_app::layout::UNSCOPED_ENV, why),
+        None => command.env_remove(hoh_app::layout::UNSCOPED_ENV),
     };
-    command.env(hoh_app::host::UNSUPERVISED_ENV, unsupervised);
+    command.env(hoh_app::layout::UNSUPERVISED_ENV, unsupervised);
     // Where a test holds the start just before the host is spawned, and sees what came of it (debug builds only).
     crate::debug_hold::at("before-launch");
     // A host is wait-only from its spawn: nothing of this client ever signals it; its start takes a ticket at the
