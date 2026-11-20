@@ -114,7 +114,7 @@ fn the_read_only_judge_on_every_generated_variant() -> R {
         .status()?;
     assert!(status.success(), "judge_check.py --emit: {status}");
     let mut judged = 0usize;
-    let mut differ_from_prototype = 0usize;
+    let mut differ_from_prototype = Vec::new();
     let mut wrong = Vec::new();
     for agent_dir in std::fs::read_dir(out.path().join("variants"))? {
         let agent_dir = agent_dir?.path();
@@ -143,7 +143,14 @@ fn the_read_only_judge_on_every_generated_variant() -> R {
                     _ => Verdict::Insufficient,
                 };
                 if prototype != verdict {
-                    differ_from_prototype += 1;
+                    // The class within non-PASS matters too (M2T20D-1151): a breach the prototype calls FAIL must not
+                    // become INSUFFICIENT, which would be retried instead of failing at once.
+                    differ_from_prototype.push(format!(
+                        "{} [{} / {}] prototype {prototype:?} got {verdict:?}: {why:?}",
+                        v.strip_prefix(out.path()).unwrap_or(&v).display(),
+                        expect["kind"],
+                        expect["label"]
+                    ));
                 }
                 if !ok {
                     wrong.push(format!(
@@ -158,7 +165,8 @@ fn the_read_only_judge_on_every_generated_variant() -> R {
         }
     }
     println!(
-        "{judged} variants judged; {differ_from_prototype} differ from the prototype's verdict class"
+        "{judged} variants judged; {} differ from the prototype's verdict class",
+        differ_from_prototype.len()
     );
     assert!(judged > 1000, "{judged} variants");
     assert!(
@@ -166,6 +174,17 @@ fn the_read_only_judge_on_every_generated_variant() -> R {
         "{} of {judged} variants off their class:\n{}",
         wrong.len(),
         wrong
+            .iter()
+            .take(30)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        differ_from_prototype.is_empty(),
+        "{} of {judged} variants differ from the prototype's verdict class:\n{}",
+        differ_from_prototype.len(),
+        differ_from_prototype
             .iter()
             .take(30)
             .cloned()
