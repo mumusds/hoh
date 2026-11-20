@@ -1,5 +1,5 @@
 {
-  "_doc": "docs/adr/ADR-031.md, 设计修正 2, E: every place in non-test code that starts or replaces a process or makes the plain spawner, with its owner (scripts/product/spawn_scan.py).",
+  "_doc": "docs/adr/ADR-031.md, 设计修正 2, E: every place in non-test code that starts or replaces a process or makes the plain spawner, with its owner; the host-only modules where the plain spawner may be made; and each place a client file writes stderr other than through its writer (scripts/product/spawn_scan.py).",
   "client_files": [
     "crates/hoh-app/src/cli.rs",
     "crates/hoh-app/src/client.rs",
@@ -16,8 +16,18 @@
     "crates/hoh-app/src/prompt.rs",
     "crates/hoh-app/src/session.rs",
     "crates/hoh-app/src/signals.rs",
+    "crates/hoh-app/src/stderr.rs",
+    "crates/hoh-app/src/stderr/",
     "crates/hoh-app/src/tui.rs",
     "crates/hoh-app/src/tui/"
+  ],
+  "host_only_files": [
+    "crates/hoh-app/src/compat.rs",
+    "crates/hoh-app/src/gate.rs",
+    "crates/hoh-app/src/host/",
+    "crates/hoh-app/src/installer.rs",
+    "crates/hoh-app/src/verify.rs",
+    "crates/hoh-app/src/verify/"
   ],
   "host_only_functions": [
     "hoh_app::gate::main",
@@ -96,6 +106,14 @@
       "count": 1,
       "owner": "test-seam",
       "reason": "compat::register, called only by tests before a host starts (ADR-030 decision 10)"
+    }
+  ],
+  "stderr_sites": [
+    {
+      "file": "crates/hoh-app/src/stderr.rs",
+      "item": "std::io::stderr",
+      "count": 1,
+      "reason": "fd 2's one descriptor (Fd2): the writer thread's, the direct write before the signal state is registered, the exit's bounded direct write after the writer ended, and the panic hook's words (ADR-031, 设计修正 2, C)"
     }
   ]
 }

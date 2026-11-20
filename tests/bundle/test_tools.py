@@ -904,10 +904,13 @@ class SpawnScan(unittest.TestCase):
         sys.path.insert(0,str(ROOT/'scripts/product'))
         import spawn_scan
         return spawn_scan
-    def manifest(self,sites=(),host_only=('hoh_app::gate::main',)):
-        return {'client_files':['crates/hoh-app/src/client.rs','crates/hoh-app/src/doctor/','crates/hoh-app/src/owned.rs'],
+    def manifest(self,sites=(),host_only=('hoh_app::gate::main',),stderr=()):
+        return {'client_files':['crates/hoh-app/src/client.rs','crates/hoh-app/src/doctor/','crates/hoh-app/src/owned.rs',
+                                'crates/hoh-app/src/stderr.rs'],
+                'host_only_files':['crates/hoh-app/src/host/','crates/hoh-app/src/gate.rs','crates/hoh-app/src/installer.rs'],
                 'host_only_functions':list(host_only),
-                'sites':[dict(zip(('file','item','count','owner','reason'),site)) for site in sites]}
+                'sites':[dict(zip(('file','item','count','owner','reason'),site)) for site in sites],
+                'stderr_sites':[dict(zip(('file','item','count','reason'),site)) for site in stderr]}
     GATE=('crates/hoh-app/src/owned.rs','hoh_core::spawn::Direct',1,'gate','the gate')
     def test_listed_places_pass_and_any_difference_fails(self):
         s=self.scan();gate=self.GATE
@@ -944,10 +947,55 @@ class SpawnScan(unittest.TestCase):
                                 ('crates/hoh-app/src/client.rs','hoh_core::spawn::Direct')])
         self.assertEqual(len(problems),1)
         self.assertIn('does not refer to a reachable function',problems[0])
+    def test_the_plain_spawner_is_made_only_in_the_host_only_modules(self):
+        # 设计修正 2, A (CLT-1007, CLT-1101): host-only, entry and test-seam places only in host_only_files.
+        s=self.scan()
+        host=('crates/hoh-app/src/host/agents.rs','hoh_core::spawn::Direct')
+        self.assertEqual(s.judge([host],self.manifest([(*host,1,'host-only','x')])),[])
+        unit=('crates/hoh-app/src/installer.rs','hoh_core::spawn::Direct')
+        self.assertEqual(s.judge([unit],self.manifest([(*unit,1,'entry','x')])),[])
+        agents=('crates/hoh-agents/src/probe.rs','hoh_core::spawn::Direct')
+        self.assertIn('only for the host-only modules',' '.join(s.judge([agents],self.manifest([(*agents,1,'host-only','x')]))))
+    def test_a_client_file_writes_stderr_only_where_listed(self):
+        # 设计修正 2, C and E: a direct stderr write in a client file is listed with its count; elsewhere it is not the
+        # client's.
+        s=self.scan()
+        fd2=('crates/hoh-app/src/stderr.rs','std::io::stderr')
+        self.assertEqual(s.judge([fd2],self.manifest(stderr=[(*fd2,1,'the writer')])),[])
+        self.assertIn('writes stderr directly',' '.join(s.judge([fd2],self.manifest())))
+        doctor=('crates/hoh-app/src/doctor/live.rs','std::eprintln')
+        self.assertIn('writes stderr directly',' '.join(s.judge([fd2,doctor],self.manifest(stderr=[(*fd2,1,'w')]))))
+        self.assertIn('listed x1 as a stderr site but found x2',' '.join(s.judge([fd2,fd2],self.manifest(stderr=[(*fd2,1,'w')]))))
+        self.assertIn('no longer found',' '.join(s.judge([],self.manifest(stderr=[(*fd2,1,'w')]))))
+        self.assertIn('not a client file',' '.join(s.judge([],self.manifest(stderr=[('crates/hoh-app/src/host/http.rs','std::io::stderr',0,'w')]))))
+        self.assertEqual(s.judge([('crates/hoh-app/src/host/http.rs','std::io::stderr')],self.manifest()),[])
+    def test_a_client_file_never_refers_to_a_host_only_module(self):
+        # 设计修正 2, A (CTO decision, CLT-1007): paths, use groups, globs and a renamed crate are refused; comments,
+        # strings and test modules are not code.
+        s=self.scan();f='crates/hoh-app/src/client.rs'
+        clean='''// hoh_app::host::Host in a comment
+/* hoh_app::gate::main /* nested */ */
+const A: &str = "hoh_app::host::run_ready";
+const B: &str = r#"hoh_app::verify"#;
+const C: char = '"';
+use hoh_app::{layout, unit::{self, show}};
+fn f() { let _ = hoh_app::layout::component("x"); }
+#[cfg(test)]
+mod tests { use hoh_app::host::HostConfig; fn g() { if true { } } }
+'''
+        self.assertEqual(s.boundary_problems(f,clean),[])
+        for bad,why in [('fn f() { hoh_app :: host::run_ready(); }','hoh_app::host'),
+                        ('use hoh_app::{layout, verify::check};','hoh_app::verify'),
+                        ('use hoh_app::{unit::{a, b}, gate};','hoh_app::gate'),
+                        ('use hoh_app::*;','hoh_app::*'),
+                        ('use hoh_app as app;','another name'),
+                        ('extern crate hoh_app as app;','another name')]:
+            self.assertIn(why,' '.join(s.boundary_problems(f,clean+bad)),bad)
     def test_the_shipped_list_names_known_owners_with_reasons(self):
         s=self.scan();manifest=json.loads((ROOT/'scripts/product/spawn-sites.json').read_text())
-        found=[(e['file'],e['item']) for e in manifest['sites'] for _ in range(e['count'])]
+        found=[(e['file'],e['item']) for e in manifest['sites']+manifest['stderr_sites'] for _ in range(e['count'])]
         self.assertEqual(s.judge(found,manifest),[])
+        self.assertEqual([p for path,source in s.client_sources(manifest) for p in s.boundary_problems(path,source)],[])
         self.assertIn('crates/hoh-app/src/doctor/',manifest['client_files'])
 
 class ProcessLifecycle(unittest.TestCase):
