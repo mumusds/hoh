@@ -20,11 +20,11 @@ if [[ -z "${HOH_BUILD_COMMIT:-}" ]]; then
   echo "deployment: not a Git checkout: no commit for hoh --version to name" >&2
   exit 1
 fi
-cargo build --workspace --release --locked
+executable="$(bash scripts/product/release-exe.sh)"
 work="$(mktemp -d)"
 log="$(mktemp)"
 trap 'rm -rf "$work" "$log"' EXIT
-bash scripts/product/bundle.sh "$work/hoh-release.tar.gz"
+bash scripts/product/bundle.sh "$work/hoh-release.tar.gz" "$executable"
 echo "deployment: release bundle $(sha256sum "$work/hoh-release.tar.gz" | cut -c1-16)… of $HOH_BUILD_COMMIT" >&2
 rc=0
 HOH_RELEASE_BUNDLE="$work/hoh-release.tar.gz" HOH_EXPECTED_COMMIT="$HOH_BUILD_COMMIT" \

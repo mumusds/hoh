@@ -4,7 +4,7 @@ set -Eeuo pipefail
 cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 # shellcheck source=scripts/product/build-commit.sh
 source scripts/product/build-commit.sh
-cargo build --workspace --release --locked
+executable="$(bash scripts/product/release-exe.sh)"
 if [[ -f web/package.json ]]; then
   npm ci --prefix web
   npm run build --prefix web
@@ -14,6 +14,6 @@ else
 fi
 # Release bundle for the release gate (CR-003): only under tools/run_check.py.
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
-  bash scripts/product/bundle.sh "$HOH_EVIDENCE_DIR/hoh-release.tar.gz"
+  bash scripts/product/bundle.sh "$HOH_EVIDENCE_DIR/hoh-release.tar.gz" "$executable"
   echo "build: release bundle $(sha256sum "$HOH_EVIDENCE_DIR/hoh-release.tar.gz" | cut -c1-16)…" >&2
 fi
