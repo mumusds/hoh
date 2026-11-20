@@ -8,5 +8,6 @@
 pub mod compat;
 pub mod gate;
 pub mod host;
+pub mod layout;
 pub mod unit;
 pub mod verify;

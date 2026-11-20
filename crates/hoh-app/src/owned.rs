@@ -101,6 +101,11 @@ impl Gate {
         ))?)
     }
 
+    /// Refuse every ticket from now on (the stop's first step, which [`Gate::stop`] takes too).
+    pub fn refuse(&self) {
+        self.locked().stopping = true;
+    }
+
     /// Stop: refuse new tickets, kill every registered helper (its group, then its leader), wait at most `bound` for
     /// the helper starts in flight to end, read the registry again, and reap what exited within the rest of the bound,
     /// seeing each exit and cleaning its group first; with descendants adopted, kill every one still alive and scan

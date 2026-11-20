@@ -8,12 +8,13 @@
 #![forbid(unsafe_code)]
 
 /// A line on stderr, whatever becomes of it: `eprintln!` panics when the write fails (a hung-up terminal, a full
-/// device), which would turn the exit code into 101 (M1QA-01). Defined before the modules, so they can use it.
+/// device), which would turn the exit code into 101 (M1QA-01). Once a client's signal state is registered the line goes
+/// to its one stderr writer, before that straight to fd 2 (docs/adr/ADR-031.md, 设计修正 2, C). Defined before the
+/// modules, so they can use it.
 macro_rules! say {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stderr(), $($arg)*);
-    }};
+    ($($arg:tt)*) => {
+        crate::stderr::say(&format!($($arg)*))
+    };
 }
 
 mod cli;
@@ -30,6 +31,7 @@ mod owned;
 mod prompt;
 mod session;
 mod signals;
+mod stderr;
 mod tui;
 
 use cli::Invocation;

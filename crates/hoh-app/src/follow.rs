@@ -222,7 +222,8 @@ impl Follower<'_> {
                 Ok(Some(event)) => {
                     quiet_since = Instant::now();
                     match watch.see(event) {
-                        Seen::Dropped(seq) => self.stderr.say(&format!(
+                        // A line per event: progress, within its budget (设计修正 2, C; CLT-1102).
+                        Seen::Dropped(seq) => self.stderr.progress(&format!(
                             "hoh: 丢弃了 seq 不在 {} 之后的事件（seq {}）",
                             watch.last(),
                             seq.map_or_else(|| "无".to_owned(), |s| s.to_string())
@@ -286,7 +287,8 @@ impl Follower<'_> {
         }
         let kind = event["kind"].as_str().unwrap_or_default();
         if kind == "run.waiting" {
-            self.stderr.say(&format!(
+            // A line per event: progress, within its budget (设计修正 2, C; CLT-1102).
+            self.stderr.progress(&format!(
                 "hoh: 等待外部恢复，下次重试 {}",
                 event["payload"]["next_retry_at"].as_str().unwrap_or("未知")
             ));
@@ -303,7 +305,7 @@ impl Follower<'_> {
                     return Err(client_code(ClientEvent::TerminalIo));
                 }
             }
-            Output::Text => self.stderr.say(&format!(
+            Output::Text => self.stderr.progress(&format!(
                 "#{} {kind}",
                 event["seq"].as_i64().unwrap_or_default()
             )),
@@ -359,10 +361,10 @@ pub fn conclude(
             failed.unwrap_or(code)
         }
         Outcome::Code(code @ (129 | 130 | 143)) => {
-            stderr.say(&format!(
+            // Rule 2's sentence: first among the client's own words at the exit, said once it is queued (设计修正 2, C).
+            state.say(&format!(
                 "hoh: 已脱离 Run {run_id}（它在后台继续，没有发出任何命令）；用 hoh attach {run_id} 重新附着"
             ));
-            state.mark_said();
             *code
         }
         Outcome::Code(code) => *code,

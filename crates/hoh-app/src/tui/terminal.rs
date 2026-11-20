@@ -266,6 +266,7 @@ pub fn debug_restore_gate() {
         while !std::path::Path::new(&gate).exists() {
             if std::time::Instant::now() >= end {
                 say!("HOH_DEBUG_TUI_RESTORE_GATE: not opened within 10 s");
+                crate::stderr::settle(std::time::Duration::from_secs(1));
                 std::process::abort();
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -280,7 +281,9 @@ pub fn restore_on_panic() {
         debug_restore_gate();
         if let Err(e) = with_retries(3, restore) {
             settle();
-            say!("hoh：终端未能恢复：{e}；可运行 stty sane 或 reset");
+            crate::stderr::panicking(&format!(
+                "hoh：终端未能恢复：{e}；可运行 stty sane 或 reset"
+            ));
         }
         previous(info);
     }));

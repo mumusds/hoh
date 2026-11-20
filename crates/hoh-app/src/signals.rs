@@ -2,15 +2,15 @@
 //! before any wait ([`register`]), and every stage after uses the same one ([`current`]). Every wait the client makes
 //! looks at it while it waits ([`wait`]), and every exit consults it first ([`State::exit`]): a received SIGTERM,
 //! SIGINT or SIGHUP decides the exit code (143, 130, 129) and the message. The state also holds the client's one start
-//! gate, which every process the client starts goes through and which a signal exit stops (设计修正 2, A), and says
-//! its messages through one bounded path (rule 6).
+//! gate, which every process the client starts goes through and which a signal exit stops (设计修正 2, A), and the
+//! client's one stderr writer, made as the state is registered (设计修正 2, C; rule 6).
 
 use crate::exit::{ClientEvent, client_code};
 use crate::owned::{Gate, Stopped};
+use crate::stderr::{MakeSink, Writer};
 use hoh_core::spawn::Spawner;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
-use std::os::fd::AsFd as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -22,17 +22,8 @@ pub const LOOK: Duration = Duration::from_millis(100);
 /// helpers it killed to be reaped (设计修正 2, D: the first two rows share it).
 pub const HELPERS_WAIT: Duration = Duration::from_millis(1500);
 
-/// How long a message waits for stderr (rule 6); not written by then, it is given up.
-pub const SAY_WAIT: Duration = Duration::from_millis(500);
-
-/// Where the bounded diagnostics path writes: the process's stderr (fd 2, never through std's lock), or a unit test's
-/// descriptor.
-#[derive(Clone)]
-enum Out {
-    Stderr,
-    #[cfg(test)]
-    Fd(Arc<std::os::fd::OwnedFd>),
-}
+/// How many pids the exit names of the helpers it could not confirm ended.
+const NAMED: usize = 8;
 
 /// The signal state of a client process: the number of the exit signal that came (0 for none), whether the window was
 /// resized, the run the client is about (for the message), and whether a stage already said why it ended.
@@ -43,15 +34,17 @@ pub struct State {
     said: AtomicBool,
     /// The start gate every process the client starts goes through (设计修正 2, A).
     gate: Arc<Gate>,
-    out: Out,
-    /// Messages given up since the last one written (rule 6).
-    late: AtomicU64,
+    /// The client's one stderr writer (设计修正 2, C).
+    writer: Arc<Writer>,
+    /// The unit whose `systemctl --user start` is running, if one is (设计修正 2, A: the unit mode).
+    unit: Mutex<Option<String>>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
 
 /// The process's signal state, registered now if it is not yet (and never a second time); 74 when the handlers cannot
-/// be registered.
+/// be registered, or when the stderr writer's thread cannot be made (nothing is written then; a signal that came once
+/// the handlers were in decides the code instead: 设计修正 2, C).
 pub fn register() -> Result<&'static State, u8> {
     if let Some(state) = STATE.get() {
         return Ok(state);
@@ -69,10 +62,33 @@ pub fn register() -> Result<&'static State, u8> {
         say!("hoh：无法登记信号处理：{e}");
         return Err(client_code(ClientEvent::TerminalIo));
     }
-    let _ = STATE.set(State::with(signal, resized));
+    let state = assemble(
+        signal,
+        resized,
+        crate::stderr::fd2(),
+        &crate::stderr::thread("hoh-stderr"),
+    )?;
+    let _ = STATE.set(state);
     STATE
         .get()
         .ok_or_else(|| client_code(ClientEvent::TerminalIo))
+}
+
+/// The signal state of `signal` and `resized` with its stderr writer, made by `spawn` writing to what `make` makes; or,
+/// with no thread for the writer, the exit code: the signal's when one came, else 74.
+fn assemble(
+    signal: Arc<AtomicUsize>,
+    resized: Arc<AtomicBool>,
+    make: MakeSink,
+    spawn: crate::stderr::Spawn<'_>,
+) -> Result<State, u8> {
+    match Writer::start(make, spawn) {
+        Ok(writer) => Ok(State::writing(signal, resized, writer)),
+        Err(_) => Err(match signal.load(Ordering::SeqCst) {
+            0 => client_code(ClientEvent::TerminalIo),
+            signal => code(signal),
+        }),
+    }
 }
 
 /// The process's signal state, if a command registered it.
@@ -96,20 +112,28 @@ pub fn code(signal: usize) -> u8 {
 }
 
 impl State {
-    fn with(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>) -> State {
-        State::writing(signal, resized, Out::Stderr)
-    }
-
-    fn writing(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>, out: Out) -> State {
+    fn writing(signal: Arc<AtomicUsize>, resized: Arc<AtomicBool>, writer: Arc<Writer>) -> State {
         State {
             signal,
             resized,
             run: Mutex::new(None),
             said: AtomicBool::new(false),
             gate: Arc::default(),
-            out,
-            late: AtomicU64::new(0),
+            writer,
+            unit: Mutex::new(None),
         }
+    }
+
+    /// The client's one stderr writer.
+    pub fn writer(&self) -> &Arc<Writer> {
+        &self.writer
+    }
+
+    /// Unit `name`'s `systemctl --user start` runs until the guard is dropped: a stop that begins meanwhile says the
+    /// start was interrupted and its result is unknown (设计修正 2, A and D).
+    pub fn unit_starting(&self, name: &str) -> UnitStart<'_> {
+        *self.unit.lock().unwrap_or_else(PoisonError::into_inner) = Some(name.to_owned());
+        UnitStart(self)
     }
 
     /// The spawner of everything the client starts: its start gate (设计修正 2, A).
@@ -124,9 +148,17 @@ impl State {
 
     /// Stop the start gate within [`HELPERS_WAIT`]: nothing is started from now on, every helper the client started is
     /// killed (its group and its leader) and reaped, and what could not be confirmed is reported (设计修正 2, A, A2,
-    /// D). The host is never signalled (REQ-001 failure mode 3).
-    pub fn stop(&self) -> Stopped {
-        self.gate.stop(HELPERS_WAIT)
+    /// D), with the unit whose start was running as the stop began. The host is never signalled (REQ-001 failure mode
+    /// 3).
+    pub fn stop(&self) -> (Stopped, Option<String>) {
+        // The unit start seen and the gate closed under the unit's lock: a start that marks itself after this finds
+        // the gate closed and starts nothing.
+        let unit = {
+            let unit = self.unit.lock().unwrap_or_else(PoisonError::into_inner);
+            self.gate.refuse();
+            unit.clone()
+        };
+        (self.gate.stop(HELPERS_WAIT), unit)
     }
 
     /// The flag the shell's loop looks at: the number of the signal that came, 0 for none.
@@ -152,18 +184,11 @@ impl State {
         *self.run.lock().unwrap_or_else(PoisonError::into_inner) = Some(run_id.to_owned());
     }
 
-    /// Say `text` on stderr, through the bounded path, as why the client ends: the exit adds nothing to it.
+    /// Say `text` on stderr as why the client ends (rule 2's sentence: first among the client's own words at the
+    /// exit, 设计修正 2, C): the exit adds nothing to it. Said once it is queued.
     pub fn say(&self, text: &str) {
-        self.said(text);
+        self.writer.front(text);
         self.mark_said();
-    }
-
-    /// `text` as a line through the one bounded diagnostics path (rule 6): written straight to stderr's descriptor,
-    /// never through std's stderr lock (the forwarder may hold it, blocked on a full pipe), by a thread of its own that
-    /// is waited for at most [`SAY_WAIT`]; not written by then (or with no thread for it), it is given up and counted,
-    /// and the next line said here first says how many were. Whether it was written.
-    fn said(&self, text: &str) -> bool {
-        say_on(&self.out, &self.late, text, &say_thread)
     }
 
     /// A stage said why the client ends (the follower's conclusion), or says nothing on purpose (the shell, which only
@@ -175,29 +200,35 @@ impl State {
     /// The exit code of a client that ends with `code` (rule 2 of the design correction): a received signal's instead,
     /// whatever ended it. Unless a stage said why, it is said: the run and how to attach again when there is one, else
     /// that the client ends `before` anything (“没有提交命令”, “没有附着”).
+    /// The exit writes, after them, only what the stop could not finish (设计修正 2, D), and the writer's exit writes
+    /// all of it within its bound (C).
     pub fn exit(&self, code: u8, before: &str) -> u8 {
         // Nothing the client owns outlives it, whatever ends it (设计修正 2, B; at a normal end its helpers have ended,
-        // so this is quick), and the message never waits on stderr (rule 6).
-        self.stop();
-        let Some(signal) = self.received() else {
-            return code;
-        };
-        // Where a test holds a signal exit once the stop is done (debug builds only).
-        crate::debug_hold::at("exit");
-        if !self.said.swap(true, Ordering::SeqCst) {
-            let run = self
-                .run
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            self.said(&match run {
-                Some(run) => format!(
-                    "hoh: 收到信号，已脱离 Run {run}（它在后台继续）；用 hoh attach {run} 重新附着"
-                ),
-                None => format!("hoh: 收到信号，{before}"),
-            });
+        // so this is quick).
+        let (stopped, unit) = self.stop();
+        let signal = self.received();
+        if signal.is_some() {
+            // Where a test holds a signal exit once the stop is done (debug builds only).
+            crate::debug_hold::at("exit");
+            if !self.said.swap(true, Ordering::SeqCst) {
+                let run = self
+                    .run
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                self.writer.front(&match run {
+                    Some(run) => format!(
+                        "hoh: 收到信号，已脱离 Run {run}（它在后台继续）；用 hoh attach {run} 重新附着"
+                    ),
+                    None => format!("hoh: 收到信号，{before}"),
+                });
+            }
         }
-        signal
+        self.writer.exit(
+            &unfinished(&stopped, unit.as_deref()),
+            crate::stderr::EXIT_WAIT,
+        );
+        signal.unwrap_or(code)
     }
 
     /// [`wait`] with this state.
@@ -209,55 +240,50 @@ impl State {
     }
 }
 
-/// Write all of `bytes` to `out`, straight to its descriptor; whether it all went.
-fn write_out(out: &Out, mut bytes: &[u8]) -> bool {
-    let stderr = std::io::stderr();
-    let fd = match out {
-        Out::Stderr => stderr.as_fd(),
-        #[cfg(test)]
-        Out::Fd(fd) => fd.as_fd(),
-    };
-    while !bytes.is_empty() {
-        match rustix::io::write(fd, bytes) {
-            Ok(0) => return false,
-            Ok(n) => bytes = &bytes[n..],
-            Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return false,
-        }
+/// Marks unit `name`'s start as running while it lives ([`State::unit_starting`]).
+pub struct UnitStart<'a>(&'a State);
+
+impl Drop for UnitStart<'_> {
+    fn drop(&mut self) {
+        *self.0.unit.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
-    true
 }
 
-/// [`State::said`] on `out`, counting what is given up in `late`, with threads made by `spawn`.
-fn say_on(out: &Out, late: &AtomicU64, text: &str, spawn: Spawn<'_>) -> bool {
-    let before = late.swap(0, Ordering::SeqCst);
-    let mut line = String::new();
-    if before > 0 {
-        line.push_str(&format!(
-            "hoh: 此前有 {before} 条消息没能及时写到 stderr，已放弃\n"
+/// What the exit says of a stop that did not finish (设计修正 2, D), and nothing for one that did: helper starts still
+/// in flight at its bound, helpers not confirmed ended (their pids, the first [`NAMED`]), a unit start interrupted
+/// (`unit`). Never a positive statement.
+fn unfinished(stopped: &Stopped, unit: Option<&str>) -> Vec<String> {
+    let mut said = Vec::new();
+    match stopped.helpers_in_flight {
+        0 => {}
+        1 => said.push("hoh: 一次启动仍未返回，退出后可能出现进程（pid 未知）".to_owned()),
+        n => said.push(format!(
+            "hoh: {n} 次启动仍未返回，退出后可能出现进程（pid 未知）"
+        )),
+    }
+    if !stopped.unconfirmed.is_empty() {
+        let mut pids: Vec<String> = stopped
+            .unconfirmed
+            .iter()
+            .take(NAMED)
+            .map(u32::to_string)
+            .collect();
+        if stopped.unconfirmed.len() > NAMED {
+            pids.push("…".to_owned());
+        }
+        said.push(format!(
+            "hoh: 有 {} 个辅助进程没能在 {:.1} s 内确认结束（pid {}）",
+            stopped.unconfirmed.len(),
+            HELPERS_WAIT.as_secs_f64(),
+            pids.join(", ")
         ));
     }
-    line.push_str(text);
-    line.push('\n');
-    let (sent, got) = std::sync::mpsc::channel();
-    let target = out.clone();
-    let written = spawn(Box::new(move || {
-        let _ = sent.send(write_out(&target, line.as_bytes()));
-    }))
-    .is_ok()
-        && got.recv_timeout(SAY_WAIT) == Ok(true);
-    if !written {
-        late.fetch_add(before + 1, Ordering::SeqCst);
+    if let Some(unit) = unit {
+        said.push(format!(
+            "hoh: unit {unit} 的启动被打断，结果未知；见 systemctl --user status {unit}"
+        ));
     }
-    written
-}
-
-/// [`Spawn`] of the diagnostics path's writer.
-fn say_thread(work: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name("hoh-say".to_owned())
-        .spawn(work)
-        .map(drop)
+    said
 }
 
 /// A thread running `work`, or why it could not be made.
@@ -333,7 +359,7 @@ mod tests {
     use super::*;
 
     fn state() -> State {
-        State::with(Arc::default(), Arc::default())
+        captured().0
     }
 
     fn no_thread(_work: Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> {
@@ -404,11 +430,23 @@ mod tests {
         );
     }
 
+    /// The sink of one end of a socket pair, as many times as it is made.
+    fn sink(ours: std::os::unix::net::UnixStream) -> MakeSink {
+        let file = Arc::new(std::fs::File::from(std::os::fd::OwnedFd::from(ours)));
+        Arc::new(move || Box::new(file.try_clone().expect("a duplicate of the socket")))
+    }
+
     /// A state writing to one end of a socket pair; the other end, to read what it said.
     fn captured() -> (State, std::os::unix::net::UnixStream) {
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-        let out = Out::Fd(Arc::new(std::os::fd::OwnedFd::from(ours)));
-        (State::writing(Arc::default(), Arc::default(), out), theirs)
+        let state = assemble(
+            Arc::default(),
+            Arc::default(),
+            sink(ours),
+            &crate::stderr::thread("hoh-stderr"),
+        )
+        .expect("the writer");
+        (state, theirs)
     }
 
     /// What is waiting to be read on `from` (without waiting for more).
@@ -452,43 +490,58 @@ mod tests {
     }
 
     #[test]
-    fn a_message_stderr_does_not_take_is_given_up_within_its_bound_and_counted() {
-        // Rule 6 (CLT-201): a line stderr does not take (its buffer full, nobody reading) is given up after at most
-        // SAY_WAIT, never waited for, and counted; the next line, once stderr takes it, says how many were given up.
-        // Without a thread to write it, it is given up at once.
+    fn no_writer_thread_ends_the_registration_with_74_and_writes_nothing() {
+        // 设计修正 2, C (CLT-900, CLT-1003; verification 15): no thread for the stderr writer as the state is
+        // registered: nothing is written (not even straight to a stderr that may be full) and the client ends with 74;
+        // a signal that came once the handlers were in keeps its own code.
         let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-        ours.set_nonblocking(true).expect("nonblocking");
-        let piece = [b'N'; 4096];
-        while std::io::Write::write(&mut &ours, &piece).is_ok() {}
-        ours.set_nonblocking(false).expect("blocking");
-        let out = Out::Fd(Arc::new(std::os::fd::OwnedFd::from(ours)));
-        let late = AtomicU64::new(0);
-        let at = std::time::Instant::now();
-        assert!(!say_on(&out, &late, "hoh: 收到信号，没有附着", &say_thread));
-        let took = at.elapsed();
-        assert!(took >= SAY_WAIT && took < SAY_WAIT * 3, "{took:?}");
-        assert_eq!(late.load(Ordering::SeqCst), 1);
-        let no_thread =
-            |_: Box<dyn FnOnce() + Send + 'static>| Err(std::io::Error::from_raw_os_error(11));
-        let at = std::time::Instant::now();
-        assert!(!say_on(&out, &late, "hoh: 再一条", &no_thread));
-        assert!(at.elapsed() < SAY_WAIT, "{:?}", at.elapsed());
-        assert_eq!(late.load(Ordering::SeqCst), 2);
-        // Read from now on: the next line goes, and says the two given up before it.
-        let reader = std::thread::spawn(move || {
-            use std::io::Read as _;
-            let mut said = Vec::new();
-            let _ = (&theirs).read_to_end(&mut said);
-            String::from_utf8_lossy(&said).into_owned()
-        });
-        assert!(say_on(&out, &late, "hoh: 第三条", &say_thread));
-        assert_eq!(late.load(Ordering::SeqCst), 0);
-        drop(out);
-        let said = reader.join().expect("the reader");
-        assert!(
-            said.contains("hoh: 此前有 2 条消息没能及时写到 stderr，已放弃\nhoh: 第三条\n"),
-            "{}",
-            said.trim_start_matches('N')
+        let signal = Arc::new(AtomicUsize::new(0));
+        let refused = assemble(signal.clone(), Arc::default(), sink(ours), &no_thread);
+        assert_eq!(refused.err(), Some(74));
+        signal.store(SIGTERM as usize, Ordering::SeqCst);
+        let (ours, _) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        assert_eq!(
+            assemble(signal, Arc::default(), sink(ours), &no_thread).err(),
+            Some(143)
+        );
+        assert_eq!(waiting(&theirs), "");
+    }
+
+    #[test]
+    fn the_exit_says_only_what_the_stop_did_not_finish() {
+        // 设计修正 2, D: a stop that finished says nothing; one that did not says each unfinished item, never a
+        // positive statement.
+        assert!(unfinished(&Stopped::default(), None).is_empty());
+        let stopped = Stopped {
+            helpers_in_flight: 1,
+            unconfirmed: (1..=10).collect(),
+            hosts: vec![77],
+            hosts_in_flight: 1,
+        };
+        assert_eq!(
+            unfinished(&stopped, Some("hoh-host@abc.service")),
+            [
+                "hoh: 一次启动仍未返回，退出后可能出现进程（pid 未知）",
+                "hoh: 有 10 个辅助进程没能在 1.5 s 内确认结束（pid 1, 2, 3, 4, 5, 6, 7, 8, …）",
+                "hoh: unit hoh-host@abc.service 的启动被打断，结果未知；见 systemctl --user status hoh-host@abc.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_unit_start_running_as_the_stop_begins_is_said_and_one_that_ended_is_not() {
+        // 设计修正 2, A and D (CLT-753, CLT-1008): the stop sees the unit start that runs as it begins.
+        let (state, _) = captured();
+        drop(state.unit_starting("hoh-host@a.service"));
+        assert_eq!(state.stop().1, None);
+        let (state, said) = captured();
+        let _running = state.unit_starting("hoh-host@b.service");
+        state.signal().store(SIGTERM as usize, Ordering::SeqCst);
+        assert_eq!(state.exit(69, "没有提交命令"), 143);
+        assert_eq!(
+            waiting(&said),
+            "hoh: 收到信号，没有提交命令\nhoh: unit hoh-host@b.service 的启动被打断，结果未知；见 systemctl --user \
+             status hoh-host@b.service\n"
         );
     }
 }

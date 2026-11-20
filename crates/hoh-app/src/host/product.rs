@@ -176,11 +176,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `id` as one path component: `%` and `/` escaped, so distinct ids stay distinct. A client reads an attempt's
-/// native stderr where [`attempt_logs`] puts it (docs/adr/ADR-031.md decision 11).
-pub fn component(id: &str) -> String {
-    id.replace('%', "%25").replace('/', "%2F")
-}
+pub use crate::layout::{attempt_logs, component};
 
 /// Where HoH session `session_id`'s first input is kept for its first turn (docs/adr/ADR-024.md decision 4).
 pub fn first_input_path(project: &Path, session_id: &str) -> PathBuf {
@@ -1181,11 +1177,6 @@ fn keep_logs(
         }
     }
     (rows, failed)
-}
-
-/// The directory of attempt `attempt_id`'s raw logs in the project at `project`: its agent's `*stderr.log` among them.
-pub fn attempt_logs(project: &Path, attempt_id: &str) -> PathBuf {
-    project.join(".hoh/attempts").join(component(attempt_id))
 }
 
 /// The bridge file of attempt `attempt_id` in the project at `project`, where a reconcile reads it again

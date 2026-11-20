@@ -32,13 +32,7 @@ pub use reconcile::ReconcileSettings;
 pub use runner::{Executor, Gate, Outcome, Refusal, RunnerConfig, RunnerPoint, Started, Work};
 pub use watchdog::Watchdog;
 
-/// Set by the client on a host it starts directly, not in a delegated scope: why (docs/adr/ADR-021.md decision 2). The
-/// host records it in host.json, so `hoh doctor` reports a running host's actual reason (CR-012, CR12-03).
-pub const UNSCOPED_ENV: &str = "HOH_HOST_UNSCOPED";
-
-/// Set by the client on a host it starts other than as its systemd unit: why (docs/adr/ADR-023.md decisions 6 and 7).
-/// The host records it in host.json; without it, a host not run as its unit says so.
-pub const UNSUPERVISED_ENV: &str = "HOH_HOST_UNSUPERVISED";
+pub use crate::layout::{UNSCOPED_ENV, UNSUPERVISED_ENV};
 
 use hoh_core::persistence::{self, Options, PersistError, Reader, Store, location};
 use std::path::{Path, PathBuf};
