@@ -354,8 +354,12 @@ impl Host {
             })
         })?;
         // HoH's own state, kept out of git (docs/adr/ADR-027.md decision 3).
-        hoh_core::state_dir::ensure(&files)
-            .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?;
+        if let Some(diagnostic) = hoh_core::state_dir::ensure(&files)
+            .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "hoh host: {diagnostic}; continuing");
+        }
         let lock = take_lock(&files)?;
         let store = Store::open_with_mountinfo(
             &files.join("state.db"),
@@ -468,7 +472,7 @@ impl Host {
             )));
         }
         set_mode(&socket, 0o600)?;
-        rustix::net::listen(&unix, 128).map_err(|e| StartError::other(e.to_string()))?;
+        listen_socket(&unix).map_err(|e| StartError::other(e.to_string()))?;
         let unix = std::os::unix::net::UnixListener::from(unix);
         unix.set_nonblocking(true)
             .map_err(|e| StartError::other(e.to_string()))?;
@@ -904,6 +908,11 @@ fn remove_stale_socket(path: &Path) -> Result<(), StartError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StartError::other(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Keep the Linux platform default used by std/mio: the kernel caps -1 at somaxconn (CLN2-52).
+fn listen_socket(socket: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    Ok(rustix::net::listen(socket, -1)?)
 }
 
 /// On Linux, bind takes its pathname's permissions from the socket inode, restricted further by umask. Set that

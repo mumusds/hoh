@@ -16,21 +16,19 @@ static STAGED: AtomicU64 = AtomicU64::new(0);
 
 /// Makes `dir` (a project's `.hoh/`) and, if it has none, its `.gitignore` holding [`IGNORE_ALL`]. The file is written
 /// whole to a name of its own, synced, then linked to `.gitignore`: the name never shows a part of it, and a file put
-/// there meanwhile by another process or the user is kept.
-pub fn ensure(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    // A newly visible directory never grants access beyond its owner. Tighten an existing directory before any
-    // state is written too; an earlier version may have made it under a permissive umask (M2T12R-08).
+/// there meanwhile by another process or the user is kept. An optional diagnostic says why an existing owned
+/// directory's mode could not be tightened; it never prevents access. The host reports it through its own log,
+/// and input history through its notice; this shared library does not write to the client's stderr (ADR-031).
+pub fn ensure(dir: &Path) -> std::io::Result<Option<String>> {
+    // A newly visible directory never grants access beyond its owner. Legacy directory hardening is best effort:
+    // a read-only mount must still reach the original host.lock diagnostic (ADR-016, CLN2-55).
     create_private(dir)?;
-    let mode = std::fs::metadata(dir)?.permissions().mode();
-    let private = mode & 0o700;
-    // Remove access, never add owner permissions that the user (or umask) deliberately withheld.
-    if mode & 0o7777 != private {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(private))?;
-    }
+    let diagnostic = tighten(dir, rustix::process::geteuid().as_raw())
+        .err()
+        .map(|e| format!("cannot tighten {}: {e}", dir.display()));
     let target = dir.join(".gitignore");
     match std::fs::symlink_metadata(&target) {
-        Ok(_) => return Ok(()),
+        Ok(_) => return Ok(diagnostic),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
@@ -53,7 +51,32 @@ pub fn ensure(dir: &Path) -> std::io::Result<()> {
         }
     })();
     let _ = std::fs::remove_file(&staged);
-    placed
+    placed.map(|()| diagnostic)
+}
+
+/// Tighten only a real directory owned by `uid`. Hold a no-follow descriptor through the metadata check and chmod:
+/// replacing the path with a symlink cannot redirect the mode change to its target.
+fn tighten(dir: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Ok(());
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
+        .open(dir)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != uid {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode();
+    let private = mode & 0o700;
+    // Remove access, never add owner permissions that the user (or umask) deliberately withheld.
+    if mode & 0o7777 != private {
+        directory.set_permissions(std::fs::Permissions::from_mode(private))?;
+    }
+    Ok(())
 }
 
 /// The mkdir itself has a private mode; checked separately before any later chmod or state write.

@@ -33,3 +33,41 @@ fn a_bound_socket_is_private_before_the_host_can_publish_it() -> std::io::Result
     assert_eq!(std::fs::metadata(&socket)?.permissions().mode() & 0o077, 0);
     Ok(())
 }
+
+#[test]
+fn the_host_socket_keeps_the_platform_default_backlog() -> std::io::Result<()> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    // Keep the connections pending: no accept thread and no scheduling-dependent burst against a running host.
+    fn pending(path: &std::path::Path) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+        let address = SocketAddrUnix::new(path)?;
+        let mut clients = Vec::new();
+        for _ in 0..256 {
+            let fd = rustix::net::socket_with(
+                AddressFamily::UNIX,
+                SocketType::STREAM,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+                None,
+            )?;
+            match rustix::net::connect(&fd, &address) {
+                Ok(()) => clients.push(fd),
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(clients)
+    }
+    let dir = tempfile::tempdir()?;
+    let default_path = dir.path().join("default.sock");
+    let _default = std::os::unix::net::UnixListener::bind(&default_path)?;
+    let expected = pending(&default_path)?;
+    let host_path = dir.path().join("host.sock");
+    let host = super::bind_socket(&host_path)?;
+    super::listen_socket(&host)?;
+    let actual = pending(&host_path)?;
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "pending connections before accept"
+    );
+    Ok(())
+}

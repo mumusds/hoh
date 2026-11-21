@@ -1608,8 +1608,9 @@ impl World {
 impl Drop for World {
     /// Its processes stopped, its directory removed here and not only by the TempDir, whose removal ignores its errors
     /// ([`removed`]): a removal that fails, or a directory made again just after it, is reported ([`leftover`]) on
-    /// stderr while unwinding, without replacing the original failure. On an otherwise successful exit it fails
-    /// the test: a printed cleanup diagnostic alone is not evidence of successful removal. Nothing is tried again.
+    /// stderr during panic unwinding, preserving that panic. Otherwise cleanup failure panics and fails the test;
+    /// this includes an ordinary return of Err, whose error this destructor cannot inspect or preserve. A printed
+    /// diagnostic alone is not evidence of successful removal. Nothing is tried again.
     fn drop(&mut self) {
         use std::io::Write as _;
         self.stop();

@@ -130,6 +130,44 @@ fn an_unreadable_history_is_reported_and_the_shell_still_opens() {
 }
 
 #[test]
+fn a_history_mode_warning_is_visible_and_does_not_prevent_input() {
+    use std::os::unix::fs::PermissionsExt as _;
+    assert!(
+        !rustix::process::geteuid().is_root(),
+        "file modes require a non-root test user"
+    );
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join(".hoh");
+    std::fs::create_dir(&dir).expect("state dir");
+    std::fs::write(dir.join(".gitignore"), "*\n").expect("ignore");
+    std::fs::write(dir.join("input-history.jsonl"), "not json\n").expect("history");
+    let mut app = app_in(root.path());
+    // Write/search are allowed, but the no-follow read descriptor for mode tightening is refused. Real I/O,
+    // no chmod privilege or global fault switch: appending to the existing history file can still succeed.
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let restore = Restore(dir.clone());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o333)).expect("mode");
+    typed(&mut app, "first");
+    app.key(key(KeyCode::Enter));
+    typed(&mut app, "second");
+    app.key(key(KeyCode::Enter));
+    drop(restore);
+    assert_eq!(History::load(root.path()).entries(), ["first", "second"]);
+    let rows = screen(&app, 180, 30).join("\n");
+    assert!(rows.contains("权限未能收紧"), "{rows}");
+    assert!(
+        rows.contains("无法解析"),
+        "the earlier history notice remains: {rows}"
+    );
+    assert!(!rows.contains("输入历史未能保存"), "{rows}");
+}
+
+#[test]
 fn enter_records_the_input_and_asks_to_start_a_run() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = app_in(dir.path());

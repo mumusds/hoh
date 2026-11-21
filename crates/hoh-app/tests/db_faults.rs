@@ -1305,6 +1305,94 @@ fn read_only_a_hoh_directory_the_host_cannot_write_is_named_as_such_not_taken_fo
     project.stop_host()
 }
 
+/// CLN2-55's mode/readonly seam, in this test's directory; no privileged mount and no product injection switch.
+fn state_mode_fault_shim(root: &Path) -> R<PathBuf> {
+    let shim = root.join("state_mode_fault.so");
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-O1", "-Wall", "-Werror", "-o"])
+        .arg(&shim)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/state_mode_fault.c"
+        ))
+        .arg("-ldl")
+        .output()?;
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    Ok(shim)
+}
+
+#[test]
+fn a_failed_legacy_mode_change_is_only_a_diagnostic() -> R {
+    if let Some(dir) = std::env::var_os("CLN2_STATE_DIR") {
+        let dir = PathBuf::from(dir);
+        let diagnostic = hoh_core::state_dir::ensure(&dir)?.ok_or("no mode diagnostic")?;
+        assert!(diagnostic.contains("cannot tighten"), "{diagnostic}");
+        let errno: i32 = std::env::var("CLN2_MODE_ERRNO")?.parse()?;
+        assert!(
+            diagnostic.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
+            "{diagnostic}"
+        );
+        assert_eq!(std::fs::read(dir.join(".gitignore"))?, b"*\n");
+        assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o755);
+        return Ok(());
+    }
+    let root = tempfile::tempdir()?;
+    let shim = state_mode_fault_shim(root.path())?;
+    for errno in [1, 30] {
+        let dir = root.path().join(format!("state-{errno}"));
+        std::fs::create_dir(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "a_failed_legacy_mode_change_is_only_a_diagnostic",
+                "--nocapture",
+            ])
+            .env("LD_PRELOAD", &shim)
+            .env("CLN2_STATE_DIR", &dir)
+            .env("CLN2_MODE_ERRNO", errno.to_string())
+            .env("CLN2_ALLOW_WRITES", "1")
+            .output()?;
+        assert!(output.status.success(), "{}", text(&output));
+    }
+    Ok(())
+}
+
+#[test]
+fn read_only_a_legacy_0755_state_directory_keeps_the_host_lock_diagnostic() -> R {
+    not_root()?;
+    let (project, before) = made()?;
+    let dir = project.hoh_dir();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    let shim = state_mode_fault_shim(&project.root)?;
+    // No root/user namespace: emulate EROFS at the libc boundary of this product child only.
+    let out = project.hoh_with(
+        &["__host", project.path().to_str().ok_or("project path")?],
+        &[
+            ("LD_PRELOAD", shim.into_os_string()),
+            ("CLN2_STATE_DIR", dir.clone().into_os_string()),
+        ],
+    )?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stderr.contains("host.lock") && stderr.contains("Read-only file system"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("cannot tighten") && stderr.contains(".hoh"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o755);
+    assert_eq!(project.dump()?, before);
+    project.accepted("after the read-only fault")?;
+    project.stop_host()
+}
+
 /// A file system of the test's own, mounted with `sudo -n`. A test unmounts it by [`finish`], checked; one that ends
 /// otherwise (a failed assertion) leaves it to `Drop`, the fallback.
 struct Mount {
