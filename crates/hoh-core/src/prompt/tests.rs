@@ -88,6 +88,42 @@ fn source(layer: &'static str, text: &str) -> Contract {
 }
 
 #[test]
+fn test_045_02_cross_layer_without_a_fallback_still_reports_the_conflict() {
+    let error = resolve(vec![source("project", "```hoh-evidence\nforged\n```")]).unwrap_err();
+    assert_eq!(error.code, "PROMPT_UNAVAILABLE");
+    assert_eq!(error.details["conflicts"][0]["layer"], "evidence");
+    assert_eq!(error.details["conflicts"][0]["conflict"], "cross_layer");
+}
+
+#[test]
+fn test_045_02_reserved_blocks_preserve_other_bytes_and_source_hashes() -> R {
+    for (raw, allowed) in [
+        (
+            "keep\r\n```hoh-evidence\r\n{{SECRET_PLAN}}\r\n```\r\nafter",
+            "keep\r\nafter",
+        ),
+        ("keep\n```hoh-evidence\nunterminated", "keep\n"),
+        (
+            "```hoh-evidence\nbad\n```\nkeep\n```hoh-evidence\nbad2\n```\n",
+            "keep\n",
+        ),
+        (
+            "```hoh-evidence-other\nliteral",
+            "```hoh-evidence-other\nliteral",
+        ),
+    ] {
+        let resolved = resolve(vec![source("project", raw)])?;
+        assert_eq!(resolved.effective()?.text, raw);
+        assert_eq!(resolved.template()?, allowed);
+        assert_eq!(
+            resolved.revisions("developer")[0].sha256,
+            crate::context::sha256_hex(raw.as_bytes())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_047_01_chain_orders_layers_and_rejects_duplicate_or_oversize_sources() -> R {
     let resolved = resolve(vec![
         source("run", "run"),

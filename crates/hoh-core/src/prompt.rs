@@ -1,6 +1,7 @@
 //! Role contract overrides (REQ-045, REQ-047, ADR-034). Pure policy, shared by host and clients.
 
 use crate::config::Contract;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAX_BYTES: usize = 32 * 1024;
@@ -77,10 +78,84 @@ pub struct Resolved {
 
 impl Resolved {
     pub fn effective(&self) -> Result<&Contract, Error> {
-        self.chain
-            .last()
-            .ok_or_else(|| unavailable("no role contract"))
+        self.chain.last().ok_or_else(|| {
+            let mut error = unavailable("no role contract");
+            if !self.conflicts.is_empty() {
+                error.details["conflicts"] = json!(self.conflicts);
+            }
+            error
+        })
     }
+
+    /// Render only the allowed role text, while keeping original bytes in the source/revision chain.
+    pub fn template(&self) -> Result<std::borrow::Cow<'_, str>, Error> {
+        let source = self.effective()?;
+        if source.layer == "builtin" || !source.text.lines().any(evidence_block) {
+            return Ok(std::borrow::Cow::Borrowed(&source.text));
+        }
+        let mut text = String::new();
+        let mut blocked = false;
+        for line in source.text.split_inclusive('\n') {
+            if blocked {
+                if line.trim() == "```" {
+                    blocked = false;
+                }
+            } else if evidence_block(line) {
+                blocked = true;
+            } else {
+                text.push_str(line);
+            }
+        }
+        if text.trim().is_empty() {
+            let mut error = unavailable("no role text outside the evidence override");
+            error.details["conflicts"] = json!(self.conflicts);
+            return Err(error);
+        }
+        Ok(std::borrow::Cow::Owned(text))
+    }
+
+    /// Immutable source identities include the preceding revision, so changing an ancestor changes its descendants.
+    pub fn revisions(&self, role: &str) -> Vec<Revision> {
+        let mut parent = None;
+        self.chain
+            .iter()
+            .map(|source| {
+                let sha256 = crate::context::sha256_hex(source.text.as_bytes());
+                let revision_id = format!(
+                    "prompt/{}",
+                    crate::context::sha256_hex(
+                        json!([role, source.layer, source.path, sha256, parent])
+                            .to_string()
+                            .as_bytes()
+                    )
+                );
+                let revision = Revision {
+                    revision_id: revision_id.clone(),
+                    layer: source.layer.to_owned(),
+                    path: source.path.clone(),
+                    sha256,
+                    parent_revision: parent.take(),
+                };
+                parent = Some(revision_id);
+                revision
+            })
+            .collect()
+    }
+}
+
+fn evidence_block(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix("```hoh-evidence")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    pub revision_id: String,
+    pub layer: String,
+    pub path: String,
+    pub sha256: String,
+    pub parent_revision: Option<String>,
 }
 
 pub fn resolve(mut sources: Vec<Contract>) -> Result<Resolved, Error> {
@@ -99,25 +174,19 @@ pub fn resolve(mut sources: Vec<Contract>) -> Result<Resolved, Error> {
         return Err(unavailable("duplicate override layer"));
     }
     let mut conflicts = Vec::new();
-    sources.retain(|source| {
-        let conflict = source.layer != "builtin"
-            && source.text.lines().any(|line| {
-                line.trim_start()
-                    .strip_prefix("```hoh-evidence")
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            });
+    for source in &sources {
+        let conflict = source.layer != "builtin" && source.text.lines().any(evidence_block);
         if conflict {
             conflicts.push(json!({"layer": "evidence", "conflict": "cross_layer",
                 "source_layer": source.layer, "path": source.path,
                 "sha256": crate::context::sha256_hex(source.text.as_bytes())}));
         }
-        !conflict
-    });
+    }
     let resolved = Resolved {
         chain: sources,
         conflicts,
     };
-    validate_variables(&resolved.effective()?.text)?;
+    validate_variables(&resolved.template()?)?;
     Ok(resolved)
 }
 

@@ -51,11 +51,14 @@ fn executor(project: &Path) -> ProductExecutor {
     )
 }
 
-fn contract(text: &str) -> hoh_core::config::Contract {
-    hoh_core::config::Contract {
-        layer: "project",
-        path: ".hoh/prompts/c.md".to_owned(),
-        text: text.to_owned(),
+fn contract(text: &str) -> hoh_core::prompt::Resolved {
+    hoh_core::prompt::Resolved {
+        chain: vec![hoh_core::config::Contract {
+            layer: "project",
+            path: ".hoh/prompts/c.md".to_owned(),
+            text: text.to_owned(),
+        }],
+        conflicts: Vec::new(),
     }
 }
 
@@ -707,7 +710,14 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_decisi
             .to_owned(),
     };
     let (text, _) = executor(dir.path())
-        .pack(&work, &builtin, None)
+        .pack(
+            &work,
+            &hoh_core::prompt::Resolved {
+                chain: vec![builtin],
+                conflicts: Vec::new(),
+            },
+            None,
+        )
         .map_err(|r| format!("{r:?}"))?;
     // docs/adr/ADR-032.md decision 1: the decisions are the final message's block, and no output file is named.
     for part in [

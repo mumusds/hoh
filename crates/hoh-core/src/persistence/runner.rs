@@ -237,7 +237,9 @@ pub struct Observed {
 /// (docs/adr/ADR-026.md decision 7). Written in the commit that marks the attempt RUNNING, before its start gate opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptRecord {
-    /// `builtin` or `project`.
+    /// Ordered override sources; empty only for older/custom executors that record one source.
+    pub chain: Vec<crate::prompt::Revision>,
+    /// The effective override layer: `builtin`, `global`, `project` or `run`.
     pub layer: String,
     pub role: String,
     pub path: String,
@@ -331,6 +333,9 @@ impl PromptRecord {
     /// Its `prompt_revisions` id: the contract's layer, role, path and content, so two files of the same content are
     /// two sources (M2T07R-205).
     pub fn revision_id(&self) -> String {
+        if let Some(leaf) = self.chain.last() {
+            return leaf.revision_id.clone();
+        }
         format!(
             "{}/{}/{}/{}",
             self.layer, self.role, self.content_sha256, self.path
@@ -1171,12 +1176,59 @@ pub(super) fn record_prompt(
     at: &str,
 ) -> Result<Vec<NewEvent>, PersistError> {
     let revision = prompt.revision_id();
-    tx.execute(
+    if prompt.chain.is_empty() {
+        tx.execute(
         "INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![revision, prompt.layer, prompt.role, prompt.content_sha256, prompt.path, at],
     )
-    .map_err(sqlite_error)?;
+        .map_err(sqlite_error)?;
+    } else {
+        let mut parent: Option<&str> = None;
+        for source in &prompt.chain {
+            if source.parent_revision.as_deref() != parent {
+                return Err(PersistError::IntegrityViolation(
+                    "prompt chain parent mismatch".to_owned(),
+                ));
+            }
+            tx.execute("INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, parent_revision, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![source.revision_id, source.layer, prompt.role, source.sha256, source.path, source.parent_revision, at]).map_err(sqlite_error)?;
+            let stored: (String, String, String, String, Option<String>) = tx.query_row(
+                "SELECT layer, role, content_sha256, path, parent_revision FROM prompt_revisions WHERE revision_id = ?1",
+                [&source.revision_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).map_err(sqlite_error)?;
+            if stored
+                != (
+                    source.layer.clone(),
+                    prompt.role.clone(),
+                    source.sha256.clone(),
+                    source.path.clone(),
+                    source.parent_revision.clone(),
+                )
+            {
+                return Err(PersistError::IntegrityViolation(
+                    "stored prompt revision differs from its source chain".to_owned(),
+                ));
+            }
+            parent = Some(&source.revision_id);
+        }
+        let leaf = prompt
+            .chain
+            .last()
+            .ok_or_else(|| PersistError::IntegrityViolation("empty prompt chain".to_owned()))?;
+        if (
+            leaf.layer.as_str(),
+            leaf.path.as_str(),
+            leaf.sha256.as_str(),
+        ) != (
+            prompt.layer.as_str(),
+            prompt.path.as_str(),
+            prompt.content_sha256.as_str(),
+        ) {
+            return Err(PersistError::IntegrityViolation(
+                "prompt leaf differs from effective contract".to_owned(),
+            ));
+        }
+    }
     tx.execute(
         "UPDATE attempts SET prompt_revision = ?2, prompt_sha256 = ?3, \
          resource_bundle_version = coalesce(?4, resource_bundle_version) WHERE attempt_id = ?1",
