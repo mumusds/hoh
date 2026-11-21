@@ -64,7 +64,7 @@ pub enum RunTarget {
     /// stays stopped.
     Input(Input),
     /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
-    Specification(Box<super::SpecApproval>),
+    Specification(Box<super::SpecRequest>),
 }
 
 /// What an input command brings (docs/adr/ADR-031.md decision 7).
@@ -263,7 +263,15 @@ pub(super) fn submit(
         }
         RunTarget::Specification(input) => {
             super::hold::command(&tx, &command.run_id)?;
-            super::spec::approve(&tx, command, input, ctx)?
+            match super::spec::apply(&tx, command, input, ctx) {
+                Ok(result) => result,
+                Err(PersistError::SpecInvalid(error)) => {
+                    super::spec::failed(&tx, command, &error, ctx)?;
+                    super::writer::commit(tx, ctx)?;
+                    return Err(PersistError::SpecInvalid(error));
+                }
+                Err(error) => return Err(error),
+            }
         }
         target => {
             // A run command: every event of its run in this transaction is the command's, written even while the run
