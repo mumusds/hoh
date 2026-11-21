@@ -158,7 +158,15 @@ pub(super) fn run_named(
 #[derive(Debug)]
 enum Failed {
     Full(String),
-    Wal { step: &'static str, detail: String },
+    Wal {
+        step: &'static str,
+        detail: String,
+    },
+    /// Kept structured until the outer private directory has also been removed (F7-600).
+    Room {
+        failed: Box<Failed>,
+        left: Vec<super::private::Leftover>,
+    },
 }
 
 impl Failed {
@@ -171,15 +179,32 @@ impl Failed {
 
     /// The store's error, the cleanup's leftovers, if any, after its reason.
     fn with_cleanup(self, left: Option<String>) -> PersistError {
-        let left = left
+        let suffix = left
+            .as_ref()
             .map(|left| format!("; cleanup: {left}"))
             .unwrap_or_default();
         match self {
-            Failed::Full(detail) => PersistError::Full(format!("{detail}{left}")),
+            Failed::Full(detail) => PersistError::Full(format!("{detail}{suffix}")),
             Failed::Wal { step, detail } => PersistError::WalUnsupported {
                 step,
-                detail: format!("{detail}{left}"),
+                detail: format!("{detail}{suffix}"),
             },
+            Failed::Room { failed, left: room } => {
+                // The outer cleanup can remove a path the nested probe could not. Keep a report on every other
+                // answer, including an unreadable path; only confirmed absence makes the earlier report obsolete.
+                let room: Vec<_> = room
+                    .into_iter()
+                    .filter(|item| {
+                        !std::fs::symlink_metadata(&item.path)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    })
+                    .collect();
+                let reports: Vec<_> = left
+                    .into_iter()
+                    .chain((!room.is_empty()).then(|| told(&room)))
+                    .collect();
+                failed.with_cleanup((!reports.is_empty()).then(|| reports.join("; ")))
+            }
         }
     }
 }
@@ -365,19 +390,26 @@ fn judge(
     let what = format!("{what} failed, SQLite extended code {extended}");
     let kib = super::room::BYTES >> 10;
     let seen = room();
-    let left = seen.left_told();
-    match seen.written {
+    let failed = match seen.written {
         Err(e) if super::room::none(&e) => Failed::Full(format!(
             "WAL self-test at {}: {detail} ({what}); its directory has no room: a {kib} KiB write and fsync \
-             failed: {e}{left}",
+             failed: {e}",
             step.name()
         )),
         Ok(()) => wal(format!(
-            "{detail} ({what}); not for want of room: its directory took a {kib} KiB write and fsync{left}"
+            "{detail} ({what}); not for want of room: its directory took a {kib} KiB write and fsync"
         )),
         Err(e) => wal(format!(
-            "{detail} ({what}); room not known: a {kib} KiB write and fsync in its directory failed: {e}{left}"
+            "{detail} ({what}); room not known: a {kib} KiB write and fsync in its directory failed: {e}"
         )),
+    };
+    if seen.left.is_empty() {
+        failed
+    } else {
+        Failed::Room {
+            failed: Box::new(failed),
+            left: seen.left,
+        }
     }
 }
 
@@ -1319,6 +1351,7 @@ mod tests {
             });
             assert_eq!(seen.get(), probed, "{extended:?}: {judged:?}");
             let got = match &judged {
+                Failed::Room { .. } => panic!("the test's probe left nothing: {judged:?}"),
                 Failed::Full(_) => "full",
                 Failed::Wal { detail, .. } if detail.contains("not for want of room") => {
                     "not for want of room"
