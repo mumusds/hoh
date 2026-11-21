@@ -78,7 +78,12 @@ def context(role: str, profile: str, candidate: dict, judged: dict, judgement_pa
                              f'{judgement_path}. {len(judged["members"])} members, {len(judged["invalid"])} invalid; '
                              f'TEST statuses {json.dumps(statuses, sort_keys=True)}; unsatisfied: '
                              f'{json.dumps(judged["unsatisfied"][:200])}; invalid: '
-                             f'{json.dumps(judged["invalid"][:50])}. Records are claims to check, not proof.'),
+                             f'{json.dumps(judged["invalid"][:50])}. Records are claims to check, not proof.'
+                             + (' The canonical release traceability check runs after independent QA. Its record '
+                                'may therefore be absent and TEST-052-05 MISSING at QA time; this ordering is '
+                                'expected, not by itself a product defect or a PASS. You may run your own '
+                                'candidate-bound traceability check for diagnosis; release still requires the '
+                                'canonical check and its recorded result.' if role == 'qa' else '')),
         'TASK_CONTEXT': (f'Role {role}, check {CHECK[role]}. Do not modify, add or delete any tracked file, and create '
                          f'no file in the checkout except under {observations} (ignored by git), where your notes, '
                          'logs and experiment outputs go; a planned check you run goes through tools/run_check.py with '
