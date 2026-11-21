@@ -130,10 +130,6 @@ pub(super) fn apply(
     }];
     if matches!(&input.action, SpecAction::Approve(a) if a.decision != SpecDecision::Reject) {
         let id = child_id(&command.command_id, "spec");
-        let affected = match events[0].payload["cr_id"].as_str() {
-            Some(cr) => tasks::impact_tasks(tx, cr)?,
-            None => Default::default(),
-        };
         let rows = tx.prepare("SELECT r.run_id,r.revision,r.state FROM runs r LEFT JOIN specs s ON s.spec_id=r.spec_id WHERE r.project_id=?1 AND (r.run_id=?2 OR s.revision<=?3) ORDER BY r.run_id").map_err(sqlite_error)?
             .query_map(params![project,command.run_id,base.as_ref().map_or(0,|b| b.revision)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))
             .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
@@ -160,8 +156,7 @@ pub(super) fn apply(
                 events.push(event);
             }
             if let Some(base) = &base {
-                let migration =
-                    tasks::migrate(tx, &run, (&id, base.revision + 1), &affected, &events[0])?;
+                let migration = tasks::migrate(tx, &run, (&id, base.revision + 1), &events[0])?;
                 cas.extend(migration.cas);
                 events.extend(migration.events);
                 events.extend(super::recovery::spec_changed(
