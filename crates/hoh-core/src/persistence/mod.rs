@@ -2338,6 +2338,14 @@ impl Reader {
         control::running_attempts(&self.conn, run_id)
     }
 
+    /// The project's active attempt cancellation requests, as (run id, attempt id), without a writer job.
+    pub fn requested_cancellations(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String)>, PersistError> {
+        control::requested_attempts(&self.conn, project_id)
+    }
+
     /// The session `session_id`, if it exists.
     pub fn session(&self, session_id: &str) -> Result<Option<Session>, PersistError> {
         attempts::read_session(&self.conn, session_id)

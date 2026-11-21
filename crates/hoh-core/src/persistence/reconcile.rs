@@ -386,6 +386,9 @@ fn apply(
         )
         .map_err(sqlite_error)?;
     let (attempt_to, task_to) = match attempt_to {
+        None if cancel_requested && matches!(disposition, Disposition::Redeliver) => {
+            (Some(AttemptState::Cancelled), None)
+        }
         Some(AttemptState::Failed | AttemptState::Settled | AttemptState::UnknownEffect)
             if cancel_requested =>
         {

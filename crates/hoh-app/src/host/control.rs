@@ -101,7 +101,19 @@ async fn tick(
     for run in &waiting.pausing {
         held.item(store.pause_step(run, common.clock.now()).await)?;
     }
-    for run in waiting.cancelling {
+    let mut runs: BTreeSet<String> = waiting.cancelling.into_iter().collect();
+    let project = common.shared.project_id.clone();
+    runs.extend(
+        super::runner::no_run(
+            super::http::read(&common.shared, move |reader| {
+                reader.requested_cancellations(&project)
+            })
+            .await,
+        )?
+        .into_iter()
+        .map(|(run, _)| run),
+    );
+    for run in runs {
         let new = common
             .cancelling
             .lock()
@@ -120,11 +132,45 @@ async fn tick(
     Ok(())
 }
 
-/// Cancel `run_id` until it is CANCELLED (or no longer cancelling).
+/// One cancellation owner per run, shared by explicit run cancellation and attempt-only requests.
+/// Only an explicit CANCEL_REQUESTED run may use the run-level canceller (ADR-033 Q10).
 async fn cancel(common: &Arc<Common>, run_id: &str) {
     let mut works: BTreeMap<String, Work> = BTreeMap::new();
     let pins: Pins = Arc::default();
     loop {
+        let requested = async {
+            let waiting = common
+                .shared
+                .store
+                .runner_waiting(&common.shared.project_id)
+                .await?;
+            let whole_run = waiting.cancelling.iter().any(|run| run == run_id);
+            let project = common.shared.project_id.clone();
+            let ids: BTreeSet<String> = super::http::read(&common.shared, move |reader| {
+                reader.requested_cancellations(&project)
+            })
+            .await?
+            .into_iter()
+            .filter(|(run, _)| run == run_id)
+            .map(|(_, attempt)| attempt)
+            .collect();
+            Ok::<_, PersistError>((whole_run, ids))
+        }
+        .await;
+        let (whole_run, ids) = match requested {
+            Ok(requested) => requested,
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "hoh host: reading cancellation requests for {run_id}: {e}"
+                );
+                return;
+            }
+        };
+        if !whole_run && ids.is_empty() {
+            return;
+        }
         // What this host runs for the run stops first, so the cancel alone ends its attempts (one writer, ADR-021
         // decision 8c); a native interrupt goes to the work it was given.
         let entries: Vec<(String, Entry)> = common
@@ -133,7 +179,7 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
             .map(|mut inflight| {
                 let ids: Vec<String> = inflight
                     .iter()
-                    .filter(|(_, e)| e.work.run_id == run_id)
+                    .filter(|(id, e)| e.work.run_id == run_id && (whole_run || ids.contains(*id)))
                     .map(|(id, _)| id.clone())
                     .collect();
                 ids.into_iter()
@@ -151,13 +197,23 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
         let step = async {
             // How each attempt still running is tracked, as its start recorded.
             let mut trackings = BTreeMap::new();
-            for attempt in common.shared.store.running_attempts(run_id).await? {
+            let attempts = if whole_run {
+                common.shared.store.running_attempts(run_id).await?
+            } else {
+                super::http::read(&common.shared, move |reader| {
+                    ids.iter()
+                        .filter_map(|id| reader.attempt(id).transpose())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .await?
+            };
+            for attempt in &attempts {
                 let id = attempt.attempt_id.clone();
                 let event = super::http::read(&common.shared, move |reader| {
                     reader.attempt_event("attempt.tracking", &id)
                 })
                 .await?;
-                trackings.insert(attempt.attempt_id, Tracking::of(event.as_ref()));
+                trackings.insert(attempt.attempt_id.clone(), Tracking::of(event.as_ref()));
             }
             let processes: Arc<dyn Processes> = Arc::new(HostProcesses {
                 works: works.clone(),
@@ -167,6 +223,28 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
                 pins: pins.clone(),
                 trackings,
             });
+            if !whole_run {
+                for attempt in &attempts {
+                    if attempt.cancel_requested
+                        && matches!(
+                            attempt.state,
+                            AttemptState::Prepared | AttemptState::Starting | AttemptState::Running
+                        )
+                    {
+                        common
+                            .canceller
+                            .step_attempt(
+                                &common.shared.store,
+                                attempt,
+                                processes.clone(),
+                                common.clock.clone(),
+                                Arc::new(std::thread::sleep),
+                            )
+                            .await?;
+                    }
+                }
+                return Ok(Finished::Running(attempts.len()));
+            }
             common
                 .canceller
                 .step(
