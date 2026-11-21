@@ -37,16 +37,18 @@ pub struct SpecRequest {
 struct Approved {
     id: String,
     revision: i64,
+    sha256: String,
 }
 
 fn latest(tx: &Transaction<'_>, project: &str) -> Result<Option<Approved>, PersistError> {
     tx.query_row(
-        "SELECT spec_id,revision FROM specs WHERE project_id=?1 ORDER BY revision DESC LIMIT 1",
+        "SELECT spec_id,revision,sha256 FROM specs WHERE project_id=?1 ORDER BY revision DESC LIMIT 1",
         params![project],
         |r| {
             Ok(Approved {
                 id: r.get(0)?,
                 revision: r.get(1)?,
+                sha256: r.get(2)?,
             })
         },
     )
@@ -191,21 +193,34 @@ fn propose(
     index: &Index,
     base: &Approved,
 ) -> Result<Vec<NewEvent>, PersistError> {
-    let old = indexed(tx, &base.id)?;
-    let mappings = tx.prepare("SELECT task_id,requirement_id FROM task_requirements WHERE spec_id=?1 ORDER BY task_id,requirement_id").map_err(sqlite_error)?
-        .query_map(params![base.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))
-        .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
-    let impact = specindex::impact(&old, index.value(), &mappings);
-    let id = child_id(&command.command_id, "cr");
-    tx.execute("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES(?1,?2,?3,'PROPOSED',?4,?5,?6)",
-        params![id,command.event.project_id,base.id,proposal.reason,impact.to_string(),crate::time::now_rfc3339()]).map_err(sqlite_error)?;
-    // The locked CR row has no proposal digest column. This durable event binds it without changing Q8's shape.
     let mut event = command.event.clone();
-    event.kind = "spec.proposed".into();
-    event.payload = json!({"command_id":command.command_id,"run_id":command.run_id,"cr_id":id,"base_spec_id":base.id,
-        "spec_revision":base.revision,"spec_sha256":index.sha256()});
+    if index.sha256() == base.sha256 {
+        // Regeneration repairs a generated file, but does not revise the approved specification.
+        event.kind = "spec.regenerated".into();
+        event.payload = json!({"command_id":command.command_id,"run_id":command.run_id,
+            "spec_revision":base.revision,"spec_sha256":base.sha256});
+    } else {
+        let old = indexed(tx, &base.id)?;
+        let mappings = tx.prepare("SELECT task_id,requirement_id FROM task_requirements WHERE spec_id=?1 ORDER BY task_id,requirement_id").map_err(sqlite_error)?
+            .query_map(params![base.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))
+            .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+        let impact = specindex::impact(&old, index.value(), &mappings);
+        let id = child_id(&command.command_id, "cr");
+        tx.execute("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES(?1,?2,?3,'PROPOSED',?4,?5,?6)",
+            params![id,command.event.project_id,base.id,proposal.reason,impact.to_string(),crate::time::now_rfc3339()]).map_err(sqlite_error)?;
+        // The locked CR row has no proposal digest column. This durable event binds it without changing Q8's shape.
+        event.kind = "spec.proposed".into();
+        event.payload = json!({"command_id":command.command_id,"run_id":command.run_id,"cr_id":id,"base_spec_id":base.id,
+            "spec_revision":base.revision,"spec_sha256":index.sha256()});
+    }
     let mut events = vec![event];
-    if let Some(mut payload) = index.drift(files.existing_index.as_deref()) {
+    if let Some(mut payload) = index.drift(files.existing_index.as_deref())
+        && !known_digest(
+            tx,
+            &command.event.project_id,
+            files.existing_index.as_deref(),
+        )?
+    {
         payload["spec_revision"] = json!(base.revision);
         payload["command_id"] = json!(command.command_id);
         let mut drift = command.event.clone();
@@ -215,6 +230,24 @@ fn propose(
         events.push(drift);
     }
     Ok(events)
+}
+
+/// A previously generated index can lag behind Markdown without being manually edited.
+fn known_digest(
+    tx: &Transaction<'_>,
+    project: &str,
+    bytes: Option<&[u8]>,
+) -> Result<bool, PersistError> {
+    let Some(bytes) = bytes else {
+        return Ok(false);
+    };
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM specs WHERE project_id=?1 AND sha256=?2)
+         OR EXISTS(SELECT 1 FROM change_requests c JOIN events e ON json_extract(e.payload_json,'$.cr_id')=c.cr_id
+                   WHERE c.project_id=?1 AND e.project_id=?1 AND e.kind='spec.proposed'
+                     AND json_extract(e.payload_json,'$.spec_sha256')=?2)",
+        params![project, specindex::digest(bytes)], |r| r.get(0),
+    ).map_err(sqlite_error)
 }
 
 fn approve(
@@ -238,6 +271,12 @@ fn approve(
             return Err(PersistError::SpecConflict(Box::new(
                 json!({"expected":approval.spec_sha256,"actual":index.sha256(),"expected_base":from,"actual_base":base.id}),
             )));
+        }
+        if approval.decision != SpecDecision::Reject && index.sha256() == base.sha256 {
+            return Err(PersistError::SpecConflict(Box::new(json!({
+                "expected":approval.spec_sha256,"actual":base.sha256,
+                "reason":"the proposed result equals its approved base"
+            }))));
         }
         cr = Some(id);
     }

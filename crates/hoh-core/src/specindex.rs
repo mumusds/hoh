@@ -58,7 +58,8 @@ impl Index {
         digest(&self.bytes)
     }
 
-    /// The diagnostic payload for explicit regeneration; a missing file is creation, not drift.
+    /// A byte-difference diagnostic. The store excludes known generated digests before recording manual drift.
+    /// A missing file is creation, not drift.
     pub fn drift(&self, existing: Option<&[u8]>) -> Option<Value> {
         existing
             .filter(|bytes| *bytes != self.bytes)
