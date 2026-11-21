@@ -1441,8 +1441,6 @@ fn test_001_01_the_workspace_shows_the_runs_and_a_sigterm_changes_nothing() -> R
         let info: serde_json::Value =
             serde_json::from_slice(&std::fs::read(world.project().join(".hoh/host.json"))?)?;
         let host_pid = u32::try_from(info["pid"].as_u64().ok_or("no host pid")?)?;
-        let host_start =
-            hoh_agents::identity::start_id(host_pid)?.ok_or("the host's process is gone")?;
         let (rows, cols) = (40, 120);
         let mut pty = Pty::new(rows, cols)?;
         let stty = pty.stty()?;
@@ -1492,9 +1490,9 @@ fn test_001_01_the_workspace_shows_the_runs_and_a_sigterm_changes_nothing() -> R
         );
         // `stty -g` byte for byte as before.
         assert_eq!(pty.stty()?, stty, "terminal attributes");
-        // The host's process is still there and serving: the host this process runs (no other was started).
+        // The host is the one this process runs (its pid is ours, so a look at that pid proves nothing: M2T13R-355); that
+        // it lives on is its answer to the next request, and no other host was started.
         assert_eq!(host_pid, std::process::id());
-        assert!(!hoh_agents::identity::ended(host_pid, Some(&host_start))?);
         let (served, _) = runtime.block_on(world::exchange(&host, "GET", "/v1/runs", None))?;
         assert_eq!(served, 200);
         assert!(world.hosts()?.is_empty(), "{:?}", world.hosts());
