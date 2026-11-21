@@ -149,12 +149,16 @@ impl Helper {
                 while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                // Not reaped in time: a thread of its own waits for it, so it never stays a zombie of this process
-                // (CLT-1258); with no thread for it, it does until this process ends (a stated residual).
+                // Not reaped in time: a thread of its own sees it exit, cleans its group while the zombie still holds the
+                // group's id, then reaps it, so it never stays a zombie of this process (CLT-1258, CLN4-54); with no
+                // thread for it, it does until this process ends (a stated residual).
                 if matches!(child.try_wait(), Ok(None)) {
                     let _ = std::thread::Builder::new()
                         .name("hoh-reap".to_owned())
                         .spawn(move || {
+                            if exited(|| WaitId::Pid(pid)) {
+                                let _ = kill_process_group(pid, Signal::KILL);
+                            }
                             let _ = child.wait();
                         });
                 }
@@ -322,24 +326,56 @@ impl Drop for Shared {
     /// it. With no thread (or no duplicate of its pidfd) for that, it stays a zombie until this process ends (a stated
     /// residual).
     fn drop(&mut self) {
-        if self.reaped() || self.end(END_WAIT).is_some() || self.reaped() {
+        self.let_go(END_WAIT);
+    }
+}
+
+impl Shared {
+    /// [`Drop`]'s work with `bound` for the wait: ended within it, or handed to a reaper thread ([`Shared::hand_over`]).
+    fn let_go(&self, bound: Duration) {
+        if self.reaped() || self.end(bound).is_some() || self.reaped() {
             return;
         }
+        self.hand_over();
+    }
+
+    /// Hand the leader to a reaper thread of its own ([`reap_later`]); once that thread runs, this handle counts as
+    /// reaped and never signals the group by number again. Whether it was handed over.
+    fn hand_over(&self) -> bool {
         let Ok(pidfd) = self.pidfd.try_clone() else {
-            return;
+            return false;
         };
         let pid = self.pid;
-        let _ = std::thread::Builder::new()
+        let made = std::thread::Builder::new()
             .name("hoh-reap".to_owned())
             .spawn(move || reap_later(pid, &pidfd));
+        if made.is_ok() {
+            self.locked().reaped = true;
+        }
+        made.is_ok()
+    }
+}
+
+/// Wait, without consuming it, until the process `id` names has exited: whether it did (an error other than EINTR,
+/// ECHILD say, is no exit seen).
+fn exited<'a>(id: impl Fn() -> WaitId<'a>) -> bool {
+    let seen = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(id(), seen) {
+            Ok(Some(_)) => return true,
+            Err(rustix::io::Errno::INTR) => {}
+            _ => return false,
+        }
     }
 }
 
 /// A leader its handle let go of, still running: wait for its exit on `pidfd` without consuming it, kill what is left of
 /// its group (the zombie still holds the group's id), then reap it, consuming the status (A2's order).
 fn reap_later(pid: Pid, pidfd: &OwnedFd) {
-    let seen = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
-    while let Err(rustix::io::Errno::INTR) = waitid(WaitId::PidFd(pidfd.as_fd()), seen) {}
+    // Only once its exit is seen (and not consumed): its group's id is then still the zombie's (CLN4-53).
+    if !exited(|| WaitId::PidFd(pidfd.as_fd())) {
+        return;
+    }
     let _ = kill_process_group(pid, Signal::KILL);
     while let Err(rustix::io::Errno::INTR) =
         waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED)
