@@ -18,7 +18,9 @@
 
 `hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
-没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。本版本还没有在产品里写入或批准规格的途径：TUI 的 `/plan` 显示“M3 前未提供”，API 的 ProposeSpecChange、ApproveSpec 返回 422 CAPABILITY_UNSUPPORTED；规格的生成、批准与追踪属于 M3-T02。
+没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。本版本还没有在产品里写入或批准规格的途径：API 的 ProposeSpecChange、ApproveSpec 返回 422 CAPABILITY_UNSUPPORTED；规格的生成、批准与追踪属于 M3-T02。
+
+TUI 的 `/plan`、`/build`、`/auto` 切换模式，Shift+Tab 按 `[ui] mode_cycle` 轮换（默认 PLAN→BUILD→AUTO，可配置为两个或三个不重复的合法模式）。未附着时只选择下一次新建 Run 的模式，不改变项目默认；已附着时切换当前 Run。写任务正在执行时，切换会等待安全点，顶栏在生效后更新。未知 Slash 显示错误，不作为普通输入发送；模式切换本身不生成或批准规格。
 
 不存在hoh plan/hoh mode plan/hoh run子命令。Shell帮助保持短；TUI输入/可搜索命令，低频设置从面板进入。
 

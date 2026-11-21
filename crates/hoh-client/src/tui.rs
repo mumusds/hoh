@@ -354,6 +354,7 @@ pub fn attach(project: &Path, host: HostInfo, run: &Value, state: &State) -> u8 
     app.list(&runs);
     let link = conn.link(&run_id);
     app.attach(&run_id, &label);
+    app.projection(run);
     app.tracking(&run["projection"]["degraded_tracking"]);
     run_with(app, state, &conn, Some(link))
 }
@@ -492,6 +493,7 @@ fn take_events(app: &mut App, link: &Link) -> bool {
             if let Some(label) = run["projection"]["label"].as_str() {
                 app.relabel(label);
             }
+            app.projection(&run);
             app.tracking(&run["projection"]["degraded_tracking"]);
         }
     }
@@ -530,12 +532,12 @@ fn control(link: &Link, kind: &str) -> String {
 /// attached, a chosen run attached, an input sent to the attached run; each outcome said on the message bar.
 fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request) {
     match request {
-        Request::Start(goal) => {
+        Request::Start { goal, mode } => {
             let command = json!({
                 "expected_revision": 0,
                 "kind": "StartRun",
                 "run_id": null,
-                "payload": {"goal": goal, "mode": app.mode(), "interactive": true},
+                "payload": {"goal": goal, "mode": mode, "interactive": true},
             });
             match conn.submit(command) {
                 Ok(accepted) => {
@@ -548,6 +550,16 @@ fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request
                 }
                 Err(f) => app.say(format!("未提交：{}：{}", f.code, f.message)),
             }
+        }
+        Request::SetMode(mode) => set_mode(app, link.as_ref(), &mode),
+        Request::CycleMode => {
+            if let Some(link) = link.as_ref()
+                && let Ok(Some(run)) = link.run()
+            {
+                app.projection(&run);
+            }
+            let mode = app.next_mode();
+            set_mode(app, link.as_ref(), &mode);
         }
         Request::Attach(run_id) => match attach_to(app, conn, link, &run_id) {
             Ok(()) => app.say(format!("已附着 Run {run_id}")),
@@ -565,6 +577,32 @@ fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request
             }
             None => app.say("输入未发送：没有附着的 Run".to_owned()),
         },
+    }
+}
+
+/// The same SetMode command for Slash and Shift+Tab, refreshed on a revision conflict.
+fn set_mode(app: &mut App, link: Option<&Link>, mode: &str) {
+    let Some(link) = link else {
+        app.say("模式未切换：没有附着的 Run".to_owned());
+        return;
+    };
+    let result = link.run().and_then(|run| {
+        let run = run.ok_or_else(|| Failure::unreachable("Run 不存在"))?;
+        crate::client::fresh(
+            |command| link.submit(command), || link.run(), &link.run_id,
+            run["revision"].as_i64().unwrap_or_default(),
+            |revision| json!({"expected_revision":revision,"kind":"SetMode","run_id":link.run_id,"payload":{"mode":mode}}),
+        )
+    });
+    match result {
+        Ok(_) => {
+            app.mode_requested(mode);
+            if let Ok(Some(run)) = link.run() {
+                app.projection(&run);
+            }
+            app.say(format!("SetMode {mode} 已受理"));
+        }
+        Err(f) => app.say(format!("模式未切换：{}：{}", f.code, f.message)),
     }
 }
 
@@ -588,6 +626,7 @@ fn attach_to(
         .to_owned();
     *link = Some(conn.link(run_id));
     app.attach(run_id, &label);
+    app.projection(&run);
     app.tracking(&run["projection"]["degraded_tracking"]);
     if let Ok(runs) = conn.runs() {
         app.list(&runs);

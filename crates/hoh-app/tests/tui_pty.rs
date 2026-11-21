@@ -1919,3 +1919,124 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
     runtime.block_on(host.shutdown());
     outcome
 }
+
+#[test]
+fn test_007_01_slash_and_shift_tab_submit_one_setmode_shape() -> R {
+    use serde_json::json;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    for (name, cycle, initial, expected) in [
+        ("mode-default", None, "AUTO", vec!["PLAN", "BUILD", "AUTO"]),
+        (
+            "mode-two",
+            Some("[ui]\nmode_cycle = [\"PLAN\", \"AUTO\"]"),
+            "PLAN",
+            vec!["AUTO", "PLAN"],
+        ),
+    ] {
+        let world = world::World::named(name)?;
+        world.configure(&[], cycle.unwrap_or(""))?;
+        let host = runtime.block_on(world.start_plain_host(None))?;
+        let body = json!({"schema_version":"1.0", "command_id":"start-mode", "idempotency_key":"start-mode",
+            "expected_revision":0, "kind":"StartRun", "run_id":null, "payload":{"goal":"mode", "mode":initial, "interactive":true}});
+        let (status, accepted) =
+            runtime.block_on(world::exchange(&host, "POST", "/v1/commands", Some(&body)))?;
+        assert_eq!(status, 202, "{accepted}");
+        let run = accepted["run_id"].as_str().ok_or("run_id")?;
+        let (rows, cols) = (32, 150);
+        let mut pty = Pty::new(rows, cols)?;
+        let before = pty.stty()?;
+        let mut child = world.hoh_pty(&pty, &["attach", run])?;
+        let screen = pty::screen_until(&pty, rows, cols, WAIT, |s| {
+            s.lines().next().is_some_and(|top| top.contains(run))
+        })?;
+        assert!(
+            screen
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains(&format!("模式 {initial}")),
+            "{screen}"
+        );
+        for (i, want) in expected.iter().enumerate() {
+            pty.send(if cycle.is_none() && i == 0 {
+                b"/plan\r"
+            } else {
+                b"\x1b[Z"
+            })?;
+            let marker = format!("sync{i}");
+            pty.send(marker.as_bytes())?;
+            let screen = pty::screen_until(&pty, rows, cols, WAIT, |s| {
+                s.lines().any(|line| line == format!("> {marker}"))
+            })?;
+            assert_eq!(
+                world.query("SELECT count(*) FROM commands WHERE kind = 'SetMode'")?,
+                (i + 1).to_string(),
+                "{screen}"
+            );
+            assert_eq!(world.query("SELECT mode FROM runs")?, *want, "{screen}");
+            let screen = pty::screen_until(&pty, rows, cols, WAIT, |s| {
+                s.lines()
+                    .next()
+                    .is_some_and(|top| top.contains(&format!("模式 {want}")))
+            })?;
+            if let Some(evidence) = std::env::var_os("HOH_EVIDENCE_DIR") {
+                std::fs::write(
+                    Path::new(&evidence).join(format!("test-007-01-{name}-{i}.txt")),
+                    screen.as_bytes(),
+                )?;
+            }
+            pty.send(b"\x03")?;
+        }
+        if cycle.is_none() {
+            let revision: i64 = world.query("SELECT revision FROM runs")?.parse()?;
+            let body = json!({"schema_version":"1.0", "command_id":"http-plan", "idempotency_key":"http-plan",
+                "expected_revision":revision, "kind":"SetMode", "run_id":run,"payload":{"mode":"PLAN"}});
+            assert_eq!(
+                runtime
+                    .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&body)))?
+                    .0,
+                202
+            );
+            pty::screen_until(&pty, rows, cols, WAIT, |s| {
+                s.lines()
+                    .next()
+                    .is_some_and(|top| top.contains("模式 PLAN"))
+            })?;
+            let commands = world
+                .rows("SELECT payload_json FROM commands WHERE kind = 'SetMode' ORDER BY rowid")?;
+            assert_eq!(commands.len(), 4);
+            assert_eq!(commands[0]["payload_json"], commands[3]["payload_json"]);
+        }
+        let transitions = world.rows("SELECT json_extract(payload_json,'$.from') AS from_mode, json_extract(payload_json,'$.to') AS to_mode FROM events WHERE kind = 'run.mode_changed' ORDER BY seq")?;
+        let wanted = if cycle.is_none() {
+            vec![
+                ("AUTO", "PLAN"),
+                ("PLAN", "BUILD"),
+                ("BUILD", "AUTO"),
+                ("AUTO", "PLAN"),
+            ]
+        } else {
+            vec![("PLAN", "AUTO"), ("AUTO", "PLAN")]
+        };
+        assert_eq!(
+            transitions,
+            wanted
+                .into_iter()
+                .map(|(from, to)| json!({"from_mode":from,"to_mode":to}))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM input_queue")?,
+            "0",
+            "mode commands never enter agent input"
+        );
+        signal(&child, Signal::TERM)?;
+        assert_eq!(exit_within(&mut child, WAIT)?.code(), Some(143));
+        pty.drained(WAIT)?;
+        assert_eq!(pty.stty()?, before);
+        runtime.block_on(host.shutdown());
+    }
+    Ok(())
+}

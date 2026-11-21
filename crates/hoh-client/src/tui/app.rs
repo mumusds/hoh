@@ -2,8 +2,8 @@
 //! project's host connected: the top bar shows the project, the mode, the run attached (none at first) and the
 //! project's baseline, and the body lists the runs. Enter records the line in the project's history; unattached, text
 //! starting with `/` is the Workspace's own (`/resume` opens the selector of the runs not ended, the one `hoh attach`
-//! opens; any other is not before M3) and any other text asks for a new run, which the shell then attaches; attached,
-//! Enter asks to send the text to the run as input. What is asked of the host is queued as a [`Request`], which the
+//! opens; mode commands choose the next run's mode) and other text asks for a new run, which the shell then attaches; attached,
+//! Enter sends plain text as input; mode commands and Shift+Tab ask SetMode (ADR-036). What is asked of the host is queued as a [`Request`], which the
 //! loop does in order. The Ctrl+C choice offers only "脱离" with no run attached; attached (docs/adr/ADR-021.md decision
 //! 10) the run's events are shown and counted on the status bar, and the choice also offers "暂停" and "取消任务".
 
@@ -33,7 +33,11 @@ pub enum Exit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// StartRun with this goal (Enter, unattached), then attach the new run.
-    Start(String),
+    Start { goal: String, mode: String },
+    /// Change the attached run through SetMode.
+    SetMode(String),
+    /// Cycle when performed, so consecutive keys observe the preceding request.
+    CycleMode,
     /// SendInput with this text to the attached run (Enter, attached), or to the run a `Start` before it starts.
     Input(String),
     /// Attach this run (chosen in the selector).
@@ -139,6 +143,8 @@ const RUN_CHOICES: &[(&str, Exit)] = &[
 /// tracked by the degraded /proc scan (docs/adr/ADR-021.md decision 8d, M2T06R-560).
 #[derive(Debug)]
 struct Attached {
+    mode: String,
+    pending_mode: Option<String>,
     run_id: String,
     label: String,
     events: u64,
@@ -170,6 +176,7 @@ pub struct App {
     settings: Option<super::settings::Settings>,
     project: String,
     mode: String,
+    mode_cycle: Vec<String>,
     editor: Editor,
     history: History,
     /// The history entry shown by Up/Down, with the draft from before browsing.
@@ -195,6 +202,7 @@ impl App {
             settings: None,
             project,
             mode: DEFAULT_MODE.to_owned(),
+            mode_cycle: hoh_core::config::Config::default().ui.mode_cycle,
             editor: Editor::default(),
             history,
             browsing: None,
@@ -218,17 +226,69 @@ impl App {
         let mut app = App::new(name, History::load(project));
         app.mode = mode_of(project);
         app.root = Some(project.to_path_buf());
+        if let Ok(config) = hoh_core::config::load(project) {
+            app.mode_cycle = config.ui.mode_cycle;
+        }
         app
     }
 
     /// The mode new runs start in: the one the top bar shows.
     pub fn mode(&self) -> &str {
-        &self.mode
+        self.run.as_ref().map_or(self.mode.as_str(), |r| &r.mode)
+    }
+
+    pub fn projection(&mut self, value: &Value) {
+        if let Some(run) = self.run.as_mut()
+            && let Some(mode) = value["projection"]["mode"].as_str()
+        {
+            run.mode = mode.to_owned();
+            if run.pending_mode.as_deref() == Some(mode) {
+                run.pending_mode = None;
+            }
+        }
+    }
+
+    pub fn mode_requested(&mut self, mode: &str) {
+        if let Some(run) = self.run.as_mut() {
+            run.pending_mode = Some(mode.to_owned());
+        }
+    }
+
+    pub fn next_mode(&self) -> String {
+        let current = self
+            .run
+            .as_ref()
+            .and_then(|r| r.pending_mode.as_deref())
+            .unwrap_or(self.mode());
+        let next = self
+            .mode_cycle
+            .iter()
+            .position(|m| m == current)
+            .map_or(0, |i| (i + 1) % self.mode_cycle.len());
+        self.mode_cycle[next].clone()
+    }
+
+    fn has_run(&self) -> bool {
+        self.run.is_some()
+            || self
+                .requests
+                .iter()
+                .any(|r| matches!(r, Request::Start { .. }))
+    }
+
+    fn choose_mode(&mut self, mode: &str) {
+        if self.has_run() {
+            self.requests.push(Request::SetMode(mode.to_owned()));
+        } else {
+            self.mode = mode.to_owned();
+        }
     }
 
     /// Bind the shell to run `run_id`, shown as `label`.
     pub fn attach(&mut self, run_id: &str, label: &str) {
         self.run = Some(Attached {
+            mode: self.mode.clone(),
+            pending_mode: None,
             run_id: run_id.to_owned(),
             label: label.to_owned(),
             events: 0,
@@ -308,6 +368,16 @@ impl App {
         run.events += 1;
         let kind = event["kind"].as_str().unwrap_or_default();
         let payload = &event["payload"];
+        if let Some(mode) = payload["to"].as_str() {
+            if kind == "run.mode_changed" {
+                run.mode = mode.to_owned();
+                run.pending_mode = None;
+            } else if kind == "run.mode_change_pending" {
+                run.pending_mode = Some(mode.to_owned());
+                self.messages
+                    .push(format!("模式 {mode} 待当前写任务结束后生效"));
+            }
+        }
         match payload["attempt_id"].as_str() {
             // An attempt tracked by the degraded /proc scan: said with which and why, and counted on the status bar.
             Some(attempt) if kind == "attempt.tracking" && payload["tracking"] == "proc" => {
@@ -433,6 +503,13 @@ impl App {
             KeyCode::Char(c) if plain => {
                 self.editor.insert(c.encode_utf8(&mut [0; 4]));
                 self.browsing = None;
+            }
+            KeyCode::BackTab => {
+                if self.has_run() {
+                    self.requests.push(Request::CycleMode);
+                } else {
+                    self.mode = self.next_mode();
+                }
             }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.editor.backspace(),
@@ -569,22 +646,24 @@ impl App {
             }
             return;
         }
-        // Attached, or a run being started: input of that run (an Enter after the one that starts a run, before the
-        // loop has started it, goes to the run it starts).
-        if self.run.is_some() || self.requests.iter().any(|r| matches!(r, Request::Start(_))) {
-            self.requests.push(Request::Input(text));
-            return;
-        }
         let command = text.trim();
-        if command == "/resume" {
-            if !self.open_picker(false) {
-                self.messages.push("没有可附着的 Run。".to_owned());
+        match command {
+            "/plan" => self.choose_mode("PLAN"),
+            "/build" => self.choose_mode("BUILD"),
+            "/auto" => self.choose_mode("AUTO"),
+            "/resume" => {
+                if !self.open_picker(false) {
+                    self.messages.push("没有可附着的 Run。".to_owned());
+                }
             }
-        } else if command.starts_with('/') {
-            self.messages
-                .push(format!("{command}：M3 前未提供，未发送。"));
-        } else {
-            self.requests.push(Request::Start(text));
+            _ if command.starts_with('/') => {
+                self.messages.push(format!("未知命令：{command}，未发送。"))
+            }
+            _ if self.has_run() => self.requests.push(Request::Input(text)),
+            _ => self.requests.push(Request::Start {
+                goal: text,
+                mode: self.mode.clone(),
+            }),
         }
     }
 
@@ -635,7 +714,7 @@ impl App {
             Paragraph::new(format!(
                 " HoH │ {} │ 模式 {} │ {run} │ baseline {} │ host 已连接 ",
                 self.project,
-                self.mode,
+                self.mode(),
                 self.baseline()
             ))
             .style(bar),
@@ -689,7 +768,7 @@ impl App {
                 ),
                 (None, Some(run)) => format!(
                     " {} │ 事件 {} · #{}{} │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
-                    self.mode,
+                    self.mode(),
                     run.events,
                     run.last,
                     if run.degraded.is_empty() {
@@ -700,7 +779,7 @@ impl App {
                 ),
                 (None, None) => format!(
                     " {} │ host 已连接 │ Enter 发送 · ↑↓ 历史 · Ctrl+R 搜索 · Ctrl+C 清空/退出",
-                    self.mode
+                    self.mode()
                 ),
             },
         };

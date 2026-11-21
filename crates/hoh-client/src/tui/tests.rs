@@ -184,7 +184,13 @@ fn enter_records_the_input_and_asks_to_start_a_run() {
     let rows = screen(&app, 100, 30);
     assert!(rows.iter().any(|r| r.contains("你：hi")), "{rows:#?}");
     // Unattached, the text is the goal of a new run (docs/adr/ADR-031.md decision 13).
-    assert_eq!(app.take_requests(), [Request::Start("hi".to_owned())]);
+    assert_eq!(
+        app.take_requests(),
+        [Request::Start {
+            goal: "hi".to_owned(),
+            mode: "AUTO".to_owned()
+        }]
+    );
 }
 
 #[test]
@@ -965,7 +971,7 @@ fn the_workspace_lists_the_runs_not_ended_first_and_the_newest_first_one_line_ea
 #[test]
 fn a_slash_command_is_the_workspaces_own_and_resume_chooses_among_the_runs_not_ended() {
     // Decision 13, E11: `/resume` opens the selector of the runs not ended (the one of attach); any other `/…` is
-    // "M3 前未提供"; neither asks the host for anything. Esc closes the selector; Enter on a run attaches it.
+    // "未知命令"; neither asks the host for anything. Esc closes the selector; Enter on a run attaches it.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = app_in(dir.path());
     app.list(&[
@@ -975,11 +981,7 @@ fn a_slash_command_is_the_workspaces_own_and_resume_chooses_among_the_runs_not_e
     ]);
     typed(&mut app, "/plan x");
     app.key(key(KeyCode::Enter));
-    assert!(
-        screen(&app, 80, 20)
-            .iter()
-            .any(|r| r.contains("M3 前未提供"))
-    );
+    assert!(screen(&app, 80, 20).iter().any(|r| r.contains("未知命令")));
     typed(&mut app, "/resume");
     app.key(key(KeyCode::Enter));
     let rows = screen(&app, 80, 20);
@@ -1045,27 +1047,30 @@ fn attachs_selector_leaves_on_esc_or_on_the_ctrl_c_choice() {
 }
 
 #[test]
-fn enter_while_attached_sends_the_text_as_input_slash_included() {
-    // Decision 13 (Enter, attached): SendInput with the text, whatever it starts with; an Enter after one that starts
+fn enter_after_start_sends_plain_text_as_input() {
+    // ADR-036: plain text is SendInput; an Enter after one that starts
     // a run, before the loop has done it, goes to the run it starts.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = app_in(dir.path());
     typed(&mut app, "a");
     app.key(key(KeyCode::Enter));
-    typed(&mut app, "/resume");
+    typed(&mut app, "followup");
     app.key(key(KeyCode::Enter));
     assert_eq!(
         app.take_requests(),
         [
-            Request::Start("a".to_owned()),
-            Request::Input("/resume".to_owned())
+            Request::Start {
+                goal: "a".to_owned(),
+                mode: "AUTO".to_owned()
+            },
+            Request::Input("followup".to_owned())
         ]
     );
     app.attach("R", "RUNNING");
     typed(&mut app, "b");
     app.key(key(KeyCode::Enter));
     assert_eq!(app.take_requests(), [Request::Input("b".to_owned())]);
-    assert_eq!(History::load(dir.path()).entries(), ["a", "/resume", "b"]);
+    assert_eq!(History::load(dir.path()).entries(), ["a", "followup", "b"]);
 }
 
 /// The status bar: the last row of a screen of `height` rows.
@@ -1543,4 +1548,68 @@ fn test_047_03_settings_exposes_drift_and_both_diffs() {
     assert!(shown.contains("--- old-builtin"));
     assert!(shown.contains("+++ new-builtin"));
     assert!(shown.contains("+++ override"));
+}
+
+#[test]
+fn unattached_modes_are_local_and_slashes_never_become_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = App::open(dir.path());
+    typed(&mut app, "/plan");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(app.mode(), "PLAN");
+    assert!(app.take_requests().is_empty());
+    app.key(key(KeyCode::BackTab));
+    assert_eq!(app.mode(), "BUILD");
+    typed(&mut app, "/auto");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(app.mode(), "AUTO");
+    assert_eq!(mode_of(dir.path()), "AUTO", "project default is untouched");
+    app.attach("R", "RUNNING");
+    for command in ["/plan", "/build", "/auto"] {
+        typed(&mut app, command);
+        app.key(key(KeyCode::Enter));
+        let requests = app.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !matches!(requests[0], Request::Input(_)),
+            "HoH command was forwarded: {requests:?}"
+        );
+    }
+    typed(&mut app, "/unknown-mode-command");
+    app.key(key(KeyCode::Enter));
+    assert!(app.take_requests().is_empty());
+    assert!(screen(&app, 120, 30).iter().any(|r| r.contains("未知命令")));
+}
+
+#[test]
+fn top_bar_follows_the_attached_runs_mode_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = App::open(dir.path());
+    app.attach("R", "RUNNING");
+    app.event(&serde_json::json!({"seq":1, "kind":"run.mode_changed", "payload":{"from":"AUTO", "to":"PLAN"}}));
+    assert!(screen(&app, 120, 30)[0].contains("模式 PLAN"));
+}
+
+#[test]
+fn a_key_batch_keeps_start_mode_and_ordered_cycles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = App::open(dir.path());
+    for line in ["/plan", "goal", "/auto"] {
+        typed(&mut app, line);
+        app.key(key(KeyCode::Enter));
+    }
+    app.key(key(KeyCode::BackTab));
+    app.key(key(KeyCode::BackTab));
+    assert_eq!(
+        app.take_requests(),
+        [
+            Request::Start {
+                goal: "goal".to_owned(),
+                mode: "PLAN".to_owned()
+            },
+            Request::SetMode("AUTO".to_owned()),
+            Request::CycleMode,
+            Request::CycleMode,
+        ]
+    );
 }
