@@ -934,19 +934,31 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "规格追踪、readiness、CR、项目发现与文档事实源",
+   "title": "文档事实源与规格变更（规格位置与冻结形式、索引、CR、影响闭包、证据失效）",
    "depends_on": [
     "M3-T01"
    ],
    "requirements": [
-    "REQ-028",
-    "REQ-030",
-    "REQ-031",
-    "REQ-032",
-    "REQ-033",
-    "REQ-034"
+    "REQ-034",
+    "REQ-033"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）；TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位）（CR-017，ADR-027 的移交）。规格变化置 STALE 时写 candidate.stale{candidate_id, reason}（ADR-028 决定 11 的持久取代事实）；规格事实源的位置替换 M2-T16 冻结使用的约定路径（ADR-028 决定 4）；以 SPEC_MISMATCH 被挡住的写 Task 经规格变更流程放行；spec.changed 的产生，并把验证中的候选按 REQ-053 行为 7 置 STALE；旧规格下的开发 Task 的迁移或替代（含 task_requirements 的需求映射，使它们在新规格下可派发）（CR-018）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。规格变化置 STALE 时写 candidate.stale{candidate_id, reason}（ADR-028 决定 11 的持久取代事实）；规格事实源的位置替换 M2-T16 冻结使用的约定路径（ADR-028 决定 4），冻结形式为 docs/spec/index.json，索引带 scenarios（TEST→check，CR-026）；以 SPEC_MISMATCH 被挡住的写 Task 经规格变更流程放行；spec.changed 的产生，并把验证中的候选按 REQ-053 行为 7 置 STALE；旧规格下的开发 Task 的迁移或替代（含 task_requirements 的需求映射，使它们在新规格下可派发）（CR-018）。规格位置不再指向 contracts/requirements.json 后，删去 persistence_scan 的对应条目（CR-019）。"
+  },
+  {
+   "id": "M3-T06",
+   "milestone": "M3",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Readiness Gate（含独立规格审查）与规格收敛（假设台账、来源校验）",
+   "depends_on": [
+    "M3-T02"
+   ],
+   "requirements": [
+    "REQ-031",
+    "REQ-030"
+   ],
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。按任务范围选代码的上下文来源（REQ-039，ADR-026 决定 12）在本任务实现：Task 的路径范围随计划与 readiness 出现（CR-016），M3-T07 的脏文件判定使用它。独立规格审查在本任务实现（CR-026，CR26D-05、-101、-200..202）：审查 Task 的建立与在 Run 工作状态中的派发；contracts/spec-review-attempt.schema.json 的原生记录与 contracts/spec-review-report.schema.json 的报告的构造（只从 COMPLETED 的 TaskResult）、两份 schema 进入产品的 schema 集，收取时的逐项核对（schema、摘要、会话、stdout、修订绑定、真实完成状态、会话独立；会话独立按 CR-029 的身份规则：HoH 会话 id 或 (agent, 原生会话 id) 相同即同一会话，身份收集与候选报告的独立性判定共用同一原则，规格审查不进候选报告表，CR-026 应用时的更正 A）与 REJECTED 的原因；spec_review.opened 与 spec_review.reported；readiness 的 spec_review 只由没有 critical 或 high 发现的 PASS 满足。配置键 [assumptions] 的加载器支持（解析、键名与值的校验、保留名拒绝、缺省空表、进入 Run 的配置快照）与 config/hoh.example.toml 中的空表在同一提交加入，并在该提交上重跑 TEST-018-01（cargo test -p hoh-core test_018_01）（CR-026，CR26D-103）。"
   },
   {
    "id": "M3-T03",
@@ -954,18 +966,31 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "四层Prompt、内置Skill/模板、覆盖与升级",
+   "title": "四层Prompt版本、自定义与升级",
    "depends_on": [
-    "M3-T01",
     "M3-T02"
    ],
    "requirements": [
-    "REQ-029",
     "REQ-045",
-    "REQ-046",
     "REQ-047"
    ],
    "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+  },
+  {
+   "id": "M3-T09",
+   "milestone": "M3",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Slash 统一操作与运行中对话（投递循环接入 host）",
+   "depends_on": [
+    "M3-T02"
+   ],
+   "requirements": [
+    "REQ-007",
+    "REQ-017"
+   ],
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。steer/query 的产品路由与投递：ADR-018 决定 4 的投递循环接入 host 与它的消费者（领取永不取验证交接，ADR-028 决定 9），当前 epoch 的路由，M2T17R-153（新持有者首个输入之前不投递）、M2T17R-154（哪些 Commander 消息还要核对接收方的 epoch）、M2T17R-254（KeyReuse 计为一次拒绝、不重试到死信）（ADR-025 决定 10）；接管之后的 query/steer 路由（取代 M2-T16 的 deferred 回应），历史上 deferred 的消息不补投（ADR-028 决定 13）（CR-018）。用户输入交给 Commander（ADR-025 决定 1）。TUI 与 CLI 的入口在 crates/hoh-client（包 G 之后的布局，CR-026 应用时的更正 B）：模式切换、Slash 与运行中对话的客户端部分改在 hoh-client，经 host 的共享命令与 API 接入，host 逻辑不搬进客户端，客户端不依赖 hoh-app（scripts/product/spawn_scan.py 按 cargo metadata 的边界检查保持通过）。配置键 [ui] mode_cycle 的加载器支持（解析、合法值、缺省、快照）与 config/hoh.example.toml 中的缺省值在同一提交加入，并在该提交上重跑 TEST-018-01（CR-026，CR26D-103）。ADR-031 中 TUI 未附着时“其余 /… 显示‘M3 前未提供’”一句的更正（CR-026 第 2 节的更新表）在本任务。改动进程与并发，按 docs/19 由两名互补审查者审查。"
   },
   {
    "id": "M3-T04",
@@ -973,20 +998,66 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "Plan/Build/Auto、Slash统一操作、运行中对话、局部咨询、停滞诊断",
+   "title": "Plan 与 Build/Auto（首次批准之前的起草、起草 Task、批准者判定）",
    "depends_on": [
-    "M3-T01",
+    "M3-T06",
+    "M3-T09"
+   ],
+   "requirements": [
+    "REQ-008",
+    "REQ-009"
+   ],
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。所有者 2026-11-17 对 C22 的决定 (a) 在本任务实现（CR-026 第 2 节）：迁移 002（contracts/sql/002_spec_drafting.sql，persistence 白名单的条目已由 M3-T01 加入）加入 MIGRATIONS；迁移运行器对每个迁移在 BEGIN IMMEDIATE 之前关闭 foreign_keys，COMMIT 之前执行 PRAGMA foreign_key_check 且必须无行，之后无论成败恢复 foreign_keys=ON 并核对；迁移的往返与回滚测试（受锁 SQL 的“Evolution”注释）：有数据的 v1 库迁到 v2 后各表行数与值不变、foreign_key_check 为空、两个索引与两个触发器都在，迁移中途失败回滚到 v1，旧二进制拒绝 v2 库（SchemaTooNew）；SQL 层的负例：kind=work 而 spec_id 为空被 CHECK 拒，项目已有已批准修订时插入 spec_id 为空的 Task 被触发器拒，spec_id 在空与非空之间变化或 kind 变化被触发器拒。CR-026 第 2 节清单中按 tasks.spec_id 非空写的代码路径在本任务改为处理空值。起草 Task（Runtime 建、SPECIFYING 中派发、完成即送批或提出 CR）、Runtime 推进 CREATED→DISCOVERING→SPECIFYING（发现的内容 run.baseline 与离开 DISCOVERING 的条件由 M3-T07 补上）、首个起草 Attempt 准备阶段的 git init、批准问题 spec_approval、Plan 写集的核对与批准的来源判定在本任务实现（CR26D-06、-11、-105、-203）：host 在 HTTP 层为每个命令判定来源（user、attempt、unknown 与原因）并随命令传入，ApproveSpec、AnswerQuestion 与解析为答复的 SendInput REPLY 归一到同一个批准应用点，在那里拒绝非 user 的来源，并把 spec_approval 的答复构造为该用户的 ApproveSpec；来源判定另有单元测试：找不到对端、/proc 不可读、对端属于另一个 uid 都为 origin_unknown。Runtime 的起草 Task 在 Run 的工作状态（SPECIFYING、READY、RUNNING、VERIFYING）中派发，不改生命周期（CR26D-201）。no_spec 问题的新文字与选项 [adopt, draft]，以及随之更新的 ADR-031 决定 1（加日期更正）与 docs/12 的句子（CR-026 第 2 节列出）在本任务完成（CR26D-251）。"
+  },
+  {
+   "id": "M3-T08",
+   "milestone": "M3",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "内置模板与内置Skill（含首次起草时的模板实例化）",
+   "depends_on": [
+    "M3-T04",
     "M3-T03"
    ],
    "requirements": [
-    "REQ-007",
-    "REQ-008",
-    "REQ-009",
-    "REQ-017",
+    "REQ-029",
+    "REQ-046"
+   ],
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。Skill 正文按需加载与短索引（REQ-039 行为 7 的前半，ADR-026）在本任务实现。首个起草 Attempt 开始之前的模板实例化（规格骨架与有效档的全部模板，记为该 Attempt 的 effect，不覆盖已有文件）在本任务实现（CR-026 的 C22 决定 (a)，CR26D-154）。"
+  },
+  {
+   "id": "M3-T07",
+   "milestone": "M3",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "需求追踪与项目发现",
+   "depends_on": [
+    "M3-T04",
+    "M3-T06"
+   ],
+   "requirements": [
+    "REQ-032",
+    "REQ-028"
+   ],
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。TEST-032-01 的测试在 tests/bundle、名称含 test_032_01（traceability 自测据此定位），运行产品当前的导出（CR-017，ADR-027 的移交，CR-026）。追踪读取候选 spec 文件的 scenarios：scripts/product/traceability.py 的 World.tests() 与产品的追踪导出用同一规则，只有没有 scenarios 键的 spec 文件才读 contracts/acceptance-scenarios.json（CR-026，CR26D-102）。DISCOVERING 中的项目发现与 run.baseline、离开 DISCOVERING 的条件（基线之后）在本任务实现，接上 M3-T04 的阶段推进（CR26D-151）。"
+  },
+  {
+   "id": "M3-T10",
+   "milestone": "M3",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "局部咨询与停滞诊断",
+   "depends_on": [
+    "M3-T09"
+   ],
+   "requirements": [
     "REQ-023",
     "REQ-040"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。steer/query 的产品路由与投递：ADR-018 决定 4 的投递循环接入 host 与它的消费者（领取永不取验证交接，ADR-028 决定 9），当前 epoch 的路由，M2T17R-153（新持有者首个输入之前不投递）、M2T17R-154（哪些 Commander 消息还要核对接收方的 epoch）、M2T17R-254（KeyReuse 计为一次拒绝、不重试到死信）（ADR-025 决定 10）；角色间咨询的 wait-for 环检测；接管之后的 query/steer 路由（取代 M2-T16 的 deferred 回应），历史上 deferred 的消息不补投（ADR-028 决定 13）（CR-018）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。角色间咨询的 wait-for 环检测（CR-018）；no_progress、milestone_ready 与 release_request 的产生方（ADR-025 决定 1；后两者没有 M3 的 AC，其定义在本任务的 ADR 中给出，不改变 REQ-021 的唤醒集合）。配置键 [supervision] max_discussion_rounds 的加载器支持（解析、合法值、缺省、快照）与 config/hoh.example.toml 中的缺省值在同一提交加入，并在该提交上重跑 TEST-018-01（CR-026，CR26D-103）。"
   },
   {
    "id": "M3-T05",
@@ -998,7 +1069,12 @@
    "depends_on": [
     "M3-T02",
     "M3-T03",
-    "M3-T04"
+    "M3-T04",
+    "M3-T06",
+    "M3-T07",
+    "M3-T08",
+    "M3-T09",
+    "M3-T10"
    ],
    "requirements": [
     "REQ-007",

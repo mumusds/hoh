@@ -983,7 +983,7 @@
       ]
     },
     "BlockedReason": {
-      "description": "runs/tasks/role_bindings.blocked_reason (CR-003). Precedence for runs: BLOCKED_AUTH > COMMANDER_UNAVAILABLE > BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION.",
+      "description": "runs/tasks/role_bindings.blocked_reason (CR-003). Precedence for runs: BLOCKED_AUTH > COMMANDER_UNAVAILABLE > BUDGET_UNENFORCEABLE > BLOCKED_CAPABILITY > NEED_DECISION. READINESS_NOT_MET (CR-026) is a task's blocked_reason only: the task's requirement or its dependency closure is not ready (REQ-031); it never blocks a run.",
       "enum": [
         "NEED_DECISION",
         "BLOCKED_AUTH",
@@ -992,7 +992,8 @@
         "BUDGET_UNENFORCEABLE",
         "AGENT_UNAVAILABLE",
         "MODEL_UNAVAILABLE",
-        "COMPAT_UNVERIFIED"
+        "COMPAT_UNVERIFIED",
+        "READINESS_NOT_MET"
       ]
     },
     "RejectionReason": {
@@ -1012,7 +1013,9 @@
         "KEY_REUSE",
         "LEASE_UNAVAILABLE",
         "RETRY_NOT_DUE",
-        "ROLE_BINDING_PENDING"
+        "ROLE_BINDING_PENDING",
+        "CONSULT_CYCLE",
+        "DISCUSSION_LIMIT"
       ]
     },
     "ErrorCode": {
@@ -1033,7 +1036,12 @@
         "SCORE_OUT_OF_RANGE",
         "CURSOR_EXPIRED",
         "DAG_DUPLICATE_TASK",
-        "RUN_CONFIG_FROZEN"
+        "RUN_CONFIG_FROZEN",
+        "SPEC_CONFLICT",
+        "SPEC_INVALID",
+        "SPEC_APPROVAL_NOT_USER",
+        "PROMPT_VARIABLE_MISSING",
+        "PROMPT_TOO_LONG"
       ]
     },
     "SchedulerSettings": {
