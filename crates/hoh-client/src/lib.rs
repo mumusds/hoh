@@ -10,6 +10,10 @@
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
+// Nor may client code allow the lints the spawn scan names starts and stderr writes by (a plain spawner, a stderr
+// macro): the repository's clippy.toml lists none of them, so such an allow has no other use (CLT-1452).
+#![forbid(clippy::disallowed_types)]
+#![forbid(clippy::disallowed_macros)]
 
 /// A line on stderr, whatever becomes of it: `eprintln!` panics when the write fails (a hung-up terminal, a full
 /// device), which would turn the exit code into 101 (M1QA-01). Once a client's signal state is registered the line goes

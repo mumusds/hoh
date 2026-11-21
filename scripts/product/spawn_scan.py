@@ -11,7 +11,9 @@ boundary is the crate graph, the rest is listed.
    `CommandExt::exec`, `pre_exec`, nix's `fork`, `exec*`, `daemon`, `posix_spawn*`) or makes the plain spawner
    (`hoh_core::spawn::Direct`), and every call of a host-only function, is found by a clippy run of the scan's own
    (type-resolved: an alias, a re-export or a call through a trait is found; a thread's `spawn` or an HTTP `status` is
-   not), in the dev and the release profile, the places of both counted once. spawn-sites.json lists each (file,
+   not), in the dev and the release profile, the places of both counted once. The scan's lints are forced
+   (`--force-warn`), so no `allow` hides a place from it: persistence's allow for its database calls included (CLT-1450). tokio's
+   `process` starts are listed too, though no member enables that feature (CLT-1454). spawn-sites.json lists each (file,
    item) with its count, owner and reason: `spawner` (hoh-core's spawn.rs), `gate` (the client's one start gate),
    `host-only`, `entry` and `test-seam` (only in `host_only_files`). A client file holds no listed place but the gate's
    and calls no host-only function.
@@ -55,6 +57,13 @@ SPAWN_METHODS = (
     "nix::spawn::posix_spawn",
     "nix::spawn::posix_spawnp",
 )
+# Starts that exist only with a feature no member enables today (tokio's `process`): listed all the same, so enabling it
+# makes every use a place the scan judges (CLT-1454); while their paths do not resolve, that is no problem.
+OPTIONAL_METHODS = (
+    "tokio::process::Command::spawn",
+    "tokio::process::Command::output",
+    "tokio::process::Command::status",
+)
 DIRECT = "hoh_core::spawn::Direct"
 OWNERS = {
     "spawner": ("crates/hoh-core/src/spawn.rs",),
@@ -76,7 +85,7 @@ LINTS = ("clippy::disallowed_methods", "clippy::disallowed_types", "clippy::disa
 def configuration(host_only, stderr_functions=()):
     """The clippy configuration of the scan's own run."""
     methods = "".join(f'    {{ path = "{m}", reason = "spawn-scan" }},\n'
-                      for m in (*SPAWN_METHODS, *STDERR_METHODS, *host_only, *stderr_functions))
+                      for m in (*SPAWN_METHODS, *OPTIONAL_METHODS, *STDERR_METHODS, *host_only, *stderr_functions))
     macros = "".join(f'    {{ path = "{m}", reason = "spawn-scan" }},\n' for m in STDERR_MACROS)
     return (
         f"disallowed-methods = [\n{methods}]\n"
@@ -249,7 +258,9 @@ def found_in(messages):
         diagnostic = message["message"]
         text = diagnostic.get("message", "")
         if "does not refer to a reachable function" in text or "does not refer to an existing" in text:
-            problems.append(f"the scan's clippy configuration: {text}")
+            named = text.split("`")[1] if text.count("`") >= 2 else ""
+            if named not in OPTIONAL_METHODS:
+                problems.append(f"the scan's clippy configuration: {text}")
             continue
         if (diagnostic.get("code") or {}).get("code") not in LINTS:
             continue
@@ -263,6 +274,12 @@ def found_in(messages):
     return found, problems
 
 
+def rustflags():
+    """The scan's clippy flags: lints capped at warn, so every crate is checked whatever a hit in an earlier one; the
+    scan's own lints forced, so no allow hides a place (CLT-1450, CLT-1452)."""
+    return "--cap-lints warn " + " ".join(f"--force-warn {lint}" for lint in LINTS)
+
+
 def run_clippy(host_only, stderr_functions=(), release=False):
     """The scan's clippy run, in the dev or the release profile: its JSON messages, or SystemExit when it does not
     finish."""
@@ -271,7 +288,9 @@ def run_clippy(host_only, stderr_functions=(), release=False):
     env.pop("RUSTC", None)
     with tempfile.TemporaryDirectory() as conf:
         Path(conf, "clippy.toml").write_text(configuration(host_only, stderr_functions))
-        env.update(CLIPPY_CONF_DIR=conf, RUSTFLAGS="--cap-lints warn")
+        # Forced: an allow of the scan's lints (persistence's allow for its database calls, or one a file adds) hides nothing from
+        # the scan (CLT-1450, CLT-1452).
+        env.update(CLIPPY_CONF_DIR=conf, RUSTFLAGS=rustflags())
         done = subprocess.run(
             ["cargo", "clippy", "--workspace", "--lib", "--bins", "--locked", "--message-format=json",
              "--target-dir", str(ROOT / "target" / "spawn-scan"), *(["--release"] if release else [])],
