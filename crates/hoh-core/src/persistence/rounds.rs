@@ -311,7 +311,9 @@ fn parameters(snapshot: &str) -> Result<Params, PersistError> {
 
 /// The run's READY tasks and the PENDING ones whose dependencies are all ACCEPTED, with the five facts (REQ-038); a
 /// task waiting for its retry is no candidate until its `next_retry_at` (REQ-042 behaviour 2; it does not age
-/// meanwhile).
+/// meanwhile). Approval can commit after verification reconciliation: a STALE candidate's verifiers must not
+/// dispatch even if their READY tasks migrated to the new specification. Same-revision sibling rounds retain
+/// their existing history/classification semantics when another round has rejected their shared candidate.
 fn candidates(
     tx: &rusqlite::Transaction<'_>,
     run_id: &str,
@@ -326,6 +328,12 @@ fn candidates(
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
               WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED'), t.next_retry_at IS NOT NULL \
              FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') \
+             AND NOT EXISTS (SELECT 1 FROM events o JOIN candidates c \
+                 ON c.candidate_id = json_extract(o.payload_json, '$.candidate_id') \
+                 WHERE o.run_id = t.run_id AND o.kind = 'verification.round_opened' \
+                 AND t.task_id IN (json_extract(o.payload_json, '$.tasks.qa'), \
+                                  json_extract(o.payload_json, '$.tasks.reviewer')) \
+                 AND c.state = 'STALE') \
              AND (t.next_retry_at IS NULL OR t.next_retry_at <= ?2) ORDER BY t.created_seq, t.task_id",
         )
         .map_err(sqlite_error)?;
