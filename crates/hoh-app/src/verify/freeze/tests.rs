@@ -267,3 +267,76 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
 fn wal_probe_helper() {
     std::process::exit(hoh_core::persistence::selftest::probe_main());
 }
+
+fn repository_with_ignored_markdown(index_includes_ignored: bool) -> R<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("docs/spec"))?;
+    std::fs::create_dir_all(root.join("tests"))?;
+    std::fs::write(root.join(".gitignore"), ".hoh/\n/docs/spec/extra.md\n")?;
+    std::fs::write(root.join("environment.json"), "{}\n")?;
+    std::fs::write(root.join("tests/check-plan.json"), "{\"checks\":{}}\n")?;
+    let markdown = "# 用户\n# 范围\n# 非目标\n# 决策\n# 开放问题\n# 需求\n";
+    std::fs::write(root.join("docs/spec/a.md"), markdown)?;
+    std::fs::write(root.join("docs/spec/extra.md"), markdown)?;
+    let mut sources = crate::host::spec::sources(root)?;
+    if !index_includes_ignored {
+        sources.retain(|s| s.path == "docs/spec/a.md");
+    }
+    let index = hoh_core::specindex::generate_index(&sources)?;
+    std::fs::write(root.join(hoh_core::specindex::PATH), index.bytes())?;
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."],
+        &["commit", "-qm", "committed sources"],
+    ] {
+        git(root, args)?;
+    }
+    Ok(dir)
+}
+
+#[test]
+fn test_034_04_freeze_ignores_markdown_outside_the_commit() -> R {
+    let dir = repository_with_ignored_markdown(false)?;
+    let root = dir.path();
+    let before = prepare_job(root, &root.join(".hoh"), "R", &inputs());
+    assert!(
+        before.is_ok(),
+        "ignored Markdown must not enter freeze: {before:?}"
+    );
+    let before = before?;
+    assert!(
+        !before
+            .sealed
+            .manifest
+            .source_files
+            .iter()
+            .any(|f| f.path == "docs/spec/extra.md")
+    );
+    // Even invalid ignored bytes must not affect the same committed candidate.
+    std::fs::write(root.join("docs/spec/extra.md"), "not a specification")?;
+    let after = prepare_job(root, &root.join(".hoh"), "R", &inputs())?;
+    assert_eq!(before.sealed.candidate_id, after.sealed.candidate_id);
+    std::fs::remove_file(root.join("docs/spec/extra.md"))?;
+    let removed = prepare_job(root, &root.join(".hoh"), "R", &inputs())?;
+    assert_eq!(before.sealed.candidate_id, removed.sealed.candidate_id);
+    Ok(())
+}
+
+#[test]
+fn test_034_04_freeze_rejects_index_including_ignored_markdown() -> R {
+    let dir = repository_with_ignored_markdown(true)?;
+    let root = dir.path();
+    let result = prepare_job(root, &root.join(".hoh"), "R", &inputs());
+    assert!(
+        matches!(result, Err(FreezeError::SpecInvalid(_))),
+        "an index derived from ignored Markdown must be refused: {result:?}"
+    );
+    assert!(!root.join(".hoh/objects").exists());
+    std::fs::remove_file(root.join("docs/spec/extra.md"))?;
+    assert!(matches!(
+        prepare_job(root, &root.join(".hoh"), "R", &inputs()),
+        Err(FreezeError::SpecInvalid(_))
+    ));
+    Ok(())
+}

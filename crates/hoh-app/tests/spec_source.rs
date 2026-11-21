@@ -126,11 +126,42 @@ async fn test_034_01_approve_freezes_index_json() -> R {
         "SELECT ac_id,requirement_id,body,check_id FROM acceptance_criteria ORDER BY ac_id",
     )?;
     assert_eq!(criteria.len(), 7);
-    for (row, scenario) in criteria.iter().zip(
-        index.value()["scenarios"]
-            .as_array()
-            .ok_or("no scenarios")?,
-    ) {
+    // Read the expected mapping from the authored Markdown, independently of the product index.
+    let mut markdown_checks = std::collections::BTreeMap::new();
+    for source in sources() {
+        let mut acceptance = None;
+        let markdown = std::fs::read_to_string(world.project().join(&source.path))?;
+        for line in markdown.lines() {
+            if let Some(id) = line.strip_prefix("### ") {
+                acceptance = Some(id.to_owned());
+            } else if let Some(check) = line.strip_prefix("check: ") {
+                let id = acceptance.take().ok_or("check without AC")?;
+                assert!(markdown_checks.insert(id, check.to_owned()).is_none());
+            }
+        }
+    }
+    assert_eq!(markdown_checks.len(), 7);
+    let scenarios = index.value()["scenarios"]
+        .as_array()
+        .ok_or("no scenarios")?;
+    assert_eq!(scenarios.len(), 7, "exactly one scenario per authored AC");
+    for scenario in scenarios {
+        let ac = scenario["acceptance_id"].as_str().ok_or("no scenario AC")?;
+        assert_eq!(
+            scenario["check_id"], markdown_checks[ac],
+            "scenario check must match Markdown for {ac}"
+        );
+    }
+    for row in &criteria {
+        let ac_id = row["ac_id"].as_str().ok_or("no row AC")?;
+        assert_eq!(
+            row["check_id"], markdown_checks[ac_id],
+            "stored check must match Markdown for {ac_id}"
+        );
+        let scenario = scenarios
+            .iter()
+            .find(|s| s["acceptance_id"] == row["ac_id"])
+            .ok_or("missing scenario")?;
         assert_eq!(row["ac_id"], scenario["acceptance_id"]);
         assert_eq!(row["requirement_id"], scenario["requirement_id"]);
         assert_eq!(row["check_id"], scenario["check_id"]);
