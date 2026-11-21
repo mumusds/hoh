@@ -3267,3 +3267,209 @@ async fn test_047_03_start_run_failure_keeps_pins_unpublished() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_017_01_idle_commander_rebind_answers_ask_in_its_first_input_turn() -> R {
+    use crate::persistence::{Claimed, NewInput, Settlement};
+    use std::time::{Duration, SystemTime};
+    let dir = tempfile::Builder::new().prefix("m3t09-rebind-").tempdir()?;
+    let (store, path) = open(&dir)?;
+    exec(
+        &path,
+        "INSERT INTO specs(spec_id,project_id,sha256,revision) VALUES ('s1','p1',printf('%064d',1),1)",
+    )?;
+    store
+        .submit_command(start("R1", Config::default().budget))
+        .await?;
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".into(),
+            role: "commander".into(),
+            role_epoch: 1,
+            agent: "codex".into(),
+            agent_version: "1".into(),
+            capabilities: json!({"structured_events":true}),
+            identity: granted_identity(),
+        })
+        .await?;
+    // Finish the real adoption wake before the rebind, leaving an idle Run with
+    // no work or unrelated wake that could accidentally pay the first-input debt.
+    let initial = SystemTime::now();
+    store
+        .supervise(
+            "R1",
+            crate::decision::Context {
+                now: Some(initial),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let context = crate::decision::Context {
+        now: Some(initial + Duration::from_secs(3)),
+        ..Default::default()
+    };
+    store.supervise("R1", context.clone()).await?;
+    let adopted = store
+        .allocate_supervision("p1", context)
+        .await?
+        .ok_or("adoption turn")?;
+    turn_ends(&store, &path, &adopted.attempt_id, true, "old-commander").await?;
+    store
+        .submit_command(team_change(
+            "commander-rebind",
+            0,
+            json!({"commander":{"agent":"claude"}}),
+        ))
+        .await?;
+    store
+        .team_checkpoint("R1", crate::persistence::Availability::default())
+        .await?;
+    store
+        .bind_session(crate::persistence::SessionGrant {
+            run_id: "R1".into(),
+            role: "commander".into(),
+            role_epoch: 2,
+            agent: "claude".into(),
+            agent_version: "1".into(),
+            capabilities: json!({"structured_events":true}),
+            identity: granted_identity(),
+        })
+        .await?;
+    let start = store
+        .runner_waiting("p1")
+        .await?
+        .session_starts
+        .pop()
+        .ok_or("session start")?;
+    let session = start.session_id.clone().ok_or("session")?;
+    let revision = values(&path, "SELECT revision FROM runs WHERE run_id='R1'")?;
+    let now = SystemTime::now();
+    let context = crate::decision::Context {
+        now: Some(now),
+        wall: Some(now),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .allocate_supervision("p1", context.clone())
+            .await?
+            .is_none(),
+        "idle run has no unrelated wake"
+    );
+    store
+        .enqueue_input(NewInput {
+            input_id: "rebind-ask".into(),
+            run_id: "R1".into(),
+            kind: "ASK".into(),
+            target_role: None,
+            payload: json!({"text":"progress?"}),
+        })
+        .await?;
+    assert!(
+        store
+            .claim_inputs(now, vec!["commander".into()], 3)
+            .await?
+            .is_none(),
+        "session.start must be delivered first"
+    );
+    assert!(
+        store
+            .deliver_session_start(&start.message_id, &session)
+            .await?
+    );
+    let row = store
+        .claim_inputs(now, vec!["commander".into()], 3)
+        .await?
+        .and_then(Claimed::start)
+        .expect("idle Commander must accept ASK for the turn carrying its first-input package");
+    store
+        .consume_input(row.clone(), now)
+        .await?
+        .ok_or("input delivered")?;
+    store
+        .settle_outbox(&row.message_id, row.attempt_count, Settlement::Delivered, 3)
+        .await?;
+    store.supervise("R1", context.clone()).await?;
+    let context = crate::decision::Context {
+        now: Some(now + Duration::from_secs(30)),
+        ..context
+    };
+    store.supervise("R1", context.clone()).await?;
+    let turn = store
+        .allocate_supervision("p1", context.clone())
+        .await?
+        .ok_or("ASK wake allocated")?;
+    let assignment = super::assignment(
+        &Connection::open(&path)?,
+        "p1",
+        "R1",
+        &turn.task_id,
+        &turn.attempt_id,
+        "commander",
+    )?;
+    assert!(
+        assignment.first_input,
+        "ASK must carry the first-input package, not pay the debt early"
+    );
+    assert_eq!(assignment.role_epoch, 2);
+    assert_eq!(
+        assignment.supervision.ok_or("supervision")?.summary["user_input"]["input_id"],
+        "rebind-ask"
+    );
+    assert!(
+        store.allocate_supervision("p1", context).await?.is_none(),
+        "only one first-input turn at a time"
+    );
+    exec(
+        &path,
+        &format!(
+            "UPDATE attempts SET state='RUNNING',pid=4242 WHERE attempt_id='{}'",
+            turn.attempt_id
+        ),
+    )?;
+    store
+        .runner_finished(
+            &turn.attempt_id,
+            crate::persistence::Ending {
+                success: true,
+                detail: "answered".into(),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at: now,
+                draw: 0,
+                observed: crate::persistence::Observed {
+                    final_text: Some("Idle; ready for your next task.".into()),
+                    ..Default::default()
+                },
+                unknown_effect: false,
+            },
+        )
+        .await?;
+    let input = store.reader()?.input("rebind-ask")?.ok_or("input")?;
+    assert_eq!(input.state, crate::lifecycle::InputState::Applied);
+    assert_eq!(input.payload["answer"], "Idle; ready for your next task.");
+    assert_eq!(
+        values(&path, "SELECT revision FROM runs WHERE run_id='R1'")?,
+        revision,
+        "events: {:?}",
+        values(
+            &path,
+            "SELECT kind,payload_json FROM events WHERE run_id='R1'"
+        )?
+    );
+    assert_eq!(
+        values(&path, "SELECT count(*) FROM tasks WHERE role<>'commander'")?,
+        vec![vec![json!(0)]]
+    );
+    assert_eq!(
+        values(
+            &path,
+            "SELECT count(*) FROM receipts WHERE message_id='rebind-ask'"
+        )?,
+        vec![vec![json!(1)]]
+    );
+    assert_eq!(
+        values(&path, "SELECT state FROM handoffs")?,
+        vec![vec![json!("ACCEPTED")]]
+    );
+    Ok(())
+}

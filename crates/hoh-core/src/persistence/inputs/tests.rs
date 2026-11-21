@@ -145,9 +145,9 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
     let (store, path) = open(&dir)?;
     seed(&path)?;
     let conn = Connection::open(&path)?;
-    conn.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','commander','1','{}');
-        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','commander','codex','sc',2,1,'2026-11-21T00:00:00Z');")?;
-    let start = crate::ids::child_id("R", "session-start/commander/2");
+    conn.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','developer','1','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','developer','codex','sc',2,1,'2026-11-21T00:00:00Z');")?;
+    let start = crate::ids::child_id("R", "session-start/developer/2");
     store
         .commit(Commit {
             events: vec![NewEvent {
@@ -162,7 +162,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
                 message_id: start.clone(),
                 event: 0,
                 run_id: Some("R".to_owned()),
-                recipient_role: "commander".to_owned(),
+                recipient_role: "developer".to_owned(),
                 role_epoch: 2,
                 payload: json!({"notice":"runtime","kind":"session.start"}),
             }],
@@ -174,7 +174,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
             input_id: "ask".to_owned(),
             run_id: "R".to_owned(),
             kind: "ASK".to_owned(),
-            target_role: None,
+            target_role: Some("developer".into()),
             payload: json!({"text":"progress?"}),
         })
         .await?;
@@ -190,7 +190,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
     let now = std::time::SystemTime::now();
     assert!(
         store
-            .claim_outbox(now, vec!["commander".to_owned()], 3)
+            .claim_outbox(now, vec!["developer".to_owned()], 3)
             .await?
             .is_none()
     );
@@ -198,10 +198,10 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
         "UPDATE outbox SET state='ACKED' WHERE message_id=?1",
         params![start],
     )?;
-    conn.execute("INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES ('commander',?1,'2026-11-21T00:00:00Z',?2)",params![start,json!({"session_id":"sc"}).to_string()])?;
+    conn.execute("INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES ('developer',?1,'2026-11-21T00:00:00Z',?2)",params![start,json!({"session_id":"sc"}).to_string()])?;
     assert!(
         store
-            .claim_outbox(now, vec!["commander".to_owned()], 3)
+            .claim_outbox(now, vec!["developer".to_owned()], 3)
             .await?
             .is_none(),
         "ACK alone does not pay the first-input debt"
@@ -214,10 +214,10 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
         )?,
         0
     );
-    conn.execute_batch("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('T','R','s1','IMPLEMENTED','commander',0,1);
+    conn.execute_batch("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('T','R','s1','IMPLEMENTED','developer',0,1);
         INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A','T','SETTLED','sc',2,1,1);")?;
     let row = store
-        .claim_outbox(now, vec!["commander".to_owned()], 3)
+        .claim_outbox(now, vec!["developer".to_owned()], 3)
         .await?
         .and_then(Claimed::start)
         .ok_or("no input after first turn")?;
@@ -251,7 +251,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
         [],
     )?;
     let row = store
-        .claim_inputs(now, vec!["commander".to_owned()], 3)
+        .claim_inputs(now, vec!["developer".to_owned()], 3)
         .await?
         .and_then(Claimed::start)
         .ok_or("no reclaimed input")?;
@@ -287,19 +287,19 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
                 input_id: id.to_owned(),
                 run_id: "R".to_owned(),
                 kind: "ASK".to_owned(),
-                target_role: None,
+                target_role: Some("developer".into()),
                 payload: json!({"text":"question"}),
             })
             .await?;
     }
     let stale = store
-        .claim_inputs(now, vec!["commander".to_owned()], 3)
+        .claim_inputs(now, vec!["developer".to_owned()], 3)
         .await?
         .and_then(Claimed::start)
         .ok_or("stale input")?;
     assert_eq!(stale.message_id, "stale");
     conn.execute(
-        "UPDATE role_bindings SET role_epoch=3 WHERE run_id='R' AND role='commander'",
+        "UPDATE role_bindings SET role_epoch=3 WHERE run_id='R' AND role='developer'",
         [],
     )?;
     let rejected: Value = serde_json::from_str(
@@ -322,7 +322,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
         InputState::Rejected
     );
     let exhausted = store
-        .claim_inputs(now, vec!["commander".to_owned()], 1)
+        .claim_inputs(now, vec!["developer".to_owned()], 1)
         .await?
         .and_then(Claimed::start)
         .ok_or("exhausted input")?;
