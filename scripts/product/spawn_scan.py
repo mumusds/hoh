@@ -244,9 +244,18 @@ def judge(found, manifest):
     return list(dict.fromkeys(problems))
 
 
-def found_in(messages):
+def tokio_process_enabled(metadata):
+    """Whether any resolved tokio package has its `process` feature on (then its starts must resolve, CLN3-01)."""
+    names = {p["id"]: p["name"] for p in metadata.get("packages", [])}
+    return any(names.get(node["id"]) == "tokio" and "process" in node.get("features", [])
+               for node in (metadata.get("resolve") or {}).get("nodes", []))
+
+
+def found_in(messages, optional_may_be_unresolved=True):
     """[(file, item)] from cargo's JSON messages: one per place a scan lint names, and the configuration's own
-    complaints (an entry that does not resolve) as problems."""
+    complaints (an entry that does not resolve) as problems. An optional entry (tokio's process starts) may be
+    unresolved only while no member enables that feature; once it is enabled, a misspelt optional entry is a
+    configuration problem like any other (CLN3-01)."""
     found, problems, seen = [], [], set()
     for line in messages.splitlines():
         try:
@@ -259,7 +268,7 @@ def found_in(messages):
         text = diagnostic.get("message", "")
         if "does not refer to a reachable function" in text or "does not refer to an existing" in text:
             named = text.split("`")[1] if text.count("`") >= 2 else ""
-            if named not in OPTIONAL_METHODS:
+            if not (optional_may_be_unresolved and named in OPTIONAL_METHODS):
                 problems.append(f"the scan's clippy configuration: {text}")
             continue
         if (diagnostic.get("code") or {}).get("code") not in LINTS:
@@ -307,10 +316,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     manifest = json.loads(args.sites.read_text())
     host_only, writers = manifest["host_only_functions"], manifest.get("stderr_functions", [])
-    problems = closure_problems(run_metadata())
+    metadata = run_metadata()
+    problems = closure_problems(metadata)
     # Both profiles: code under cfg(not(debug_assertions)) is compiled in the release one only; a place both compile is
     # one place.
-    found, configured = found_in(run_clippy(host_only, writers) + "\n" + run_clippy(host_only, writers, release=True))
+    found, configured = found_in(run_clippy(host_only, writers) + "\n" + run_clippy(host_only, writers, release=True),
+                                 optional_may_be_unresolved=not tokio_process_enabled(metadata))
     classes, classified = classify(manifest)
     problems = list(dict.fromkeys(problems + configured + judge(found, manifest) + classified + path_problems(manifest)))
     if problems:
