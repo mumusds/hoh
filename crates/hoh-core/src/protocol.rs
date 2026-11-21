@@ -119,7 +119,7 @@ schema_enum!(
     /// `BlockedReason`: runs/tasks/role_bindings.blocked_reason.
     BlockedReason, "SCREAMING_SNAKE_CASE",
     [NeedDecision, BlockedAuth, BlockedCapability, CommanderUnavailable, BudgetUnenforceable, AgentUnavailable, ModelUnavailable,
-     CompatUnverified]
+     CompatUnverified, ReadinessNotMet]
 );
 
 impl BlockedReason {
@@ -134,7 +134,14 @@ impl BlockedReason {
             BlockedReason::AgentUnavailable => "AGENT_UNAVAILABLE",
             BlockedReason::ModelUnavailable => "MODEL_UNAVAILABLE",
             BlockedReason::CompatUnverified => "COMPAT_UNVERIFIED",
+            BlockedReason::ReadinessNotMet => "READINESS_NOT_MET",
         }
+    }
+
+    /// Whether a run can be blocked for this reason. READINESS_NOT_MET (CR-026, REQ-031 behaviour 5) is a task's
+    /// reason only: it never enters a run's blocker set (protocol.schema.json `BlockedReason`).
+    pub fn blocks_run(self) -> bool {
+        self != BlockedReason::ReadinessNotMet
     }
 
     /// The reason named `name`, if it is one.
@@ -147,14 +154,14 @@ schema_enum!(
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
      BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable,
-     RetryNotDue, RoleBindingPending]
+     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
     ErrorCode, "SCREAMING_SNAKE_CASE",
     [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
      ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired,
-     DagDuplicateTask, RunConfigFrozen]
+     DagDuplicateTask, RunConfigFrozen, SpecConflict, SpecInvalid, SpecApprovalNotUser, PromptVariableMissing, PromptTooLong]
 );
 schema_enum!(
     /// Task states (`transition_task.to_state`).
@@ -651,6 +658,17 @@ schema_def!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_is_the_one_blocked_reason_that_never_blocks_a_run() {
+        // protocol.schema.json BlockedReason: READINESS_NOT_MET is a task's reason only (CR-026, REQ-031).
+        let task_only: Vec<BlockedReason> = BlockedReason::ALL
+            .iter()
+            .copied()
+            .filter(|r| !r.blocks_run())
+            .collect();
+        assert_eq!(task_only, [BlockedReason::ReadinessNotMet]);
+    }
 
     #[test]
     fn a_blocked_reason_names_itself_as_its_serde_form_does() {

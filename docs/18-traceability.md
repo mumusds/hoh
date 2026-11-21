@@ -10,9 +10,9 @@
 |REQ-004|标准输出契约|M1|required|v1, v0.1|detailed|AC-004-01（TEST-004-01·unit·M1-T06）<br>AC-004-02（TEST-004-02·integration·M2-T13）<br>AC-004-03（TEST-004-03·integration·M2-T13）<br>AC-004-04（TEST-004-04·integration·M2-T13）|M1-T06, M1-T09, M2-T13, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-005|脱离与附着|M2|required|v1, v0.1|detailed|AC-005-01（TEST-005-01·tui-pty·M2-T13）<br>AC-005-02（TEST-005-02·integration·M2-T06）<br>AC-005-03（TEST-005-03·integration·M2-T06）<br>AC-005-04（TEST-005-04·recovery·M2-T14）<br>AC-005-05（TEST-005-05·integration·M2-T06）<br>AC-005-06（TEST-005-06·deployment·M2-T14）|M2-T06, M2-T14, M2-T13, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-006|环境诊断|M1|required|v1|detailed|AC-006-01（TEST-006-01·integration·M1-T07）<br>AC-006-02（TEST-006-02·integration·M1-T07）<br>AC-006-03（TEST-006-03·adapter-live·M1-T07）|M1-T07, M1-T09, M7-T04|
-|REQ-007|Slash 与统一操作|M3|required|v1|outline|AC-007-01（TEST-007-01·tui-pty·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
-|REQ-008|Plan 互动与文档|M3|required|v1|outline|AC-008-01（TEST-008-01·tui-pty·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
-|REQ-009|Build 与 Auto|M3|required|v1|outline|AC-009-01（TEST-009-01·integration·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
+|REQ-007|Slash 与统一操作|M3|required|v1|detailed|AC-007-01（TEST-007-01·tui-pty·M3-T09）<br>AC-007-02（TEST-007-02·integration·M3-T09）<br>AC-007-03（TEST-007-03·tui-pty·M3-T09）|M3-T01, M3-T09, M3-T05, M7-T04|
+|REQ-008|Plan 互动与文档|M3|required|v1|detailed|AC-008-01（TEST-008-01·tui-pty·M3-T04）<br>AC-008-02（TEST-008-02·recovery·M3-T04）<br>AC-008-03（TEST-008-03·tui-pty·M3-T04）<br>AC-008-04（TEST-008-04·integration·M3-T04）<br>AC-008-05（TEST-008-05·integration·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
+|REQ-009|Build 与 Auto|M3|required|v1|detailed|AC-009-01（TEST-009-01·integration·M3-T04）<br>AC-009-02（TEST-009-02·integration·M3-T04）<br>AC-009-03（TEST-009-03·unit·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
 |REQ-010|Workspace 工作台|M4|required|v1|outline|AC-010-01（TEST-010-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
 |REQ-011|Team/Focus 布局|M4|required|v1|outline|AC-011-01（TEST-011-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
 |REQ-012|可展开内容块|M4|required|v1|outline|AC-012-01（TEST-012-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
@@ -20,37 +20,37 @@
 |REQ-014|真实进度状态栏|M4|required|v1|outline|AC-014-01（TEST-014-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
 |REQ-015|输入与终端兼容|M4|required|v1|outline|AC-015-01（TEST-015-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
 |REQ-016|无障碍与键位|M4|required|v1|outline|AC-016-01（TEST-016-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
-|REQ-017|运行中对话|M3|required|v1|outline|AC-017-01（TEST-017-01·integration·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
+|REQ-017|运行中对话|M3|required|v1|detailed|AC-017-01（TEST-017-01·integration·M3-T09）<br>AC-017-02（TEST-017-02·adapter-live·M3-T09）<br>AC-017-03（TEST-017-03·integration·M3-T09）<br>AC-017-04（TEST-017-04·tui-pty·M3-T09）<br>AC-017-05（TEST-017-05·recovery·M3-T09）|M3-T01, M3-T09, M3-T05, M7-T04|
 |REQ-018|默认与自定义团队|M2|required|v1|detailed|AC-018-01（TEST-018-01·unit·M2-T07）<br>AC-018-02（TEST-018-02·integration·M2-T07）<br>AC-018-03（TEST-018-03·integration·M2-T07）<br>AC-018-04（TEST-018-04·integration·M2-T07）<br>AC-018-05（TEST-018-05·integration·M2-T07）|M2-T07, M2-T11, M7-T04|
 |REQ-019|角色交接|M2|required|v1|detailed|AC-019-01（TEST-019-01·integration·M2-T17）<br>AC-019-02（TEST-019-02·integration·M2-T17）<br>AC-019-03（TEST-019-03·integration·M2-T17）<br>AC-019-04（TEST-019-04·integration·M2-T17）<br>AC-019-05（TEST-019-05·recovery·M2-T17）|M2-T17, M2-T11, M7-T04|
 |REQ-020|能力匹配与缺员|M2|required|v1|detailed|AC-020-01（TEST-020-01·unit·M2-T15）<br>AC-020-02（TEST-020-02·integration·M2-T15）<br>AC-020-03（TEST-020-03·integration·M2-T15）<br>AC-020-04（TEST-020-04·integration·M2-T15）<br>AC-020-05（TEST-020-05·unit·M2-T15）|M2-T15, M2-T20, M2-T11, M7-T04|
 |REQ-021|Commander 监督|M2|required|v1|detailed|AC-021-01（TEST-021-01·unit·M2-T08）<br>AC-021-02（TEST-021-02·unit·M2-T08）<br>AC-021-03（TEST-021-03·recovery·M2-T08）<br>AC-021-04（TEST-021-04·integration·M2-T08）<br>AC-021-05（TEST-021-05·integration·M2-T16）<br>AC-021-06（TEST-021-06·integration·M2-T20）<br>AC-021-07（TEST-021-07·adapter-live·M2-T20）|M2-T08, M2-T16, M2-T20, M2-T21, M2-T11, M7-T04|
 |REQ-022|通信与交接|M2|required|v1|detailed|AC-022-01（TEST-022-01·integration·M2-T04）<br>AC-022-02（TEST-022-02·integration·M2-T12）<br>AC-022-03（TEST-022-03·integration·M2-T04）<br>AC-022-04（TEST-022-04·integration·M2-T04）<br>AC-022-05（TEST-022-05·integration·M2-T04）|M2-T12, M2-T04, M2-T11, M7-T04|
-|REQ-023|局部咨询与升级|M3|required|v1|outline|AC-023-01（TEST-023-01·integration·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
+|REQ-023|局部咨询与升级|M3|required|v1|detailed|AC-023-01（TEST-023-01·integration·M3-T10）<br>AC-023-02（TEST-023-02·integration·M3-T10）<br>AC-023-03（TEST-023-03·integration·M3-T10）<br>AC-023-04（TEST-023-04·integration·M3-T10）|M3-T01, M3-T10, M3-T05, M7-T04|
 |REQ-024|Codex 原生接口|M1|required|v1|detailed|AC-024-01（TEST-024-01·integration·M1-T04）<br>AC-024-02（TEST-024-02·integration·M1-T04）<br>AC-024-03（TEST-024-03·integration·M1-T04）<br>AC-024-04（TEST-024-04·adapter-live·M1-T04）|M1-T04, M1-T09, M2-T20, M7-T04|
 |REQ-025|Claude 原生接口|M1|required|v1, v0.1|detailed|AC-025-01（TEST-025-01·integration·M1-T03）<br>AC-025-02（TEST-025-02·integration·M1-T03）<br>AC-025-03（TEST-025-03·integration·M1-T03）<br>AC-025-04（TEST-025-04·adapter-live·M1-T03）|M1-T03, M1-T09, M2-T20, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-026|Pi 原生接口|M1|required|v1|detailed|AC-026-01（TEST-026-01·integration·M1-T05）<br>AC-026-02（TEST-026-02·integration·M1-T05）<br>AC-026-03（TEST-026-03·integration·M1-T05）<br>AC-026-04（TEST-026-04·adapter-live·M1-T05）|M1-T05, M1-T09, M2-T20, M7-T04|
 |REQ-027|协议版本与能力|M1|required|v1, v0.1|detailed|AC-027-01（TEST-027-01·integration·M1-T01）<br>AC-027-02（TEST-027-02·integration·M1-T07）<br>AC-027-03（TEST-027-03·integration·M2-T07）<br>AC-027-04（TEST-027-04·integration·M2-T15）|M1-T01, M1-T07, M1-T09, M2-T07, M2-T15, M2-T20, M2-T11, V01-T01, V01-T02, M7-T04|
-|REQ-028|项目发现|M3|required|v1|outline|AC-028-01（TEST-028-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
-|REQ-029|内置模板|M3|required|v1|outline|AC-029-01（TEST-029-01·unit·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
-|REQ-030|规格收敛|M3|required|v1|outline|AC-030-01（TEST-030-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
-|REQ-031|Readiness Gate|M3|required|v1|outline|AC-031-01（TEST-031-01·unit·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
-|REQ-032|需求追踪|M3|required|v1|outline|AC-032-01（TEST-032-01·traceability·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
-|REQ-033|规格变更|M3|required|v1|outline|AC-033-01（TEST-033-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
-|REQ-034|文档事实源|M3|required|v1|outline|AC-034-01（TEST-034-01·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
+|REQ-028|项目发现|M3|required|v1|detailed|AC-028-01（TEST-028-01·integration·M3-T07）<br>AC-028-02（TEST-028-02·integration·M3-T07）<br>AC-028-03（TEST-028-03·integration·M3-T07）<br>AC-028-04（TEST-028-04·integration·M3-T07）|M3-T01, M3-T07, M3-T05, M7-T04|
+|REQ-029|内置模板|M3|required|v1|detailed|AC-029-01（TEST-029-01·unit·M3-T08）<br>AC-029-02（TEST-029-02·integration·M3-T08）<br>AC-029-03（TEST-029-03·deployment·M3-T08）|M3-T01, M3-T08, M3-T05, M7-T04|
+|REQ-030|规格收敛|M3|required|v1|detailed|AC-030-01（TEST-030-01·integration·M3-T06）<br>AC-030-02（TEST-030-02·integration·M3-T06）<br>AC-030-03（TEST-030-03·integration·M3-T06）|M3-T01, M3-T06, M3-T05, M7-T04|
+|REQ-031|Readiness Gate|M3|required|v1|detailed|AC-031-01（TEST-031-01·unit·M3-T06）<br>AC-031-02（TEST-031-02·integration·M3-T06）<br>AC-031-03（TEST-031-03·unit·M3-T06）<br>AC-031-04（TEST-031-04·integration·M3-T06）<br>AC-031-05（TEST-031-05·unit·M3-T06）|M3-T01, M3-T06, M3-T05, M7-T04|
+|REQ-032|需求追踪|M3|required|v1|detailed|AC-032-01（TEST-032-01·traceability·M3-T07）<br>AC-032-02（TEST-032-02·integration·M3-T07）<br>AC-032-03（TEST-032-03·integration·M3-T07）<br>AC-032-04（TEST-032-04·integration·M3-T07）|M3-T01, M3-T07, M3-T05, M7-T04|
+|REQ-033|规格变更|M3|required|v1|detailed|AC-033-01（TEST-033-01·integration·M3-T02）<br>AC-033-02（TEST-033-02·recovery·M3-T02）<br>AC-033-03（TEST-033-03·integration·M3-T02）<br>AC-033-04（TEST-033-04·integration·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
+|REQ-034|文档事实源|M3|required|v1|detailed|AC-034-01（TEST-034-01·integration·M3-T02）<br>AC-034-02（TEST-034-02·integration·M3-T02）<br>AC-034-03（TEST-034-03·integration·M3-T02）<br>AC-034-04（TEST-034-04·unit·M3-T02）|M3-T01, M3-T02, M3-T05, M7-T04|
 |REQ-035|双层编排|M2|required|v1, v0.1|detailed|AC-035-01（TEST-035-01·unit·M2-T02）<br>AC-035-02（TEST-035-02·integration·M2-T03）<br>AC-035-03（TEST-035-03·integration·M2-T16）<br>AC-035-04（TEST-035-04·unit·M2-T02）<br>AC-035-05（TEST-035-05·integration·M2-T16）|M2-T02, M2-T03, M2-T16, M2-T21, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-036|持久生命周期|M2|required|v1, v0.1|detailed|AC-036-01（TEST-036-01·unit·M2-T02）<br>AC-036-02（TEST-036-02·recovery·M2-T05）<br>AC-036-03（TEST-036-03·integration·M2-T16）<br>AC-036-04（TEST-036-04·integration·M2-T12）|M2-T02, M2-T12, M2-T05, M2-T16, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-037|单写者与并行验证|M2|required|v1, v0.1|detailed|AC-037-01（TEST-037-01·integration·M2-T03）<br>AC-037-02（TEST-037-02·integration·M2-T16）<br>AC-037-03（TEST-037-03·integration·M2-T16）<br>AC-037-04（TEST-037-04·integration·M2-T16）|M2-T03, M2-T16, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-038|任务DAG调度|M2|required|v1, v0.1|detailed|AC-038-01（TEST-038-01·unit·M2-T03）<br>AC-038-02（TEST-038-02·unit·M2-T03）<br>AC-038-03（TEST-038-03·integration·M2-T03）<br>AC-038-04（TEST-038-04·unit·M2-T03）<br>AC-038-05（TEST-038-05·integration·M2-T03）<br>AC-038-06（TEST-038-06·unit·M2-T03）|M2-T03, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-039|上下文渐进披露|M2|required|v1|detailed|AC-039-01（TEST-039-01·unit·M2-T09）<br>AC-039-02（TEST-039-02·unit·M2-T09）<br>AC-039-03（TEST-039-03·integration·M2-T16）<br>AC-039-04（TEST-039-04·integration·M2-T09）|M2-T09, M2-T16, M2-T11, M7-T04|
-|REQ-040|停滞与诊断|M3|required|v1|outline|AC-040-01（TEST-040-01·unit·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
+|REQ-040|停滞与诊断|M3|required|v1|detailed|AC-040-01（TEST-040-01·integration·M3-T10）<br>AC-040-02（TEST-040-02·unit·M3-T10）<br>AC-040-03（TEST-040-03·unit·M3-T10）<br>AC-040-04（TEST-040-04·integration·M3-T10）|M3-T01, M3-T10, M3-T05, M7-T04|
 |REQ-041|恢复与幂等|M2|required|v1, v0.1|detailed|AC-041-01（TEST-041-01·recovery·M2-T05）<br>AC-041-02（TEST-041-02·recovery·M2-T05）<br>AC-041-03（TEST-041-03·recovery·M2-T05）<br>AC-041-04（TEST-041-04·integration·M2-T12）<br>AC-041-05（TEST-041-05·recovery·M2-T05）|M2-T12, M2-T05, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-042|预算与等待|M2|required|v1, v0.1|detailed|AC-042-01（TEST-042-01·unit·M2-T19）<br>AC-042-02（TEST-042-02·recovery·M2-T19）<br>AC-042-03（TEST-042-03·integration·M2-T19）<br>AC-042-04（TEST-042-04·integration·M2-T13）<br>AC-042-05（TEST-042-05·unit·M2-T19）<br>AC-042-06（TEST-042-06·integration·M2-T19）<br>AC-042-07（TEST-042-07·unit·M2-T21）|M2-T19, M2-T21, M2-T13, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-043|暂停取消分离|M2|required|v1, v0.1|detailed|AC-043-01（TEST-043-01·integration·M2-T06）<br>AC-043-02（TEST-043-02·integration·M2-T06）<br>AC-043-03（TEST-043-03·tui-pty·M2-T06）<br>AC-043-04（TEST-043-04·integration·M2-T06）<br>AC-043-05（TEST-043-05·unit·M2-T06）|M2-T06, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-044|可恢复版本|M5|required|v1|outline|AC-044-01（TEST-044-01·recovery·M5-T02）|M5-T01, M5-T02, M5-T04, M7-T04|
-|REQ-045|四层Prompt版本|M3|required|v1|outline|AC-045-01（TEST-045-01·unit·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
-|REQ-046|内置Skill|M3|required|v1|outline|AC-046-01（TEST-046-01·integration·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
-|REQ-047|自定义与升级|M3|required|v1|outline|AC-047-01（TEST-047-01·integration·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
+|REQ-045|四层Prompt版本|M3|required|v1|detailed|AC-045-01（TEST-045-01·integration·M3-T03）<br>AC-045-02（TEST-045-02·unit·M3-T03）<br>AC-045-03（TEST-045-03·integration·M3-T03）<br>AC-045-04（TEST-045-04·unit·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
+|REQ-046|内置Skill|M3|required|v1|detailed|AC-046-01（TEST-046-01·integration·M3-T08）<br>AC-046-02（TEST-046-02·integration·M3-T08）<br>AC-046-03（TEST-046-03·unit·M3-T08）|M3-T01, M3-T08, M3-T05, M7-T04|
+|REQ-047|自定义与升级|M3|required|v1|detailed|AC-047-01（TEST-047-01·integration·M3-T03）<br>AC-047-02（TEST-047-02·tui-pty·M3-T03）<br>AC-047-03（TEST-047-03·deployment·M3-T03）|M3-T01, M3-T03, M3-T05, M7-T04|
 |REQ-048|Smart Compact集成|M5|degradable|v1|outline|AC-048-01（TEST-048-01·plugin-live·M5-T03）|M5-T01, M5-T03, M5-T04, M7-T04|
 |REQ-049|Hermes Memory集成|M5|degradable|v1|outline|AC-049-01（TEST-049-01·plugin-live·M5-T03）|M5-T01, M5-T03, M5-T04, M7-T04|
 |REQ-050|rpiv Todo集成|M5|degradable|v1|outline|AC-050-01（TEST-050-01·plugin-live·M5-T03）|M5-T01, M5-T03, M5-T04, M7-T04|
@@ -75,4 +75,4 @@
 |REQ-069|交付真实性|M7|required|v1|outline|AC-069-01（TEST-069-01·traceability·M7-T02）|M7-T01, M7-T02, M7-T04|
 |REQ-070|长期维护与升级|M7|required|v1|outline|AC-070-01（TEST-070-01·deployment·M7-T02）|M7-T01, M7-T02, M7-T04|
 
-合计：70 项需求（27 项 detailed），169 条验收。v0.1 范围：18 项需求。
+合计：70 项需求（43 项 detailed），214 条验收。v0.1 范围：18 项需求。

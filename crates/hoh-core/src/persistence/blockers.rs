@@ -34,9 +34,10 @@ pub(super) fn precedence(reason: BlockedReason) -> u8 {
     }
 }
 
-/// Order reasons by precedence (then by name), each once.
+/// Order reasons by precedence (then by name), each once; a reason that never blocks a run
+/// ([`BlockedReason::blocks_run`]) is left out, so no run-level set or claim holds one.
 pub(super) fn ordered(reasons: impl IntoIterator<Item = BlockedReason>) -> Vec<BlockedReason> {
-    let mut reasons: Vec<BlockedReason> = reasons.into_iter().collect();
+    let mut reasons: Vec<BlockedReason> = reasons.into_iter().filter(|r| r.blocks_run()).collect();
     reasons.sort_by_key(|r| (precedence(*r), r.as_str()));
     reasons.dedup();
     reasons
@@ -70,12 +71,15 @@ impl Claims {
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        let stored = ordered(
-            serde_json::from_str::<Vec<String>>(&stored)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|r| BlockedReason::parse(r)),
-        );
+        // The row's set as it is, a reason that never blocks a run included, so a row holding one differs from the
+        // claims' set and is written back without it (M3A-150).
+        let mut stored: Vec<BlockedReason> = serde_json::from_str::<Vec<String>>(&stored)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| BlockedReason::parse(r))
+            .collect();
+        stored.sort_by_key(|r| (precedence(*r), r.as_str()));
+        stored.dedup();
         // The latest claim event carries the open claims after it and its number (docs/adr/ADR-025.md v20,
         // M2T08R-403): two index lookups, not the run's whole claim history.
         let mut latest: Option<(i64, String)> = None;
@@ -97,6 +101,18 @@ impl Claims {
                 PersistError::IntegrityViolation(format!("a claim event of {run_id}: {e}"))
             })?;
             if let (Some(open), Some(n)) = (payload["open"].as_array(), payload["n"].as_u64()) {
+                // The event's own claim is checked as a replayed one is (M3A-151).
+                if payload["source"].as_str().is_none()
+                    || payload["reason"]
+                        .as_str()
+                        .and_then(BlockedReason::parse)
+                        .filter(|r| r.blocks_run())
+                        .is_none()
+                {
+                    return Err(PersistError::IntegrityViolation(format!(
+                        "a claim event of {run_id} names no source or no reason that blocks a run: {payload}"
+                    )));
+                }
                 let mut claims = Claims {
                     project_id: project_id.to_owned(),
                     run_id: run_id.to_owned(),
@@ -108,10 +124,13 @@ impl Claims {
                 for pair in open {
                     let (Some(source), Some(reason)) = (
                         pair[0].as_str(),
-                        pair[1].as_str().and_then(BlockedReason::parse),
+                        pair[1]
+                            .as_str()
+                            .and_then(BlockedReason::parse)
+                            .filter(|r| r.blocks_run()),
                     ) else {
                         return Err(PersistError::IntegrityViolation(format!(
-                            "a claim snapshot of {run_id} names no source or reason: {pair}"
+                            "a claim snapshot of {run_id} names no source or no reason that blocks a run: {pair}"
                         )));
                     };
                     claims.open.insert((source.to_owned(), reason));
@@ -146,10 +165,13 @@ impl Claims {
             })?;
             let (Some(source), Some(reason)) = (
                 payload["source"].as_str(),
-                payload["reason"].as_str().and_then(BlockedReason::parse),
+                payload["reason"]
+                    .as_str()
+                    .and_then(BlockedReason::parse)
+                    .filter(|r| r.blocks_run()),
             ) else {
                 return Err(PersistError::IntegrityViolation(format!(
-                    "a claim event of {run_id} names no source or reason: {payload}"
+                    "a claim event of {run_id} names no source or no reason that blocks a run: {payload}"
                 )));
             };
             let claim = (source.to_owned(), reason);
@@ -160,7 +182,7 @@ impl Claims {
             }
         }
         if rows.is_empty() {
-            for reason in claims.stored.clone() {
+            for reason in ordered(claims.stored.clone()) {
                 let source = if reason == BlockedReason::BudgetUnenforceable {
                     BUDGET
                 } else {
