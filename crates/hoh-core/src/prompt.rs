@@ -98,9 +98,24 @@ pub fn resolve(mut sources: Vec<Contract>) -> Result<Resolved, Error> {
     {
         return Err(unavailable("duplicate override layer"));
     }
+    let mut conflicts = Vec::new();
+    sources.retain(|source| {
+        let conflict = source.layer != "builtin"
+            && source.text.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix("```hoh-evidence")
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            });
+        if conflict {
+            conflicts.push(json!({"layer": "evidence", "conflict": "cross_layer",
+                "source_layer": source.layer, "path": source.path,
+                "sha256": crate::context::sha256_hex(source.text.as_bytes())}));
+        }
+        !conflict
+    });
     let resolved = Resolved {
         chain: sources,
-        conflicts: Vec::new(),
+        conflicts,
     };
     validate_variables(&resolved.effective()?.text)?;
     Ok(resolved)
