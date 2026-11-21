@@ -56,6 +56,58 @@ async fn first_line(p: &mut Process) -> Result<String, Box<dyn std::error::Error
     }
 }
 
+/// M2QA-001: SIGQUIT can also be caught in each child; inherited SIGHUP/SIGTERM policy is left alone.
+#[tokio::test]
+async fn inherited_quit_is_catchable_without_changing_hup_or_term() -> R {
+    const CHILD: &str = "HOH_TEST_INHERITED_QUIT";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new("python3")
+            .args([
+                "-c",
+                "import os, signal, sys\n\
+                 for sig in [signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM]: signal.signal(sig, signal.SIG_IGN)\n\
+                 os.execv(sys.argv[1], sys.argv[1:])",
+            ])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "inherited_quit_is_catchable_without_changing_hup_or_term",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "inherited dispositions: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return Ok(());
+    }
+    let existing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, existing.clone())?;
+    // A shell cannot install a trap for a signal ignored at entry. HUP/TERM must still be ignored, while QUIT's
+    // trap must run (exit 9 is the failure). Exercise both the first and a subsequent spawn in this fresh process.
+    for _ in 0..2 {
+        let mut process = Process::spawn(
+            sh("trap 'echo quit; exit 0' QUIT; kill -HUP $$; kill -TERM $$; kill -QUIT $$; exit 9"),
+            Config::default(),
+            &hoh_core::spawn::Direct::plain(),
+        )?;
+        let (frames, report) = until_exit(&mut process, Duration::from_secs(10)).await?;
+        assert_eq!(report.status, Some(Termination::Code(0)), "{report:?}");
+        assert_eq!(frames, vec![Frame::Line(b"quit".to_vec())]);
+        assert!(report.group_reaped);
+    }
+    // A parent with no existing QUIT handler survives it; an existing INT handler still runs alongside the new flag.
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT)?;
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::QUIT)?;
+    assert!(existing.load(std::sync::atomic::Ordering::SeqCst));
+    Ok(())
+}
+
 #[tokio::test]
 async fn orphans_left_in_the_group_are_killed_when_the_leader_exits() -> R {
     // The grandchild keeps stdout open: without the group kill the stream would never end.

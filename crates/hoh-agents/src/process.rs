@@ -23,6 +23,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock, atomic::AtomicBool};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
@@ -238,6 +239,25 @@ pub(crate) trait FakeEvents: Send + Sync + std::fmt::Debug {
     fn next(&mut self) -> Pin<Box<dyn std::future::Future<Output = Option<Event>> + Send + '_>>;
 }
 
+/// Caught dispositions become SIG_DFL on exec; SIG_IGN survives it and even prevents a shell from installing a
+/// trap. A background starter can ignore INT/QUIT, so make them caught before any agent turn starts (M2QA-001).
+/// The flags live with the registrations for the process lifetime. Existing host/client handlers are chained;
+/// HUP/TERM policy belongs to those owners, and Rust's Command already resets PIPE (ADR-021, 2026-11-21).
+fn prepare_child_signals() -> io::Result<()> {
+    static REGISTERED: OnceLock<io::Result<()>> = OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            let received = Arc::new(AtomicBool::new(false));
+            for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+                signal_hook::flag::register(signal, Arc::clone(&received))?;
+            }
+            Ok(())
+        })
+        .as_ref()
+        .copied()
+        .map_err(|error| io::Error::new(error.kind(), format!("agent signal handlers: {error}")))
+}
+
 impl Process {
     /// Start `command` with piped stdio in a new process group, through `spawner` (docs/adr/ADR-031.md, 设计修正 2:
     /// the host's direct spawner or a client's gate). Must be called within a Tokio runtime with IO and time enabled.
@@ -246,6 +266,7 @@ impl Process {
         config: Config,
         spawner: &dyn hoh_core::spawn::Spawner,
     ) -> io::Result<Process> {
+        prepare_child_signals()?;
         // The copies exist before the child does, so a file that cannot be created starts nothing.
         let create = |path: &Option<PathBuf>| path.as_ref().map(std::fs::File::create).transpose();
         let stdout_copy = create(&config.stdout_copy)?;

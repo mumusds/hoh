@@ -844,6 +844,34 @@ async fn a_frame_too_large_ends_the_turn() -> R {
     Ok(())
 }
 
+/// M2QA-001: run the same assertion in a fresh process whose parent ignored SIGINT, as a background shell job does.
+/// Changing this test process's own disposition would race other tests and miss initialization before the first spawn.
+#[test]
+fn a_deadline_still_interrupts_when_the_parent_ignored_sigint() -> R {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_IGN); \
+             signal.signal(signal.SIGQUIT, signal.SIG_IGN); os.execv(sys.argv[1], sys.argv[1:])",
+        ])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "a_deadline_is_a_failure_even_after_a_success_frame",
+            "--nocapture",
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "deadline with inherited SIG_IGN: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    Ok(())
+}
+
 /// The deadline is a failure even if the interrupted child then reports success (M1T03R-05).
 #[tokio::test]
 async fn a_deadline_is_a_failure_even_after_a_success_frame() -> R {
