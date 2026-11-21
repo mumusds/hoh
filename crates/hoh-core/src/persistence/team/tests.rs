@@ -3189,3 +3189,79 @@ async fn a_handover_package_whose_epoch_was_passed_before_delivery_is_rejected()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_047_03_start_run_pins_bundle_for_every_role() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t03-pin-").tempdir()?;
+    let (store, path) = open(&dir)?;
+    store
+        .submit_command(start("R-resource", Config::default().budget))
+        .await?;
+    let pins = rows::<String>(
+        &path,
+        "SELECT json_extract(payload_json, '$.role') FROM events WHERE kind = 'resource.pinned' ORDER BY json_extract(payload_json, '$.role')",
+    )?;
+    assert_eq!(
+        pins,
+        Config::default()
+            .team
+            .keys()
+            .map(|role| vec![role.clone()])
+            .collect::<Vec<_>>(),
+        "StartRun must pin the bytes, not only the team config"
+    );
+    drop(store);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_047_03_start_run_failure_keeps_pins_unpublished() -> R {
+    use std::sync::{Arc, atomic::Ordering};
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-start-rollback-")
+        .tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let faults = Arc::new(FailingCommits::default());
+    let store = Store::open(
+        &path,
+        Options {
+            faults: faults.clone(),
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    exec(
+        &path,
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES ('p1','/unused','now');",
+    )?;
+    faults.0.store(true, Ordering::SeqCst);
+    assert!(
+        store
+            .submit_command(start("R-pin-failure", Config::default().budget))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        rows::<i64>(&path, "SELECT count(*) FROM runs")?,
+        vec![vec![0]]
+    );
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM events WHERE kind='resource.pinned'"
+        )?,
+        vec![vec![0]]
+    );
+    faults.0.store(false, Ordering::SeqCst);
+    store
+        .submit_command(start("R-pin-failure", Config::default().budget))
+        .await?;
+    assert_eq!(
+        rows::<i64>(
+            &path,
+            "SELECT count(*) FROM events WHERE kind='resource.pinned'"
+        )?,
+        vec![vec![6]]
+    );
+    Ok(())
+}

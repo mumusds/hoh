@@ -15,6 +15,7 @@ fn work(prompt: Option<&str>) -> Work {
         effect_key: "k".to_owned(),
         assignment: Assignment {
             context_seq: 0,
+            resource_bundle: None,
             agent: Some("claude".to_owned()),
             model: None,
             role_epoch: 1,
@@ -1436,6 +1437,76 @@ async fn a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_
     assert_eq!(
         (refusal.reason.as_str(), refusal.class),
         ("BLOCKED_CAPABILITY", FailureClass::Capability)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_047_03_packing_uses_the_attempt_pin_not_the_current_binary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-pack-pin-")
+        .tempdir()?;
+    let mut old = hoh_core::resource_bundle::Bundle::current();
+    old.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "old developer\n".to_owned(),
+    );
+    let mut w = work(None);
+    w.assignment.resource_bundle = Some(old.store(dir.path())?);
+    let (_, record) = executor(dir.path())
+        .pack(&w, &contract("old developer\n"), None)
+        .map_err(|r| r.reason)?;
+    assert_eq!(
+        record.packed.ok_or("no packing")?.resource_bundle_version,
+        old.version()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::Builder::new().prefix("m3t03-drift-").tempdir()?;
+    let mut old = hoh_core::resource_bundle::Bundle::current();
+    old.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "old developer\n".to_owned(),
+    );
+    hoh_core::prompt_files::save_override_based_on(
+        dir.path(),
+        ".hoh/prompts/developer.md",
+        "custom developer\n",
+        "developer",
+        &old,
+    )?;
+    let resolved = hoh_core::prompt_files::load(dir.path(), None, "R1", "developer", None)?;
+    let (_, record) = executor(dir.path())
+        .pack(&work(None), &resolved, None)
+        .map_err(|r| r.reason)?;
+    let packing = record.packed.ok_or("no packing")?;
+    assert!(
+        packing.event["resource_drift"].is_array(),
+        "drift is absent: {}",
+        packing.event
+    );
+    let reports = packing.event["resource_drift"].as_array().unwrap();
+    assert_eq!(reports.len(), 1);
+    let sha = reports[0]["sha256"].as_str().ok_or("drift sha")?;
+    let report: serde_json::Value =
+        serde_json::from_slice(&hoh_core::objects::get(dir.path(), sha)?)?;
+    assert_eq!(
+        report["diff"],
+        hoh_core::prompt::three_way_diff(
+            "old developer\n",
+            hoh_core::config::builtin_contract("developer").unwrap(),
+            "custom developer\n"
+        )
+    );
+    assert!(
+        packing
+            .artifacts
+            .iter()
+            .any(|a| a.sha256 == sha && a.kind == "resource_drift")
     );
     Ok(())
 }

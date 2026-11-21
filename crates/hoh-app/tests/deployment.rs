@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 
 mod installed;
+mod pty;
+mod resource_deployment;
+mod world;
 
 use installed::{Manager, R};
 use serde_json::{Value, json};

@@ -85,3 +85,6 @@ pub mod verification;
 
 /// Crate version, reported by the `hoh` binary for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[forbid(clippy::disallowed_methods)]
+pub mod resource_bundle;

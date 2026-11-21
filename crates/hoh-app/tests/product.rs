@@ -2913,11 +2913,13 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
             state.queued_input_ids,
             ids(format!("SELECT input_id AS id FROM input_queue WHERE run_id = '{run_id}' AND state = 'QUEUED'"))?
         );
+        // Compare the checkpoint snapshot to messages that already existed then. A new Commander's dispatch can
+        // be queued after the handoff was prepared and before this reader runs; it is not part of the package.
         assert_eq!(
             state.unacked_message_ids,
             ids(format!(
                 "SELECT message_id AS id FROM outbox WHERE run_id = '{run_id}' AND state <> 'ACKED' \
-                 AND message_id <> '{}'",
+                 AND event_seq < (SELECT event_seq FROM outbox WHERE message_id = '{}')",
                 input["message_id"].as_str().ok_or("no message id")?
             ))?
         );

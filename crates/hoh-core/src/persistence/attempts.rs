@@ -359,6 +359,9 @@ pub(super) fn insert_prepared(tx: &Transaction<'_>, a: &NewAttempt) -> Result<()
         params![a.attempt_id, a.task_id, a.session_id, a.role_epoch, a.host_epoch, a.config_revision, a.agent],
     )
     .map_err(sqlite_error)?;
+    // Bind at PREPARED, inside the dispatch transaction: a concurrent checkpoint either sees this attempt or
+    // commits first, in which case this attempt observes its new pin.
+    tx.execute("UPDATE attempts SET resource_bundle_version = (SELECT json_extract(e.payload_json, '$.resource_bundle_version') FROM events e JOIN tasks t ON t.run_id = e.run_id WHERE t.task_id = ?2 AND e.kind = 'resource.pinned' AND json_extract(e.payload_json, '$.role') = t.role ORDER BY e.seq DESC LIMIT 1) WHERE attempt_id = ?1", params![a.attempt_id, a.task_id]).map_err(sqlite_error)?;
     Ok(())
 }
 

@@ -139,7 +139,19 @@ async fn a_started_run_adopts_the_projects_latest_approved_specification_and_wak
         json!(["CREATED", 0, "s2", null, null, []])
     );
     let written = events(&path, "R", 0)?;
-    assert_eq!(kinds(&written), ["run.created", "spec.changed"]);
+    assert_eq!(
+        kinds(&written),
+        [
+            "run.created",
+            "spec.changed",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned"
+        ]
+    );
     assert_eq!(written[1].3, adopted("R", "s2", 2, 2));
     let wake = crate::supervise::classify(
         crate::supervise::Policy::Efficient,
@@ -193,6 +205,12 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
         kinds(&written),
         [
             "run.created",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
+            "resource.pinned",
             "run.blocker_claimed",
             "question.asked",
             "run.blocked",
@@ -200,10 +218,10 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
         ]
     );
     assert_eq!(
-        (&written[1].3["source"], &written[1].3["reason"]),
+        (&written[7].3["source"], &written[7].3["reason"]),
         (&json!("runtime:no_spec"), &json!("NEED_DECISION"))
     );
-    let question = &written[2];
+    let question = &written[8];
     assert_eq!(question.3["question_id"], json!(question.1));
     assert_eq!(question.3["reason"], "no_spec");
     assert_eq!(question.3["choices"], json!(["adopt"]));
@@ -214,7 +232,7 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
         "{}",
         question.3
     );
-    let result = &written[4].3;
+    let result = &written[10].3;
     assert_eq!(
         (
             &result["state"],
@@ -223,11 +241,11 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
         ),
         (&json!("BLOCKED"), &json!("NEED_DECISION"), &json!(3))
     );
-    assert_eq!(result["last_event_seq"], json!(written[4].0));
+    assert_eq!(result["last_event_seq"], json!(written[10].0));
     let last: i64 =
         Connection::open(&path)?.query_row("SELECT max(seq) FROM events", [], |r| r.get(0))?;
     assert_eq!(
-        last, written[4].0,
+        last, written[10].0,
         "the run.result is the commit's last event"
     );
     // The same command again: the stored body.

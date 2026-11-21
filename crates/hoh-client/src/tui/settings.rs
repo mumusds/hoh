@@ -33,12 +33,40 @@ impl Settings {
             .find(|c| c.layer == "builtin")
             .ok_or_else(|| prompt::unavailable("该职位没有内置默认契约"))?;
         let effective = resolved.effective()?;
+        let reports = prompt_files::drift_reports(
+            root,
+            &resolved,
+            &hoh_core::resource_bundle::Bundle::current(),
+        )?;
+        let mut diff =
+            prompt::unified_diff(&builtin.text, &effective.text, "builtin", effective.layer);
+        for report in &reports {
+            diff.push_str(&format!(
+                "\n覆盖漂移：{}\n",
+                report["path"].as_str().unwrap_or_default()
+            ));
+            if report["base_status"] == "known" {
+                for name in ["builtin", "override"] {
+                    diff.push_str(report["diff"][name].as_str().unwrap_or_default());
+                }
+            } else {
+                diff.push_str("基准缺失或与覆盖不匹配，旧内置未知；仅显示当前内置对照。\n");
+                diff.push_str(report["current_diff"].as_str().unwrap_or_default());
+            }
+        }
         Ok(Self {
             role: role.to_owned(),
             configured,
-            diff: prompt::unified_diff(&builtin.text, &effective.text, "builtin", effective.layer),
+            diff,
             scroll: 0,
-            notice: "↑↓ / PgUp PgDn 浏览 · r 恢复默认（删除 project 覆盖）· Esc 返回".to_owned(),
+            notice: format!(
+                "{}↑↓ / PgUp PgDn 浏览 · r 恢复默认（删除 project 覆盖）· Esc 返回",
+                if reports.is_empty() {
+                    ""
+                } else {
+                    "覆盖漂移；三方对照见 diff 末尾。"
+                }
+            ),
         })
     }
 

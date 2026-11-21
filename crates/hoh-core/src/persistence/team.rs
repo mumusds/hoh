@@ -585,9 +585,18 @@ pub(super) fn checkpoint(
     };
     let now = crate::time::now_rfc3339();
     let bindings = bound(&tx, run_id, None)?;
-    let mut events = Vec::new();
+    let mut events = super::resources::events(
+        &tx,
+        &project_id,
+        run_id,
+        bindings
+            .iter()
+            .filter(|b| !live.contains(&b.role))
+            .map(|b| b.role.clone()),
+        ctx.resource_bundle,
+    )?;
     let mut outbox = Vec::new();
-    let mut changed = false;
+    let mut changed = !events.is_empty();
     let mut behind = false;
     let applied = |role: &str, epoch: i64, from: serde_json::Value, to: serde_json::Value| {
         super::writer::NewEvent {
@@ -755,6 +764,13 @@ pub(super) fn checkpoint(
         .map_err(sqlite_error)?;
         let to =
             serde_json::json!({"agent": role.agent.as_str(), "model": role.model, "role_epoch": 1});
+        events.extend(super::resources::events(
+            &tx,
+            &project_id,
+            run_id,
+            [name.clone()],
+            ctx.resource_bundle,
+        )?);
         events.push(applied(name, 1, serde_json::Value::Null, to));
     }
     if !behind && run_revision < revision {
@@ -804,6 +820,8 @@ pub struct Assignment {
     /// The store's event watermark when this assignment (and its context) was read: an event after it was not seen
     /// by the turn's prompt (docs/adr/ADR-028.md decision 3, M2T16R-01).
     pub context_seq: i64,
+    /// Immutable resource pin selected when the attempt was prepared.
+    pub resource_bundle: Option<crate::resource_bundle::Pin>,
     pub agent: Option<String>,
     pub model: Option<String>,
     pub role_epoch: i64,
@@ -876,6 +894,7 @@ pub(super) fn assignment(
             |r| {
                 Ok(Assignment {
                     context_seq,
+                    resource_bundle: None,
                     agent: r.get(0)?,
                     model: r.get(1)?,
                     role_epoch: r.get(2)?,
@@ -906,6 +925,19 @@ pub(super) fn assignment(
             ..Assignment::default()
         });
     };
+    let version: Option<String> = conn
+        .query_row(
+            "SELECT resource_bundle_version FROM attempts WHERE attempt_id = ?1",
+            [attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    assignment.resource_bundle = super::resources::latest(conn, run_id, role, version.as_deref())?;
+    if version.is_some() && assignment.resource_bundle.is_none() {
+        return Err(PersistError::IntegrityViolation(
+            "attempt resource pin is missing".to_owned(),
+        ));
+    }
     assignment.prompt = at_revision(conn, project_id, assignment.config_revision)?
         .and_then(|config| config.team.get(role).and_then(|r| r.prompt.clone()));
     if let Some(session) = &assignment.session_id {

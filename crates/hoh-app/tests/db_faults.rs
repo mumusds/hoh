@@ -217,6 +217,26 @@ impl Project {
         }
         Ok(last)
     }
+
+    /// These empty-agent StartRun fixtures are ready for a fault only after every staffing failure has reached
+    /// the supervisor. A quiet interval can fall inside its debounce window; observe the completed events instead.
+    fn staffing_deferred(&self) -> R {
+        let end = Instant::now() + LIMIT;
+        loop {
+            let done = self.sql(
+                "SELECT count(*) FROM events blocked WHERE blocked.kind = 'team.binding_blocked' AND EXISTS \
+                 (SELECT 1 FROM events deferred, json_each(deferred.payload_json, '$.event_seqs') source \
+                  WHERE deferred.kind = 'supervisor.deferred' AND source.value = blocked.seq)",
+            )?;
+            if done == "6" {
+                return Ok(());
+            }
+            if Instant::now() > end {
+                return Err(format!("staffing deferred barrier: {done}/6 roles completed").into());
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 impl Drop for Project {
@@ -1011,6 +1031,7 @@ fn full_a_commands_commit_that_fails_for_quota_is_db_full_and_writes_nothing() -
         }
         let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        project.staffing_deferred()?;
         let before = project.quiet_dump()?;
         std::fs::write(&arm, "")?;
         let out = project.submit("second")?;
@@ -1064,6 +1085,7 @@ fn full_a_commands_commit_over_quota_whose_room_probe_stays_says_db_full_and_log
     not_root()?;
     let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    project.staffing_deferred()?;
     let before = project.quiet_dump()?;
     let run_id = project.sql("SELECT run_id FROM runs")?;
     let revision: i64 = project.sql("SELECT revision FROM runs")?.parse()?;
