@@ -354,8 +354,12 @@ impl Host {
             })
         })?;
         // HoH's own state, kept out of git (docs/adr/ADR-027.md decision 3).
-        hoh_core::state_dir::ensure(&files)
-            .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?;
+        if let Some(diagnostic) = hoh_core::state_dir::ensure(&files)
+            .map_err(|e| StartError::other(format!("cannot make {}: {e}", files.display())))?
+        {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "hoh host: {diagnostic}; continuing");
+        }
         let lock = take_lock(&files)?;
         let store = Store::open_with_mountinfo(
             &files.join("state.db"),
@@ -452,7 +456,7 @@ impl Host {
             .port();
         let token = token()?;
         remove_stale_socket(&socket)?;
-        let unix = tokio::net::UnixListener::bind(&socket)
+        let unix = bind_socket(&socket)
             .map_err(|e| StartError::other(format!("cannot bind {}: {e}", socket.display())))?;
         let mut host_files = HostFiles {
             files: files.clone(),
@@ -468,6 +472,12 @@ impl Host {
             )));
         }
         set_mode(&socket, 0o600)?;
+        listen_socket(&unix).map_err(|e| StartError::other(e.to_string()))?;
+        let unix = std::os::unix::net::UnixListener::from(unix);
+        unix.set_nonblocking(true)
+            .map_err(|e| StartError::other(e.to_string()))?;
+        let unix = tokio::net::UnixListener::from_std(unix)
+            .map_err(|e| StartError::other(e.to_string()))?;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         // Whether its attempts get cgroups of their own, or why not (decision 8d, M2T06R-557).
         let delegated = if config.hooks.cgroups_allowed() {
@@ -898,6 +908,27 @@ fn remove_stale_socket(path: &Path) -> Result<(), StartError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(StartError::other(format!("{}: {e}", path.display()))),
     }
+}
+
+/// Keep the Linux platform default used by std/mio: the kernel caps -1 at somaxconn (CLN2-52).
+fn listen_socket(socket: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    Ok(rustix::net::listen(socket, -1)?)
+}
+
+/// On Linux, bind takes its pathname's permissions from the socket inode, restricted further by umask. Set that
+/// inode's mode before bind so the name is private from its first visibility (M2T12R-08); no process-wide umask change.
+/// Listening happens only after the caller arms its file guard, so a later failure removes the bound name too.
+fn bind_socket(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )?;
+    rustix::fs::fchmod(&socket, rustix::fs::Mode::from_raw_mode(0o600))?;
+    rustix::net::bind(&socket, &SocketAddrUnix::new(path)?)?;
+    Ok(socket)
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), StartError> {

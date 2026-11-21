@@ -339,10 +339,19 @@ pub enum Presence {
 /// What a record names now: [`find`], and for a leader that is gone, whether its number is free ([`number_free`]: no
 /// process uses it as its pid or as its group, by the kernel's answers, M2T06R-700, -800).
 pub fn presence(pid: Option<i64>, boot: Option<&str>, start: Option<&str>) -> io::Result<Presence> {
+    presence_with(pid, boot, start, || find(pid, boot, start))
+}
+
+fn presence_with(
+    pid: Option<i64>,
+    boot: Option<&str>,
+    start: Option<&str>,
+    inspect: impl FnOnce() -> io::Result<Result<Found, Gone>>,
+) -> io::Result<Presence> {
     if pid.is_some() && (boot.is_none() || start.is_none()) {
         return Ok(Presence::Unverifiable);
     }
-    Ok(match find(pid, boot, start)? {
+    Ok(match inspect()? {
         Ok(found) => Presence::Ours(found),
         Err(Gone::NoProcess) => {
             let pgid = pid.and_then(|p| u32::try_from(p).ok()).unwrap_or(0);
@@ -523,6 +532,19 @@ fn find_with(
     start: Option<&str>,
     read_start: impl FnOnce(u32) -> io::Result<Option<String>>,
 ) -> io::Result<Result<Found, Gone>> {
+    find_with_open(pid, boot, start, read_start, |pid| {
+        pidfd_open(pid, PidfdFlags::empty())
+    })
+}
+
+/// The kernel lookup is injectable too: resource/permission errors must remain inspection failures (M2T05R-750).
+fn find_with_open(
+    pid: Option<i64>,
+    boot: Option<&str>,
+    start: Option<&str>,
+    read_start: impl FnOnce(u32) -> io::Result<Option<String>>,
+    open_pidfd: impl FnOnce(Pid) -> rustix::io::Result<OwnedFd>,
+) -> io::Result<Result<Found, Gone>> {
     let Some(pid) = pid.and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0) else {
         return Ok(Err(Gone::NoPid));
     };
@@ -537,7 +559,7 @@ fn find_with(
         return Ok(Err(Gone::NoPid));
     };
     // The pidfd first: from here on it names one process, whatever happens to the pid.
-    let pidfd = match pidfd_open(raw, PidfdFlags::empty()) {
+    let pidfd = match open_pidfd(raw) {
         Ok(fd) => fd,
         Err(e) if no_process(e) => return Ok(Err(Gone::NoProcess)),
         Err(e) => return Err(e.into()),
@@ -704,6 +726,55 @@ impl Found {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pidfd_resource_error_fails_find_and_presence_instead_of_proving_absence() -> io::Result<()>
+    {
+        let pid = Some(i64::from(std::process::id()));
+        let boot = boot_id()?;
+        for error in [
+            rustix::io::Errno::MFILE,
+            rustix::io::Errno::NOMEM,
+            rustix::io::Errno::PERM,
+        ] {
+            let inspect = || {
+                find_with_open(
+                    pid,
+                    Some(&boot),
+                    Some("1"),
+                    |_| panic!("a failed pidfd lookup must not read the start time"),
+                    |_| Err(error),
+                )
+            };
+            assert_eq!(
+                inspect().expect_err("cannot inspect").raw_os_error(),
+                Some(error.raw_os_error())
+            );
+            assert_eq!(
+                presence_with(pid, Some(&boot), Some("1"), inspect)
+                    .expect_err("cannot inspect")
+                    .raw_os_error(),
+                Some(error.raw_os_error())
+            );
+        }
+        for error in [
+            rustix::io::Errno::SRCH,
+            rustix::io::Errno::INVAL,
+            rustix::io::Errno::NOENT,
+        ] {
+            assert!(matches!(
+                find_with_open(
+                    pid,
+                    Some(&boot),
+                    Some("1"),
+                    |_| panic!("no process"),
+                    |_| Err(error)
+                )?,
+                Err(Gone::NoProcess)
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn this_process_is_itself_and_any_other_record_names_another() -> io::Result<()> {

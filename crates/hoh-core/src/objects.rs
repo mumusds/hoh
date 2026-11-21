@@ -77,7 +77,10 @@ pub fn put(project: &Path, bytes: &[u8]) -> Result<String, String> {
 /// The project's `.hoh/`, made with its `.gitignore` before an object goes under it (docs/adr/ADR-027.md decision 3).
 fn state_dir(project: &Path) -> Result<(), String> {
     let top = project.join(".hoh");
-    crate::state_dir::ensure(&top).map_err(|e| format!("{}: {e}", top.display()))
+    // Object writes depend on access, not on best-effort legacy mode hardening (diagnosed at host startup).
+    crate::state_dir::ensure(&top)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", top.display()))
 }
 
 /// [`put`] with `sync_dir` syncing a directory: the object's own directory once its link is made (or found), then

@@ -524,8 +524,12 @@ impl App {
         }
         let text = self.editor.take();
         self.browsing = None;
-        if let Err(e) = self.history.append(&text) {
-            self.messages.push(format!("输入历史未能保存：{e}"));
+        match self.history.append(&text) {
+            Err(e) => self.messages.push(format!("输入历史未能保存：{e}")),
+            Ok(Some(diagnostic)) => self
+                .messages
+                .push(format!("项目状态目录的权限未能收紧：{diagnostic}")),
+            Ok(None) => {}
         }
         self.messages.push(format!("你：{text}"));
         // Attached, or a run being started: input of that run (an Enter after the one that starts a run, before the

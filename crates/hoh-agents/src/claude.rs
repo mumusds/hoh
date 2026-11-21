@@ -503,8 +503,7 @@ pub async fn run(
             resolved_model: driven.model.clone(),
             failure_reason: failure.clone(),
             cancel_requested: Some(driven.cancelled),
-            usage: driven.usage.clone(),
-            cost_usd: driven.cost,
+            usage: usage_with_estimate(driven.usage.clone(), driven.cost),
             ..AttemptFacts::default()
         },
         cancel,
@@ -529,6 +528,18 @@ pub async fn run(
         max_buffered: driven.report.as_ref().map(|r| r.stdout.max_buffered),
         steps: driven.report.map(|r| r.steps).unwrap_or_default(),
     })
+}
+
+/// Claude's estimate is diagnostic usage, never a priced attempt cost (ADR-020, M2T19R-64).
+fn usage_with_estimate(usage: Option<Value>, cost: Option<f64>) -> Option<Value> {
+    match (usage, cost) {
+        (Some(Value::Object(mut usage)), Some(cost)) => {
+            usage.insert("reported_cost_usd".to_owned(), json!(cost));
+            Some(Value::Object(usage))
+        }
+        (None, Some(cost)) => Some(json!({"reported_cost_usd": cost})),
+        (usage, _) => usage,
+    }
 }
 
 /// The process settings of `turn`: its escalation, its deadline and its raw logs.
@@ -622,15 +633,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         {
             return observer.refused(refused);
         }
-        // Claude's own cost estimate goes with the usage, never as the run's cost (ADR-020, M2T07R-256).
-        let usage = match (driven.usage, driven.cost) {
-            (Some(Value::Object(mut usage)), Some(cost)) => {
-                usage.insert("reported_cost_usd".to_owned(), json!(cost));
-                Some(Value::Object(usage))
-            }
-            (None, Some(cost)) => Some(json!({"reported_cost_usd": cost})),
-            (usage, _) => usage,
-        };
+        let usage = usage_with_estimate(driven.usage, driven.cost);
         Facts {
             state,
             failure,
