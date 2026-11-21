@@ -43,7 +43,7 @@ Usage: python3 tests/fixtures/commander-readonly/judge_check.py [--excerpts DIR]
 Exit 1 on any defect (an excerpt/raw difference, a non-PASS-expected variant that PASSes, a changed invariant).
 """
 from __future__ import annotations
-import argparse, copy, hashlib, json, re, sys, tomllib
+import argparse, copy, hashlib, json, math, re, sys, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -151,6 +151,42 @@ class Case:
         return self.paths[head] + ('/' + tail if tail else '')
 
 
+def _json_loads(text: str):
+    """The prototype's JSON boundary: serde_json's default finite numbers and 127-container depth.
+
+    Scan the structural depth before decoding so even Python's recursion limit cannot escape as a crash.
+    Quotes and escaped quotes do not count as containers. Rust remains the authoritative judge.
+    """
+    depth, quoted, escaped = 0, False, False
+    for ch in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                quoted = False
+        elif ch == '"':
+            quoted = True
+        elif ch in '[{':
+            depth += 1
+            if depth >= 128:
+                raise ValueError('JSON recursion limit exceeded')
+        elif ch in ']}':
+            depth -= 1
+    def finite(raw):
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError('JSON number out of range')
+        return value
+    def integer(raw):
+        value = int(raw)
+        return value if -(2**63) <= value <= 2**64-1 else finite(raw)
+    def constant(raw):
+        raise ValueError(f'non-JSON constant: {raw}')
+    return json.loads(text, parse_float=finite, parse_int=integer, parse_constant=constant)
+
+
 def json_lines(text: str, source: str, problems: list[str]) -> list[dict]:
     """LF-delimited JSON, matching serde: do not silently lose a line or accept lone surrogates."""
     out = []
@@ -159,7 +195,7 @@ def json_lines(text: str, source: str, problems: list[str]) -> list[dict]:
         lines.pop()
     for number, line in enumerate(lines, 1):
         try:
-            f = json.loads(line)
+            f = _json_loads(line)
             # Check decoded keys and nested strings too; a valid surrogate pair decodes to one scalar.
             json.dumps(f, ensure_ascii=False).encode('utf-8')
         except (ValueError, UnicodeEncodeError):
@@ -180,14 +216,14 @@ def _raw_observations(raw_dir: Path, raw_meta: dict, agent: str) -> dict:
     observations = raw_meta.get('observations') or {
         'exit': {'returncode': raw_meta['exit_code'], 'how': raw_meta['stopped']}, 'logs_complete': raw_meta['stopped'] == 'exited'}
     if 'version' not in observations:
-        observations = {**observations, 'version': json.loads((raw_dir.parents[1] / 'summary.json').read_text())['versions'][agent]}
+        observations = {**observations, 'version': _json_loads((raw_dir.parents[1] / 'summary.json').read_text())['versions'][agent]}
     return observations
 
 
 def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case | None, str]:
     """The case from its excerpts, and from its raw source when present with the recorded sha256 (else None, why)."""
     base = excerpts / agent
-    meta = json.loads((base / f'{name}.meta.json').read_text())
+    meta = _json_loads((base / f'{name}.meta.json').read_text())
     stdout_text = (base / f'{name}.stdout.excerpt.jsonl').read_bytes().decode('utf-8')
     rollout_path, stdin_path = base / f'{name}.rollout.excerpt.jsonl', base / f'{name}.stdin.excerpt.jsonl'
     rollout_text = rollout_path.read_bytes().decode('utf-8') if rollout_path.is_file() else None
@@ -197,7 +233,7 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
     excerpt = Case(agent, name, 'excerpt', json_lines(stdout_text, 'stdout', problems), json_lines(rollout_text, 'rollout', problems) if rollout_text else None,
                    meta['snapshot_diff'], placeholders, meta['token_sha256'], meta['exit_code'],
                    json_lines(stdin_text, 'stdin', problems) if stdin_text else None, _session_arg(meta['argv']), meta.get('observations'), problems)
-    header = json.loads(stdout_text.split('\n', 1)[0])['_excerpt']
+    header = _json_loads(stdout_text.split('\n', 1)[0])['_excerpt']
     raw_dir = root / Path(header['source']).parent
     raw_stdout = raw_dir / 'stdout.jsonl'
     if not raw_stdout.is_file():
@@ -206,15 +242,15 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
         return excerpt, None, 'raw recording differs from the recorded sha256'
     for text, file in ((rollout_text, 'rollout.jsonl'), (stdin_text, 'stdin.txt')):
         if text:
-            want = json.loads(text.split('\n', 1)[0])['_excerpt']['source_sha256']
+            want = _json_loads(text.split('\n', 1)[0])['_excerpt']['source_sha256']
             if not (raw_dir / file).is_file() or sha256((raw_dir / file).read_bytes()) != want:
                 return excerpt, None, f'raw {file} missing or differs from the recorded sha256'
-    raw_meta = json.loads((raw_dir / 'meta.json').read_text())
+    raw_meta = _json_loads((raw_dir / 'meta.json').read_text())
     inverse = {v.strip('<>'): k for k, v in raw_meta['placeholders'].items()}
     problems = []
     raw = Case(agent, name, 'raw', json_lines(raw_stdout.read_bytes().decode('utf-8'), 'stdout', problems),
                json_lines((raw_dir / 'rollout.jsonl').read_bytes().decode('utf-8'), 'rollout', problems) if rollout_text else None,
-               json.loads((raw_dir / 'snapshot.json').read_text())['diff'], inverse, raw_meta['token_sha256'],
+               _json_loads((raw_dir / 'snapshot.json').read_text())['diff'], inverse, raw_meta['token_sha256'],
                raw_meta['exit_code'], json_lines((raw_dir / 'stdin.txt').read_bytes().decode('utf-8'), 'stdin', problems) if stdin_text else None,
                _session_arg(raw_meta['argv']), _raw_observations(raw_dir, raw_meta, agent), problems)
     return excerpt, raw, ''
@@ -687,7 +723,7 @@ def stream_items(c: Case) -> tuple[list[list[tuple]], list[tuple[str, str]], lis
 
 def _decode(js: str) -> str | None:
     try:
-        v = json.loads(js)
+        v = _json_loads(js)
     except ValueError:
         return None
     return v if isinstance(v, str) else None
@@ -999,7 +1035,7 @@ def code_mode_script(src: str) -> list[tuple] | None:
 def _exec_body(text) -> str | None:
     """An exec_command item: a JSON object with an integer exit_code and a string output; its output."""
     try:
-        body = json.loads(text) if isinstance(text, str) else None
+        body = _json_loads(text) if isinstance(text, str) else None
     except ValueError:
         return None
     if isinstance(body, dict) and isinstance(body.get('exit_code'), int) and not isinstance(body.get('exit_code'), bool) \
@@ -1224,7 +1260,7 @@ def observer_reports(c: Case) -> list[dict]:
     for f in c.stdout:
         if f.get('type') == 'extension_ui_request' and f.get('method') == 'notify':
             try:
-                m = json.loads(f.get('message') or '')
+                m = _json_loads(f.get('message') or '')
             except ValueError:
                 continue
             if isinstance(m, dict) and m.get('hoh_observer') == 1:
@@ -1301,7 +1337,7 @@ def e11_block(c: Case) -> str:
     if len(lines) != 1:
         return 'insufficient'
     try:
-        d = json.loads(lines[0])
+        d = _json_loads(lines[0])
         ok = d.get('nonce') == 'spike' and sha256(d['message']['token'].encode()) == c.token_sha256
     except (ValueError, KeyError, TypeError, AttributeError):
         ok = False
@@ -2307,6 +2343,21 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
                            ('a bare CR between records', '{"note":"first"}\r{"note":"second"}'), ('a lone surrogate value', '{"note":"\\ud800"}'),
                            ('a lone surrogate key', '{"\\udfff":"value"}'), ('a nested lone surrogate', '{"note":["\\ud800"]}')):
             add('rollout JSONL', label, edit=lambda m, bad=bad: _rollout_jsonl(m, bad + '\n'))
+        # CLN1-02: the prototype must reject the same malformed numeric values and nesting as serde_json.
+        # Keep raw text through --emit so the Rust comparison sees the exact invalid input.
+        for label, value in (
+                ('NaN', 'NaN'), ('Infinity', 'Infinity'), ('negative Infinity', '-Infinity'),
+                ('positive float overflow', '1e400'), ('negative float overflow', '-1e400'),
+                ('integer overflow', '1' + '0'*400),
+                ('128 nested containers', '['*127 + '0' + ']'*127),
+                ('1001 nested containers', '['*1000 + '0' + ']'*1000)):
+            add('rollout JSONL', label, edit=lambda m, value=value: _rollout_jsonl(m, '{"note":' + value + '}\n'))
+        for label, value in (
+                ('a finite exponent', '1e308'),
+                ('127 nested containers', '['*126 + '0' + ']'*126),
+                ('quoted container delimiters', json.dumps('['*200 + '"' + ']'*200))):
+            add('rollout JSONL', label, expect='same',
+                edit=lambda m, value=value: _rollout_jsonl(m, '{"note":' + value + '}\n'))
         for suffix in ('', '{bad json\n'):
             add('rollout JSONL', 'a U+2028 script' + (' and a malformed line' if suffix else ''),
                 edit=lambda m, suffix=suffix: (

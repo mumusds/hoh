@@ -8633,6 +8633,110 @@
     {
      "expect": "non-PASS",
      "kind": "rollout JSONL",
+     "label": "NaN",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "Infinity",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "negative Infinity",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "positive float overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "negative float overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "integer overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "128 nested containers",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "1001 nested containers",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "a finite exponent",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "127 nested containers",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "quoted container delimiters",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
      "label": "a U+2028 script",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -10248,6 +10352,17 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -14698,6 +14813,110 @@
     {
      "expect": "non-PASS",
      "kind": "rollout JSONL",
+     "label": "NaN",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "Infinity",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "negative Infinity",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "positive float overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "negative float overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "integer overflow",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "128 nested containers",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "1001 nested containers",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "a finite exponent",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "127 nested containers",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "quoted container delimiters",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
      "label": "a U+2028 script",
      "ok": true,
      "verdict": "INSUFFICIENT",
@@ -16314,6 +16533,17 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
