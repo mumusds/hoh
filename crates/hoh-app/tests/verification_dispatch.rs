@@ -2882,7 +2882,7 @@ async fn test_053_04_a_new_candidate_resets_the_current_projection_and_the_accep
         assert_eq!(snapshot(&before, "AC-090-02"), json!(["NOT_RUN", null, true]), "{before}");
         assert_eq!(
             before["projection"],
-            json!({"candidate_id": c1, "candidate_state": "ACCEPTED", "accepted": 1, "passing": 1, "total": 2})
+            json!({"candidate_id": c1, "candidate_state": "ACCEPTED", "spec_revision": 1, "accepted": 1, "passing": 1, "total": 2})
         );
         assert_eq!(
             after["snapshot"]["candidate"],
@@ -2897,7 +2897,7 @@ async fn test_053_04_a_new_candidate_resets_the_current_projection_and_the_accep
         );
         assert_eq!(
             after["projection"],
-            json!({"candidate_id": c2, "candidate_state": "VERIFYING", "accepted": 0, "passing": 0, "total": 2})
+            json!({"candidate_id": c2, "candidate_state": "VERIFYING", "spec_revision": 1, "accepted": 0, "passing": 0, "total": 2})
         );
         assert_eq!(after["acceptance_results"], before["acceptance_results"]);
         assert!(before["acceptance_results"].as_i64().is_some_and(|n| n >= 1), "{before}");

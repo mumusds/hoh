@@ -2,6 +2,9 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+#[path = "spec_source/tasks.rs"]
+mod spec_tasks;
+
 mod pty;
 mod world;
 
@@ -829,19 +832,22 @@ async fn test_033_03_revision_stales_all_acceptance() -> R {
     );
     let (_, page) =
         world::exchange(&host, "GET", &format!("/v1/runs/{run}/acceptance"), None).await?;
-    assert_eq!(page["current"]["spec_revision"], 2);
-    let acs = page["current"]["acs"].as_array().ok_or("current ACs")?;
-    assert_eq!(acs.len(), 7);
+    let items = page["items"].as_array().ok_or("acceptance items")?;
+    let current: Vec<_> = items.iter().filter(|a| a["spec_revision"] == 2).collect();
+    assert_eq!(current.len(), 7);
     assert!(
-        acs.iter()
-            .all(|a| a["label"] == "NOT_RUN" && a["rows"] == json!([]))
+        current
+            .iter()
+            .all(|a| a["label"] == "NOT_RUN" && a["candidate_id"].is_null())
     );
-    assert!(acs.iter().any(|a| a["requirement_id"] == "REQ-B"));
-    let history = page["items"].as_array().ok_or("history")?;
+    assert!(current.iter().any(|a| a["ac_id"] == "AC-B-01"));
+    let history: Vec<_> = items.iter().filter(|a| a["spec_revision"] == 1).collect();
     assert_eq!(history.len(), 7);
-    assert!(history.iter().all(|a| a["spec_revision"] == 1
-        && a["label"] == "STALE"
-        && a["candidate_id"] == candidate));
+    assert!(
+        history
+            .iter()
+            .all(|a| a["label"] == "STALE" && a["candidate_id"] == candidate)
+    );
     // Pagination retains every historical AC exactly once.
     let mut cursor = None;
     let mut paged = Vec::new();
@@ -856,9 +862,9 @@ async fn test_033_03_revision_stales_all_acceptance() -> R {
         if cursor.is_none() {
             break;
         }
-        assert!(paged.len() < 8, "pagination must advance");
+        assert!(paged.len() < 15, "pagination must advance");
     }
-    assert_eq!(&paged, history);
+    assert_eq!(&paged, items);
     let result = decide(
         &world,
         &host,

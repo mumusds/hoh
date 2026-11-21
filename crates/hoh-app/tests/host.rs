@@ -2066,7 +2066,7 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
     conforms(&run, &got)?;
     assert_eq!(
         got["projection"]["acceptance"],
-        json!({"candidate_id": c2, "candidate_state": "VERIFYING", "accepted": 0, "passing": 0, "total": 2})
+        json!({"candidate_id": c2, "candidate_state": "VERIFYING", "spec_revision": 1, "accepted": 0, "passing": 0, "total": 2})
     );
     for (path, code) in [
         ("/v1/runs/missing/acceptance", "RUN_NOT_FOUND"),
