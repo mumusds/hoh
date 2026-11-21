@@ -2912,12 +2912,24 @@ async fn test_019_02_the_new_commanders_first_input_is_the_checkpoint_package() 
             state.queued_input_ids,
             ids(format!("SELECT input_id AS id FROM input_queue WHERE run_id = '{run_id}' AND state = 'QUEUED'"))?
         );
+        // The package is the run's state at its checkpoint, the commit that rebound the role and wrote the package's
+        // own notice (docs/adr/ADR-024.md decision 2): what the supervisor enqueues after it (a wake whose debounce
+        // ended after the change, dispatched once the new Commander has its first input) is not in it. So the
+        // messages it lists are those the outbox held before that commit and that are still not acknowledged; M1 is
+        // never delivered (the fixture's own assertion below).
+        let checkpoint: i64 = query(
+            &project,
+            &format!(
+                "SELECT event_seq FROM outbox WHERE message_id = '{}'",
+                input["message_id"].as_str().ok_or("no message id")?
+            ),
+        )?
+        .parse()?;
         assert_eq!(
             state.unacked_message_ids,
             ids(format!(
                 "SELECT message_id AS id FROM outbox WHERE run_id = '{run_id}' AND state <> 'ACKED' \
-                 AND message_id <> '{}'",
-                input["message_id"].as_str().ok_or("no message id")?
+                 AND event_seq < {checkpoint}"
             ))?
         );
         assert_eq!(
