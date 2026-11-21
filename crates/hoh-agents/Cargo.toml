@@ -14,6 +14,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # float_roundtrip: schema numbers are parsed correctly rounded, so the probe can tell which read back exactly (M1T07R-39).
 serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
 sha2 = "0.11.1"
+signal-hook = "0.3.18"
 tokio = { version = "1.53.3", features = ["rt", "net", "io-util", "time", "sync", "macros", "signal"] }
 
 [lints]
