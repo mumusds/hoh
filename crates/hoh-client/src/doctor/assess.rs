@@ -175,11 +175,6 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
     }
 }
 
-/// The Commander's read-only workspace profile on `agent`, probed as `entry` (docs/adr/ADR-032.md decisions 4 and 7):
-/// the parts the registry judges it by, each by the registry's own function — the probe rule (the entry's), the
-/// read-only builder on the tested help (`claude::read_only_missing`, `pi::read_only_missing`; codex's builds on its
-/// App Server only), the compat manifest's read_only case for this version (`hoh_agents::compat::read_only_case`) and, for codex on
-/// its App Server, this host's check of its sandbox (`probe::codex_sandbox_check`) — and `workspace` their Kleene
 /// What doctor tells the user to do for an agent: the login's note, when its login is not known to work, and the compat
 /// suite's, when its protocol is unknown (M1QA-09).
 pub(super) fn remedy(protocol: Protocol, auth_note: Option<String>) -> Option<String> {
@@ -194,6 +189,11 @@ pub(super) fn remedy(protocol: Protocol, auth_note: Option<String>) -> Option<St
 /// The compat suite's note for an agent whose protocol is unknown.
 const SUITE_NOTE: &str = "host 在没有写租约时自动运行兼容套件；运行中的写任务结束后即登记该版本";
 
+/// The Commander's read-only workspace profile on `agent`, probed as `entry` (docs/adr/ADR-032.md decisions 4 and 7):
+/// the parts the registry judges it by, each by the registry's own function — the probe rule (the entry's), the
+/// read-only builder on the tested help (`claude::read_only_missing`, `pi::read_only_missing`; codex's builds on its
+/// App Server only), the compat manifest's read_only case for this version (`hoh_agents::compat::read_only_case`) and, for codex on
+/// its App Server, this host's check of its sandbox (`probe::codex_sandbox_check`) — and `workspace` their Kleene
 /// conjunction, as `granted` has it.
 pub(super) fn read_only(
     agent: Agent,
