@@ -1303,6 +1303,7 @@ async fn list_acceptance(
             StatusCode::OK,
             axum::Json(json!({
                 "items": page.items,
+                "current": page.current,
                 "next_cursor": page.next.map(|(seq, row, ac)| format!("{seq}:{row}:{ac}")),
                 "watermark": page.watermark,
             })),
@@ -1403,6 +1404,7 @@ async fn get_run(
                     "acceptance": {
                         "candidate_id": acceptance.candidate.as_ref().map(|c| c.candidate_id.clone()),
                         "candidate_state": acceptance.candidate.as_ref().map(|c| c.state.clone()),
+                        "spec_revision": acceptance.spec_revision,
                         "accepted": acceptance.accepted,
                         "passing": acceptance.passing,
                         "total": acceptance.total,
