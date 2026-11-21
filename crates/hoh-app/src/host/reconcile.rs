@@ -154,7 +154,8 @@ pub(super) fn end(
         };
     }
     let cgroup = tracking.cgroup();
-    let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id));
+    let mut outside = Outside::new(&super::runner::marker(&row.project_id, &row.attempt_id))
+        .born(row.process_start_id.as_deref());
     let (term, kill) = (settings.term_grace, settings.kill_grace);
     let group = match seen {
         // Its group cannot be told apart: no signal may go to it (ADR-019 decision 8). Its cgroup, by membership, is
