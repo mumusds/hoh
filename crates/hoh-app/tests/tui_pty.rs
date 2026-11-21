@@ -19,6 +19,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod prerequisites;
 mod pty;
 mod world;
 
@@ -552,12 +553,7 @@ fn the_tui_restores_the_terminal_before_it_says_what_its_stop_left_unfinished() 
         .filter(|u| Path::new("/var/lib/systemd/linger").join(u).is_file())
         .filter(|_| Path::new("/sys/fs/cgroup/cgroup.controllers").exists())
     else {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no linger record for this user, or no cgroup v2, here"
-        );
-        return Ok(());
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
     };
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
     let _daemons = Daemons(project.path().to_path_buf());

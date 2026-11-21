@@ -63,6 +63,7 @@ jobs:
           for _ in $(seq 1 100); do [ -S "$runtime/systemd/private" ] && break; sleep 0.1; done
           [ -S "$runtime/systemd/private" ]
           echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+      # Keep HOH_TEST_ALLOW_MISSING_PREREQUISITES unset: this job provides linger and the user manager.
       - run: cargo test --workspace --locked
       # docs/09 fault matrix item 7 on file systems of the tests' own (a small tmpfs, an ext4 image that turns
       # read-only), mounted with sudo -n: the tests marked ignore for that. GitHub's ubuntu runners have passwordless
