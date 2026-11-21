@@ -833,6 +833,8 @@ pub struct SessionGrant {
 /// for the prompt's header.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Assignment {
+    /// Inputs routed to this attempt before its prompt is packed (ADR-036).
+    pub inputs: Vec<serde_json::Value>,
     /// The store's event watermark when this assignment (and its context) was read: an event after it was not seen
     /// by the turn's prompt (docs/adr/ADR-028.md decision 3, M2T16R-01).
     pub context_seq: i64,
@@ -909,6 +911,7 @@ pub(super) fn assignment(
             params![attempt_id, run_id, task_id, role],
             |r| {
                 Ok(Assignment {
+                    inputs: Vec::new(),
                     context_seq,
                     resource_bundle: None,
                     agent: r.get(0)?,

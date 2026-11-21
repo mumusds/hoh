@@ -348,3 +348,306 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_017_02_role_inputs_are_claimed_for_the_host_router() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-routing-")
+        .tempdir_in("/home/ai/dev")?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sd','codex','developer','1','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','developer','codex','sd',1,1,'2026-11-21T00:00:00Z');")?;
+    store.enqueue_input(steer("I1")).await?;
+    let claim = store
+        .claim_inputs(
+            std::time::SystemTime::now(),
+            vec!["developer".to_owned()],
+            5,
+        )
+        .await?;
+    assert!(
+        claim.is_some(),
+        "the host router must claim developer STEER inputs"
+    );
+    Ok(())
+}
+
+fn routed_world(path: &Path) -> R {
+    seed(path)?;
+    Connection::open(path)?.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sd','codex','developer','1','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','developer','codex','sd',1,1,'2026-11-21T00:00:00Z');
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('T','R','s1','RUNNING','developer',0,1);
+        INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A1','T','RUNNING','sd',1,1,1);")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_02_next_attempt_merge_has_a_durable_boundary_and_one_receipt() -> R {
+    use crate::persistence::InputRouting;
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-next-")
+        .tempdir_in("/home/ai/dev")?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("I1")).await?;
+    let row = store
+        .claim_inputs(std::time::SystemTime::now(), vec!["developer".into()], 5)
+        .await?
+        .and_then(crate::persistence::Claimed::start)
+        .ok_or("no claim")?;
+    let routed = store
+        .route_input(InputRouting::Stage {
+            row: row.clone(),
+            attempt: None,
+            now: std::time::SystemTime::now(),
+        })
+        .await?;
+    assert!(
+        routed.reply.is_some(),
+        "fallback must durably route and acknowledge its input"
+    );
+    assert_eq!(
+        store.reader()?.input("I1")?.ok_or("input")?.state,
+        InputState::Queued
+    );
+    assert!(
+        store
+            .route_input(InputRouting::Take {
+                attempt: "A1".into()
+            })
+            .await?
+            .inputs
+            .is_empty()
+    );
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1'; INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A2','T','STARTING','sd',1,1,1);")?;
+    let next = store
+        .route_input(InputRouting::Take {
+            attempt: "A2".into(),
+        })
+        .await?;
+    assert_eq!(next.inputs.len(), 1);
+    assert_eq!(next.inputs[0]["text"], "Stop and reply STEERED.");
+    assert_eq!(
+        store
+            .route_input(InputRouting::Take {
+                attempt: "A2".into()
+            })
+            .await?
+            .inputs,
+        next.inputs,
+        "idempotent prompt preparation"
+    );
+    assert_eq!(
+        store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: None,
+                now: std::time::SystemTime::now()
+            })
+            .await?
+            .reply,
+        routed.reply
+    );
+    let events = store.reader()?.events("R")?;
+    let delivered: Vec<_> = events
+        .iter()
+        .filter(|(k, _)| k == "input.delivered")
+        .collect();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].1["boundary"], "next_attempt");
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM receipts WHERE consumer='developer' AND message_id='I1'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_02_turn_ack_and_settlement_both_orders_never_reach_a_second_attempt() -> R {
+    use crate::persistence::{InputOutcome, InputRouting};
+    for settle_first in [false, true] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-turn-")
+            .tempdir_in("/home/ai/dev")?;
+        let (store, path) = open(&dir)?;
+        routed_world(&path)?;
+        store.enqueue_input(steer("I1")).await?;
+        let row = store
+            .claim_inputs(std::time::SystemTime::now(), vec!["developer".into()], 5)
+            .await?
+            .and_then(crate::persistence::Claimed::start)
+            .ok_or("claim")?;
+        let staged = store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: Some("A1".into()),
+                now: std::time::SystemTime::now(),
+            })
+            .await?;
+        assert_eq!(
+            staged.steer.as_ref().map(|i| i.input_id.as_str()),
+            Some("I1"),
+            "reserve the running turn before sending"
+        );
+        let conn = Connection::open(&path)?;
+        if settle_first {
+            conn.execute(
+                "UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1'",
+                [],
+            )?;
+        }
+        let ack = InputRouting::Finish {
+            input_id: "I1".into(),
+            attempt: "A1".into(),
+            outcome: InputOutcome::Delivered,
+        };
+        store.route_input(ack.clone()).await?;
+        if !settle_first {
+            conn.execute(
+                "UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1'",
+                [],
+            )?;
+        }
+        store.settle_ended_inputs("p1").await?;
+        store.route_input(ack).await?;
+        conn.execute_batch("INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A2','T','STARTING','sd',1,1,1);")?;
+        assert!(
+            store
+                .route_input(InputRouting::Take {
+                    attempt: "A2".into()
+                })
+                .await?
+                .inputs
+                .is_empty()
+        );
+        assert_eq!(
+            store.reader()?.input("I1")?.ok_or("input")?.state,
+            InputState::Applied
+        );
+        let events = store.reader()?.events("R")?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(k, _)| k == "input.delivered")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|(k, _)| k == "input.delivered")
+                .ok_or("delivery")?
+                .1["boundary"],
+            "turn"
+        );
+        assert_eq!(
+            events.iter().filter(|(k, _)| k == "input.applied").count(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_02_end_before_stage_falls_back_but_epoch_change_before_ack_rejects() -> R {
+    use crate::persistence::{InputOutcome, InputRouting};
+    for rebind in [false, true] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-fence-")
+            .tempdir_in("/home/ai/dev")?;
+        let (store, path) = open(&dir)?;
+        routed_world(&path)?;
+        store.enqueue_input(steer("I1")).await?;
+        let row = store
+            .claim_inputs(std::time::SystemTime::now(), vec!["developer".into()], 5)
+            .await?
+            .and_then(crate::persistence::Claimed::start)
+            .ok_or("claim")?;
+        let conn = Connection::open(&path)?;
+        if !rebind {
+            conn.execute(
+                "UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1'",
+                [],
+            )?;
+        }
+        let staged = store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: Some("A1".into()),
+                now: std::time::SystemTime::now(),
+            })
+            .await?;
+        if rebind {
+            assert!(staged.steer.is_some());
+            conn.execute(
+                "UPDATE role_bindings SET role_epoch=2 WHERE role='developer'",
+                [],
+            )?;
+            store
+                .route_input(InputRouting::Finish {
+                    input_id: "I1".into(),
+                    attempt: "A1".into(),
+                    outcome: InputOutcome::Delivered,
+                })
+                .await?;
+            let input = store.reader()?.input("I1")?.ok_or("input")?;
+            assert_eq!(input.state, InputState::Rejected);
+            assert_eq!(input.payload["reason"], "STALE_ROLE_EPOCH");
+        } else {
+            assert!(staged.steer.is_none());
+            assert!(staged.reply.is_some());
+            assert_eq!(
+                store.reader()?.input("I1")?.ok_or("input")?.payload["boundary"],
+                "next_attempt"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_02_historical_deferred_request_is_never_backfilled() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-history-")
+        .tempdir_in("/home/ai/dev")?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    let key = crate::ids::child_id("A1", "request/old");
+    store
+        .commit(crate::persistence::Commit {
+            events: vec![crate::persistence::NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".into(),
+                run_id: Some("R".into()),
+                event_id: crate::ids::child_id(&key, "deferred"),
+                kind: "request.deferred".into(),
+                payload: json!({"message_id":"old"}),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let message = serde_json::from_value(
+        json!({"schema_version":"1.0","message_id":"old","run_id":"R","task_id":"T","attempt_id":"A1","sender_role":"developer","recipient_role":"reviewer","role_epoch":1,"correlation_id":"c","causation_id":null,"idempotency_key":"old","expected_revision":1,"spec_sha256":"1".repeat(64),"candidate_id":null,"kind":"query","payload":{"question":"old question"}}),
+    )?;
+    assert_eq!(
+        store
+            .verifier_request(crate::persistence::VerifierRequest::Route(Box::new(
+                message
+            )))
+            .await?,
+        None
+    );
+    assert_eq!(
+        Connection::open(&path)?.query_row("SELECT count(*) FROM input_queue", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    Ok(())
+}

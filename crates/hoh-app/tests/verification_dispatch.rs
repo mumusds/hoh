@@ -1253,12 +1253,12 @@ const MESSAGE: &str = "message() { printf '{\"schema_version\": \"1.0\", \"messa
 \"$1\" \"$RUN_ID\" \"$TASK_ID\" \"$ATTEMPT_ID\" \"$3\" \"$ROLE_EPOCH\" \"$1\" \"$SPEC\" \"$2\" \"$4\" > \"$OUT/$1.json\"; }; ";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -> R {
+async fn test_017_02_verifier_routes_information_and_rejects_candidate_changes() -> R {
     // docs/adr/ADR-028.md decisions 7 and 13: the qa FakeAgent, in its run directory, runs `run-check unit` (the check
     // runs there, its producer the qa attempt, and the helper ends with its exit code 1), `run-check nope` (not a
     // check of the frozen plan: refused, exit 2, verification.check_refused), asks the developer to change the
     // candidate (rejected: request.rejected and an OPEN Issue on the candidate) and asks an information question
-    // (deferred); no message is queued for the developer.
+    // (queued for the developer); the candidate change remains refused.
     let dir = tempfile::tempdir()?;
     let (project, spec) = project(dir.path()).await?;
     seed(&project, &world(&spec))?;
@@ -1295,7 +1295,7 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
         assert!(read("unit.txt").contains("\"status\":\"ran\""), "{}", read("unit.txt"));
         assert_eq!(read("nope.code").trim(), "2", "{}", read("nope.txt"));
         assert!(read("change.txt").contains("\"status\":\"rejected\""), "{}", read("change.txt"));
-        assert!(read("info.txt").contains("\"status\":\"deferred\""), "{}", read("info.txt"));
+        assert!(read("info.txt").contains("\"status\":\"queued\""), "{}", read("info.txt"));
         let qa = rows(
             &project,
             "SELECT a.attempt_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.role = 'qa'",
@@ -1320,7 +1320,7 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
         assert_eq!(
             rows(
                 &project,
-                "SELECT json_extract(payload_json, '$.message_id') AS m FROM events WHERE kind = 'request.deferred'"
+                "SELECT json_extract(payload_json, '$.message_id') AS m FROM events WHERE kind = 'request.routed'"
             )?,
             json!([{"m": "m-info"}])
         );
@@ -1332,6 +1332,7 @@ async fn a_verifier_runs_planned_checks_and_asks_through_its_request_helpers() -
             )?[0]["n"],
             json!(0)
         );
+        assert_eq!(rows(&project, "SELECT kind,target_role FROM input_queue WHERE json_extract(payload_json,'$.message_id')='m-info'")?, json!([{"kind":"ASK","target_role":"developer"}]));
         R::Ok(())
     }
     .await;

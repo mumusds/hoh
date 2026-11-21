@@ -729,6 +729,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         }
     });
     Ok(Held {
+        steers: None,
         pid,
         open,
         cancel,

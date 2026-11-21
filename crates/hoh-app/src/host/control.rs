@@ -132,9 +132,6 @@ async fn tick(
             }));
         }
     }
-    // Delivery follows control, including on hosts without an executor. A delivery failure cannot
-    // prevent the pause and cancel work above; it is reported by the loop and retried on its next tick.
-    super::inputs::tick(&common.shared, common.clock.as_ref()).await?;
     Ok(())
 }
 

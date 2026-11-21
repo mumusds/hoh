@@ -1827,6 +1827,14 @@ impl Store {
             .map(drop)
     }
 
+    /// Route a role input or take its next-attempt prompt, on the store's single writer.
+    pub async fn route_input(&self, request: InputRouting) -> Result<InputRouted, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::RouteInput(request))
+            .await
+            .map(|done| done.routed)
+    }
+
     /// Consume an input notice. None returns a delivery held behind the first-input gate.
     pub async fn consume_input(
         &self,
@@ -2500,3 +2508,5 @@ impl Reader {
 
 #[cfg(test)]
 mod tests;
+
+pub use inputs::routing::{InputOutcome, InputRouted, InputRouting};

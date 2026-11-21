@@ -3773,3 +3773,272 @@ async fn test_017_01_ask_on_a_stopped_run_keeps_its_revision_and_published_resul
     host.shutdown().await;
     Ok(())
 }
+
+#[derive(Debug)]
+struct RoutingAgent {
+    started: tokio::sync::mpsc::UnboundedSender<(hoh_app::host::Work, std::process::ChildStdin)>,
+    steers: tokio::sync::mpsc::UnboundedSender<(
+        String,
+        tokio::sync::oneshot::Sender<hoh_agents::codex::SteerReceipt>,
+    )>,
+    leaders: Arc<Mutex<Vec<(u32, String)>>>,
+}
+impl hoh_app::host::Executor for RoutingAgent {
+    fn deliver(
+        &self,
+        _: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "read -r go; [ \"$go\" = go ] || exit 1; read -r done; exit 0",
+            ])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let start = hoh_agents::identity::start_id(pid)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "start id".to_owned())?;
+        self.leaders
+            .lock()
+            .map_err(|e| e.to_string())?
+            .push((pid, start));
+        let mut stdin = child.stdin.take().ok_or_else(|| "stdin".to_owned())?;
+        let (tx, work) = (self.started.clone(), work.clone());
+        Ok(hoh_app::host::Started {
+            pid,
+            gate: hoh_app::host::Gate::new(move || {
+                use std::io::Write as _;
+                stdin.write_all(b"go\n").map_err(|e| e.to_string())?;
+                tx.send((work, stdin)).map_err(|e| e.to_string())
+            }),
+            ended: reaping(child),
+            prompt: None,
+            ran: None,
+        })
+    }
+    fn steer(
+        &self,
+        work: &hoh_app::host::Work,
+        _: &hoh_core::persistence::InputRow,
+    ) -> tokio::sync::oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.steers.send((work.attempt_id.clone(), tx));
+        rx
+    }
+}
+#[derive(Debug)]
+struct InputBarrier(tokio::sync::mpsc::UnboundedSender<String>);
+impl hoh_app::host::HostHooks for InputBarrier {
+    fn input_delivered(&self, id: &str) {
+        let _ = self.0.send(id.to_owned());
+    }
+    fn cgroups_allowed(&self) -> bool {
+        false
+    }
+}
+async fn input_state_barrier(project: &Path, id: &str, state: &str) -> R {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if query(
+                project,
+                &format!("SELECT state FROM input_queue WHERE input_id='{id}'"),
+            )? == state
+            {
+                return R::Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() -> R {
+    for supported in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-host-")
+            .tempdir_in("/home/ai/dev")?;
+        let project = dir.path().join("p");
+        std::fs::create_dir(&project)?;
+        Host::start(config(&project)).await?.shutdown().await;
+        seed(
+            &project,
+            &format!(
+                "{WORLD} DELETE FROM tasks WHERE task_id='T3'; UPDATE tasks SET writer=0; UPDATE sessions SET capabilities_json=json_set(capabilities_json,'$.mid_turn_steer',json('{}'));",
+                if supported { "true" } else { "false" }
+            ),
+        )?;
+        let (started, mut turns) = tokio::sync::mpsc::unbounded_channel();
+        let (steers, mut steering) = tokio::sync::mpsc::unbounded_channel();
+        let (notified, mut delivered) = tokio::sync::mpsc::unbounded_channel();
+        let leaders = Arc::default();
+        let _cleanup = Leaders(Arc::clone(&leaders));
+        let agent = Arc::new(RoutingAgent {
+            started,
+            steers,
+            leaders,
+        });
+        let mut settings = config(&project);
+        let mut ctx = context();
+        ctx.reader_slots = Some(1);
+        settings.hooks = Arc::new(InputBarrier(notified));
+        settings.runner = Some(hoh_app::host::RunnerConfig {
+            executor: agent,
+            context: ctx,
+        });
+        let host = start_when_free(settings).await?;
+        let (first, mut release) = tokio::time::timeout(Duration::from_secs(20), turns.recv())
+            .await?
+            .ok_or("first turn")?;
+        assert_eq!(first.task_id, "T1");
+        let rev = query(&project, "SELECT revision FROM runs WHERE run_id='R'")?.parse::<i64>()?;
+        let body = json!({"schema_version":"1.0","command_id":"steer","idempotency_key":"steer","kind":"SendInput","run_id":"R","expected_revision":rev,"payload":{"input_kind":"STEER","target_role":"developer","text":"ordered input"}});
+        assert_eq!(command(&host, &body).await?.0, 202);
+        let id = hoh_core::ids::child_id("steer", "input");
+        if supported {
+            let (attempt, ack) = tokio::time::timeout(Duration::from_secs(20), steering.recv())
+                .await?
+                .ok_or("steer")?;
+            assert_eq!(attempt, first.attempt_id);
+            ack.send(hoh_agents::codex::SteerReceipt::Delivered {
+                turn_id: "native-turn".into(),
+            })
+            .map_err(|_| "lost reply")?;
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(20), delivered.recv())
+                .await?
+                .as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            query(
+                &project,
+                &format!("SELECT state FROM input_queue WHERE input_id='{id}'")
+            )?,
+            if supported { "DELIVERED" } else { "QUEUED" }
+        );
+        use std::io::Write as _;
+        release.write_all(b"done\n")?;
+        drop(release);
+        let (second, mut release) = tokio::time::timeout(Duration::from_secs(20), turns.recv())
+            .await?
+            .ok_or("second turn")?;
+        assert_eq!(second.task_id, "T2");
+        assert_eq!(second.assignment.inputs.len(), usize::from(!supported));
+        if !supported {
+            assert_eq!(second.assignment.inputs[0]["text"], "ordered input");
+        }
+        release.write_all(b"done\n")?;
+        drop(release);
+        input_state_barrier(&project, &id, "APPLIED").await?;
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM events WHERE kind='input.delivered' AND json_extract(payload_json,'$.input_id')='{id}'"
+                )
+            )?,
+            "1"
+        );
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json,'$.boundary') FROM events WHERE kind='input.delivered' AND json_extract(payload_json,'$.input_id')='{id}'"
+                )
+            )?,
+            if supported { "turn" } else { "next_attempt" }
+        );
+        assert!(steering.try_recv().is_err());
+        host.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_017_02_cancel_completes_while_steer_ack_is_held() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-cancel-")
+        .tempdir_in("/home/ai/dev")?;
+    let project = dir.path().join("p");
+    std::fs::create_dir(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        &format!(
+            "{WORLD} DELETE FROM tasks WHERE task_id<>'T1'; UPDATE tasks SET writer=0; UPDATE sessions SET capabilities_json=json_set(capabilities_json,'$.mid_turn_steer',json('true'));"
+        ),
+    )?;
+    let (started, mut turns) = tokio::sync::mpsc::unbounded_channel();
+    let (steers, mut steering) = tokio::sync::mpsc::unbounded_channel();
+    let leaders = Arc::default();
+    let _cleanup = Leaders(Arc::clone(&leaders));
+    let mut settings = config(&project);
+    settings.cancel = hoh_core::cancel::Graces {
+        native: Duration::ZERO,
+        term: Duration::ZERO,
+        kill_every: Duration::from_millis(1),
+    };
+    settings.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(RoutingAgent {
+            started,
+            steers,
+            leaders,
+        }),
+        context: context(),
+    });
+    let host = start_when_free(settings).await?;
+    let (_work, _release) = tokio::time::timeout(Duration::from_secs(20), turns.recv())
+        .await?
+        .ok_or("turn")?;
+    let rev = query(&project, "SELECT revision FROM runs WHERE run_id='R'")?.parse::<i64>()?;
+    let body = json!({"schema_version":"1.0","command_id":"late","idempotency_key":"late","kind":"SendInput","run_id":"R","expected_revision":rev,"payload":{"input_kind":"STEER","target_role":"developer","text":"late reply"}});
+    assert_eq!(command(&host, &body).await?.0, 202);
+    let (_, ack) = tokio::time::timeout(Duration::from_secs(20), steering.recv())
+        .await?
+        .ok_or("steer")?;
+    assert_eq!(
+        control(&host, &project, "CancelRun", "cancel-steer")
+            .await?
+            .0,
+        202
+    );
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if query(&project, "SELECT state FROM runs WHERE run_id='R'")? == "CANCELLED" {
+                return R::Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    ack.send(hoh_agents::codex::SteerReceipt::Delivered {
+        turn_id: "late".into(),
+    })
+    .map_err(|_| "ack must still be held, not timed out")?;
+    let id = hoh_core::ids::child_id("late", "input");
+    input_state_barrier(&project, &id, "REJECTED").await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) FROM events WHERE kind='input.applied'"
+        )?,
+        "0"
+    );
+    host.shutdown().await;
+    Ok(())
+}

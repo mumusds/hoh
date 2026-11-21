@@ -6693,3 +6693,62 @@ async fn an_episode_open_when_its_host_stops_is_neither_repeated_nor_cleared_by_
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_017_02_product_host_sends_codex_steer_before_recorded_turn_completion() -> R {
+    // Recording replay only, not adapter-live acceptance. The fake cannot emit its steer response or turn end
+    // until the product host has sent turn/steer: the protocol request itself is the barrier.
+    let world = World::new()?;
+    let body = world.codex_body("gpt-6-astra", "A")?;
+    let d = world.bin().join("codex.d");
+    let case = format!("{PROTOCOL}/codex/0.166.0/app-server-steer");
+    let frames = std::fs::read_to_string(format!("{case}/stdout.jsonl"))?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|f| f["id"] != json!(3))
+        .map(|f| format!("{f}\n"))
+        .collect::<String>();
+    std::fs::write(d.join("steer.jsonl"), frames)?;
+    std::fs::write(
+        d.join("steer-requests.json"),
+        json!({"0":"initialize","1":"thread/start","2":"turn/start","4":"turn/steer"}).to_string(),
+    )?;
+    let branch = format!(
+        "*STEER*) exec timeout 60 python3 '{APP_SERVER}' \"$d/steer.jsonl\" \"$d/steer-requests.json\" \"$d/log.$$\";;\n                    *HUGE*)"
+    );
+    world.script("codex", &body.replace("*HUGE*)", &branch))?;
+    world.bind_installed()?;
+    let host = start_when_free(world.config()).await?;
+    let project = world.project();
+    let outcome=async {
+        configure(&host,"dev-steer",team_revision(&project)?,json!({"developer":{"agent":"codex"}})).await?;
+        let run=started(&host,&project,"steer-run").await?;
+        ready(&project,&run,&[("T-STEER","developer")])?;
+        tokio::time::timeout(Duration::from_secs(40),async {
+            loop {if query(&project,"SELECT state FROM attempts WHERE attempt_id='T-STEER/attempt-1'")?=="RUNNING" {return R::Ok(());}tokio::task::yield_now().await;}
+        }).await??;
+        let revision=query(&project,&format!("SELECT revision FROM runs WHERE run_id='{run}'"))?.parse::<i64>()?;
+        let (status,reply)=common::fresh(json!(revision),|revision| {
+            let body=json!({"schema_version":"1.0","command_id":"native-steer","idempotency_key":"native-steer","kind":"SendInput","run_id":run,"expected_revision":revision,"payload":{"input_kind":"STEER","target_role":"developer","text":"Stop running the command now and reply exactly STEERED."}});
+            let host=&host;async move {exchange(host,"POST","/v1/commands",Some(&body)).await}
+        }).await?;
+        assert_eq!(status,202,"{reply}");
+        let id=hoh_core::ids::child_id("native-steer","input");
+        tokio::time::timeout(Duration::from_secs(30),async {
+            loop {if query(&project,&format!("SELECT state FROM input_queue WHERE input_id='{id}'"))?=="APPLIED" {return R::Ok(());}tokio::task::yield_now().await;}
+        }).await??;
+        assert_eq!(query(&project,&format!("SELECT count(*) FROM events WHERE kind='input.delivered' AND json_extract(payload_json,'$.input_id')='{id}' AND json_extract(payload_json,'$.boundary')='turn'"))?,"1");
+        let pid=query(&project,"SELECT pid FROM attempts WHERE attempt_id='T-STEER/attempt-1'")?;
+        let trace=std::fs::read_to_string(d.join(format!("log.{pid}/trace.jsonl")))?.lines().map(serde_json::from_str::<Value>).collect::<Result<Vec<_>,_>>()?;
+        let steer=trace.iter().position(|f|f["dir"]=="in" && f["method"]=="turn/steer").ok_or("steer trace")?;
+        let end=trace.iter().position(|f|f["dir"]=="out" && f["method"]=="turn/completed").ok_or("completion trace")?;
+        assert!(steer<end);
+        assert_eq!(trace.iter().filter(|f|f["dir"]=="in" && f["method"]=="turn/steer").count(),1);
+        R::Ok(())
+    }.await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

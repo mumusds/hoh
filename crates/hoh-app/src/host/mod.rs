@@ -207,6 +207,9 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// connection here).
     fn after_commit(&self) {}
 
+    /// Input consumed durably, before its outbox ACK (CR-006 recovery barrier).
+    fn input_delivered(&self, _message_id: &str) {}
+
     /// At `point` of the runner (AC-041-01: a test's implementation ends the process here): the tick's own points
     /// (AfterStaffing), and every point of an attempt through [`HostHooks::runner_of`]'s default.
     fn runner(&self, _point: RunnerPoint) {}
@@ -588,6 +591,13 @@ impl Host {
                 stopped.clone(),
             ))));
         }
+        served.push(tokio::spawn(begun.clone().scope(inputs::run(
+            shared.clone(),
+            config.clock.0.clone(),
+            config.runner.as_ref().map(|r| r.executor.clone()),
+            inflight.clone(),
+            stopped.clone(),
+        ))));
         // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
         served.push(tokio::spawn(begun.clone().scope(control::run(
             shared.clone(),

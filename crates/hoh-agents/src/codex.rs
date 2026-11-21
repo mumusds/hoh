@@ -884,13 +884,13 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
     let observer = Observer::new(&attempt.attempt_id, turn.observe.clone());
     let gate = gate.clone();
+    let (steers, mut input_rx) = mpsc::channel::<Steer>(32);
     let ended = tokio::spawn(async move {
         if opened.await.is_err() {
             let report = crate::adapter::close_gate(&mut process).await;
             return Facts::gate_closed(raw_log_path, report.as_ref());
         }
-        // No steering in the runner's mode yet: the channel is closed.
-        let (_, mut steers) = mpsc::channel::<Steer>(1);
+
         // The agent's files are re-checked while the turn runs, from the gate's opening, and on the App Server before
         // its first input (docs/adr/ADR-030.md decision 9); exec's prompt goes with the go line.
         let mut watch = Watch::new(gate.expect.clone());
@@ -902,7 +902,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 &turn,
                 &mut process,
                 Stop::Native(&native),
-                &mut steers,
+                &mut input_rx,
                 &mut held,
                 Some(gate.go()),
                 &mut watch,
@@ -921,7 +921,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             &mut process,
             input,
             Stop::Native(&native),
-            &mut steers,
+            &mut input_rx,
             &mut watch,
         )
         .await;
@@ -961,6 +961,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         }
     });
     Ok(Held {
+        steers: Some(steers),
         pid,
         open,
         cancel,

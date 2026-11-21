@@ -105,6 +105,8 @@ pub(super) fn enqueue(
             PersistError::IntegrityViolation("input payload must be an object".to_owned())
         })?
         .insert("role_epoch".to_owned(), json!(epoch));
+    let after: i64 = tx.query_row("SELECT coalesce(max(a.rowid),0) FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id=?1 AND t.role=?2 AND a.state IN ('STARTING','RUNNING')",params![i.run_id,role],|r|r.get(0)).map_err(sqlite_error)?;
+    payload["after_attempt"] = json!(after);
     tx.execute(
         "INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) \
          VALUES (?1, ?2, ?3, ?4, 'QUEUED', ?5)",
@@ -216,6 +218,8 @@ pub(super) fn read_input(
     }))
 }
 
+pub(super) mod routing;
+
 #[cfg(test)]
 mod tests;
 
@@ -283,7 +287,7 @@ fn change(
         &row.run_id,
         child_id(&row.input_id, to.as_str().to_ascii_lowercase().as_str()),
         kind,
-        json!({"input_id":row.input_id,"from":row.state.as_str(),"to":to.as_str(),"answer":answer,"reason":reason}),
+        json!({"input_id":row.input_id,"from":row.state.as_str(),"to":to.as_str(),"answer":answer,"reason":reason,"boundary":payload.get("boundary"),"attempt_id":payload.get("attempt_id")}),
     )
 }
 
@@ -403,6 +407,7 @@ pub(super) fn finish(
     answer: Option<&str>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
+    routing::finish_attempt(tx, attempt, ctx)?;
     let Some(row) = for_attempt(tx, attempt)?.filter(|r| r.state == InputState::Delivered) else {
         return Ok(());
     };
@@ -460,6 +465,7 @@ pub(super) fn sweep(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tx = writer::begin(conn, ctx)?;
+    routing::sweep(&tx, project, ctx)?;
     let ids: Vec<String> = {
         let mut q = tx.prepare("SELECT i.input_id FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND (r.state IN ('COMPLETED','CANCELLED','FAILED') OR (i.state='DELIVERED' AND coalesce(i.target_role,'commander')='commander' AND coalesce((SELECT b.role_epoch FROM role_bindings b WHERE b.run_id=i.run_id AND b.role='commander'),-1) <> json_extract(i.payload_json,'$.role_epoch'))) AND i.state IN ('QUEUED','DELIVERED') ORDER BY i.rowid LIMIT 32").map_err(sqlite_error)?;
         q.query_map(params![project], |r| r.get(0))
@@ -468,7 +474,7 @@ pub(super) fn sweep(
             .map_err(sqlite_error)?
     };
     if ids.is_empty() {
-        return Ok(());
+        return writer::commit(tx, ctx);
     }
     for id in ids {
         let terminal: bool = tx.query_row("SELECT r.state IN ('COMPLETED','CANCELLED','FAILED') FROM runs r JOIN input_queue i USING(run_id) WHERE i.input_id=?1",params![id],|r|r.get(0)).map_err(sqlite_error)?;

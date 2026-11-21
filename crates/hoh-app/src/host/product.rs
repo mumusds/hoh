@@ -29,6 +29,7 @@ pub struct ProductExecutor {
     graces: (Duration, Duration),
     /// The native cancel of each attempt whose turn runs.
     cancels: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
+    steers: Arc<Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<hoh_agents::codex::Steer>>>>,
     /// A test's look at each attempt's gate key as it is drawn; the product has none.
     keys: Option<KeyHook>,
     /// A test's look at each diagnostic a turn collects as it collects it; the product has none.
@@ -105,6 +106,7 @@ impl ProductExecutor {
             gate,
             graces,
             cancels: Arc::default(),
+            steers: Arc::default(),
             keys: None,
             observe: None,
             keeping: None,
@@ -502,6 +504,11 @@ impl ProductExecutor {
             })?;
         let a = &work.assignment;
         let mut facts = a.context.clone().unwrap_or_default();
+        for input in &a.inputs {
+            facts
+                .scope
+                .push(format!("运行中输入（ASK 只回答，不改任务）：{input}"));
+        }
         // What the store named and only the executor reads (docs/adr/ADR-028.md decision 14): registered objects by
         // their digests, and the candidate's changed files at its commit.
         facts.resolve_loads(|sha| hoh_core::objects::get(&self.project, sha));
@@ -1054,11 +1061,18 @@ impl Executor for ProductExecutor {
             refused(&r.code, class, r.detail)
         })?;
         let id = work.attempt_id.clone();
+        if let Some(sender) = held.steers.clone() {
+            self.steers
+                .lock()
+                .map_err(|_| Refusal::from("steer registry poisoned".to_owned()))?
+                .insert(id.clone(), sender);
+        }
         if let Ok(mut cancels) = self.cancels.lock() {
             cancels.insert(id.clone(), held.cancel.clone());
         }
         let (tx, ended) = oneshot::channel();
         let cancels = self.cancels.clone();
+        let steers = self.steers.clone();
         // A degrade is one fact, the registry's, of this identity (decision 15; docs/adr/ADR-032.md decision 10 (A),
         // M2T20R-01): its next turns use exec and the read-only profile is withheld from it, both read by a prepare in
         // one look; a host fact, so staffing moves the commander and prepare refuses it as unavailable.
@@ -1080,6 +1094,9 @@ impl Executor for ProductExecutor {
                 // is done here, so nothing of this host writes the project after its stop.
                 _ = stopping.wait_for(|stopped| *stopped) => return,
             };
+            if let Ok(mut senders) = steers.lock() {
+                senders.remove(&id);
+            }
             if let Ok(mut cancels) = cancels.lock() {
                 cancels.remove(&id);
             }
@@ -1155,6 +1172,9 @@ impl Executor for ProductExecutor {
     fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             self.stopping.send_replace(true);
+            if let Ok(mut senders) = self.steers.lock() {
+                senders.clear();
+            }
             let watchers = self
                 .watchers
                 .lock()
@@ -1168,6 +1188,37 @@ impl Executor for ProductExecutor {
                 }
             }
         })
+    }
+
+    fn steer(
+        &self,
+        work: &Work,
+        input: &hoh_core::persistence::InputRow,
+    ) -> oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
+        use hoh_agents::codex::{Steer, SteerReceipt};
+        let (reply, received) = oneshot::channel();
+        let sender = self
+            .steers
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&work.attempt_id).cloned());
+        let request = Steer {
+            input_id: input.input_id.clone(),
+            text: input.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            expected_turn: None,
+            reply,
+        };
+        if let Some(sender) = sender {
+            if let Err(error) = sender.try_send(request) {
+                let _ = error.into_inner().reply.send(SteerReceipt::NotNow);
+            }
+        } else {
+            let _ = request.reply.send(SteerReceipt::NotNow);
+        }
+        received
     }
 
     fn cancel(&self, work: &Work) -> bool {

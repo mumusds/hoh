@@ -104,7 +104,7 @@ pub(super) fn claim_next(
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
                    AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
-                   AND (?4 = 0 OR (json_extract(payload_json,'$.notice') = 'input' AND recipient_role = 'commander' \
+                   AND (?4 = 0 OR (json_extract(payload_json,'$.notice') = 'input' \
                      AND json_extract(payload_json,'$.kind') IN ('ASK','STEER'))) \
                  AND (run_id IS NULL OR (SELECT r.state FROM runs r WHERE r.run_id = outbox.run_id) IS NOT 'INCOMPLETE' \
                    OR {}) \
