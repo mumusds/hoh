@@ -1004,6 +1004,20 @@ class SpawnScan(unittest.TestCase):
             m={'client_files':['crates/hoh-client/src/']}
             self.assertIn('names stderr by its path',' '.join(s.path_problems(m,root)))
             f.write_text('fn f() {}');self.assertEqual(s.path_problems(m,root),[])
+    def test_no_allow_hides_a_place_and_tokios_process_starts_are_named(self):
+        # CLT-1450, CLT-1452: the scan forces its three lints, so persistence's allow (or any other) hides nothing.
+        # CLT-1454 (3): tokio's process starts are in the configuration; unresolved while no member enables the
+        # feature, that is no problem, while any other unresolved entry still is.
+        s=self.scan()
+        for lint in s.LINTS:
+            self.assertIn(f'--force-warn {lint}',s.rustflags())
+        self.assertIn('--cap-lints warn',s.rustflags())
+        self.assertIn('tokio::process::Command::spawn',s.configuration([],[]))
+        line=lambda text:json.dumps({'reason':'compiler-message','message':{'code':None,'message':text,'spans':[]}})
+        found,problems=s.found_in('\n'.join([line('`tokio::process::Command::output` does not refer to a reachable function'),
+                                             line('`std::process::Command::spawnx` does not refer to a reachable function')]))
+        self.assertEqual(found,[]);self.assertEqual(len(problems),1);self.assertIn('spawnx',problems[0])
+        self.assertIn('outside the gate',' '.join(s.judge([('crates/hoh-client/src/prompt.rs','tokio::process::Command::spawn')],self.manifest())))
     def test_every_source_file_is_in_one_class(self):
         # CLT-1251, CLT-1350 (b): every .rs file under crates/*/src, tests.rs included, is in exactly one class.
         s=self.scan()
