@@ -367,7 +367,21 @@ fn judge(
             .filter(|s| s.as_str() != session)
             .cloned(),
     );
-    let shared: Vec<_> = observed.intersection(&conflicts).collect();
+    // CR-029 through the rule the specification review shares (docs/adr/ADR-035.md): both sides' strings are of no
+    // known kind here (HoH ids, this agent's native ids and native attempt records' session_ids mixed), so each is
+    // claimed as both; the result is the strings both sides hold.
+    let side = |ids: &std::collections::BTreeSet<String>| {
+        let mut side = crate::verification::identity::Identities::default();
+        for id in ids {
+            side.claim(&agent, id);
+        }
+        side
+    };
+    let shared: std::collections::BTreeSet<String> =
+        crate::verification::identity::shared(&side(&observed), &side(&conflicts))
+            .iter()
+            .map(|i| i.id().to_owned())
+            .collect();
     if !shared.is_empty() {
         reasons.push(format!(
             "NATIVE_SESSION_NOT_INDEPENDENT: {CONFLICT} its {agent} native attempt's sessions {shared:?} \

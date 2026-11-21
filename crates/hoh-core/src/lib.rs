@@ -49,6 +49,9 @@ pub mod objects;
 pub mod persistence;
 #[forbid(clippy::disallowed_methods)]
 pub mod protocol;
+/// The Readiness Gate (REQ-031, docs/adr/ADR-035.md).
+#[forbid(clippy::disallowed_methods)]
+pub mod readiness;
 #[forbid(clippy::disallowed_methods)]
 pub mod reconcile;
 #[forbid(clippy::disallowed_methods)]

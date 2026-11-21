@@ -159,7 +159,7 @@ pub fn validate(
             missing: deps.iter().map(|d| (*d).to_owned()).collect(),
         });
     }
-    let order = kahn(&inside)?;
+    let order = order(&inside).map_err(|cycle| PlanError::Cycle { cycle })?;
     let mut by_id: BTreeMap<&str, &PlannedTask> = proposal
         .tasks
         .iter()
@@ -173,8 +173,12 @@ pub fn validate(
     Ok(Plan { tasks })
 }
 
-/// Kahn's algorithm with a sorted ready set; a cycle when tasks are left.
-fn kahn<'a>(deps: &BTreeMap<&'a str, BTreeSet<&'a str>>) -> Result<Vec<&'a str>, PlanError> {
+/// Kahn's algorithm with a sorted ready set over `deps` (each task's dependencies, all of them keys): the tasks in
+/// dependency order, or, when tasks are left, the tasks of one cycle in dependency order from its smallest id. Shared
+/// by plan validation and the Readiness Gate (docs/adr/ADR-035.md).
+pub(crate) fn order<'a>(
+    deps: &BTreeMap<&'a str, BTreeSet<&'a str>>,
+) -> Result<Vec<&'a str>, Vec<String>> {
     let mut waiting: BTreeMap<&str, usize> = deps.iter().map(|(id, d)| (*id, d.len())).collect();
     let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (id, d) in deps {
@@ -228,9 +232,7 @@ fn kahn<'a>(deps: &BTreeMap<&'a str, BTreeSet<&'a str>>) -> Result<Vec<&'a str>,
     {
         cycle.rotate_left(smallest);
     }
-    Err(PlanError::Cycle {
-        cycle: cycle.iter().map(|id| (*id).to_owned()).collect(),
-    })
+    Err(cycle.iter().map(|id| (*id).to_owned()).collect())
 }
 
 #[cfg(test)]
