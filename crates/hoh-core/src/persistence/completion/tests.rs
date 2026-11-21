@@ -86,7 +86,7 @@ pub(in crate::persistence) fn freeze_of(tree: char) -> Freeze {
     let sealed = Manifest {
         git_commit: "a".repeat(40),
         git_tree: tree.to_string().repeat(40),
-        spec: file("contracts/requirements.json", 1),
+        spec: file("docs/spec/index.json", 1),
         environment: file(".hoh/environment.json", 2),
         test_plan: file("tests/check-plan.json", 3),
         source_files: vec![file("src/lib.rs", 4)],
@@ -97,7 +97,7 @@ pub(in crate::persistence) fn freeze_of(tree: char) -> Freeze {
         sealed,
         export: object(9, "candidate", "candidate.json"),
         inputs: vec![
-            object(1, "spec", "contracts/requirements.json"),
+            object(1, "spec", "docs/spec/index.json"),
             object(2, "environment", ".hoh/environment.json"),
             object(3, "test_plan", "tests/check-plan.json"),
         ],

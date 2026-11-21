@@ -3,6 +3,36 @@
 use hoh_core::specindex::{IndexError, Source};
 use std::path::Path;
 
+pub(crate) fn files(root: &Path) -> Result<hoh_core::persistence::SpecFiles, IndexError> {
+    let sources = sources(root)?;
+    let path = hoh_core::specindex::PATH;
+    let tracked = super::control::git(root, &["ls-files", "-z", "--", path])
+        .map_err(|e| IndexError::at(path, 1, e))?;
+    let tracked_index = if tracked.is_empty() {
+        None
+    } else {
+        match std::fs::symlink_metadata(root.join(path)) {
+            Ok(meta) if meta.is_file() => Some(
+                std::fs::read(root.join(path))
+                    .map_err(|e| IndexError::at(path, 1, e.to_string()))?,
+            ),
+            Ok(_) => {
+                return Err(IndexError::at(
+                    path,
+                    1,
+                    "index must be a regular file, not a link",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(IndexError::at(path, 1, e.to_string())),
+        }
+    };
+    Ok(hoh_core::persistence::SpecFiles {
+        sources,
+        tracked_index,
+    })
+}
+
 /// The direct Markdown children of docs/spec, without following directory or file links.
 pub(crate) fn sources(root: &Path) -> Result<Vec<Source>, IndexError> {
     for path in ["docs", "docs/spec"] {

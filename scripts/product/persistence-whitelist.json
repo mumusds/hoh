@@ -35,9 +35,7 @@
   "tests/fixtures/protocol/codex/0.166.0/help.txt": "recorded Codex help (migrate-nfs-db subcommand: SQLite databases)",
   "tools/validate_bundle.py": "kit validator checking the SQL contract on a temporary database"
  },
- "read_as_data": {
-  "contracts/requirements.json": "the specification the writer's completion freezes, at CR-018's layout path until M3-T02 (docs/adr/ADR-028.md decision 4): read as bytes and JSON, never run; its prose mentions SQLite, it holds no SQL write"
- },
+ "read_as_data": {},
  "append_only_allow": [
   {
    "file": "crates/hoh-core/src/persistence/evidence.rs",

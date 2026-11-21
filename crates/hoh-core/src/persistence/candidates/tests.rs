@@ -68,7 +68,7 @@ fn freeze_of(run: &str, tree: char) -> Freeze {
     let sealed = Manifest {
         git_commit: "a".repeat(40),
         git_tree: tree.to_string().repeat(40),
-        spec: file("contracts/requirements.json", 1),
+        spec: file("docs/spec/index.json", 1),
         environment: file(".hoh/environment.json", 2),
         test_plan: file("tests/check-plan.json", 3),
         source_files: vec![file("src/lib.rs", 4)],
@@ -79,7 +79,7 @@ fn freeze_of(run: &str, tree: char) -> Freeze {
         sealed,
         export: object(9, "application/json", "candidate", "candidate.json"),
         inputs: vec![
-            object(1, "application/json", "spec", "contracts/requirements.json"),
+            object(1, "application/json", "spec", "docs/spec/index.json"),
             object(
                 2,
                 "application/json",

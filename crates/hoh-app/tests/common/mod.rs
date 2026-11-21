@@ -54,6 +54,7 @@ fn stale(status: u16, body: &Value) -> Option<Value> {
 }
 
 mod output;
+pub mod spec;
 #[allow(unused_imports)] // each test binary uses a part of it
 pub use output::output_within;
 

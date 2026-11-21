@@ -24,9 +24,17 @@ fn frozen(dir: &Path) -> R<(PathBuf, Sealed)> {
     run_git(&project, &["init", "-q"])?;
     // The layout's inputs where the freeze takes them, and a source of the project's own.
     let layout = crate::host::completion_inputs();
+    let source = hoh_core::specindex::Source {
+        path: "docs/spec/fixture.md".to_owned(),
+        bytes: "# 用户\n# 范围\n# 非目标\n# 决策\n# 开放问题\n# 需求\n"
+            .as_bytes()
+            .to_vec(),
+    };
+    let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))?;
     for (path, text) in [
         (Path::new("src/work.rs"), "pub fn a() {}\n"),
-        (layout.spec.as_path(), "{\"requirements\": []}\n"),
+        (layout.spec.as_path(), std::str::from_utf8(index.bytes())?),
+        (Path::new(&source.path), std::str::from_utf8(&source.bytes)?),
         (layout.test_plan.as_path(), "{\"checks\": {}}\n"),
     ] {
         let file = project.join(path);

@@ -1762,9 +1762,10 @@ async fn a_developers_completed_result_is_frozen_accepted_and_settled_in_one_com
     let spec =
         "{\"requirements\": [{\"id\": \"REQ-001\", \"acceptance\": [{\"id\": \"AC-001-01\"}]}]}\n";
     git(&project, &["init", "-q"])?;
+    let spec = common::spec::write(&project, &serde_json::from_str(spec)?, "unit")?;
     for (path, text) in [
         ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", spec),
+        ("docs/spec/index.json", spec.as_str()),
         ("tests/check-plan.json", "{\"checks\": {}}\n"),
     ] {
         let file = project.join(path);
@@ -1908,9 +1909,10 @@ fn verified_project(world: &World) -> R<String> {
     let spec = "{\"requirements\": [{\"id\": \"REQ-001\", \"acceptance\": [{\"id\": \"AC-001-01\"}, \
                 {\"id\": \"AC-001-02\"}]}]}\n";
     git(&project, &["init", "-q"])?;
+    let spec = common::spec::write(&project, &serde_json::from_str(spec)?, "unit")?;
     for (path, text) in [
         ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", spec),
+        ("docs/spec/index.json", spec.as_str()),
         ("tests/check-plan.json", "{\"checks\": {}}\n"),
     ] {
         let file = project.join(path);

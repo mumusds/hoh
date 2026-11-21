@@ -76,9 +76,18 @@ fn repository() -> R<tempfile::TempDir> {
     git(root, &["init", "-q"])?;
     // The layout's inputs where the freeze takes them (`inputs()`), and a source of the project's own.
     let layout = inputs();
+    let source = hoh_core::specindex::Source {
+        path: "docs/spec/fixture.md".to_owned(),
+        bytes: "# 用户\n# 范围\n# 非目标\n# 决策\n# 开放问题\n# 需求\n"
+            .as_bytes()
+            .to_vec(),
+    };
+    let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))?;
+    let spec = std::str::from_utf8(index.bytes())?;
     for (path, text) in [
         (Path::new("src/work.rs"), "pub fn a() {}\n"),
-        (layout.spec.as_path(), "{\"requirements\": []}\n"),
+        (layout.spec.as_path(), spec),
+        (Path::new(&source.path), std::str::from_utf8(&source.bytes)?),
         (layout.test_plan.as_path(), "{\"checks\": {}}\n"),
     ] {
         let file = root.join(path);
@@ -88,6 +97,19 @@ fn repository() -> R<tempfile::TempDir> {
     git(root, &["add", "."])?;
     git(root, &["commit", "-q", "-m", "work"])?;
     Ok(dir)
+}
+
+#[test]
+fn freeze_inputs_use_generated_specification() {
+    let files = inputs();
+    assert_eq!(files.spec, Path::new(hoh_core::specindex::PATH));
+    assert_eq!(files.environment, Path::new(".hoh/environment.json"));
+    assert_eq!(files.test_plan, Path::new("tests/check-plan.json"));
+    assert!(
+        ![files.spec, files.environment, files.test_plan]
+            .iter()
+            .any(|path| path.starts_with("contracts"))
+    );
 }
 
 #[test]

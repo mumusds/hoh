@@ -63,6 +63,8 @@ pub enum RunTarget {
     /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
     /// stays stopped.
     Input(Input),
+    /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
+    Specification(Box<super::SpecApproval>),
 }
 
 /// What an input command brings (docs/adr/ADR-031.md decision 7).
@@ -259,6 +261,10 @@ pub(super) fn submit(
             super::hold::command(&tx, &command.run_id)?;
             input_command(&tx, command, input, ctx)?
         }
+        RunTarget::Specification(input) => {
+            super::hold::command(&tx, &command.run_id)?;
+            super::spec::approve(&tx, command, input, ctx)?
+        }
         target => {
             // A run command: every event of its run in this transaction is the command's, written even while the run
             // is stopped (docs/adr/ADR-031.md correction D: an INCOMPLETE run takes commands).
@@ -310,7 +316,10 @@ pub(super) fn submit(
                     }
                     to
                 }
-                RunTarget::Start { .. } | RunTarget::Team(_) | RunTarget::Input(_) => {
+                RunTarget::Start { .. }
+                | RunTarget::Team(_)
+                | RunTarget::Input(_)
+                | RunTarget::Specification(_) => {
                     unreachable!("handled above")
                 }
             };

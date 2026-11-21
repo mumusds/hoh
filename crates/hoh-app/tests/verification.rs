@@ -5,6 +5,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_app::verify::check::{
     CheckError, Launch, Ran, Request, checkouts_in_flight, pre_check, run, run_with,
 };
@@ -105,11 +107,12 @@ impl Fixture {
         let root = &dir.path().join("repo");
         std::fs::create_dir_all(root)?;
         git(root, &["init", "-q"])?;
+        let spec = common::spec::write(root, &serde_json::from_str(SPEC)?, "qa")?;
         for (path, text) in [
             ("src/lib.rs", "pub fn a() {}\n"),
             ("src/b.rs", "pub fn b() {}\n"),
             ("src/c.rs", "pub fn c() {}\n"),
-            ("contracts/requirements.json", SPEC),
+            ("docs/spec/index.json", spec.as_str()),
             ("environment.json", "{\"os\": \"linux\"}\n"),
             ("tests/check-plan.json", plan),
             ("qa.sh", qa),
@@ -137,7 +140,7 @@ impl Fixture {
             dir,
             store,
             inputs: Inputs {
-                spec: "contracts/requirements.json".into(),
+                spec: "docs/spec/index.json".into(),
                 environment: "environment.json".into(),
                 test_plan: "tests/check-plan.json".into(),
             },
@@ -325,7 +328,7 @@ async fn every_difference_from_the_frozen_candidate_is_named_before_anything_run
             "spec changed",
             |f| {
                 Ok(std::fs::write(
-                    f.root().join("contracts/requirements.json"),
+                    f.root().join("docs/spec/index.json"),
                     "{}
 ",
                 )?)
@@ -705,8 +708,7 @@ impl Fixture {
     /// The run's spec as the store knows it: the fixture spec's digest, REQ-001 and its AC-001-01, scenario-checked by
     /// qa.
     fn seed_spec(&self) -> R {
-        let (sha, _) =
-            hoh_core::objects::hash_file(&self.root().join("contracts/requirements.json"))?;
+        let (sha, _) = hoh_core::objects::hash_file(&self.root().join("docs/spec/index.json"))?;
         self.seed(&format!(
             "UPDATE specs SET sha256 = '{sha}' WHERE spec_id = (SELECT spec_id FROM runs WHERE run_id = 'R');
              INSERT INTO requirements(requirement_id, spec_id, title, required_release)
@@ -1955,10 +1957,7 @@ async fn a_lost_policy_or_spec_object_is_put_back_before_the_command_runs() -> R
     )
     .await?;
     let c = f.frozen().await?;
-    for rel in [
-        "contracts/release-policy.json",
-        "contracts/requirements.json",
-    ] {
+    for rel in ["contracts/release-policy.json", "docs/spec/index.json"] {
         let (sha, _) = hoh_core::objects::hash_file(&f.root().join(rel))?;
         std::fs::remove_file(f.root().join(hoh_core::objects::relative_path(&sha)))?;
     }

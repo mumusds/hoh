@@ -866,6 +866,32 @@ async fn submit_command(
             None,
             json!({}),
         ),
+        CommandBody::ApproveSpec(approval) => {
+            let root = shared.root.clone();
+            let files = super::begun::spawn_blocking(move || super::spec::files(&root)).await;
+            let files = match files {
+                Ok(files) => files,
+                Err(e) => {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "UNPROCESSABLE",
+                        format!("specification read stopped: {e}"),
+                        true,
+                        None,
+                    );
+                }
+            };
+            (
+                "ApproveSpec",
+                RunTarget::Specification(Box::new(hoh_core::persistence::SpecApproval {
+                    approval: approval.clone(),
+                    files,
+                })),
+                "spec.changed",
+                None,
+                json!({}),
+            )
+        }
         _ => {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
