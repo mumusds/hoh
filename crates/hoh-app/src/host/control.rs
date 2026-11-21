@@ -224,6 +224,10 @@ impl Processes for HostProcesses {
             _ => None,
         };
         let has_native = native.is_some();
+        let cgroup = self
+            .trackings
+            .get(&attempt.attempt_id)
+            .and_then(Tracking::cgroup);
         let outside = {
             let Ok(mut pins) = self.pins.lock() else {
                 return Some((Box::new(Fixed(Look::Lost)), false));
@@ -235,15 +239,12 @@ impl Processes for HostProcesses {
                             &self.project_id,
                             &attempt.attempt_id,
                         ))
-                        .born(attempt.process_start_id.as_deref()),
+                        .born(attempt.process_start_id.as_deref())
+                        .by_cgroup(cgroup.is_some()),
                     ))
                 })
                 .clone()
         };
-        let cgroup = self
-            .trackings
-            .get(&attempt.attempt_id)
-            .and_then(Tracking::cgroup);
         let control = |group: Watch| {
             if let Ok(mut outside) = outside.lock() {
                 if matches!(group, Watch::Found(_)) {
