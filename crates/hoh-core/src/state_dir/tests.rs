@@ -154,3 +154,36 @@ fn ensuring_twice_or_from_many_threads_writes_one_whole_file() -> R {
     assert_eq!(names, vec![".gitignore".to_owned()]);
     Ok(())
 }
+
+#[test]
+fn state_directories_are_private_when_created_and_when_reopened() -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join(".hoh");
+    create_private(&dir)?;
+    assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o077, 0);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::write(dir.join(".gitignore"), b"user's rules\n")?;
+    ensure(&dir)?;
+    assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::read(dir.join(".gitignore"))?, b"user's rules\n");
+    Ok(())
+}
+
+#[test]
+fn reopening_a_state_directory_never_restores_owner_permissions() -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join(".hoh");
+    ensure(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+    let outcome = ensure(&dir);
+    let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    outcome?;
+    assert_eq!(
+        mode, 0o500,
+        "privacy must not restore the owner's write permission"
+    );
+    Ok(())
+}

@@ -18,7 +18,16 @@ static STAGED: AtomicU64 = AtomicU64::new(0);
 /// whole to a name of its own, synced, then linked to `.gitignore`: the name never shows a part of it, and a file put
 /// there meanwhile by another process or the user is kept.
 pub fn ensure(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    // A newly visible directory never grants access beyond its owner. Tighten an existing directory before any
+    // state is written too; an earlier version may have made it under a permissive umask (M2T12R-08).
+    create_private(dir)?;
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    let private = mode & 0o700;
+    // Remove access, never add owner permissions that the user (or umask) deliberately withheld.
+    if mode & 0o7777 != private {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(private))?;
+    }
     let target = dir.join(".gitignore");
     match std::fs::symlink_metadata(&target) {
         Ok(_) => return Ok(()),
@@ -45,6 +54,15 @@ pub fn ensure(dir: &Path) -> std::io::Result<()> {
     })();
     let _ = std::fs::remove_file(&staged);
     placed
+}
+
+/// The mkdir itself has a private mode; checked separately before any later chmod or state write.
+fn create_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 #[cfg(test)]
