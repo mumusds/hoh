@@ -1870,3 +1870,52 @@ fn test_005_01_a_detached_run_survives_the_hangup_and_attach_sees_what_happened(
     assert_eq!(work_done(&world, &run)?, before);
     Ok(())
 }
+
+#[test]
+fn test_047_02_tui_diff_and_restore_default() -> R {
+    let world = world::World::named("m3t03-settings")?;
+    world.register()?;
+    world.commit_project(&world::fixture_spec())?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(world.init_store())?;
+    let spec = world.seed_spec()?;
+    let project = world.project();
+    let file = project.join(".hoh/prompts/developer.md");
+    std::fs::create_dir_all(file.parent().ok_or("parent")?)?;
+    std::fs::write(&file, "CUSTOM SETTINGS CONTRACT\n")?;
+    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/prompts");
+    let before = tree(&resources)?;
+    let host = runtime.block_on(world.start_host())?;
+    let outcome = (|| -> R {
+        let mut pty = Pty::new(40, 120)?;
+        let mut child = world.hoh_pty(&pty, &[])?;
+        pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("host 已连接"))?;
+        pty.send(b"/settings developer\r")?;
+        let shown = pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("--- builtin"))?;
+        assert!(shown.contains("+++ project"), "{shown}");
+        assert!(shown.contains("@@ -1,"), "{shown}");
+        pty.send(b"r")?;
+        pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("已恢复默认"))?;
+        assert!(!file.exists());
+        assert_eq!(
+            tree(&resources)?,
+            before,
+            "installed-source resources are immutable"
+        );
+        signal(&child, Signal::TERM)?;
+        assert_eq!(exit_within(&mut child, WAIT)?.code(), Some(143));
+        pty.drained(WAIT)?;
+        let run = runtime.block_on(world::start_run(&host, "settings", "settings restore"))?;
+        world.exec(&format!("UPDATE runs SET state = 'RUNNING' WHERE run_id = '{run}';
+          INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
+          VALUES ('T-settings', '{run}', '{spec}', 'READY', 1, 'developer', 0, 1, 1);"))?;
+        world.wait("SELECT count(*) FROM attempts a JOIN prompt_revisions p ON p.revision_id = a.prompt_revision WHERE a.task_id = 'T-settings' AND p.layer = 'builtin'", "1", Duration::from_secs(45))?;
+        assert_eq!(tree(&resources)?, before);
+        Ok(())
+    })();
+    runtime.block_on(host.shutdown());
+    outcome
+}

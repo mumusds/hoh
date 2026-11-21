@@ -1485,3 +1485,33 @@ fn the_status_bar_says_that_enter_sends() {
         app.attach("R", "RUNNING");
     }
 }
+
+#[test]
+fn test_047_02_settings_diff_restore_and_cancel() {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-settings-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join(".hoh/prompts/developer.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "custom developer\n").unwrap();
+    let mut app = App::open(dir.path());
+    app.attach("R", "RUNNING");
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    let shown = screen(&app, 110, 30).join("\n");
+    assert!(shown.contains("设置：developer"), "{shown}");
+    assert!(shown.contains("--- builtin"), "{shown}");
+    assert!(shown.contains("+++ project"), "{shown}");
+    assert!(
+        app.take_requests().is_empty(),
+        "settings is local even when attached"
+    );
+    app.key(key(KeyCode::Esc));
+    assert!(path.exists(), "closing settings never restores");
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    app.key(key(KeyCode::Char('r')));
+    assert!(!path.exists(), "restore deletes the project override");
+    assert!(screen(&app, 110, 30).join("\n").contains("已恢复默认"));
+}

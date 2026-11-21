@@ -11,6 +11,7 @@ mod app;
 mod editor;
 mod history;
 mod input;
+mod settings;
 mod terminal;
 #[cfg(test)]
 mod tests;
