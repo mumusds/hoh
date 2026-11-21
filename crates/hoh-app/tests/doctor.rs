@@ -1717,6 +1717,14 @@ fn live_drives_an_exec_only_codex_through_exec() -> R {
     let (out, _) = s.doctor_in(&[], &["--live", "--output", "json"], &[])?;
     let report: Value = serde_json::from_slice(&out.stdout)?;
     let live = &report["agents"]["codex"]["live"];
+    // No record at all: the live check never reached codex (not taken for ready, or the check ended before its turns);
+    // its item and the report's warnings say which.
+    assert!(
+        !live.is_null(),
+        "no live record for codex: {} {}",
+        report["agents"]["codex"],
+        report["summary"]
+    );
     assert!(live["error"].is_null(), "the live turn did not run: {live}");
     assert_eq!(live["state"], "SETTLED", "{live}");
     assert_eq!(live["stored"]["state"], "SETTLED", "{live}");
