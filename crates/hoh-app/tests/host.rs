@@ -940,12 +940,22 @@ async fn test_041_04_retry_after_disconnect_returns_first_result() -> R {
 
 /// Every connection has the required settings and the readers refuse writes; with an outside connection holding the
 /// write lock, a command waits (202 when the lock goes within the busy timeout, 503 DB_BUSY after 5 to 6 s when it
-/// does not) while reads answer within 500 ms.
+/// does not) while reads answer within 500 ms. The host has nothing else to write (AC-062-01's given: a host just
+/// started, the outside connection, two PauseRuns): its runs have no work, so a pause completes at once, and the
+/// second hold begins only once the first run is PAUSED. A run pausing with work keeps the host's pause step taking
+/// the write lock at each tick (docs/adr/ADR-021.md decision 7), and a command queued behind such a step waits for it
+/// first: the single writer takes its jobs in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
     let dir = tempfile::tempdir()?;
     let host = Host::start(config(dir.path())).await?;
-    seed_runs(&host, dir.path(), &["r1".to_owned(), "r2".to_owned()])?;
+    python(
+        &db(dir.path()),
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); p=sys.stdin.read().strip(); \
+         c.executemany(\"INSERT INTO runs(run_id, project_id, state, mode, created_at) VALUES (?, ?, 'CREATED', 'AUTO', \
+         '2026-11-06T00:00:00Z')\", [('r1', p), ('r2', p)]); c.commit(); c.close()",
+        &host.project_id,
+    )?;
     let diagnostics = host.diagnostics().await?;
     for pragmas in std::iter::once(&diagnostics.writer).chain(&diagnostics.readers) {
         assert_eq!(
@@ -1024,6 +1034,17 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
             assert!(took <= Duration::from_secs(5), "202 after {took:?}");
         }
         locker.wait()?;
+        // The host's pause step done (no work: PAUSED at once), nothing of it left to write.
+        let end = Instant::now() + Duration::from_secs(10);
+        while !expect_busy
+            && scalar(
+                dir.path(),
+                &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
+            )? != "PAUSED"
+        {
+            assert!(Instant::now() < end, "{run} was not paused");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     host.shutdown().await;
     Ok(())
