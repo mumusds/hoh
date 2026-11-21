@@ -64,6 +64,8 @@ pub mod schema;
 #[forbid(clippy::disallowed_methods)]
 pub mod spawn;
 #[forbid(clippy::disallowed_methods)]
+pub mod specindex;
+#[forbid(clippy::disallowed_methods)]
 pub mod staffing;
 #[forbid(clippy::disallowed_methods)]
 pub mod state_dir;

@@ -23,6 +23,7 @@ mod processes;
 pub mod product;
 mod reconcile;
 mod runner;
+pub(crate) mod spec;
 mod suites;
 #[cfg(test)]
 mod tests;

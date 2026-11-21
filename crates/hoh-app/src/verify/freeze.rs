@@ -17,6 +17,8 @@ pub struct Inputs {
 /// Why a freeze did not happen.
 #[derive(Debug)]
 pub enum FreezeError {
+    /// The committed specification does not parse or its generated index has drifted (REQ-034).
+    SpecInvalid(hoh_core::specindex::IndexError),
     /// The checkout cannot be frozen as it is; every reason found, each naming its path.
     Refused(Vec<String>),
     /// The store refused or failed.
@@ -28,6 +30,7 @@ pub enum FreezeError {
 impl std::fmt::Display for FreezeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FreezeError::SpecInvalid(e) => write!(f, "SPEC_INVALID: {e}"),
             FreezeError::Refused(reasons) => {
                 write!(f, "the checkout cannot be frozen: {}", reasons.join("; "))
             }
@@ -314,6 +317,14 @@ fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, F
     if !reasons.is_empty() {
         return Err(FreezeError::Refused(reasons));
     }
+    if inputs.spec == Path::new(hoh_core::specindex::PATH) {
+        let index = crate::host::spec::sources(checkout)
+            .and_then(|files| hoh_core::specindex::generate_index(&files))
+            .map_err(FreezeError::SpecInvalid)?;
+        let bytes = std::fs::read(checkout.join(&inputs.spec))
+            .map_err(|e| io(format!("{}: {e}", inputs.spec.display())))?;
+        index.verify(&bytes).map_err(FreezeError::SpecInvalid)?;
+    }
     let head = |rev: &str| -> Result<String, FreezeError> {
         Ok(String::from_utf8_lossy(&git(&["rev-parse", rev])?)
             .trim()
@@ -435,3 +446,6 @@ fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, F
         inputs: kept,
     })
 }
+
+#[cfg(test)]
+mod tests;
