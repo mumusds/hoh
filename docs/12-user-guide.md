@@ -61,3 +61,7 @@ NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --res
 ## 最终报告
 
 包含产物版本、发布状态（COMPLETED / COMPLETED_DEGRADED 及降级清单 / INTERIM_RELEASED / INCOMPLETE / BLOCKED / FAILED）、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。
+
+### 职位契约设置
+
+在 TUI 输入 `/settings developer`（或 `/settings`）打开 developer 契约的统一 diff。附着 Run 后也可使用。↑↓、PgUp、PgDn 浏览；按 r 恢复默认，Esc 返回。恢复默认只删除项目的 `.hoh/prompts/developer.md`，下一 Attempt 重新读取覆盖链；若有 global 或 run 覆盖，它们仍按原优先级生效。安装资源不被修改。配置 `prompt` 指定其他文件时，恢复操作拒绝删除，须先移除该配置再操作约定路径。

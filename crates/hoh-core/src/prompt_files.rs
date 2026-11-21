@@ -254,3 +254,44 @@ pub fn save_override(root: &Path, relative: &str, text: &str) -> Result<(), Erro
         .and_then(|dir| dir.sync_all())
         .map_err(prompt::unavailable)
 }
+
+/// Restore only the conventional project override owned by this product. No glob, recursive removal or configured
+/// arbitrary file deletion. Directory handles and NOFOLLOW prevent a swapped ancestor from redirecting the unlink.
+pub fn restore_project(root: &Path, role: &str, configured: Option<&str>) -> Result<bool, Error> {
+    use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
+    if configured.is_some_and(|p| !p.starts_with(crate::config::BUILTIN_PROMPT)) {
+        return Err(prompt::unavailable(
+            "配置指定了文件；请先移除 prompt 配置再恢复约定路径",
+        ));
+    }
+    if crate::config::builtin_contract(
+        configured
+            .and_then(|p| p.strip_prefix(crate::config::BUILTIN_PROMPT))
+            .unwrap_or(role),
+    )
+    .is_none()
+    {
+        return Err(prompt::unavailable("该职位没有内置默认契约"));
+    }
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::open(root, flags, Mode::empty()).map_err(prompt::unavailable)?;
+    for name in [".hoh", "prompts"] {
+        dir = match fs::openat(&dir, name, flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(rustix::io::Errno::NOENT) => return Ok(false),
+            Err(e) => return Err(prompt::unavailable(e)),
+        };
+    }
+    let name = format!("{}.md", crate::layout::component(role));
+    let stat = match fs::statat(&dir, &name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(false),
+        Err(e) => return Err(prompt::unavailable(e)),
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(prompt::unavailable("覆盖不是普通文件，未删除"));
+    }
+    fs::unlinkat(&dir, &name, AtFlags::empty()).map_err(prompt::unavailable)?;
+    fs::fsync(&dir).map_err(prompt::unavailable)?;
+    Ok(true)
+}

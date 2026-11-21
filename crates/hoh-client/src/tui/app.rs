@@ -166,6 +166,8 @@ struct Search {
 
 #[derive(Debug)]
 pub struct App {
+    root: Option<std::path::PathBuf>,
+    settings: Option<super::settings::Settings>,
     project: String,
     mode: String,
     editor: Editor,
@@ -189,6 +191,8 @@ impl App {
     pub fn new(project: String, history: History) -> App {
         let messages = history.notice().map(str::to_owned).into_iter().collect();
         App {
+            root: None,
+            settings: None,
             project,
             mode: DEFAULT_MODE.to_owned(),
             editor: Editor::default(),
@@ -213,6 +217,7 @@ impl App {
         );
         let mut app = App::new(name, History::load(project));
         app.mode = mode_of(project);
+        app.root = Some(project.to_path_buf());
         app
     }
 
@@ -385,6 +390,23 @@ impl App {
             }
             return None;
         }
+        if let Some(settings) = self.settings.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.settings = None,
+                KeyCode::Char('c') if ctrl => self.menu = Some(0),
+                KeyCode::Char('r') => {
+                    if let Some(root) = &self.root {
+                        settings.restore(root);
+                    }
+                }
+                KeyCode::Down => settings.scroll(1),
+                KeyCode::Up => settings.scroll(-1),
+                KeyCode::PageDown => settings.scroll(20),
+                KeyCode::PageUp => settings.scroll(-20),
+                _ => (),
+            }
+            return None;
+        }
         if self.picker.is_some() {
             return self.picker_key(key);
         }
@@ -510,7 +532,7 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if self.menu.is_some() || self.picker.is_some() {
+        if self.menu.is_some() || self.picker.is_some() || self.settings.is_some() {
             return;
         }
         self.search = None;
@@ -532,6 +554,21 @@ impl App {
             Ok(None) => {}
         }
         self.messages.push(format!("你：{text}"));
+        let mut words = text.split_whitespace();
+        if words.next() == Some("/settings") {
+            let role = words.next().unwrap_or("developer");
+            if let Some(root) = &self.root {
+                match super::settings::Settings::open(
+                    root,
+                    self.run.as_ref().map_or("settings", |r| r.run_id.as_str()),
+                    role,
+                ) {
+                    Ok(settings) => self.settings = Some(settings),
+                    Err(e) => self.messages.push(format!("设置无法打开：{e}")),
+                }
+            }
+            return;
+        }
         // Attached, or a run being started: input of that run (an Enter after the one that starts a run, before the
         // loop has started it, goes to the run it starts).
         if self.run.is_some() || self.requests.iter().any(|r| matches!(r, Request::Start(_))) {
@@ -670,6 +707,9 @@ impl App {
         frame.render_widget(Paragraph::new(line).style(bar), status);
         if let Some(picker) = &self.picker {
             Self::draw_picker(frame, body, picker);
+        }
+        if let Some(settings) = &self.settings {
+            settings.draw(frame, body);
         }
         match self.menu {
             Some(selected) => self.draw_menu(frame, body, selected),

@@ -78,3 +78,36 @@ fn test_045_02_layer_conflicts_keep_valid_contracts_and_builtin_evidence_heading
     }
     Ok(())
 }
+
+#[test]
+fn test_047_02_restore_deletes_only_owned_override_and_rejects_links() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-restore-")
+        .tempdir()?;
+    let root = dir.path().join("p");
+    std::fs::create_dir_all(root.join(".hoh/prompts"))?;
+    let override_file = root.join(".hoh/prompts/developer.md");
+    let neighbor = root.join(".hoh/prompts/developer.md.backup");
+    std::fs::write(&override_file, "custom")?;
+    std::fs::write(&neighbor, "keep")?;
+    assert!(restore_project(&root, "developer", Some(".hoh/prompts/developer.md")).is_err());
+    assert!(override_file.exists());
+    assert!(restore_project(&root, "developer", None)?);
+    assert!(!restore_project(&root, "developer", None)?);
+    assert_eq!(std::fs::read_to_string(&neighbor)?, "keep");
+    assert_eq!(
+        load(&root, None, "R", "developer", None)?
+            .effective()?
+            .layer,
+        "builtin"
+    );
+    std::os::unix::fs::symlink(&neighbor, &override_file)?;
+    assert!(restore_project(&root, "developer", None).is_err());
+    assert_eq!(std::fs::read_to_string(&neighbor)?, "keep");
+    std::fs::remove_file(&override_file)?;
+    std::fs::rename(root.join(".hoh/prompts"), root.join("saved"))?;
+    std::os::unix::fs::symlink(root.join("saved"), root.join(".hoh/prompts"))?;
+    assert!(restore_project(&root, "developer", None).is_err());
+    assert!(root.join("saved/developer.md.backup").exists());
+    Ok(())
+}
