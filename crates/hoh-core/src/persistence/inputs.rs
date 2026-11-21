@@ -231,6 +231,33 @@ pub(super) fn first_input_wait(
     role: &str,
     epoch: Option<i64>,
 ) -> Result<bool, PersistError> {
+    first_input_gate(conn, run, role, epoch, false)
+}
+
+/// Commander ASK/STEER is carried by a new supervision turn, which also carries
+/// the owed first-input package. It must wait for session.start and any first turn
+/// already in flight, but must not wait for its own turn to complete before routing.
+/// Other inputs and HCP messages retain the ordinary first-input gate.
+pub(super) fn delivery_input_wait(
+    conn: &Connection,
+    run: &str,
+    role: &str,
+    epoch: Option<i64>,
+    payload: &Value,
+) -> Result<bool, PersistError> {
+    let carries_package = role == "commander"
+        && payload["notice"] == "input"
+        && matches!(payload["kind"].as_str(), Some("ASK" | "STEER"));
+    first_input_gate(conn, run, role, epoch, carries_package)
+}
+
+fn first_input_gate(
+    conn: &Connection,
+    run: &str,
+    role: &str,
+    epoch: Option<i64>,
+    carries_package: bool,
+) -> Result<bool, PersistError> {
     let binding: Option<(i64, Option<String>)> = conn
         .query_row(
             "SELECT role_epoch,session_id FROM role_bindings WHERE run_id=?1 AND role=?2",
@@ -249,6 +276,9 @@ pub(super) fn first_input_wait(
         return Ok(true);
     }
     match session {
+        Some(session) if carries_package => {
+            super::handover::first_input_in_flight(conn, run, role, current, &session)
+        }
         Some(session) => super::handover::first_input_owed(conn, run, role, current, &session),
         None => Ok(true),
     }
@@ -328,7 +358,7 @@ pub(super) fn consume(
         return Ok(Some(stored));
     }
     super::hold::writable(&tx, &run)?;
-    if first_input_wait(&tx, &run, &role, Some(epoch))? {
+    if delivery_input_wait(&tx, &run, &role, Some(epoch), &claimed.payload)? {
         return Ok(None);
     }
     let row = read_input(&tx, &claimed.message_id)?

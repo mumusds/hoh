@@ -5020,6 +5020,10 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
             process["found"] == "gone" || (process["found"] == "ours" && process["reaped"] == true),
             "{judged}"
         );
+        keep(
+            "TEST-005-04-before-assert.json",
+            &Value::Object(seen.clone()),
+        )?;
         assert_eq!(started["payload"]["unfinished"], 1, "{started}");
         Ok(())
     })();

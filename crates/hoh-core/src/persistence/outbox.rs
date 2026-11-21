@@ -138,7 +138,7 @@ pub(super) fn claim_next(
             continue;
         }
         if let Some(run) = &run_id
-            && super::inputs::first_input_wait(
+            && super::inputs::delivery_input_wait(
                 &tx,
                 run,
                 &recipient_role,
@@ -150,6 +150,7 @@ pub(super) fn claim_next(
                 } else {
                     Some(role_epoch)
                 },
+                &serde_json::from_str::<Value>(&payload).unwrap_or(Value::Null),
             )?
         {
             excluded.insert(message_id);

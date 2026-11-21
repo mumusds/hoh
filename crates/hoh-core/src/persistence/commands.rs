@@ -569,6 +569,10 @@ fn input_command(
             }
         }
     };
+    // A working ASK is read-only (AC-017-01). In a stopped state the accepted
+    // command still moves the revision and closes with a fresh result (ADR-031 E3).
+    let publish_result = queued.as_ref().is_none_or(|input| input.kind != "ASK")
+        || matches!(state.as_str(), "BLOCKED" | "PAUSED" | "INCOMPLETE");
     // The acceptance event is the commit's first (decision 9 finds it by its command_id).
     let done = writer::write(
         tx,
@@ -596,7 +600,7 @@ fn input_command(
         if let Some(input) = &queued {
             super::inputs::enqueue(tx, input, ctx)?;
         }
-        if queued.as_ref().is_none_or(|input| input.kind != "ASK") {
+        if publish_result {
             writer::write(
                 tx,
                 &Commit {
@@ -611,9 +615,8 @@ fn input_command(
             )?;
         }
     }
-    // Mutating input commands publish the new revision's result (E3). ASK keeps the
-    // already published result: its read-only command must not emit the same result id twice.
-    if queued.as_ref().is_none_or(|input| input.kind != "ASK") {
+    // The stopped-state command's result has its new revision; working ASK emits none.
+    if publish_result {
         writer::result_due(tx, &command.run_id)?;
     }
     let now: i64 = tx

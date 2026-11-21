@@ -3744,33 +3744,59 @@ fn input_rows(path: &Path, sql: &str) -> R<Value> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_017_01_ask_on_a_stopped_run_keeps_its_revision_and_published_result() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t09-stopped-ask-")
-        .tempdir()?;
-    let host = Host::start(config(dir.path())).await?;
-    let start = json!({"schema_version":"1.0","command_id":"start-ask","idempotency_key":"start-ask",
-        "kind":"StartRun","run_id":null,"expected_revision":0,"payload":{"goal":"ask","mode":"AUTO","interactive":true}});
-    let (status, started) = command(&host, &start).await?;
-    assert_eq!(status, 202, "{started}");
-    let revision = started["revision"].as_i64().ok_or("revision")?;
-    let ask = json!({"schema_version":"1.0","command_id":"stopped-ask","idempotency_key":"stopped-ask",
-        "kind":"SendInput","run_id":started["run_id"],"expected_revision":revision,
-        "payload":{"text":"why stopped?","target_role":null,"input_kind":"ASK"}});
-    let (status, accepted) = command(&host, &ask).await?;
-    assert_eq!(status, 202, "{accepted}");
-    assert_eq!(
-        query(dir.path(), "SELECT revision FROM runs")?,
-        revision.to_string()
-    );
-    assert_eq!(
-        query(
-            dir.path(),
-            "SELECT count(*) FROM events WHERE kind='run.result'"
-        )?,
-        "1"
-    );
-    host.shutdown().await;
+async fn test_017_01_ask_on_a_stopped_run_publishes_a_new_result() -> R {
+    for state in ["INCOMPLETE", "BLOCKED", "PAUSED"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-stopped-ask-")
+            .tempdir()?;
+        let host = Host::start(config(dir.path())).await?;
+        let start = json!({"schema_version":"1.0","command_id":"start-ask","idempotency_key":"start-ask",
+            "kind":"StartRun","run_id":null,"expected_revision":0,"payload":{"goal":"ask","mode":"AUTO","interactive":true}});
+        let (status, started) = command(&host, &start).await?;
+        assert_eq!(status, 202, "{started}");
+        // No executor: isolate each stopped-state command boundary from scheduling.
+        seed(dir.path(), &format!("UPDATE runs SET state='{state}'"))?;
+        let revision = started["revision"].as_i64().ok_or("revision")?;
+        let ask = json!({"schema_version":"1.0","command_id":"stopped-ask","idempotency_key":"stopped-ask",
+            "kind":"SendInput","run_id":started["run_id"],"expected_revision":revision,
+            "payload":{"text":"why stopped?","target_role":null,"input_kind":"ASK"}});
+        let (status, accepted) = command(&host, &ask).await?;
+        assert_eq!(status, 202, "{state}: {accepted}");
+        assert_eq!(accepted["revision"], revision + 1);
+        assert_eq!(query(dir.path(), "SELECT state FROM runs")?, state);
+        assert_eq!(
+            query(dir.path(), "SELECT revision FROM runs")?,
+            (revision + 1).to_string()
+        );
+        let result = input_rows(
+            &db(dir.path()),
+            "SELECT seq,kind,payload_json FROM events WHERE run_id IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )?;
+        assert_eq!(result[0]["kind"], "run.result", "{state}: {result}");
+        let payload: Value =
+            serde_json::from_str(result[0]["payload_json"].as_str().ok_or("result payload")?)?;
+        assert_eq!(payload["state"], state);
+        assert_eq!(payload["last_event_seq"], result[0]["seq"]);
+        assert_eq!(
+            query(
+                dir.path(),
+                "SELECT count(*) FROM events WHERE kind='run.result'"
+            )?,
+            "2"
+        );
+        assert_eq!(query(dir.path(), "SELECT count(*) FROM tasks")?, "0");
+        assert_eq!(query(dir.path(), "SELECT count(*) FROM attempts")?, "0");
+        // An idempotent replay returns the same acceptance and does not publish again.
+        assert_eq!(command(&host, &ask).await?, (202, accepted));
+        assert_eq!(
+            query(
+                dir.path(),
+                "SELECT count(*) FROM events WHERE kind='run.result'"
+            )?,
+            "2"
+        );
+        host.shutdown().await;
+    }
     Ok(())
 }
 
@@ -3999,14 +4025,16 @@ async fn test_017_02_cancel_completes_while_steer_ack_is_held() -> R {
     });
     let host = start_when_free(settings).await?;
     let (_work, _release) = tokio::time::timeout(Duration::from_secs(20), turns.recv())
-        .await?
-        .ok_or("turn")?;
+        .await
+        .map_err(|e| format!("stage=work-start: {e}"))?
+        .ok_or("stage=work-start: channel closed")?;
     let rev = query(&project, "SELECT revision FROM runs WHERE run_id='R'")?.parse::<i64>()?;
     let body = json!({"schema_version":"1.0","command_id":"late","idempotency_key":"late","kind":"SendInput","run_id":"R","expected_revision":rev,"payload":{"input_kind":"STEER","target_role":"developer","text":"late reply"}});
     assert_eq!(command(&host, &body).await?.0, 202);
     let (_, ack) = tokio::time::timeout(Duration::from_secs(20), steering.recv())
-        .await?
-        .ok_or("steer")?;
+        .await
+        .map_err(|e| format!("stage=steer-request: {e}"))?
+        .ok_or("stage=steer-request: channel closed")?;
     assert_eq!(
         control(&host, &project, "CancelRun", "cancel-steer")
             .await?
@@ -4015,19 +4043,27 @@ async fn test_017_02_cancel_completes_while_steer_ack_is_held() -> R {
     );
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            if query(&project, "SELECT state FROM runs WHERE run_id='R'")? == "CANCELLED" {
+            // Observe the product asynchronously. Spawning and synchronously waiting
+            // for a Python process on every poll blocks this runtime and adds more
+            // processes to the canceller's /proc scans under parallel suite load.
+            let (status, run) = get(&host, "/v1/runs/R").await?;
+            assert_eq!(status, 200, "stage=cancelled-with-ack-held: {run}");
+            if run["state"] == "CANCELLED" {
                 return R::Ok(());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await??;
+    .await
+    .map_err(|e| format!("stage=cancelled-with-ack-held: {e}"))??;
     ack.send(hoh_agents::codex::SteerReceipt::Delivered {
         turn_id: "late".into(),
     })
     .map_err(|_| "ack must still be held, not timed out")?;
     let id = hoh_core::ids::child_id("late", "input");
-    input_state_barrier(&project, &id, "REJECTED").await?;
+    input_state_barrier(&project, &id, "REJECTED")
+        .await
+        .map_err(|e| format!("stage=late-ack-rejected: {e}"))?;
     assert_eq!(
         query(
             &project,
