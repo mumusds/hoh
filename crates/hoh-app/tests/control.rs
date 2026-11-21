@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod pty;
+mod world;
 use common::{IN_SCOPE, in_delegated_scope};
 
 use hoh_app::host::{Host, HostConfig};
@@ -3499,6 +3501,274 @@ async fn test_007_02_latest_pending_target_survives_host_restart() -> R {
             "SELECT count(*) FROM events WHERE kind = 'run.mode_changed'"
         )?,
         "2"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Work keeps running while a scripted Commander answers a user query.
+#[derive(Debug)]
+struct InputTeam {
+    worker: Arc<Agents>,
+    commander: Arc<world::Team>,
+}
+impl hoh_app::host::Executor for InputTeam {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        if work.role == "commander" {
+            self.commander.deliver(work)
+        } else {
+            self.worker.deliver(work)
+        }
+    }
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        if work.role == "commander" {
+            self.commander.start(work)
+        } else {
+            self.worker.start(work)
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_017_01_ask_uses_outbox_and_a_read_only_commander_turn_while_writer_runs() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t09-ask-").tempdir()?;
+    let release = dir.path().join("release");
+    let script = format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done",
+        release.display()
+    );
+    let worker = Arc::new(Agents::new(&[("T1", &script)]));
+    let commander = world::Team::answering(
+        |turn| {
+            if turn.summary["user_input"]["kind"] == "ASK" {
+                vec![world::transition("VERIFYING")]
+            } else {
+                Vec::new()
+            }
+        },
+        |turn| {
+            if turn.summary["user_input"]["text"] == "empty" {
+                return None;
+            }
+            Some(format!(
+                "T1 正在运行：{}",
+                turn.summary["user_input"]["text"]
+                    .as_str()
+                    .unwrap_or("missing question")
+            ))
+        },
+    );
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(&project, &format!("{WORLD}
+        DELETE FROM tasks WHERE task_id IN ('T2','T3');
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','commander','1','{{}}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at)
+          VALUES ('R','commander','codex','sc',1,1,'2026-11-21T00:00:00Z');"))?;
+    let mut settings = config(&project);
+    let mut context = context();
+    context
+        .required_capabilities
+        .insert("commander".to_owned(), Default::default());
+    context.commander_dir = Some(dir.path().join("commander"));
+    settings.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(InputTeam {
+            worker: worker.clone(),
+            commander: commander.clone(),
+        }),
+        context,
+    });
+    let host = start_when_free(settings).await?;
+    until(
+        &project,
+        "SELECT count(*) FROM attempts WHERE task_id = 'T1' AND state = 'RUNNING'",
+        "1",
+        Duration::from_secs(20),
+    )
+    .await?;
+    let run_revision = query(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+    let task_revision = query(&project, "SELECT revision FROM tasks WHERE task_id = 'T1'")?;
+    let body = json!({"schema_version":"1.0","command_id":"ask-1","idempotency_key":"ask-1",
+        "kind":"SendInput","run_id":"R","expected_revision":run_revision.parse::<i64>()?,
+        "payload":{"text":"现在进展如何？","target_role":null,"input_kind":"ASK"}});
+    let (status, accepted) = command(&host, &body).await?;
+    assert_eq!(status, 202, "{accepted}");
+    assert_eq!(
+        query(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?,
+        run_revision,
+        "ASK must not touch the run revision"
+    );
+    assert_eq!(
+        command(&host, &body).await?,
+        (status, accepted),
+        "command replay"
+    );
+    until(
+        &project,
+        "SELECT state FROM input_queue",
+        "APPLIED",
+        Duration::from_secs(20),
+    )
+    .await?;
+    let inputs = input_rows(&db(&project), "SELECT * FROM input_queue")?;
+    let id = inputs[0]["input_id"].as_str().ok_or("input id")?;
+    assert_eq!(
+        query(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?,
+        run_revision
+    );
+    assert_eq!(
+        query(&project, "SELECT revision FROM tasks WHERE task_id = 'T1'")?,
+        task_revision
+    );
+    assert_eq!(
+        query(&project, "SELECT state FROM attempts WHERE task_id = 'T1'")?,
+        "RUNNING"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) FROM attempts a JOIN tasks t USING(task_id) WHERE t.role <> 'commander'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT count(*) FROM decisions WHERE state = 'APPLIED'"
+        )?,
+        "0",
+        "ASK cannot apply model decisions"
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!("SELECT state FROM outbox WHERE message_id = '{id}'")
+        )?,
+        "ACKED"
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!("SELECT count(*) FROM receipts WHERE message_id = '{id}'")
+        )?,
+        "1"
+    );
+    let events = input_rows(
+        &db(&project),
+        "SELECT kind,payload_json FROM events WHERE kind IN ('input.queued','input.delivered','input.applied') ORDER BY seq",
+    )?;
+    assert_eq!(
+        events
+            .as_array()
+            .ok_or("events")?
+            .iter()
+            .map(|v| v["kind"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        ["input.queued", "input.delivered", "input.applied"]
+    );
+    let applied: Value =
+        serde_json::from_str(events[2]["payload_json"].as_str().ok_or("payload")?)?;
+    assert_eq!(applied["answer"], "T1 正在运行：现在进展如何？");
+    let turns = commander.turns();
+    assert_eq!(turns.len(), 1);
+    assert!(
+        turns[0].0.summary["wake"]["fingerprint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("user_input")
+    );
+    assert_eq!(turns[0].0.summary["user_input"]["input_id"], id);
+    for (key, kind, text, applied) in [
+        ("plain", "REPLY", "普通输入", true),
+        ("empty", "ASK", "empty", false),
+    ] {
+        let revision: i64 =
+            query(&project, "SELECT revision FROM runs WHERE run_id='R'")?.parse()?;
+        let body = json!({"schema_version":"1.0","command_id":key,"idempotency_key":key,"kind":"SendInput","run_id":"R","expected_revision":revision,
+            "payload":{"text":text,"target_role":null,"input_kind":kind}});
+        let (status, reply) = command(&host, &body).await?;
+        assert_eq!(status, 202, "{reply}");
+        let input = hoh_core::ids::child_id(key, "input");
+        until(
+            &project,
+            &format!("SELECT state FROM input_queue WHERE input_id='{input}'"),
+            if applied { "APPLIED" } else { "REJECTED" },
+            Duration::from_secs(20),
+        )
+        .await?;
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT json_extract(payload_json,'$.{}') FROM input_queue WHERE input_id='{input}'",
+                    if applied { "answer" } else { "reason" }
+                )
+            )?,
+            if applied {
+                "T1 正在运行：普通输入"
+            } else {
+                "empty_answer"
+            }
+        );
+    }
+    assert_eq!(
+        query(&project, "SELECT revision FROM tasks WHERE task_id='T1'")?,
+        task_revision
+    );
+    assert_eq!(commander.turns().len(), 3);
+    std::fs::write(&release, b"done")?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "SETTLED",
+        Duration::from_secs(20),
+    )
+    .await?;
+    host.shutdown().await;
+    Ok(())
+}
+
+fn input_rows(path: &Path, sql: &str) -> R<Value> {
+    Ok(serde_json::from_str(&python(
+        path,
+        "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1],timeout=10); c.row_factory=sqlite3.Row; print(json.dumps([dict(r) for r in c.execute(sys.stdin.read())]))",
+        sql,
+    )?)?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_017_01_ask_on_a_stopped_run_keeps_its_revision_and_published_result() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-stopped-ask-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    let start = json!({"schema_version":"1.0","command_id":"start-ask","idempotency_key":"start-ask",
+        "kind":"StartRun","run_id":null,"expected_revision":0,"payload":{"goal":"ask","mode":"AUTO","interactive":true}});
+    let (status, started) = command(&host, &start).await?;
+    assert_eq!(status, 202, "{started}");
+    let revision = started["revision"].as_i64().ok_or("revision")?;
+    let ask = json!({"schema_version":"1.0","command_id":"stopped-ask","idempotency_key":"stopped-ask",
+        "kind":"SendInput","run_id":started["run_id"],"expected_revision":revision,
+        "payload":{"text":"why stopped?","target_role":null,"input_kind":"ASK"}});
+    let (status, accepted) = command(&host, &ask).await?;
+    assert_eq!(status, 202, "{accepted}");
+    assert_eq!(
+        query(dir.path(), "SELECT revision FROM runs")?,
+        revision.to_string()
+    );
+    assert_eq!(
+        query(
+            dir.path(),
+            "SELECT count(*) FROM events WHERE kind='run.result'"
+        )?,
+        "1"
     );
     host.shutdown().await;
     Ok(())

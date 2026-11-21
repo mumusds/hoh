@@ -596,21 +596,26 @@ fn input_command(
         if let Some(input) = &queued {
             super::inputs::enqueue(tx, input, ctx)?;
         }
-        writer::write(
-            tx,
-            &Commit {
-                cas: vec![StateCas {
-                    id: command.run_id.clone(),
-                    expected_revision: revision,
-                    change: Change::Touch(writer::Entity::Run),
-                }],
-                ..Commit::default()
-            },
-            ctx,
-        )?;
+        if queued.as_ref().is_none_or(|input| input.kind != "ASK") {
+            writer::write(
+                tx,
+                &Commit {
+                    cas: vec![StateCas {
+                        id: command.run_id.clone(),
+                        expected_revision: revision,
+                        change: Change::Touch(writer::Entity::Run),
+                    }],
+                    ..Commit::default()
+                },
+                ctx,
+            )?;
+        }
     }
-    // A run that stays stopped ends the commit with its result (E3).
-    writer::result_due(tx, &command.run_id)?;
+    // Mutating input commands publish the new revision's result (E3). ASK keeps the
+    // already published result: its read-only command must not emit the same result id twice.
+    if queued.as_ref().is_none_or(|input| input.kind != "ASK") {
+        writer::result_due(tx, &command.run_id)?;
+    }
     let now: i64 = tx
         .query_row(
             "SELECT revision FROM runs WHERE run_id = ?1",

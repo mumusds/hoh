@@ -925,13 +925,19 @@ fn effect(
     }
     if to == EffectState::Observed && key == crate::reconcile::work_key(attempt_id) {
         if super::wakes::is_supervision(&tx, &task_id)? {
-            events.extend(super::outputs::recorded(
-                &project_id,
-                &run_id,
-                attempt_id,
-                detail["success"] == json!(true),
-                &messages,
-            ));
+            if super::inputs::for_attempt(&tx, attempt_id)?.is_some_and(|i| i.kind == "ASK") {
+                if !messages.is_empty() {
+                    events.push(event(&project_id,&run_id,child_id(attempt_id,"outputs-discarded"),"supervisor.output_discarded",json!({"attempt_id":attempt_id,"count":messages.len(),"detail":"read_only_ask"})));
+                }
+            } else {
+                events.extend(super::outputs::recorded(
+                    &project_id,
+                    &run_id,
+                    attempt_id,
+                    detail["success"] == json!(true),
+                    &messages,
+                ));
+            }
         } else if let Some(kept) = outputs(
             &tx,
             &project_id,
@@ -1521,5 +1527,12 @@ pub(super) fn finished_in(
         commit.events.extend(failed.events);
     }
     writer::write(tx, &commit, ctx)?;
+    super::inputs::finish(
+        tx,
+        attempt_id,
+        success && !unknown,
+        ending.observed.final_text.as_deref(),
+        ctx,
+    )?;
     Ok(true)
 }

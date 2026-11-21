@@ -89,6 +89,8 @@ pub enum DeliveryError {
     Invalid(String),
     /// The message's run stopped (in G, its stop published) between the claim and the consume: the consume was rolled
     /// back, nothing was applied; the delivery is given back, no failure (docs/adr/ADR-031.md correction D).
+    /// A holder has not finished its first input. Return the generation without counting a failure.
+    Deferred,
     Held {
         run: String,
         state: protocol::RunState,
@@ -99,6 +101,7 @@ pub enum DeliveryError {
 /// answer.
 fn delivery_error(error: PersistError) -> DeliveryError {
     match error {
+        PersistError::FirstInputPending => DeliveryError::Deferred,
         PersistError::Held { run, state } => DeliveryError::Held { run, state },
         error => DeliveryError::Lost(error.to_string()),
     }
@@ -106,6 +109,11 @@ fn delivery_error(error: PersistError) -> DeliveryError {
 
 /// How a message reaches its consumer; the answer is the reply exactly as the consumer stored it.
 pub trait Transport: Send + Sync {
+    /// Whether this transport only consumes the host's Commander input notices.
+    fn inputs_only(&self) -> bool {
+        false
+    }
+
     fn deliver(
         &self,
         row: &OutboxRow,
@@ -194,6 +202,26 @@ impl<C: Clock> Transport for LocalTransport<'_, C> {
     }
 }
 
+/// Commander inputs are local durable deliveries; running its turn is the supervisor's work.
+#[derive(Debug)]
+pub struct InputTransport<'a, C: Clock + ?Sized> {
+    pub store: &'a Store,
+    pub clock: &'a C,
+}
+
+impl<C: Clock + ?Sized> Transport for InputTransport<'_, C> {
+    fn inputs_only(&self) -> bool {
+        true
+    }
+    async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
+        self.store
+            .consume_input(row.clone(), self.clock.now())
+            .await
+            .map_err(delivery_error)?
+            .ok_or(DeliveryError::Deferred)
+    }
+}
+
 /// What one tick did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tick {
@@ -206,7 +234,7 @@ pub struct Tick {
 
 /// Takes, delivers and settles outbox messages of `roles`, at most `batch` a tick, up to `max_attempts` deliveries
 /// each (`delivery.max_delivery_attempts`, REQ-018).
-pub struct Dispatcher<'a, C: Clock, T: Transport> {
+pub struct Dispatcher<'a, C: Clock + ?Sized, T: Transport> {
     pub store: &'a Store,
     pub clock: &'a C,
     pub transport: &'a T,
@@ -215,7 +243,7 @@ pub struct Dispatcher<'a, C: Clock, T: Transport> {
     pub batch: usize,
 }
 
-impl<C: Clock, T: Transport> std::fmt::Debug for Dispatcher<'_, C, T> {
+impl<C: Clock + ?Sized, T: Transport> std::fmt::Debug for Dispatcher<'_, C, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dispatcher")
             .field("roles", &self.roles)
@@ -225,18 +253,22 @@ impl<C: Clock, T: Transport> std::fmt::Debug for Dispatcher<'_, C, T> {
     }
 }
 
-impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
+impl<C: Clock + ?Sized, T: Transport> Dispatcher<'_, C, T> {
     /// Up to `batch` deliveries, each taken just before it is handed to the transport (so a cancelled tick costs no
     /// delivery that never started) and settled with its generation.
     pub async fn tick(&self) -> Result<Tick, PersistError> {
         let mut tick = Tick::default();
         for _ in 0..self.batch {
-            let Some(row) = self
-                .store
-                .claim_outbox(self.clock.now(), self.roles.clone(), self.max_attempts)
-                .await?
-                .and_then(crate::persistence::Claimed::start)
-            else {
+            let claimed = if self.transport.inputs_only() {
+                self.store
+                    .claim_inputs(self.clock.now(), self.roles.clone(), self.max_attempts)
+                    .await?
+            } else {
+                self.store
+                    .claim_outbox(self.clock.now(), self.roles.clone(), self.max_attempts)
+                    .await?
+            };
+            let Some(row) = claimed.and_then(crate::persistence::Claimed::start) else {
                 break;
             };
             let settlement = match self.transport.deliver(&row).await {
@@ -252,7 +284,7 @@ impl<C: Clock, T: Transport> Dispatcher<'_, C, T> {
                     tick.invalid.push(row.message_id.clone());
                     Settlement::Invalid(e)
                 }
-                Err(DeliveryError::Held { .. }) => {
+                Err(DeliveryError::Held { .. } | DeliveryError::Deferred) => {
                     tick.held.push(row.message_id.clone());
                     Settlement::Unapplied
                 }

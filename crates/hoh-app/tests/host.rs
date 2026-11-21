@@ -1543,7 +1543,7 @@ async fn commands_and_runs_follow_the_openapi_contract() -> R {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_007_01_mode_cycle_is_frozen_in_the_run_snapshot() -> R {
+async fn mode_cycle_is_frozen_in_the_run_snapshot() -> R {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir(dir.path().join(".hoh"))?;
     std::fs::write(
