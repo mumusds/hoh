@@ -142,6 +142,7 @@ fn ensuring_twice_or_from_many_threads_writes_one_whole_file() -> R {
         handles.into_iter().try_for_each(|h| {
             h.join()
                 .map_err(|_| "a thread panicked")?
+                .map(|_| ())
                 .map_err(|e| e.to_string())
         })
     })?;
@@ -185,5 +186,40 @@ fn reopening_a_state_directory_never_restores_owner_permissions() -> R {
         mode, 0o500,
         "privacy must not restore the owner's write permission"
     );
+    Ok(())
+}
+
+#[test]
+fn a_symlinked_state_directory_keeps_its_targets_mode() -> R {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("shared-state");
+    std::fs::create_dir(&target)?;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+    let dir = root.path().join(".hoh");
+    symlink(&target, &dir)?;
+    ensure(&dir)?;
+    assert_eq!(
+        std::fs::read(target.join(".gitignore"))?,
+        IGNORE_ALL.as_bytes()
+    );
+    assert_eq!(
+        std::fs::metadata(&target)?.permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(std::fs::symlink_metadata(&dir)?.is_symlink());
+    Ok(())
+}
+
+#[test]
+fn a_directory_owned_by_another_user_is_not_tightened() -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join(".hoh");
+    std::fs::create_dir(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    // A uid seam avoids chown/root: the real directory belongs to a different uid than the one doing the check.
+    tighten(&dir, rustix::process::geteuid().as_raw().wrapping_add(1))?;
+    assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o755);
     Ok(())
 }

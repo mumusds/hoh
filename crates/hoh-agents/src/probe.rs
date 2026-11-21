@@ -6884,6 +6884,61 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn new_schema_scratch_preserves_unowned_old_probe_names()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "HOH_TEST_OLD_PROBE_NAMES";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir()?;
+            let output = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "probe::tests::new_schema_scratch_preserves_unowned_old_probe_names",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("TMPDIR", root.path())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+        // pid_max cannot be allocated in this namespace. The name and owner still prove nothing about who
+        // created either directory: both stand for replacements a previous probe refused to claim (CLN2-01/-02).
+        let pid = std::fs::read_to_string("/proc/sys/kernel/pid_max")?;
+        let pid = pid.trim();
+        let root = std::env::temp_dir();
+        let names = [
+            format!("hoh-probe-{pid}-1-0"),
+            format!("hoh-probe-{pid}-1-0-q-{pid}-2-0"),
+        ];
+        for name in &names {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir)?;
+            std::fs::write(dir.join("sentinel"), b"not this process's scratch")?;
+        }
+        let scratch = Scratch::new(
+            Instant::now() + Duration::from_secs(10),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Held::default(),
+        )?;
+        drop(scratch);
+        let kept: Vec<_> = names
+            .iter()
+            .map(|name| std::fs::read(root.join(name).join("sentinel")).ok())
+            .collect();
+        assert!(
+            kept.iter()
+                .all(|bytes| bytes.as_deref() == Some(b"not this process's scratch")),
+            "old directories: {kept:?}"
+        );
+        Ok(())
+    }
+
     /// A scratch directory is removed within its deadline, or left (M1T07R-40, round 14).
     #[test]
     fn scratch_is_removed_within_its_deadline() -> Result<(), Box<dyn std::error::Error>> {

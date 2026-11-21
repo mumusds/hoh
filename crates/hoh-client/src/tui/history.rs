@@ -59,11 +59,13 @@ impl History {
     }
 
     /// Append `text` (creating `.hoh/` with its `.gitignore` if needed, docs/adr/ADR-027.md decision 3) and keep it;
-    /// written as one line and synced.
-    pub fn append(&mut self, text: &str) -> std::io::Result<()> {
-        if let Some(dir) = self.path.parent() {
-            hoh_core::state_dir::ensure(dir)?;
-        }
+    /// written as one line and synced. A mode-tightening diagnostic is returned for the shell's message bar;
+    /// it does not prevent writing and does not replace the notice about loading earlier entries.
+    pub fn append(&mut self, text: &str) -> std::io::Result<Option<String>> {
+        let diagnostic = match self.path.parent() {
+            Some(dir) => hoh_core::state_dir::ensure(dir)?,
+            None => None,
+        };
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -80,7 +82,7 @@ impl History {
         file.write_all(&line)?;
         file.sync_data()?;
         self.entries.push(text.to_owned());
-        Ok(())
+        Ok(diagnostic)
     }
 
     /// The newest entry before index `before` that contains `query`.
