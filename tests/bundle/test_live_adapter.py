@@ -78,6 +78,18 @@ class Harness(unittest.TestCase):
         return p,results,[c for c in calls if 'verification_live' in c['argv']]
 
 class AdapterLiveQa(Harness):
+    def test_check_environment_lists_match_the_bridges_source_of_truth(self):
+        # EVL-02: keep the shell/Rust implementations simple, but fail the bundle if either drifts from
+        # agent_task.CHECK_VARIABLES. Native turns also remove the scenario-only live profile and output path.
+        import re
+        from agent_task import CHECK_VARIABLES
+        shell=(ROOT/'scripts/product/adapter-live.sh').read_text()
+        unset=re.search(r'(?m)^\s+unset HOH_.*(?:\\\n.*)*',shell).group(0)
+        rust=(ROOT/'crates/hoh-app/src/gate.rs').read_text().split('fn agent_environment(',1)[1].split('\n}',1)[0]
+        self.assertEqual(set(re.findall(r'\bHOH_[A-Z0-9_]+\b',unset)),set(CHECK_VARIABLES))
+        self.assertEqual(set(re.findall(r'"(HOH_[A-Z0-9_]+)"',rust)),
+                         set(CHECK_VARIABLES)|{'HOH_LIVE_PROFILE','HOH_LIVE_OUT'})
+
     def test_each_scenario_has_its_own_evidence_directory(self):
         # EVL-01: identical relative artifact names must survive all six scenarios.
         p,results,_=self.run_script(verdicts={'qa':passed()})
