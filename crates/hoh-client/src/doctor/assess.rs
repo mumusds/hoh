@@ -158,13 +158,7 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
     };
     let (protocol, protocol_detail) = protocol(&entry, manifest, agent);
     let (auth_check, auth_note) = auth(agent, Path::new(&entry.launcher_path), env);
-    let remedy = match (protocol, auth_note) {
-        (_, Some(note)) => Some(note),
-        (Protocol::Unknown, None) => {
-            Some("host 在没有写租约时自动运行兼容套件；运行中的写任务结束后即登记该版本".to_owned())
-        }
-        _ => None,
-    };
+    let remedy = remedy(protocol, auth_note);
     let read_only = read_only(agent, &entry, env, manifest);
     AgentItem {
         installed: true,
@@ -186,6 +180,20 @@ pub fn agent(agent: Agent, env: &ProbeEnv, manifest: Option<&CompatManifest>) ->
 /// read-only builder on the tested help (`claude::read_only_missing`, `pi::read_only_missing`; codex's builds on its
 /// App Server only), the compat manifest's read_only case for this version (`hoh_agents::compat::read_only_case`) and, for codex on
 /// its App Server, this host's check of its sandbox (`probe::codex_sandbox_check`) — and `workspace` their Kleene
+/// What doctor tells the user to do for an agent: the login's note, when its login is not known to work, and the compat
+/// suite's, when its protocol is unknown (M1QA-09).
+pub(super) fn remedy(protocol: Protocol, auth_note: Option<String>) -> Option<String> {
+    match (protocol, auth_note) {
+        (Protocol::Unknown, Some(note)) => Some(format!("{note}；{SUITE_NOTE}")),
+        (_, Some(note)) => Some(note),
+        (Protocol::Unknown, None) => Some(SUITE_NOTE.to_owned()),
+        _ => None,
+    }
+}
+
+/// The compat suite's note for an agent whose protocol is unknown.
+const SUITE_NOTE: &str = "host 在没有写租约时自动运行兼容套件；运行中的写任务结束后即登记该版本";
+
 /// conjunction, as `granted` has it.
 pub(super) fn read_only(
     agent: Agent,
