@@ -288,6 +288,67 @@ async fn test_054_01_native_session_conflicts_with_every_other_role_and_history(
 }
 
 #[tokio::test]
+async fn test_054_01_native_attempt_rejects_other_roles_hoh_sessions() -> R {
+    // M2R-1001: session_ids must exclude other roles' HoH ids even across agents and binding changes.
+    for role in ["qa", "reviewer"] {
+        let other_verifier = if role == "qa" { "reviewer" } else { "qa" };
+        for other in ["developer", "commander", other_verifier] {
+            for history in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let (store, path) = open(dir.path())?;
+                verifying(&store).await?;
+                let started = start_verifiers(&store, &path).await?;
+                let attempt = &started.iter().find(|(r, _)| r == role).ok_or("no role")?.1;
+                let conn = Connection::open(&path)?;
+                conn.execute_batch(
+                    "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+                       ('sc', 'codex', 'commander', '1', '{}');
+                     INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at)
+                       VALUES ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-12T00:00:00Z');",
+                )?;
+                let session: String = conn.query_row(
+                    "SELECT session_id FROM role_bindings WHERE run_id = 'R' AND role = ?1",
+                    [other],
+                    |r| r.get(0),
+                )?;
+                if history {
+                    // Developer and verifier attempts retain their HoH ids; Commander history is an event.
+                    if other == "commander" {
+                        conn.execute(
+                            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                             VALUES ('p1', 'old-native', 'R', 'session.native', ?1, '2026-11-12T00:00:02Z')",
+                            [json!({"session_id": session, "native_id": "unrelated-native"}).to_string()],
+                        )?;
+                    }
+                    conn.execute(
+                        "UPDATE role_bindings SET session_id = NULL WHERE run_id = 'R' AND role = ?1",
+                        [other],
+                    )?;
+                }
+                let mut intake = consistent(&path, attempt, (role, "PASS"), fresh_objects(&path)?)?
+                    .intake(attempt);
+                assert_ne!(intake.report["session_id"], session);
+                intake.native_session_ids.push(session.clone());
+                let done = store.record_report(intake.clone()).await?;
+                assert_eq!(
+                    done.state,
+                    ReportState::Rejected,
+                    "{role}/{other}/history={history}/HoH={session}: {done:?}"
+                );
+                assert_eq!(codes(&done.reasons), ["NATIVE_SESSION_NOT_INDEPENDENT"]);
+                assert_eq!(store.record_report(intake).await?, done);
+                assert_eq!(events(&path, "report.rejected")?.len(), 1);
+                assert_eq!(
+                    report_status(&conn, &[vec![attempt.clone()]], role)?.0,
+                    Report::NotRun
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_054_01_native_report_history_rejects_qa_then_reviewer() -> R {
     native_report_history("qa").await
 }
