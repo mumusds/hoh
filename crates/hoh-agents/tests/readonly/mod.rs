@@ -78,13 +78,22 @@ pub struct Case {
     /// A live turn's nonce (TEST-021-07): its block is the product's (`supervise::decision_lines`) and its message a
     /// record_assumption naming the token. `None`: an S0 recording's `{"nonce": "spike", "message": {"token": …}}`.
     pub nonce: Option<String>,
+    parse_problems: Vec<String>,
     facts: OnceCell<ReplayFacts>,
 }
 
-/// The JSON objects of `text`'s lines; a line that is no object, or an excerpt header, is skipped.
-fn json_lines(text: &str) -> Vec<Value> {
+/// JSONL uses LF record boundaries. Preserve a diagnostic for every unparseable line; only valid
+/// non-objects and excerpt headers are omitted. A final LF is a terminator, not an extra empty line.
+fn json_lines(text: &str, source: &str, problems: &mut Vec<String>) -> Vec<Value> {
     text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .enumerate()
+        .filter_map(|(i, line)| match serde_json::from_str::<Value>(line) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                problems.push(format!("{source} line {} is not valid JSON", i + 1));
+                None
+            }
+        })
         .filter(|v| v.is_object() && v.get("_excerpt").is_none())
         .collect()
 }
@@ -107,12 +116,19 @@ impl Case {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
+        let mut parse_problems = Vec::new();
         Ok(Case {
             agent: Agent::of(agent),
             exec: name.starts_with("exec"),
-            stdout: json_lines(&std::fs::read_to_string(file("stdout.excerpt.jsonl"))?),
-            rollout: read_if(&file("rollout.excerpt.jsonl"))?.map(|t| json_lines(&t)),
-            requests: read_if(&file("stdin.excerpt.jsonl"))?.map(|t| json_lines(&t)),
+            stdout: json_lines(
+                &std::fs::read_to_string(file("stdout.excerpt.jsonl"))?,
+                "stdout",
+                &mut parse_problems,
+            ),
+            rollout: read_if(&file("rollout.excerpt.jsonl"))?
+                .map(|t| json_lines(&t, "rollout", &mut parse_problems)),
+            requests: read_if(&file("stdin.excerpt.jsonl"))?
+                .map(|t| json_lines(&t, "stdin", &mut parse_problems)),
             observations: meta
                 .get("observations")
                 .cloned()
@@ -121,6 +137,7 @@ impl Case {
             paths,
             token_sha256: meta["token_sha256"].as_str().unwrap_or_default().to_owned(),
             nonce: None,
+            parse_problems,
             facts: OnceCell::new(),
         })
     }
@@ -140,12 +157,15 @@ impl Case {
             .iter()
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
             .collect();
+        let mut parse_problems = Vec::new();
         Ok(Some(Case {
             agent,
             exec: false,
-            stdout: json_lines(&stdout),
-            rollout: read_if(&file("rollout.jsonl"))?.map(|t| json_lines(&t)),
-            requests: read_if(&file("stdin.jsonl"))?.map(|t| json_lines(&t)),
+            stdout: json_lines(&stdout, "stdout", &mut parse_problems),
+            rollout: read_if(&file("rollout.jsonl"))?
+                .map(|t| json_lines(&t, "rollout", &mut parse_problems)),
+            requests: read_if(&file("stdin.jsonl"))?
+                .map(|t| json_lines(&t, "stdin", &mut parse_problems)),
             observations: serde_json::from_str(&std::fs::read_to_string(file(
                 "observations.json",
             ))?)?,
@@ -153,6 +173,7 @@ impl Case {
             paths,
             token_sha256: side["token_sha256"].as_str().unwrap_or_default().to_owned(),
             nonce: side["nonce"].as_str().map(str::to_owned),
+            parse_problems,
             facts: OnceCell::new(),
         }))
     }
@@ -1476,7 +1497,8 @@ fn request_problems(c: &Case) -> Vec<String> {
 }
 
 fn call_problems(c: &Case) -> Vec<String> {
-    let mut out = request_problems(c);
+    let mut out = c.parse_problems.clone();
+    out.extend(request_problems(c));
     if c.agent == Agent::Codex {
         out.extend(untaken(c));
         out.extend(stream_items(c).problems);
@@ -1591,8 +1613,11 @@ fn control_gaps(control: Option<&Case>, agent: Agent) -> Vec<String> {
         }
     } else {
         gaps.extend(
-            request_problems(control)
-                .into_iter()
+            control
+                .parse_problems
+                .iter()
+                .cloned()
+                .chain(request_problems(control))
                 .map(|p| format!("control: {p}")),
         );
     }
@@ -1674,5 +1699,47 @@ pub fn round_verdict(c: &Case, control: Option<&Case>) -> (Verdict, Vec<String>)
         (Verdict::Pass, why)
     } else {
         (Verdict::Insufficient, why)
+    }
+}
+
+#[cfg(test)]
+mod jsonl_tests {
+    use super::*;
+
+    #[test]
+    fn test_021_07_malformed_rollout_line_is_a_problem() -> R {
+        let excerpts = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/commander-readonly/excerpts");
+        let out = tempfile::tempdir()?;
+        let codex = out.path().join("codex");
+        std::fs::create_dir(&codex)?;
+        for file in std::fs::read_dir(excerpts.join("codex"))? {
+            let file = file?;
+            std::fs::copy(file.path(), codex.join(file.file_name()))?;
+        }
+        for name in ["app-ro-new", "app-ro-resumed"] {
+            let path = codex.join(format!("{name}.rollout.excerpt.jsonl"));
+            let original = std::fs::read_to_string(&path)?;
+            let line = original.lines().count() + 1;
+            for bad in [
+                r#"{bad json"#,
+                r#"{"note":"\ud800"}"#,
+                r#"{"\udfff":"value"}"#,
+                r#"{"note":["\ud800"]}"#,
+            ] {
+                std::fs::write(&path, format!("{original}{bad}\n"))?;
+                let case = Case::excerpt(out.path(), "codex", name)?;
+                let control = Case::excerpt(out.path(), "codex", "app-control")?;
+                assert_eq!(
+                    round_verdict(&case, Some(&control)),
+                    (
+                        Verdict::Insufficient,
+                        vec![format!("rollout line {line} is not valid JSON")]
+                    ),
+                    "{name}: {bad}"
+                );
+            }
+        }
+        Ok(())
     }
 }

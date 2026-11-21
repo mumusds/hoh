@@ -8536,6 +8536,123 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "an escaped newline in a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex at the script start",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a lone surrogate in a string",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "Unicode separators inside a recorded call",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "a valid surrogate pair",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "malformed JSON",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a bare CR between records",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a lone surrogate value",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a lone surrogate key",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a nested lone surrogate",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 34 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a U+2028 script",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a U+2028 script and a malformed line",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 36 is not valid JSON",
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -10114,6 +10231,18 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
@@ -14472,6 +14601,123 @@
     },
     {
      "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "an escaped newline in a regex",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a regex at the script start",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "code mode lexis",
+     "label": "a lone surrogate in a string",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "Unicode separators inside a recorded call",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "same",
+     "kind": "rollout JSONL",
+     "label": "a valid surrogate pair",
+     "ok": true,
+     "verdict": "PASS",
+     "why": []
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "malformed JSON",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a bare CR between records",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a lone surrogate value",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a lone surrogate key",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a nested lone surrogate",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 67 is not valid JSON"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a U+2028 script",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
+     "kind": "rollout JSONL",
+     "label": "a U+2028 script and a malformed line",
+     "ok": true,
+     "verdict": "INSUFFICIENT",
+     "why": [
+      "rollout line 69 is not valid JSON",
+      "an unclassified call (custom_tool_call exec)"
+     ]
+    },
+    {
+     "expect": "non-PASS",
      "kind": "item default-deny",
      "label": "a killed driver run whose command has a trailing space",
      "ok": true,
@@ -16051,6 +16297,18 @@
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "INSUFFICIENT",
+    "PASS",
+    "PASS",
     "INSUFFICIENT",
     "INSUFFICIENT",
     "INSUFFICIENT",
