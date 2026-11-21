@@ -230,10 +230,13 @@ impl Processes for HostProcesses {
             };
             pins.entry(attempt.attempt_id.clone())
                 .or_insert_with(|| {
-                    Arc::new(Mutex::new(Outside::new(&super::runner::marker(
-                        &self.project_id,
-                        &attempt.attempt_id,
-                    ))))
+                    Arc::new(Mutex::new(
+                        Outside::new(&super::runner::marker(
+                            &self.project_id,
+                            &attempt.attempt_id,
+                        ))
+                        .born(attempt.process_start_id.as_deref()),
+                    ))
                 })
                 .clone()
         };

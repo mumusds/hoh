@@ -159,33 +159,6 @@ fn stat_process(root: &Path, pid: u32) -> Stat {
     }
 }
 
-/// Whether `pid`'s environment has `marker` (`NAME=value`) as one of its entries: `None` when that cannot be told (a
-/// read that failed other than for another user's process or a process gone).
-fn marked(root: &Path, pid: u32, marker: &[u8]) -> Option<bool> {
-    match std::fs::read(root.join(pid.to_string()).join("environ")) {
-        Ok(env) => Some(env.split(|b| *b == 0).any(|entry| entry == marker)),
-        // Its main thread may have exited while other threads still run: theirs are read (M2T06R-301).
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            Some(marked_threads(root, pid, marker))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
-            Some(false)
-        }
-        Err(_) => None,
-    }
-}
-
-/// Whether a thread of `pid` that can be read has `marker` in its environment.
-fn marked_threads(root: &Path, pid: u32, marker: &[u8]) -> bool {
-    let Ok(tasks) = std::fs::read_dir(root.join(pid.to_string()).join("task")) else {
-        return false;
-    };
-    tasks.filter_map(Result::ok).any(|task| {
-        std::fs::read(task.path().join("environ"))
-            .is_ok_and(|env| env.split(|b| *b == 0).any(|entry| entry == marker))
-    })
-}
-
 /// Whether a process of an attempt other than its leader runs, a tool (docs/adr/ADR-022.md decision 19 item 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tools {
@@ -409,6 +382,9 @@ pub(super) struct Outside {
     leader: Option<Pinned>,
     /// `ATTEMPT_ENV=<marker>` as it appears in an environment.
     marker: Vec<u8>,
+    /// The leader's start time as recorded, kept when the leader is no longer pinned: every process of the attempt
+    /// descends from the leader, so one started before it is not the attempt's (M2R-500, as WD-03).
+    born: Option<u64>,
     pins: Vec<Pinned>,
     /// The strongest signal sent so far: one found later gets it at once.
     sent: Option<rustix::process::Signal>,
@@ -430,6 +406,7 @@ impl Outside {
         Outside {
             leader: None,
             marker: format!("{ATTEMPT_ENV}={marker}").into_bytes(),
+            born: None,
             pins: Vec::new(),
             sent: None,
             quiet: 0,
@@ -450,6 +427,13 @@ impl Outside {
         self
     }
 
+    /// The leader's start time as recorded (`attempts.process_start_id`), if known: what tells an older process whose
+    /// environment cannot be read not to be the attempt's.
+    pub(super) fn born(mut self, start_id: Option<&str>) -> Outside {
+        self.born = start_id.and_then(|s| s.parse::<u64>().ok()).or(self.born);
+        self
+    }
+
     /// The group was seen alive: the scans that count for the proof start again after it (M2T06R-252).
     pub(super) fn group_alive(&mut self) {
         self.quiet = 0;
@@ -461,6 +445,9 @@ impl Outside {
         let wanted = pid
             .and_then(|p| u32::try_from(p).ok())
             .zip(start_id.and_then(|s| s.parse::<u64>().ok()));
+        if let Some((_, start)) = wanted {
+            self.born = Some(start);
+        }
         if self
             .leader
             .as_ref()
@@ -488,15 +475,25 @@ impl Outside {
         }
         let mut seen: BTreeSet<u32> = processes.iter().map(|p| p.pid).collect();
         let mut by_marker: BTreeSet<u32> = BTreeSet::new();
-        let mut batch: Vec<u32> = processes.iter().map(|p| p.pid).collect();
+        let mut batch: Vec<usize> = (0..processes.len()).collect();
         let mut settled = false;
+        let me = rustix::process::getuid().as_raw();
         for _ in 0..=SWEEPS {
-            for pid in batch.drain(..) {
-                match marked(&self.root, pid, &self.marker) {
+            for at in batch.drain(..) {
+                let process = &processes[at];
+                match marked_tri(&self.root, process, &self.marker, me) {
                     Some(true) => {
-                        by_marker.insert(pid);
+                        by_marker.insert(process.pid);
                     }
                     Some(false) => {}
+                    // Neither its environment nor a thread's could be read, and it is this user's (a non-dumpable or
+                    // set-user-id process refuses its environment, M2R-500): unrelated only if it started before the
+                    // leader or has ended; else it may be the attempt's, and the scan proves nothing (as WD-03). With
+                    // no leader start recorded nothing bounds it (the user's own service manager refuses its
+                    // environment too): not counted, the stated residual of such a record (a STARTING attempt with no
+                    // process, held at its gate, has none outside; a pid recorded without a start is a legacy row).
+                    None if self.born.is_none_or(|born| process.start < born)
+                        || has_ended(process) => {}
                     None => complete = false,
                 }
             }
@@ -516,7 +513,7 @@ impl Outside {
                 }
                 match stat_process(&self.root, pid) {
                     Stat::Read(process) => {
-                        batch.push(pid);
+                        batch.push(processes.len());
                         processes.push(process);
                     }
                     Stat::Gone => {}
@@ -920,13 +917,17 @@ mod tests {
             format!("{ATTEMPT_ENV}=p/A1\0"),
         )?;
         let marker = format!("{ATTEMPT_ENV}=p/A1").into_bytes();
-        let found = marked(root.path(), 500, &marker);
+        let me = rustix::process::getuid().as_raw();
+        let process = parse_stat(
+            500,
+            b"500 (tool) S 1 500 500 0 -1 0 0 0 0 0 0 0 0 0 20 0 2 0 900 0",
+        )
+        .ok_or("no stat")?;
+        let found = marked_tri(root.path(), &process, &marker, me);
+        let other = marked_tri(root.path(), &process, b"HOH_ATTEMPT_ID=other/A9", me);
         std::fs::set_permissions(dir.join("environ"), std::fs::Permissions::from_mode(0o600))?;
         assert_eq!(found, Some(true));
-        assert_eq!(
-            marked(root.path(), 500, b"HOH_ATTEMPT_ID=other/A9"),
-            Some(false)
-        );
+        assert_eq!(other, Some(false));
         Ok(())
     }
 
@@ -1107,6 +1108,91 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         assert_eq!(said, "hidden");
         assert_eq!(unreadable, Some(std::io::ErrorKind::PermissionDenied));
         assert_eq!(found, Tools::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn a_non_dumpable_orphan_of_the_attempt_leaves_the_outside_scan_incomplete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2R-500 (the scan's side of WD-03): its leader ended, a process of the attempt, marked, outside its leader's
+        // tree (a child of another parent here, as one re-parented to init), makes itself non-dumpable (PR_SET_DUMPABLE 0), so its
+        // environment is refused (EACCES) though it is this user's and started after the leader. Its marker cannot be
+        // read, so no scan may prove the attempt's processes gone while it runs: every scan is incomplete. Before, the
+        // refusal read as "unmarked" and two scans gave Done while it ran.
+        let marker = format!("p/M2R500-{}", std::process::id());
+        let (mut leader, _) = python(
+            "print('up', flush=True); import time; time.sleep(60)",
+            Some(&marker),
+        )?;
+        let (mut orphan, said) = python(
+            "import ctypes, time; assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0; print('hidden', flush=True); \
+             time.sleep(60)",
+            Some(&marker),
+        )?;
+        let unreadable = std::fs::read(format!("/proc/{}/environ", orphan.id()))
+            .err()
+            .map(|e| e.kind());
+        let start = match stat(Path::new("/proc"), leader.id()) {
+            Stat::Read(p) => Some(p.start.to_string()),
+            _ => None,
+        };
+        // The leader has ended (the settle after its end), as recorded.
+        let _ = leader.kill();
+        let _ = leader.wait();
+        let mut outside = Outside::new(&marker);
+        outside.set_leader(Some(i64::from(leader.id())), start.as_deref());
+        let proofs: Vec<Proof> = (0..3).map(|_| outside.scan()).collect();
+        let _ = orphan.kill();
+        let _ = orphan.wait();
+        assert_eq!(said, "hidden");
+        assert_eq!(unreadable, Some(std::io::ErrorKind::PermissionDenied));
+        assert!(start.is_some(), "the leader's start was not read");
+        assert_eq!(proofs, [Proof::Incomplete; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_process_leaves_the_outside_scan_incomplete_unless_older_than_the_leader_or_another_users()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2R-500, as WD-03: a process whose environment and threads' cannot be read is unrelated to the attempt only
+        // when it started before the leader as recorded (even once the leader is gone and no longer pinned), or its
+        // real user is another; then two scans prove the attempt's processes gone. Else every scan is incomplete. With
+        // no start recorded it is not counted (the stated residual of such a record). Its environment here is a
+        // directory: a read that fails.
+        let me = rustix::process::getuid().as_raw();
+        let unreadable = |start: u32, uid: u32| -> std::io::Result<tempfile::TempDir> {
+            let root = tree(&[])?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+            let dir = root.path().join("300");
+            std::fs::create_dir_all(dir.join("environ"))?;
+            std::fs::create_dir_all(dir.join("task/300/environ"))?;
+            let stat = format!("300 (tool) S 1 300 300 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0");
+            std::fs::write(dir.join("stat"), &stat)?;
+            std::fs::write(dir.join("task/300/stat"), &stat)?;
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\ttool\nTgid:\t300\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+            )?;
+            Ok(root)
+        };
+        let proofs = |root: &tempfile::TempDir, leader: Option<&str>| {
+            let mut outside = Outside::new("p/A1")
+                .born(leader)
+                .with_root(Some(root.path().to_owned()));
+            // The leader recorded (pid 100) is gone: no pin, its start time kept.
+            outside.set_leader(Some(100), leader);
+            [outside.scan(), outside.scan()]
+        };
+        let (older, other, same) = (
+            unreadable(400, me)?,
+            unreadable(900, me.wrapping_add(1))?,
+            unreadable(900, me)?,
+        );
+        assert_eq!(proofs(&older, Some("500")), [Proof::Pending, Proof::Done]);
+        assert_eq!(proofs(&other, Some("500")), [Proof::Pending, Proof::Done]);
+        assert_eq!(proofs(&same, Some("500")), [Proof::Incomplete; 2]);
+        assert_eq!(proofs(&same, None), [Proof::Pending, Proof::Done]);
         Ok(())
     }
 

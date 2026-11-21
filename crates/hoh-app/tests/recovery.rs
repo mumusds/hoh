@@ -922,6 +922,12 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, creat
   ('T1', 'R', 's2', 'READY', 1, 'developer', 1, 1, 1);
 ";
 
+/// This test process's start time, as a recorded leader's that started recently (after the machine's own processes).
+fn recent_start() -> R<String> {
+    Ok(hoh_agents::identity::start_id(std::process::id())?
+        .ok_or("no start time of this process")?)
+}
+
 /// Seed `sql` (with `:p` the host's project id) into the project's database.
 fn seed(project: &Path, sql: &str) -> R {
     let script = "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
@@ -1264,12 +1270,15 @@ fn test_041_05_a_started_effect_is_found_or_unknown_never_done_again() -> R {
             "{RUNNING_WORLD}
              INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
                process_start_id, started_at) VALUES
-               ('AE', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z'),
-               ('AE2', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+               ('AE', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '{start}', '2026-11-07T00:00:00Z'),
+               ('AE2', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '{start}', '2026-11-07T00:00:00Z');
              INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AE', 'STARTED'), ('pr:R/T3', 'AE2', 'STARTED');",
             boot = hoh_agents::identity::boot_id()?,
             // A pid no process has (pid_max is at most 2^22): the record of agents long gone.
             gone = 1 << 23,
+            // A leader long gone that started after this machine's long-lived processes: one of this user's whose
+            // environment cannot be read (its service manager's) is older, so not the attempt's (M2R-500).
+            start = recent_start()?,
         ),
     )?;
     let remote = dir.path().join("forge.json");
@@ -1350,12 +1359,15 @@ fn a_writer_found_interrupted_at_a_restart_ends_with_the_workspace_it_left_recor
              UPDATE tasks SET writer = 1 WHERE task_id = 'T2';
              INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
                process_start_id, started_at) VALUES
-               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '{start}', '2026-11-07T00:00:00Z');
              INSERT INTO effects(effect_key, attempt_id, state) VALUES ('pr:R/T2', 'AW', 'STARTED');
              INSERT INTO leases(project_id, kind, attempt_id, epoch, expires_at) VALUES
                (:p, 'writer', 'AW', 1, '2999-01-01T00:00:00Z');",
             boot = hoh_agents::identity::boot_id()?,
             gone = 1 << 23,
+            // A leader long gone that started after this machine's long-lived processes: one of this user's whose
+            // environment cannot be read (its service manager's) is older, so not the attempt's (M2R-500).
+            start = recent_start()?,
         ),
     )?;
     let remote = dir.path().join("forge.json");
@@ -1429,8 +1441,8 @@ fn a_writer_whose_work_was_observed_done_is_completed_from_its_bridge_at_the_res
              UPDATE tasks SET writer = 1;
              INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision, pid, boot_id,
                process_start_id, started_at) VALUES
-               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z'),
-               ('AX', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '1', '2026-11-07T00:00:00Z');
+               ('AW', 'T2', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '{start}', '2026-11-07T00:00:00Z'),
+               ('AX', 'T3', 'RUNNING', 1, 1, 1, {gone}, '{boot}', '{start}', '2026-11-07T00:00:00Z');
              INSERT INTO effects(effect_key, attempt_id, state) VALUES ('AW/work', 'AW', 'OBSERVED'),
                ('AX/work', 'AX', 'COMMITTED');
              INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
@@ -1444,6 +1456,9 @@ fn a_writer_whose_work_was_observed_done_is_completed_from_its_bridge_at_the_res
                (:p, 'writer', 'AW', 1, '2999-01-01T00:00:00Z');",
             boot = hoh_agents::identity::boot_id()?,
             gone = 1 << 23,
+            // A leader long gone that started after this machine's long-lived processes: one of this user's whose
+            // environment cannot be read (its service manager's) is older, so not the attempt's (M2R-500).
+            start = recent_start()?,
         ),
     )?;
     let bridge = project.join(".hoh/attempts/AW");

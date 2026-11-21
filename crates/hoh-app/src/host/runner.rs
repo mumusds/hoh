@@ -1500,11 +1500,12 @@ async fn attempt(
     // Its group is empty: its processes outside the group are stopped too, and it ends, its slot with it, only with the
     // termination proof (docs/adr/ADR-021.md decision 8d, M2T06R-100); else it stays RUNNING like an unreaped group.
     let marker = work.marker();
+    let born = who.start_id.clone();
     let (term, kill) = (common.settings.term_grace, common.settings.kill_grace);
     let root = common.shared.hooks.proc_root();
     let group = tracking.cgroup();
     let (steps, proof) = super::begun::spawn_blocking(move || {
-        let mut outside = Outside::new(&marker).with_root(root);
+        let mut outside = Outside::new(&marker).born(Some(&born)).with_root(root);
         match group {
             // The cgroup, then what may have left it with its marker (decision 8d v6, M2T06R-400).
             Some(group) => {
