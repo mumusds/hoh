@@ -79,16 +79,29 @@ pub(super) fn revision(conn: &Connection, project_id: &str) -> Result<i64, Persi
     .map_err(sqlite_error)
 }
 
+/// What StartRun freezes of the configuration into a new run (its snapshot, budget and deadline).
+pub(super) struct Frozen<'a> {
+    pub budget: &'a Budget,
+    pub policy: &'a str,
+    pub assumptions: &'a std::collections::BTreeMap<String, crate::config::Assumed>,
+    pub unattended: bool,
+}
+
 /// In StartRun's transaction: bind every role of the current revision to run `run_id` at epoch 1, snapshot the
-/// scheduler (CR-007 S2) and the supervision policy (docs/adr/ADR-025.md decision 9), and write the run's budget and
-/// deadline (ADR-020 decision 7).
+/// scheduler (CR-007 S2), the supervision policy (docs/adr/ADR-025.md decision 9), `[assumptions]` and whether the run
+/// is unattended (ADR-035 decision 11), and write the run's budget and deadline (ADR-020 decision 7).
 pub(super) fn start_run(
     tx: &Connection,
     run_id: &str,
     project_id: &str,
-    budget: &Budget,
-    policy: &str,
+    frozen: Frozen<'_>,
 ) -> Result<(), PersistError> {
+    let Frozen {
+        budget,
+        policy,
+        assumptions,
+        unattended,
+    } = frozen;
     let (revision, config) = current(tx, project_id)?;
     let now = crate::time::now_rfc3339();
     for (role, binding) in &config.team {
@@ -115,6 +128,10 @@ pub(super) fn start_run(
         // The repair limits the run's completions and verification rounds count against (docs/adr/ADR-028.md
         // decisions 11 and 12), frozen like the rest.
         "repairs": {"local": budget.max_local_repairs, "protocol": budget.max_protocol_repairs},
+        // What the run may assume when unattended, and whether it is (REQ-030 behaviour 4): its record_assumptions are
+        // checked against these (docs/adr/ADR-035.md decision 11).
+        "unattended": unattended,
+        "assumptions": assumptions,
     });
     tx.execute(
         "UPDATE runs SET config_revision = ?2, config_snapshot_json = ?3, deadline_at = ?4 WHERE run_id = ?1",

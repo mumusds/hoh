@@ -198,6 +198,10 @@ pub enum Variant {
     CodexExecOnly,
 }
 
+/// The decision class the world's configuration lists under `[assumptions]` and its pinned Commander's
+/// record_assumption cites (`assumptions.world`, REQ-030 behaviour 4).
+pub const WORLD_ASSUMPTION: &str = "world";
+
 /// What the pinned fake Commander submits.
 #[derive(Debug, Clone)]
 pub struct Commander {
@@ -221,7 +225,9 @@ impl Default for Commander {
     fn default() -> Self {
         Commander {
             statement: "fixture 默认：沿用项目已批准的规格，不另作假设".to_owned(),
-            basis: "项目的 contracts/requirements.json".to_owned(),
+            // The default the world's configuration lists ([`World::configure`]): an unattended run assumes only those
+            // (REQ-030 behaviour 4).
+            basis: format!("assumptions.{WORLD_ASSUMPTION}"),
             tasks: vec!["develop".to_owned()],
             stale_once: Vec::new(),
             assume_on: None,
@@ -381,7 +387,7 @@ def commander(text, wake, cfg):
     assume_on = c.get('assume_on')
     fingerprint = re.search(r'本次唤醒要回答的问题：唤醒 [^（]*（种类 [^，]*，严重度 [^，]*，指纹 ([^）]*)）', text)
     assumption = {'kind': 'record_assumption', 'statement': c.get('statement', 'fixture'),
-                  'basis': c.get('basis', 'fixture')}
+                  'basis': c.get('basis', 'assumptions.world')}
     payloads = []
     if assume_on and fingerprint and fingerprint.group(1) == assume_on and once('record_assumption'):
         payloads.append(assumption)
@@ -997,10 +1003,16 @@ impl World {
         Ok(())
     }
 
-    /// The project's `.hoh/config.toml`: `toml` (top-level keys first, then tables), then each `(role, agent)` of
-    /// `team` as `[team.<role>]`. Read by a host as it starts and by each new run.
+    /// The project's `.hoh/config.toml`: `toml` (top-level keys first, then tables), then `[assumptions]` listing
+    /// [`WORLD_ASSUMPTION`] (the pinned Commander's basis) unless `toml` has its own, then each `(role, agent)` of `team`
+    /// as `[team.<role>]`. Read by a host as it starts and by each new run.
     pub fn configure(&self, team: &[(&str, &str)], toml: &str) -> R {
         let mut text = format!("config_version = \"1.0\"\n{toml}\n");
+        if !toml.contains("[assumptions]") {
+            text.push_str(&format!(
+                "[assumptions]\n{WORLD_ASSUMPTION} = \"沿用项目已批准的规格\"\n"
+            ));
+        }
         for (role, agent) in team {
             text.push_str(&format!("[team.{role}]\nagent = \"{agent}\"\n"));
         }
@@ -1797,7 +1809,7 @@ pub struct Turn {
 }
 
 /// What the scripted Commander decides on a turn: the decision payloads it submits, in order, each at the revision the
-/// one before it leaves (the turn's revision, then one more for each).
+/// one before it leaves (the turn's revision, then one more for each but one marked [`rejected`]).
 pub type Script = dyn Fn(&Turn) -> Vec<Value> + Send + Sync;
 
 /// An executor of an in-process host (verification_dispatch.rs's pattern, [`World::team_host`]) that plays the
@@ -1919,16 +1931,24 @@ impl hoh_app::host::Executor for Team {
         let spec = input.summary["run"]["spec_sha256"]
             .as_str()
             .map_or_else(|| "0".repeat(64), str::to_owned);
+        // Each decision at the revision the ones before it leave: one more for each, none for one the script expects
+        // rejected ([`rejected`]).
+        let mut moved = 0;
         let messages: Vec<Value> = (self.script)(&turn)
             .into_iter()
             .zip(0..)
-            .map(|(payload, i)| {
+            .map(|(mut payload, i)| {
+                let revision = turn.revision + moved;
+                match payload.as_object_mut().and_then(|p| p.remove(REJECTED)) {
+                    Some(Value::Bool(true)) => {}
+                    _ => moved += 1,
+                }
                 json!({
                     "schema_version": "1.0", "message_id": format!("d{i}"), "run_id": turn.run_id,
                     "task_id": work.task_id, "attempt_id": turn.attempt_id, "sender_role": "commander",
                     "recipient_role": "runtime", "role_epoch": turn.role_epoch, "correlation_id": "team",
                     "causation_id": turn.wake, "idempotency_key": format!("{}/d{i}", turn.attempt_id),
-                    "expected_revision": turn.revision + i, "spec_sha256": spec, "candidate_id": null,
+                    "expected_revision": revision, "spec_sha256": spec, "candidate_id": null,
                     "kind": "decision", "payload": payload,
                 })
             })
@@ -2009,6 +2029,18 @@ pub fn steps(from: &str, to: &str) -> Vec<Value> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The key of a scripted decision the script expects the Runtime to reject (stripped before it is submitted).
+const REJECTED: &str = "world_rejected";
+
+/// The scripted Commander's decision `payload`, expected rejected: it moves no revision, so the decisions after it in
+/// the turn are submitted at the revision before it.
+pub fn rejected(mut payload: Value) -> Value {
+    if let Some(p) = payload.as_object_mut() {
+        p.insert(REJECTED.to_owned(), Value::Bool(true));
+    }
+    payload
 }
 
 /// The scripted Commander's request_user_decision: `question` for a person, `question_id` its own id.

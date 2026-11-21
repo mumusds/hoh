@@ -126,6 +126,8 @@ async fn world(store: &Store, path: &Path) -> R {
                 mode: "AUTO".to_owned(),
                 budget: Config::default().budget,
                 policy: "balanced".to_owned(),
+                assumptions: std::collections::BTreeMap::new(),
+                unattended: true,
             },
             event: NewEvent {
                 intent: Intent::Progress,

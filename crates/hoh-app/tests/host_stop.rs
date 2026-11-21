@@ -67,6 +67,8 @@ async fn a_turn_that_ends_after_its_host_stopped_has_nothing_written_for_it() ->
     // The product's world: a run whose Developer works 3 s; the host stops while that turn is in flight.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.developer(&world::Developer {
         seconds: 3.0,
         ..world::Developer::default()
@@ -153,6 +155,8 @@ async fn a_step_an_attempt_began_on_a_blocking_thread_ends_before_its_host_stop_
     use std::sync::atomic::Ordering::SeqCst;
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.register()?;
     let hold = std::sync::Arc::new(HoldCompletion::default());
     let mut config = world.host_config()?;
@@ -256,6 +260,8 @@ async fn the_commit_of_pending_check_records_at_the_stop_ends_before_the_stop_re
     // stop waits for it, and nothing appears in the project after the stop returned.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.verifier(
         "qa",
         &world::Verifier {
@@ -291,6 +297,8 @@ async fn a_finished_turns_logs_being_kept_at_the_stop_are_kept_before_the_stop_r
     // appears in the project after it returned.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.register()?;
     let hold = std::sync::Arc::new(Hold::default());
     let mut config = world.host_config()?;
@@ -336,6 +344,8 @@ async fn a_check_running_at_the_stop_is_cancelled_and_still_recorded_before_the_
     // nothing appearing in the project after it.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     let plan = world.project().join("tests/check-plan.json");
     let mut checks: serde_json::Value = serde_json::from_slice(&std::fs::read(&plan)?)?;
     checks["checks"]["slow"] = serde_json::json!({"mode": "product", "timeout_seconds": 300,
@@ -488,6 +498,8 @@ async fn a_step_past_the_stops_bound_keeps_the_project_locked_and_the_stop_is_no
     // and is not clean; the project stays locked while the step runs, and is let go only once it ended.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.register()?;
     let hold = std::sync::Arc::new(Hold::default());
     let mut config = world.host_config()?;
@@ -523,6 +535,8 @@ async fn logs_kept_past_both_bounds_keep_the_project_locked_and_the_stop_is_not_
     // project stays locked while it runs, and is let go only once it ended.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.register()?;
     let hold = std::sync::Arc::new(Hold::default());
     let mut config = world.host_config()?;
@@ -571,6 +585,8 @@ async fn a_stop_past_its_bound_returns_at_it_even_when_what_still_runs_holds_the
     // it does; it returns at its bound, is not clean, and the project stays locked until the task ended.
     let world = World::new()?;
     world.commit_project(&world::fixture_spec())?;
+    // Its [assumptions] lists the pinned Commander's basis: the run StartRun makes is unattended (REQ-030).
+    world.configure(&[], "")?;
     world.verifier(
         "qa",
         &world::Verifier {

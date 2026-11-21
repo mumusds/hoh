@@ -65,3 +65,8 @@ mouse = true
 host = "127.0.0.1"   # loopback only; remote use: ssh -L 8787:127.0.0.1:8787 vm
 port = 8787
 # Requests need the per-host token from .hoh/host.json and a loopback Host/Origin (contracts/openapi.json).
+[assumptions]
+# Defaults an unattended run (hoh -p) may assume, by decision class (ASCII lowercase letters, digits, underscores):
+# a string or an array of strings; the Commander's record_assumption cites one as basis "assumptions.<class>".
+# Nothing else is assumed; product_direction, scope and non_goals are refused here (REQ-030). Empty: no assumptions.
+# language = "Rust"
