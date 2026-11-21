@@ -138,6 +138,12 @@ impl BlockedReason {
         }
     }
 
+    /// Whether a run can be blocked for this reason. READINESS_NOT_MET (CR-026, REQ-031 behaviour 5) is a task's
+    /// reason only: it never enters a run's blocker set (protocol.schema.json `BlockedReason`).
+    pub fn blocks_run(self) -> bool {
+        self != BlockedReason::ReadinessNotMet
+    }
+
     /// The reason named `name`, if it is one.
     pub fn parse(name: &str) -> Option<BlockedReason> {
         Self::ALL.iter().copied().find(|r| r.as_str() == name)
@@ -652,6 +658,17 @@ schema_def!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_is_the_one_blocked_reason_that_never_blocks_a_run() {
+        // protocol.schema.json BlockedReason: READINESS_NOT_MET is a task's reason only (CR-026, REQ-031).
+        let task_only: Vec<BlockedReason> = BlockedReason::ALL
+            .iter()
+            .copied()
+            .filter(|r| !r.blocks_run())
+            .collect();
+        assert_eq!(task_only, [BlockedReason::ReadinessNotMet]);
+    }
 
     #[test]
     fn a_blocked_reason_names_itself_as_its_serde_form_does() {

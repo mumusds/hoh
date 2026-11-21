@@ -547,3 +547,68 @@ async fn a_blocked_runs_budget_stop_waits_for_its_unfinished_attempts() -> R {
     assert_eq!(run(&path)?.0, "INCOMPLETE");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_task_blocked_only_by_readiness_never_blocks_its_run() -> R {
+    // protocol.schema.json BlockedReason: READINESS_NOT_MET (CR-026, REQ-031 behaviour 5) is a task's reason only and
+    // never blocks a run: the other ready tasks go on, and with none the run stays as it is without a pace claim.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'READINESS_NOT_MET' WHERE task_id = 'T1';"
+    ))?;
+    assert!(tick(&store, at("2026-11-07T00:00:10Z")?).await?.is_empty());
+    assert_eq!(run(&path)?, ("RUNNING".to_owned(), None, "[]".to_owned()));
+    assert!(claims(&path)?.is_empty());
+    let blocked: i64 = Connection::open(&path)?.query_row(
+        "SELECT count(*) FROM events WHERE run_id = 'R' AND kind = 'run.blocked'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(blocked, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_readiness_and_another_reason_the_run_is_blocked_by_the_other_only() -> R {
+    // A stalled run whose tasks are blocked by READINESS_NOT_MET and NEED_DECISION: the pace claims NEED_DECISION only.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'READINESS_NOT_MET' WHERE task_id = 'T1';
+         INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate, blocked_reason)
+           VALUES ('T2', 'R', 's1', 'BLOCKED', 1, 'developer', 2, 1, 'NEED_DECISION');"
+    ))?;
+    assert!(tick(&store, at("2026-11-07T00:00:10Z")?).await?.is_empty());
+    assert_eq!(
+        run(&path)?,
+        (
+            "BLOCKED".to_owned(),
+            Some("NEED_DECISION".to_owned()),
+            "[\"NEED_DECISION\"]".to_owned()
+        )
+    );
+    assert_eq!(claims(&path)?, ["claimed NEED_DECISION pace"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_of_a_reason_that_never_blocks_a_run_is_an_integrity_violation() -> R {
+    // No source can claim READINESS_NOT_MET; a stored claim of it is not taken as a run's blocker.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    foreign_claim(&path, "READINESS_NOT_MET", "commander:d1")?;
+    let err = store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await
+        .err()
+        .ok_or("a READINESS_NOT_MET claim was accepted")?;
+    assert!(
+        err.to_string().contains("no reason that blocks a run"),
+        "{err}"
+    );
+    Ok(())
+}
