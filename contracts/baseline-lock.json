@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 20,
+  "revision": 21,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "08a588f4b43e7e0339f1302c3ae3fc04364c676bc6d4903361358d82fd4b2cf9"
+    "lock_sha256": "b81d445136e716462f4e3774882c97ed2387aaf02069a9c92e212447666f354c"
   },
   "change_requests": [
     {
@@ -102,6 +102,11 @@
       "id": "CR-027",
       "path": "docs/cr/CR-027-ac-021-06-commander-vacancy-run.md",
       "sha256": "31051e5b52fc51a24b303b98e4d0321ff029d67fb1dbbfe9a30c1ff7d00ab7b1"
+    },
+    {
+      "id": "CR-029",
+      "path": "docs/cr/CR-029-native-session-independence.md",
+      "sha256": "fc5e72eace73adef738c44e76142e48ebfe6867800a7ba3830d7b59259c641dd"
     }
   ],
   "files": {
@@ -127,7 +132,7 @@
     "tools/baseline.py": "2a402141ba6e810eb85613947be508a1e066a27de2f736cd15ef5891bb9380c2",
     "tools/candidate.py": "83682c51735bcc84c1ac81217111f6eecd63ef660a57a9c4f182394d4001b98c",
     "tools/common.py": "e0df9f5e3208342b72670dcbc458229cf898a57b02b79615d723707645e7e44a",
-    "tools/release_gate.py": "c2baa7126f9b73800f43fd4a7c8089d5f1327be3b44abad9bbf5bdca604f79c3",
+    "tools/release_gate.py": "a022b9e596467d389b1f101f05f3dd2c68f5b7269cbc7fd967dee6f9870f69b5",
     "tools/run_check.py": "d155bf2f31c87133a0a8be426c85f301147fc785d4da5b8d48bc59a2ee3d99bf"
   }
 }
