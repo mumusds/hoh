@@ -201,7 +201,8 @@ async fn test_025_01_a_recorded_tool_turn_replays_byte_exact_and_resumes_by_sess
     assert_eq!(row.state, AttemptState::Settled);
     assert_eq!(row.resolved_model.as_deref(), Some(model.as_str()));
     assert_eq!(row.session_id.as_deref(), Some("S1"));
-    assert!(row.usage.is_some() && row.cost_usd.is_some());
+    assert!(row.usage.is_some());
+    assert_eq!(row.cost_usd, None, "a CLI estimate is not a priced cost");
     let s = reader.session("S1")?.ok_or("no session")?;
     assert_eq!(s.native_id.as_deref(), Some(session.as_str()));
 
@@ -1266,6 +1267,33 @@ async fn claude_runner_mode_runs_nothing_before_its_gate_and_reports_facts_witho
         events,
         "the store was written"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_run_keeps_the_agents_own_cost_estimate_only_in_usage() -> R {
+    // M2T19R-64 / ADR-020: the direct (doctor) path follows the runner's accounting rule too.
+    for usage in [
+        serde_json::json!({"input_tokens": 3}),
+        serde_json::Value::Null,
+    ] {
+        let world = World::new()?;
+        let result = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "ok", "session_id": "sid-1", "usage": usage, "total_cost_usd": 0.25
+        });
+        let fake = world.fake("costed", format!("{INIT}\n{result}\n").as_bytes(), b"", 0)?;
+        let attempt = world.attempt("A1").await?;
+        let outcome = world
+            .run(&attempt, &world.turn(&fake, "logs-costed")?)
+            .await?;
+        assert_eq!(outcome.state, AttemptState::Settled);
+        let row = world.store.reader()?.attempt("A1")?.ok_or("no attempt")?;
+        assert_eq!(row.cost_usd, None, "a CLI estimate is not a priced cost");
+        let mut expected = usage.as_object().cloned().unwrap_or_default();
+        expected.insert("reported_cost_usd".to_owned(), serde_json::json!(0.25));
+        assert_eq!(row.usage, Some(serde_json::Value::Object(expected)));
+    }
     Ok(())
 }
 
