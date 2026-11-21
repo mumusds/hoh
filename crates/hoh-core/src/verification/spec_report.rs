@@ -24,6 +24,9 @@ pub mod codes {
     pub const NATIVE_ATTEMPT_INVALID: &str = "native_attempt_invalid";
     pub const RAW_SESSION_SHA256_MISMATCH: &str = "raw_session_sha256_mismatch";
     pub const NATIVE_ATTEMPT_SHA256_MISMATCH: &str = "native_attempt_sha256_mismatch";
+    pub const RAW_SESSION_REF_MISMATCH: &str = "raw_session_ref_mismatch";
+    pub const NATIVE_ATTEMPT_REF_MISMATCH: &str = "native_attempt_ref_mismatch";
+    pub const RAW_SESSION_ARTIFACT_MISMATCH: &str = "raw_session_artifact_mismatch";
     pub const SESSION_NOT_IN_NATIVE_ATTEMPT: &str = "session_not_in_native_attempt";
     pub const ROLE_MISMATCH: &str = "role_mismatch";
     pub const REVIEW_ID_MISMATCH: &str = "review_id_mismatch";
