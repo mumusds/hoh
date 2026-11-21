@@ -406,7 +406,8 @@ fn session_native_history(
 
 /// Native identities are namespaced by agent. Include the run's other roles' bindings, attempts and completed-turn
 /// history, plus every native id supplied by their reports on this candidate. Neither a binding change nor a later
-/// native id erases an earlier conflict. HoH session ids are checked separately by conflicting_sessions.
+/// native id erases an earlier conflict. Their HoH session ids also conflict in a native attempt's session_ids,
+/// regardless of agent; conflicting_sessions separately checks the report's own HoH session id.
 fn conflicting_native_sessions(
     tx: &Transaction<'_>,
     run_id: &str,
@@ -423,7 +424,8 @@ fn conflicting_native_sessions(
                UNION SELECT s.session_id FROM events e JOIN sessions s \
                  ON s.session_id = json_extract(e.payload_json, '$.session_id') \
                  WHERE e.run_id = ?1 AND e.kind = 'session.native' AND s.role <> ?3) \
-             SELECT s.native_id FROM sessions s JOIN other_sessions o ON o.session_id = s.session_id \
+             SELECT session_id FROM other_sessions WHERE session_id IS NOT NULL \
+             UNION SELECT s.native_id FROM sessions s JOIN other_sessions o ON o.session_id = s.session_id \
                WHERE s.agent = ?4 AND s.native_id IS NOT NULL \
              UNION SELECT json_extract(n.payload_json, '$.native_id') FROM events n JOIN sessions s \
                ON s.session_id = json_extract(n.payload_json, '$.session_id') \
