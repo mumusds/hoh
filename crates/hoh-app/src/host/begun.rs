@@ -517,15 +517,16 @@ mod scan {
         (
             "hoh-core/src/spawn.rs",
             "std::thread::Builder::new()",
-            1,
-            "the reaper of a helper whose leader did not exit within its handle's bound, a probe's or the WAL \
-             self-test's (writes nothing; docs/adr/ADR-031.md, 设计修正 2, A2)",
+            3,
+            "the reapers of a helper whose leader did not exit within its handle's bound (a probe's or the WAL \
+             self-test's), of a helper its last owner let go of (the handle's drop, CLT-1257), and of a child the \
+             wrapping failure did not reap in time (CLT-1258); each writes nothing (docs/adr/ADR-031.md, 设计修正 2, A2)",
         ),
         (
             "hoh-core/src/spawn.rs",
             ".spawn(",
-            1,
-            "that reaper's Builder chain",
+            3,
+            "those reapers' Builder chains",
         ),
     ];
 
