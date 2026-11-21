@@ -733,6 +733,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     usage: Some(json!({"input_tokens": 3})),
                     native_session: Some("native-1".to_owned()),
                     prompt: Some(crate::persistence::PromptRecord {
+        chain: Vec::new(),
                         layer: "project".to_owned(),
                         role: "developer".to_owned(),
                         path: ".hoh/prompts/developer.md".to_owned(),
@@ -1516,6 +1517,7 @@ async fn an_unknown_effect_ends_the_attempt_and_runs_nothing_again() -> R {
 fn two_prompt_files_of_the_same_content_are_two_sources() {
     // M2T07R-205 (ADR-022 decision 11): the prompt revision names its file too.
     let record = |path: &str| crate::persistence::PromptRecord {
+        chain: Vec::new(),
         layer: "project".to_owned(),
         role: "developer".to_owned(),
         path: path.to_owned(),
@@ -1631,6 +1633,7 @@ async fn a_turns_prompt_is_recorded_in_the_commit_that_marks_it_running() -> R {
     assert!(store.runner_received(notice, clock).await?);
     let object = "ab".repeat(32);
     let prompt = crate::persistence::PromptRecord {
+        chain: Vec::new(),
         layer: "builtin".to_owned(),
         role: "developer".to_owned(),
         path: "resources/prompts/developer.md".to_owned(),

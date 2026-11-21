@@ -39,8 +39,8 @@ pub fn builtin_contract(role: &str) -> Option<&'static str> {
     })
 }
 
-/// A role contract as a turn is sent it (docs/adr/ADR-022.md decision 11): its layer (`builtin` or `project`), its path
-/// and its text.
+/// A role contract source: its override layer, path and text. `contract` reads the legacy builtin/project choice;
+/// `prompt_files::load` resolves builtin/global/project/run for each Attempt (ADR-034).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contract {
     pub layer: &'static str,

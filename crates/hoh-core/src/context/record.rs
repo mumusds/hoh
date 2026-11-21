@@ -6,7 +6,7 @@ use super::{
 };
 use serde_json::{Value, json};
 
-/// The role contract a prompt was packed into: its layer (`builtin` or `project`), its path and its text.
+/// The effective role contract a prompt was packed into: its override layer, path and text.
 #[derive(Debug, Clone, Copy)]
 pub struct Contract<'a> {
     pub layer: &'a str,
@@ -42,6 +42,82 @@ pub struct Recorded {
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
+
+/// The source chain and per-layer provenance gathered for this Attempt, outside the packer's pure rendering.
+#[derive(Debug)]
+pub struct PromptSources<'a> {
+    pub role: &'a str,
+    pub resolved: &'a crate::prompt::Resolved,
+    pub layers: Value,
+}
+
+pub fn record_resolved(
+    sources: PromptSources<'_>,
+    mandatory: &Mandatory,
+    package: Option<&Value>,
+    entries: &[Entry],
+    params: Params,
+    version: &str,
+) -> Result<Recorded, PackError> {
+    let contract = sources
+        .resolved
+        .effective()
+        .map_err(|e| PackError::Template(e.to_string()))?;
+    let template = sources
+        .resolved
+        .template()
+        .map_err(|e| PackError::Template(e.to_string()))?;
+    let mut recorded = record(
+        Contract {
+            layer: contract.layer,
+            path: &contract.path,
+            text: &template,
+        },
+        mandatory,
+        package,
+        entries,
+        params,
+        version,
+    )?;
+    let mut manifest = recorded
+        .objects
+        .pop()
+        .ok_or_else(|| PackError::Template("missing manifest".to_owned()))?;
+    let mut value: Value =
+        serde_json::from_slice(&manifest.bytes).map_err(|e| PackError::Template(e.to_string()))?;
+    let chain = sources.resolved.revisions(sources.role);
+    for (key, field) in [
+        ("override_chain", json!(chain)),
+        ("sources", sources.layers),
+        ("conflicts", json!(sources.resolved.conflicts)),
+    ] {
+        value[key] = field.clone();
+        recorded.event[key] = field;
+    }
+    manifest.bytes = value.to_string().into_bytes();
+    recorded.manifest_sha256 = manifest.sha256();
+    recorded.event["manifest"] = json!(recorded.manifest_sha256);
+    if let Some(inputs) = recorded.event["inputs"].as_array_mut() {
+        for input in inputs
+            .iter_mut()
+            .filter(|input| input["kind"] == "manifest")
+        {
+            input["sha256"] = json!(recorded.manifest_sha256);
+        }
+        for (source, revision) in sources.resolved.chain.iter().zip(&chain) {
+            recorded.objects.push(Object {
+                bytes: source.text.as_bytes().to_vec(),
+                mime: TEXT,
+                kind: "override",
+                name: source.path.clone(),
+            });
+            inputs.push(json!({"kind": "override", "layer": source.layer, "path": source.path,
+                "sha256": revision.sha256, "revision_id": revision.revision_id, "resource_bundle_version": version}));
+        }
+    }
+    recorded.objects.push(manifest);
+    Ok(recorded)
+}
 
 /// Packs `entries` into `contract` with `mandatory` under `params`, and records it: every input an object, the
 /// manifest naming them all with every value packing read, and the event with the inputs list (never empty: the

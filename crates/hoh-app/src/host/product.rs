@@ -361,6 +361,19 @@ fn class_of_code(code: Option<&str>) -> FailureClass {
 }
 
 /// A refusal of `reason`, `class`, with `detail` kept in the attempt's event.
+fn prompt_refusal(error: hoh_core::prompt::Error) -> Refusal {
+    Refusal {
+        reason: error.code.to_owned(),
+        class: if error.code == "PROMPT_UNAVAILABLE" && error.details["conflicts"].is_null() {
+            FailureClass::Transient { retry_after: None }
+        } else {
+            FailureClass::Decision
+        },
+        detail: Some(error.to_string()),
+        details: Some(error.details),
+    }
+}
+
 fn refused(reason: &str, class: FailureClass, detail: String) -> Refusal {
     Refusal {
         reason: reason.to_owned(),
@@ -464,16 +477,18 @@ impl ProductExecutor {
     fn pack(
         &self,
         work: &Work,
-        contract: &hoh_core::config::Contract,
+        resolved: &hoh_core::prompt::Resolved,
         package: Option<&serde_json::Value>,
     ) -> Result<(String, PromptRecord), Refusal> {
         use hoh_core::context;
-        hoh_core::prompt::validate_variables(&contract.text).map_err(|error| Refusal {
-            reason: error.code.to_owned(),
-            class: FailureClass::Decision,
-            detail: Some(error.to_string()),
-            details: Some(error.details),
-        })?;
+        let contract = resolved.effective().map_err(prompt_refusal)?;
+        hoh_core::prompt::validate_variables(&resolved.template().map_err(prompt_refusal)?)
+            .map_err(|error| Refusal {
+                reason: error.code.to_owned(),
+                class: FailureClass::Decision,
+                detail: Some(error.to_string()),
+                details: Some(error.details),
+            })?;
         let a = &work.assignment;
         let mut facts = a.context.clone().unwrap_or_default();
         // What the store named and only the executor reads (docs/adr/ADR-028.md decision 14): registered objects by
@@ -536,14 +551,49 @@ impl ProductExecutor {
             .map(|_| self.project.display().to_string());
         let deterministic =
             |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
-        let mandatory = context::mandatory(&facts, &work.role, &lead, project.as_deref())
+        let mut mandatory = context::mandatory(&facts, &work.role, &lead, project.as_deref())
             .map_err(deterministic)?;
+        let mut project_sources =
+            hoh_core::prompt_files::project_references(&self.project).map_err(prompt_refusal)?;
+        project_sources["spec"] = facts.spec.as_ref().map(|(sha, revision)| serde_json::json!({"kind": "spec", "sha256": sha, "revision": revision})).unwrap_or_default();
+        let adrs = project_sources["adrs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        mandatory.project.push_str(if adrs.is_empty() {
+            "\nADR：无"
+        } else {
+            "\nADR："
+        });
+        for reference in &adrs {
+            mandatory.project.push_str(&format!(
+                "\n- {} sha256={}",
+                reference["path"].as_str().unwrap_or_default(),
+                reference["sha256"].as_str().unwrap_or_default()
+            ));
+        }
+        let conventions = &project_sources["conventions"];
+        if conventions.is_null() {
+            mandatory.project.push_str("\n约定：无");
+        } else {
+            mandatory.project.push_str(&format!(
+                "\n约定：{} sha256={}",
+                conventions["path"].as_str().unwrap_or_default(),
+                conventions["sha256"].as_str().unwrap_or_default()
+            ));
+        }
+        let sources = serde_json::json!({
+            "role_contract": resolved.revisions(&work.role), "project": project_sources,
+            "task": {"run_id": work.run_id, "task_id": work.task_id, "attempt_id": work.attempt_id, "role_epoch": a.role_epoch},
+            "evidence": facts.entries.iter().filter(|e| e.class == context::Class::Evidence)
+                .map(|e| serde_json::json!({"path": e.path, "sha256": sha256_hex(e.text.as_bytes())})).collect::<Vec<_>>()
+        });
         let version = hoh_core::objects::resource_bundle_version();
-        let mut recorded = context::record(
-            context::Contract {
-                layer: contract.layer,
-                path: &contract.path,
-                text: &contract.text,
+        let mut recorded = context::record_resolved(
+            context::PromptSources {
+                role: &work.role,
+                resolved,
+                layers: sources,
             },
             &mandatory,
             package,
@@ -592,6 +642,7 @@ impl ProductExecutor {
         artifacts.sort_by(|x, y| x.sha256.cmp(&y.sha256));
         artifacts.dedup_by(|x, y| x.sha256 == y.sha256);
         let record = PromptRecord {
+            chain: resolved.revisions(&work.role),
             layer: contract.layer.to_owned(),
             role: work.role.clone(),
             path: contract.path.clone(),
@@ -652,14 +703,14 @@ impl ProductExecutor {
             exec_only,
             ..
         } = current;
-        let contract = hoh_core::config::contract(&self.project, &work.role, a.prompt.as_deref())
-            .map_err(|why| {
-            refused(
-                "PROMPT_UNAVAILABLE",
-                FailureClass::Transient { retry_after: None },
-                why,
-            )
-        })?;
+        let contract = hoh_core::prompt_files::load(
+            &self.project,
+            hoh_core::prompt_files::global_root().as_deref(),
+            &work.run_id,
+            &work.role,
+            a.prompt.as_deref(),
+        )
+        .map_err(prompt_refusal)?;
         // A new holder's first turn starts from its handover package (REQ-019 b4), as the store says which turn that
         // is (ADR-024 decision 4): one whose kept input is gone or unreadable is not started without it.
         let package = match (a.first_input, a.session_id.as_deref()) {
