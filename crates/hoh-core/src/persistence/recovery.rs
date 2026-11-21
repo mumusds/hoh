@@ -92,14 +92,31 @@ pub(super) fn spec_changed(
     template: &super::writer::NewEvent,
 ) -> Result<Vec<super::writer::NewEvent>, PersistError> {
     let candidates = tx
-        .prepare("SELECT candidate_id FROM candidates WHERE run_id=?1 AND state IN ('FROZEN','VERIFYING','ACCEPTED') ORDER BY candidate_id")
+        .prepare("SELECT candidate_id,state FROM candidates WHERE run_id=?1 AND state IN ('FROZEN','VERIFYING','ACCEPTED','STALE') ORDER BY candidate_id")
         .map_err(sqlite_error)?
-        .query_map(params![run], |r| r.get::<_, String>(0))
+        .query_map(params![run], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(sqlite_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error)?;
     let mut events = Vec::new();
-    for candidate in candidates {
+    let rounds = super::closing::rounds(tx, run)?;
+    for (candidate, state) in candidates {
+        // Round membership, not the role or the run alone, owns a verification attempt (ADR-033 Q10).
+        for round in rounds.iter().filter(|round| round.candidate == candidate) {
+            tx.execute(
+                "UPDATE attempts SET cancel_requested=1 WHERE task_id IN (?1,?2) \
+                 AND state IN ('PREPARED','STARTING','RUNNING')",
+                params![round.qa, round.reviewer],
+            )
+            .map_err(sqlite_error)?;
+        }
+        super::reports::stale_reports(
+            tx,
+            run,
+            std::slice::from_ref(&candidate),
+            "candidate_stale",
+            "spec_changed",
+        )?;
         tx.execute("UPDATE candidates SET state='STALE' WHERE candidate_id=?1 AND state IN ('FROZEN','VERIFYING','ACCEPTED')", params![candidate])
             .map_err(sqlite_error)?;
         let (id, kind) = judgment(&candidate);
@@ -110,7 +127,7 @@ pub(super) fn spec_changed(
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        if !exists {
+        if !exists && state != "STALE" {
             let mut event = template.clone();
             event.event_id = id;
             event.run_id = Some(run.to_owned());

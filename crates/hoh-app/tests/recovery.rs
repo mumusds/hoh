@@ -22,6 +22,12 @@ type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 mod common;
 mod installed;
+mod pty;
+mod recovery {
+    use super::*;
+    mod spec_change;
+}
+mod world;
 
 const CHILD_PROJECT: &str = "HOH_TEST_RECOVERY_PROJECT";
 /// `<job>:<point>`: the child kills itself when its writer reaches that point of such a request.

@@ -733,6 +733,11 @@ impl World {
     /// path needs.
     pub fn named(name: &str) -> R<World> {
         let dir = tempfile::Builder::new().prefix("hohw").tempdir()?;
+        Self::in_directory(dir, name)
+    }
+
+    /// A world in a caller-owned temporary directory, for recovery matrices with an explicit scratch root.
+    pub fn in_directory(dir: tempfile::TempDir, name: &str) -> R<World> {
         let world = World {
             dir,
             setsid: found("setsid")?,

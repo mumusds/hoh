@@ -664,7 +664,7 @@ fn received(
         .map_err(sqlite_error)?;
     let prepared: Option<String> = tx
         .query_row(
-            "SELECT state FROM attempts WHERE attempt_id = ?1",
+            "SELECT state FROM attempts WHERE attempt_id = ?1 AND cancel_requested = 0",
             params![notice.attempt_id],
             |r| r.get(0),
         )

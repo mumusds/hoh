@@ -100,6 +100,23 @@ pub(super) fn run(
     }
 }
 
+/// Active cancellation requests, read without a reconcile job or a write transaction (ADR-033 Q10).
+pub(super) fn requested_attempts(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Vec<(String, String)>, PersistError> {
+    conn.prepare(
+        "SELECT r.run_id,a.attempt_id FROM attempts a JOIN tasks t ON t.task_id=a.task_id \
+         JOIN runs r ON r.run_id=t.run_id WHERE r.project_id=?1 AND a.cancel_requested=1 \
+         AND a.state IN ('PREPARED','STARTING','RUNNING') ORDER BY r.run_id,a.attempt_id",
+    )
+    .map_err(sqlite_error)?
+    .query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))
+    .map_err(sqlite_error)?
+    .collect::<Result<_, _>>()
+    .map_err(sqlite_error)
+}
+
 /// The attempts of run `run_id` that start or run, oldest first (what a cancel must stop, ADR-021 decision 8).
 pub(super) fn running_attempts(
     conn: &Connection,
@@ -377,7 +394,10 @@ fn record_pass(
     };
     events.push(event(end, pass.at));
     let ends = pass.end == PassEnd::Empty
-        && matches!(state, AttemptState::Starting | AttemptState::Running);
+        && matches!(
+            state,
+            AttemptState::Prepared | AttemptState::Starting | AttemptState::Running
+        );
     // Its work, started and never observed, is not known to have happened or not (ADR-021 decision 8e), named as the
     // runner's end and a reconcile name it (docs/adr/ADR-022.md decision 12 v3, M2T07R-552).
     let unknown = if ends {

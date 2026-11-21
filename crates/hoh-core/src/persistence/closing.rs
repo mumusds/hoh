@@ -420,10 +420,19 @@ pub(super) fn reconcile_in(
             let Some((state, revision, _)) = task_state(tx, task)? else {
                 continue;
             };
-            if !matches!(
-                state,
-                TaskState::Ready | TaskState::Blocked | TaskState::Pending
-            ) {
+            let cancelled_attempts = matches!(state, TaskState::Running | TaskState::Leased)
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND cancel_requested=1 AND state='CANCELLED') \
+                     AND NOT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND state IN ('PREPARED','STARTING','RUNNING'))",
+                    params![task],
+                    |r| r.get::<_, bool>(0),
+                ).map_err(sqlite_error)?;
+            if !cancelled_attempts
+                && !matches!(
+                    state,
+                    TaskState::Ready | TaskState::Blocked | TaskState::Pending
+                )
+            {
                 continue;
             }
             tx.execute(

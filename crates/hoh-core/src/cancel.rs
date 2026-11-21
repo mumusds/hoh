@@ -249,6 +249,14 @@ pub struct Canceller {
     pub poll: Duration,
 }
 
+/// Whether a single-attempt pass ran, and the workspace record it needed to release a writer's lease.
+#[derive(Debug)]
+pub enum AttemptPass {
+    /// No process control was available; an earlier pass's workspace record is still current.
+    Skipped,
+    Passed(Option<serde_json::Value>),
+}
+
 impl Canceller {
     pub fn new(graces: Graces, poll: Duration) -> Canceller {
         Canceller {
@@ -274,86 +282,17 @@ impl Canceller {
         // (docs/adr/ADR-024.md decision 9), not taken a second time.
         let mut last_record: Option<serde_json::Value> = None;
         for attempt in store.running_attempts(run_id).await? {
-            let Some((mut control, native)) = processes.control(&attempt) else {
-                continue;
-            };
-            last_record = None;
-            let from = self
-                .progress
-                .lock()
-                .map(|p| p.get(&attempt.attempt_id).copied().unwrap_or_default())
-                .unwrap_or_default();
-            let (graces, poll, at) = (self.graces, self.poll, clock.clone());
-            let wait = wait.clone();
-            let done = tokio::task::spawn_blocking(move || {
-                let mut wait = |d: Duration| wait(d);
-                pass(
-                    control.as_mut(),
-                    at.as_ref(),
-                    &mut wait,
-                    &graces,
-                    native,
-                    from,
-                    poll,
+            if let AttemptPass::Passed(record) = self
+                .step_attempt(
+                    store,
+                    &attempt,
+                    processes.clone(),
+                    clock.clone(),
+                    wait.clone(),
                 )
-            })
-            .await
-            .map_err(|e| {
-                crate::persistence::PersistError::IntegrityViolation(format!(
-                    "a cancel pass failed: {e}"
-                ))
-            })?;
-            if let Ok(mut progress) = self.progress.lock() {
-                if done.end == PassEnd::Unreaped {
-                    progress.insert(attempt.attempt_id.clone(), done.progress);
-                } else {
-                    progress.remove(&attempt.attempt_id);
-                }
-            }
-            // A lost pass after a recorded lost one is the same finding when it has nothing else to record: its
-            // whole outcome is compared, and only what was committed is remembered (CGW-101's rule).
-            let repeated = done.end == PassEnd::Lost
-                && done.only_its_end()
-                && self
-                    .lost
-                    .lock()
-                    .is_ok_and(|lost| lost.contains(&attempt.attempt_id));
-            if repeated {
-                continue;
-            }
-            let Pass {
-                sent,
-                term_incomplete,
-                end,
-                progress: _,
-            } = done;
-            let mut pass = crate::persistence::CancelPass {
-                attempt_id: attempt.attempt_id.clone(),
-                sent,
-                term_incomplete,
-                end,
-                at: clock.now(),
-                workspace: None,
-            };
-            match store.cancel_pass(pass.clone()).await {
-                // The pass ends the writer lease's RUNNING holder, its group proven empty: its lease goes only with the
-                // workspace's record, taken now and written in the same end (REQ-019 behaviour 6, decision 9).
-                Err(crate::persistence::PersistError::WorkspaceRecordRequired(_)) => {
-                    let record = workspace_of(processes.clone()).await?;
-                    pass.workspace = Some(record.clone());
-                    store.cancel_pass(pass).await?;
-                    last_record = Some(record);
-                }
-                other => {
-                    other?;
-                }
-            }
-            if let Ok(mut lost) = self.lost.lock() {
-                if end == PassEnd::Lost {
-                    lost.insert(attempt.attempt_id);
-                } else {
-                    lost.remove(&attempt.attempt_id);
-                }
+                .await?
+            {
+                last_record = record;
             }
         }
         if !store.running_attempts(run_id).await?.is_empty() {
@@ -373,6 +312,101 @@ impl Canceller {
         store
             .finish_cancel(run_id, workspace, pending, clock.now())
             .await
+    }
+
+    /// One attempt's existing cancellation ladder and proof, without any run-state transition or round closure.
+    /// The caller first stops the host task that owns this attempt. Used for specification changes (ADR-033 Q10).
+    /// The optional workspace record is only for a writer whose lease required it.
+    pub async fn step_attempt(
+        &self,
+        store: &crate::persistence::Store,
+        attempt: &crate::persistence::AttemptRow,
+        processes: std::sync::Arc<dyn Processes>,
+        clock: std::sync::Arc<dyn Clock>,
+        wait: std::sync::Arc<dyn Fn(Duration) + Send + Sync>,
+    ) -> Result<AttemptPass, crate::persistence::PersistError> {
+        let Some((mut control, native)) = processes.control(attempt) else {
+            return Ok(AttemptPass::Skipped);
+        };
+        let mut last_record = None;
+        let from = self
+            .progress
+            .lock()
+            .map(|p| p.get(&attempt.attempt_id).copied().unwrap_or_default())
+            .unwrap_or_default();
+        let (graces, poll, at) = (self.graces, self.poll, clock.clone());
+        let wait = wait.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let mut wait = |d: Duration| wait(d);
+            pass(
+                control.as_mut(),
+                at.as_ref(),
+                &mut wait,
+                &graces,
+                native,
+                from,
+                poll,
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::persistence::PersistError::IntegrityViolation(format!(
+                "a cancel pass failed: {e}"
+            ))
+        })?;
+        if let Ok(mut progress) = self.progress.lock() {
+            if done.end == PassEnd::Unreaped {
+                progress.insert(attempt.attempt_id.clone(), done.progress);
+            } else {
+                progress.remove(&attempt.attempt_id);
+            }
+        }
+        // A lost pass after a recorded lost one is the same finding when it has nothing else to record: its
+        // whole outcome is compared, and only what was committed is remembered (CGW-101's rule).
+        let repeated = done.end == PassEnd::Lost
+            && done.only_its_end()
+            && self
+                .lost
+                .lock()
+                .is_ok_and(|lost| lost.contains(&attempt.attempt_id));
+        if repeated {
+            return Ok(AttemptPass::Passed(None));
+        }
+        let Pass {
+            sent,
+            term_incomplete,
+            end,
+            progress: _,
+        } = done;
+        let mut pass = crate::persistence::CancelPass {
+            attempt_id: attempt.attempt_id.clone(),
+            sent,
+            term_incomplete,
+            end,
+            at: clock.now(),
+            workspace: None,
+        };
+        match store.cancel_pass(pass.clone()).await {
+            // The pass ends the writer lease's RUNNING holder, its group proven empty: its lease goes only with the
+            // workspace's record, taken now and written in the same end (REQ-019 behaviour 6, decision 9).
+            Err(crate::persistence::PersistError::WorkspaceRecordRequired(_)) => {
+                let record = workspace_of(processes.clone()).await?;
+                pass.workspace = Some(record.clone());
+                store.cancel_pass(pass).await?;
+                last_record = Some(record);
+            }
+            other => {
+                other?;
+            }
+        }
+        if let Ok(mut lost) = self.lost.lock() {
+            if end == PassEnd::Lost {
+                lost.insert(attempt.attempt_id.clone());
+            } else {
+                lost.remove(&attempt.attempt_id);
+            }
+        }
+        Ok(AttemptPass::Passed(last_record))
     }
 }
 
