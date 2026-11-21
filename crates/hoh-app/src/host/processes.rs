@@ -318,6 +318,33 @@ fn marked_tri(root: &Path, process: &Proc, marker: &[u8], me: u32) -> Option<boo
     }
 }
 
+/// Whether `pid`'s cgroup (`<root>/<pid>/cgroup`, readable even for a non-dumpable process) could hold a process of an
+/// attempt tracked by a cgroup: inside the user's manager (a `user@<me>.service` component), where the attempt's
+/// cgroup is and where its processes can move themselves; never a login session's scope or another system-owned cgroup,
+/// which this user may not move a process into. What cannot be told counts: a cgroup that cannot be read, a path with no
+/// cgroup v2 line, or a host whose own cgroup (`<root>/self/cgroup`) does not show its user's manager (another cgroup
+/// namespace's view).
+fn in_users_manager(root: &Path, pid: u32, me: u32) -> bool {
+    let unit = format!("user@{me}.service");
+    let inside = |text: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(|path| path.split('/').any(|part| part == unit))
+    };
+    if std::fs::read_to_string(root.join("self/cgroup"))
+        .ok()
+        .and_then(|own| inside(&own))
+        != Some(true)
+    {
+        return true;
+    }
+    match std::fs::read_to_string(root.join(pid.to_string()).join("cgroup")) {
+        Ok(text) => inside(&text) != Some(false),
+        Err(e) if gone(&e) => false,
+        Err(_) => true,
+    }
+}
+
 /// A process of an attempt outside its group, pinned by a pidfd.
 pub(super) struct Pinned {
     pid: u32,
@@ -385,8 +412,8 @@ pub(super) struct Outside {
     /// The leader's start time as recorded, kept when the leader is no longer pinned: every process of the attempt
     /// descends from the leader, so one started before it is not the attempt's (M2R-500, as WD-03).
     born: Option<u64>,
-    /// Whether the attempt is tracked by its delegated cgroup: then the cgroup's proof covers what stays in it, and an
-    /// unreadable environment is not counted here (see [`Outside::by_cgroup`]).
+    /// Whether the attempt is tracked by its delegated cgroup: then an unreadable environment counts only inside the
+    /// user's manager (see [`Outside::by_cgroup`]).
     by_cgroup: bool,
     pins: Vec<Pinned>,
     /// The strongest signal sent so far: one found later gets it at once.
@@ -439,11 +466,11 @@ impl Outside {
     }
 
     /// Whether the attempt is tracked by its delegated cgroup (`Tracking::Cgroup`). The rule of M2R-500 (an unreadable
-    /// environment of this user's process started after the leader leaves the scan incomplete) holds in /proc tracking
-    /// only: with a cgroup, a process of the attempt that stays in it is the cgroup's to prove, and one that left it and
-    /// hid its marker is ADR-021 8d's stated residual (M2T06R-400, -554), while counting every later non-dumpable
-    /// process of this user (a later login's sshd session, a later ssh-agent, a set-user-id tool run in a terminal)
-    /// would hold every attempt's proof, and its writer lease, until that process ended.
+    /// environment of this user's process started after the leader leaves the scan incomplete) then holds only for a
+    /// process that could have moved there from the attempt's cgroup: one inside the user's manager (CTO decision,
+    /// 2026-11-21; [`in_users_manager`]). A later login's sshd session (in its session scope) or another process in a
+    /// system-owned cgroup cannot hold every attempt's proof, and its writer lease, until it ends. In /proc tracking
+    /// every such process counts: that cost is ADR-021 8d's stated residual.
     pub(super) fn by_cgroup(mut self, by_cgroup: bool) -> Outside {
         self.by_cgroup = by_cgroup;
         self
@@ -507,10 +534,10 @@ impl Outside {
                     // no leader start recorded nothing bounds it (the user's own service manager refuses its
                     // environment too): not counted, the stated residual of such a record (a STARTING attempt with no
                     // process, held at its gate, has none outside; a pid recorded without a start is a legacy row).
-                    // With the attempt's cgroup it is not counted either ([`Outside::by_cgroup`]).
-                    None if self.by_cgroup
-                        || self.born.is_none_or(|born| process.start < born)
+                    None if self.born.is_none_or(|born| process.start < born)
                         || has_ended(process) => {}
+                    // With the attempt's cgroup, only one that could have moved there from it ([`Outside::by_cgroup`]).
+                    None if self.by_cgroup && !in_users_manager(&self.root, process.pid, me) => {}
                     None => complete = false,
                 }
             }
@@ -1169,12 +1196,12 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
     }
 
     #[test]
-    fn a_later_non_dumpable_process_of_this_user_holds_the_proof_in_proc_tracking_only()
+    fn a_later_unrelated_non_dumpable_process_of_this_user_holds_the_proof_in_proc_tracking()
     -> Result<(), Box<dyn std::error::Error>> {
         // M2R-500's cost, measured: a process of this user unrelated to the attempt (unmarked, as a later login's sshd
         // session or a later ssh-agent), started after the leader and non-dumpable, cannot be told apart from one of
-        // the attempt's that hid its marker. In /proc tracking every scan is incomplete while it runs; with the
-        // attempt's delegated cgroup it is not counted, and two scans prove the attempt's processes gone.
+        // the attempt's that hid its marker. In /proc tracking every scan is incomplete while it runs (with a cgroup it
+        // counts only inside the user's manager: the fake /proc test above, as where this one runs depends on the host).
         let marker = format!("p/M2R500-cost-{}", std::process::id());
         let (mut leader, _) = python(
             "print('up', flush=True); import time; time.sleep(60)",
@@ -1191,18 +1218,78 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         };
         let _ = leader.kill();
         let _ = leader.wait();
-        let proofs = |by_cgroup: bool| {
-            let mut outside = Outside::new(&marker).by_cgroup(by_cgroup);
-            outside.set_leader(Some(i64::from(leader.id())), start.as_deref());
-            [outside.scan(), outside.scan()]
-        };
-        let (proc_mode, cgroup_mode) = (proofs(false), proofs(true));
+        let mut outside = Outside::new(&marker);
+        outside.set_leader(Some(i64::from(leader.id())), start.as_deref());
+        let proc_mode = [outside.scan(), outside.scan()];
         let _ = later.kill();
         let _ = later.wait();
         assert_eq!(said, "hidden");
         assert!(start.is_some(), "the leader's start was not read");
         assert_eq!(proc_mode, [Proof::Incomplete; 2]);
-        assert_eq!(cgroup_mode, [Proof::Pending, Proof::Done]);
+        Ok(())
+    }
+
+    #[test]
+    fn with_a_cgroup_an_unreadable_process_holds_the_proof_only_inside_the_users_manager()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2R-500 with the attempt's delegated cgroup (CTO decision, 2026-11-21): an unreadable process of this user
+        // started after the leader could be one of the attempt's only inside the user's manager (user@<uid>.service),
+        // where an attempt's process can move itself; one in a login session's scope (a later SSH login's sshd
+        // session) or another system-owned cgroup is not counted. One whose cgroup cannot be read is counted, and so is
+        // every one when the host's own cgroup does not show its user's manager. In /proc tracking each is counted. Its environment here is a directory: a read that fails.
+        let me = rustix::process::getuid().as_raw();
+        let host =
+            format!("0::/user.slice/user-{me}.slice/user@{me}.service/app.slice/hoh.scope\n");
+        let unreadable = |cgroup: Option<&str>| -> std::io::Result<tempfile::TempDir> {
+            let root = tree(&[])?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+            std::fs::create_dir_all(root.path().join("self"))?;
+            std::fs::write(root.path().join("self/cgroup"), &host)?;
+            let dir = root.path().join("300");
+            std::fs::create_dir_all(dir.join("environ"))?;
+            std::fs::create_dir_all(dir.join("task/300/environ"))?;
+            let stat = "300 (sshd) S 1 300 300 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 0";
+            std::fs::write(dir.join("stat"), stat)?;
+            std::fs::write(dir.join("task/300/stat"), stat)?;
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\tsshd\nTgid:\t300\nUid:\t{me}\t{me}\t{me}\t{me}\n"),
+            )?;
+            match cgroup {
+                Some(cgroup) => std::fs::write(dir.join("cgroup"), cgroup)?,
+                // A cgroup file that cannot be read.
+                None => std::fs::create_dir_all(dir.join("cgroup"))?,
+            }
+            Ok(root)
+        };
+        let proofs = |root: &tempfile::TempDir, by_cgroup: bool| {
+            let mut outside = Outside::new("p/A1")
+                .by_cgroup(by_cgroup)
+                .with_root(Some(root.path().to_owned()));
+            outside.set_leader(Some(100), Some("500"));
+            [outside.scan(), outside.scan()]
+        };
+        let session = unreadable(Some(&format!(
+            "0::/user.slice/user-{me}.slice/session-3.scope\n"
+        )))?;
+        let system = unreadable(Some("0::/system.slice/ssh.service\n"))?;
+        let manager = unreadable(Some(&format!(
+            "0::/user.slice/user-{me}.slice/user@{me}.service/app.slice/x.scope\n"
+        )))?;
+        let unknown = unreadable(None)?;
+        let done = [Proof::Pending, Proof::Done];
+        assert_eq!(proofs(&session, true), done);
+        assert_eq!(proofs(&system, true), done);
+        assert_eq!(proofs(&manager, true), [Proof::Incomplete; 2]);
+        assert_eq!(proofs(&unknown, true), [Proof::Incomplete; 2]);
+        assert_eq!(proofs(&session, false), [Proof::Incomplete; 2]);
+        // A host whose own view does not show its user's manager (another cgroup namespace's): nothing can be told.
+        std::fs::write(
+            session.path().join("self/cgroup"),
+            "0::/app.slice/hoh.scope\n",
+        )?;
+        assert_eq!(proofs(&session, true), [Proof::Incomplete; 2]);
         Ok(())
     }
 
