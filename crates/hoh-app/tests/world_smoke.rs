@@ -93,6 +93,42 @@ fn a_world_directory_that_was_not_removed_is_reported_with_what_is_left_and_who_
 }
 
 #[test]
+fn a_world_cleanup_failure_fails_the_test_without_replacing_an_existing_panic() -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    for unwinding in [false, true] {
+        let world = World::new()?;
+        let root = world.root().to_path_buf();
+        let closed = root.join("closed");
+        std::fs::create_dir(&closed)?;
+        std::fs::write(closed.join("kept"), b"leftover")?;
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _world = world;
+            if unwinding {
+                panic!("the original test failure");
+            }
+        }));
+        // Restore this test's own directory before asserting, even on the old, non-failing Drop.
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::remove_dir_all(&root)?;
+        let error = result.expect_err("a failed World cleanup must fail a passing test");
+        if unwinding {
+            assert_eq!(
+                error.downcast_ref::<&str>(),
+                Some(&"the original test failure")
+            );
+        } else {
+            let text = error
+                .downcast_ref::<String>()
+                .ok_or("cleanup diagnostic missing")?;
+            assert!(text.contains(&root.display().to_string()), "{text}");
+            assert!(text.contains("was not removed"), "{text}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_world_directory_made_again_just_after_its_removal_is_reported_too() -> R {
     // World::drop removes its directory (world::removed) and, when that succeeded, looks once more a moment later: a
     // directory something made again meanwhile (a late writer's create_dir_all) is reported as a failed removal is.
