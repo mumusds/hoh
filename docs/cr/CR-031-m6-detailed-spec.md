@@ -2,9 +2,9 @@
 
 ID：CR-031
 状态：DRAFT
-批准人：待定（CTO 依 CR-003 D1 预授权，须在独立设计审查 PASS 之后；本稿作者不批准自己）。C1 已由所有者于 2026-11-22 批准，C2–C20 已由 CTO 采纳（见“CTO 的问题与决定”）
-日期：2026-11-22（第 2 稿；第 1 稿为 `05b2ef6c`，设计审查第 1 轮的处置见“审查记录”）
-基线：拟改受锁文件 `contracts/requirements.json`（REQ-058、059、060、061、065、066 由 outline 细化为 detailed，共 23 条 AC；REQ-018 增加一条决定：`[git]` 配置键）、`contracts/acceptance-scenarios.json`（这 6 项的 23 个场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode` 增加 `WEB_ASSETS_UNAVAILABLE`）、`contracts/openapi.json`（增加 Web 外壳的两条路径 `/` 与 `/assets/{asset}`，`/v1/events` 的说明增加 cursor_ahead 一句）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M6 实现任务的拆分）。不新增受锁契约，不新增 SQL 迁移。批准后 `python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18，`python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`；同一提交须把 `WEB_ASSETS_UNAVAILABLE` 加进 Rust 的 `ErrorCode` 枚举（`crates/hoh-core/src/protocol.rs`，protocol_roundtrip 要求与 schema 逐项相等）并运行完整的 `cargo test --workspace --locked`（docs/24 第 5 节）
+批准人：待定（CTO 依 CR-003 D1 预授权，须在独立设计审查 PASS 之后；本稿作者不批准自己）。各 C 项的决定状态只在“CTO 的问题与决定”的表中，取自 CTO 决定记录（本行不另写状态）
+日期：2026-11-22（第 3 稿；第 1 稿为 `05b2ef6c`，第 2 稿为 `39386bf0`，设计审查第 1、2 轮的处置见“审查记录”）
+基线：拟改受锁文件 `contracts/requirements.json`（REQ-058、059、060、061、065、066 由 outline 细化为 detailed，共 23 条 AC；REQ-018 增加一条决定：`[git]` 配置键）、`contracts/acceptance-scenarios.json`（这 6 项的 23 个场景）、`contracts/protocol.schema.json`（`$defs.ErrorCode` 增加 `WEB_ASSETS_UNAVAILABLE`）、`contracts/openapi.json`（增加 Web 外壳的两条路径 `/` 与 `/assets/{asset}`，`/v1/events` 的说明增加 cursor_ahead 一句，`components.responses.Forbidden` 的说明写明 403 的 `details.reason`）；不在锁内、随 CR 一起改：`contracts/development-tasks.json`（M6 实现任务的拆分）。不新增受锁契约，不新增 SQL 迁移。批准后 `python3 tools/gen_spec_views.py` 重新生成 docs/02 与 docs/18，`python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`；同一提交须把 `WEB_ASSETS_UNAVAILABLE` 加进 Rust 的 `ErrorCode` 枚举（`crates/hoh-core/src/protocol.rs`，protocol_roundtrip 要求与 schema 逐项相等）并运行完整的 `cargo test --workspace --locked`（docs/24 第 5 节）
 
 本 CR 是 M6-T01（“细化 M6 需求为 detailed：每项 2–5 条可判定 AC 与场景，写 CR 并 relock 基线”）的 CR，**草稿，未批准、未应用**。M6-T01 依赖 M5-T04，尚未领取；本 CR 的提交不改任何受锁文件。下文第 3–7 节的片段由应用脚本从本文的 JSON 块直接取出，已在仓库之外的副本上应用并通过 `tools/validate_bundle.py` 与 bundle 自检（见“验证方式”）。本稿的输入：main `8d9ae599`（基线 revision 22，CR-026 已应用）、已批准未应用的 CR-028（`prep/M4-T01-spec` 的 `dde5109f`），以及仍在设计审查中的 CR-030 第 1 稿（M5，`prep/M5-T01-spec` 的 `6c0fc5b6`）。凡依赖 CR-028 或 CR-030 的地方都列在“对未应用规格的假设”中，M6-T01 领取时逐条重核；行号只作 `8d9ae599` 上的提示，以引文与函数名为锚。
 
@@ -16,10 +16,10 @@ M6 的 6 项需求（REQ-058、059、060、061、065、066）都是 `spec_maturi
 
 - `hoh web` 只解析参数，执行时以 3 退出并打印 NOT_IMPLEMENTED（`crates/hoh-client/src/lib.rs` 的 `Invocation::Web` 分支）；`hoh web --help` 已写“启动或连接本项目的 host，并给出本机 Web 界面的地址”。
 - host 已在 `127.0.0.1:<port>`（缺省 8787，被占用时取空闲端口并写进 host.json）与 `.hoh/host.sock` 上提供同一组路由；TCP 上每个请求的 Host 必须恰为 `127.0.0.1:<port>`、Origin 缺省或为 `http://127.0.0.1:<port>`，除 `/healthz` 外都要 `X-HoH-Token`（`crates/hoh-app/src/host/http.rs` 的 `check_request`）。`[web] host` 只接受 loopback 地址，`0.0.0.0` 被配置加载器拒绝（`crates/hoh-core/src/config/tests.rs`）。
-- host 每次启动都生成新的 token（`crates/hoh-app/src/host/mod.rs` 的 `token()`：32 个随机字节的十六进制，写进 host.json），旧 token 在新 host 上一律 403；CLI 与 TUI 重读 host.json 取得新 token，浏览器页面读不到 host.json（第 1 稿审查 CR31D-01）。`/healthz` 不要 token，只返回 `{status}`。
+- host 每次启动都生成新的 token（`crates/hoh-app/src/host/mod.rs` 的 `token()`：32 个随机字节的十六进制，写进 host.json），旧 token 在新 host 上一律 403；CLI 与 TUI 重读 host.json 取得新 token，浏览器页面读不到 host.json（第 1 稿审查 CR31D-01）。`check_request` 对 Host、Origin、请求目标的 authority 与 token 的拒绝都返回同一个 `FORBIDDEN`、没有 `details`（`http.rs` 的 `forbidden`），客户端无法从响应区分换 token 与地址被拒（设计审查第 2 轮 CR31D-53）。`/healthz` 不要 token，只返回 `{status}`。
 - openapi 的 `localToken` 规定：`hoh web` 用 URL 片段中的 token 打开浏览器，页面只把它留在内存中；SSE 也用该头。`/v1/events` 的 409 与 410（`CURSOR_EXPIRED` 带顶层 `snapshot_watermark`）已声明；ADR-016 决定 7 写明 M2 不清理事件，所以 410 不会出现；`after` 大于当前水位的游标今天被接受，之后 seq 不超过它的新事件会被跳过。
 - 写命令都带 `expected_revision`，不符为 409 `STALE_REVISION`（Run 与团队两种实体），幂等重放与 `KEY_REUSE` 已有（ADR-016 决定 4、6）；CLI 在 `STALE_REVISION` 时重读重提（`hoh-client/src/client.rs` 的 `fresh`，ADR-031 决定 9）。
-- 产品没有任何分支、push、PR 的代码；候选从工作树的 `HEAD` 冻结（`crates/hoh-app/src/verify/freeze.rs`），验证在 detached 的运行目录中进行。`[delivery]` 表已被 HCP 消息投递占用（`max_delivery_attempts`），所以本 CR 的 Git 配置放在新的 `[git]` 表中。
+- 产品没有任何分支、push、PR 的代码；候选从工作树的 `HEAD` 冻结（`crates/hoh-app/src/verify/freeze.rs`）：冻结驱动以调用方给的状态目录判定 HoH 自己的文件（environment 须是跟踪文件或该状态目录中的普通文件，路径不得含 `..`），并把对象写到该状态目录的父目录（`state.parent()`），`candidates.source_path` 是清单导出的对象路径（ADR-027 决定 4），检查驱动以 `project.join(source_path)` 读它（`check.rs` 的 `run_with`）；产品的环境描述是项目的 `.hoh/environment.json`（`verify/environment.rs`）。验证在项目树之外的运行目录中进行：`git clone --shared` 项目后 detach 到候选的 commit，写回冻结的环境文件，再做完整的前核对（`verify/rundir.rs`，ADR-028 决定 6）。`[delivery]` 表已被 HCP 消息投递占用（`max_delivery_attempts`），所以本 CR 的 Git 配置放在新的 `[git]` 表中。
 - build 检查在有 `web/package.json` 时执行 `npm ci` 与构建，否则只打印提示（`scripts/product/build.sh`，注释写明 M6-T02 须把缺少 web/ 改为失败）；`bundle.sh` 已在 `web/dist` 存在时把它打进 `hoh/web`。web-e2e 检查的 argv 是 `not-implemented.sh web-e2e M6-T02`，归属 M6-T02。
 - deployment 检查在私有 `systemd --user` 管理器与临时 HOME 中跑 TEST-005-06，没有全新 VM；`scripts/dev/test-infra.sh` 已装 qemu/KVM、cloud-image-utils 与 Playwright 的系统依赖（`.hoh-dev/test-infra.json`：`playwright_install_deps` 1.64.1、`kvm_group_configured`）。
 - 本 VM 为 Ubuntu 26.04.1，`kernel.apparmor_restrict_unprivileged_userns = 1`：`unshare -rn` 以 “write failed /proc/self/uid_map: Operation not permitted” 失败，无特权的网络命名空间不可用（C11 的依据）。
@@ -45,11 +45,12 @@ M6 的 6 项需求（REQ-058、059、060、061、065、066）都是 `spec_maturi
 - **同一 Engine**：Web 是 host 的又一个客户端，与 TUI 同一 CommandService（docs/03）。页面只经 `/v1` 读写，不读 SQLite、不读项目文件、不持有租约；`hoh web` 不启动第二个 host 或第二个循环。读模型完全沿用 CR-028 的约定：快照 H、按需分页、SSE `after=H`、块以 `block_id` 为身份、客户端缓存上限（1000 个块描述、4 MiB 正文、2 个在途页），本 CR 不另建 Web 专用的读接口。
 - **外壳与 token（C1，所有者已于 2026-11-22 批准）**：`GET /` 与 `GET /assets/{asset}` 提供构建产物，不要 token、仍校验 Host/Origin；每个 `/v1` 请求（含 SSE）都要 token；token 只在 URL 片段与页面内存中，从不进入请求行、host 日志或 Referer。docs/03 第 51 行的“每个请求都要携带……token”在 M6-T01 应用本 CR 时改写为“每个 API 请求”，并写明外壳不含项目数据。
 - **规范地址（C22）**：`[web] host` 的取值 v（加载器只接受 `localhost` 与 loopback IP，REQ-018）决定绑定地址、规范 authority 与打印的地址：IPv4 loopback 字面量绑定该地址，authority 为 `<v>:<port>`；`::1` 只绑定 IPv6 的 `::1`，authority 为 `[::1]:<port>`；`localhost` 绑定 `127.0.0.1`（固定映射，不经解析器或 hosts 文件），authority 为 `localhost:<port>`。缺省 v=127.0.0.1。Host 必须逐字节等于规范 authority，Origin 缺省或等于 `http://<规范 authority>`；其他任何 authority（包括同一机器的其他 loopback 写法）都 403。`hoh web` 打印 `http://<规范 authority>/#token=<token>`。
-- **重新授权（C21）**：host 每次启动换 token，页面持有的 token 在 host 重启后失效。此前有效的 token 被 `/v1` 以 403 拒绝时，页面进入“需要重新授权”状态（不清除投影与草稿，不重试该 token），提示运行 `hoh web` 并在新标签页打开它打印的地址；新页面读出片段 token、以它请求 getRun 成功后，经同源的 `BroadcastChannel("hoh-auth")` 发出 `{project_id, token}`；同源的旧页面收到后先核对消息中的 `project_id` 与自己的相同，再以该 token 请求自己的 Run 的 getRun，成功且返回的 `project_id` 相同才采用（否则不采用、不显示其数据），然后以 `Last-Event-ID` 续接 SSE（随后可能进入 409 cursor_ahead 的快照重同步）。`BroadcastChannel` 只在同一浏览器的同源文档之间传递，token 不写入任何存储、不发给 host 以外的地方。host 换了端口（原端口被占用，现有规则取空闲端口）时新地址与旧页面不同源，旧页面收不到授权：它保持“需要重新授权/不可达”并提供“复制草稿”，草稿只在用户操作时进入剪贴板。
+- **403 的原因（C25）**：TCP 与 socket 上的每个 403 都带稳定的 `details.reason`：`bad_token`（`X-HoH-Token` 缺失或不等于本 host 的 token）或 `bad_authority`（Host、Origin、请求目标的 authority 不符，Origin 多于一个，socket 上带 Origin 或 authority）；同一请求两者都不符时先判 authority，报 `bad_authority`（与今天 `check_request` 的顺序相同）。code 仍为 `FORBIDDEN`，message 不变，不新增 ErrorCode；这是给 openapi 已有的 403 响应补齐机器可读的字段（CR-003 D1 第 1 条），写进 `components.responses.Forbidden` 的说明（第 5 节）。页面只凭 `details.reason` 区分：`bad_token` 才可能进入重新授权，`bad_authority` 只提示用规范地址或相同端口转发打开，不改变已持有的 token。
+- **重新授权（C21）**：host 每次启动换 token，页面持有的 token 在 host 重启后失效。此前有效的 token 被 `/v1` 以 403 且 `details.reason=bad_token` 拒绝时，页面进入“需要重新授权”状态（不清除投影与草稿，不重试该 token），提示运行 `hoh web` 并在新标签页打开它打印的地址；新页面读出片段 token、以它请求 getRun 成功后，经同源的 `BroadcastChannel("hoh-auth")` 发出 `{project_id, token}`；同源的旧页面收到后先核对消息中的 `project_id` 与自己的相同，再以该 token 请求自己的 Run 的 getRun，成功且返回的 `project_id` 相同才采用（否则不采用、不显示其数据），然后以 `Last-Event-ID` 续接 SSE（随后可能进入 409 cursor_ahead 的快照重同步）。`BroadcastChannel` 只在同一浏览器的同源文档之间传递，token 不写入任何存储、不发给 host 以外的地方。host 换了端口（原端口被占用，现有规则取空闲端口）时新地址与旧页面不同源，旧页面收不到授权：它保持“需要重新授权/不可达”并提供“复制草稿”，草稿只在用户操作时进入剪贴板。
 - **Web 资产的位置（C2）**：发布包与安装版本目录中的 `web/`，与二进制并列（`hoh/bin/hoh` 与 `hoh/web/`）；host 由自身可执行文件的位置找到它，不加环境变量入口。`web/manifest.json` 记录版本、commit 与每个文件的 sha256 与 Content-Type，host 在第一次提供外壳前核对，并按记录的 Content-Type 提供资产（CR31D-06）。
 - **检查**：AC 只用 v1 档已有、且由 M6 实现任务的祖先或其自身交付的检查：web-e2e（M6-T02 交付）、integration（M0-T03）、recovery（M2-T05）、deployment（M2-T14）。web-e2e 在 run_check 下同时运行 web/ 的单元测试与 Playwright 场景；deployment 增加全新 VM 场景（M6-T03），argv 不变。没有 AC 用 adapter-live、plugin-live、soak。
 - **测试替身与模式**：FakeAgent、假 gh、本地 bare remote、debug 构建的接缝与标明 stub 的拦截都只在 product 检查中使用，结果记为 product，从不记为 live（docs/09）。host 的 debug 接缝只在 debug 构建中存在（`release_seams.sh` 核对）；页面的测试接缝只在 web/ 的 e2e 构建（`vite build --mode e2e`，输出到与 `web/dist` 不同的目录）中存在，web-e2e 核对发布用的 `web/dist` 不含接缝的标识（C24）。
-- **新事件**（`$defs.Event.kind` 是开放字符串，不需 CR；AC 中出现的为定名）：`run.work_branch`、`delivery.completed`；另有交付过程的 `delivery.*` 事件，名称由 M6-T06 的 ADR 定。新的 Run 级问题原因：`work_branch_moved`、`delivery_conflict`、`delivery_pr_closed`、`delivery_merge_unverified`。`candidate.frozen` 的载荷增加 `branch` 与 `source`（`work_branch` 或 `merged`，第 2 节第 6 条）；候选清单（`contracts/candidate.schema.json`，`additionalProperties: false`）与 `candidates` 表不变。
+- **新事件**（`$defs.Event.kind` 是开放字符串，不需 CR；AC 中出现的为定名）：`run.work_branch`、`delivery.completed`；另有交付过程的 `delivery.*` 事件，名称由 M6-T06 的 ADR 定。新的 Run 级问题原因：`work_branch_moved`、`delivery_conflict`、`delivery_pr_closed`、`delivery_merge_unverified`。`candidate.frozen` 的载荷增加 `branch` 与 `source`（`work_branch` 或 `merged`，第 2 节第 6 条），`source=merged` 时另有 `pr_url`、`pr_head` 与 `checkout`（核验 checkout 的绝对路径，只供审计与清理核对）；候选清单（`contracts/candidate.schema.json`，`additionalProperties: false`）、`candidates` 表与 `candidates.source_path` 的含义（导出的对象路径，ADR-027 决定 4）都不变。
 - **可配置性**：新增 `[git]` 表三个键（第 4 节）；它们进入 `config/hoh.example.toml` 的时间是加载器接受它们的同一提交（CR26D-103 的规则），本 CR 不改 example。
 
 ### 2. 交付模型（REQ-065 的设计依据）
@@ -63,9 +64,9 @@ M6 的 6 项需求（REQ-058、059、060、061、065、066）都是 `spec_maturi
 3. **PR 交付经 gh**：推送与建 PR 是 Runtime 的外部效果（不经 Agent），每步一条 effect；建 PR 前按 run 标记查找（docs/07 §5）。HoH 不合并 PR（C7）：合并对外且不可逆，由用户或仓库规则完成；HoH 观察合并，在目标分支的最终提交上重新冻结并完整验证（C18），这就是“merge 后重新绑定最终 SHA”。等待 CI 与合并时 Run 为 WAITING_EXTERNAL（已有状态，不改 Run 的迁移表与 AC-036-01）。
 4. **目标分支前移用 merge**：rebase 会改写已推送的提交；merge 产生新提交、推送不需 force（C8）。
 5. **载体**：交付的外部操作记在一个由 Runtime 执行、`attempts.agent` 为空的交付 Attempt 上（001 的 `attempts.agent` 可空，`effects.attempt_id` 必填），其 Task 为 `kind='work'`、由 Runtime 建立、不进 Agent 派发。具体形状由 M6-T06 的 ADR 定；若实现证明必须给 `tasks.kind` 增加取值，那需要新的迁移，须另写 CR（M4 的 CR-028 已预定 003），不在本 CR 中预设（C19）。
-6. **两类候选（C23）**：*工作分支候选*由写者在用户工作树中提交后冻结，commit 是工作分支的头，按 REQ-052 的规则从用户工作树冻结（未提交或未跟踪的文件即拒绝）；本地交付与 PR 头的验证都用它。*最终交付候选*只在 PR 交付且观察到合并后出现，commit 是目标分支上的最终提交 F，而用户工作树的 HEAD 仍在工作分支（merge、squash、rebase 三种合并后都可能仍是 H1）：Runtime (a) 以 `git fetch <remote> +refs/heads/<目标分支>:refs/hoh/delivery/<run_id>/base` 取得目标分支（只写 `refs/hoh/` 下 HoH 自己的引用，不改用户的分支、`refs/remotes/`、HEAD、index 与工作树）；(b) 核对 F：`gh pr view` 报告 state=MERGED 与 mergeCommit=F，F 存在于取得的对象中且是取得的目标分支头的祖先或其本身，PR 的 baseRefName 等于 run.work_branch 当前记录的目标分支；任一不符则不冻结，Run 以 NEED_DECISION 提问（delivery_merge_unverified，列出不符项）；(c) 在 HoH 自己的路径（`.hoh/` 下，按 run 与 F 命名，登记确切路径）以 `git worktree add --detach` 建立 F 的只读核验 checkout，任何写者都不在其中写入；(d) 对该 checkout 按 REQ-052 的同一清洁规则冻结（commit=F，tree 为 F 的 tree，`source_path` 为该 checkout），candidate.frozen 载荷为 `{branch: 目标分支, source: "merged", pr_url, pr_head}`；(e) 在其上运行完整的发布验证（C18），通过后绑定 release；(f) release 绑定或 Run 结束后，按登记的确切路径移除该 checkout 与 `refs/hoh/delivery/<run_id>/` 下的引用。最终交付候选验证失败时写 Issue（绑定该候选）并唤醒 Commander，Run 不 COMPLETED；修复仍在工作分支上按第 4 条 merge 目标分支后进行，产生新的 PR。
+6. **两类候选（C23；取得、冻结与清理的机制见 C26）**：*工作分支候选*由写者在用户工作树中提交后冻结，commit 是工作分支的头，按 REQ-052 的规则从用户工作树冻结（未提交或未跟踪的文件即拒绝）；本地交付与 PR 头的验证都用它。*最终交付候选*只在 PR 交付且观察到合并后出现，commit 是目标分支上的最终提交 F，而用户工作树的 HEAD 仍在工作分支（merge、squash、rebase 三种合并后都可能仍是 H1）：Runtime (a) 以 `git fetch --no-tags --no-write-fetch-head --refmap= <remote> +refs/heads/<目标分支>:refs/hoh/delivery/<run_id>/base` 取得目标分支：只写 `refs/hoh/` 下 HoH 自己的这一个引用；`--no-tags` 使远端标签不被自动跟随写入 `refs/tags/`（CR31D-51），`--refmap=`（空）使 git 不按 `remote.<name>.fetch` 顺带更新 `refs/remotes/`（不加它时以 remote 名取得会顺带移动 `refs/remotes/<remote>/<目标分支>`，第 3 稿的实测见“验证方式”），`--no-write-fetch-head` 使 `.git/FETCH_HEAD` 不变；用户的分支、`refs/remotes/`、`refs/tags/`、HEAD、index 与工作树都不变。(b) 核对 F：`gh pr view` 报告 state=MERGED 与 mergeCommit=F，F 存在于取得的对象中且是取得的目标分支头的祖先或其本身，PR 的 baseRefName 等于 run.work_branch 当前记录的目标分支。第一次不符时不冻结、不提问，等待一个轮询间隔（30 s，第 3 条的起始间隔）后重做一次 (a) 与 (b)（合并刚发生时 forge 与目标分支可能短暂不一致，CR31D-54）；仍不符则 Run 以 NEED_DECISION 提问（delivery_merge_unverified），问题列出每个不符项（字段、forge 报告的值、本地核对的值）与三个选项：*再次取得并核对*（重做一次 (a) 与 (b)，通过即继续 (c)，仍不符再提同一问题）、*改为本地交付*（不再观察这个 PR，按第 2 条以已通过发布验证的 PR 头候选完成本地交付：releases 绑定它，`delivery.completed{mode: "local", branch: 工作分支, commit: H1, candidate_id}`）、*取消*（Run 取消，不绑定 release）。(c) 建立 F 的核验 checkout V：位置与验证者的运行目录同根、在项目树之外（ADR-028 决定 6）：`<运行目录的根>/<project_id>/delivery-<run_id>-<F 的前 12 个十六进制字符>/`，先把这个确切路径登记为交付 Attempt 的资源再创建；创建与运行目录相同：`git clone --shared --no-checkout` 项目（不复制对象、不写项目的仓库），`git checkout --detach F`，建立 V 的 `.hoh/`（被 git 忽略），把项目当前的 `.hoh/environment.json`（先按 `verify/environment.rs` 确保它是本环境的描述）逐字节复制到 V 的 `.hoh/environment.json`。任何写者与 Agent 都不在 V 中运行。(d) 冻结：以 V 为 checkout、V 的 `.hoh/` 为 HoH 的状态目录调用同一个冻结驱动，所以 REQ-052 的清洁规则、状态守卫与 environment 规则（`.hoh/environment.json` 是该状态目录中的普通文件）照常成立；对象库的根显式传入，为项目（M6-T06 给冻结驱动增加这个参数，现有调用方传 `state.parent()`，行为不变），所以清单导出、spec、environment、test plan 与 release policy 的对象都写进项目的 `.hoh/objects/`，`candidates.source_path` 仍是导出的对象路径（ADR-027 决定 4），检查驱动照旧以 `project.join(source_path)` 读它。清单为 commit=F、tree 为 F 的 tree、environment 的路径 `.hoh/environment.json` 与摘要同项目的环境描述；candidate.frozen 载荷为 `{branch: 目标分支, source: "merged", pr_url, pr_head, checkout: V}`。(e) 冻结返回（冻结或被拒）后立即按登记的确切路径删除 V；V 只含 git 的检出与 `.hoh/` 下的两个文件，对象目录中只有指向项目的 alternates（实测见“验证方式”），HoH 的对象都在项目的 `.hoh/objects/` 中，所以删除 V 不会删掉候选的导出或任何冻结的输入。(f) 在 C' 上运行完整的发布验证（C18），与任何候选相同：验证者在各自的运行目录中从项目的对象与 F 检出（`verify/rundir.rs`），不使用 V；`refs/hoh/delivery/<run_id>/base` 使 F 在验证期间可达，release 绑定或 Run 结束后才以 `git update-ref -d` 删除 `refs/hoh/delivery/<run_id>/` 下的引用。V 存在期间 host 被 kill -9：重启后按登记的确切路径删除遗留的 V（不按名称模式查找），再从 (a) 重做；同一内容在同一 Run 中再冻结得到同一个候选（REQ-052 决定 1），不会产生第二个。最终交付候选验证失败时写 Issue（绑定该候选）并唤醒 Commander，Run 不 COMPLETED；修复仍在工作分支上按第 4 条 merge 目标分支后进行，产生新的 PR。
 
-**未采用**：HoH 自动合并 PR（对外、不可逆，且会替用户改目标分支）；在本地自动把工作分支合并进 base（改用户的分支）；rebase 加 `--force-with-lease`（违反所有者规则）；不经 gh、自己实现 GitHub REST 客户端与认证（要处理凭证，超出“不读写凭证”）；合并后把用户工作树切到 F 再冻结（改用户的 HEAD 与工作树，且与写者所在的工作分支冲突）；把 PR 头候选的证据转给 F（docs/07 §7）。
+**未采用**：HoH 自动合并 PR（对外、不可逆，且会替用户改目标分支）；在本地自动把工作分支合并进 base（改用户的分支）；rebase 加 `--force-with-lease`（违反所有者规则）；不经 gh、自己实现 GitHub REST 客户端与认证（要处理凭证，超出“不读写凭证”）；合并后把用户工作树切到 F 再冻结（改用户的 HEAD 与工作树，且与写者所在的工作分支冲突）；把核验 checkout 的路径写进 `candidates.source_path`（第 2 稿的写法：违反 ADR-027 决定 4，检查驱动读不到导出，CR31D-50）；以 `git worktree add` 在项目的 `.hoh/` 下建立核验 checkout（写项目仓库的 worktree 管理数据；项目的 `.hoh/` 是它的父目录，冻结驱动的 environment 规则拒绝 `..`；若把状态目录放进它，对象随它一起被删除）；把 PR 头候选的证据转给 F（docs/07 §7）。
 
 ### 3. 新增的原因码（`contracts/protocol.schema.json`，CR-003 D1 第 1 条）
 
@@ -85,7 +86,7 @@ REQ-018 的 decisions 末尾增加一条（行为与 AC 不变）：
 
 ### 5. `contracts/openapi.json` 的补充
 
-在 `paths` 中增加下面两条（Web 外壳，`security: []`；`/assets/{asset}` 的 Content-Type 按 manifest 记录的类型，CR31D-06），并在 `/v1/events` 的 `get.description` 末尾追加一句；其余不变。CR-028 应用时也会改 openapi（新路由与命名 schema）：两者改的是不同的路径，M6-T01 应用时在 CR-028 之后的文件上增加这两条并核对没有同名路径。
+在 `paths` 中增加下面两条（Web 外壳，`security: []`；`/assets/{asset}` 的 Content-Type 按 manifest 记录的类型，CR31D-06），在 `/v1/events` 的 `get.description` 末尾追加一句，并把 `components.responses.Forbidden` 整体换为本节最后的对象（只改说明，写明 `details.reason`，C25）；其余不变。CR-028 应用时也会改 openapi（新路由与命名 schema）：两者改的是不同的路径，M6-T01 应用时在 CR-028 之后的文件上增加这两条并核对没有同名路径。
 
 ```json
 {
@@ -184,13 +185,30 @@ REQ-018 的 decisions 末尾增加一条（行为与 AC 不变）：
 An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "cursor_ahead", watermark: H}: the cursor is not from this store's history, and the client resyncs from a snapshot (CR-031, REQ-059).
 ```
 
+`components.responses.Forbidden` 换为（旧：说明为 “Missing/invalid token, or Host/Origin not the bound loopback address”，content 相同；`Error.details` 本就是开放对象，schema 不变）：
+
+```json
+{
+  "Forbidden": {
+    "description": "Missing or invalid token, or Host/Origin not the host's canonical loopback authority (CR-031, REQ-061). details.reason says which, so a client can tell a restarted host from a refused address (CR-031, REQ-059): bad_authority when the Host, the Origin or the request target's authority is refused (also more than one Origin, or an Origin or an authority on the socket); bad_token when X-HoH-Token is missing or is not this host's token. A request failing both is bad_authority. The code stays FORBIDDEN; a client re-authorizes only on bad_token.",
+    "content": {
+      "application/json": {
+        "schema": {
+          "$ref": "#/components/schemas/Error"
+        }
+      }
+    }
+  }
+}
+```
+
 ### 6. 各需求的细化
 
 每项给出替换后的整个需求对象与它的全部场景。AC 与 TEST 的 id 按 validate_bundle 的规则依次编号；原有的 AC-xxx-01 保留 id，改写为可判定的内容（原文各项的覆盖见“不变的部分”）。id、category、priority、milestone、title、required_release、release_class、release_targets、summary 都不变。顺序按实现任务分组。
 
 #### REQ-058 Web GUI入口（3 条 AC；实现：M6-T02）
 
-`contracts/requirements.json` 中 REQ-058 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-058-01；第 2 稿改写行为 1、2、5，失败模式与 AC-058-01，CR31D-06、-07）：
+`contracts/requirements.json` 中 REQ-058 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-058-01；第 2 稿改写行为 1、2、5，失败模式与 AC-058-01，CR31D-06、-07；第 3 稿给失败模式与 AC-058-01 加上 403 的 details.reason，CR31D-53）：
 
 ```json
 {
@@ -217,8 +235,8 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
   "failure_modes": [
     "已有 host 时再运行 hoh web 不起新 host：host.json 的 pid 与 host_epoch 不变，hoh __host 进程仍只有一个。",
     "Web 资产缺失、web/manifest.json 的版本或 commit 与二进制不同、或文件摘要不符：GET / 返回 503 WEB_ASSETS_UNAVAILABLE（details.reason 依次为 missing、mismatch、corrupt），hoh web 以 1 退出、stdout 为空并在 stderr 说明；/v1、TUI 与 hoh -p 不受影响。",
-    "页面从未取得有效 token（片段缺失或错误）：/v1 返回 403，页面显示“请用 hoh web 给出的地址打开”，不重试、不猜测；此前有效的 token 被拒（host 已重启换了 token）：进入 REQ-059 行为 7 的重新授权，不清除投影与草稿。",
-    "Host 不是规范 authority，或 Origin 既非缺省也非 http://<规范 authority>（含同机的其他 loopback 写法与经 DNS 重绑定的名字）：外壳与 /v1 都返回 403（REQ-061 行为 4）。",
+    "页面从未取得有效 token（片段缺失或错误）：/v1 返回 403 且 details.reason=bad_token，页面显示“请用 hoh web 给出的地址打开”，不重试、不猜测；此前有效的 token 被以 details.reason=bad_token 拒绝（host 已重启换了 token）：进入 REQ-059 行为 7 的重新授权，不清除投影与草稿（C25）。",
+    "Host 不是规范 authority，或 Origin 既非缺省也非 http://<规范 authority>（含同机的其他 loopback 写法与经 DNS 重绑定的名字）：外壳与 /v1 都返回 403 且 details.reason=bad_authority（REQ-061 行为 4，C25）；页面不把它当作 host 重启，不进入重新授权，也不丢弃已持有的 token。",
     "页面打开期间 host 重启：旧 token 失效，页面进入重连与重新授权（REQ-059 行为 3、7），保留草稿，不重复应用事件。"
   ],
   "doc_refs": [
@@ -239,7 +257,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
       "id": "AC-058-01",
       "given": "夹具 git 项目，产品 host 已为它运行（FakeAgent 世界），Run R 处于 PAUSED，有已批准修订、两条 Task 与若干事件；[web] 为缺省配置；环境中没有 DISPLAY、WAYLAND_DISPLAY 与 BROWSER",
       "when": "连续执行两次 hoh web，以 Chromium 与 Firefox 打开第一次给出的地址并浏览七个页面 60 s 后关闭，记录浏览器的网络日志与控制台；另以去掉 token 片段的地址打开一次，并以 Host: rebind.test:<port> 请求 GET / 与 GET /v1/runs 各一次",
-      "then": "两次都退出 0，stdout 各恰一行 http://127.0.0.1:<port>/#token=<token> 且相同；hoh __host 进程恰一个，host.json 的 pid 与 host_epoch 不变；浏览期间没有 POST，commands、tasks、attempts 行数与 R 的 revision 不变；关闭页面后 R 仍为 PAUSED；读出 token 后地址栏不含片段，localStorage、sessionStorage 与 cookie 中没有 token；无 token 时外壳可加载、/v1 返回 403、页面显示重新打开的提示；Host 为 rebind.test 时两个请求都 403；外壳响应带 Content-Security-Policy: default-src 'self' 与 Referrer-Policy: no-referrer；页面加载的每个 /assets/ 响应为 200 且 Content-Type 等于 web/manifest.json 对该文件的记录（脚本为 text/javascript，样式为 text/css），带 nosniff；页面的根组件已渲染（data-testid=app-ready 可见），控制台没有脚本加载、MIME 或 CSP 违规的错误",
+      "then": "两次都退出 0，stdout 各恰一行 http://127.0.0.1:<port>/#token=<token> 且相同；hoh __host 进程恰一个，host.json 的 pid 与 host_epoch 不变；浏览期间没有 POST，commands、tasks、attempts 行数与 R 的 revision 不变；关闭页面后 R 仍为 PAUSED；读出 token 后地址栏不含片段，localStorage、sessionStorage 与 cookie 中没有 token；无 token 时外壳可加载、/v1 返回 403 且 details.reason=bad_token、页面显示重新打开的提示；Host 为 rebind.test 时两个请求都 403 且 details.reason=bad_authority；外壳响应带 Content-Security-Policy: default-src 'self' 与 Referrer-Policy: no-referrer；页面加载的每个 /assets/ 响应为 200 且 Content-Type 等于 web/manifest.json 对该文件的记录（脚本为 text/javascript，样式为 text/css），带 nosniff；页面的根组件已渲染（data-testid=app-ready 可见），控制台没有脚本加载、MIME 或 CSP 违规的错误",
       "test_id": "TEST-058-01"
     },
     {
@@ -289,8 +307,8 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
       "host 进程恰一个且 pid、host_epoch 不变",
       "浏览期间无 POST、行数与 revision 不变，R 仍 PAUSED",
       "地址栏无片段、存储与 cookie 中无 token",
-      "无 token 时外壳 200、/v1 403、页面提示",
-      "rebind.test 的两个请求 403",
+      "无 token 时外壳 200、/v1 403 且 reason=bad_token、页面提示",
+      "rebind.test 的两个请求 403 且 reason=bad_authority",
       "外壳的 CSP 与 Referrer-Policy 头",
       "/assets/ 的 Content-Type 与 manifest 一致且带 nosniff",
       "app-ready 可见、控制台无加载/MIME/CSP 错误"
@@ -367,7 +385,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
 
 #### REQ-061 无障碍和远程体验（4 条 AC；实现：M6-T02（AC-061-01、-02、-04）与 M6-T03（AC-061-03））
 
-`contracts/requirements.json` 中 REQ-061 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-061-01；第 2 稿改写行为 4 并增加 AC-061-04，CR31D-07）：
+`contracts/requirements.json` 中 REQ-061 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-061-01；第 2 稿改写行为 4 并增加 AC-061-04，CR31D-07；第 3 稿给行为 4、失败模式、AC-061-03、-04 与决定加上 403 的 details.reason，CR31D-53）：
 
 ```json
 {
@@ -387,11 +405,11 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     "键盘：全部核心流程（在七个页面间导航、改模式、发送输入、暂停/恢复/取消、答复问题与批准规格、修改职位绑定、打开证据）只用键盘可以完成；焦点始终可见，顺序与视觉顺序一致，没有键盘陷阱；Esc 关闭对话框与抽屉等临时层而不取消工作（与 TUI 一致，docs/03）；每个交互元素有可访问名称；冲突、重连与重同步经 aria-live 区域播报。",
     "可达性基线：锁定版本的 axe-core 对七个页面的默认状态与打开的批准对话框检查 WCAG 2.1 A 与 AA 规则，违规为 0；状态不只用颜色表达（带文字）；遵从 prefers-reduced-motion。",
     "小视口：360×640、768×1024、1280×800 三种视口与 1280×800 下 200% 缩放时页面没有横向滚动（文档的 scrollWidth 不大于视口宽度）；核心动作可见，或在可由键盘打开的菜单中；长文本在块内换行或滚动，不撑破布局。",
-    "默认 loopback 与规范地址：[web] host 的取值 v（缺省 127.0.0.1；加载器只接受 localhost 与 loopback IP，REQ-018）决定三件事，三者一致（C20、C22；今天 host 不读这个键、恒绑 127.0.0.1）：(1) 绑定地址：IPv4 loopback 字面量绑定该地址；::1 只绑定 IPv6 的 ::1；localhost 绑定 127.0.0.1（固定映射，不经解析器或 hosts 文件）；端口为 [web] port，被占用时取空闲端口并写进 host.json（现有规则）。(2) 规范 authority：IPv4 为 <v>:<port>，::1 为 [::1]:<port>（IPv6 加方括号），localhost 为 localhost:<port>，<port> 为实际监听端口。(3) TCP 上 Host 必须逐字节等于规范 authority、Origin 缺省或等于 http://<规范 authority>，其他任何 authority（包括同机的其他 loopback 写法，例如配置为 ::1 时的 127.0.0.1:<port>）都 403；hoh web 打印 http://<规范 authority>/#token=<token>。没有配置能让它监听非 loopback 地址；外部只能经 SSH 端口转发访问，且本地端口必须与远端端口相同（缺省配置下为 ssh -L <port>:127.0.0.1:<port> <vm>，docs/11），因为 Host 校验绑定的是规范 authority。",
+    "默认 loopback 与规范地址：[web] host 的取值 v（缺省 127.0.0.1；加载器只接受 localhost 与 loopback IP，REQ-018）决定三件事，三者一致（C20、C22；今天 host 不读这个键、恒绑 127.0.0.1）：(1) 绑定地址：IPv4 loopback 字面量绑定该地址；::1 只绑定 IPv6 的 ::1；localhost 绑定 127.0.0.1（固定映射，不经解析器或 hosts 文件）；端口为 [web] port，被占用时取空闲端口并写进 host.json（现有规则）。(2) 规范 authority：IPv4 为 <v>:<port>，::1 为 [::1]:<port>（IPv6 加方括号），localhost 为 localhost:<port>，<port> 为实际监听端口。(3) TCP 上 Host 必须逐字节等于规范 authority、Origin 缺省或等于 http://<规范 authority>，其他任何 authority（包括同机的其他 loopback 写法，例如配置为 ::1 时的 127.0.0.1:<port>）都 403 且 details.reason=bad_authority，token 缺失或错误的 403 为 details.reason=bad_token，两者都不符时为 bad_authority（C25）；hoh web 打印 http://<规范 authority>/#token=<token>。没有配置能让它监听非 loopback 地址；外部只能经 SSH 端口转发访问，且本地端口必须与远端端口相同（缺省配置下为 ssh -L <port>:127.0.0.1:<port> <vm>，docs/11），因为 Host 校验绑定的是规范 authority。",
     "没有桌面环境：hoh web 在 DISPLAY、WAYLAND_DISPLAY 与 BROWSER 都为空时只打印地址、不尝试启动浏览器并退出 0；docs/12 给出在没有桌面的 VM 上经 SSH 转发打开地址的步骤，这些步骤按 REQ-066 实跑。"
   ],
   "failure_modes": [
-    "经转发访问时本地端口与远端不同：Host 校验返回 403，页面与 docs/12 说明必须用相同端口转发。",
+    "经转发访问时本地端口与远端不同：Host 校验返回 403 且 details.reason=bad_authority，页面据此提示必须用相同端口转发（不进入重新授权），docs/12 写明同一要求。",
     "有桌面但浏览器启动失败：stderr 说明，仍打印地址并退出 0。",
     "窄屏下被收起的动作：仍可从菜单到达，不会消失。"
   ],
@@ -422,21 +440,21 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
       "id": "AC-061-03",
       "given": "全新 Ubuntu 26.04 云镜像 VM（无桌面、qemu/KVM），已安装本候选的发布包，VM 中的夹具项目配置 [web] port=P（P 为宿主上空闲的端口）并有待批的规格修订；宿主可用密钥 ssh 到 VM，VM 的 PATH 中 xdg-open 是记录调用的垫片",
       "when": "经非交互 ssh 在 VM 中执行 hoh web --project <夹具>；在 VM 中列出监听套接字；从宿主直接连接 VM 的网络地址:P；建立 ssh -N -L P:127.0.0.1:P 后在宿主用无头 Chromium 打开打印的地址，浏览 Overview、把模式改为 PLAN 并批准待批修订；再经 ssh -N -L Q:127.0.0.1:P（Q≠P）访问一次",
-      "then": "hoh web 退出 0，stdout 恰一行地址，xdg-open 垫片未被调用；TCP 监听只有 127.0.0.1:P，没有 0.0.0.0、:: 或 VM 的网络地址；直连被拒绝；经同端口转发页面可用，两个命令被接受，批准的来源判定为 user 且写入新修订；经 Q 转发时请求 403，页面显示必须用相同端口转发的提示",
+      "then": "hoh web 退出 0，stdout 恰一行地址，xdg-open 垫片未被调用；TCP 监听只有 127.0.0.1:P，没有 0.0.0.0、:: 或 VM 的网络地址；直连被拒绝；经同端口转发页面可用，两个命令被接受，批准的来源判定为 user 且写入新修订；经 Q 转发时请求 403 且 details.reason=bad_authority，页面显示必须用相同端口转发的提示、不显示需要重新授权",
       "test_id": "TEST-061-03"
     },
     {
       "id": "AC-061-04",
       "given": "同一夹具项目依次以三种 [web] 配置启动产品 host：缺省（无 host 键）、host=\"::1\"、host=\"localhost\"；各配置的 port 为测试取得的空闲端口 P；Playwright（Chromium）",
-      "when": "每种配置下运行 hoh web 并列出 host 进程的 TCP 监听套接字，用 Chromium 打开打印的地址并浏览 Overview；再以 Host 依次为 127.0.0.1:P、[::1]:P、localhost:P、127.0.0.2:P 与 rebind.test:P（Origin 与 Host 同名）请求 GET / 与 GET /v1/runs（带正确 token）",
-      "then": "三种配置打印的地址依次为 http://127.0.0.1:P/、http://[::1]:P/、http://localhost:P/（各带 #token= 片段）；监听套接字依次恰为 127.0.0.1:P、[::1]:P、127.0.0.1:P，没有 0.0.0.0 或 ::；每种配置下页面可用，Overview 显示 Run；Host 等于该配置的规范 authority 时 GET / 为 200、GET /v1/runs 为 200，其余四种 Host 的两个请求都 403",
+      "when": "每种配置下运行 hoh web 并列出 host 进程的 TCP 监听套接字，用 Chromium 打开打印的地址并浏览 Overview；再以 Host 依次为 127.0.0.1:P、[::1]:P、localhost:P、127.0.0.2:P 与 rebind.test:P（Origin 与 Host 同名）请求 GET / 与 GET /v1/runs（带正确 token）；最后以规范 Host 带错误 token、以 rebind.test:P 带错误 token 各请求一次 GET /v1/runs",
+      "then": "三种配置打印的地址依次为 http://127.0.0.1:P/、http://[::1]:P/、http://localhost:P/（各带 #token= 片段）；监听套接字依次恰为 127.0.0.1:P、[::1]:P、127.0.0.1:P，没有 0.0.0.0 或 ::；每种配置下页面可用，Overview 显示 Run；Host 等于该配置的规范 authority 时 GET / 为 200、GET /v1/runs 为 200，其余四种 Host 的两个请求都 403 且 details.reason=bad_authority；带规范 Host 而 token 错误的 GET /v1/runs 为 403 且 details.reason=bad_token；Host 与 token 都不符的请求为 bad_authority",
       "test_id": "TEST-061-04"
     }
   ],
   "decisions": [
     "可达性以 axe-core 的 WCAG 2.1 A/AA 规则零违规加键盘全流程判定（CR-031，C14）。",
     "远程访问在全新的无桌面 Ubuntu 云镜像 VM 中验证：Host 精确校验使同机转发无法使用相同端口，本机也不允许无特权用户命名空间（CR-031，C11）。",
-    "绑定地址、规范 authority、Host/Origin 校验与 hoh web 打印的地址都由 [web] host 决定：localhost 固定绑定 127.0.0.1、authority 为 localhost:<port>；::1 的 authority 加方括号；其他 authority 一律 403（CR-031，C20、C22）。"
+    "绑定地址、规范 authority、Host/Origin 校验与 hoh web 打印的地址都由 [web] host 决定：localhost 固定绑定 127.0.0.1、authority 为 localhost:<port>；::1 的 authority 加方括号；其他 authority 一律 403（CR-031，C20、C22）；403 以 details.reason 区分 bad_authority 与 bad_token，两者都不符时为 bad_authority（CR-031，C25）。"
   ]
 }
 ```
@@ -514,7 +532,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
       "只监听 127.0.0.1:P",
       "直连被拒",
       "转发后页面可用、两个命令被接受、批准来源为 user 并写入新修订",
-      "不同端口 403 并有提示"
+      "不同端口 403（bad_authority）并有同端口提示、无重新授权"
     ],
     "observables": [
       "ssh 会话的 stdout/stderr 与退出码",
@@ -541,7 +559,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
       "三种配置打印的地址依次为 127.0.0.1、[::1]、localhost 的规范形式",
       "监听套接字依次恰为 127.0.0.1:P、[::1]:P、127.0.0.1:P",
       "页面可用",
-      "规范 authority 的两个请求 200，其余四种 Host 403"
+      "规范 authority 的两个请求 200，其余四种 Host 403 且 bad_authority，错误 token 为 bad_token，两者都不符为 bad_authority"
     ],
     "observables": [
       "hoh web 的 stdout 与退出码",
@@ -556,7 +574,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
 
 #### REQ-059 事件重连（5 条 AC；实现：M6-T05）
 
-`contracts/requirements.json` 中 REQ-059 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-059-01；第 2 稿增加行为 7 与 AC-059-05，改写 AC-059-03、-04，CR31D-01、-04、-05）：
+`contracts/requirements.json` 中 REQ-059 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-059-01；第 2 稿增加行为 7 与 AC-059-05，改写 AC-059-03、-04，CR31D-01、-04、-05；第 3 稿让行为 7 只认 bad_token，增加一条失败模式，AC-059-05 断言 reason 并增加子例 (d)，CR31D-53）：
 
 ```json
 {
@@ -579,14 +597,15 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     "游标失效时按快照重同步：SSE 以 409 CONFLICT 且 details.reason=cursor_ahead 拒绝游标（游标超过 host 已提交的水位，例如项目数据库被换成较早的副本），或以 410 CURSOR_EXPIRED 拒绝（v1 不删除事件，这一分支在产品中不可达，只以标明 stub 的注入响应覆盖页面的处理，CR-028），或分页游标以 410 CURSOR_EXPIRED 过期（M4 的派生索引 generation）：页面丢弃该视图的本地投影与缓存块，重新取快照与页，从新快照的 watermark 续接，并显示“已按快照重新同步”与原因；草稿保留；不把旧投影与新快照拼接。",
     "host 端：SSE 的 after 或 Last-Event-ID 大于连接时已提交的水位 H 时返回 409 CONFLICT，details 为 {reason: \"cursor_ahead\", watermark: H}，什么也不推送（今天这样的游标被接受，之后 seq 不超过游标的新事件被跳过）；after 与 Last-Event-ID 矛盾的 409 与 410 的形状不变（ADR-016，CR-028）。",
     "慢客户端：页面待应用的事件队列至多 2000 条且正文合计至多 4 MiB，超过即主动关闭 SSE、丢弃未应用的部分，并从最后已应用的 seq 续接（这是续接，不是快照重同步）；host 端每条 SSE 按页从数据库读取（ADR-016 决定 7），慢连接不在内存中缓冲无界数据，不阻塞 writer、命令或其他连接。",
-    "重新授权（C21）：host 每次启动换 token（M2 的现状）。页面此前有效的 token 被 /v1 以 403 拒绝时，页面进入“需要重新授权”：停止以该 token 重试，保留投影、草稿、展开状态与锚点，显示“host 已重启：运行 hoh web 并在新标签页打开它给出的地址”。同源的新页面读出片段 token 并以它请求 getRun 成功后，经 BroadcastChannel(\"hoh-auth\") 发出 {project_id, token}；旧页面收到后先核对消息中的 project_id 与自己的相同，再以该 token 请求自己的 Run 的 getRun，成功且返回的 project_id 相同才采用该 token，然后按行为 3 以 Last-Event-ID 续接（游标超过新水位时按行为 4 重同步）；project_id 不同或 getRun 失败（例如 404）则不采用、不显示其数据。token 只在页面内存与这条同源通道中，不写入任何存储、URL 或日志。host 换了端口时新地址与旧页面不同源，旧页面收不到授权：它保持“需要重新授权/不可达”，继续按行为 3 的退避探测原地址，并提供“复制草稿”（只在用户操作时写入剪贴板）。有未提交的草稿时离开页面触发浏览器的离开确认。"
+    "重新授权（C21）：host 每次启动换 token（M2 的现状）。页面此前有效的 token 被 /v1 以 403 且 details.reason=bad_token 拒绝时（只认这个原因；bad_authority 或没有该原因的 403 不触发重新授权，按 REQ-058 失败模式与 REQ-061 处理，C25），页面进入“需要重新授权”：停止以该 token 重试，保留投影、草稿、展开状态与锚点，显示“host 已重启：运行 hoh web 并在新标签页打开它给出的地址”。同源的新页面读出片段 token 并以它请求 getRun 成功后，经 BroadcastChannel(\"hoh-auth\") 发出 {project_id, token}；旧页面收到后先核对消息中的 project_id 与自己的相同，再以该 token 请求自己的 Run 的 getRun，成功且返回的 project_id 相同才采用该 token，然后按行为 3 以 Last-Event-ID 续接（游标超过新水位时按行为 4 重同步）；project_id 不同或 getRun 失败（例如 404）则不采用、不显示其数据。token 只在页面内存与这条同源通道中，不写入任何存储、URL 或日志。host 换了端口时新地址与旧页面不同源，旧页面收不到授权：它保持“需要重新授权/不可达”，继续按行为 3 的退避探测原地址，并提供“复制草稿”（只在用户操作时写入剪贴板）。有未提交的草稿时离开页面触发浏览器的离开确认。"
   ],
   "failure_modes": [
     "重连后服务端重发已应用的 seq：不重复显示、不重复计数。",
     "快照与旧投影来自不同 watermark：整体替换，禁止拼接。",
     "断线期间提交的命令响应丢失：按 REQ-060 以同一 idempotency_key 重试，不当作新命令。",
     "事件 data 无法解析：页面停止跟随，显示该 SSE id 与诊断，不跳过（与 TUI 相同，ADR-031 决定 10），提示重新加载。",
-    "重新授权收到另一项目的 token（同一端口上换成了另一项目的 host）：消息或 getRun 的 project_id 不同、或 getRun 失败，不采用，页面不显示其数据，保持需要重新授权。"
+    "重新授权收到另一项目的 token（同一端口上换成了另一项目的 host）：消息或 getRun 的 project_id 不同、或 getRun 失败，不采用，页面不显示其数据，保持需要重新授权。",
+    "此前有效的 token 得到 details.reason=bad_authority 的 403（例如用户改从另一个 loopback 写法或不同端口的转发打开）：不进入重新授权，保留并继续使用该 token，显示用规范地址或相同端口转发打开的提示。"
   ],
   "doc_refs": [
     "docs/03-ux.md",
@@ -629,15 +648,15 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     {
       "id": "AC-059-05",
       "given": "产品 host 以缺省配置在端口 P 上为夹具项目 X 运行，另有项目 Y 的夹具（[web] port 也为 P）；页面 A（Chromium）由 X 的 hoh web 打开并附着 RUNNING 的 Run，已应用到 seq=S，输入框中有草稿“继续核对”",
-      "when": "(a) 同址：停止并重启 X 的 host（仍在 P 上），A 显示需要重新授权后，在 X 中运行 hoh web 并在同一浏览器上下文的新标签页打开打印的地址；(b) 换项目：停止 X 的 host，在 P 上启动 Y 的 host，在 Y 中运行 hoh web 并在新标签页打开；然后停止 Y 的 host，按 (a) 回到 X；(c) 换地址：停止 X 的 host，测试占用 P（接受 TCP 连接后立即关闭），重启 X 的 host，在 X 中运行 hoh web 并在新标签页打开，在 A 上触发“复制草稿”",
-      "then": "每次重启后 host.json 的 token 与此前的都不同，旧 token 对新 host 的 /v1/runs 为 403；(a) A 在第一个 403 之后显示需要重新授权，不再以旧 token 发请求，投影与草稿保留；新标签页打开后 A 采用新 token 并以 Last-Event-ID=它最后已应用的 seq 续接，最终 A 已应用的 seq 集合等于数据库中该 Run 的事件 seq 集合且无重复，草稿仍为“继续核对”；(b) Y 的授权消息带 Y 的 project_id，A 不采用（不以 Y 的 token 请求 X 的 Run 以外的任何数据），A 不显示 Y 的任何数据并保持需要重新授权；回到 X 后结果同 (a)；(c) hoh web 打印的地址的端口为 P2≠P；A 保持需要重新授权或不可达，复制得到的剪贴板文本为“继续核对”；P2 上的新页面可用；全程 token 不出现在任一页面的 localStorage、sessionStorage、cookie、IndexedDB、请求 URL 与 Referer 中，也不出现在 .hoh/ 下 host 的日志中",
+      "when": "(a) 同址：停止并重启 X 的 host（仍在 P 上），A 显示需要重新授权后，在 X 中运行 hoh web 并在同一浏览器上下文的新标签页打开打印的地址；(b) 换项目：停止 X 的 host，在 P 上启动 Y 的 host，在 Y 中运行 hoh web 并在新标签页打开；然后停止 Y 的 host，按 (a) 回到 X；(c) 换地址：停止 X 的 host，测试占用 P（接受 TCP 连接后立即关闭），重启 X 的 host，在 X 中运行 hoh web 并在新标签页打开，在 A 上触发“复制草稿”；(d) 原因区分（先于 (a)，host 未重启、A 的 token 有效）：以标明 stub 的 Playwright 路由拦截使 A 的下一个 /v1 请求得到 403 FORBIDDEN 且 details.reason=bad_authority，之后撤去拦截",
+      "then": "每次重启后 host.json 的 token 与此前的都不同，旧 token 对新 host 的 /v1/runs 为 403；(a) 重启后 A 以旧 token 得到的第一个 403 的 details.reason=bad_token，A 在这个 403 之后显示需要重新授权，不再以旧 token 发请求，投影与草稿保留；新标签页打开后 A 采用新 token 并以 Last-Event-ID=它最后已应用的 seq 续接，最终 A 已应用的 seq 集合等于数据库中该 Run 的事件 seq 集合且无重复，草稿仍为“继续核对”；(b) Y 的授权消息带 Y 的 project_id，A 不采用（不以 Y 的 token 请求 X 的 Run 以外的任何数据），A 不显示 Y 的任何数据并保持需要重新授权；回到 X 后结果同 (a)；(c) hoh web 打印的地址的端口为 P2≠P；A 保持需要重新授权或不可达，复制得到的剪贴板文本为“继续核对”；P2 上的新页面可用；全程 token 不出现在任一页面的 localStorage、sessionStorage、cookie、IndexedDB、请求 URL 与 Referer 中，也不出现在 .hoh/ 下 host 的日志中；(d) A 不显示需要重新授权，显示用规范地址或相同端口转发打开的提示，撤去拦截后 A 的下一个 /v1 请求仍带原 token 且为 200，SSE 续接不缺 seq，该子例的证据标为 stub",
       "test_id": "TEST-059-05"
     }
   ],
   "decisions": [
     "SSE 游标超过已提交水位是无效游标：409 CONFLICT 加 details.reason=cursor_ahead 与 watermark，不用 410；与 CR-028 对超过水位的分页游标按无效处理一致，SSE 的 410 在 v1 仍不可达（CR-031，C3）。",
     "页面事件队列上限 2000 条或 4 MiB，与 M4 客户端缓存上限（1000 个块描述、4 MiB 正文、2 个在途页）同一量级；溢出续接而不是重同步（CR-031，C15）；溢出以 e2e 构建的消费暂停接缝确定地触发，双客户端时延与 RSS 另作子例（CR-031，C24）。",
-    "host 重启换 token；页面以同源 BroadcastChannel 从新打开的页面取得新 token，按 project_id 核对后采用；不持久化 token、不固定 token（CR-031，C21）。"
+    "host 重启换 token；页面以同源 BroadcastChannel 从新打开的页面取得新 token，按 project_id 核对后采用；不持久化 token、不固定 token（CR-031，C21）；只有 details.reason=bad_token 的 403 触发重新授权（CR-031，C25）。"
   ]
 }
 ```
@@ -768,13 +787,15 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     "fixture": "两个夹具项目 X、Y（[web] port 都为 P）+ 产品 host + Playwright（Chromium，同一浏览器上下文、授予剪贴板权限）+ 占用端口的 TCP 监听器",
     "steps": [
       "A 由 X 的 hoh web 打开并写入草稿",
+      "(d) 以标明 stub 的拦截使 A 的一个 /v1 请求得到 403 bad_authority，再撤去拦截",
       "重启 X 的 host，运行 hoh web 并在新标签页打开",
       "在 P 上换成 Y 的 host 并打开它的地址，再回到 X",
       "占用 P 后重启 X 的 host，运行 hoh web 并在新标签页打开，在 A 上复制草稿",
       "导出各 host.json 的 token、页面存储、网络日志、host 日志与已应用 seq"
     ],
     "pass_criteria": [
-      "每次重启 token 都变，旧 token 403",
+      "每次重启 token 都变，旧 token 403 且 reason=bad_token，A 在该 403 后进入需要重新授权",
+      "bad_authority 的 403 不触发重新授权，原 token 继续使用（stub 子例）",
       "同址时 A 重新授权后续接，seq 集合与数据库一致无重复，草稿保留",
       "另一项目的授权不被采用，A 不显示其数据",
       "换地址时打印 P2，A 保持需要重新授权并可复制草稿",
@@ -954,7 +975,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
 
 #### REQ-065 Git集成与交付（5 条 AC；实现：M6-T06）
 
-`contracts/requirements.json` 中 REQ-065 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-065-01；第 2 稿改写行为 2、6 与 AC-065-01、-02、-04，CR31D-02、-03、-08）：
+`contracts/requirements.json` 中 REQ-065 的整个对象换为下文（旧：outline，只有 summary 与一条 AC-065-01；第 2 稿改写行为 2、6 与 AC-065-01、-02、-04，CR31D-02、-03、-08；第 3 稿改写行为 2、6、两条失败模式、决定与 AC-065-04，增加一条失败模式，CR31D-50、-51、-54）：
 
 ```json
 {
@@ -972,11 +993,11 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
   "summary": "分支候选、PR/CI可选；merge后重新绑定最终SHA；无remote本地release可验收",
   "behavior": [
     "工作分支：Run 的第一个写 Attempt 准备时，Runtime 写 run.work_branch{branch, base_branch, base_commit}。HEAD 在分支 B 上时工作分支就是 B，HoH 不切换用户的分支；HEAD 游离、或 [git] delivery=\"pr\" 而 B 就是 PR 的目标分支时，Runtime 在当前提交上新建并切换到 hoh/run-<run_id 的前 12 个十六进制字符>（git switch -c，保留未提交的改动；无法切换时提问），记为该 Attempt 的 effect（C10）。目标分支为 [git] base，未配置时为 B。之后每个写 Attempt 派发前核对 HEAD 在工作分支上；不在时不派发，Run 以 NEED_DECISION 提问（问题原因 work_branch_moved：回到工作分支后继续，或取消）。",
-    "候选绑定分支，两类候选（C23）：工作分支候选从用户工作树冻结（REQ-052 的清洁规则不变：有未提交或未跟踪的文件即拒绝，被 git 忽略的文件不在此列），commit 必须是工作分支的头，candidate.frozen 的载荷加 {branch: 工作分支, source: \"work_branch\"}；最终交付候选只在 PR 交付观察到合并后按行为 6 产生，commit 是目标分支上的最终提交 F，从只读核验 checkout 冻结，载荷为 {branch: 目标分支, source: \"merged\", pr_url, pr_head}。本地交付与 PR 头的验证只用工作分支候选。",
+    "候选绑定分支，两类候选（C23）：工作分支候选从用户工作树冻结（REQ-052 的清洁规则不变：有未提交或未跟踪的文件即拒绝，被 git 忽略的文件不在此列），commit 必须是工作分支的头，candidate.frozen 的载荷加 {branch: 工作分支, source: \"work_branch\"}；最终交付候选只在 PR 交付观察到合并后按行为 6 产生，commit 是目标分支上的最终提交 F，从项目树之外的核验 checkout 冻结、对象写进项目的对象库，载荷为 {branch: 目标分支, source: \"merged\", pr_url, pr_head, checkout}。本地交付与 PR 头的验证只用工作分支候选。",
     "本地交付（[git] delivery=\"local\"，缺省，C6）：Run 的最终候选通过发布验证（REQ-056）后，Runtime 写 delivery.completed{mode: \"local\", branch, commit, tree, candidate_id}，releases 行绑定该候选；不 push、不调用 gh、不增删 remote、不改其他分支的引用；没有 remote 的仓库照样完成（docs/11）。",
     "PR 交付（[git] delivery=\"pr\"；[git] remote 缺省为 origin，须指向 github.com；PATH 中有 gh 且 gh auth status 成功）：最终候选通过发布验证后，Runtime (a) 以 git push <remote> <工作分支> 推送（不带 --force、--force-with-lease，从不推送目标分支）；(b) 先以 gh pr list --head <工作分支> --state all 按 run 标记（PR 正文中的 hoh-run: <run_id>）查找已有 PR，没有才 gh pr create --base <目标分支> --head <工作分支>；(c) Run 进入 WAITING_EXTERNAL（resume_state 为当时的状态），轮询 PR 与 CI 的状态（间隔 30 s 起加倍，至多 600 s；常量）。每个外部操作是交付 Attempt 的一条 effect（PREPARED→STARTED→OBSERVED→COMMITTED，REQ-041）；重启后按远端引用与 run 标记核对，不重复推送或建 PR（docs/07 §5），无法确认的为 UNKNOWN_EFFECT 并交诊断。",
     "CI 可选：PR 没有检查时不等待；有检查时等全部结束；任一失败时写 Issue（severity high，fingerprint ci:<检查名>，绑定 PR 头的候选）并唤醒 Commander，交付停止直到出现新的候选；CI 全部成功不等于合并。",
-    "合并后重新绑定最终 SHA：HoH 不合并 PR（C7）。观察到 PR 已合并后，Runtime 取得并核对最终提交 F（merge 提交、squash 或 rebase 合并产生的新提交）后冻结最终交付候选（C23）：(a) git fetch <remote> +refs/heads/<目标分支>:refs/hoh/delivery/<run_id>/base，只写 refs/hoh/ 下 HoH 自己的引用，不改用户的分支、refs/remotes/、HEAD、index 与工作树；(b) gh pr view 报告 state=MERGED、mergeCommit=F、baseRefName 等于 run.work_branch 当前记录的目标分支，且 F 是取得的目标分支头的祖先或其本身；任一不符则不冻结，Run 以 NEED_DECISION 提问（delivery_merge_unverified，列出不符项）；(c) 在 .hoh/ 下按 run 与 F 命名、登记确切路径的位置以 git worktree add --detach 建立 F 的只读核验 checkout（任何写者都不在其中写入）；(d) 对它按 REQ-052 的同一清洁规则冻结（commit=F，tree 为 F 的 tree，source_path 为该 checkout）；(e) 在其上运行完整的发布验证，不复用 PR 头候选的任何证据，即使 tree 相同（docs/07 §6、§7，C18）；(f) release 绑定或 Run 结束后按登记的路径移除该 checkout 与 refs/hoh/delivery/<run_id>/ 下的引用。用户工作树的 HEAD、分支与文件在整个过程中不变。通过后 releases 行与 delivery.completed{mode: \"pr\", pr_url, merged_commit: F, candidate_id} 绑定新候选，Run 才能 COMPLETED；PR 头候选的证据保留为历史。最终交付候选的验证失败：写 Issue（绑定该候选）并唤醒 Commander，Run 不 COMPLETED，修复在工作分支上按行为 7 先 merge 目标分支再进行，并产生新的 PR。PR 被关闭而未合并：NEED_DECISION（delivery_pr_closed：重新打开后继续、改为本地交付或取消）。",
+    "合并后重新绑定最终 SHA：HoH 不合并 PR（C7）。观察到 PR 已合并后，Runtime 取得并核对最终提交 F（merge 提交、squash 或 rebase 合并产生的新提交），再冻结最终交付候选 C'（C23、C26）：(a) git fetch --no-tags --no-write-fetch-head --refmap= <remote> +refs/heads/<目标分支>:refs/hoh/delivery/<run_id>/base：只写 refs/hoh/ 下 HoH 自己的这一个引用，不改用户的分支、refs/remotes/、refs/tags/、.git/FETCH_HEAD、HEAD、index 与工作树；(b) 核对：gh pr view 报告 state=MERGED、mergeCommit=F、baseRefName 等于 run.work_branch 当前记录的目标分支，且 F 是取得的目标分支头的祖先或其本身；第一次不符时不冻结、不提问，等待一个轮询间隔（30 s）后重做一次 (a) 与 (b)；仍不符则 Run 以 NEED_DECISION 提问（delivery_merge_unverified），列出每个不符项（字段、forge 报告的值、本地核对的值）与三个选项：再次取得并核对（重做一次 (a) 与 (b)，通过即继续，仍不符再提同一问题）、改为本地交付（不再观察这个 PR，以已通过发布验证的 PR 头候选按行为 3 完成本地交付）、取消（Run 取消，不绑定 release）；(c) 核验 checkout V：先登记确切路径 <运行目录的根>/<project_id>/delivery-<run_id>-<F 的前 12 个十六进制字符>/（与验证者的运行目录同根、在项目树之外，ADR-028 决定 6），再以 git clone --shared --no-checkout 项目、git checkout --detach F 建立，V 的 .hoh/ 被 git 忽略，其中的 environment.json 是项目 .hoh/environment.json 的逐字节副本；任何写者与 Agent 都不在 V 中运行；(d) 以 V 为 checkout、V 的 .hoh/ 为状态目录、项目为对象库的根调用同一个冻结驱动（REQ-052 的清洁规则、状态守卫与 environment 规则不变）：清单 commit=F、tree 为 F 的 tree、environment 为 .hoh/environment.json（摘要等于项目的环境描述）；导出与冻结的输入都写进项目的 .hoh/objects/，candidates.source_path 为导出的对象路径（ADR-027 决定 4）；candidate.frozen 的载荷为 {branch: 目标分支, source: \"merged\", pr_url, pr_head, checkout: V}；(e) 冻结返回（冻结或被拒）后立即按登记的确切路径删除 V；V 中没有 HoH 的对象，删除它不影响候选的导出与冻结的输入；(f) 在 C' 上运行完整的发布验证：验证者照常在各自的运行目录中从项目的对象与 F 检出，不复用 PR 头候选的任何证据，即使 tree 相同（docs/07 §6、§7，C18）；release 绑定或 Run 结束后删除 refs/hoh/delivery/<run_id>/ 下的引用。用户工作树的 HEAD、分支与文件在整个过程中不变。通过后 releases 行与 delivery.completed{mode: \"pr\", pr_url, merged_commit: F, candidate_id} 绑定 C'，Run 才能 COMPLETED；PR 头候选的证据保留为历史。最终交付候选的验证失败：写 Issue（绑定该候选）并唤醒 Commander，Run 不 COMPLETED，修复在工作分支上按行为 7 先 merge 目标分支再进行，并产生新的 PR。PR 被关闭而未合并：NEED_DECISION（delivery_pr_closed：重新打开后继续、改为本地交付或取消）。",
     "目标分支前移与改目标：PR 落后于目标分支，或 PR 的目标被改为另一分支时，Runtime 在持有写者租约、工作树干净、HEAD 在工作分支上时 fetch，并把目标分支 merge 进工作分支（新提交，第一父为原分支头）；不 rebase、不改写已推送的提交、不 force push（docs/24 第 5 节；未推送过的工作分支也用 merge，一条规则，C8）；推送后在新提交上冻结候选并重新验证，旧候选不再是交付候选。merge 冲突：git merge --abort，HEAD 与工作树回到 merge 之前，不推送，Run 以 NEED_DECISION 提问（delivery_conflict，列出冲突路径）。",
     "只用 git 与 gh 的 argv（不经 shell，docs/04）；不读写凭证，认证由 git 与 gh 自己的配置负责；hoh doctor 报告 git 与 gh 的版本与 gh auth status 的结论，不输出凭证。"
   ],
@@ -984,7 +1005,8 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     "delivery=\"pr\" 而 gh 缺失：Run BLOCKED(BLOCKED_CAPABILITY)；gh 未认证：BLOCKED(BLOCKED_AUTH)；问题给出“修好后继续”或“改为本地交付”，不自动降级为本地交付。",
     "推送被拒（远端工作分支有本地没有的提交）：不 force；fetch 后按 merge 规则产生新提交与新候选。",
     "推送或建 PR 期间 kill -9：重启后 STARTED 的 effect 按远端核对（远端分支已是该提交、按标记找到 PR 即采用而不重做；确认远端没有该效果才执行），无法确认的（例如 forge 查询失败）为 effect UNKNOWN、交付 Attempt UNKNOWN_EFFECT 并交诊断，不盲目重做（REQ-041）。",
-    "合并后的 F 核对不符（PR 不是 MERGED、mergeCommit 不在取得的目标分支中、目标分支名不符）：不冻结最终交付候选，NEED_DECISION（delivery_merge_unverified）。",
+    "合并后的 F 核对不符（PR 不是 MERGED、mergeCommit 不在取得的目标分支中、目标分支名不符）：等待 30 s 后再取得并核对一次；仍不符才不冻结最终交付候选，NEED_DECISION（delivery_merge_unverified：再次取得并核对、改为本地交付或取消）。",
+    "核验 checkout 存在期间 host 被 kill -9：重启后按登记的确切路径删除遗留的 V，从行为 6 (a) 重做；同一内容在同一 Run 中再冻结得到同一个候选，不产生第二个。",
     "工作分支候选冻结时用户有普通未跟踪文件：REQ-052 拒绝冻结，HoH 不提交、不删除、不忽略该文件，Run 不能以它完成；用户删除、提交或忽略它之后才能继续。",
     "工作分支被用户切走或删除：不派发写 Attempt，以 work_branch_moved 提问。",
     "delivery=\"local\" 时完全不触网，有无 remote 都一样。"
@@ -1024,9 +1046,9 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     },
     {
       "id": "AC-065-04",
-      "given": "PR 头候选 C（commit H1、tree T1）已通过发布验证；用户工作树的 HEAD 在 feature=H1、工作树干净，用户的本地分支 main 指向 M0；假 forge 分别以 rebase 合并（bare 仓库的 main 上得到 tree 相同、SHA 不同的 F1）、merge 提交（F2，两个父）与 squash（F3）合并该 PR，gh pr view 报告 state=MERGED 与 mergeCommit；第四种情形中 forge 报告的 mergeCommit 不在 bare 仓库的 main 中",
-      "when": "host 观察到每种合并（各一次独立运行）",
-      "then": "三种合并都先把目标分支取到 refs/hoh/delivery/<run_id>/base，再在 .hoh/ 下 F 的只读核验 checkout 上冻结新候选 C'（commit=F，tree 为 F 的 tree，source_path 为该 checkout，candidate.frozen 的 source=merged、branch=main），并在 C' 上运行发布验证，新的检查记录与证据都属于 C'，C 的证据不计入 C' 的验收；C' 通过之前 Run 不是 COMPLETED；通过后 releases 行与 delivery.completed 绑定 C' 与 F，Run 为 COMPLETED；rebase 情形中 F1≠H1 而 tree 相同，仍重新验证；从观察到合并到结束，用户工作树的 HEAD 仍为 feature=H1，git status 与文件摘要不变，refs/heads/ 与 refs/remotes/ 下的引用不变（本地 main 仍为 M0）；结束后核验 checkout 与 refs/hoh/delivery/<run_id>/ 都已移除；第四种情形：不冻结任何候选，Run 为 BLOCKED(NEED_DECISION)，问题原因 delivery_merge_unverified 并列出不符项",
+      "given": "PR 头候选 C（commit H1、tree T1）已通过发布验证；用户工作树的 HEAD 在 feature=H1、工作树干净，用户的本地分支 main 与 refs/remotes/origin/main 都指向 M0；PATH 中的 git 是记录每次 argv 后转调真实 git 的垫片；可控时钟；FakeAgent 验证者开始时记录核验 checkout 的路径是否存在；假 forge 合并该 PR 并以 gh pr view 报告 state=MERGED 与 mergeCommit，合并后在 bare 仓库的新 main 头上加标签 v-new。六种情形各一次独立运行：R（rebase 合并，得到 tree 与 T1 相同、SHA 不同的 F1）、M（merge 提交 F2，两个父）、S（squash，F3）；T（短暂不一致：第一次 gh pr view 报告的 mergeCommit 不在 bare 仓库的 main 中，30 s 后与 main 一致）；U1、U2（持续不一致：mergeCommit 一直不在 main 中，U1 在问题出现后由测试使 forge 一致）",
+      "when": "host 观察到合并，测试按需推进可控时钟；U1 在问题出现后以 AnswerQuestion 选择“再次取得并核对”，U2 选择“改为本地交付”",
+      "then": "R、M、S：git 垫片记录的每次取得的 argv 都是 git fetch --no-tags --no-write-fetch-head --refmap= origin +refs/heads/main:refs/hoh/delivery/<run_id>/base；新候选 C' 的 commit=F、tree 为 F 的 tree，candidate.frozen 的 source=merged、branch=main、checkout 为 <运行目录的根>/<project_id>/delivery-<run_id>-<F 前 12 位>/（在项目树之外）；C' 的 candidates.source_path 是项目 .hoh/objects/ 下的对象路径，该对象存在、其 sha256 等于路径中的摘要、内容的 git_commit=F，清单的 environment 为 .hoh/environment.json 且摘要等于项目 .hoh/environment.json 的摘要；C' 的每个 FakeAgent 验证者开始时核验 checkout 的路径都已不存在；新的检查记录与证据都属于 C'，C 的证据不计入 C' 的验收；C' 通过之前 Run 不是 COMPLETED；通过后 releases 行与 delivery.completed 绑定 C' 与 F，Run 为 COMPLETED，此时 C' 的导出对象仍存在且摘要不变；R 中 F1≠H1 而 tree 相同，仍重新验证；从观察到合并到结束，用户工作树的 HEAD 仍为 feature=H1，git status 与文件摘要不变，refs/heads/、refs/remotes/、refs/tags/ 下的引用与 .git/FETCH_HEAD 不变（本地 main 与 origin/main 仍为 M0，没有 v-new）；结束后 refs/hoh/delivery/<run_id>/ 下没有引用。T：两次取得之间的可控时钟间隔为 30 s，没有提问，之后结果同 R、M、S。U1、U2：恰两次取得与核对之后（间隔 30 s）Run 为 BLOCKED(NEED_DECISION)，问题原因 delivery_merge_unverified，不符项列出 mergeCommit 字段、forge 报告的值与“不在取得的 main 中”，选项恰为再次取得并核对、改为本地交付、取消，此前没有冻结任何候选；U1 作答后再取得一次并冻结 C'，之后结果同 R、M、S；U2 作答后不再调用 gh pr view，releases 与 delivery.completed{mode: local, branch: feature, commit: H1} 绑定 C，Run 为 COMPLETED",
       "test_id": "TEST-065-04"
     },
     {
@@ -1040,7 +1062,7 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
   "decisions": [
     "交付缺省为本地（[git] delivery=\"local\"）；PR 交付须显式配置，因为推送与建 PR 是对外的动作（CR-031，C6）。",
     "HoH 不合并 PR，只观察合并并在最终提交上重新冻结与验证（CR-031，C7、C18）。",
-    "两类候选：工作分支候选从用户工作树冻结，最终交付候选从 F 的只读核验 checkout 冻结，F 先经 forge 报告与目标分支的祖先关系核对；用户的 HEAD、分支与工作树不因交付而改变（CR-031，C23）。",
+    "两类候选：工作分支候选从用户工作树冻结，最终交付候选从项目树之外 F 的核验 checkout 冻结，F 先经 forge 报告与目标分支的祖先关系核对；用户的 HEAD、分支与工作树不因交付而改变（CR-031，C23）。最终交付候选的对象写进项目的对象库，source_path 仍是导出的对象路径，核验 checkout 在冻结后即删除（CR-031，C26）。",
     "目标分支前移时以 merge 更新工作分支，从不 rebase 或 force push 已推送的分支（docs/24 第 5 节，所有者的“已推送分支只追加提交”，CR-031，C8）。",
     "HoH 在当前分支上工作，只在 HEAD 游离或 PR 交付而当前分支就是目标分支时新建 hoh/run-<id> 分支，之后不切换分支（CR-031，C10）。",
     "PR 路径的测试以本地 bare 仓库作 remote、以按真实 gh 只读录制的 JSON 字段形状实现的假 gh 作 forge，结果记为 product 而不是 live；不新增 live 检查（CR-031，C9）。"
@@ -1144,28 +1166,34 @@ An after or Last-Event-ID greater than H is 409 CONFLICT with details {reason: "
     "requirement_id": "REQ-065",
     "acceptance_id": "AC-065-04",
     "check_id": "integration",
-    "fixture": "已通过发布验证的 PR 头候选 C + 用户工作树在 feature=H1、本地 main=M0 + 假 gh forge 的 rebase、merge、squash 三种合并与 mergeCommit 不符的一种情形 + 产品 host（FakeAgent 验证者）",
+    "fixture": "已通过发布验证的 PR 头候选 C + 用户工作树在 feature=H1、本地 main 与 origin/main=M0 + 记录 argv 的 git 垫片 + 可控时钟 + 假 gh forge（rebase、merge、squash 三种合并，短暂与持续的 mergeCommit 不符，合并后加标签 v-new）+ 产品 host（FakeAgent 验证者记录核验 checkout 是否存在）",
     "steps": [
-      "导出用户工作树状态与全部引用",
-      "假 forge 合并 PR（每种方式一次独立运行）",
-      "等待 host 取得并核对 F、在核验 checkout 上冻结新候选并验证",
-      "mergeCommit 不符的情形",
-      "导出 candidates、evidence、acceptance_results、releases、事件、引用与用户工作树状态"
+      "导出用户工作树状态、全部引用与 .git/FETCH_HEAD",
+      "假 forge 合并 PR（R、M、S、T、U1、U2 各一次独立运行），按需推进时钟",
+      "等待 host 取得并核对 F、冻结新候选并验证",
+      "U1、U2 在问题出现后作答",
+      "导出 git 垫片的 argv、candidates、对象、evidence、acceptance_results、releases、事件、问题、引用与用户工作树状态"
     ],
     "pass_criteria": [
-      "新候选 commit=F、tree 为 F 的 tree、source_path 为核验 checkout、source=merged",
+      "取得的 argv 带 --no-tags --no-write-fetch-head --refmap= 且只写 refs/hoh/delivery/<run_id>/base",
+      "新候选 commit=F、tree 为 F 的 tree、source=merged、checkout 在项目树之外",
+      "source_path 是存在且摘要相符的导出对象，environment 摘要等于项目的环境描述",
+      "验证者开始时核验 checkout 已删除，绑定 release 时导出对象仍在",
       "新证据都属于 C'，C 的证据不计入",
       "C' 通过前 Run 未 COMPLETED",
       "releases 与 delivery.completed 绑定 C' 与 F",
       "rebase 情形 tree 相同仍重新验证",
-      "用户 HEAD、工作树、refs/heads/ 与 refs/remotes/ 不变，核验 checkout 与 refs/hoh/delivery/ 结束后移除",
-      "不符情形不冻结并以 delivery_merge_unverified 提问"
+      "用户 HEAD、工作树、refs/heads/、refs/remotes/、refs/tags/ 与 FETCH_HEAD 不变，refs/hoh/delivery/ 结束后移除",
+      "短暂不一致：间隔 30 s 再核对一次、不提问",
+      "持续不一致：两次核对后以 delivery_merge_unverified 提问，列出不符项与三个选项，未冻结候选",
+      "再次取得并核对后冻结并验证；改为本地交付后 releases 绑定 C 且 mode=local"
     ],
     "observables": [
-      "引用与工作树状态前后",
-      "候选与证据导出",
+      "git argv 记录",
+      "引用、FETCH_HEAD 与工作树状态前后",
+      "候选、对象与证据导出",
       "releases 行",
-      "events 导出",
+      "events 与 questions 导出",
       "Run 状态时间线",
       "判定结果"
     ]
@@ -1405,7 +1433,7 @@ M6-T02、M6-T03 保留 id，新增 M6-T05、M6-T06；M6-T01（spec）不变，M6
     "checks": [
       "web-e2e"
     ],
-    "done_when": "所列需求中本任务的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。交付 web-e2e 检查：scripts/product/web-e2e.sh 取代 tests/check-plan.json 中的占位 argv（not-implemented.sh web-e2e M6-T02），在 run_check 下运行 web/ 的单元测试与 Playwright 场景，把每个 TEST id 的结果写入 test-results.jsonl，没有测试通过或缺少本任务的任一 TEST id 时以 3 失败（与 deployment.sh 的 NO_TESTS 规则相同）；Playwright 与浏览器的版本锁定，缓存放在项目盘而不是 /tmp（docs/19）；被测 host 在去掉外层检查环境变量（HOH_EVIDENCE_DIR 等）的环境中运行（docs/24 第 5 节）。scripts/product/build.sh 把缺少 web/ 改为构建失败（docs/23 的移交），bundle.sh 把 web/dist（含 web/manifest.json）打进 hoh/web。host 的外壳路由（openapi 的 / 与 /assets/{asset}，CR-031）、按 web/manifest.json 记录的 Content-Type 提供资产（构建遇到表外扩展名即失败）、WEB_ASSETS_UNAVAILABLE 的产生与 web/manifest.json 的核对。web/ 的 API 客户端由 contracts/openapi.json 生成并提交，web-e2e 中有一项核对重新生成逐字节相同。host 的绑定、规范 authority、Host/Origin 校验与 hoh web 打印的地址都取 [web] host（缺省 127.0.0.1；localhost 固定绑定 127.0.0.1，::1 的 authority 加方括号，CR-031 C20、C22），另以 hoh-app 的 integration 测试覆盖 127.0.0.1、::1、localhost 三种取值与其他 authority 的 403。"
+    "done_when": "所列需求中本任务的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。交付 web-e2e 检查：scripts/product/web-e2e.sh 取代 tests/check-plan.json 中的占位 argv（not-implemented.sh web-e2e M6-T02），在 run_check 下运行 web/ 的单元测试与 Playwright 场景，把每个 TEST id 的结果写入 test-results.jsonl，没有测试通过或缺少本任务的任一 TEST id 时以 3 失败（与 deployment.sh 的 NO_TESTS 规则相同）；Playwright 与浏览器的版本锁定，缓存放在项目盘而不是 /tmp（docs/19）；被测 host 在去掉外层检查环境变量（HOH_EVIDENCE_DIR 等）的环境中运行（docs/24 第 5 节）。scripts/product/build.sh 把缺少 web/ 改为构建失败（docs/23 的移交），bundle.sh 把 web/dist（含 web/manifest.json）打进 hoh/web。host 的外壳路由（openapi 的 / 与 /assets/{asset}，CR-031）、按 web/manifest.json 记录的 Content-Type 提供资产（构建遇到表外扩展名即失败）、WEB_ASSETS_UNAVAILABLE 的产生与 web/manifest.json 的核对。web/ 的 API 客户端由 contracts/openapi.json 生成并提交，web-e2e 中有一项核对重新生成逐字节相同。host 的绑定、规范 authority、Host/Origin 校验与 hoh web 打印的地址都取 [web] host（缺省 127.0.0.1；localhost 固定绑定 127.0.0.1，::1 的 authority 加方括号，CR-031 C20、C22），另以 hoh-app 的 integration 测试覆盖 127.0.0.1、::1、localhost 三种取值与其他 authority 的 403。TCP 与 socket 上的每个 403 带 details.reason：bad_authority（Host、Origin、请求目标的 authority、多个 Origin、socket 上的 Origin 或 authority）或 bad_token（token 缺失或错误），两者都不符为 bad_authority；contracts/openapi.json 的 components.responses.Forbidden 说明它（CR-031 C25），hoh-app 的 integration 测试逐个覆盖这些拒绝的 reason。"
   },
   {
     "id": "M6-T05",
@@ -1453,7 +1481,7 @@ M6-T02、M6-T03 保留 id，新增 M6-T05、M6-T06；M6-T01（spec）不变，M6
       "AC-065-04",
       "AC-065-05"
     ],
-    "done_when": "所列需求中本任务的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。配置键 [git] delivery、remote、base 的加载器支持（解析、合法值、缺省、快照）与 config/hoh.example.toml 中的缺省值在同一提交加入，并在该提交上重跑 TEST-018-01（CR26D-103 的规则）；假 gh 的 JSON 字段形状来自对本仓库已合并 PR 的只读 gh 录制（gh pr view、gh pr list 的 --json 输出），录制所用的 gh 版本与命令写在夹具旁，录制不创建、不修改任何远端对象；hoh doctor 增加 git 与 gh 的版本与 gh auth status 的结论（不输出凭证）；交付 Attempt 的 effect 接入启动 reconcile（REQ-041）；debug 构建的交付屏障接缝（外部调用之前、外部调用成功而 OBSERVED 未提交）只在 debug 构建中存在，release_seams.sh 核对。TDD 之前写 ADR 定下最终交付候选的取得、核对、只读核验 checkout、冻结与清理（REQ-065 行为 6，C23），以及交付 Attempt 的形状与 delivery.* 事件名（C19）。HoH 不合并 PR、从不 force push。本任务有外部效果与恢复，按 docs/19 由两名互补的审查者审查。"
+    "done_when": "所列需求中本任务的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。配置键 [git] delivery、remote、base 的加载器支持（解析、合法值、缺省、快照）与 config/hoh.example.toml 中的缺省值在同一提交加入，并在该提交上重跑 TEST-018-01（CR26D-103 的规则）；假 gh 的 JSON 字段形状来自对本仓库已合并 PR 的只读 gh 录制（gh pr view、gh pr list 的 --json 输出），录制所用的 gh 版本与命令写在夹具旁，录制不创建、不修改任何远端对象；hoh doctor 增加 git 与 gh 的版本与 gh auth status 的结论（不输出凭证）；交付 Attempt 的 effect 接入启动 reconcile（REQ-041）；debug 构建的交付屏障接缝（外部调用之前、外部调用成功而 OBSERVED 未提交）只在 debug 构建中存在，release_seams.sh 核对。TDD 之前写 ADR 定下最终交付候选的取得、核对与再核对、核验 checkout 的位置与登记、冻结与清理（REQ-065 行为 6，C23、C26），以及交付 Attempt 的形状与 delivery.* 事件名（C19）。冻结驱动增加对象库根的显式参数（现有调用方传 state.parent()，现有冻结与检查测试不改即通过），候选的 source_path 始终是导出的对象路径（ADR-027 决定 4）；核验 checkout 与 refs/hoh/delivery/<run_id>/ 只按登记的确切路径或引用名删除。HoH 不合并 PR、从不 force push。本任务有外部效果与恢复，按 docs/19 由两名互补的审查者审查。"
   },
   {
     "id": "M6-T03",
@@ -1505,19 +1533,19 @@ M6-T04 的 `depends_on`：
 | M6-T02 | AC-058-03 | web-e2e | Web 的命令提交与生成的客户端（本任务）；SetMode、SendInput 与 TUI 的模式切换和输入（M3-T09、M4-T02）；PauseRun、ResumeRun（M2-T06、M2-T13）；ConfigureTeam（M2-T07） |
 | M6-T02 | AC-061-01 | web-e2e | 键盘流程、焦点与 axe-core（本任务）；ApproveSpec 与来源判定（M3-T02、M3-T04）；SetMode、SendInput（M3-T09）；PauseRun、ResumeRun（M2-T06、M2-T13）；ConfigureTeam（M2-T07）；证据与 artifact（M4-T03） |
 | M6-T02 | AC-061-02 | web-e2e | 响应式布局与菜单（本任务）；时间线分页（M4-T03）；SetMode、SendInput（M3-T09） |
-| M6-T02 | AC-061-04 | web-e2e | 规范地址、按 [web] host 绑定与 Host/Origin 校验、hoh web 打印的地址（本任务）；[web] 配置的加载与快照（M2-T07）；host 的拉起、端口与 host.json（M2-T12）；getRun 与 Overview（M2-T12、本任务） |
+| M6-T02 | AC-061-04 | web-e2e | 规范地址、按 [web] host 绑定与 Host/Origin 校验、403 的 details.reason、hoh web 打印的地址（本任务）；[web] 配置的加载与快照（M2-T07）；host 的拉起、端口与 host.json（M2-T12）；getRun 与 Overview（M2-T12、本任务） |
 | M6-T05 | AC-059-01 | web-e2e | 页面的事件存储（本任务）；web-e2e 检查与 web/ 工程（M6-T02） |
 | M6-T05 | AC-059-02 | web-e2e | 断线续接（本任务）；页面与外壳（M6-T02）；SSE 的 replay/live（M2-T12）；FakeAgent 世界（M2-T13） |
 | M6-T05 | AC-059-03 | web-e2e | 快照重同步、host 的 cursor_ahead 与重新授权（本任务）；分页游标的 generation 与 410（M4-T03）；getRun 的 watermark（M2-T12）；启动 reconcile 的恢复事件（M2-T05）；PauseRun、ResumeRun（M2-T06、M2-T13）；页面与 hoh web（M6-T02） |
 | M6-T05 | AC-059-04 | web-e2e | 队列上界、溢出续接与 e2e 构建的消费暂停接缝（本任务）；SSE 按页读取（M2-T12）；SendInput（M3-T09）；页面与 web-e2e 检查（M6-T02） |
-| M6-T05 | AC-059-05 | web-e2e | 重新授权、同源交接与 project_id 核对（本任务）；hoh web 与外壳（M6-T02）；host 每次启动换 token、host.json 与 SSE 续接（M2-T12）；getRun 的 project_id（M4-T03，按 A4-10 待 CR-028）；FakeAgent 世界（M2-T13） |
+| M6-T05 | AC-059-05 | web-e2e | 重新授权、只认 bad_token 的触发、同源交接与 project_id 核对（本任务）；hoh web 与外壳、403 的 details.reason（M6-T02）；host 每次启动换 token、host.json 与 SSE 续接（M2-T12）；getRun 的 project_id（M4-T03，按 A4-10 待 CR-028）；FakeAgent 世界（M2-T13） |
 | M6-T05 | AC-060-01 | web-e2e | 冲突显示与控制命令的重提（本任务）；SetMode 与 STALE_REVISION（M3-T09、M2-T12）；TUI 的 /plan 与 409 处理（M3-T09、M4-T02）；PauseRun（M2-T06）；页面（M6-T02） |
 | M6-T05 | AC-060-02 | web-e2e | 同 key 重试（本任务）；幂等重放、KEY_REUSE 与 HostHooks（M2-T12）；SendInput 与 input_queue（M3-T09）；页面（M6-T02） |
 | M6-T05 | AC-060-03 | web-e2e | 冲突显示（本任务）；ConfigureTeam 与团队 revision（M2-T07）；ApproveSpec 与 SPEC_CONFLICT（M3-T02）；spec_approval 问题（M3-T04）；Settings 与 Specs 页面（M6-T02） |
 | M6-T06 | AC-065-01 | integration | 工作分支、候选的 source 与本地交付（本任务）；BUILD Run 跑到 COMPLETED（M3-T04、M2-T13）；冻结与未跟踪文件的拒绝（M2-T10、M2-T16）；发布验证与 releases 行（M5-T07，待 CR-030） |
 | M6-T06 | AC-065-02 | recovery | push 与建 PR 的 effect、交付屏障接缝及其核对（本任务）；effect ledger、UNKNOWN_EFFECT、kill -9 reconcile 与 recovery 检查（M2-T05）；WAITING_EXTERNAL（M2-T19）；发布验证（M5-T07，待 CR-030） |
 | M6-T06 | AC-065-03 | integration | CI 轮询与 Issue（本任务）；Issue 与 Commander 唤醒（M2-T18、M2-T08）；可控时钟与等待（M2-T19） |
-| M6-T06 | AC-065-04 | integration | 合并观察、F 的取得与核对、只读核验 checkout 与最终交付候选（本任务）；冻结（M2-T10、M2-T16）；验证与汇合（M2-T16、M2-T18）；NEED_DECISION 的问题（M2-T13）；发布验证（M5-T07，待 CR-030） |
+| M6-T06 | AC-065-04 | integration | 合并观察、F 的取得与再核对、核验 checkout、冻结驱动的对象库根参数、最终交付候选与改为本地交付（本任务）；冻结（M2-T10、M2-T16）；运行目录与验证、汇合（M2-T16、M2-T18）；可控时钟与等待（M2-T19）；NEED_DECISION 的问题与作答（M2-T13）；发布验证（M5-T07，待 CR-030） |
 | M6-T06 | AC-065-05 | integration | merge 更新与冲突提问（本任务）；写者租约（M2-T03）；NEED_DECISION 的问题（M2-T13）；冻结与重新验证（M2-T16） |
 | M6-T03 | AC-066-01 | deployment | 全新 VM 与文档执行器（本任务）；install.sh 与 deployment 检查（M2-T14）；hoh web（M6-T02）；hoh doctor（M1-T07）；文档中的 Git 交付配置（M6-T06） |
 | M6-T03 | AC-066-02 | deployment | manifest、web_assets 与第三方声明（本任务）；外壳与 WEB_ASSETS_UNAVAILABLE（M6-T02）；安装（M2-T14）；hoh doctor（M1-T07） |
@@ -1542,12 +1570,13 @@ M6 在 M4、M5 之后实现。本稿写于 CR-028 已批准未应用、CR-030 �
 | A4-8 | CR-028 改 openapi 的路径与本 CR 新增的 `/`、`/assets/{asset}` 不重名 | 第 5 节 |
 | A4-9 | M4 的 TUI 对 SetMode 的 409 不自动重发、不改显示的模式（CR-028 的 AC-010-02） | AC-060-01 中 TUI 一方失败的情形 |
 | A4-10 | CR-028 的 UI 读模型绑定 `project_id`（CR-028 决定部分：“UI 读模型绑定 project_id/run_id/…/watermark”），页面经 getRun 可读到它（今天 getRun 的 `projection` 是开放对象，没有 project_id）；若 CR-028 应用后 getRun 读不到 project_id，M6-T01 应用前在本 CR 中改为由 M6-T05 在 getRun 的 projection 中加入它并重新审查 | REQ-059 行为 7、AC-059-05 (b) |
+| A4-11 | CR-028 不改 `components.responses.Forbidden`，并保持“403 的 token/Host/Origin 语义不变”（CR-028 §2）；它的 AC-012-03（TUI 以旧 token 得到 403 后整个连接按过期处理、保留草稿）只依赖状态码，不依赖 403 没有 `details`，所以 C25 增加 `details.reason` 不改变它的判定；若 CR-028 应用时改了 Forbidden，M6-T01 在那时的对象上只替换 description | 第 5 节；C25；AC-058-01、AC-059-05、AC-061-03、-04 |
 
 **M5（CR-030 第 1 稿，`prep/M5-T01-spec` 的 `6c0fc5b6`，设计审查中、未批准）**
 
 | ID | 假设 | 用到它的地方 |
 |---|---|---|
-| A5-1 | REQ-056 的发布验证（对最终候选的全范围验证，由 Runtime 触发，使 Run→COMPLETED 可以满足）按候选进行，可以在任意新冻结的候选上再做一次，包括从只读核验 checkout 冻结的最终交付候选；`releases` 行绑定通过它的候选。CR-030 第 1 稿把 REQ-056 交给新任务 M5-T07，以持久的 release_validation_id 绑定 run/spec/candidate；闭包表据此写 M5-T07（待 CR-030）。若批准的 CR-030 再改归属或不允许对新候选再做一次，M6-T01 应用前修订本 CR | REQ-065 行为 3、6；AC-065-01、-02、-04 |
+| A5-1 | REQ-056 的发布验证（对最终候选的全范围验证，由 Runtime 触发，使 Run→COMPLETED 可以满足）按候选进行，可以在任意新冻结的候选上再做一次，包括从核验 checkout 冻结的最终交付候选；`releases` 行绑定通过它的候选。CR-030 第 1 稿把 REQ-056 交给新任务 M5-T07，以持久的 release_validation_id 绑定 run/spec/candidate；闭包表据此写 M5-T07（待 CR-030）。若批准的 CR-030 再改归属或不允许对新候选再做一次，M6-T01 应用前修订本 CR | REQ-065 行为 3、6；AC-065-01、-02、-04 |
 | A5-2 | REQ-044（可恢复版本：保存失败分支，回到已验证基线，不 reset 用户未提交的改动；CR-030 第 1 稿规定建立指向失败候选的失败分支与新的恢复提交，归 M5-T06）若规定 HoH 创建或切换分支，本 CR 的“HoH 不切换工作分支、HEAD 离开工作分支即提问”须与之对齐：由 REQ-044 规定的切换不算“被用户切走” | REQ-065 行为 1，C10 |
 | A5-3 | REQ-057（运行时 UX 与部署验证：PTY/浏览器/安装/升级/回滚的实际流程）若有用到浏览器（web-e2e）的 AC，它的实现任务只能在 M6-T02 之后；若 CR-030 把这类 AC 交给 M6 的任务，M6-T01 应用时把它并入合适的 M6 任务并保持每任务至多 2 项需求、8 条 AC；若 CR-030 先建了全新 VM 的测试设施，M6-T03 复用它而不另建（CR-030 第 1 稿：REQ-057 归 M5-T08，其 AC 用两种全新 VM 验证 HoH 对目标工程的部署与浏览器流程，不验证 HoH 自己的 Web；M6-T03 应用时核对能否复用其 VM 设施） | 第 7 节 |
 | A5-4 | REQ-063（备份与迁移）的恢复会让数据库回到较早的 seq；AC-059-03 (a) 不依赖它（测试自己在停机时复制数据库文件），只要求页面对这种游标按快照重同步 | AC-059-03 |
@@ -1576,45 +1605,49 @@ docs/24 明确点给 M6 的只有第 5 节“已推送分支只追加提交 → 
 | 第 5 节：打包脚本猜测产物路径（REQ-069） | 部分覆盖，其余留 M7 | REQ-066 行为 1、2 与 AC-066-02：发布包中二进制、资源与 Web 资产的版本与 commit 两两核对，web/ 与二进制不一致时拒绝提供；“由构建工具说出产物路径”属交付真实性（REQ-069，M7-T01） |
 | 第 5 节：改受锁契约后只跑了 bundle 与指名测试（REQ-033、REQ-052） | 吸收进应用步骤 | 本 CR 增加一个 ErrorCode：应用提交同时改 Rust 枚举并跑完整的 `cargo test --workspace --locked`（见“基线”行与“应用时的步骤”）；副本中已演示不改 Rust 枚举时 protocol_roundtrip 变红（见“验证方式”） |
 | 2.5 消息交叉与未确认的指令（REQ-022；M4 的 Team 视图显示未确认的指令） | 沿用 M4 | Web 的 Team 页取与 TUI 相同的投影（AC-058-02 逐字段对照）；未确认指令的显示由 CR-028 定义 |
-| 2.6 只清理自己登记的资源 | 吸收进测试设施 | VM、bare 仓库、sshd 与浏览器进程都按确切路径与 pid 登记、结束时只清理自己登记的；产品中最终交付候选的只读核验 checkout 与 `refs/hoh/delivery/<run_id>/` 引用也按登记的确切路径移除（REQ-065 行为 6）（M6-T03 的 done_when“结束即删”的对象是本次 `mktemp -d` 的目录） |
+| 2.6 只清理自己登记的资源 | 吸收进测试设施 | VM、bare 仓库、sshd 与浏览器进程都按确切路径与 pid 登记、结束时只清理自己登记的；产品中最终交付候选的核验 checkout 与 `refs/hoh/delivery/<run_id>/` 引用也按登记的确切路径或引用名移除，遗留的核验 checkout 在重启后按登记路径删除（REQ-065 行为 6）（M6-T03 的 done_when“结束即删”的对象是本次 `mktemp -d` 的目录） |
 | 1.1–1.3、2.1–2.4、2.7、3.1–3.3、4.1–4.2 | 不在 M6 | 分别属于 M2–M5 已定或 M5、M7 的细化（各条“落地时机”）；Web 只显示 Runtime 已有的事实，不改变这些机制 |
 
-## CTO 的问题与决定（C1–C24）
+## CTO 的问题与决定（C1–C26）
 
-已记录的决定（来源：`/home/ai/dev/hoh/.hoh-dev/evidence/spec-drafts-cto-decisions.md`，主仓库中被 git 忽略的 CTO 决定记录，2026-11-22）：
+**决定状态从哪里来（CR31D-52）**：每个 C 项的状态只取自 CTO 决定记录 `/home/ai/dev/hoh/.hoh-dev/evidence/spec-drafts-cto-decisions.md`（主仓库中被 git 忽略；第 3 稿核对时 11 行，sha256 `6e32906f8fdb0c119e4bdf8823723f81bb4ef773e1280089bdf9011f6a18e08b`，记录的日期为 2026-11-22），按下面的规则得出，写在下表的“状态”列并注明记录的行号；本 CR 的其他地方（文首、“是否属于 CR-003 D1”）不另写状态，只引用本表：
 
-- **C1：所有者于 2026-11-22 批准。** 静态外壳不带 token 提供，仍校验 Host/Origin；每个 `/v1` 请求都要 token；token 在 URL 片段中，从不进入 host 日志或 Referer；docs/03 第 51 行在应用本 CR 时改为“每个 API 请求”。它改写的是所有者写下的交互/安全约定，所以由所有者而不是 CTO 决定；已决定，不再询问。
-- **C2–C20：CTO 采纳本稿第 1 稿的提议**，不再询问。第 2 稿按设计审查改写了 C15 的触发方式（见 C24）与 C20 的地址规则（见 C22），提议的取向不变。
-- **C21–C24：第 2 稿为处置设计审查第 1 轮的发现而新增，待 CTO 决定**；它们已按“提议”写进上文的需求，CTO 改变任一项时相应文字随之修改后再送审查。它们都不改 CONTRACT 的架构或交互决定、不缩小范围、不降低门槛，也不改变 C1 的所有者决定（token 仍只在片段与页面内存中，C21 的同源交接不经过 host）。
+- 记录中有所有者批准该项的行（`OWNER APPROVED C<n>`）→ “所有者批准（记录第 k 行）”；
+- 否则，记录中有关于 CR-031 的一行写明包含该项的范围（`C<a>-C<b>`）已被采纳（`adopted`）→ “CTO 采纳（记录第 k 行）”；
+- 否则 → “待 CTO 决定”。
 
-没有需要所有者决定的未决问题。
+已采纳的项，后来的稿不改它的条文：要改，就新增一个 C 项（待 CTO 决定），并在原项的“提议”末尾注明被哪一项细化或取代。“验证方式”中的状态核对脚本按上述规则从记录重新计算每项的状态，与表中的值逐项比较，任一不符即失败。
 
-| ID | 问题 | 提议 | 理由 |
-|---|---|---|---|
-| C1（所有者已批准，2026-11-22） | Web 外壳是否要 token | 外壳（`/`、`/assets/`）不要 token、仍校验 Host/Origin 并带 CSP 与 no-referrer；每个 `/v1` 请求都要 token；token 不进入 host 日志或 Referer；docs/03 的“每个请求”改为“每个 API 请求” | openapi 的 localToken 把 token 放在 URL 片段，片段不发给服务器，外壳必须先于 token 加载；外壳不含项目数据、不调用命令，API 的认证不变 |
-| C2 | Web 资产嵌入二进制还是放在版本目录 | 版本目录中的 `web/`，由 `web/manifest.json` 与二进制的版本、commit、文件摘要核对 | workspace 不允许构建脚本（docs/22），`include_bytes!` 会让 cargo 构建依赖 npm 产物；docs/11 的布局已是“资源按版本目录” |
-| C3 | SSE 游标超过已提交水位时的响应 | 409 `CONFLICT` 加 `details{reason: cursor_ahead, watermark}`，不用 410 | 与 CR-028 对超过水位的分页游标按无效处理一致，也不必改 CR-028 中“SSE 410 在 v1 不可达”的 AC-010-03；客户端对两者都做快照重同步 |
-| C4 | 测哪些浏览器 | Chromium 跑全部 web-e2e 场景，Firefox 跑 AC-058-01 与 AC-061-01；docs/12 只声明这两种 | 覆盖两个主流引擎的入口与键盘可达性，成本可控；不宣称未测的浏览器（与 CONTRACT 第 15 条同一原则） |
-| C5 | Web 能否编辑 Prompt | 只读显示各层与修订；编辑仍按 REQ-047 的文件覆盖 | 新增写命令要改受锁的命令种类（protocol 的 Command.kind 与 001 的 commands.kind CHECK）；REQ-058 的 summary 只要求“可查看” |
-| C6 | 缺省的交付模式 | `[git] delivery = "local"`；PR 交付须显式配置 | push 与建 PR 是对外动作；与所有者 O1–O6 的保守取向一致 |
-| C7 | 谁合并 PR | 用户或仓库规则；HoH 不合并、不改目标分支 | 合并对外且不可逆；REQ-065 只要求合并后重新绑定 |
-| C8 | 目标分支前移时怎样更新工作分支 | merge（不 rebase、不 force push），未推送的分支也用 merge | 所有者“已推送分支只追加提交”（docs/24 第 5 节）；一条规则比按是否推送过分两条更可判定 |
-| C9 | PR 路径用什么测 | 本地 bare 仓库作 remote、假 gh（字段形状取自对本仓库已合并 PR 的只读 gh 录制），记 product；不新增 live 检查 | 真实 GitHub 的写操作对外、要仓库与凭证；新增检查会改 release-policy 的 14 项。残余风险：gh 输出格式变化，由录制版本与 doctor 报告的 gh 版本对照，docs/12 写明 |
-| C10 | 工作分支 | 在当前分支上工作；HEAD 游离或 PR 交付而当前分支就是目标分支时新建 `hoh/run-<run_id 前 12 位>`；之后 HoH 不切换分支，HEAD 离开即提问 | 不改变写者在用户工作树中工作的既有前提（REQ-028），也不在多个 Run 之间偷偷切换分支 |
-| C11 | 远程访问在哪里测 | 全新 Ubuntu 26.04 云镜像 VM（qemu/KVM）中运行 host，宿主经 `ssh -L P:127.0.0.1:P` 访问 | Host 精确校验要求两端端口相同，同机做不到；本机禁止无特权用户命名空间（背景中的实测）；同一 VM 也承担 REQ-066 与 CR-028 的 24.04 准备 |
-| C12 | deployment 检查的时长 | 两台 VM 加原有的 TEST-005-06 在现有的 3600 s 内；M6-T03 先测成本，超出时由 CTO 决定是否调整 `tests/check-plan.json` 的 timeout（不减少内容） | 调整 timeout 不放宽任何判定，但改变检查计划，须先有测量 |
-| C13 | Web 资产不一致的错误码 | 新 ErrorCode `WEB_ASSETS_UNAVAILABLE`（503，details.reason 三值） | ReasonCode 的新码须经 CR；一个码加 details 比三个码简单 |
-| C14 | 可达性怎样判定 | axe-core（锁定版本）的 WCAG 2.1 A/AA 规则零违规，加键盘全流程、焦点可见与四种视口无横向滚动 | 可机器判定；不以截图观感判定（REQ-057 的同一原则） |
-| C15 | 慢客户端的界限 | 页面队列至多 2000 条或 4 MiB，溢出即续接；host RSS 增量至多 64 MiB；B 页的显示时延至多 2 s、命令 202 至多 1 s；每个子例 30 s 内追上 | 与 CR-028 的客户端缓存同一量级；时延断言宽于 REQ-068 的 500 ms，避免与 M7 的性能检查重复；溢出的触发方式见 C24 |
-| C16 | CI 的来源与轮询 | gh 报告的 PR 检查；没有检查不等待；失败写 high Issue 并停止交付；轮询 30 s 起加倍至 600 s（常量） | CI 可选；常量避免再加配置键 |
-| C17 | Web 遇到过期写是否自动重提 | 依据所见内容的决定不重提；Pause/Resume/Cancel 按 ADR-031 决定 9 重读重提 | “冲突明确、不悄悄覆盖”（docs/03）；控制命令与 CLI 一致 |
-| C18 | 合并后的最终提交怎样验证 | 在最终提交上冻结新候选并完整跑发布验证，不复用 PR 头候选的证据，即使 tree 相同 | docs/07 §6“不得仅按文件路径相同就重用旧证据”、§7“不能用 PR 头旧证据证明 merge commit” |
-| C19 | 交付 Attempt 的载体 | Runtime 建立的 `kind='work'` Task 与 `agent` 为空的 Attempt，外部操作记为它的 effect；若实现证明需要新的 `tasks.kind`，另写 CR 加迁移 | 001 与 002 已允许这一形状；不在细化 CR 中预设迁移 |
-| C20 | `[web] host` 与实际绑定不一致（范围外发现：加载器接受 `::1`、`localhost` 等 loopback，host 却恒绑 `127.0.0.1` 且不读该键，`crates/hoh-app/src/host/mod.rs` 的 bind 与 `http.rs` 的 `check_request`） | M6-T02 让 host 的绑定、Host/Origin 校验与 `hoh web` 打印的地址都取 `[web] host`（缺省 127.0.0.1），不缩小加载器接受的取值 | 不缩小 REQ-018 已接受的配置；让默认 loopback 的行为与配置一致、可判定（REQ-061 行为 4） |
-| C21 | host 重启换 token 后页面怎样重新授权（CR31D-01） | 此前有效的 token 被 403 即进入“需要重新授权”，保留投影与草稿；用户运行 `hoh web` 并在新标签页打开；新页面以同源 `BroadcastChannel("hoh-auth")` 交出 `{project_id, token}`，旧页面核对消息与 getRun 的 project_id 后采用并续接；端口变了则旧页面不同源，只提供“复制草稿”；以真实的 host 重启换 token 测试（AC-059-05） | 不改 host 每次启动换 token 的现状，也不持久化 token（C1 的“token 只在内存中”不变）；浏览器读不到 host.json，只有用户再次运行 `hoh web` 才能得到新 token；同源通道不经过 host，token 不进日志；project_id 核对防止同一端口上换成另一项目的 host。未采用：把 token 持久化以便跨重启复用（扩大泄露窗口、改 M2 已验收的行为）；`/healthz` 返回 token 或可换取 token 的凭据（不带认证的端点交出凭据） |
-| C22 | 配置地址、监听地址、规范 authority 怎样统一（CR31D-07） | IPv4 loopback 字面量按原样绑定，authority 为 `<v>:<port>`；`::1` 只绑定 IPv6，authority 为 `[::1]:<port>`；`localhost` 固定绑定 127.0.0.1，authority 为 `localhost:<port>`；Host 逐字节等于规范 authority，其他一律 403；AC-061-04 测三种取值 | 不缩小 REQ-018 已接受的取值；localhost 不经解析器，绑定可判定；DNS 重绑定的名字不可能等于配置的规范 authority，所以仍被拒；一个 authority 使打印的地址、Host 与 Origin 校验一致 |
-| C23 | 合并后的最终提交从哪里冻结（CR31D-02） | 区分工作分支候选（用户工作树、分支头）与最终交付候选（F）；F 先经 `gh pr view` 的 mergeCommit 与取得的目标分支的祖先关系核对，再在 `.hoh/` 下的只读核验 checkout（`git worktree add --detach`）上按 REQ-052 的规则冻结，之后完整重新验证并按登记路径清理；取得只写 `refs/hoh/`；用户的 HEAD、分支与工作树不变；核对不符以 `delivery_merge_unverified` 提问 | 合并后用户工作树的 HEAD 可能仍是 H1，现有冻结从调用 checkout 的 HEAD 冻结；切换用户工作树会改用户的分支并与写者冲突；`candidates.source_path` 已能记录不同的源路径，候选清单与表不需改动 |
-| C24 | 慢客户端的溢出怎样确定地触发（CR31D-05） | web/ 的 e2e 构建（`vite build --mode e2e`）提供只暂停“应用”的接缝，条数与字节两种界限各一个子例；接收、排队、溢出关闭与续接用与发布构建相同的代码；发布用的 `web/dist` 不含接缝（web-e2e 核对）；真实双客户端的时延与 RSS 另作子例，不要求溢出 | CPU 降速不能保证生产快于消费，正确的快实现会被判失败；与 host 的 debug 接缝同一原则：接缝只在测试构建中 |
+按记录：C1 由所有者批准；C2–C20 与 C21–C24 由 CTO 采纳；第 3 稿新增的 C25（403 的 details.reason，CR31D-53）与 C26（最终交付候选的核验 checkout 与对象库，CR31D-50）待 CTO 决定，已按“提议”写进上文的需求，CTO 改变任一项时相应文字随之修改后再送审查。C25 细化 C21 的触发条件，C26 取代 C23 中核验 checkout 的位置、建立方式与 source_path 的说法；C21、C23 的其余内容不变。C25、C26 都不改 CONTRACT 的架构或交互决定、不缩小范围、不降低门槛，也不改变 C1 的所有者决定（token 仍只在片段与页面内存中）。没有需要所有者决定的未决问题。
+
+| ID | 状态（取自决定记录） | 问题 | 提议 | 理由 |
+|---|---|---|---|---|
+| C1 | 所有者批准（记录第 8 行） | Web 外壳是否要 token | 外壳（`/`、`/assets/`）不要 token、仍校验 Host/Origin 并带 CSP 与 no-referrer；每个 `/v1` 请求都要 token；token 不进入 host 日志或 Referer；docs/03 的“每个请求”改为“每个 API 请求” | openapi 的 localToken 把 token 放在 URL 片段，片段不发给服务器，外壳必须先于 token 加载；外壳不含项目数据、不调用命令，API 的认证不变 |
+| C2 | CTO 采纳（记录第 6 行） | Web 资产嵌入二进制还是放在版本目录 | 版本目录中的 `web/`，由 `web/manifest.json` 与二进制的版本、commit、文件摘要核对 | workspace 不允许构建脚本（docs/22），`include_bytes!` 会让 cargo 构建依赖 npm 产物；docs/11 的布局已是“资源按版本目录” |
+| C3 | CTO 采纳（记录第 6 行） | SSE 游标超过已提交水位时的响应 | 409 `CONFLICT` 加 `details{reason: cursor_ahead, watermark}`，不用 410 | 与 CR-028 对超过水位的分页游标按无效处理一致，也不必改 CR-028 中“SSE 410 在 v1 不可达”的 AC-010-03；客户端对两者都做快照重同步 |
+| C4 | CTO 采纳（记录第 6 行） | 测哪些浏览器 | Chromium 跑全部 web-e2e 场景，Firefox 跑 AC-058-01 与 AC-061-01；docs/12 只声明这两种 | 覆盖两个主流引擎的入口与键盘可达性，成本可控；不宣称未测的浏览器（与 CONTRACT 第 15 条同一原则） |
+| C5 | CTO 采纳（记录第 6 行） | Web 能否编辑 Prompt | 只读显示各层与修订；编辑仍按 REQ-047 的文件覆盖 | 新增写命令要改受锁的命令种类（protocol 的 Command.kind 与 001 的 commands.kind CHECK）；REQ-058 的 summary 只要求“可查看” |
+| C6 | CTO 采纳（记录第 6 行） | 缺省的交付模式 | `[git] delivery = "local"`；PR 交付须显式配置 | push 与建 PR 是对外动作；与所有者 O1–O6 的保守取向一致 |
+| C7 | CTO 采纳（记录第 6 行） | 谁合并 PR | 用户或仓库规则；HoH 不合并、不改目标分支 | 合并对外且不可逆；REQ-065 只要求合并后重新绑定 |
+| C8 | CTO 采纳（记录第 6 行） | 目标分支前移时怎样更新工作分支 | merge（不 rebase、不 force push），未推送的分支也用 merge | 所有者“已推送分支只追加提交”（docs/24 第 5 节）；一条规则比按是否推送过分两条更可判定 |
+| C9 | CTO 采纳（记录第 6 行） | PR 路径用什么测 | 本地 bare 仓库作 remote、假 gh（字段形状取自对本仓库已合并 PR 的只读 gh 录制），记 product；不新增 live 检查 | 真实 GitHub 的写操作对外、要仓库与凭证；新增检查会改 release-policy 的 14 项。残余风险：gh 输出格式变化，由录制版本与 doctor 报告的 gh 版本对照，docs/12 写明 |
+| C10 | CTO 采纳（记录第 6 行） | 工作分支 | 在当前分支上工作；HEAD 游离或 PR 交付而当前分支就是目标分支时新建 `hoh/run-<run_id 前 12 位>`；之后 HoH 不切换分支，HEAD 离开即提问 | 不改变写者在用户工作树中工作的既有前提（REQ-028），也不在多个 Run 之间偷偷切换分支 |
+| C11 | CTO 采纳（记录第 6 行） | 远程访问在哪里测 | 全新 Ubuntu 26.04 云镜像 VM（qemu/KVM）中运行 host，宿主经 `ssh -L P:127.0.0.1:P` 访问 | Host 精确校验要求两端端口相同，同机做不到；本机禁止无特权用户命名空间（背景中的实测）；同一 VM 也承担 REQ-066 与 CR-028 的 24.04 准备 |
+| C12 | CTO 采纳（记录第 6 行） | deployment 检查的时长 | 两台 VM 加原有的 TEST-005-06 在现有的 3600 s 内；M6-T03 先测成本，超出时由 CTO 决定是否调整 `tests/check-plan.json` 的 timeout（不减少内容） | 调整 timeout 不放宽任何判定，但改变检查计划，须先有测量 |
+| C13 | CTO 采纳（记录第 6 行） | Web 资产不一致的错误码 | 新 ErrorCode `WEB_ASSETS_UNAVAILABLE`（503，details.reason 三值） | ReasonCode 的新码须经 CR；一个码加 details 比三个码简单 |
+| C14 | CTO 采纳（记录第 6 行） | 可达性怎样判定 | axe-core（锁定版本）的 WCAG 2.1 A/AA 规则零违规，加键盘全流程、焦点可见与四种视口无横向滚动 | 可机器判定；不以截图观感判定（REQ-057 的同一原则） |
+| C15 | CTO 采纳（记录第 6 行） | 慢客户端的界限 | 页面队列至多 2000 条或 4 MiB，溢出即续接；host RSS 增量至多 64 MiB；B 页的显示时延至多 2 s、命令 202 至多 1 s；每个子例 30 s 内追上 | 与 CR-028 的客户端缓存同一量级；时延断言宽于 REQ-068 的 500 ms，避免与 M7 的性能检查重复；溢出的触发方式见 C24 |
+| C16 | CTO 采纳（记录第 6 行） | CI 的来源与轮询 | gh 报告的 PR 检查；没有检查不等待；失败写 high Issue 并停止交付；轮询 30 s 起加倍至 600 s（常量） | CI 可选；常量避免再加配置键 |
+| C17 | CTO 采纳（记录第 6 行） | Web 遇到过期写是否自动重提 | 依据所见内容的决定不重提；Pause/Resume/Cancel 按 ADR-031 决定 9 重读重提 | “冲突明确、不悄悄覆盖”（docs/03）；控制命令与 CLI 一致 |
+| C18 | CTO 采纳（记录第 6 行） | 合并后的最终提交怎样验证 | 在最终提交上冻结新候选并完整跑发布验证，不复用 PR 头候选的证据，即使 tree 相同 | docs/07 §6“不得仅按文件路径相同就重用旧证据”、§7“不能用 PR 头旧证据证明 merge commit” |
+| C19 | CTO 采纳（记录第 6 行） | 交付 Attempt 的载体 | Runtime 建立的 `kind='work'` Task 与 `agent` 为空的 Attempt，外部操作记为它的 effect；若实现证明需要新的 `tasks.kind`，另写 CR 加迁移 | 001 与 002 已允许这一形状；不在细化 CR 中预设迁移 |
+| C20 | CTO 采纳（记录第 6 行） | `[web] host` 与实际绑定不一致（范围外发现：加载器接受 `::1`、`localhost` 等 loopback，host 却恒绑 `127.0.0.1` 且不读该键，`crates/hoh-app/src/host/mod.rs` 的 bind 与 `http.rs` 的 `check_request`） | M6-T02 让 host 的绑定、Host/Origin 校验与 `hoh web` 打印的地址都取 `[web] host`（缺省 127.0.0.1），不缩小加载器接受的取值 | 不缩小 REQ-018 已接受的配置；让默认 loopback 的行为与配置一致、可判定（REQ-061 行为 4） |
+| C21 | CTO 采纳（记录第 11 行） | host 重启换 token 后页面怎样重新授权（CR31D-01） | 此前有效的 token 被 403 即进入“需要重新授权”，保留投影与草稿；用户运行 `hoh web` 并在新标签页打开；新页面以同源 `BroadcastChannel("hoh-auth")` 交出 `{project_id, token}`，旧页面核对消息与 getRun 的 project_id 后采用并续接；端口变了则旧页面不同源，只提供“复制草稿”；以真实的 host 重启换 token 测试（AC-059-05）。（第 3 稿：触发条件由 C25 细化为只认 `details.reason=bad_token` 的 403） | 不改 host 每次启动换 token 的现状，也不持久化 token（C1 的“token 只在内存中”不变）；浏览器读不到 host.json，只有用户再次运行 `hoh web` 才能得到新 token；同源通道不经过 host，token 不进日志；project_id 核对防止同一端口上换成另一项目的 host。未采用：把 token 持久化以便跨重启复用（扩大泄露窗口、改 M2 已验收的行为）；`/healthz` 返回 token 或可换取 token 的凭据（不带认证的端点交出凭据） |
+| C22 | CTO 采纳（记录第 11 行） | 配置地址、监听地址、规范 authority 怎样统一（CR31D-07） | IPv4 loopback 字面量按原样绑定，authority 为 `<v>:<port>`；`::1` 只绑定 IPv6，authority 为 `[::1]:<port>`；`localhost` 固定绑定 127.0.0.1，authority 为 `localhost:<port>`；Host 逐字节等于规范 authority，其他一律 403；AC-061-04 测三种取值 | 不缩小 REQ-018 已接受的取值；localhost 不经解析器，绑定可判定；DNS 重绑定的名字不可能等于配置的规范 authority，所以仍被拒；一个 authority 使打印的地址、Host 与 Origin 校验一致 |
+| C23 | CTO 采纳（记录第 11 行） | 合并后的最终提交从哪里冻结（CR31D-02） | 区分工作分支候选（用户工作树、分支头）与最终交付候选（F）；F 先经 `gh pr view` 的 mergeCommit 与取得的目标分支的祖先关系核对，再在 `.hoh/` 下的只读核验 checkout（`git worktree add --detach`）上按 REQ-052 的规则冻结，之后完整重新验证并按登记路径清理；取得只写 `refs/hoh/`；用户的 HEAD、分支与工作树不变；核对不符以 `delivery_merge_unverified` 提问。（第 3 稿：其中核验 checkout 的位置与建立方式（`.hoh/` 下、`git worktree add`）以及“source_path 为该 checkout”被 C26 取代，CR31D-50） | 合并后用户工作树的 HEAD 可能仍是 H1，现有冻结从调用 checkout 的 HEAD 冻结；切换用户工作树会改用户的分支并与写者冲突；`candidates.source_path` 已能记录不同的源路径，候选清单与表不需改动 |
+| C24 | CTO 采纳（记录第 11 行） | 慢客户端的溢出怎样确定地触发（CR31D-05） | web/ 的 e2e 构建（`vite build --mode e2e`）提供只暂停“应用”的接缝，条数与字节两种界限各一个子例；接收、排队、溢出关闭与续接用与发布构建相同的代码；发布用的 `web/dist` 不含接缝（web-e2e 核对）；真实双客户端的时延与 RSS 另作子例，不要求溢出 | CPU 降速不能保证生产快于消费，正确的快实现会被判失败；与 host 的 debug 接缝同一原则：接缝只在测试构建中 |
+| C25 | 待 CTO 决定 | 页面怎样区分 host 重启换 token 与地址被拒（CR31D-53） | 每个 403 带稳定的 `details.reason`：`bad_token`（token 缺失或错误）或 `bad_authority`（Host、Origin、请求目标的 authority、多个 Origin、socket 上的 Origin 或 authority），两者都不符为 `bad_authority`；code 仍为 `FORBIDDEN`；写进 openapi 的 `components.responses.Forbidden` 说明；页面只在此前有效的 token 得到 `bad_token` 时重新授权，`bad_authority` 只提示规范地址或相同端口转发，不丢弃 token；AC-059-05 断言 reason 并以 stub 子例覆盖 bad_authority 不触发重新授权，AC-061-04 与 AC-058-01 断言 host 给出的 reason | 今天三类拒绝都是同一个 FORBIDDEN、没有 details（`http.rs` 的 `check_request`），把任意 403 当成重启会停用仍然有效的 token，也会把相同端口转发的错误误报为重启；给已有的 403 响应补一个机器可读的字段属于 CR-003 D1 第 1 条（补齐缺失的字段），不加 ErrorCode、不改 Error 的 schema（`details` 本就是开放对象）、不改认证规则。先判 authority 与今天的检查顺序一致，且不泄露 token 是否正确。未采用：新的 ErrorCode（要改受锁的 ReasonCode，且与 FORBIDDEN 的通用码重复）；按 message 文字区分（不是契约） |
+| C26 | 待 CTO 决定 | 最终交付候选的核验 checkout 放在哪里、对象写到哪里、何时删除（CR31D-50） | 核验 checkout V 与验证者的运行目录同根、在项目树之外（`<运行目录的根>/<project_id>/delivery-<run_id>-<F 前 12 位>/`），先登记确切路径再以 `git clone --shared --no-checkout` 与 `git checkout --detach F` 建立；V 的 `.hoh/` 被忽略，`environment.json` 为项目环境描述的逐字节副本；以 V 为 checkout、V 的 `.hoh/` 为状态目录、项目为对象库的根冻结（冻结驱动增加对象库根的显式参数，现有调用方不变），`source_path` 仍是导出的对象路径；V 记在 candidate.frozen 载荷的 `checkout` 中；冻结返回后立即删除 V，验证照常在运行目录中进行，`refs/hoh/delivery/<run_id>/` 在 release 绑定或 Run 结束后删除；取得用 `git fetch --no-tags --no-write-fetch-head --refmap=` | ADR-027 决定 4 与 `candidates.rs` 规定 `source_path` 是导出的对象路径，检查驱动以 `project.join(source_path)` 读它（`check.rs` 的 `run_with`），第 2 稿把 checkout 写进去会使检查读不到导出；冻结驱动只接受状态目录之内的非跟踪 environment，并把对象写到状态目录的父目录：以项目的 `.hoh/` 为状态目录时 V 中的 `.hoh/environment.json` 被拒，以 V 的 `.hoh/` 为状态目录而不分开对象库时对象随 V 一起被删除，所以必须把对象库的根与状态目录分开。V 采用运行目录已有的建立方式（`verify/rundir.rs`）：不写项目的仓库，对象目录只有 alternates（实测）；V 只为冻结存在，冻结后即删，验证不依赖它；`--refmap=` 与 `--no-write-fetch-head` 是实测发现的另两处写入（以 remote 名取得会顺带移动 `refs/remotes/`）。未采用：在项目的 `.hoh/` 下 `git worktree add`（写项目仓库的 worktree 管理数据，且项目的 `.hoh/` 是它的父目录）；把 V 的路径加进候选清单（`candidate.schema.json` 的 `additionalProperties: false`，要改受锁 schema）或 `candidates` 表（要迁移） |
 
 ## 不变的部分
 
@@ -1631,16 +1664,16 @@ docs/24 明确点给 M6 的只有第 5 节“已推送分支只追加提交 → 
 | REQ-066 | 二进制、内置资源、Web 资产版本一致 → 066-02；安装配置命令经实跑 → 066-01；原 when 的“全新 VM 安装和卸载保留数据” → 066-01、066-03 |
 
 - 六个 TEST-xxx-01 的 check 都不变（058、059、060、061 为 web-e2e，065 为 integration，066 为 deployment）；新增的 TEST 用 web-e2e、integration、recovery、deployment，都在 v1 档的必跑检查中。
-- 不改：CONTRACT、`docs/10-acceptance.md`、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`tests/check-plan.json`（web-e2e 的 argv 由 M6-T02 交付时替换，这是 CR-003 的既定移交）、`contracts/sql/` 下的全部迁移、`contracts/candidate.schema.json`、各 schema 中除 ErrorCode 之外的部分、`config/hoh.example.toml`、Run 的状态迁移表（AC-036-01）、各检查的归属（web-e2e 仍归 M6-T02，deployment 仍归 M2-T14）。没有门禁阈值、检查或证据规则被放宽。
+- 不改：CONTRACT、`docs/10-acceptance.md`、`contracts/release-policy.json`、`tools/release_gate.py` 与其余门禁工具、`tests/check-plan.json`（web-e2e 的 argv 由 M6-T02 交付时替换，这是 CR-003 的既定移交）、`contracts/sql/` 下的全部迁移、`contracts/candidate.schema.json`、`candidates` 表与 `source_path` 的含义（ADR-027 决定 4）、各 schema 中除 ErrorCode 之外的部分、openapi 的 Error schema 与 securitySchemes、`config/hoh.example.toml`、Run 的状态迁移表（AC-036-01）、各检查的归属（web-e2e 仍归 M6-T02，deployment 仍归 M2-T14）。没有门禁阈值、检查或证据规则被放宽。
 - 非 M6 的需求只有 REQ-018 增加一条决定（`[git]` 键），它的行为与 AC 不变。
 - 开发流程的 low 清理包（docs/19）在 M6-T04 之前照常进行，不是 development-tasks 中的任务。
 
 ## 是否属于 CR-003 D1
 
-1. 把 6 项 outline 细化为 detailed，补齐一个原因码（`WEB_ASSETS_UNAVAILABLE`）与 openapi 中 Web 外壳的两条路径，REQ-018 的键表增加 `[git]`（第 1 条）。
+1. 把 6 项 outline 细化为 detailed，补齐一个原因码（`WEB_ASSETS_UNAVAILABLE`）与 openapi 中 Web 外壳的两条路径，给已有的 403 响应补齐机器可读的 `details.reason`（只改 `components.responses.Forbidden` 的说明，code、Error 的 schema 与认证规则不变，C25），REQ-018 的键表增加 `[git]`（第 1 条）。
 2. 不删需求或 AC；required、release_class、release_targets 不变（第 2 条）。
 3. 不放宽任何门禁、检查或证据规则；PR 头候选的证据不能用于最终提交（加严）；文档命令须实跑或逐个标注理由（加严）（第 3 条）。
-4. 不改 CONTRACT 的架构与交互决定：Web 是同一 host 的客户端（第 2、6、13 条），命令面不变（第 3 条），默认 loopback 与 SSH 转发照 docs/11；交付由 Runtime 执行、Commander 不写（CR-024）。C1 改写了 docs/03 中所有者写下的一句交互/安全约定（“每个请求”→“每个 API 请求”），已按 docs/21 交所有者，所有者于 2026-11-22 批准；本 CR 的其余部分（含第 2 稿新增的 C21–C24）都在 D1 之内（第 4 条）。
+4. 不改 CONTRACT 的架构与交互决定：Web 是同一 host 的客户端（第 2、6、13 条），命令面不变（第 3 条），默认 loopback 与 SSH 转发照 docs/11；交付由 Runtime 执行、Commander 不写（CR-024）。C1 改写了 docs/03 中所有者写下的一句交互/安全约定（“每个请求”→“每个 API 请求”），已按 docs/21 交所有者，所有者于 2026-11-22 批准；本 CR 的其余部分（含第 2、3 稿新增的 C21–C26；C26 给冻结驱动增加的对象库根参数是 M6-T06 的实现细节，不改 REQ-052 的冻结规则与 ADR-027 决定 4）都在 D1 之内（第 4 条）。
 
 故本 CR 拟由 CTO 依 D1 在独立设计审查 PASS 之后批准；C1 部分已有所有者的批准。
 
@@ -1669,31 +1702,53 @@ docs/24 明确点给 M6 的只有第 5 节“已推送分支只追加提交 → 
 
 第 2 轮应审查第 2 稿相对 `05b2ef6c` 的差异：上述修正、新增的 AC-059-05 与 AC-061-04、C21–C24，以及这些修正是否引入新的矛盾。
 
+### 第 2 轮（设计审查，第 2 稿的修正差异）
+
+- 审查者：Grok（grok 1.0.89，模型 grok-4.7，reviewer 角色，独立会话），attempt `cd922f21-5a44-4b5a-a9fb-404b768734e8`，会话 `01a1ff8a-18c3-7e52-9ef6-fa0f76f0ee04`；2026-11-21T19:16:41Z–19:31:26Z，退出码 0。
+- 对象：冻结提交 `39386bf0` 的只读审查副本，差异 `05b2ef6c..39386bf0`（只改了本文件）。
+- 记录：主仓库 `.hoh-dev/evidence/m6spec-review-grok-r2.out`（桥的摘要，其 `report` 字段为 null）；`hoh-report` 取自同一 attempt 的 `.hoh-dev/attempts/cd922f21-5a44-4b5a-a9fb-404b768734e8/attempt.json` 的 `assistant_text_tail` 与 `stdout.jsonl` 的最后结果。
+- 结论：FAIL，1 high（CR31D-50）、4 medium（CR31D-51..54）、0 low、无 critical。审查者核对了第 1 轮 CR31D-01、-03..-09 的修正已落地，CR31D-02 的修正不完整（即 CR31D-50）；本文的 JSON 块都可解析；没有重跑 validate_bundle。
+
+| ID | 级别 | 发现（摘要） | 处置（第 3 稿） |
+|---|---|---|---|
+| CR31D-50 | high | 行为 6、AC-065-04 与 C23 把核验 checkout 写进 `candidates.source_path`，而 ADR-027 决定 4 规定它是导出的对象路径，`check.rs` 以 `project.join(source_path)` 读导出；核验目录在项目 `.hoh/` 下时冻结驱动拒绝 `..` 路径的 environment，把状态目录放进核验目录则对象随清理被删除 | 已修（CR31D-02 的同一类第二次：先读 `freeze.rs`、`environment.rs`、`candidates.rs`、`check.rs` 与 `rundir.rs` 写出设计修正 C26，并以 git 实测核对 clone 与取得的行为，再改条文；第 1 节“新事件”、第 2 节第 6 条、REQ-065 行为 2、6、失败模式与决定、AC-065-04、TEST-065-04、M6-T06 的 done_when、闭包表）：`source_path` 仍是导出的对象路径；核验 checkout 与验证者的运行目录同根、在项目树之外，以 `git clone --shared` 建立（对象目录只有 alternates，实测），其 `.hoh/` 作冻结的状态目录、`environment.json` 为项目环境描述的逐字节副本；冻结驱动增加对象库根的显式参数，对象写进项目的 `.hoh/objects/`；checkout 路径记在 candidate.frozen 载荷的 `checkout`；冻结返回后立即删除 checkout，验证照常在运行目录中进行；AC-065-04 断言 source_path 指向存在且摘要相符的导出对象、environment 摘要、验证者开始时 checkout 已删除、绑定 release 时导出仍在 |
+| CR31D-51 | medium | `git fetch <remote> +refs/heads/<目标>:refs/hoh/...` 会自动跟随写入远端的新标签，AC 只断言 refs/heads 与 refs/remotes | 已修：argv 加 `--no-tags`；AC-065-04 断言 `refs/tags/` 不变（夹具在合并后加标签 v-new）。修正时在副本中实测（见“验证方式”）又发现两处同类写入：以 remote 名取得时 git 按 `remote.<name>.fetch` 顺带移动 `refs/remotes/<remote>/<目标>`（第 2 稿“不改 refs/remotes/”的说法不成立），并写 `.git/FETCH_HEAD`；argv 再加 `--refmap=` 与 `--no-write-fetch-head`，AC 同时断言 `refs/remotes/` 与 FETCH_HEAD 不变并核对 git 垫片记录的 argv |
+| CR31D-52 | medium | C21–C24 仍写“待 CTO 决定”，而 CTO 决定记录第 11 行已写明采纳，与第 1 轮 CR31D-09 同一类 | 已修，并按“同类问题第二次先改设计”改了写法：“CTO 的问题与决定”的表增加“状态（取自决定记录）”列，每项的状态按写明的规则从记录得出并注明行号（C1 所有者批准，第 8 行；C2–C20 采纳，第 6 行；C21–C24 采纳，第 11 行；C25、C26 待定），文首与其他节不再另写状态；已采纳的项不改条文，改动写成新的 C 项并在原项注明；“验证方式”增加状态核对脚本，从记录重新计算并与表逐项比较 |
+| CR31D-53 | medium | 重新授权的触发是“此前有效的 token 被 403”，而 `http.rs` 对 Host、Origin 与错误 token 返回同一个 FORBIDDEN、没有 details，页面无法区分换 token 与地址被拒 | 已修（C25；第 1 节、第 5 节的 `components.responses.Forbidden`、REQ-058 失败模式与 AC-058-01、REQ-061 行为 4、失败模式、AC-061-03、-04 与决定、REQ-059 行为 7、失败模式、AC-059-05 与决定、M6-T02 的 done_when、闭包表）：每个 403 带 `details.reason`（`bad_token` 或 `bad_authority`，两者都不符为 `bad_authority`），作为 CR-003 D1 第 1 条对 openapi 已有 403 的细化写进 Forbidden 的说明；重新授权只认 `bad_token`；AC-059-05 断言重启后第一个 403 的 reason 为 `bad_token`，并以标明 stub 的子例 (d) 断言 `bad_authority` 不触发重新授权、原 token 继续可用 |
+| CR31D-54 | medium | delivery_merge_unverified 只列不符项，没有选项；fetch 先于 gh pr view，短暂不一致也会走进提问，之后没有重试或退出 | 已修：第一次不符时等待 30 s 后重做一次取得与核对，仍不符才提问；问题列出每个不符项（字段、forge 的值、本地核对的值）与三个选项：再次取得并核对、改为本地交付（以已通过发布验证的 PR 头候选完成本地交付）、取消；AC-065-04 增加短暂不一致（T：不提问）与持续不一致的两种作答（U1 再次取得后冻结，U2 改为本地交付后绑定 PR 头候选） |
+
+第 3 轮应审查第 3 稿相对 `39386bf0` 的差异：上述修正、新增的 C25、C26 与状态核对规则，以及这些修正是否引入新的矛盾。
+
 ## 验证方式
 
-第 3–7 节的片段由应用脚本从本文的 JSON 块直接取出（每节的 ```json 块与 `/v1/events` 的 ```text 块），在仓库之外的副本上机械验证，不改工作树中的受锁文件。副本中的 CR 与本文只差“状态”一行（副本中为 APPROVED 以便 relock）以及“审查记录”“验证方式”两节的文字；片段部分逐字相同。第 2 稿重新写了应用脚本与闭包核对脚本（第 1 稿所用的脚本未保留），两者都放在副本目录中，用完与副本一并删除。
+第 3–7 节的片段由应用脚本从本文的 JSON 块直接取出（每节的 ```json 块与 `/v1/events` 的 ```text 块），在仓库之外的副本上机械验证，不改工作树中的受锁文件。副本中的 CR 与本文只差“状态”一行（副本中为 APPROVED 以便 relock）以及片段之外的说明文字（“验证方式”一节与各需求前的修订说明）；片段部分逐字相同（提交前以脚本比较两者的全部 ```json 与 ```text 块，相同）。第 3 稿重写了应用脚本与闭包核对脚本（第 2 稿的未保留），并新增状态核对脚本与 git 实测脚本；这一次四个脚本与全部输出都保存在主仓库被 git 忽略的 `.hoh-dev/evidence/m6-spec-d3/`（脚本在其 `scripts/` 下），副本目录用完即删。
 
-1. `mktemp -d /home/ai/dev/m6spec-XXXXXX` 建立副本目录；`git archive` 取 `prep/M6-T01-spec` 的 HEAD（`05b2ef6c`：基线 revision 22 的 main `8d9ae599` 加第 1 稿）解到其中，`git init` 后提交为基础，再放入第 2 稿的 CR 并把“状态”改为 APPROVED。
-2. 应用脚本（`python3 -I <副本目录>/tools/apply_cr031.py <副本>`）按第 3–7 节整体替换六个需求对象与它们的场景（场景放在旧场景的位置）、给 REQ-018 的 decisions 末尾追加一条、给 ErrorCode 的 enum 末尾追加 `WEB_ASSETS_UNAVAILABLE`、给 openapi 增加两条路径（先核对不重名）并在 `/v1/events` 的说明末尾追加一句、替换 M6-T02 与 M6-T03 并把 M6-T05、M6-T06 插在 M6-T03 之前、把 M6-T04 的依赖从 `["M6-T02", "M6-T03"]` 改为四个实现任务；`config/hoh.example.toml` 不动。
-3. 在副本中运行 `python3 tools/validate_bundle.py`（预期只有受锁文件变化与生成视图过期）、`python3 tools/gen_spec_views.py`、`python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`（不需 `--add`：没有新契约）、`python3 tools/validate_bundle.py`，再以 `source .hoh-dev/env.sh` 的环境运行 `bash scripts/check.sh --bundle`。
-4. 闭包核对脚本（`python3 <副本目录>/tools/closure_cr031.py <副本>`，用 `tools/validate_bundle.py` 的 `ancestors` 与 `owned_acceptance`）核对第 8 节表中点名的每个提供者都是该 AC 所属任务本身或其祖先（只有表中标“待 CR-028”“待 CR-030”的 M4-T06、M4-T09、M5-T07 例外，它们在副本中不存在）、每条 AC 恰归一个 M6 实现任务、表中的检查与场景的 check_id 一致、表的行恰为 23 条 AC。另以一次变异确认脚本能报错：在 AC-065-03 的提供者中加入非祖先 M6-T05，脚本报 1 处不符。
+1. `mktemp -d /home/ai/dev/m6spec-XXXXXX` 建立副本目录；`git archive` 取 `prep/M6-T01-spec` 的 HEAD（`39386bf0`：基线 revision 22 的 main `8d9ae599` 加第 1、2 稿）解到其中，`git init` 后提交为基础，再放入第 3 稿的 CR 并把“状态”改为 APPROVED。
+2. 应用脚本（`python3 -I scripts/apply_cr031.py <副本>`）按第 3–7 节整体替换六个需求对象与它们的场景（场景放在旧场景的位置）、给 REQ-018 的 decisions 末尾追加一条、给 ErrorCode 的 enum 末尾追加 `WEB_ASSETS_UNAVAILABLE`、给 openapi 增加两条路径（先核对不重名）、在 `/v1/events` 的说明末尾追加一句并替换 `components.responses.Forbidden`（先核对它的 content 不变）、替换 M6-T02 与 M6-T03 并把 M6-T05、M6-T06 插在 M6-T03 之前、把 M6-T04 的依赖从 `["M6-T02", "M6-T03"]` 改为四个实现任务；`config/hoh.example.toml` 不动。
+3. 在副本中运行 `python3 tools/validate_bundle.py`（预期只有受锁文件变化与生成视图过期）、`python3 tools/gen_spec_views.py`、`python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`（不需 `--add`：没有新契约）、`python3 tools/validate_bundle.py`，再以 `source .hoh-dev/env.sh`（工作树的，副本中没有 `.hoh-dev/`）的环境运行 `bash scripts/check.sh --bundle`。
+4. 闭包核对脚本（`python3 -I scripts/closure_cr031.py <副本>`，用副本中 `tools/validate_bundle.py` 的 `ancestors` 与 `owned_acceptance`）核对第 8 节表中点名的每个提供者都是该 AC 所属任务本身或其祖先（只有表中标“待 CR-028”“待 CR-030”的 M4-T06、M4-T09、M5-T07 例外，它们在副本中不存在）、每条 AC 恰归一个 M6 实现任务、表中的检查与场景的 check_id 一致、表的行恰为 23 条 AC；`--mutate` 在 AC-065-03 的提供者中加入非祖先 M6-T05，确认脚本能报错。
+5. 状态核对脚本（`python3 -I scripts/status_cr031.py <本文> <CTO 决定记录>`）按“CTO 的问题与决定”写明的规则从决定记录重新计算每个 C 项的状态，与表的“状态”列逐项比较，并确认“审查记录”之前、该节之外没有写状态；另以一份把 C22 改标为“待 CTO 决定”的副本确认脚本能报错（CR31D-52）。
+6. git 实测（`bash scripts/git_probe.sh <空目录>`，只在给定目录中建仓库，`HOME` 指向其中，git 2.53.0）：在一次性的 bare 远端与本地克隆上，目标分支前移并加新标签 v-new 后，分别以三种 argv 取得到 `refs/hoh/delivery/R/base`，导出 `refs/heads`、`refs/remotes`、`refs/tags` 与 `.git/FETCH_HEAD` 的前后；再以 `git clone --shared --no-checkout` 与 `git checkout --detach F` 建立核验 checkout，看它的 HEAD、tree、状态与对象目录（CR31D-50、-51）。
 
-结果（第 2 稿提交前的最后一次运行，2026-11-21 UTC）：
+结果（第 3 稿提交前的运行，2026-11-21 UTC；输出文件名为 `.hoh-dev/evidence/m6-spec-d3/` 下的文件）：
 
-- 应用脚本：退出码 0（applied）
-- 应用片段后、生成视图与 relock 之前的 `python3 tools/validate_bundle.py`：退出码 1，status=FAIL，只有三项预期的错误（受锁的 contracts/acceptance-scenarios.json 已变、docs/02 与 docs/18 过期），没有归属或格式错误
-- `python3 tools/gen_spec_views.py`：退出码 0
-- `python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`：退出码 0（Baseline HOH-BASELINE-1.1 revision 23 verified (27 files)）
-- `python3 tools/validate_bundle.py`：退出码 0；status=PASS，errors=[]；counts：requirements=70、detailed_requirements=49（原 43）、acceptance=231（原 214）、development_tasks=67（原 65）
-- 副本中改动的文件：contracts/acceptance-scenarios.json、contracts/baseline-lock.json、contracts/development-tasks.json、contracts/openapi.json、contracts/protocol.schema.json、contracts/requirements.json、docs/02-functional-spec.md、docs/18-traceability.md、docs/cr/CR-031-m6-detailed-spec.md
-- 闭包核对：退出码 0；23 行、23 条 AC、121 处提供者引用（含“本任务”），5 处为“待 CR-028/CR-030”，0 处不符；M6-T02=2 项需求/6 条 AC、M6-T05=2/8、M6-T06=1/5、M6-T03=2/4，23 条 AC 都恰有一个所属任务；变异检查：报 1 处不符（not ancestor M6-T06 AC-065-03 M6-T05）
-- `bash scripts/check.sh --bundle`（同一副本）：退出码 0；Ran 570 tests in 146.731s；OK (skipped=2)：`test_ledger_outline_requirements_not_ready`（“M3 already detailed”）与 `test_repository_packages_verified`（“Pi packages not installed here”），两项在 main 上同样跳过，不计为产品 PASS。此前一次未加载 `.hoh-dev/env.sh` 的运行因缺少 jsonschema 与 `XDG_RUNTIME_DIR` 失败（186 failures、31 errors），属环境错误，不计入；另一次运行在片段的最后文字修改之前被中止，结果未用
-- Rust 演示（第 1 稿第 5 步）在第 2 稿中没有重跑（NOT_RUN）：第 3 节的 ErrorCode 改动与第 1 稿逐字相同，第 1 稿的结果仍适用（只改 schema 时 `cargo test -p hoh-core --locked --test protocol_roundtrip` 失败于 `rust_enums_list_exactly_the_schema_values`，加入 `WebAssetsUnavailable` 后 8 passed，`cargo check --workspace --all-targets --locked` 退出码 0）；完整的 `cargo test --workspace --locked` 是应用时的步骤（“应用时的步骤”第 3 条），也没有运行
+- 应用脚本：退出码 0（applied，`01-apply.out`）
+- 应用片段后、生成视图与 relock 之前的 `python3 tools/validate_bundle.py`：退出码 1，status=FAIL，只有三项预期的错误（受锁的 contracts/acceptance-scenarios.json 已变、docs/02 与 docs/18 过期），没有归属或格式错误（`02-validate-before.out`）
+- `python3 tools/gen_spec_views.py`：退出码 0（`03-gen-views.out`）
+- `python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`：退出码 0（Baseline HOH-BASELINE-1.1 revision 23 verified (27 files)，`04-relock.out`）
+- `python3 tools/validate_bundle.py`：退出码 0；status=PASS，errors=[]；counts：requirements=70、detailed_requirements=49（原 43）、acceptance=231（原 214）、development_tasks=67（原 65）（`05-validate-after.out`）
+- 副本中改动的文件：contracts/acceptance-scenarios.json、contracts/baseline-lock.json、contracts/development-tasks.json、contracts/openapi.json、contracts/protocol.schema.json、contracts/requirements.json、docs/02-functional-spec.md、docs/18-traceability.md、docs/cr/CR-031-m6-detailed-spec.md（`06-changed-files.out`）；openapi 的差异只有两条新路径、`/v1/events` 说明的一句与 Forbidden 的说明
+- 闭包核对：退出码 0；23 行、23 条 AC、122 处提供者引用（含“本任务”），5 处为“待 CR-028/CR-030”，0 处不符；M6-T02=2 项需求/6 条 AC、M6-T05=2/8、M6-T06=1/5、M6-T03=2/4，23 条 AC 都恰有一个所属任务（`07-closure.out`）；变异检查：退出码 1，报 1 处不符（not ancestor M6-T06 AC-065-03 M6-T05，`08-closure-mutation.out`）
+- 状态核对：退出码 0；26 项，所有者批准 C1，CTO 采纳 C2–C24，待 CTO 决定 C25、C26，0 处不符（`09-status.out`）；变异检查：退出码 1，报 C22 不符（`10-status-mutation.out`）
+- git 实测（`git-probe.out`，退出码 0）：不带选项的取得写入了 `refs/tags/v-new`、移动了 `refs/remotes/origin/main` 与 `origin/HEAD` 并写 FETCH_HEAD；只加 `--no-tags` 时标签不再写入，但 `refs/remotes/origin/main` 仍被移动；`--no-tags --no-write-fetch-head --refmap=` 时 `refs/heads`、`refs/remotes`、`refs/tags` 与 FETCH_HEAD 都不变，只有 `refs/hoh/delivery/R/base` 指向 F，F 是它的祖先或其本身；核验 checkout 的 HEAD 为 F、tree 等于 F 的 tree，加入被忽略的 `.hoh/` 与 `environment.json` 后状态为空，对象目录中 0 个对象文件、只有指向项目的 alternates，用户克隆的 HEAD 仍在 feature、状态为空
+- `bash scripts/check.sh --bundle`（同一副本）：退出码 0；Ran 570 tests in 134.867s；OK (skipped=2)：`test_ledger_outline_requirements_not_ready`（“M3 already detailed”）与 `test_repository_packages_verified`（“Pi packages not installed here”），两项在 main 上同样跳过，不计为产品 PASS（`12-check-bundle.out`）。此前一次未加载 env.sh 的运行因缺少 jsonschema 失败（186 failures、31 errors），属环境错误，不计入（`11-check-bundle-no-env.out`）
+- 工作树（相对 `39386bf0` 只改本文件，加入本行之前）上的 `bash scripts/check.sh --bundle`：退出码 0；Ran 570 tests；OK (skipped=2)，跳过项同上（`13-worktree-check-bundle.out`）
+- Rust 演示（第 1 稿第 5 步）在第 2、3 稿中没有重跑（NOT_RUN）：第 3 节的 ErrorCode 改动与第 1 稿逐字相同，C25 不加 ErrorCode，第 1 稿的结果仍适用（只改 schema 时 `cargo test -p hoh-core --locked --test protocol_roundtrip` 失败于 `rust_enums_list_exactly_the_schema_values`，加入 `WebAssetsUnavailable` 后 8 passed，`cargo check --workspace --all-targets --locked` 退出码 0）；完整的 `cargo test --workspace --locked` 是应用时的步骤（“应用时的步骤”第 3 条），也没有运行
 
-本 CR 的 23 条 AC 都是待实现的规格，产品的红/绿与全部 web-e2e、deployment、integration、recovery 场景都 **NOT_RUN**；以上只是规格片段的机械自检，不是验收。设计审查第 1 轮为 FAIL（见“审查记录”），第 2 轮尚未进行。
+本 CR 的 23 条 AC 都是待实现的规格，产品的红/绿与全部 web-e2e、deployment、integration、recovery 场景都 **NOT_RUN**；以上只是规格片段的机械自检与对 git 行为的实测，不是验收。设计审查第 1、2 轮为 FAIL（见“审查记录”），第 3 轮尚未进行。
 
 ## 应用时的步骤（M6-T01 领取时，M5-T04 之后）
 
 1. 按当时的 main 重核本 CR：“对未应用规格的假设”逐条核对（CR-028、CR-030 已应用后的 requirements、openapi、protocol、development-tasks），第 8 节的闭包表把“待 CR-028”“待 CR-030”的提供者换成实际任务后重新机械核对；有变化的先写进本 CR 的更正、经审查后再应用。
-2. 按 docs/21 的“基线变更的机械步骤”在工作树中应用第 3–7 节的片段（都是完整对象：六个需求对象与它们的场景整体替换，REQ-018 的 decisions 末尾追加一条，ErrorCode 的 enum 末尾追加一个值，openapi 增加两条路径并在 `/v1/events` 的说明末尾追加一句，M6 的任务按第 7 节替换与插入；本稿使用的应用脚本见“验证方式”），在同一提交中把 `WEB_ASSETS_UNAVAILABLE` 加进 `crates/hoh-core/src/protocol.rs` 的 `ErrorCode`，并把 docs/03 第 51 行的“每个请求都要携带……token”改为“每个 API 请求”（C1，所有者已批准），写明外壳不含项目数据。
+2. 按 docs/21 的“基线变更的机械步骤”在工作树中应用第 3–7 节的片段（都是完整对象：六个需求对象与它们的场景整体替换，REQ-018 的 decisions 末尾追加一条，ErrorCode 的 enum 末尾追加一个值，openapi 增加两条路径、在 `/v1/events` 的说明末尾追加一句并替换 `components.responses.Forbidden`，M6 的任务按第 7 节替换与插入；本稿使用的应用脚本见“验证方式”），在同一提交中把 `WEB_ASSETS_UNAVAILABLE` 加进 `crates/hoh-core/src/protocol.rs` 的 `ErrorCode`，并把 docs/03 第 51 行的“每个请求都要携带……token”改为“每个 API 请求”（C1，所有者已批准），写明外壳不含项目数据。
 3. `python3 tools/gen_spec_views.py`；`python3 tools/baseline.py relock --cr docs/cr/CR-031-m6-detailed-spec.md`；`python3 tools/validate_bundle.py`；`bash scripts/check.sh --bundle`；`cargo test --workspace --locked`（docs/24 第 5 节）；提交。
