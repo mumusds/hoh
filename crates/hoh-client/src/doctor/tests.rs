@@ -1,6 +1,6 @@
 //! The doctor's conclusions from status output and the compat manifest, and its JSON line (ADR-015).
 
-use super::assess::{conclusion, protocol};
+use super::assess::{conclusion, protocol, remedy};
 use super::report::{Auth, Protocol};
 use hoh_agents::compat::{
     Agent, AgentEntry, CompatManifest, SUITE_SET_SHA256, Suite, SuiteStatus, Transport,
@@ -313,4 +313,20 @@ fn live_pi_relies_on_agent_settled_only_for_a_recorded_version()
         assert_eq!(turn.launch.settled_event, settled, "{version:?}");
     }
     Ok(())
+}
+
+#[test]
+fn the_remedy_keeps_the_compat_suites_note_when_the_login_has_one_too() {
+    // M1QA-09: an agent both logged out and of an unknown protocol gets both notes; before, the login's replaced the
+    // compat suite's.
+    let login = "运行 codex login 登录".to_owned();
+    let both = remedy(Protocol::Unknown, Some(login.clone())).unwrap_or_default();
+    assert!(both.contains(&login), "{both}");
+    assert!(both.contains("兼容套件"), "{both}");
+    assert_eq!(
+        remedy(Protocol::Compatible, Some(login.clone())),
+        Some(login)
+    );
+    assert!(remedy(Protocol::Unknown, None).is_some_and(|n| n.contains("兼容套件")));
+    assert_eq!(remedy(Protocol::Compatible, None), None);
 }
