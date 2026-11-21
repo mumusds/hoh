@@ -700,6 +700,8 @@ pub(crate) async fn close_gate(
 /// A turn in the runner's mode, started and held at its gate.
 #[derive(Debug)]
 pub struct Held {
+    /// The exact Codex turn's input port; absent on adapters without mid-turn steering.
+    pub steers: Option<tokio::sync::mpsc::Sender<crate::codex::Steer>>,
     /// The gate's pid: the agent's once the gate execs it, the leader of its own process group.
     pub pid: u32,
     /// Sent: the gate opens and the turn's input follows. Dropped unsent: the gate reads the end of its input and the

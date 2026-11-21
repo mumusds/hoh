@@ -381,6 +381,9 @@ impl State<'_> {
     }
 
     fn send_steer(&mut self, s: Steer) {
+        if s.reply.is_closed() {
+            return;
+        }
         // Only where the schema has turn/steer (the probe's mid_turn_steer); otherwise the input waits for a later
         // turn, as on exec (M1T07R-28, REQ-027).
         if !self.turn.launch.requests.contains(super::STEER_REQUEST) {

@@ -2386,3 +2386,66 @@ async fn codex_exec_reports_no_reset_for_a_recorded_usage_limit() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_017_02_runner_exposes_its_exact_turn_steer_sender() -> R {
+    let world = World::new()?;
+    let fake = world.fake(
+        "runner-steer",
+        Some(&Case::load("app-server-steer")?),
+        "exec",
+        false,
+    )?;
+    let attempt = world.attempt("A1").await?;
+    let turn = world.turn(&fake, "logs/runner-steer")?;
+    let held = codex::start(&attempt, &turn, &gate(&world)?)?;
+    let sender = held.steers.clone();
+    if sender.is_none() {
+        drop(held.open);
+        tokio::time::timeout(Duration::from_secs(10), held.ended).await??;
+        assert!(
+            sender.is_some(),
+            "runner mode must expose the Codex steering channel"
+        );
+        return Ok(());
+    }
+    let sender = sender.ok_or("sender")?;
+    let (reply, first) = oneshot::channel();
+    sender
+        .send(Steer {
+            input_id: "I1".into(),
+            text: "Stop and reply STEERED.".into(),
+            expected_turn: Some("hoh-stale-turn-id".into()),
+            reply,
+        })
+        .await?;
+    held.open.send(()).map_err(|()| "gate")?;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(20), first).await??,
+        SteerReceipt::Rejected { .. }
+    ));
+    let (reply, second) = oneshot::channel();
+    sender
+        .send(Steer {
+            input_id: "I2".into(),
+            text: "Stop running the command now and reply exactly STEERED.".into(),
+            expected_turn: None,
+            reply,
+        })
+        .await?;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(20), second).await??,
+        SteerReceipt::Delivered { .. }
+    ));
+    let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    assert_eq!(facts.state, AttemptState::Settled);
+    assert_eq!(
+        received(&fake)?
+            .iter()
+            .filter(|m| m["method"] == "turn/steer")
+            .count(),
+        2
+    );
+    assert!(sender.is_closed(), "finished turns close their input port");
+    Ok(())
+}

@@ -1004,12 +1004,14 @@ pub(super) fn refuse(
 }
 
 /// A verifier's request through its bridge that the Runtime answers itself (docs/adr/ADR-028.md decisions 7 and 13).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VerifierRequest {
     /// A request that the candidate under verification be changed, while its round is open: refused with an Issue.
     RejectChange(ChangeRequest),
     /// Any other message: deferred (routing between roles is M3-T04's, CR-018).
     Defer(Deferred),
+    /// Route a new query/steer; historical deferred requests keep their old answer.
+    Route(Box<crate::protocol::Message>),
 }
 
 /// A refused change request.
@@ -1042,9 +1044,13 @@ pub(super) fn request(
     request: &VerifierRequest,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Option<String>, PersistError> {
+    if let VerifierRequest::Route(message) = request {
+        return super::inputs::routing::request(conn, message, ctx);
+    }
     let tx = super::writer::begin(conn, ctx)?;
     let (run_id, attempt_id, message_id) = match request {
         VerifierRequest::RejectChange(r) => (&r.run_id, &r.attempt_id, &r.message_id),
+        VerifierRequest::Route(_) => unreachable!("routed above"),
         VerifierRequest::Defer(d) => (&d.run_id, &d.attempt_id, &d.message_id),
     };
     let project_id: String = tx
@@ -1106,6 +1112,7 @@ pub(super) fn request(
                 Some(key.clone()),
             )
         }
+        VerifierRequest::Route(_) => unreachable!("routed above"),
         VerifierRequest::Defer(d) => (
             vec![event(
                 child_id(&key, "deferred"),

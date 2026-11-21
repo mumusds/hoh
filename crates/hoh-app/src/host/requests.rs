@@ -3,7 +3,7 @@
 //! waiting for its response; the host takes the requests of each running verifier in order, one at a time, while its
 //! process runs. Not a `hoh` subcommand (CONTRACT 3): a file bridge of the running attempt.
 
-use hoh_core::persistence::{ChangeRequest, Deferred, Store, VerifierRequest};
+use hoh_core::persistence::{ChangeRequest, Store, VerifierRequest};
 use hoh_core::protocol::{Message, MessageKind};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -90,7 +90,7 @@ pub(super) fn write_helpers(
     );
     let ask = format!(
         "#!/bin/sh\n# HoH's request helper (docs/adr/ADR-028.md decisions 7 and 13): ask <message.json> sends one HCP \
-         query or steer of this attempt and prints the answer (rejected or deferred).\n\
+         query or steer of this attempt and prints the answer (rejected, queued or historical deferred).\n\
          [ -f \"$1\" ] || {{ echo 'ask: give the message file' >&2; exit 2; }}\n\
          {}{{ printf '{{\"kind\":\"message\",\"message\":'; cat \"$1\"; printf '}}\\n'; }} > \"$d/$n.tmp\" && \
          mv \"$d/$n.tmp\" \"$d/$n.json\" || exit 2\n{}exit 0\n",
@@ -128,8 +128,7 @@ pub(super) fn respond(helpers: &Helpers, n: u64, answer: &Value) -> std::io::Res
 }
 
 /// What a verifier's message asks, by decision 13: a change of the candidate under verification (a steer to the
-/// developer, or a query whose payload's intent is `change_candidate`) is refused with an Issue; anything else is
-/// deferred.
+/// developer, or a query whose payload's intent is `change_candidate`) is refused with an Issue; other queries and steers are routed (ADR-036).
 pub(super) fn classify(message: &Message, round_id: &str, candidate_id: &str) -> VerifierRequest {
     let change = (message.kind == MessageKind::Steer && message.recipient_role == "developer")
         || (message.kind == MessageKind::Query
@@ -157,12 +156,7 @@ pub(super) fn classify(message: &Message, round_id: &str, candidate_id: &str) ->
             text,
         })
     } else {
-        VerifierRequest::Defer(Deferred {
-            run_id: message.run_id.clone(),
-            attempt_id: message.attempt_id.clone(),
-            message_id: message.message_id.clone(),
-            recipient_role: message.recipient_role.clone(),
-        })
+        VerifierRequest::Route(Box::new(message.clone()))
     }
 }
 
@@ -180,8 +174,9 @@ pub(super) async fn answer_message(
         Ok(issue) if rejected => json!({"status": "rejected", "reason_code": "ILLEGAL_TRANSITION",
             "detail": "the candidate under verification is not changed; an Issue for the next candidate",
             "issue_id": issue}),
-        Ok(_) => json!({"status": "deferred",
-            "detail": "routing between roles is not available yet; the question is kept for the next decision"}),
+        Ok(Some(input)) => json!({"status":"queued","input_id":input}),
+        Ok(None) => json!({"status": "deferred",
+            "detail": "this historical request was deferred before routing was available; it is not replayed"}),
         Err(e) => json!({"status": "error", "detail": e.to_string()}),
     }
 }

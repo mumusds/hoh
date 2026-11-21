@@ -197,6 +197,17 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
         answer
     }
 
+    /// Steer only this exact attempt. Unsupported or ended turns leave the input for the next attempt.
+    fn steer(
+        &self,
+        _work: &Work,
+        _input: &hoh_core::persistence::InputRow,
+    ) -> oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(hoh_agents::codex::SteerReceipt::CapabilityUnsupported);
+        rx
+    }
+
     /// Ask `work`'s process to stop the agent's own way (its native cancel), before any signal: the first step when its
     /// lease expired (AC-041-02). It only asks and returns at once: the settle looks at the group around it
     /// (M2T05R-452). Whether it asked a turn it still holds: only then does the settle wait the native grace, and its
@@ -1296,6 +1307,12 @@ async fn attempt(
         None => None,
     };
     held.helpers = helpers.clone();
+    held.assignment.inputs = store
+        .route_input(hoh_core::persistence::InputRouting::Take {
+            attempt: id.clone(),
+        })
+        .await?
+        .inputs;
     let start = super::begun::spawn_blocking(move || executor.start(&held))
         .await
         .unwrap_or_else(|e| Err(Refusal::from(format!("its start was lost: {e}"))));
