@@ -154,7 +154,7 @@ schema_enum!(
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
      BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable,
-     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit]
+     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit, AssumptionNotListed]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
