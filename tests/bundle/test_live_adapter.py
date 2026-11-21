@@ -30,6 +30,7 @@ name=args[args.index('--exact')+1]
 agent={'claude_live_turns_resume_and_cancel':'claude','codex_live_turn_and_cancel':'codex','pi_live_turns_resume_and_cancel':'pi',
        'doctor_live_versions_whitelist_and_verified_logins':'doctor','verification_live_candidate_to_qa':'qa',
        'commander_live_read_only_turns':'commander'}[name]
+open(os.path.join(os.environ['HOH_LIVE_OUT'],'shared-name.txt'),'w').write(agent)
 v=json.loads(os.environ.get('FAKE_VERDICTS','{}')).get(agent)
 if v is not None:open(os.path.join(os.environ['HOH_LIVE_OUT'],agent+'-live-verdict.json'),'w').write(json.dumps(v))
 """
@@ -77,6 +78,21 @@ class Harness(unittest.TestCase):
         return p,results,[c for c in calls if 'verification_live' in c['argv']]
 
 class AdapterLiveQa(Harness):
+    def test_each_scenario_has_its_own_evidence_directory(self):
+        # EVL-01: identical relative artifact names must survive all six scenarios.
+        p,results,_=self.run_script(verdicts={'qa':passed()})
+        self.assertEqual(p.returncode,3,p.stderr)
+        self.assertEqual(len(results),6)
+        calls=[json.loads(line) for line in self.calls.read_text().splitlines()]
+        dirs=[Path(call['env']['HOH_LIVE_OUT']) for call in calls]
+        self.assertEqual(len(set(dirs)),6,'scenarios share an evidence directory')
+        for agent in ('claude','codex','pi','doctor','qa','commander'):
+            directory=self.ev/agent
+            self.assertIn(directory,dirs)
+            self.assertEqual((directory/'shared-name.txt').read_text(),agent)
+            self.assertTrue((directory/f'{agent}-live-verdict.json').is_file())
+        self.assertFalse((self.ev/'shared-name.txt').exists())
+
     def test_live_scenarios_cannot_inherit_the_outer_checks_evidence(self):
         # Regression for V01QA-001/-002 (AC-025-04 / AC-053-05). Keep an existing row byte-for-byte: isolation must
         # prevent the write, not discard a foreign FAIL after it has reached the outer evidence file.
@@ -132,7 +148,7 @@ class AdapterLiveQa(Harness):
                 self.calls.unlink(missing_ok=True);(self.ev/'test-results.jsonl').unlink(missing_ok=True)
                 p,results,calls=self.run_script(verdicts={'qa':verdict},env={'HOH_CANDIDATE_ID':'CAND-'+'a'*64})
                 self.assertEqual(len(calls),1,calls);self.assertEqual(calls[0]['argv'],QA_ARGV)
-                self.assertEqual(calls[0]['env'],{'HOH_LIVE_OUT':str(self.ev),'HOH_LIVE_CLAUDE':str(self.bin/'claude'),
+                self.assertEqual(calls[0]['env'],{'HOH_LIVE_OUT':str(self.ev/'qa'),'HOH_LIVE_CLAUDE':str(self.bin/'claude'),
                                                   'HOH_LIVE_PI':str(self.bin/'pi'),'HOH_LIVE_CODEX':str(self.bin/'codex')})
                 row=results['TEST-053-05'];self.assertEqual((row['status'],row['name']),(status,QA_TEST),row)
                 self.assertTrue(row['detail'].startswith(verdict['status']+': '),row)
@@ -157,7 +173,8 @@ class AdapterLiveQa(Harness):
         for name,verdict,env,why in cases:
             with self.subTest(name):
                 self.calls.unlink(missing_ok=True);(self.ev/'test-results.jsonl').unlink(missing_ok=True)
-                (self.ev/'qa-live-verdict.json').write_text(json.dumps(passed()))
+                (self.ev/'qa').mkdir(exist_ok=True)
+                (self.ev/'qa/qa-live-verdict.json').write_text(json.dumps(passed()))
                 p,results,calls=self.run_script(verdicts={} if verdict is None else {'qa':verdict},env=env)
                 self.assertEqual(len(calls),1,calls)
                 row=results['TEST-053-05'];self.assertEqual(row['status'],'FAIL',row);self.assertIn(why,row['detail'])
@@ -202,7 +219,7 @@ class AdapterLiveCommander(Harness):
                 calls=self.commander_calls();self.assertEqual(len(calls),1,calls)
                 self.assertEqual(calls[0]['argv'],['test','-p','hoh-agents','--locked','--test','commander_live','--','--ignored',
                                                    '--exact','commander_live_read_only_turns','--nocapture'])
-                self.assertEqual(calls[0]['env'],{'HOH_LIVE_OUT':str(self.ev),'HOH_LIVE_CLAUDE':str(self.bin/'claude'),
+                self.assertEqual(calls[0]['env'],{'HOH_LIVE_OUT':str(self.ev/'commander'),'HOH_LIVE_CLAUDE':str(self.bin/'claude'),
                                                   'HOH_LIVE_PI':str(self.bin/'pi'),'HOH_LIVE_CODEX':str(self.bin/'codex')})
                 row=results['TEST-021-07'];self.assertEqual((row['status'],row['name']),(status,COMMANDER_TEST),row)
                 self.assertEqual(p.returncode,code,p.stderr)
