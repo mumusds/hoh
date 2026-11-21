@@ -4812,16 +4812,34 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
                 &db(&project),
                 "SELECT state FROM attempts WHERE task_id = 'T2'",
             )?;
+            // R's adoption of its specification wakes its Commander once the wake's debounce ends (docs/adr/ADR-031.md
+            // decision 1). That wake taken in and answered (its latest turn SETTLED, docs/adr/ADR-025.md) and nothing
+            // else unfinished, T2's attempt is the only one at the kill whenever the setup ends.
+            let commander = query(
+                &db(&project),
+                &format!(
+                    "SELECT (SELECT coalesce(max(last_handled_seq), 0) FROM supervisor_cursor WHERE run_id = '{run_id}') \
+                     >= (SELECT seq FROM events WHERE run_id = '{run_id}' AND kind = 'spec.changed') \
+                     AND NOT EXISTS (SELECT 1 FROM supervisor_triggers WHERE run_id = '{run_id}' AND state = 'PENDING') \
+                     AND (SELECT state FROM attempts WHERE attempt_id LIKE '{run_id}/trigger/%' ORDER BY rowid DESC LIMIT 1) \
+                       IS 'SETTLED' \
+                     AND NOT EXISTS (SELECT 1 FROM attempts WHERE task_id <> 'T2' \
+                       AND state IN ('PREPARED', 'STARTING', 'RUNNING'))"
+                ),
+            )?;
             if t1 == "SETTLED"
                 && effect.split(',').any(|e| e == "COMMITTED")
                 && t2 == "RUNNING"
+                && commander == "1"
                 && marker.exists()
                 && manager.bin().join("claude.d/t2.pid").exists()
             {
                 break;
             }
             if Instant::now() > end {
-                waited = Err(format!("T1 {t1:?} ({effect:?}), T2 {t2:?}"));
+                waited = Err(format!(
+                    "T1 {t1:?} ({effect:?}), T2 {t2:?}, the Commander's wake over: {commander:?}"
+                ));
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
