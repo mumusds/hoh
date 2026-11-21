@@ -119,7 +119,7 @@ schema_enum!(
     /// `BlockedReason`: runs/tasks/role_bindings.blocked_reason.
     BlockedReason, "SCREAMING_SNAKE_CASE",
     [NeedDecision, BlockedAuth, BlockedCapability, CommanderUnavailable, BudgetUnenforceable, AgentUnavailable, ModelUnavailable,
-     CompatUnverified]
+     CompatUnverified, ReadinessNotMet]
 );
 
 impl BlockedReason {
@@ -134,6 +134,7 @@ impl BlockedReason {
             BlockedReason::AgentUnavailable => "AGENT_UNAVAILABLE",
             BlockedReason::ModelUnavailable => "MODEL_UNAVAILABLE",
             BlockedReason::CompatUnverified => "COMPAT_UNVERIFIED",
+            BlockedReason::ReadinessNotMet => "READINESS_NOT_MET",
         }
     }
 
@@ -147,14 +148,14 @@ schema_enum!(
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
      BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable,
-     RetryNotDue, RoleBindingPending]
+     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
     ErrorCode, "SCREAMING_SNAKE_CASE",
     [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
      ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired,
-     DagDuplicateTask, RunConfigFrozen]
+     DagDuplicateTask, RunConfigFrozen, SpecConflict, SpecInvalid, SpecApprovalNotUser, PromptVariableMissing, PromptTooLong]
 );
 schema_enum!(
     /// Task states (`transition_task.to_state`).
