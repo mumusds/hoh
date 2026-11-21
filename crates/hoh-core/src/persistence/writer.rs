@@ -490,6 +490,8 @@ impl Job {
             Job::Reconcile(..) => "Reconcile",
             // A run's pace is a write of its own kind (fault hooks tell it from an attempt's runner writes).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Pace { .. }) => "Pace",
+            // SetMode's safe point is a run operation, separate from attempt receipts/effects.
+            Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Mode(..)) => "Mode",
             // The stall detector's look (docs/adr/ADR-031.md design correction C).
             Job::Runner(job, _) if matches!(**job, super::runner::RunnerJob::Stall { .. }) => {
                 "Stall"
@@ -1717,7 +1719,9 @@ pub(super) fn parse<S: Lifecycle>(name: &str) -> Result<S, PersistError> {
 /// An outbox operation for the writer thread.
 pub(super) enum OutboxJob {
     /// Now, roles, the delivery limit.
-    Claim(std::time::SystemTime, Vec<String>, i64),
+    Claim(std::time::SystemTime, Vec<String>, i64, bool),
+    Input(super::outbox::OutboxRow, std::time::SystemTime),
+    InputSweep(String),
     /// Message id, generation, settlement, the delivery limit.
     Settle(String, i64, super::outbox::Settlement, i64),
     Consume(
@@ -1737,6 +1741,7 @@ pub(super) enum OutboxJob {
 #[derive(Debug, Default)]
 pub(super) struct OutboxDone {
     pub(super) rows: Vec<Claimed>,
+    pub(super) input_reply: Option<String>,
     pub(super) consumed: Option<super::outbox::Consumed>,
     pub(super) event_seq: Option<i64>,
     pub(super) task_result: Option<super::results::TaskResultOutcome>,
@@ -1750,11 +1755,11 @@ fn run_outbox(
 ) -> Result<OutboxDone, PersistError> {
     use super::outbox;
     Ok(match job {
-        OutboxJob::Claim(now, roles, max) => {
+        OutboxJob::Claim(now, roles, max, inputs_only) => {
             // The returned claims are undone in this claim's own transaction, and messages with a live guard are not
             // claimed again; a claim that cannot run keeps the returns for the next (M2T04R-400, -450).
             let (returned, live) = claims.take_for_claim();
-            match outbox::claim_next(conn, now, &roles, max, &returned, &live, ctx) {
+            match outbox::claim_next(conn, now, &roles, max, inputs_only, &returned, &live, ctx) {
                 Ok(rows) => OutboxDone {
                     rows: rows.into_iter().map(|row| claims.register(row)).collect(),
                     ..OutboxDone::default()
@@ -1765,6 +1770,14 @@ fn run_outbox(
                 }
             }
         }
+        OutboxJob::InputSweep(project) => {
+            super::inputs::sweep(conn, &project, ctx)?;
+            OutboxDone::default()
+        }
+        OutboxJob::Input(row, now) => OutboxDone {
+            input_reply: super::inputs::consume(conn, &row, now, ctx)?,
+            ..Default::default()
+        },
         OutboxJob::Settle(id, generation, settlement, max) => {
             outbox::settle(conn, &id, generation, &settlement, max, ctx)?;
             OutboxDone::default()

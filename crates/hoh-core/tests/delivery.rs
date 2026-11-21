@@ -2892,3 +2892,78 @@ async fn an_unapplied_settlement_gives_back_only_its_own_generation() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_017_01_first_input_gate_also_returns_an_hcp_delivery_claimed_before_handover() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-delivery-")
+        .tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    let clock = FakeClock::new();
+    let message = to_qa("input-gate", 3, 2, &format!("{:064}", 2), Some("C2"))?;
+    enqueue(&store, "input-gate", &[message]).await?;
+    let row = store
+        .claim_outbox(clock.now(), vec!["qa".to_owned()], 3)
+        .await?
+        .and_then(hoh_core::persistence::Claimed::start)
+        .ok_or("claim")?;
+    let start = hoh_core::ids::child_id("R", "session-start/qa/2");
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".to_owned(),
+                run_id: Some("R".to_owned()),
+                event_id: "input-gate-start".to_owned(),
+                kind: "handoff.prepared".to_owned(),
+                payload: json!({}),
+            }],
+            outbox: vec![NewOutbox {
+                message_id: start,
+                event: 0,
+                run_id: Some("R".to_owned()),
+                recipient_role: "qa".to_owned(),
+                role_epoch: 2,
+                payload: json!({"notice":"runtime","kind":"session.start"}),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let transport = LocalTransport::new(&store, &clock).with("qa", Touch);
+    assert!(matches!(
+        transport.deliver(&row).await,
+        Err(DeliveryError::Deferred)
+    ));
+    store
+        .settle_outbox(
+            &row.message_id,
+            row.attempt_count,
+            hoh_core::persistence::Settlement::Unapplied,
+            3,
+        )
+        .await?;
+    let tick = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: vec!["qa".to_owned()],
+        max_attempts: 3,
+        batch: 3,
+    }
+    .tick()
+    .await?;
+    assert!(tick.delivered.is_empty() && tick.failed.is_empty());
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT state,attempt_count FROM outbox WHERE message_id='input-gate'"
+        )?,
+        vec![vec![json!("PENDING"), json!(0)]]
+    );
+    assert_eq!(
+        rows(&path, "SELECT revision FROM tasks WHERE task_id='T'")?,
+        vec![vec![json!(3)]]
+    );
+    Ok(())
+}

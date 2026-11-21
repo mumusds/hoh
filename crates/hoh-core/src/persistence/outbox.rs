@@ -76,6 +76,7 @@ pub(super) fn claim_next(
     now: SystemTime,
     roles: &[String],
     max_attempts: i64,
+    inputs_only: bool,
     returned: &[OutboxRow],
     live: &std::collections::BTreeSet<String>,
     ctx: &super::writer::Ctx<'_>,
@@ -88,7 +89,7 @@ pub(super) fn claim_next(
     }
     let stamp = rfc3339_utc(now);
     let roles = json!(roles).to_string();
-    let live = json!(live).to_string();
+    let mut excluded = live.clone();
     // A verification handoff is never claimed: its round's verifier task takes it at its dispatch (docs/adr/ADR-028.md
     // decision 9, M2T16D-255).
     loop {
@@ -103,10 +104,12 @@ pub(super) fn claim_next(
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
                    AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
+                   AND (?4 = 0 OR (json_extract(payload_json,'$.notice') = 'input' AND recipient_role = 'commander' \
+                     AND json_extract(payload_json,'$.kind') IN ('ASK','STEER'))) \
                  AND (run_id IS NULL OR (SELECT r.state FROM runs r WHERE r.run_id = outbox.run_id) IS NOT 'INCOMPLETE' \
                    OR {}) \
                  ORDER BY event_seq, message_id LIMIT 1", super::hold::not_held("outbox.run_id")),
-                params![stamp, roles, live],
+                params![stamp, roles, json!(excluded).to_string(), inputs_only],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()
@@ -130,6 +133,24 @@ pub(super) fn claim_next(
                 Some("run_ended"),
                 ctx,
             )?;
+            continue;
+        }
+        if let Some(run) = &run_id
+            && super::inputs::first_input_wait(
+                &tx,
+                run,
+                &recipient_role,
+                if serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .is_some_and(|p| p["sender_role"] == "commander")
+                {
+                    None
+                } else {
+                    Some(role_epoch)
+                },
+            )?
+        {
+            excluded.insert(message_id);
             continue;
         }
         if count >= max_attempts {
@@ -225,6 +246,7 @@ fn dead_letter(
         params![error, message_id],
     )
     .map_err(sqlite_error)?;
+    super::inputs::exhausted(tx, message_id, reason.unwrap_or("delivery_exhausted"), ctx)?;
     let project_id = project_of(tx, run_id.as_deref(), message_id)?;
     writer::write(
         tx,
@@ -668,6 +690,9 @@ pub(super) fn consume(
             (result_json, Some(reason))
         }
         None => {
+            if super::inputs::first_input_wait(&tx, &message.run_id, consumer, None)? {
+                return Err(PersistError::FirstInputPending);
+            }
             let mut events = effect.events.clone();
             events.push(NewEvent {
                 intent: Intent::Progress,

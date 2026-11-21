@@ -201,7 +201,17 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
         .map_err(sqlite_error)?
         .collect::<Result<_, _>>()
         .map_err(sqlite_error)?;
-    wakes_of(tx, run_id, rows)
+    let mut wakes = wakes_of(tx, run_id, rows)?;
+    for wake in &mut wakes {
+        if wake.fingerprint.starts_with("user_input/")
+            && super::inputs::for_wake(tx, &wake.event_seqs)?
+                .is_some_and(|i| i.state == crate::lifecycle::InputState::Rejected)
+        {
+            // The input's persisted rejection closes its wake, including before a first turn.
+            wake.superseded = true;
+        }
+    }
+    Ok(wakes)
 }
 
 /// Whether wake `wake_id` of run `run_id` is settled for good (docs/adr/ADR-031.md correction C's precondition,
@@ -777,6 +787,7 @@ pub(super) fn supervision_input(
         run_revision,
         role_epoch,
         summary: json!({
+            "user_input": super::inputs::for_attempt(conn,attempt_id)?.map(|i|json!({"input_id":i.input_id,"kind":i.kind,"text":i.payload["text"],"role_epoch":i.payload["role_epoch"]})),
             "wake": {"id": wake_id, "fingerprint": this.fingerprint, "severity": this.severity.as_str(),
                 "spec_id": this.spec_id, "woken_at": this.woken_at},
             "turn": {"attempt_id": attempt_id, "generation": allocation["generation"],
@@ -977,6 +988,12 @@ pub(super) fn allocate(
                     .is_none_or(|target| target.as_ref().is_none_or(|id| *id == w.id))
             })
         {
+            if let Some(input) = super::inputs::for_wake(&tx, &wake.event_seqs)?
+                && (input.state != crate::lifecycle::InputState::Delivered
+                    || input.payload["role_epoch"].as_u64() != Some(binding.role_epoch))
+            {
+                continue;
+            }
             let aged = parse_rfc3339_millis(&wake.woken_at)
                 .and_then(|at| now.duration_since(at).ok())
                 .is_some_and(|waited| waited > SUPERVISION_TURN);
@@ -1145,6 +1162,7 @@ pub(super) fn allocate(
             run_id: Some(chosen.run_id.clone()),
             kind: ALLOCATED.to_owned(),
             payload: json!({
+                "input_id": super::inputs::for_wake(&tx,&chosen.wake.event_seqs)?.map(|i|i.input_id),
                 "wake": chosen.wake.id,
                 "dedup_key": {"run_id": chosen.run_id, "fingerprint": chosen.wake.fingerprint, "spec_id": chosen.wake.spec_id},
                 "generation": generation,

@@ -249,6 +249,8 @@ pub enum PersistError {
     Migration { version: i64, detail: String },
     /// A FOREIGN KEY, CHECK, UNIQUE or NOT NULL constraint failed; nothing of the transaction was written.
     IntegrityViolation(String),
+    /// The recipient still owes its first input; return this delivery without counting it.
+    FirstInputPending,
     /// An interrupted end of the writer lease's holder (to UNKNOWN_EFFECT, or from RUNNING to any end but SETTLED)
     /// without the workspace's record (`WORKSPACE_RECORD_REQUIRED`): its lease goes only with the record (REQ-019 behaviour 6,
     /// docs/adr/ADR-024.md decision 9); nothing was written, the slot stays held. The caller takes the record and ends
@@ -506,6 +508,9 @@ impl std::fmt::Display for PersistError {
                 "held: run {run} stopped in {}: nothing was written",
                 crate::lifecycle::Lifecycle::as_str(*state)
             ),
+            PersistError::FirstInputPending => {
+                f.write_str("the recipient still owes its first input")
+            }
             PersistError::Storage(detail) => write!(f, "storage error: {detail}"),
         }
     }
@@ -1796,9 +1801,42 @@ impl Store {
         max_attempts: i64,
     ) -> Result<Option<Claimed>, PersistError> {
         self.writer
-            .outbox(writer::OutboxJob::Claim(now, roles, max_attempts))
+            .outbox(writer::OutboxJob::Claim(now, roles, max_attempts, false))
             .await
             .map(|done| done.rows.into_iter().next())
+    }
+
+    /// Only Commander input notices, using the same claims and settlement as HCP delivery.
+    pub async fn claim_inputs(
+        &self,
+        now: std::time::SystemTime,
+        roles: Vec<String>,
+        max_attempts: i64,
+    ) -> Result<Option<Claimed>, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Claim(now, roles, max_attempts, true))
+            .await
+            .map(|done| done.rows.into_iter().next())
+    }
+
+    /// Reject unfinished inputs of terminal runs without reviving their progress.
+    pub async fn settle_ended_inputs(&self, project: &str) -> Result<(), PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::InputSweep(project.to_owned()))
+            .await
+            .map(drop)
+    }
+
+    /// Consume an input notice. None returns a delivery held behind the first-input gate.
+    pub async fn consume_input(
+        &self,
+        row: OutboxRow,
+        now: std::time::SystemTime,
+    ) -> Result<Option<String>, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::Input(row, now))
+            .await
+            .map(|done| done.input_reply)
     }
 
     /// Settle delivery `generation` (the row's `attempt_count` when it was taken) of `message_id` (ADR-018 decision

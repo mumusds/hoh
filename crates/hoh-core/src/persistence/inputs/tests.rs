@@ -120,6 +120,12 @@ async fn stale_illegal_and_orphan_inputs_write_nothing() -> R {
         store.enqueue_input(orphan).await,
         Err(PersistError::IntegrityViolation(_))
     ));
+    let mut malformed = steer("malformed");
+    malformed.payload = json!("not an object");
+    assert!(matches!(
+        store.enqueue_input(malformed).await,
+        Err(PersistError::IntegrityViolation(_))
+    ));
     let mut bad = steer("I8");
     bad.kind = "WHISPER".to_owned();
     assert!(store.enqueue_input(bad).await.is_err());
@@ -129,5 +135,216 @@ async fn stale_illegal_and_orphan_inputs_write_nothing() -> R {
     ));
     assert_eq!(events()?, before);
     assert_eq!(store.reader()?.input("I9")?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delivery() -> R {
+    use crate::persistence::{Claimed, Commit, Intent, NewEvent, NewOutbox};
+    let dir = tempfile::Builder::new().prefix("m3t09-input-").tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','commander','1','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','commander','codex','sc',2,1,'2026-11-21T00:00:00Z');")?;
+    let start = crate::ids::child_id("R", "session-start/commander/2");
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".to_owned(),
+                run_id: Some("R".to_owned()),
+                event_id: "start".to_owned(),
+                kind: "session.start".to_owned(),
+                payload: json!({}),
+            }],
+            outbox: vec![NewOutbox {
+                message_id: start.clone(),
+                event: 0,
+                run_id: Some("R".to_owned()),
+                recipient_role: "commander".to_owned(),
+                role_epoch: 2,
+                payload: json!({"notice":"runtime","kind":"session.start"}),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    store
+        .enqueue_input(NewInput {
+            input_id: "ask".to_owned(),
+            run_id: "R".to_owned(),
+            kind: "ASK".to_owned(),
+            target_role: None,
+            payload: json!({"text":"progress?"}),
+        })
+        .await?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM outbox WHERE message_id='ask'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1,
+        "input acceptance must enqueue delivery"
+    );
+    let now = std::time::SystemTime::now();
+    assert!(
+        store
+            .claim_outbox(now, vec!["commander".to_owned()], 3)
+            .await?
+            .is_none()
+    );
+    conn.execute(
+        "UPDATE outbox SET state='ACKED' WHERE message_id=?1",
+        params![start],
+    )?;
+    conn.execute("INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES ('commander',?1,'2026-11-21T00:00:00Z',?2)",params![start,json!({"session_id":"sc"}).to_string()])?;
+    assert!(
+        store
+            .claim_outbox(now, vec!["commander".to_owned()], 3)
+            .await?
+            .is_none(),
+        "ACK alone does not pay the first-input debt"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT attempt_count FROM outbox WHERE message_id='ask'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    conn.execute_batch("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('T','R','s1','IMPLEMENTED','commander',0,1);
+        INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A','T','SETTLED','sc',2,1,1);")?;
+    let row = store
+        .claim_outbox(now, vec!["commander".to_owned()], 3)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("no input after first turn")?;
+    assert_eq!(row.message_id, "ask");
+    assert_eq!(row.attempt_count, 1);
+    assert_eq!(row.role_epoch, 2);
+    // The debt can return after the claim; consume rechecks and gives the generation back.
+    conn.execute(
+        "UPDATE attempts SET state='FAILED' WHERE attempt_id='A'",
+        [],
+    )?;
+    assert_eq!(store.consume_input(row.clone(), now).await?, None);
+    store
+        .settle_outbox(
+            "ask",
+            row.attempt_count,
+            crate::persistence::Settlement::Unapplied,
+            3,
+        )
+        .await?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT attempt_count FROM outbox WHERE message_id='ask'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    conn.execute(
+        "UPDATE attempts SET state='SETTLED' WHERE attempt_id='A'",
+        [],
+    )?;
+    let row = store
+        .claim_inputs(now, vec!["commander".to_owned()], 3)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("no reclaimed input")?;
+    let answer = store
+        .consume_input(row.clone(), now)
+        .await?
+        .ok_or("not delivered")?;
+    assert_eq!(store.consume_input(row.clone(), now).await?, Some(answer));
+    store
+        .settle_outbox(
+            "ask",
+            row.attempt_count,
+            crate::persistence::Settlement::Delivered,
+            3,
+        )
+        .await?;
+    assert_eq!(
+        store.reader()?.input("ask")?.ok_or("input")?.state,
+        InputState::Delivered
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM receipts WHERE message_id='ask'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+
+    for id in ["stale", "exhausted", "ended"] {
+        store
+            .enqueue_input(NewInput {
+                input_id: id.to_owned(),
+                run_id: "R".to_owned(),
+                kind: "ASK".to_owned(),
+                target_role: None,
+                payload: json!({"text":"question"}),
+            })
+            .await?;
+    }
+    let stale = store
+        .claim_inputs(now, vec!["commander".to_owned()], 3)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("stale input")?;
+    assert_eq!(stale.message_id, "stale");
+    conn.execute(
+        "UPDATE role_bindings SET role_epoch=3 WHERE run_id='R' AND role='commander'",
+        [],
+    )?;
+    let rejected: Value = serde_json::from_str(
+        &store
+            .consume_input(stale.clone(), now)
+            .await?
+            .ok_or("stale refused")?,
+    )?;
+    assert_eq!(rejected["reason"], "STALE_ROLE_EPOCH");
+    store
+        .settle_outbox(
+            "stale",
+            stale.attempt_count,
+            crate::persistence::Settlement::Delivered,
+            3,
+        )
+        .await?;
+    assert_eq!(
+        store.reader()?.input("stale")?.ok_or("input")?.state,
+        InputState::Rejected
+    );
+    let exhausted = store
+        .claim_inputs(now, vec!["commander".to_owned()], 1)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("exhausted input")?;
+    assert_eq!(exhausted.message_id, "exhausted");
+    store
+        .settle_outbox(
+            "exhausted",
+            exhausted.attempt_count,
+            crate::persistence::Settlement::Failed("consumer lost".to_owned()),
+            1,
+        )
+        .await?;
+    let rejected = store.reader()?.input("exhausted")?.ok_or("input")?;
+    assert_eq!(rejected.state, InputState::Rejected);
+    assert_eq!(rejected.payload["reason"], "delivery_exhausted");
+    conn.execute("UPDATE runs SET state='CANCELLED' WHERE run_id='R'", [])?;
+    store.settle_ended_inputs("p1").await?;
+    for id in ["ask", "ended"] {
+        let rejected = store.reader()?.input(id)?.ok_or("input")?;
+        assert_eq!(rejected.state, InputState::Rejected);
+        assert_eq!(rejected.payload["reason"], "run_ended");
+    }
+
     Ok(())
 }

@@ -1832,6 +1832,7 @@ pub struct Turn {
 /// What the scripted Commander decides on a turn: the decision payloads it submits, in order, each at the revision the
 /// one before it leaves (the turn's revision, then one more for each but one marked [`rejected`]).
 pub type Script = dyn Fn(&Turn) -> Vec<Value> + Send + Sync;
+type Answer = dyn Fn(&Turn) -> Option<String> + Send + Sync;
 
 /// An executor of an in-process host (verification_dispatch.rs's pattern, [`World::team_host`]) that plays the
 /// Commander by a script: each supervision turn is a process of its own process group, held at its start gate, that
@@ -1841,6 +1842,7 @@ pub type Script = dyn Fn(&Turn) -> Vec<Value> + Send + Sync;
 /// ([`Team::refused`]); a turn still running when it is dropped is ended.
 pub struct Team {
     script: Box<Script>,
+    answer: Box<Answer>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1861,7 +1863,16 @@ impl Team {
     pub fn new(
         script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
     ) -> std::sync::Arc<Team> {
+        Self::answering(script, |_| None)
+    }
+
+    /// A scripted Commander with a final textual answer as well as bridge decisions.
+    pub fn answering(
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        answer: impl Fn(&Turn) -> Option<String> + Send + Sync + 'static,
+    ) -> std::sync::Arc<Team> {
         std::sync::Arc::new(Team {
+            answer: Box::new(answer),
             script: Box::new(script),
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
@@ -1955,6 +1966,7 @@ impl hoh_app::host::Executor for Team {
         // Each decision at the revision the ones before it leave: one more for each, none for one the script expects
         // rejected ([`rejected`]).
         let mut moved = 0;
+        let final_text = (self.answer)(&turn);
         let messages: Vec<Value> = (self.script)(&turn)
             .into_iter()
             .zip(0..)
@@ -2018,6 +2030,7 @@ impl hoh_app::host::Executor for Team {
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: hoh_core::persistence::Observed {
                     messages: lines,
+                    final_text,
                     ..Default::default()
                 },
                 unknown_effect: false,

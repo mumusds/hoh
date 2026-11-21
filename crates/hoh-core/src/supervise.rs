@@ -106,6 +106,19 @@ pub fn classify(
     spec_revision: Option<i64>,
 ) -> Option<Wake> {
     let severity = match kind {
+        "input.queued"
+            if payload["target_role"] == "commander"
+                && matches!(payload["kind"].as_str(), Some("ASK" | "STEER")) =>
+        {
+            return Some(Wake {
+                key: Key {
+                    fingerprint: escape(&format!("user_input/{}", payload["input_id"].as_str()?)),
+                    spec_revision,
+                },
+                severity: Severity::Normal,
+                retrigger: false,
+            });
+        }
         "integrity_violation" => Severity::Integrity,
         "issue.opened" => issue_severity(payload)?,
         "need_decision" | "no_progress" | "budget.risk" | "team.binding_blocked" => Severity::High,

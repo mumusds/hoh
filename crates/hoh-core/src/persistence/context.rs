@@ -510,6 +510,15 @@ fn wake(
         wake["severity"].as_str().unwrap_or("?"),
         wake["fingerprint"].as_str().unwrap_or("?")
     ));
+    if let Some(text) = summary["user_input"]["text"].as_str() {
+        facts.question = Some(format!(
+            "用户输入 {}（{}）：\n{}",
+            summary["user_input"]["input_id"], summary["user_input"]["kind"], text
+        ));
+        if summary["user_input"]["kind"] == "ASK" {
+            facts.scope.push("只读 ASK：只根据当前证据回答问题，以最终文本输出回答；不得提交决策或修改任务/Run。".to_owned());
+        }
+    }
     let total = |key: &str| summary[key].as_u64().unwrap_or(0).to_string();
     // The turn's own identity first: its answers name it (commander.md's output contract, M2T09R-03).
     facts.header = vec![

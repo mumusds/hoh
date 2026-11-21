@@ -734,7 +734,7 @@ fn assumptions_table_parses_and_refuses_reserved_names() -> R {
 }
 
 #[test]
-fn test_007_01_mode_cycle_accepts_only_two_or_three_distinct_modes() -> R {
+fn mode_cycle_accepts_only_two_or_three_distinct_modes() -> R {
     for modes in [r#"["PLAN", "AUTO"]"#, r#"["AUTO", "BUILD", "PLAN"]"#] {
         let config = parse(&with(&format!("[ui]\nmode_cycle = {modes}")))?;
         assert_eq!(

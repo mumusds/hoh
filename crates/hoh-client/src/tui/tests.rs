@@ -1172,7 +1172,7 @@ fn the_status_bar_counts_each_event_of_the_attached_run_once_and_shows_the_lates
 #[test]
 fn the_acceptance_of_an_input_says_whether_it_answered_a_question() {
     // Decision 13 (Enter, attached): once the acceptance event of the client's SendInput comes (its payload names the
-    // command), the message bar says "已答复 <question_id>", or "已排队（M3-T04 投递）" when it answered none.
+    // command), the message bar says "已答复 <question_id>", or "已排队" when it answered none.
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = app_in(dir.path());
     app.attach("R", "BLOCKED");
@@ -1193,10 +1193,7 @@ fn the_acceptance_of_an_input_says_whether_it_answered_a_question() {
         &serde_json::json!({"seq": 5, "kind": "input.accepted", "payload": {"command_id": "c2"}}),
     );
     let rows = screen(&app, 100, 20);
-    assert!(
-        rows.iter().any(|r| r.contains("已排队（M3-T04 投递）")),
-        "{rows:#?}"
-    );
+    assert!(rows.iter().any(|r| r.contains("已排队")), "{rows:#?}");
     app.event(&serde_json::json!({"seq": 6, "kind": "x", "payload": {"command_id": "c2"}}));
     assert_eq!(
         screen(&app, 100, 20)

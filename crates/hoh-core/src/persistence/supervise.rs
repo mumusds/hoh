@@ -18,6 +18,7 @@ use std::time::SystemTime;
 /// The event kinds that can wake the Commander under some policy (`supervise::classify`'s): the step reads only these
 /// from the run's events after its cursor, and moves the cursor past the rest without reading them.
 const KINDS: &[&str] = &[
+    "input.queued",
     "integrity_violation",
     "issue.opened",
     "need_decision",

@@ -389,6 +389,16 @@ impl App {
             }
             _ => self.messages.push(format!("#{seq} {kind}")),
         }
+        if kind == "input.applied"
+            && let Some(answer) = payload["answer"].as_str()
+        {
+            self.messages.push(format!("Commander：{answer}"));
+        }
+        if kind == "input.rejected"
+            && let Some(reason) = payload["reason"].as_str()
+        {
+            self.messages.push(format!("输入未应用：{reason}"));
+        }
         if kind != "run.result"
             && let Some(command) = event["payload"]["command_id"].as_str()
             && let Some(at) = self.awaiting.iter().position(|c| c == command)
@@ -397,7 +407,7 @@ impl App {
             self.messages
                 .push(match event["payload"]["question_id"].as_str() {
                     Some(question) => format!("已答复 {question}"),
-                    None => "已排队（M3-T04 投递）".to_owned(),
+                    None => "已排队".to_owned(),
                 });
         }
         kind.starts_with("run.")
