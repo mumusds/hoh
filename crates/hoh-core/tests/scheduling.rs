@@ -823,3 +823,38 @@ async fn a_plan_names_only_the_runs_requirements_and_no_other_runs_task_ids() ->
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_007_02_pending_mode_blocks_both_writer_dispatch_paths_but_not_readers() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    seed(&db, "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at)
+        VALUES ('p1','mode-pending','R','run.mode_change_pending','{\"from\":\"AUTO\",\"to\":\"PLAN\",\"command_id\":\"mode\"}','2026-11-04T00:00:00Z');")?;
+    assert!(
+        store
+            .schedule_round("R", context())
+            .await?
+            .dispatched
+            .is_none(),
+        "pending mode must hold a writer even when its slot is free"
+    );
+    let decided = store
+        .decide(proposal("blocked-writer", 7, dispatch("T1"))?, context())
+        .await?;
+    assert!(
+        !matches!(decided, Decided::Applied { .. }),
+        "Commander dispatch bypassed pending mode: {decided:?}"
+    );
+    assert_eq!(count(&db, "attempts")?, 0);
+    seed(&db, "UPDATE tasks SET writer = 0 WHERE task_id = 'T2';")?;
+    assert_eq!(
+        store
+            .schedule_round("R", context())
+            .await?
+            .dispatched
+            .map(|d| d.task_id),
+        Some("T2".to_owned())
+    );
+    Ok(())
+}

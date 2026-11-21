@@ -790,6 +790,10 @@ async fn submit_command(
                 "StartRun",
                 RunTarget::Start {
                     mode: mode.clone(),
+                    mode_cycle: effective.as_ref().map_or_else(
+                        || hoh_core::config::Config::default().ui.mode_cycle,
+                        |config| config.ui.mode_cycle.clone(),
+                    ),
                     budget: effective.as_ref().map_or_else(
                         || hoh_core::config::Config::default().budget,
                         |config| config.budget.clone(),
@@ -809,6 +813,13 @@ async fn submit_command(
                 json!({"goal": start.goal, "mode": mode, "interactive": start.interactive}),
             )
         }
+        CommandBody::SetMode(change) => (
+            "SetMode",
+            RunTarget::SetMode(change.mode),
+            "run.mode_changed",
+            None,
+            json!({}),
+        ),
         CommandBody::PauseRun(reason) => (
             "PauseRun",
             RunTarget::To(RunState::PauseRequested),

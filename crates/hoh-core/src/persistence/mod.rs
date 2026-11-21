@@ -31,6 +31,7 @@ mod inputs;
 mod issues;
 mod join;
 mod leases;
+mod modes;
 pub mod need;
 mod outbox;
 mod outputs;
@@ -1493,6 +1494,12 @@ impl Store {
                 "a renewal answered with something else".to_owned(),
             )),
         }
+    }
+
+    /// Fulfil the latest SetMode intent once no writer attempt remains in flight (ADR-036).
+    pub async fn mode_step(&self, run_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Mode(run_id.to_owned()))
+            .await
     }
 
     async fn runner_step(&self, job: runner::RunnerJob) -> Result<bool, PersistError> {

@@ -1488,14 +1488,6 @@ async fn commands_and_runs_follow_the_openapi_contract() -> R {
         (pause("c1", "k1", "r1", 0, "other"), 409, "KEY_REUSE"),
         (pause("c2", "k2", "r1", 0, "stale"), 409, "STALE_REVISION"),
         (pause("c3", "k3", "missing", 0, "none"), 409, "RUN_NOT_FOUND"),
-        (
-            json!({"schema_version": "1.0", "command_id": "c4", "idempotency_key": "k4", "expected_revision": 1,
-                   "kind": "SetMode", "run_id": "r1", "payload": {"mode": "PLAN"}})
-            .to_string()
-            .into_bytes(),
-            422,
-            "CAPABILITY_UNSUPPORTED",
-        ),
         // A run not paused does not resume (ADR-021 decision 7).
         (
             json!({"schema_version": "1.0", "command_id": "c6", "idempotency_key": "k6", "expected_revision": 1,
@@ -1536,6 +1528,58 @@ async fn commands_and_runs_follow_the_openapi_contract() -> R {
     conforms(&error, &missing)?;
     assert_eq!(missing["code"], "RUN_NOT_FOUND");
     assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "1");
+    let mode = json!({"schema_version": "1.0", "command_id": "c4", "idempotency_key": "k4", "expected_revision": 1,
+        "kind": "SetMode", "run_id": "r1", "payload": {"mode": "PLAN"}}).to_string().into_bytes();
+    let changed = call(&to, "POST", "/v1/commands", &host.token, &mode).await?;
+    assert_eq!(changed.status, 202, "{changed:?}");
+    conforms(&accepted, &changed.json()?)?;
+    assert_eq!(
+        scalar(dir.path(), "SELECT mode FROM runs WHERE run_id = 'r1'")?,
+        "PLAN"
+    );
+    assert_eq!(scalar(dir.path(), "SELECT count(*) FROM commands")?, "2");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_007_01_mode_cycle_is_frozen_in_the_run_snapshot() -> R {
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join(".hoh"))?;
+    std::fs::write(
+        dir.path().join(hoh_core::config::FILE),
+        "config_version = \"1.0\"\n[ui]\nmode_cycle = [\"PLAN\", \"AUTO\"]\n",
+    )?;
+    let host = Host::start(config(dir.path())).await?;
+    let request = json!({"schema_version":"1.0", "command_id":"cycle-start", "idempotency_key":"cycle-start",
+        "expected_revision":0, "kind":"StartRun", "run_id":null, "payload":{"goal":"snapshot", "mode":"PLAN", "interactive":true}}).to_string().into_bytes();
+    let accepted = call(
+        &To::Tcp(host.port),
+        "POST",
+        "/v1/commands",
+        &host.token,
+        &request,
+    )
+    .await?;
+    assert_eq!(accepted.status, 202, "{accepted:?}");
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT json_extract(config_snapshot_json, '$.ui.mode_cycle') FROM runs"
+        )?,
+        "[\"PLAN\",\"AUTO\"]"
+    );
+    std::fs::write(
+        dir.path().join(hoh_core::config::FILE),
+        "config_version = \"1.0\"\n",
+    )?;
+    assert_eq!(
+        scalar(
+            dir.path(),
+            "SELECT json_extract(config_snapshot_json, '$.ui.mode_cycle') FROM runs"
+        )?,
+        "[\"PLAN\",\"AUTO\"]"
+    );
     host.shutdown().await;
     Ok(())
 }

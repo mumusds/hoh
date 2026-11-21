@@ -91,9 +91,18 @@ pub(super) fn round(
     let refused = super::verification::refused(&tx, run_id)?;
     // Nor a verifier of a candidate whose pending records failed to recover (decision 16).
     let recovering = super::closing::held_by_recovery(&tx, run_id)?;
+    let mode_pending = super::modes::pending(&tx, run_id)?.is_some();
+    let held_by_mode: Vec<String> = rows
+        .iter()
+        .filter(|r| mode_pending && r.candidate.writer)
+        .map(|r| r.candidate.task_id.clone())
+        .collect();
     rows.retain(|r| {
         let task = &r.candidate.task_id;
-        !held.contains(task) && !refused.contains(task) && !recovering.contains(task)
+        !(mode_pending && r.candidate.writer)
+            && !held.contains(task)
+            && !refused.contains(task)
+            && !recovering.contains(task)
     });
     if retries_only {
         rows.retain(|r| {
@@ -250,6 +259,7 @@ pub(super) fn round(
                 "waited": waited,
                 "promoted": promoted,
                 "held_by_open_round": held,
+                "mode_change_pending": held_by_mode,
             }),
         }],
         outbox: vec![NewOutbox {

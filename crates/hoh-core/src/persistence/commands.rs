@@ -54,11 +54,14 @@ pub enum RunTarget {
         assumptions: std::collections::BTreeMap<String, crate::config::Assumed>,
         /// StartRun's `interactive: false` (`hoh -p`), frozen into the run's snapshot (docs/adr/ADR-035.md decision 11).
         unattended: bool,
+        mode_cycle: Vec<String>,
     },
     /// The project's team (ConfigureTeam, docs/adr/ADR-022.md decisions 3 and 4): revision r+1 over the current r,
     /// applied at once; `expected_revision` is the team revision. An empty `run_id` is the project's command (null in
     /// the request); a run id names a run that must exist.
     Team(super::team::TeamChange),
+    /// Mode intent applied now or at the writer safe point (ADR-036).
+    SetMode(crate::protocol::Mode),
     /// An input to the run (AnswerQuestion, SendInput; docs/adr/ADR-031.md decision 7): accepted in any state but a
     /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
     /// stays stopped.
@@ -165,6 +168,7 @@ pub(super) fn submit(
             policy,
             assumptions,
             unattended,
+            mode_cycle,
         } => {
             if command.expected_revision != 0 {
                 return Err(PersistError::StaleRevision {
@@ -189,6 +193,7 @@ pub(super) fn submit(
                 &command.run_id,
                 &command.event.project_id,
                 super::team::Frozen {
+                    mode_cycle,
                     budget,
                     policy,
                     assumptions,
@@ -268,6 +273,10 @@ pub(super) fn submit(
             )?;
             (revision, done.event_seqs[0])
         }
+        RunTarget::SetMode(mode) => {
+            super::hold::command(&tx, &command.run_id)?;
+            super::modes::set(&tx, command, *mode, ctx)?
+        }
         RunTarget::Input(input) => {
             super::hold::command(&tx, &command.run_id)?;
             input_command(&tx, command, input, ctx)?
@@ -338,7 +347,8 @@ pub(super) fn submit(
                 RunTarget::Start { .. }
                 | RunTarget::Team(_)
                 | RunTarget::Input(_)
-                | RunTarget::Specification(_) => {
+                | RunTarget::Specification(_)
+                | RunTarget::SetMode(_) => {
                     unreachable!("handled above")
                 }
             };
@@ -765,7 +775,10 @@ pub(super) fn snapshot(
 }
 
 /// The run `run_id` and the highest event seq, inside the caller's read transaction.
-fn snapshot_rows(conn: &Connection, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
+pub(super) fn snapshot_rows(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<(RunRow, i64)>, PersistError> {
     {
         let run = conn
             .query_row(
