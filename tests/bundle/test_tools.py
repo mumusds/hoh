@@ -1018,6 +1018,14 @@ class SpawnScan(unittest.TestCase):
                                              line('`std::process::Command::spawnx` does not refer to a reachable function')]))
         self.assertEqual(found,[]);self.assertEqual(len(problems),1);self.assertIn('spawnx',problems[0])
         self.assertIn('outside the gate',' '.join(s.judge([('crates/hoh-client/src/prompt.rs','tokio::process::Command::spawn')],self.manifest())))
+        # CLN3-01: once tokio's process feature is on, an optional entry that does not resolve is a problem too, and
+        # all three starts are configured by their full paths.
+        for m in ('spawn','output','status'):
+            self.assertIn(f'tokio::process::Command::{m}',s.configuration([],[]))
+        _,problems=s.found_in(line('`tokio::process::Command::spawnx` does not refer to a reachable function'),optional_may_be_unresolved=False)
+        self.assertEqual(len(problems),1)
+        meta=lambda feats:{'packages':[{'id':'t','name':'tokio'}],'resolve':{'nodes':[{'id':'t','features':feats}]}}
+        self.assertTrue(s.tokio_process_enabled(meta(['process','rt'])));self.assertFalse(s.tokio_process_enabled(meta(['rt'])))
     def test_every_source_file_is_in_one_class(self):
         # CLT-1251, CLT-1350 (b): every .rs file under crates/*/src, tests.rs included, is in exactly one class.
         s=self.scan()
