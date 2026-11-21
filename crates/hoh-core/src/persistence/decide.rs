@@ -728,13 +728,14 @@ fn load_snapshot(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Snapshot, PersistError> {
     let run_id = proposal.run_id.as_str();
-    let commander_epoch = load_binding(tx, run_id, COMMANDER)?.map(|b| b.role_epoch);
+    let commander_epoch =
+        load_binding(tx, run_id, COMMANDER, &ctx.resource_bundle.version())?.map(|b| b.role_epoch);
     let task = match proposal.task_id() {
         Some(id) => load_task(tx, run_id, id, run.spec_id.as_deref(), context.now())?,
         None => None,
     };
     let target = match proposal.target_role() {
-        Some(role) => load_binding(tx, run_id, role)?,
+        Some(role) => load_binding(tx, run_id, role, &ctx.resource_bundle.version())?,
         None => None,
     };
     let required_capabilities = task
@@ -915,6 +916,7 @@ pub(super) fn load_binding(
     tx: &Transaction<'_>,
     run_id: &str,
     role: &str,
+    resource_version: &str,
 ) -> Result<Option<BindingView>, PersistError> {
     let row: Option<(i64, String, Option<String>, Option<String>)> = tx
         .query_row(
@@ -934,8 +936,8 @@ pub(super) fn load_binding(
         .map(|v| crate::decision::granted_capabilities(&v))
         .unwrap_or_default();
     // What keeps an ACTIVE binding from being dispatched now, each named (CR-025, ROLE_BINDING_PENDING): a role whose
-    // change waits for its checkpoint, or that has no session yet, is not dispatched, and its tasks are not judged by
-    // capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50); nor while staffing holds a rebind
+    // configuration or resource change waits for its checkpoint, or that has no session yet, is not dispatched. Its
+    // tasks are not judged by capabilities it does not have yet (docs/adr/ADR-022.md decision 8, M2T07R-50); nor while staffing holds a rebind
     // of it pending for the attempt in flight (docs/adr/ADR-030.md decision 5: the new session is granted once it
     // ended); nor is a new holder whose first input, its handover package, is not delivered yet (docs/adr/ADR-024.md
     // decision 4, M2T17R-03); nor, while the session owes its first input, a second attempt of it (M2T17R-201). A BLOCKED
@@ -943,7 +945,7 @@ pub(super) fn load_binding(
     use crate::decision::Pending;
     let mut pending = Vec::new();
     if state == "ACTIVE" {
-        if super::team::pending(tx, run_id, role)? {
+        if super::team::pending(tx, run_id, role, resource_version)? {
             pending.push(Pending::TeamChange);
         }
         if super::staffing::pending_change(tx, run_id, role, epoch)?

@@ -567,7 +567,9 @@ fn freeze_and_accept(
     // hand-made fixture lacks one. A verifier's binding BLOCKED for any reason does not stop the freeze: its task is
     // marked and waits (decision 7), and without its report there is no join, so the candidate is never ACCEPTED.
     for role in super::results::VERIFIERS {
-        if super::decide::load_binding(tx, &task.run_id, role)?.is_none() {
+        if super::decide::load_binding(tx, &task.run_id, role, &ctx.resource_bundle.version())?
+            .is_none()
+        {
             return decide(
                 tx,
                 job,

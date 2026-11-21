@@ -81,7 +81,7 @@ pub(super) fn round(
         return Ok(RoundOutcome::default());
     }
     let params = parameters(&snapshot)?;
-    let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context)?;
+    let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context, ctx)?;
     // A round's verifier tasks are the Runtime's: dispatched on a BLOCKED run too (docs/adr/ADR-028.md decision 10).
     let verifiers = super::verification::verifier_tasks(&tx, run_id)?;
     // A writer an open round with an open Issue holds is not selected: it stays READY until the round closes
@@ -138,7 +138,7 @@ pub(super) fn round(
         }
     }
     let task = &rows[chosen];
-    let binding = decide::load_binding(&tx, run_id, &task.role)?
+    let binding = decide::load_binding(&tx, run_id, &task.role, &ctx.resource_bundle.version())?
         .ok_or_else(|| PersistError::Storage(format!("role {} lost its binding", task.role)))?;
     // A verifier task goes with its round's current handoff, at its role's current epoch, in a session of its own; a
     // refusal is written and nothing is leased (docs/adr/ADR-028.md decisions 9 and 10).
@@ -319,6 +319,7 @@ fn candidates(
     run_id: &str,
     run_spec: Option<&str>,
     context: &Context,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Vec<Row>, PersistError> {
     let mut statement = tx
         .prepare(
@@ -379,7 +380,7 @@ fn candidates(
             continue;
         }
         if !bindings.contains_key(&role) {
-            let binding = decide::load_binding(tx, run_id, &role)?;
+            let binding = decide::load_binding(tx, run_id, &role, &ctx.resource_bundle.version())?;
             bindings.insert(role.clone(), binding);
         }
         let capable = match (

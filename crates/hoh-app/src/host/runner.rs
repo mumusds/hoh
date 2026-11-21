@@ -764,9 +764,9 @@ async fn tick(
         }
         None => hoh_core::persistence::Availability::default(),
     };
-    // The team changes whose checkpoint has come, in every run not ended that is behind the project's revision
-    // (decision 8), before any pace or round: a change to an agent unavailable is refused, one to an agent not looked
-    // at yet waits.
+    // Team changes behind the project's revision (decision 8), and resource upgrades with an idle role (CR-026 C14),
+    // before any pace or round. Busy resource-only changes pause dispatch without a checkpoint transaction each tick;
+    // a team change to an unavailable agent is refused, one to an agent not looked at yet waits.
     for run in &waiting.team_behind {
         held.item(store.team_checkpoint(run, availability.clone()).await)?;
     }

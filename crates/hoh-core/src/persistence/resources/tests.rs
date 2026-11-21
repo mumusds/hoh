@@ -84,6 +84,144 @@ fn assigned(path: &Path, id: &str) -> R<Option<String>> {
     )?)
 }
 
+// AC-047-03 / M3G-50: a steady supply of ready tasks must drain, rather than extend, the old bundle's attempts.
+#[tokio::test]
+async fn test_047_03_overlapping_attempts_pause_dispatch_until_resource_checkpoint() -> R {
+    for state in ["PREPARED", "STARTING", "RUNNING"] {
+        let (_dir, path) = setup().await?;
+        let store = Store::open(&path, options(old()))?;
+        Connection::open(&path)?.execute_batch(
+            "UPDATE runs SET spec_id='s' WHERE run_id='R';
+             INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json)
+               VALUES ('sd', 'claude', 'developer', '1', '{\"structured_events\":true}');
+             UPDATE role_bindings SET session_id='sd' WHERE run_id='R' AND role='developer';
+             INSERT INTO tasks(task_id, run_id, spec_id, state, role, created_seq, cost_estimate)
+               VALUES ('overlap', 'R', 's', 'LEASED', 'developer', 2, 1),
+                      ('next', 'R', 's', 'READY', 'developer', 3, 1);",
+        )?;
+        store.create_attempt(attempt("A")).await?;
+        store
+            .create_attempt(NewAttempt {
+                task_id: "overlap".to_owned(),
+                ..attempt("B")
+            })
+            .await?;
+        Connection::open(&path)?.execute("UPDATE attempts SET state=?1", [state])?;
+        drop(store);
+        let store = Store::open(&path, options(Bundle::current()))?;
+        let context = crate::decision::Context {
+            required_capabilities: [(
+                "developer".to_owned(),
+                ["structured_events".to_owned()].into(),
+            )]
+            .into(),
+            reader_slots: Some(4),
+            ..Default::default()
+        };
+        let proposal = crate::decision::Proposal {
+            decision_id: "dispatch-next".to_owned(),
+            run_id: "R".to_owned(),
+            role_epoch: 1,
+            expected_revision: 0,
+            spec_sha256: format!("{:064}", 1),
+            candidate_id: None,
+            causation_id: None,
+            payload: crate::protocol::decode(
+                &json!({"kind":"dispatch", "task_id":"next", "role":"developer"}),
+            )?,
+        };
+        assert!(
+            matches!(
+                store.decide(proposal, context.clone()).await?,
+                crate::persistence::Decided::Rejected {
+                    reason: crate::protocol::RejectionReason::RoleBindingPending,
+                    ..
+                }
+            ),
+            "Commander dispatch must honor resource lag too"
+        );
+        // Other roles may upgrade independently; the developer still has two overlapping attempts.
+        assert!(store.team_checkpoint("R", Availability::default()).await?);
+        drop(store);
+        let store = Store::open(&path, options(Bundle::current()))?;
+        for ended in [None, Some("A")] {
+            if let Some(id) = ended {
+                Connection::open(&path)?.execute(
+                    "UPDATE attempts SET state='CANCELLED' WHERE attempt_id=?1",
+                    [id],
+                )?;
+            }
+            for _ in 0..3 {
+                assert!(
+                    store
+                        .schedule_round("R", context.clone())
+                        .await?
+                        .dispatched
+                        .is_none(),
+                    "{state}: resource lag must pause new dispatch while B remains in flight"
+                );
+                assert!(
+                    !store
+                        .runner_waiting("p")
+                        .await?
+                        .staffing
+                        .iter()
+                        .any(|b| b.role == "developer"),
+                    "staffing must honor the same pending predicate"
+                );
+                assert_eq!(
+                    pin(&path, "developer")?.resource_bundle_version,
+                    old().version()
+                );
+            }
+        }
+        Connection::open(&path)?.execute(
+            "UPDATE attempts SET state='FAILED' WHERE attempt_id='B'",
+            [],
+        )?;
+        assert_eq!(store.runner_waiting("p").await?.team_behind, ["R"]);
+        assert!(store.team_checkpoint("R", Availability::default()).await?);
+        let dispatched = store
+            .schedule_round("R", context)
+            .await?
+            .dispatched
+            .ok_or("dispatch did not resume")?;
+        assert_eq!(dispatched.task_id, "next");
+        assert_eq!(
+            assigned(&path, &dispatched.attempt_id)?,
+            Some(Bundle::current().version())
+        );
+        assert_eq!(assigned(&path, "A")?, Some(old().version()));
+        assert_eq!(assigned(&path, "B")?, Some(old().version()));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_047_03_busy_resource_lag_does_not_request_checkpoint_every_tick() -> R {
+    let (_dir, path) = setup().await?;
+    let store = Store::open(&path, options(old()))?;
+    store.create_attempt(attempt("A")).await?;
+    drop(store);
+    let store = Store::open(&path, options(Bundle::current()))?;
+    assert_eq!(store.runner_waiting("p").await?.team_behind, ["R"]);
+    assert!(store.team_checkpoint("R", Availability::default()).await?);
+    for _ in 0..3 {
+        assert!(
+            store.runner_waiting("p").await?.team_behind.is_empty(),
+            "only the busy developer is behind; no checkpoint can advance it"
+        );
+    }
+    Connection::open(&path)?.execute(
+        "UPDATE attempts SET state='CANCELLED' WHERE attempt_id='A'",
+        [],
+    )?;
+    assert_eq!(store.runner_waiting("p").await?.team_behind, ["R"]);
+    assert!(store.team_checkpoint("R", Availability::default()).await?);
+    assert!(store.runner_waiting("p").await?.team_behind.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_047_03_dispatch_before_checkpoint_keeps_old_until_all_attempts_end() -> R {
     for state in ["PREPARED", "STARTING", "RUNNING"] {

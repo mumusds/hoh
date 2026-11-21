@@ -1723,7 +1723,13 @@ async fn a_binding_reports_exactly_which_of_its_changes_hold() -> R {
         drop(store);
         let mut conn = Connection::open(&path)?;
         let tx = conn.transaction()?;
-        let binding = load_binding(&tx, "R", "developer")?.ok_or("no binding")?;
+        let binding = load_binding(
+            &tx,
+            "R",
+            "developer",
+            &crate::resource_bundle::Bundle::current().version(),
+        )?
+        .ok_or("no binding")?;
         assert_eq!(
             (binding.pending, binding.active, binding.blocked),
             (pending.clone(), pending.is_empty(), false),
