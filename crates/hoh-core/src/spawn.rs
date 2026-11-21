@@ -155,12 +155,7 @@ impl Helper {
                 if matches!(child.try_wait(), Ok(None)) {
                     let _ = std::thread::Builder::new()
                         .name("hoh-reap".to_owned())
-                        .spawn(move || {
-                            if exited(|| WaitId::Pid(pid)) {
-                                let _ = kill_process_group(pid, Signal::KILL);
-                            }
-                            let _ = child.wait();
-                        });
+                        .spawn(move || reap_child_later(child));
                 }
                 return Err(e);
             }
@@ -367,6 +362,15 @@ fn exited<'a>(id: impl Fn() -> WaitId<'a>) -> bool {
             _ => return false,
         }
     }
+}
+
+/// The wrapping failure's reaper: keep the unreaped leader's group identity until its after-exit cleanup.
+fn reap_child_later(mut child: Child) {
+    let pid = Pid::from_child(&child);
+    if exited(|| WaitId::Pid(pid)) {
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    let _ = child.wait();
 }
 
 /// A leader its handle let go of, still running: wait for its exit on `pidfd` without consuming it, kill what is left of
