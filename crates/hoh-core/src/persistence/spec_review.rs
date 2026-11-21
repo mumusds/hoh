@@ -69,9 +69,10 @@ pub(super) fn record(
 }
 
 /// Take `intake` in, in the caller's transaction: its objects registered, every check run, and one `spec_review.reported`
-/// (`child_id(attempt, "spec-review/reported")`). Replayed with the same objects, nothing is written and its outcome is
-/// returned; with others, `KeyReuse`. A review that was never opened, an attempt that does not exist, or an object
-/// whose bytes are not its artifact's are the caller's integrity errors, not reasons.
+/// (`child_id(attempt, "spec-review/reported")`). Replayed with the same review, objects and recomputed log digest,
+/// nothing is written and its outcome is returned; with any of them changed, `KeyReuse`. A review that was never opened,
+/// an attempt that does not exist, or an object whose bytes are not its artifact's are the caller's integrity errors,
+/// not reasons. A raw artifact whose digest is not the recomputed one is a reason and is not registered.
 pub(super) fn intake_in(
     tx: &Transaction<'_>,
     intake: &SpecReviewIntake,
@@ -100,15 +101,22 @@ pub(super) fn intake_in(
         })?;
     let event_id = child_id(&intake.attempt_id, "spec-review/reported");
     let reference = |a: &ArtifactRow| json!({"path": a.path, "sha256": a.sha256});
-    let references = json!({
+    // What a replay must repeat: the review, the three objects and the digest recomputed from the turn log.
+    let identity = json!({
+        "review_id": intake.review_id,
         "report": intake.report.as_ref().map(|k| reference(&k.artifact)),
         "raw_session": reference(&intake.raw),
         "native_attempt": intake.native.as_ref().map(|k| reference(&k.artifact)),
+        "raw_sha256": intake.raw_sha256,
     });
-    if let Some(done) = replayed(tx, &event_id, &references)? {
+    if let Some(done) = replayed(tx, &event_id, &identity)? {
         return Ok(done);
     }
-    let mut artifacts = vec![intake.raw.clone()];
+    let raw_is_its_log = intake.raw.sha256 == intake.raw_sha256;
+    let mut artifacts = Vec::new();
+    if raw_is_its_log {
+        artifacts.push(intake.raw.clone());
+    }
     artifacts.extend(
         [&intake.report, &intake.native]
             .into_iter()
@@ -125,6 +133,37 @@ pub(super) fn intake_in(
         &expected,
     );
     let mut reasons = checked.reasons.clone();
+    // The objects the report names are the ones given and registered, and the raw artifact is the turn log's.
+    if let Some(report) = &checked.report {
+        let given = [
+            (
+                "raw_session",
+                codes::RAW_SESSION_REF_MISMATCH,
+                Some(&identity["raw_session"]),
+            ),
+            (
+                "native_attempt",
+                codes::NATIVE_ATTEMPT_REF_MISMATCH,
+                intake.native.as_ref().map(|_| &identity["native_attempt"]),
+            ),
+        ];
+        for (key, code, given) in given {
+            if let Some(given) = given.filter(|given| report[key] != **given) {
+                reasons.push(format!(
+                    "{code}: the report names {key} {}, the object given is {given}",
+                    report[key]
+                ));
+            }
+        }
+    }
+    if !raw_is_its_log {
+        reasons.push(format!(
+            "{}: the raw session artifact names sha256 {}, its log's bytes hash to {}",
+            codes::RAW_SESSION_ARTIFACT_MISMATCH,
+            intake.raw.sha256,
+            intake.raw_sha256
+        ));
+    }
     if task_id != opened.task_id {
         reasons.push(format!(
             "{}: attempt {} is of task {task_id}, review {} of task {}",
@@ -158,8 +197,8 @@ pub(super) fn intake_in(
         "status": checked.report.as_ref().map(|r| r["status"].clone()), "state": state.as_str(),
         "reasons": reasons, "session_id": session, "attempt_id": intake.attempt_id,
     });
-    for key in ["report", "raw_session", "native_attempt"] {
-        payload[key] = references[key].clone();
+    for key in REPLAY_KEYS.iter().filter(|key| **key != "review_id") {
+        payload[*key] = identity[*key].clone();
     }
     writer::write(
         tx,
@@ -281,22 +320,25 @@ fn session_reasons(
     Ok(reasons)
 }
 
-/// The sessions the reviewer must be independent of: the run's Commander (its binding, its tasks' attempts and the
-/// commander sessions of its `session.native` records) and the revision's drafters (the attempts of the tasks
-/// `spec.drafting` names with the revision's digest, in the project; docs/adr/ADR-035.md decision 6).
+/// The sessions the reviewer must be independent of (CR-026 correction A, docs/adr/ADR-035.md decision 6): for the
+/// run's Commander and, for each Task `spec.drafting` names with the revision's digest in the project, for that Task's
+/// run and role, the role's current binding, every Attempt of the role's Tasks in that run and the role's sessions
+/// of the run's `session.native` records. Their identities are taken by [`identities_of`].
 fn authors(tx: &Transaction<'_>, opened: &Opened) -> Result<BTreeSet<String>, PersistError> {
     let mut statement = tx
         .prepare(
-            "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = 'commander' \
-               AND session_id IS NOT NULL \
+            "WITH roles(run_id, role) AS (\
+               SELECT ?1, 'commander' \
+               UNION SELECT t.run_id, t.role FROM tasks t WHERE t.task_id IN (\
+                 SELECT json_extract(payload_json, '$.task_id') FROM events WHERE project_id = ?2 \
+                   AND kind = 'spec.drafting' AND json_extract(payload_json, '$.spec_sha256') = ?3)) \
+             SELECT b.session_id FROM role_bindings b JOIN roles r ON r.run_id = b.run_id AND r.role = b.role \
+               WHERE b.session_id IS NOT NULL \
              UNION SELECT a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-               WHERE t.run_id = ?1 AND t.role = 'commander' AND a.session_id IS NOT NULL \
+               JOIN roles r ON r.run_id = t.run_id AND r.role = t.role WHERE a.session_id IS NOT NULL \
              UNION SELECT s.session_id FROM events e JOIN sessions s \
                ON s.session_id = json_extract(e.payload_json, '$.session_id') \
-               WHERE e.run_id = ?1 AND e.kind = 'session.native' AND s.role = 'commander' \
-             UNION SELECT a.session_id FROM attempts a WHERE a.session_id IS NOT NULL AND a.task_id IN (\
-               SELECT json_extract(payload_json, '$.task_id') FROM events WHERE project_id = ?2 \
-                 AND kind = 'spec.drafting' AND json_extract(payload_json, '$.spec_sha256') = ?3)",
+               JOIN roles r ON r.run_id = e.run_id AND r.role = s.role WHERE e.kind = 'session.native'",
         )
         .map_err(sqlite_error)?;
     let rows = statement
@@ -339,11 +381,21 @@ fn identities_of(
     Ok(ids)
 }
 
-/// The outcome of `event_id` taken in before with the same objects; `KeyReuse` with others; none when it was not.
+/// The keys of a `spec_review.reported` a replay must repeat.
+const REPLAY_KEYS: [&str; 5] = [
+    "review_id",
+    "report",
+    "raw_session",
+    "native_attempt",
+    "raw_sha256",
+];
+
+/// The outcome of `event_id` taken in before with the same `identity` (its [`REPLAY_KEYS`]); `KeyReuse` with another;
+/// none when it was not.
 fn replayed(
     tx: &Transaction<'_>,
     event_id: &str,
-    references: &Value,
+    identity: &Value,
 ) -> Result<Option<SpecReviewTaken>, PersistError> {
     let payload: Option<String> = tx
         .query_row(
@@ -358,12 +410,10 @@ fn replayed(
     };
     let p: Value = serde_json::from_str(&payload)
         .map_err(|e| PersistError::IntegrityViolation(format!("{event_id}: {e}")))?;
-    if ["report", "raw_session", "native_attempt"]
-        .iter()
-        .any(|key| p[*key] != references[*key])
-    {
+    if REPLAY_KEYS.iter().any(|key| p[*key] != identity[*key]) {
         return Err(PersistError::KeyReuse(format!(
-            "the review report of {event_id} was taken in before with other objects"
+            "the review report of {event_id} was taken in before with another review, other objects or another \
+             log digest"
         )));
     }
     let reasons: Vec<String> = p["reasons"]
