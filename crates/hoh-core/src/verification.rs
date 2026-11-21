@@ -1075,6 +1075,7 @@ pub const ATTEMPT_MARKER: &str = "hoh-runtime:verification-attempt";
 
 pub mod acceptance;
 pub mod classify;
+pub mod identity;
 pub mod issues;
 pub mod report;
 
