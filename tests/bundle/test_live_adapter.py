@@ -12,9 +12,20 @@ QA_ARGV=['test','-p','hoh-app','--locked','--test','verification_live','--','--i
          'verification_live_candidate_to_qa','--nocapture']
 # The stand-in for `cargo test`: records how it was called and writes the verdict FAKE_VERDICTS gives for the test it
 # was asked to run (none when it gives none), as the ignored test would into HOH_LIVE_OUT.
-FAKE_CARGO=r"""import json,os,sys
+FAKE_CARGO=r"""import json,os,subprocess,sys
 args=sys.argv[1:]
 with open(os.environ['CALLS'],'a') as f:f.write(json.dumps({'argv':args,'env':{k:v for k,v in os.environ.items() if k.startswith('HOH_LIVE')}})+'\n')
+if os.environ.get('FAKE_TRY_OUTER_EVIDENCE'):
+    # A scenario's descendant inherits cargo's environment, as the in-process host and its agents do. Reproduce a
+    # fixture check run directly by an agent, without the inner run-check assigning its own evidence directory.
+    subprocess.run([sys.executable,'-c', '''import json,os
+if os.environ.get('HOH_EVIDENCE_DIR'):
+    with open(os.path.join(os.environ['HOH_EVIDENCE_DIR'],'test-results.jsonl'),'a') as f:
+        f.write(json.dumps({'schema_version':'1.0','test_id':'TEST-090-02','name':'fixture','status':'FAIL'})+'\\n')
+'''],check=True)
+    with open(os.environ['FAKE_TRY_OUTER_EVIDENCE'],'a') as f:
+        f.write(json.dumps({k:v for k,v in os.environ.items() if k in
+            ('HOH_EVIDENCE_DIR','HOH_CHECK_ID','HOH_CANDIDATE_ID','HOH_SPEC_SHA256','HOH_CANDIDATE_FILE','HOH_CHECK_RECORD_ID')})+'\n')
 name=args[args.index('--exact')+1]
 agent={'claude_live_turns_resume_and_cancel':'claude','codex_live_turn_and_cancel':'codex','pi_live_turns_resume_and_cancel':'pi',
        'doctor_live_versions_whitelist_and_verified_logins':'doctor','verification_live_candidate_to_qa':'qa',
@@ -66,6 +77,31 @@ class Harness(unittest.TestCase):
         return p,results,[c for c in calls if 'verification_live' in c['argv']]
 
 class AdapterLiveQa(Harness):
+    def test_live_scenarios_cannot_inherit_the_outer_checks_evidence(self):
+        # Regression for V01QA-001/-002 (AC-025-04 / AC-053-05). Keep an existing row byte-for-byte: isolation must
+        # prevent the write, not discard a foreign FAIL after it has reached the outer evidence file.
+        results_file=self.ev/'test-results.jsonl'
+        sentinel=json.dumps({'schema_version':'1.0','test_id':'TEST-025-04','name':'outer','status':'PASS'})+'\n'
+        results_file.write_text(sentinel)
+        seen=self.root/'seen.jsonl'
+        parent={'HOH_CHECK_ID':'adapter-live','HOH_CANDIDATE_ID':'CAND-'+'a'*64,'HOH_SPEC_SHA256':'b'*64,
+                'HOH_CANDIDATE_FILE':str(self.root/'candidate.json'),'HOH_CHECK_RECORD_ID':'outer-record',
+                'FAKE_TRY_OUTER_EVIDENCE':str(seen)}
+        for profile in ('v0.1','v1'):
+            with self.subTest(profile=profile):
+                results_file.write_text(sentinel);seen.unlink(missing_ok=True);self.calls.unlink(missing_ok=True)
+                p,results,calls=self.run_script(verdicts={'qa':passed()},env=parent|{'HOH_LIVE_PROFILE':profile})
+                self.assertEqual(p.returncode,3,p.stderr)  # Other mock verdicts remain BLOCKED.
+                self.assertTrue(results_file.read_text().startswith(sentinel))
+                self.assertNotIn('TEST-090-02',results,'a nested fixture contaminated the outer evidence')
+                environments=[json.loads(line) for line in seen.read_text().splitlines()]
+                self.assertEqual(len(environments),5 if profile=='v0.1' else 6)
+                self.assertTrue(all(e=={} for e in environments),environments)
+                self.assertEqual(calls[0]['env']['HOH_LIVE_PROFILE'],profile,'the harness still selects its team')
+                live=json.loads((self.ev/'live-sessions.json').read_text())
+                self.assertEqual(live['check_id'],'adapter-live')
+                self.assertEqual(live['harness_candidate_id'],parent['HOH_CANDIDATE_ID'])
+
     def assertBlocked(self,results,calls,why):
         row=results['TEST-053-05'];self.assertEqual((row['status'],row['name']),('SKIPPED',QA_TEST),row)
         self.assertTrue(row['detail'].startswith('BLOCKED: '),row);self.assertIn(why,row['detail'])

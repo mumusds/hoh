@@ -67,8 +67,14 @@ live() {
     printf '{"status": "BLOCKED", "detail": "%s not installed (the default QA and Reviewer; HOH_LIVE_PROFILE=v0.1 puts claude in their place)", "sessions": []}\n' \
       "${missing% }" > "$verdict"
   else
-    HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$codex" HOH_LIVE_PI="$pi" cargo test -p "$package" --locked \
-      --test "$binary" -- --ignored --exact "$name" --nocapture > "$out/$agent-live.log" 2>&1 || true
+    # Only this driver owns run_check's evidence context. A scenario may start an inner host whose agents run fixture
+    # checks directly; none may inherit the outer evidence directory or its candidate/check identity. Keep the live
+    # profile here for the scenario's team selection; the product's agent gate strips it before native turns start.
+    (
+      unset HOH_EVIDENCE_DIR HOH_CHECK_ID HOH_CANDIDATE_ID HOH_SPEC_SHA256 HOH_CANDIDATE_FILE HOH_CHECK_RECORD_ID
+      HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$codex" HOH_LIVE_PI="$pi" cargo test -p "$package" --locked \
+        --test "$binary" -- --ignored --exact "$name" --nocapture
+    ) > "$out/$agent-live.log" 2>&1 || true
   fi
 }
 live claude claude_live claude_live_turns_resume_and_cancel

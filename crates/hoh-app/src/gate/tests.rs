@@ -45,6 +45,10 @@ fn gate_child() {
 
 /// The child running `gate::main(args)` with `input` on stdin (`pause`: verify, wait, exec, see [`PAUSE`]).
 fn spawn(args: &[OsString], pause: Option<&Path>) -> R<std::process::Child> {
+    Ok(child_command(args, pause)?.spawn()?)
+}
+
+fn child_command(args: &[OsString], pause: Option<&Path>) -> R<Command> {
     let args: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -65,7 +69,7 @@ fn spawn(args: &[OsString], pause: Option<&Path>) -> R<std::process::Child> {
     if let Some(dir) = pause {
         command.env(PAUSE, dir);
     }
-    Ok(command.spawn()?)
+    Ok(command)
 }
 
 /// `gate::main(args)` given `input` (then its end): its exit code and stderr.
@@ -160,6 +164,98 @@ fn checked(expect: &Expect, status: &Path, program: &Path, args: &[&str]) -> Vec
 fn executable(path: &Path, text: &str) -> R {
     std::fs::write(path, text)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+#[test]
+fn agent_turns_cannot_write_to_an_inherited_checks_evidence() -> R {
+    // V01QA-001/-002: a fake agent tries a nested fixture check with the parent's environment. Both checked product
+    // gates and unchecked gates must strip check context, but keep the attempt marker and ordinary configuration.
+    const VARIABLES: &[&str] = &[
+        "HOH_EVIDENCE_DIR",
+        "HOH_CHECK_ID",
+        "HOH_CANDIDATE_ID",
+        "HOH_SPEC_SHA256",
+        "HOH_CANDIDATE_FILE",
+        "HOH_CHECK_RECORD_ID",
+        "HOH_LIVE_PROFILE",
+        "HOH_LIVE_OUT",
+    ];
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let agent = root.join("agent");
+    executable(
+        &agent,
+        r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+names = ('HOH_EVIDENCE_DIR', 'HOH_CHECK_ID', 'HOH_CANDIDATE_ID', 'HOH_SPEC_SHA256',
+         'HOH_CANDIDATE_FILE', 'HOH_CHECK_RECORD_ID', 'HOH_LIVE_PROFILE', 'HOH_LIVE_OUT',
+         'HOH_ATTEMPT_ID', 'HOH_AGENT_TEST_CONFIG')
+print(json.dumps({k: os.environ[k] for k in names if k in os.environ}), flush=True)
+subprocess.run(['sh', '-c', '''
+if [ -n "${HOH_EVIDENCE_DIR:-}" ]; then
+    printf '%s\n' '{"test_id":"TEST-090-02","status":"FAIL"}' >> "$HOH_EVIDENCE_DIR/test-results.jsonl"
+fi
+'''], check=True)
+sys.exit(int(sys.argv[1]))
+"#,
+    )?;
+    let outer = root.join("test-results.jsonl");
+    let sentinel = b"outer evidence must remain unchanged\n";
+    std::fs::write(&outer, sentinel)?;
+    for is_checked in [true, false] {
+        for exit in ["0", "7"] {
+            let args = if is_checked {
+                checked(
+                    &expect_of(Agent::Claude, &agent)?,
+                    &root.join(format!("gate-{exit}.jsonl")),
+                    &agent,
+                    &[exit],
+                )
+            } else {
+                vec![agent.as_os_str().to_owned(), exit.into()]
+            };
+            let mut command = child_command(&args, None)?;
+            for name in VARIABLES {
+                command.env(name, &root);
+            }
+            command
+                .env("HOH_ATTEMPT_ID", "inner-attempt")
+                .env("HOH_AGENT_TEST_CONFIG", "preserved");
+            let mut child = command.spawn()?;
+            let go = if is_checked {
+                format!("go {KEY}\n")
+            } else {
+                "go\n".to_owned()
+            };
+            child
+                .stdin
+                .take()
+                .ok_or("no stdin")?
+                .write_all(go.as_bytes())?;
+            let out = output_within(child, Duration::from_secs(60))?;
+            assert_eq!(out.status.code(), Some(exit.parse()?), "{out:?}");
+            assert_eq!(
+                std::fs::read(&outer)?,
+                sentinel,
+                "a nested fixture wrote the outer evidence (checked={is_checked}, exit={exit})"
+            );
+            // libtest prints its own preamble before gate_child execs the fake agent.
+            let stdout = String::from_utf8(out.stdout)?;
+            let env: Value = stdout
+                .lines()
+                .find_map(|l| {
+                    l.find('{')
+                        .and_then(|at| serde_json::from_str(&l[at..]).ok())
+                })
+                .ok_or("no environment from fake agent")?;
+            for name in VARIABLES {
+                assert!(env.get(*name).is_none(), "{name} reached the agent");
+            }
+            assert_eq!(env["HOH_ATTEMPT_ID"], "inner-attempt");
+            assert_eq!(env["HOH_AGENT_TEST_CONFIG"], "preserved");
+        }
+    }
     Ok(())
 }
 
