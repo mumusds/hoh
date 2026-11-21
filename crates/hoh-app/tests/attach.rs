@@ -703,6 +703,22 @@ fn started_pid(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
     }
 }
 
+/// [`started_pid`], and on its failure the stand-in that `file` names, if it started meanwhile, killed (CLT-354): a
+/// failed test leaves no `sleep 30` behind.
+fn started_or_ended(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
+    started_pid(file, client, limit).inspect_err(|_| {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+            && let Ok(pidfd) =
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        {
+            kill_held(&pidfd);
+        }
+    })
+}
+
 /// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
 fn ended(pidfd: &std::os::fd::OwnedFd) -> R<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec};
@@ -769,7 +785,7 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
                 .stderr(Stdio::piped())
                 .spawn()?,
         ));
-        let pid = started_pid(&pid_file, &mut client, LIMIT)?;
+        let pid = started_or_ended(&pid_file, &mut client, LIMIT)?;
         let probe = rustix::process::pidfd_open(
             rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
             rustix::process::PidfdFlags::empty(),
@@ -991,7 +1007,7 @@ fn a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended() -> R 
     let mut probe = None;
     let outcome = (|| -> R<(Output, bool)> {
         reached(&holds.join("helper-spawned.reached"), &mut client, LIMIT)?;
-        let pid = started_pid(&pid_file, &mut client, LIMIT)?;
+        let pid = started_or_ended(&pid_file, &mut client, LIMIT)?;
         let held = probe.insert(rustix::process::pidfd_open(
             rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
             rustix::process::PidfdFlags::empty(),
