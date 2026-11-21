@@ -726,7 +726,7 @@ impl World {
     /// [`World::new`] with the project directory named `name` (the Workspace's top bar shows it), short as a socket
     /// path needs.
     pub fn named(name: &str) -> R<World> {
-        let dir = tempfile::Builder::new().prefix("hohw").tempdir_in("/tmp")?;
+        let dir = tempfile::Builder::new().prefix("hohw").tempdir()?;
         let world = World {
             dir,
             setsid: found("setsid")?,
@@ -1608,13 +1608,17 @@ impl World {
 impl Drop for World {
     /// Its processes stopped, its directory removed here and not only by the TempDir, whose removal ignores its errors
     /// ([`removed`]): a removal that fails, or a directory made again just after it, is reported ([`leftover`]) on
-    /// stderr, written directly so that the test harness, which captures only the print macros, shows it for a passing
-    /// test too. Nothing is tried again.
+    /// stderr while unwinding, without replacing the original failure. On an otherwise successful exit it fails
+    /// the test: a printed cleanup diagnostic alone is not evidence of successful removal. Nothing is tried again.
     fn drop(&mut self) {
         use std::io::Write as _;
         self.stop();
         if let Some(report) = removed(self.root()) {
-            let _ = std::io::stderr().write_all(report.as_bytes());
+            if std::thread::panicking() {
+                let _ = std::io::stderr().write_all(report.as_bytes());
+            } else {
+                panic!("{report}");
+            }
         }
     }
 }
