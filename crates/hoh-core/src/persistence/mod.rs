@@ -47,7 +47,7 @@ mod series;
 mod snapshot;
 mod spec_review;
 mod spec;
-pub use spec::{SpecApproval, SpecFiles};
+pub use spec::{SpecAction, SpecFiles, SpecRequest};
 mod staffing;
 mod stall;
 mod suites;
@@ -281,6 +281,10 @@ pub enum PersistError {
     /// A command names what its run does not have (`BAD_REQUEST`): an answer's choice that is not its question's
     /// (docs/adr/ADR-031.md decision 7); nothing was written.
     BadRequest(String),
+    /// A specification command's expected digest or CR base conflicts; no writes (REQ-034).
+    SpecConflict(Box<serde_json::Value>),
+    /// Markdown cannot be indexed. Only its diagnostic event may have been recorded (REQ-034).
+    SpecInvalid(crate::specindex::IndexError),
     /// A scheduler change for a run that exists: a run keeps the parameters of its snapshot (`RUN_CONFIG_FROZEN`,
     /// CR-007); nothing was written.
     RunConfigFrozen(String),
@@ -357,6 +361,8 @@ impl PersistError {
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
+            PersistError::SpecConflict(_) => Some(ErrorCode::SpecConflict),
+            PersistError::SpecInvalid(_) => Some(ErrorCode::SpecInvalid),
             PersistError::InvalidTeamConfig { .. } => Some(ErrorCode::InvalidTeamConfig),
             PersistError::RunConfigFrozen(_) => Some(ErrorCode::RunConfigFrozen),
             PersistError::Plan(plan) => plan.code(),
@@ -386,6 +392,8 @@ impl PersistError {
 impl std::fmt::Display for PersistError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PersistError::SpecConflict(details) => write!(f, "SPEC_CONFLICT: {details}"),
+            PersistError::SpecInvalid(error) => write!(f, "SPEC_INVALID: {error}"),
             PersistError::OnNetworkFs { path, fstype } => {
                 write!(f, "DB_ON_NETWORK_FS: {} is on {fstype}", path.display())
             }

@@ -4,7 +4,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod impact;
 mod parse;
+pub use impact::impact;
 
 pub const PATH: &str = "docs/spec/index.json";
 

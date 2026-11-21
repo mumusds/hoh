@@ -1,33 +1,60 @@
 //! Approved specifications and their derived rows (REQ-034; ADR-033).
-//! The host supplies bytes; this module owns their one approval transaction.
+//! The host supplies bytes; this module owns their command transaction.
 
 use super::commands::SubmitCommand;
-use super::writer::{self, Change, Commit, Ctx, Entity, StateCas};
+use super::writer::{self, Change, Commit, Ctx, Entity, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
-use crate::protocol::{ApproveSpec, RunState, SpecDecision};
+use crate::protocol::{ApproveSpec, ProposeSpecChange, RunState, SpecDecision};
 use crate::specindex::{self, Index, IndexError, Source};
 use rusqlite::{OptionalExtension, Transaction, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
-/// A workspace snapshot read by the host. A tracked index is its working-tree bytes, never a generated substitute.
+/// A workspace snapshot read by the host, including the existing bytes and their Git tracking identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecFiles {
     pub sources: Vec<Source>,
+    pub existing_index: Option<Vec<u8>>,
     pub tracked_index: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpecApproval {
-    pub approval: ApproveSpec,
+pub enum SpecAction {
+    Approve(ApproveSpec),
+    Propose(ProposeSpecChange),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecRequest {
+    pub action: SpecAction,
     pub files: Result<SpecFiles, IndexError>,
 }
 
-pub(super) fn approve(
+struct Approved {
+    id: String,
+    revision: i64,
+}
+
+fn latest(tx: &Transaction<'_>, project: &str) -> Result<Option<Approved>, PersistError> {
+    tx.query_row(
+        "SELECT spec_id,revision FROM specs WHERE project_id=?1 ORDER BY revision DESC LIMIT 1",
+        params![project],
+        |r| {
+            Ok(Approved {
+                id: r.get(0)?,
+                revision: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+pub(super) fn apply(
     tx: &Transaction<'_>,
     command: &SubmitCommand,
-    input: &SpecApproval,
+    input: &SpecRequest,
     ctx: &Ctx<'_>,
 ) -> Result<(i64, i64), PersistError> {
     let run: Option<(String, i64, String)> = tx
@@ -43,7 +70,7 @@ pub(super) fn approve(
     };
     if writer::parse::<RunState>(&state)?.is_terminal() {
         return Err(PersistError::BadRequest(
-            "an ended run cannot approve specifications".into(),
+            "an ended run cannot change specifications".into(),
         ));
     }
     if project != command.event.project_id {
@@ -62,59 +89,212 @@ pub(super) fn approve(
     let files = input
         .files
         .as_ref()
-        .map_err(|e| PersistError::BadRequest(e.to_string()))?;
-    let index = specindex::generate_index(&files.sources)
-        .map_err(|e| PersistError::BadRequest(e.to_string()))?;
-    if index.sha256() != input.approval.spec_sha256
-        || files.tracked_index.as_deref() != Some(index.bytes())
-    {
-        return Err(PersistError::BadRequest(
-            "specification digest conflicts with the generated or tracked index".into(),
-        ));
+        .map_err(|e| PersistError::SpecInvalid(e.clone()))?;
+    let index = specindex::generate_index(&files.sources).map_err(PersistError::SpecInvalid)?;
+    let expected = match &input.action {
+        SpecAction::Approve(a) => &a.spec_sha256,
+        SpecAction::Propose(p) => &p.spec_sha256,
+    };
+    let actual = index.sha256();
+    let tracked_differs = matches!(input.action, SpecAction::Approve(_))
+        && files.tracked_index.as_deref() != Some(index.bytes());
+    if expected != &actual || tracked_differs {
+        let mut details = json!({"expected":expected,"actual":actual});
+        if tracked_differs {
+            details["tracked"] = json!(files.tracked_index.as_deref().map(specindex::digest));
+        }
+        return Err(PersistError::SpecConflict(Box::new(details)));
     }
-    let latest: Option<String> = tx
-        .query_row(
-            "SELECT spec_id FROM specs WHERE project_id=?1 ORDER BY revision DESC LIMIT 1",
-            params![project],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    if latest.is_some() {
-        return Err(PersistError::BadRequest(
-            "a later specification revision requires a proposed change".into(),
-        ));
+    let base = latest(tx, &project)?;
+    let mut events = match &input.action {
+        SpecAction::Propose(proposal) => {
+            let base = base.as_ref().ok_or_else(|| {
+                PersistError::BadRequest(
+                    "the first specification uses ApproveSpec, without a CR".into(),
+                )
+            })?;
+            propose(tx, command, proposal, files, &index, base)?
+        }
+        SpecAction::Approve(approval) => approve(tx, command, approval, &index, base.as_ref())?,
+    };
+    // Approvals may update other non-terminal runs (Q3). Their touches fence decisions against the old revision.
+    let mut cas = vec![StateCas {
+        id: command.run_id.clone(),
+        expected_revision: revision,
+        change: Change::Touch(Entity::Run),
+    }];
+    if matches!(&input.action, SpecAction::Approve(a) if a.decision != SpecDecision::Reject) {
+        let id = child_id(&command.command_id, "spec");
+        let rows = tx.prepare("SELECT r.run_id,r.revision,r.state FROM runs r LEFT JOIN specs s ON s.spec_id=r.spec_id WHERE r.project_id=?1 AND (r.run_id=?2 OR s.revision<=?3) ORDER BY r.run_id").map_err(sqlite_error)?
+            .query_map(params![project,command.run_id,base.as_ref().map_or(0,|b| b.revision)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))
+            .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+        for (run, revision, state) in rows {
+            if writer::parse::<RunState>(&state)?.is_terminal() {
+                continue;
+            }
+            tx.execute(
+                "UPDATE runs SET spec_id=?1 WHERE run_id=?2",
+                params![id, run],
+            )
+            .map_err(sqlite_error)?;
+            if run != command.run_id {
+                super::hold::command(tx, &run)?;
+                cas.push(StateCas {
+                    id: run.clone(),
+                    expected_revision: revision,
+                    change: Change::Touch(Entity::Run),
+                });
+                let mut event = events[0].clone();
+                event.event_id = child_id(&command.command_id, &format!("spec/changed/{run}"));
+                event.run_id = Some(run.clone());
+                event.payload["run_id"] = json!(run);
+                events.push(event);
+            }
+        }
     }
-    if input.approval.decision == SpecDecision::Reject {
-        return Err(PersistError::BadRequest(
-            "there is no proposed change to reject".into(),
-        ));
-    }
-    let id = child_id(&command.command_id, "spec");
-    insert(tx, &project, &id, 1, &index)?;
-    tx.execute(
-        "UPDATE runs SET spec_id=?1 WHERE run_id=?2",
-        params![id, command.run_id],
-    )
-    .map_err(sqlite_error)?;
-    let mut event = command.event.clone();
-    event.kind = "spec.changed".to_owned();
-    event.payload = json!({"command_id": command.command_id, "run_id": command.run_id,
-        "spec_id": id, "spec_revision": 1, "spec_sha256": index.sha256(), "cause": "approved", "from": null});
     let done = writer::write(
         tx,
         &Commit {
-            cas: vec![StateCas {
-                id: command.run_id.clone(),
-                expected_revision: revision,
-                change: Change::Touch(Entity::Run),
-            }],
-            events: vec![event],
+            cas,
+            events,
             ..Commit::default()
         },
         ctx,
     )?;
     Ok((done.revisions[0], done.event_seqs[0]))
+}
+
+fn propose(
+    tx: &Transaction<'_>,
+    command: &SubmitCommand,
+    proposal: &ProposeSpecChange,
+    files: &SpecFiles,
+    index: &Index,
+    base: &Approved,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let old = indexed(tx, &base.id)?;
+    let mappings = tx.prepare("SELECT task_id,requirement_id FROM task_requirements WHERE spec_id=?1 ORDER BY task_id,requirement_id").map_err(sqlite_error)?
+        .query_map(params![base.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))
+        .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+    let impact = specindex::impact(&old, index.value(), &mappings);
+    let id = child_id(&command.command_id, "cr");
+    tx.execute("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES(?1,?2,?3,'PROPOSED',?4,?5,?6)",
+        params![id,command.event.project_id,base.id,proposal.reason,impact.to_string(),crate::time::now_rfc3339()]).map_err(sqlite_error)?;
+    // The locked CR row has no proposal digest column. This durable event binds it without changing Q8's shape.
+    let mut event = command.event.clone();
+    event.kind = "spec.proposed".into();
+    event.payload = json!({"command_id":command.command_id,"run_id":command.run_id,"cr_id":id,"base_spec_id":base.id,
+        "spec_revision":base.revision,"spec_sha256":index.sha256()});
+    let mut events = vec![event];
+    if let Some(mut payload) = index.drift(files.existing_index.as_deref()) {
+        payload["spec_revision"] = json!(base.revision);
+        payload["command_id"] = json!(command.command_id);
+        let mut drift = command.event.clone();
+        drift.event_id = child_id(&command.event.event_id, "generated-drift");
+        drift.kind = "spec.generated_drift".into();
+        drift.payload = payload;
+        events.push(drift);
+    }
+    Ok(events)
+}
+
+fn approve(
+    tx: &Transaction<'_>,
+    command: &SubmitCommand,
+    approval: &ApproveSpec,
+    index: &Index,
+    base: Option<&Approved>,
+) -> Result<Vec<NewEvent>, PersistError> {
+    let mut cr = None;
+    if let Some(base) = base {
+        let proposed: Option<(String,String)> = tx.query_row(
+            "SELECT c.cr_id,c.base_spec_id FROM change_requests c JOIN events e ON json_extract(e.payload_json,'$.cr_id')=c.cr_id WHERE c.project_id=?1 AND c.state='PROPOSED' AND e.kind='spec.proposed' AND json_extract(e.payload_json,'$.spec_sha256')=?2 ORDER BY e.seq DESC LIMIT 1",
+            params![command.event.project_id,index.sha256()], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
+        let Some((id, from)) = proposed else {
+            return Err(PersistError::SpecConflict(Box::new(
+                json!({"expected":approval.spec_sha256,"actual":index.sha256(),"reason":"no proposed change for this digest"}),
+            )));
+        };
+        if from != base.id {
+            return Err(PersistError::SpecConflict(Box::new(
+                json!({"expected":approval.spec_sha256,"actual":index.sha256(),"expected_base":from,"actual_base":base.id}),
+            )));
+        }
+        cr = Some(id);
+    }
+    let mut event = command.event.clone();
+    if approval.decision == SpecDecision::Reject {
+        let cr = cr.ok_or_else(|| {
+            PersistError::BadRequest("there is no proposed change to reject".into())
+        })?;
+        tx.execute("UPDATE change_requests SET state='REJECTED',decided_by=?1 WHERE cr_id=?2 AND state='PROPOSED'",params![command.command_id,cr]).map_err(sqlite_error)?;
+        event.kind = "spec.rejected".into();
+        event.payload = json!({"command_id":command.command_id,"cr_id":cr,"spec_revision":base.map_or(0,|b| b.revision)});
+    } else {
+        let revision = base.map_or(1, |b| b.revision + 1);
+        let id = child_id(&command.command_id, "spec");
+        insert(tx, &command.event.project_id, &id, revision, index)?;
+        if let Some(cr) = &cr {
+            tx.execute("UPDATE change_requests SET state='APPLIED',result_spec_id=?1,decided_by=?2 WHERE cr_id=?3 AND state='PROPOSED'",params![id,command.command_id,cr]).map_err(sqlite_error)?;
+        }
+        event.kind = "spec.changed".into();
+        event.payload = json!({"command_id":command.command_id,"run_id":command.run_id,"spec_id":id,"spec_revision":revision,
+            "spec_sha256":index.sha256(),"cause":if base.is_some() {"changed"} else {"approved"},"from":base.map(|b| b.revision)});
+        if let Some(cr) = cr {
+            event.payload["cr_id"] = json!(cr);
+            event.payload["to"] = json!(revision);
+        }
+    }
+    Ok(vec![event])
+}
+
+/// A parse failure commits only a diagnostic. The rejected command gets no accepted row or Run touch.
+pub(super) fn failed(
+    tx: &Transaction<'_>,
+    command: &SubmitCommand,
+    error: &IndexError,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let mut event = command.event.clone();
+    event.kind = "spec.index_failed".into();
+    event.payload = json!({"command_id":command.command_id,"path":error.path,"line":error.line,"error":error.error,
+        "spec_revision":latest(tx,&command.event.project_id)?.map_or(0,|b| b.revision)});
+    writer::write(
+        tx,
+        &Commit {
+            events: vec![event],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    Ok(())
+}
+
+/// Reconstruct only the approved semantic index from its derived rows; source-byte digests are not impact edges.
+fn indexed(tx: &Transaction<'_>, spec: &str) -> Result<Value, PersistError> {
+    let rows = tx.prepare("SELECT requirement_id,title,release_class FROM requirements WHERE spec_id=?1 ORDER BY requirement_id").map_err(sqlite_error)?
+        .query_map(params![spec],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))
+        .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+    let mut requirements = Vec::new();
+    let mut scenarios = Vec::new();
+    for (id, title, class) in rows {
+        let criteria=tx.prepare("SELECT ac_id,body,check_id FROM acceptance_criteria WHERE spec_id=?1 AND requirement_id=?2 ORDER BY ac_id").map_err(sqlite_error)?
+            .query_map(params![spec,id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))
+            .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+        let mut acceptance = Vec::new();
+        for (ac, body, check) in criteria {
+            let body: Value = serde_json::from_str(&body).map_err(|e| {
+                PersistError::IntegrityViolation(format!(
+                    "approved AC {ac} is not indexed JSON: {e}"
+                ))
+            })?;
+            scenarios.push(json!({"id":body["test_id"],"requirement_id":id,"acceptance_id":ac,"check_id":check}));
+            acceptance.push(body);
+        }
+        requirements.push(json!({"id":id,"title":title,"release_class":class,"release_targets":["project"],"acceptance":acceptance}));
+    }
+    scenarios.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(json!({"requirements":requirements,"scenarios":scenarios}))
 }
 
 fn insert(

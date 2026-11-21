@@ -559,6 +559,17 @@ async fn current_revision(shared: &Arc<Shared>, run_id: &str) -> Option<i64> {
 /// database is 503 and retryable; the database's own text never reaches the client.
 async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Response {
     match e {
+        PersistError::SpecConflict(details) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"code":"SPEC_CONFLICT","message":"specification conflicts with the current sources or approved base",
+                "retryable":false,"current_revision":current_revision(shared,run_id).await,"details":*details})),
+        ).into_response(),
+        PersistError::SpecInvalid(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({"code":"SPEC_INVALID","message":error.to_string(),"retryable":false,
+                "current_revision":current_revision(shared,run_id).await,
+                "details":{"path":error.path,"line":error.line,"error":error.error}})),
+        ).into_response(),
         PersistError::KeyReuse(key) => error(
             StatusCode::CONFLICT,
             "KEY_REUSE",
@@ -771,6 +782,7 @@ async fn submit_command(
     // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind
     // and payload, and the runtime notice for the host loop (ADR-016 decision 5, ADR-018 decision 4).
     let kind = command.kind();
+    let mut regeneration = None;
     let (name, target, event_kind, control, details) = match &command.body {
         CommandBody::StartRun(start) => {
             let mode = json!(start.mode).as_str().unwrap_or("AUTO").to_owned();
@@ -866,7 +878,7 @@ async fn submit_command(
             None,
             json!({}),
         ),
-        CommandBody::ApproveSpec(approval) => {
+        CommandBody::ApproveSpec(_) | CommandBody::ProposeSpecChange(_) => {
             let root = shared.root.clone();
             let files = super::begun::spawn_blocking(move || super::spec::files(&root)).await;
             let files = match files {
@@ -881,10 +893,31 @@ async fn submit_command(
                     );
                 }
             };
+            let (name, action) = match &command.body {
+                CommandBody::ApproveSpec(approval) => (
+                    "ApproveSpec",
+                    hoh_core::persistence::SpecAction::Approve(approval.clone()),
+                ),
+                CommandBody::ProposeSpecChange(proposal) => {
+                    // A successful command or its replay may finish the generated file's publication. An old replay
+                    // whose current sources no longer have its digest never regenerates those new sources for it.
+                    if let Ok(snapshot) = &files
+                        && hoh_core::specindex::generate_index(&snapshot.sources)
+                            .is_ok_and(|index| index.sha256() == proposal.spec_sha256)
+                    {
+                        regeneration = Some(snapshot.clone());
+                    }
+                    (
+                        "ProposeSpecChange",
+                        hoh_core::persistence::SpecAction::Propose(proposal.clone()),
+                    )
+                }
+                _ => unreachable!("specification command matched above"),
+            };
             (
-                "ApproveSpec",
-                RunTarget::Specification(Box::new(hoh_core::persistence::SpecApproval {
-                    approval: approval.clone(),
+                name,
+                RunTarget::Specification(Box::new(hoh_core::persistence::SpecRequest {
+                    action,
                     files,
                 })),
                 "spec.changed",
@@ -987,9 +1020,11 @@ async fn submit_command(
     match shared.store.submit_command(submit).await {
         Ok(CommandOutcome::Accepted { result_json, .. }) => {
             shared.hooks.after_commit();
-            accepted(result_json, false)
+            publish_spec(&shared, regeneration, result_json, false).await
         }
-        Ok(CommandOutcome::Replayed { result_json }) => accepted(result_json, true),
+        Ok(CommandOutcome::Replayed { result_json }) => {
+            publish_spec(&shared, regeneration, result_json, true).await
+        }
         // A team command's revision is the team's (M2T07R-04).
         Err(PersistError::KeyReuse(key)) if name == "ConfigureTeam" => error(
             StatusCode::CONFLICT,
@@ -1000,6 +1035,36 @@ async fn submit_command(
         ),
         Err(e) => store_error(&shared, run_id, e).await,
     }
+}
+
+async fn publish_spec(
+    shared: &Arc<Shared>,
+    snapshot: Option<hoh_core::persistence::SpecFiles>,
+    result_json: String,
+    replayed: bool,
+) -> Response {
+    if let Some(snapshot) = snapshot {
+        let root = shared.root.clone();
+        let result =
+            super::begun::spawn_blocking(move || super::spec::publish(&root, &snapshot)).await;
+        let failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(failure) = failure {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNPROCESSABLE",
+                format!(
+                    "proposal accepted; index publication failed: {failure}; retry the identical command"
+                ),
+                true,
+                None,
+            );
+        }
+    }
+    accepted(result_json, replayed)
 }
 
 /// 202 with the stored result bytes; a replay says so.
