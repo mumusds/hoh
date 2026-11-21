@@ -43,7 +43,7 @@ fn receipt(
     row: &InputRow,
     now: std::time::SystemTime,
 ) -> Result<String, PersistError> {
-    let reply=json!({"message_id":row.input_id,"kind":if row.state==InputState::Rejected {"rejected"} else {"ack"},"reason":row.payload.get("reason")}).to_string();
+    let reply=json!({"message_id":row.input_id,"kind":if row.state==InputState::Rejected {"rejected"} else {"ack"},"reason":row.payload.get("reason"),"input_sha256":fingerprint(row)}).to_string();
     tx.execute(
         "INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES (?1,?2,?3,?4)",
         params![
@@ -57,14 +57,20 @@ fn receipt(
     Ok(reply)
 }
 fn previous(tx: &Transaction<'_>, id: &str, role: &str) -> Result<Option<String>, PersistError> {
-    tx.query_row(
-        "SELECT result_json FROM receipts WHERE consumer=?1 AND message_id=?2",
-        params![role, id],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(sqlite_error)
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT result_json FROM receipts WHERE consumer=?1 AND message_id=?2",
+            params![role, id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(ref reply) = stored {
+        check_receipt(tx, id, reply)?;
+    }
+    Ok(stored)
 }
+
 fn current(tx: &Transaction<'_>, row: &InputRow) -> Result<bool, PersistError> {
     tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)",
@@ -114,10 +120,6 @@ pub(in super::super) fn route(
             attempt,
             now,
         } => {
-            if let Some(reply) = previous(&tx, &claimed.message_id, &claimed.recipient_role)? {
-                result.reply = Some(reply);
-                return Ok(result);
-            }
             let raw:(Option<String>,String,i64,String)=tx.query_row("SELECT run_id,recipient_role,role_epoch,payload_json FROM outbox WHERE message_id=?1",params![claimed.message_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(sqlite_error)?;
             if raw.0 != claimed.run_id
                 || raw.1 != claimed.recipient_role
@@ -127,6 +129,10 @@ pub(in super::super) fn route(
                     != claimed.payload
             {
                 return Err(PersistError::KeyReuse(claimed.message_id.clone()));
+            }
+            if let Some(reply) = previous(&tx, &claimed.message_id, &claimed.recipient_role)? {
+                result.reply = Some(reply);
+                return Ok(result);
             }
             let mut row = read_input(&tx, &claimed.message_id)?
                 .ok_or_else(|| PersistError::IntegrityViolation("missing input".into()))?;

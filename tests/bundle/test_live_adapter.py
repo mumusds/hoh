@@ -29,7 +29,7 @@ if os.environ.get('HOH_EVIDENCE_DIR'):
 name=args[args.index('--exact')+1]
 agent={'claude_live_turns_resume_and_cancel':'claude','codex_live_turn_and_cancel':'codex','pi_live_turns_resume_and_cancel':'pi',
        'doctor_live_versions_whitelist_and_verified_logins':'doctor','verification_live_candidate_to_qa':'qa',
-       'commander_live_read_only_turns':'commander'}[name]
+       'commander_live_read_only_turns':'commander','steer_live::test_017_02_steer_boundaries_live':'steer'}[name]
 open(os.path.join(os.environ['HOH_LIVE_OUT'],'shared-name.txt'),'w').write(agent)
 v=json.loads(os.environ.get('FAKE_VERDICTS','{}')).get(agent)
 if v is not None:open(os.path.join(os.environ['HOH_LIVE_OUT'],agent+'-live-verdict.json'),'w').write(json.dumps(v))
@@ -66,7 +66,7 @@ class Harness(unittest.TestCase):
         # The other live tests' verdicts are given too, so the qa path is the only one under test.
         given={'claude':{'status':'BLOCKED','detail':'fake','sessions':[]},'codex':{'status':'BLOCKED','detail':'fake','sessions':[]},
                'pi':{'status':'BLOCKED','detail':'fake','sessions':[]},'doctor':{'status':'BLOCKED','detail':'fake','sessions':[]},
-               'commander':{'status':'BLOCKED','detail':'fake','sessions':[]}}|(verdicts or {})
+               'commander':{'status':'BLOCKED','detail':'fake','sessions':[]},'steer':{'status':'BLOCKED','detail':'fake','sessions':[]}}|(verdicts or {})
         base={'PATH':own_python(self.bin,str(self.tools)),'HOME':str(self.root),'HOH_EVIDENCE_DIR':str(self.ev),
               'CALLS':str(self.calls),'FAKE_VERDICTS':json.dumps(given)}
         p=subprocess.run([shutil.which('bash'),str(self.root/'scripts/product/adapter-live.sh')],capture_output=True,text=True,
@@ -91,14 +91,14 @@ class AdapterLiveQa(Harness):
                          set(CHECK_VARIABLES)|{'HOH_LIVE_PROFILE','HOH_LIVE_OUT'})
 
     def test_each_scenario_has_its_own_evidence_directory(self):
-        # EVL-01: identical relative artifact names must survive all six scenarios.
+        # EVL-01: identical relative artifact names must survive all seven scenarios.
         p,results,_=self.run_script(verdicts={'qa':passed()})
         self.assertEqual(p.returncode,3,p.stderr)
-        self.assertEqual(len(results),6)
+        self.assertEqual(len(results),7)
         calls=[json.loads(line) for line in self.calls.read_text().splitlines()]
         dirs=[Path(call['env']['HOH_LIVE_OUT']) for call in calls]
-        self.assertEqual(len(set(dirs)),6,'scenarios share an evidence directory')
-        for agent in ('claude','codex','pi','doctor','qa','commander'):
+        self.assertEqual(len(set(dirs)),7,'scenarios share an evidence directory')
+        for agent in ('claude','codex','pi','doctor','qa','commander','steer'):
             directory=self.ev/agent
             self.assertIn(directory,dirs)
             self.assertEqual((directory/'shared-name.txt').read_text(),agent)
@@ -123,7 +123,7 @@ class AdapterLiveQa(Harness):
                 self.assertTrue(results_file.read_text().startswith(sentinel))
                 self.assertNotIn('TEST-090-02',results,'a nested fixture contaminated the outer evidence')
                 environments=[json.loads(line) for line in seen.read_text().splitlines()]
-                self.assertEqual(len(environments),5 if profile=='v0.1' else 6)
+                self.assertEqual(len(environments),6 if profile=='v0.1' else 7)
                 self.assertTrue(all(e=={} for e in environments),environments)
                 self.assertEqual(calls[0]['env']['HOH_LIVE_PROFILE'],profile,'the harness still selects its team')
                 live=json.loads((self.ev/'live-sessions.json').read_text())
@@ -205,7 +205,7 @@ class AdapterLiveCommander(Harness):
     def everything_else_passes(self,v01):
         bound=dict(DEFAULT,qa='claude',reviewer='claude') if v01 else DEFAULT
         ok={'status':'PASS','detail':'fake','sessions':[session('claude','native-x')]}
-        return {'claude':ok,'codex':ok,'pi':ok,'doctor':ok,'qa':passed(bound)}
+        return {'claude':ok,'codex':ok,'pi':ok,'doctor':ok,'steer':ok,'qa':passed(bound)}
     def test_test_021_07_is_not_run_under_v01_and_does_not_count(self):
         # Under v0.1 the commander test is never invoked, TEST-021-07 is SKIPPED with "v1 only", and with every other
         # item PASS the exit code is 0; another item's NOT_RUN still makes it 3.
@@ -243,5 +243,35 @@ class AdapterLiveCommander(Harness):
                 self.assertEqual(self.commander_calls(),[])
                 row=results['TEST-021-07'];self.assertEqual(row['status'],'SKIPPED',row);self.assertIn(why,row['detail'])
                 self.assertTrue(row['detail'].startswith('BLOCKED: '),row)
+
+class AdapterLiveSteer(Harness):
+    def steer_calls(self):
+        return [json.loads(l) for l in self.calls.read_text().splitlines() if 'steer_live::test_017_02' in l] if self.calls.exists() else []
+    def test_017_02_steer_entry_records_its_own_verdict_and_codex_path(self):
+        p,results,_=self.run_script(verdicts={'qa':{'status':'BLOCKED','detail':'fake','sessions':[]},'steer':{'status':'PASS','detail':'fake native boundary','sessions':[session('codex','native-steer')]}})
+        self.assertEqual(p.returncode,3,'the other mock scenarios are blocked')
+        row=results['TEST-017-02']
+        self.assertEqual((row['status'],row['name']),('PASS','crates/hoh-app/tests/steer_live/mod.rs::test_017_02_steer_boundaries_live'))
+        calls=self.steer_calls();self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0]['argv'],['test','-p','hoh-app','--locked','--test','product','--','--ignored','--exact','steer_live::test_017_02_steer_boundaries_live','--nocapture'])
+        self.assertEqual(calls[0]['env']['HOH_LIVE_CODEX'],str(self.bin/'codex'))
+        self.assertEqual(calls[0]['env']['HOH_LIVE_OUT'],str(self.ev/'steer'))
+    def test_017_02_missing_codex_or_root_never_runs_the_steer_entry(self):
+        for agents,root,why in [(('claude','pi'),False,'codex is not installed'),(('claude','codex','pi'),True,'running as root')]:
+            with self.subTest(why=why):
+                self.calls.unlink(missing_ok=True)
+                p,results,_=self.run_script(agents=agents,root=root)
+                self.assertEqual(p.returncode,3,p.stderr)
+                self.assertEqual(self.steer_calls(),[])
+                self.assertEqual(results['TEST-017-02']['status'],'SKIPPED')
+                self.assertIn(why,results['TEST-017-02']['detail'])
+    def test_017_02_missing_or_failed_verdict_cannot_pass(self):
+        for verdict in [None,{'status':'FAIL','detail':'boundary wrong','sessions':[]}]:
+            with self.subTest(verdict=verdict):
+                self.calls.unlink(missing_ok=True)
+                (self.ev/'steer/steer-live-verdict.json').unlink(missing_ok=True)
+                p,results,_=self.run_script(verdicts={'steer':verdict})
+                self.assertEqual(p.returncode,1,p.stderr)
+                self.assertEqual(results['TEST-017-02']['status'],'FAIL')
 
 if __name__=='__main__':unittest.main()

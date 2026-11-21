@@ -3868,9 +3868,7 @@ async fn input_state_barrier(project: &Path, id: &str, state: &str) -> R {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() -> R {
     for supported in [true, false] {
-        let dir = tempfile::Builder::new()
-            .prefix("m3t09-host-")
-            .tempdir_in("/home/ai/dev")?;
+        let dir = tempfile::Builder::new().prefix("m3t09-host-").tempdir()?;
         let project = dir.path().join("p");
         std::fs::create_dir(&project)?;
         Host::start(config(&project)).await?.shutdown().await;
@@ -3971,9 +3969,7 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_017_02_cancel_completes_while_steer_ack_is_held() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t09-cancel-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t09-cancel-").tempdir()?;
     let project = dir.path().join("p");
     std::fs::create_dir(&project)?;
     Host::start(config(&project)).await?.shutdown().await;

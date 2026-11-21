@@ -38,7 +38,7 @@ live() {
   rm -f "$verdict"
   # doctor runs every installed CLI itself ("hoh" stands for the binary under test, always present); qa needs claude for
   # its Developer, and pi and codex for its default QA and Reviewer unless HOH_LIVE_PROFILE=v0.1.
-  case "$agent" in doctor) cli=hoh;; qa|commander) cli=claude;; *) cli="$agent";; esac
+  case "$agent" in steer) cli=codex;; doctor) cli=hoh;; qa|commander) cli=claude;; *) cli="$agent";; esac
   if [[ "$cli" == hoh ]]; then bin=hoh; else bin="$(command -v "$cli" || true)"; fi
   codex="$bin" pi="$bin"
   if [[ "$agent" == commander ]]; then
@@ -59,7 +59,7 @@ live() {
     printf '{"status": "NOT_RUN", "detail": "pi is not installed", "sessions": []}\n' > "$verdict"
   elif [[ -z "$bin" ]]; then
     printf '{"status": "BLOCKED", "detail": "%s is not installed", "sessions": []}\n' "$cli" > "$verdict"
-  elif [[ ("$agent" == claude || "$agent" == qa || "$agent" == commander) && "$(id -u)" == 0 ]]; then
+  elif [[ ("$agent" == claude || "$agent" == qa || "$agent" == commander || "$agent" == steer) && "$(id -u)" == 0 ]]; then
     # AC-025-04 runs as a non-root user: the adapter never bypasses permissions as root.
     printf '{"status": "BLOCKED", "detail": "running as root", "sessions": []}\n' > "$verdict"
   elif [[ -n "$missing" && "$agent" == commander ]]; then
@@ -81,6 +81,7 @@ live() {
 }
 live claude claude_live claude_live_turns_resume_and_cancel
 live codex codex_live codex_live_turn_and_cancel
+live steer product steer_live::test_017_02_steer_boundaries_live hoh-app
 live pi pi_live pi_live_turns_resume_and_cancel
 # doctor runs every installed CLI itself; "hoh" stands for the binary under test (always present).
 live doctor doctor_live doctor_live_versions_whitelist_and_verified_logins hoh-app
@@ -93,6 +94,7 @@ from pathlib import Path
 out = Path(sys.argv[1])
 cases = [('claude', 'TEST-025-04', 'crates/hoh-agents/tests/claude_live.rs::claude_live_turns_resume_and_cancel'),
          ('codex', 'TEST-024-04', 'crates/hoh-agents/tests/codex_live.rs::codex_live_turn_and_cancel'),
+         ('steer', 'TEST-017-02', 'crates/hoh-app/tests/steer_live/mod.rs::test_017_02_steer_boundaries_live'),
          ('pi', 'TEST-026-04', 'crates/hoh-agents/tests/pi_live.rs::pi_live_turns_resume_and_cancel'),
          ('doctor', 'TEST-006-03', 'crates/hoh-app/tests/doctor_live.rs::doctor_live_versions_whitelist_and_verified_logins'),
          ('qa', 'TEST-053-05', 'crates/hoh-app/tests/verification_live.rs::verification_live_candidate_to_qa'),

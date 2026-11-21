@@ -591,13 +591,18 @@ impl Host {
                 stopped.clone(),
             ))));
         }
-        served.push(tokio::spawn(begun.clone().scope(inputs::run(
-            shared.clone(),
-            config.clock.0.clone(),
-            config.runner.as_ref().map(|r| r.executor.clone()),
-            inflight.clone(),
-            stopped.clone(),
-        ))));
+        begun
+            .clone()
+            .scope(async {
+                served.push(begun::spawn(inputs::run(
+                    shared.clone(),
+                    config.clock.0.clone(),
+                    config.runner.as_ref().map(|r| r.executor.clone()),
+                    inflight.clone(),
+                    stopped.clone(),
+                )));
+            })
+            .await;
         // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
         served.push(tokio::spawn(begun.clone().scope(control::run(
             shared.clone(),

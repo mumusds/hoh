@@ -688,3 +688,85 @@ async fn another_message_under_a_rejected_messages_id_is_key_reuse_at_either_fen
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_017_05_commander_key_reuse_records_one_rejection_receipt_without_retry() -> R {
+    use hoh_core::delivery::{Consumer, Dispatcher, LocalTransport, SystemClock};
+    struct Applies;
+    impl Consumer for Applies {
+        fn effect(&self, message: &Message) -> ConsumeEffect {
+            applied(message)
+        }
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-hcp-key-")
+        .tempdir()?;
+    let (store, path) = open(&dir)?;
+    world(&store, &path).await?;
+    hand_over(&store, &path).await?;
+    let old = commander_message("reused", 1, "developer", "steer")?;
+    assert!(matches!(
+        store.commander_message(&old).await?,
+        Fenced::Rejected { .. }
+    ));
+    let mut other = commander_message("reused", 2, "developer", "steer")?;
+    other
+        .payload
+        .insert("text".into(), json!("different content"));
+    queue(&store, &other).await?;
+    let clock = SystemClock;
+    let transport = LocalTransport::new(&store, &clock).with("developer", Applies);
+    let dispatcher = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: vec!["developer".into()],
+        max_attempts: 1,
+        batch: 32,
+    };
+    dispatcher.tick().await?;
+    dispatcher.tick().await?;
+    assert_eq!(
+        one(
+            &path,
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='reused'"
+        )?,
+        "ACKED:0"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM receipts WHERE consumer='developer' AND message_id='reused'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT json_extract(result_json,'$.reason_code') FROM receipts WHERE consumer='developer' AND message_id='reused'"
+        )?,
+        "KEY_REUSE"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind='outbox.rejected' AND json_extract(payload_json,'$.message_id')='reused'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT count(*) FROM events WHERE kind IN ('outbox.dead_letter','steer.taken')"
+        )?,
+        "0"
+    );
+    assert_eq!(
+        one(
+            &path,
+            "SELECT json_extract(payload_json,'$.payload.text') FROM decisions WHERE decision_id='reused'"
+        )?,
+        "stop and rebase"
+    );
+    Ok(())
+}

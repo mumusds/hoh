@@ -30,6 +30,8 @@ pub struct OutboxRow {
 pub enum Settlement {
     /// The consumer answered (an ack or a rejection: both are delivered).
     Delivered,
+    /// A conflicting id is consumed as a rejection, without exhausting delivery retries.
+    Rejected(String),
     /// No answer reached the sender (a lost ACK, a consumer down): tried again until the limit.
     Failed(String),
     /// The row holds no valid message: dead at once.
@@ -306,6 +308,30 @@ pub(super) fn settle(
     let unsettled = state == "DELIVERING" || state == "PENDING";
     let current = state == "DELIVERING" && count == generation;
     match settlement {
+        Settlement::Rejected(reason) if unsettled => {
+            // The claim increment is not a delivery failure. Undo it only for this generation;
+            // a late rejection must not subtract a different in-flight generation's count.
+            tx.execute("UPDATE outbox SET state='ACKED',attempt_count=attempt_count-?3,next_retry_at=NULL,last_error=?2 WHERE message_id=?1",params![message_id,reason,i64::from(current)]).map_err(sqlite_error)?;
+            super::inputs::exhausted(&tx, message_id, reason, ctx)?;
+            rejected_receipt(&tx, message_id, &recipient, reason, ctx.now())?;
+            let project_id = project_of(&tx, run_id.as_deref(), message_id)?;
+            writer::write(
+                &tx,
+                &Commit {
+                    events: vec![NewEvent {
+                        intent: Intent::Record,
+                        project_id,
+                        run_id,
+                        event_id: child_id(message_id, "outbox-rejected"),
+                        kind: "outbox.rejected".into(),
+                        payload: json!({"message_id":message_id,"recipient_role":recipient,"reason":reason}),
+                    }],
+                    ..Default::default()
+                },
+                ctx,
+            )?;
+        }
+
         Settlement::Delivered if unsettled => {
             tx.execute(
                 "UPDATE outbox SET state = 'ACKED', next_retry_at = NULL, last_error = NULL WHERE message_id = ?1",
@@ -355,6 +381,55 @@ pub(super) fn settle(
         _ => {}
     }
     super::writer::commit_unhooked(tx, ctx)?;
+    Ok(())
+}
+
+/// Keep a collision's original receipt intact. When the conflict came from Commander history instead,
+/// persist the rejection reply so a later consumer also sees the terminal result.
+fn rejected_receipt(
+    tx: &Transaction<'_>,
+    id: &str,
+    consumer: &str,
+    reason: &str,
+    now: SystemTime,
+) -> Result<(), PersistError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM receipts WHERE consumer=?1 AND message_id=?2)",
+            params![consumer, id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if exists {
+        return Ok(());
+    }
+    let result = if let Some(row) = super::inputs::read_input(tx, id)? {
+        json!({"message_id":id,"kind":"rejected","reason":reason,"input_sha256":super::inputs::fingerprint(&row)}).to_string()
+    } else {
+        let raw: String = tx
+            .query_row(
+                "SELECT payload_json FROM outbox WHERE message_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let message: Message =
+            serde_json::from_str(&raw).map_err(|e| PersistError::Storage(e.to_string()))?;
+        let code: RejectionReason = serde_json::from_value(json!(reason))
+            .map_err(|e| PersistError::Storage(e.to_string()))?;
+        reply(
+            &message,
+            consumer,
+            MessageKind::Rejected,
+            Some(code),
+            json!({"detail":reason}),
+        )?
+    };
+    tx.execute(
+        "INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES (?1,?2,?3,?4)",
+        params![consumer, id, rfc3339_utc(now), result],
+    )
+    .map_err(sqlite_error)?;
     Ok(())
 }
 

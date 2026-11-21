@@ -5808,3 +5808,276 @@ fn a_model_failure_recovered_after_observed_falls_back_like_a_settled_one() -> R
     }
     keep("model-failure-recovered.json", &Value::Object(kept))
 }
+
+const INPUT_RECOVERY_PROJECT: &str = "HOH_TEST_INPUT_RECOVERY_PROJECT";
+const INPUT_RECOVERY_KILL: &str = "HOH_TEST_INPUT_RECOVERY_KILL";
+
+#[derive(Debug)]
+struct InputCrash {
+    project: PathBuf,
+    kill: bool,
+}
+impl hoh_app::host::HostHooks for InputCrash {
+    fn input_delivered(&self, id: &str) {
+        if let Err(error) = self.record(id) {
+            eprintln!("input recovery hook failed: {error}");
+            std::process::exit(76);
+        }
+    }
+}
+impl InputCrash {
+    fn record(&self, id: &str) -> R {
+        use std::io::Write as _;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.project.join("transmissions.jsonl"))?;
+        let pid = std::process::id();
+        writeln!(
+            log,
+            "{}",
+            json!({"message_id":id,"pid":pid,"start_id":hoh_agents::identity::start_id(pid)?})
+        )?;
+        log.sync_all()?;
+        if self.kill && id == "M2" {
+            rustix::process::kill_process(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            )?;
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "child process for TEST-017-05; fake Commander only"]
+fn input_recovery_host() -> R {
+    let Some(project) = std::env::var_os(INPUT_RECOVERY_PROJECT).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let kill = std::env::var_os(INPUT_RECOVERY_KILL).is_some();
+    let mut settings = config(&project);
+    settings.hooks = Arc::new(InputCrash {
+        project: project.clone(),
+        kill,
+    });
+    let clock = hoh_core::delivery::MonotonicClock::anchored(
+        std::time::SystemTime::now() + Duration::from_secs(if kill { 0 } else { 60 }),
+    );
+    settings.clock = hoh_app::host::HostClock(Arc::new(clock));
+    settings.runner = Some(hoh_app::host::RunnerConfig {
+        executor: world::Team::answering(
+            |_| Vec::new(),
+            |turn| {
+                Some(format!(
+                    "answered {}",
+                    turn.summary["user_input"]["input_id"]
+                ))
+            },
+        ),
+        context: Context {
+            required_capabilities: [("commander".into(), Default::default())].into(),
+            commander_dir: Some(project.join("commander")),
+            ..Default::default()
+        },
+    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let host = Host::start(settings).await?;
+        let mut changed = host.store().watermark();
+        let outcome = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                let reader = host.store().reader()?;
+                let applied = ["M1", "M2"].iter().all(|id| {
+                    reader
+                        .input(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|i| i.state == hoh_core::lifecycle::InputState::Applied)
+                });
+                // The actual consume and outbox bookkeeping have finished, regardless of M3's verdict.
+                let m3_done = query(
+                    &db(&project),
+                    "SELECT state FROM outbox WHERE message_id='M3'",
+                )? == "ACKED";
+                if applied && m3_done {
+                    return R::Ok(());
+                }
+                drop(reader);
+                changed.changed().await?;
+            }
+        })
+        .await;
+        host.shutdown().await;
+        outcome??;
+        Ok(())
+    })
+}
+
+#[test]
+fn test_017_05_delivery_redelivers_once_after_kill9() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t09-kill-").tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir(&project)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        Host::start(config(&project))
+            .await
+            .map(|h| h.shutdown())?
+            .await;
+        R::Ok(())
+    })?;
+    seed(&project,"INSERT INTO specs(spec_id,project_id,sha256,revision) VALUES ('s1',:p,printf('%064d',1),1);
+        INSERT INTO runs(run_id,project_id,spec_id,state,mode,revision,created_at) VALUES ('R',:p,'s1','RUNNING','AUTO',1,'2026-11-21T00:00:00Z');
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','commander','1','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','commander','codex','sc',1,1,'2026-11-21T00:00:00Z');")?;
+    for id in ["M1", "M2", "M3"] {
+        seed(&project,&format!("INSERT INTO input_queue(input_id,run_id,kind,target_role,state,payload_json) VALUES ('{id}','R','ASK','commander','QUEUED','{{\"text\":\"{id}\",\"role_epoch\":1}}');
+            INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES ('{id}-queued',:p,'R','input.queued','{{\"input_id\":\"{id}\",\"kind\":\"ASK\",\"target_role\":\"commander\",\"role_epoch\":1}}','2026-11-21T00:00:00Z');
+            INSERT INTO outbox(message_id,event_seq,run_id,recipient_role,role_epoch,state,payload_json) VALUES ('{id}',last_insert_rowid(),'R','commander',1,'PENDING','{{\"notice\":\"input\",\"input_id\":\"{id}\",\"kind\":\"ASK\"}}');"))?;
+    }
+    seed(&project,&format!("INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES ('commander','M3','2026-11-21T00:00:00Z','{{\"message_id\":\"M3\",\"kind\":\"ack\",\"input_sha256\":\"{}\"}}');
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES ('verify',:p,'R','verification.handoff','{{}}','2026-11-21T00:00:00Z');
+        INSERT INTO outbox(message_id,event_seq,run_id,recipient_role,role_epoch,state,payload_json) VALUES ('verify',last_insert_rowid(),'R','commander',1,'PENDING','{{\"kind\":\"handoff\",\"payload\":{{\"handoff_kind\":\"verification\"}}}}');","0".repeat(64)))?;
+    let launch = |kill: bool| -> R<ChildGuard> {
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.args([
+            "--exact",
+            "input_recovery_host",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(INPUT_RECOVERY_PROJECT, &project)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+        if kill {
+            cmd.env(INPUT_RECOVERY_KILL, "1");
+        } else {
+            cmd.env_remove(INPUT_RECOVERY_KILL);
+        }
+        let child = cmd.spawn()?;
+        let identity = json!({"pid":child.id(),"start_id":hoh_agents::identity::start_id(child.id())?,"kill":kill});
+        std::fs::write(
+            project.join(if kill {
+                "first-host.json"
+            } else {
+                "second-host.json"
+            }),
+            identity.to_string(),
+        )?;
+        Ok(ChildGuard(child))
+    };
+    let (killed, stderr) = wait(launch(true)?, Duration::from_secs(30))?;
+    assert_eq!(killed.signal(), Some(9), "{stderr}");
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT state FROM outbox WHERE message_id='M2'"
+        )?,
+        "DELIVERING"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT count(*) FROM receipts WHERE consumer='commander' AND message_id='M2'"
+        )?,
+        "1"
+    );
+    let (restarted, stderr) = wait(launch(false)?, Duration::from_secs(50))?;
+    assert!(restarted.success(), "{stderr}");
+    let transmissions = std::fs::read_to_string(project.join("transmissions.jsonl"))?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    for (id, count) in [("M1", 1), ("M2", 2)] {
+        assert_eq!(
+            transmissions
+                .iter()
+                .filter(|r| r["message_id"] == id)
+                .count(),
+            count
+        );
+        assert_eq!(
+            query(
+                &db(&project),
+                &format!(
+                    "SELECT count(*) FROM receipts WHERE consumer='commander' AND message_id='{id}'"
+                )
+            )?,
+            "1"
+        );
+        assert_eq!(
+            query(
+                &db(&project),
+                &format!(
+                    "SELECT count(*) FROM events WHERE kind='input.applied' AND json_extract(payload_json,'$.input_id')='{id}'"
+                )
+            )?,
+            "1"
+        );
+    }
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT state FROM input_queue WHERE input_id='M3'"
+        )?,
+        "REJECTED"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='M3'"
+        )?,
+        "ACKED:0"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT count(*) FROM events WHERE kind='outbox.rejected' AND json_extract(payload_json,'$.message_id')='M3'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT count(*) FROM events WHERE kind='input.applied' AND json_extract(payload_json,'$.input_id')='M3'"
+        )?,
+        "0"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT count(*) FROM outbox WHERE state='DEAD_LETTER'"
+        )?,
+        "0"
+    );
+    assert_eq!(
+        query(
+            &db(&project),
+            "SELECT state || ':' || attempt_count FROM outbox WHERE message_id='verify'"
+        )?,
+        "PENDING:0"
+    );
+    keep(
+        "input-kill9-redelivery.json",
+        &json!({
+            "scenario":"TEST-017-05", "kind":"product", "agent":"fake Commander",
+            "kill_signal":killed.signal(), "restart_exit":restarted.code(),
+            "transmissions":transmissions,
+            "m1":{"receipt_count":1,"applied_count":1},
+            "m2":{"receipt_count":1,"applied_count":1},
+            "m3":{"state":"REJECTED","outbox":"ACKED:0","rejection_count":1},
+            "verification_outbox":"PENDING:0","dead_letters":0
+        }),
+    )
+}

@@ -308,9 +308,6 @@ pub(super) fn consume(
         )
         .optional()
         .map_err(sqlite_error)?;
-    if let Some(stored) = stored {
-        return Ok(Some(stored));
-    }
     let (run, role, epoch, raw): (String, String, i64, String) = tx
         .query_row(
             "SELECT run_id,recipient_role,role_epoch,payload_json FROM outbox WHERE message_id=?1",
@@ -325,6 +322,10 @@ pub(super) fn consume(
             != claimed.payload
     {
         return Err(PersistError::KeyReuse(claimed.message_id.clone()));
+    }
+    if let Some(stored) = stored {
+        check_receipt(&tx, &claimed.message_id, &stored)?;
+        return Ok(Some(stored));
     }
     super::hold::writable(&tx, &run)?;
     if first_input_wait(&tx, &run, &role, Some(epoch))? {
@@ -361,7 +362,7 @@ pub(super) fn consume(
             ctx,
         )?;
     }
-    let result = json!({"message_id":claimed.message_id,"kind":if reason.is_some(){"rejected"}else{"ack"},"reason":reason}).to_string();
+    let result = json!({"message_id":claimed.message_id,"kind":if reason.is_some(){"rejected"}else{"ack"},"reason":reason,"input_sha256":fingerprint(&row)}).to_string();
     tx.execute(
         "INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES (?1,?2,?3,?4)",
         params![
@@ -465,6 +466,7 @@ pub(super) fn sweep(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tx = writer::begin(conn, ctx)?;
+    let before = tx.total_changes();
     routing::sweep(&tx, project, ctx)?;
     let ids: Vec<String> = {
         let mut q = tx.prepare("SELECT i.input_id FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND (r.state IN ('COMPLETED','CANCELLED','FAILED') OR (i.state='DELIVERED' AND coalesce(i.target_role,'commander')='commander' AND coalesce((SELECT b.role_epoch FROM role_bindings b WHERE b.run_id=i.run_id AND b.role='commander'),-1) <> json_extract(i.payload_json,'$.role_epoch'))) AND i.state IN ('QUEUED','DELIVERED') ORDER BY i.rowid LIMIT 32").map_err(sqlite_error)?;
@@ -474,6 +476,10 @@ pub(super) fn sweep(
             .map_err(sqlite_error)?
     };
     if ids.is_empty() {
+        if tx.total_changes() == before {
+            // An idle poll has no write to commit and must not consume a real write's fault hook.
+            return Ok(());
+        }
         return writer::commit(tx, ctx);
     }
     for id in ids {
@@ -490,4 +496,29 @@ pub(super) fn sweep(
         )?;
     }
     writer::commit(tx, ctx)
+}
+
+/// Immutable input identity; delivery state, answer and routing metadata are deliberately excluded.
+pub(super) fn fingerprint(row: &InputRow) -> String {
+    use sha2::{Digest as _, Sha256};
+    let identity = json!({"id":row.input_id,"run":row.run_id,"kind":row.kind,"role":row.target_role,
+        "epoch":row.payload["role_epoch"],"text":row.payload["text"],"source":row.payload.get("source_message")});
+    Sha256::digest(identity.to_string().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn check_receipt(conn: &Connection, id: &str, receipt: &str) -> Result<(), PersistError> {
+    let value: Value =
+        serde_json::from_str(receipt).map_err(|e| PersistError::Storage(e.to_string()))?;
+    let row = read_input(conn, id)?
+        .ok_or_else(|| PersistError::IntegrityViolation("receipt without input".into()))?;
+    if value.get("message_id").is_some_and(|v| v != id)
+        || value
+            .get("input_sha256")
+            .is_some_and(|v| v != &json!(fingerprint(&row)))
+    {
+        return Err(PersistError::KeyReuse(id.to_owned()));
+    }
+    Ok(())
 }
