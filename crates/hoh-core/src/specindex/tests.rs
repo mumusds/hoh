@@ -15,7 +15,7 @@ fn source(path: &str, body: &str) -> Source {
 
 fn requirement(id: &str, class: &str) -> String {
     format!(
-        "## REQ-{id} 标题\n{class}### AC-{id}-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n"
+        "## REQ-{id} 标题\n{class}### AC-{id}-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: check-{id}\n"
     )
 }
 
@@ -41,8 +41,8 @@ fn test_034_04_generator_canonical_bytes_and_source_digest() -> R {
              "acceptance": [{"id": "AC-B-01", "given": "前提", "when": "操作", "then": "结果", "test_id": "TEST-B-01"}]}
         ],
         "scenarios": [
-            {"id": "TEST-A-01", "requirement_id": "REQ-A", "acceptance_id": "AC-A-01", "check_id": "unit"},
-            {"id": "TEST-B-01", "requirement_id": "REQ-B", "acceptance_id": "AC-B-01", "check_id": "unit"}
+            {"id": "TEST-A-01", "requirement_id": "REQ-A", "acceptance_id": "AC-A-01", "check_id": "check-A"},
+            {"id": "TEST-B-01", "requirement_id": "REQ-B", "acceptance_id": "AC-B-01", "check_id": "check-B"}
         ]
     });
     assert_eq!(
@@ -91,7 +91,7 @@ fn test_034_04_invalid_grammar_reports_source_and_line() -> R {
         ("## REQ-A 标题", "## REQ-A"),
         ("AC-A-01", "AC-B-01"),
         ("AC-A-01", "AC-A-1"),
-        ("check: unit", "check: "),
+        ("check: check-A", "check: "),
         ("# 用户", "# Users"),
         ("given: 前提", " given: 前提"),
         ("# 决策\n无", "# 决策\n- 决定"),

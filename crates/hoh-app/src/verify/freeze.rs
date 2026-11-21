@@ -317,20 +317,34 @@ fn prepare(checkout: &Path, state: &Path, inputs: &Inputs) -> Result<Prepared, F
     if !reasons.is_empty() {
         return Err(FreezeError::Refused(reasons));
     }
-    if inputs.spec == Path::new(hoh_core::specindex::PATH) {
-        let index = crate::host::spec::sources(checkout)
-            .and_then(|files| hoh_core::specindex::generate_index(&files))
-            .map_err(FreezeError::SpecInvalid)?;
-        let bytes = std::fs::read(checkout.join(&inputs.spec))
-            .map_err(|e| io(format!("{}: {e}", inputs.spec.display())))?;
-        index.verify(&bytes).map_err(FreezeError::SpecInvalid)?;
-    }
     let head = |rev: &str| -> Result<String, FreezeError> {
         Ok(String::from_utf8_lossy(&git(&["rev-parse", rev])?)
             .trim()
             .to_owned())
     };
     let (commit, tree) = (head("HEAD")?, head("HEAD^{tree}")?);
+    if inputs.spec == Path::new(hoh_core::specindex::PATH) {
+        // The clean index's tracked paths belong to HEAD. Regenerate from that captured commit's bytes;
+        // ignored or untracked Markdown must never become part of a frozen specification.
+        let sources = tracked
+            .iter()
+            .filter(|path| {
+                path.strip_prefix("docs/spec/")
+                    .is_some_and(|name| name.ends_with(".md") && !name.contains('/'))
+            })
+            .map(|path| {
+                Ok(hoh_core::specindex::Source {
+                    path: path.clone(),
+                    bytes: git(&["show", &format!("{commit}:{path}")])?,
+                })
+            })
+            .collect::<Result<Vec<_>, FreezeError>>()?;
+        let index =
+            hoh_core::specindex::generate_index(&sources).map_err(FreezeError::SpecInvalid)?;
+        let bytes = std::fs::read(checkout.join(&inputs.spec))
+            .map_err(|e| io(format!("{}: {e}", inputs.spec.display())))?;
+        index.verify(&bytes).map_err(FreezeError::SpecInvalid)?;
+    }
     let digest = |rel: &str| -> Result<String, FreezeError> {
         hoh_core::objects::hash_file(&checkout.join(rel))
             .map(|(sha, _)| sha)
