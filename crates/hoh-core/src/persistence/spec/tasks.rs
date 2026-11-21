@@ -90,6 +90,14 @@ pub(super) fn migrate(
             .map_err(sqlite_error)?;
         } else {
             // Partially deleted work is cancelled as a whole; do not silently drop one of its requirements.
+            // The host's single-Attempt cancel proves the process ended and releases its lease. Persist its
+            // request with task cancellation so a writer cannot finish against an already CANCELLED task.
+            tx.execute(
+                "UPDATE attempts SET cancel_requested=1 WHERE task_id=?1 \
+                 AND state IN ('PREPARED','STARTING','RUNNING')",
+                params![task],
+            )
+            .map_err(sqlite_error)?;
             cancelled.push(Cancelled {
                 from: task.clone(),
                 deleted_requirement_ids: deleted.clone(),

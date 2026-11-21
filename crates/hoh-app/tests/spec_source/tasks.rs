@@ -498,6 +498,253 @@ async fn test_033_04_every_nonterminal_task_of_each_moved_run_migrates() -> R {
 }
 
 #[tokio::test]
+async fn test_033_04_deleted_requirement_cancels_unfinished_writer_attempts() -> R {
+    for (task_state, attempt_state) in [
+        ("RUNNING", "RUNNING"),
+        ("LEASED", "PREPARED"),
+        ("LEASED", "STARTING"),
+    ] {
+        let world = World::new()?;
+        let (host, run, _) = approved(&world).await?;
+        // A real, task-owned process stands in for the writer; no model or credentials are used.
+        let mut process = if attempt_state == "RUNNING" {
+            use std::os::unix::process::CommandExt as _;
+            Some(pty::Hoh(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()?,
+            ))
+        } else {
+            None
+        };
+        world.exec(&format!(
+            "UPDATE runs SET state='RUNNING',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL WHERE run_id='{run}';
+             INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+             SELECT 'deleted-writer',run_id,spec_id,'{task_state}','developer',1,1 FROM runs WHERE run_id='{run}';
+             INSERT INTO task_requirements SELECT 'deleted-writer','REQ-C',spec_id FROM runs WHERE run_id='{run}';
+             INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('writer-session','claude','developer','fake','[]');
+             INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision)
+             VALUES('unfinished','deleted-writer','writer-session','{attempt_state}',1,1,0),
+                   ('historical','deleted-writer','writer-session','SETTLED',1,1,0);
+             INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at)
+             SELECT project_id,'writer','unfinished',1,'2099-01-01T00:00:00Z' FROM runs WHERE run_id='{run}';
+             INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+             SELECT 'unaffected',run_id,spec_id,'RUNNING','researcher',0,2 FROM runs WHERE run_id='{run}';
+             INSERT INTO task_requirements SELECT 'unaffected','REQ-B',spec_id FROM runs WHERE run_id='{run}';
+             INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision)
+             VALUES('other-attempt','unaffected','writer-session','RUNNING',1,1,0);"
+        ))?;
+        if let Some(process) = &process {
+            let identity = hoh_agents::identity::of(process.0.id())?.ok_or("writer identity")?;
+            world.exec(&format!(
+                "UPDATE attempts SET pid={},boot_id='{}',process_start_id='{}' WHERE attempt_id='unfinished'",
+                identity.pid, identity.boot_id, identity.start_id
+            ))?;
+        }
+        let next = remove_c(&world)?;
+        submit_spec(&host, &run, "cancel-propose", "ProposeSpecChange", &next).await?;
+        let before = world.rows("SELECT * FROM attempts ORDER BY attempt_id")?;
+        let tasks_before = world.rows("SELECT * FROM tasks ORDER BY task_id")?;
+        world.exec("CREATE TRIGGER refuse_writer_cancel BEFORE INSERT ON events WHEN NEW.kind='task.cancelled' BEGIN SELECT RAISE(ABORT,'fixture refuses writer cancellation'); END;")?;
+        let body = command(
+            &host,
+            &run,
+            "cancel-rollback",
+            "ApproveSpec",
+            json!({"spec_sha256":next.sha256(),"decision":"APPROVE_ONLY"}),
+        )
+        .await?;
+        assert_ne!(
+            world::exchange(&host, "POST", "/v1/commands", Some(&body))
+                .await?
+                .0,
+            202
+        );
+        assert_eq!(
+            world.rows("SELECT * FROM attempts ORDER BY attempt_id")?,
+            before
+        );
+        assert_eq!(
+            world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+            tasks_before
+        );
+        assert_eq!(world.query("SELECT count(*) FROM specs")?, "1");
+        assert_eq!(
+            world.query("SELECT attempt_id FROM leases WHERE kind='writer'")?,
+            "unfinished"
+        );
+        world.exec("DROP TRIGGER refuse_writer_cancel;")?;
+
+        let approval = submit_spec(&host, &run, "cancel-approve", "ApproveSpec", &next).await?;
+        assert_eq!(
+            world.query("SELECT state FROM tasks WHERE task_id='deleted-writer'")?,
+            "CANCELLED"
+        );
+        assert_eq!(
+            world.query("SELECT cancel_requested FROM attempts WHERE attempt_id='unfinished'")?,
+            "1",
+            "approval must request cancellation of the {attempt_state} Attempt of a {task_state} deleted writer"
+        );
+        // The host's existing single-Attempt controller stops the writer process, proves its end,
+        // settles cancellation and releases the writer lease; no runner_error completion is involved.
+        if let Some(process) = &mut process {
+            use std::os::unix::process::ExitStatusExt as _;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // This test spawned the process, so it must reap it before the host can prove the group empty.
+            let status = loop {
+                if let Some(status) = process.0.try_wait()? {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("cancelled writer is still alive".into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            assert_eq!(
+                status.signal(),
+                Some(15),
+                "writer must end by cancellation, not its natural timeout"
+            );
+        }
+        world
+            .until(
+                "SELECT state FROM attempts WHERE attempt_id='unfinished'",
+                "CANCELLED",
+                std::time::Duration::from_secs(5),
+            )
+            .await?;
+        assert_eq!(world.query("SELECT count(*) FROM leases WHERE attempt_id='unfinished' AND expires_at>strftime('%Y-%m-%dT%H:%M:%SZ','now')")?, "0");
+        assert_eq!(world.query("SELECT state FROM runs")?, "RUNNING");
+        assert_eq!(world.query("SELECT count(*) FROM attempts WHERE attempt_id IN ('historical','other-attempt') AND cancel_requested=1")?, "0");
+        assert_eq!(
+            world.query("SELECT state FROM attempts WHERE attempt_id='other-attempt'")?,
+            "RUNNING"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='cancel.reaped' AND json_extract(payload_json,'$.attempt_id')='unfinished'")?, "1");
+        assert_eq!(
+            world.query("SELECT count(*) FROM events WHERE payload_json LIKE '%runner_error%'")?,
+            "0"
+        );
+        assert_eq!(
+            world::exchange(&host, "POST", "/v1/commands", Some(&approval))
+                .await?
+                .0,
+            202
+        );
+        assert_eq!(event_payloads(&world, "task.cancelled")?.len(), 1);
+        host.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_033_02_approval_between_reconcile_and_schedule_never_dispatches_stale_verifiers() -> R
+{
+    use hoh_core::handoff::{Recipient, Verification};
+    let world = World::new()?;
+    let (host, run, first) = approved(&world).await?;
+    let candidate = accepted_candidate(&world, &host, &run).await?;
+    world.exec(&format!(r#"UPDATE tasks SET state='VERIFYING' WHERE task_id='TA';
+        UPDATE candidates SET state='VERIFYING' WHERE candidate_id='{candidate}';
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+        SELECT 'ready-qa',run_id,spec_id,'READY','qa',0,10 FROM runs WHERE run_id='{run}';
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+        SELECT 'ready-reviewer',run_id,spec_id,'READY','reviewer',0,11 FROM runs WHERE run_id='{run}';
+        INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at)
+        SELECT project_id,'ready-round',run_id,'verification.round_opened',
+        '{{"round_id":"ready-round","candidate_id":"{candidate}","source_task_ids":["TA"],"acceptance_ids":["AC-A-01","AC-A-02"],"tasks":{{"qa":"ready-qa","reviewer":"ready-reviewer"}}}}',created_at FROM runs WHERE run_id='{run}';"#))?;
+    let row = world.rows("SELECT candidate_id AS id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256 FROM candidates")?.remove(0);
+    let messages = hoh_core::handoff::verification(
+        &Verification {
+            round_id: "ready-round".into(),
+            run_id: run.clone(),
+            task_id: "TA".into(),
+            attempt_id: "observed".into(),
+            candidate: serde_json::from_value(row)?,
+            spec_sha256: first.sha256(),
+            spec_revision: 1,
+            acceptance_ids: vec!["AC-A-01".into(), "AC-A-02".into()],
+            goal: "verify the candidate".into(),
+            task_revision: 0,
+            cause: "ready-round".into(),
+            references: vec![],
+            budget_tokens: 32000,
+        },
+        &[
+            Recipient {
+                role: "qa".into(),
+                role_epoch: 1,
+            },
+            Recipient {
+                role: "reviewer".into(),
+                role_epoch: 1,
+            },
+        ],
+    )
+    .ok_or("verification handoffs")?;
+    for message in messages {
+        let payload = serde_json::to_string(&message)?.replace('\'', "''");
+        world.exec(&format!("INSERT INTO outbox(message_id,event_seq,run_id,recipient_role,role_epoch,payload_json,state)
+            SELECT '{}',seq,'{run}','{}',1,'{payload}','PENDING' FROM events WHERE event_id='ready-round'",message.message_id,message.recipient_role))?;
+    }
+    let verifier_context = |role: &str| hoh_core::decision::Context {
+        required_capabilities: [(role.into(), Default::default())].into(),
+        ..Default::default()
+    };
+    // Both verifiers really reach attempt creation before approval; rollback preserves the READY fixture.
+    world.exec("CREATE TRIGGER dispatch_probe BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT,'fixture: verifier is dispatchable'); END;")?;
+    for role in ["qa", "reviewer"] {
+        let probe = host
+            .store()
+            .schedule_round(&run, verifier_context(role))
+            .await;
+        assert!(
+            probe
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("fixture: verifier is dispatchable")),
+            "{role}: {probe:?}"
+        );
+    }
+    world.exec("DROP TRIGGER dispatch_probe;")?;
+    let next = revise_a(&world)?;
+    submit_spec(&host, &run, "ready-propose", "ProposeSpecChange", &next).await?;
+    host.store()
+        .reconcile_verification(&run, Default::default())
+        .await?;
+    submit_spec(&host, &run, "ready-approve", "ApproveSpec", &next).await?;
+    assert_eq!(world.query("SELECT state FROM candidates")?, "STALE");
+    assert_eq!(world.query("SELECT count(*) FROM tasks t JOIN runs r ON r.run_id=t.run_id WHERE t.task_id IN ('ready-qa','ready-reviewer') AND t.state='READY' AND t.spec_id=r.spec_id")?, "2");
+    let before = world.rows("SELECT * FROM attempts ORDER BY attempt_id")?;
+    // Do not reconcile again: approval committed in the host's reconcile/schedule gap.
+    for role in ["qa", "reviewer"] {
+        let scheduled = host
+            .store()
+            .schedule_round(&run, verifier_context(role))
+            .await?;
+        assert!(
+            scheduled.dispatched.is_none(),
+            "stale {role} must be undispatchable before another reconcile: {scheduled:?}"
+        );
+    }
+    assert_eq!(
+        world.rows("SELECT * FROM attempts ORDER BY attempt_id")?,
+        before
+    );
+    let reconciled = host
+        .store()
+        .reconcile_verification(&run, Default::default())
+        .await?;
+    assert_eq!(
+        reconciled.closed,
+        vec![("ready-round".into(), "superseded".into())]
+    );
+    assert_eq!(world.query("SELECT count(*) FROM tasks WHERE task_id IN ('ready-qa','ready-reviewer') AND state='CANCELLED'")?, "2");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_033_04_stale_candidate_source_returns_ready_on_new_revision() -> R {
     let world = World::new()?;
     let (host, run, _) = approved(&world).await?;
