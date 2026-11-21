@@ -350,7 +350,8 @@ class CodeMode(unittest.TestCase):
             c=J.load(FIXTURES/'excerpts',none,'codex',name)[0];control=J.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
             rows=[r for r in J.run_mutants(c,control) if r['kind']=='code mode lexis']
             self.assertEqual(len(rows),15,name)
-            self.assertTrue({'an escaped newline in a regex','a regex at the script start','a lone surrogate in a string'}
+            self.assertTrue({'an escaped newline in a regex','a lone low surrogate in a discovery string',
+                             'a lone high surrogate in a discovery string'}
                             <= {r['label'] for r in rows},name)
             for r in rows:self.assertEqual(r['verdict'],'INSUFFICIENT',(name,r['label']))
 

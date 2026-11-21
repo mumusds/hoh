@@ -2276,6 +2276,8 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
         # discovery a lexer that took "/*" for a regex, or CR and U+2028 for whitespace or string text, would classify:
         # unclassifiable, never PASS. The first hides an exec_command from such a lexer (V8 runs it).
         hidden = '; await tools.exec_command({cmd:\'touch /x\'}); //'
+        # CLN1-01: surrogate variants use a discovery result ([]) so accepting their strings would PASS.
+        # A regex at script start is covered by the lexer unit test, since the statement grammar also rejects it.
         for label, source in (
                 ('a block comment taken for a regex hides an exec_command (the reviewer\'s M2T20D-1100)',
                  f'text(ALL_TOOLS.filter(t => /*/.test("*/") || t.name.includes("){hidden}")));\n'),
@@ -2292,8 +2294,8 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
                 ('a regex with a flag outside gimsuy', 'text(ALL_TOOLS.filter(t => /w/x.test(t.name)));\n'),
                 ('a regex with a repeated flag', 'text(ALL_TOOLS.filter(t => /w/ii.test(t.name)));\n'),
                 ('an escaped newline in a regex', 'text(ALL_TOOLS.filter(t => /a\\\nb/.test(t.name)));'),
-                ('a regex at the script start', '/w/.test("x");'),
-                ('a lone surrogate in a string', 'text(await tools.exec_command({cmd:"\\ud800"}));')):
+                ('a lone low surrogate in a discovery string', 'text(ALL_TOOLS.filter(t => t.name.includes("\\udfff")));'),
+                ('a lone high surrogate in a discovery string', 'text(ALL_TOOLS.filter(t => t.name.includes("\\ud800")));')):
             add('code mode lexis', label, edit=lambda m, src=source: _code_mode_call(m, src, [COMPLETED, '[]']))
         # M2T20D-1201: preserve raw record boundaries and malformed lines in --emit; reserializing the
         # successfully parsed objects would hide the lost-line defect from the Rust/prototype comparison.
