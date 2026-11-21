@@ -1,4 +1,6 @@
 //! CLT-353: a missing prerequisite cannot silently become a passing test.
+#![forbid(clippy::disallowed_methods)]
+#![forbid(unsafe_code)]
 mod prerequisites;
 
 type R = Result<(), Box<dyn std::error::Error>>;
