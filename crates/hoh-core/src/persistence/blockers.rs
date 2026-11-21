@@ -71,12 +71,15 @@ impl Claims {
                 |r| r.get(0),
             )
             .map_err(sqlite_error)?;
-        let stored = ordered(
-            serde_json::from_str::<Vec<String>>(&stored)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|r| BlockedReason::parse(r)),
-        );
+        // The row's set as it is, a reason that never blocks a run included, so a row holding one differs from the
+        // claims' set and is written back without it (M3A-150).
+        let mut stored: Vec<BlockedReason> = serde_json::from_str::<Vec<String>>(&stored)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| BlockedReason::parse(r))
+            .collect();
+        stored.sort_by_key(|r| (precedence(*r), r.as_str()));
+        stored.dedup();
         // The latest claim event carries the open claims after it and its number (docs/adr/ADR-025.md v20,
         // M2T08R-403): two index lookups, not the run's whole claim history.
         let mut latest: Option<(i64, String)> = None;
@@ -98,6 +101,18 @@ impl Claims {
                 PersistError::IntegrityViolation(format!("a claim event of {run_id}: {e}"))
             })?;
             if let (Some(open), Some(n)) = (payload["open"].as_array(), payload["n"].as_u64()) {
+                // The event's own claim is checked as a replayed one is (M3A-151).
+                if payload["source"].as_str().is_none()
+                    || payload["reason"]
+                        .as_str()
+                        .and_then(BlockedReason::parse)
+                        .filter(|r| r.blocks_run())
+                        .is_none()
+                {
+                    return Err(PersistError::IntegrityViolation(format!(
+                        "a claim event of {run_id} names no source or no reason that blocks a run: {payload}"
+                    )));
+                }
                 let mut claims = Claims {
                     project_id: project_id.to_owned(),
                     run_id: run_id.to_owned(),
@@ -167,7 +182,7 @@ impl Claims {
             }
         }
         if rows.is_empty() {
-            for reason in claims.stored.clone() {
+            for reason in ordered(claims.stored.clone()) {
                 let source = if reason == BlockedReason::BudgetUnenforceable {
                     BUDGET
                 } else {
