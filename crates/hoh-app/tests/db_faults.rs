@@ -198,24 +198,33 @@ impl Project {
     }
 
     /// [`Project::dump`] once the running host has gone quiet: the same for a second (its tick is 200 ms), so that
-    /// what its last command set going (the supervisor's cursor, say) is in it and not taken for a fault's write.
+    /// what its last command set going (the supervisor's cursor, say) is in it and not taken for a fault's write. A
+    /// supervisor trigger fires only once its trailing debounce ends (2 s, docs/adr/ADR-025.md decision 1; longer than
+    /// that second), and in a run without a specification its firing writes the trigger's NO_SPEC deferral
+    /// (docs/adr/ADR-025.md decision 4): so a PENDING trigger of such a run without its deferral is not quiet either.
     fn quiet_dump(&self) -> R<String> {
         const QUIET: Duration = Duration::from_secs(1);
+        const UNTOLD: &str = "SELECT count(*) FROM supervisor_triggers t JOIN runs r ON r.run_id = t.run_id \
+                              WHERE t.state = 'PENDING' AND r.spec_id IS NULL AND NOT EXISTS \
+                              (SELECT 1 FROM events e WHERE e.event_id = t.trigger_id || '/deferred/NO_SPEC')";
         let end = Instant::now() + Duration::from_secs(20);
         let mut last = self.dump()?;
         let mut since = Instant::now();
-        while since.elapsed() < QUIET {
+        loop {
             if Instant::now() > end {
                 return Err("the host did not go quiet in 20 s".into());
             }
             std::thread::sleep(Duration::from_millis(100));
+            // Read before the dump it vouches for: a deferral written after this read is in that dump or a later one.
+            let told = self.sql(UNTOLD)? == "0";
             let now = self.dump()?;
-            if now != last {
+            if now != last || !told {
                 last = now;
                 since = Instant::now();
+            } else if since.elapsed() >= QUIET {
+                return Ok(last);
             }
         }
-        Ok(last)
     }
 }
 
