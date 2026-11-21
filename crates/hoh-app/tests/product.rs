@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod common;
+mod product_prompts;
 
 use hoh_app::host::{Host, HostConfig};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};

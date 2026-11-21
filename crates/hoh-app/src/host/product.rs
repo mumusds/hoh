@@ -468,6 +468,12 @@ impl ProductExecutor {
         package: Option<&serde_json::Value>,
     ) -> Result<(String, PromptRecord), Refusal> {
         use hoh_core::context;
+        hoh_core::prompt::validate_variables(&contract.text).map_err(|error| Refusal {
+            reason: error.code.to_owned(),
+            class: FailureClass::Decision,
+            detail: Some(error.to_string()),
+            details: Some(error.details),
+        })?;
         let a = &work.assignment;
         let mut facts = a.context.clone().unwrap_or_default();
         // What the store named and only the executor reads (docs/adr/ADR-028.md decision 14): registered objects by
