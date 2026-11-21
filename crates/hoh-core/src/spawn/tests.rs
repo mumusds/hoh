@@ -335,3 +335,66 @@ fn a_leader_handed_to_the_reaper_thread_is_reaped_when_it_exits_and_its_handle_s
     drop(helper);
     Ok(())
 }
+
+/// A leader held on stdin until the test releases it, with a member that outlives its exit.
+fn leader_with_member(dir: &std::path::Path) -> R<(Child, OwnedFd, i32)> {
+    let member_file = dir.join("member");
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "sleep 30 < /dev/null & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; read release; exit 0", "reaper-test"])
+        .arg(&member_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    let child = command.spawn()?;
+    let member = written_pid(&member_file)?;
+    let held = pidfd_open(
+        Pid::from_raw(member).ok_or("member pid")?,
+        PidfdFlags::empty(),
+    )?;
+    Ok((child, held, member))
+}
+
+fn check_after_exit_reaper(wrapping_failure: bool) -> R {
+    use std::io::Write as _;
+    let dir = tempfile::Builder::new().prefix("CLN4-151-").tempdir()?;
+    let (mut child, member_held, member) = leader_with_member(dir.path())?;
+    let pid = Pid::from_child(&child);
+    let mut release = child.stdin.take().ok_or("leader stdin")?;
+    let helper = if wrapping_failure {
+        // The wrapping failure's actual reaper body, after the initial bounded kill/wait has expired.
+        // Enter here with a live leader to deterministically expose the after-exit group kill, independent of
+        // whether the kernel happened to process the initial SIGKILL before the zero-bound try_wait.
+        std::thread::spawn(move || reap_child_later(child));
+        None
+    } else {
+        let pidfd = pidfd_open(pid, PidfdFlags::empty())?;
+        let helper = Helper::own(&mut child, pid, pidfd);
+        assert!(helper.shared.hand_over(), "no handle reaper thread");
+        Some(helper)
+    };
+    // No kill before the leader exits. Its stdin handshake holds that boundary without a timing race.
+    assert!(!ended(member), "member killed before leader exit");
+    release.write_all(b"go\n")?;
+    drop(release);
+    let leader_reaped = reaped(pid.as_raw_pid());
+    let member_ended = ends(member);
+    // Exact kernel identity: even a failing mutation must leave no sleeper behind or target a reused pid.
+    let _ = pidfd_send_signal(&member_held, Signal::KILL);
+    assert!(ends(member), "test cleanup left its member running");
+    drop(helper);
+    assert!(leader_reaped, "reaper left its leader behind");
+    assert!(member_ended, "reaper let a group member outlive the leader");
+    Ok(())
+}
+
+#[test]
+fn the_handle_reaper_ends_members_after_the_leader_exits() -> R {
+    check_after_exit_reaper(false)
+}
+
+#[test]
+fn the_wrapping_failure_reaper_ends_members_after_the_leader_exits() -> R {
+    check_after_exit_reaper(true)
+}
