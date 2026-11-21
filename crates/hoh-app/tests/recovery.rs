@@ -422,6 +422,64 @@ impl hoh_app::host::HostHooks for KillAtRunner {
     }
 }
 
+/// The child's hooks while the test, as the run's Commander, submits its decision as the host starts (CHILD_DECIDE):
+/// the runner's first tick waits at its staffing point until the decision was submitted, then everything goes to
+/// `inner`. Otherwise the tick's stall detector can judge the READY run before the decision it waits for and wake the
+/// Commander (docs/adr/ADR-031.md design correction C), whose supervision turns the FakeExecutor cannot run.
+#[derive(Debug)]
+struct AfterDecision {
+    inner: Arc<dyn hoh_app::host::HostHooks>,
+    decided: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl hoh_app::host::HostHooks for AfterDecision {
+    fn after_commit(&self) {
+        self.inner.after_commit();
+    }
+
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::AfterStaffing {
+            let end = Instant::now() + Duration::from_secs(60);
+            while !self.decided.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        self.inner.runner(point);
+    }
+
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, attempt_id: &str) {
+        self.inner.runner_of(point, attempt_id);
+    }
+
+    fn announced(&self) {
+        self.inner.announced();
+    }
+
+    fn suite_ran(&self, agent: &str) {
+        self.inner.suite_ran(agent);
+    }
+
+    fn before_file_revision(&self) {
+        self.inner.before_file_revision();
+    }
+
+    fn completing(&self, attempt_id: &str) {
+        self.inner.completing(attempt_id);
+    }
+
+    fn reconciling(&self, candidate_id: &str) {
+        self.inner.reconciling(candidate_id);
+    }
+
+    fn proc_root(&self) -> Option<PathBuf> {
+        self.inner.proc_root()
+    }
+
+    fn cgroups_allowed(&self) -> bool {
+        self.inner.cgroups_allowed()
+    }
+}
+
 /// Holds each compat suite whose run ended before its publication until `<0>/release` exists, making `<0>/held` as it
 /// does (the test's hook, CR-006).
 #[derive(Debug)]
@@ -685,16 +743,22 @@ fn recovery_host() {
         .build()
         .expect("a runtime");
     if let Ok(decision) = std::env::var(CHILD_DECIDE) {
+        let decided = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        config.hooks = Arc::new(AfterDecision {
+            inner: config.hooks.clone(),
+            decided: decided.clone(),
+        });
         let code = runtime.block_on(async {
             let host = Host::start(config).await.expect("the host starts");
             let message: Message = serde_json::from_str(&decision).expect("a decision message");
             let proposal = Proposal::from_message(&message).expect("a proposal");
-            let decided = host.store().decide(proposal, Context::default()).await;
+            let outcome = host.store().decide(proposal, Context::default()).await;
+            decided.store(true, std::sync::atomic::Ordering::SeqCst);
             if runner_kill.is_some() {
                 // The runner reaches its kill point while this waits.
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
-            eprintln!("decided without being killed: {decided:?}");
+            eprintln!("decided without being killed: {outcome:?}");
             NOT_KILLED
         });
         std::process::exit(code);
