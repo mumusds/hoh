@@ -197,7 +197,9 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | code mode | same | — | — | 6 PASS | 6 PASS | — | — |
 | code mode | non-PASS | — | — | 1 FAIL, 48 INSUFFICIENT | 1 FAIL, 48 INSUFFICIENT | — | — |
 | code mode mismatch | non-PASS | — | — | 2 FAIL, 12 INSUFFICIENT | 2 FAIL, 12 INSUFFICIENT | — | — |
-| code mode lexis | non-PASS | — | — | 12 INSUFFICIENT | 12 INSUFFICIENT | — | — |
+| code mode lexis | non-PASS | — | — | 15 INSUFFICIENT | 15 INSUFFICIENT | — | — |
+| rollout JSONL | same | — | — | 2 PASS | 2 PASS | — | — |
+| rollout JSONL | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
 | item default-deny | non-PASS | — | — | 3 INSUFFICIENT | 3 INSUFFICIENT | — | — |
 | incomplete driver run | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
 | incomplete patch call | non-PASS | — | — | 2 INSUFFICIENT | 2 INSUFFICIENT | — | — |
@@ -932,6 +934,18 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | code mode lexis | a U+2029 in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | an escaped newline in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a regex at the script start | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a lone surrogate in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | rollout JSONL | Unicode separators inside a recorded call | same | PASS | — |
+| codex/app-ro-new | rollout JSONL | a valid surrogate pair | same | PASS | — |
+| codex/app-ro-new | rollout JSONL | malformed JSON | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a bare CR between records | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a lone surrogate value | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a lone surrogate key | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a nested lone surrogate | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a U+2028 script | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | rollout JSONL | a U+2028 script and a malformed line | non-PASS | INSUFFICIENT | rollout line 36 is not valid JSON; an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-new | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |
@@ -1449,6 +1463,18 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | code mode lexis | a U+2029 in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | an escaped newline in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a regex at the script start | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a lone surrogate in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | rollout JSONL | Unicode separators inside a recorded call | same | PASS | — |
+| codex/app-ro-resumed | rollout JSONL | a valid surrogate pair | same | PASS | — |
+| codex/app-ro-resumed | rollout JSONL | malformed JSON | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a bare CR between records | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a lone surrogate value | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a lone surrogate key | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a nested lone surrogate | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a U+2028 script | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | rollout JSONL | a U+2028 script and a malformed line | non-PASS | INSUFFICIENT | rollout line 69 is not valid JSON; an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | a commandExecution of another command | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
 | codex/app-ro-resumed | item default-deny | an item of an unknown type | non-PASS | INSUFFICIENT | an unclassified item (mcpToolCall) |

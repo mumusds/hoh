@@ -135,25 +135,35 @@ class Case:
 
     def __init__(self, agent: str, name: str, form: str, stdout: list[dict], rollout: list[dict] | None,
                  diff: dict | None, paths: dict[str, str], token_sha256: str, exit_code, requests: list[dict] | None,
-                 session_arg: str | None, observations: dict | None = None):
+                 session_arg: str | None, observations: dict | None = None, parse_problems: list[str] | None = None):
         self.agent, self.name, self.form = agent, name, form
         self.stdout, self.rollout, self.diff, self.paths = stdout, rollout, diff, paths
         self.token_sha256, self.exit_code, self.requests, self.session_arg = token_sha256, exit_code, requests, session_arg
         # The adapter's external observations (design correction 7, M2T20D-801): the process's end, whether both
         # streams were read to their end; for pi the launch, the noted session files and the get_state file's identity.
         self.observations = observations or {}
+        self.parse_problems = parse_problems if parse_problems is not None else []
+        # Only raw JSONL variants override serialization, so the Rust reader sees the malformed input too.
+        self.rollout_text: str | None = None
 
     def region(self, rel: str) -> str:  # 'P/.git' -> the case's real or placeholder path
         head, _, tail = rel.partition('/')
         return self.paths[head] + ('/' + tail if tail else '')
 
 
-def json_lines(text: str) -> list[dict]:
+def json_lines(text: str, source: str, problems: list[str]) -> list[dict]:
+    """LF-delimited JSON, matching serde: do not silently lose a line or accept lone surrogates."""
     out = []
-    for line in text.splitlines():
+    lines = text.split('\n')
+    if lines[-1] == '':  # A final LF terminates the preceding record, as Rust lines() does.
+        lines.pop()
+    for number, line in enumerate(lines, 1):
         try:
             f = json.loads(line)
-        except ValueError:
+            # Check decoded keys and nested strings too; a valid surrogate pair decodes to one scalar.
+            json.dumps(f, ensure_ascii=False).encode('utf-8')
+        except (ValueError, UnicodeEncodeError):
+            problems.append(f'{source} line {number} is not valid JSON')
             continue
         if isinstance(f, dict) and '_excerpt' not in f:
             out.append(f)
@@ -178,15 +188,16 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
     """The case from its excerpts, and from its raw source when present with the recorded sha256 (else None, why)."""
     base = excerpts / agent
     meta = json.loads((base / f'{name}.meta.json').read_text())
-    stdout_text = (base / f'{name}.stdout.excerpt.jsonl').read_text()
+    stdout_text = (base / f'{name}.stdout.excerpt.jsonl').read_bytes().decode('utf-8')
     rollout_path, stdin_path = base / f'{name}.rollout.excerpt.jsonl', base / f'{name}.stdin.excerpt.jsonl'
-    rollout_text = rollout_path.read_text() if rollout_path.is_file() else None
-    stdin_text = stdin_path.read_text() if stdin_path.is_file() else None
+    rollout_text = rollout_path.read_bytes().decode('utf-8') if rollout_path.is_file() else None
+    stdin_text = stdin_path.read_bytes().decode('utf-8') if stdin_path.is_file() else None
     placeholders = {'P': '<P>', 'W': '<W>', 'T': '<T>'}
-    excerpt = Case(agent, name, 'excerpt', json_lines(stdout_text), json_lines(rollout_text) if rollout_text else None,
+    problems = []
+    excerpt = Case(agent, name, 'excerpt', json_lines(stdout_text, 'stdout', problems), json_lines(rollout_text, 'rollout', problems) if rollout_text else None,
                    meta['snapshot_diff'], placeholders, meta['token_sha256'], meta['exit_code'],
-                   json_lines(stdin_text) if stdin_text else None, _session_arg(meta['argv']), meta.get('observations'))
-    header = json.loads(stdout_text.splitlines()[0])['_excerpt']
+                   json_lines(stdin_text, 'stdin', problems) if stdin_text else None, _session_arg(meta['argv']), meta.get('observations'), problems)
+    header = json.loads(stdout_text.split('\n', 1)[0])['_excerpt']
     raw_dir = root / Path(header['source']).parent
     raw_stdout = raw_dir / 'stdout.jsonl'
     if not raw_stdout.is_file():
@@ -195,16 +206,17 @@ def load(excerpts: Path, root: Path, agent: str, name: str) -> tuple[Case, Case 
         return excerpt, None, 'raw recording differs from the recorded sha256'
     for text, file in ((rollout_text, 'rollout.jsonl'), (stdin_text, 'stdin.txt')):
         if text:
-            want = json.loads(text.splitlines()[0])['_excerpt']['source_sha256']
+            want = json.loads(text.split('\n', 1)[0])['_excerpt']['source_sha256']
             if not (raw_dir / file).is_file() or sha256((raw_dir / file).read_bytes()) != want:
                 return excerpt, None, f'raw {file} missing or differs from the recorded sha256'
     raw_meta = json.loads((raw_dir / 'meta.json').read_text())
     inverse = {v.strip('<>'): k for k, v in raw_meta['placeholders'].items()}
-    raw = Case(agent, name, 'raw', json_lines(raw_stdout.read_text()),
-               json_lines((raw_dir / 'rollout.jsonl').read_text()) if rollout_text else None,
+    problems = []
+    raw = Case(agent, name, 'raw', json_lines(raw_stdout.read_bytes().decode('utf-8'), 'stdout', problems),
+               json_lines((raw_dir / 'rollout.jsonl').read_bytes().decode('utf-8'), 'rollout', problems) if rollout_text else None,
                json.loads((raw_dir / 'snapshot.json').read_text())['diff'], inverse, raw_meta['token_sha256'],
-               raw_meta['exit_code'], json_lines((raw_dir / 'stdin.txt').read_text()) if stdin_text else None,
-               _session_arg(raw_meta['argv']), _raw_observations(raw_dir, raw_meta, agent))
+               raw_meta['exit_code'], json_lines((raw_dir / 'stdin.txt').read_bytes().decode('utf-8'), 'stdin', problems) if stdin_text else None,
+               _session_arg(raw_meta['argv']), _raw_observations(raw_dir, raw_meta, agent), problems)
     return excerpt, raw, ''
 
 
@@ -1365,8 +1377,8 @@ def request_problems(c: Case) -> list[str]:
 def call_problems(c: Case) -> list[str]:
     """Stage 2 for the turn: codex's items (stream) and calls (rollout), claude's and pi's tool calls."""
     if c.agent == 'codex':
-        return request_problems(c) + untaken(c) + stream_items(c)[2] + rollout_calls(c)[1]
-    return request_problems(c) + tool_problems(c)
+        return c.parse_problems + request_problems(c) + untaken(c) + stream_items(c)[2] + rollout_calls(c)[1]
+    return c.parse_problems + request_problems(c) + tool_problems(c)
 
 
 def write_tool_successes(c: Case) -> list[str]:
@@ -1430,7 +1442,7 @@ def control_gaps(control: Case | None, agent: str) -> list[str]:
         gaps += [f'control: {p}' for p in call_problems(control)]
         gaps += [f'control {mech} {op}' for mech in MECHANISMS for op in OPS if not control_cell_written(control, mech, op)]
     else:
-        gaps += [f'control: {p}' for p in request_problems(control)]
+        gaps += [f'control: {p}' for p in control.parse_problems + request_problems(control)]
     return gaps
 
 
@@ -1909,6 +1921,15 @@ def _code_mode_call(m: Case, source: str, texts: list[str] | None, call_id: str 
                                                                'output': [{'type': 'input_text', 'text': t} for t in texts], **meta}})
 
 
+def _rollout_jsonl(m: Case, suffix: str = '', note: str | None = None) -> None:
+    """Exercise the actual JSONL reader, retaining the exact bytes for the Rust variant reader."""
+    if note is not None:
+        call = next(l['payload'] for l in _turn_lines(m) if (l.get('payload') or {}).get('type') == 'custom_tool_call')
+        call['note'] = note
+    m.rollout_text = ''.join(json.dumps(l, ensure_ascii=False) + '\n' for l in m.rollout) + suffix
+    m.rollout = json_lines(m.rollout_text, 'rollout', m.parse_problems)
+
+
 def _driver_then(m: Case, extra: str, extra_texts: list[str]) -> None:
     """The turn's first driver call with `extra` statements after it in the same script, its output with
     `extra_texts` appended (a script of several statements, design correction 8)."""
@@ -2269,8 +2290,26 @@ def mutants(c: Case, control: Case | None) -> list[tuple[str, str, Case, Case | 
                 ('a U+2028 in a string', 'text(ALL_TOOLS.filter(t => t.name.includes("a\u2028b")));\n'),
                 ('a U+2029 in a regex', 'text(ALL_TOOLS.filter(t => /a\u2029b/.test(t.name)));\n'),
                 ('a regex with a flag outside gimsuy', 'text(ALL_TOOLS.filter(t => /w/x.test(t.name)));\n'),
-                ('a regex with a repeated flag', 'text(ALL_TOOLS.filter(t => /w/ii.test(t.name)));\n')):
+                ('a regex with a repeated flag', 'text(ALL_TOOLS.filter(t => /w/ii.test(t.name)));\n'),
+                ('an escaped newline in a regex', 'text(ALL_TOOLS.filter(t => /a\\\nb/.test(t.name)));'),
+                ('a regex at the script start', '/w/.test("x");'),
+                ('a lone surrogate in a string', 'text(await tools.exec_command({cmd:"\\ud800"}));')):
             add('code mode lexis', label, edit=lambda m, src=source: _code_mode_call(m, src, [COMPLETED, '[]']))
+        # M2T20D-1201: preserve raw record boundaries and malformed lines in --emit; reserializing the
+        # successfully parsed objects would hide the lost-line defect from the Rust/prototype comparison.
+        add('rollout JSONL', 'Unicode separators inside a recorded call', expect='same',
+            edit=lambda m: _rollout_jsonl(m, note='a\u2028b\u2029c\x85d\v\f\x1c\x1d\x1e'))
+        add('rollout JSONL', 'a valid surrogate pair', expect='same',
+            edit=lambda m: _rollout_jsonl(m, '{"note":"\\ud83d\\ude00"}\n'))
+        for label, bad in (('malformed JSON', '{bad json'),
+                           ('a bare CR between records', '{"note":"first"}\r{"note":"second"}'), ('a lone surrogate value', '{"note":"\\ud800"}'),
+                           ('a lone surrogate key', '{"\\udfff":"value"}'), ('a nested lone surrogate', '{"note":["\\ud800"]}')):
+            add('rollout JSONL', label, edit=lambda m, bad=bad: _rollout_jsonl(m, bad + '\n'))
+        for suffix in ('', '{bad json\n'):
+            add('rollout JSONL', 'a U+2028 script' + (' and a malformed line' if suffix else ''),
+                edit=lambda m, suffix=suffix: (
+                    _code_mode_call(m, 'text(ALL_TOOLS.filter(t => t.name.includes("a\u2028b")));', [COMPLETED, '[]']),
+                    _rollout_jsonl(m, suffix)))
         add('item default-deny', 'a killed driver run whose command has a trailing space', edit=_odd_driver_command)
         add('item default-deny', 'a commandExecution of another command', edit=_other_command)
         add('item default-deny', 'an item of an unknown type', edit=_unknown_item)
@@ -2571,7 +2610,8 @@ def emit(excerpts: Path, root: Path, out: Path) -> None:
                     continue
                 (d / f'{prefix}stdout.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.stdout))
                 if case.rollout is not None:
-                    (d / f'{prefix}rollout.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.rollout))
+                    (d / f'{prefix}rollout.jsonl').write_text(case.rollout_text if case.rollout_text is not None else
+                                                         ''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.rollout))
                 if case.requests is not None:
                     (d / f'{prefix}stdin.jsonl').write_text(''.join(json.dumps(f, ensure_ascii=False) + '\n' for f in case.requests))
                 (d / f'{prefix}observations.json').write_text(json.dumps(case.observations, ensure_ascii=False) + '\n')

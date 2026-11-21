@@ -259,6 +259,51 @@ class Judge(unittest.TestCase):
                 elif change!='as recorded':self.assertEqual(summary,'12 insufficient',(case,change))
 
 
+class RolloutJsonLines(unittest.TestCase):
+    """TEST-021-07 / M2T20D-1201: the original JSONL, before either judge can discard lines."""
+    def test_unicode_separators_in_a_recorded_call_are_not_record_boundaries(self):
+        J=judge_check
+        c=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex','app-ro-new')[0]
+        control=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex','app-control')[0]
+        call=next(l['payload'] for l in c.rollout if (l.get('payload') or {}).get('type')=='custom_tool_call')
+        call['note']='a\u2028b\u2029c\x85d'
+        with tempfile.TemporaryDirectory() as d:
+            out=Path(d)/'excerpts';shutil.copytree(FIXTURES/'excerpts',out)
+            path=out/'codex/app-ro-new.rollout.excerpt.jsonl'
+            header=path.read_text().split('\n',1)[0]
+            path.write_text(header+'\n'+''.join(json.dumps(l,ensure_ascii=False)+'\n' for l in c.rollout))
+            got=J.load(out,Path('/nonexistent'),'codex','app-ro-new')[0]
+            self.assertEqual(J.round_verdict(got,control),('PASS',[]))
+            self.assertEqual(got.rollout,c.rollout)
+
+    def test_malformed_lines_are_reported_even_when_all_required_calls_are_present(self):
+        J=judge_check
+        for name in ('app-ro-new','app-ro-resumed'):
+            for bad in ('{bad json', '{"note":"\\ud800"}', '{"\\udfff":"value"}', '{"note":["\\ud800"]}'):
+                with self.subTest(name=name,bad=bad), tempfile.TemporaryDirectory() as d:
+                    out=Path(d)/'excerpts';shutil.copytree(FIXTURES/'excerpts',out)
+                    path=out/f'codex/{name}.rollout.excerpt.jsonl'
+                    original=path.read_text();line=len(original.split('\n'))
+                    path.write_text(original+bad+'\n')
+                    c=J.load(out,Path('/nonexistent'),'codex',name)[0]
+                    control=J.load(out,Path('/nonexistent'),'codex','app-control')[0]
+                    self.assertEqual(J.round_verdict(c,control),('INSUFFICIENT',[f'rollout line {line} is not valid JSON']))
+
+    def test_the_generated_raw_variants_keep_the_expected_verdict_and_reason(self):
+        J=judge_check
+        for name in ('app-ro-new','app-ro-resumed'):
+            c=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex',name)[0]
+            control=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex','app-control')[0]
+            rows=[r for r in J.run_mutants(c,control) if r['kind']=='rollout JSONL']
+            self.assertEqual(len(rows),9,name)
+            for r in rows:
+                want='PASS' if r['expect']=='same' else 'INSUFFICIENT'
+                self.assertEqual(r['verdict'],want,(name,r['label']))
+                if r['label']=='a U+2028 script and a malformed line':
+                    self.assertTrue(any('is not valid JSON' in p for p in r['why']),r)
+                    self.assertIn('an unclassified call (custom_tool_call exec)',r['why'])
+
+
 class CodeMode(unittest.TestCase):
     """Design correction 8: code mode's calls by the grammar, not the recorded text."""
     def test_the_grammar_takes_the_recorded_forms_and_nothing_else(self):
@@ -304,7 +349,9 @@ class CodeMode(unittest.TestCase):
         for name in ('app-ro-new','app-ro-resumed'):
             c=J.load(FIXTURES/'excerpts',none,'codex',name)[0];control=J.load(FIXTURES/'excerpts',none,'codex','app-control')[0]
             rows=[r for r in J.run_mutants(c,control) if r['kind']=='code mode lexis']
-            self.assertEqual(len(rows),12,name)
+            self.assertEqual(len(rows),15,name)
+            self.assertTrue({'an escaped newline in a regex','a regex at the script start','a lone surrogate in a string'}
+                            <= {r['label'] for r in rows},name)
             for r in rows:self.assertEqual(r['verdict'],'INSUFFICIENT',(name,r['label']))
 
 if __name__=='__main__':unittest.main()
