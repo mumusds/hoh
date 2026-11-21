@@ -3,8 +3,8 @@
 ID：CR-032
 状态：DRAFT
 批准人：待 CTO 在独立设计审查后依 CR-003 D1 决定；本文不是批准记录
-日期：2026-11-22（第 2 稿；按首轮设计审查与当日 CTO/所有者决定修订）
-输入基线：`535b4469b78e08bb4c792dfa29fea252ae78d459`（第 1 稿；受锁基线仍为 `8d9ae599d30982fd431b950dec229786cdc15379` 的 revision 22），分支 `prep/M7-T01-spec`
+日期：2026-11-22（第 3 稿；按第 2 轮修复 diff 审查与 CTO 决定修订）
+输入基线：`303a81a03899f0baf1889f1ece3516f419148db8`（第 2 稿；受锁基线仍为 `8d9ae599d30982fd431b950dec229786cdc15379` 的 revision 22），分支 `prep/M7-T01-spec`
 适用任务：M7-T01 的规格准备；正式应用仍依赖 M6-T04，未领取或推进全局任务
 
 本次只提交本文件。下文把 REQ-067、068、069、070 各细化为 4 条，共 16 条可判定 AC；保留原有四条 AC/TEST ID 与原范围，`required_release=true`、`release_class=required`、`release_targets=["v1"]`、P1 和 summary 不变。实际工作树的需求、场景、任务图、检查计划和基线锁均不改。提案仅在临时副本应用并机械验证，产品/性能/soak/升级结果全部 NOT_RUN，不能用包自测代替验收。
@@ -27,24 +27,24 @@ M4 CR-028 的已绑定性能/资源/输入/终端决定继续生效；150MiB/100
 |---|---|---|---|
 | A1 | CR-028，APPROVED、未应用，精确输入见下 | M4-T03/T10 提供 integration 五阶段/排他/私有manager/百万库与原始样本；M4-T07 完整终端矩阵；M4-T04 对这些任务收口。影响全部068与067观察 | 核对实际runner、环境字段/工件及各阶段预算；M7不得复制第二套测量器。不存在则前序补齐，M7性能BLOCKED |
 | A2 | CR-028 §5.1、REQ-015矩阵 | 同一参考profile才可正式integration PASS；M7补本地SSD证明；M6准备24.04，M7-T04一次最终tui-pty收两平台/完整宽度交集 | 核对实际硬件/限制和平台manifest，rotational不能证明后端；证据或预算不足交D3/CTO，不改参考值来通过 |
-| A3 | prep/M5-T01-spec 的 CR-030 DRAFT快照（精确绑定见下）；未提交/未批准/未应用 | M5-T05/REQ-063备份迁移，T06/REQ-044恢复与STEER，T02/REQ-055回归，T07/REQ-056发布门禁，T08/REQ-057目标项目fresh-VM验证；T03/T09/T10插件安装/集成或合规降级。影响067/069/070 | 当前草案的接口是open假设。应用时按最终CR重核逐AC、owner与产物格式；M5-T04须覆盖全部8个实现owner。M5目标项目Web验证不等于M6 HoH Web GUI；缺能力先阻塞相关任务 |
+| A3 | prep/M5-T01-spec 的 CR-030 DRAFT第2稿提交8cd48eab（精确绑定见下）；未批准/未应用 | M5-T05/REQ-063备份迁移，T06/REQ-044恢复与STEER，T02/REQ-055回归，T07/REQ-056发布门禁，T08/REQ-057目标项目fresh-VM验证；T03/T09/T10插件安装/集成或合规降级，T03独占三底座provider_content_filter诊断映射。影响067/069/070 | 当前草案的接口是open假设。应用时按最终CR重核逐AC、owner与产物格式；M5-T04须覆盖全部8个实现owner。M5目标项目Web验证不等于M6 HoH Web GUI；缺能力先阻塞相关任务 |
 | A4 | CR-026 应用时的更正、docs/24 §2.3/2.7 | CR-030 AC-055-04/M5-T02负责两轮设计修正和审查轮数；AC-044-04/05/M5-T06固定code_target={git_commit,tree_sha256,candidate_id或null}；067恢复不得继续旧身份，069导出真实审查历史 | 逐项核对M5的AC或明确不吸收理由；M7不默认为已完成，不擅改REQ-017/021/044/055/056。未落实且影响当前验证时交CTO补前序CR |
-| A5 | prep/M6-T01-spec 的 CR-031 DRAFT，第2稿工作树快照（精确绑定见下）；未批准/未应用 | M6-T02提供Web外壳/资产；M6-T05负责重连/重新授权/多客户端；M6-T06负责Git交付与合并提交身份；M6-T03负责Ubuntu 24.04/26.04全新VM、安装/文档和资产一致性；M6-T04依赖T02/T03/T05/T06收全 | 069-02与070-01..04共用deployment的3600s，按共同约定8先测全部成本、超预算交CTO重规划，不放宽timeout或删AC；现deployment.sh只强制test_005_06，新增测试的NO_TESTS责任见T02/T06。C1按所有者2026-11-22批准：静态外壳无需token、Host/Origin仍校验、每个/v1请求均需token，token不进服务日志或Referer；不再列为待批准。缺能力由M6补齐，按最终CR复核闭包 |
+| A5 | prep/M6-T01-spec 的 CR-031 DRAFT，第2稿39386bf0；第3稿ce5260a9及已采纳C25/C26列入应用重核（精确绑定见下）；未批准/未应用 | M6-T02提供Web外壳/资产；M6-T05负责重连/重新授权/多客户端；M6-T06负责Git交付与合并提交身份；M6-T03负责Ubuntu 24.04/26.04全新VM、安装/文档和资产一致性；M6-T04依赖T02/T03/T05/T06收全 | 069-02与070-01..04共用M7-T01应用时检查计划中的deployment.timeout_seconds，按共同约定8先测全部成本；任何调整只按CR-031 C12先实测再由CTO决定，M7不自行调整，不删AC；现deployment.sh只强制test_005_06，新增测试的NO_TESTS责任见T02/T06。C1按所有者2026-11-22批准：静态外壳无需token、Host/Origin仍校验、每个/v1请求均需token，token不进服务日志或Referer；不再列为待批准。缺能力由M6补齐，按最终CR复核闭包 |
 | A6 | M3 CR-026规格已应用；实现任务尚需完成 | M3-T02/03/07/09提供spec identity/资源版本/追踪/运行中输入；M3-T05完成是M4入口 | 依最终主分支核对实现与已批准字段；本文不把M3规格提交当可用于旧版本升级的产品release |
 | A7 | CR-017/ADR-027现有移交 | M7-T02切三个检查的profile为v1；M7-T03交付soak，发布前全量运行 | 检查已应用前序计划的argv/产物；保留其他新增产物，不用本基线的整份check-plan覆盖前序变更；确认D7的实施诊断与最终验收顺序 |
 
-M4来源：`prep/M4-T01-spec` 的提交 `dde5109f43a2081b5d5e5c507b91a14b12c62143`，`docs/cr/CR-028-m4-detailed-spec.md` 字节 sha256=`e442f111eb14227ba2fc5496dafe812e8eca1ee070b3ee7208f9c3ca560e1800`。M5开始读取时没有正文；后续已读取CR-030第1稿工作树文件，分支HEAD仍为8d9ae599d30982fd431b950dec229786cdc15379，文件未提交，sha256=035a55e8a0b55437c830e32acc34771628de8119c883654c394923105be4657c（124087字节），保存的只读快照作为本稿输入，不宣称它是最终稿或已批准。复核到的AC/owner见A3/A4及下方承接表；并行作者后续变更不自动进入本稿。所有假设的责任人为 CTO，置信度为“已有范围约束，具体接口待核”；没有把未应用前序规格当成当前行为。
+M4来源：`prep/M4-T01-spec` 的提交 `dde5109f43a2081b5d5e5c507b91a14b12c62143`，CR-028 字节sha256=`e442f111eb14227ba2fc5496dafe812e8eca1ee070b3ee7208f9c3ca560e1800`。本稿改用已提交的CR-030第2稿 `8cd48eab4646bf46dfa6f399dca35aca4cbf7ea8`，字节sha256=`7b99e45375276d0b8fe33a945a2d4b5a22e77b5eee4d75c433cb1cb44b12463d`；其REQ-051 behavior明确由M5-T03交付Codex/Claude/Pi共用的provider_content_filter诊断映射，M7只消费。第2稿所用CR-030第1稿未提交快照保留在历史证据，不再作为分类归属的当前依据。
 
+CR-031第2稿输入就是提交 `39386bf0a04ee1d35e95a3b71b7c8b664996d97e` 的文件，字节sha256=`008349e656768c6e7a12ade4f4afdc858f9c7ca633e48cfd5d354a2603d677d1`；第2稿所写“HEAD 05b2ef6c上的未提交修订”已更正。另读取第3稿 `ce5260a926277de03f3d7009345660b4281f8f21`，sha256=`7071caf96840ae20b0e6d338d50498e061ac31ec5e33c84590d0ce1795d3bfd6`。A5应用重核须包括C25的403 details.reason与C26的项目外核验checkout/独立对象库根/source_path仍为导出对象；该稿正文尚写待定，CTO决策记录已于2026-11-22采纳，附第3轮设计审查条件，不把它当成已批准/已应用。当前任务图探针仍以第2稿为主，并核对第3稿相同的M6 owner/依赖；接口按最终获批稿重核。
 
-
-CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.md`，分支 `prep/M6-T01-spec`，读取时HEAD为 `05b2ef6cbc00354142bc35b330a6a371b1d1fc27`，该文件有未提交修订；固定快照sha256=`008349e656768c6e7a12ade4f4afdc858f9c7ca633e48cfd5d354a2603d677d1`，保存在 `/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d2/CR-031-input.md`。只绑定此快照，不把并行作者后续编辑或DRAFT当已应用实现。CR-031 C12原文仍含“CTO决定是否调整timeout”；本次委派明确禁止放宽检查时限，因此M7按更严格的3600s总预算、先测后重规划执行，不采用该放宽选项。M4/M5输入快照也已保存在同一主仓库证据目录，避免worktree删除使引用失效。
+上述固定快照保存在 `/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d3/` 的 `CR-028-input.md`、`CR-030-input.md`、`CR-031-input.md`、`CR-031-draft3-input.md`，摘要与提交见 `source-bindings.json`。CR-031 C12继续有效：M7采用M7-T01应用时计划中的deployment timeout；任何变更须先测量，再交CTO按C12决定并绑定新计划/候选，不能由M7自行覆盖。所有前序能力假设的责任人为CTO；已有范围约束，具体实现/接口待核；批准或提交不等于生产能力已交付。
 
 ### CR-030 DRAFT 的具体承接（不提前批准）
 
 | M5提案 | M7消费与未定边界 |
 |---|---|
 | AC-044-02/03：operation恢复、活动工作/唤醒/next_action；AC-044-04/05：code_target和UNKNOWN_EFFECT | AC-067-03/04按真实状态恢复；AC-069-03保留旧身份历史；不从恢复摘要认定完成，不重绑旧STEER |
-| AC-051-02/03：活动组合锁与原子更新；051-04：failure_class=provider_content_filter | AC-070-02沿旧插件锁；067-03消费相同诊断，不新增枚举或自动耗尽过滤重试；M5范围若只覆盖插件驱动，M7扩展观察覆盖原生工程Attempt按已采纳D5由M7-T03落实原生Attempt诊断接线并核对能力 |
+| AC-051-02/03：活动组合锁与原子更新；051-04：failure_class=provider_content_filter | AC-070-02沿旧插件锁；067-03只在soak中观察并核对M5-T03产出的三底座原生Attempt分类，不交付或改写共用映射，不新增枚举或自动耗尽过滤重试；若最终M5缺原生覆盖，按A3先由CTO安排前序补充CR，相关M7验证BLOCKED，不把分类写责任转给M7 |
 | AC-055-02/03/04/05：影响闭包、候选外缓存/证据隔离、审查系列、Flaky新候选 | 067负例与069审计保留首失败；采用现有系列/栅栏，不以新提交重置审查计数；所有check子环境按M5隔离 |
 | AC-056-01..05/M5-T07：fixture判定器与Runtime最终全范围验证分离、原子manifest/run.result | 069测试可证明判定器且实际未齐时报告未完成；真正70需求/14检查由M7-T04收取。它提供发布后置义务，不能自动证明D7的前序traceability已通过 |
 | AC-057-01/03/04、063-01..04：fresh VM目标项目、备份/迁移/拒读/维护边界 | 070复用相同一致性备份与恢复规则，HoH自身安装包/两平台由M6补齐；不固化未来migration编号或旧产品commit |
@@ -62,17 +62,25 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
 
 其余明确分配M3/M4/M5/M6的条目不在本CR重写AC：权限/角色分离由既有Runtime，界面由M4/Web由M6，备份/Flaky/插件由M5；上表列出M7会重新观察的交界。正式应用本CR后在docs/24相关条目追加“CR-032”，本次只交CR不改经验库。
 
-## 共同测量、证据与实现约定（D1–D7 已采纳，来源见决策节）
+## 共同测量、证据与实现约定（D1–D9 已采纳，来源见决策节）
 
 1. **证据层次。** 下述check_id均已存在：soak=live；integration/deployment/traceability=product。模式由冻结计划决定，fault-injection/mock是子场景的明确标签，不篡改execution.mode。`test-result.status`只有PASS/FAIL/DEGRADED/SKIPPED；NOT_RUN/BLOCKED属于汇总/原因，不写非法枚举。测试名含相应test_NNN_MM，逐TEST输出和原始工件不共用一条空泛总结。
-2. **soak持续性（D1/D2）。** 观察者每60s持久记录一次，正常间隔≤120s。故障前先登记kind/目标身份/触发条件/预期恢复/最大窗口，从kill触发到reconcile完成与host-ready各≤30s；外层受控host故障观察窗口≤120s，必须包含这两项30s证明且观察者持续记录，120s不是恢复时限的替代；缺口有注入开始/结束及外部观察佐证才可视为受控故障。未登记缺口、观察者丢失、无法证明的时间均不能补心跳；取消、未结束执行或候选漂移不能延长旧窗口。没有为了达到时间而暂停deadline/预算。预定kill/recovery是已标记受控故障，任何实际未处理崩溃或重复效果FAIL。20轮必须分布在整个窗口：每个完全位于有效执行窗口内的连续24h区间均至少一个live iteration.accepted（按半开区间[t,t+86400s)及原始时间戳判定），不足不靠重复记录补数。以总数≥20但开头集中完成后空转的审计副本作为分布负例，仍须拒绝；这是已采纳D1，不改变最低20。
+2. **soak持续性（D1/D2）。** 观察者每60s持久记录一次，正常间隔≤120s。故障前先登记kind/目标身份/触发条件/预期恢复/最大窗口，从kill触发到reconcile完成与host-ready各≤30s；外层受控host故障观察窗口≤120s，必须包含这两项30s证明且观察者持续记录，120s不是恢复时限的替代；缺口有注入开始/结束及外部观察佐证才可视为受控故障。未登记缺口、观察者丢失、无法证明的时间均不能补心跳；取消、未结束执行或候选漂移不能延长旧窗口。没有为了达到时间而暂停deadline/预算。预定kill/recovery是已标记受控故障，任何实际未处理崩溃或重复效果FAIL。20轮必须分布在整个窗口：有效执行窗口取本次soak的execution.json.started_at至finished_at，每个完全位于此窗口内的连续24h区间均至少一个计入上述≥20总数、唯一且可追溯的有效live iteration.accepted（按半开区间[t,t+86400s)及原始时间戳判定），不足不靠重复记录补数。以总数≥20但开头集中完成后空转的审计副本作为分布负例，仍须拒绝；这是已采纳D1，不改变最低20。额度等待仍按既定重置时刻、不切fallback；若超过24h而形成无有效轮次的完整区间，本次soak窗口不满足，保留失败后重新跑完整窗口，不能延长/暂停原窗口来豁免分布条件。
 3. **soak故障记录。** 真实网络临时中断、host SIGKILL、重投与客户端断开在隔离项目执行。503/reset/filter等确定性分类边界可用有已验证版本/来源实录摘要、明确fault-injection的原生协议夹具；缺来源格式即相关子场景BLOCKED，不猜字段。不能声称真的向provider制造过滤/429；真实provider出现的失败按实际记录另列。三Agent live工程活动须独立有原生证据。原始时间线按既有soak-event schema，扩展数据放details，不假造新的协议字段。观察者/驱动均有deadline，没有另建产品全局编排循环。
 4. **性能（D3）。** 延续M4的release、串行、唯一integration、真实service/scope/Attempt cgroup与guardian；保留debug功能测试及全五阶段成本。150MiB是host+TUI之和；input/commit到真实屏幕计时，冷样本不删，p95第ceil(0.95N)项。终端每组≥1000样本，原值不可因CPU包络、SSD未证实或预算不足降低。正式参考profile仍是M4批准的profile，不把24.04功能回归冒称参考性能。SSD证明记录宿主/虚拟化磁盘后端配置与设备映射，无法取得则BLOCKED；若必须换参考硬件，另修订并审查，不在运行中改清单。
 5. **长期维护（D4）。** 复用M5恢复/备份、M6安装与版本manifest；固定回归集覆盖Greenfield/Brownfield、Plan/Build/Auto、拒绝与恢复、候选/QA/Review、TUI/Web和插件诊断。每个Adapter/Prompt/调度策略变更的旧新对照使用同一固定集；产品路径可用明确fixture，原生协议兼容和最终发布所需live检查仍真实执行。具体旧产品版本必须取已交付、可构建/安装的commit与包，不把本草案或M3规格提交充作旧产品。已有M4 pre-003生产者不自动成为全部升级路径的旧版本。
 6. **计划与工件。** M7-T01不提前替换soak占位命令。M7-T03在驱动交付同一提交替换该argv，保留live/345600秒与三件既有产物。测量、维护、build清单等额外原始文件须由对应检查的已声明工件携带或在驱动交付时追加声明；不删除既有声明，不把仅落盘但未哈希的文件当门禁证据。M7-T02切换profile不改任何policy/阈值。前序计划可能已扩展，应用时只做最小字段合并。
 7. **阶段与最终验收（D7）。** traceability在v1配置下会要求包括soak在内的全范围结果；不能把M7-T02“先拿全v1 traceability PASS”作为M7-T03可开工的条件，形成环。T02先交付审计实现/绑定的逐测试诊断与独立范围审查，未满足的全量检查如实保留；AC仍未验收。任务板的实现交付与产品AC accepted不同。T03驱动和真实soak完成后，T04在最终同一候选重新收全部检查、traceability及独立报告。CTO于2026-11-22已采纳此自举实施路线：AC保持未验收，只由M7-T04收同一最终候选全量证据；不伪造PASS、不改Runtime门禁，也不把任务板实现交付状态写成Runtime的accepted。将来迁入正式Runtime若仍受deps accepted约束，须另有经批准的合法批次设计；本稿未授权修改eligible规则，也不以该未来条件重新阻塞当前已选路线。实现任务之间仅依赖已提供的能力，不依赖未来最终发布结果。
 
-8. **共享deployment预算与测试发现（D4/D6，CR32D-04）。** 唯一deployment检查总时限仍为3600s，计入原TEST-005-06、CR-031的两平台fresh-VM/文档/资源场景、TEST-069-02以及TEST-070-01..04的三类变更对照、正常/失败/取消/恢复、构建/启动/收证/清理；不能按任务各自领取3600s。M7-T06在编码完整矩阵前先记录M6现有各阶段实测成本及M7代表路径增量，再冻结完整矩阵的分段预算并实测全量；M7-T02加入069-02时再测合并成本。测量不是验收，不足/超时如实FAIL或未执行，保留首失败和耗时；装不下则在冻结正式验收候选前交CTO重规划驱动/准备步骤或前序能力，禁止放宽timeout、删除/跳过AC、把两次检查拼成一次PASS。NO_TESTS白名单只追加：T06要求test_070_01、test_070_02、test_070_03、test_070_04，T02要求test_069_02；保留test_005_06与M6加入的全部测试。没有测试通过或缺任一必需TEST的实际通过记录时以3/NO_TESTS非成功退出；已有失败仍FAIL，不能由存在函数名、空结果或ignore满足。更改驱动与对应测试在实现任务同一提交，当前草案不改脚本。
+8. **共享deployment预算与测试发现（D4/D6，CR32D-04）。** 唯一deployment检查的总时限采用M7-T01应用时`tests/check-plan.json`的`checks.deployment.timeout_seconds`（本输入基线为3600s，仅是当前值），计入原TEST-005-06、CR-031的两平台fresh-VM/文档/资源场景、TEST-069-02以及TEST-070-01..04的三类变更对照、正常/失败/取消/恢复、构建/启动/收证/清理；不能按任务各自领取一份完整时限。M7-T06在编码完整矩阵前先记录M6现有各阶段实测成本及M7代表路径增量，再冻结完整矩阵的分段预算并实测全量；M7-T02加入069-02时再测合并成本。测量不是验收，不足/超时如实FAIL或未执行，保留首失败和耗时；装不下则在冻结正式验收候选前提交实测阶段耗时与完整负载给CTO，按CR-031 C12先测量再决定是否调整timeout或重规划驱动/准备步骤；M7任务不得自行调整，获准变更须更新计划并冻结新候选。无论timeout是否调整，都禁止删除/跳过AC、改变判定阈值或把两次检查拼成一次PASS。NO_TESTS白名单只追加：T06要求test_070_01、test_070_02、test_070_03、test_070_04，T02要求test_069_02；保留test_005_06与M6加入的全部测试。没有测试通过或缺任一必需TEST的实际通过记录时以3/NO_TESTS非成功退出；已有失败仍FAIL，不能由存在函数名、空结果或ignore满足。更改驱动与对应测试在实现任务同一提交，当前草案不改脚本。
+
+### 恢复观察与时钟对齐（D2，CR32D-53）
+
+观察定义沿已读实现，不新增产品ready事件：`crates/hoh-app/src/host/mod.rs` 先等待reconcile、再服务与写host.json；`host/reconcile.rs`最后调用持久层，`crates/hoh-core/src/persistence/reconcile.rs`提交`reconcile.completed`及payload.host_epoch。`crates/hoh-client/src/client.rs`与ADR-023决定6以host.json的pid匹配systemd MainPID且`/healthz`返回200作为就绪；`host/http.rs::health`在DB writer结束后返回503。
+
+- **reconcile完成**：观察者首次读到本项目、本次重启的新host_epoch对应的已提交`reconcile.completed`事件，保存seq、host_epoch及原始事件引用；旧epoch、仅日志文字或进程存活不满足。首次读到的时刻是完成时延的保守上界。
+- **host-ready**：读取本项目新host_epoch的`.hoh/host.json`，pid与本次登记单元的当前MainPID一致（无单元路径则与登记的新子进程一致），再核对boot_id/PID/start_time身份和该host的`/healthz`实际200；请求前后身份不变才记首次就绪。保存身份字段与响应证明，不以文件出现或`systemctl start`退出0代替。
+- **计时与对齐**：故障前后由同一持续外部观察者记录UTC读数及包住该读数的单调时钟前/后值，覆盖观察开始、kill发送前后、首次看到完成事件、首次就绪与结束，保留原始采样区间及observer boot_id。kill起点取发送前的单调值，两个终点取各首次成功观察之后的单调值，差值各≤30s；外层窗口同钟≤120s。不能拿host重启后重置的进程时钟或事件UTC相减替代这两个时延。UTC配对样本把故障/事件seq定位到本次execution.json.started_at/finished_at窗口，轮次分布按原始occurred_at核对，时长仍取墙钟跨度与duration_seconds较小者。观察者重启、boot_id变化或墙钟跳变致对应关系无法证明时该窗口不满足，不倒推/修饰时间或拼接。
 
 ## 各需求与场景的替换片段
 
@@ -108,7 +116,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
       "id": "AC-067-01",
       "given": "同一冻结候选、真实 host、三种已认证原生 Agent 和已批准的工程夹具规格，soak 检查有连续观察者",
       "when": "经冻结计划运行一次不少于 72h 的 soak 并在结束后核对全部记录",
-      "then": "min(墙钟跨度,duration_seconds)≥259200 秒，心跳满足共同约定；至少 20 个唯一且可追溯的 live iteration.accepted，且每个完全位于有效执行窗口内的连续24h半开区间[t,t+86400s)至少一个live iteration.accepted；没有未处理崩溃、重复写或未关闭 critical/high；每条时间线行绑定本 HoH 候选且有序并位于执行窗口，任一条件缺失不 PASS",
+      "then": "min(墙钟跨度,duration_seconds)≥259200 秒，心跳满足共同约定；至少 20 个唯一且可追溯的 live iteration.accepted，且有效执行窗口取本次soak的execution.json.started_at至finished_at，每个完全位于其中的连续24h半开区间[t,t+86400s)至少一个计入上述≥20总数、唯一且可追溯的有效live iteration.accepted；额度等待超过24h形成无有效轮次区间时本窗口不满足，保留失败并重跑完整窗口，不延长或暂停窗口；没有未处理崩溃、重复写或未关闭 critical/high；每条时间线行绑定本 HoH 候选且有序并位于执行窗口，任一条件缺失不 PASS",
       "test_id": "TEST-067-01"
     },
     {
@@ -122,7 +130,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
       "id": "AC-067-03",
       "given": "登记了精确资源身份的真实 host/隔离工程仓库、已开始的写 Attempt，以及独立 fault-injection 子场景",
       "when": "依次执行 host SIGKILL 后重启、同一效果消息重投、断网后恢复和客户端重连；再通过标注的协议夹具观察 503/Retry-After、额度 reset 与内容过滤截断",
-      "then": "host 恢复沿既有 reconcile，从kill触发到reconcile完成与host-ready各≤30s；持续外部观察的受控故障窗口≤120s且包含这两项30s证明，120s不替代恢复时限；原效果至多提交一次、旧 writer 被 fence；不能确定的效果保持 UNKNOWN_EFFECT 并阻断重复执行；客户端断开不取消已接受任务；503 与额度不早于持久重试时刻派发，重启不清预算，额度不切 fallback；过滤原文与 failure_class=provider_content_filter 诊断可查且不记能力不足/成功，诊断子场景不贡献 live 轮次",
+      "then": "host 恢复沿既有 reconcile，从kill触发到本项目新host_epoch的已提交reconcile.completed首次被观察、到同epoch host.json的进程身份匹配且/healthz实际200的首次就绪各≤30s（按“恢复观察与时钟对齐”的同一外部单调时钟与UTC配对记录）；持续外部观察的受控故障窗口≤120s且包含这两项30s证明，120s不替代恢复时限；原效果至多提交一次、旧 writer 被 fence；不能确定的效果保持 UNKNOWN_EFFECT 并阻断重复执行；客户端断开不取消已接受任务；503 与额度不早于持久重试时刻派发，重启不清预算，额度不切 fallback；只观察并核对M5-T03产出的分类，过滤原文与 failure_class=provider_content_filter 诊断可查且不记能力不足/成功，诊断子场景不贡献 live 轮次",
       "test_id": "TEST-067-03"
     },
     {
@@ -134,11 +142,11 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
     }
   ],
   "behavior": [
-    "同一冻结 HoH 候选在真实 host 上持续运行至少 259200 秒；时长取执行记录 duration_seconds 与墙钟结束减开始的较小值，另以连续持久心跳交叉核验。禁止改时钟、拼接不同执行窗口、短时 sleep 后填大时长。所有 timeline 行绑定 harness_candidate_id，不与被开发夹具项目的 candidate_id 混用。",
+    "同一冻结 HoH 候选在真实 host 上持续运行至少 259200 秒；有效执行窗口来自本次soak的execution.json.started_at/finished_at；时长取执行记录 duration_seconds 与墙钟结束减开始的较小值，另以连续持久心跳交叉核验。禁止改时钟、拼接不同执行窗口、短时 sleep 后填大时长。所有 timeline 行绑定 harness_candidate_id，不与被开发夹具项目的 candidate_id 混用。",
     "至少 20 个互不重复的真实工程轮次通过候选 QA/Review 汇合；工程夹具覆盖 docs/09 的新建 CLI、已有 Web 增量、跨模块 Bug 修复，至少 3 个独立 seed/初始目录，逐轮记录功能正确性、回归捕获、错误验收、总资源和人工干预（未知资源明确unknown），并记录同预算单 Agent 多轮对照（对照不计 HoH accepted 轮次、不宣称统计普遍最优）；iteration.accepted 来自 Runtime 持久事实，能追到 run/iteration/task/attempt、原生会话、夹具候选、逐测试记录及独立报告。启动一个 Agent、提交一次文件、mock 轮次、失败/取消轮次都不计 accepted。开发、QA、Reviewer 的独立身份沿 CR-029，三种原生 Agent 的真实使用有原始记录。",
-    "外部观察者持续记录 host 的 boot_id/PID/start_time、UTC 和单调时长、最后事件 seq、在途 Attempt、心跳和资源归属；按本 CR 共同约定每 60 秒采样，缺口超过 120 秒无法解释为已登记故障时不满足。预先登记的故障注入单列 fault-injection，其恢复不能掩盖未处理崩溃、重复副作用或证据丢失。 每个连续24h区间的分布条件按AC-067-01独立核对，轮次总数通过不能覆盖分布失败。",
-    "用真实 host/持久层执行 host SIGKILL、重复投递、客户端断开/重连、临时服务不可达的恢复；旧 writer fencing、effect ledger 对账及 UNKNOWN_EFFECT 阻塞沿 ADR-019/020/021。只能清理本次登记的路径/unit/进程身份；取消与超时保留部分原始记录，不能把失败历史删掉后续跑成 PASS。 kill到reconcile完成、host-ready均≤30s，外层受控故障观察≤120s且须包含该证明。",
-    "provider 内容过滤截断单列诊断 failure_class=provider_content_filter（外部诊断工件的原因，不在本 CR 增加协议枚举）；有明确原生证据才分类，不从任意错误猜测。它不表示能力不足，不计成功，也不触发自动降级模型。过滤不自动耗尽重试，交既有决策路径；其它故障的 Retry-After/退避/预算/重试上限保持；额度耗尽按已观测重置时刻等待、不切 fallback。内容过滤在 CTO 决策后才调整后续任务，未决状态不伪装为进展。",
+    "外部观察者持续记录 host 的 boot_id/PID/start_time、UTC 和单调时长、最后事件 seq、在途 Attempt、心跳和资源归属；按本 CR 共同约定每 60 秒采样，缺口超过 120 秒无法解释为已登记故障时不满足。预先登记的故障注入单列 fault-injection，其恢复不能掩盖未处理崩溃、重复副作用或证据丢失。 每个连续24h区间的分布条件按AC-067-01独立核对，轮次总数通过不能覆盖分布失败。 区间内轮次与≥20总数使用同一唯一、可追溯的有效live集合；额度等待超过24h造成分布失败时保留记录，重新跑完整窗口，不延长或暂停原窗口。",
+    "用真实 host/持久层执行 host SIGKILL、重复投递、客户端断开/重连、临时服务不可达的恢复；旧 writer fencing、effect ledger 对账及 UNKNOWN_EFFECT 阻塞沿 ADR-019/020/021。只能清理本次登记的路径/unit/进程身份；取消与超时保留部分原始记录，不能把失败历史删掉后续跑成 PASS。 kill到reconcile完成、host-ready均≤30s，外层受控故障观察≤120s且须包含该证明。 完成事件、新epoch的host.json与实际健康响应、外部同钟计时及UTC配对按“恢复观察与时钟对齐”，旧epoch或不能对齐的记录不满足。",
+    "三底座原生Attempt的provider_content_filter共用诊断映射唯一由M5-T03交付，M7-T03只在soak中观察并核对其输出；最终M5缺覆盖先按A3补前序CR，相关M7验证BLOCKED，不转移分类写责任。provider 内容过滤截断单列诊断 failure_class=provider_content_filter（外部诊断工件的原因，不在本 CR 增加协议枚举）；有明确原生证据才分类，不从任意错误猜测。它不表示能力不足，不计成功，也不触发自动降级模型。过滤不自动耗尽重试，交既有决策路径；其它故障的 Retry-After/退避/预算/重试上限保持；额度耗尽按已观测重置时刻等待、不切 fallback。内容过滤在 CTO 决策后才调整后续任务，未决状态不伪装为进展。",
     "soak 驱动是有截止时间的一次受控验收运行，可调度已授权固定工程任务并收取 Runtime 事件，不成为产品外层无限 continue/全局编排器；未知成本、认证或工具条件按既有规则阻塞。源、规格、环境描述或计划变更必须新候选并重新完整 72h，不能借旧窗口通过。"
   ],
   "failure_modes": [
@@ -174,13 +182,13 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
     "check_id": "soak",
     "fixture": "同一冻结候选、真实 host、三种已认证原生 Agent 和已批准的工程夹具规格，soak 检查有连续观察者",
     "steps": [
-      "test_067_01：记录真实起点/候选/环境/会话并启动有界观察者",
+      "test_067_01：记录真实起点/候选/环境/会话并启动有界观察者，结束后以本次execution.json.started_at/finished_at固定有效窗口",
       "持续采样并收取真实工程轮次，完成预登记故障表",
       "核对起止、每行身份、唯一轮次及完整性后产生 TEST-067-01 结果",
-      "对审计副本构造总数≥20但集中在开头的轮次，断言24h分布失败；不把它计为正式live窗口"
+      "对审计副本构造总数≥20但集中在开头、区间仅有重复/不可追溯/mock轮次、额度等待超过24h而区间无有效轮次的负例，均断言分布不满足；不把它们计为正式live窗口，不延长或暂停窗口"
     ],
     "pass_criteria": [
-      "min(墙钟跨度,duration_seconds)≥259200 秒，心跳满足共同约定；至少 20 个唯一且可追溯的 live iteration.accepted，且每个完全位于有效执行窗口内的连续24h半开区间[t,t+86400s)至少一个live iteration.accepted；没有未处理崩溃、重复写或未关闭 critical/high；每条时间线行绑定本 HoH 候选且有序并位于执行窗口，任一条件缺失不 PASS"
+      "min(墙钟跨度,duration_seconds)≥259200 秒，心跳满足共同约定；至少 20 个唯一且可追溯的 live iteration.accepted，且有效执行窗口取本次soak的execution.json.started_at至finished_at，每个完全位于其中的连续24h半开区间[t,t+86400s)至少一个计入上述≥20总数、唯一且可追溯的有效live iteration.accepted；额度等待超过24h形成无有效轮次区间时本窗口不满足，保留失败并重跑完整窗口，不延长或暂停窗口；没有未处理崩溃、重复写或未关闭 critical/high；每条时间线行绑定本 HoH 候选且有序并位于执行窗口，任一条件缺失不 PASS"
     ],
     "observables": [
       "execution.json 与 timeline.jsonl",
@@ -218,18 +226,18 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
     "fixture": "登记了精确资源身份的真实 host/隔离工程仓库、已开始的写 Attempt，以及独立 fault-injection 子场景",
     "steps": [
       "test_067_03：按预登记触发点逐项注入并保存注入起止、事件水位",
-      "重启 host 后从产品恢复路径观察 lease/effect/attempt，而非直接改 DB",
-      "原生格式夹具逐项驱动错误分类并标 fault-injection；核对所有非本次资源未被清理"
+      "重启host后从产品恢复路径核对新host_epoch的已提交reconcile.completed及host.json身份与/healthz 200，不直接改DB；按“恢复观察与时钟对齐”记录同一外部单调时钟与UTC配对",
+      "原生格式夹具逐项驱动M5-T03共用错误分类并标fault-injection，M7只观察并核对；核对所有非本次资源未被清理"
     ],
     "pass_criteria": [
-      "host 恢复沿既有 reconcile，从kill触发到reconcile完成与host-ready各≤30s；持续外部观察的受控故障窗口≤120s且包含这两项30s证明，120s不替代恢复时限；原效果至多提交一次、旧 writer 被 fence；不能确定的效果保持 UNKNOWN_EFFECT 并阻断重复执行；客户端断开不取消已接受任务；503 与额度不早于持久重试时刻派发，重启不清预算，额度不切 fallback；过滤原文与 failure_class=provider_content_filter 诊断可查且不记能力不足/成功，诊断子场景不贡献 live 轮次"
+      "host 恢复沿既有 reconcile，从kill触发到本项目新host_epoch的已提交reconcile.completed首次被观察、到同epoch host.json的进程身份匹配且/healthz实际200的首次就绪各≤30s（按“恢复观察与时钟对齐”的同一外部单调时钟与UTC配对记录）；持续外部观察的受控故障窗口≤120s且包含这两项30s证明，120s不替代恢复时限；原效果至多提交一次、旧 writer 被 fence；不能确定的效果保持 UNKNOWN_EFFECT 并阻断重复执行；客户端断开不取消已接受任务；503 与额度不早于持久重试时刻派发，重启不清预算，额度不切 fallback；只观察并核对M5-T03产出的分类，过滤原文与 failure_class=provider_content_filter 诊断可查且不记能力不足/成功，诊断子场景不贡献 live 轮次"
     ],
     "observables": [
       "故障清单、host 与进程身份",
       "reconcile/effect/lease/input 事件",
       "Retry-After/reset/内容过滤的原始协议证据和分类结果",
       "资源清理清单",
-      "kill/reconcile完成/host-ready单调时刻，≤30s及外层≤120s窗口证明"
+      "新host_epoch/事件seq/host.json身份与MainPID或登记子进程、/healthz响应；observer boot_id与kill/完成首次观察/首次就绪的单调和UTC配对原样本，≤30s及外层≤120s证明"
     ]
   },
   {
@@ -614,7 +622,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
       "id": "AC-070-02",
       "given": "活跃Run定义为runs.state除CANCELLED、FAILED、COMPLETED以外的全部状态：CREATED/DISCOVERING/SPECIFYING/READY/RUNNING/VERIFYING/PAUSE_REQUESTED/PAUSED/WAITING_EXTERNAL/BLOCKED/CANCEL_REQUESTED/INCOMPLETE，逐态有版本快照的矩阵包含PAUSE_REQUESTED与CANCEL_REQUESTED，至少一例有在途Attempt或未决effect",
       "when": "检测到更新并触发自动更新路径/维护请求，再重启host并查询同一Run",
-      "then": "上述全部非终态均满足：自动更新不替换活跃Run的binary/CLI/Prompt/Skill/插件/调度版本；不满足维护前提的请求被拒并有原因，重启后快照和原Attempt绑定保持；显式checkpoint换绑仍走原契约，不借维护改写快照",
+      "then": "上述全部非终态均满足：自动更新不替换活跃Run的binary/CLI/Prompt/Skill/插件/调度版本；维护请求因任一非终态Run被拒，拒绝消息列出全部阻塞Run的run_id/当前state及“完成或取消这些Run后重试”的处理方法；用户文档明确全部非终态（包括CREATED/READY/INCOMPLETE）均有意阻塞，并说明如何查到这些Run及经现有流程完成或取消；实际完成或取消全部阻塞Run后，仍须确认无在途Attempt/未决effect/写租约才可维护，不能只因收到取消请求就放行，重启后快照和原Attempt绑定保持；显式checkpoint换绑仍走原契约，不借维护改写快照",
       "test_id": "TEST-070-02"
     },
     {
@@ -635,10 +643,10 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
   "behavior": [
     "Adapter/原生CLI/Prompt/Skill/调度策略、产品版本、锁文件与必要配置都有可复核的版本或摘要；Run使用冻结配置和资源版本，实际启动版本与兼容矩阵核对。升级候选的版本差异显式记录，不能把unknown补成当前最新。",
     "每次改变Adapter/Prompt/调度策略，使用同一组固定且有版本的回归任务在升级前后分别执行，保留版本、命令、结果/原始记录、AC覆盖、时延及未知用量；比较差异，不以两次都退出0作成功。两边源和证据独立绑定，旧成功不作为新候选通过。",
-    "活跃Run定义为runs.state除CANCELLED、FAILED、COMPLETED以外的全部状态：CREATED/DISCOVERING/SPECIFYING/READY/RUNNING/VERIFYING/PAUSE_REQUESTED/PAUSED/WAITING_EXTERNAL/BLOCKED/CANCEL_REQUESTED/INCOMPLETE；矩阵逐态覆盖并至少明确观察PAUSE_REQUESTED与CANCEL_REQUESTED；不在其间自动替换二进制、底座CLI、Prompt/Skill、插件或调度快照。允许显式安全点的角色交接仍按REQ-019/047，不等于自动升级；不重写已持久Run快照或旧Attempt资源。",
+    "活跃Run定义为runs.state除CANCELLED、FAILED、COMPLETED以外的全部状态：CREATED/DISCOVERING/SPECIFYING/READY/RUNNING/VERIFYING/PAUSE_REQUESTED/PAUSED/WAITING_EXTERNAL/BLOCKED/CANCEL_REQUESTED/INCOMPLETE；矩阵逐态覆盖并至少明确观察PAUSE_REQUESTED与CANCEL_REQUESTED；不在其间自动替换二进制、底座CLI、Prompt/Skill、插件或调度快照。允许显式安全点的角色交接仍按REQ-019/047，不等于自动升级；不重写已持久Run快照或旧Attempt资源。 CTO于2026-11-22确认全部非终态均有意阻止维护，CREATED/READY/INCOMPLETE也不例外；维护拒绝必须列全run_id与当前state，用户文档（docs/11部署升级、docs/12用户指南）说明如何定位阻塞Run并通过现有流程完成或取消后重试。仅暂停、等待、客户端退出或Cancel被接受但仍处于CANCEL_REQUESTED都不解除阻塞；全部Run终结后仍须检查Attempt/effect/写租约条件。",
     "升级由用户或已授权维护动作在无活跃Run、无在途Attempt及未决effect/写租约的维护边界执行；先核对并备份，再迁移/健康检查，成功才切换。失败/取消保留旧可用版本与完整备份并记录下一步；若新schema不可被旧binary读取，拒绝直接降级，走经过验证的备份恢复，不能丢数据硬降schema。 正常升级后由祖先M2-T14提供的systemd用户单元重启，核对单元/ExecStart实际解析路径、MainPID运行映像与新包摘要及健康，不用手工启动替代单元证明。",
     "新旧版本对照与恢复覆盖官方支持的Ubuntu 24.04/26.04 x86_64；文档写实际执行命令与边界。暂时无法获取旧版本/认证或环境时标NOT_RUN/BLOCKED，不能用mock升级代替部署证据；只操作登记的测试安装和数据。",
-    "与M6和REQ-069共享deployment的3600s；按共同约定8先测成本并冻结完整矩阵分段预算，装不下交CTO重规划，不放宽timeout或删AC。test_070_01..04纳入NO_TESTS必需集，任一缺实际通过记录不能退出0。"
+    "与M6和REQ-069共享M7-T01应用时检查计划中的deployment.timeout_seconds；按共同约定8先测成本并冻结完整矩阵分段预算，任何变更只按CR-031 C12先实测再由CTO决定，M7不自行调整、不删AC。test_070_01..04纳入NO_TESTS必需集，任一缺实际通过记录不能退出0。"
   ],
   "failure_modes": [
     "实际CLI/资源版本漂移、兼容性未知或锁文件缺失：明确诊断，按既有COMPAT_UNVERIFIED等规则阻塞，不能静默采用。",
@@ -694,14 +702,15 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
     "fixture": "活跃Run定义为runs.state除CANCELLED、FAILED、COMPLETED以外的全部状态：CREATED/DISCOVERING/SPECIFYING/READY/RUNNING/VERIFYING/PAUSE_REQUESTED/PAUSED/WAITING_EXTERNAL/BLOCKED/CANCEL_REQUESTED/INCOMPLETE，逐态有版本快照的矩阵包含PAUSE_REQUESTED与CANCEL_REQUESTED，至少一例有在途Attempt或未决effect",
     "steps": [
       "test_070_02：逐状态建立真实产品Run和快照",
-      "模拟更新可用这一外部通知，实际维护路径验证边界",
-      "重启并核对配置/资源摘要和Attempt身份"
+      "模拟更新可用这一外部通知，实际维护路径逐态拒绝；加入多个阻塞Run的组合，核对消息列全run_id/state及完成或取消后的重试方法，并与用户文档对照",
+      "重启并核对配置/资源摘要和Attempt身份",
+      "经现有流程实际完成或取消阻塞Run后再检查维护前提；CANCEL_REQUESTED或仍有Attempt/未决effect/写租约时继续拒绝，全清后才允许维护"
     ],
     "pass_criteria": [
-      "上述全部非终态均满足：自动更新不替换活跃Run的binary/CLI/Prompt/Skill/插件/调度版本；不满足维护前提的请求被拒并有原因，重启后快照和原Attempt绑定保持；显式checkpoint换绑仍走原契约，不借维护改写快照"
+      "上述全部非终态均满足：自动更新不替换活跃Run的binary/CLI/Prompt/Skill/插件/调度版本；维护请求因任一非终态Run被拒，拒绝消息列出全部阻塞Run的run_id/当前state及“完成或取消这些Run后重试”的处理方法；用户文档明确全部非终态（包括CREATED/READY/INCOMPLETE）均有意阻塞，并说明如何查到这些Run及经现有流程完成或取消；实际完成或取消全部阻塞Run后，仍须确认无在途Attempt/未决effect/写租约才可维护，不能只因收到取消请求就放行，重启后快照和原Attempt绑定保持；显式checkpoint换绑仍走原契约，不借维护改写快照"
     ],
     "observables": [
-      "Run/Attempt快照与维护拒绝",
+      "全部阻塞Run的run_id/state、Run/Attempt快照、维护拒绝消息及完成/取消后的重试结果；对应用户文档与实际操作记录",
       "更新前后binary/资源/配置摘要",
       "重启事件与显式换绑正对照"
     ]
@@ -829,7 +838,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
       "AC-070-04"
     ],
     "checks": [],
-    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。交付两平台升级/失败/取消/恢复与三个变更维度的固定回归；复用M5备份/M6安装能力，不增加Shell命令；测试安装与资源归属可核验。 按共同约定8先测M6全新VM与既有TEST-005-06和本任务完整矩阵的合并成本，deployment总3600s不变；超预算交CTO重规划、不删AC。向deployment既有NO_TESTS必需集追加test_070_01、test_070_02、test_070_03、test_070_04；任一没有实际通过记录时以3/NO_TESTS退出，原失败保留；T02后续追加069-02不能覆盖此集合。两请求态的活跃Run与升级后用户单元重启的证据必含。"
+    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。交付两平台升级/失败/取消/恢复与三个变更维度的固定回归；复用M5备份/M6安装能力，不增加Shell命令；测试安装与资源归属可核验。 按共同约定8先测M6全新VM与既有TEST-005-06和本任务完整矩阵的合并成本，deployment总时限采用M7-T01应用时计划值；任何变更只按CR-031 C12先实测再由CTO决定，M7不自行调整、不删AC。向deployment既有NO_TESTS必需集追加test_070_01、test_070_02、test_070_03、test_070_04；任一没有实际通过记录时以3/NO_TESTS退出，原失败保留；T02后续追加069-02不能覆盖此集合。两请求态的活跃Run与升级后用户单元重启的证据必含。 全部非终态Run有意阻止维护；拒绝消息与用户文档列出阻塞Run及完成或取消后重试的方法，TEST-070-02含多Run、请求未终结仍拒绝、全清后放行对照。"
   },
   {
     "id": "M7-T02",
@@ -852,7 +861,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
       "AC-069-04"
     ],
     "checks": [],
-    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。承接CR-017/ADR-027：traceability及independent-*的argv切换v1，保留mode/超时/产物；test_069_01写在tests/bundle供traceability自测发现；test_069_02由deployment、test_069_03/04由integration的真实target执行。M6真实build包及交付导出路径可审计；全v1 traceability在soak之前预期未满足，测试级诊断PASS不冒充AC验收；最终本候选全量收取由M7-T04负责，见D7。 按共同约定8实测加入test_069_02后的完整deployment成本（含M6与T06），总3600s不变，超预算交CTO重规划、不删AC；向既有NO_TESTS必需集追加test_069_02并保留test_005_06、M6全部TEST与test_070_01..04，任一缺实际通过记录时以3/NO_TESTS退出，不能只按旧test_005_06通过判成功。"
+    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。承接CR-017/ADR-027：traceability及independent-*的argv切换v1，保留mode/超时/产物；test_069_01写在tests/bundle供traceability自测发现；test_069_02由deployment、test_069_03/04由integration的真实target执行。M6真实build包及交付导出路径可审计；全v1 traceability在soak之前预期未满足，测试级诊断PASS不冒充AC验收；最终本候选全量收取由M7-T04负责，见D7。 按共同约定8实测加入test_069_02后的完整deployment成本（含M6与T06），总时限采用M7-T01应用时计划值；任何变更只按CR-031 C12先实测再由CTO决定，M7不自行调整、不删AC；向既有NO_TESTS必需集追加test_069_02并保留test_005_06、M6全部TEST与test_070_01..04，任一缺实际通过记录时以3/NO_TESTS退出，不能只按旧test_005_06通过判成功。"
   },
   {
     "id": "M7-T03",
@@ -879,7 +888,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
     "checks": [
       "soak"
     ],
-    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。保留soak唯一check owner；交付有截止时间的真实host驱动、逐事件harness_candidate_id、心跳、原生轮次链及故障矩阵，满足ADR-027原则一规则18。用正式候选经冻结计划实跑72h/20轮；任何源码/规格/环境/计划改变新候选重跑。驱动成熟后最后固定候选由M7-T04重新收全量证据，旧候选的soak不可借用。 D1每个连续24h区间的真实轮次分布、D2的kill到reconcile/host-ready各≤30s与外层观察≤120s均需独立断言；D5原生Attempt过滤诊断接线由本任务落实。"
+    "done_when": "所列AC的实现与检查驱动完成，冻结候选上逐TEST原始记录齐全并经独立QA/Review；required项不能DEGRADED，自测不作验收。保留soak唯一check owner；交付有截止时间的真实host驱动、逐事件harness_candidate_id、心跳、原生轮次链及故障矩阵，满足ADR-027原则一规则18。用正式候选经冻结计划实跑72h/20轮；任何源码/规格/环境/计划改变新候选重跑。驱动成熟后最后固定候选由M7-T04重新收全量证据，旧候选的soak不可借用。 D1每个连续24h区间的真实轮次分布、D2的kill到reconcile/host-ready各≤30s与外层观察≤120s均需独立断言；D5只在soak中观察并核对M5-T03交付的三底座原生Attempt过滤分类；共用映射仍由M5-T03独占，缺覆盖按A3先补前序CR并阻塞相关M7验证。"
   },
   {
     "id": "M7-T04",
@@ -981,14 +990,14 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
 | K2 host/恢复/效果/预算 | M2-T01/02/05/06/07/19，候选/汇合M2-T10/16/18，CLI/TUI结果M2-T13；经M2-T11→V01-T02→M3→M4→M5→M6-T04→M7-T01 | A6；完成能力不能只靠规格存在 |
 | K3 测量/界面/公开事件 | M4-T03/T07/T09/T10→M4-T04→M5-T01→M5-T04→M6-T01→M6-T04→M7-T01 | A1/A2：当前main仍旧任务表；批准CR-028应用后须重算，当前闭包仅核旧M4-T02/T03 |
 | K4 发布/回归/恢复/插件 | M5-T05/T06/T02/T03/T09/T10/T07/T08→M5-T04→M6-T01→M6-T04→M7-T01 | A3/A4；当前DRAFT ID已核，不将其当最终应用ID |
-| K5 Web/交付/两平台 | M6-T02（Web外壳/资产）、M6-T05（重连/多客户端）、M6-T06（Git/合并身份）、M6-T03（两平台fresh-VM/安装/文档）→M6-T04→M7-T01 | A5的CR-031快照，M6-T04必须依赖全部四owner；共享deployment先测3600s总成本，平台实测是M7-T04收取前提 |
+| K5 Web/交付/两平台 | M6-T02（Web外壳/资产）、M6-T05（重连/多客户端）、M6-T06（Git/合并身份）、M6-T03（两平台fresh-VM/安装/文档）→M6-T04→M7-T01 | A5的CR-031快照，M6-T04必须依赖全部四owner；共享deployment按M7-T01应用时计划时限先测合并成本，任何变更仅按CR-031 C12先实测再由CTO决定，平台实测是M7-T04收取前提 |
 | K6 M7自身 | 性能M7-T05；维护M7-T06；真实性/profile切换M7-T02；soak驱动M7-T03 | 本稿的16条AC，不由前序代签 |
 
 | AC | 唯一实现owner / check | 所需能力及提供方（均为自身或依赖闭包） |
 |---|---|---|
 | AC-067-01 | M7-T03 / soak | K1/K2/K3/K4/K5 + 本任务真实soak/时钟/轮次驱动；T02审计、T05测量、T06版本维护均为祖先 |
 | AC-067-02 | M7-T03 / soak | K2候选/独立会话/汇合；K3 iteration归属；K4审查与发布；本任务真实轮次审计，T02证据链 |
-| AC-067-03 | M7-T03 / soak | K2 reconcile/lease/effect/retry/cancel；K4恢复点/备份；本任务故障注入/消费M5-T03的过滤诊断，M7-T06固定回归 |
+| AC-067-03 | M7-T03 / soak | K2 reconcile/lease/effect/retry/cancel；K4恢复点/备份；本任务故障注入/只观察并核对M5-T03的过滤分类，M7-T06固定回归 |
 | AC-067-04 | M7-T03 / soak | K2取消/fencing/完整性；本任务观察者/窗口审计与资源登记；T02跨候选拒绝 |
 | AC-068-01 | M7-T05 / integration | K1 integration；K2 host/PTY；K3参考runner/RSS/百万库；本任务SSD核验和REQ-068完整计量 |
 | AC-068-02 | M7-T05 / integration | K3编辑/流合并/公开seq与大库；本任务各尺寸负载和独立样本组 |
@@ -999,7 +1008,7 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
 | AC-069-03 | M7-T02 / integration | K2冻结/失效 + A6的M3-T02规格变更；K5的M6-T06合并提交；本任务跨身份拒绝/历史报告 |
 | AC-069-04 | M7-T02 / integration | K2/CR-029独立身份；K4全量门禁/插件降级；本任务完整与未齐夹具断言，最终真实证据由T04收取 |
 | AC-070-01 | M7-T06 / deployment | K1 deployment；K2兼容；M3-T03资源版本；K4回归；K5安装；本任务三维版本对照 |
-| AC-070-02 | M7-T06 / deployment | K2状态/配置快照/安全点/重启；M3-T03资源锁定；本任务维护边界检查 |
+| AC-070-02 | M7-T06 / deployment | K2状态/配置快照/安全点/重启；M3-T03资源锁定；本任务维护边界检查、阻塞Run清单与完成/取消指引 |
 | AC-070-03 | M7-T06 / deployment | K4备份/迁移/恢复；K5的M6-T03两平台安装，K1的M2-T14用户单元；本任务升级/取消故障、单元重启及健康检查 |
 | AC-070-04 | M7-T06 / deployment | K2 doctor/兼容；K4备份校验/拒读；K5回滚文档；本任务漂移与损坏负例 |
 
@@ -1011,21 +1020,28 @@ CR-031输入来自 `/home/ai/dev/hoh-wt/m6-spec/docs/cr/CR-031-m6-detailed-spec.
 
 | ID / 状态 | 原问题与采纳的推荐默认 | 理由、落点与执行前提 |
 |---|---|---|
-| D1 已采纳 | 每60s持久心跳、正常间隔≤120s；每个连续24h区间≥1个真实accepted轮次，总数≥20 | 排除开头跑完后空转；AC-067-01/02与分布负例，区间判据见共同约定2 |
-| D2 已采纳 | 受控故障外层观察≤120s、观察者不中断；kill→reconcile完成/host-ready各≤30s | 保留CR-028更严恢复界限；AC-067-03/04。观察者失效或候选漂移重开完整窗口，保留失败、不拼接、不暂停原deadline/预算；实测不符交CTO重规划，不放宽时限 |
+| D1 已采纳 | 每60s持久心跳、正常间隔≤120s；execution.json起止窗口内每个完整连续24h区间≥1个计入≥20总数的唯一可追溯有效live轮次；超24h额度等待导致分布失败时重跑完整窗口，不延长/暂停 | 排除开头跑完后空转；AC-067-01/02与分布负例，区间判据见共同约定2 |
+| D2 已采纳 | 受控故障外层观察≤120s、观察者不中断；kill→reconcile完成/host-ready各≤30s | 保留CR-028更严恢复界限；AC-067-03/04，完成事件/新host_epoch身份与健康响应及同钟UTC对齐见“恢复观察与时钟对齐”。观察者失效或候选漂移重开完整窗口，保留失败、不拼接、不暂停原deadline/预算；实测不符交CTO重规划，不放宽时限 |
 | D3 已采纳 | 复用M4唯一reference/runner与同次重测样本；宿主后端配置+设备映射证明SSD；先测全五阶段成本再冻结预算 | AC-068-01..04；integration仍3600s（工作≤3000s、清理300s、调度300s），缺SSD证明BLOCKED，成本装不下交CTO重规划，不能改阈值/timeout或删场景 |
-| D4 已采纳 | 固定版本化回归集覆盖三类变更，复用M5备份与M6安装/资源升级；旧版本取真实交付包，不兼容schema只从有效备份恢复 | AC-070-01..04；无新Shell子命令。共享deployment先测成本并保留3600s（共同约定8），接口按A3/A5最终应用结果复核，缺能力补前序 |
-| D5 已采纳 | 有原生证据才记诊断failure_class=provider_content_filter，复用M5 AC-051-04；不是能力不足/成功、不加HCP枚举，过滤不自动耗尽重试，交既有决策路径；额度仍等待不fallback | AC-067-03，M7-T03落实原生Attempt观察接线；若需要改变FailureClass/协议语义，先提出前序补充CR，不借本稿授权 |
+| D4 已采纳 | 固定版本化回归集覆盖三类变更，复用M5备份与M6安装/资源升级；旧版本取真实交付包，不兼容schema只从有效备份恢复 | AC-070-01..04；无新Shell子命令。共享deployment先测成本，时限按应用时计划值，任何变更仅按CR-031 C12由CTO在实测后决定（共同约定8），接口按A3/A5最终应用结果复核，缺能力补前序 |
+| D5 已采纳 | 有原生证据才记诊断failure_class=provider_content_filter，复用M5 AC-051-04；不是能力不足/成功、不加HCP枚举，过滤不自动耗尽重试，交既有决策路径；额度仍等待不fallback | AC-067-03，M7-T03只在soak中观察并核对M5-T03交付的三底座原生Attempt分类；最终缺覆盖按A3先补前序CR；若需要改变FailureClass/协议语义，先提出前序补充CR，不借本稿授权 |
 | D6 已采纳 | 复用M6最终manifest，以构建工具真实路径、提交/输入/产物hash逐文件核验；缺字段随负责驱动交付并锁定契约 | AC-069-02，M7-T02；格式按A5重核，不另建第二清单、不用版本字符串替代，受锁字段改变另有具体CR |
 | D7 已采纳、问题关闭 | 沿自举路线先实现与逐TEST诊断，AC保持未验收；只有M7-T04收取同一最终候选全量证据；不伪造PASS、不改Runtime门禁 | T02/T03顺序实现不以前序全v1 traceability PASS解锁；最终产品AC与发布只由T04完整证据判定。未来迁入Runtime另核合法机制，不改变现eligible规则；当前实施路线不再标为应用前阻塞 |
 
+第3稿新增决定沿同一CTO来源 `/home/ai/dev/hoh/.hoh-dev/evidence/spec-drafts-cto-decisions.md` 的“CR-032 r2 CR32D-55 / CR32D-51”条目（2026-11-22）；本次快照为 `m7-spec-d3/cto-decisions-2026-11-22.md`，sha256=`9d34f0ca2e47d05fca38a47d2031ef9ead97230f4cd0bc23482c7a962c7cc140`。D1–D7原采纳记录仍保留，上表D4与下面D8/D9是该决定的落实。
+
+| ID / 状态 | 问题与采纳默认 | 落点 |
+|---|---|---|
+| D8 已采纳（CR32D-51） | M7采用M7-T01应用时检查计划的deployment timeout；任何变更只通过CR-031 C12的先实测、再由CTO决定规则，M7不自行调整 | A5、共同约定8、REQ-070行为、T02/T06 done_when、D4 |
+| D9 已采纳（CR32D-55） | 每个非终态Run都出于安全目的阻塞升级/维护；用户文档与拒绝消息必须点名阻塞Runs及出路（完成或取消） | AC/TEST-070-02、多Run与全清对照、REQ-070行为、T06文档义务；既有Attempt/effect/租约条件保留 |
+
 CR-031 C1由**所有者于2026-11-22批准**，来源同上及本次委派：静态Web外壳无需token，Host/Origin校验保留，每个`/v1`请求token-gated；docs/03的措辞为“每个API请求”，token不进入服务日志或Referer。A5及M7对Web/交付的假设按此执行，不重新请求批准。
 
-当前没有未回答的CTO选项。前序能力、SSD证明与合并检查成本是实施时的实测条件，不是已采纳决定的pending标签；若不能在现有CONTRACT架构、范围与门禁内满足，则记录实测证据、保留未验收状态并提交阻塞CTO问题，不自行降低要求。CR-031 C12的timeout放宽选项不在本次授权内。
+当前没有未回答的CTO选项。前序能力、SSD证明与合并检查成本是实施时的实测条件，不是已采纳决定的pending标签；若不能在现有CONTRACT架构、范围与门禁内满足，则记录实测证据、保留未验收状态并提交阻塞CTO问题，不自行降低要求。CR-031 C12不被本稿撤销或自行执行：任何deployment timeout变更均先实测、交CTO决定。
 
 ## 审查记录
 
-第1轮独立设计审查：reviewer **Grok / grok-4.7**，原生session **01a1ff66-9c22-76d0-8222-4ffc486e14b6**；attempt **f7f36acb-96af-4f94-a5f2-98f4fd3ca87a**，2026-11-21 18:37:55–18:56:29 UTC。入口记录 `/home/ai/dev/hoh/.hoh-dev/evidence/m7spec-review-grok-r1.out` 指向原生attempt的`stdout.jsonl`；以其最终`hoh-report`为准，结论 **FAIL**，1 high、6 medium、3 low。受审提交为本次输入`535b4469`，CR字节sha256=`a19f912a6d116d69352a041172a701569b3dedbcef737439c4c2b11c567bf626`。原生attempt路径为 `/home/ai/dev/hoh/.hoh-dev/attempts/f7f36acb-96af-4f94-a5f2-98f4fd3ca87a/attempt.json`；本轮提取报告与attempt副本在主仓库证据目录的`review-r1-report.json`、`review-r1-attempt.json`。没有把进程退出0当成审查PASS。
+第1轮独立设计审查：reviewer **Grok / grok-4.7**，原生session **01a1ff66-9c22-76d0-8222-4ffc486e14b6**；attempt **f7f36acb-96af-4f94-a5f2-98f4fd3ca87a**，2026-11-21 18:37:55–18:56:29 UTC。入口记录 `/home/ai/dev/hoh/.hoh-dev/evidence/m7spec-review-grok-r1.out` 指向原生attempt的`stdout.jsonl`；以其最终`hoh-report`为准，结论 **FAIL**，1 high、6 medium、3 low。受审提交为第1稿`535b4469`，CR字节sha256=`a19f912a6d116d69352a041172a701569b3dedbcef737439c4c2b11c567bf626`。原生attempt路径为 `/home/ai/dev/hoh/.hoh-dev/attempts/f7f36acb-96af-4f94-a5f2-98f4fd3ca87a/attempt.json`；本轮提取报告与attempt副本在主仓库`m7-spec-d2/`证据目录的`review-r1-report.json`、`review-r1-attempt.json`。没有把进程退出0当成审查PASS。
 
 | finding | 原等级 | 第2稿处置 |
 |---|---|---|
@@ -1040,7 +1056,22 @@ CR-031 C1由**所有者于2026-11-22批准**，来源同上及本次委派：静
 | CR32D-09 | low | 同批场景已修：067/068/070各场景明确test_NNN_MM，069保留；16条均核对 |
 | CR32D-10 | low | 同段已修：070-03 then/场景要求用户单元ExecStart解析到新binary、经单元重启、MainPID映像与健康证明，闭包点名M2-T14 |
 
-本轮10项均已在文本处理，无延期low；处置属于开发者claim与机械自测，**不改写首轮FAIL，也不自签设计审查PASS**。本次未启动复审Agent；下一轮由CTO安排，聚焦此修复diff、依赖边界与回归。
+第2稿处理了本轮10项，无延期low；不改写首轮FAIL。随后独立第2轮已核对这些修复，结果如下。
+
+第2轮独立设计审查：reviewer **Claude / claude-opus-5-5**，原生session **77090e39-c166-4bef-bfdc-c4c276727b9b**，attempt **9954fcd3-a56b-498f-b1e6-09482ae3fa54**，2026-11-21 20:04:33–20:09:52 UTC。审查范围为`535b4469..303a81a0`修复diff、相关调用链与回归；入口 `/home/ai/dev/hoh/.hoh-dev/evidence/m7spec-review-claude-r2.out`，以其指向原生stdout.jsonl的最终`hoh-report`为准：**PASS，无critical/high，2 medium、4 low**。首轮10项已由该轮确认修复。报告/最终正文/attempt已固定在 `m7-spec-d3/review-r2-report.json`、`review-r2-final.md`、`review-r2-attempt.json`；进程退出0不代替报告结论。
+
+| finding | 原等级 | 第3稿处置与核对依据 |
+|---|---|---|
+| CR32D-50 | medium | A3/承接表、067行为/AC/场景、T03 done_when与D5统一为只观察/核对M5-T03分类；读取CR-030第2稿REQ-051 behavior后确认映射唯一写者，缺前序能力先补前序CR |
+| CR32D-51 | medium | A5、共同约定8、070行为、T02/T06 done_when、K5与D4/D8均采用应用时计划值；读取deployment.sh/检查计划和CR-031 C12，按CTO决定保留先测后决规则 |
+| CR32D-52 | low | 067-01及场景、共同约定2/D1点名execution.json起止；区间轮次与≥20采用同一有效集合；超24h额度等待造成分布失败须完整重跑，不延长/暂停；核对execution schema/run_check/release_gate的窗口与计数路径 |
+| CR32D-53 | low | 读取host启动/reconcile、持久事件生产、client就绪与health路径及ADR-023决定6；新增“恢复观察与时钟对齐”，067-03及场景绑定新epoch事件/身份/真实200和外部同钟UTC样本 |
+| CR32D-54 | low | CR-031输入纠正为39386bf0，按字节摘要核对；ce5260a9及已采纳C25/C26列入A5应用重核并保存快照，保留其第3轮设计审查条件 |
+| CR32D-55 | low | 读取runs.state与取消收口路径；D9记录CTO有意阻塞全部非终态的裁决，070-02 then/场景与T06要求完整阻塞Run清单和完成/取消指引，含多Run与取消尚未终结不放行 |
+
+本轮六项均修入文本，无延期CR32D-50..55。以上处置和机械检查是**自测，非验收**；第2轮PASS针对第2稿，不能替代主会话对第3稿修复diff的核对。按本次委派轮次上限，主会话核对本次diff后收口，**不再发起新的审查轮次**，本次未运行审查Agent。
+
+第2轮正文还给出两项**修复范围外backlog**（未编号、未定级；不替审查者补造等级）：AC-067-03断网恢复未给外层窗口上限；TEST-068-01/02把“先测五阶段成本”的任务义务放进测试步骤。保留到M7后续low清理/实施前核对，本次不扩大修复diff，不默认为已解决；来源`review-r2-final.md`的“修复范围外，记入backlog”。
 
 ## 影响、不变内容与正式应用清单
 
@@ -1048,42 +1079,43 @@ CR-031 C1由**所有者于2026-11-22批准**，来源同上及本次委派：静
 
 本CR不更改CONTRACT、release-policy、协议/候选/执行/soak-event schema、既有检查argv或生产代码。上文驱动、profile迁移、manifest补齐、安装/用户文档等义务由各实现任务在真实交付时更改；需受锁契约增字段时先具象化补充CR，不用本草案空白授权未来任意schema变更。既有14个检查、required gate与soak最低时长/轮次不变，任何额外声明工件只增加不删除。因规格和测试数改变，旧候选全部重新冻结/验证；本文无复用历史PASS的例外。
 
-正式应用依次：确认M6-T04与所有能力假设、执行已采纳D1–D7及C1；独立规格审查按docs/19收敛并由CTO按docs/21批准；领取M7-T01后核对当前main/锁/任务状态与用户改动；按片段合并并再核逐AC闭包；生成视图、relock、bundle；按docs/24规格影响闭包经验，在真实应用时运行完整`cargo test --workspace --locked`及受影响静态检查，核对契约与Rust实现。本文机械演练没有改Rust/schema，不声称已运行这项未来完整Rust回归。应用中任何修正先写CR，不能为了绿灯删AC或降基线。实现改命令时文档只写实际执行过的命令。
+正式应用依次：确认M6-T04与所有能力假设、执行已采纳D1–D9及C1；独立规格审查按docs/19收敛并由CTO按docs/21批准；领取M7-T01后核对当前main/锁/任务状态与用户改动；按片段合并并再核逐AC闭包；生成视图、relock、bundle；按docs/24规格影响闭包经验，在真实应用时运行完整`cargo test --workspace --locked`及受影响静态检查，核对契约与Rust实现。本文机械演练没有改Rust/schema，不声称已运行这项未来完整Rust回归。应用中任何修正先写CR，不能为了绿灯删AC或降基线。实现改命令时文档只写实际执行过的命令。
 
 ## 验证方式
 
-本次为 **BUNDLE_ONLY，自测，非验收**；不运行live Agent或产品验收。所有证据保存在主仓库 `/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d2/`，下列文件名均相对该目录；不是可删除worktree的忽略目录。真实受锁文件、任务图、检查计划与release-policy未改，`product_accepted=false`。
+本次为 **BUNDLE_ONLY，自测，非验收**，没有运行live Agent或产品验收。证据保存在主仓库 `/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d3/`，以下文件名均相对该目录；`product_accepted=false`。第2稿历史证据保留在 `m7-spec-d2/`，不覆盖、不借作第3稿PASS。
 
-1. 驱动 `python3 /home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d2/validate_draft2.py` 从本CR直接提取九个带`fragment:`标记的JSON块，应用4个需求、16个场景、6个M7任务。逐项核对固定需求字段与旧AC/TEST ID保留、非M7条目不变、Given/When/Then非空、fixture/判据与AC相同、TEST命名与check映射，以及每实现任务≤2REQ/≤8AC和唯一归属。原始片段与完整受测CR保存在`fragments.json`、`tested-cr.md`。
-2. 真实工作树的 `python3 tools/validate_bundle.py`、`python3 tools/baseline.py verify`均退出0（`real-baseline-validate.log`、`real-baseline-verify.log`）。从输入提交`535b4469b78e08bb4c792dfa29fea252ae78d459`执行`git clone --shared --no-checkout`及`git checkout --detach`，均退出0；完整argv/cwd/退出码/耗时与日志sha256在`commands.json`。
-3. 副本根由`mktemp -d /home/ai/dev/m7spec-XXXXXX`创建，本次为`/home/ai/dev/m7spec-5WLwHS`；测试TMPDIR另建在Git/Cargo树之外的`/home/ai/dev/m7spec-gS8zvi`。精确路径、创建时设备/inode与任务归属在`resources.json`。shell加载真实工作树env.sh，子进程继承；只在副本把CR状态写为APPROVED、批准人写`SCRATCH ONLY`，这是机械演练，不是CTO批准。当前检查计划的soak占位与v0.1参数均未提前修改。
-4. 下列命令真实执行，bundle串行运行以免争用；未改测试、超时或门禁。
+驱动 `python3 /home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d3/validate_draft3.py` 退出0：直接提取本CR的九个JSON块，在输入提交`303a81a03899f0baf1889f1ece3516f419148db8`的独立副本应用4个需求、16个场景及6个M7任务。固定字段、旧AC/TEST ID、非M7条目、Given/When/Then、fixture/pass_criteria一致性、测试命名、每实现任务≤2REQ/≤8AC与唯一归属均核对。原片段和受测CR为 `fragments.json`、`tested-cr.md`，副本应用文件保存在 `scratch-applied-artifacts/`。
+
+副本与测试TMPDIR均由 `mktemp -d /home/ai/dev/m7spec-XXXXXX` 创建，实际路径为`/home/ai/dev/m7spec-DqhPSD`与`/home/ai/dev/m7spec-5YUE6x`。目录归属、device/inode见 `resources.json`；只在副本把CR写为APPROVED、批准人写SCRATCH ONLY，以演练relock，真实状态仍为DRAFT。`git clone --shared --no-checkout`与`git checkout --detach`均退出0；完整argv、cwd、耗时、退出码及日志sha256见 `commands.json`。两套bundle串行运行，未改检查计划、门禁或测试。
 
 | cwd | 实际命令 | 退出码 | 原始记录 |
 |---|---|---|---|
-| 副本 | `python3 tools/gen_spec_views.py` | 0 | `generate.log`；0.05s |
-| 副本 | `python3 tools/baseline.py relock --cr docs/cr/CR-032-m7-detailed-spec.md` | 0 | `relock.log`；0.516s |
-| 副本 | `python3 tools/validate_bundle.py` | 0 | `validate-applied.log`；0.697s |
-| 副本 | `bash scripts/check.sh --bundle` | 0 | `scratch-bundle.log`；1556.131s |
-| 真实工作树 | `bash scripts/check.sh --bundle` | 0 | `real-bundle.log`；916.11s |
+| 真实工作树 | `python3 tools/validate_bundle.py` | 0 | `real-baseline-validate.log`；1.068s |
+| 真实工作树 | `python3 tools/baseline.py verify` | 0 | `real-baseline-verify.log`；0.642s |
+| 副本 | `python3 tools/gen_spec_views.py` | 0 | `generate.log`；0.088s |
+| 副本 | `python3 tools/baseline.py relock --cr docs/cr/CR-032-m7-detailed-spec.md` | 0 | `relock.log`；0.669s |
+| 副本 | `python3 tools/validate_bundle.py` | 0 | `validate-applied.log`；0.834s |
+| 副本 | `bash scripts/check.sh --bundle` | 0 | `scratch-bundle.log`；1702.513s |
+| 真实工作树 | `bash scripts/check.sh --bundle` | 0 | `real-bundle.log`；1428.8s |
 
-副本bundle：**570 tests / 1554.343s / OK (skipped=2)**。真实工作树bundle：**570 tests / 914.308s / OK (skipped=2)**。副本`validate_bundle`为PASS、errors=0，70项需求、47项detailed、226条AC、67个任务；只代表当前基线+CR-032，不把未应用M4/M5/M6计为实现。副本relock为revision23、27个受锁文件；真实树仍revision22。两套bundle的既有skip按原日志保留，不计产品PASS：
+副本bundle：**570 tests / 1700.683s / OK (skipped=2)**；真实工作树bundle：**570 tests / 1426.685s / OK (skipped=2)**。副本validate_bundle：PASS、errors=0，70项需求、47项detailed、226条AC、67个任务；仅表示输入基线+CR-032，不代表前序M4/M5/M6实现。副本relock为revision23、27个受锁文件；真实树仍revision22。两套日志的既有skip如下，原文保留，不计产品PASS：
 
-- `test_ledger_outline_requirements_not_ready (test_bundle.SetupAndLedger.test_ledger_outline_requirements_not_ready) ... skipped 'M3 already detailed'`
-- `test_repository_packages_verified (test_tools.PiPackages.test_repository_packages_verified) ... skipped 'Pi packages not installed here'`
+- scratch-bundle：`test_ledger_outline_requirements_not_ready (test_bundle.SetupAndLedger.test_ledger_outline_requirements_not_ready) ... skipped 'M3 already detailed'`
+- scratch-bundle：`test_repository_packages_verified (test_tools.PiPackages.test_repository_packages_verified) ... skipped 'Pi packages not installed here'`
+- real-bundle：`test_ledger_outline_requirements_not_ready (test_bundle.SetupAndLedger.test_ledger_outline_requirements_not_ready) ... skipped 'M3 already detailed'`
+- real-bundle：`test_repository_packages_verified (test_tools.PiPackages.test_repository_packages_verified) ... skipped 'Pi packages not installed here'`
 
-结构/闭包探针通过（`ownership-probe.json`）：16条AC均唯一owner与合法check，verify最后且不拥有acceptance；调用真实`validate_bundle.ownership_problems`无错误，当前前序提供者均在祖先闭包。活跃Run矩阵从`contracts/sql/001_initial.sql`的runs.state枚举提取后核对，全部12个非终态均覆盖。
+结构/依赖探针 `ownership-probe.json` 通过：16条AC唯一owner且check合法，verify最后、不拥有acceptance；调用真实 `validate_bundle.ownership_problems` 无错误。活跃矩阵按SQL的runs.state枚举核对，12个非终态齐全。`combined-graph-probe.json` 通过：固定CR-028/030及CR-031第2/3稿的组合图共82个任务，无缺依赖/环，所有M4/M5/M6能力提供者在M7祖先闭包。CR-031第2/3稿task ID和depends_on一致；此探针只合并任务图，不把未应用前序规格当生产能力。
 
-组合图探针通过（`combined-graph-probe.json`）：从固定CR-028/030/031快照提取任务数组，并采用CR-031明确给出的M6-T04四项依赖后，**82个任务、无缺失依赖/环**；M4/M5提供者与M6-T02/T03/T05/T06均在M7实现owner和最终verify的祖先闭包。此项仅验证任务图，不应用前序需求/OpenAPI/SQL，不证明前序能力已实现。审查处置文本探针`finding-disposition-probe.json`逐项核对10项修复落点，通过不等于独立复审PASS。
+`python3 /home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d3/probe_draft3.py` 退出0，`finding-disposition-probe.json`核对CR32D-50..55的落点、前序快照摘要、审查报告等级及AC/场景一致性；REQ-068/069的需求与场景片段逐对象不变。它是文本/结构探针，不是生产行为或独立审查。已读源码的哈希见 `inspected-code-sources.json`。
 
-辅助脚本准备失败另存`preparation-1/`：第一次把baseline-lock的files映射误当列表，执行命令前退出1；修正后第二次clone退出128，因为归属marker使目标目录非空。改为在主仓库登记归属后clone成功；两次均未运行产品检查、未改测试。失败日志/资源登记/精确清理记录保留，没有将准备失败报告为产品红灯。
+最终九个JSON块按文中顺序以两个LF连接的sha256：`a4e2db4b68efadc1931763a6292f16e7609b8a9aac9bec6c70bf62283ac9823f`。补写本节后再核对片段与 `tested-cr.md` 逐字相同，真实树受锁文件、任务表与检查计划对照 `source-integrity-before.json` 不变；提交前的validate_bundle、baseline verify、diff检查及内容核对记录为 `precommit-checks.json`、`final-content-probe.json`。两个临时根已按登记的精确路径/device/inode核对归属并清理，见 `cleanup.json`；测试证据不随副本删除。
 
-第1稿历史记录完整复制到`draft1-history/`，包括最终成功与四次中间失败，不覆盖删除，也不作为第2稿通过证据。历史范围外`CR032-OBS-01`（medium）：ProcessLifecycle测试读取已存在但内容尚空的pid文件；原traceback在`draft1-history/bound-m5/scratch-bundle.log`。本次未修该测试，不因后续通过称竞态已解决。
-
-最终九个JSON块按文中顺序以两个LF连接的sha256：`0ec1a5ee7863da51dbb5e9ec41644c4c834d4d1fd5a3b3e796a7472c086d7785`。补写本节后核对片段与`tested-cr.md`逐字相同，真实树27个锁定文件、任务表/检查计划摘要对照`source-integrity-before.json`不变；提交前再运行validate_bundle、baseline verify与diff检查，记录在`precommit-checks.json`。副本按`resources.json`精确身份清理，结果在`cleanup.json`。本次未运行完整Rust产品回归、live、两平台部署/升级或72h soak；正式应用时仍须按影响闭包跑完整Rust回归和各计划检查，不能借bundle替代。
+历史范围外 `CR032-OBS-01`（medium，ProcessLifecycle读取已存在但内容尚空的pid文件）仍未在本任务修复；原traceback为 `m7-spec-d2/draft1-history/bound-m5/scratch-bundle.log`，后续bundle通过不证明竞态已消失。本次没有生产红绿循环，也未运行完整Rust产品回归、两平台部署/升级、live或72h soak；正式应用仍须按影响闭包运行完整Rust回归及计划检查。
 
 ## 交付边界与续作
 
-纯文档草案按`resources/skills/tdd/SKILL.md`无需生产红绿循环；这里的机械检查是**自测，非验收**。16条AC对应的产品测试、72h soak、三Agent live、两平台升级、最终v1 release_gate均NOT_RUN；第1轮独立设计审查为FAIL，第2稿复审NOT_RUN；不报告产品COMPLETED，也不把草案提交当M7-T01正式完成。
+纯文档草案按`resources/skills/tdd/SKILL.md`无需生产红绿循环；这里的机械检查是**自测，非验收**。16条AC对应的产品测试、72h soak、三Agent live、两平台升级、最终v1 release_gate均NOT_RUN；第1轮独立设计审查为FAIL，第2轮对第2稿修复diff为PASS，第3稿由主会话核对修复diff，不再开审查轮次；不报告产品COMPLETED，也不把草案提交当M7-T01正式完成。
 
-本次委派没有Runtime身份头/run_id/attempt_id/role_epoch、TaskResult输出文件与指定诊断目录，因此不编造TaskResult或candidate_id。唯一写权限来自本次输入；起始工作树干净。诊断保留在主仓库`/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d2/`，只提交本CR，不推送、不relock真实树、不改全局PROGRESS/taskboard。下一步由CTO组织第2稿修复diff复审，并按最终前序应用结果复核接口；M6-T04后按最终主分支复核应用。
+本次委派没有Runtime身份头/run_id/attempt_id/role_epoch、TaskResult输出文件与指定诊断目录，因此不编造TaskResult或candidate_id。唯一写权限来自本次输入；起始工作树干净。诊断保留在主仓库`/home/ai/dev/hoh/.hoh-dev/evidence/m7-spec-d3/`，只提交本CR，不推送、不relock真实树、不改全局PROGRESS/taskboard。下一步由主会话核对本次修复diff和机械验证，按轮次上限收口；M6-T04后按最终前序规格/主分支复核接口、任务闭包及deployment计划时限，再正式应用。
