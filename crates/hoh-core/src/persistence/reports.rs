@@ -359,11 +359,15 @@ fn judge(
         ));
     }
     let conflicts = conflicting_native_sessions(tx, on.run_id, on.candidate, on.task_role, &agent)?;
-    let shared: Vec<&String> = intake
-        .native_session_ids
-        .iter()
-        .filter(|s| s.as_str() != session && conflicts.contains(*s))
-        .collect();
+    let mut observed = session_native_history(tx, on.run_id, session, &agent)?;
+    observed.extend(
+        intake
+            .native_session_ids
+            .iter()
+            .filter(|s| s.as_str() != session)
+            .cloned(),
+    );
+    let shared: Vec<_> = observed.intersection(&conflicts).collect();
     if !shared.is_empty() {
         reasons.push(format!(
             "NATIVE_SESSION_NOT_INDEPENDENT: {CONFLICT} its {agent} native attempt's sessions {shared:?} \
@@ -371,6 +375,33 @@ fn judge(
         ));
     }
     Ok(reasons)
+}
+
+/// What the store already knows about the reporting session remains part of its identity even if this export
+/// omits it. Include report history too: exporting a shorter list must not erase an earlier observation.
+fn session_native_history(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    session: &str,
+    agent: &str,
+) -> Result<std::collections::BTreeSet<String>, PersistError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT native_id FROM sessions WHERE session_id = ?1 AND native_id IS NOT NULL \
+         UNION SELECT json_extract(payload_json, '$.native_id') FROM events \
+           WHERE run_id = ?2 AND kind = 'session.native' \
+             AND json_extract(payload_json, '$.session_id') = ?1 \
+             AND json_extract(payload_json, '$.native_id') IS NOT NULL \
+         UNION SELECT j.value FROM events n, json_each(n.payload_json, '$.native_session_ids') j \
+           WHERE n.run_id = ?2 AND n.kind = 'report.native_sessions' \
+             AND json_extract(n.payload_json, '$.session_id') = ?1 \
+             AND json_extract(n.payload_json, '$.agent') = ?3",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![session, run_id, agent], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
 /// Native identities are namespaced by agent. Include the run's other roles' bindings, attempts and completed-turn

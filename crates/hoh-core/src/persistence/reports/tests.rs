@@ -385,6 +385,40 @@ async fn test_054_01_native_identity_is_scoped_to_agent_and_run() -> R {
 }
 
 #[tokio::test]
+async fn test_054_01_native_identity_includes_the_reporting_sessions_history() -> R {
+    // A native export may only repeat its HoH id. That must not hide the native identity already in the store.
+    for history in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (store, path, _, intake) = qa_intake(dir.path()).await?;
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            "UPDATE sessions SET agent = 'pi', native_id = 'shared-native' WHERE session_id = 'sd';",
+        )?;
+        if history {
+            conn.execute_batch(
+                "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   VALUES ('p1', 'qa-native-history', 'R', 'session.native',
+                     '{\"session_id\":\"sq\",\"native_id\":\"shared-native\"}', '2026-11-12T00:00:02Z');
+                 UPDATE sessions SET native_id = 'new-native' WHERE session_id = 'sq';",
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE sessions SET native_id = 'shared-native' WHERE session_id = 'sq'",
+                [],
+            )?;
+        }
+        let done = store.record_report(intake).await?;
+        assert_eq!(
+            done.state,
+            ReportState::Rejected,
+            "history={history}: {done:?}"
+        );
+        assert_eq!(codes(&done.reasons), ["NATIVE_SESSION_NOT_INDEPENDENT"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
     // AC-054-02 at the store (REQ-054 behaviour 4, failure mode 2; decision 8): C1's verifiers run when E's completion
     // freezes C2 (D taken into C2's round). Their reports on C1 arrive afterwards: their rows are STALE (and kept), C1's
