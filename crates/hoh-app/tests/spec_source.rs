@@ -2,8 +2,10 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
-#[path = "spec_source/tasks.rs"]
-mod spec_tasks;
+mod spec_source {
+    use super::*;
+    mod tasks;
+}
 
 mod pty;
 mod world;
@@ -516,7 +518,7 @@ async fn test_034_03_proposal_replay_finishes_interrupted_index_publication() ->
     assert_eq!(after[5], before[5]);
     assert_eq!(
         world.query("SELECT count(*) FROM events WHERE kind='spec.generated_drift'")?,
-        "1"
+        "0"
     );
     let approve = command(
         &host,
@@ -989,6 +991,91 @@ async fn test_033_03_stale_states_preserve_judgments_and_rollback_atomically() -
             .count(),
         3
     );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_034_04_approval_refuses_legacy_cr_with_base_digest() -> R {
+    let world = World::new()?;
+    let (host, run, first) = approved(&world).await?;
+    // A CR persisted by the old implementation must not create a duplicate approved revision.
+    world.exec("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at)
+        SELECT 'legacy-empty',project_id,spec_id,'PROPOSED','legacy repair',json_object('requirements',json('[]'),'acceptance',json('[]'),'tests',json('[]'),'tasks',json('[]')),'2026-11-21T00:00:00Z' FROM specs;
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at)
+        SELECT 'legacy-proposal',s.project_id,r.run_id,'spec.proposed',
+        json_object('cr_id','legacy-empty','spec_sha256',s.sha256),'2026-11-21T00:00:00Z'
+        FROM specs s JOIN runs r ON r.spec_id=s.spec_id;")?;
+    let before = snapshot(&world)?;
+    let body = command(
+        &host,
+        &run,
+        "approve-legacy",
+        "ApproveSpec",
+        json!({"spec_sha256":first.sha256(),"decision":"APPROVE_ONLY"}),
+    )
+    .await?;
+    let (status, response) = world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(
+        status, 409,
+        "a CR whose result equals its base must be refused: {response}"
+    );
+    assert_eq!(response["code"], "SPEC_CONFLICT");
+    assert_eq!(snapshot(&world)?, before);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_034_04_known_generated_digests_are_not_manual_drift() -> R {
+    let world = World::new()?;
+    let (host, run, first) = approved(&world).await?;
+    let mut previous = first.clone();
+    for n in 1..=3 {
+        let mut files = sources();
+        files[0].bytes.extend(std::iter::repeat_n(b'\n', n));
+        std::fs::write(world.project().join(&files[0].path), &files[0].bytes)?;
+        let next = specindex::generate_index(&files)?;
+        // The first is approved; the second is only proposed; the third is an older approved revision.
+        if n == 3 {
+            std::fs::write(world.project().join(specindex::PATH), first.bytes())?;
+        }
+        let body = command(
+            &host,
+            &run,
+            &format!("known-{n}"),
+            "ProposeSpecChange",
+            json!({"spec_sha256":next.sha256(),"reason":"normal Markdown edit"}),
+        )
+        .await?;
+        let (status, response) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{response}");
+        assert_eq!(
+            world.query("SELECT count(*) FROM events WHERE kind='spec.generated_drift'")?,
+            "0",
+            "an approved or proposed generated index is not a manual edit (case {n})"
+        );
+        assert_eq!(
+            std::fs::read(world.project().join(specindex::PATH))?,
+            next.bytes()
+        );
+        assert_ne!(next.sha256(), previous.sha256());
+        if n == 2 {
+            let body = command(
+                &host,
+                &run,
+                "approve-known",
+                "ApproveSpec",
+                json!({"spec_sha256":next.sha256(),"decision":"APPROVE_ONLY"}),
+            )
+            .await?;
+            let (status, response) =
+                world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+            assert_eq!(status, 202, "{response}");
+        }
+        previous = next;
+    }
     host.shutdown().await;
     Ok(())
 }
