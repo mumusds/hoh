@@ -3,7 +3,8 @@
 //! runs (ADR-019 decision 8, ADR-021 decision 8d), with no shell (REQ-024, REQ-025 behaviour 1).
 //!
 //! It reads stdin one byte at a time up to a line feed, so nothing after the line is consumed. If the line is `go`, it
-//! execs the program in its own place: the same pid, process group, environment (the attempt's marker) and cgroup,
+//! execs the program in its own place: the same pid, process group, attempt marker and cgroup. The environment is
+//! inherited except for the enclosing development check's evidence context (see [`agent_environment`]),
 //! with every signal back to its default action and none blocked, whatever the gate inherited (a parent that ignores
 //! SIGINT, as a shell's background job does, would otherwise make the agent deaf to its native cancel, M2T07R-203).
 //! At the end of its input, or for any other line, it exits 0 and the agent never runs.
@@ -173,9 +174,10 @@ pub fn main(args: &[OsString]) -> i32 {
             return 0;
         }
         defaults();
-        let error = std::process::Command::new(call.program)
-            .args(call.rest)
-            .exec();
+        let mut command = std::process::Command::new(call.program);
+        command.args(call.rest);
+        agent_environment(&mut command);
+        let error = command.exec();
         say(&format!("{}: {error}", call.program.to_string_lossy()));
         return EXEC_FAILED;
     };
@@ -518,7 +520,27 @@ pub fn exec(verified: &Verified, args: &[OsString]) -> std::io::Error {
     if let Some((first, rest)) = invocation.argv.split_first() {
         command.arg0(first).args(rest);
     }
-    command.envs(invocation.env).exec()
+    command.envs(invocation.env);
+    agent_environment(&mut command);
+    command.exec()
+}
+
+/// An agent turn is not the enclosing development check. In particular, a fixture command run by the agent must
+/// not find the parent's evidence sink or candidate identity in its environment. Inner Runtime checks assign their
+/// own context when they execute the frozen plan; ordinary configuration and HOH_ATTEMPT_ID stay inherited.
+fn agent_environment(command: &mut std::process::Command) {
+    for name in [
+        "HOH_EVIDENCE_DIR",
+        "HOH_CHECK_ID",
+        "HOH_CANDIDATE_ID",
+        "HOH_SPEC_SHA256",
+        "HOH_CANDIDATE_FILE",
+        "HOH_CHECK_RECORD_ID",
+        "HOH_LIVE_PROFILE",
+        "HOH_LIVE_OUT",
+    ] {
+        command.env_remove(name);
+    }
 }
 
 /// Every standard signal back to its default action in the program the gate execs, and none blocked: an action set
