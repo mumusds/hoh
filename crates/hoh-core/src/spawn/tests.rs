@@ -294,3 +294,44 @@ fn a_child_the_wrapping_failure_did_not_reap_in_time_is_reaped_by_a_thread_of_it
     );
     Ok(())
 }
+
+#[test]
+fn a_leader_handed_to_the_reaper_thread_is_reaped_when_it_exits_and_its_handle_signals_no_more() -> R
+{
+    // A2, the handle's drop past its bound (CLT-1257, CLN4-53): a leader that has not exited is handed to a reaper
+    // thread of its own, which sees it exit, cleans its group and reaps it; the handle counts as reaped from the hand-
+    // over on, so it never signals the group by number again (its id may be another's once the thread reaped it). The
+    // thread signals the group only after the exit: a leader that ends its own work writes its mark first.
+    let dir = tempfile::tempdir()?;
+    let mark = dir.path().join("ended");
+    let script = format!("sleep 0.3; : > '{}'", mark.display());
+    let helper =
+        Direct::plain().helper(Command::new("sh").args(["-c", &script]), HelperStderr::Null)?;
+    let pid = i32::try_from(helper.shared.pid())?;
+    assert!(helper.shared.hand_over(), "no reaper thread");
+    assert!(
+        helper.shared.reaped(),
+        "the handle still counts its leader as its own"
+    );
+    assert!(
+        !helper.shared.signal_group(Signal::KILL),
+        "the handed-over group was signalled by number"
+    );
+    let gone = reaped(pid);
+    if !gone {
+        let _ = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::NOHANG,
+        );
+    }
+    assert!(
+        gone,
+        "the reaper thread did not reap the leader once it exited"
+    );
+    assert!(
+        mark.exists(),
+        "the reaper thread ended the leader before it exited"
+    );
+    drop(helper);
+    Ok(())
+}
