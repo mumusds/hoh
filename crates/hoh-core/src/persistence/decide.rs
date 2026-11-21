@@ -154,6 +154,7 @@ fn fenced(tx: &Transaction<'_>, turn: &Answered) -> Result<Option<Rejection>, Pe
                     turn.wake,
                     now.map_or_else(|| "none".to_owned(), |n| n.to_string())
                 ),
+                details: None,
             }));
         }
     }
@@ -613,28 +614,33 @@ fn rejected(
     context: &Context,
     rejection: &Rejection,
 ) -> NewEvent {
+    let mut payload = json!({
+        "decision_id": proposal.decision_id,
+        "kind": proposal.kind(),
+        "reason_code": reason_name(rejection.reason),
+        "detail": rejection.detail,
+        "role_epoch": proposal.role_epoch,
+        "current_role_epoch": snapshot.commander_epoch,
+        "expected_revision": proposal.expected_revision,
+        "current_revision": snapshot.run.revision,
+        "spec_sha256": proposal.spec_sha256,
+        "current_spec_sha256": snapshot.run.spec_sha256,
+        "inputs": {
+            "required_capabilities": snapshot.required_capabilities,
+            "budget_headroom": context.budget_headroom,
+        },
+    });
+    // What the rejection names, machine-readable, when it has more than its detail (ADR-035 decision 10).
+    if let Some(details) = &rejection.details {
+        payload["details"] = details.clone();
+    }
     NewEvent {
         intent: Intent::Progress,
         project_id: project_id.to_owned(),
         event_id: child_id(&proposal.decision_id, "rejected"),
         run_id: Some(proposal.run_id.clone()),
         kind: "decision.rejected".to_owned(),
-        payload: json!({
-            "decision_id": proposal.decision_id,
-            "kind": proposal.kind(),
-            "reason_code": reason_name(rejection.reason),
-            "detail": rejection.detail,
-            "role_epoch": proposal.role_epoch,
-            "current_role_epoch": snapshot.commander_epoch,
-            "expected_revision": proposal.expected_revision,
-            "current_revision": snapshot.run.revision,
-            "spec_sha256": proposal.spec_sha256,
-            "current_spec_sha256": snapshot.run.spec_sha256,
-            "inputs": {
-                "required_capabilities": snapshot.required_capabilities,
-                "budget_headroom": context.budget_headroom,
-            },
-        }),
+        payload,
     }
 }
 
@@ -727,6 +733,11 @@ fn load_snapshot(
     } else {
         crate::decision::Quiet::default()
     };
+    let assumptions = if proposal.kind() == "record_assumption" {
+        load_assumptions(tx, run_id)?
+    } else {
+        None
+    };
     Ok(Snapshot {
         run,
         commander_epoch,
@@ -738,7 +749,38 @@ fn load_snapshot(
         free_slot,
         evidence,
         quiet,
+        assumptions,
     })
+}
+
+/// The decision classes an unattended run's configuration snapshot lists under `[assumptions]` (REQ-030 behaviour 4);
+/// `None` for an interactive run, or a snapshot without `unattended` (docs/adr/ADR-035.md decision 11).
+fn load_assumptions(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<BTreeSet<String>>, PersistError> {
+    let snapshot: Option<String> = tx
+        .query_row(
+            "SELECT config_snapshot_json FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let snapshot: Value = match snapshot {
+        Some(text) => serde_json::from_str(&text).map_err(|e| {
+            PersistError::IntegrityViolation(format!("run {run_id}'s configuration snapshot: {e}"))
+        })?,
+        None => return Ok(None),
+    };
+    if snapshot["unattended"] != Value::Bool(true) {
+        return Ok(None);
+    }
+    Ok(Some(
+        snapshot["assumptions"]
+            .as_object()
+            .map(|listed| listed.keys().cloned().collect())
+            .unwrap_or_default(),
+    ))
 }
 
 fn strings(

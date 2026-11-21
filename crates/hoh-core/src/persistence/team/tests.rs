@@ -1,12 +1,13 @@
 //! Team revisions and a new run's bindings, snapshot and budget against a real store (docs/adr/ADR-022.md decisions
 //! 3 and 7).
 
-use crate::config::{Agent, Budget, Config};
+use crate::config::{Agent, Assumed, Budget, Config};
 use crate::persistence::{
     CommandOutcome, Intent, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -38,6 +39,8 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
             mode: "AUTO".to_owned(),
             budget,
             policy: "balanced".to_owned(),
+            assumptions: BTreeMap::new(),
+            unattended: true,
         },
         event: NewEvent {
             intent: Intent::Progress,
@@ -169,6 +172,46 @@ async fn a_started_run_binds_the_team_of_the_current_revision_at_epoch_1() -> R 
 }
 
 #[tokio::test]
+async fn a_started_run_snapshots_its_assumptions_and_whether_it_is_unattended() -> R {
+    // REQ-030 behaviour 4 and docs/adr/ADR-035.md decision 11: StartRun freezes the configuration's [assumptions] and
+    // `unattended` (StartRun's `interactive: false`) into the run's snapshot, where its record_assumptions are checked.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    let mut unattended = start("R1", Config::default().budget);
+    if let RunTarget::Start { assumptions, .. } = &mut unattended.target {
+        *assumptions = BTreeMap::from([
+            ("language".to_owned(), Assumed::One("Rust".to_owned())),
+            (
+                "platforms".to_owned(),
+                Assumed::Many(vec!["linux".to_owned()]),
+            ),
+        ]);
+    }
+    store.submit_command(unattended).await?;
+    let mut interactive = start("R2", Config::default().budget);
+    if let RunTarget::Start { unattended, .. } = &mut interactive.target {
+        *unattended = false;
+    }
+    store.submit_command(interactive).await?;
+    assert_eq!(
+        values(
+            &path,
+            "SELECT run_id, json_extract(config_snapshot_json, '$.unattended'), \
+             json(json_extract(config_snapshot_json, '$.assumptions')) FROM runs ORDER BY run_id",
+        )?,
+        [
+            vec![
+                json!("R1"),
+                json!(1),
+                json!(r#"{"language":"Rust","platforms":["linux"]}"#)
+            ],
+            vec![json!("R2"), json!(0), json!("{}")],
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
     // CR-007 S2 and ADR-020 decision 7: StartRun records the effective scheduler in the run's snapshot and writes the
     // run's budget rows and deadline from the configuration; a cost cap is written with price_known=0 (no price table,
@@ -193,7 +236,9 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
             // The packing parameters, frozen for the run's life (docs/adr/ADR-026.md decision 7).
             "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]},
             // The repair limits its completions and rounds count against (docs/adr/ADR-028.md decisions 11, 12).
-            "repairs": {"local": 3, "protocol": 2}})
+            "repairs": {"local": 3, "protocol": 2},
+            // Unattended (`interactive: false`), with the defaults it may assume: none (docs/adr/ADR-035.md decision 11).
+            "unattended": true, "assumptions": {}})
     );
     assert_eq!(
         values(

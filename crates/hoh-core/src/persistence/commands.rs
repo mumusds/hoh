@@ -50,6 +50,10 @@ pub enum RunTarget {
         budget: crate::config::Budget,
         /// `supervision.policy`, frozen into the run's snapshot (docs/adr/ADR-025.md decision 9).
         policy: String,
+        /// `[assumptions]`, frozen into the run's snapshot: what it may assume when unattended (REQ-030 behaviour 4).
+        assumptions: std::collections::BTreeMap<String, crate::config::Assumed>,
+        /// StartRun's `interactive: false` (`hoh -p`), frozen into the run's snapshot (docs/adr/ADR-035.md decision 11).
+        unattended: bool,
     },
     /// The project's team (ConfigureTeam, docs/adr/ADR-022.md decisions 3 and 4): revision r+1 over the current r,
     /// applied at once; `expected_revision` is the team revision. An empty `run_id` is the project's command (null in
@@ -157,6 +161,8 @@ pub(super) fn submit(
             mode,
             budget,
             policy,
+            assumptions,
+            unattended,
         } => {
             if command.expected_revision != 0 {
                 return Err(PersistError::StaleRevision {
@@ -180,8 +186,12 @@ pub(super) fn submit(
                 &tx,
                 &command.run_id,
                 &command.event.project_id,
-                budget,
-                policy,
+                super::team::Frozen {
+                    budget,
+                    policy,
+                    assumptions,
+                    unattended: *unattended,
+                },
             )?;
             // The project's latest approved specification, adopted after run.created; with none, the run is BLOCKED
             // on its question runtime:no_spec in this commit (docs/adr/ADR-031.md decision 1).

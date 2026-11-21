@@ -203,6 +203,18 @@ pub struct Web {
     pub port: u16,
 }
 
+/// The decision classes `[assumptions]` may never list (REQ-030 behaviour 4, the owner's decision O2): they are never
+/// assumed, so naming one refuses the configuration like an unknown key.
+pub const RESERVED_ASSUMPTIONS: [&str; 3] = ["product_direction", "scope", "non_goals"];
+
+/// A default an unattended run may assume (REQ-018 `[assumptions]`, REQ-030 behaviour 4): a string or strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Assumed {
+    One(String),
+    Many(Vec<String>),
+}
+
 /// The effective configuration.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Config {
@@ -217,6 +229,8 @@ pub struct Config {
     pub budget: Budget,
     pub ui: Ui,
     pub web: Web,
+    /// By decision class: what an unattended run may assume (REQ-030 behaviour 4); empty by default.
+    pub assumptions: BTreeMap<String, Assumed>,
 }
 
 impl Default for Config {
@@ -277,6 +291,7 @@ impl Default for Config {
                 host: "127.0.0.1".to_owned(),
                 port: 8787,
             },
+            assumptions: BTreeMap::new(),
         }
     }
 }
@@ -667,6 +682,9 @@ impl Reader<'_> {
                 "budget" => self.budget(self.table(name, value)?, &mut config.budget)?,
                 "ui" => self.ui(self.table(name, value)?, &mut config.ui)?,
                 "web" => self.web(self.table(name, value)?, &mut config.web)?,
+                "assumptions" => {
+                    self.assumptions(self.table(name, value)?, &mut config.assumptions)?;
+                }
                 other => return Err(self.unknown(other, *at)),
             }
         }
@@ -946,6 +964,55 @@ impl Reader<'_> {
                 }
                 _ => return Err(self.unknown(&path, *at)),
             }
+        }
+        Ok(())
+    }
+
+    /// `[assumptions]` (REQ-018 key table, REQ-030 behaviour 4): each key a decision class, each value a string or an
+    /// array of strings; a reserved class is refused like an unknown key, with its key path.
+    fn assumptions(
+        &self,
+        table: &[Entry],
+        assumptions: &mut BTreeMap<String, Assumed>,
+    ) -> Result<(), ConfigError> {
+        for (name, at, value) in table {
+            let path = format!("assumptions.{name}");
+            if RESERVED_ASSUMPTIONS.contains(&name.as_str()) {
+                return Err(self.error(
+                    &path,
+                    *at,
+                    "unknown key: product_direction, scope and non_goals are never assumed (REQ-030)",
+                ));
+            }
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                return Err(self.error(
+                    &path,
+                    *at,
+                    "a decision class is ASCII lowercase letters, digits and underscores",
+                ));
+            }
+            let assumed = match &value.item {
+                Item::Str(s) => Assumed::One(s.clone()),
+                Item::Array(items) => Assumed::Many(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| self.string(&format!("{path}[{i}]"), item))
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => {
+                    return Err(self.error(
+                        &path,
+                        value.at,
+                        "expected a string or an array of strings",
+                    ));
+                }
+            };
+            assumptions.insert(name.clone(), assumed);
         }
         Ok(())
     }

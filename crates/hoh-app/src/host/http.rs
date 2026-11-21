@@ -786,6 +786,11 @@ async fn submit_command(
                         || hoh_core::config::Config::default().supervision.policy,
                         |config| config.supervision.policy.clone(),
                     ),
+                    assumptions: effective
+                        .as_ref()
+                        .map(|config| config.assumptions.clone())
+                        .unwrap_or_default(),
+                    unattended: !start.interactive,
                 },
                 "run.created",
                 None,

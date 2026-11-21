@@ -54,6 +54,7 @@ fn snapshot() -> Snapshot {
             ..Evidence::default()
         },
         quiet: crate::decision::Quiet::default(),
+        assumptions: None,
     }
 }
 
@@ -689,4 +690,53 @@ fn a_blocked_or_waiting_run_judges_a_request_for_a_person() {
         s.commander_epoch = Some(ask.role_epoch + 1);
         assert_eq!(reason(&ask, &s), StaleRoleEpoch, "{state:?}");
     }
+}
+
+#[test]
+fn an_unattended_assumption_must_cite_a_listed_key() {
+    // REQ-030 behaviour 4 (AC-030-02, CR-033): in an unattended run a record_assumption's basis is
+    // `assumptions.<class>` with the class listed in the run's configuration snapshot, else it is REJECTED
+    // ASSUMPTION_NOT_LISTED and its details name the key; an interactive run's basis is not checked.
+    let assume = |basis: &str| {
+        proposal(json!({"kind": "record_assumption", "statement": "s", "basis": basis}))
+    };
+    let mut s = snapshot();
+    assert_eq!(s.assumptions, None, "an interactive run");
+    assert_eq!(
+        validate(&assume("anything"), &s),
+        Ok(Effect::RecordAssumption)
+    );
+    s.assumptions = Some(caps(&["language"]));
+    assert_eq!(
+        validate(&assume("assumptions.language"), &s),
+        Ok(Effect::RecordAssumption)
+    );
+    for (basis, key) in [
+        ("assumptions.product_direction", Some("product_direction")),
+        ("assumptions.Language", Some("Language")),
+        ("assumptions.", Some("")),
+        ("language", None),
+        ("项目的 contracts/requirements.json", None),
+        (" assumptions.language", None),
+    ] {
+        let rejection = validate(&assume(basis), &s).expect_err(basis);
+        assert_eq!(rejection.reason, AssumptionNotListed, "{basis}");
+        assert!(
+            rejection.detail.contains(basis),
+            "{basis}: {}",
+            rejection.detail
+        );
+        assert_eq!(
+            rejection.details,
+            Some(json!({"basis": basis, "key": key, "listed": ["language"]})),
+            "{basis}"
+        );
+    }
+    s.assumptions = Some(BTreeSet::new());
+    let rejection = validate(&assume("assumptions.language"), &s).expect_err("empty table");
+    assert_eq!(rejection.reason, AssumptionNotListed);
+    assert_eq!(
+        rejection.details,
+        Some(json!({"basis": "assumptions.language", "key": "language", "listed": []}))
+    );
 }

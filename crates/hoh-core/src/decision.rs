@@ -361,6 +361,9 @@ pub struct Snapshot {
     pub evidence: Evidence,
     /// For a move of the run, what an end of it waits for (docs/adr/ADR-031.md decision 4).
     pub quiet: Quiet,
+    /// For a record_assumption of an unattended run, the decision classes its configuration snapshot lists under
+    /// `[assumptions]` (REQ-030 behaviour 4); `None` for an interactive run, whose basis is not checked.
+    pub assumptions: Option<BTreeSet<String>>,
 }
 
 /// What an end of a run waits for (docs/adr/ADR-031.md decision 4): it is ended only when quiet, so nothing of it is
@@ -382,6 +385,8 @@ pub struct Quiet {
 pub struct Rejection {
     pub reason: RejectionReason,
     pub detail: String,
+    /// What the rejection names, machine-readable (`decision.rejected.details`), when it has more than its detail.
+    pub details: Option<serde_json::Value>,
 }
 
 /// What an accepted proposal does; persistence applies it in the same transaction.
@@ -416,7 +421,11 @@ pub enum Effect {
 }
 
 fn reject<T>(reason: RejectionReason, detail: String) -> Result<T, Rejection> {
-    Err(Rejection { reason, detail })
+    Err(Rejection {
+        reason,
+        detail,
+        details: None,
+    })
 }
 
 /// The task moves the Commander may propose (ADR-011 §3.3); every other move follows attempts, the verification
@@ -505,7 +514,7 @@ pub fn validate(proposal: &Proposal, snapshot: &Snapshot) -> Result<Effect, Reje
             *to_state,
             accepted_requirements.as_deref().unwrap_or_default(),
         ),
-        DecisionPayload::RecordAssumption { .. } => Ok(Effect::RecordAssumption),
+        DecisionPayload::RecordAssumption { basis, .. } => record_assumption(snapshot, basis),
         DecisionPayload::CreateTasks { .. } => Ok(Effect::CreateTasks),
         DecisionPayload::RequestUserDecision { .. } => Ok(Effect::Unsupported(proposal.kind())),
     }
@@ -558,10 +567,40 @@ fn dependencies_accepted(task: &TaskView) -> Result<(), Rejection> {
     }
 }
 
+/// The prefix of a basis that cites a configured default (`assumptions.<class>`, REQ-030 behaviour 4).
+pub const ASSUMPTION_BASIS: &str = "assumptions.";
+
+/// A record_assumption: in an unattended run its basis must be `assumptions.<class>` with the class listed in the run's
+/// configuration snapshot (REQ-030 behaviour 4, AC-030-02); anything else is ASSUMPTION_NOT_LISTED, its details naming
+/// the key. An interactive run's basis is not checked.
+fn record_assumption(snapshot: &Snapshot, basis: &str) -> Result<Effect, Rejection> {
+    let Some(listed) = &snapshot.assumptions else {
+        return Ok(Effect::RecordAssumption);
+    };
+    let key = basis.strip_prefix(ASSUMPTION_BASIS);
+    if key.is_some_and(|key| listed.contains(key)) {
+        return Ok(Effect::RecordAssumption);
+    }
+    let shown = if listed.is_empty() {
+        "none".to_owned()
+    } else {
+        listed.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+    Err(Rejection {
+        reason: RejectionReason::AssumptionNotListed,
+        detail: format!(
+            "basis \"{basis}\" is not a key listed in [assumptions] (listed: {shown}); an unattended run assumes only \
+             those, cited as basis \"{ASSUMPTION_BASIS}<key>\""
+        ),
+        details: Some(serde_json::json!({"basis": basis, "key": key, "listed": listed})),
+    })
+}
+
 fn table<S: Lifecycle>(from: S, to: S) -> Result<(), Rejection> {
     lifecycle::check(from, to).map_err(|e| Rejection {
         reason: e.reason(),
         detail: e.to_string(),
+        details: None,
     })
 }
 

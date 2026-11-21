@@ -1666,3 +1666,105 @@ async fn a_dispatch_to_a_role_changing_by_itself_is_role_binding_pending_and_its
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn an_unattended_runs_assumption_outside_its_listed_keys_is_rejected_with_details() -> R {
+    // REQ-030 behaviour 4 (AC-030-02, CR-033): run R's configuration snapshot is unattended with [assumptions]
+    // language; a record_assumption citing assumptions.language is applied, one citing assumptions.product_direction
+    // is REJECTED ASSUMPTION_NOT_LISTED with decision.rejected.details naming the key and nothing else written. A
+    // snapshot without `unattended` is an interactive run's: its basis is not checked (ADR-035 decision 11).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        r#"UPDATE runs SET config_snapshot_json = '{"unattended": true, "assumptions": {"language": "Rust"}}';"#,
+    )?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let assume =
+        |basis: &str| json!({"kind": "record_assumption", "statement": "s", "basis": basis});
+    let decided = store
+        .decide(
+            commander.decide(3, 7, assume("assumptions.language")),
+            context(),
+        )
+        .await?;
+    assert!(
+        matches!(
+            decided,
+            Decided::Applied {
+                run_revision: 8,
+                ..
+            }
+        ),
+        "{decided:?}"
+    );
+    let before = tables(&path)?;
+    let decided = store
+        .decide(
+            commander.decide(3, 8, assume("assumptions.product_direction")),
+            context(),
+        )
+        .await?;
+    assert!(
+        matches!(
+            decided,
+            Decided::Rejected {
+                reason: RejectionReason::AssumptionNotListed,
+                ..
+            }
+        ),
+        "{decided:?}"
+    );
+    assert_eq!(tables(&path)?, before, "nothing else written");
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT decision_id, state, reason_code FROM decisions ORDER BY rowid"
+        )?,
+        [
+            vec![json!("d1"), json!("APPLIED"), Value::Null],
+            vec![
+                json!("d2"),
+                json!("REJECTED"),
+                json!("ASSUMPTION_NOT_LISTED")
+            ],
+        ]
+    );
+    let rejected = rows(
+        &path,
+        "SELECT json_extract(payload_json, '$.details') FROM events WHERE kind = 'decision.rejected'",
+    )?;
+    let details: Value = serde_json::from_str(rejected[0][0].as_str().ok_or("no details")?)?;
+    assert_eq!(
+        details,
+        json!({"basis": "assumptions.product_direction", "key": "product_direction", "listed": ["language"]})
+    );
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT count(*) FROM events WHERE kind = 'decision.applied' \
+             AND json_extract(payload_json, '$.payload.basis') = 'assumptions.product_direction'"
+        )?,
+        [vec![json!(0)]]
+    );
+    // An interactive run (no `unattended` in its snapshot): any basis.
+    seed(&path, "UPDATE runs SET config_snapshot_json = '{}';")?;
+    let decided = store
+        .decide(commander.decide(3, 8, assume("项目的规格")), context())
+        .await?;
+    assert!(
+        matches!(
+            decided,
+            Decided::Applied {
+                run_revision: 9,
+                ..
+            }
+        ),
+        "{decided:?}"
+    );
+    Ok(())
+}

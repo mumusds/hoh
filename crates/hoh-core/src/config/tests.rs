@@ -667,3 +667,68 @@ fn a_turns_contract_is_the_built_in_one_or_its_override_file_never_another_in_it
     }
     Ok(())
 }
+
+#[test]
+fn assumptions_table_parses_and_refuses_reserved_names() -> R {
+    // REQ-018 key table and REQ-030 behaviour 4 (CR-026, CR26D-52, -103): `[assumptions]` maps a decision class (ASCII
+    // lowercase letters, digits and underscores) to a string or an array of strings; the example's table is empty and
+    // so is the default; product_direction, scope and non_goals are refused like an unknown key, with their key path.
+    let text = example()?;
+    assert!(
+        text.lines().any(|line| line.trim() == "[assumptions]"),
+        "the example has the [assumptions] table"
+    );
+    assert!(
+        parse(&text)?.assumptions.is_empty(),
+        "the example's table is empty"
+    );
+    assert!(Config::default().assumptions.is_empty());
+    let config = parse(&with(
+        "[assumptions]\nlanguage = \"Rust\"\nplatforms = [\"linux\", \"macos\"]\nlayer_2 = []\n",
+    ))?;
+    assert_eq!(
+        config.assumptions,
+        BTreeMap::from([
+            ("language".to_owned(), Assumed::One("Rust".to_owned())),
+            ("layer_2".to_owned(), Assumed::Many(Vec::new()),),
+            (
+                "platforms".to_owned(),
+                Assumed::Many(vec!["linux".to_owned(), "macos".to_owned()]),
+            ),
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(&config.assumptions)?,
+        serde_json::json!({"language": "Rust", "layer_2": [], "platforms": ["linux", "macos"]})
+    );
+    for name in RESERVED_ASSUMPTIONS {
+        let error = refused(&with(&format!("[assumptions]\n{name} = \"x\"")));
+        assert_eq!(
+            error.key.as_deref(),
+            Some(format!("assumptions.{name}").as_str()),
+            "{error}"
+        );
+        assert!(error.message.contains("unknown key"), "{error}");
+        assert_eq!(error.line, Some(3), "{error}");
+    }
+    for (body, key) in [
+        ("[assumptions]\nLanguage = \"x\"", "assumptions.Language"),
+        (
+            "[assumptions]\n\"lang-uage\" = \"x\"",
+            "assumptions.lang-uage",
+        ),
+        ("[assumptions]\n\"\" = \"x\"", "assumptions."),
+        ("[assumptions]\nlanguage = 1", "assumptions.language"),
+        (
+            "[assumptions]\nlanguage = [\"Rust\", 2]",
+            "assumptions.language[1]",
+        ),
+        ("[assumptions.language]\nx = \"y\"", "assumptions.language"),
+        ("assumptions = \"x\"", "assumptions"),
+    ] {
+        let error = refused(&with(body));
+        assert_eq!(error.key.as_deref(), Some(key), "{body}: {error}");
+        assert!(error.line.is_some(), "{error}");
+    }
+    Ok(())
+}

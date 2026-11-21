@@ -41,6 +41,7 @@
 
 ## 决策规则与升级
 - 必须由真人决定：删减或扩大required范围、修改release_class或release_targets、认证、外部费用、不可逆数据操作、产品方向未知。interactive发need_decision给用户；headless且无既有授权→BLOCKED，写出精确问题与恢复动作。
+- 无人值守（`hoh -p`）的Run只能假设项目配置`[assumptions]`中列出的默认值：record_assumption的basis写`assumptions.<键>`（如`assumptions.language`）。产品方向、范围、非目标与未列出的决定不假设，用request_user_decision提问；basis不是列出的键的record_assumption被拒（ASSUMPTION_NOT_LISTED，details列出可用的键）。
 - 默认上限（以run配置为准）：同一问题本地修复≤3次，协议格式纠正≤2次，MOA≤2轮意见+1次决策。超限即换策略（研究/重规划/回滚）或BLOCKED，不无限重派。
 - 预算风险：停止派发新的高成本任务，报告剩余预算与取舍。
 - QA等待Developer修改当前候选即为死锁：改为Issue→下一候选。
