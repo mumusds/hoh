@@ -141,12 +141,16 @@ fn a_helper_whose_pidfd_cannot_be_had_has_its_group_killed_and_is_reaped() -> R 
     ));
     let leader = std::sync::Mutex::new(None);
     let member_pid = std::sync::Mutex::new(None);
-    let refused = Helper::spawn_by(&mut command, &|pid| {
-        *leader.lock().unwrap_or_else(PoisonError::into_inner) = Some(pid.as_raw_pid());
-        *member_pid.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(written_pid(&member).map_err(|e| io::Error::other(e.to_string()))?);
-        Err(io::Error::from_raw_os_error(24))
-    });
+    let refused = Helper::spawn_by(
+        &mut command,
+        &|pid| {
+            *leader.lock().unwrap_or_else(PoisonError::into_inner) = Some(pid.as_raw_pid());
+            *member_pid.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(written_pid(&member).map_err(|e| io::Error::other(e.to_string()))?);
+            Err(io::Error::from_raw_os_error(24))
+        },
+        END_WAIT,
+    );
     assert_eq!(refused.err().and_then(|e| e.raw_os_error()), Some(24));
     let member = member_pid
         .into_inner()
@@ -216,5 +220,77 @@ fn a_helpers_stderr_is_its_policys_never_the_spawners_own() -> R {
             assert_ne!(seen, ours, "the helper has the spawner's own stderr");
         }
     }
+    Ok(())
+}
+
+/// Wait at most 5 s until no process has number `pid`: reaped by whoever is its parent (this test process).
+fn reaped(pid: i32) -> bool {
+    let end = Instant::now() + Duration::from_secs(5);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if Instant::now() > end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+#[test]
+fn a_helper_let_go_before_it_was_reaped_is_ended_and_reaped() -> R {
+    // docs/adr/ADR-031.md, 设计修正 2, A2, the handle's bounded drop (CLT-1257): the last owner of a helper lets it go
+    // while it runs; the drop kills it with its group and reaps it (or leaves it to a reaper thread of its own), so no
+    // zombie of it stays in this process. Before, nothing ended it: it ran on and, once it exited, stayed a zombie.
+    let helper = Direct::plain().helper(Command::new("sleep").arg("0.3"), HelperStderr::Null)?;
+    let pid = i32::try_from(helper.shared.pid())?;
+    drop(helper);
+    let gone = reaped(pid);
+    if !gone {
+        let _ = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::NOHANG,
+        );
+    }
+    assert!(
+        gone,
+        "a helper let go of stayed in the process table (a zombie, or still running)"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_child_the_wrapping_failure_did_not_reap_in_time_is_reaped_by_a_thread_of_its_own() -> R {
+    // A2, the wrapping failure (CLT-1258): the pidfd cannot be had and the child is not reaped within the bound (here
+    // none); it is handed to a reaper thread of its own, never dropped as a zombie of this process.
+    let mut child_pid = None;
+    let pid_seen = std::sync::Mutex::new(None);
+    let refused = Helper::spawn_by(
+        Command::new("sleep")
+            .arg("30")
+            .stderr(std::process::Stdio::null()),
+        &|pid| {
+            *pid_seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(pid.as_raw_pid());
+            Err(io::Error::from_raw_os_error(24))
+        },
+        Duration::ZERO,
+    );
+    assert!(refused.is_err());
+    child_pid.replace(
+        pid_seen
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ok_or("pid")?,
+    );
+    let pid = child_pid.ok_or("pid")?;
+    let gone = reaped(pid);
+    if !gone {
+        let _ = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::NOHANG,
+        );
+    }
+    assert!(
+        gone,
+        "the child the wrapping failure let go of stayed a zombie"
+    );
     Ok(())
 }

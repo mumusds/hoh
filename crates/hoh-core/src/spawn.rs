@@ -125,13 +125,18 @@ impl Helper {
     /// child is ended as the adapters' supervisor has always ended it (M1T07R-103): its group killed, then its leader,
     /// then reaped within [`END_WAIT`], its pid and group id fixed until then because it is not reaped (CLT-700).
     fn spawn(command: &mut Command) -> io::Result<Helper> {
-        Helper::spawn_by(command, &|pid| Ok(pidfd_open(pid, PidfdFlags::empty())?))
+        Helper::spawn_by(
+            command,
+            &|pid| Ok(pidfd_open(pid, PidfdFlags::empty())?),
+            END_WAIT,
+        )
     }
 
     /// [`Helper::spawn`] with `open` opening the child's pidfd (a test's seam for its failure).
     fn spawn_by(
         command: &mut Command,
         open: &dyn Fn(Pid) -> io::Result<OwnedFd>,
+        bound: Duration,
     ) -> io::Result<Helper> {
         let mut child = command.process_group(0).spawn()?;
         let pid = Pid::from_child(&child);
@@ -140,9 +145,18 @@ impl Helper {
             Err(e) => {
                 let _ = kill_process_group(pid, Signal::KILL);
                 let _ = child.kill();
-                let end = Instant::now() + END_WAIT;
+                let end = Instant::now() + bound;
                 while matches!(child.try_wait(), Ok(None)) && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(2));
+                }
+                // Not reaped in time: a thread of its own waits for it, so it never stays a zombie of this process
+                // (CLT-1258); with no thread for it, it does until this process ends (a stated residual).
+                if matches!(child.try_wait(), Ok(None)) {
+                    let _ = std::thread::Builder::new()
+                        .name("hoh-reap".to_owned())
+                        .spawn(move || {
+                            let _ = child.wait();
+                        });
                 }
                 return Err(e);
             }
@@ -299,6 +313,37 @@ impl Shared {
             );
         None
     }
+}
+
+impl Drop for Shared {
+    /// The last owner let it go (A2's bounded drop, CLT-1257): a leader not yet reaped is killed with what is left of
+    /// its group, waited for at most [`END_WAIT`] and reaped; one that has not exited by then goes to a reaper thread of
+    /// its own, which sees it exit, kills what is left of its group while the zombie holds the group's id, and reaps
+    /// it. With no thread (or no duplicate of its pidfd) for that, it stays a zombie until this process ends (a stated
+    /// residual).
+    fn drop(&mut self) {
+        if self.reaped() || self.end(END_WAIT).is_some() || self.reaped() {
+            return;
+        }
+        let Ok(pidfd) = self.pidfd.try_clone() else {
+            return;
+        };
+        let pid = self.pid;
+        let _ = std::thread::Builder::new()
+            .name("hoh-reap".to_owned())
+            .spawn(move || reap_later(pid, &pidfd));
+    }
+}
+
+/// A leader its handle let go of, still running: wait for its exit on `pidfd` without consuming it, kill what is left of
+/// its group (the zombie still holds the group's id), then reap it, consuming the status (A2's order).
+fn reap_later(pid: Pid, pidfd: &OwnedFd) {
+    let seen = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    while let Err(rustix::io::Errno::INTR) = waitid(WaitId::PidFd(pidfd.as_fd()), seen) {}
+    let _ = kill_process_group(pid, Signal::KILL);
+    while let Err(rustix::io::Errno::INTR) =
+        waitid(WaitId::PidFd(pidfd.as_fd()), WaitIdOptions::EXITED)
+    {}
 }
 
 /// A host, as its starter holds it: it can be waited for and its stderr read, nothing else; dropping it does
