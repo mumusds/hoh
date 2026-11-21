@@ -272,24 +272,32 @@ async fn a_stale_candidate_without_a_successor_shows_every_ac_stale_and_counts_n
 
 #[tokio::test]
 async fn a_verifier_tasks_acceptance_changes_neither_accepted_nor_total() -> R {
-    // J7: C1 accepted (1 of 1). A verifier task given a requirement of its own (REQ-3 with AC-3-01, what the explicit
-    // filter of verifier tasks guards against) and ACCEPTED: AC-3-01 is not in the scope, the counts unchanged.
+    // J7 and ADR-033 Q4: the revision owns the counting scope. Adding a verifier mapping and accepting that
+    // task changes neither the existing PASS nor the unobserved AC, already included in the denominator.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     let c1 = accepted_c1(&store, &path).await?;
-    let before = snapshot(&store)?;
     let qa_task = child_id(&child_id(&c1, "round/1"), "task/qa");
-    Connection::open(&path)?.execute_batch(&format!(
+    Connection::open(&path)?.execute_batch(
         "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-3', 's1', 'r3', 1);
          INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
-           ('AC-3-01', 'REQ-3', 's1', 'b3', 'unit');
-         INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{qa_task}', 'REQ-3', 's1');
+           ('AC-3-01', 'REQ-3', 's1', 'b3', 'unit');"
+    )?;
+    let before = snapshot(&store)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('{qa_task}', 'REQ-3', 's1');
          UPDATE tasks SET state = 'ACCEPTED' WHERE task_id = '{qa_task}';"
     ))?;
     let after = snapshot(&store)?;
     assert_eq!(shown(&after), shown(&before));
-    assert_eq!(shown(&after), [ac("AC-1-01", Label::Pass, None)]);
-    assert_eq!(counts(&after), (1, 1, 1));
+    assert_eq!(
+        shown(&after),
+        [
+            ac("AC-1-01", Label::Pass, None),
+            ac("AC-3-01", Label::NotRun, None)
+        ]
+    );
+    assert_eq!(counts(&after), (1, 1, 2));
     Ok(())
 }
 
@@ -443,10 +451,9 @@ async fn a_scenario_check_that_ran_without_a_row_is_not_run_and_its_check_is_lis
 }
 
 #[tokio::test]
-async fn a_cancelled_tasks_own_ac_is_in_none_of_the_three_counts() -> R {
-    // -102: on C, D (AC-1-01) and E (AC-2-01) each with its round; D cancelled; E's QA check writes PASS rows of both
-    // ACs; both rounds pass and the join (E alone takes part) accepts C: accepted = passing = 1 and total = 1, AC-1-01
-    // listed PASS but not counted.
+async fn cancelling_a_task_does_not_remove_its_current_revision_ac_from_the_counts() -> R {
+    // ADR-033 Q4 supersedes the task-derived denominator: cancelling D does not remove AC-1-01 from the
+    // approved revision. E's QA observes both ACs on the accepted C, so both count, independently of D's state.
     let dir = tempfile::tempdir()?;
     let (store, path) = open(dir.path())?;
     let (c, r1, r2) = two_sources(&store, &path).await?;
@@ -475,11 +482,11 @@ async fn a_cancelled_tasks_own_ac_is_in_none_of_the_three_counts() -> R {
     assert_eq!(
         shown(&view),
         [
-            ("AC-1-01".to_owned(), Label::Pass, None, false),
+            ac("AC-1-01", Label::Pass, None),
             ac("AC-2-01", Label::Pass, None)
         ]
     );
-    assert_eq!(counts(&view), (1, 1, 1));
+    assert_eq!(counts(&view), (2, 2, 2));
     Ok(())
 }
 

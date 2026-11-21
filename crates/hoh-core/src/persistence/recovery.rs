@@ -2,7 +2,8 @@
 //! and 2, M2T13R-03, -101, -102): their kinds, their ids and every read of them — by their ids, never by a scan of
 //! the project's events.
 //!
-//! Their one writer, `closing::record_recovery`, takes their ids from here, each named by its candidate: the failures
+//! `closing::record_recovery` takes their ids from here; specification changes use [`spec_changed`]. Each fact is
+//! named by its candidate: the failures
 //! [`failure`] `child_id(c, "reconcile_failed/<n>")` and the recoveries [`recovery`]
 //! `child_id(c, "reconcile_recovered/<m>")`, each numbered from 1 with no gap (the next is the count of those before
 //! it, plus one, so a later one has the higher seq), and the judgment [`judgment`] `child_id(c, "stale")`. A fact
@@ -13,8 +14,8 @@
 
 use super::{PersistError, sqlite_error};
 use crate::ids::child_id;
-use rusqlite::{Connection, OptionalExtension, Statement, StatementStatus, params};
-use serde_json::Value;
+use rusqlite::{Connection, OptionalExtension, Statement, StatementStatus, Transaction, params};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// The kinds of a candidate's recovery facts — a failure, a recovery after failures, the judgment — for
@@ -77,9 +78,49 @@ pub(super) fn recovery(candidate: &str, m: u64) -> (String, &'static str) {
     )
 }
 
-/// The id and kind of candidate `candidate`'s judgment (`candidate.stale`; its one writer judges it unrecoverable).
+/// The id and kind of candidate `candidate`'s one judgment: unrecoverable evidence or a changed specification.
 pub(super) fn judgment(candidate: &str) -> (String, &'static str) {
     (child_id(candidate, "stale"), KINDS[2])
+}
+
+/// Invalidate every usable candidate of a run moving to a changed specification (ADR-033 Q4).
+/// The approval owns this transaction. An existing judgment is immutable; it does not prevent the state update.
+pub(super) fn spec_changed(
+    tx: &Transaction<'_>,
+    run: &str,
+    revision: i64,
+    template: &super::writer::NewEvent,
+) -> Result<Vec<super::writer::NewEvent>, PersistError> {
+    let candidates = tx
+        .prepare("SELECT candidate_id FROM candidates WHERE run_id=?1 AND state IN ('FROZEN','VERIFYING','ACCEPTED') ORDER BY candidate_id")
+        .map_err(sqlite_error)?
+        .query_map(params![run], |r| r.get::<_, String>(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    let mut events = Vec::new();
+    for candidate in candidates {
+        tx.execute("UPDATE candidates SET state='STALE' WHERE candidate_id=?1 AND state IN ('FROZEN','VERIFYING','ACCEPTED')", params![candidate])
+            .map_err(sqlite_error)?;
+        let (id, kind) = judgment(&candidate);
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_id=?1)",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if !exists {
+            let mut event = template.clone();
+            event.event_id = id;
+            event.run_id = Some(run.to_owned());
+            event.kind = kind.to_owned();
+            event.payload =
+                json!({"candidate_id":candidate,"reason":"spec_changed","spec_revision":revision});
+            events.push(event);
+        }
+    }
+    Ok(events)
 }
 
 /// One recovery fact: its seq, the run it is of (its own, or the one its Record names) and its payload.

@@ -150,6 +150,14 @@ pub(super) fn apply(
                 event.payload["run_id"] = json!(run);
                 events.push(event);
             }
+            if let Some(base) = &base {
+                events.extend(super::recovery::spec_changed(
+                    tx,
+                    &run,
+                    base.revision + 1,
+                    &command.event,
+                )?);
+            }
         }
     }
     let done = writer::write(

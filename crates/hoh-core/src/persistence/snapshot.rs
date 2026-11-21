@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct AcceptanceView {
     pub run_id: String,
     pub spec_id: Option<String>,
+    pub spec_revision: Option<i64>,
     /// The run's latest candidate (its last `candidate.frozen`, whatever its state); none before any.
     pub candidate: Option<CandidateShown>,
-    /// Every AC in the run's scope (its development tasks' requirements under its specification), by id.
+    /// Every AC of the run's current approved revision, by id (ADR-033 Q4).
     pub acs: Vec<AcShown>,
     /// The counted ACs whose label satisfies them.
     pub passing: usize,
@@ -46,8 +47,7 @@ pub struct CandidateShown {
     pub state: String,
 }
 
-/// One AC of a snapshot: its label and reason, its rows on the candidate, and whether it is counted (a development
-/// task not CANCELLED has it).
+/// One AC of the approved revision: its label, reason and rows on the current candidate. Every current AC counts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AcShown {
     pub ac_id: String,
@@ -91,6 +91,8 @@ pub struct AcceptanceItem {
 /// item's freeze seq and AC) when there are more, and the watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptancePage {
+    /// Current revision, including unobserved ACs before a new candidate exists.
+    pub current: AcceptanceView,
     pub items: Vec<AcceptanceItem>,
     /// The last item's candidate (freeze seq, row) and AC.
     pub next: Option<(i64, i64, String)>,
@@ -156,8 +158,7 @@ fn run_spec(
     Ok(found.map(|(spec, revision)| spec.zip(revision)))
 }
 
-/// An AC in a run's scope (decision 5): its requirement, whether its requirement may degrade, and whether a
-/// development task not CANCELLED has it.
+/// An AC of the approved revision (ADR-033 Q4), with its requirement and release class.
 struct InScope {
     ac: String,
     requirement: String,
@@ -165,47 +166,31 @@ struct InScope {
     counted: bool,
 }
 
-/// The ACs in run `run_id`'s scope under specification `spec_id`, by id: its development tasks' (never a verifier
-/// task's, J7) requirements' criteria; counted when one of those tasks is not CANCELLED (-102).
-fn scope(conn: &Connection, run_id: &str, spec_id: &str) -> Result<Vec<InScope>, PersistError> {
-    let verifiers = super::verification::verifier_tasks(conn, run_id)?;
-    let mut statement = conn
-        .prepare(
-            "SELECT t.task_id, t.state, a.ac_id, a.requirement_id, q.release_class = 'degradable' \
-             FROM tasks t JOIN task_requirements tr ON tr.task_id = t.task_id AND tr.spec_id = ?2 \
-             JOIN acceptance_criteria a ON a.requirement_id = tr.requirement_id AND a.spec_id = tr.spec_id \
-             JOIN requirements q ON q.requirement_id = a.requirement_id AND q.spec_id = a.spec_id \
-             WHERE t.run_id = ?1 ORDER BY a.ac_id, t.task_id",
-        )
-        .map_err(sqlite_error)?;
-    let found: Vec<(String, String, String, String, bool)> = statement
-        .query_map(params![run_id, spec_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+/// Every AC of this revision, independently of task mappings or task states (ADR-033 Q4).
+fn scope(conn: &Connection, spec_id: &str) -> Result<Vec<InScope>, PersistError> {
+    conn.prepare(
+        "SELECT a.ac_id,a.requirement_id,q.release_class='degradable' FROM acceptance_criteria a \
+         JOIN requirements q ON q.requirement_id=a.requirement_id AND q.spec_id=a.spec_id \
+         WHERE a.spec_id=?1 ORDER BY a.ac_id",
+    )
+    .map_err(sqlite_error)?
+    .query_map(params![spec_id], |r| {
+        Ok(InScope {
+            ac: r.get(0)?,
+            requirement: r.get(1)?,
+            degradable: r.get(2)?,
+            counted: true,
         })
-        .map_err(sqlite_error)?
-        .collect::<Result<_, _>>()
-        .map_err(sqlite_error)?;
-    let mut acs: BTreeMap<String, InScope> = BTreeMap::new();
-    for (task, state, ac, requirement, degradable) in found {
-        if verifiers.contains(&task) {
-            continue;
-        }
-        let counted = state != "CANCELLED";
-        acs.entry(ac.clone())
-            .and_modify(|a| a.counted |= counted)
-            .or_insert(InScope {
-                ac,
-                requirement,
-                degradable,
-                counted,
-            });
-    }
-    Ok(acs.into_values().collect())
+    })
+    .map_err(sqlite_error)?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(sqlite_error)
 }
 
 /// A candidate of a run: its id, state and its `candidate.frozen`'s seq (0 without one).
 struct Frozen {
     id: String,
+    spec_sha256: String,
     state: String,
     seq: i64,
     /// Its row, which orders candidates with the same freeze seq (none written: older or imported data, M2T18R-53).
@@ -220,7 +205,7 @@ fn candidates(conn: &Connection, run_id: &str) -> Result<Vec<Frozen>, PersistErr
         .prepare(
             "SELECT c.candidate_id, c.state, coalesce((SELECT max(e.seq) FROM events e WHERE e.run_id = c.run_id \
                AND e.kind = 'candidate.frozen' AND json_extract(e.payload_json, '$.candidate_id') = c.candidate_id), 0) \
-               AS frozen, c.rowid \
+               AS frozen, c.rowid, c.spec_sha256 \
              FROM candidates c WHERE c.run_id = ?1 ORDER BY frozen DESC, c.rowid DESC",
         )
         .map_err(sqlite_error)?;
@@ -231,6 +216,7 @@ fn candidates(conn: &Connection, run_id: &str) -> Result<Vec<Frozen>, PersistErr
                 state: r.get(1)?,
                 seq: r.get(2)?,
                 rowid: r.get(3)?,
+                spec_sha256: r.get(4)?,
             })
         })
         .map_err(sqlite_error)?;
@@ -474,14 +460,29 @@ pub(super) fn view_in(
     let Some(spec) = run_spec(conn, run_id)? else {
         return Ok(None);
     };
+    let spec_revision = spec.as_ref().map(|(_, revision)| *revision);
     let spec_id = spec.map(|(id, _)| id);
     let scope = match &spec_id {
-        Some(spec_id) => scope(conn, run_id, spec_id)?,
+        Some(spec_id) => scope(conn, spec_id)?,
         None => Vec::new(),
     };
     let latest = candidates(conn, run_id)?.into_iter().next();
     let rounds = closing::rounds(conn, run_id)?;
-    let (acs, qa, review, checks) = match (&latest, &spec_id) {
+    let current_digest: Option<String> = match &spec_id {
+        Some(id) => Some(
+            conn.query_row(
+                "SELECT sha256 FROM specs WHERE spec_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?,
+        ),
+        None => None,
+    };
+    let current = latest
+        .as_ref()
+        .filter(|c| current_digest.as_deref() == Some(c.spec_sha256.as_str()));
+    let (acs, qa, review, checks) = match (current, &spec_id) {
         (Some(c), Some(spec_id)) => {
             let (qa, review) = reports(conn, &c.id, Some(spec_id), &rounds)?;
             (
@@ -525,6 +526,7 @@ pub(super) fn view_in(
     Ok(Some(AcceptanceView {
         run_id: run_id.to_owned(),
         spec_id,
+        spec_revision,
         candidate: latest.map(|c| CandidateShown {
             candidate_id: c.id,
             state: c.state,
@@ -550,9 +552,27 @@ pub(super) fn acceptance(
     })
 }
 
+/// Revisions with actual rows on this candidate. Before any observation, use its bound digest;
+/// legacy imported candidates with no matching spec retain the current revision's empty projection.
+fn historical_specs(
+    conn: &Connection,
+    c: &Frozen,
+    current: &str,
+    revision: i64,
+) -> Result<Vec<(String, i64)>, PersistError> {
+    let mut found = conn.prepare("SELECT DISTINCT s.spec_id,s.revision FROM acceptance_results a JOIN specs s ON s.spec_id=a.spec_id WHERE a.candidate_id=?1 ORDER BY s.revision DESC")
+        .map_err(sqlite_error)?.query_map(params![c.id], |r| Ok((r.get(0)?,r.get(1)?)))
+        .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
+    if found.is_empty() {
+        let bound = conn.query_row("SELECT s.spec_id,s.revision FROM specs s JOIN runs r ON r.project_id=s.project_id JOIN candidates c ON c.run_id=r.run_id WHERE c.candidate_id=?1 AND s.sha256=c.spec_sha256 ORDER BY s.revision DESC LIMIT 1",params![c.id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
+        found.push(bound.unwrap_or_else(|| (current.to_owned(), revision)));
+    }
+    Ok(found)
+}
+
 /// A page of run `run_id`'s acceptance projection (`GET /v1/runs/{run_id}/acceptance`, decision 5): every candidate of
-/// the run, the latest first, each AC in the run's scope on it by id, labelled by the display projection of its rows
-/// there under the run's specification; at most `limit` items after `after` (the freeze seq, the candidate's row and the AC of the last item of
+/// the run, the latest first, each revision's ACs by id. Historical revisions retain their rows and show STALE.
+/// At most `limit` items after `after` (the freeze seq, the candidate's row and revision/AC of the last item of
 /// the previous page); the next cursor when more follow. None when there is no such run.
 pub(super) fn acceptance_page(
     conn: &Connection,
@@ -561,18 +581,19 @@ pub(super) fn acceptance_page(
     after: Option<(i64, i64, String)>,
 ) -> Result<Option<AcceptancePage>, PersistError> {
     read(conn, || {
-        let Some(spec) = run_spec(conn, run_id)? else {
+        let watermark = super::commands::max_seq(conn)?;
+        let Some(current) = view_in(conn, run_id, watermark)? else {
             return Ok(None);
         };
-        let watermark = super::commands::max_seq(conn)?;
+        let spec = current.spec_id.clone().zip(current.spec_revision);
         let Some((spec_id, spec_revision)) = spec else {
             return Ok(Some(AcceptancePage {
+                current,
                 items: Vec::new(),
                 next: None,
                 watermark,
             }));
         };
-        let scope = scope(conn, run_id, &spec_id)?;
         let rounds = closing::rounds(conn, run_id)?;
         let all = candidates(conn, run_id)?;
         let latest = all.first().map(|c| c.id.clone());
@@ -585,26 +606,36 @@ pub(super) fn acceptance_page(
             {
                 continue;
             }
-            for a in shown(conn, run_id, &spec_id, c, &scope, &rounds)? {
-                let key = (c.seq, c.rowid, a.ac_id.clone());
-                if after.as_ref().is_some_and(|(seq, row, ac)| {
-                    (c.seq, c.rowid) == (*seq, *row) && a.ac_id <= *ac
-                }) {
-                    continue;
+            for (id, revision) in historical_specs(conn, c, &spec_id, spec_revision)? {
+                let scope = scope(conn, &id)?;
+                for a in shown(conn, run_id, &id, c, &scope, &rounds)? {
+                    // The opaque cursor includes the revision so an AC retained across revisions cannot be skipped.
+                    let order = format!("{:020}:{}", i64::MAX - revision, a.ac_id);
+                    let key = (c.seq, c.rowid, order.clone());
+                    if after.as_ref().is_some_and(|(seq, row, ac)| {
+                        (c.seq, c.rowid) == (*seq, *row) && order <= *ac
+                    }) {
+                        continue;
+                    }
+                    let old = id != spec_id;
+                    keyed.push((
+                        key,
+                        AcceptanceItem {
+                            spec_id: id.clone(),
+                            spec_revision: revision,
+                            candidate_id: c.id.clone(),
+                            candidate_state: c.state.clone(),
+                            ac_id: a.ac_id,
+                            label: if old { Label::Stale } else { a.label },
+                            why: if old {
+                                Some(Why::CandidateStale)
+                            } else {
+                                a.why
+                            },
+                            latest: latest.as_deref() == Some(c.id.as_str()),
+                        },
+                    ));
                 }
-                keyed.push((
-                    key,
-                    AcceptanceItem {
-                        spec_id: spec_id.clone(),
-                        spec_revision,
-                        candidate_id: c.id.clone(),
-                        candidate_state: c.state.clone(),
-                        ac_id: a.ac_id,
-                        label: a.label,
-                        why: a.why,
-                        latest: latest.as_deref() == Some(c.id.as_str()),
-                    },
-                ));
             }
             if keyed.len() > limit {
                 break;
@@ -615,6 +646,7 @@ pub(super) fn acceptance_page(
             .flatten();
         keyed.truncate(limit);
         Ok(Some(AcceptancePage {
+            current,
             items: keyed.into_iter().map(|(_, item)| item).collect(),
             next,
             watermark,

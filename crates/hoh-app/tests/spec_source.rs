@@ -597,3 +597,392 @@ async fn test_034_02_cr_base_conflict_is_read_only() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+async fn submit_spec(host: &Host, run: &str, key: &str, kind: &str, index: &Index) -> R<Value> {
+    let payload = if kind == "ProposeSpecChange" {
+        json!({"spec_sha256":index.sha256(),"reason":"revise acceptance"})
+    } else {
+        json!({"spec_sha256":index.sha256(),"decision":"APPROVE_ONLY"})
+    };
+    let body = command(host, run, key, kind, payload).await?;
+    let (status, response) = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(status, 202, "{kind}: {response}");
+    Ok(body)
+}
+
+fn revise_a(world: &World) -> R<Index> {
+    let mut files = sources();
+    files[0].bytes = String::from_utf8(files[0].bytes.clone())?
+        .replacen("then: result 2", "then: result X", 1)
+        .into_bytes();
+    std::fs::write(world.project().join(&files[0].path), &files[0].bytes)?;
+    Ok(specindex::generate_index(&files)?)
+}
+
+fn tasks(world: &World, run: &str) -> R {
+    for (seq, req) in ["A", "B", "C"].into_iter().enumerate() {
+        world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+            SELECT 'T{req}',run_id,spec_id,'ACCEPTED','developer',1,{seq} FROM runs WHERE run_id='{run}';
+            INSERT INTO task_requirements(task_id,requirement_id,spec_id)
+            SELECT 'T{req}','REQ-{req}',spec_id FROM runs WHERE run_id='{run}';"))?;
+    }
+    Ok(())
+}
+
+fn event_payloads(world: &World, kind: &str) -> R<Vec<Value>> {
+    world
+        .rows(&format!(
+            "SELECT payload_json FROM events WHERE kind='{kind}' ORDER BY seq"
+        ))?
+        .iter()
+        .map(|r| {
+            Ok(serde_json::from_str(
+                r["payload_json"].as_str().ok_or("no payload")?,
+            )?)
+        })
+        .collect()
+}
+
+async fn decide(
+    world: &World,
+    host: &Host,
+    run: &str,
+    id: &str,
+    candidate: Option<String>,
+    payload: Value,
+) -> R<hoh_core::persistence::Decided> {
+    let state = world.rows(&format!("SELECT r.revision,s.sha256,b.role_epoch FROM runs r JOIN specs s ON s.spec_id=r.spec_id JOIN role_bindings b ON b.run_id=r.run_id AND b.role='commander' WHERE r.run_id='{run}'"))?;
+    let proposal = hoh_core::decision::Proposal {
+        decision_id: id.into(),
+        run_id: run.into(),
+        expected_revision: state[0]["revision"].as_u64().ok_or("revision")?,
+        role_epoch: state[0]["role_epoch"].as_u64().ok_or("epoch")?,
+        spec_sha256: state[0]["sha256"].as_str().ok_or("digest")?.into(),
+        candidate_id: candidate,
+        causation_id: None,
+        payload: hoh_core::protocol::decode(&payload)?,
+    };
+    Ok(host
+        .store()
+        .decide(proposal, hoh_core::decision::Context::default())
+        .await?)
+}
+
+#[tokio::test]
+async fn test_033_01_change_request_closure_and_approve() -> R {
+    let world = World::new()?;
+    let (host, run, first) = approved(&world).await?;
+    tasks(&world, &run)?;
+    let other = world::start_run(&host, "other", "same project").await?;
+    let ended = world::start_run(&host, "ended", "historical run").await?;
+    world.exec(&format!(
+        "UPDATE runs SET state='COMPLETED' WHERE run_id='{ended}'"
+    ))?;
+    let before_runs = world.rows("SELECT run_id,spec_id FROM runs ORDER BY run_id")?;
+    let before_tasks = world.rows("SELECT * FROM tasks ORDER BY task_id")?;
+    let next = revise_a(&world)?;
+    let proposal = submit_spec(&host, &run, "closure", "ProposeSpecChange", &next).await?;
+    let crs = world.rows("SELECT * FROM change_requests")?;
+    assert_eq!(crs.len(), 1);
+    assert_eq!(crs[0]["state"], "PROPOSED");
+    assert_eq!(
+        crs[0]["base_spec_id"],
+        before_runs
+            .iter()
+            .find(|r| r["run_id"] == run)
+            .ok_or("run")?["spec_id"]
+    );
+    let impact: Value = serde_json::from_str(crs[0]["impact_json"].as_str().ok_or("impact")?)?;
+    assert_eq!(
+        impact,
+        json!({"requirements":["REQ-A"],"acceptance":["AC-A-01","AC-A-02"],"tests":["TEST-A-01","TEST-A-02"],"tasks":["TA"]})
+    );
+    assert_eq!(
+        world.rows("SELECT run_id,spec_id FROM runs ORDER BY run_id")?,
+        before_runs
+    );
+    assert_eq!(
+        world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+        before_tasks
+    );
+    assert_eq!(world.query("SELECT count(*) FROM specs")?, "1");
+    assert_eq!(
+        world::exchange(&host, "POST", "/v1/commands", Some(&proposal))
+            .await?
+            .0,
+        202
+    );
+    assert_eq!(world.query("SELECT count(*) FROM change_requests")?, "1");
+    let approval = submit_spec(&host, &run, "closure-approval", "ApproveSpec", &next).await?;
+    let current = world.query("SELECT spec_id FROM specs WHERE revision=2")?;
+    assert_ne!(first.sha256(), next.sha256());
+    assert_eq!(world.query("SELECT state FROM change_requests")?, "APPLIED");
+    assert_eq!(
+        world.query("SELECT result_spec_id FROM change_requests")?,
+        current
+    );
+    for id in [&run, &other] {
+        assert_eq!(
+            world.query(&format!("SELECT spec_id FROM runs WHERE run_id='{id}'"))?,
+            current
+        );
+    }
+    assert_eq!(world.query(&format!("SELECT s.revision FROM runs r JOIN specs s ON s.spec_id=r.spec_id WHERE r.run_id='{ended}'"))?, "1");
+    let changed_events: Vec<_> = event_payloads(&world, "spec.changed")?
+        .into_iter()
+        .filter(|e| e["cause"] == "changed")
+        .collect();
+    assert_eq!(changed_events.len(), 2);
+    for e in changed_events {
+        assert_eq!(e["from"], 1);
+        assert_eq!(e["to"], 2);
+        assert_eq!(e["spec_revision"], 2);
+        assert_eq!(e["cr_id"], crs[0]["cr_id"]);
+    }
+    let after = snapshot(&world)?;
+    assert_eq!(
+        world::exchange(&host, "POST", "/v1/commands", Some(&approval))
+            .await?
+            .0,
+        202
+    );
+    assert_eq!(snapshot(&world)?, after);
+    // Q3 also includes non-terminal runs still on a revision older than this CR's base.
+    let older = world::start_run(&host, "older", "older specification").await?;
+    world.exec(&format!("UPDATE runs SET spec_id=(SELECT spec_id FROM specs WHERE revision=1) WHERE run_id='{older}'"))?;
+    let third = changed(&world)?;
+    submit_spec(&host, &run, "third-proposal", "ProposeSpecChange", &third).await?;
+    submit_spec(&host, &run, "third-approval", "ApproveSpec", &third).await?;
+    for id in [&run, &other, &older] {
+        assert_eq!(world.query(&format!("SELECT s.revision FROM runs r JOIN specs s ON s.spec_id=r.spec_id WHERE r.run_id='{id}'"))?, "3");
+    }
+    assert_eq!(world.query(&format!("SELECT s.revision FROM runs r JOIN specs s ON s.spec_id=r.spec_id WHERE r.run_id='{ended}'"))?, "1");
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Persisted accepted candidate fixture; no verification process or live agent runs.
+async fn accepted_candidate(world: &World, host: &Host, run: &str) -> R<String> {
+    tasks(world, run)?;
+    let frozen = freeze(
+        host.store(),
+        &world.project(),
+        &world.project().join(".hoh"),
+        run,
+        &Inputs {
+            spec: specindex::PATH.into(),
+            environment: "environment.json".into(),
+            test_plan: "tests/check-plan.json".into(),
+        },
+    )
+    .await?;
+    let hoh_core::persistence::Frozen::New { candidate_id, .. } = frozen else {
+        return Err("new candidate expected".into());
+    };
+    world.exec(&format!("UPDATE candidates SET state='ACCEPTED' WHERE candidate_id='{candidate_id}';
+        INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('observed','TA','SETTLED',1,1,0);
+        INSERT INTO artifacts(artifact_id,sha256,path,bytes,mime) VALUES('observed','{hash}','fixture',0,'application/json');
+        INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
+        VALUES('observed','{candidate_id}','observed','observed','fixture','fixture','PASS','mock','2026-11-21T00:00:00Z');
+        INSERT INTO acceptance_results(ac_id,spec_id,candidate_id,evidence_id,status)
+        SELECT a.ac_id,a.spec_id,'{candidate_id}','observed','PASS' FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}';
+        UPDATE runs SET state='VERIFYING',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL WHERE run_id='{run}';",hash="0".repeat(64)))?;
+    world.staff(run)?;
+    Ok(candidate_id)
+}
+
+#[tokio::test]
+async fn test_033_03_revision_stales_all_acceptance() -> R {
+    let world = World::new()?;
+    let (host, run, first) = approved(&world).await?;
+    let candidate = accepted_candidate(&world, &host, &run).await?;
+    let (_, before) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    assert_eq!(before["projection"]["acceptance"]["accepted"], 7);
+    let old_rows = world.rows("SELECT * FROM acceptance_results ORDER BY ac_id")?;
+    let next = revise_a(&world)?;
+    assert_ne!(first.sha256(), next.sha256());
+    submit_spec(&host, &run, "stale-proposal", "ProposeSpecChange", &next).await?;
+    assert_eq!(world.query("SELECT state FROM candidates")?, "ACCEPTED");
+    let approval = submit_spec(&host, &run, "stale-approval", "ApproveSpec", &next).await?;
+    assert_eq!(
+        world.query("SELECT state FROM candidates")?,
+        "STALE",
+        "a changed specification must stale its accepted candidate"
+    );
+    let stale = event_payloads(&world, "candidate.stale")?;
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0]["candidate_id"], candidate);
+    assert_eq!(stale[0]["reason"], "spec_changed");
+    assert_eq!(
+        world.rows("SELECT * FROM acceptance_results ORDER BY ac_id")?,
+        old_rows,
+        "history is immutable"
+    );
+    let (_, after) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    let summary = &after["projection"]["acceptance"];
+    assert_eq!(summary["spec_revision"], 2);
+    assert_eq!(summary["accepted"], 0);
+    assert_eq!(summary["passing"], 0);
+    assert_eq!(
+        summary["total"], 7,
+        "all current ACs count without migrating accepted tasks"
+    );
+    let (_, page) =
+        world::exchange(&host, "GET", &format!("/v1/runs/{run}/acceptance"), None).await?;
+    assert_eq!(page["current"]["spec_revision"], 2);
+    let acs = page["current"]["acs"].as_array().ok_or("current ACs")?;
+    assert_eq!(acs.len(), 7);
+    assert!(
+        acs.iter()
+            .all(|a| a["label"] == "NOT_RUN" && a["rows"] == json!([]))
+    );
+    assert!(acs.iter().any(|a| a["requirement_id"] == "REQ-B"));
+    let history = page["items"].as_array().ok_or("history")?;
+    assert_eq!(history.len(), 7);
+    assert!(history.iter().all(|a| a["spec_revision"] == 1
+        && a["label"] == "STALE"
+        && a["candidate_id"] == candidate));
+    // Pagination retains every historical AC exactly once.
+    let mut cursor = None;
+    let mut paged = Vec::new();
+    loop {
+        let path = match &cursor {
+            Some(c) => format!("/v1/runs/{run}/acceptance?limit=2&cursor={c}"),
+            None => format!("/v1/runs/{run}/acceptance?limit=2"),
+        };
+        let (_, p) = world::exchange(&host, "GET", &path, None).await?;
+        paged.extend(p["items"].as_array().ok_or("items")?.iter().cloned());
+        cursor = p["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+        assert!(paged.len() < 8, "pagination must advance");
+    }
+    assert_eq!(&paged, history);
+    let result = decide(
+        &world,
+        &host,
+        &run,
+        "complete-stale",
+        None,
+        world::transition("COMPLETED"),
+    )
+    .await?;
+    assert!(
+        matches!(
+            result,
+            hoh_core::persistence::Decided::Rejected {
+                reason: hoh_core::protocol::RejectionReason::EvidenceGateUnmet,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_ne!(
+        world.query(&format!("SELECT state FROM runs WHERE run_id='{run}'"))?,
+        "COMPLETED"
+    );
+    assert_eq!(
+        world::exchange(&host, "POST", "/v1/commands", Some(&approval))
+            .await?
+            .0,
+        202
+    );
+    assert_eq!(event_payloads(&world, "candidate.stale")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_033_03_stale_states_preserve_judgments_and_rollback_atomically() -> R {
+    let world = World::new()?;
+    let (host, run, _) = approved(&world).await?;
+    let original = accepted_candidate(&world, &host, &run).await?;
+    let ended = world::start_run(&host, "history", "finished").await?;
+    world.exec(&format!(
+        "UPDATE runs SET state='COMPLETED' WHERE run_id='{ended}'"
+    ))?;
+    for state in [
+        "FROZEN",
+        "VERIFYING",
+        "REJECTED",
+        "INVALID",
+        "STALE",
+        "ACCEPTED",
+    ] {
+        world.exec(&format!("INSERT INTO candidates SELECT 'C-{state}',run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,'{state}',created_at FROM candidates WHERE candidate_id='{original}'"))?;
+    }
+    world.exec(&format!("INSERT INTO candidates SELECT 'C-history','{ended}',git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,'ACCEPTED',created_at FROM candidates WHERE candidate_id='{original}';
+        INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at)
+        SELECT project_id,'{judgment}',run_id,'candidate.stale','{{\"candidate_id\":\"C-ACCEPTED\",\"reason\":\"evidence_unrecoverable\"}}',created_at FROM runs WHERE run_id='{run}';",
+        judgment=hoh_core::ids::child_id("C-ACCEPTED","stale")))?;
+    let next = revise_a(&world)?;
+    submit_spec(&host, &run, "states-propose", "ProposeSpecChange", &next).await?;
+    let body = command(
+        &host,
+        &run,
+        "states-approve",
+        "ApproveSpec",
+        json!({"spec_sha256":next.sha256(),"decision":"APPROVE_ONLY"}),
+    )
+    .await?;
+    let before = snapshot(&world)?;
+    let candidates = world.rows("SELECT * FROM candidates ORDER BY candidate_id")?;
+    world.exec("CREATE TRIGGER refuse_stale BEFORE INSERT ON events WHEN NEW.kind='candidate.stale' BEGIN SELECT RAISE(ABORT,'fixture refuses stale event'); END;")?;
+    let (status, response) = world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(status, 409, "the injected constraint refusal: {response}");
+    assert_eq!(
+        snapshot(&world)?,
+        before,
+        "approval must roll back every derived row and run change"
+    );
+    assert_eq!(
+        world.rows("SELECT * FROM candidates ORDER BY candidate_id")?,
+        candidates
+    );
+    world.exec("DROP TRIGGER refuse_stale;")?;
+    assert_eq!(
+        world::exchange(&host, "POST", "/v1/commands", Some(&body))
+            .await?
+            .0,
+        202
+    );
+    for state in ["FROZEN", "VERIFYING", "ACCEPTED", "STALE"] {
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state FROM candidates WHERE candidate_id='C-{state}'"
+            ))?,
+            "STALE"
+        );
+    }
+    for state in ["REJECTED", "INVALID"] {
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state FROM candidates WHERE candidate_id='C-{state}'"
+            ))?,
+            state
+        );
+    }
+    assert_eq!(
+        world.query("SELECT state FROM candidates WHERE candidate_id='C-history'")?,
+        "ACCEPTED"
+    );
+    let judgments = event_payloads(&world, "candidate.stale")?;
+    assert_eq!(judgments.len(), 4);
+    assert_eq!(
+        judgments
+            .iter()
+            .find(|e| e["candidate_id"] == "C-ACCEPTED")
+            .ok_or("prior judgment")?["reason"],
+        "evidence_unrecoverable"
+    );
+    assert_eq!(
+        judgments
+            .iter()
+            .filter(|e| e["reason"] == "spec_changed")
+            .count(),
+        3
+    );
+    host.shutdown().await;
+    Ok(())
+}
