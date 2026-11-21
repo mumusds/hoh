@@ -819,9 +819,10 @@ async fn accepted_candidate(world: &World, host: &Host, run: &str) -> R<String> 
         INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('observed','TA','SETTLED',1,1,0);
         INSERT INTO artifacts(artifact_id,sha256,path,bytes,mime) VALUES('observed','{hash}','fixture',0,'application/json');
         INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
-        VALUES('observed','{candidate_id}','observed','observed','fixture','fixture','PASS','mock','2026-11-21T00:00:00Z');
+        SELECT 'observed-'||a.ac_id,'{candidate_id}','observed','observed',a.check_id,'check','PASS','mock','2026-11-21T00:00:00Z'
+        FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}';
         INSERT INTO acceptance_results(ac_id,spec_id,candidate_id,evidence_id,status)
-        SELECT a.ac_id,a.spec_id,'{candidate_id}','observed','PASS' FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}';
+        SELECT a.ac_id,a.spec_id,'{candidate_id}','observed-'||a.ac_id,'PASS' FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}';
         UPDATE runs SET state='VERIFYING',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL WHERE run_id='{run}';",hash="0".repeat(64)))?;
     world.staff(run)?;
     Ok(candidate_id)
@@ -832,6 +833,29 @@ async fn test_033_03_revision_stales_all_acceptance() -> R {
     let world = World::new()?;
     let (host, run, first) = approved(&world).await?;
     let candidate = accepted_candidate(&world, &host, &run).await?;
+    // Exercise the real gate on this candidate, then roll back only the completion write so that
+    // the same non-terminal Run can receive the approval below. A rejected gate never hits this trigger.
+    world.exec("CREATE TRIGGER completion_probe BEFORE UPDATE OF state ON runs WHEN NEW.state='COMPLETED' BEGIN SELECT RAISE(ABORT,'fixture: completion gate passed'); END;")?;
+    let before_completion = decide(
+        &world,
+        &host,
+        &run,
+        "complete-before-approval",
+        Some(candidate.clone()),
+        world::transition("COMPLETED"),
+    )
+    .await;
+    assert!(
+        before_completion
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("fixture: completion gate passed")),
+        "revision 1 must pass the real completion gate: {before_completion:?}"
+    );
+    world.exec("DROP TRIGGER completion_probe;")?;
+    assert_eq!(
+        world.query(&format!("SELECT state FROM runs WHERE run_id='{run}'"))?,
+        "VERIFYING"
+    );
     let (_, before) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
     assert_eq!(before["projection"]["acceptance"]["accepted"], 7);
     let old_rows = world.rows("SELECT * FROM acceptance_results ORDER BY ac_id")?;
@@ -903,20 +927,49 @@ async fn test_033_03_revision_stales_all_acceptance() -> R {
         &host,
         &run,
         "complete-stale",
-        None,
+        Some(candidate.clone()),
+        world::transition("COMPLETED"),
+    )
+    .await?;
+    let hoh_core::persistence::Decided::Rejected { reason, detail, .. } = result else {
+        return Err(format!("stale completion must be refused: {result:?}").into());
+    };
+    assert_eq!(
+        reason,
+        hoh_core::protocol::RejectionReason::EvidenceGateUnmet,
+        "{detail}"
+    );
+    assert!(
+        detail.contains(&candidate) && detail.contains("STALE"),
+        "{detail}"
+    );
+    for ac in &current {
+        assert!(
+            detail.contains(ac["ac_id"].as_str().ok_or("AC id")?),
+            "the new revision's AC must be named: {detail}"
+        );
+    }
+    assert!(!detail.contains("no candidate"), "{detail}");
+    let unrelated = decide(
+        &world,
+        &host,
+        &run,
+        "complete-unknown-candidate",
+        Some(format!("CAND-{}", "f".repeat(64))),
         world::transition("COMPLETED"),
     )
     .await?;
     assert!(
         matches!(
-            result,
+            unrelated,
             hoh_core::persistence::Decided::Rejected {
-                reason: hoh_core::protocol::RejectionReason::EvidenceGateUnmet,
+                reason: hoh_core::protocol::RejectionReason::CandidateMismatch,
                 ..
             }
         ),
-        "{result:?}"
+        "{unrelated:?}"
     );
+
     assert_ne!(
         world.query(&format!("SELECT state FROM runs WHERE run_id='{run}'"))?,
         "COMPLETED"
@@ -928,6 +981,37 @@ async fn test_033_03_revision_stales_all_acceptance() -> R {
         202
     );
     assert_eq!(event_payloads(&world, "candidate.stale")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_033_03_same_revision_stale_candidate_keeps_candidate_mismatch() -> R {
+    let world = World::new()?;
+    let (host, run, _) = approved(&world).await?;
+    let candidate = accepted_candidate(&world, &host, &run).await?;
+    world.exec(&format!(
+        "UPDATE candidates SET state='STALE' WHERE candidate_id='{candidate}'"
+    ))?;
+    let result = decide(
+        &world,
+        &host,
+        &run,
+        "same-revision-stale",
+        Some(candidate),
+        world::transition("COMPLETED"),
+    )
+    .await?;
+    assert!(
+        matches!(
+            result,
+            hoh_core::persistence::Decided::Rejected {
+                reason: hoh_core::protocol::RejectionReason::CandidateMismatch,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
     host.shutdown().await;
     Ok(())
 }

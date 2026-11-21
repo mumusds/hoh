@@ -226,7 +226,7 @@ pub(super) fn decide_in(
         None => answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?,
     };
     // The fences in order: the Commander's epoch, the run's revision, then the tasks its turn was shown.
-    let verdict = match decision::validate(proposal, &snapshot) {
+    let mut verdict = match decision::validate(proposal, &snapshot) {
         Err(r)
             if matches!(
                 r.reason,
@@ -240,6 +240,9 @@ pub(super) fn decide_in(
             None => verdict,
         },
     };
+    if let Err(ref mut rejection) = verdict {
+        explain_stale_completion(tx, proposal, rejection)?;
+    }
     let decided = match verdict {
         Ok(Effect::Unsupported(kind)) => return Ok(Decided::Unsupported { kind }),
         Ok(effect) => {
@@ -331,6 +334,46 @@ pub(super) fn decide_in(
         }
     };
     Ok(decided)
+}
+
+/// Refine an already refused completion's diagnostic for revision-bound stale evidence (REQ-033).
+/// The gate and its acceptance predicate are unchanged; all other candidate mismatches keep their reason.
+fn explain_stale_completion(
+    tx: &Transaction<'_>,
+    proposal: &Proposal,
+    rejection: &mut Rejection,
+) -> Result<(), PersistError> {
+    if rejection.reason != RejectionReason::CandidateMismatch
+        || !matches!(
+            proposal.payload,
+            protocol::DecisionPayload::TransitionRun {
+                to_state: RunState::Completed,
+                ..
+            }
+        )
+    {
+        return Ok(());
+    }
+    let Some(candidate) = proposal.candidate_id.as_deref() else {
+        return Ok(());
+    };
+    let current: Option<(String, i64)> = tx.query_row(
+        "SELECT s.spec_id,s.revision FROM candidates c JOIN runs r ON r.run_id=c.run_id JOIN specs s ON s.spec_id=r.spec_id WHERE c.run_id=?1 AND c.candidate_id=?2 AND c.state='STALE' AND c.spec_sha256<>s.sha256",
+        params![proposal.run_id,candidate], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional().map_err(sqlite_error)?;
+    let Some((spec, revision)) = current else {
+        return Ok(());
+    };
+    let criteria = strings(
+        tx,
+        "SELECT a.ac_id FROM acceptance_criteria a JOIN requirements q ON q.spec_id=a.spec_id AND q.requirement_id=a.requirement_id WHERE a.spec_id=?1 AND q.required_release=1",
+        &[&spec],
+    )?;
+    rejection.reason = RejectionReason::EvidenceGateUnmet;
+    rejection.detail = format!(
+        "candidate {candidate} is STALE: its old-revision evidence cannot satisfy specification revision {revision} acceptance criteria {criteria:?}"
+    );
+    Ok(())
 }
 
 /// The `supervisor.retrigger` of a stale answer to `turn`'s wake (decision 6): the wake's base fingerprint and the
