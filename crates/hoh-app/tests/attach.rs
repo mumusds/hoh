@@ -687,11 +687,11 @@ fn lingering_user() -> Option<String> {
 
 /// The pid a stand-in wrote to `file` once it started (written to a temporary name, then renamed), waited for at most
 /// `limit` while `client` runs.
-fn started_pid(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
+fn started_pid(file: &Path, client: &mut Kid, limit: Duration) -> R<(i32, String)> {
     let end = Instant::now() + limit;
     loop {
-        if let Ok(text) = std::fs::read_to_string(file) {
-            return Ok(text.trim().parse()?);
+        if std::fs::exists(file)? {
+            return named(file).ok_or_else(|| "the stand-in's pid file names no process".into());
         }
         if let Some(status) = client.get_mut()?.try_wait()? {
             return Err(format!("the client ended first: {status}").into());
@@ -703,20 +703,95 @@ fn started_pid(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
     }
 }
 
-/// [`started_pid`], and on its failure the stand-in that `file` names, if it started meanwhile, killed (CLT-354): a
-/// failed test leaves no `sleep 30` behind.
-fn started_or_ended(file: &Path, client: &mut Kid, limit: Duration) -> R<i32> {
-    started_pid(file, client, limit).inspect_err(|_| {
-        if let Some(pid) = std::fs::read_to_string(file)
-            .ok()
-            .and_then(|text| text.trim().parse::<i32>().ok())
-            .and_then(rustix::process::Pid::from_raw)
-            && let Ok(pidfd) =
-                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
-        {
-            kill_held(&pidfd);
-        }
-    })
+/// The stand-in that `file` names: its pid (first line) and its start time (field 22 of the `/proc/<pid>/stat` line
+/// it wrote after it).
+fn named(file: &Path) -> Option<(i32, String)> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse().ok()?;
+    let start = hoh_agents::identity::after_command_name(lines.next()?.as_bytes())?
+        .split_whitespace()
+        .nth(19)?
+        .to_owned();
+    Some((pid, start))
+}
+
+/// A pidfd on process `pid` only while it is still the one started at `start` (CLN4-55): the pidfd is opened first and
+/// the start time read after it, so a number the stand-in left and another process took is never held (and so never
+/// killed); `None` when it is gone or another's.
+fn hold(pid: i32, start: &str) -> R<Option<std::os::fd::OwnedFd>> {
+    let raw = rustix::process::Pid::from_raw(pid).ok_or("no pid")?;
+    let pidfd = match rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let now = hoh_agents::identity::start_id(u32::try_from(pid)?)?;
+    Ok((now.as_deref() == Some(start)).then_some(pidfd))
+}
+
+/// Kill the stand-in that `file` names, if it started and is still that process.
+fn kill_named(file: &Path) {
+    if let Some((pid, start)) = named(file)
+        && let Ok(Some(pidfd)) = hold(pid, &start)
+    {
+        kill_held(&pidfd);
+    }
+}
+
+/// [`started_pid`], held (checked to be the stand-in that started, [`hold`]); on a failure the stand-in that `file`
+/// names, if it started meanwhile, killed (CLT-354): a failed test leaves no `sleep 30` behind.
+fn started_or_ended(file: &Path, client: &mut Kid, limit: Duration) -> R<std::os::fd::OwnedFd> {
+    let held = started_pid(file, client, limit).and_then(|(pid, start)| {
+        hold(pid, &start)?.ok_or_else(|| "the stand-in ended before it was held".into())
+    });
+    if held.is_err() {
+        kill_named(file);
+    }
+    held
+}
+
+#[test]
+fn a_stand_ins_number_taken_by_another_process_is_not_killed() -> R {
+    // CLN4-55: the cleanup kills the stand-in its file names only while that number is still the stand-in's (its start
+    // time); a process of the same number started at another time lives on. A process that is the one named is killed.
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("probe.pid");
+    let other = Kid(Some(Command::new("sleep").arg("30").spawn()?));
+    let pid = i32::try_from(other.get()?.id())?;
+    std::fs::write(
+        &file,
+        format!("{pid}\n{pid} (sleep) {}1\n", "0 ".repeat(19)),
+    )?;
+    let watch = rustix::process::pidfd_open(
+        rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
+        rustix::process::PidfdFlags::empty(),
+    )?;
+    kill_named(&file);
+    // A signal sent would have ended it well within this look's 300 ms.
+    let mut fds = [rustix::event::PollFd::new(
+        &watch,
+        rustix::event::PollFlags::IN,
+    )];
+    let within = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: 300_000_000,
+    };
+    assert_eq!(
+        rustix::event::poll(&mut fds, Some(&within))?,
+        0,
+        "a process whose number the stand-in had was killed"
+    );
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    std::fs::write(&file, format!("{pid}\n{stat}"))?;
+    kill_named(&file);
+    let status = finish(other.take()?, LIMIT)?.status;
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(9),
+        "the stand-in named was not killed"
+    );
+    Ok(())
 }
 
 /// Whether the process `pidfd` holds has ended (exited, whoever reaps it).
@@ -762,7 +837,7 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+                "#!/bin/sh\n{{ echo $$; cat /proc/$$/stat; }} > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
                 pid_file.display()
             ),
         )?;
@@ -785,11 +860,7 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
                 .stderr(Stdio::piped())
                 .spawn()?,
         ));
-        let pid = started_or_ended(&pid_file, &mut client, LIMIT)?;
-        let probe = rustix::process::pidfd_open(
-            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
-            rustix::process::PidfdFlags::empty(),
-        )?;
+        let probe = started_or_ended(&pid_file, &mut client, LIMIT)?;
         let outcome = (|| -> R<(Output, bool)> {
             send(client.get()?, signal)?;
             let out = finish(client.take()?, LIMIT)?;
@@ -1068,7 +1139,7 @@ fn sleeping_systemd_run(env: &Env) -> R<(std::ffi::OsString, PathBuf, PathBuf)> 
     std::fs::write(
         &fake,
         format!(
-            "#!/bin/sh\necho $$ > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
+            "#!/bin/sh\n{{ echo $$; cat /proc/$$/stat; }} > '{0}.tmp' && mv '{0}.tmp' '{0}'\nexec sleep 30\n",
             pid_file.display()
         ),
     )?;
@@ -1118,11 +1189,7 @@ fn a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended() -> R 
     let mut probe = None;
     let outcome = (|| -> R<(Output, bool)> {
         reached(&holds.join("helper-spawned.reached"), &mut client, LIMIT)?;
-        let pid = started_or_ended(&pid_file, &mut client, LIMIT)?;
-        let held = probe.insert(rustix::process::pidfd_open(
-            rustix::process::Pid::from_raw(pid).ok_or("no pid")?,
-            rustix::process::PidfdFlags::empty(),
-        )?);
+        let held = probe.insert(started_or_ended(&pid_file, &mut client, LIMIT)?);
         send(client.get()?, rustix::process::Signal::TERM)?;
         reached(&holds.join("stopping"), &mut client, LIMIT)?;
         std::fs::remove_file(holds.join("helper-spawned"))?;
