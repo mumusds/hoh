@@ -476,6 +476,10 @@ impl ProductExecutor {
         if let Some(source) = facts.code.clone() {
             facts.add_code(code_files(&self.project, &source));
         }
+        // A work task's path scope: its files at the workspace's HEAD (docs/adr/ADR-035.md decision 3).
+        if let Some(paths) = facts.code_scope.clone() {
+            facts.add_scoped_code(scoped_files(&self.project, &paths));
+        }
         let lead = package.map(context::lead).unwrap_or_default();
         // A work turn has a bridge file in its attempt's directory (docs/adr/ADR-028.md decision 2), told in its identity
         // header, the values its every output must repeat. A Commander turn is told where the project is (it runs
@@ -1190,7 +1194,6 @@ pub(super) fn code_files(
     project: &Path,
     source: &hoh_core::context::CodeSource,
 ) -> Result<(Vec<hoh_core::context::CodeFile>, usize), String> {
-    use hoh_core::context::{CODE_BYTES, CODE_FILES, CodeFile};
     let git = |args: &[&str]| super::control::git(project, args);
     let names = git(&[
         "diff",
@@ -1207,11 +1210,52 @@ pub(super) fn code_files(
         .collect();
     paths.sort();
     let total = paths.len();
-    let files = paths
+    Ok((read_at(project, &source.commit, paths), total))
+}
+
+/// The files under a work task's `paths` in the workspace's HEAD (docs/adr/ADR-035.md decision 3): HEAD, the first
+/// [`CODE_FILES`](hoh_core::context::CODE_FILES) of them by path read at it, and how many there are. Blocking.
+pub(super) fn scoped_files(
+    project: &Path,
+    paths: &[String],
+) -> Result<(String, Vec<hoh_core::context::CodeFile>, usize), String> {
+    let git = |args: &[&str]| super::control::git(project, args);
+    let head = git(&["rev-parse", "--verify", "-q", "HEAD^{commit}"])
+        .map_err(|_| "工作区还没有提交".to_owned())?;
+    let head = String::from_utf8_lossy(&head).trim().to_owned();
+    let mut args = vec![
+        "ls-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        "--full-tree",
+        &head,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    let names = git(&args)?;
+    let mut found: Vec<String> = names
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    found.sort();
+    found.dedup();
+    let total = found.len();
+    let files = read_at(project, &head, found);
+    Ok((head, files, total))
+}
+
+/// The first [`CODE_FILES`](hoh_core::context::CODE_FILES) of `paths` read at `commit`, each up to
+/// [`CODE_BYTES`](hoh_core::context::CODE_BYTES) of UTF-8 text, else its path only with why.
+fn read_at(project: &Path, commit: &str, paths: Vec<String>) -> Vec<hoh_core::context::CodeFile> {
+    use hoh_core::context::{CODE_BYTES, CODE_FILES, CodeFile};
+    let git = |args: &[&str]| super::control::git(project, args);
+    paths
         .into_iter()
         .take(CODE_FILES)
         .map(|path| {
-            let at = format!("{}:{path}", source.commit);
+            let at = format!("{commit}:{path}");
             let text = match git(&["cat-file", "-s", &at]) {
                 Err(_) => Err("在候选 commit 中没有这个文件（已删除）".to_owned()),
                 Ok(size) => match String::from_utf8_lossy(&size).trim().parse::<u64>() {
@@ -1225,8 +1269,7 @@ pub(super) fn code_files(
             };
             CodeFile { path, text }
         })
-        .collect();
-    Ok((files, total))
+        .collect()
 }
 
 #[cfg(test)]

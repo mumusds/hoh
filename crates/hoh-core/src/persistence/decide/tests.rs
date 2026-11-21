@@ -1768,3 +1768,68 @@ async fn an_unattended_runs_assumption_outside_its_listed_keys_is_rejected_with_
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn plan_paths_are_stored_with_the_import_and_refused_outside_the_project() -> R {
+    // CR-033 decision 1, docs/adr/ADR-035.md decision 3 (REQ-039, closes CR33-01): a create_tasks whose task has
+    // `paths` keeps them in its plan.imported (no SQL column) and Reader::task_paths reads them back; a task without
+    // any has the empty scope. A plan with an absolute or `..` path is refused as a plan, nothing imported (an empty
+    // path never gets this far: the decision's payload is held to the schema, whose minLength refuses it).
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, REQUIREMENTS)?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let before = planned_tables(&path)?;
+    for bad in ["/repo/src", "src/../.."] {
+        let mut task = planned("P1", &[], &["REQ-1"]);
+        task["paths"] = json!(["src", bad]);
+        let refused = store
+            .decide(
+                commander.decide(3, 7, create_tasks(json!([task]))),
+                context(),
+            )
+            .await;
+        let Err(PersistError::Plan(crate::dag::PlanError::Invalid(violations))) = refused else {
+            return Err(format!("{bad:?}: not refused as a plan: {refused:?}").into());
+        };
+        assert!(
+            violations.iter().any(|v| v.contains("paths[1]")),
+            "{bad:?}: {violations:?}"
+        );
+        assert_eq!(planned_tables(&path)?, before, "{bad:?}: nothing imported");
+    }
+    let mut scoped = planned("P1", &[], &["REQ-1"]);
+    scoped["paths"] = json!(["src/lib.rs", "docs/"]);
+    let decided = store
+        .decide(
+            commander.decide(
+                3,
+                7,
+                create_tasks(json!([scoped, planned("P2", &["P1"], &["REQ-1"])])),
+            ),
+            context(),
+        )
+        .await?;
+    assert!(matches!(decided, Decided::Applied { .. }), "{decided:?}");
+    let imported = rows(
+        &path,
+        "SELECT json_extract(j.value, '$.task_id'), json(json_extract(j.value, '$.paths')) FROM events e, \
+         json_each(json_extract(e.payload_json, '$.tasks')) j WHERE e.kind = 'plan.imported' ORDER BY 1",
+    )?;
+    assert_eq!(
+        imported,
+        [
+            vec![json!("P1"), json!(r#"["src/lib.rs","docs/"]"#)],
+            vec![json!("P2"), json!("[]")],
+        ]
+    );
+    let reader = store.reader()?;
+    assert_eq!(reader.task_paths("P1")?, ["src/lib.rs", "docs/"]);
+    assert!(reader.task_paths("P2")?.is_empty());
+    assert!(reader.task_paths("T1")?.is_empty(), "a task of no import");
+    Ok(())
+}

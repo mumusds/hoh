@@ -2060,6 +2060,12 @@ impl Reader {
         candidates::evidence_outcome(&self.conn, evidence_id)
     }
 
+    /// Task `task_id`'s path scope as its plan's import recorded it (docs/adr/ADR-035.md decision 3, CR-033):
+    /// project-relative files or directories; empty when it has none.
+    pub fn task_paths(&self, task_id: &str) -> Result<Vec<String>, PersistError> {
+        plan::task_paths(&self.conn, task_id)
+    }
+
     /// The run `run_id`'s specification and acceptance criteria (docs/adr/ADR-027.md decision 9).
     pub fn run_acceptance(&self, run_id: &str) -> Result<Option<RunAcceptance>, PersistError> {
         candidates::acceptance(&self.conn, run_id)

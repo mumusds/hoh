@@ -177,6 +177,61 @@ fn a_candidates_changed_files_are_read_from_its_commit_in_path_order_within_thei
 }
 
 #[test]
+fn work_context_selects_code_by_task_paths_at_the_workspaces_head()
+-> Result<(), Box<dyn std::error::Error>> {
+    // REQ-039 by task scope (ADR-026 decision 12; docs/adr/ADR-035.md decision 3): the files under the task's paths in
+    // the workspace's HEAD (a file or a directory, recursively), by path, within the code source's limits, read at
+    // that commit (not the work tree); none outside them. Packed, they are the task layer's code entries.
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    git_in(root, &["init", "-q"])?;
+    std::fs::create_dir_all(root.join("src/deep"))?;
+    std::fs::create_dir_all(root.join("docs"))?;
+    std::fs::write(root.join("src/scope.rs"), "fn in_scope() {}\n")?;
+    std::fs::write(root.join("src/deep/mod.rs"), "fn deep_in_scope() {}\n")?;
+    std::fs::write(root.join("src/big.rs"), "x".repeat(70 * 1024))?;
+    std::fs::write(root.join("docs/out.md"), "SENTINEL-OUT-OF-SCOPE\n")?;
+    std::fs::write(root.join("README"), "SENTINEL-OUT-OF-SCOPE\n")?;
+    git_in(root, &["add", "."])?;
+    git_in(root, &["commit", "-q", "-m", "base"])?;
+    let head = git_in(root, &["rev-parse", "HEAD"])?;
+    // The work tree moved on: HEAD is what is read.
+    std::fs::write(root.join("src/scope.rs"), "SENTINEL-WORK-TREE-EDIT\n")?;
+    let (commit, files, total) = scoped_files(root, &["src".to_owned(), "missing/".to_owned()])?;
+    assert_eq!(commit, head);
+    assert_eq!(total, 3);
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["src/big.rs", "src/deep/mod.rs", "src/scope.rs"]);
+    assert!(
+        matches!(&files[0].text, Err(why) if why.contains("64 KiB")),
+        "{:?}",
+        files[0]
+    );
+    assert_eq!(files[2].text, Ok("fn in_scope() {}\n".to_owned()));
+    let (_, one, total) = scoped_files(root, &["./src/deep/mod.rs".to_owned()])?;
+    assert_eq!((total, one[0].path.as_str()), (1, "src/deep/mod.rs"));
+    let mut w = work(None);
+    if let Some(facts) = w.assignment.context.as_mut() {
+        facts.code_scope = Some(vec!["src/".to_owned()]);
+    }
+    let (text, _) = executor(root)
+        .pack(&w, &contract("Contract.\n\n"), None)
+        .map_err(|r| format!("{r:?}"))?;
+    let task = text.find("### 任务上下文").ok_or("no task layer")?;
+    let code = text.find("fn deep_in_scope()").ok_or("no scoped file")?;
+    assert!(code > task, "{text}");
+    assert!(text.contains(&head), "{text}");
+    for absent in ["SENTINEL-OUT-OF-SCOPE", "SENTINEL-WORK-TREE-EDIT"] {
+        assert!(!text.contains(absent), "{absent}: {text}");
+    }
+    // No commit yet: why, never a silent empty source.
+    let empty = tempfile::tempdir()?;
+    git_in(empty.path(), &["init", "-q"])?;
+    assert!(scoped_files(empty.path(), &["src".to_owned()]).is_err());
+    Ok(())
+}
+
+#[test]
 fn a_turns_loads_and_code_source_are_read_into_its_prompt() -> Result<(), Box<dyn std::error::Error>>
 {
     // docs/adr/ADR-028.md decision 14: the store names a registered object and the code source, the executor reads

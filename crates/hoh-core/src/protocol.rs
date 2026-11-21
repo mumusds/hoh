@@ -636,6 +636,9 @@ pub struct PlannedTask {
         deserialize_with = "crate::integer::option"
     )]
     pub cost_estimate: Option<u8>,
+    /// Its path scope (CR-033): project-relative files or directories; empty when none was planned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 macro_rules! schema_def {
