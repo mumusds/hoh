@@ -710,15 +710,21 @@ fn swap_leaves_the_outside_alone(
     };
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     project.stop_host()?;
-    if rival.contains(&("F7_RIVAL_OP", "mkdir")) {
+    {
         let path = std::fs::read_to_string(&swapped)?;
         assert!(
             !path.is_empty(),
             "the shim must record the swapped directory"
         );
-        assert!(
+        let remains = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        assert_eq!(
             stderr.contains(&format!("{path} is left, not removed")),
-            "{why}: {path} not reported as a leftover in {stderr}"
+            remains,
+            "{why}: the leftover report must match {path}'s final existence: {stderr}"
         );
     }
     assert_eq!(
@@ -796,12 +802,7 @@ fn full_a_room_probes_directory_swapped_for_a_symlink_right_after_it_is_made_is_
             ("F7_IO_ERRNO", "122"),
         ],
         false,
-        &[
-            "DB_WAL_UNSUPPORTED",
-            "room not known",
-            ".db-room-",
-            "is left, not removed",
-        ],
+        &["DB_WAL_UNSUPPORTED", "room not known", ".db-room-"],
     )
 }
 
@@ -841,11 +842,7 @@ fn full_the_self_tests_room_probe_directory_swapped_for_a_symlink_takes_nothing_
             ("F7_IO_ERRNO", "122"),
         ],
         false,
-        &[
-            "DB_WAL_UNSUPPORTED",
-            "not for want of room",
-            "is left, not removed",
-        ],
+        &["DB_WAL_UNSUPPORTED", "not for want of room"],
     )
 }
 
