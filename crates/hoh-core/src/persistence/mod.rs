@@ -46,6 +46,8 @@ mod runner;
 mod series;
 mod snapshot;
 mod spec_review;
+mod spec;
+pub use spec::{SpecApproval, SpecFiles};
 mod staffing;
 mod stall;
 mod suites;

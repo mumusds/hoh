@@ -16,11 +16,10 @@ use hoh_core::retry::FailureClass;
 use serde_json::json;
 use std::path::Path;
 
-/// The freeze's inputs by the project layout's convention until the specification's own location exists (decision 4;
-/// M3-T02 replaces them, CR-018): relative to the checkout.
+/// The project's generated specification and check plan, with the host's environment (REQ-034; ADR-033).
 pub(crate) fn inputs() -> Inputs {
     Inputs {
-        spec: "contracts/requirements.json".into(),
+        spec: hoh_core::specindex::PATH.into(),
         environment: ".hoh/environment.json".into(),
         test_plan: "tests/check-plan.json".into(),
     }

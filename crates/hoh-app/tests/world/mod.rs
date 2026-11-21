@@ -209,7 +209,7 @@ pub struct Commander {
     pub statement: String,
     pub basis: String,
     /// The suffixes of the developer tasks its create_tasks plans (`<run_id>-<suffix>`), each for every requirement of
-    /// the project's `contracts/requirements.json`.
+    /// the project's `docs/spec/index.json`.
     pub tasks: Vec<String>,
     /// The decision kinds whose first submission for a run names a revision one past the run's, so the Runtime
     /// rejects it (STALE_REVISION) and the script submits it again.
@@ -317,7 +317,7 @@ def requirements(wake, c):
     if c.get('requirements'):
         return c['requirements']
     root = wake.get('项目根') or os.getcwd()
-    with open(os.path.join(root, 'contracts', 'requirements.json'), encoding='utf-8') as f:
+    with open(os.path.join(root, 'docs', 'spec', 'index.json'), encoding='utf-8') as f:
         return [r['id'] for r in json.load(f)['requirements']]
 
 
@@ -1029,15 +1029,31 @@ impl World {
         Ok(())
     }
 
-    /// The project as a committed Git repository with specification `spec` in `contracts/requirements.json` and its
+    /// The project as a committed Git repository with specification `spec` in `docs/spec/index.json` and its
     /// check plan in `tests/check-plan.json` (each criterion's check writes its TEST's result line, PASS or FAIL as
     /// the criterion says, and fails with it); the specification's sha256.
     pub fn commit_project(&self, spec: &[Requirement]) -> R<String> {
-        let requirements = json!({"requirements": spec.iter().map(|r| json!({
-            "id": r.id, "title": r.title, "acceptance": r.criteria.iter().map(|c| json!({
-                "id": c.id, "body": c.body, "test_id": c.test_id, "check_id": c.check_id(),
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>()});
+        let mut markdown =
+            "# 用户\nFixture\n# 范围\nFixture\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n"
+                .to_owned();
+        for r in spec {
+            markdown.push_str(&format!("## {} {}\n", r.id, r.title));
+            for c in &r.criteria {
+                markdown.push_str(&format!(
+                    "### {}\ngiven: fixture\nwhen: checked\nthen: {}\ncheck: {}\n",
+                    c.id,
+                    c.body,
+                    c.check_id()
+                ));
+            }
+        }
+        let source = hoh_core::specindex::Source {
+            path: "docs/spec/fixture.md".to_owned(),
+            bytes: markdown.into_bytes(),
+        };
+        let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))?;
+        std::fs::create_dir_all(self.project().join("docs/spec"))?;
+        std::fs::write(self.project().join(&source.path), &source.bytes)?;
         let mut checks = serde_json::Map::new();
         for c in spec.iter().flat_map(|r| &r.criteria) {
             let status = if c.passes { "PASS" } else { "FAIL" };
@@ -1050,10 +1066,10 @@ impl World {
             );
         }
         let plan = json!({"schema_version": "1.0", "plan_id": "m2t13-world", "checks": checks});
-        let text = format!("{}\n", serde_json::to_string_pretty(&requirements)?);
+        let text = String::from_utf8(index.bytes().to_vec())?;
         for (path, body) in [
             ("src/lib.rs", "pub fn fixture() {}\n".to_owned()),
-            ("contracts/requirements.json", text.clone()),
+            ("docs/spec/index.json", text.clone()),
             (
                 "tests/check-plan.json",
                 format!("{}\n", serde_json::to_string_pretty(&plan)?),
@@ -1092,9 +1108,9 @@ impl World {
 
     /// The committed specification's rows in the store (specs, requirements, acceptance_criteria), as an approved
     /// specification has them (docs/adr/ADR-031.md decision 1: the fixture writes them; ADR-028 decision 4: its
-    /// sha256 is the digest of the project's `contracts/requirements.json`); the spec_id.
+    /// sha256 is the digest of the project's `docs/spec/index.json`); the spec_id.
     pub fn seed_spec(&self) -> R<String> {
-        let text = std::fs::read(self.project().join("contracts/requirements.json"))?;
+        let text = std::fs::read(self.project().join("docs/spec/index.json"))?;
         let spec: Value = serde_json::from_slice(&text)?;
         let id = "spec-world";
         let mut sql = format!(
@@ -1113,8 +1129,8 @@ impl World {
                      ({}, {}, '{id}', {}, {});\n",
                     sql_text(&c["id"]),
                     sql_text(&r["id"]),
-                    sql_text(&c["body"]),
-                    sql_text(&c["check_id"])
+                    sql_text(&c["then"]),
+                    sql_text(&spec["scenarios"].as_array().ok_or("no scenarios")?.iter().find(|s| s["acceptance_id"] == c["id"]).ok_or("no scenario")?["check_id"])
                 ));
             }
         }

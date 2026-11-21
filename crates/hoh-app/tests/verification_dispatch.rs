@@ -158,9 +158,10 @@ async fn project_with(dir: &Path, spec: &str, plan: &str) -> R<(PathBuf, String)
     let project = dir.join("p");
     std::fs::create_dir_all(&project)?;
     git(&project, &["init", "-q"])?;
+    let spec = common::spec::write(&project, &serde_json::from_str(spec)?, "integration")?;
     for (path, text) in [
         ("src/lib.rs", "pub fn a() {}\n"),
-        ("contracts/requirements.json", spec),
+        ("docs/spec/index.json", spec.as_str()),
         ("tests/check-plan.json", plan),
     ] {
         let file = project.join(path);

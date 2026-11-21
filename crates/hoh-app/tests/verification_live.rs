@@ -28,6 +28,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use hoh_agents::compat::Agent;
 use hoh_agents::login::Login;
 use hoh_app::host::{Executor, Gate, Host, HostConfig, Outcome, Refusal, Started, Work};
@@ -516,10 +518,11 @@ fn fixture(project: &Path, team: &Team) -> R<String> {
     ] {
         git(project, &["config", key, value])?;
     }
+    let spec = common::spec::write(project, &serde_json::from_str(SPEC)?, "feature-a")?;
     for (file, text) in [
         ("README.md", README.to_owned()),
         ("lib.sh", LIB.to_owned()),
-        ("contracts/requirements.json", SPEC.to_owned()),
+        ("docs/spec/index.json", spec.clone()),
         ("tests/check-plan.json", plan()?),
     ] {
         let file = project.join(file);
@@ -545,7 +548,7 @@ fn fixture(project: &Path, team: &Team) -> R<String> {
     }
     std::fs::create_dir_all(project.join(".hoh"))?;
     std::fs::write(project.join(".hoh/config.toml"), config)?;
-    Ok(sha256_hex(SPEC.as_bytes()))
+    Ok(sha256_hex(spec.as_bytes()))
 }
 
 /// The product's executor for every role but the Commander, whose turns a fake answers by recording an assumption
