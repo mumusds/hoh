@@ -1,10 +1,10 @@
-# CR-030 · M5 证据、恢复与 Pi 插件需求细化（第 2 稿）
+# CR-030 · M5 证据、恢复与 Pi 插件需求细化（第 3 稿）
 
 ID：CR-030
 状态：DRAFT
 批准人：本稿不批准；CTO 默认已于2026-11-22采纳，修订稿待独立复审通过后按 CR-003 D1 批准
 日期：2026-11-22（沿用所引用 CTO/所有者决定的标注日期；执行日志保留实际 UTC 时间）
-原稿输入基线：`8d9ae599d30982fd431b950dec229786cdc15379`；本次修订起点：`6c0fc5b67aeec72579f1cc2a5cf1070e9e17ee47`；工作树 `/home/ai/dev/hoh-wt/m5-spec`；分支 `prep/M5-T01-spec`
+原稿输入基线：`8d9ae599d30982fd431b950dec229786cdc15379`；本次修订起点：`8cd48eab4646bf46dfa6f399dca35aca4cbf7ea8`；工作树 `/home/ai/dev/hoh-wt/m5-spec`；分支 `prep/M5-T01-spec`
 适用任务：M5-T01 准备；正式应用仍须 M4-T04 完成、领取 M5-T01、独立审查通过及 CTO 按 CR-003 D1 批准
 
 ## 背景与授权边界
@@ -68,14 +68,14 @@ CR-028 来源分支 HEAD：`dde5109f43a2081b5d5e5c507b91a14b12c62143`；所读�
 4. **审查系列（Q3）。** 分别持久设计/实现review series、轮号、候选与spec、finding来源、缺陷family、处置和设计修正ArtifactRef；重启、修正或新提交不清同系列轮号，范围正式变更须明确记录新系列与原因，不能为逃避上限重置。连续两轮同family有可核对发现即在继续修复前要求设计修正，即使别的AC增长。初审全范围，复审聚焦修复diff及调用链/回归；范围外新medium/low记待办，不扩本轮；critical/high仍阻断。前3轮无critical/high且medium已处置可收敛；第4轮无critical/high时medium须修复并红绿、Runtime核对证据+只读Commander决定，low入包，不另开完整审查；第4轮仍critical/high先设计修正，只再开一次新会话第5轮核这些项，仍有即BLOCKED。任何required AC FAIL或发布门禁不满足仍阻断，审查收敛不篡改已有报告、不免独立验收。low包在verify前完成或按AC记有证据的延期。缺陷family由持久分类及证据支撑，不能单靠模型声称“不同问题”重置。 series的一轮是一次约定范围的独立审查及其有版本处置记录，设计/实现分别编号；ADR-028 verification round是每次冻结自动建立的QA/Review义务，二者以series_id/series_round与verification_round_id显式关联，互不替代。一轮处置可产生多个修复候选，每个候选仍完整走新验证轮次和Candidate Gate；重验不据此重开全范围设计讨论，缺独立Review/QA仍不能accepted。第4轮medium修复后的独立Review只核修复diff/调用链/回归并属于该轮处置，不构成第5轮全量设计审查；Runtime核对red/green与绑定，Commander只读决定收敛，Developer持唯一写租约。
 5. **STEER（Q2，已采纳）。** code_target是受理时的来源，不是要求投递时HEAD逐字相等的锁：仅绑定发给当前repo写者（Developer或执行spec_draft的CTO等持写租约职位）的STEER；Commander、QA/Reviewer/Research等只读职位不加此绑定，仍遵守既有epoch/spec及QA/Review冻结候选交接。来源包含run/task、branch、lineage_generation、git_commit、tree_sha256、candidate_id或null，unborn时git_commit=null/unborn=true并记录只读工作区摘要。受理/写者提交登记/派发在安全点串行，任何异步等待后重核；允许原版本，或同Task同分支同generation且由Runtime登记的写者提交组成的后继链（含起草任务的首提交），不能仅凭Git祖先关系认后继。恢复（虽为追加提交）、切换分支、其它Task线或未知外部提交都使旧来源失效，原始来源不改写；外部未提交编辑仍先停写。HCP envelope携带投递时真实当前candidate，正文引用保留source code_target与证明链，REQ-022当前目标校验保持严格；无candidate不造id。支持turn者按turn投递，不支持的Claude/Pi按next_attempt投递，本写者完成C2不会单凭hash变化拒绝；跨Task意图须新指令，不能暗转。拒绝为CANDIDATE_MISMATCH并留expected/actual；role/spec按原原因码；不可确认原生投递只令Attempt/effect UNKNOWN_EFFECT，input_queue保持DELIVERED。客户端显示受理来源及生效边界，不声称保护受理前的旧用户视图；无新增SendInput外部字段。
 6. **恢复/备份（Q7）。** 每次维护动作operation_id绑定项目/Run/Attempt/epoch、登记资源、effect阶段与manifest；完成仅原子提交后可见。备份固定DB快照与引用闭包，复制期pin对象防GC；恢复独占项目锁、停派发并收尾所有Attempt，再校验/原子替换/reconcile。维护从现有交互/诊断入口接入；不加Shell子命令。不可恢复外部效果不盲重放。
-7. **全范围发布验证（Q6，已采纳并补齐接线）。** 按release_validation_id持久绑定run/spec/candidate/environment/test_plan/profile、两个独立只读Attempt、scope与实际送达确认集；以请求幂等键和当前身份CAS建立一个活动义务。不得伪造verification.round_opened或用round_of_task猜归属。record_evidence入口先验证真实生产者的持久归属，再分增量轮次、release义务、既有非轮次三种路径；宣称发布生产者却未关联、或同时关联两种义务均拒绝；既有合法非轮次生产者仍走原路径。共用同一证据结论函数、原生身份/独立性/hash校验，证据/evidence.recorded照旧入库；release的AC行和报告以release_validation_id写入独立事件/工件投影，不落入候选的acceptance_results，重启按该id/record_id去重回放。普通PASS/FAIL不迁移C及源Task、不改变C的增量验收投影；FAIL登记带release_validation_id/证据/归属的Issue并保持发布阻断。**唯一例外是完整性INVALID：仍在record_evidence同一事务按ADR-027决定5否决C（包括ACCEPTED→INVALID）并写integrity_violation/唤醒Commander，绝不吞掉否决；既有INVALID行及全局否决保留，禁止向INVALID候选新增PASS/DEGRADED行。** 这澄清CR-018“不迁移”是普通发布结论不回写增量状态，而不是完整性豁免；ADR-028非轮次默认写验收行分支明确排除release生产者，原非轮次夹具/其它路径不变。发布QA/Review报告复用验证器但按release身份收取，报告失败只阻断并登记Issue，完整性违规走同一否决；结果收取及issues::settle_all在同一事务。无结论可在同C新建关联的重验义务，候选上发布失败/否决历史按原规则保留，不能换id洗白；普通FAIL的返工由Commander决定并通过既有写任务路径产生新候选，不由发布收取偷改ACCEPTED源Task；INVALID只允许新提交/新候选经完整Candidate Gate后重新发布。换spec/candidate使旧义务只作历史；取消停止派发/收取推进，保全证据；无法恢复/身份不明维持BLOCKED。manifest/releases/run.result提交再次CAS当前身份与Issue快照。M5-T07的ADR只补函数和必要新迁移的映射/契约回归，不把本接线延期。
+7. **全范围发布验证（Q6，已采纳并补齐接线）。** 按release_validation_id持久绑定run/spec/candidate/environment/test_plan/profile、两个独立只读Attempt、scope与实际送达确认集；以请求幂等键和当前身份CAS建立一个活动义务。不得伪造verification.round_opened或用round_of_task猜归属。record_evidence入口先验证真实生产者的持久归属，再分增量轮次、release义务、既有非轮次三种路径；宣称发布生产者却未关联、或同时关联两种义务均拒绝；既有合法非轮次生产者仍走原路径。共用同一证据结论函数、原生身份/独立性/hash校验，证据/evidence.recorded照旧入库；release的AC行和报告以release_validation_id写入独立事件/工件投影，不落入候选的acceptance_results，重启按该id/record_id去重回放。**发布执行记录使用独立根 `.hoh/release-evidence/<release_validation_id>/<check_id>/<record_id>/`，不进入 ADR-027 决定10 / `scripts/product/traceability.py::members()` 的候选成员集（原搜索根 `.hoh-dev/` 与 `.hoh/evidence/` 不扩到发布根，也不向其中复制发布 execution.json）。** 驱动在运行前按持久生产者归属选择该根，收取与reconcile重核同一归属；路径不得由模型自报来排除证据。记录内的candidate/hash与stdout/stderr/artifacts边界照旧校验，record_id唯一性及目录不重叠检查覆盖两个根。候选增量追踪和acceptance_results只消费同一增量成员集；发布判定只读绑定该义务的release投影（连同已有失败/否决历史），不以候选扫描或增量PASS补齐发布证据，并仍核对C的全局INVALID否决与Run Issue。普通PASS/FAIL不迁移C及源Task、不改变C的增量验收投影；两者入库前后候选追踪成员集合、逐TEST结论及增量acceptance_results必须完全相同；FAIL登记带release_validation_id/证据/归属的Issue并保持发布阻断。**唯一例外是完整性INVALID：仍在record_evidence同一事务按ADR-027决定5否决C（包括ACCEPTED→INVALID）并写integrity_violation/唤醒Commander，绝不吞掉否决；既有INVALID行及全局否决保留，禁止向INVALID候选新增PASS/DEGRADED行。** 这澄清CR-018“不迁移”是普通发布结论不回写增量状态，而不是完整性豁免；ADR-028非轮次默认写验收行分支明确排除release生产者，原非轮次夹具/其它路径不变。发布QA/Review报告复用验证器但按release身份收取，报告失败只阻断并登记Issue，完整性违规走同一否决；结果收取及issues::settle_all在同一事务。无结论可在同C新建关联的重验义务，候选上发布失败/否决历史按原规则保留，不能换id洗白；普通FAIL的返工由Commander决定并通过既有写任务路径产生新候选，不由发布收取偷改ACCEPTED源Task；INVALID只允许新提交/新候选经完整Candidate Gate后重新发布。换spec/candidate使旧义务只作历史；取消停止派发/收取推进，保全证据；无法恢复/身份不明维持BLOCKED。manifest/releases/run.result提交再次CAS当前身份与Issue快照。M5-T07的ADR只补函数和必要新迁移的映射/契约回归，不把本接线延期。
 8. **真实部署范围（Q1）。** M5的浏览器测试是HoH验证受控工程目标的实际浏览器流程，目标fixture有真实进程、DOM/网络、数据与升级回滚断言。它不冒充HoH尚未完成的M6 Web GUI。HoH自身完整Web仍由M6 web-e2e及M7全量验收。Q1已于2026-11-22采纳，不再阻塞本稿应用；实现/验收仍必须有双OS真实记录。
 
-Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不声称新能力已实现）：`crates/hoh-core/src/persistence/evidence.rs` 从生产者 Task 查 `round_of_task`，非轮次会即时写 `acceptance_results`，随后在同事务处理 `INVALID`、`evidence.recorded`、`integrity_violation` 与 `issues::settle_all`；`crates/hoh-core/src/persistence/reports.rs::intake_in` 目前要求生产者属于验证轮次。因此 T07 必须在这两个入口按持久 release 身份明确分路，不能只给非轮次 Attempt 加一个字段后沿用旧写入路径。共同约定7规定结果去向，新增的派发、完成、reconcile 和报告收取分支均需沿此归属，重启不能退回非轮次默认分支。正式实现的契约/迁移/事件枚举影响闭包要包含这些调用者与完整 Rust 回归。
+Q6 的现有接线核对（本次修订起点 `8cd48eab`，只是读源码，不声称新能力已实现）：`crates/hoh-core/src/persistence/evidence.rs` 从生产者 Task 查 `round_of_task`，非轮次会即时写 `acceptance_results`，随后在同事务处理 `INVALID`、`evidence.recorded`、`integrity_violation` 与 `issues::settle_all`；`crates/hoh-core/src/persistence/reports.rs::intake_in` 目前要求生产者属于验证轮次。因此 T07 必须在这两个入口按持久 release 身份明确分路，不能只给非轮次 Attempt 加一个字段后沿用旧写入路径。共同约定7规定结果去向，新增的派发、完成、reconcile 和报告收取分支均需沿此归属，重启不能退回非轮次默认分支。正式实现的契约/迁移/事件枚举影响闭包要包含这些调用者与完整 Rust 回归。 本轮再读 `crates/hoh-app/src/verify/check.rs` 的记录目录与 `record_id_reused/overlaps`、`scripts/product/traceability.py` 的 SEARCH/find/members/report：当前只按candidate_id扫描共同根，未区分发布生产者。T07须将独立根接入创建、查重、pending/reconcile、引用保护与冻结路径守卫（`verify/freeze.rs`），候选扫描仍限原根；发布投影读取显式release成员及C的全局否决，不能把分离目录误作完整性豁免。
 
 ## 需求对象：拟替换 requirements.json 的九个对象
 
-以下每个JSON fence是一个完整需求对象。其余需求的字段值、数组与字段顺序保留；不改schema、policy或check-plan。第2稿隔离应用器按输入文件的一空格缩进、UTF-8、LF写入，探针逐对象核对未改内容；正式应用仍须重新生成/重锁/验证，不能照搬本次副本锁。
+以下每个JSON fence是一个完整需求对象。其余需求的字段值、数组与字段顺序保留；不改schema、policy或check-plan。第3稿隔离应用器按输入文件的一空格缩进、UTF-8、LF写入，探针逐对象核对未改内容；正式应用仍须重新生成/重锁/验证，不能照搬本次副本锁。
 
 ### REQ-044 · 可恢复版本（5 条 AC）
 
@@ -98,7 +98,7 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
       "id": "AC-044-01",
       "given": "同一项目已有经验证的基线 B、严重回归候选 C；HEAD 在 HoH 登记的工作分支 W 上；原工作区分别有用户 tracked、暂存、untracked 修改，失败记录已登记",
       "when": "请求恢复 B，先在脏目录观察拒绝，再经用户处置后在 HoH 登记的干净工作区执行恢复",
-      "then": "脏目录逐文件字节、index、HEAD、untracked 清单不变，停止新写派发并给出待用户处置原因；用户处置后，先以 refs/heads/hoh/failed/<run_id>/<operation_id> 保存 C（已存在且不指向 C 则拒绝），保留日志与证据；在本 operation 登记的临时 worktree 构造恢复提交 R，parent 为 W 当前 HEAD、tree 等于 B，并在独占安全点以预期旧 HEAD 的 CAS 只追加推进 W；用户目录仍在 W，不 checkout B、不 reset/rebase/force、不改其它分支；B/C 的 ref 与证据 hash 不变；R 不是已验收候选，冻结 R 后必须重验，不能复用 B 的 PASS",
+      "then": "脏目录逐文件字节、index、HEAD、untracked 清单不变，停止新写派发并给出待用户处置原因；用户处置后，先以 refs/heads/hoh/failed/<run_id>/<operation_id> 保存 C（已存在且不指向 C 则拒绝），保留日志与证据；在本 operation 登记的临时 worktree 构造恢复提交 R，parent 为 W 当前 HEAD、tree 等于 B，并在独占安全点以预期旧 HEAD 的 CAS 只追加推进 W；成功后用户目录仍在 W、HEAD 为 R，index 与工作树逐文件字节等于 tree B（包括路径集合与删除项），无相对 R 的未提交差异；只推进 ref 而未应用 index/工作树不能报告成功；不 checkout B、不 reset/rebase/force、不改其它分支；B/C 的 ref 与证据 hash 不变；R 不是已验收候选，冻结 R 后必须重验，不能复用 B 的 PASS",
       "test_id": "TEST-044-01"
     },
     {
@@ -131,7 +131,7 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
     }
   ],
   "behavior": [
-    "恢复只追加工作分支 W 的新提交 R（parent=当前 HEAD，tree=B），失败 ref 的命名/CAS/冲突见 AC-044-01；用户目录不换分支。临时 worktree 仅用于构造与核对，不强制把已在 W 上打开的用户目录切走；最终应用树前再次核对工作区/index 与租约，发现用户编辑保全现场并阻塞。恢复提交仍需新候选验证。",
+    "恢复只追加工作分支 W 的新提交 R（parent=当前 HEAD，tree=B），失败 ref 的命名/CAS/冲突见 AC-044-01；用户目录不换分支。临时 worktree 仅用于构造与核对，不强制把已在 W 上打开的用户目录切走；最终应用树前再次核对工作区/index 与租约，发现用户编辑保全现场并阻塞。成功时须复核用户目录仍在 W、HEAD=R、index 与工作树逐文件字节和路径集合等于 tree B，不能只 update-ref；脏目录先拒绝、不 reset。恢复提交仍需新候选验证。",
     "恢复清单是持久 ArtifactRef，包含活动工作、精确资源归属、证据、预算、下一动作与唤醒条件；它是恢复线索，不是 Runtime/Git 的替代事实源。",
     "运行中 STEER 补齐 CR-026 M3A-02：写者来源 code_target 与投递时当前目标分开，只有共同约定5的相等或可证正常后继允许投递；受理、提交登记与投递在写者安全点串行，异步等待后重核。恢复/换分支/外部修改不可借 Git 祖先关系绕过。",
     "不加 SendInput 外部字段：code_target 是 host 的内部来源元数据，存于自由 JSON 与事件，客户端显示来源和生效边界。Commander/QA/Reviewer/Research 等只读职位不加此写者绑定；QA/Review 原冻结候选交接仍严格相等。unborn 与正常 next_attempt 不改变 REQ-017 的既定可用性。"
@@ -531,8 +531,8 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
     {
       "id": "AC-056-02",
       "given": "同Run的两个开发Task已在不同增量候选接受，最终C为ACCEPTED但仅覆盖最后增量；具备持久release_validation_id",
-      "when": "Runtime触发全范围验证，重复release_request并在两方结果收取间重启；分别换spec/candidate、取消、提交普通FAIL、篡改证据hash/源文件；最后重验或以新提交返工",
-      "then": "全范围覆盖profile每项required AC/check，不开verification.round_opened；发布结果行按release_validation_id隔离、不写入或改变C的增量acceptance_results投影；正常PASS/FAIL不迁移源Task或候选，普通FAIL登记有主Issue并阻断发布；完整性INVALID是唯一例外，仍经record_evidence同事务把C从ACCEPTED等可否决状态置INVALID、写integrity_violation并唤醒Commander，禁止新增PASS/DEGRADED行且原Task状态不被发布义务偷偷迁移；同请求仅一个活动义务，独立QA/Review身份绑定及重启去重不变；换身份旧结果只作历史、取消停止发布；无结论可在同C新验证义务重验，FAIL需修复而INVALID必需新提交新候选及其完整Candidate Gate，历史不洗白，齐全合法前Run不COMPLETED",
+      "when": "Runtime触发全范围验证，重复release_request并在两方结果收取间重启；分别换spec/candidate、取消、分别提交普通PASS/FAIL、篡改证据hash/源文件；最后重验或以新提交返工",
+      "then": "全范围覆盖profile每项required AC/check，不开verification.round_opened；发布结果行按release_validation_id隔离、不写入或改变C的增量acceptance_results投影；发布执行记录位于独立release-evidence根，不进入ADR-027决定10的候选追踪成员集；普通PASS与FAIL入库前后C的追踪成员集合、逐TEST结论及增量投影保持发布前的内容，发布判定只读release投影且仍核对C的全局否决和Run Issue；正常PASS/FAIL不迁移源Task或候选，普通FAIL登记有主Issue并阻断发布；完整性INVALID是唯一例外，仍经record_evidence同事务把C从ACCEPTED等可否决状态置INVALID、写integrity_violation并唤醒Commander，禁止新增PASS/DEGRADED行且原Task状态不被发布义务偷偷迁移；同请求仅一个活动义务，独立QA/Review身份绑定及重启去重不变；换身份旧结果只作历史、取消停止发布；无结论可在同C新验证义务重验，FAIL需修复而INVALID必需新提交新候选及其完整Candidate Gate，历史不洗白，齐全合法前Run不COMPLETED",
       "test_id": "TEST-056-02"
     },
     {
@@ -737,13 +737,13 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
     "fixture": "同一项目已有经验证的基线 B、严重回归候选 C；HEAD 在 HoH 登记的工作分支 W 上；原工作区分别有用户 tracked、暂存、untracked 修改，失败记录已登记；各独立反例使用隔离夹具，保留正对照与原始记录。",
     "steps": [
       "必需子例 test_044_01_protect_dirty：分别带tracked、index、untracked修改请求恢复B",
-      "必需子例 test_044_01_append_restore：用户处置后保存C，构造并CAS追加R到W",
+      "必需子例 test_044_01_append_restore：用户处置后保存C，构造并CAS追加R到W，再核对用户目录的HEAD、index与工作树",
       "必需子例 test_044_01_ref_conflict：预置同operation失败ref指向其它提交，再恢复",
       "必需子例 test_044_01_head_race：构造R后使W或工作区改变，再提交恢复"
     ],
     "pass_criteria": [
       "test_044_01_protect_dirty：三个变体均阻塞，逐字节/index/HEAD/untracked清单不变",
-      "test_044_01_append_restore：failed ref指向C，R父为旧W头/tree=B，用户仍在W，B/C及证据不变，R需新验收",
+      "test_044_01_append_restore：failed ref指向C，R父为旧W头/tree=B；用户目录仍在W、HEAD=R，index与工作树逐文件字节及路径集合等于tree B（含删除项），相对R无未提交差异；仅update-ref而index/文件仍为C时断言失败；B/C及证据不变，R需新验收",
       "test_044_01_ref_conflict：拒绝且不覆盖旧ref/用户树，保留诊断",
       "test_044_01_head_race：CAS或安全点复核失败，不覆盖新HEAD/用户文件",
       "覆盖断言核对上述必需子例名称全集与逐项观测；缺例/缺矩阵格写本TEST的FAIL行并使检查非零。未运行或合法降级按共同约定2/3记录，不伪造PASS。"
@@ -1503,11 +1503,12 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
     "requirement_id": "REQ-056",
     "acceptance_id": "AC-056-02",
     "check_id": "integration",
-    "fixture": "同Run的两个开发Task已在不同增量候选接受，最终C为ACCEPTED但仅覆盖最后增量；具备持久release_validation_id；同一子例内顺序/并发/重启复用其登记状态，禁止在中途重建项目或清历史；不同独立子例隔离。",
+    "fixture": "同Run的两个开发Task已在不同增量候选接受，最终C为ACCEPTED但仅覆盖最后增量；具备持久release_validation_id；发布前保存C的候选追踪成员（路径/record_id/hash）、逐TEST结论与增量acceptance_results完整快照；同一子例内顺序/并发/重启复用其登记状态，禁止在中途重建项目或清历史；不同独立子例隔离。",
     "steps": [
       "必需子例 test_056_02_accepted_scope：两个增量Task接受后对最终ACCEPTED C触发发布验证",
       "必需子例 test_056_02_restart_dedup：重复release_request并在QA/Review收取间及记录重放时重启",
-      "必需子例 test_056_02_ordinary_fail：完整性有效的发布检查/报告FAIL",
+      "必需子例 test_056_02_ordinary_fail：完整性有效的发布检查/报告FAIL入库，再重读候选追踪与增量投影",
+      "必需子例 test_056_02_ordinary_pass：独立正对照中完整性有效的发布检查/报告PASS入库，再重读候选追踪与增量投影",
       "必需子例 test_056_02_integrity_invalid：分别篡改证据hash、检查期间源码后收取",
       "必需子例 test_056_02_stale_cancel：分别换spec、换candidate及取消后送旧结果",
       "必需子例 test_056_02_reverify_repair：无结论后同C重验；FAIL/INVALID后尝试新id洗白，再修复新提交新候选"
@@ -1515,8 +1516,9 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
     "pass_criteria": [
       "test_056_02_accepted_scope：覆盖profile全required，独立QA/Review，无verification.round_opened，源Task/C及增量验收投影不变",
       "test_056_02_restart_dedup：单活动义务，release_validation_id/record_id去重，原生身份和全部行可追溯",
-      "test_056_02_ordinary_fail：登记有主Issue并阻断发布，C/源Task和增量acceptance_results不被发布行改写",
-      "test_056_02_integrity_invalid：同record_evidence事务否决C为INVALID并写integrity_violation，Commander唤醒，不新增PASS/DEGRADED，源Task不被发布义务迁移",
+      "test_056_02_ordinary_fail：登记有主Issue并阻断发布；发布execution.json只在独立根且不在候选成员集，C/源Task不迁移，C的追踪成员集合、逐TEST结论和增量acceptance_results与发布前快照完全相同；release投影仍包含该FAIL并不能被候选增量PASS补齐或抵消",
+      "test_056_02_ordinary_pass：发布PASS只进入release投影且不能替代其缺失项；发布execution.json不在候选成员集，C/源Task不迁移，C的追踪成员集合、逐TEST结论和增量acceptance_results与发布前快照完全相同；发布判定只读release投影并仍核对全局否决与Issue",
+      "test_056_02_integrity_invalid：同record_evidence事务否决C为INVALID并写integrity_violation，Commander唤醒，独立目录不掩盖全局否决、候选与发布判定均拒绝，发布行仍不插入acceptance_results，不新增PASS/DEGRADED，源Task不被发布义务迁移",
       "test_056_02_stale_cancel：旧义务仅历史/取消不推进，Run不COMPLETED，记录保留",
       "test_056_02_reverify_repair：无结论可重验，失败/否决不能换id洗白；新候选须完整Candidate Gate和全量发布证据",
       "覆盖断言核对上述必需子例名称全集与逐项观测；缺例/缺矩阵格写本TEST的FAIL行并使检查非零。未运行或合法降级按共同约定2/3记录，不伪造PASS。"
@@ -1528,7 +1530,9 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
       "release验证身份与范围",
       "round事件计数",
       "源Task/candidate快照",
-      "原生会话/报告与重启记录"
+      "原生会话/报告与重启记录",
+      "发布前后候选追踪成员（路径/record_id/hash）、逐TEST结论与增量acceptance_results快照",
+      "独立release记录目录与release投影、C的全局INVALID否决事件"
     ]
   },
   {
@@ -1967,7 +1971,7 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
       "AC-044-04",
       "AC-044-05"
     ],
-    "done_when": "指定AC在同一冻结候选的场景检查中有逐TEST原始证据；自测，非验收；独立审查无未解决critical/high；不以缺工具或fixture冒充live。交付失败分支/恢复清单、用户改动保护及STEER受理/投递code_target绑定，接线input_queue、HCP、原生投递与恢复；承接CR-026 M3A-02；回归REQ-017/022/028/037/041。 明确W上parent=旧HEAD/tree=B的追加恢复与failed ref CAS；STEER区分来源与当前目标，验证同写者next_attempt后继、恢复generation拒绝、unborn首提交及只读职位豁免。 所属场景以本CR必需子例清单生成覆盖断言；漏任一名字/矩阵格或只有聚合日志即输出该TEST的FAIL行并非零，证明删一个子例能变红，不修改release-policy的证据规则。对新增场景先测完整所属check耗时，遵守冻结timeout及既有余量，无法容纳则CTO重规划，绝不减AC。"
+    "done_when": "指定AC在同一冻结候选的场景检查中有逐TEST原始证据；自测，非验收；独立审查无未解决critical/high；不以缺工具或fixture冒充live。交付失败分支/恢复清单、用户改动保护及STEER受理/投递code_target绑定，接线input_queue、HCP、原生投递与恢复；承接CR-026 M3A-02；回归REQ-017/022/028/037/041。 明确W上parent=旧HEAD/tree=B的追加恢复与failed ref CAS，成功后用户目录仍在W、HEAD=R、index与工作树字节/路径等于tree B且干净，脏目录先拒绝、不reset；STEER区分来源与当前目标，验证同写者next_attempt后继、恢复generation拒绝、unborn首提交及只读职位豁免。 所属场景以本CR必需子例清单生成覆盖断言；漏任一名字/矩阵格或只有聚合日志即输出该TEST的FAIL行并非零，证明删一个子例能变红，不修改release-policy的证据规则。对新增场景先测完整所属check耗时，遵守冻结timeout及既有余量，无法容纳则CTO重规划，绝不减AC。"
   },
   {
     "id": "M5-T02",
@@ -2086,7 +2090,7 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
       "AC-056-04",
       "AC-056-05"
     ],
-    "done_when": "指定AC在同一冻结候选的场景检查中有逐TEST原始证据；自测，非验收；独立审查无未解决critical/high；不以缺工具或fixture冒充live。承接CR-018：Runtime触发最终候选全范围验证，不开增量轮次，可对ACCEPTED候选运行，普通发布结果不迁移候选/源Task状态（完整性INVALID仍即时否决候选），使多Task Run完成具备真实全量证据。承接CR-020：发布投影传profile，规则16仅核outcome PASS产生的PASS行，RowFact.live_agents来自live-sessions；全Run OPEN/REOPENED critical/high含取消Task，按ADR-029决定10送达/absent条目规则、同事务issues::settle_all；验收失败Issue按新行求解；待确认集与open_issues在导出读快照直接求状态函数；出口仅重验/返工/取消且阻断保持，豁免需所有者。落实共同约定7已定的生产者分类、独立发布行/投影、普通FAIL Issue与INVALID同事务否决，实施ADR列函数/迁移与回归并审查，不复用round_of_task伪造全量验证。 对record_evidence非轮次路径和报告收取加发布身份分支，覆盖两次重启/重复收取/篡改/取消/旧身份；全量正对照上测试记忆claim不能替观察。 所属场景以本CR必需子例清单生成覆盖断言；漏任一名字/矩阵格或只有聚合日志即输出该TEST的FAIL行并非零，证明删一个子例能变红，不修改release-policy的证据规则。对新增场景先测完整所属check耗时，遵守冻结timeout及既有余量，无法容纳则CTO重规划，绝不减AC。"
+    "done_when": "指定AC在同一冻结候选的场景检查中有逐TEST原始证据；自测，非验收；独立审查无未解决critical/high；不以缺工具或fixture冒充live。承接CR-018：Runtime触发最终候选全范围验证，不开增量轮次，可对ACCEPTED候选运行，普通发布结果不迁移候选/源Task状态（完整性INVALID仍即时否决候选），使多Task Run完成具备真实全量证据。承接CR-020：发布投影传profile，规则16仅核outcome PASS产生的PASS行，RowFact.live_agents来自live-sessions；全Run OPEN/REOPENED critical/high含取消Task，按ADR-029决定10送达/absent条目规则、同事务issues::settle_all；验收失败Issue按新行求解；待确认集与open_issues在导出读快照直接求状态函数；出口仅重验/返工/取消且阻断保持，豁免需所有者。落实共同约定7已定的生产者分类、独立发布行/投影与release-evidence根（不进入候选members扫描，发布判定只读release投影并核全局否决/Issue）、普通PASS/FAIL前后候选成员/逐TEST结论/增量投影不变、普通FAIL Issue与INVALID同事务否决，实施ADR列函数/迁移与回归并审查，不复用round_of_task伪造全量验证。 对record_evidence非轮次路径和报告收取加发布身份分支，覆盖两次重启/重复收取/篡改/取消/旧身份；全量正对照上测试记忆claim不能替观察。 所属场景以本CR必需子例清单生成覆盖断言；漏任一名字/矩阵格或只有聚合日志即输出该TEST的FAIL行并非零，证明删一个子例能变红，不修改release-policy的证据规则。对新增场景先测完整所属check耗时，遵守冻结timeout及既有余量，无法容纳则CTO重规划，绝不减AC。"
   },
   {
     "id": "M5-T08",
@@ -2232,7 +2236,7 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
 
 ## CTO 决定与剩余问题
 
-来源：[CTO 决策原件](/home/ai/dev/hoh/.hoh-dev/evidence/spec-drafts-cto-decisions.md)，标注日期 **2026-11-22**；本次原样留存到 `/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/cto-decisions.md`。Q1–Q7 的推荐默认均为 **ADOPTED**，不是重新待决的提案；CTO采纳默认不等于本CR已经独立复审/正式批准。原文件同时记录所有者已批准 CR-031 C1，A5 与 REQ-057 已同步。
+来源：[CTO 决策原件](/home/ai/dev/hoh/.hoh-dev/evidence/spec-drafts-cto-decisions.md)，标注日期 **2026-11-22**；draft3重新读取并原样留存到 `/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/cto-decisions.md`。Q1–Q7 的推荐默认均为 **ADOPTED**，不是重新待决的提案；CTO采纳默认不等于本CR已经独立复审/正式批准。原文件同时记录所有者已批准 CR-031 C1，A5 与 REQ-057 已同步。
 
 | ID | 2026-11-22 已采纳的默认 | 本稿落实与后续验证 |
 |---|---|---|
@@ -2241,10 +2245,10 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
 | Q3 | 事件+ArtifactRef持久化series/family，Commander确认分类，Runtime计数 | 055-04；明确series与验证轮次映射、Runtime核对+Commander决定，修复候选仍完整Candidate Gate |
 | Q4 | 当前锁定来源/版本为起点，实施核对schema/hook并实测 | 048/051；无法兼容以真实证据按CR-001降级，不虚称版本已经验证 |
 | Q5 | 原生支持则原生，缺元数据由HoH引用工件补齐，Hermes负责长期召回 | 049；项目隔离/恢复无法满足时只降级真实集成，required安装诊断保留 |
-| Q6 | 独立release_validation_id；批准前写清与INVALID的接线 | 共同约定7、056-02及T07已写明生产者分类、独立发布行、普通FAIL Issue、INVALID唯一状态迁移例外及出口；原“阻塞设计选择”关闭，修订正确性须复审 |
+| Q6 | 独立release_validation_id；批准前写清与INVALID的接线 | 共同约定7、056-02及T07已写明生产者分类、独立发布行/记录根/成员边界、普通PASS/FAIL增量不变、普通FAIL Issue、INVALID唯一状态迁移例外及出口；原“阻塞设计选择”关闭，修订正确性须复审 |
 | Q7 | 现有交互/诊断入口到内部维护，独占恢复且显式确认；保护引用、按operation清理 | 063-04、T05；保留期数值随实际配置加载器交付，不猜值，不加Shell命令 |
 
-本轮没有新增必须改变 CONTRACT 架构或缩减范围才能裁决的问题。**条件性的 CTO 重规划点**：T02/T07新增 integration 与 T08 的 deployment 先测全阶段成本（包含既有M4义务），保持冻结超时和既有余量；推荐默认是优化/复用或经独立审查增加 required 检查以分担工作并保持原AC全部满足，不延长原timeout、不去掉子例、不给未测项PASS。无法在这些边界内兑现时提交测量与阻塞问题，由CTO裁决；如需更改CONTRACT或降低门槛则必须升级所有者，本稿不批准这种变更。插件锁/新schema若与已采纳默认不兼容，同样先以证据说明差异再细化，不静默套用。
+本轮CTO来源文件没有新增M5决定；上述Q1–Q7继续生效，CR30D-50/51按第2轮修正意见细化，不将作者修订记作新CTO批准。本轮没有新增必须改变 CONTRACT 架构或缩减范围才能裁决的问题。**条件性的 CTO 重规划点**：T02/T07新增 integration 与 T08 的 deployment 先测全阶段成本（包含既有M4义务），保持冻结超时和既有余量；推荐默认是优化/复用或经独立审查增加 required 检查以分担工作并保持原AC全部满足，不延长原timeout、不去掉子例、不给未测项PASS。无法在这些边界内兑现时提交测量与阻塞问题，由CTO裁决；如需更改CONTRACT或降低门槛则必须升级所有者，本稿不批准这种变更。插件锁/新schema若与已采纳默认不兼容，同样先以证据说明差异再细化，不静默套用。
 
 ## 审查记录
 
@@ -2271,7 +2275,19 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
 | CR30D-17 | low | 同文修复：051-04/T03共用诊断覆盖三适配器，保留原错误，不限插件，不冒充live |
 | CR30D-18 | low | 同文修复：063-04给出设置→维护、确认/取消确认、operation查询与安全点取消子例 |
 
-本轮18项均已在稿件中处理，无剩余low延期；“修复”是作者处置，不替代独立复审结论。下一轮限定本修复diff、相关契约调用链和回归，不新增本任务范围外实现。本轮不启动任何live审查会话。
+第1轮18项在draft2均有作者处置、无low延期；第2轮确认CR30D-01仍有缺口，见下表。“修复”是作者处置，不替代独立复审结论。下一轮限定本修复diff、相关契约调用链和回归，不新增本任务范围外实现。本轮不启动任何live审查会话。
+
+
+第2轮：Grok Reviewer（原生记录解析模型 `grok-4.7`），session **`01a1ffb5-e62c-7bd1-b52e-26965172347a`**，attempt **`21bbf0ad-107e-4e77-bda0-9ae5d9f0e2b7`**；只审修复diff `6c0fc5b67aeec72579f1cc2a5cf1070e9e17ee47..8cd48eab4646bf46dfa6f399dca35aca4cbf7ea8` 及调用链。最终 `hoh-report` 为 **FAIL（1 high、1 medium）**；确认CR30D-02..18已解决，CR30D-01部分解决。来源 `/home/ai/dev/hoh/.hoh-dev/evidence/m5spec-review-grok-r2.out` 指向原生attempt；核对原始stdout摘要后，将原记录、会话及提取的最终报告保存到 `m5-spec-d3/r2-attempt.json`、`r2-stdout.jsonl`、`r2-report.json`。原生完成只表示报告交付，不是设计PASS。
+
+**连续两轮同类缺口的设计修正（CR30D-01→50）**：根因是将“发布与增量分离”只落实在SQL写入端，遗漏文件扫描这一读取端。以真实生产者归属同时决定记录根、成员集与投影：增量记录仍用原根和原聚合，发布记录在独立根、只进入release投影；两者共用完整性验证与候选INVALID否决事务。正常PASS/FAIL必须在写入与重读两端都证明增量不变，不能只检查表未更新。该修正依据已采纳Q6与第2轮报告，不新增架构或缩减范围。
+
+| finding | 原等级 | draft3处置与可复核位置 |
+|---|---|---|
+| CR30D-50 | high | 修复：共同约定7、接线核对、AC/TEST-056-02与T07明确独立发布根、不进决定10成员集、只读release投影；普通FAIL与新增普通PASS子例均核对候选成员/逐TEST结论/增量投影不变；INVALID仍同事务否决C并写integrity_violation，发布行不写acceptance_results |
+| CR30D-51 | medium | 修复：AC-044-01 then、behavior、test_044_01_append_restore与T06要求用户目录仍在W、HEAD=R、index与工作树字节/路径等于tree B且干净；保留脏目录先拒绝、不reset |
+
+第2轮的两项无编号low备忘进入 **M5-T08 verify前low清理包**：`refs/heads/hoh/failed/...` 会进入分支列表；`lineage_generation` 的存储与递增事件仍由效果反推。按报告原级别延期，本轮不改；清理时逐项修复或按AC记录有证据的延期。第3轮只审 `8cd48eab` 到draft3新提交的修复diff、调用链与回归。本轮不启动live审查；本表“修复”是作者处置，须第3轮独立核对，CR仍DRAFT。
 
 ## 批准后应用清单与不变内容
 
@@ -2290,28 +2306,27 @@ Q6 的现有接线核对（本次修订起点 `6c0fc5b6`，只是读源码，不
 
 ## 验证方式
 
-本次为 **文档机械自测，非验收**。没有实现或执行39条拟议产品AC，没有运行live Agent、真实插件、双OS部署、浏览器、soak或本稿的新产品红绿；这些产品结果均为 **NOT_RUN**。不修改真实工作树的受锁契约/基线/检查计划/产品源码；不调用release_gate宣称v1完成。首轮独立设计审查是已有FAIL输入，本轮没有启动复审，CR保持DRAFT。
+本次为 **文档机械自测，非验收**。没有实现或执行39条拟议产品AC，没有运行live Agent、真实插件、双OS部署、浏览器、soak或新产品红绿；这些产品结果及Rust产品回归均为 **NOT_RUN**。第二轮独立设计审查为已有FAIL输入，本轮没有启动第3轮，CR保持DRAFT。真实工作树只改本CR，不修改受锁契约、基线、检查计划、产品源码、任务板或全局PROGRESS。
 
-全部本轮证据保存在主仓库 **`/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/`**（非可移除worktree的忽略目录），包括原生审查记录/原始会话、CTO决定、输入绑定、脚本、逐命令argv/退出码/耗时和原始stdout/stderr。原生审查stdout的SHA-256已与attempt记录一致；来源摘要见 `source-bindings.json`。`unchanged-source.json`记录真实工作树的CONTRACT、requirements、scenarios、tasks、policy、plan、protocol及baseline-lock与修订起点逐字节相同的核对。
+全部本轮证据保存在主仓库 **`/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/`**：原生审查记录/原始会话/最终报告、CTO决定、输入绑定、复现脚本、逐命令argv/退出码/耗时与原始stdout/stderr。第2轮最终报告已逐值核对原生stdout第49条（最后一条）result中的hoh-report，stdout摘要与attempt记录一致。`source-bindings.json`、`cited-source-bindings.json`记录审查/CTO/M4来源与所读代码版本；`unchanged-source.json`记录真实受锁文件与修订起点逐字节相同，`fix-scope.json`记录状态行及JSON改动范围。
 
-本次实际以 `mktemp -d /home/ai/dev/m5spec-XXXXXX` 创建 **`/home/ai/dev/m5spec-01rvP8`**；`ownership.json`及`source-bindings.json`登记本任务与确切路径。`baseline/`与`repo/`均为输入commit `6c0fc5b67aeec72579f1cc2a5cf1070e9e17ee47` 的本地共享对象克隆，分别测试基线与M5提案应用；所有测试临时目录经TMPDIR放在该根的 `tmp/`。清理只对本任务登记的确切根进行，结果见 `cleanup.json`；证据保留在上述主仓库目录。运行用户uid=1000，显式加载本工作树 `.hoh-dev/env.sh`，Python 3.14.4、rustc 1.99.1、Git 2.53.0，版本命令输出见 `execution-environment.json`。
+实际以 `mktemp -d /home/ai/dev/m5spec-XXXXXX` 创建 **`/home/ai/dev/m5spec-R5lg9y`**，根及证据目录的 `ownership.json` 登记本任务与确切路径。`baseline/` 与 `repo/` 均为 draft2 commit `8cd48eab4646bf46dfa6f399dca35aca4cbf7ea8` 的本地共享对象克隆，分别测试原基线与M5提案应用；TMPDIR固定为该根的 `tmp/`，不使用/tmp。清理仅删除登记的确切根，结果见 `cleanup.json`；证据保留在主仓库。运行前实际加载本工作树 `.hoh-dev/env.sh`，非root身份及工具版本保存在 `execution-environment.json`。
 
-副本应用器仅替换9个REQ对象、39个场景与10个M5任务，按输入的一空格缩进写入；只在副本中将CR头改为APPROVED并注明“隔离副本机械验证占位；不构成正式批准”，以测试正式基线变更步骤。副本revision22→23、27个受锁文件；副本锁绝不复制回工作树。探针另将已批准但未应用的CR-028任务图覆盖到内存做闭包校验，**没有**把M4产品实现或全部M4契约应用到该副本。
+副本应用器仅替换9个REQ对象、39个场景与10个M5任务，一空格缩进/UTF-8/LF；仅在副本将CR头改为APPROVED并标注“隔离副本机械验证占位；不构成正式批准”，测试revision22→23的正式机械步骤，27个受锁文件。副本锁不复制回工作树。另将已批准但未应用CR-028的任务图覆盖到内存做A1闭包探针；**未**把完整M4契约或产品能力应用到副本，正式M4+M5合并仍需重验。
 
-复现脚本为 [m5-spec-d2/apply.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/apply.py)、[probe.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/probe.py)、[audit.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/audit.py)、[run-command.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/run-command.py)；apply/probe均显式接收副本路径，probe还接收M4原文路径，不写死临时目录名。apply要求上一级有本次注册的ownership文件并拒绝真实工作树；新复现须先注册自己的scratch根。原始M4文本由实际执行的 `git show prep/M4-T01-spec:docs/cr/CR-028-m4-detailed-spec.md` 保存为 `/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2/m4-cr028.md`；来源commit/hash见A1后绑定与source-bindings。下面表中的E表示`/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d2`，S表示`/home/ai/dev/m5spec-01rvP8`；完整展开argv与cwd在各同名JSON记录中，日志在同名`.log`中。
+复现脚本：[apply.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/apply.py)、[probe.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/probe.py)、[audit.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/audit.py)、[run-command.py](/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3/run-command.py)。apply/probe显式接收副本路径，apply要求上一级有已注册ownership且拒绝真实工作树；probe另接收M4原文路径。M4文本实际由 `git show prep/M4-T01-spec:docs/cr/CR-028-m4-detailed-spec.md` 取得并保存为 `m4-cr028.md`，commit/hash与A1绑定一致。下表E=`/home/ai/dev/hoh/.hoh-dev/evidence/m5-spec-d3`，S=`/home/ai/dev/m5spec-R5lg9y`；完整展开argv/cwd/退出码在同名JSON记录，原始输出在同名log。
 
 | 位置 / 实际命令 | 退出码 | 结果与记录 |
 |---|---:|---|
-| S/baseline：`bash scripts/check.sh --bundle` | 0 | 570 tests，1526.701s，OK (skipped=2)；baseline-bundle.json/log |
+| S/baseline：`bash scripts/check.sh --bundle` | 0 | 570 tests，1532.242s，OK (skipped=2)；baseline-bundle.json/log |
+| 工作树：`python3 E/audit.py /home/ai/dev/hoh-wt/m5-spec` | 0 | 39场景/163具名必需子例、steps/pass_criteria对应、39行闭包表、两轮20项作者处置、原TEST检查归属保留；draft-audit.json/log |
 | S/repo：`python3 E/apply.py S/repo` | 0 | 应用9REQ/39场景/10任务，仅副本；apply.json/log |
-| S/repo：`python3 E/probe.py S/repo E/m4-cr028.md` | 0 | 39AC/8 implement、唯一owner、每任务≤2REQ/≤8AC、每AC闭包、M4图覆盖0错误；其它REQ/任务及policy/plan/protocol内容不变；probe.json/log |
-| 工作树：`python3 E/audit.py /home/ai/dev/hoh-wt/m5-spec` | 0 | 39场景/162具名必需子例、steps/pass_criteria对应、39行闭包表、18项处置、原TEST检查归属保留；draft-audit.json/log |
+| S/repo：`python3 E/probe.py S/repo E/m4-cr028.md` | 0 | 39AC/8 implement、唯一owner、每任务≤2REQ/≤8AC、逐AC闭包及M4任务图覆盖均0错误；其余REQ/任务及policy/plan/protocol不变；probe.json/log |
 | S/repo：`python3 tools/gen_spec_views.py` | 0 | 生成docs/02与docs/18；generate.json/log |
 | S/repo：`python3 tools/baseline.py relock --cr docs/cr/CR-030-m5-detailed-spec.md` | 0 | 仅副本revision23；relock.json/log |
 | S/repo：`python3 tools/validate_bundle.py` | 0 | BUNDLE_ONLY PASS：70REQ、52 detailed、244AC、71 tasks，product_accepted=false；validate.json/log |
-| S/repo：`python3 tools/baseline.py relock --cr docs/cr/CR-030-m5-detailed-spec.md --amend` | 0 | 补齐文档叙述后、完整套件前仅副本重算；pre-suite-relock.json/log |
-| S/repo：`bash scripts/check.sh --bundle` | 0 | 570 tests，1639.064s，OK (skipped=2)；applied-bundle.json/log |
+| S/repo：`bash scripts/check.sh --bundle` | 0 | 570 tests，1795.100s，OK (skipped=2)；applied-bundle.json/log |
 
-两套测试的skip均为既有 `test_ledger_outline_requirements_not_ready`（M3 already detailed）与 `test_repository_packages_verified`（Pi packages not installed here）；未记为PASS，完整原文保留在日志及 `bundle-summaries.json`。本次未新增生产测试，不声称文档修订完成了生产TDD；未来实现任务仍须逐场景红→绿及独立验证。
+两套suite的skip均为既有 `test_ledger_outline_requirements_not_ready`（M3 already detailed）和 `test_repository_packages_verified`（Pi packages not installed here）；不记为PASS，原文见日志及 `bundle-summaries.json`。本次未写生产测试，不声称文档修订完成了生产TDD；未来实现任务仍须逐场景红→绿及独立验证。
 
-11个JSON fence的规范化SHA-256为 **`08784ab62698bc584d534c57369998dbeb824935a836a9fde5d4b514a92e08c9`**；填入本节与源码接线/审查来源说明不改变这些片段。收尾时以最终文档同步副本，只重新计算该副本CR锁，核对fence摘要、probe/audit、validate_bundle、baseline verify及真实工作树的validate/原锁/diff；实际退出码、最终CR摘要与版本一致性记录集中在 `final-checks.json`，完整逐命令记录在 `commands.json`。本轮没有基于未应用M4/M6/M7能力宣称验收：正式应用仍须重核实际主线和CTO/独立复审结论，运行完整bundle与契约影响闭包的 `cargo test --workspace --locked`，再由各实现任务兑现产品AC。
+11个JSON fence的规范化SHA-256为 **`61836e09b92ee5f9c6db592bf6f3b6b4af7de84b4bcbe736563cd5aaf84aeba5`**；与应用后完整suite的受测片段一致，原输入文件摘要见 `suite-inputs.json`。补齐本节后以最终文档同步副本，仅重算副本CR锁（`python3 tools/baseline.py relock --cr docs/cr/CR-030-m5-detailed-spec.md --amend`），再核对fence摘要、probe/audit、validate_bundle、baseline verify及真实工作树的validate/原锁/diff。收尾命令的实际退出码、最终CR摘要及版本一致性集中在 `final-checks.json`，全部逐命令记录索引为 `commands.json`。这些叙述更新不改变已受测的JSON提案；正式应用仍须重核实际主线/CTO决定及独立复审，完整bundle与 `cargo test --workspace --locked` 及后续产品验收不能由本次机械自测替代。
