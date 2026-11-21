@@ -23,3 +23,13 @@ fn a_released_project_lock_is_free_while_a_copy_of_its_descriptor_lives() {
     );
     drop(copy);
 }
+
+#[test]
+fn a_bound_socket_is_private_before_the_host_can_publish_it() -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("host.sock");
+    let _bound = super::bind_socket(&socket)?;
+    assert_eq!(std::fs::metadata(&socket)?.permissions().mode() & 0o077, 0);
+    Ok(())
+}
