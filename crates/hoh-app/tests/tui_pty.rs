@@ -783,7 +783,7 @@ fn open_attach(project: &Path, home: &Path) -> R<Session> {
 fn test_043_03_the_tui_leaves_on_sighup_sigterm_and_detach_with_the_host_and_agent_alive_and_the_run_unchanged()
 -> R {
     // AC-043-03: hoh's TUI attached to run R in a PTY while its FakeAgent works 60 s; the host and Agent pids recorded.
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
@@ -932,7 +932,7 @@ impl Drop for Daemons {
 #[test]
 fn a_host_started_by_a_detach_in_a_terminal_outlives_its_hang_up() -> R {
     // CR-010 decision 2 (REQ-005 behaviour 2): supplementary detach evidence, no TEST id (AC-005-01 is M2-T13's).
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
@@ -1034,7 +1034,7 @@ impl Drop for WriteLock {
 /// ends at once with `code`, the terminal as it was (the Workspace never entered), and the host goes on in the
 /// background and becomes ready once the lock goes.
 fn a_signal_while_the_attachs_host_starts_ends_it(sig: Signal, code: i32) -> R {
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
@@ -1144,7 +1144,7 @@ fn a_signal_while_the_attach_waits_behind_the_start_lock_ends_it_with_the_termin
     // ADR-031's design correction (client signals), rules 2 and 3 (CLT-100): `hoh attach <run>` with a terminal, its
     // host's start held behind the project's start lock another client holds, takes SIGTERM: 143 within 2 s, said as
     // REQ-004 says it (nothing was attached), the Workspace never entered, the terminal's attributes as they were.
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
@@ -1269,7 +1269,7 @@ fn choose(s: &mut Session, down: usize, said: &str) -> R {
 fn the_tuis_pause_and_cancel_choices_send_their_own_commands_and_it_stays_attached() -> R {
     // M2T06R-55 (ADR-021 decision 10): R RUNNING with nothing running. 暂停 sends PauseRun (R reaches PAUSED), then
     // 取消任务 sends CancelRun (R reaches CANCELLED); the TUI stays attached through both and shows the run's events.
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
@@ -1319,7 +1319,7 @@ fn an_attached_tui_goes_on_with_its_run_through_a_host_started_again() -> R {
     // M2T06R-04 (REQ-005 behaviour 3, ADR-021 decisions 4 and 10): the TUI attached to R (PAUSED), its host stopped
     // normally and another started (another token). The TUI shows the run's next event, received from the new host,
     // and its pause is accepted there.
-    let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+    let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
     let (project, home) = (dir.path().join("p"), dir.path().join("home"));
     std::fs::create_dir_all(&project)?;
     std::fs::create_dir_all(&home)?;
