@@ -1078,6 +1078,7 @@ pub mod classify;
 pub mod identity;
 pub mod issues;
 pub mod report;
+pub mod spec_report;
 
 /// An Issue's fingerprint without a locator (a change request's, docs/adr/ADR-028.md decision 13): see
 /// [`acceptance::fingerprint`] (docs/adr/ADR-029.md decision 9).

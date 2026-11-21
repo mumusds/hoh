@@ -45,6 +45,7 @@ mod rounds;
 mod runner;
 mod series;
 mod snapshot;
+mod spec_review;
 mod staffing;
 mod stall;
 mod suites;
@@ -75,6 +76,7 @@ pub use snapshot::{
     AcShown, AcceptanceItem, AcceptancePage, AcceptanceView, CandidateShown, CheckShown, IssueItem,
     IssuesPage, RowShown,
 };
+pub use spec_review::{KeptObject, SpecReviewIntake, SpecReviewTaken};
 pub use staffing::{
     BINDING_BLOCKED, BINDING_EXCLUDED, BINDING_FALLBACK, BINDING_UNBLOCKED, CHANGE_PENDING,
     CHANGE_WITHDRAWN, EXCLUSION_SKIPPED, Evidence, StaffChange, StaffWrite, TASK_UNBLOCKED,
@@ -1709,6 +1711,15 @@ impl Store {
     /// no task or attempt moves. A verifier's completion takes its report in within its own commit.
     pub async fn record_report(&self, intake: ReportIntake) -> Result<IntakeState, PersistError> {
         self.writer.record_report(intake).await
+    }
+
+    /// Take a specification review's report in through its single intake entry (REQ-031 behaviour 4,
+    /// docs/adr/ADR-035.md): every check, then one `spec_review.reported`, CURRENT or REJECTED with its reasons.
+    pub async fn intake_spec_review(
+        &self,
+        intake: SpecReviewIntake,
+    ) -> Result<SpecReviewTaken, PersistError> {
+        self.writer.intake_spec_review(intake).await
     }
 
     /// Answer a verifier's request through its bridge (docs/adr/ADR-028.md decision 13): a change request refused with

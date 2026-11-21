@@ -1066,6 +1066,28 @@ pub fn native_attempt() -> &'static Schema {
     })
 }
 
+/// `contracts/spec-review-report.schema.json` (an independent review of a specification revision, REQ-031, CR-026).
+pub fn spec_review_report() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "spec-review-report.schema.json",
+            include_str!("../../../contracts/spec-review-report.schema.json"),
+        )
+    })
+}
+
+/// `contracts/spec-review-attempt.schema.json` (the runtime's export of a specification review's native attempt).
+pub fn spec_review_attempt() -> &'static Schema {
+    static SCHEMA: OnceLock<Schema> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        load(
+            "spec-review-attempt.schema.json",
+            include_str!("../../../contracts/spec-review-attempt.schema.json"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1380,46 @@ mod tests {
     fn embedded_contracts_load() {
         assert!(protocol().document().get("$defs").is_some());
         assert!(compat_manifest().document().get("$defs").is_some());
+        assert!(spec_review_report().document().get("$defs").is_some());
+        assert!(spec_review_attempt().document().get("required").is_some());
+    }
+
+    #[test]
+    fn spec_review_schemas_load_and_validate_samples() {
+        // REQ-031 behaviour 4 (CR-026): the specification review's report and native attempt record are product schemas.
+        let digest = "a".repeat(64);
+        let commit = "c".repeat(40);
+        let file = serde_json::json!({"path": ".hoh/objects/sha256/aa/x", "sha256": digest});
+        let report = serde_json::json!({
+            "schema_version": "1.0", "role": "reviewer", "session_id": "S-1", "spec_revision": 2,
+            "spec_sha256": digest, "git_commit": commit, "status": "PASS", "scope": ["docs/spec"],
+            "findings": [{"id": "F-1", "severity": "medium", "summary": "s"}],
+            "raw_session": file, "native_attempt": file,
+        });
+        assert_eq!(
+            spec_review_report().validate(&report).map_err(|v| v.len()),
+            Ok(())
+        );
+        let attempt = serde_json::json!({
+            "record_type": "runtime_spec_review_export", "role": "reviewer", "status": "COMPLETED",
+            "session_ids": ["S-1", "native-1"], "review_id": "rv-1", "attempt_id": "a-1", "spec_revision": 2,
+            "spec_sha256": digest, "git_commit": commit, "stdout_sha256": digest,
+        });
+        assert_eq!(
+            spec_review_attempt()
+                .validate(&attempt)
+                .map_err(|v| v.len()),
+            Ok(())
+        );
+        // The report is of a revision, never of a candidate; the record only of a COMPLETED attempt.
+        let mut candidate = report.clone();
+        candidate["candidate_id"] = serde_json::json!(format!("CAND-{digest}"));
+        assert!(spec_review_report().validate(&candidate).is_err());
+        let mut failed = attempt.clone();
+        failed["status"] = serde_json::json!("FAILED");
+        assert!(spec_review_attempt().validate(&failed).is_err());
+        let mut absolute = report;
+        absolute["raw_session"]["path"] = serde_json::json!("/etc/passwd");
+        assert!(spec_review_report().validate(&absolute).is_err());
     }
 }

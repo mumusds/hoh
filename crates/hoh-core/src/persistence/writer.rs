@@ -208,6 +208,11 @@ enum Job {
         Box<super::reports::ReportIntake>,
         oneshot::Sender<Result<super::reports::IntakeState, PersistError>>,
     ),
+    /// A specification review's report taken in ([`super::spec_review::record`]).
+    SpecReview(
+        Box<super::spec_review::SpecReviewIntake>,
+        oneshot::Sender<Result<super::spec_review::SpecReviewTaken, PersistError>>,
+    ),
     /// A verifier's request the Runtime answers ([`super::verification::request`]).
     Request(
         Box<super::verification::VerifierRequest>,
@@ -475,6 +480,7 @@ impl Job {
             Job::Evidence(..) => "Evidence",
             Job::Amend(..) => "Amend",
             Job::Report(..) => "Report",
+            Job::SpecReview(..) => "SpecReview",
             Job::Plan(..) => "Plan",
             Job::Round(..) => "Round",
             Job::Reconcile(..) => "Reconcile",
@@ -691,6 +697,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::reports::record(&mut conn, &job, &ctx),
+                            ));
+                        }
+                        Job::SpecReview(job, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::spec_review::record(&mut conn, &job, &ctx),
                             ));
                         }
                         Job::Request(job, reply) => {
@@ -980,6 +993,14 @@ impl Writer {
         intake: super::reports::ReportIntake,
     ) -> Result<super::reports::IntakeState, PersistError> {
         self.submit(|tx| Job::Report(Box::new(intake), tx)).await
+    }
+
+    pub(super) async fn intake_spec_review(
+        &self,
+        intake: super::spec_review::SpecReviewIntake,
+    ) -> Result<super::spec_review::SpecReviewTaken, PersistError> {
+        self.submit(|tx| Job::SpecReview(Box::new(intake), tx))
+            .await
     }
 
     pub(super) async fn verifier_request(
