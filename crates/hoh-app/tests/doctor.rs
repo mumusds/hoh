@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+mod prerequisites;
+
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn fixtures() -> PathBuf {
@@ -1542,12 +1544,7 @@ fn a_signal_while_doctors_start_check_asks_systemd_run_leaves_no_probe_behind() 
         || !Path::new("/var/lib/systemd/linger").join(&user).is_file()
         || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
     {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no linger record for this user, or no cgroup v2, here"
-        );
-        return Ok(());
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
     }
     let s = Sandbox::new()?;
     s.codex(Status::LoggedIn)?;

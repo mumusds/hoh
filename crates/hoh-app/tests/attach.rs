@@ -7,6 +7,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod prerequisites;
 mod pty;
 mod world;
 
@@ -820,12 +821,7 @@ fn a_signal_while_the_start_asks_systemd_run_leaves_no_probe_behind() -> R {
     // in a process group of its own, has ended by the time the client has; no host is started after the signal. Before,
     // the probe outlived the client, orphaned, past its 2 s bound.
     let Some(user) = lingering_user() else {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no linger record for this user, or no cgroup v2, here"
-        );
-        return Ok(());
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
     };
     for (signal, code) in ENDING {
         let env = Env::new()?;
@@ -1163,12 +1159,7 @@ fn a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended() -> R 
     // and kills the probe's group and leader, the stop reaps it, and the client ends with 143 saying only rule 2's
     // sentence (nothing unconfirmed, nothing in flight). The probe has ended by the time the client has.
     let Some(user) = lingering_user() else {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no linger record for this user, or no cgroup v2, here"
-        );
-        return Ok(());
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
     };
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
@@ -1219,12 +1210,7 @@ fn a_helper_start_in_flight_past_the_stops_bound_is_said_and_the_client_ends() -
     // says, after rule 2's sentence, that a start had not returned and a process may appear after it (pid unknown).
     // Whether that process exists is not asserted.
     let Some(user) = lingering_user() else {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no linger record for this user, or no cgroup v2, here"
-        );
-        return Ok(());
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
     };
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
@@ -2800,12 +2786,7 @@ fn a_host_started_in_a_scope_lives_on_when_its_client_takes_a_signal() -> R {
     // not a helper: `hoh -p` takes SIGTERM just after it spawned it (the debug marker after the spawn), ends with 143,
     // and that very process (systemd-run execs the host, keeping its pid) lives on and becomes the project's host.
     if !scope_available() {
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no user manager with linger and systemd-run here"
-        );
-        return Ok(());
+        return prerequisites::missing("no user manager with linger and systemd-run here");
     }
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
@@ -2994,12 +2975,7 @@ fn doctor_bounds_the_systemd_run_version_probe_and_lists_it() -> R {
     if !manager_and_linger() {
         // Visible, not a silent pass (M2T06R-656): straight to the stderr of the test process, which libtest's capture
         // of `eprintln!` would hide in a passing test's output (M2T06R-701).
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no user systemd manager or no linger here"
-        );
-        return Ok(());
+        return prerequisites::missing("no user systemd manager or no linger here");
     }
     let env = Env::new()?;
     let path = hanging_systemd_run(&env)?;
@@ -3051,12 +3027,7 @@ fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
     if !manager_and_linger() {
         // Visible, not a silent pass (M2T06R-656): straight to the stderr of the test process, which libtest's capture
         // of `eprintln!` would hide in a passing test's output (M2T06R-701).
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no user systemd manager or no linger here"
-        );
-        return Ok(());
+        return prerequisites::missing("no user systemd manager or no linger here");
     }
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
@@ -3117,13 +3088,7 @@ fn doctor_and_the_hosts_record_say_how_systemd_run_failed() -> R {
     // failure, with its exit and its stderr, both by doctor's check before a start and in the host.json of the host the
     // client then starts directly; not as "gave no version within 2 s", which named no cause.
     if !manager_and_linger() || !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        // Visible, not a silent pass (M2T06R-656).
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP: no user systemd manager, no linger or no cgroup v2 here"
-        );
-        return Ok(());
+        return prerequisites::missing("no user systemd manager, no linger or no cgroup v2 here");
     }
     let env = Env::new()?;
     let _daemons = Daemons(env.project());
