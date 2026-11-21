@@ -289,13 +289,29 @@ class RolloutJsonLines(unittest.TestCase):
                     control=J.load(out,Path('/nonexistent'),'codex','app-control')[0]
                     self.assertEqual(J.round_verdict(c,control),('INSUFFICIENT',[f'rollout line {line} is not valid JSON']))
 
+    def test_serde_number_and_depth_boundaries(self):
+        J=judge_check
+        invalid=['NaN','Infinity','-Infinity','1e400','-1e400','1'+'0'*400,
+                 '['*127+'0'+']'*127,'['*1000+'0'+']'*1000]
+        valid=['1e308','-1e308','['*126+'0'+']'*126,json.dumps('['*200+'"'+']'*200)]
+        for value in invalid+valid:
+            with self.subTest(value=value[:40],length=len(value)):
+                problems=[]
+                rows=J.json_lines('{"note":'+value+'}\n','rollout',problems)
+                if value in invalid:
+                    self.assertEqual(rows,[])
+                    self.assertEqual(problems,['rollout line 1 is not valid JSON'])
+                else:
+                    self.assertEqual(len(rows),1)
+                    self.assertEqual(problems,[])
+
     def test_the_generated_raw_variants_keep_the_expected_verdict_and_reason(self):
         J=judge_check
         for name in ('app-ro-new','app-ro-resumed'):
             c=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex',name)[0]
             control=J.load(FIXTURES/'excerpts',Path('/nonexistent'),'codex','app-control')[0]
             rows=[r for r in J.run_mutants(c,control) if r['kind']=='rollout JSONL']
-            self.assertEqual(len(rows),9,name)
+            self.assertEqual(len(rows),20,name)
             for r in rows:
                 want='PASS' if r['expect']=='same' else 'INSUFFICIENT'
                 self.assertEqual(r['verdict'],want,(name,r['label']))

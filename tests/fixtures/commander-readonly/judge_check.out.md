@@ -198,8 +198,8 @@ Per mutant kind and positive round: how many variants, and their verdicts. "non-
 | code mode | non-PASS | — | — | 1 FAIL, 48 INSUFFICIENT | 1 FAIL, 48 INSUFFICIENT | — | — |
 | code mode mismatch | non-PASS | — | — | 2 FAIL, 12 INSUFFICIENT | 2 FAIL, 12 INSUFFICIENT | — | — |
 | code mode lexis | non-PASS | — | — | 15 INSUFFICIENT | 15 INSUFFICIENT | — | — |
-| rollout JSONL | same | — | — | 2 PASS | 2 PASS | — | — |
-| rollout JSONL | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
+| rollout JSONL | same | — | — | 5 PASS | 5 PASS | — | — |
+| rollout JSONL | non-PASS | — | — | 15 INSUFFICIENT | 15 INSUFFICIENT | — | — |
 | item default-deny | non-PASS | — | — | 3 INSUFFICIENT | 3 INSUFFICIENT | — | — |
 | incomplete driver run | non-PASS | — | — | 7 INSUFFICIENT | 7 INSUFFICIENT | — | — |
 | incomplete patch call | non-PASS | — | — | 2 INSUFFICIENT | 2 INSUFFICIENT | — | — |
@@ -944,6 +944,17 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | rollout JSONL | a lone surrogate value | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
 | codex/app-ro-new | rollout JSONL | a lone surrogate key | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
 | codex/app-ro-new | rollout JSONL | a nested lone surrogate | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | NaN | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | Infinity | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | negative Infinity | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | positive float overflow | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | negative float overflow | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | integer overflow | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | 128 nested containers | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | 1001 nested containers | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
+| codex/app-ro-new | rollout JSONL | a finite exponent | same | PASS | — |
+| codex/app-ro-new | rollout JSONL | 127 nested containers | same | PASS | — |
+| codex/app-ro-new | rollout JSONL | quoted container delimiters | same | PASS | — |
 | codex/app-ro-new | rollout JSONL | a U+2028 script | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | rollout JSONL | a U+2028 script and a malformed line | non-PASS | INSUFFICIENT | rollout line 36 is not valid JSON; an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
@@ -1473,6 +1484,17 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | rollout JSONL | a lone surrogate value | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
 | codex/app-ro-resumed | rollout JSONL | a lone surrogate key | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
 | codex/app-ro-resumed | rollout JSONL | a nested lone surrogate | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | NaN | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | Infinity | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | negative Infinity | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | positive float overflow | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | negative float overflow | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | integer overflow | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | 128 nested containers | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | 1001 nested containers | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
+| codex/app-ro-resumed | rollout JSONL | a finite exponent | same | PASS | — |
+| codex/app-ro-resumed | rollout JSONL | 127 nested containers | same | PASS | — |
+| codex/app-ro-resumed | rollout JSONL | quoted container delimiters | same | PASS | — |
 | codex/app-ro-resumed | rollout JSONL | a U+2028 script | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | rollout JSONL | a U+2028 script and a malformed line | non-PASS | INSUFFICIENT | rollout line 69 is not valid JSON; an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | item default-deny | a killed driver run whose command has a trailing space | non-PASS | INSUFFICIENT | an unclassified item (commandExecution) |
