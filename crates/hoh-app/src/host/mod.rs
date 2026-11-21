@@ -524,34 +524,6 @@ impl Host {
                 stopped.clone(),
             ))),
         ];
-        // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
-        // with the listeners and before the store closes (ADR-019 decision 8).
-        let inflight: control::Inflight = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-        if let Some(runner) = config.runner.clone() {
-            served.push(tokio::spawn(begun.clone().scope(runner::run(
-                shared.clone(),
-                runner,
-                runner::Setup {
-                    clock: config.clock.0.clone(),
-                    settings: config.reconcile.clone(),
-                    host_epoch: started.host_epoch,
-                    jitter: jitter.clone(),
-                    inflight: inflight.clone(),
-                    watchdog: config.watchdog,
-                },
-                stopped.clone(),
-            ))));
-        }
-        // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
-        served.push(tokio::spawn(begun.clone().scope(control::run(
-            shared.clone(),
-            config.clock.0.clone(),
-            config.runner.as_ref().map(|r| r.executor.clone()),
-            inflight,
-            repo.clone(),
-            config.cancel,
-            stopped,
-        ))));
         let supervisor = std::fs::read_to_string("/proc/self/cgroup")
             .ok()
             .and_then(|text| crate::unit::supervisor_of(&text));
@@ -595,6 +567,36 @@ impl Host {
             host_files.remove();
             return Err(e);
         }
+        // The runner after the reconcile (every dispatch it makes or takes comes after reconcile.completed), stopped
+        // with the listeners and before the store closes (ADR-019 decision 8). It and the pause and cancel loop start
+        // only once host.json announced the host: a host that has not announced itself does no work, and one whose
+        // announcement failed did none (docs/adr/ADR-016.md decision 1, step 8).
+        let inflight: control::Inflight = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        if let Some(runner) = config.runner.clone() {
+            served.push(tokio::spawn(begun.clone().scope(runner::run(
+                shared.clone(),
+                runner,
+                runner::Setup {
+                    clock: config.clock.0.clone(),
+                    settings: config.reconcile.clone(),
+                    host_epoch: started.host_epoch,
+                    jitter: jitter.clone(),
+                    inflight: inflight.clone(),
+                    watchdog: config.watchdog,
+                },
+                stopped.clone(),
+            ))));
+        }
+        // Pause and cancel move on with or without an executor (docs/adr/ADR-021.md decision 7).
+        served.push(tokio::spawn(begun.clone().scope(control::run(
+            shared.clone(),
+            config.clock.0.clone(),
+            config.runner.as_ref().map(|r| r.executor.clone()),
+            inflight,
+            repo.clone(),
+            config.cancel,
+            stopped,
+        ))));
         config.hooks.announced();
         Ok(Host {
             project_id: started.project_id,
