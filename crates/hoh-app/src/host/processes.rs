@@ -385,6 +385,9 @@ pub(super) struct Outside {
     /// The leader's start time as recorded, kept when the leader is no longer pinned: every process of the attempt
     /// descends from the leader, so one started before it is not the attempt's (M2R-500, as WD-03).
     born: Option<u64>,
+    /// Whether the attempt is tracked by its delegated cgroup: then the cgroup's proof covers what stays in it, and an
+    /// unreadable environment is not counted here (see [`Outside::by_cgroup`]).
+    by_cgroup: bool,
     pins: Vec<Pinned>,
     /// The strongest signal sent so far: one found later gets it at once.
     sent: Option<rustix::process::Signal>,
@@ -407,6 +410,7 @@ impl Outside {
             leader: None,
             marker: format!("{ATTEMPT_ENV}={marker}").into_bytes(),
             born: None,
+            by_cgroup: false,
             pins: Vec::new(),
             sent: None,
             quiet: 0,
@@ -431,6 +435,17 @@ impl Outside {
     /// environment cannot be read not to be the attempt's.
     pub(super) fn born(mut self, start_id: Option<&str>) -> Outside {
         self.born = start_id.and_then(|s| s.parse::<u64>().ok()).or(self.born);
+        self
+    }
+
+    /// Whether the attempt is tracked by its delegated cgroup (`Tracking::Cgroup`). The rule of M2R-500 (an unreadable
+    /// environment of this user's process started after the leader leaves the scan incomplete) holds in /proc tracking
+    /// only: with a cgroup, a process of the attempt that stays in it is the cgroup's to prove, and one that left it and
+    /// hid its marker is ADR-021 8d's stated residual (M2T06R-400, -554), while counting every later non-dumpable
+    /// process of this user (a later login's sshd session, a later ssh-agent, a set-user-id tool run in a terminal)
+    /// would hold every attempt's proof, and its writer lease, until that process ended.
+    pub(super) fn by_cgroup(mut self, by_cgroup: bool) -> Outside {
+        self.by_cgroup = by_cgroup;
         self
     }
 
@@ -492,7 +507,9 @@ impl Outside {
                     // no leader start recorded nothing bounds it (the user's own service manager refuses its
                     // environment too): not counted, the stated residual of such a record (a STARTING attempt with no
                     // process, held at its gate, has none outside; a pid recorded without a start is a legacy row).
-                    None if self.born.is_none_or(|born| process.start < born)
+                    // With the attempt's cgroup it is not counted either ([`Outside::by_cgroup`]).
+                    None if self.by_cgroup
+                        || self.born.is_none_or(|born| process.start < born)
                         || has_ended(process) => {}
                     None => complete = false,
                 }
@@ -1148,6 +1165,44 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         assert_eq!(unreadable, Some(std::io::ErrorKind::PermissionDenied));
         assert!(start.is_some(), "the leader's start was not read");
         assert_eq!(proofs, [Proof::Incomplete; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_later_non_dumpable_process_of_this_user_holds_the_proof_in_proc_tracking_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // M2R-500's cost, measured: a process of this user unrelated to the attempt (unmarked, as a later login's sshd
+        // session or a later ssh-agent), started after the leader and non-dumpable, cannot be told apart from one of
+        // the attempt's that hid its marker. In /proc tracking every scan is incomplete while it runs; with the
+        // attempt's delegated cgroup it is not counted, and two scans prove the attempt's processes gone.
+        let marker = format!("p/M2R500-cost-{}", std::process::id());
+        let (mut leader, _) = python(
+            "print('up', flush=True); import time; time.sleep(60)",
+            Some(&marker),
+        )?;
+        let (mut later, said) = python(
+            "import ctypes, time; assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0; print('hidden', flush=True); \
+             time.sleep(60)",
+            None,
+        )?;
+        let start = match stat(Path::new("/proc"), leader.id()) {
+            Stat::Read(p) => Some(p.start.to_string()),
+            _ => None,
+        };
+        let _ = leader.kill();
+        let _ = leader.wait();
+        let proofs = |by_cgroup: bool| {
+            let mut outside = Outside::new(&marker).by_cgroup(by_cgroup);
+            outside.set_leader(Some(i64::from(leader.id())), start.as_deref());
+            [outside.scan(), outside.scan()]
+        };
+        let (proc_mode, cgroup_mode) = (proofs(false), proofs(true));
+        let _ = later.kill();
+        let _ = later.wait();
+        assert_eq!(said, "hidden");
+        assert!(start.is_some(), "the leader's start was not read");
+        assert_eq!(proc_mode, [Proof::Incomplete; 2]);
+        assert_eq!(cgroup_mode, [Proof::Pending, Proof::Done]);
         Ok(())
     }
 

@@ -1505,7 +1505,10 @@ async fn attempt(
     let root = common.shared.hooks.proc_root();
     let group = tracking.cgroup();
     let (steps, proof) = super::begun::spawn_blocking(move || {
-        let mut outside = Outside::new(&marker).born(Some(&born)).with_root(root);
+        let mut outside = Outside::new(&marker)
+            .born(Some(&born))
+            .by_cgroup(group.is_some())
+            .with_root(root);
         match group {
             // The cgroup, then what may have left it with its marker (decision 8d v6, M2T06R-400).
             Some(group) => {
