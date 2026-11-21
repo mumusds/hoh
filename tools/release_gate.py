@@ -234,6 +234,7 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
     roles=unique_index(manifest['independent_reports'],'role','independent role')
     need(set(roles)=={'qa','reviewer'},'independent QA and reviewer required')
     session_ids={manifest['developer_session_id']}
+    native_session_ids=set()
     for role,entry in roles.items():
         check_id=REPORT_CHECK[role];need(check_id in executions,f'{role}: {check_id} check missing')
         directory=exec_dirs[check_id]
@@ -255,6 +256,10 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
         need(attempt['candidate_id']==candidate,f'{role}: native attempt ran for another candidate')
         need(actual['session_id'] in attempt['session_ids'],f'{role}: report session not observed in the native attempt')
         need(manifest['developer_session_id'] not in attempt['session_ids'],f'{role}: native attempt reused the developer session')
+        # CR-029: distinct report ids do not establish independence of the full native attempts.
+        observed=set(attempt['session_ids'])
+        need(native_session_ids.isdisjoint(observed),'QA/reviewer native sessions must be distinct')
+        native_session_ids.update(observed)
         need(sha256(raw)==attempt['stdout_sha256'],f'{role}: raw session is not the native attempt output')
         need(actual['session_id'] in executions[check_id].get('_live_session_ids',set()),f'{role}: report session not listed in {check_id} live sessions')
         blocking=[f['id'] for f in actual['findings'] if f['severity'] in policy['required_zero_issue_severities']]
