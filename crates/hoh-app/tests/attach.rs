@@ -946,6 +946,117 @@ fn a_signal_while_the_exit_writes_to_a_full_stderr_decides_the_code_and_is_said(
     Ok(())
 }
 
+#[test]
+fn an_attachs_candidate_list_and_a_held_start_lock_are_said_whole_after_a_held_writer() -> R {
+    // ADR-031, 设计修正 2, verification 7, the two exits round 1 left at the unit level (CLT-1260): the client's
+    // stderr writer is held from its first line until its exit began, then let go. An attach with two runs to choose
+    // from and no terminal ends 64 with its whole candidate list (both runs named); `-p` behind a start lock another
+    // client holds ends 69 with its whole diagnostic. A writer that drops its own words at the exit makes this red.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    let held = |args: &[&str]| -> R<Output> {
+        std::fs::write(holds.join("stderr-writer"), "")?;
+        for mark in ["stderr-writer.reached", "stderr-exit"] {
+            let _ = std::fs::remove_file(holds.join(mark));
+        }
+        let client = env
+            .isolated(args)?
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        with_the_writer_held(&holds, client)
+    };
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let out = env.hoh(&["-p", "x", "--detach"])?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        runs.push(String::from_utf8(out.stdout)?.trim().to_owned());
+    }
+    let out = held(&["attach"])?;
+    let said = String::from_utf8(out.stderr)?;
+    assert_eq!(out.status.code(), Some(64), "{said}");
+    assert!(out.stdout.is_empty());
+    assert!(
+        said.starts_with("hoh: 有 2 个可附着的 Run，请用 hoh attach <run_id> 指定其一：\n"),
+        "{said}"
+    );
+    for run in &runs {
+        assert!(said.contains(&format!("  {run}  ")), "{run}: {said}");
+    }
+    assert_eq!(said.lines().count(), 3, "{said}");
+    drop(Daemons(env.project()));
+    let lock = StartLock::take(&env.project())?;
+    let out = held(&["-p", "x"])?;
+    drop(lock);
+    let said = String::from_utf8(out.stderr)?;
+    assert_eq!(out.status.code(), Some(69), "{said}");
+    assert_eq!(
+        said,
+        "hoh: GONE: another client is starting the host and it did not become ready\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_attachs_signal_exit_says_rule_twos_sentence_whole_to_a_reader_that_reads() -> R {
+    // ADR-031, 设计修正 2, verification 6, its process-level half (CLT-1260): an attach following a run with stream-json
+    // (so nothing but the client's own words goes to stderr) takes SIGTERM while its reader keeps reading: rule 2's
+    // sentence, whole, is all it says, and it ends 143.
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let out = env.hoh(&["-p", "x", "--detach"])?;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = String::from_utf8(out.stdout)?.trim().to_owned();
+    let mut client = Kid(Some(
+        env.isolated(&["attach", &run, "--output", "stream-json"])?
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let outcome = (|| -> R<Output> {
+        use std::io::BufRead as _;
+        let stdout = client.get_mut()?.stdout.take().ok_or("stdout")?;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut first = String::new();
+        reader.read_line(&mut first)?;
+        if first.is_empty() {
+            return Err("the attach showed no event".into());
+        }
+        // Its stdout read on to the end too, so nothing but the signal ends the follow.
+        let rest = std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut reader, &mut rest);
+        });
+        send(client.get()?, rustix::process::Signal::TERM)?;
+        let out = finish(client.take()?, LIMIT);
+        let _ = rest.join();
+        out
+    })();
+    let out = outcome?;
+    let said = String::from_utf8(out.stderr)?;
+    assert_eq!(out.status.code(), Some(143), "{said}");
+    assert_eq!(
+        said,
+        format!(
+            "hoh: 已脱离 Run {run}（它在后台继续，没有发出任何命令）；用 hoh attach {run} 重新附着\n"
+        )
+    );
+    Ok(())
+}
+
 /// A `systemd-run` stand-in on a PATH of its own that writes its pid to `<dir>/probe.pid` and sleeps, and a fake
 /// runtime directory that stands in for the user's manager (so none is contacted): the PATH, the runtime directory and
 /// the pid file.
