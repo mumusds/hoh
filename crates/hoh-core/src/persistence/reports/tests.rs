@@ -221,6 +221,170 @@ async fn test_054_01_reports_in_conflicting_sessions_are_rejected() -> R {
 }
 
 #[tokio::test]
+async fn test_054_01_native_session_conflicts_with_every_other_role_and_history() -> R {
+    // M2R-001: different HoH ids do not make a shared (agent, native id) independent.
+    for role in ["qa", "reviewer"] {
+        let other_verifier = if role == "qa" { "reviewer" } else { "qa" };
+        for other in ["commander", "developer", other_verifier] {
+            for history in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let (store, path) = open(dir.path())?;
+                verifying(&store).await?;
+                let started = start_verifiers(&store, &path).await?;
+                let attempt = &started.iter().find(|(r, _)| r == role).ok_or("no role")?.1;
+                let conn = Connection::open(&path)?;
+                conn.execute_batch(
+                    "INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
+                       ('sc', 'codex', 'commander', '1', '{}');
+                     INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at)
+                       VALUES ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-12T00:00:00Z');
+                     UPDATE sessions SET agent = 'codex';
+                     UPDATE role_bindings SET agent = 'codex';",
+                )?;
+                let session: String = conn.query_row(
+                    "SELECT session_id FROM role_bindings WHERE run_id = 'R' AND role = ?1",
+                    [other],
+                    |r| r.get(0),
+                )?;
+                if history {
+                    conn.execute(
+                        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                         VALUES ('p1', 'old-native', 'R', 'session.native', ?1, '2026-11-12T00:00:02Z')",
+                        [json!({"session_id": session, "native_id": "shared-native", "attempt_id": "old-attempt"}).to_string()],
+                    )?;
+                    conn.execute(
+                        "UPDATE role_bindings SET session_id = NULL WHERE role = ?1",
+                        [other],
+                    )?;
+                    conn.execute(
+                        "UPDATE sessions SET native_id = 'new-native' WHERE session_id = ?1",
+                        [&session],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE sessions SET native_id = 'shared-native' WHERE session_id = ?1",
+                        [&session],
+                    )?;
+                }
+                let mut intake = consistent(&path, attempt, (role, "PASS"), fresh_objects(&path)?)?
+                    .intake(attempt);
+                assert_ne!(intake.report["session_id"], session);
+                intake.native_session_ids.push("shared-native".to_owned());
+                let done = store.record_report(intake).await?;
+                assert_eq!(
+                    done.state,
+                    ReportState::Rejected,
+                    "{role}/{other}/history={history}: {done:?}"
+                );
+                assert_eq!(codes(&done.reasons), ["NATIVE_SESSION_NOT_INDEPENDENT"]);
+                assert_eq!(
+                    report_status(&conn, &[vec![attempt.clone()]], role)?.0,
+                    Report::NotRun
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_054_01_native_report_history_rejects_qa_then_reviewer() -> R {
+    native_report_history("qa").await
+}
+
+#[tokio::test]
+async fn test_054_01_native_report_history_rejects_reviewer_then_qa() -> R {
+    native_report_history("reviewer").await
+}
+
+async fn native_report_history(first_role: &str) -> R {
+    // The overlap can be an additional native id from the first report, absent from sessions.native_id.
+    // Keep it across restart and a binding change so a later report cannot erase the conflict.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    verifying(&store).await?;
+    let started = start_verifiers(&store, &path).await?;
+    Connection::open(&path)?.execute_batch(
+        "UPDATE sessions SET agent = 'codex'; UPDATE role_bindings SET agent = 'codex';",
+    )?;
+    let (first, second): (Vec<_>, Vec<_>) = started.iter().partition(|(r, _)| r == first_role);
+    let (role, attempt) = first[0];
+    let mut intake =
+        consistent(&path, attempt, (role, "PASS"), fresh_objects(&path)?)?.intake(attempt);
+    intake.native_session_ids.push("shared-native".to_owned());
+    assert_eq!(
+        store.record_report(intake).await?.state,
+        ReportState::Current
+    );
+    Connection::open(&path)?.execute(
+        "UPDATE role_bindings SET session_id = NULL WHERE role = ?1",
+        [role],
+    )?;
+    drop(store);
+    let store = Store::open(
+        &path,
+        crate::persistence::Options {
+            wal_probe: Some(crate::persistence::selftest::test_probe(None)),
+            ..crate::persistence::Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    let (role, attempt) = second[0];
+    let mut intake =
+        consistent(&path, attempt, (role, "PASS"), fresh_objects(&path)?)?.intake(attempt);
+    intake.native_session_ids.push("shared-native".to_owned());
+    let done = store.record_report(intake.clone()).await?;
+    assert_eq!(
+        done.state,
+        ReportState::Rejected,
+        "first={first_role}: {done:?}"
+    );
+    assert_eq!(codes(&done.reasons), ["NATIVE_SESSION_NOT_INDEPENDENT"]);
+    assert_eq!(store.record_report(intake).await?, done);
+    assert_eq!(events(&path, "report.rejected")?.len(), 1);
+    assert_eq!(
+        report_status(&Connection::open(&path)?, &[vec![attempt.clone()]], role)?.0,
+        Report::NotRun
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_054_01_native_identity_is_scoped_to_agent_and_run() -> R {
+    for other_run in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let (store, path, _, mut intake) = qa_intake(dir.path()).await?;
+        let conn = Connection::open(&path)?;
+        if other_run {
+            conn.execute_batch(
+                "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at)
+                   VALUES ('R2', 'p1', 's1', 'RUNNING', 'AUTO', 1, '2026-11-12T00:00:00Z');
+                 INSERT INTO sessions(session_id, agent, role, native_id, agent_version, capabilities_json)
+                   VALUES ('sc2', 'pi', 'commander', 'shared-native', '1', '{}');
+                 INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at)
+                   VALUES ('R2', 'commander', 'pi', 'sc2', 1, 1, '2026-11-12T00:00:00Z');
+                 INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+                   VALUES ('p1', 'other-native', 'R2', 'session.native',
+                     '{\"session_id\":\"sc2\",\"native_id\":\"shared-native\"}', '2026-11-12T00:00:02Z');",
+            )?;
+        } else {
+            // claude and pi may use identical strings for unrelated native identities.
+            conn.execute(
+                "UPDATE sessions SET native_id = 'shared-native' WHERE session_id = 'sd'",
+                [],
+            )?;
+        }
+        intake.native_session_ids.push("shared-native".to_owned());
+        let done = store.record_report(intake).await?;
+        assert_eq!(
+            done.state,
+            ReportState::Current,
+            "other_run={other_run}: {done:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_054_02_a_report_on_a_superseded_candidate_is_stale() -> R {
     // AC-054-02 at the store (REQ-054 behaviour 4, failure mode 2; decision 8): C1's verifiers run when E's completion
     // freezes C2 (D taken into C2's round). Their reports on C1 arrive afterwards: their rows are STALE (and kept), C1's
@@ -454,6 +618,11 @@ async fn a_report_whose_native_sessions_are_a_developers_is_rejected_native_sess
     for how in ["session row", "session.native"] {
         let dir = tempfile::tempdir()?;
         let (store, path, _, mut intake) = qa_intake(dir.path()).await?;
+        // Match the agent as well as the native id; different agents have separate native namespaces.
+        Connection::open(&path)?.execute(
+            "UPDATE sessions SET agent = 'claude' WHERE session_id = 'sq'",
+            [],
+        )?;
         let sql = if how == "session row" {
             "UPDATE sessions SET native_id = 'native-dev' WHERE session_id = 'sd';"
         } else {

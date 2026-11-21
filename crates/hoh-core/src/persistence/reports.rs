@@ -165,7 +165,7 @@ pub(super) fn intake_in(
             reasons,
         });
     }
-    let (state, events) = if !reasons.is_empty() {
+    let (state, mut events) = if !reasons.is_empty() {
         (
             ReportState::Rejected,
             vec![event(
@@ -210,6 +210,29 @@ pub(super) fn intake_in(
         ],
     )
     .map_err(sqlite_error)?;
+    // Keep every observed native id, not only sessions.native_id (the last completed turn). A later verifier
+    // may finish in another native session after having shared an earlier one with this attempt.
+    if let Some(session) = session.as_deref() {
+        let agent: String = tx
+            .query_row(
+                "SELECT agent FROM sessions WHERE session_id = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let native_ids: Vec<_> = intake
+            .native_session_ids
+            .iter()
+            .filter(|s| s.as_str() != session)
+            .collect();
+        events.push(event(
+            "native-sessions",
+            "report.native_sessions",
+            json!({"report_id": report_id, "attempt_id": intake.attempt_id, "candidate_id": candidate,
+                "role": task_role, "session_id": session, "agent": agent,
+                "native_session_ids": native_ids}),
+        ));
+    }
     writer::write(
         tx,
         &Commit {
@@ -252,15 +275,15 @@ fn judge(
 ) -> Result<Vec<String>, PersistError> {
     let text = |key: &str| intake.report[key].as_str().unwrap_or_default();
     let (role, session) = (text("role"), text("session_id"));
-    let session_role: Option<String> = tx
+    let session_identity: Option<(String, String)> = tx
         .query_row(
-            "SELECT role FROM sessions WHERE session_id = ?1",
+            "SELECT role, agent FROM sessions WHERE session_id = ?1",
             params![session],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some(session_role) = session_role else {
+    let Some((session_role, agent)) = session_identity else {
         return Ok(vec![format!(
             "{SESSION_UNKNOWN}: the report's session {session} is not in sessions"
         )]);
@@ -335,49 +358,56 @@ fn judge(
             intake.native_status
         ));
     }
-    let developers = developer_sessions(tx, on.run_id, on.candidate)?;
+    let conflicts = conflicting_native_sessions(tx, on.run_id, on.candidate, on.task_role, &agent)?;
     let shared: Vec<&String> = intake
         .native_session_ids
         .iter()
-        .filter(|s| developers.contains(*s))
+        .filter(|s| s.as_str() != session && conflicts.contains(*s))
         .collect();
     if !shared.is_empty() {
         reasons.push(format!(
-            "NATIVE_SESSION_NOT_INDEPENDENT: {CONFLICT} its native attempt's sessions {shared:?} are a source \
-             attempt's"
+            "NATIVE_SESSION_NOT_INDEPENDENT: {CONFLICT} its {agent} native attempt's sessions {shared:?} \
+             were used by another role in this run"
         ));
     }
     Ok(reasons)
 }
 
-/// The HoH and native sessions of every attempt of candidate `candidate`'s source tasks (the sources of its rounds)
-/// in run `run_id`: their `attempts.session_id`, those sessions' `native_id`, and the native sessions their turns
-/// recorded (`session.native`).
-fn developer_sessions(
+/// Native identities are namespaced by agent. Include the run's other roles' bindings, attempts and completed-turn
+/// history, plus every native id supplied by their reports on this candidate. Neither a binding change nor a later
+/// native id erases an earlier conflict. HoH session ids are checked separately by conflicting_sessions.
+fn conflicting_native_sessions(
     tx: &Transaction<'_>,
     run_id: &str,
     candidate: &str,
+    role: &str,
+    agent: &str,
 ) -> Result<std::collections::BTreeSet<String>, PersistError> {
     let mut statement = tx
         .prepare(
-            "WITH sources AS (SELECT DISTINCT s.value AS task_id FROM events e, \
-               json_each(e.payload_json, '$.source_task_ids') s WHERE e.kind = ?1 AND e.run_id = ?2 \
-               AND json_extract(e.payload_json, '$.candidate_id') = ?3), \
-             tried AS (SELECT a.attempt_id, a.session_id FROM attempts a WHERE a.task_id IN (SELECT task_id FROM sources)) \
-             SELECT session_id FROM tried WHERE session_id IS NOT NULL \
-             UNION SELECT s.native_id FROM sessions s WHERE s.session_id IN (SELECT session_id FROM tried) \
-               AND s.native_id IS NOT NULL \
-             UNION SELECT json_extract(n.payload_json, '$.native_id') FROM events n WHERE n.run_id = ?2 \
-               AND n.kind = 'session.native' \
-               AND json_extract(n.payload_json, '$.attempt_id') IN (SELECT attempt_id FROM tried) \
-               AND json_extract(n.payload_json, '$.native_id') IS NOT NULL",
+            "WITH other_sessions AS (\
+               SELECT a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                 WHERE t.run_id = ?1 AND t.role <> ?3 \
+               UNION SELECT b.session_id FROM role_bindings b WHERE b.run_id = ?1 AND b.role <> ?3 \
+               UNION SELECT s.session_id FROM events e JOIN sessions s \
+                 ON s.session_id = json_extract(e.payload_json, '$.session_id') \
+                 WHERE e.run_id = ?1 AND e.kind = 'session.native' AND s.role <> ?3) \
+             SELECT s.native_id FROM sessions s JOIN other_sessions o ON o.session_id = s.session_id \
+               WHERE s.agent = ?4 AND s.native_id IS NOT NULL \
+             UNION SELECT json_extract(n.payload_json, '$.native_id') FROM events n JOIN sessions s \
+               ON s.session_id = json_extract(n.payload_json, '$.session_id') \
+               WHERE n.run_id = ?1 AND n.kind = 'session.native' AND s.agent = ?4 \
+                 AND s.session_id IN (SELECT session_id FROM other_sessions) \
+                 AND json_extract(n.payload_json, '$.native_id') IS NOT NULL \
+             UNION SELECT j.value FROM events n, json_each(n.payload_json, '$.native_session_ids') j \
+               WHERE n.run_id = ?1 AND n.kind = 'report.native_sessions' \
+                 AND json_extract(n.payload_json, '$.candidate_id') = ?2 \
+                 AND json_extract(n.payload_json, '$.role') <> ?3 \
+                 AND json_extract(n.payload_json, '$.agent') = ?4",
         )
         .map_err(sqlite_error)?;
     let rows = statement
-        .query_map(
-            params![super::verification::ROUND_OPENED, run_id, candidate],
-            |r| r.get(0),
-        )
+        .query_map(params![run_id, candidate, role, agent], |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
