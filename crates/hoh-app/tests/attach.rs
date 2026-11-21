@@ -116,7 +116,7 @@ impl Env {
     fn new() -> R<Env> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = tempfile::Builder::new().prefix("hoh").tempdir_in("/tmp")?;
+        let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
         std::fs::create_dir_all(dir.path().join("p"))?;
         std::fs::create_dir_all(dir.path().join("home"))?;
         std::fs::create_dir_all(dir.path().join("agents"))?;
