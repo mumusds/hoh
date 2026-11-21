@@ -104,7 +104,15 @@ async fn inherited_quit_is_catchable_without_changing_hup_or_term() -> R {
     // A parent with no existing QUIT handler survives it; an existing INT handler still runs alongside the new flag.
     rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::INT)?;
     rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::QUIT)?;
-    assert!(existing.load(std::sync::atomic::Ordering::SeqCst));
+    // A process-directed signal may run its handler on another thread after kill returns (M2QF-01): wait, bounded.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !existing.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the existing INT handler never ran"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     Ok(())
 }
 
