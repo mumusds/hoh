@@ -226,8 +226,8 @@ async fn a_rejected_latest_candidate_vetoed_afterwards_is_invalid_in_the_snapsho
         [AcceptanceItem {
             spec_id: "s1".to_owned(),
             spec_revision: 1,
-            candidate_id: c1.clone(),
-            candidate_state: "REJECTED".to_owned(),
+            candidate_id: Some(c1.clone()),
+            candidate_state: Some("REJECTED".to_owned()),
             ac_id: "AC-1-01".to_owned(),
             label: Label::Invalid,
             why: Some(Why::CandidateInvalid),
@@ -535,8 +535,8 @@ async fn the_lists_give_each_candidates_projection_newest_first_and_each_issues_
     let item = |candidate: &str, state: &str, label: Label, latest: bool| AcceptanceItem {
         spec_id: "s1".to_owned(),
         spec_revision: 1,
-        candidate_id: candidate.to_owned(),
-        candidate_state: state.to_owned(),
+        candidate_id: Some(candidate.to_owned()),
+        candidate_state: Some(state.to_owned()),
         ac_id: "AC-1-01".to_owned(),
         label,
         why: None,

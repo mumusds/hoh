@@ -286,7 +286,7 @@ pub(super) fn import_in(
         }
     }
     let task_ids: Vec<String> = plan.tasks.iter().map(|t| t.task_id.clone()).collect();
-    let commit = Commit {
+    let mut commit = Commit {
         events: vec![NewEvent {
             intent: Intent::Progress,
             project_id,
@@ -297,6 +297,13 @@ pub(super) fn import_in(
         }],
         ..Commit::default()
     };
+    commit.events.extend(super::spec::replace_after_import(
+        tx,
+        run_id,
+        &spec_id,
+        &task_ids,
+        &commit.events[0],
+    )?);
     let done = writer::write(tx, &commit, ctx)?;
     Ok((task_ids, done.event_seqs[0]))
 }

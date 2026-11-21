@@ -1270,7 +1270,8 @@ async fn list_acceptance(
     if !(1..=500).contains(&limit) {
         return unreadable_page();
     }
-    // The cursor is `<freeze seq>:<candidate row>:<AC>` of the last item of the previous page (M2T18R-53).
+    // The opaque cursor is the freeze seq, candidate row and revision/AC order (ADR-033).
+    // Unobserved current criteria use the reserved (i64::MAX, 0) position before candidate history.
     let after = match query.cursor.as_deref().map(|c| {
         let mut parts = c.splitn(3, ':');
         (parts.next(), parts.next(), parts.next())
@@ -1303,7 +1304,6 @@ async fn list_acceptance(
             StatusCode::OK,
             axum::Json(json!({
                 "items": page.items,
-                "current": page.current,
                 "next_cursor": page.next.map(|(seq, row, ac)| format!("{seq}:{row}:{ac}")),
                 "watermark": page.watermark,
             })),

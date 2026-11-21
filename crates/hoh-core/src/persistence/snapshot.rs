@@ -78,8 +78,8 @@ pub struct CheckShown {
 pub struct AcceptanceItem {
     pub spec_id: String,
     pub spec_revision: i64,
-    pub candidate_id: String,
-    pub candidate_state: String,
+    pub candidate_id: Option<String>,
+    pub candidate_state: Option<String>,
     pub ac_id: String,
     pub label: Label,
     pub why: Option<Why>,
@@ -91,8 +91,6 @@ pub struct AcceptanceItem {
 /// item's freeze seq and AC) when there are more, and the watermark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptancePage {
-    /// Current revision, including unobserved ACs before a new candidate exists.
-    pub current: AcceptanceView,
     pub items: Vec<AcceptanceItem>,
     /// The last item's candidate (freeze seq, row) and AC.
     pub next: Option<(i64, i64, String)>,
@@ -582,13 +580,11 @@ pub(super) fn acceptance_page(
 ) -> Result<Option<AcceptancePage>, PersistError> {
     read(conn, || {
         let watermark = super::commands::max_seq(conn)?;
-        let Some(current) = view_in(conn, run_id, watermark)? else {
+        let Some(spec) = run_spec(conn, run_id)? else {
             return Ok(None);
         };
-        let spec = current.spec_id.clone().zip(current.spec_revision);
         let Some((spec_id, spec_revision)) = spec else {
             return Ok(Some(AcceptancePage {
-                current,
                 items: Vec::new(),
                 next: None,
                 watermark,
@@ -598,7 +594,43 @@ pub(super) fn acceptance_page(
         let all = candidates(conn, run_id)?;
         let latest = all.first().map(|c| c.id.clone());
         let mut keyed: Vec<((i64, i64, String), AcceptanceItem)> = Vec::new();
+        let current_missing = match all.first() {
+            None => true,
+            Some(c) => !historical_specs(conn, c, &spec_id, spec_revision)?
+                .iter()
+                .any(|(id, _)| id == &spec_id),
+        };
+        if current_missing {
+            // Unobserved current criteria have no candidate. The reserved cursor position precedes history,
+            // without adding a field to the locked ApiPage envelope or inventing a candidate identity.
+            for a in scope(conn, &spec_id)? {
+                let order = format!("{:020}:{}", i64::MAX - spec_revision, a.ac);
+                let key = (i64::MAX, 0, order);
+                if after.as_ref().is_some_and(|(seq, row, ac)| {
+                    (key.0, key.1) > (*seq, *row)
+                        || ((key.0, key.1) == (*seq, *row) && key.2 <= *ac)
+                }) {
+                    continue;
+                }
+                keyed.push((
+                    key,
+                    AcceptanceItem {
+                        spec_id: spec_id.clone(),
+                        spec_revision,
+                        candidate_id: None,
+                        candidate_state: None,
+                        ac_id: a.ac,
+                        label: Label::NotRun,
+                        why: None,
+                        latest: false,
+                    },
+                ));
+            }
+        }
         for c in &all {
+            if keyed.len() > limit {
+                break;
+            }
             // Only the candidates at or after the cursor's are read.
             if after
                 .as_ref()
@@ -623,8 +655,8 @@ pub(super) fn acceptance_page(
                         AcceptanceItem {
                             spec_id: id.clone(),
                             spec_revision: revision,
-                            candidate_id: c.id.clone(),
-                            candidate_state: c.state.clone(),
+                            candidate_id: Some(c.id.clone()),
+                            candidate_state: Some(c.state.clone()),
                             ac_id: a.ac_id,
                             label: if old { Label::Stale } else { a.label },
                             why: if old {
@@ -646,7 +678,6 @@ pub(super) fn acceptance_page(
             .flatten();
         keyed.truncate(limit);
         Ok(Some(AcceptancePage {
-            current,
             items: keyed.into_iter().map(|(_, item)| item).collect(),
             next,
             watermark,
