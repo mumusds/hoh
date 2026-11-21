@@ -62,6 +62,9 @@ pub(super) fn outcome(project: &Path, identity: &Identity, ending: &mut Ending) 
             result: Box::new(result),
             self_tests,
         },
+        Err(FreezeError::SpecInvalid(error)) => WriterOutcome::Correct {
+            reasons: vec![format!("its freeze was refused: SPEC_INVALID: {error}")],
+        },
         Err(FreezeError::Refused(reasons)) => WriterOutcome::Correct {
             reasons: reasons
                 .into_iter()
