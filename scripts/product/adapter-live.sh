@@ -7,7 +7,7 @@
 #   TEST-053-05  qa      crates/hoh-app/tests/verification_live.rs::verification_live_candidate_to_qa
 #   TEST-021-07  commander  crates/hoh-agents/tests/commander_live.rs::commander_live_read_only_turns
 # Each is an ignored test whose name carries no TEST id (so the integration check never reports it as skipped); it
-# writes $HOH_EVIDENCE_DIR/<agent>-live-verdict.json, which this script turns into test-results.jsonl lines and
+# writes $HOH_LIVE_OUT/<agent>-live-verdict.json, which this script turns into test-results.jsonl lines and
 # live-sessions.json (contracts/live-session.schema.json). A verdict is PASS, BLOCKED (CLI missing, not logged in, or
 # claude run as root), NOT_RUN (pi not installed, AC-026-04) or FAIL; BLOCKED and NOT_RUN are reported SKIPPED, never
 # PASS. Exit 0 = all PASS, 1 = any FAIL, 3 = otherwise BLOCKED or NOT_RUN.
@@ -31,8 +31,10 @@ unset AI_AGENT CLAUDECODE CLAUDE_PID CLAUDE_EFFORT CLAUDE_CODE_SESSION_ID CLAUDE
 
 # live <agent> <test binary> <test name> [package]
 live() {
-  local agent="$1" binary="$2" name="$3" package="${4:-hoh-agents}" verdict cli bin codex pi missing=""
-  verdict="$out/$agent-live-verdict.json"
+  local agent="$1" binary="$2" name="$3" package="${4:-hoh-agents}" scenario verdict cli bin codex pi missing=""
+  scenario="$out/$agent"
+  mkdir -p "$scenario"
+  verdict="$scenario/$agent-live-verdict.json"
   rm -f "$verdict"
   # doctor runs every installed CLI itself ("hoh" stands for the binary under test, always present); qa needs claude for
   # its Developer, and pi and codex for its default QA and Reviewer unless HOH_LIVE_PROFILE=v0.1.
@@ -72,7 +74,7 @@ live() {
     # profile here for the scenario's team selection; the product's agent gate strips it before native turns start.
     (
       unset HOH_EVIDENCE_DIR HOH_CHECK_ID HOH_CANDIDATE_ID HOH_SPEC_SHA256 HOH_CANDIDATE_FILE HOH_CHECK_RECORD_ID
-      HOH_LIVE_OUT="$out" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$codex" HOH_LIVE_PI="$pi" cargo test -p "$package" --locked \
+      HOH_LIVE_OUT="$scenario" HOH_LIVE_CLAUDE="$bin" HOH_LIVE_CODEX="$codex" HOH_LIVE_PI="$pi" cargo test -p "$package" --locked \
         --test "$binary" -- --ignored --exact "$name" --nocapture
     ) > "$out/$agent-live.log" 2>&1 || true
   fi
@@ -103,7 +105,7 @@ statuses, sessions = [], []
 with (out / 'test-results.jsonl').open('a', encoding='utf-8') as results:
     for agent, test_id, name in cases:
         try:
-            v = json.loads((out / f'{agent}-live-verdict.json').read_text())
+            v = json.loads((out / agent / f'{agent}-live-verdict.json').read_text())
         except (OSError, ValueError) as exc:
             v = {'status': 'FAIL', 'detail': f'no verdict ({exc}); see {agent}-live.log', 'sessions': []}
         status = v.get('status')
