@@ -302,7 +302,7 @@ fn wait_on_screen(pty: &Pty, rows: u16, cols: u16, text: &str) -> R<Vec<String>>
 
 #[test]
 fn enter_starts_a_run_and_attaches_it_and_a_slash_command_sends_nothing() -> R {
-    // Decision 13 (Enter, unattached): text starting with `/` is the Workspace's own (`/resume`, else "M3 前未提供"),
+    // Decision 13, corrected by ADR-036: slash commands belong to the Workspace; an unknown slash is rejected,
     // never a StartRun (E11); any other text is one StartRun{goal, the top bar's mode, interactive}, after which the
     // Workspace is attached to the new run (its Ctrl+C choice offers 暂停 and 取消任务). Detaching sends nothing.
     let world = World::new()?;
@@ -316,7 +316,7 @@ fn enter_starts_a_run_and_attaches_it_and_a_slash_command_sends_nothing() -> R {
     pty.wait_for("模式 BUILD", 0, WAIT)?;
     let from = pty.output().len();
     pty.send(b"/plan x\r")?;
-    pty.wait_for("M3 前未提供", from, WAIT)?;
+    pty.wait_for("未知命令", from, WAIT)?;
     assert_eq!(commands()?, before);
     pty.send("你好 world\r".as_bytes())?;
     pty.wait_for("已附着", from, WAIT)?;
