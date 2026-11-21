@@ -46,6 +46,10 @@ pub struct Facts {
     pub loads: Vec<Load>,
     /// A candidate's changed files, read by the executor ([`Facts::add_code`], decision 14's code source).
     pub code: Option<CodeSource>,
+    /// A work turn's path scope (REQ-039 by task scope, ADR-026 decision 12; docs/adr/ADR-035.md decision 3): the files
+    /// under these project-relative paths at the workspace's HEAD, read by the executor ([`Facts::add_scoped_code`]);
+    /// none when its task has no paths or another code source.
+    pub code_scope: Option<Vec<String>>,
     /// A verifier turn's: the Issue ids its mandatory scope delivers with their description for it to confirm fixed
     /// (docs/adr/ADR-029.md decision 10), recorded in its `context.packed`; none for any other turn.
     pub confirm_ids: Option<Vec<String>>,
@@ -149,6 +153,64 @@ impl Facts {
                 recency: 0,
                 causal: 0,
             });
+        }
+    }
+
+    /// Its path scope's files as Code entries (docs/adr/ADR-035.md decision 3): `files` as the executor read them at
+    /// the workspace's HEAD `commit` (in path order, at most [`CODE_FILES`]) with how many the scope holds in all, or why
+    /// none could be read.
+    pub fn add_scoped_code(&mut self, files: Result<(String, Vec<CodeFile>, usize), String>) {
+        let Some(paths) = self.code_scope.take() else {
+            return;
+        };
+        let entry = |path: String, text: String| Entry {
+            class: super::Class::Code,
+            kind: super::Kind::Plain,
+            path,
+            text,
+            summary: None,
+            relevance: 1,
+            recency: 0,
+            causal: 0,
+        };
+        let scope = paths.join("、");
+        let (commit, files, total) = match files {
+            Ok(files) => files,
+            Err(why) => {
+                self.entries.push(entry(
+                    "code/unavailable".to_owned(),
+                    format!("任务路径范围（{scope}）内的文件不可读：{why}"),
+                ));
+                return;
+            }
+        };
+        if total == 0 {
+            self.entries.push(entry(
+                "code/scope".to_owned(),
+                format!("任务路径范围（{scope}）在工作区 HEAD {commit} 中还没有文件"),
+            ));
+            return;
+        }
+        let listed = files.len();
+        for file in files {
+            let text = match file.text {
+                Ok(text) => format!(
+                    "任务路径范围内的文件 {}（工作区 HEAD {commit} 中的内容）：\n{text}",
+                    file.path
+                ),
+                Err(why) => format!("任务路径范围内的文件 {}（只列路径：{why}）", file.path),
+            };
+            self.entries
+                .push(entry(format!("code/{}", file.path), text));
+        }
+        if total > listed {
+            self.entries.push(entry(
+                "code/more".to_owned(),
+                format!(
+                    "任务路径范围（{scope}）内另有 {} 个文件未列出（至多列 {CODE_FILES} 个；工作区 HEAD {commit}）",
+                    total - listed
+                ),
+            ));
         }
     }
 

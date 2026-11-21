@@ -807,3 +807,76 @@ fn a_change_requests_issue_in_a_wake_is_marked_for_the_runtimes_rework_after_its
     assert!(!of(6)?.text.contains("轮次关闭后由 Runtime 返工"));
     Ok(())
 }
+
+#[test]
+fn work_context_selects_code_by_task_paths() -> R {
+    // REQ-039 by task scope (ADR-026 decision 12, CR-016; docs/adr/ADR-035.md decision 3): a work turn of a task whose
+    // plan gave it paths names them as its code source (the executor reads their files at the workspace's HEAD) and
+    // lists them in its mandatory scope; a task without paths has none; a reworked task keeps its rejected candidate's
+    // changed files as its code source (the scope is still listed).
+    let (_dir, conn) = world()?;
+    event(
+        &conn,
+        "plan-2",
+        "plan.imported",
+        &json!({"tasks": [{"task_id": "T1", "title": "装箱器", "paths": ["crates/core/src/pack.rs", "docs/"]},
+            {"task_id": "T2", "title": "验收", "paths": []}]}),
+    )?;
+    let got = facts(&conn, "R", "T1", "A1", None)?;
+    assert_eq!(
+        got.code_scope,
+        Some(vec![
+            "crates/core/src/pack.rs".to_owned(),
+            "docs/".to_owned()
+        ])
+    );
+    assert!(got.code.is_none(), "no rework");
+    assert!(
+        got.scope
+            .iter()
+            .any(|s| s == "路径范围：crates/core/src/pack.rs、docs/"),
+        "{:?}",
+        got.scope
+    );
+    let other = facts(&conn, "R", "T2", "A1", None)?;
+    assert_eq!(other.code_scope, None, "no paths, no scoped code");
+    assert!(
+        other.scope.iter().all(|s| !s.contains("路径范围")),
+        "{:?}",
+        other.scope
+    );
+    // Reworked: its rejected candidate's changed files are its code source instead.
+    conn.execute_batch(
+        "INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
+           test_plan_sha256, source_path, state, created_at)
+           VALUES ('CAND-6', 'R', printf('%040d', 6), printf('%040d', 9), printf('%064d', 2), printf('%064d', 3),
+           printf('%064d', 4), '/repo', 'REJECTED', '2026-11-07T00:00:00Z');",
+    )?;
+    event(
+        &conn,
+        "ws-A0",
+        "attempt.workspace_start",
+        &json!({"attempt_id": "A0", "head": "5".repeat(40)}),
+    )?;
+    event(
+        &conn,
+        "opened-1",
+        "verification.round_opened",
+        &json!({"round_id": "CAND-6/round/1", "candidate_id": "CAND-6", "source_task_ids": ["T1"]}),
+    )?;
+    event(
+        &conn,
+        "consumed-1",
+        "verification.failures_consumed",
+        &json!({"round_id": "CAND-6/round/1", "task_id": "T1", "by": "rework", "items": ["ac:AC-1-02:x"]}),
+    )?;
+    let reworked = facts(&conn, "R", "T1", "A1", None)?;
+    assert!(reworked.code.is_some(), "the rework's code source");
+    assert_eq!(reworked.code_scope, None);
+    assert!(
+        reworked.scope.iter().any(|s| s.starts_with("路径范围：")),
+        "{:?}",
+        reworked.scope
+    );
+    Ok(())
+}

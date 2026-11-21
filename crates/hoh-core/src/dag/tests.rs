@@ -225,3 +225,78 @@ fn a_long_chain_into_a_cycle_is_named_without_a_quadratic_walk() {
         "{elapsed:?} against {baseline:?}"
     );
 }
+
+#[test]
+fn plan_paths_are_validated_and_kept() {
+    // CR-033 decision 1 (REQ-039, ADR-026 decision 12): a planned task's optional `paths` are project-relative files
+    // or directories, kept with the task; an absolute path, an empty one or one with a `..` component refuses the
+    // whole plan (nothing of it is imported), every such path named. No `paths` is the empty scope.
+    let mut scoped = planned("a", &[]);
+    scoped["paths"] = json!(["crates/hoh-core/src/dag.rs", "docs/", "./a/b", "a..b/c"]);
+    let kept = validate(&plan(vec![scoped, planned("b", &["a"])]), &none(), &none())
+        .expect("a plan with project-relative paths");
+    assert_eq!(
+        kept.tasks
+            .iter()
+            .map(|t| (t.task_id.as_str(), t.paths.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "a",
+                vec![
+                    "crates/hoh-core/src/dag.rs".to_owned(),
+                    "docs/".to_owned(),
+                    "./a/b".to_owned(),
+                    "a..b/c".to_owned()
+                ]
+            ),
+            ("b", Vec::new()),
+        ]
+    );
+    // Kept through the protocol type's round trip, absent when empty.
+    let back = serde_json::to_value(&kept.tasks[0]).expect("serialize");
+    assert_eq!(back["paths"][0], "crates/hoh-core/src/dag.rs");
+    assert!(
+        serde_json::to_value(&kept.tasks[1])
+            .expect("serialize")
+            .get("paths")
+            .is_none()
+    );
+    for (paths, named) in [
+        (json!(["/etc/passwd"]), vec!["paths[0] \"/etc/passwd\""]),
+        (json!([".."]), vec!["paths[0] \"..\""]),
+        (json!(["src/../../x"]), vec!["paths[0] \"src/../../x\""]),
+        (
+            json!(["a/..", "/b"]),
+            vec!["paths[0] \"a/..\"", "paths[1] \"/b\""],
+        ),
+    ] {
+        let mut task = planned("a", &[]);
+        task["paths"] = paths.clone();
+        let error = validate(&plan(vec![planned("z", &[]), task]), &none(), &none())
+            .expect_err("a path outside the project was accepted");
+        assert_eq!(error.code(), None, "{paths}");
+        let PlanError::Invalid(violations) = &error else {
+            panic!("{paths}: {error:?}");
+        };
+        assert_eq!(violations.len(), named.len(), "{violations:?}");
+        for (violation, named) in violations.iter().zip(named) {
+            assert!(
+                violation.contains("task a") && violation.contains(named),
+                "{paths}: {violation}"
+            );
+        }
+    }
+    // An empty path is refused by the schema already (minLength 1), the plan with it.
+    let mut task = planned("a", &[]);
+    task["paths"] = json!(["src", ""]);
+    let error = validate(&plan(vec![planned("z", &[]), task]), &none(), &none())
+        .expect_err("an empty path was accepted");
+    let PlanError::Invalid(violations) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        violations.iter().any(|v| v.contains("/tasks/1/paths/1")),
+        "{violations:?}"
+    );
+}

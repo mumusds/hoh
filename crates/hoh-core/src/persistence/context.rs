@@ -175,6 +175,12 @@ fn work(
             deps.join("、")
         }
     ));
+    // Its path scope as its plan gave it (REQ-039 by task scope, docs/adr/ADR-035.md decision 3), in the mandatory
+    // scope; with no other code source, its files at the workspace's HEAD are its code source (read by the executor).
+    let paths = super::plan::task_paths(conn, task_id)?;
+    if !paths.is_empty() {
+        facts.scope.push(format!("路径范围：{}", paths.join("、")));
+    }
     facts.acceptance = acceptance(conn, task_id, spec_id)?;
     // What its previous attempt is to correct or do again (docs/adr/ADR-028.md decisions 3, 11 and 12, M2T16R-07): the
     // reasons the Runtime gave, in the mandatory scope, so the next turn knows them whatever the budget.
@@ -267,6 +273,9 @@ fn work(
             base,
             commit: r.git_commit,
         });
+    }
+    if facts.code.is_none() && !paths.is_empty() {
+        facts.code_scope = Some(paths);
     }
     Ok(())
 }

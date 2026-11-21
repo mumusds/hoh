@@ -1,7 +1,7 @@
-//! Plan validation before import (REQ-038): the scores' range, the schema, duplicate task ids, missing dependencies
-//! and cycles, in that order; the whole plan is refused on the first failure, so nothing of it is imported. O(V+E):
-//! Kahn's algorithm over a sorted ready set, so the resulting order (and any cycle named) does not depend on the
-//! order of the plan's array.
+//! Plan validation before import (REQ-038): the scores' range, the schema, the tasks' paths (CR-033), duplicate task
+//! ids, missing dependencies and cycles, in that order; the whole plan is refused on the first failure, so nothing of
+//! it is imported. O(V+E): Kahn's algorithm over a sorted ready set, so the resulting order (and any cycle named) does
+//! not depend on the order of the plan's array.
 
 use crate::protocol::{self, ErrorCode, PlanProposal, PlannedTask};
 use serde_json::{Value, json};
@@ -112,6 +112,35 @@ fn check_scores(raw: &Value) -> Result<(), PlanError> {
     Ok(())
 }
 
+/// Every planned path outside the project (CR-033 decision 1): absolute, empty, or with a `..` component; the whole
+/// plan is refused with each named, as a score out of range is (the schema gives only the shape).
+fn check_paths(proposal: &PlanProposal) -> Result<(), PlanError> {
+    let violations: Vec<String> = proposal
+        .tasks
+        .iter()
+        .flat_map(|task| {
+            task.paths
+                .iter()
+                .enumerate()
+                .filter(|(_, path)| {
+                    path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..")
+                })
+                .map(|(i, path)| {
+                    format!(
+                        "task {}: paths[{i}] \"{path}\" is not a path inside the project (relative, not empty, \
+                         without ..)",
+                        task.task_id
+                    )
+                })
+        })
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(PlanError::Invalid(violations))
+    }
+}
+
 /// Validate `raw` (a `PlanProposal`) for a run whose tasks are `existing`; `taken` are task ids other runs use (task
 /// ids are unique in the store, so they count as duplicates too, but are no dependencies).
 pub fn validate(
@@ -122,6 +151,7 @@ pub fn validate(
     check_scores(raw)?;
     let proposal: PlanProposal =
         protocol::decode(raw).map_err(|e| PlanError::Invalid(vec![e.to_string()]))?;
+    check_paths(&proposal)?;
     let mut ids = BTreeSet::new();
     let mut duplicates = BTreeSet::new();
     for task in &proposal.tasks {

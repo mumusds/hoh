@@ -265,6 +265,8 @@ pub(super) fn import_in(
             "state": state,
             "layer": layer,
             "created_seq": seq,
+            // Its path scope (docs/adr/ADR-035.md decision 3, CR-033): kept here, not in a column.
+            "paths": task.paths,
         }));
     }
     for task in &plan.tasks {
@@ -297,4 +299,25 @@ pub(super) fn import_in(
     };
     let done = writer::write(tx, &commit, ctx)?;
     Ok((task_ids, done.event_seqs[0]))
+}
+
+/// Task `task_id`'s path scope as the latest plan.imported naming it recorded it (docs/adr/ADR-035.md decision 3).
+pub(super) fn task_paths(conn: &Connection, task_id: &str) -> Result<Vec<String>, PersistError> {
+    let paths: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(j.value, '$.paths') FROM events e, \
+             json_each(json_extract(e.payload_json, '$.tasks')) j \
+             WHERE e.run_id = (SELECT run_id FROM tasks WHERE task_id = ?1) AND e.kind = 'plan.imported' \
+             AND json_extract(j.value, '$.task_id') = ?1 ORDER BY e.seq DESC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    match paths.flatten() {
+        None => Ok(Vec::new()),
+        Some(text) => serde_json::from_str(&text).map_err(|e| {
+            PersistError::IntegrityViolation(format!("task {task_id}'s planned paths: {e}"))
+        }),
+    }
 }
