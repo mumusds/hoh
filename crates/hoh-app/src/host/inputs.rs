@@ -28,12 +28,13 @@ pub(super) async fn run(
                 if let Err(e)=outcome {eprintln!("hoh host: input delivery: {e}");}
             }
         }
-        tokio::select! {_=stop.changed()=>break,_=watermark.changed()=>{},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
+        tokio::select! {_=stop.changed()=>break,changed=watermark.changed()=>{if changed.is_err(){break;}},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
 }
 fn delivery_error(error: PersistError) -> DeliveryError {
     match error {
         PersistError::Held { run, state } => DeliveryError::Held { run, state },
+        PersistError::KeyReuse(_) => DeliveryError::KeyReuse,
         PersistError::FirstInputPending => DeliveryError::Deferred,
         other => DeliveryError::Lost(other.to_string()),
     }

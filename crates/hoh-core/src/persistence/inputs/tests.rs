@@ -353,7 +353,7 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
 async fn test_017_02_role_inputs_are_claimed_for_the_host_router() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t09-routing-")
-        .tempdir_in("/home/ai/dev")?;
+        .tempdir()?;
     let (store, path) = open(&dir)?;
     seed(&path)?;
     let conn = Connection::open(&path)?;
@@ -386,9 +386,7 @@ fn routed_world(path: &Path) -> R {
 #[tokio::test]
 async fn test_017_02_next_attempt_merge_has_a_durable_boundary_and_one_receipt() -> R {
     use crate::persistence::InputRouting;
-    let dir = tempfile::Builder::new()
-        .prefix("m3t09-next-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t09-next-").tempdir()?;
     let (store, path) = open(&dir)?;
     routed_world(&path)?;
     store.enqueue_input(steer("I1")).await?;
@@ -473,9 +471,7 @@ async fn test_017_02_next_attempt_merge_has_a_durable_boundary_and_one_receipt()
 async fn test_017_02_turn_ack_and_settlement_both_orders_never_reach_a_second_attempt() -> R {
     use crate::persistence::{InputOutcome, InputRouting};
     for settle_first in [false, true] {
-        let dir = tempfile::Builder::new()
-            .prefix("m3t09-turn-")
-            .tempdir_in("/home/ai/dev")?;
+        let dir = tempfile::Builder::new().prefix("m3t09-turn-").tempdir()?;
         let (store, path) = open(&dir)?;
         routed_world(&path)?;
         store.enqueue_input(steer("I1")).await?;
@@ -559,9 +555,7 @@ async fn test_017_02_turn_ack_and_settlement_both_orders_never_reach_a_second_at
 async fn test_017_02_end_before_stage_falls_back_but_epoch_change_before_ack_rejects() -> R {
     use crate::persistence::{InputOutcome, InputRouting};
     for rebind in [false, true] {
-        let dir = tempfile::Builder::new()
-            .prefix("m3t09-fence-")
-            .tempdir_in("/home/ai/dev")?;
+        let dir = tempfile::Builder::new().prefix("m3t09-fence-").tempdir()?;
         let (store, path) = open(&dir)?;
         routed_world(&path)?;
         store.enqueue_input(steer("I1")).await?;
@@ -616,7 +610,7 @@ async fn test_017_02_end_before_stage_falls_back_but_epoch_change_before_ack_rej
 async fn test_017_02_historical_deferred_request_is_never_backfilled() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t09-history-")
-        .tempdir_in("/home/ai/dev")?;
+        .tempdir()?;
     let (store, path) = open(&dir)?;
     routed_world(&path)?;
     let key = crate::ids::child_id("A1", "request/old");
@@ -648,6 +642,336 @@ async fn test_017_02_historical_deferred_request_is_never_backfilled() -> R {
         Connection::open(&path)?.query_row("SELECT count(*) FROM input_queue", [], |r| r
             .get::<_, i64>(0))?,
         0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_key_reuse_is_one_rejection_even_at_delivery_limit() -> R {
+    use crate::delivery::{Dispatcher, InputTransport, SystemClock};
+    let dir = tempfile::Builder::new().prefix("m3t09-key-").tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("M3")).await?;
+    // Same (consumer,message_id), a receipt for different content: this is a real consume KeyReuse,
+    // not a transport that merely returns a made-up failure.
+    Connection::open(&path)?.execute("INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES ('developer','M3','2026-11-21T00:00:00Z',?1)",params![json!({"message_id":"M3","kind":"ack","input_sha256":"0".repeat(64)}).to_string()])?;
+    let clock = SystemClock;
+    let transport = InputTransport {
+        store: &store,
+        clock: &clock,
+    };
+    let dispatch = Dispatcher {
+        store: &store,
+        clock: &clock,
+        transport: &transport,
+        roles: vec!["developer".into()],
+        max_attempts: 1,
+        batch: 32,
+    };
+    dispatch.tick().await?;
+    dispatch.tick().await?;
+    let input = store.reader()?.input("M3")?.ok_or("input")?;
+    assert_eq!(
+        input.state,
+        InputState::Rejected,
+        "KeyReuse must reject, not replay another input's receipt"
+    );
+    assert_eq!(input.payload["reason"], "KEY_REUSE");
+    let conn = Connection::open(&path)?;
+    assert_eq!(
+        conn.query_row("SELECT state FROM outbox WHERE message_id='M3'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "ACKED"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT attempt_count FROM outbox WHERE message_id='M3'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    let events = store.reader()?.events("R")?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(k, _)| k == "outbox.rejected")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(k, _)| k == "outbox.dead_letter")
+            .count(),
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_duplicate_consumers_and_late_settlement_orders_apply_once() -> R {
+    use crate::persistence::{Claimed, Settlement};
+    for failure_first in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-overlap-")
+            .tempdir()?;
+        let (store, path) = open(&dir)?;
+        routed_world(&path)?;
+        store.enqueue_input(steer("M2")).await?;
+        let now = std::time::SystemTime::now();
+        let one = store
+            .claim_inputs(now, vec!["developer".into()], 5)
+            .await?
+            .and_then(Claimed::start)
+            .ok_or("first")?;
+        let first = store.consume_input(one.clone(), now).await?;
+        // Consumer committed, but its ACK is deliberately held. The next generation can now overlap it.
+        let later = now + std::time::Duration::from_secs(60);
+        let two = store
+            .claim_inputs(later, vec!["developer".into()], 5)
+            .await?
+            .and_then(Claimed::start)
+            .ok_or("second")?;
+        let (a, b) = tokio::join!(
+            store.consume_input(two.clone(), later),
+            store.consume_input(one.clone(), later)
+        );
+        assert_eq!(a?, first);
+        assert_eq!(b?, first);
+        if failure_first {
+            store
+                .settle_outbox(
+                    "M2",
+                    one.attempt_count,
+                    Settlement::Failed("lost ACK".into()),
+                    5,
+                )
+                .await?;
+        }
+        store
+            .settle_outbox("M2", two.attempt_count, Settlement::Delivered, 5)
+            .await?;
+        if !failure_first {
+            store
+                .settle_outbox(
+                    "M2",
+                    one.attempt_count,
+                    Settlement::Failed("late failure".into()),
+                    5,
+                )
+                .await?;
+        }
+        let conn = Connection::open(&path)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT state||':'||attempt_count FROM outbox WHERE message_id='M2'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "ACKED:2"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM receipts WHERE consumer='developer' AND message_id='M2'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert_eq!(
+            store
+                .reader()?
+                .events("R")?
+                .iter()
+                .filter(|(k, _)| k == "input.delivered")
+                .count(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_both_claim_paths_exclude_verification_even_with_an_input_notice() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-handoff-")
+        .tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.commit(Commit{events:vec![NewEvent{intent:Intent::Progress,project_id:"p1".into(),run_id:Some("R".into()),event_id:"handoff".into(),kind:"verification.handoff".into(),payload:json!({})}],outbox:vec![NewOutbox{message_id:"verify".into(),event:0,run_id:Some("R".into()),recipient_role:"developer".into(),role_epoch:1,payload:json!({"notice":"input","kind":"ASK","payload":{"handoff_kind":"verification"}})}],..Default::default()}).await?;
+    let now = std::time::SystemTime::now();
+    let (inputs, messages) = tokio::join!(
+        store.claim_inputs(now, vec!["developer".into()], 1),
+        store.claim_outbox(now, vec!["developer".into()], 1)
+    );
+    assert!(inputs?.is_none());
+    assert!(messages?.is_none());
+    assert_eq!(
+        Connection::open(&path)?.query_row(
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='verify'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "PENDING:0"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_unanswered_turn_reservation_cannot_be_sent_again_or_merged() -> R {
+    use crate::persistence::{Claimed, InputOutcome, InputRouting};
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-reserve-")
+        .tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("I1")).await?;
+    let now = std::time::SystemTime::now();
+    let one = store
+        .claim_inputs(now, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim")?;
+    assert!(
+        store
+            .route_input(InputRouting::Stage {
+                row: one,
+                attempt: Some("A1".into()),
+                now
+            })
+            .await?
+            .steer
+            .is_some()
+    );
+    let later = now + std::time::Duration::from_secs(60);
+    let two = store
+        .claim_inputs(later, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("redelivery")?;
+    let retry = store
+        .route_input(InputRouting::Stage {
+            row: two,
+            attempt: Some("A1".into()),
+            now: later,
+        })
+        .await?;
+    assert!(retry.steer.is_none());
+    assert!(retry.reply.is_some());
+    store
+        .route_input(InputRouting::Finish {
+            input_id: "I1".into(),
+            attempt: "A1".into(),
+            outcome: InputOutcome::Delivered,
+        })
+        .await?;
+    let row = store.reader()?.input("I1")?.ok_or("input")?;
+    assert_eq!(row.state, InputState::Rejected);
+    assert_eq!(row.payload["reason"], "UNKNOWN_DELIVERY");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_receipt_replay_checks_envelope_and_preserves_legacy_receipts() -> R {
+    use crate::persistence::{Claimed, InputRouting};
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-receipt-")
+        .tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("M2")).await?;
+    let now = std::time::SystemTime::now();
+    let row = store
+        .claim_inputs(now, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim")?;
+    store.consume_input(row.clone(), now).await?;
+    let mut changed = row.clone();
+    changed.payload["text"] = json!("different");
+    assert!(matches!(
+        store.consume_input(changed.clone(), now).await,
+        Err(PersistError::KeyReuse(_))
+    ));
+    assert!(matches!(
+        store
+            .route_input(InputRouting::Stage {
+                row: changed,
+                attempt: None,
+                now
+            })
+            .await,
+        Err(PersistError::KeyReuse(_))
+    ));
+    // S3 receipts predate the input digest. Replay remains safe after envelope equality and preserves that history.
+    let legacy = json!({"message_id":"M2","kind":"ack","reason":null}).to_string();
+    Connection::open(&path)?.execute(
+        "UPDATE receipts SET result_json=?1 WHERE message_id='M2'",
+        params![legacy],
+    )?;
+    assert_eq!(
+        store.consume_input(row.clone(), now).await?,
+        Some(legacy.clone())
+    );
+    assert_eq!(
+        store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: None,
+                now
+            })
+            .await?
+            .reply,
+        Some(legacy)
+    );
+    assert_eq!(
+        store
+            .reader()?
+            .events("R")?
+            .iter()
+            .filter(|(k, _)| k == "input.delivered")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_idle_sweeps_do_not_cross_the_write_fault_boundary() -> R {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    #[derive(Debug, Default)]
+    struct Commits(AtomicUsize);
+    impl crate::persistence::FaultHooks for Commits {
+        fn before_commit(&self) -> Result<(), PersistError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let dir = tempfile::Builder::new().prefix("m3t09-idle-").tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let hooks = Arc::new(Commits::default());
+    let store = Store::open(
+        &path,
+        Options {
+            faults: hooks.clone(),
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    seed(&path)?;
+    let before = hooks.0.load(Ordering::SeqCst);
+    store.settle_ended_inputs("p1").await?;
+    store.settle_ended_inputs("p1").await?;
+    assert_eq!(
+        hooks.0.load(Ordering::SeqCst),
+        before,
+        "an empty sweep must not consume the next real write's fault barrier"
     );
     Ok(())
 }

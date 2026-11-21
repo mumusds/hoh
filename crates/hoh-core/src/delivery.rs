@@ -85,6 +85,8 @@ impl Clock for SystemClock {
 pub enum DeliveryError {
     /// No answer reached the sender: it is tried again (a lost ACK is found by the receipt).
     Lost(String),
+    /// An id was reused for different content: one terminal rejection, never a retry.
+    KeyReuse,
     /// The row holds no valid message: it is recorded and dead at once.
     Invalid(String),
     /// The message's run stopped (in G, its stop published) between the claim and the consume: the consume was rolled
@@ -101,6 +103,7 @@ pub enum DeliveryError {
 /// answer.
 fn delivery_error(error: PersistError) -> DeliveryError {
     match error {
+        PersistError::KeyReuse(_) => DeliveryError::KeyReuse,
         PersistError::FirstInputPending => DeliveryError::Deferred,
         PersistError::Held { run, state } => DeliveryError::Held { run, state },
         error => DeliveryError::Lost(error.to_string()),
@@ -228,6 +231,7 @@ pub struct Tick {
     pub delivered: Vec<String>,
     pub failed: Vec<String>,
     pub invalid: Vec<String>,
+    pub rejected: Vec<String>,
     /// Given back unapplied: their run stopped between the claim and the consume (docs/adr/ADR-031.md correction D).
     pub held: Vec<String>,
 }
@@ -275,6 +279,10 @@ impl<C: Clock + ?Sized, T: Transport> Dispatcher<'_, C, T> {
                 Ok(_) => {
                     tick.delivered.push(row.message_id.clone());
                     Settlement::Delivered
+                }
+                Err(DeliveryError::KeyReuse) => {
+                    tick.rejected.push(row.message_id.clone());
+                    Settlement::Rejected("KEY_REUSE".to_owned())
                 }
                 Err(DeliveryError::Lost(e)) => {
                     tick.failed.push(row.message_id.clone());
