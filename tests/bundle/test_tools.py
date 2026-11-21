@@ -336,6 +336,23 @@ class IndependentReport(unittest.TestCase):
 
 class TestResultsConverter(unittest.TestCase):
     """scripts/product/test_results.py maps libtest lines to TEST ids (CR-003 per-test evidence)."""
+    def test_deployment_skip_keeps_its_check_binding_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            log=Path(d)/'log';out=Path(d)/'out.jsonl'
+            reason='runs in deployment check (AC-005-06); needs the candidate release bundle'
+            log.write_text('test test_005_06_release ... ignored, '+reason+'\n'
+                           'test test_005_06_release ... ok\n'
+                           'test test_005_06_release ... FAILED\n'
+                           'test test_005_06_release ... ignored\n')
+            r=subprocess.run([sys.executable,str(ROOT/'scripts/product/test_results.py'),'--log',str(log),'--out',str(out)],capture_output=True,text=True)
+            self.assertEqual(r.returncode,0,r.stderr)
+            rows=list(map(json.loads,out.read_text().splitlines()))
+            self.assertEqual(rows[0]['status'],'SKIPPED')
+            self.assertEqual(rows[0].get('detail'),reason)
+            self.assertEqual([r['status'] for r in rows[1:]],['PASS','FAIL','SKIPPED'])
+            self.assertTrue(all('detail' not in row for row in rows[1:]))
+            self.assertTrue(all(row['test_id']=='TEST-005-06' for row in rows))
+
     def test_mapping_and_statuses(self):
         with tempfile.TemporaryDirectory() as d:
             log=Path(d)/'log';out=Path(d)/'out.jsonl'

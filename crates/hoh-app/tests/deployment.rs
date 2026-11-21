@@ -93,7 +93,7 @@ fn real_environment() -> R<Value> {
 }
 
 #[test]
-#[ignore = "needs the candidate's release bundle: scripts/product/deployment.sh"]
+#[ignore = "runs in the deployment check (AC-005-06); needs the candidate's release bundle: scripts/product/deployment.sh"]
 fn test_005_06_the_release_bundle_installs_runs_a_detached_run_and_uninstalls_without_root() -> R {
     let bundle = PathBuf::from(
         std::env::var_os("HOH_RELEASE_BUNDLE")

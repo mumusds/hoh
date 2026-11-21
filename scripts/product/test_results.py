@@ -22,7 +22,13 @@ def results(log: str) -> list[dict]:
             continue
         name = m['name']
         for req, num in sorted(set(TEST_ID.findall(name))):
-            out.append({'schema_version': '1.0', 'test_id': f'TEST-{req}-{num}', 'name': name, 'status': STATUS[m['result']]})
+            row = {'schema_version': '1.0', 'test_id': f'TEST-{req}-{num}', 'name': name, 'status': STATUS[m['result']]}
+            # libtest prints the #[ignore] reason after a comma; retain it so another check's deliberate exclusion
+            # (notably TEST-005-06, executed by deployment) is explicit without changing its status or AC binding.
+            tail = line.strip()[m.end():].strip()
+            if m['result'] == 'ignored' and tail.startswith(',') and tail[1:].strip():
+                row['detail'] = tail[1:].strip()[:4096]
+            out.append(row)
     return out
 
 def main(argv: list[str] | None = None) -> int:
