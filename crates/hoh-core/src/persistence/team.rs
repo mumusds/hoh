@@ -479,9 +479,15 @@ fn verdicts(
 }
 
 /// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): the project's current revision
-/// changes it and that change is not refused. Such a role is not dispatched, so no attempt is leased under the binding
-/// being replaced; a refused change leaves the old binding working, so the role is never vacant (M2T07R-150).
-pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<bool, PersistError> {
+/// changes it and that change is not refused, or its resource pin differs from the host bundle (CR-026 C14). Such a
+/// role is not dispatched, so no new attempt prolongs the old binding or pin. A refused configuration change alone
+/// leaves the old binding working (M2T07R-150); it does not waive a pending resource upgrade.
+pub(super) fn pending(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    resource_version: &str,
+) -> Result<bool, PersistError> {
     let project_id: Option<String> = conn
         .query_row(
             "SELECT project_id FROM runs WHERE run_id = ?1",
@@ -496,6 +502,13 @@ pub(super) fn pending(conn: &Connection, run_id: &str, role: &str) -> Result<boo
     let Some(binding) = bound(conn, run_id, Some(role))?.pop() else {
         return Ok(false);
     };
+    // CR-026 C14: drain the role's old attempts before upgrading, just as for a team change. Runs predating pins
+    // retain their compatibility path until their first idle checkpoint; there are no old bytes to preserve.
+    if super::resources::latest(conn, run_id, role, None)?
+        .is_some_and(|pin| pin.resource_bundle_version != resource_version)
+    {
+        return Ok(true);
+    }
     let Some((revision, wanted)) = latest(conn, &project_id)? else {
         return Ok(false);
     };

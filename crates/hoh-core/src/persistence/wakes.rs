@@ -869,7 +869,9 @@ pub(super) fn allocate(
     let mut candidates = Vec::new();
     let mut rearmed = Commit::default();
     for (run_id, spec_id, run_revision) in runs {
-        let Some(binding) = decide::load_binding(&tx, &run_id, COMMANDER)? else {
+        let Some(binding) =
+            decide::load_binding(&tx, &run_id, COMMANDER, &ctx.resource_bundle.version())?
+        else {
             continue;
         };
         let mut wakes = of_run(&tx, &run_id)?;
@@ -903,7 +905,7 @@ pub(super) fn allocate(
         if !binding.active {
             // Not active yet: an owed wake waits, said once (decision 3, "not active yet").
             if wakes.iter().any(Wake::owed)
-                && let Some(reason) = inactive_reason(&tx, &run_id)?
+                && let Some(reason) = inactive_reason(&tx, &run_id, &ctx.resource_bundle.version())?
             {
                 rearmed.events.extend(defer_once(
                     &tx, project_id, &run_id, reason, epoch, &wakes, now,
@@ -942,7 +944,15 @@ pub(super) fn allocate(
             continue;
         }
         // An unavailable Commander gets no turn but a probe (decision 5).
-        let (reasons, _, _) = unavailability(&tx, &run_id, &wakes, epoch, &state, context)?;
+        let (reasons, _, _) = unavailability(
+            &tx,
+            &run_id,
+            &wakes,
+            epoch,
+            &state,
+            context,
+            &ctx.resource_bundle.version(),
+        )?;
         // Only on the verdict the step recorded, and only when this view agrees with it: available both, an ordinary
         // turn; unavailable both, a probe; else nothing until the next step records the change (v17, M2T08R-251).
         let recorded_unavailable = recorded(&tx, &run_id)?.is_some_and(|r| r.unavailable);
@@ -1226,6 +1236,7 @@ fn registry_reason(
     tx: &Transaction<'_>,
     run_id: &str,
     context: &Context,
+    resource_version: &str,
 ) -> Result<(Option<&'static str>, Value), PersistError> {
     let agent: Option<String> = tx
         .query_row(
@@ -1262,7 +1273,7 @@ fn registry_reason(
     // decides. Its wakes wait for its session (NO_SESSION): no failed attempt, though still under DEFER_LIMIT (reason
     // `inactive` past it, counted from the deferral recorded in the store, so a restart does not reset it).
     let said = look.is_some_and(|o| !o.available || !o.logged_in) || before.is_some();
-    if said && super::staffing::waits_to_staff(tx, run_id, COMMANDER, context)? {
+    if said && super::staffing::waits_to_staff(tx, run_id, COMMANDER, context, resource_version)? {
         return Ok((None, look.map_or(Value::Null, |o| identity(&o))));
     }
     Ok(match (look, before) {
@@ -1299,14 +1310,15 @@ fn unavailability(
     epoch: i64,
     binding: &str,
     context: &Context,
+    resource_version: &str,
 ) -> Result<(Vec<&'static str>, Value, Option<String>), PersistError> {
     let mut reasons = Vec::new();
     if binding == "BLOCKED" {
         reasons.push("binding_blocked");
     }
-    let (registry, observation) = registry_reason(tx, run_id, context)?;
+    let (registry, observation) = registry_reason(tx, run_id, context, resource_version)?;
     reasons.extend(registry);
-    if inactive_too_long(tx, run_id, context.now())? {
+    if inactive_too_long(tx, run_id, context.now(), resource_version)? {
         reasons.push("inactive");
     }
     let cap = i64::from(crate::retry::MAX_RETRIES);
@@ -1438,6 +1450,7 @@ pub(super) fn verdict(
     tx: &Transaction<'_>,
     run_id: &str,
     context: &Context,
+    resource_version: &str,
 ) -> Result<Option<Verdict>, PersistError> {
     let binding: Option<(String, i64)> = tx
         .query_row(
@@ -1451,8 +1464,15 @@ pub(super) fn verdict(
         return Ok(None);
     };
     let wakes = of_run(tx, run_id)?;
-    let (reasons, observation, refused) =
-        unavailability(tx, run_id, &wakes, epoch, &binding, context)?;
+    let (reasons, observation, refused) = unavailability(
+        tx,
+        run_id,
+        &wakes,
+        epoch,
+        &binding,
+        context,
+        resource_version,
+    )?;
     Ok(Some(Verdict {
         reasons,
         observation,
@@ -1888,7 +1908,11 @@ const DEFER_LIMIT: Duration = Duration::from_secs(30 * 60);
 /// Why run `run_id`'s Commander is not active: no session (`NO_SESSION`), its handover's session.start not delivered
 /// (`FIRST_INPUT_UNDELIVERED`), a team change waiting for its checkpoint (`CHANGE_PENDING`), or its first input in
 /// a turn now (`FIRST_INPUT_IN_FLIGHT`); none for a BLOCKED binding (that is unavailability, decision 5).
-fn inactive_reason(conn: &Connection, run_id: &str) -> Result<Option<&'static str>, PersistError> {
+fn inactive_reason(
+    conn: &Connection,
+    run_id: &str,
+    resource_version: &str,
+) -> Result<Option<&'static str>, PersistError> {
     let row: Option<(String, i64, Option<String>)> = conn
         .query_row(
             "SELECT state, role_epoch, session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
@@ -1908,7 +1932,9 @@ fn inactive_reason(conn: &Connection, run_id: &str) -> Result<Option<&'static st
         Some(_) if super::handover::first_input_pending(conn, run_id, COMMANDER, epoch)? => {
             Some("FIRST_INPUT_UNDELIVERED")
         }
-        Some(_) if super::team::pending(conn, run_id, COMMANDER)? => Some("CHANGE_PENDING"),
+        Some(_) if super::team::pending(conn, run_id, COMMANDER, resource_version)? => {
+            Some("CHANGE_PENDING")
+        }
         Some(_) => Some("FIRST_INPUT_IN_FLIGHT"),
     })
 }
@@ -1960,8 +1986,9 @@ fn inactive_too_long(
     tx: &Transaction<'_>,
     run_id: &str,
     now: std::time::SystemTime,
+    resource_version: &str,
 ) -> Result<bool, PersistError> {
-    let Some(reason) = inactive_reason(tx, run_id)?
+    let Some(reason) = inactive_reason(tx, run_id, resource_version)?
         .filter(|r| matches!(*r, "NO_SESSION" | "FIRST_INPUT_UNDELIVERED"))
     else {
         return Ok(false);

@@ -266,9 +266,14 @@ fn a0_ends(path: &PathBuf) -> R {
 fn active(path: &PathBuf, role: &str) -> R<bool> {
     let mut conn = Connection::open(path)?;
     let tx = conn.transaction()?;
-    Ok(crate::persistence::decide::load_binding(&tx, "R1", role)?
-        .ok_or("no binding")?
-        .active)
+    Ok(crate::persistence::decide::load_binding(
+        &tx,
+        "R1",
+        role,
+        &crate::resource_bundle::Bundle::current().version(),
+    )?
+    .ok_or("no binding")?
+    .active)
 }
 
 /// Run R1's `role` as the team view shows it: its missing lines and pending change.
@@ -959,7 +964,12 @@ async fn a_switch_with_no_attempt_in_flight_rebinds_the_role_in_one_transaction(
     );
     {
         let conn = Connection::open(&path)?;
-        assert!(!crate::persistence::team::pending(&conn, "R1", "qa")?);
+        assert!(!crate::persistence::team::pending(
+            &conn,
+            "R1",
+            "qa",
+            &crate::resource_bundle::Bundle::current().version()
+        )?);
     }
     let waiting = store.runner_waiting("p1").await?;
     assert!(waiting.team_behind.is_empty(), "{:?}", waiting.team_behind);

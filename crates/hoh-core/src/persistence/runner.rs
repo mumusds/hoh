@@ -48,11 +48,11 @@ pub struct Waiting {
     /// which the host loop moves on with or without an executor (docs/adr/ADR-021.md decision 7).
     pub pausing: Vec<String>,
     pub cancelling: Vec<String>,
-    /// The runs, not ended, behind the project's current team revision: their checkpoint comes first
-    /// (docs/adr/ADR-022.md decision 8).
+    /// Nonterminal runs behind the team revision, or with an idle role behind the host's resource bundle. A resource
+    /// upgrade that only waits for in-flight attempts needs no checkpoint transaction yet (CR-026 C14).
     pub team_behind: Vec<String>,
     /// Every binding of every run not ended that staffing judges (docs/adr/ADR-030.md decision 1): a removed role, and a
-    /// role whose configuration change waits for its checkpoint, left out.
+    /// role whose configuration or resource change waits for its checkpoint, left out.
     pub staffing: Vec<crate::staffing::Staffed>,
     /// The project's current team: each role and the built-in role whose contract it follows (its own, a custom role's
     /// `builtin:<role>`, or none), for the capabilities it needs (decision 10).
@@ -609,7 +609,10 @@ fn waiting(
                     "SELECT run_id FROM runs WHERE project_id = ?1 \
                      AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') AND (config_revision < \
                      (SELECT coalesce(max(revision), 0) FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED') OR EXISTS ( \
-                     SELECT 1 FROM role_bindings b WHERE b.run_id = runs.run_id AND coalesce((SELECT json_extract(e.payload_json, '$.resource_bundle_version') \
+                     SELECT 1 FROM role_bindings b WHERE b.run_id = runs.run_id \
+                     AND NOT EXISTS (SELECT 1 FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+                       WHERE t.run_id = b.run_id AND t.role = b.role AND a.state IN ('PREPARED', 'STARTING', 'RUNNING')) \
+                     AND coalesce((SELECT json_extract(e.payload_json, '$.resource_bundle_version') \
                      FROM events e WHERE e.run_id = b.run_id AND e.kind = 'resource.pinned' AND json_extract(e.payload_json, '$.role') = b.role ORDER BY e.seq DESC LIMIT 1), '') <> ?2)) \
                      ORDER BY created_at, run_id",
                 )
@@ -620,7 +623,7 @@ fn waiting(
                 .collect::<Result<_, _>>()
                 .map_err(sqlite_error)?
         },
-        staffing: super::staffing::staffed(conn, project_id)?,
+        staffing: super::staffing::staffed(conn, project_id, resource_version)?,
         roles: super::team::roles(conn, project_id)?,
         agents: super::team::agents(conn, project_id)?,
     })

@@ -142,7 +142,12 @@ pub(super) fn accept_in(
             result.attempt_id, result.task_id
         )));
     }
-    let binding = load_binding(tx, &result.run_id, &result.role)?;
+    let binding = load_binding(
+        tx,
+        &result.run_id,
+        &result.role,
+        &ctx.resource_bundle.version(),
+    )?;
     let candidate = match &result.candidate_id {
         Some(id) => load_candidate(tx, &result.run_id, id)?,
         None => None,
@@ -304,6 +309,7 @@ pub(super) fn accept_in(
             outbox_event: 0,
             follows: None,
         },
+        ctx,
     )?;
     let task = |expected: i64, to| StateCas {
         id: result.task_id.clone(),

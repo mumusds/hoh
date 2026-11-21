@@ -157,7 +157,11 @@ pub(super) fn next_round(
 /// specification (never empty), the handoff to each verifier at its current epoch (enveloped by the first source,
 /// M2T16D-659) and the two verifier tasks: `child_id(round, "task/<role>")`, readers in layer 0, READY, with no
 /// task_requirements (their scope is the handoff's acceptance_ids, M2T16D-258). Runtime's: decision 10.
-pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, PersistError> {
+pub(super) fn open_in(
+    tx: &Transaction<'_>,
+    o: &Opening<'_>,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<Opened, PersistError> {
     let mut sources = o.sources.clone();
     sources.sort_by(|a, b| a.task_id.cmp(&b.task_id));
     sources.dedup_by(|a, b| a.task_id == b.task_id);
@@ -173,9 +177,10 @@ pub(super) fn open_in(tx: &Transaction<'_>, o: &Opening<'_>) -> Result<Opened, P
     acceptance_ids.dedup();
     let mut recipients = Vec::with_capacity(super::results::VERIFIERS.len());
     for role in super::results::VERIFIERS {
-        let binding = load_binding(tx, o.run_id, role)?.ok_or_else(|| {
-            PersistError::IntegrityViolation(format!("run {} has no {role} bound", o.run_id))
-        })?;
+        let binding = load_binding(tx, o.run_id, role, &ctx.resource_bundle.version())?
+            .ok_or_else(|| {
+                PersistError::IntegrityViolation(format!("run {} has no {role} bound", o.run_id))
+            })?;
         recipients.push(Recipient {
             role: role.to_owned(),
             role_epoch: binding.role_epoch,
@@ -295,6 +300,7 @@ pub(super) fn reverify(
             outbox_event: 0,
             follows: Some((previous, root)),
         },
+        ctx,
     )?;
     super::writer::write(
         tx,
@@ -391,6 +397,7 @@ pub(super) fn rebuild_handoff(
     round_id: &str,
     role: &str,
     command_id: &str,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<Result<super::writer::Commit, String>, PersistError> {
     let opened: Option<String> = tx
         .query_row(
@@ -454,7 +461,7 @@ pub(super) fn rebuild_handoff(
             acceptance_ids.push(ac.to_owned());
         }
     }
-    let Some(binding) = load_binding(tx, run_id, role)? else {
+    let Some(binding) = load_binding(tx, run_id, role, &ctx.resource_bundle.version())? else {
         return Ok(Err(format!("run {run_id} has no {role} bound")));
     };
     let verification = Verification {

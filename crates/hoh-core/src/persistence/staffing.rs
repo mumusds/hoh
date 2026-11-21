@@ -109,8 +109,12 @@ struct Row {
 /// lacks first, decision 3), the capabilities its role's contract requires, its session with the identity it was
 /// granted under (decision 4), whether the role has an attempt in flight, the exclusion records of its run, role and
 /// revision (decision 6) and the change its epoch holds pending. A removed role is left out (it stays BLOCKED), and so
-/// is a role whose configuration change waits for its checkpoint (ADR-022 decision 8: the checkpoint's).
-pub(super) fn staffed(conn: &Connection, project_id: &str) -> Result<Vec<Staffed>, PersistError> {
+/// is a role whose configuration or resource change waits for its checkpoint (ADR-022 decision 8, CR-026 C14).
+pub(super) fn staffed(
+    conn: &Connection,
+    project_id: &str,
+    resource_version: &str,
+) -> Result<Vec<Staffed>, PersistError> {
     let mut statement = conn
         .prepare(
             "SELECT b.run_id, b.role, b.agent, b.model, b.role_epoch, b.config_revision, b.state, b.blocked_reason, \
@@ -158,7 +162,7 @@ pub(super) fn staffed(conn: &Connection, project_id: &str) -> Result<Vec<Staffed
             },
             None => None,
         };
-        if super::team::pending(conn, &row.run_id, &row.role)? {
+        if super::team::pending(conn, &row.run_id, &row.role, resource_version)? {
             continue;
         }
         let builtin = crate::config::BUILTIN_ROLES
@@ -899,6 +903,7 @@ pub(super) fn waits_to_staff(
     run_id: &str,
     role: &str,
     context: &crate::decision::Context,
+    resource_version: &str,
 ) -> Result<bool, PersistError> {
     use crate::staffing::{Kind, select, verdict};
     let Some(snapshot) = &context.staffing else {
@@ -915,7 +920,7 @@ pub(super) fn waits_to_staff(
     else {
         return Ok(false);
     };
-    let Some(binding) = staffed(conn, &project_id)?
+    let Some(binding) = staffed(conn, &project_id, resource_version)?
         .into_iter()
         .find(|s| s.run_id == run_id && s.role == role)
     else {
@@ -942,9 +947,10 @@ pub(super) fn dispatchable(
     role: &str,
     context: &crate::decision::Context,
     reason: BlockedReason,
+    resource_version: &str,
 ) -> Result<Option<i64>, PersistError> {
     use crate::staffing::{Compat, Fact};
-    let Some(binding) = super::decide::load_binding(tx, run_id, role)? else {
+    let Some(binding) = super::decide::load_binding(tx, run_id, role, resource_version)? else {
         return Ok(None);
     };
     if !binding.active

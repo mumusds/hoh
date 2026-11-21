@@ -689,8 +689,14 @@ pub(super) fn pace(
             else {
                 continue;
             };
-            let Some(epoch) =
-                super::staffing::dispatchable(&tx, run_id, &task.role, context, reason)?
+            let Some(epoch) = super::staffing::dispatchable(
+                &tx,
+                run_id,
+                &task.role,
+                context,
+                reason,
+                &ctx.resource_bundle.version(),
+            )?
             else {
                 continue;
             };
@@ -732,7 +738,7 @@ pub(super) fn pace(
                 ),
                 None => {
                     let (Some(binding), Some(required)) = (
-                        load_binding(&tx, run_id, &task.role)?,
+                        load_binding(&tx, run_id, &task.role, &ctx.resource_bundle.version())?,
                         context.required_capabilities.get(&task.role),
                     ) else {
                         continue;

@@ -913,6 +913,7 @@ fn task_exit(
                         round,
                         &role,
                         a.command_id,
+                        ctx,
                     )?
                     .map_err(|detail| {
                         unmet(

@@ -950,7 +950,7 @@ fn fire(
             ctx,
         )?;
     }
-    let Some(verdict) = wakes::verdict(tx, run_id, context)? else {
+    let Some(verdict) = wakes::verdict(tx, run_id, context, &ctx.resource_bundle.version())? else {
         return Ok((fired, events, None));
     };
     let all = wakes::of_run(tx, run_id)?;
