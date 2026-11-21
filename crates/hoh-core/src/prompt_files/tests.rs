@@ -111,3 +111,146 @@ fn test_047_02_restore_deletes_only_owned_override_and_rejects_links() -> R {
     assert!(root.join("saved/developer.md.backup").exists());
     Ok(())
 }
+
+#[test]
+fn test_047_03_save_records_base_and_override_identity() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t03-base-").tempdir()?;
+    save_override(dir.path(), ".hoh/prompts/developer.md", "custom\n")?;
+    let sidecar = dir.path().join(".hoh/prompts/developer.md.base.json");
+    assert!(
+        sidecar.is_file(),
+        "saved overrides must carry their old builtin base"
+    );
+    let base: serde_json::Value = serde_json::from_slice(&std::fs::read(sidecar)?)?;
+    assert_eq!(
+        base["resource_bundle_version"],
+        crate::objects::resource_bundle_version()
+    );
+    assert_eq!(
+        base["builtin_sha256"],
+        crate::context::sha256_hex(
+            crate::config::builtin_contract("developer")
+                .unwrap()
+                .as_bytes()
+        )
+    );
+    assert_eq!(
+        base["override_sha256"],
+        crate::context::sha256_hex(b"custom\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_047_03_drift_missing_mismatched_and_unchanged_bases_are_explicit() -> R {
+    use crate::resource_bundle::Bundle;
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-drift-base-")
+        .tempdir()?;
+    let file = ".hoh/prompts/developer.md";
+    let read = || load(dir.path(), None, "R", "developer", None);
+    save_override(dir.path(), file, "custom\n")?;
+    assert!(drift_reports(dir.path(), &read()?, &Bundle::current())?.is_empty());
+    let mut changed_schema = Bundle::current();
+    changed_schema.files.insert(
+        "contracts/protocol.schema.json".to_owned(),
+        "changed schema".to_owned(),
+    );
+    assert!(
+        drift_reports(dir.path(), &read()?, &changed_schema)?.is_empty(),
+        "only changed builtin text causes drift"
+    );
+    std::fs::write(dir.path().join(file), "edited outside save\n")?;
+    let reports = drift_reports(dir.path(), &read()?, &Bundle::current())?;
+    assert_eq!(reports[0]["base_status"], "missing_or_mismatched");
+    assert!(
+        reports[0]["diff"].is_null(),
+        "do not invent the lost old base"
+    );
+    assert!(
+        reports[0]["current_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+edited outside save")
+    );
+    std::fs::remove_file(dir.path().join(format!("{file}.base.json")))?;
+    assert_eq!(
+        drift_reports(dir.path(), &read()?, &Bundle::current())?[0]["base_status"],
+        "missing_or_mismatched"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_047_03_pinned_bytes_survive_override_restore_and_corruption_refuses_load() -> R {
+    use crate::resource_bundle::Bundle;
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-pin-bytes-")
+        .tempdir()?;
+    let mut old = Bundle::current();
+    assert_eq!(old.version(), crate::objects::resource_bundle_version());
+    old.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "old contract\n".to_owned(),
+    );
+    let pin = old.store(dir.path())?;
+    save_override(dir.path(), ".hoh/prompts/developer.md", "custom\n")?;
+    restore_project(dir.path(), "developer", None)?;
+    let loaded = pin.load(dir.path())?;
+    assert_eq!(
+        load_with_bundle(dir.path(), None, "R", "developer", None, &loaded)?
+            .effective()?
+            .text,
+        "old contract\n"
+    );
+    std::fs::write(
+        crate::objects::object_path(dir.path(), &pin.bundle_sha256)?,
+        "corrupt",
+    )?;
+    assert!(pin.load(dir.path()).is_err());
+    Ok(())
+}
+
+#[test]
+fn test_047_03_read_between_base_and_override_rename_never_trusts_mixed_bytes() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-save-order-")
+        .tempdir()?;
+    let file = ".hoh/prompts/developer.md";
+    save_override(dir.path(), file, "before\n")?;
+    let root = dir.path().to_path_buf();
+    let (reached, entered) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        save_based_on(
+            &root,
+            file,
+            "after\n",
+            "developer",
+            &crate::resource_bundle::Bundle::current(),
+            &|| {
+                reached.send(()).unwrap();
+                resume.recv().unwrap();
+            },
+        )
+    });
+    entered.recv_timeout(std::time::Duration::from_secs(10))?;
+    let during = load(dir.path(), None, "R", "developer", None)
+        .and_then(|r| drift_reports(dir.path(), &r, &crate::resource_bundle::Bundle::current()));
+    release.send(())?;
+    writer.join().unwrap()?;
+    let during = during?;
+    assert_eq!(during[0]["base_status"], "missing_or_mismatched");
+    assert!(during[0]["diff"].is_null());
+    let after = load(dir.path(), None, "R", "developer", None)?;
+    assert_eq!(after.effective()?.text, "after\n");
+    assert!(
+        drift_reports(
+            dir.path(),
+            &after,
+            &crate::resource_bundle::Bundle::current()
+        )?
+        .is_empty()
+    );
+    Ok(())
+}

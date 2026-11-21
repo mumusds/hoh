@@ -65,3 +65,5 @@ NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --res
 ### 职位契约设置
 
 在 TUI 输入 `/settings developer`（或 `/settings`）打开 developer 契约的统一 diff。附着 Run 后也可使用。↑↓、PgUp、PgDn 浏览；按 r 恢复默认，Esc 返回。恢复默认只删除项目的 `.hoh/prompts/developer.md`，下一 Attempt 重新读取覆盖链；若有 global 或 run 覆盖，它们仍按原优先级生效。安装资源不被修改。配置 `prompt` 指定其他文件时，恢复操作拒绝删除，须先移除该配置再操作约定路径。
+
+覆盖文件的基准放在同名 `.base.json` 旁路，不进入 Prompt 正文。资源包升级后，设置页会标出漂移，并在 diff 末尾给出旧内置、新内置、覆盖的对照；手工放置或修改而没有匹配基准时，会明确提示旧内置未知。运行中已开始职位的资源版本到其无在途 Attempt 的 checkpoint 才更新；覆盖文件仍在每次 Attempt 开始前重新读取。

@@ -39,6 +39,7 @@ pub mod questions;
 mod reconcile;
 mod recovery;
 mod reports;
+mod resources;
 mod results;
 mod retry;
 mod rounds;
@@ -123,6 +124,8 @@ use std::time::Duration;
 /// Initial values of REQ-062.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// The resource bytes owned by this host process (immutable across its lifetime).
+    pub resource_bundle: Arc<crate::resource_bundle::Bundle>,
     /// SQLite busy_timeout, and the longest a caller waits for room in the writer queue.
     pub busy_timeout: Duration,
     /// Requests waiting for the writer before callers are held back.
@@ -154,6 +157,7 @@ impl Options {
     /// The initial values, the WAL self-test's process started by `spawner`.
     pub fn new(spawner: Arc<dyn crate::spawn::Spawner>) -> Self {
         Self {
+            resource_bundle: Arc::new(crate::resource_bundle::Bundle::current()),
             busy_timeout: Duration::from_millis(5000),
             queue: 64,
             wal_probe: None,

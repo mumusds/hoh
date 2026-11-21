@@ -1515,3 +1515,32 @@ fn test_047_02_settings_diff_restore_and_cancel() {
     assert!(!path.exists(), "restore deletes the project override");
     assert!(screen(&app, 110, 30).join("\n").contains("已恢复默认"));
 }
+
+#[test]
+fn test_047_03_settings_exposes_drift_and_both_diffs() {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-drift-ui-")
+        .tempdir()
+        .unwrap();
+    let mut old = hoh_core::resource_bundle::Bundle::current();
+    old.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "old developer\n".to_owned(),
+    );
+    hoh_core::prompt_files::save_override_based_on(
+        dir.path(),
+        ".hoh/prompts/developer.md",
+        "custom\n",
+        "developer",
+        &old,
+    )
+    .unwrap();
+    let mut app = App::open(dir.path());
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    let shown = screen(&app, 120, 400).join("\n");
+    assert!(shown.contains("漂移"), "{shown}");
+    assert!(shown.contains("--- old-builtin"));
+    assert!(shown.contains("+++ new-builtin"));
+    assert!(shown.contains("+++ override"));
+}

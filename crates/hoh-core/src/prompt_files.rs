@@ -27,12 +27,30 @@ pub fn load(
     role: &str,
     configured: Option<&str>,
 ) -> Result<prompt::Resolved, Error> {
+    load_with_bundle(
+        root,
+        global,
+        run,
+        role,
+        configured,
+        &crate::resource_bundle::Bundle::current(),
+    )
+}
+
+pub fn load_with_bundle(
+    root: &Path,
+    global: Option<&Path>,
+    run: &str,
+    role: &str,
+    configured: Option<&str>,
+    bundle: &crate::resource_bundle::Bundle,
+) -> Result<prompt::Resolved, Error> {
     use crate::config::{self, Contract};
     let builtin = configured
         .and_then(|p| p.strip_prefix(config::BUILTIN_PROMPT))
         .unwrap_or(role);
     let mut sources = Vec::new();
-    if let Some(text) = config::builtin_contract(builtin) {
+    if let Ok(text) = bundle.text(&format!("resources/prompts/{builtin}.md")) {
         sources.push(Contract {
             layer: "builtin",
             path: format!("resources/prompts/{builtin}.md"),
@@ -193,6 +211,52 @@ pub fn project_references(root: &Path) -> Result<serde_json::Value, Error> {
 pub fn save_override(root: &Path, relative: &str, text: &str) -> Result<(), Error> {
     prompt::validate_size(text)?;
     prompt::validate_variables(text)?;
+    let role = Path::new(relative)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let bundle = crate::resource_bundle::Bundle::current();
+    if bundle.text(&format!("resources/prompts/{role}.md")).is_ok() {
+        return save_override_based_on(root, relative, text, role, &bundle);
+    }
+    write_atomic(root, relative, text)
+}
+
+/// Save against a named builtin (also supports configured filenames). The sidecar binds both source and override
+/// digests: a crash between the two renames is diagnosed as unknown base, never mistaken for a matching baseline.
+pub fn save_override_based_on(
+    root: &Path,
+    relative: &str,
+    text: &str,
+    builtin: &str,
+    bundle: &crate::resource_bundle::Bundle,
+) -> Result<(), Error> {
+    save_based_on(root, relative, text, builtin, bundle, &|| {})
+}
+
+fn save_based_on(
+    root: &Path,
+    relative: &str,
+    text: &str,
+    builtin: &str,
+    bundle: &crate::resource_bundle::Bundle,
+    after_base: &dyn Fn(),
+) -> Result<(), Error> {
+    prompt::validate_size(text)?;
+    prompt::validate_variables(text)?;
+    let base = bundle
+        .text(&format!("resources/prompts/{builtin}.md"))
+        .map_err(prompt::unavailable)?;
+    let sidecar = serde_json::json!({"builtin": base, "builtin_sha256": crate::context::sha256_hex(base.as_bytes()),
+        "resource_bundle_version": bundle.version(), "override_sha256": crate::context::sha256_hex(text.as_bytes())});
+    // Preflight the destination before changing metadata. write_atomic repeats the check before its own rename.
+    optional_file(root, relative)?;
+    write_atomic(root, &format!("{relative}.base.json"), &sidecar.to_string())?;
+    after_base();
+    write_atomic(root, relative, text)
+}
+
+fn write_atomic(root: &Path, relative: &str, text: &str) -> Result<(), Error> {
     let path = Path::new(relative);
     if path.as_os_str().is_empty()
         || path
@@ -294,4 +358,54 @@ pub fn restore_project(root: &Path, role: &str, configured: Option<&str>) -> Res
     fs::unlinkat(&dir, &name, AtFlags::empty()).map_err(prompt::unavailable)?;
     fs::fsync(&dir).map_err(prompt::unavailable)?;
     Ok(true)
+}
+
+/// Compare each override's saved base to the installed bundle, even while its Attempt still uses an older pin.
+/// Missing or mismatched metadata is explicitly unknown; it never supplies invented old bytes to a three-way diff.
+pub fn drift_reports(
+    root: &Path,
+    resolved: &prompt::Resolved,
+    installed: &crate::resource_bundle::Bundle,
+) -> Result<Vec<serde_json::Value>, Error> {
+    use serde_json::{Value, json};
+    let Some(builtin) = resolved.chain.iter().find(|s| s.layer == "builtin") else {
+        return Ok(Vec::new());
+    };
+    let new = installed.text(&builtin.path).map_err(prompt::unavailable)?;
+    let new_sha = crate::context::sha256_hex(new.as_bytes());
+    let mut reports = Vec::new();
+    for source in resolved.chain.iter().filter(|s| s.layer != "builtin") {
+        let sidecar = format!("{}.base.json", source.path);
+        let data = if source.layer == "global" {
+            let path = Path::new(&sidecar);
+            read_optional(
+                path.parent()
+                    .ok_or_else(|| prompt::unavailable("base has no parent"))?,
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| prompt::unavailable("invalid base filename"))?,
+            )?
+        } else {
+            read_optional(root, &sidecar)?
+        };
+        let base: Option<Value> = data.and_then(|s| serde_json::from_str(&s).ok());
+        let override_sha = crate::context::sha256_hex(source.text.as_bytes());
+        let old = base.as_ref().and_then(|b| {
+            let text = b["builtin"].as_str()?;
+            (b["builtin_sha256"] == crate::context::sha256_hex(text.as_bytes())
+                && b["override_sha256"] == override_sha
+                && b["resource_bundle_version"].is_string())
+            .then_some(text)
+        });
+        if old.is_some_and(|old| old == new) {
+            continue;
+        }
+        reports.push(json!({"layer":source.layer, "path":source.path, "base_status":if old.is_some() {"known"} else {"missing_or_mismatched"},
+            "base_resource_bundle_version":base.as_ref().and_then(|b|b["resource_bundle_version"].as_str()),
+            "resource_bundle_version":installed.version(), "builtin_sha256":new_sha,
+            "old_builtin_sha256":old.map(|s|crate::context::sha256_hex(s.as_bytes())), "override_sha256":override_sha,
+            "diff":old.map(|old|prompt::three_way_diff(old,new,&source.text)),
+            "current_diff":prompt::unified_diff(new,&source.text,"new-builtin","override")}));
+    }
+    Ok(reports)
 }

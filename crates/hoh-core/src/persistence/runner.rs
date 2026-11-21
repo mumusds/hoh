@@ -349,7 +349,9 @@ pub(super) fn run(
     ctx: &Ctx<'_>,
 ) -> Result<RunnerDone, PersistError> {
     match job {
-        RunnerJob::Waiting(project_id) => waiting(conn, &project_id).map(RunnerDone::Waiting),
+        RunnerJob::Waiting(project_id) => {
+            waiting(conn, &project_id, &ctx.resource_bundle.version()).map(RunnerDone::Waiting)
+        }
         RunnerJob::SessionStarts(project_id) => {
             super::handover::waiting(conn, &project_id).map(RunnerDone::SessionStarts)
         }
@@ -457,7 +459,11 @@ pub(super) fn run(
     }
 }
 
-fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError> {
+fn waiting(
+    conn: &Connection,
+    project_id: &str,
+    resource_version: &str,
+) -> Result<Waiting, PersistError> {
     let mut statement = conn
         .prepare(
             "SELECT o.message_id, o.run_id, json_extract(o.payload_json, '$.task_id'), \
@@ -601,13 +607,15 @@ fn waiting(conn: &Connection, project_id: &str) -> Result<Waiting, PersistError>
             let mut statement = conn
                 .prepare(
                     "SELECT run_id FROM runs WHERE project_id = ?1 \
-                     AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') AND config_revision < \
-                     (SELECT coalesce(max(revision), 0) FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED') \
+                     AND state NOT IN ('CANCELLED', 'COMPLETED', 'FAILED', 'INCOMPLETE') AND (config_revision < \
+                     (SELECT coalesce(max(revision), 0) FROM team_revisions WHERE project_id = ?1 AND state = 'APPLIED') OR EXISTS ( \
+                     SELECT 1 FROM role_bindings b WHERE b.run_id = runs.run_id AND coalesce((SELECT json_extract(e.payload_json, '$.resource_bundle_version') \
+                     FROM events e WHERE e.run_id = b.run_id AND e.kind = 'resource.pinned' AND json_extract(e.payload_json, '$.role') = b.role ORDER BY e.seq DESC LIMIT 1), '') <> ?2)) \
                      ORDER BY created_at, run_id",
                 )
                 .map_err(sqlite_error)?;
             statement
-                .query_map(params![project_id], |r| r.get(0))
+                .query_map(params![project_id, resource_version], |r| r.get(0))
                 .map_err(sqlite_error)?
                 .collect::<Result<_, _>>()
                 .map_err(sqlite_error)?
@@ -1229,6 +1237,20 @@ pub(super) fn record_prompt(
             ));
         }
     }
+    if let Some(packed) = &prompt.packed {
+        let expected: Option<String> = tx
+            .query_row(
+                "SELECT resource_bundle_version FROM attempts WHERE attempt_id = ?1",
+                [attempt_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        if expected.is_some_and(|v| v != packed.resource_bundle_version) {
+            return Err(PersistError::IntegrityViolation(
+                "packed prompt differs from the prepared resource pin".to_owned(),
+            ));
+        }
+    }
     tx.execute(
         "UPDATE attempts SET prompt_revision = ?2, prompt_sha256 = ?3, \
          resource_bundle_version = coalesce(?4, resource_bundle_version) WHERE attempt_id = ?1",
@@ -1251,13 +1273,29 @@ pub(super) fn record_prompt(
     if let Some(object) = payload.as_object_mut() {
         object.insert("attempt_id".to_owned(), json!(attempt_id));
     }
-    Ok(vec![event(
+    let mut events = vec![event(
         project_id,
         run_id,
         child_id(attempt_id, "context.packed"),
         "context.packed",
         payload,
-    )])
+    )];
+    if let Some(reports) = packed.event["resource_drift"]
+        .as_array()
+        .filter(|r| !r.is_empty())
+    {
+        events.insert(
+            0,
+            event(
+                project_id,
+                run_id,
+                child_id(attempt_id, "resource.drift"),
+                "resource.drift",
+                json!({"attempt_id":attempt_id,"role":prompt.role,"reports":reports}),
+            ),
+        );
+    }
+    Ok(events)
 }
 
 fn finished(

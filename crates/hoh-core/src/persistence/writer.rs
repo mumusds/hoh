@@ -271,6 +271,7 @@ impl Drop for Kept {
 /// What a request of the writer runs with (ADR-019 decisions 1 and 2): its name, the fault hooks and the epoch fence
 /// of the host it serves.
 pub(super) struct Ctx<'a> {
+    pub(super) resource_bundle: &'a crate::resource_bundle::Bundle,
     job: &'static str,
     hooks: &'a dyn FaultHooks,
     fence: Option<&'a Fence>,
@@ -289,7 +290,10 @@ impl Ctx<'_> {
     /// A request outside the writer loop in a unit test: no hooks, no fence.
     #[cfg(test)]
     pub(super) fn quiet() -> Ctx<'static> {
+        static RESOURCE_BUNDLE: std::sync::OnceLock<crate::resource_bundle::Bundle> =
+            std::sync::OnceLock::new();
         Ctx {
+            resource_bundle: RESOURCE_BUNDLE.get_or_init(crate::resource_bundle::Bundle::current),
             job: "Test",
             hooks: &super::NoFaults,
             fence: None,
@@ -566,6 +570,7 @@ impl Writer {
         let writer_claims = Registry::default();
         let faults = options.faults.clone();
         let clock = options.clock.clone();
+        let resource_bundle = options.resource_bundle.clone();
         let (end, ended) = watch::channel(false);
         std::thread::Builder::new()
             .name("hoh-db-writer".to_owned())
@@ -597,6 +602,7 @@ impl Writer {
                     before();
                     faults.before_job(job.name());
                     let ctx = Ctx {
+                        resource_bundle: &resource_bundle,
                         job: job.name(),
                         hooks: faults.as_ref(),
                         fence: fence.as_ref(),
@@ -827,6 +833,7 @@ impl Writer {
                 // kept (a lock goes only after the last write), then the word.
                 let left = writer_claims.close_and_take_all();
                 let close = Ctx {
+                    resource_bundle: &resource_bundle,
                     job: "Close",
                     hooks: faults.as_ref(),
                     fence: fence.as_ref(),

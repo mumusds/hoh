@@ -381,19 +381,25 @@ pub fn pack_with(
 /// a heading line and one line of compact JSON that defines every local `$ref` it uses. A role without a built-in
 /// contract hands back a TaskResult.
 pub fn output_schemas(role: &str) -> Result<String, String> {
+    output_schemas_with(role, |path| {
+        let text = crate::objects::RESOURCES
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, s)| *s)
+            .ok_or_else(|| format!("{path} is not built in"))?;
+        serde_json::from_str(text).map_err(|e| format!("{path}: {e}"))
+    })
+}
+
+pub fn output_schemas_with(
+    role: &str,
+    source: impl Fn(&str) -> Result<Value, String>,
+) -> Result<String, String> {
     let names: &[&str] = match role {
         "commander" => &["Message", "DecisionPayload"],
         "qa" => &["TaskResult", "AcceptanceObservation", "IndependentReport"],
         "reviewer" => &["TaskResult", "IndependentReport"],
         _ => &["TaskResult"],
-    };
-    let source = |path: &str| -> Result<Value, String> {
-        let text = crate::objects::RESOURCES
-            .iter()
-            .find(|(p, _)| *p == path)
-            .map(|(_, text)| *text)
-            .ok_or_else(|| format!("{path} is not built in"))?;
-        serde_json::from_str(text).map_err(|e| format!("{path}: {e}"))
     };
     let protocol = source("contracts/protocol.schema.json")?;
     let mut out = String::new();

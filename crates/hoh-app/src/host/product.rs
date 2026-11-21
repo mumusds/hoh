@@ -470,6 +470,16 @@ fn keep_diagnostics(outcome: &Outcome) {
 }
 
 impl ProductExecutor {
+    fn bundle(&self, work: &Work) -> Result<hoh_core::resource_bundle::Bundle, Refusal> {
+        work.assignment.resource_bundle.as_ref().map_or_else(
+            || Ok(hoh_core::resource_bundle::Bundle::current()),
+            |pin| {
+                pin.load(&self.project)
+                    .map_err(|why| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why))
+            },
+        )
+    }
+
     /// The prompt `work` is sent, packed from its four layers within its run's budget, its inputs kept as objects, and
     /// the record of it (docs/adr/ADR-026.md decisions 3 to 7); or why it cannot start: CONTEXT_BUDGET_TOO_SMALL with
     /// what the mandatory items need and the budget (decision 9), PROMPT_UNAVAILABLE for a contract whose placeholders
@@ -481,6 +491,7 @@ impl ProductExecutor {
         package: Option<&serde_json::Value>,
     ) -> Result<(String, PromptRecord), Refusal> {
         use hoh_core::context;
+        let bundle = self.bundle(work)?;
         let contract = resolved.effective().map_err(prompt_refusal)?;
         hoh_core::prompt::validate_variables(&resolved.template().map_err(prompt_refusal)?)
             .map_err(|error| Refusal {
@@ -553,6 +564,12 @@ impl ProductExecutor {
             |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
         let mut mandatory = context::mandatory(&facts, &work.role, &lead, project.as_deref())
             .map_err(deterministic)?;
+        mandatory.schemas = context::output_schemas_with(&work.role, |path| {
+            serde_json::from_str(bundle.text(path)?).map_err(|e| e.to_string())
+        })
+        .map_err(deterministic)?
+        .trim_end()
+        .to_owned();
         let mut project_sources =
             hoh_core::prompt_files::project_references(&self.project).map_err(prompt_refusal)?;
         project_sources["spec"] = facts.spec.as_ref().map(|(sha, revision)| serde_json::json!({"kind": "spec", "sha256": sha, "revision": revision})).unwrap_or_default();
@@ -588,7 +605,7 @@ impl ProductExecutor {
             "evidence": facts.entries.iter().filter(|e| e.class == context::Class::Evidence)
                 .map(|e| serde_json::json!({"path": e.path, "sha256": sha256_hex(e.text.as_bytes())})).collect::<Vec<_>>()
         });
-        let version = hoh_core::objects::resource_bundle_version();
+        let version = bundle.version();
         let mut recorded = context::record_resolved(
             context::PromptSources {
                 role: &work.role,
@@ -638,6 +655,33 @@ impl ProductExecutor {
                 name: object.name.clone(),
             });
         }
+        let mut drift_refs = Vec::new();
+        for report in hoh_core::prompt_files::drift_reports(
+            &self.project,
+            resolved,
+            &hoh_core::resource_bundle::Bundle::current(),
+        )
+        .map_err(prompt_refusal)?
+        {
+            let bytes = report.to_string().into_bytes();
+            let sha = hoh_core::objects::put(&self.project, &bytes).map_err(|why| {
+                refused(
+                    "CONTEXT_UNAVAILABLE",
+                    FailureClass::Transient { retry_after: None },
+                    why,
+                )
+            })?;
+            drift_refs.push(serde_json::json!({"layer":report["layer"], "path":report["path"], "base_status":report["base_status"], "sha256":sha}));
+            artifacts.push(hoh_core::persistence::ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha),
+                sha256: sha,
+                bytes: bytes.len() as u64,
+                mime: "application/json".to_owned(),
+                kind: "resource_drift".to_owned(),
+                name: "resource drift".to_owned(),
+            });
+        }
+        recorded.event["resource_drift"] = serde_json::json!(drift_refs);
         // One row per object (an entry's text may also be another's).
         artifacts.sort_by(|x, y| x.sha256.cmp(&y.sha256));
         artifacts.dedup_by(|x, y| x.sha256 == y.sha256);
@@ -703,12 +747,14 @@ impl ProductExecutor {
             exec_only,
             ..
         } = current;
-        let contract = hoh_core::prompt_files::load(
+        let bundle = self.bundle(work)?;
+        let contract = hoh_core::prompt_files::load_with_bundle(
             &self.project,
             hoh_core::prompt_files::global_root().as_deref(),
             &work.run_id,
             &work.role,
             a.prompt.as_deref(),
+            &bundle,
         )
         .map_err(prompt_refusal)?;
         // A new holder's first turn starts from its handover package (REQ-019 b4), as the store says which turn that

@@ -334,14 +334,17 @@ pub fn resource_bundle_version() -> String {
 }
 
 /// The resources and the packing format, which the digest covers as one more line.
-fn with_format<'a>(resources: &[(&'a str, &'a str)], format: &'a str) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn with_format<'a>(
+    resources: &[(&'a str, &'a str)],
+    format: &'a str,
+) -> Vec<(&'a str, &'a str)> {
     let mut all = resources.to_vec();
     all.push(("context::FORMAT", format));
     all
 }
 
 /// The sha256 of the resources' `<path> <sha256>` lines, sorted by path.
-fn digest_of(resources: &[(&str, &str)]) -> String {
+pub(crate) fn digest_of(resources: &[(&str, &str)]) -> String {
     let mut lines: Vec<String> = resources
         .iter()
         .map(|(path, text)| format!("{path} {}\n", sha256_hex(text.as_bytes())))

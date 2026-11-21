@@ -195,6 +195,16 @@ pub(super) fn submit(
                     unattended: *unattended,
                 },
             )?;
+            let resource_events = super::resources::events(
+                &tx,
+                &command.event.project_id,
+                &command.run_id,
+                super::team::current(&tx, &command.event.project_id)?
+                    .1
+                    .team
+                    .into_keys(),
+                ctx.resource_bundle,
+            )?;
             // The project's latest approved specification, adopted after run.created; with none, the run is BLOCKED
             // on its question runtime:no_spec in this commit (docs/adr/ADR-031.md decision 1).
             let project_id = &command.event.project_id;
@@ -205,6 +215,7 @@ pub(super) fn submit(
                 &Commit {
                     events: std::iter::once(command.event.clone())
                         .chain(adopted)
+                        .chain(resource_events)
                         .collect(),
                     outbox: command.outbox.clone().into_iter().collect(),
                     ..Commit::default()
