@@ -19,12 +19,10 @@ struct Seen {
     start: String,
 }
 
-/// What the sweep reads of /proc (a test's seam): the pids it lists, a process's stat, and the uid that owns a
-/// process's directory.
+/// What the sweep reads of /proc (a test's seam): the pids it lists and a process's stat.
 trait Proc {
     fn pids(&self) -> std::io::Result<Vec<std::io::Result<u32>>>;
     fn stat(&self, pid: u32) -> std::io::Result<Vec<u8>>;
-    fn owner(&self, pid: u32) -> std::io::Result<u32>;
 }
 
 /// The real /proc.
@@ -43,22 +41,18 @@ impl Proc for RealProc {
     fn stat(&self, pid: u32) -> std::io::Result<Vec<u8>> {
         std::fs::read(format!("/proc/{pid}/stat"))
     }
-
-    fn owner(&self, pid: u32) -> std::io::Result<u32> {
-        use std::os::unix::fs::MetadataExt as _;
-        Ok(std::fs::metadata(format!("/proc/{pid}"))?.uid())
-    }
 }
 
 /// Every process /proc shows, and whether it was read whole: a /proc that cannot be listed, or a process's stat that
-/// cannot be read for another reason than its being gone or its being another user's (refused, its directory another
-/// uid's: CLT-1353), leaves the table incomplete (CLT-1200).
+/// cannot be read for another reason than its being gone, leaves the table incomplete (CLT-1200). A refused stat (a
+/// /proc mounted with hidepid) is such a reason, whoever owns the process: a setuid descendant's directory is root's,
+/// yet doctor may signal it (CLT-1353, CLN4-150).
 fn table() -> (Vec<Seen>, bool) {
-    table_with(&RealProc, rustix::process::getuid().as_raw())
+    table_with(&RealProc)
 }
 
-/// [`table`] from `proc`, for this process's user `uid`.
-fn table_with(proc: &dyn Proc, uid: u32) -> (Vec<Seen>, bool) {
+/// [`table`] from `proc`.
+fn table_with(proc: &dyn Proc) -> (Vec<Seen>, bool) {
     let Ok(pids) = proc.pids() else {
         return (Vec::new(), false);
     };
@@ -72,15 +66,6 @@ fn table_with(proc: &dyn Proc, uid: u32) -> (Vec<Seen>, bool) {
         let stat = match proc.stat(pid) {
             Ok(stat) => stat,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) => {
-                continue;
-            }
-            // Refused, and another user's (its directory is another uid's): no descendant doctor could signal anyway
-            // (one that changed its uid is the stated residual of ADR-031 B), so skipped, not taken for an incomplete
-            // scan (CLT-1353: /proc mounted with hidepid refuses every other user's stat).
-            Err(e)
-                if matches!(e.raw_os_error(), Some(1 | 13))
-                    && proc.owner(pid).is_ok_and(|owner| owner != uid) =>
-            {
                 continue;
             }
             Err(_) => {
@@ -224,11 +209,11 @@ pub fn sweep(root: u32, end: Instant) -> Swept {
 mod tests {
     use super::*;
 
-    /// A /proc of a few processes, `(pid, parent, owner uid)` each; the stat of each pid in `denied` is refused (EPERM,
-    /// as a /proc mounted with hidepid answers for another user's process).
+    /// A /proc of a few processes, `(pid, parent, owner uid)` each (the uid names the case; the sweep does not read it); the stat of each pid in `denied` is refused with
+    /// its error number (EPERM or EACCES, as a /proc mounted with hidepid answers for another user's process).
     struct Fake {
         processes: Vec<(u32, u32, u32)>,
-        denied: Vec<u32>,
+        denied: Vec<(u32, i32)>,
     }
 
     impl Proc for Fake {
@@ -237,8 +222,8 @@ mod tests {
         }
 
         fn stat(&self, pid: u32) -> std::io::Result<Vec<u8>> {
-            if self.denied.contains(&pid) {
-                return Err(std::io::Error::from_raw_os_error(1));
+            if let Some((_, errno)) = self.denied.iter().find(|(p, _)| *p == pid) {
+                return Err(std::io::Error::from_raw_os_error(*errno));
             }
             let (_, parent, _) = self
                 .processes
@@ -247,41 +232,27 @@ mod tests {
                 .ok_or_else(|| std::io::Error::from_raw_os_error(2))?;
             Ok(format!("{pid} (x) S {parent} {}{pid}0", "0 ".repeat(17)).into_bytes())
         }
-
-        fn owner(&self, pid: u32) -> std::io::Result<u32> {
-            self.processes
-                .iter()
-                .find(|(p, _, _)| *p == pid)
-                .map(|(_, _, uid)| *uid)
-                .ok_or_else(|| std::io::Error::from_raw_os_error(2))
-        }
     }
 
     #[test]
-    fn another_users_unreadable_process_leaves_the_scan_complete() {
-        // ADR-031, 设计修正 2, B (CLT-1353): on a /proc mounted with hidepid another user's stat is refused (EPERM).
-        // Its directory is another uid's, so it is no descendant doctor could signal: skipped, the scan stays
-        // complete. A refused stat of this user's own process still leaves the scan incomplete. Before, any refusal
-        // made every scan incomplete, and doctor's exit waited its whole bound to say so.
-        let fake = Fake {
-            processes: vec![(10, 1, 1000), (11, 10, 1000), (99, 500, 0)],
-            denied: vec![99],
-        };
-        let (seen, complete) = table_with(&fake, 1000);
-        let mut pids: Vec<u32> = seen.iter().map(|s| s.pid).collect();
-        pids.sort_unstable();
-        assert_eq!(pids, [10, 11]);
-        assert!(
-            complete,
-            "another user's refused stat made the scan incomplete"
-        );
-        let own = Fake {
-            processes: vec![(10, 1, 1000), (11, 10, 1000)],
-            denied: vec![11],
-        };
-        assert!(
-            !table_with(&own, 1000).1,
-            "this user's own refused stat left the scan complete"
-        );
+    fn an_unreadable_process_leaves_the_scan_incomplete_whoever_owns_its_directory() {
+        // ADR-031, 设计修正 2, B (CLT-1353, CLN4-150): a process whose stat is refused (EPERM or EACCES, as on a /proc
+        // mounted with hidepid) leaves the scan incomplete, whatever uid owns its directory: a setuid descendant's is
+        // root's, yet doctor may signal it, and its own children hang below it. So the sweep says it could not
+        // confirm; it never calls such a scan complete. The processes it could read are still seen.
+        for (uid, errno) in [(0, 1), (0, 13), (1000, 1), (1000, 13)] {
+            let fake = Fake {
+                processes: vec![(10, 1, 1000), (11, 10, 1000), (12, 11, uid), (13, 12, 1000)],
+                denied: vec![(12, errno)],
+            };
+            let (seen, complete) = table_with(&fake);
+            let mut pids: Vec<u32> = seen.iter().map(|s| s.pid).collect();
+            pids.sort_unstable();
+            assert_eq!(pids, [10, 11, 13]);
+            assert!(
+                !complete,
+                "a refused stat (errno {errno}) of a process whose directory is uid {uid}'s left the scan complete"
+            );
+        }
     }
 }
