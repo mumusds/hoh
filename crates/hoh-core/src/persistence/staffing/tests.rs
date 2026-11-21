@@ -45,6 +45,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
             policy: "balanced".to_owned(),
             assumptions: std::collections::BTreeMap::new(),
             unattended: true,
+            mode_cycle: crate::config::Config::default().ui.mode_cycle,
         },
         event: NewEvent {
             intent: Intent::Progress,

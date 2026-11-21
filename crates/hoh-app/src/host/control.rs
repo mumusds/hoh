@@ -98,6 +98,9 @@ async fn tick(
     // Each pausing run's step is its own item: a run stopped meanwhile is Held, skipped, and the others go on
     // (docs/adr/ADR-031.md correction D rule 2 (b), M2T13R-01).
     let mut held = super::runner::Held::default();
+    for run in &waiting.mode_changes {
+        held.item(store.mode_step(run).await)?;
+    }
     for run in &waiting.pausing {
         held.item(store.pause_step(run, common.clock.now()).await)?;
     }

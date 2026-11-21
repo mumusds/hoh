@@ -81,6 +81,7 @@ pub(super) fn revision(conn: &Connection, project_id: &str) -> Result<i64, Persi
 
 /// What StartRun freezes of the configuration into a new run (its snapshot, budget and deadline).
 pub(super) struct Frozen<'a> {
+    pub mode_cycle: &'a [String],
     pub budget: &'a Budget,
     pub policy: &'a str,
     pub assumptions: &'a std::collections::BTreeMap<String, crate::config::Assumed>,
@@ -97,6 +98,7 @@ pub(super) fn start_run(
     frozen: Frozen<'_>,
 ) -> Result<(), PersistError> {
     let Frozen {
+        mode_cycle,
         budget,
         policy,
         assumptions,
@@ -124,6 +126,7 @@ pub(super) fn start_run(
     let snapshot = serde_json::json!({
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
         "supervision": {"policy": policy},
+        "ui": {"mode_cycle": mode_cycle},
         "context": {"budget_tokens": context.budget_tokens, "shares": context.shares},
         // The repair limits the run's completions and verification rounds count against (docs/adr/ADR-028.md
         // decisions 11 and 12), frozen like the rest.

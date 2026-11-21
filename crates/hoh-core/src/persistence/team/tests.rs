@@ -41,6 +41,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
             policy: "balanced".to_owned(),
             assumptions: BTreeMap::new(),
             unattended: true,
+            mode_cycle: crate::config::Config::default().ui.mode_cycle,
         },
         event: NewEvent {
             intent: Intent::Progress,
@@ -233,6 +234,7 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
             "information_gain": 2}, "max_wait_rounds": 20},
             // The supervision policy, frozen too (docs/adr/ADR-025.md decision 9).
             "supervision": {"policy": "balanced"},
+            "ui": {"mode_cycle": ["PLAN", "BUILD", "AUTO"]},
             // The packing parameters, frozen for the run's life (docs/adr/ADR-026.md decision 7).
             "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]},
             // The repair limits its completions and rounds count against (docs/adr/ADR-028.md decisions 11, 12).

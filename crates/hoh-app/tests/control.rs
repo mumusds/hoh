@@ -3320,3 +3320,186 @@ async fn in_the_cancel_world_a_run_is_held_only_in_the_tick_of_its_stop() -> R {
     );
     Ok(())
 }
+
+/// AC-007-02: the host owns the safe point, with a real process standing in for the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_007_02_mode_change_waits_for_the_safe_point() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t09-mode-").tempdir()?;
+    let release = dir.path().join("release");
+    let script = format!(
+        "while [ ! -f '{}' ]; do sleep 0.02; done",
+        release.display()
+    );
+    let agents = Arc::new(Agents::new(&[("T1", &script)]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let (project, host) = host_seeded(
+        dir.path(),
+        &agents,
+        None,
+        "UPDATE runs SET mode = 'BUILD' WHERE run_id = 'R';",
+    )
+    .await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let set = |key: &str, revision: i64, mode: &str| {
+        json!({
+            "schema_version": "1.0", "command_id": key, "idempotency_key": key,
+            "expected_revision": revision, "kind": "SetMode", "run_id": "R", "payload": {"mode": mode}
+        })
+    };
+    let revision = seq(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+    let request = set("plan", revision, "PLAN");
+    let (status, accepted) = command(&host, &request).await?;
+    assert_eq!(status, 202, "SetMode must be accepted: {accepted}");
+    assert_eq!(
+        command(&host, &request).await?,
+        (202, accepted.clone()),
+        "idempotent replay"
+    );
+    assert_eq!(
+        query(&project, "SELECT mode FROM runs WHERE run_id = 'R'")?,
+        "BUILD"
+    );
+    assert_eq!(
+        query(
+            &project,
+            "SELECT json_extract(payload_json, '$.from') || '>' || json_extract(payload_json, '$.to') FROM events WHERE kind = 'run.mode_change_pending'"
+        )?,
+        "BUILD>PLAN"
+    );
+    let stale = command(&host, &set("stale", revision, "AUTO")).await?;
+    assert_eq!(stale.0, 409);
+    assert_eq!(stale.1["code"], "STALE_REVISION");
+    assert_eq!(query(&project, "SELECT count(*) FROM attempts")?, "1");
+    assert_eq!(
+        query(&project, "SELECT state FROM tasks WHERE task_id = 'T2'")?,
+        "READY"
+    );
+    std::fs::write(&release, "go")?;
+    until(
+        &project,
+        "SELECT mode FROM runs WHERE run_id = 'R'",
+        "PLAN",
+        Duration::from_secs(15),
+    )
+    .await?;
+    assert_eq!(
+        query(
+            &project,
+            "SELECT state FROM attempts WHERE task_id = 'T1' ORDER BY started_at LIMIT 1"
+        )?,
+        "SETTLED"
+    );
+    let changed = seq(
+        &project,
+        "SELECT seq FROM events WHERE kind = 'run.mode_changed'",
+    )?;
+    let ended = seq(
+        &project,
+        "SELECT seq FROM events WHERE kind = 'attempt.moved' AND json_extract(payload_json, '$.to') = 'SETTLED' ORDER BY seq LIMIT 1",
+    )?;
+    assert!(
+        changed > ended,
+        "mode must change after the active writer ends"
+    );
+    assert_eq!(
+        query(
+            &project,
+            &format!(
+                "SELECT count(*) FROM events WHERE kind = 'schedule.round' AND seq > (SELECT seq FROM events WHERE kind = 'run.mode_change_pending') AND seq < {changed}"
+            )
+        )?,
+        "0"
+    );
+    assert!(
+        seq(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?
+            > accepted["revision"].as_i64().ok_or("revision")?
+    );
+    assert!(
+        agents
+            .native
+            .lock()
+            .map(|calls| calls.is_empty())
+            .unwrap_or(false),
+        "mode switching must not interrupt the writer"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_007_02_latest_pending_target_survives_host_restart() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-pending-")
+        .tempdir()?;
+    let project = dir.path();
+    let host = Host::start(config(project)).await?;
+    seed(
+        project,
+        &format!(
+            "{WORLD}
+        UPDATE runs SET mode = 'BUILD' WHERE run_id = 'R';
+        INSERT INTO attempts(attempt_id, task_id, state, role_epoch, host_epoch, config_revision)
+        VALUES ('held', 'T1', 'PREPARED', 1, 1, 1);"
+        ),
+    )?;
+    for (id, mode) in [("first", "PLAN"), ("last", "AUTO")] {
+        let revision = seq(project, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+        let response = command(&host, &json!({"schema_version":"1.0", "command_id":id,
+            "idempotency_key":id, "expected_revision":revision, "kind":"SetMode", "run_id":"R", "payload":{"mode":mode}})).await?;
+        assert_eq!(response.0, 202, "{response:?}");
+    }
+    assert_eq!(
+        query(project, "SELECT mode FROM runs WHERE run_id = 'R'")?,
+        "BUILD"
+    );
+    host.shutdown().await;
+    seed(
+        project,
+        "UPDATE attempts SET state = 'SETTLED' WHERE attempt_id = 'held';",
+    )?;
+    let host = start_when_free(config(project)).await?;
+    until(
+        project,
+        "SELECT mode FROM runs WHERE run_id = 'R'",
+        "AUTO",
+        Duration::from_secs(10),
+    )
+    .await?;
+    assert_eq!(
+        query(
+            project,
+            "SELECT count(*) FROM events WHERE kind = 'run.mode_changed'"
+        )?,
+        "1"
+    );
+    assert_eq!(
+        query(
+            project,
+            "SELECT json_extract(payload_json, '$.command_id') FROM events WHERE kind = 'run.mode_changed'"
+        )?,
+        "last"
+    );
+    let revision = seq(project, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+    let response = command(&host, &json!({"schema_version":"1.0", "command_id":"immediate",
+        "idempotency_key":"immediate", "expected_revision":revision, "kind":"SetMode", "run_id":"R", "payload":{"mode":"PLAN"}})).await?;
+    assert_eq!(response.0, 202);
+    assert_eq!(
+        query(project, "SELECT mode FROM runs WHERE run_id = 'R'")?,
+        "PLAN"
+    );
+    assert_eq!(
+        query(
+            project,
+            "SELECT count(*) FROM events WHERE kind = 'run.mode_changed'"
+        )?,
+        "2"
+    );
+    host.shutdown().await;
+    Ok(())
+}

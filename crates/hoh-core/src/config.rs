@@ -195,6 +195,7 @@ pub struct Ui {
     pub view: String,
     pub statusline: String,
     pub mouse: bool,
+    pub mode_cycle: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -286,6 +287,7 @@ impl Default for Config {
                 view: "workspace".to_owned(),
                 statusline: "standard".to_owned(),
                 mouse: true,
+                mode_cycle: ["PLAN", "BUILD", "AUTO"].map(str::to_owned).to_vec(),
             },
             web: Web {
                 host: "127.0.0.1".to_owned(),
@@ -931,6 +933,36 @@ impl Reader<'_> {
                 "view" => ui.view = self.one_of(&path, value, &["workspace", "team", "focus"])?,
                 "statusline" => ui.statusline = self.one_of(&path, value, &["standard"])?,
                 "mouse" => ui.mouse = self.boolean(&path, value)?,
+                "mode_cycle" => {
+                    let Item::Array(items) = &value.item else {
+                        return Err(self.error(
+                            &path,
+                            value.at,
+                            "expected two or three distinct modes",
+                        ));
+                    };
+                    if !(2..=3).contains(&items.len()) {
+                        return Err(self.error(
+                            &path,
+                            value.at,
+                            "expected two or three distinct modes",
+                        ));
+                    }
+                    let mut cycle = Vec::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let item_path = format!("{path}[{i}]");
+                        let mode = self.one_of(&item_path, item, &["PLAN", "BUILD", "AUTO"])?;
+                        if cycle.contains(&mode) {
+                            return Err(self.error(
+                                &item_path,
+                                item.at,
+                                "mode is already in the cycle",
+                            ));
+                        }
+                        cycle.push(mode);
+                    }
+                    ui.mode_cycle = cycle;
+                }
                 _ => return Err(self.unknown(&path, *at)),
             }
         }

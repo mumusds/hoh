@@ -924,6 +924,9 @@ async fn tick(
         if held.contains(run) || held.item(store.pace_run(run, at()).await)?.is_none() {
             continue;
         }
+        if held.item(store.mode_step(run).await)?.is_none() {
+            continue;
+        }
         while let Some(round) = held.item(store.schedule_round(run, at()).await)?
             && round.dispatched.is_some()
         {}

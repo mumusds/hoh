@@ -243,6 +243,19 @@ pub(super) fn decide_in(
     if let Err(ref mut rejection) = verdict {
         explain_stale_completion(tx, proposal, rejection)?;
     }
+    let verdict = match verdict {
+        Ok(Effect::Dispatch { .. })
+            if snapshot.task.as_ref().is_some_and(|task| task.writer)
+                && super::modes::pending(tx, &proposal.run_id)?.is_some() =>
+        {
+            Err(Rejection {
+                reason: RejectionReason::IllegalTransition,
+                detail: "mode_change_pending: writer dispatch waits for the mode safe point"
+                    .to_owned(),
+            })
+        }
+        other => other,
+    };
     let decided = match verdict {
         Ok(Effect::Unsupported(kind)) => return Ok(Decided::Unsupported { kind }),
         Ok(effect) => {

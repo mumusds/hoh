@@ -47,6 +47,8 @@ pub struct Waiting {
     /// The runs whose pause waits for its safe point (PAUSE_REQUESTED) and those being cancelled (CANCEL_REQUESTED),
     /// which the host loop moves on with or without an executor (docs/adr/ADR-021.md decision 7).
     pub pausing: Vec<String>,
+    /// Runs with an unfulfilled SetMode command.
+    pub mode_changes: Vec<String>,
     pub cancelling: Vec<String>,
     /// Nonterminal runs behind the team revision, or with an idle role behind the host's resource bundle. A resource
     /// upgrade that only waits for in-flight attempts needs no checkpoint transaction yet (CR-026 C14).
@@ -134,6 +136,7 @@ pub(super) enum RunnerJob {
         run_id: String,
         context: Box<crate::decision::Context>,
     },
+    Mode(String),
     Ack(String),
     /// A session.start notice settled (docs/adr/ADR-024.md decision 4): delivered to this session, or superseded.
     SessionStart(String, Option<String>),
@@ -416,6 +419,7 @@ pub(super) fn run(
         RunnerJob::Checkpoint(run_id, availability) => {
             super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
         }
+        RunnerJob::Mode(run) => super::modes::step(conn, &run, ctx).map(RunnerDone::Applied),
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
         }
@@ -602,6 +606,7 @@ fn waiting(
         started,
         runs,
         pausing: in_state("PAUSE_REQUESTED")?,
+        mode_changes: super::modes::waiting(conn, project_id)?,
         cancelling: in_state("CANCEL_REQUESTED")?,
         team_behind: {
             let mut statement = conn

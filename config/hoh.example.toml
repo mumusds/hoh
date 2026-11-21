@@ -61,6 +61,7 @@ max_protocol_repairs = 2
 view = "workspace"
 statusline = "standard"
 mouse = true
+mode_cycle = ["PLAN", "BUILD", "AUTO"]
 [web]
 host = "127.0.0.1"   # loopback only; remote use: ssh -L 8787:127.0.0.1:8787 vm
 port = 8787
