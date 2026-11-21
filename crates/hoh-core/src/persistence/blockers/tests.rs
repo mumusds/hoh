@@ -612,3 +612,53 @@ async fn a_claim_of_a_reason_that_never_blocks_a_run_is_an_integrity_violation()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_legacy_row_holding_readiness_is_written_back_without_it() -> R {
+    // M3A-150: a BLOCKED row with no claim history whose set names READINESS_NOT_MET besides NEED_DECISION is taken
+    // over with the NEED_DECISION claim only, and its stored set is rewritten without READINESS_NOT_MET.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION' WHERE task_id = 'T1';
+         UPDATE runs SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION',
+           blocked_reasons_json = '[\"NEED_DECISION\",\"READINESS_NOT_MET\"]' WHERE run_id = 'R';"
+    ))?;
+    store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await?;
+    assert_eq!(claims(&path)?, ["claimed NEED_DECISION pace migrated"]);
+    assert_eq!(
+        run(&path)?,
+        (
+            "BLOCKED".to_owned(),
+            Some("NEED_DECISION".to_owned()),
+            "[\"NEED_DECISION\"]".to_owned()
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_snapshot_claim_event_naming_a_task_only_reason_is_an_integrity_violation() -> R {
+    // M3A-151: the latest claim event's own reason is checked on the snapshot path too, not only its `open` pairs.
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    Connection::open(&path)?.execute_batch(&format!(
+        "{WORLD}
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'snap/1', 'R', 'run.blocker_claimed',
+            '{{\"reason\": \"READINESS_NOT_MET\", \"source\": \"pace\", \"open\": [], \"n\": 0}}', '2026-11-07T00:00:00Z');"
+    ))?;
+    let err = store
+        .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
+        .await
+        .err()
+        .ok_or("a READINESS_NOT_MET snapshot event was accepted")?;
+    assert!(
+        err.to_string().contains("no reason that blocks a run"),
+        "{err}"
+    );
+    Ok(())
+}
