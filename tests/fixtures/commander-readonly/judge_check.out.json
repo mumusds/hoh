@@ -8547,7 +8547,7 @@
     {
      "expect": "non-PASS",
      "kind": "code mode lexis",
-     "label": "a regex at the script start",
+     "label": "a lone low surrogate in a discovery string",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -8557,7 +8557,7 @@
     {
      "expect": "non-PASS",
      "kind": "code mode lexis",
-     "label": "a lone surrogate in a string",
+     "label": "a lone high surrogate in a discovery string",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -14612,7 +14612,7 @@
     {
      "expect": "non-PASS",
      "kind": "code mode lexis",
-     "label": "a regex at the script start",
+     "label": "a lone low surrogate in a discovery string",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [
@@ -14622,7 +14622,7 @@
     {
      "expect": "non-PASS",
      "kind": "code mode lexis",
-     "label": "a lone surrogate in a string",
+     "label": "a lone high surrogate in a discovery string",
      "ok": true,
      "verdict": "INSUFFICIENT",
      "why": [

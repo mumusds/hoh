@@ -935,8 +935,8 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-new | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | code mode lexis | an escaped newline in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
-| codex/app-ro-new | code mode lexis | a regex at the script start | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
-| codex/app-ro-new | code mode lexis | a lone surrogate in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a lone low surrogate in a discovery string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-new | code mode lexis | a lone high surrogate in a discovery string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-new | rollout JSONL | Unicode separators inside a recorded call | same | PASS | — |
 | codex/app-ro-new | rollout JSONL | a valid surrogate pair | same | PASS | — |
 | codex/app-ro-new | rollout JSONL | malformed JSON | non-PASS | INSUFFICIENT | rollout line 34 is not valid JSON |
@@ -1464,8 +1464,8 @@ Raw recordings: the same verdict for every variant of 6 of 6 rounds.
 | codex/app-ro-resumed | code mode lexis | a regex with a flag outside gimsuy | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode lexis | a regex with a repeated flag | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | code mode lexis | an escaped newline in a regex | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
-| codex/app-ro-resumed | code mode lexis | a regex at the script start | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
-| codex/app-ro-resumed | code mode lexis | a lone surrogate in a string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a lone low surrogate in a discovery string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
+| codex/app-ro-resumed | code mode lexis | a lone high surrogate in a discovery string | non-PASS | INSUFFICIENT | an unclassified call (custom_tool_call exec) |
 | codex/app-ro-resumed | rollout JSONL | Unicode separators inside a recorded call | same | PASS | — |
 | codex/app-ro-resumed | rollout JSONL | a valid surrogate pair | same | PASS | — |
 | codex/app-ro-resumed | rollout JSONL | malformed JSON | non-PASS | INSUFFICIENT | rollout line 67 is not valid JSON |
