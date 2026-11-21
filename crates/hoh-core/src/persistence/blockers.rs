@@ -34,9 +34,10 @@ pub(super) fn precedence(reason: BlockedReason) -> u8 {
     }
 }
 
-/// Order reasons by precedence (then by name), each once.
+/// Order reasons by precedence (then by name), each once; a reason that never blocks a run
+/// ([`BlockedReason::blocks_run`]) is left out, so no run-level set or claim holds one.
 pub(super) fn ordered(reasons: impl IntoIterator<Item = BlockedReason>) -> Vec<BlockedReason> {
-    let mut reasons: Vec<BlockedReason> = reasons.into_iter().collect();
+    let mut reasons: Vec<BlockedReason> = reasons.into_iter().filter(|r| r.blocks_run()).collect();
     reasons.sort_by_key(|r| (precedence(*r), r.as_str()));
     reasons.dedup();
     reasons
@@ -108,10 +109,13 @@ impl Claims {
                 for pair in open {
                     let (Some(source), Some(reason)) = (
                         pair[0].as_str(),
-                        pair[1].as_str().and_then(BlockedReason::parse),
+                        pair[1]
+                            .as_str()
+                            .and_then(BlockedReason::parse)
+                            .filter(|r| r.blocks_run()),
                     ) else {
                         return Err(PersistError::IntegrityViolation(format!(
-                            "a claim snapshot of {run_id} names no source or reason: {pair}"
+                            "a claim snapshot of {run_id} names no source or no reason that blocks a run: {pair}"
                         )));
                     };
                     claims.open.insert((source.to_owned(), reason));
@@ -146,10 +150,13 @@ impl Claims {
             })?;
             let (Some(source), Some(reason)) = (
                 payload["source"].as_str(),
-                payload["reason"].as_str().and_then(BlockedReason::parse),
+                payload["reason"]
+                    .as_str()
+                    .and_then(BlockedReason::parse)
+                    .filter(|r| r.blocks_run()),
             ) else {
                 return Err(PersistError::IntegrityViolation(format!(
-                    "a claim event of {run_id} names no source or reason: {payload}"
+                    "a claim event of {run_id} names no source or no reason that blocks a run: {payload}"
                 )));
             };
             let claim = (source.to_owned(), reason);

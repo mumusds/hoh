@@ -534,7 +534,8 @@ pub(super) fn view(conn: &Connection, run_id: &str, seq: i64) -> Result<ResultVi
     let blocked_reason = match (state, blocked) {
         (protocol::RunState::Blocked, Some(reason)) => Some(
             protocol::BlockedReason::parse(&reason)
-                .ok_or_else(|| integrity(format!("unknown blocked reason {reason:?}")))?,
+                .filter(|r| r.blocks_run())
+                .ok_or_else(|| integrity(format!("not a run's blocked reason {reason:?}")))?,
         ),
         (protocol::RunState::Blocked, None) => {
             return Err(integrity("BLOCKED without a blocked reason".to_owned()));
