@@ -223,10 +223,10 @@ pub(super) fn submit_in(
                 },
             )?;
             let resource_events = super::resources::events(
-                &tx,
+                tx,
                 &command.event.project_id,
                 &command.run_id,
-                super::team::current(&tx, &command.event.project_id)?
+                super::team::current(tx, &command.event.project_id)?
                     .1
                     .team
                     .into_keys(),

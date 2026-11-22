@@ -43,6 +43,7 @@ async fn setup() -> R<(tempfile::TempDir, PathBuf)> {
             payload_sha256: "1".repeat(64),
             target: RunTarget::Start {
                 mode: "AUTO".to_owned(),
+                mode_cycle: Config::default().ui.mode_cycle,
                 budget: Config::default().budget,
                 policy: "balanced".to_owned(),
                 assumptions: Default::default(),
