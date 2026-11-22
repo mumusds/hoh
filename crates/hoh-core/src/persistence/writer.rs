@@ -1731,6 +1731,7 @@ pub(super) enum OutboxJob {
     InputSweep(String),
     ChangeInput(Box<super::ChangeInput>),
     RouteInput(super::InputRouting),
+    Consult(Box<crate::protocol::Message>),
     /// Message id, generation, settlement, the delivery limit.
     Settle(String, i64, super::outbox::Settlement, i64),
     Consume(
@@ -1751,6 +1752,7 @@ pub(super) enum OutboxJob {
 pub(super) struct OutboxDone {
     pub(super) rows: Vec<Claimed>,
     pub(super) input_reply: Option<String>,
+    pub(super) consult: Option<serde_json::Value>,
     pub(super) changed: super::ChangedInput,
     pub(super) routed: super::InputRouted,
     pub(super) consumed: Option<super::outbox::Consumed>,
@@ -1781,6 +1783,10 @@ fn run_outbox(
                 }
             }
         }
+        OutboxJob::Consult(message) => OutboxDone {
+            consult: super::consult::request(conn, &message, ctx)?,
+            ..Default::default()
+        },
         OutboxJob::RouteInput(request) => OutboxDone {
             routed: super::inputs::routing::route(conn, &request, ctx)?,
             ..Default::default()

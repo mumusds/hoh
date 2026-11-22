@@ -49,6 +49,7 @@ fn start(run_id: &str) -> SubmitCommand {
         payload: json!({"goal": "g", "mode": "AUTO", "interactive": false}),
         payload_sha256: format!("{:064}", run_id.len()),
         target: RunTarget::Start {
+            max_discussion_rounds: 2,
             mode: "AUTO".to_owned(),
             budget: Config::default().budget,
             policy: "balanced".to_owned(),

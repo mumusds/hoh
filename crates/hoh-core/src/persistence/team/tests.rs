@@ -36,6 +36,7 @@ fn start(run_id: &str, budget: Budget) -> SubmitCommand {
         payload: json!({"goal": "g", "mode": "AUTO", "interactive": false}),
         payload_sha256: format!("{:064}", run_id.len()),
         target: RunTarget::Start {
+            max_discussion_rounds: 2,
             mode: "AUTO".to_owned(),
             budget,
             policy: "balanced".to_owned(),
@@ -233,7 +234,7 @@ async fn a_started_run_snapshots_the_scheduler_and_gets_its_budget() -> R {
         json!({"scheduler": {"weights": {"user_value": 4, "unblock_value": 3, "risk_reduction": 3,
             "information_gain": 2}, "max_wait_rounds": 20},
             // The supervision policy, frozen too (docs/adr/ADR-025.md decision 9).
-            "supervision": {"policy": "balanced"},
+            "supervision": {"policy": "balanced", "max_discussion_rounds": 2},
             "ui": {"mode_cycle": ["PLAN", "BUILD", "AUTO"]},
             // The packing parameters, frozen for the run's life (docs/adr/ADR-026.md decision 7).
             "context": {"budget_tokens": 32_000, "shares": [45, 35, 20]},
@@ -3471,5 +3472,30 @@ async fn test_017_01_idle_commander_rebind_answers_ask_in_its_first_input_turn()
         values(&path, "SELECT state FROM handoffs")?,
         vec![vec![json!("ACCEPTED")]]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_03_started_run_freezes_discussion_limit() -> R {
+    for max in [2, 3] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = open(&dir)?;
+        let mut command = start("R-discussion", Config::default().budget);
+        if let RunTarget::Start {
+            max_discussion_rounds,
+            ..
+        } = &mut command.target
+        {
+            *max_discussion_rounds = max;
+        }
+        store.submit_command(command).await?;
+        assert_eq!(
+            values(
+                &path,
+                "SELECT json_extract(config_snapshot_json,'$.supervision.max_discussion_rounds') FROM runs WHERE run_id='R-discussion'"
+            )?,
+            vec![vec![json!(max)]]
+        );
+    }
     Ok(())
 }

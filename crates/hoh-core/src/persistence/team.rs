@@ -84,6 +84,7 @@ pub(super) struct Frozen<'a> {
     pub mode_cycle: &'a [String],
     pub budget: &'a Budget,
     pub policy: &'a str,
+    pub max_discussion_rounds: u32,
     pub assumptions: &'a std::collections::BTreeMap<String, crate::config::Assumed>,
     pub unattended: bool,
 }
@@ -101,6 +102,7 @@ pub(super) fn start_run(
         mode_cycle,
         budget,
         policy,
+        max_discussion_rounds,
         assumptions,
         unattended,
     } = frozen;
@@ -125,7 +127,7 @@ pub(super) fn start_run(
     let context = crate::context::CONTEXT_V1;
     let snapshot = serde_json::json!({
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
-        "supervision": {"policy": policy},
+        "supervision": {"policy": policy, "max_discussion_rounds": max_discussion_rounds},
         "ui": {"mode_cycle": mode_cycle},
         "context": {"budget_tokens": context.budget_tokens, "shares": context.shares},
         // The repair limits the run's completions and verification rounds count against (docs/adr/ADR-028.md

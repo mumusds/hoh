@@ -856,6 +856,9 @@ async fn submit_command(
             (
                 "StartRun",
                 RunTarget::Start {
+                    max_discussion_rounds: effective
+                        .as_ref()
+                        .map_or(2, |config| config.supervision.max_discussion_rounds),
                     mode: mode.clone(),
                     mode_cycle: effective.as_ref().map_or_else(
                         || hoh_core::config::Config::default().ui.mode_cycle,

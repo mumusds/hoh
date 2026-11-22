@@ -51,6 +51,7 @@ pub enum RunTarget {
         budget: crate::config::Budget,
         /// `supervision.policy`, frozen into the run's snapshot (docs/adr/ADR-025.md decision 9).
         policy: String,
+        max_discussion_rounds: u32,
         /// `[assumptions]`, frozen into the run's snapshot: what it may assume when unattended (REQ-030 behaviour 4).
         assumptions: std::collections::BTreeMap<String, crate::config::Assumed>,
         /// StartRun's `interactive: false` (`hoh -p`), frozen into the run's snapshot (docs/adr/ADR-035.md decision 11).
@@ -192,6 +193,7 @@ pub(super) fn submit_in(
             mode,
             budget,
             policy,
+            max_discussion_rounds,
             assumptions,
             unattended,
             mode_cycle,
@@ -222,6 +224,7 @@ pub(super) fn submit_in(
                     mode_cycle,
                     budget,
                     policy,
+                    max_discussion_rounds: *max_discussion_rounds,
                     assumptions,
                     unattended: *unattended,
                 },

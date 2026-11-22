@@ -760,3 +760,26 @@ fn mode_cycle_accepts_only_two_or_three_distinct_modes() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_023_03_discussion_round_configuration_is_bounded() -> R {
+    assert_eq!(
+        serde_json::to_value(Config::default())?["supervision"]["max_discussion_rounds"],
+        2
+    );
+    for n in 1..=5 {
+        let config = parse(&with(&format!(
+            "[supervision]\nmax_discussion_rounds = {n}"
+        )))?;
+        assert_eq!(
+            serde_json::to_value(config)?["supervision"]["max_discussion_rounds"],
+            n
+        );
+    }
+    for n in ["0", "6", "-1", "2.5", "true", "\"3\""] {
+        refused(&with(&format!(
+            "[supervision]\nmax_discussion_rounds = {n}"
+        )));
+    }
+    Ok(())
+}

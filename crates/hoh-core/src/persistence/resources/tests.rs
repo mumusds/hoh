@@ -42,6 +42,7 @@ async fn setup() -> R<(tempfile::TempDir, PathBuf)> {
             payload: json!({"goal":"resource order", "mode":"AUTO", "interactive":false}),
             payload_sha256: "1".repeat(64),
             target: RunTarget::Start {
+                max_discussion_rounds: 2,
                 mode: "AUTO".to_owned(),
                 mode_cycle: Config::default().ui.mode_cycle,
                 budget: Config::default().budget,
