@@ -636,7 +636,7 @@ async fn test_023_01_exhausted_consultation_returns_a_diagnostic_and_releases_re
                 &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
                 true
             )?[0]["state"],
-            "BLOCKED"
+            "CANCELLED"
         );
         assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
         assert!(
@@ -649,7 +649,7 @@ async fn test_023_01_exhausted_consultation_returns_a_diagnostic_and_releases_re
                 &format!("SELECT blocked_reason FROM tasks WHERE task_id='{child}'"),
                 true
             )?[0]["blocked_reason"],
-            "NEED_DECISION"
+            Value::Null
         );
         assert_eq!(
             sql(
@@ -677,14 +677,15 @@ async fn test_023_01_exhausted_consultation_returns_a_diagnostic_and_releases_re
         assert!(
             input["text"]
                 .as_str()
-                .is_some_and(|s| s.contains("dismiss_consult") && s.contains(child)),
-            "the delivered text must tell the parent how to end its stopped child"
+                .is_some_and(|s| s.contains("CANCELLED") && s.contains(child) && s.contains(stop)),
+            "the delivered text names the terminal outcome and its boundary"
         );
         assert_eq!(
             events(dir.path(), "task.consult_finished")?[0]["detail"],
             stop
         );
         assert!(input.get("source_message").is_none());
+        store.reader()?.check_question_anchors()?;
         drop(store);
     }
     Ok(())
@@ -959,9 +960,9 @@ async fn test_023_01_dc_no_admissible_holder_stops_run() -> R {
 }
 
 #[tokio::test]
-async fn test_023_01_dc_parent_can_dismiss_only_its_stopped_consult() -> R {
+async fn test_023_01_dc2_runtime_stop_needs_no_parent_disposition() -> R {
     let dir = tempfile::Builder::new()
-        .prefix("m3t10-dc-dismiss-")
+        .prefix("m3t10-dc2-stop-")
         .tempdir()?;
     let host = Host::start(config(dir.path())).await?;
     let project = host.project_id.clone();
@@ -973,21 +974,12 @@ async fn test_023_01_dc_parent_can_dismiss_only_its_stopped_consult() -> R {
         INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',100);", false)?;
     let reply = store
         .consult_request(message(
-            "dismiss-child",
+            "stopped-child",
             json!({"intent":"consult","question":"bounded"}),
         )?)
         .await?
         .ok_or("child")?;
     let child = reply["task_id"].as_str().ok_or("child")?;
-    let request =
-        |id: &str, child: &str| message(id, json!({"intent":"dismiss_consult","task_id":child}));
-    let early = store
-        .consult_request(request("dismiss-early", child)?)
-        .await?;
-    assert!(
-        early.as_ref().is_some_and(|v| v["status"] == "rejected"),
-        "an active consult cannot be dismissed: {early:?}"
-    );
     sql(
         dir.path(),
         "UPDATE events SET payload_json=json_set(payload_json,'$.deadline','2020-01-01T00:00:00Z') WHERE kind='task.consult'",
@@ -997,55 +989,40 @@ async fn test_023_01_dc_parent_can_dismiss_only_its_stopped_consult() -> R {
     assert_eq!(
         sql(
             dir.path(),
-            &format!("SELECT blocked_reason FROM tasks WHERE task_id='{child}'"),
-            true
-        )?[0]["blocked_reason"],
-        "NEED_DECISION"
-    );
-    let mut stale = request("dismiss-stale", child)?;
-    stale.role_epoch = 2;
-    assert_eq!(
-        store
-            .consult_request(stale)
-            .await?
-            .ok_or("stale rejection")?["reason_code"],
-        "STALE_ROLE_EPOCH"
-    );
-    assert_eq!(
-        store
-            .consult_request(request("dismiss-unowned", "D")?)
-            .await?
-            .ok_or("ownership rejection")?["status"],
-        "rejected"
-    );
-    let mut old_spec = request("dismiss-spec", child)?;
-    old_spec.spec_sha256 = format!("{:064}", 9);
-    assert_eq!(
-        store
-            .consult_request(old_spec)
-            .await?
-            .ok_or("spec rejection")?["reason_code"],
-        "SPEC_MISMATCH"
-    );
-    let reply = store
-        .consult_request(request("dismiss-ok", child)?)
-        .await?
-        .ok_or("dismiss response")?;
-    assert_eq!(reply["status"], "accepted");
-    assert_eq!(
-        store.consult_request(request("dismiss-ok", child)?).await?,
-        Some(reply)
-    );
-    assert_eq!(
-        sql(
-            dir.path(),
             &format!("SELECT state,blocked_reason FROM tasks WHERE task_id='{child}'"),
             true
         )?,
         json!([{"state":"CANCELLED","blocked_reason":null}])
     );
-    assert_eq!(events(dir.path(), "task.consult_dismissed")?.len(), 1);
+    // The removed operation is no longer handled, regardless of the parent's epoch.
+    for epoch in [1, 2] {
+        let mut old = message(
+            &format!("dismiss-{epoch}"),
+            json!({"intent":"dismiss_consult","task_id":child}),
+        )?;
+        old.role_epoch = epoch;
+        assert!(store.consult_request(old).await?.is_none());
+    }
+    sql(
+        dir.path(),
+        "UPDATE attempts SET state='SETTLED' WHERE attempt_id='A'; UPDATE tasks SET state='ACCEPTED' WHERE task_id='D'",
+        false,
+    )?;
+    drop(store);
+    let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+    for _ in 0..3 {
+        store.settle_ended_inputs(&project).await?;
+        let paced = store.pace_run("R", context()).await?;
+        assert!(paced.blocked.is_empty());
+        assert!(paced.incomplete.is_none());
+        store.reader()?.check_question_anchors()?;
+    }
     assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
+    assert_eq!(
+        events(dir.path(), "task.consult_finished")?[0]["status"],
+        "CANCELLED"
+    );
+    assert!(events(dir.path(), "task.consult_dismissed")?.is_empty());
     assert!(events(dir.path(), "need_decision")?.is_empty());
     assert_eq!(
         sql(
@@ -1054,6 +1031,14 @@ async fn test_023_01_dc_parent_can_dismiss_only_its_stopped_consult() -> R {
             true
         )?[0]["reserved_value"],
         0.0
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM input_queue WHERE target_role='developer'",
+            true
+        )?[0]["n"],
+        1
     );
     Ok(())
 }

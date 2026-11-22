@@ -103,9 +103,9 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
     {
         reason = Some("budget_exhausted");
         detail = Some(stop);
-        // The parent receives the Runtime diagnostic; no AgentBlocked question is fabricated.
+        // A Runtime stop is terminal; only real Agent questions use BLOCKED(NEED_DECISION).
         tx.execute(
-            "UPDATE tasks SET blocked_reason='NEED_DECISION' WHERE task_id=?1",
+            "UPDATE tasks SET blocked_reason=NULL,next_retry_at=NULL WHERE task_id=?1",
             params![task],
         )
         .map_err(sqlite_error)?;
@@ -115,7 +115,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 cas: vec![StateCas {
                     id: task.into(),
                     expected_revision: revision,
-                    change: Change::Task(TaskState::Blocked),
+                    change: Change::Task(TaskState::Cancelled),
                 }],
                 ..Default::default()
             },
@@ -262,13 +262,8 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 serde_json::to_value(&message).map_err(|e| PersistError::Storage(e.to_string()))?;
             json!({"text":source.to_string(),"source_message":source})
         } else {
-            let disposition = (reason == Some("budget_exhausted"))
-                .then(|| json!({"intent":"dismiss_consult","task_id":task}));
-            let action = disposition
-                .as_ref()
-                .map(|p| format!(" To end this stopped child, send a query with payload {p}."))
-                .unwrap_or_default();
-            json!({"text":format!("Consultation {task} ended without a result: {}{}{action}",reason.unwrap_or("unavailable"),detail.as_ref().map(|s|format!(" ({s})")).unwrap_or_default()),"consultation_diagnostic":{"task_id":task,"correlation_id":request.message_id,"reason":reason,"detail":detail,"origin":"runtime","disposition":disposition}})
+            let status = (reason == Some("budget_exhausted")).then_some("CANCELLED");
+            json!({"text":format!("Consultation {task} ended{}: {}{}",status.map(|s|format!(" {s}")).unwrap_or_default(),reason.unwrap_or("unavailable"),detail.as_ref().map(|s|format!(" ({s})")).unwrap_or_default()),"consultation_diagnostic":{"task_id":task,"correlation_id":request.message_id,"reason":reason,"detail":detail,"origin":"runtime","status":status}})
         };
         payload["consultation_task_id"] = json!(task);
         inputs::enqueue(
@@ -302,7 +297,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         &request,
         done,
         "task.consult_finished",
-        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":actual.as_ref().map(|r|r.status)}),
+        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":if reason == Some("budget_exhausted") { json!("CANCELLED") } else { json!(actual.as_ref().map(|r|r.status)) }}),
     )?;
     Ok(())
 }
@@ -323,66 +318,4 @@ pub(super) fn parent_valid(
     child: &str,
 ) -> Result<bool, PersistError> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN tasks t ON t.task_id=json_extract(e.payload_json,'$.parent_task_id') JOIN runs r ON r.run_id=t.run_id WHERE e.run_id=?1 AND e.kind='task.consult' AND json_extract(e.payload_json,'$.task_id')=?2 AND t.state<>'CANCELLED' AND t.spec_id=r.spec_id AND r.spec_id=json_extract(e.payload_json,'$.spec_id'))",params![run,child],|r|r.get(0)).map_err(sqlite_error)
-}
-
-/// A current parent can dispose of its own Runtime-stopped child, not cancel arbitrary work.
-pub(super) fn dismiss(
-    tx: &Transaction<'_>,
-    project: &str,
-    message: &Message,
-    ctx: &Ctx<'_>,
-) -> Result<Value, PersistError> {
-    let Some(task) = message.payload.get("task_id").and_then(Value::as_str) else {
-        return Ok(rejected(
-            "ILLEGAL_TRANSITION",
-            json!({"cause":"consult_task_required"}),
-        ));
-    };
-    let revision: Option<i64> = tx.query_row(
-        "SELECT t.revision FROM tasks t JOIN events e ON e.run_id=t.run_id AND e.kind='task.consult'
-         AND json_extract(e.payload_json,'$.task_id')=t.task_id
-         WHERE t.run_id=?1 AND t.task_id=?2 AND t.state='BLOCKED' AND t.blocked_reason='NEED_DECISION'
-         AND json_extract(e.payload_json,'$.parent_task_id')=?3
-         AND json_extract(e.payload_json,'$.parent_role')=?4
-         AND json_extract(e.payload_json,'$.parent_epoch')=?5
-         AND json_extract(e.payload_json,'$.spec_id')=t.spec_id
-         AND EXISTS(SELECT 1 FROM events d WHERE d.run_id=t.run_id AND d.kind='task.consult_finished'
-           AND json_extract(d.payload_json,'$.task_id')=t.task_id
-           AND json_extract(d.payload_json,'$.reason')='budget_exhausted')
-         AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=t.task_id
-           AND a.state IN ('PREPARED','STARTING','RUNNING','UNKNOWN_EFFECT'))",
-        params![message.run_id,task,message.task_id,message.sender_role,i64::try_from(message.role_epoch).ok()], |r| r.get(0),
-    ).optional().map_err(sqlite_error)?;
-    let Some(revision) = revision else {
-        return Ok(rejected(
-            "ILLEGAL_TRANSITION",
-            json!({"cause":"not_owned_stopped_consult","task_id":task}),
-        ));
-    };
-    tx.execute(
-        "UPDATE tasks SET blocked_reason=NULL WHERE task_id=?1",
-        params![task],
-    )
-    .map_err(sqlite_error)?;
-    writer::write(
-        tx,
-        &Commit {
-            cas: vec![StateCas {
-                id: task.into(),
-                expected_revision: revision,
-                change: Change::Task(TaskState::Cancelled),
-            }],
-            ..Default::default()
-        },
-        ctx,
-    )?;
-    event(
-        tx,
-        project,
-        message,
-        child_id(task, "dismissed"),
-        "task.consult_dismissed",
-        json!({"task_id":task,"parent_task_id":message.task_id,"message_id":message.message_id}),
-    )?;
-    Ok(json!({"status":"accepted","task_id":task,"state":"CANCELLED"}))
 }

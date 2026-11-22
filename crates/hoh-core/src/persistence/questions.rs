@@ -245,6 +245,56 @@ pub fn open(conn: &Connection, run_id: &str) -> Result<Vec<Question>, PersistErr
     Ok(out)
 }
 
+/// A read-only store-wide invariant audit, sharing the same open-question projection as answers and clients.
+/// This is explicit so it can also diagnose old or manually seeded stores without changing their history.
+pub(super) fn check_anchors(conn: &Connection) -> Result<(), PersistError> {
+    let tx = conn.unchecked_transaction().map_err(sqlite_error)?;
+    let runs: Vec<(String, bool)> = {
+        let mut q = tx.prepare("SELECT run_id,state='BLOCKED' AND blocked_reason='NEED_DECISION' FROM runs ORDER BY run_id")
+            .map_err(sqlite_error)?;
+        q.query_map([], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<bool>>(1)?.unwrap_or(false)))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<_, _>>()
+        .map_err(sqlite_error)?
+    };
+    for (run, blocked) in runs {
+        let mut questions = Vec::new();
+        for question in open(&tx, &run)? {
+            let answered: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='question.answered' AND seq>?2 AND json_extract(payload_json,'$.question_id')=?3)",
+                params![run, question.seq, question.question_id], |r| r.get(0),
+            ).map_err(sqlite_error)?;
+            if !answered {
+                questions.push(question);
+            }
+        }
+        let mut q = tx.prepare("SELECT task_id FROM tasks WHERE run_id=?1 AND state='BLOCKED' AND blocked_reason='NEED_DECISION' ORDER BY task_id")
+            .map_err(sqlite_error)?;
+        for task in q
+            .query_map(params![run], |r| r.get::<_, String>(0))
+            .map_err(sqlite_error)?
+        {
+            let task = task.map_err(sqlite_error)?;
+            if !questions
+                .iter()
+                .any(|q| q.task_id.as_deref() == Some(&task))
+            {
+                return Err(PersistError::IntegrityViolation(format!(
+                    "task {task} BLOCKED(NEED_DECISION) has no open question anchor"
+                )));
+            }
+        }
+        if blocked && questions.is_empty() {
+            return Err(PersistError::IntegrityViolation(format!(
+                "run {run} BLOCKED(NEED_DECISION) has no open question anchor"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The Commander's question of PROPOSED request `decision_id`, held by claim `source`.
 fn commander(
     conn: &Connection,

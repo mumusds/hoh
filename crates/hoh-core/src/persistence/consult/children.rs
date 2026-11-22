@@ -60,14 +60,22 @@ pub(super) fn create(
         }
     } else {
         // Read-only consultations consume work, never candidate/verification iterations.
-        let mut q=tx.prepare("SELECT kind,max(0,limit_value-used_value-reserved_value)/10.0 FROM budgets WHERE scope_kind='run' AND scope_id=?1 AND kind IN ('wall_seconds','attempts','tokens','usd') AND limit_value IS NOT NULL ORDER BY kind").map_err(sqlite_error)?;
+        let mut q=tx.prepare("SELECT kind,max(0,limit_value-used_value-reserved_value) FROM budgets WHERE scope_kind='run' AND scope_id=?1 AND kind IN ('wall_seconds','attempts','tokens','usd') AND limit_value IS NOT NULL ORDER BY kind").map_err(sqlite_error)?;
         for row in q
             .query_map(params![message.run_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
             })
             .map_err(sqlite_error)?
         {
-            let (kind, value) = row.map_err(sqlite_error)?;
+            let (kind, remaining) = row.map_err(sqlite_error)?;
+            let value = if kind == "attempts" {
+                if remaining < 1.0 {
+                    return Ok(refuse("attempt_budget_required"));
+                }
+                (remaining / 10.0).max(1.0)
+            } else {
+                remaining / 10.0
+            };
             if value > 0.0 {
                 budget.insert(kind, json!(value));
             }

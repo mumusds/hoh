@@ -2585,3 +2585,45 @@ mod scale {
         Ok(())
     }
 }
+
+#[test]
+fn test_023_01_dc2_store_audit_requires_open_question_anchors() -> R {
+    for orphan in ["task", "run", "answered_task", "answered_run", "second_run"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-dc2-anchors-")
+            .tempdir()?;
+        let (store, path) = open_store(&dir)?;
+        world(
+            &path,
+            "BLOCKED",
+            &[("commander:D1", "NEED_DECISION")],
+            &format!("{COMMANDER}{}", work_task("agent_blocked")),
+        )?;
+        store.reader()?.check_question_anchors()?;
+        match orphan {
+            "task" => exec(&path, "DELETE FROM events WHERE event_id='T/need'")?,
+            "run" => exec(
+                &path,
+                "UPDATE tasks SET state='CANCELLED',blocked_reason=NULL; UPDATE decisions SET state='APPLIED'",
+            )?,
+            "answered_task" => exec(
+                &path,
+                "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES ('p1','answered','R','question.answered','{\"question_id\":\"T/need\"}','2026-11-22T00:00:00Z')",
+            )?,
+            "answered_run" => exec(
+                &path,
+                "UPDATE tasks SET state='CANCELLED',blocked_reason=NULL; INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES ('p1','answered','R','question.answered','{\"question_id\":\"D1\"}','2026-11-22T00:00:00Z')",
+            )?,
+            _ => exec(
+                &path,
+                "INSERT INTO runs(run_id,project_id,spec_id,state,mode,blocked_reason,created_at) VALUES ('R2','p1','s1','BLOCKED','AUTO','NEED_DECISION','2026-11-22T00:00:00Z')",
+            )?,
+        }
+        let result = store.reader()?.check_question_anchors();
+        assert!(
+            matches!(&result, Err(PersistError::IntegrityViolation(s)) if s.contains("open question anchor")),
+            "{orphan}: {result:?}"
+        );
+    }
+    Ok(())
+}

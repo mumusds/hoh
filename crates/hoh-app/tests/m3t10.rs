@@ -1101,6 +1101,15 @@ impl hoh_app::host::Executor for FakeConsult {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_023_01_running_request_and_result_use_existing_delivery_loop() -> R {
+    consult_delivery(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_023_01_dc2_runtime_cancelled_outcome_reaches_parent_delivery_loop() -> R {
+    consult_delivery(true).await
+}
+
+async fn consult_delivery(runtime_stop: bool) -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t10-consult-host-")
         .tempdir()?;
@@ -1151,7 +1160,7 @@ async fn test_023_01_running_request_and_result_use_existing_delivery_loop() -> 
     let helpers = work
         .helpers
         .as_ref()
-        .expect("running developer must have the existing request bridge");
+        .ok_or("running developer must have the existing request bridge")?;
     let revision = sql(
         dir.path(),
         "SELECT revision FROM tasks WHERE task_id='D'",
@@ -1163,6 +1172,13 @@ async fn test_023_01_running_request_and_result_use_existing_delivery_loop() -> 
         "live-consult",
         json!({"intent":"consult","question":"Which existing protocol can carry this result?","budget":{"wall_seconds":30},"deadline":"2098-01-01T00:00:00Z"}),
     )?;
+    if runtime_stop {
+        // An explicit, non-default bound below the dispatch estimate makes the Runtime stop before
+        // starting any researcher. This deterministically exercises the parent delivery loop.
+        request
+            .payload
+            .insert("budget".into(), json!({"attempts":0.5}));
+    }
     request.attempt_id = work.attempt_id.clone();
     request.role_epoch = work.assignment.role_epoch as u64;
     request.expected_revision = revision;
@@ -1176,6 +1192,73 @@ async fn test_023_01_running_request_and_result_use_existing_delivery_loop() -> 
         .await?
         .ok_or("consultation result delivered")?;
     assert_eq!(input.target_role.as_deref(), Some("developer"));
+    if runtime_stop {
+        let asked = asking.await??;
+        assert!(
+            asked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&asked.stderr)
+        );
+        let response: Value = serde_json::from_slice(&asked.stdout)?;
+        let child = response["task_id"].as_str().ok_or("child")?;
+        wait_sql(
+            dir.path(),
+            &clock,
+            &format!(
+                "SELECT state FROM input_queue WHERE input_id='{}'",
+                input.input_id
+            ),
+            |v| v[0]["state"] == "DELIVERED",
+        )
+        .await?;
+        use std::io::Write as _;
+        release.write_all(b"done\n")?;
+        drop(release);
+        wait_sql(
+            dir.path(),
+            &clock,
+            &format!(
+                "SELECT state FROM input_queue WHERE input_id='{}'",
+                input.input_id
+            ),
+            |v| v[0]["state"] == "APPLIED",
+        )
+        .await?;
+        host.store().settle_ended_inputs(&host.project_id).await?;
+        let tasks = sql(
+            dir.path(),
+            &format!("SELECT state,blocked_reason FROM tasks WHERE task_id='{child}'"),
+            true,
+        )?;
+        let finished = events(dir.path(), "task.consult_finished")?;
+        let receipt = sql(
+            dir.path(),
+            &format!(
+                "SELECT count(*) n FROM receipts WHERE message_id='{}'",
+                input.input_id
+            ),
+            true,
+        )?;
+        let anchors = host.store().reader()?.check_question_anchors();
+        host.shutdown().await;
+        assert_eq!(tasks, json!([{"state":"CANCELLED","blocked_reason":null}]));
+        anchors?;
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0]["status"], "CANCELLED");
+        assert_eq!(finished[0]["reason"], "budget_exhausted");
+        let diagnostic = &input.payload["consultation_diagnostic"];
+        assert_eq!(diagnostic["status"], "CANCELLED");
+        assert_eq!(diagnostic["correlation_id"], "live-consult");
+        assert_eq!(diagnostic["detail"], "consult_attempts");
+        assert_eq!(diagnostic["origin"], "runtime");
+        assert!(
+            input.payload.get("source_message").is_none(),
+            "no fabricated TaskResult"
+        );
+        assert_eq!(receipt[0]["n"], 1);
+        assert!(fake.research.lock().map_err(|e| e.to_string())?.is_empty());
+        return Ok(());
+    }
     let returned = &input.payload["source_message"];
     assert_eq!(returned["kind"], "result");
     assert_eq!(returned["correlation_id"], "live-consult");
@@ -1302,7 +1385,14 @@ fn child_ending(result: Value) -> hoh_core::persistence::Ending {
 }
 #[tokio::test]
 async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -> R {
-    for scenario in ["completed", "failed", "cancelled", "stale_parent"] {
+    for scenario in [
+        "completed",
+        "failed",
+        "blocked",
+        "incomplete",
+        "cancelled",
+        "stale_parent",
+    ] {
         let dir = tempfile::Builder::new().prefix("m3t10-return-").tempdir()?;
         let host = Host::start(config(dir.path())).await?;
         sql(dir.path(), WORLD, false)?;
@@ -1332,10 +1422,11 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
                 child_ending(child_result(
                     child,
                     "C",
-                    if scenario == "failed" {
-                        "FAILED"
-                    } else {
-                        "COMPLETED"
+                    match scenario {
+                        "failed" => "FAILED",
+                        "blocked" => "BLOCKED",
+                        "incomplete" => "INCOMPLETE",
+                        _ => "COMPLETED",
                     },
                 )),
             )
@@ -1358,10 +1449,11 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
             } else {
                 assert_eq!(
                     payload["source_message"]["payload"]["status"],
-                    if scenario == "failed" {
-                        "FAILED"
-                    } else {
-                        "COMPLETED"
+                    match scenario {
+                        "failed" => "FAILED",
+                        "blocked" => "BLOCKED",
+                        "incomplete" => "INCOMPLETE",
+                        _ => "COMPLETED",
                     }
                 );
             }
@@ -1369,6 +1461,7 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
         assert!(host.store().reader()?.wait_for("R")?.is_empty());
         let ended = events(dir.path(), "task.consult_finished")?;
         assert_eq!(ended.len(), 1);
+        host.store().reader()?.check_question_anchors()?;
         host.shutdown().await;
         let restarted = Host::start(config(dir.path())).await?;
         restarted
@@ -1387,6 +1480,7 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
             .len(),
             rows.as_array().ok_or("rows")?.len()
         );
+        restarted.store().reader()?.check_question_anchors()?;
         restarted.shutdown().await;
     }
     Ok(())
@@ -1429,6 +1523,7 @@ async fn test_023_01_bad_result_uses_bounded_protocol_repairs() -> R {
         )?[0]["n"],
         1
     );
+    host.store().reader()?.check_question_anchors()?;
     host.shutdown().await;
     Ok(())
 }

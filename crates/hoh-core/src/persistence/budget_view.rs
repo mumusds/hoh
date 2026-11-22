@@ -62,7 +62,7 @@ impl Hold {
 #[derive(Debug)]
 struct Consult {
     deadline: SystemTime,
-    eligible: bool,
+    unfinished: bool,
     open: bool,
     amounts: BTreeMap<String, Amount>,
     holds: BTreeMap<String, Hold>,
@@ -148,7 +148,7 @@ impl View {
         if self
             .consults
             .iter()
-            .any(|(task, c)| c.open && c.eligible && self.task_stop(task).is_none())
+            .any(|(task, c)| c.open && c.unfinished && self.task_stop(task).is_none())
         {
             None
         } else {
@@ -224,25 +224,21 @@ pub(super) fn load(
         amounts: rows(tx, "run", run)?,
         consults: BTreeMap::new(),
     };
-    let mut q = tx.prepare("SELECT e.payload_json,t.state,t.next_retry_at,
-        NOT EXISTS(SELECT 1 FROM events d WHERE d.run_id=e.run_id AND d.kind='task.consult_finished' AND json_extract(d.payload_json,'$.task_id')=t.task_id),
-        NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks u ON u.task_id=d.depends_on WHERE d.task_id=t.task_id AND u.state<>'ACCEPTED')
+    let mut q = tx.prepare("SELECT e.payload_json,t.state,
+        NOT EXISTS(SELECT 1 FROM events d WHERE d.run_id=e.run_id AND d.kind='task.consult_finished' AND json_extract(d.payload_json,'$.task_id')=t.task_id)
         FROM events e JOIN tasks t ON t.task_id=json_extract(e.payload_json,'$.task_id') AND t.run_id=e.run_id
         WHERE e.run_id=?1 AND e.kind='task.consult' ORDER BY e.seq").map_err(sqlite_error)?;
-    let at = crate::time::rfc3339_utc(now);
     for row in q
         .query_map(params![run], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, bool>(3)?,
-                r.get::<_, bool>(4)?,
+                r.get::<_, bool>(2)?,
             ))
         })
         .map_err(sqlite_error)?
     {
-        let (meta, state, retry, open, dependencies) = row.map_err(sqlite_error)?;
+        let (meta, state, open) = row.map_err(sqlite_error)?;
         let meta: Value = serde_json::from_str(&meta)
             .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
         let task = meta["task_id"]
@@ -276,8 +272,9 @@ pub(super) fn load(
                 deadline: parse(meta["deadline"].as_str().ok_or_else(|| {
                     PersistError::IntegrityViolation("consult deadline missing".into())
                 })?)?,
-                eligible: (state == "READY" || (state == "PENDING" && dependencies))
-                    && retry.as_ref().is_none_or(|next| next <= &at),
+                // A retry or recoverable staffing block is not a budget stop. Ended children awaiting
+                // settlement still own their holds, but cannot be a way forward themselves.
+                unfinished: !matches!(state.as_str(), "IMPLEMENTED" | "ACCEPTED" | "CANCELLED"),
                 open,
                 amounts,
                 holds,
