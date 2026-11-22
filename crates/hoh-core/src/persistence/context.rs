@@ -189,6 +189,24 @@ fn work(
             deps.join("、")
         }
     ));
+    let (revision, state): (i64, String) = conn
+        .query_row(
+            "SELECT revision,state FROM tasks WHERE task_id=?1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    // Assignment is prepared while LEASED; the existing start CAS moves it to RUNNING before opening its gate.
+    facts.scope.push(format!(
+        "运行中 query/steer 的 expected_revision（Task revision）：{}",
+        revision + i64::from(state == "LEASED")
+    ));
+    let consultation:Option<String>=conn.query_row("SELECT payload_json FROM events WHERE kind='task.consult' AND json_extract(payload_json,'$.task_id')=?1 ORDER BY seq DESC LIMIT 1",params![task_id],|r|r.get(0)).optional().map_err(sqlite_error)?;
+    if let Some(raw) = consultation {
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+        facts.scope.push(format!("只读咨询任务：{}",json!({"question":v["question"],"parent_task_id":v["parent_task_id"],"budget":v["budget"],"deadline":v["deadline"]})));
+    }
     // Its path scope as its plan gave it (REQ-039 by task scope, docs/adr/ADR-035.md decision 3), in the mandatory
     // scope; with no other code source, its files at the workspace's HEAD are its code source (read by the executor).
     let paths = super::plan::task_paths(conn, task_id)?;

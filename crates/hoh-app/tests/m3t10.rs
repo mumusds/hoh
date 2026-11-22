@@ -733,3 +733,808 @@ INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,c
     host.shutdown().await;
     Ok(())
 }
+
+async fn get_tasks(host: &Host, path: &str) -> R<(u16, Value)> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
+    stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\nConnection: close\r\n\r\n",host.port,host.token).as_bytes()).await?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await?;
+    let response = String::from_utf8(bytes)?;
+    let (headers, body) = response.split_once("\r\n\r\n").ok_or("HTTP headers")?;
+    let status = headers.split_whitespace().nth(1).ok_or("status")?.parse()?;
+    Ok((status, serde_json::from_str(body)?))
+}
+#[tokio::test]
+async fn test_023_01_consult_becomes_child_task() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-consult-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z' WHERE run_id='R'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',600);",
+        false,
+    )?;
+    let request = message(
+        "consult",
+        json!({"intent":"consult","question":"Which existing protocol can carry this result?","budget":{"wall_seconds":30},"deadline":"2098-01-01T00:00:00Z"}),
+    )?;
+    let reply = host
+        .store()
+        .consult_request(request.clone())
+        .await?
+        .expect("consult must create a child task");
+    assert_eq!(reply["status"], "queued");
+    let child = reply["task_id"].as_str().ok_or("child id")?;
+    assert_eq!(
+        host.store().consult_request(request).await?,
+        Some(reply.clone())
+    );
+    let tasks = sql(
+        dir.path(),
+        &format!("SELECT * FROM tasks WHERE task_id='{child}'"),
+        true,
+    )?;
+    assert_eq!(tasks[0]["role"], "researcher");
+    assert_eq!(tasks[0]["writer"], 0);
+    assert_eq!(tasks[0]["state"], "READY");
+    assert_eq!(tasks[0]["spec_id"], "s1");
+    let budgets = sql(
+        dir.path(),
+        &format!(
+            "SELECT kind,limit_value FROM budgets WHERE scope_kind='task' AND scope_id='{child}'"
+        ),
+        true,
+    )?;
+    assert_eq!(budgets, json!([{"kind":"wall_seconds","limit_value":30.0}]));
+    let consult = events(dir.path(), "task.consult")?;
+    assert_eq!(consult.len(), 1);
+    assert_eq!(consult[0]["parent_task_id"], "D");
+    assert_eq!(consult[0]["deadline"], "2098-01-01T00:00:00Z");
+    assert_eq!(
+        host.store().reader()?.wait_for("R")?,
+        vec![("developer".into(), "researcher".into())]
+    );
+    let (status, page) = get_tasks(&host, "/v1/runs/R/tasks?limit=1").await?;
+    assert_eq!(status, 200, "{page}");
+    assert!(page["watermark"].as_i64().is_some_and(|s| s > 0));
+    let mut all = page["items"].as_array().ok_or("items")?.clone();
+    let mut cursor = page["next_cursor"].clone();
+    while let Some(next) = cursor.as_str() {
+        let (_, page) =
+            get_tasks(&host, &format!("/v1/runs/R/tasks?limit=1&cursor={next}")).await?;
+        all.extend(page["items"].as_array().ok_or("items")?.clone());
+        cursor = page["next_cursor"].clone();
+    }
+    let shown = all
+        .iter()
+        .find(|i| i["task_id"] == child)
+        .ok_or("child on task list")?;
+    assert_eq!(shown["parent_task_id"], "D");
+    assert_eq!(shown["deadline"], "2098-01-01T00:00:00Z");
+    assert_eq!(shown["budget"]["wall_seconds"], 30.0);
+    assert_eq!(shown["dependencies"], json!([]));
+    assert_eq!(shown["lease_holder"], Value::Null);
+    for path in [
+        "/v1/runs/missing/tasks",
+        "/v1/runs/R/tasks?limit=0",
+        "/v1/runs/R/tasks?limit=501",
+        "/v1/runs/R/tasks?cursor=invalid",
+    ] {
+        assert_eq!(get_tasks(&host, path).await?.0, 404);
+    }
+    host.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn test_023_01_task_list_is_available_without_consultations() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-task-list-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let (status, page) = get_tasks(&host, "/v1/runs/R/tasks").await?;
+    assert_eq!(status, 200, "task list endpoint missing: {page}");
+    assert_eq!(page["items"][0]["task_id"], "D");
+    assert_eq!(page["items"][0]["parent_task_id"], Value::Null);
+    host.shutdown().await;
+    Ok(())
+}
+#[tokio::test]
+async fn test_023_01_consult_requires_a_bounded_current_request() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-consult-bounds-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let base = json!({"intent":"consult","question":"bounded research","budget":{"wall_seconds":30},"deadline":"2098-01-01T00:00:00Z"});
+    for (id, field, value) in [
+        ("empty", "question", json!("")),
+        ("bad-budget", "budget", json!({"wall_seconds":-1})),
+        ("bad-deadline", "deadline", json!("tomorrow")),
+    ] {
+        let mut payload = base.clone();
+        payload[field] = value;
+        let response = host
+            .store()
+            .consult_request(message(id, payload)?)
+            .await?
+            .expect("malformed consult must be rejected");
+        assert_eq!(response["status"], "rejected");
+    }
+    let mut missing = message("missing", base.clone())?;
+    missing.recipient_role = "unbound".into();
+    assert_eq!(
+        host.store()
+            .consult_request(missing)
+            .await?
+            .expect("unbound request")["status"],
+        "rejected"
+    );
+    assert!(events(dir.path(), "task.consult")?.is_empty());
+    sql(
+        dir.path(),
+        "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',600);",
+        false,
+    )?;
+    let result = host
+        .store()
+        .consult_request(message(
+            "default",
+            json!({"intent":"consult","question":"use run bounds"}),
+        )?)
+        .await?
+        .expect("default bounded consult");
+    assert_eq!(result["status"], "queued");
+    let facts = events(dir.path(), "task.consult")?;
+    assert_eq!(facts[0]["budget"]["wall_seconds"], 60.0);
+    assert_eq!(facts[0]["deadline"], "2099-01-01T00:00:00Z");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FakeConsult {
+    started: tokio::sync::mpsc::UnboundedSender<(hoh_app::host::Work, std::process::ChildStdin)>,
+    steers: tokio::sync::mpsc::UnboundedSender<hoh_core::persistence::InputRow>,
+    research: std::sync::Mutex<Vec<hoh_app::host::Work>>,
+}
+impl hoh_app::host::Executor for FakeConsult {
+    fn deliver(
+        &self,
+        _: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(Ok(()));
+        rx
+    }
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        use std::os::unix::process::CommandExt as _;
+        let researcher = work.role == "researcher";
+        if researcher {
+            self.research
+                .lock()
+                .map_err(|e| e.to_string())?
+                .push(work.clone());
+        }
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                if researcher {
+                    "read -r go; exit 0"
+                } else {
+                    "read -r go; read -r done; exit 0"
+                },
+            ])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let mut stdin = child.stdin.take().ok_or_else(|| "stdin".to_owned())?;
+        let held = work.clone();
+        let started = self.started.clone();
+        let result = json!({"schema_version":"1.0","run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"role":work.role,"role_epoch":work.assignment.role_epoch,"status":"COMPLETED","summary":"Use the existing durable input delivery loop","candidate_id":null,"evidence":[],"issues":[],"next_action":"Return to parent"});
+        let (tx, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = tx.send(hoh_app::host::Outcome {
+                success: status.is_ok_and(|s| s.success()),
+                detail: "scripted consultation".into(),
+                class: hoh_core::retry::FailureClass::Capability,
+                group_gone: hoh_agents::identity::group_empty(pid),
+                observed: hoh_core::persistence::Observed {
+                    messages: vec![result.to_string()],
+                    ..Default::default()
+                },
+                unknown_effect: false,
+                retry_at: None,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate: hoh_app::host::Gate::new(move || {
+                use std::io::Write as _;
+                stdin.write_all(b"go\n").map_err(|e| e.to_string())?;
+                if !researcher {
+                    started.send((held, stdin)).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }),
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+    fn steer(
+        &self,
+        _: &hoh_app::host::Work,
+        input: &hoh_core::persistence::InputRow,
+    ) -> tokio::sync::oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.steers.send(input.clone());
+        let _ = tx.send(hoh_agents::codex::SteerReceipt::Delivered {
+            turn_id: "consult-parent".into(),
+        });
+        rx
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_023_01_running_request_and_result_use_existing_delivery_loop() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-consult-host-")
+        .tempdir()?;
+    Host::start(config(dir.path())).await?.shutdown().await;
+    sql(dir.path(), WORLD, false)?;
+    sql(
+        dir.path(),
+        PARTICIPANTS
+            .replace(
+                "'D','R','s1','RUNNING','developer',1,1",
+                "'D','R','s1','READY','developer',0,1",
+            )
+            .split("INSERT INTO attempts")
+            .next()
+            .ok_or("seed")?,
+        false,
+    )?;
+    sql(
+        dir.path(),
+        "UPDATE sessions SET capabilities_json='{\"mid_turn_steer\":true}'; UPDATE runs SET deadline_at='2099-01-01T00:00:00Z' WHERE run_id='R'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',600);",
+        false,
+    )?;
+    let (stx, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let (itx, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+    let fake = std::sync::Arc::new(FakeConsult {
+        started: stx,
+        steers: itx,
+        research: Default::default(),
+    });
+    let clock = std::sync::Arc::new(Clock::default());
+    let mut c = config(dir.path());
+    c.clock = hoh_app::host::HostClock(clock.clone());
+    c.runner = Some(hoh_app::host::RunnerConfig {
+        executor: fake.clone(),
+        context: Context {
+            required_capabilities: [
+                ("developer".into(), Default::default()),
+                ("researcher".into(), Default::default()),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    });
+    let host = Host::start(c).await?;
+    let (work, mut release) = tokio::time::timeout(Duration::from_secs(20), starts.recv())
+        .await?
+        .ok_or("parent started")?;
+    let helpers = work
+        .helpers
+        .as_ref()
+        .expect("running developer must have the existing request bridge");
+    let revision = sql(
+        dir.path(),
+        "SELECT revision FROM tasks WHERE task_id='D'",
+        true,
+    )?[0]["revision"]
+        .as_u64()
+        .ok_or("revision")?;
+    let mut request = message(
+        "live-consult",
+        json!({"intent":"consult","question":"Which existing protocol can carry this result?","budget":{"wall_seconds":30},"deadline":"2098-01-01T00:00:00Z"}),
+    )?;
+    request.attempt_id = work.attempt_id.clone();
+    request.role_epoch = work.assignment.role_epoch as u64;
+    request.expected_revision = revision;
+    let request_file = dir.path().join("consult-request.json");
+    std::fs::write(&request_file, serde_json::to_vec(&request)?)?;
+    let ask = helpers.ask.clone();
+    let asking = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(ask).arg(request_file).output()
+    });
+    let input = tokio::time::timeout(Duration::from_secs(20), inputs.recv())
+        .await?
+        .ok_or("consultation result delivered")?;
+    assert_eq!(input.target_role.as_deref(), Some("developer"));
+    let returned = &input.payload["source_message"];
+    assert_eq!(returned["kind"], "result");
+    assert_eq!(returned["correlation_id"], "live-consult");
+    assert_eq!(returned["payload"]["status"], "COMPLETED");
+    assert_eq!(
+        returned["payload"]["summary"],
+        "Use the existing durable input delivery loop"
+    );
+    hoh_core::protocol::decode::<hoh_core::protocol::Message>(returned)?.check_payload()?;
+    let agent_text: Value = serde_json::from_str(
+        input.payload["text"]
+            .as_str()
+            .ok_or("agent-facing result")?,
+    )?;
+    assert_eq!(
+        &agent_text, returned,
+        "the native adapter and next-attempt prompt receive the complete result envelope"
+    );
+    let asked = asking.await??;
+    assert!(
+        asked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    let response: Value = serde_json::from_slice(&asked.stdout)?;
+    assert_eq!(response["status"], "queued");
+    let run_check = helpers.run_check.clone();
+    let refused = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(run_check).arg("unit").output()
+    })
+    .await??;
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("frozen verification assignment"));
+    wait_sql(
+        dir.path(),
+        &clock,
+        &format!(
+            "SELECT state FROM input_queue WHERE input_id='{}'",
+            input.input_id
+        ),
+        |v| v[0]["state"] == "DELIVERED",
+    )
+    .await?;
+    use std::io::Write as _;
+    release.write_all(b"done\n")?;
+    drop(release);
+    wait_sql(
+        dir.path(),
+        &clock,
+        &format!(
+            "SELECT state FROM input_queue WHERE input_id='{}'",
+            input.input_id
+        ),
+        |v| v[0]["state"] == "APPLIED",
+    )
+    .await?;
+    let research = fake.research.lock().map_err(|e| e.to_string())?.clone();
+    assert_eq!(research.len(), 1);
+    assert!(!research[0].assignment.writer);
+    assert!(
+        research[0]
+            .assignment
+            .context
+            .as_ref()
+            .ok_or("child context")?
+            .scope
+            .iter()
+            .any(|s| s.contains("Which existing protocol"))
+    );
+    assert_eq!(host.store().reader()?.wait_for("R")?, vec![]);
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM attempts a LEFT JOIN tasks t USING(task_id) WHERE t.task_id IS NULL",
+            true
+        )?[0]["n"],
+        0
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            &format!(
+                "SELECT state FROM outbox WHERE message_id='{}'",
+                input.input_id
+            ),
+            true
+        )?[0]["state"],
+        "ACKED"
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            &format!(
+                "SELECT count(*) n FROM receipts WHERE message_id='{}'",
+                input.input_id
+            ),
+            true
+        )?[0]["n"],
+        1
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+fn child_result(child: &str, attempt: &str, status: &str) -> Value {
+    json!({"schema_version":"1.0","run_id":"R","task_id":child,"attempt_id":attempt,"role":"researcher","role_epoch":1,"status":status,"summary":"research outcome","candidate_id":null,"evidence":[],"issues":[],"next_action":"return to parent"})
+}
+fn seed_child_attempt(root: &Path, child: &str, attempt: &str) -> R {
+    sql(root,&format!("UPDATE tasks SET state='RUNNING' WHERE task_id='{child}'; INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES ('{attempt}','{child}','sr','RUNNING',1,1,1);"),false).map(drop)
+}
+fn child_ending(result: Value) -> hoh_core::persistence::Ending {
+    hoh_core::persistence::Ending {
+        success: true,
+        detail: "scripted research end".into(),
+        class: hoh_core::retry::FailureClass::Capability,
+        at: SystemTime::now(),
+        draw: 0,
+        observed: hoh_core::persistence::Observed {
+            messages: vec![result.to_string()],
+            ..Default::default()
+        },
+        unknown_effect: false,
+    }
+}
+#[tokio::test]
+async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -> R {
+    for scenario in ["completed", "failed", "cancelled", "stale_parent"] {
+        let dir = tempfile::Builder::new().prefix("m3t10-return-").tempdir()?;
+        let host = Host::start(config(dir.path())).await?;
+        sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), PARTICIPANTS, false)?;
+        let reply=host.store().consult_request(message("return",json!({"intent":"consult","question":"research","budget":{"wall_seconds":10},"deadline":"2099-01-01T00:00:00Z"}))?).await?.expect("consult child");
+        let child = reply["task_id"].as_str().ok_or("child")?;
+        seed_child_attempt(dir.path(), child, "C")?;
+        if scenario == "stale_parent" {
+            sql(
+                dir.path(),
+                "UPDATE role_bindings SET role_epoch=2 WHERE role='developer'",
+                false,
+            )?;
+        }
+        if scenario == "cancelled" {
+            sql(
+                dir.path(),
+                &format!(
+                    "UPDATE attempts SET cancel_requested=1 WHERE attempt_id='C'; UPDATE tasks SET state='CANCELLED' WHERE task_id='{child}';"
+                ),
+                false,
+            )?;
+        }
+        host.store()
+            .runner_finished(
+                "C",
+                child_ending(child_result(
+                    child,
+                    "C",
+                    if scenario == "failed" {
+                        "FAILED"
+                    } else {
+                        "COMPLETED"
+                    },
+                )),
+            )
+            .await?;
+        let rows = sql(
+            dir.path(),
+            "SELECT payload_json FROM input_queue WHERE target_role='developer'",
+            true,
+        )?;
+        assert_eq!(
+            rows.as_array().ok_or("rows")?.len(),
+            usize::from(scenario != "stale_parent")
+        );
+        if scenario != "stale_parent" {
+            let payload: Value =
+                serde_json::from_str(rows[0]["payload_json"].as_str().ok_or("payload")?)?;
+            if scenario == "cancelled" {
+                assert!(payload["source_message"].is_null());
+                assert_eq!(payload["consultation_diagnostic"]["reason"], "cancelled");
+            } else {
+                assert_eq!(
+                    payload["source_message"]["payload"]["status"],
+                    if scenario == "failed" {
+                        "FAILED"
+                    } else {
+                        "COMPLETED"
+                    }
+                );
+            }
+        }
+        assert!(host.store().reader()?.wait_for("R")?.is_empty());
+        let ended = events(dir.path(), "task.consult_finished")?;
+        assert_eq!(ended.len(), 1);
+        host.shutdown().await;
+        let restarted = Host::start(config(dir.path())).await?;
+        restarted
+            .store()
+            .settle_ended_inputs(&restarted.project_id)
+            .await?;
+        assert_eq!(events(dir.path(), "task.consult_finished")?, ended);
+        assert_eq!(
+            sql(
+                dir.path(),
+                "SELECT payload_json FROM input_queue WHERE target_role='developer'",
+                true
+            )?
+            .as_array()
+            .ok_or("rows")?
+            .len(),
+            rows.as_array().ok_or("rows")?.len()
+        );
+        restarted.shutdown().await;
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn test_023_01_bad_result_uses_bounded_protocol_repairs() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-bad-result-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let reply=host.store().consult_request(message("bad",json!({"intent":"consult","question":"research","budget":{"wall_seconds":10},"deadline":"2099-01-01T00:00:00Z"}))?).await?.expect("consult child");
+    let child = reply["task_id"].as_str().ok_or("child")?;
+    for n in 1..=3 {
+        let attempt = format!("bad-{n}");
+        seed_child_attempt(dir.path(), child, &attempt)?;
+        host.store()
+            .runner_finished(&attempt, child_ending(json!({"status":"COMPLETED"})))
+            .await?;
+        assert_eq!(
+            sql(
+                dir.path(),
+                &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
+                true
+            )?[0]["state"],
+            if n < 3 { "READY" } else { "BLOCKED" }
+        );
+        assert_eq!(
+            events(dir.path(), "task.consult_finished")?.len(),
+            usize::from(n == 3)
+        );
+    }
+    assert!(host.store().reader()?.wait_for("R")?.is_empty());
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM input_queue WHERE target_role='developer'",
+            true
+        )?[0]["n"],
+        1
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_01_reconcile_returns_observed_result_once() -> R {
+    use hoh_core::reconcile::EffectState;
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-observed-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let reply=host.store().consult_request(message("observed",json!({"intent":"consult","question":"recover the result","budget":{"wall_seconds":10},"deadline":"2099-01-01T00:00:00Z"}))?).await?.expect("consult child");
+    let child = reply["task_id"].as_str().ok_or("child")?;
+    seed_child_attempt(dir.path(), child, "observed-child")?;
+    // Record the identity of our own gated child, then observe its natural exit before simulating the crash.
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut process = std::process::Command::new("sh")
+        .args(["-c", "read -r go; exit 0"])
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = process.id();
+    let start = hoh_agents::identity::start_id(pid)?.ok_or("process identity")?;
+    let boot = hoh_agents::identity::boot_id()?;
+    sql(
+        dir.path(),
+        &format!(
+            "UPDATE attempts SET pid={pid},boot_id='{boot}',process_start_id='{start}' WHERE attempt_id='observed-child'"
+        ),
+        false,
+    )?;
+    process.stdin.take().ok_or("stdin")?.write_all(b"go\n")?;
+    assert!(process.wait()?.success());
+    let key = hoh_core::reconcile::work_key("observed-child");
+    sql(
+        dir.path(),
+        &format!(
+            "INSERT INTO effects(effect_key,attempt_id,state) VALUES ('{key}','observed-child','STARTED');"
+        ),
+        false,
+    )?;
+    assert!(host.store().runner_effect("observed-child",&key,EffectState::Started,EffectState::Observed,json!({"success":true,"messages":[child_result(child,"observed-child","COMPLETED").to_string()],"messages_truncated":false})).await?);
+    assert!(events(dir.path(), "task.consult_finished")?.is_empty());
+    host.shutdown().await;
+    let restarted = Host::start(config(dir.path())).await?;
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT state FROM attempts WHERE attempt_id='observed-child'",
+            true
+        )?[0]["state"],
+        "SETTLED"
+    );
+    assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM input_queue WHERE target_role='developer'",
+            true
+        )?[0]["n"],
+        1
+    );
+    restarted
+        .store()
+        .settle_ended_inputs(&restarted.project_id)
+        .await?;
+    assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
+    restarted.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_01_reconcile_routes_a_workers_unanswered_bridge_query() -> R {
+    use hoh_core::reconcile::EffectState;
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-unanswered-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        "UPDATE tasks SET writer=0 WHERE task_id='D'",
+        false,
+    )?;
+    let mut process = std::process::Command::new("sh")
+        .args(["-c", "read -r go; exit 0"])
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = process.id();
+    let start = hoh_agents::identity::start_id(pid)?.ok_or("process identity")?;
+    let boot = hoh_agents::identity::boot_id()?;
+    sql(
+        dir.path(),
+        &format!(
+            "UPDATE attempts SET pid={pid},boot_id='{boot}',process_start_id='{start}' WHERE attempt_id='A'"
+        ),
+        false,
+    )?;
+    process.stdin.take().ok_or("stdin")?.write_all(b"go\n")?;
+    assert!(process.wait()?.success());
+    let request = message(
+        "unanswered",
+        json!({"intent":"consult","question":"survive an interrupted handoff","budget":{"wall_seconds":10},"deadline":"2099-01-01T00:00:00Z"}),
+    )?;
+    let bridge = hoh_app::host::product::bridge_of(dir.path(), "A");
+    std::fs::create_dir_all(bridge.parent().ok_or("bridge parent")?)?;
+    std::fs::write(bridge, serde_json::to_string(&request)? + "\n")?;
+    let key = hoh_core::reconcile::work_key("A");
+    sql(
+        dir.path(),
+        &format!("INSERT INTO effects(effect_key,attempt_id,state) VALUES ('{key}','A','STARTED')"),
+        false,
+    )?;
+    host.store()
+        .runner_effect(
+            "A",
+            &key,
+            EffectState::Started,
+            EffectState::Observed,
+            json!({"success":true,"messages":[serde_json::to_string(&request)?]}),
+        )
+        .await?;
+    host.shutdown().await;
+    let restarted = Host::start(config(dir.path())).await?;
+    assert_eq!(
+        events(dir.path(), "task.consult")?.len(),
+        1,
+        "recover the unhandled request before settling its source"
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT state FROM attempts WHERE attempt_id='A'",
+            true
+        )?[0]["state"],
+        "SETTLED"
+    );
+    restarted.shutdown().await;
+    let again = Host::start(config(dir.path())).await?;
+    assert_eq!(events(dir.path(), "task.consult")?.len(), 1);
+    again.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_01_unknown_pricing_is_preserved_in_child_budget() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-consult-pricing-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        "INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,price_known) VALUES ('run','R','usd',10,0)",
+        false,
+    )?;
+    let reply = host
+        .store()
+        .consult_request(message(
+            "pricing",
+            json!({"intent":"consult","question":"research","deadline":"2099-01-01T00:00:00Z"}),
+        )?)
+        .await?
+        .expect("bounded child");
+    let child = reply["task_id"].as_str().ok_or("child")?;
+    assert_eq!(
+        sql(
+            dir.path(),
+            &format!(
+                "SELECT price_known FROM budgets WHERE scope_kind='task' AND scope_id='{child}' AND kind='usd'"
+            ),
+            true
+        )?[0]["price_known"],
+        0,
+        "allocating a limit cannot establish token pricing"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_01_queued_result_is_rejected_when_parent_is_cancelled() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-result-cancel-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let reply=host.store().consult_request(message("cancel-later",json!({"intent":"consult","question":"research","budget":{"wall_seconds":10},"deadline":"2099-01-01T00:00:00Z"}))?).await?.expect("child");
+    let child = reply["task_id"].as_str().ok_or("child")?;
+    seed_child_attempt(dir.path(), child, "C")?;
+    host.store()
+        .runner_finished("C", child_ending(child_result(child, "C", "COMPLETED")))
+        .await?;
+    sql(
+        dir.path(),
+        "UPDATE tasks SET state='CANCELLED' WHERE task_id='D'",
+        false,
+    )?;
+    host.store().settle_ended_inputs(&host.project_id).await?;
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT state FROM input_queue WHERE target_role='developer'",
+            true
+        )?[0]["state"],
+        "REJECTED",
+        "a queued answer cannot survive its parent cancellation"
+    );
+    host.shutdown().await;
+    Ok(())
+}

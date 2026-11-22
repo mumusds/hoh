@@ -1,4 +1,11 @@
 //! Scoped consultation transactions (REQ-023, ADR-037).
+mod children;
+mod listing;
+mod returned;
+pub use listing::TasksPage;
+pub(super) use listing::page;
+pub(super) use returned::{finish, input_current, sweep};
+
 use super::writer::{self, Ctx, Intent, NewEvent};
 use super::{PersistError, closing, sqlite_error};
 use crate::ids::child_id;
@@ -49,7 +56,7 @@ fn source(tx: &Transaction<'_>, message: &Message) -> Result<Option<Value>, Pers
             json!({"role":message.sender_role}),
         )));
     }
-    let current:Option<(String,i64,String)>=tx.query_row("SELECT a.state,t.revision,s.sha256 FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) JOIN specs s ON s.spec_id=r.spec_id WHERE a.attempt_id=?1 AND t.task_id=?2 AND t.run_id=?3 AND t.role=?4 AND a.role_epoch=?5",params![message.attempt_id,message.task_id,message.run_id,message.sender_role,epoch],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sqlite_error)?;
+    let current:Option<(String,i64,String)>=tx.query_row("SELECT a.state,t.revision,s.sha256 FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) JOIN specs s ON s.spec_id=r.spec_id WHERE a.attempt_id=?1 AND t.task_id=?2 AND t.run_id=?3 AND t.role=?4 AND a.role_epoch=?5 AND t.state='RUNNING' AND a.cancel_requested=0 AND t.spec_id=r.spec_id",params![message.attempt_id,message.task_id,message.run_id,message.sender_role,epoch],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sqlite_error)?;
     let Some((state, revision, spec)) = current else {
         return Ok(Some(rejected(
             "ILLEGAL_TRANSITION",
@@ -149,7 +156,7 @@ pub(super) fn request(
         if let Some(members) = cycle(&edges, (&message.sender_role, &message.recipient_role)) {
             rejected("CONSULT_CYCLE", json!({"members":members}))
         } else {
-            return Ok(None);
+            children::create(&tx, &project, message, &key, ctx)?
         }
     } else if major {
         major_decision(&tx, &project, message)?

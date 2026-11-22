@@ -672,6 +672,7 @@ pub(super) fn sweep(
     let tx = writer::begin(conn, ctx)?;
     let before = tx.total_changes();
     routing::sweep(&tx, project, ctx)?;
+    super::consult::sweep(&tx, project, ctx)?;
     let ids: Vec<String> = {
         // A receipt can acknowledge next-attempt routing while the input stays QUEUED. After a rebind no
         // attempt at the old epoch will take it; reject it here without rewriting the original receipt.

@@ -311,8 +311,8 @@ pub(super) async fn apply(
     } else {
         None
     };
-    // A verifier's messages left in its bridge are answered as its own end would answer them (decision 13).
-    if ends && row.verifier {
+    // Working attempts' messages left in their bridge use the same request path before their source is settled.
+    if ends && (row.verifier || (row.role != "commander" && !row.cancel_requested)) {
         answer_left_messages(store, project, &row).await?;
     }
     let found = row.clone();
@@ -333,8 +333,8 @@ pub(super) async fn apply(
     Ok(seq)
 }
 
-/// The query and steer messages verifier attempt `row` left in its bridge file, answered (refused with an Issue, or
-/// deferred) as the runner answers them at its end (docs/adr/ADR-028.md decision 13); answered again, the same answer.
+/// The query and steer messages attempt `row` left in its bridge file use the runner's same request handling;
+/// a committed request replays its saved reply without creating another consultation.
 async fn answer_left_messages(
     store: &Store,
     project: &std::path::Path,
@@ -345,9 +345,6 @@ async fn answer_left_messages(
     let round = super::begun::spawn_blocking(move || reader.verifier_round(&run, &task))
         .await
         .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??;
-    let Some((round_id, candidate_id)) = round else {
-        return Ok(());
-    };
     let bridge = super::product::bridge_of(project, &row.attempt_id);
     let (lines, _) = super::begun::spawn_blocking(move || super::product::read_bridge(&bridge))
         .await
@@ -360,7 +357,15 @@ async fn answer_left_messages(
         role_epoch: u64::try_from(row.role_epoch).unwrap_or_default(),
     };
     for message in &hoh_core::bridge::parse(&lines, &identity).messages {
-        super::requests::answer_message(store, message, &round_id, &candidate_id).await;
+        let reply = match &round {
+            Some((round_id, candidate_id)) => {
+                super::requests::answer_message(store, message, round_id, candidate_id).await
+            }
+            None => super::requests::answer_work(store, message).await,
+        };
+        if reply["status"] == "error" {
+            return Err(PersistError::Storage(reply.to_string()));
+        }
     }
     Ok(())
 }

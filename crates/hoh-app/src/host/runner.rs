@@ -53,7 +53,7 @@ pub struct Work {
     /// A verifier's run directory, its working directory: the candidate's checkout outside the project
     /// (docs/adr/ADR-028.md decision 6); none for any other work.
     pub run_dir: Option<std::path::PathBuf>,
-    /// A verifier's request helpers, `run-check` and `ask` (docs/adr/ADR-028.md decision 7); none for any other work.
+    /// Working attempts' request helpers. `run-check` is accepted only for frozen verification work.
     pub helpers: Option<super::requests::Helpers>,
 }
 
@@ -1400,7 +1400,7 @@ async fn attempt(
         .as_ref()
         .map(|v| v.dir.clone())
         .or_else(|| review_dir.clone());
-    // A verifier's request helpers, in its attempt directory before it starts (docs/adr/ADR-028.md decision 7).
+    // The existing request helpers, provisioned before working attempts start (ADR-028, ADR-037).
     let helpers = match &verifier {
         Some(v) => {
             let (root, attempt) = (common.shared.root.clone(), id.clone());
@@ -1426,7 +1426,21 @@ async fn attempt(
                 }
             }
         }
-        None => None,
+        None => {
+            let (root, attempt) = (common.shared.root.clone(), id.clone());
+            let written = super::begun::spawn_blocking(move || {
+                super::requests::write_helpers(&root, &attempt, 60)
+            })
+            .await;
+            match written {
+                Ok(Ok(helpers)) => Some(helpers),
+                error => {
+                    let ending = common.failed(format!("HELPERS_UNAVAILABLE: {error:?}"));
+                    finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
+                    return Ok(());
+                }
+            }
+        }
     };
     held.helpers = helpers.clone();
     held.assignment.inputs = store
@@ -1539,7 +1553,7 @@ async fn attempt(
         return Ok(());
     }
     hooks.runner_of(RunnerPoint::AfterEffectStarted, &id);
-    // While a verifier runs, its requests are taken in order, one at a time; once its process has ended none is taken
+    // While a worker runs, its requests are taken in order, one at a time; once its process has ended none is taken
     // (a request is never cut off: its check and record end before the end is looked at; decision 7). Its inactivity
     // watchdog looks at it meanwhile, on its own clock, and only records (docs/adr/ADR-022.md decision 19): a look is
     // an operation of the attempt in flight beside its end and its requests, never in their way; one not done when
@@ -1554,7 +1568,7 @@ async fn attempt(
     let leader = (pid, who.start_id.parse::<u64>().ok());
     let mut look = None;
     let end = loop {
-        let serving = verifier.as_ref().zip(helpers.as_ref());
+        let serving = helpers.as_ref();
         // The end is polled first. A finished sample is still an in-flight look until its record commits, and polling
         // it enqueues that record (WD-01): `select!` would otherwise start at a random branch and, when the end is
         // already ready, poll the look first about three times in four. A request already entered is not cut off; its
@@ -1563,8 +1577,8 @@ async fn attempt(
             biased;
             outcome = &mut ended => break outcome,
             () = tokio::time::sleep(Duration::from_millis(200)), if serving.is_some() => {
-                if let Some((v, helpers)) = serving {
-                    served += serve_request(common, &work, v, helpers, served + 1).await?;
+                if let Some(helpers) = serving {
+                    served += serve_request(common, &work, verifier.as_ref(), helpers, served + 1).await?;
                 }
             }
             _ = looks.tick(), if look.is_none() && watch.is_some() => {
@@ -1714,9 +1728,7 @@ async fn attempt(
     }
     hooks.runner_of(RunnerPoint::AfterEffectCommitted, &id);
     // A verifier's messages left in its bridge are answered as its requests are (decision 13), before its end.
-    if let Some(v) = &verifier {
-        answer_bridge_messages(common, &work, v, &outcome.observed.messages).await?;
-    }
+    answer_bridge_messages(common, &work, verifier.as_ref(), &outcome.observed.messages).await?;
     // A verifier's run directory looked at again before its end (docs/adr/ADR-028.md decision 8).
     let tree_checked = match &verifier {
         Some(v) => Some(super::verifying::check(store, &common.shared.root, &id, v).await),
@@ -1845,12 +1857,12 @@ where
     hand(ending).await
 }
 
-/// Serve request `n` of verifier `work` (docs/adr/ADR-028.md decisions 7 and 13), when it is there: 1 when it was
+/// Serve request `n` of `work` through the existing bridge (ADR-028, ADR-037): 1 when it was
 /// answered, 0 when it is not there yet.
 async fn serve_request(
     common: &Common,
     work: &Work,
-    v: &super::verifying::Verifier,
+    v: Option<&super::verifying::Verifier>,
     helpers: &super::requests::Helpers,
     n: u64,
 ) -> Result<u64, PersistError> {
@@ -1870,7 +1882,12 @@ async fn serve_request(
         Ok(request) => match request["kind"].as_str() {
             Some("check") => {
                 let check_id = request["check_id"].as_str().unwrap_or_default().to_owned();
-                run_check(common, work, v, n, &check_id).await?
+                match v {
+                    Some(v) => run_check(common, work, v, n, &check_id).await?,
+                    None => {
+                        json!({"status":"refused","reasons":["checks require a frozen verification assignment"]})
+                    }
+                }
             }
             Some("message") => {
                 let line = request["message"].to_string();
@@ -1882,8 +1899,18 @@ async fn serve_request(
                             .handoff
                             .as_ref()
                             .map_or("", |h| h.round_id.as_str());
-                        super::requests::answer_message(store, message, round, &v.candidate_id)
-                            .await
+                        match v {
+                            Some(v) => {
+                                super::requests::answer_message(
+                                    store,
+                                    message,
+                                    round,
+                                    &v.candidate_id,
+                                )
+                                .await
+                            }
+                            None => super::requests::answer_work(store, message).await,
+                        }
                     }
                     (None, refused) => json!({"status": "refused",
                         "reasons": [refused.map_or("not a message".to_owned(), |r| r.reason.clone())]}),
@@ -2001,7 +2028,7 @@ async fn run_check(
 async fn answer_bridge_messages(
     common: &Common,
     work: &Work,
-    v: &super::verifying::Verifier,
+    v: Option<&super::verifying::Verifier>,
     lines: &[String],
 ) -> Result<(), PersistError> {
     let parsed = hoh_core::bridge::parse(lines, &identity_of(work)?);
@@ -2011,8 +2038,21 @@ async fn answer_bridge_messages(
         .as_ref()
         .map_or("", |h| h.round_id.as_str());
     for message in &parsed.messages {
-        super::requests::answer_message(&common.shared.store, message, round, &v.candidate_id)
-            .await;
+        let reply = match v {
+            Some(v) => {
+                super::requests::answer_message(
+                    &common.shared.store,
+                    message,
+                    round,
+                    &v.candidate_id,
+                )
+                .await
+            }
+            None => super::requests::answer_work(&common.shared.store, message).await,
+        };
+        if reply["status"] == "error" {
+            return Err(PersistError::Storage(reply.to_string()));
+        }
     }
     Ok(())
 }

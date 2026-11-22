@@ -1617,6 +1617,7 @@ pub(super) fn finished_in(
         commit.events.extend(failed.events);
     }
     writer::write(tx, &commit, ctx)?;
+    super::consult::finish(tx, attempt_id, ctx)?;
     super::inputs::finish(
         tx,
         attempt_id,

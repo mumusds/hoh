@@ -104,6 +104,7 @@ pub(super) fn claim_next(
                         OR (state = 'DELIVERING' AND next_retry_at <= ?1)) \
                    AND recipient_role IN (SELECT value FROM json_each(?2)) \
                    AND json_extract(payload_json, '$.notice') IS NOT 'runtime' \
+                   AND json_extract(payload_json, '$.notice') IS NOT 'consult' \
                    AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
                    AND (?4 = 0 OR (json_extract(payload_json,'$.notice') = 'input' \
