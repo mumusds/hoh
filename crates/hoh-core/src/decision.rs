@@ -364,6 +364,9 @@ pub struct Snapshot {
     /// For a record_assumption of an unattended run, the decision classes its configuration snapshot lists under
     /// `[assumptions]` (REQ-030 behaviour 4); `None` for an interactive run, whose basis is not checked.
     pub assumptions: Option<BTreeSet<String>>,
+    /// For a transition_run to READY, the run's readiness under its specification revision (REQ-031, C5:
+    /// docs/adr/ADR-035.md decision 4); `None` when none is judged (no specification adopted).
+    pub readiness: Option<crate::readiness::Readiness>,
 }
 
 /// What an end of a run waits for (docs/adr/ADR-031.md decision 4): it is ended only when quiet, so nothing of it is
@@ -817,6 +820,26 @@ fn transition_run(
                 quiet.unread_limit
             ));
         }
+    }
+    // Only readiness lets a run into READY (REQ-031 behaviour 1 and 7, C5): the Commander cannot overrule it.
+    if to == RunState::Ready
+        && let Some(crate::readiness::Readiness::NotReady(reasons)) = &snapshot.readiness
+    {
+        let named: Vec<String> = reasons
+            .iter()
+            .map(|r| format!("{} {}", r.code.as_str(), r.ids.join(",")))
+            .collect();
+        return Err(Rejection {
+            reason: RejectionReason::IllegalTransition,
+            detail: format!(
+                "run {} -> READY: readiness is not met ({})",
+                from.as_str(),
+                named.join("; ")
+            ),
+            details: Some(serde_json::json!({
+                "reasons": reasons.iter().map(crate::readiness::Reason::json).collect::<Vec<_>>()
+            })),
+        });
     }
     let mut needed: BTreeSet<String> = accepted.iter().cloned().collect();
     if to == RunState::Completed {

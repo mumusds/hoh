@@ -460,7 +460,9 @@ fn asking_commander() -> std::sync::Arc<world::Team> {
                 decided.push(world::ask("q-login", QUESTION));
                 decided
             }
-            "SPECIFYING" if answered => vec![world::transition("INCOMPLETE")],
+            // Its revision ready, the run is READY by the Runtime's readiness (docs/adr/ADR-035.md decision 4)
+            // by the time its Commander has the answer.
+            "SPECIFYING" | "READY" if answered => vec![world::transition("INCOMPLETE")],
             _ => Vec::new(),
         }
     })

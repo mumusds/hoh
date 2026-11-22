@@ -56,6 +56,13 @@ fn open_with(
 
 /// Run R on spec s3 (revision 3) in `state`, supervised by its Commander (codex, session sc, bound and active), and
 /// `extra`: nothing else of it.
+/// Spec s3's specification review a CURRENT PASS (`world`'s `extra`): readiness lets its run into READY
+/// (docs/adr/ADR-035.md decision 4).
+const REVIEWED: &str = "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+   ('p1', 'reviewed-s3', NULL, 'spec_review.reported', json_object('review_id', 'rv-s3', 'spec_id', 's3',
+    'spec_revision', 3, 'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv',
+    'findings', json_array()), '2026-11-07T00:00:00Z');";
+
 fn world(path: &PathBuf, state: &str, extra: &str) -> R {
     exec(
         path,
@@ -772,7 +779,7 @@ async fn a_plan_only_turn_does_not_count_as_progress_and_a_moved_state_does() ->
     let dir = tempfile::tempdir()?;
     let clock = Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
-    world(&path, "CREATED", "")?;
+    world(&path, "CREATED", REVIEWED)?;
     const STATES: &[&str] = &["CREATED", "DISCOVERING", "SPECIFYING", "READY"];
     drive(
         &store,
@@ -1582,7 +1589,7 @@ async fn a_resume_of_a_commander_decided_incomplete_run_is_stalled_at_that_ticks
         let dir = tempfile::tempdir()?;
         let clock = Arc::new(TestClock::default());
         let (store, path) = open(&dir, &clock)?;
-        world(&path, "SPECIFYING", "")?;
+        world(&path, "SPECIFYING", REVIEWED)?;
         let (_, ms) = drive(&store, &clock, &path, 0, 10, &to("INCOMPLETE"), |p| {
             Ok(state(p)? == json!("INCOMPLETE"))
         })

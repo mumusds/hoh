@@ -95,7 +95,10 @@ fn test_034_04_invalid_grammar_reports_source_and_line() -> R {
         ("# 用户", "# Users"),
         ("given: 前提", " given: 前提"),
         ("# 决策\n无", "# 决策\n- 决定"),
-        ("# 开放问题\n无", "# 开放问题\n- 问题\n阻塞：也许"),
+        ("# 开放问题\n无", "# 开放问题\n- Q-1 问题\n阻塞：也许"),
+        ("# 开放问题\n无", "# 开放问题\n- 问题\n阻塞：否"),
+        ("# 开放问题\n无", "# 开放问题\n- Q-1\n阻塞：否"),
+        ("# 开放问题\n无", "# 开放问题\n- Q-a.b 问题\n阻塞：否"),
         ("## REQ-A 标题", "## REQ-A 标题\nclass: optional"),
         (
             "## REQ-A 标题",
@@ -141,7 +144,7 @@ fn test_034_04_invalid_grammar_reports_source_and_line() -> R {
 fn test_034_04_decisions_questions_crlf_and_empty_sections() -> R {
     let text = format!("{PREFIX}{}", requirement("A", ""))
         .replace("# 决策\n无", "# 决策\n- 确认范围\nsource: question_id=q-1")
-        .replace("# 开放问题\n无", "# 开放问题\n- 颜色\n阻塞：否");
+        .replace("# 开放问题\n无", "# 开放问题\n- Q-color 颜色\n阻塞：否");
     let a = Source {
         path: "docs/spec/a.md".into(),
         bytes: text.as_bytes().to_vec(),
@@ -165,5 +168,86 @@ fn test_034_04_decisions_questions_crlf_and_empty_sections() -> R {
             .to_vec(),
     };
     assert_eq!(generate_index(&[empty])?.value()["requirements"], json!([]));
+    Ok(())
+}
+
+/// Q1 (docs/adr/ADR-035.md decision 1): open questions carry ids from the REQ/AC id set and their blocking mark;
+/// decisions carry their source; both are exposed with their source positions and never enter index.json.
+#[test]
+fn test_031_03_questions_and_decisions_are_exposed_outside_the_index() -> R {
+    let text = format!("{PREFIX}{}", requirement("A", ""))
+        .replace(
+            "# 决策\n无",
+            "# 决策\n- 确认范围\nsource: question_id=q-1\n- 默认语言\nsource: event_id=e/2",
+        )
+        .replace(
+            "# 开放问题\n无",
+            "# 开放问题\n- Q-color 颜色\n阻塞：否\n\n- Q-db 数据库\n阻塞：是",
+        );
+    let a = Source {
+        path: "docs/spec/a.md".into(),
+        bytes: text.as_bytes().to_vec(),
+    };
+    let index = generate_index(std::slice::from_ref(&a))?;
+    assert_eq!(
+        index.questions(),
+        &[
+            Question {
+                id: "Q-color".into(),
+                text: "颜色".into(),
+                blocking: false,
+                path: a.path.clone(),
+                line: 13
+            },
+            Question {
+                id: "Q-db".into(),
+                text: "数据库".into(),
+                blocking: true,
+                path: a.path.clone(),
+                line: 16
+            },
+        ]
+    );
+    assert_eq!(
+        index.decisions(),
+        &[
+            Decision {
+                text: "确认范围".into(),
+                source_kind: "question_id".into(),
+                source_id: "q-1".into(),
+                path: a.path.clone(),
+                line: 8
+            },
+            Decision {
+                text: "默认语言".into(),
+                source_kind: "event_id".into(),
+                source_id: "e/2".into(),
+                path: a.path.clone(),
+                line: 10
+            },
+        ]
+    );
+    let plain = generate_index(&[source("docs/spec/a.md", &requirement("A", ""))])?;
+    assert!(plain.questions().is_empty() && plain.decisions().is_empty());
+    let keys: Vec<&String> = index.value().as_object().ok_or("object")?.keys().collect();
+    assert_eq!(keys, ["files", "generated", "requirements", "scenarios"]);
+    // A question id is in the one id set of REQs and ACs: unique within and across files.
+    let clash = text.replace("Q-db", "Q-color");
+    let error = generate_index(&[Source {
+        path: a.path.clone(),
+        bytes: clash.into_bytes(),
+    }])
+    .expect_err("an id used twice");
+    assert!(error.error.contains("duplicate id"), "{error}");
+    let b = Source {
+        path: "docs/spec/b.md".into(),
+        bytes: format!("{PREFIX}{}", requirement("B", ""))
+            .replace("# 开放问题\n无", "# 开放问题\n- Q-color 又一个\n阻塞：是")
+            .into_bytes(),
+    };
+    assert!(
+        generate_index(&[a, b]).is_err(),
+        "a question id used in two files"
+    );
     Ok(())
 }

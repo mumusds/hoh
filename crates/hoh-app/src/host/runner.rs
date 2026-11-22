@@ -938,6 +938,12 @@ async fn tick(
         if held.item(store.mode_step(run).await)?.is_none() {
             continue;
         }
+        // Its readiness before its rounds (REQ-031 behaviour 5 and 7, docs/adr/ADR-035.md decisions 4 and 8): a
+        // planned task that is not ready is BLOCKED before a round could take it; a SPECIFYING run that is ready
+        // moves to READY.
+        if held.item(store.settle_readiness(run).await)?.is_none() {
+            continue;
+        }
         while let Some(round) = held.item(store.schedule_round(run, at()).await)?
             && round.dispatched.is_some()
         {}

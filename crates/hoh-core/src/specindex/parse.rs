@@ -1,12 +1,14 @@
 //! ADR-033's line grammar; source positions survive blank-line skipping.
 
-use super::{IndexError, Source};
+use super::{Decision, IndexError, Question, Source};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 pub(super) struct Parsed {
     pub requirements: Vec<Value>,
     pub scenarios: Vec<Value>,
+    pub questions: Vec<Question>,
+    pub decisions: Vec<Decision>,
 }
 
 struct Lines<'a> {
@@ -51,31 +53,82 @@ impl<'a> Lines<'a> {
         }
         Ok(())
     }
-    fn entries(&mut self, decisions: bool) -> Result<(), IndexError> {
+    fn line(&self) -> usize {
+        self.lines.get(self.at).map_or(self.end, |(line, _)| *line)
+    }
+    fn decisions(&mut self, parsed: &mut Parsed) -> Result<(), IndexError> {
         if self.peek() == "无" {
             self.at += 1;
             return Ok(());
         }
         while !self.peek().is_empty() && !self.peek().starts_with('#') {
-            self.field("- ")?;
-            if decisions {
-                let at = self.at;
-                let source = self.field("source: ")?;
-                if !source.split_once('=').is_some_and(|(kind, id)| {
-                    ["question_id", "input_id", "event_id"].contains(&kind) && identifier(id)
-                }) {
-                    self.at = at;
-                    return Err(self.error("expected source: question_id|input_id|event_id=<id>"));
-                }
-            } else {
-                if !["阻塞：是", "阻塞：否"].contains(&self.peek()) {
-                    return Err(self.error("expected 阻塞：是 or 阻塞：否"));
-                }
-                self.at += 1;
-            }
+            let line = self.line();
+            let text = self.field("- ")?;
+            let at = self.at;
+            let source = self.field("source: ")?;
+            let Some((kind, id)) = source.split_once('=').filter(|(kind, id)| {
+                ["question_id", "input_id", "event_id"].contains(kind) && identifier(id)
+            }) else {
+                self.at = at;
+                return Err(self.error("expected source: question_id|input_id|event_id=<id>"));
+            };
+            parsed.decisions.push(Decision {
+                text,
+                source_kind: kind.to_owned(),
+                source_id: id.to_owned(),
+                path: self.path.to_owned(),
+                line,
+            });
         }
         Ok(())
     }
+    /// `- Q-<id> <text>` then `阻塞：是|否` (docs/adr/ADR-035.md decision 1); the id is in the REQ/AC id set.
+    fn questions(
+        &mut self,
+        parsed: &mut Parsed,
+        ids: &mut BTreeSet<String>,
+    ) -> Result<(), IndexError> {
+        if self.peek() == "无" {
+            self.at += 1;
+            return Ok(());
+        }
+        while !self.peek().is_empty() && !self.peek().starts_with('#') {
+            let line = self.line();
+            let Some((qid, text)) = self
+                .peek()
+                .strip_prefix("- Q-")
+                .and_then(|s| s.split_once(' '))
+                .filter(|(qid, text)| word(qid) && !text.trim().is_empty())
+            else {
+                return Err(self.error("expected - Q-<id> <question>"));
+            };
+            let id = format!("Q-{qid}");
+            self.id(ids, &id)?;
+            let text = text.to_owned();
+            self.at += 1;
+            let blocking = match self.peek() {
+                "阻塞：是" => true,
+                "阻塞：否" => false,
+                _ => return Err(self.error("expected 阻塞：是 or 阻塞：否")),
+            };
+            self.at += 1;
+            parsed.questions.push(Question {
+                id,
+                text,
+                blocking,
+                path: self.path.to_owned(),
+                line,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `alnum (alnum | "_")*`: a REQ's or a question's own id.
+fn word(s: &str) -> bool {
+    !s.is_empty()
+        && s.as_bytes()[0].is_ascii_alphanumeric()
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn identifier(s: &str) -> bool {
@@ -113,15 +166,17 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
             lines.at += 1;
         }
     }
-    lines.take("# 决策")?;
-    lines.entries(true)?;
-    lines.take("# 开放问题")?;
-    lines.entries(false)?;
-    lines.take("# 需求")?;
     let mut parsed = Parsed {
         requirements: Vec::new(),
         scenarios: Vec::new(),
+        questions: Vec::new(),
+        decisions: Vec::new(),
     };
+    lines.take("# 决策")?;
+    lines.decisions(&mut parsed)?;
+    lines.take("# 开放问题")?;
+    lines.questions(&mut parsed, ids)?;
+    lines.take("# 需求")?;
     while !lines.peek().is_empty() {
         let Some((req, title)) = lines
             .peek()
@@ -130,11 +185,7 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
         else {
             return Err(lines.error("expected ## REQ-<id> <title>"));
         };
-        if req.is_empty()
-            || !req.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            || !req.as_bytes()[0].is_ascii_alphanumeric()
-            || title.trim().is_empty()
-        {
+        if !word(req) || title.trim().is_empty() {
             return Err(lines.error("invalid requirement id or title"));
         }
         let id = format!("REQ-{req}");

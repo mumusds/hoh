@@ -110,6 +110,11 @@ pub(super) fn apply(
         }
         return Err(PersistError::SpecConflict(Box::new(details)));
     }
+    // Every decision cites a source the project holds (REQ-030 behaviour 5), checked before anything is written; a
+    // REJECT decides on a CR and states nothing.
+    if !matches!(&input.action, SpecAction::Approve(a) if a.decision == SpecDecision::Reject) {
+        super::spec_sources::check(tx, &project, index.decisions())?;
+    }
     let base = latest(tx, &project)?;
     let mut events = match &input.action {
         SpecAction::Propose(proposal) => {
@@ -297,6 +302,11 @@ fn approve(
             event.payload["cr_id"] = json!(cr);
             event.payload["to"] = json!(revision);
         }
+        // The new revision's open questions (docs/adr/ADR-035.md decision 1), after its spec.changed: the first event
+        // stays the one other runs' copies are made from.
+        let questions =
+            super::readiness::open_questions_event(&event, &id, revision, index.questions());
+        return Ok(std::iter::once(event).chain(questions).collect());
     }
     Ok(vec![event])
 }

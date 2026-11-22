@@ -796,6 +796,15 @@ fn load_snapshot(
     } else {
         None
     };
+    // Only a move to READY reads readiness (REQ-031 behaviour 1, C5).
+    let readiness = match &proposal.payload {
+        crate::protocol::DecisionPayload::TransitionRun { to_state, .. }
+            if *to_state == crate::protocol::RunState::Ready =>
+        {
+            super::readiness::run_readiness(tx, run_id)?
+        }
+        _ => None,
+    };
     Ok(Snapshot {
         run,
         commander_epoch,
@@ -808,6 +817,7 @@ fn load_snapshot(
         evidence,
         quiet,
         assumptions,
+        readiness,
     })
 }
 

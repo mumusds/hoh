@@ -131,6 +131,8 @@ pub(super) enum RunnerJob {
         upto: i64,
         context: Box<crate::decision::Context>,
     },
+    /// A run's readiness step (docs/adr/ADR-035.md decisions 4 and 8).
+    Readiness(String),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -420,6 +422,9 @@ pub(super) fn run(
             super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Mode(run) => super::modes::step(conn, &run, ctx).map(RunnerDone::Applied),
+        RunnerJob::Readiness(run_id) => {
+            super::readiness::settle(conn, &run_id, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
         }
