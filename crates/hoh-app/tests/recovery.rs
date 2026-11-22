@@ -4628,9 +4628,7 @@ fn a_failure_recorded_before_a_kill_is_retried_by_its_class_after_the_restart() 
 /// HTTP over the host's socket with its token, as a client sends it; the status and the body.
 fn http(info: &Value, method: &str, path: &str, body: Option<&str>) -> R<(u16, String)> {
     use std::io::{Read as _, Write as _};
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(info["socket"].as_str().ok_or("no socket")?)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let socket = info["socket"].as_str().ok_or("no socket")?;
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-HoH-Token: {}\r\n",
         info["token"].as_str().ok_or("no token")?
@@ -4643,6 +4641,17 @@ fn http(info: &Value, method: &str, path: &str, body: Option<&str>) -> R<(u16, S
     }
     request.push_str("\r\n");
     request.push_str(body.unwrap_or_default());
+    // Approval/cancel/restart tests need a known user peer even when this runner is a user service.
+    if method == "POST"
+        && path == "/v1/commands"
+        && body
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .is_some_and(|body| body["kind"] == "ApproveSpec")
+    {
+        return world::approval::request(true, socket, &request);
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(request.as_bytes())?;
     let mut reply = String::new();
     stream.read_to_string(&mut reply)?;

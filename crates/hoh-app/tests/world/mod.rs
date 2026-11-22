@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 pub use pty::R;
 
+pub mod approval;
+
 /// The product binary.
 pub const HOH: &str = env!("CARGO_BIN_EXE_hoh");
 
@@ -2102,6 +2104,7 @@ fn ended(pid: u32) -> R<bool> {
 }
 
 /// One HTTP exchange with an in-process host over its TCP port: the status and the JSON body.
+/// Ordinary ApproveSpec fixtures use a known user peer; origin rejection tests supply their own peers.
 pub async fn exchange(
     host: &Host,
     method: &str,
@@ -2109,6 +2112,9 @@ pub async fn exchange(
     body: Option<&Value>,
 ) -> R<(u16, Value)> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let approving = method == "POST"
+        && path == "/v1/commands"
+        && body.is_some_and(|body| body["kind"] == "ApproveSpec");
     let body = body.map(Value::to_string).unwrap_or_default();
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n",
@@ -2123,6 +2129,14 @@ pub async fn exchange(
     }
     request.push_str("\r\n");
     request.push_str(&body);
+    if approving {
+        let address = host.port.to_string();
+        let (status, body) = tokio::task::spawn_blocking(move || {
+            approval::request(false, &address, &request).map_err(|e| e.to_string())
+        })
+        .await??;
+        return Ok((status, serde_json::from_str(&body)?));
+    }
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", host.port)).await?;
     stream.write_all(request.as_bytes()).await?;
     let mut raw = Vec::new();
