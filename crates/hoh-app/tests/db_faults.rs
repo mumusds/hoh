@@ -1611,7 +1611,12 @@ fn full_a_full_file_system_is_db_full_and_retryable_writes_nothing_and_writes_re
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
+        // The supervisor's work for "first" (its cursor, the trigger's NO_SPEC deferral) is waited for while the
+        // store can still write: on the full file system it cannot commit, so a wait begun after the fill never ends
+        // (the cursor stays short of the last event), and what it did write there would depend on the race.
+        project.quiet_dump()?;
         let filler = mount.fill()?;
+        // Still quiet on the full file system: the cursor is at the last event and nothing new was committed.
         let before = project.quiet_dump()?;
         let out = project.submit("second")?;
         assert_ne!(out.status.code(), Some(0), "{}", text(&out));
