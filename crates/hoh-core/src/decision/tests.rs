@@ -14,7 +14,8 @@ fn task(id: &str, state: TaskState) -> TaskView {
         task_id: id.to_owned(),
         state,
         revision: 4,
-        spec_id: "s2".to_owned(),
+        spec_id: Some("s2".to_owned()),
+        kind: TaskKind::Work,
         role: "developer".to_owned(),
         cost_estimate: 1,
         writer: true,
@@ -207,7 +208,7 @@ fn a_dispatch_needs_accepted_dependencies_a_ready_task_capabilities_and_budget()
     check(
         |s| {
             if let Some(t) = &mut s.task {
-                t.spec_id = "s1".to_owned();
+                t.spec_id = Some("s1".to_owned());
             }
         },
         SpecMismatch,
@@ -649,6 +650,40 @@ fn a_verifier_task_is_the_runtimes_and_moved_or_dispatched_by_no_decision() {
             );
         }
     }
+}
+
+#[test]
+fn test_008_02_draft_kind_refuses_every_commander_task_operation() {
+    for kind in [TaskKind::Work, TaskKind::SpecDraft] {
+        assert_eq!(TaskKind::from_name(kind.as_str()), Some(kind));
+    }
+    assert_eq!(TaskKind::from_name("unknown"), None);
+    for spec in [None, Some("s2".to_owned())] {
+        for state in TaskState::ALL {
+            let mut s = snapshot();
+            let mut draft = task("T1", *state);
+            draft.kind = TaskKind::SpecDraft;
+            draft.spec_id = spec.clone();
+            // Kind is authoritative even when a caller omitted the derived runtime_owned flag.
+            draft.runtime_owned = false;
+            s.task = Some(draft);
+            assert_eq!(reason(&dispatch_t1(), &s), IllegalTransition);
+            for target in TaskState::ALL {
+                let p = proposal(
+                    json!({"kind":"transition_task","task_id":"T1","to_state":target,"reason":"fixture"}),
+                );
+                assert_eq!(reason(&p, &s), IllegalTransition, "{state:?} -> {target:?}");
+            }
+        }
+    }
+    let mut s = snapshot();
+    s.run.spec_id = None;
+    s.task.as_mut().unwrap().spec_id = None;
+    assert_eq!(
+        reason(&dispatch_t1(), &s),
+        SpecMismatch,
+        "two absent specs are not a dispatch match"
+    );
 }
 
 #[test]

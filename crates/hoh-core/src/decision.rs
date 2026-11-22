@@ -204,13 +204,38 @@ pub struct RunView {
     pub spec_sha256: Option<String>,
 }
 
-/// The task a proposal names.
+/// The internal task category stored by migration 002 (ADR-038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Work,
+    SpecDraft,
+}
+
+impl TaskKind {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "work" => Some(Self::Work),
+            "spec_draft" => Some(Self::SpecDraft),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::SpecDraft => "spec_draft",
+        }
+    }
+}
+
+/// The task a proposal names, including a Runtime-owned draft before its first specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskView {
     pub task_id: String,
     pub state: TaskState,
     pub revision: u64,
-    pub spec_id: String,
+    pub spec_id: Option<String>,
+    pub kind: TaskKind,
     pub role: String,
     pub cost_estimate: u32,
     /// It writes the work tree, so it needs the writer lease (REQ-037); otherwise a reader slot.
@@ -222,8 +247,8 @@ pub struct TaskView {
     /// Its persisted `next_retry_at` while it is still ahead of the decision's time (REQ-042 behaviour 2); `None` when
     /// it is due or has no retry.
     pub retry_at: Option<String>,
-    /// A verification round's verifier task: the Runtime's, which no decision moves or dispatches (docs/adr/ADR-028.md
-    /// decision 10).
+    /// A verification round's verifier or a drafting task: the Runtime's, which no decision moves or dispatches
+    /// (ADR-028 decision 10, ADR-038).
     pub runtime_owned: bool,
     /// A writer an open round with an open Issue holds: not dispatched until the round closes (docs/adr/ADR-028.md
     /// decision 13).
@@ -538,12 +563,15 @@ fn named_task<'a>(snapshot: &'a Snapshot, task_id: &str) -> Result<&'a TaskView,
         ),
         // A round's verifier task is the Runtime's: dispatched by the scheduling round, ended by the reconcile
         // (docs/adr/ADR-028.md decision 10).
-        Some(task) if task.task_id == task_id && task.runtime_owned => reject(
-            RejectionReason::IllegalTransition,
-            format!(
-                "{task_id} is a verification round's task, the Runtime's; no decision moves or dispatches it"
-            ),
-        ),
+        Some(task)
+            if task.task_id == task_id
+                && (task.runtime_owned || task.kind == TaskKind::SpecDraft) =>
+        {
+            reject(
+                RejectionReason::IllegalTransition,
+                format!("{task_id} is a Runtime-owned task; no decision moves or dispatches it"),
+            )
+        }
         Some(task) if task.task_id == task_id => Ok(task),
         _ => reject(
             RejectionReason::IllegalTransition,
@@ -622,11 +650,11 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
             ),
         );
     }
-    if Some(&task.spec_id) != snapshot.run.spec_id.as_ref() {
+    if task.spec_id.is_none() || task.spec_id != snapshot.run.spec_id {
         return reject(
             SpecMismatch,
             format!(
-                "{task_id} belongs to specification {} but the run's is {:?}",
+                "{task_id} belongs to specification {:?} but the run's is {:?}",
                 task.spec_id, snapshot.run.spec_id
             ),
         );
