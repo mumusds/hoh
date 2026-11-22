@@ -116,10 +116,7 @@ pub(super) fn request(
     if !matches!(message.kind, MessageKind::Query | MessageKind::Steer)
         || (!major
             && (message.kind != MessageKind::Query
-                || !matches!(
-                    intent,
-                    "opinion" | "conclude" | "consult" | "dismiss_consult"
-                )))
+                || !matches!(intent, "opinion" | "conclude" | "consult")))
     {
         return Ok(None);
     }
@@ -157,8 +154,6 @@ pub(super) fn request(
         .map_err(sqlite_error)?;
     let reply = if let Some(reply) = source(&tx, message)? {
         reply
-    } else if intent == "dismiss_consult" {
-        returned::dismiss(&tx, &project, message, ctx)?
     } else if intent == "consult" {
         let edges = wait_for(&tx, &message.run_id)?;
         if let Some(members) = cycle(&edges, (&message.sender_role, &message.recipient_role)) {

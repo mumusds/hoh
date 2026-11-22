@@ -2359,6 +2359,11 @@ impl Reader {
         f(&self.conn).map_err(sqlite_error)
     }
 
+    /// Audit every decision-blocked task and run against its current open question in one read snapshot.
+    pub fn check_question_anchors(&self) -> Result<(), PersistError> {
+        questions::check_anchors(&self.conn)
+    }
+
     pub fn pragmas(&self) -> Result<Pragmas, PersistError> {
         pragmas(&self.conn)
     }
