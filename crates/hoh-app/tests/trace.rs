@@ -439,3 +439,118 @@ async fn trace_export_fixture_is_the_products_current_export() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_032_03_revision_stales_both_chains() -> R {
+    let world = World::new()?;
+    let index = chain_project(&world)?;
+    let (host, run) = approved(&world, &index).await?;
+    let (candidate, _) = frozen(&world, &host, &run).await?;
+    verified(&world, &run, &candidate)?;
+    let before = export(&host, &run).await?;
+    assert_eq!(before["candidate_id"], json!(candidate));
+    assert_eq!(
+        (&before["broken"], &before["orphan"], &before["stale"]),
+        (&json!([]), &json!([]), &json!([])),
+        "revision 1's chain is whole: {before}"
+    );
+    let history = world.rows("SELECT * FROM acceptance_results ORDER BY rowid")?;
+    assert_eq!(history.len(), 4);
+    // Revision 2 rewrites only REQ-A (AC-A-02's then), proposed and approved through the product.
+    let path = world.project().join("docs/spec/spec.md");
+    let text = std::fs::read_to_string(&path)?.replacen("then: result 2", "then: result X", 1);
+    std::fs::write(&path, &text)?;
+    let next = specindex::generate_index(&[Source {
+        path: "docs/spec/spec.md".into(),
+        bytes: text.into_bytes(),
+    }])?;
+    assert_ne!(next.sha256(), index.sha256());
+    for (key, kind, payload) in [
+        (
+            "revise",
+            "ProposeSpecChange",
+            json!({"spec_sha256": next.sha256(), "reason": "revise REQ-A"}),
+        ),
+        (
+            "approve-2",
+            "ApproveSpec",
+            json!({"spec_sha256": next.sha256(), "decision": "APPROVE_ONLY"}),
+        ),
+    ] {
+        let body = command(&host, &run, key, kind, payload).await?;
+        let (status, response) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{kind}: {response}");
+    }
+    let changed =
+        world.query("SELECT json_extract(impact_json, '$.requirements') FROM change_requests")?;
+    assert_eq!(changed, r#"["REQ-A"]"#, "only REQ-A changed");
+    let after = export(&host, &run).await?;
+    assert_eq!(after["spec_revision"], 2, "{after}");
+    assert_eq!(
+        after["candidate_id"],
+        Value::Null,
+        "no current candidate: {after}"
+    );
+    // Every acceptance node of revision 1 is stale, REQ-B's unchanged chain as well as REQ-A's.
+    let stale: Vec<&str> = after["stale"]
+        .as_array()
+        .ok_or("no stale")?
+        .iter()
+        .filter_map(|n| n["ac_id"].as_str())
+        .collect();
+    assert_eq!(
+        stale,
+        ["AC-A-01", "AC-A-02", "AC-B-01", "AC-B-02"],
+        "{after}"
+    );
+    let results = after["results"].as_array().ok_or("no results")?;
+    assert_eq!(results.len(), 4, "history stays: {after}");
+    assert!(
+        results.iter().all(|r| r["stale"] == true
+            && r["spec_revision"] == 1
+            && r["candidate_id"] == json!(candidate)),
+        "{after}"
+    );
+    // No node of revision 2 carries a revision-1 PASS: its acceptance has none, and every revision-1 PASS is an
+    // orphan, outside the current progress.
+    let acceptance = after["acceptance"].as_array().ok_or("no acceptance")?;
+    assert_eq!(acceptance.len(), 4);
+    assert!(
+        acceptance
+            .iter()
+            .all(|a| a["spec_revision"] == 2 && a["statuses"] == json!([])),
+        "{after}"
+    );
+    assert_eq!(after["orphan"].as_array().map(Vec::len), Some(4), "{after}");
+    assert!(
+        after["broken"]
+            .as_array()
+            .ok_or("no broken")?
+            .iter()
+            .all(|b| b["node"] == "test" && b["missing"] == "evidence"),
+        "revision 2 is not verified yet: {after}"
+    );
+    // History is queryable: the rows are unchanged and the API lists them as STALE on the candidate.
+    assert_eq!(
+        world.rows("SELECT * FROM acceptance_results ORDER BY rowid")?,
+        history
+    );
+    let items = all_pages(&host, &format!("/v1/runs/{run}/acceptance")).await?;
+    let old: Vec<&Value> = items.iter().filter(|i| i["spec_revision"] == 1).collect();
+    assert_eq!(old.len(), 4);
+    assert!(
+        old.iter()
+            .all(|i| i["label"] == "STALE" && i["candidate_id"] == json!(candidate)),
+        "{items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .filter(|i| i["spec_revision"] == 2)
+            .all(|i| i["label"] == "NOT_RUN" && i["candidate_id"].is_null()),
+        "{items:?}"
+    );
+    host.shutdown().await;
+    Ok(())
+}
