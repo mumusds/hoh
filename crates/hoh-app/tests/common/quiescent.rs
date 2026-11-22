@@ -230,11 +230,19 @@ c.execute("COMMIT")
 print(json.dumps(out))
 "#;
 
-/// One snapshot of `db` under `quiet`.
-pub fn snapshot(db: &Path, quiet: &Quiet<'_>) -> R<Snapshot> {
+/// One snapshot of `db` under `quiet`, read within `limit`.
+pub fn snapshot(db: &Path, quiet: &Quiet<'_>, limit: Duration) -> R<Snapshot> {
+    snapshot_by(SNAPSHOT, db, quiet, limit)
+}
+
+/// One snapshot of `db` under `quiet` read by `program` (Python, run as [`SNAPSHOT`] is) within `limit`: a program
+/// still running then is killed and reaped ([`super::output_within`]), and that is an error.
+fn snapshot_by(program: &str, db: &Path, quiet: &Quiet<'_>, limit: Duration) -> R<Snapshot> {
     use std::io::Write as _;
+    let reads: Vec<[&str; 2]> = quiet.reads.iter().map(|&(n, s)| [n, s]).collect();
+    let input = serde_json::to_string(&reads)?;
     let mut child = std::process::Command::new("python3")
-        .args(["-c", SNAPSHOT])
+        .args(["-c", program])
         .arg(db)
         .arg(quiet.run)
         .arg(if quiet.dump { "1" } else { "0" })
@@ -242,13 +250,17 @@ pub fn snapshot(db: &Path, quiet: &Quiet<'_>) -> R<Snapshot> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let reads: Vec<[&str; 2]> = quiet.reads.iter().map(|&(n, s)| [n, s]).collect();
-    child
-        .stdin
-        .take()
-        .ok_or("no stdin")?
-        .write_all(serde_json::to_string(&reads)?.as_bytes())?;
-    let out = child.wait_with_output()?;
+    // The reads fit in the pipe's buffer, so this does not wait on the program; its end closes the pipe.
+    let written = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(input.as_bytes()),
+        None => Err(std::io::Error::other("no stdin")),
+    };
+    if let Err(e) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("the snapshot's input: {e}").into());
+    }
+    let out = super::output_within(child, limit).map_err(|e| format!("the snapshot: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "the snapshot failed: {}",
@@ -261,38 +273,88 @@ pub fn snapshot(db: &Path, quiet: &Quiet<'_>) -> R<Snapshot> {
 
 /// The first snapshot of `db`, within `limit`, that is quiet under `quiet` and for which `until` holds (the test's
 /// own condition on the same snapshot: its reads, the run's state). On the bound: an error naming what the last
-/// snapshot still had going on and its reads. Polled, not slept on: it returns as soon as a snapshot is quiet.
+/// snapshot still had going on and its reads. The bound holds throughout: each snapshot gets only the time left (one
+/// still running then is killed and reaped), a snapshot judged after the bound is not accepted, and the pause between
+/// snapshots never runs past it. That pause starts at [`FIRST_PAUSE`] and doubles up to [`LAST_PAUSE`]: a state that
+/// settles at once is seen at once, a long wait costs few snapshots.
 pub fn await_quiescent(
     db: &Path,
     quiet: &Quiet<'_>,
     limit: Duration,
     until: impl Fn(&Snapshot) -> bool,
 ) -> R<Snapshot> {
-    const POLL: Duration = Duration::from_millis(50);
+    await_quiescent_by(SNAPSHOT, db, quiet, limit, until)
+}
+
+/// The first pause between two snapshots of [`await_quiescent`].
+pub const FIRST_PAUSE: Duration = Duration::from_millis(5);
+/// The longest pause between two snapshots of [`await_quiescent`].
+pub const LAST_PAUSE: Duration = Duration::from_millis(80);
+
+/// [`await_quiescent`] with its snapshots read by `program` (Python, run as [`SNAPSHOT`] is, printing a [`Snapshot`]):
+/// a test of the wait's own bound gives it a slow one.
+pub fn await_quiescent_by(
+    program: &str,
+    db: &Path,
+    quiet: &Quiet<'_>,
+    limit: Duration,
+    until: impl Fn(&Snapshot) -> bool,
+) -> R<Snapshot> {
     let end = Instant::now() + limit;
-    loop {
-        let seen = snapshot(db, quiet)?;
-        let differences = seen.differences(quiet);
-        let held = until(&seen);
-        if differences.is_empty() && held {
-            return Ok(seen);
-        }
-        if Instant::now() > end {
-            let message = format!(
-                "not quiescent within {limit:?}: {}; the test's condition {}; run {} {}, reads {:?}",
+    let mut pause = FIRST_PAUSE;
+    // The last snapshot judged: what it still had going on and whether the test's condition held.
+    let mut last: Option<(Snapshot, Vec<String>, bool)> = None;
+    let bound = |last: &Option<(Snapshot, Vec<String>, bool)>, why: &str| {
+        let message = match last {
+            Some((seen, differences, held)) => format!(
+                "not quiescent within {limit:?}{why}: {}; the test's condition {}; run {} {}, reads {:?}",
                 if differences.is_empty() {
                     "the supervisor and attempts quiet".to_owned()
                 } else {
                     differences.join("; ")
                 },
-                if held { "held" } else { "did not hold" },
+                if *held { "held" } else { "did not hold" },
                 quiet.run,
                 seen.run_state,
                 seen.reads
-            );
-            eprintln!("await_quiescent: {message}");
-            return Err(message.into());
+            ),
+            None => format!("not quiescent within {limit:?}{why}: no snapshot was read in time"),
+        };
+        eprintln!("await_quiescent: {message}");
+        message
+    };
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(bound(&last, "").into());
         }
-        std::thread::sleep(POLL);
+        let seen = match snapshot_by(program, db, quiet, left) {
+            Ok(seen) => seen,
+            // The snapshot ran out of the time left: the bound, with what the last snapshot judged showed.
+            Err(e) if Instant::now() >= end => {
+                return Err(
+                    bound(&last, &format!(" (the last snapshot did not finish: {e})")).into(),
+                );
+            }
+            Err(e) => return Err(e),
+        };
+        let differences = seen.differences(quiet);
+        let held = until(&seen);
+        let accepted = differences.is_empty() && held;
+        // A snapshot judged after the bound is not accepted, quiet or not.
+        if Instant::now() >= end {
+            let why = if accepted {
+                " (quiet only after it)"
+            } else {
+                ""
+            };
+            return Err(bound(&Some((seen, differences, held)), why).into());
+        }
+        if accepted {
+            return Ok(seen);
+        }
+        last = Some((seen, differences, held));
+        std::thread::sleep(pause.min(end.saturating_duration_since(Instant::now())));
+        pause = (pause * 2).min(LAST_PAUSE);
     }
 }

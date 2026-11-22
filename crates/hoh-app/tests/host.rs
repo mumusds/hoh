@@ -3590,3 +3590,78 @@ fn a_stop_signal_as_the_host_announces_itself_stops_it_cleanly() -> R {
     assert!(!dir.path().join(".hoh/host.sock").exists());
     Ok(())
 }
+
+/// A snapshot that reads its input and prints a quiet [`common::quiescent::Snapshot`] for a host without a supervisor.
+const QUIET_SNAPSHOT: &str = r#"
+import json, sys
+sys.stdin.read()
+print(json.dumps({"max_seq": 0, "cursor": None, "run_state": "", "pending_triggers": [], "in_flight": [],
+                  "unanswered_wakes": [], "pending_outputs": [], "reads": {}, "dump": None}))
+"#;
+
+/// A snapshot that never finishes in time: it writes its pid to the file named as its database, then sleeps 10 s.
+const SLOW_SNAPSHOT: &str = r#"
+import os, sys, time
+open(sys.argv[1], "w").write(str(os.getpid()))
+time.sleep(10)
+"#;
+
+/// FLK-01 (M3 flakes round 2): await_quiescent's bound holds while its snapshot runs. A snapshot still running at the
+/// bound is killed and reaped, and the wait ends within the limit plus a small margin with the bound's error.
+#[test]
+fn await_quiescent_ends_a_slow_snapshot_at_its_bound() -> R {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let pid_file = dir.path().join("snapshot.pid");
+    let quiet = Quiet::new("run-1", Watermark::Unsupervised);
+    let limit = Duration::from_millis(200);
+    let started = Instant::now();
+    let got =
+        common::quiescent::await_quiescent_by(SLOW_SNAPSHOT, &pid_file, &quiet, limit, |_| true);
+    let took = started.elapsed();
+    let error = got
+        .err()
+        .ok_or("a snapshot still running at the bound was accepted")?;
+    assert!(
+        took < limit + Duration::from_secs(1),
+        "the wait took {took:?} for a limit of {limit:?}: {error}"
+    );
+    assert!(
+        error.to_string().contains("not quiescent within"),
+        "{error}"
+    );
+    let pid = std::fs::read_to_string(&pid_file)?;
+    assert!(
+        !Path::new(&format!("/proc/{}", pid.trim())).exists(),
+        "the snapshot {pid} is still there after the wait: not killed and reaped"
+    );
+    Ok(())
+}
+
+/// FLK-01 (M3 flakes round 2): a quiet snapshot judged after the bound is not accepted: the deadline is checked before
+/// a snapshot is, so the wait never succeeds past its limit.
+#[test]
+fn await_quiescent_does_not_accept_a_snapshot_judged_after_its_bound() -> R {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let quiet = Quiet::new("run-1", Watermark::Unsupervised);
+    let limit = Duration::from_millis(100);
+    let started = Instant::now();
+    let got = common::quiescent::await_quiescent_by(
+        QUIET_SNAPSHOT,
+        &dir.path().join("unused.db"),
+        &quiet,
+        limit,
+        |_| {
+            std::thread::sleep(limit + Duration::from_millis(200));
+            true
+        },
+    );
+    let took = started.elapsed();
+    let error = got.err().ok_or_else(|| {
+        format!("a quiet snapshot judged {took:?} into a {limit:?} wait was accepted")
+    })?;
+    assert!(
+        error.to_string().contains("not quiescent within"),
+        "{error}"
+    );
+    Ok(())
+}
