@@ -9,6 +9,350 @@ fn context() -> Context {
 }
 
 #[tokio::test]
+async fn test_023_01_default_consult_does_not_reserve_candidate_iterations() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-iterations-")
+        .tempdir()?;
+    Host::start(config(dir.path())).await?.shutdown().await;
+    let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z';
+        INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,used_value,price_known) VALUES
+        ('run','R','iterations',10,0,1), ('run','R','wall_seconds',100,0,1),
+        ('run','R','attempts',100,0,1), ('run','R','tokens',1000,0,1),
+        ('run','R','usd',100,0,1);",
+        false,
+    )?;
+    let reply = store
+        .consult_request(message(
+            "no-iterations",
+            json!({
+                "intent":"consult","question":"read-only research near the iteration limit"
+            }),
+        )?)
+        .await?
+        .ok_or("consult")?;
+    let child = reply["task_id"].as_str().ok_or("child")?;
+    sql(
+        dir.path(),
+        "UPDATE budgets SET used_value=9 WHERE scope_kind='run' AND kind='iterations'",
+        false,
+    )?;
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT used_value,reserved_value FROM budgets
+        WHERE scope_kind='run' AND kind='iterations'",
+            true
+        )?,
+        json!([{"used_value":9.0,"reserved_value":0.0}]),
+        "a read-only consult cannot consume a candidate iteration"
+    );
+    assert_eq!(
+        events(dir.path(), "task.consult")?[0]["reserved_budget"],
+        json!({"wall_seconds":10.0,"attempts":10.0,"tokens":100.0,"usd":10.0})
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            &format!(
+                "SELECT count(*) n FROM budgets
+        WHERE scope_kind='task' AND scope_id='{child}' AND kind='iterations'"
+            ),
+            true
+        )?[0]["n"],
+        0
+    );
+    assert_eq!(
+        store
+            .schedule_round("R", context())
+            .await?
+            .dispatched
+            .map(|d| d.task_id),
+        Some(child.into())
+    );
+    assert!(store.pace_run("R", context()).await?.incomplete.is_none());
+    Ok(())
+}
+
+async fn dispatch_decision(
+    store: &hoh_core::persistence::Store,
+    root: &Path,
+    task: &str,
+    id: &str,
+) -> R<hoh_core::persistence::Decided> {
+    let revision = sql(root, "SELECT revision FROM runs WHERE run_id='R'", true)?[0]["revision"]
+        .as_u64()
+        .ok_or("revision")?;
+    Ok(store
+        .decide(
+            hoh_core::decision::Proposal {
+                decision_id: id.into(),
+                run_id: "R".into(),
+                role_epoch: 1,
+                expected_revision: revision,
+                spec_sha256: format!("{:064}", 1),
+                candidate_id: None,
+                causation_id: None,
+                payload: serde_json::from_value(
+                    json!({"kind":"dispatch","task_id":task,"role":"researcher"}),
+                )?,
+            },
+            context(),
+        )
+        .await?)
+}
+
+#[tokio::test]
+async fn test_023_01_consult_own_hold_allows_both_dispatch_paths_at_run_limit() -> R {
+    for kind in ["wall_seconds", "usd"] {
+        for commander in [false, true] {
+            let dir = tempfile::Builder::new()
+                .prefix("m3t10-own-hold-")
+                .tempdir()?;
+            Host::start(config(dir.path())).await?.shutdown().await;
+            let store =
+                hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+            sql(dir.path(), WORLD, false)?;
+            sql(dir.path(), PARTICIPANTS, false)?;
+            sql(
+                dir.path(),
+                &format!(
+                    "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z';
+                INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,reserved_value,price_known)
+                VALUES ('run','R','{kind}',100,20,1);"
+                ),
+                false,
+            )?;
+            let reply = store
+                .consult_request(message(
+                    "own-hold",
+                    json!({
+                        "intent":"consult","question":"use my reserved headroom"
+                    }),
+                )?)
+                .await?
+                .ok_or("consult")?;
+            let child = reply["task_id"].as_str().ok_or("child")?;
+            // The consult owns 8; other reservations own 20. Other work now uses 72.
+            sql(
+                dir.path(),
+                "UPDATE budgets SET used_value=72 WHERE scope_kind='run';
+                INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq,user_value)
+                VALUES ('other','R','s1','READY','researcher',100,5);",
+                false,
+            )?;
+            assert!(
+                matches!(
+                    dispatch_decision(&store, dir.path(), "other", "other-held").await?,
+                    hoh_core::persistence::Decided::Rejected {
+                        reason: hoh_core::protocol::RejectionReason::BudgetNotReservable,
+                        ..
+                    }
+                ),
+                "other work cannot spend the consult's hold"
+            );
+            // Actual exhaustion plus somebody else's reservation still stops the holder.
+            sql(
+                dir.path(),
+                "UPDATE budgets SET used_value=80 WHERE scope_kind='run'",
+                false,
+            )?;
+            assert!(
+                store
+                    .schedule_round("R", context())
+                    .await?
+                    .dispatched
+                    .is_none()
+            );
+            assert!(matches!(
+                dispatch_decision(&store, dir.path(), child, "own-exhausted").await?,
+                hoh_core::persistence::Decided::Rejected {
+                    reason: hoh_core::protocol::RejectionReason::BudgetNotReservable,
+                    ..
+                }
+            ));
+            sql(
+                dir.path(),
+                "UPDATE budgets SET used_value=72 WHERE scope_kind='run'",
+                false,
+            )?;
+            // A consumed part of the slice is never credited again.
+            let (used, reserved) = if kind == "wall_seconds" {
+                (80, 24)
+            } else {
+                (76, 28)
+            };
+            sql(dir.path(), &format!("UPDATE budgets SET used_value=4 WHERE scope_kind='task' AND scope_id='{child}';
+                UPDATE budgets SET used_value={used},reserved_value={reserved} WHERE scope_kind='run';"), false)?;
+            assert!(
+                store
+                    .schedule_round("R", context())
+                    .await?
+                    .dispatched
+                    .is_none()
+            );
+            assert!(
+                matches!(
+                    dispatch_decision(&store, dir.path(), child, "spent-hold").await?,
+                    hoh_core::persistence::Decided::Rejected {
+                        reason: hoh_core::protocol::RejectionReason::BudgetNotReservable,
+                        ..
+                    }
+                ),
+                "{kind}: consumed allocation is not spendable again"
+            );
+            // Restore the unspent fixture and check independent Run gates.
+            sql(
+                dir.path(),
+                "UPDATE budgets SET used_value=0 WHERE scope_kind='task';
+                UPDATE budgets SET used_value=72,reserved_value=28 WHERE scope_kind='run';
+                UPDATE runs SET deadline_at='2020-01-01T00:00:00Z';",
+                false,
+            )?;
+            assert!(
+                store
+                    .schedule_round("R", context())
+                    .await?
+                    .dispatched
+                    .is_none()
+            );
+            assert!(matches!(
+                dispatch_decision(&store, dir.path(), child, "deadline-hold").await?,
+                hoh_core::persistence::Decided::Rejected {
+                    reason: hoh_core::protocol::RejectionReason::BudgetNotReservable,
+                    ..
+                }
+            ));
+            sql(
+                dir.path(),
+                "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z'",
+                false,
+            )?;
+            if kind == "usd" {
+                sql(
+                    dir.path(),
+                    "UPDATE budgets SET price_known=0 WHERE scope_kind='run'",
+                    false,
+                )?;
+                assert!(
+                    store
+                        .schedule_round("R", context())
+                        .await?
+                        .dispatched
+                        .is_none()
+                );
+                assert!(matches!(
+                    dispatch_decision(&store, dir.path(), child, "unknown-price-hold").await?,
+                    hoh_core::persistence::Decided::Rejected {
+                        reason: hoh_core::protocol::RejectionReason::BudgetNotReservable,
+                        ..
+                    }
+                ));
+                sql(
+                    dir.path(),
+                    "UPDATE budgets SET price_known=1 WHERE scope_kind='run'",
+                    false,
+                )?;
+            }
+            drop(store);
+            let store =
+                hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+            if commander {
+                let decided = dispatch_decision(&store, dir.path(), child, "own-allowed").await?;
+                assert!(
+                    !matches!(decided, hoh_core::persistence::Decided::Rejected { .. }),
+                    "{kind} holder dispatch: {decided:?}"
+                );
+            } else {
+                assert_eq!(
+                    store
+                        .schedule_round("R", context())
+                        .await?
+                        .dispatched
+                        .map(|d| d.task_id),
+                    Some(child.into()),
+                    "{kind}: used=72 plus reserved=28 must admit its owner"
+                );
+            }
+            assert_eq!(
+                sql(
+                    dir.path(),
+                    &format!("SELECT count(*) n FROM attempts WHERE task_id='{child}'"),
+                    true
+                )?[0]["n"],
+                1
+            );
+            assert_eq!(
+                sql(
+                    dir.path(),
+                    "SELECT used_value,reserved_value FROM budgets WHERE scope_kind='run'",
+                    true
+                )?,
+                json!([{"used_value":72.0,"reserved_value":28.0}]),
+                "admission does not release the hold"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_01_unused_consult_hold_does_not_end_run_before_dispatch() -> R {
+    for kind in ["wall_seconds", "usd"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-hold-pace-")
+            .tempdir()?;
+        Host::start(config(dir.path())).await?.shutdown().await;
+        let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+        sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), PARTICIPANTS, false)?;
+        sql(
+            dir.path(),
+            &format!(
+                "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z';
+            INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,price_known)
+            VALUES ('run','R','{kind}',100,1);"
+            ),
+            false,
+        )?;
+        store
+            .consult_request(message(
+                "pace-hold",
+                json!({
+                    "intent":"consult","question":"awaiting reserved work"
+                }),
+            )?)
+            .await?
+            .ok_or("consult")?;
+        sql(
+            dir.path(),
+            "UPDATE budgets SET used_value=90 WHERE scope_kind='run';
+            UPDATE attempts SET state='SETTLED' WHERE attempt_id='A';
+            UPDATE tasks SET state='IMPLEMENTED' WHERE task_id='D';",
+            false,
+        )?;
+        assert!(
+            store.pace_run("R", context()).await?.incomplete.is_none(),
+            "{kind}: the unspent hold cannot prematurely end the run"
+        );
+        sql(
+            dir.path(),
+            "UPDATE budgets SET used_value=100 WHERE scope_kind='run'",
+            false,
+        )?;
+        assert!(
+            store.pace_run("R", context()).await?.incomplete.is_some(),
+            "{kind}: actual exhaustion still ends the run"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_023_01_default_slices_reserve_and_release_run_headroom() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t10-reserve-")
@@ -246,69 +590,97 @@ async fn test_023_01_spent_attempts_and_running_time_count_toward_task_limits() 
 
 #[tokio::test]
 async fn test_023_01_exhausted_consultation_returns_a_diagnostic_and_releases_reservation() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t10-exhausted-")
-        .tempdir()?;
-    let host = Host::start(config(dir.path())).await?;
-    let _project_id = host.project_id.clone();
-    host.shutdown().await;
-    // Drive the real Store explicitly so the host sweeper cannot race the gate under test.
-    let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
-    sql(dir.path(), WORLD, false)?;
-    sql(dir.path(), PARTICIPANTS, false)?;
-    sql(
-        dir.path(),
-        "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',100);",
-        false,
-    )?;
-    let reply = store
-        .consult_request(message(
-            "expired",
-            json!({"intent":"consult","question":"expires before dispatch"}),
-        )?)
-        .await?
-        .ok_or("child")?;
-    let child = reply["task_id"].as_str().ok_or("child")?;
-    sql(
-        dir.path(),
-        "UPDATE events SET payload_json=json_set(payload_json,'$.deadline','2026-01-01T00:00:00Z') WHERE kind='task.consult';",
-        false,
-    )?;
-    for _ in 0..2 {
-        store.settle_ended_inputs(&_project_id).await?;
+    for stop in ["consult_deadline", "consult_wall_seconds"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-exhausted-")
+            .tempdir()?;
+        let host = Host::start(config(dir.path())).await?;
+        let _project_id = host.project_id.clone();
+        host.shutdown().await;
+        // Drive the real Store explicitly so the host sweeper cannot race the gate under test.
+        let store = hoh_core::persistence::Store::open(&db(dir.path()), config(dir.path()).store)?;
+        sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), PARTICIPANTS, false)?;
+        sql(
+            dir.path(),
+            "UPDATE runs SET deadline_at='2099-01-01T00:00:00Z'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',100);",
+            false,
+        )?;
+        let reply = store
+            .consult_request(message(
+                "expired",
+                json!({"intent":"consult","question":"expires before dispatch"}),
+            )?)
+            .await?
+            .ok_or("child")?;
+        let child = reply["task_id"].as_str().ok_or("child")?;
+        if stop == "consult_deadline" {
+            sql(
+                dir.path(),
+                "UPDATE events SET payload_json=json_set(payload_json,'$.deadline','2026-01-01T00:00:00Z') WHERE kind='task.consult';",
+                false,
+            )?;
+        } else {
+            sql(
+                dir.path(),
+                "UPDATE budgets SET used_value=10 WHERE scope_kind='task'; UPDATE budgets SET used_value=10,reserved_value=0 WHERE scope_kind='run';",
+                false,
+            )?;
+        }
+        for _ in 0..2 {
+            store.settle_ended_inputs(&_project_id).await?;
+        }
+        assert_eq!(
+            sql(
+                dir.path(),
+                &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
+                true
+            )?[0]["state"],
+            "BLOCKED"
+        );
+        assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
+        assert!(
+            events(dir.path(), "need_decision")?.is_empty(),
+            "Runtime budget/deadline stops notify the parent without an AgentBlocked Commander wake"
+        );
+        assert_eq!(
+            sql(
+                dir.path(),
+                &format!("SELECT blocked_reason FROM tasks WHERE task_id='{child}'"),
+                true
+            )?[0]["blocked_reason"],
+            Value::Null
+        );
+        assert_eq!(
+            sql(
+                dir.path(),
+                "SELECT reserved_value FROM budgets WHERE scope_kind='run'",
+                true
+            )?[0]["reserved_value"],
+            0.0
+        );
+        let input: Value = serde_json::from_str(
+            sql(
+                dir.path(),
+                "SELECT payload_json FROM input_queue WHERE target_role='developer'",
+                true,
+            )?[0]["payload_json"]
+                .as_str()
+                .ok_or("input")?,
+        )?;
+        assert_eq!(
+            input["consultation_diagnostic"]["reason"],
+            "budget_exhausted"
+        );
+        assert_eq!(input["consultation_diagnostic"]["detail"], stop);
+        assert_eq!(input["consultation_diagnostic"]["origin"], "runtime");
+        assert_eq!(
+            events(dir.path(), "task.consult_finished")?[0]["detail"],
+            stop
+        );
+        assert!(input.get("source_message").is_none());
+        drop(store);
     }
-    assert_eq!(
-        sql(
-            dir.path(),
-            &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
-            true
-        )?[0]["state"],
-        "BLOCKED"
-    );
-    assert_eq!(events(dir.path(), "task.consult_finished")?.len(), 1);
-    assert_eq!(
-        sql(
-            dir.path(),
-            "SELECT reserved_value FROM budgets WHERE scope_kind='run'",
-            true
-        )?[0]["reserved_value"],
-        0.0
-    );
-    let input: Value = serde_json::from_str(
-        sql(
-            dir.path(),
-            "SELECT payload_json FROM input_queue WHERE target_role='developer'",
-            true,
-        )?[0]["payload_json"]
-            .as_str()
-            .ok_or("input")?,
-    )?;
-    assert_eq!(
-        input["consultation_diagnostic"]["reason"],
-        "budget_exhausted"
-    );
-    assert!(input.get("source_message").is_none());
-    drop(store);
     Ok(())
 }
 

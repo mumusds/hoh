@@ -802,14 +802,8 @@ fn load_snapshot(
     };
     let budget_stop = match &task {
         Some(task) if proposal.kind() == "dispatch" => {
-            super::retry::budget_stop(tx, run_id, context)?
-                .map(str::to_owned)
-                .or(super::consult::budget_stop(
-                    tx,
-                    &task.task_id,
-                    context.now(),
-                    context.wall(),
-                )?)
+            let budget = super::retry::load_budget(tx, run_id, context.now())?;
+            super::retry::task_budget_stop(tx, run_id, &task.task_id, &budget, context)?
         }
         _ => None,
     };

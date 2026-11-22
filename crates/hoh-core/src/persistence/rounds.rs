@@ -78,11 +78,6 @@ pub(super) fn round(
     if !WORKING.contains(&state) && !retries_only && !reviews_only {
         return Ok(RoundOutcome::default());
     }
-    // A budget that stops the run, or a cost limit it cannot enforce, dispatches nothing more (REQ-042 behaviour 6
-    // and 7; the pace moves the run on, ADR-020 decision 7).
-    if super::retry::budget_stop(&tx, run_id, context)?.is_some() {
-        return Ok(RoundOutcome::default());
-    }
     let params = parameters(&snapshot)?;
     let mut rows = candidates(&tx, run_id, run_spec.as_deref(), context, ctx)?;
     // A round's verifier tasks are the Runtime's: dispatched on a BLOCKED run too (docs/adr/ADR-028.md decision 10).
@@ -443,13 +438,14 @@ fn candidates(
         .map_err(sqlite_error)?;
     let mut rows = Vec::new();
     let mut bindings = std::collections::BTreeMap::new();
+    let budget = super::retry::load_budget(tx, run_id, context.now())?;
     for row in raw {
         let (
             (task_id, state, revision, spec_id, role, writer, created_seq, layer),
             (user, unblock, risk, info, cost, wait_rounds, first_eligible_seq, open, retry),
         ) = row.map_err(sqlite_error)?;
         let state = writer::parse::<TaskState>(&state)?;
-        if super::consult::budget_stop(tx, &task_id, context.now(), context.wall())?.is_some() {
+        if super::retry::task_budget_stop(tx, run_id, &task_id, &budget, context)?.is_some() {
             continue;
         }
         if state == TaskState::Pending && open > 0 {
