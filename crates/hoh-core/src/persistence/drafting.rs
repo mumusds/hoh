@@ -267,3 +267,117 @@ pub(super) fn discovery_due(conn: &Connection, run: &str) -> Result<bool, Persis
     conn.query_row("SELECT EXISTS(SELECT 1 FROM runs r WHERE run_id=?1 AND state='DISCOVERING' AND spec_id IS NULL \
         AND EXISTS(SELECT 1 FROM events WHERE run_id=r.run_id AND kind='spec.draft_requested'))",[run],|r|r.get(0)).map_err(sqlite_error)
 }
+
+fn subject(tx: &Transaction<'_>, attempt: &str) -> Result<(String, String, String), PersistError> {
+    tx.query_row("SELECT r.project_id,t.run_id,t.task_id FROM attempts a JOIN tasks t ON t.task_id=a.task_id JOIN runs r ON r.run_id=t.run_id WHERE a.attempt_id=?1 AND t.kind='spec_draft'",[attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(sqlite_error)
+}
+
+pub(super) fn completed(
+    tx: &Transaction<'_>,
+    attempt: &str,
+    git_commit: &str,
+    files: &super::SpecFiles,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let (project, run, task) = subject(tx, attempt)?;
+    let index =
+        crate::specindex::generate_index(&files.sources).map_err(PersistError::SpecInvalid)?;
+    if files.tracked_index.as_deref() != Some(index.bytes()) {
+        return Err(PersistError::IntegrityViolation(
+            "draft completion index was not committed".into(),
+        ));
+    }
+    let command = child_id(attempt, "draft/completed");
+    let (base, mut events) = super::spec::draft_proposal(tx, &project, &run, &command, files, ctx)?;
+    events.push(event(&project,&run,command.clone(),"spec.draft_completed",json!({"task_id":task,"attempt_id":attempt,"spec_sha256":index.sha256(),"git_commit":git_commit,"base_spec_id":base})));
+    super::draft_approval::move_task(tx, &task, TaskState::Implemented, ctx)?;
+    writer::write(
+        tx,
+        &Commit {
+            events,
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    ask(
+        tx,
+        &project,
+        &run,
+        &task,
+        attempt,
+        super::need::RunReason::SpecApproval,
+        json!({"text":"规格已起草并提交。答复 approve 批准；其他答复退回修改。","spec_sha256":index.sha256(),"git_commit":git_commit,"base_spec_id":base}),
+        ctx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ask(
+    tx: &Transaction<'_>,
+    project: &str,
+    run: &str,
+    task: &str,
+    attempt: &str,
+    reason: super::need::RunReason,
+    mut fields: Value,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    fields["task_id"] = json!(task);
+    fields["attempt_id"] = json!(attempt);
+    let commit = super::need::run_question(
+        tx,
+        super::need::RunQuestion {
+            project_id: project,
+            run_id: run,
+            reason,
+            question_id: child_id(attempt, reason.as_str()),
+            fields,
+            at: &crate::time::rfc3339_utc(ctx.now()),
+            detail: "draft needs the user",
+        },
+        ctx,
+    )?;
+    writer::write(tx, &commit, ctx)?;
+    Ok(())
+}
+
+pub(super) fn blocked(
+    tx: &Transaction<'_>,
+    attempt: &str,
+    detail: &str,
+    paths: Option<&Vec<String>>,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let (project, run, task) = subject(tx, attempt)?;
+    super::draft_approval::move_task(tx, &task, TaskState::Blocked, ctx)?;
+    if let Some(paths) = paths {
+        writer::write(
+            tx,
+            &Commit {
+                events: vec![event(
+                    &project,
+                    &run,
+                    child_id(attempt, "plan/write-violation"),
+                    if paths.is_empty() {
+                        "plan.write_observation_failed"
+                    } else {
+                        "plan.write_violation"
+                    },
+                    json!({"task_id":task,"attempt_id":attempt,"paths":paths,"detail":detail}),
+                )],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
+    ask(
+        tx,
+        &project,
+        &run,
+        &task,
+        attempt,
+        super::need::RunReason::DraftQuestion,
+        json!({"text":detail,"paths":paths}),
+        ctx,
+    )
+}

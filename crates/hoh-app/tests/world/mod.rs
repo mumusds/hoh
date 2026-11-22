@@ -1906,6 +1906,8 @@ pub struct Team {
     work: Option<Duration>,
     /// The project and the verdict of each specification review turn when the Team reviews ([`Team::reviewing`]).
     reviewer: Option<(PathBuf, Box<Reviewer>)>,
+    /// A scripted specification drafter, restricted to this test project.
+    drafter: Option<PathBuf>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1939,6 +1941,7 @@ impl Team {
             script: Box::new(script),
             work: None,
             reviewer: None,
+            drafter: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1956,6 +1959,7 @@ impl Team {
             script: Box::new(script),
             work: Some(hold),
             reviewer: None,
+            drafter: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1974,9 +1978,24 @@ impl Team {
             script: Box::new(script),
             work: None,
             reviewer: Some((project, Box::new(verdict))),
+            drafter: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A mock drafter whose gated process commits generated Markdown and index; no live agent.
+    pub fn drafting(project: PathBuf) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            script: Box::new(|_| Vec::new()),
+            answer: Box::new(|_| None),
+            work: None,
+            reviewer: None,
+            drafter: Some(project),
+            turns: Default::default(),
+            refused: Default::default(),
+            agents: Default::default(),
         })
     }
 
@@ -2053,8 +2072,22 @@ impl Team {
             "status": status, "summary": "规格审查", "candidate_id": null, "evidence": [], "issues": [],
             "next_action": "none"});
         let final_text = "规格审查完成。\n```hoh-report\n{\"status\": \"PASS\", \"scope\": [\"docs/spec\"], \"findings\": []}\n```";
+        let prepared = file.parent().ok_or("no parent")?;
+        let script = if work.assignment.spec_draft {
+            let source=hoh_core::specindex::Source { path:"docs/spec/main.md".into(), bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec() };
+            let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))
+                .map_err(|e| e.to_string())?;
+            std::fs::write(prepared.join("main.md"), source.bytes).map_err(|e| e.to_string())?;
+            std::fs::write(prepared.join("index.json"), index.bytes())
+                .map_err(|e| e.to_string())?;
+            "read -r go || exit 1; set -e; mkdir -p docs/spec; cp -- \"$DRAFT_INPUT/main.md\" docs/spec/main.md; cp -- \"$DRAFT_INPUT/index.json\" docs/spec/index.json; git add docs/spec; git -c user.name=test -c user.email=test@example.invalid commit --allow-empty -qm draft"
+        } else {
+            "read -r go; exit 0"
+        };
         let mut child = Command::new("sh")
-            .args(["-c", "read -r go; exit 0"])
+            .current_dir(project)
+            .env("DRAFT_INPUT", prepared)
+            .args(["-c", script])
             .process_group(0)
             .env(hoh_app::host::ATTEMPT_ENV, work.marker())
             .stdin(Stdio::piped())
@@ -2169,6 +2202,7 @@ impl hoh_app::host::Executor for Team {
         let (answer, ack) = tokio::sync::oneshot::channel();
         if work.role == "commander"
             || self.work.is_some()
+            || (work.assignment.spec_draft && self.drafter.is_some())
             || (work.role == "reviewer" && self.reviewer.is_some())
         {
             let _ = answer.send(Ok(()));
@@ -2192,6 +2226,13 @@ impl hoh_app::host::Executor for Team {
             detail,
             details: None,
         };
+        if work.assignment.spec_draft
+            && let Some(project) = &self.drafter
+        {
+            return self
+                .review(work, project, Verdict::Pass)
+                .map_err(|e| refusal("SPAWN", Some(e)));
+        }
         if let (Some((project, verdict)), "reviewer") = (&self.reviewer, work.role.as_str()) {
             return self
                 .review(work, project, verdict(work))

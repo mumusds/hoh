@@ -807,7 +807,7 @@ async fn submit_command(
             );
         }
     };
-    // Only these command shapes can become a specification approval (answer/REPLY dispatch is wired in S5).
+    // Only these command shapes can become a specification approval (including question answers and untargeted REPLY).
     // Everything else carries no approval authority and must not be delayed by /proc observations.
     let may_approve = matches!(
         &command.body,
@@ -1011,6 +1011,33 @@ async fn submit_command(
                 json!({}),
             )
         }
+    };
+    let target = if let RunTarget::Input(input) = target {
+        let root = shared.root.clone();
+        let files = if may_approve {
+            super::begun::spawn_blocking(move || super::spec::files(&root))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(hoh_core::specindex::IndexError::at(
+                        "docs/spec",
+                        1,
+                        e.to_string(),
+                    ))
+                })
+        } else {
+            Err(hoh_core::specindex::IndexError::at(
+                "docs/spec",
+                1,
+                "not an approval input",
+            ))
+        };
+        RunTarget::ObservedInput {
+            input,
+            origin,
+            files: Box::new(files),
+        }
+    } else {
+        target
     };
     // A new run's id is the host's (CR-003); every other control command names its run.
     let run_id = match (&command.body, &command.run_id) {

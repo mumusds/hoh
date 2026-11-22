@@ -22,6 +22,7 @@ mod closing;
 pub use baseline::BaselineProcess;
 mod consult;
 mod progress;
+mod draft_approval;
 mod drafting;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
@@ -2723,11 +2724,17 @@ impl Reader {
         leases::held(&self.conn, project_id, now)
     }
 
-    /// The run `run_id` with the highest event seq, read together.
+    /// A draft attempt's durable start observation (also used by reconcile).
+    pub fn draft_start(&self, attempt: &str) -> Result<Option<serde_json::Value>, PersistError> {
+        draft_approval::start(&self.conn, attempt)
+    }
+
+    /// Whether the host must take the read-only discovery observation.
     pub fn draft_discovery_due(&self, run: &str) -> Result<bool, PersistError> {
         drafting::discovery_due(&self.conn, run)
     }
 
+    /// The run `run_id` with the highest event seq, read together.
     pub fn snapshot(&self, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
         commands::snapshot(&self.conn, run_id)
     }

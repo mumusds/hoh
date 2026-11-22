@@ -195,7 +195,9 @@ pub(super) fn admit(
         };
         let draft = super::drafting::is_draft(tx, task_id)?;
         // 1. Its revision: of this run, and of its current specification when it has adopted one.
-        let verdict = if task_run != run_id || (run_spec.is_some() && task_spec != run_spec) {
+        let verdict = if task_run != run_id
+            || (run_spec.is_some() && task_spec != run_spec && !(draft && task_spec.is_none()))
+        {
             Err(Refusal::SpecMismatch {
                 task_spec,
                 run_spec: run_spec.clone(),

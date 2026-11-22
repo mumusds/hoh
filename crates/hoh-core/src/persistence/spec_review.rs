@@ -783,7 +783,7 @@ pub(super) fn authors(
                SELECT ?1, 'commander' \
                UNION SELECT t.run_id, t.role FROM tasks t WHERE t.task_id IN (\
                  SELECT json_extract(payload_json, '$.task_id') FROM events WHERE project_id = ?2 \
-                   AND kind = 'spec.drafting' AND json_extract(payload_json, '$.spec_sha256') = ?3)) \
+                   AND kind IN ('spec.draft_completed','spec.drafting') AND json_extract(payload_json, '$.spec_sha256') = ?3)) \
              SELECT b.session_id FROM role_bindings b JOIN roles r ON r.run_id = b.run_id AND r.role = b.role \
                WHERE b.session_id IS NOT NULL \
              UNION SELECT a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \

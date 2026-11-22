@@ -1522,8 +1522,14 @@ async fn attempt(
     // With the watermark of the context its prompt was packed from: failures attached after it were not seen
     // (decision 3's row, M2T16R-01).
     let context_seq = work.assignment.context_seq;
+    let draft = work.assignment.spec_draft;
     let (who, tracking, start) = super::begun::spawn_blocking(move || {
         let start = root.map(|root| {
+            if draft {
+                let mut start = super::drafting::snapshot(&root);
+                start["context_seq"] = json!(context_seq);
+                return start;
+            }
             let head = super::control::git(&root, &["rev-parse", "--verify", "HEAD"])
                 .ok()
                 .map(|out| String::from_utf8_lossy(&out).trim().to_owned());

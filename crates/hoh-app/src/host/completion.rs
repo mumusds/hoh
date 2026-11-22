@@ -175,7 +175,7 @@ fn admissible(project: &Path, dir: &str, path: &str) -> Result<(), String> {
 /// The TaskResult a work attempt's bridge gives (docs/adr/ADR-028.md decision 2), its refused lines added to `ending`'s
 /// events as `bridge.rejected`; or why its output is to be corrected (cut at its limit, missing, or its last TaskResult
 /// refused).
-fn result_of(
+pub(super) fn result_of(
     identity: &Identity,
     ending: &mut Ending,
 ) -> Result<hoh_core::protocol::TaskResult, String> {
@@ -507,10 +507,17 @@ pub(super) async fn complete(
 ) -> Result<WriterCompleted, PersistError> {
     let held = project.to_path_buf();
     let attempt_id = identity.attempt_id.clone();
+    let draft = {
+        let reader = store.reader()?;
+        reader.draft_start(&attempt_id)?
+    };
     let (outcome, ending) = super::begun::spawn_blocking(move || {
         hooks.completing(&identity.attempt_id);
         let mut ending = ending;
-        let outcome = outcome(&held, &identity, &mut ending);
+        let outcome = match draft {
+            Some(start) => super::drafting::outcome(&held, &identity, &mut ending, &start),
+            None => outcome(&held, &identity, &mut ending),
+        };
         (outcome, ending)
     })
     .await

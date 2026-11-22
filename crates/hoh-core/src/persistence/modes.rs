@@ -60,7 +60,7 @@ pub(super) fn set(
         });
     }
     let waiting = writing(tx, &run.run_id)?;
-    change(tx, &run, &command.command_id, mode, waiting, ctx)
+    change(tx, &run, &command.command_id, mode, waiting, true, ctx)
 }
 
 fn change(
@@ -69,6 +69,7 @@ fn change(
     command: &str,
     mode: Mode,
     waiting: bool,
+    touch: bool,
     ctx: &Ctx<'_>,
 ) -> Result<(i64, i64), PersistError> {
     let to = match mode {
@@ -86,11 +87,15 @@ fn change(
     let done = writer::write(
         tx,
         &Commit {
-            cas: vec![StateCas {
-                id: run.run_id.clone(),
-                expected_revision: run.revision,
-                change: Change::Touch(Entity::Run),
-            }],
+            cas: if touch {
+                vec![StateCas {
+                    id: run.run_id.clone(),
+                    expected_revision: run.revision,
+                    change: Change::Touch(Entity::Run),
+                }]
+            } else {
+                Vec::new()
+            },
             events: vec![NewEvent {
                 intent: Intent::Progress,
                 project_id: run.project_id.clone(),
@@ -115,7 +120,10 @@ fn change(
         },
         ctx,
     )?;
-    Ok((done.revisions[0], done.event_seqs[0]))
+    Ok((
+        done.revisions.first().copied().unwrap_or(run.revision),
+        done.event_seqs[0],
+    ))
 }
 
 pub(super) fn step(conn: &mut Connection, run: &str, ctx: &Ctx<'_>) -> Result<bool, PersistError> {
@@ -134,7 +142,7 @@ pub(super) fn step(conn: &mut Connection, run: &str, ctx: &Ctx<'_>) -> Result<bo
     })?;
     let mode: Mode = serde_json::from_value(pending["to"].clone())
         .map_err(|e| PersistError::IntegrityViolation(format!("pending mode: {e}")))?;
-    change(&tx, &row, command, mode, false, ctx)?;
+    change(&tx, &row, command, mode, false, true, ctx)?;
     writer::commit(tx, ctx)?;
     Ok(true)
 }
@@ -162,6 +170,6 @@ pub(super) fn intent(
     let row = super::commands::snapshot_rows(tx, run_id)?
         .map(|(r, _)| r)
         .ok_or_else(|| PersistError::RunNotFound(run_id.into()))?;
-    change(tx, &row, command, mode, writing(tx, run_id)?, ctx)?;
+    change(tx, &row, command, mode, writing(tx, run_id)?, false, ctx)?;
     Ok(())
 }
