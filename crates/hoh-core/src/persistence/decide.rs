@@ -1094,6 +1094,23 @@ pub(super) fn requirements_passed(
     spec_id: &str,
     candidate: &str,
 ) -> Result<BTreeSet<String>, PersistError> {
+    let mut passed = std::collections::BTreeMap::new();
+    for ((requirement, _), satisfied) in criteria_satisfied(conn, run_id, spec_id, candidate)? {
+        *passed.entry(requirement).or_insert(true) &= satisfied;
+    }
+    Ok(passed
+        .into_iter()
+        .filter_map(|(req, ok)| ok.then_some(req))
+        .collect())
+}
+
+/// The same evidence-bound judgement per AC, shared with net progress (ADR-037).
+pub(super) fn criteria_satisfied(
+    conn: &Connection,
+    run_id: &str,
+    spec_id: &str,
+    candidate: &str,
+) -> Result<std::collections::BTreeMap<(String, String), bool>, PersistError> {
     use crate::verification::acceptance::{self, Observation, RowFact, Standing};
     let found: Option<(String, bool, bool)> = conn
         .query_row(
@@ -1106,10 +1123,10 @@ pub(super) fn requirements_passed(
         .optional()
         .map_err(sqlite_error)?;
     let Some((state, frozen_on_it, vetoed)) = found else {
-        return Ok(BTreeSet::new());
+        return Ok(std::collections::BTreeMap::new());
     };
     if !frozen_on_it {
-        return Ok(BTreeSet::new());
+        return Ok(std::collections::BTreeMap::new());
     }
     let standing = match state.as_str() {
         _ if vetoed => Standing::Invalid,
@@ -1138,7 +1155,8 @@ pub(super) fn requirements_passed(
              WHERE x.ac_id = ?1 AND x.spec_id = ?2 AND x.candidate_id = ?3",
         )
         .map_err(sqlite_error)?;
-    let mut passed: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    let mut passed: std::collections::BTreeMap<(String, String), bool> =
+        std::collections::BTreeMap::new();
     for (requirement, degradable, ac, check) in criteria {
         let found: Vec<(String, Option<bool>)> = rows
             .query_map(params![ac, spec_id, candidate, check], |r| {
@@ -1159,12 +1177,9 @@ pub(super) fn requirements_passed(
             && acceptance::display(standing, &observation, None)
                 .label
                 .satisfied();
-        *passed.entry(requirement).or_insert(true) &= satisfied;
+        passed.insert((requirement, ac), satisfied);
     }
-    Ok(passed
-        .into_iter()
-        .filter_map(|(requirement, ok)| ok.then_some(requirement))
-        .collect())
+    Ok(passed)
 }
 
 #[cfg(test)]

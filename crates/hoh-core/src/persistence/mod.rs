@@ -19,6 +19,7 @@ mod blockers;
 mod candidates;
 mod closing;
 pub use baseline::BaselineProcess;
+mod progress;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
 pub use issues::Traced;

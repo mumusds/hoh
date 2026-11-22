@@ -809,6 +809,9 @@ pub(super) fn reconcile_in(
         &mut done,
     )?;
     super::issues::settle_all(tx, run_id, Intent::Progress)?;
+    if !cancelling {
+        super::progress::closed(tx, run_id, &done.closed)?;
+    }
     Ok(done)
 }
 
