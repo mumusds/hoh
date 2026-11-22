@@ -8,6 +8,8 @@ use hoh_core::specindex::{self, Source};
 use std::os::unix::process::ExitStatusExt as _;
 use std::time::{Duration, SystemTime};
 
+mod start_cancel;
+
 fn world() -> R<World> {
     let root = std::env::var_os("HOH_S6_SCRATCH_ROOT")
         .map(std::path::PathBuf::from)
@@ -454,6 +456,21 @@ async fn test_033_02_closed_round_before_approval_keeps_its_history() -> R {
 struct HoldApproval(std::path::PathBuf);
 impl hoh_core::persistence::FaultHooks for HoldApproval {
     fn at(&self, job: &'static str, point: hoh_core::persistence::WritePoint) {
+        use hoh_core::persistence::WritePoint;
+        if let Ok(crash) = std::fs::read_to_string(self.0.join("cancel-crash")) {
+            let hold = match crash.as_str() {
+                "before-approval" => job == "Command" && point == WritePoint::OutboxWritten,
+                "after-approval" => job == "Command" && point == WritePoint::Committed,
+                "after-cancel" => job == "Control" && point == WritePoint::Committed,
+                _ => false,
+            };
+            if hold {
+                assert!(std::fs::write(self.0.join("cancel-crash-held"), b"held").is_ok());
+                while self.0.exists() && self.0.join("cancel-crash").exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
         if job == "Command"
             && point == hoh_core::persistence::WritePoint::Committed
             && self.0.join("hold-approval").exists()
@@ -478,21 +495,22 @@ fn s6_host() -> R {
         std::env::var_os("PATH").ok_or("fake PATH")?,
         Some(root.join("pi-agent")),
     ));
-    let mut config = HostConfig::product_with(
-        &project,
-        hoh_core::config::load(&project)?,
-        world::HOH.into(),
-        registry,
-    );
+    let mut config = if root.join("plain-host").exists() {
+        HostConfig::new(&project)
+    } else {
+        HostConfig::product_with(
+            &project,
+            hoh_core::config::load(&project)?,
+            world::HOH.into(),
+            registry,
+        )
+    };
     config.port = 0;
     config.store.wal_probe = Some(world::probe());
     config.store.faults = std::sync::Arc::new(HoldApproval(root.clone()));
-    config
-        .runner
-        .as_mut()
-        .ok_or("runner")?
-        .context
-        .commander_dir = Some(root.join("state/hoh/commander"));
+    if let Some(runner) = config.runner.as_mut() {
+        runner.context.commander_dir = Some(root.join("state/hoh/commander"));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -540,6 +558,188 @@ fn info(world: &World) -> R<Value> {
     Ok(serde_json::from_slice(&std::fs::read(
         world.project().join(".hoh/host.json"),
     )?)?)
+}
+
+#[test]
+fn test_033_04_cancelled_writer_restart_at_each_commit_boundary() -> R {
+    // M3B-200: actual SIGKILL, persisted approval and the product startup reconcile.
+    // A dead RUNNING process keeps its exact recorded identity; no live agent is used.
+    for (state, expired) in [
+        ("PREPARED", false),
+        ("PREPARED", true),
+        ("STARTING", false),
+        ("RUNNING", false),
+    ] {
+        for point in ["after-approval", "before-approval", "after-cancel"] {
+            let world = world()?;
+            std::fs::write(world.root().join("plain-host"), b"plain")?;
+            world.commit_project(&world::fixture_spec())?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let run = runtime.block_on(async {
+                world.init_store().await?;
+                let host = world.start_plain_host(None).await?;
+                let run = world::start_run(&host, "cancel-start", "cancel recovery").await?;
+                let index = specindex::generate_index(&[Source { path: "docs/spec/fixture.md".into(), bytes: std::fs::read(world.project().join("docs/spec/fixture.md"))? }])?;
+                command(&host, &run, "cancel-initial", "ApproveSpec", json!({"spec_sha256":index.sha256(),"decision":"APPROVE_ONLY"})).await?;
+                world.exec("UPDATE runs SET state='RUNNING',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL;")?;
+                host.shutdown().await;
+                Ok::<_, Box<dyn std::error::Error>>(run)
+            })?;
+            let mut child = child_host(&world)?;
+            let task_state = if state == "RUNNING" {
+                "RUNNING"
+            } else {
+                "LEASED"
+            };
+            let expiry = if expired {
+                "2000-01-01T00:00:00Z"
+            } else {
+                "2099-01-01T00:00:00Z"
+            };
+            world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) SELECT 'cancel-writer',run_id,spec_id,'{task_state}','developer',1,1 FROM runs WHERE run_id='{run}';
+                INSERT INTO task_requirements SELECT 'cancel-writer',requirement_id,spec_id FROM requirements;
+                INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('cancel-attempt','cancel-writer','{state}',1,1,0);
+                INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) SELECT project_id,'writer','cancel-attempt',1,'{expiry}' FROM runs WHERE run_id='{run}';"))?;
+            if state == "RUNNING" {
+                use std::os::unix::process::CommandExt as _;
+                let mut process = std::process::Command::new("sh")
+                    .args(["-c", "read -r end"])
+                    .stdin(std::process::Stdio::piped())
+                    .process_group(0)
+                    .spawn()?;
+                let who = hoh_agents::identity::of(process.id())?.ok_or("owned identity")?;
+                world.exec(&format!("UPDATE attempts SET pid={},boot_id='{}',process_start_id='{}' WHERE attempt_id='cancel-attempt'; INSERT INTO effects(effect_key,attempt_id,state) VALUES('{}','cancel-attempt','STARTED');",process.id(),who.boot_id,who.start_id,hoh_core::reconcile::work_key("cancel-attempt")))?;
+                drop(process.stdin.take());
+                process.wait()?;
+            }
+            let path = "docs/spec/fixture.md";
+            let text = std::fs::read_to_string(world.project().join(path))?;
+            let prefix = text.split("## REQ-").next().ok_or("spec prefix")?;
+            std::fs::write(world.project().join(path), prefix)?;
+            let index = specindex::generate_index(&[Source {
+                path: path.into(),
+                bytes: prefix.as_bytes().to_vec(),
+            }])?;
+            std::fs::write(world.project().join(specindex::PATH), index.bytes())?;
+            world.git(&["add", "docs/spec"])?;
+            world.git(&["commit", "-qm", "remove requirement"])?;
+            remote_command(
+                &world,
+                &run,
+                "cancel-propose",
+                "ProposeSpecChange",
+                json!({"spec_sha256":index.sha256(),"reason":"remove requirement"}),
+            )?;
+            std::fs::write(world.root().join("cancel-crash"), point)?;
+            std::thread::scope(|scope| -> R {
+                let request = scope.spawn(|| {
+                    remote_command(
+                        &world,
+                        &run,
+                        "cancel-approve",
+                        "ApproveSpec",
+                        json!({"spec_sha256":index.sha256(),"decision":"APPROVE_ONLY"}),
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !world.root().join("cancel-crash-held").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{state}/{expired}/{point}: crash barrier"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if point == "before-approval" {
+                    assert_eq!(
+                        world.query("SELECT state FROM tasks WHERE task_id='cancel-writer'")?,
+                        task_state
+                    );
+                    assert_eq!(world.query("SELECT cancel_requested FROM attempts WHERE attempt_id='cancel-attempt'")?, "0");
+                } else {
+                    assert_eq!(
+                        world.query("SELECT state FROM tasks WHERE task_id='cancel-writer'")?,
+                        "CANCELLED"
+                    );
+                    assert_eq!(world.query("SELECT cancel_requested FROM attempts WHERE attempt_id='cancel-attempt'")?, "1");
+                    assert_eq!(
+                        world.query(
+                            "SELECT state FROM attempts WHERE attempt_id='cancel-attempt'"
+                        )?,
+                        if point == "after-cancel" {
+                            "CANCELLED"
+                        } else {
+                            state
+                        }
+                    );
+                }
+                child.0.kill()?;
+                assert_eq!(child.0.wait()?.signal(), Some(9));
+                let result = request.join().map_err(|_| "approval thread")?;
+                if point == "after-cancel" {
+                    result?;
+                } else {
+                    assert!(result.is_err());
+                }
+                Ok(())
+            })?;
+            std::fs::remove_file(world.root().join("cancel-crash"))?;
+            child = child_host(&world)
+                .map_err(|e| format!("{state}/expired={expired}/{point}: {e}"))?;
+            // Host publication follows the startup reconcile, so this is a completion barrier.
+            if point == "before-approval" {
+                assert_eq!(world.query("SELECT count(*) FROM specs")?, "1");
+                remote_command(
+                    &world,
+                    &run,
+                    "cancel-approve",
+                    "ApproveSpec",
+                    json!({"spec_sha256":index.sha256(),"decision":"APPROVE_ONLY"}),
+                )?;
+            }
+            world.wait(
+                "SELECT count(*) FROM attempts WHERE state IN ('PREPARED','STARTING','RUNNING')",
+                "0",
+                Duration::from_secs(15),
+            )?;
+            assert_eq!(
+                world.query("SELECT state FROM tasks WHERE task_id='cancel-writer'")?,
+                "CANCELLED"
+            );
+            if point != "before-approval" {
+                assert_eq!(
+                    world.query("SELECT state FROM attempts WHERE attempt_id='cancel-attempt'")?,
+                    "CANCELLED"
+                );
+            }
+            assert_eq!(world.query("SELECT count(*) FROM leases WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')")?, "0");
+            assert_eq!(
+                world.query("SELECT count(*) FROM attempts")?,
+                "1",
+                "no redispatch"
+            );
+            assert_eq!(
+                world.query("SELECT count(*) FROM events WHERE kind='runner.received'")?,
+                "0"
+            );
+            assert_eq!(world.query("SELECT state FROM runs")?, "RUNNING");
+            let history = world.rows("SELECT state,cancel_requested FROM attempts")?;
+            child.0.kill()?;
+            assert_eq!(child.0.wait()?.signal(), Some(9));
+            child = child_host(&world)?;
+            assert_eq!(
+                world.rows("SELECT state,cancel_requested FROM attempts")?,
+                history
+            );
+            assert_eq!(
+                world.query("SELECT state FROM tasks WHERE task_id='cancel-writer'")?,
+                "CANCELLED"
+            );
+            drop(child);
+            println!("cancel recovery: {state}, expired={expired}, kill={point}: passed");
+        }
+    }
+    Ok(())
 }
 
 fn remote_command(world: &World, run: &str, key: &str, kind: &str, payload: Value) -> R {

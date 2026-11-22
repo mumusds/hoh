@@ -55,7 +55,7 @@ pub struct UnfinishedRow {
     /// the only source of its retry's time on every recovery path (docs/adr/ADR-022.md decision 16's design correction,
     /// rule 3).
     pub work_retry_at: Option<std::time::SystemTime>,
-    /// Its run is being cancelled: it ends CANCELLED, whatever else is found (docs/adr/ADR-021.md decision 8e).
+    /// Cancellation requested by its run or a specification change (ADR-021 decision 8e, ADR-033 Q10).
     pub cancel_requested: bool,
     /// The workspace's record its end carries: none from the scan; the host adds it, taken after its stop, when the
     /// store asks for it (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9).
@@ -374,27 +374,29 @@ fn apply(
             ),
         };
     let tx = writer::begin(conn, ctx)?;
-    // A cancel takes precedence over how the attempt ended: CANCELLED, not counted, no retry; the run's cancel moves
-    // its task (docs/adr/ADR-021.md decision 8e). Read in this transaction, not from the scan: a CancelRun committed
-    // between the scan and this apply counts (M2T06R-02). An unknown effect too: the attempt CANCELLED, its effects
-    // UNKNOWN as the disposition moves them, its task the cancel's (M2T07R-301).
-    let cancel_requested: bool = tx
+    // Cancellation dominates every disposition that proves the process ended, including an expired PREPARED or
+    // unstarted STARTING attempt and a completion awaiting its bridge (M3B-200). Read both facts in this transaction:
+    // approval may have cancelled the task after the scan. The cancel owns the task; no retry or completion may
+    // revive it. Unreaped still needs a termination proof and keeps its slot. Effect moves/diagnostics are retained.
+    let cancelled: bool = tx
         .query_row(
-            "SELECT cancel_requested FROM attempts WHERE attempt_id = ?1",
+            "SELECT a.cancel_requested OR t.state = 'CANCELLED' FROM attempts a \
+             JOIN tasks t ON t.task_id = a.task_id WHERE a.attempt_id = ?1",
             params![row.attempt_id],
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    let (attempt_to, task_to) = match attempt_to {
-        None if cancel_requested && matches!(disposition, Disposition::Redeliver) => {
-            (Some(AttemptState::Cancelled), None)
+    let (attempt_to, task_to) = if cancelled {
+        match disposition {
+            Disposition::Unreaped => (None, None),
+            Disposition::Redeliver
+            | Disposition::Ended { .. }
+            | Disposition::Complete { .. }
+            | Disposition::Completed { .. }
+            | Disposition::UnknownEffect { .. } => (Some(AttemptState::Cancelled), None),
         }
-        Some(AttemptState::Failed | AttemptState::Settled | AttemptState::UnknownEffect)
-            if cancel_requested =>
-        {
-            (Some(AttemptState::Cancelled), None)
-        }
-        other => (other, task_to),
+    } else {
+        (attempt_to, task_to)
     };
     // An attempt left unfinished (redelivered, unreaped) is disposed of again later: each pass its own event ids.
     let pass: i64 = tx

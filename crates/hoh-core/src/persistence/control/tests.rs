@@ -1332,6 +1332,153 @@ async fn a_lost_pass_that_carries_a_new_incomplete_sigterm_is_recorded_after_an_
 }
 
 #[tokio::test]
+async fn test_033_04_cancel_dominates_every_reconcile_disposition() -> R {
+    use crate::lifecycle::AttemptState as A;
+    use crate::protocol::TaskState as T;
+    use crate::reconcile::{Disposition as D, EffectMove, EffectState as E, Process};
+    // M3B-200: both sources of cancellation count, including a commit after the scan.
+    // Unreaped keeps its slot; every other disposition ends cancelled without reviving the task.
+    let cases = [
+        (A::Prepared, D::Redeliver),
+        (
+            A::Prepared,
+            D::Ended {
+                to: A::Cancelled,
+                task_to: T::Ready,
+                effects: vec![],
+            },
+        ),
+        (
+            A::Starting,
+            D::Ended {
+                to: A::Cancelled,
+                task_to: T::Ready,
+                effects: vec![],
+            },
+        ),
+        (
+            A::Running,
+            D::Ended {
+                to: A::Failed,
+                task_to: T::Ready,
+                effects: vec![],
+            },
+        ),
+        (
+            A::Running,
+            D::Completed {
+                effects: vec![],
+                task_to: Some(T::Implemented),
+            },
+        ),
+        (A::Running, D::Complete { effects: vec![] }),
+        (
+            A::Running,
+            D::UnknownEffect {
+                effects: vec![EffectMove {
+                    key: "A1/work".into(),
+                    from: E::Started,
+                    to: E::Unknown,
+                    external_ref: None,
+                }],
+                unknown: vec!["A1/work".into()],
+            },
+        ),
+        (A::Prepared, D::Unreaped),
+        (A::Starting, D::Unreaped),
+        (A::Running, D::Unreaped),
+    ];
+    let mut failures = Vec::new();
+    for (state, disposition) in cases {
+        for (flag, cancelled_task) in [(true, false), (false, true), (true, true)] {
+            for after_scan in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let (store, path) = open(&dir)?;
+                let conn = Connection::open(&path)?;
+                conn.execute_batch(WORLD)?;
+                let task = if state == A::Running {
+                    "RUNNING"
+                } else {
+                    "LEASED"
+                };
+                conn.execute(
+                    "UPDATE attempts SET state=?1 WHERE attempt_id='A1'",
+                    [state.as_str()],
+                )?;
+                conn.execute("UPDATE tasks SET state=?1 WHERE task_id='T1'", [task])?;
+                conn.execute_batch("INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('p1','reader-1','A1',1,'2099-01-01T00:00:00Z');")?;
+                let cancel = || -> R {
+                    conn.execute(
+                        "UPDATE attempts SET cancel_requested=?1 WHERE attempt_id='A1'",
+                        [flag],
+                    )?;
+                    if cancelled_task {
+                        conn.execute_batch("UPDATE tasks SET state='CANCELLED',revision=revision+1 WHERE task_id='T1';")?;
+                    }
+                    Ok(())
+                };
+                if !after_scan {
+                    cancel()?;
+                }
+                let at = parse_rfc3339("2026-11-07T00:00:05Z").ok_or("time")?;
+                let row = store.reconcile_scan("p1", at).await?.remove(0);
+                if after_scan {
+                    cancel()?;
+                }
+                let unreaped = matches!(disposition, D::Unreaped);
+                let process = if unreaped {
+                    Process::Uncertain {
+                        basis: "unconfirmed process".into(),
+                    }
+                } else {
+                    Process::Gone {
+                        basis: "no_process".into(),
+                    }
+                };
+                let result = store
+                    .reconcile_apply(row, disposition.clone(), process, "reconcile", at, 0)
+                    .await;
+                let actual: (String, String, i64, Option<String>, i64) = conn.query_row(
+                    "SELECT a.state,t.state,t.attempt_count,t.next_retry_at,(SELECT count(*) FROM leases WHERE expires_at > '2026-11-07T00:00:05Z') FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id='A1'", [],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+                let expected = (
+                    if unreaped {
+                        state.as_str()
+                    } else {
+                        "CANCELLED"
+                    }
+                    .to_owned(),
+                    if cancelled_task { "CANCELLED" } else { task }.to_owned(),
+                    0,
+                    None,
+                    i64::from(unreaped),
+                );
+                if result.is_err() || actual != expected {
+                    failures.push(format!("{state:?}/{disposition:?}, flag={flag}, cancelled_task={cancelled_task}, after_scan={after_scan}: result={result:?}, actual={actual:?}, expected={expected:?}"));
+                }
+                if matches!(disposition, D::UnknownEffect { .. }) && result.is_ok() {
+                    let effect: String = conn.query_row(
+                        "SELECT state FROM effects WHERE effect_key='A1/work'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(
+                        effect, "UNKNOWN",
+                        "cancellation preserves effect diagnostics"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cancellation remapping gaps:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_cancelled_attempt_ends_cancelled_however_its_runner_or_a_reconcile_ends_it() -> R {
     // ADR-021 decision 8e: an attempt of a cancelled run ends CANCELLED, not counted and with no retry, whether its
     // runner saw its process fail or a later host's reconcile disposes of it.
