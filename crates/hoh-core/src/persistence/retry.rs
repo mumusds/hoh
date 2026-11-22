@@ -245,13 +245,16 @@ pub(super) fn fail_task(
 /// How long an attempt that started at `started` ran by `end`, in whole seconds: never less than its own host life
 /// recorded it ran, to `recorded_end` (its work's OBSERVED end, by the same life's clock as its start), whatever a
 /// later life's `end` says (ADR-020 decision 4, M2T19R-200, -450). A lease time is no evidence of running.
-fn ran(started: SystemTime, end: SystemTime, recorded_end: Option<SystemTime>) -> u64 {
+pub(super) fn ran(started: SystemTime, end: SystemTime, recorded_end: Option<SystemTime>) -> u64 {
     let to = |end: SystemTime| end.duration_since(started).map_or(0, |d| d.as_secs());
     to(end).max(recorded_end.map_or(0, to))
 }
 
 /// The end its work's OBSERVED record holds for `attempt_id`, if any.
-fn observed_end(conn: &Connection, attempt_id: &str) -> Result<Option<SystemTime>, PersistError> {
+pub(super) fn observed_end(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Option<SystemTime>, PersistError> {
     let observed = child_id(&crate::reconcile::work_key(attempt_id), "effect.observed");
     let ended: Option<String> = conn
         .query_row(
@@ -318,6 +321,7 @@ pub(super) fn accrue_wall(
         params![seconds as f64, run_id],
     )
     .map_err(sqlite_error)?;
+    super::consult::accrue_wall(tx, run_id, attempt_id, seconds as f64)?;
     Ok(())
 }
 
@@ -393,7 +397,11 @@ pub(super) fn load_budget(
         for (attempt_id, at) in started {
             if let Some(since) = crate::time::parse_rfc3339(&at) {
                 // As its settlement will count it (M2T19R-450).
-                wall.reserved += ran(since, now, observed_end(tx, &attempt_id)?) as f64;
+                wall.reserved += super::consult::unreserved_wall(
+                    tx,
+                    &attempt_id,
+                    ran(since, now, observed_end(tx, &attempt_id)?) as f64,
+                )?;
             }
         }
     }

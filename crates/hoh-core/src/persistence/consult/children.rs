@@ -75,6 +75,14 @@ pub(super) fn create(
     if budget.is_empty() {
         return Ok(refuse("budget_required"));
     }
+    let reserved = if message.payload.contains_key("budget") {
+        json!({})
+    } else {
+        for (kind, limit) in &budget {
+            tx.execute("UPDATE budgets SET reserved_value=reserved_value+?1 WHERE scope_kind='run' AND scope_id=?2 AND kind=?3",params![limit.as_f64(),message.run_id,kind]).map_err(sqlite_error)?;
+        }
+        json!(budget)
+    };
     let task = child_id(key, "task");
     let waiting = child_id(key, "waiting");
     tx.execute("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,information_gain,layer) SELECT ?1,?2,?3,'READY',?4,0,coalesce(max(created_seq),0)+1,1,1 FROM tasks WHERE run_id=?2",params![task,message.run_id,spec,message.recipient_role]).map_err(sqlite_error)?;
@@ -98,7 +106,7 @@ pub(super) fn create(
                 event_id: child_id(key, "created"),
                 kind: "task.consult".into(),
                 intent: Intent::Progress,
-                payload: json!({"task_id":task,"parent_task_id":message.task_id,"parent_role":message.sender_role,"parent_epoch":message.role_epoch,"recipient_epoch":target_epoch,"spec_id":spec,"role":message.recipient_role,"question":question,"budget":budget,"deadline":deadline,"message_id":message.message_id,"waiting_id":waiting,"source_message":source}),
+                payload: json!({"task_id":task,"parent_task_id":message.task_id,"parent_role":message.sender_role,"parent_epoch":message.role_epoch,"recipient_epoch":target_epoch,"spec_id":spec,"role":message.recipient_role,"question":question,"budget":budget,"reserved_budget":reserved,"deadline":deadline,"message_id":message.message_id,"waiting_id":waiting,"source_message":source}),
             }],
             outbox: vec![NewOutbox {
                 message_id: waiting,

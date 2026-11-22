@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+mod m3t10_fixes;
+
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 fn config(root: &Path) -> HostConfig {
     let mut c = HostConfig::new(root);
@@ -1491,6 +1493,29 @@ async fn test_023_01_reconcile_returns_observed_result_once() -> R {
             true
         )?[0]["n"],
         1
+    );
+    let recovered: Value = serde_json::from_str(
+        sql(
+            dir.path(),
+            "SELECT payload_json FROM input_queue WHERE target_role='developer'",
+            true,
+        )?[0]["payload_json"]
+            .as_str()
+            .ok_or("recovered input")?,
+    )?;
+    assert_eq!(recovered["source_message"]["correlation_id"], "observed");
+    assert_eq!(recovered["source_message"]["kind"], "result");
+    assert_eq!(
+        recovered["source_message"]["payload"]["status"],
+        "COMPLETED"
+    );
+    assert_eq!(
+        recovered["source_message"]["payload"]["summary"],
+        "research outcome"
+    );
+    assert_eq!(
+        recovered["source_message"]["payload"],
+        child_result(child, "observed-child", "COMPLETED")
     );
     restarted
         .store()

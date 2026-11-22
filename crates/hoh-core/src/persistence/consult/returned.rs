@@ -51,7 +51,7 @@ pub(in super::super) fn sweep(
             inputs::exhausted(tx, &input, "CONSULTATION_OBSOLETE", ctx)?;
         }
     }
-    Ok(())
+    super::recovery::sweep(tx, project, ctx)
 }
 fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     let raw:Option<(String,String)>=tx.query_row("SELECT project_id,payload_json FROM events WHERE kind='task.consult' AND json_extract(payload_json,'$.task_id')=?1 ORDER BY seq LIMIT 1",params![task],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
@@ -95,6 +95,41 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         }
     } else if state == "CANCELLED" || latest.as_ref().is_some_and(|(_, s, _)| s == "CANCELLED") {
         reason = Some("cancelled");
+    } else if matches!(state.as_str(), "READY" | "PENDING")
+        && let Some(stop) = super::bounds::stop(tx, task, ctx.now(), ctx.wall())?
+    {
+        reason = Some("budget_exhausted");
+        let event = super::super::need::task_event(
+            tx,
+            super::super::need::TaskNeed {
+                project_id: &project,
+                run_id: &request.run_id,
+                task_id: task,
+                event_id: child_id(&done, "budget"),
+                reason: super::super::need::TaskReason::Work(
+                    super::super::need::WorkReason::AgentBlocked,
+                ),
+                fields: json!({"detail":stop,"origin":"runtime"}),
+            },
+        )?;
+        tx.execute(
+            "UPDATE tasks SET blocked_reason='NEED_DECISION' WHERE task_id=?1",
+            params![task],
+        )
+        .map_err(sqlite_error)?;
+        writer::write(
+            tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: task.into(),
+                    expected_revision: revision,
+                    change: Change::Task(TaskState::Blocked),
+                }],
+                events: vec![event],
+                ..Default::default()
+            },
+            ctx,
+        )?;
     } else if let Some((attempt, attempt_state, epoch)) = &latest {
         if attempt_state == "UNKNOWN_EFFECT" {
             reason = Some("unknown_effect");
@@ -200,6 +235,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
             )?;
         }
     }
+    super::bounds::release(tx, &request.run_id, task, &meta)?;
     let input = child_id(task, "consult/result");
     if parent_current {
         let mut payload = if let Some(result) = &actual {
@@ -284,6 +320,10 @@ pub(in super::super) fn input_current(
         None => Ok(true),
     }
 }
-fn parent_valid(conn: &Connection, run: &str, child: &str) -> Result<bool, PersistError> {
+pub(super) fn parent_valid(
+    conn: &Connection,
+    run: &str,
+    child: &str,
+) -> Result<bool, PersistError> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN tasks t ON t.task_id=json_extract(e.payload_json,'$.parent_task_id') JOIN runs r ON r.run_id=t.run_id WHERE e.run_id=?1 AND e.kind='task.consult' AND json_extract(e.payload_json,'$.task_id')=?2 AND t.state<>'CANCELLED' AND t.spec_id=r.spec_id AND r.spec_id=json_extract(e.payload_json,'$.spec_id'))",params![run,child],|r|r.get(0)).map_err(sqlite_error)
 }
