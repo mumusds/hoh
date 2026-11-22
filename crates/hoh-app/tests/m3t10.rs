@@ -626,3 +626,110 @@ async fn test_023_04_major_decision_escalates_before_dispatch() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_023_02_consult_cycle_and_change_request_issue() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t10-cycle-").tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        r#"
+INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES ('research','R','s1','RUNNING','researcher',1);
+INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES ('AR','research','sr','RUNNING',1,1,1);
+INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES (:p,'waiting','R','task.consult','{}','2026-11-22T00:00:00Z');
+INSERT INTO outbox(message_id,event_seq,run_id,recipient_role,role_epoch,payload_json,state) SELECT 'waiting',seq,'R','researcher',1,'{"kind":"query","sender_role":"developer","recipient_role":"researcher"}','PENDING' FROM events WHERE event_id='waiting';
+"#,
+        false,
+    )?;
+    let before = sql(
+        dir.path(),
+        "SELECT task_id FROM tasks ORDER BY task_id",
+        true,
+    )?;
+    let mut request = message(
+        "cycle",
+        json!({"intent":"consult","question":"Ask developer"}),
+    )?;
+    request.task_id = "research".into();
+    request.attempt_id = "AR".into();
+    request.sender_role = "researcher".into();
+    request.recipient_role = "developer".into();
+    let reply = host
+        .store()
+        .consult_request(request)
+        .await?
+        .ok_or("cycle not handled")?;
+    assert_eq!(reply["reason_code"], "CONSULT_CYCLE");
+    assert_eq!(
+        reply["details"]["members"],
+        json!(["researcher", "developer"])
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT task_id FROM tasks ORDER BY task_id",
+            true
+        )?,
+        before
+    );
+    let mut self_wait = message("self", json!({"intent":"consult","question":"Ask myself"}))?;
+    self_wait.recipient_role = "developer".into();
+    assert_eq!(
+        host.store()
+            .consult_request(self_wait)
+            .await?
+            .ok_or("self wait")?["details"]["members"],
+        json!(["developer"])
+    );
+    round(dir.path(), 1)?;
+    sql(
+        dir.path(),
+        r#"
+INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sq','pi','qa','1','{}');
+INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','qa','pi','sq',1,1,'2026-11-22T00:00:00Z');
+UPDATE tasks SET state='RUNNING' WHERE task_id='q1';
+INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES ('AQ','q1','sq','RUNNING',1,1,1);
+"#,
+        false,
+    )?;
+    let issue = host
+        .store()
+        .verifier_request(hoh_core::persistence::VerifierRequest::RejectChange(
+            hoh_core::persistence::ChangeRequest {
+                run_id: "R".into(),
+                attempt_id: "AQ".into(),
+                message_id: "change".into(),
+                round_id: "r1".into(),
+                candidate_id: "C1".into(),
+                severity: "high".into(),
+                text: "Change the candidate under verification".into(),
+            },
+        ))
+        .await?
+        .ok_or("change issue")?;
+    assert!(
+        events(dir.path(), "request.rejected")?
+            .iter()
+            .any(|r| r["reason_code"] == "ILLEGAL_TRANSITION")
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            &format!("SELECT state FROM issues WHERE issue_id='{issue}'"),
+            true
+        )?[0]["state"],
+        "OPEN"
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM outbox WHERE json_extract(payload_json,'$.kind')='dispatch'",
+            true
+        )?[0]["n"],
+        0
+    );
+    host.shutdown().await;
+    Ok(())
+}
