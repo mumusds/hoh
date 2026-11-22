@@ -226,7 +226,7 @@ pub(in super::super) fn route(
                 return Ok(result);
             }
             let ids: Vec<String> = {
-                let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE run_id=?1 AND target_role=?2 AND kind IN ('STEER','ASK') AND ((state='QUEUED' AND json_extract(payload_json,'$.boundary') IS NOT 'turn' AND coalesce(json_extract(payload_json,'$.after_attempt'),0) < ?3) OR (state='DELIVERED' AND json_extract(payload_json,'$.boundary')='next_attempt' AND json_extract(payload_json,'$.attempt_id')=?4)) ORDER BY rowid").map_err(sqlite_error)?;
+                let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE run_id=?1 AND target_role=?2 AND kind IN ('STEER','ASK') AND state='QUEUED' AND json_extract(payload_json,'$.boundary') IS NOT 'turn' AND coalesce(json_extract(payload_json,'$.after_attempt'),0) < ?3 AND (json_extract(payload_json,'$.attempt_id') IS NULL OR json_extract(payload_json,'$.attempt_id')=?4) ORDER BY rowid").map_err(sqlite_error)?;
                 q.query_map(params![run, role, ordinal, attempt], |r| r.get(0))
                     .map_err(sqlite_error)?
                     .collect::<Result<_, _>>()
@@ -240,11 +240,20 @@ pub(in super::super) fn route(
                     reject(&tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
                     continue;
                 }
-                if row.state == InputState::Queued {
+                if row.payload["attempt_id"] != *attempt {
                     row.payload["boundary"] = json!("next_attempt");
                     row.payload["attempt_id"] = json!(attempt);
                     save(&tx, &row)?;
-                    change(&tx, &row, InputState::Delivered, None, None, ctx)?;
+                    // Prompt preparation is only a reservation. The RUNNING commit confirms delivery before
+                    // opening the process gate; a refusal or crash before that can safely return the input.
+                    event(
+                        &tx,
+                        ctx,
+                        &row.run_id,
+                        child_id(&id, &format!("reserved/{attempt}")),
+                        "input.reserved",
+                        json!({"input_id":id,"attempt_id":attempt,"boundary":"next_attempt"}),
+                    )?;
                     if previous(&tx, &id, &role)?.is_none() {
                         receipt(&tx, &row, std::time::SystemTime::now())?;
                     }
@@ -257,6 +266,31 @@ pub(in super::super) fn route(
     }
     writer::commit(tx, ctx)?;
     Ok(result)
+}
+
+/// Confirm reserved prompt inputs with the Attempt's RUNNING transition, before its external-effect gate opens.
+pub(in super::super) fn start_attempt(
+    tx: &Transaction<'_>,
+    attempt: &str,
+    ctx: &super::super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let ids: Vec<String> = {
+        let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE state='QUEUED' AND json_extract(payload_json,'$.boundary')='next_attempt' AND json_extract(payload_json,'$.attempt_id')=?1 ORDER BY rowid").map_err(sqlite_error)?;
+        q.query_map(params![attempt], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    for id in ids {
+        let mut row = read_input(tx, &id)?
+            .ok_or_else(|| PersistError::IntegrityViolation("reserved input disappeared".into()))?;
+        if !current(tx, &row)? {
+            reject(tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+        } else {
+            change(tx, &row, InputState::Delivered, None, None, ctx)?;
+        }
+    }
+    Ok(())
 }
 
 pub(in super::super) fn finish_attempt(
@@ -277,7 +311,7 @@ pub(in super::super) fn finish_attempt(
         return Ok(());
     };
     let ids: Vec<String> = {
-        let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE state='DELIVERED' AND json_extract(payload_json,'$.attempt_id')=?1").map_err(sqlite_error)?;
+        let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE (state='DELIVERED' OR (state='QUEUED' AND json_extract(payload_json,'$.boundary')='next_attempt')) AND json_extract(payload_json,'$.attempt_id')=?1").map_err(sqlite_error)?;
         q.query_map(params![attempt], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
@@ -288,6 +322,18 @@ pub(in super::super) fn finish_attempt(
             .ok_or_else(|| PersistError::IntegrityViolation("selected input disappeared".into()))?;
         if !current(tx, &row)? {
             reject(tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+        } else if row.state == InputState::Queued {
+            // Still reserved: this Attempt never crossed RUNNING, so none of its prompt inputs were sent.
+            next(&mut row)?;
+            save(tx, &row)?;
+            event(
+                tx,
+                ctx,
+                &row.run_id,
+                child_id(&id, &format!("released/{attempt}")),
+                "input.released",
+                json!({"input_id":id,"attempt_id":attempt,"reason":"attempt_not_started"}),
+            )?;
         } else if state == "SETTLED" {
             change(tx, &row, InputState::Applied, None, None, ctx)?;
         } else {
@@ -302,7 +348,7 @@ pub(in super::super) fn sweep(
     ctx: &super::super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
     let attempts: Vec<String> = {
-        let mut q=tx.prepare("SELECT DISTINCT json_extract(i.payload_json,'$.attempt_id') FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND i.state='DELIVERED' AND json_extract(i.payload_json,'$.attempt_id') IS NOT NULL").map_err(sqlite_error)?;
+        let mut q=tx.prepare("SELECT DISTINCT json_extract(i.payload_json,'$.attempt_id') FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND (i.state='DELIVERED' OR (i.state='QUEUED' AND json_extract(i.payload_json,'$.boundary')='next_attempt')) AND json_extract(i.payload_json,'$.attempt_id') IS NOT NULL").map_err(sqlite_error)?;
         q.query_map(params![project], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()

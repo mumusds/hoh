@@ -450,6 +450,12 @@ pub(super) fn move_attempt(
     if changed != 1 {
         return Err(stale(Some(state)));
     }
+    // Input reservations follow the same durable process boundary on normal completion and reconciliation.
+    if m.to == AttemptState::Running {
+        super::inputs::routing::start_attempt(tx, &m.attempt_id, ctx)?;
+    } else if m.to.is_terminal() || m.to == AttemptState::UnknownEffect {
+        super::inputs::routing::finish_attempt(tx, &m.attempt_id, ctx)?;
+    }
     // A settled attempt ends its task's retry: a task back to READY later (rework, a failed review) is no scheduled
     // retry; the dispatch keeps `next_retry_at` so that a withdrawn retry stays one (docs/adr/ADR-025.md decision 5).
     if m.to == AttemptState::Settled {

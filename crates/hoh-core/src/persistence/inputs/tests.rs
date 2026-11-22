@@ -383,6 +383,192 @@ fn routed_world(path: &Path) -> R {
     Ok(())
 }
 
+async fn unstarted_input_is_returned(reason: &str, reopen: bool) -> R {
+    use crate::lifecycle::AttemptState;
+    use crate::persistence::{AttemptFacts, AttemptMove, InputRouting};
+    let dir = tempfile::Builder::new()
+        .prefix("m3t09-unstarted-")
+        .tempdir()?;
+    let (mut store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("I1")).await?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1';
+        INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A2','T','STARTING','sd',1,1,1);")?;
+    let taken = store
+        .route_input(InputRouting::Take {
+            attempt: "A2".into(),
+        })
+        .await?
+        .inputs;
+    assert_eq!(taken.len(), 1);
+    assert_eq!(
+        store
+            .route_input(InputRouting::Take {
+                attempt: "A2".into()
+            })
+            .await?
+            .inputs,
+        taken
+    );
+    if reopen {
+        drop(store);
+        store = open(&dir)?.0;
+    }
+    store
+        .move_attempt(AttemptMove {
+            attempt_id: "A2".into(),
+            from: AttemptState::Starting,
+            to: AttemptState::Failed,
+            facts: AttemptFacts {
+                failure_reason: Some(reason.into()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    store.settle_ended_inputs("p1").await?;
+    let input = store.reader()?.input("I1")?.ok_or("input")?;
+    assert_eq!(input.state, InputState::Queued, "{reason}: never ran");
+    assert!(input.payload["attempt_id"].is_null());
+    conn.execute_batch("INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A3','T','STARTING','sd',1,1,1),('A4','T','STARTING','sd',1,1,1);")?;
+    assert_eq!(
+        store
+            .route_input(InputRouting::Take {
+                attempt: "A3".into()
+            })
+            .await?
+            .inputs,
+        taken
+    );
+    assert!(
+        store
+            .route_input(InputRouting::Take {
+                attempt: "A4".into()
+            })
+            .await?
+            .inputs
+            .is_empty()
+    );
+    store
+        .move_attempt(AttemptMove {
+            attempt_id: "A3".into(),
+            from: AttemptState::Starting,
+            to: AttemptState::Running,
+            facts: Default::default(),
+        })
+        .await?;
+    assert_eq!(
+        store.reader()?.input("I1")?.ok_or("input")?.state,
+        InputState::Delivered
+    );
+    store
+        .move_attempt(AttemptMove {
+            attempt_id: "A3".into(),
+            from: AttemptState::Running,
+            to: AttemptState::Settled,
+            facts: Default::default(),
+        })
+        .await?;
+    store.settle_ended_inputs("p1").await?;
+    assert_eq!(
+        store.reader()?.input("I1")?.ok_or("input")?.state,
+        InputState::Applied
+    );
+    for kind in ["input.delivered", "input.applied"] {
+        assert_eq!(
+            store
+                .reader()?
+                .events("R")?
+                .iter()
+                .filter(|(k, _)| k == kind)
+                .count(),
+            1,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM receipts WHERE message_id='I1'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_02_unstarted_input_survives_start_refusal() -> R {
+    unstarted_input_is_returned("SPAWN", false).await
+}
+#[tokio::test]
+async fn test_017_02_unstarted_input_survives_prompt_budget_refusal() -> R {
+    unstarted_input_is_returned("CONTEXT_BUDGET", false).await
+}
+#[tokio::test]
+async fn test_017_05_unstarted_input_survives_reopen_before_start() -> R {
+    unstarted_input_is_returned("reconciled before start", true).await
+}
+
+#[tokio::test]
+async fn test_017_02_started_input_is_not_returned_on_failure_or_cancel() -> R {
+    use crate::lifecycle::AttemptState;
+    use crate::persistence::{AttemptMove, InputRouting};
+    for end in [
+        AttemptState::Failed,
+        AttemptState::Cancelled,
+        AttemptState::UnknownEffect,
+    ] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t09-started-")
+            .tempdir()?;
+        let (store, path) = open(&dir)?;
+        routed_world(&path)?;
+        store.enqueue_input(steer("I1")).await?;
+        Connection::open(&path)?.execute_batch("UPDATE attempts SET state='SETTLED' WHERE attempt_id='A1'; INSERT INTO attempts(attempt_id,task_id,state,session_id,role_epoch,host_epoch,config_revision) VALUES ('A2','T','STARTING','sd',1,1,1),('A3','T','STARTING','sd',1,1,1);")?;
+        assert_eq!(
+            store
+                .route_input(InputRouting::Take {
+                    attempt: "A2".into()
+                })
+                .await?
+                .inputs
+                .len(),
+            1
+        );
+        store
+            .move_attempt(AttemptMove {
+                attempt_id: "A2".into(),
+                from: AttemptState::Starting,
+                to: AttemptState::Running,
+                facts: Default::default(),
+            })
+            .await?;
+        store
+            .move_attempt(AttemptMove {
+                attempt_id: "A2".into(),
+                from: AttemptState::Running,
+                to: end,
+                facts: Default::default(),
+            })
+            .await?;
+        store.settle_ended_inputs("p1").await?;
+        assert!(
+            store
+                .route_input(InputRouting::Take {
+                    attempt: "A3".into()
+                })
+                .await?
+                .inputs
+                .is_empty()
+        );
+        let row = store.reader()?.input("I1")?.ok_or("input")?;
+        assert_eq!(row.state, InputState::Rejected);
+        assert_eq!(row.payload["reason"], "attempt_ended");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_017_02_next_attempt_merge_has_a_durable_boundary_and_one_receipt() -> R {
     use crate::persistence::InputRouting;
@@ -449,6 +635,18 @@ async fn test_017_02_next_attempt_merge_has_a_durable_boundary_and_one_receipt()
             .reply,
         routed.reply
     );
+    assert_eq!(
+        store.reader()?.input("I1")?.ok_or("input")?.state,
+        InputState::Queued
+    );
+    store
+        .move_attempt(crate::persistence::AttemptMove {
+            attempt_id: "A2".into(),
+            from: crate::lifecycle::AttemptState::Starting,
+            to: crate::lifecycle::AttemptState::Running,
+            facts: Default::default(),
+        })
+        .await?;
     let events = store.reader()?.events("R")?;
     let delivered: Vec<_> = events
         .iter()
@@ -816,6 +1014,66 @@ async fn test_017_05_both_claim_paths_exclude_verification_even_with_an_input_no
             |r| r.get::<_, String>(0)
         )?,
         "PENDING:0"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_unanswered_turn_at_delivery_limit_preserves_unknown_delivery() -> R {
+    use crate::persistence::{Claimed, InputOutcome, InputRouting};
+    let dir = tempfile::Builder::new().prefix("m3t09-limit-").tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("I1")).await?;
+    let now = std::time::SystemTime::now();
+    let row = store
+        .claim_inputs(now, vec!["developer".into()], 1)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim")?;
+    assert!(
+        store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: Some("A1".into()),
+                now,
+            })
+            .await?
+            .steer
+            .is_some()
+    );
+    assert!(
+        store
+            .claim_inputs(
+                now + std::time::Duration::from_secs(60),
+                vec!["developer".into()],
+                1
+            )
+            .await?
+            .is_none()
+    );
+    let row = store.reader()?.input("I1")?.ok_or("input")?;
+    assert_eq!(row.state, InputState::Rejected);
+    assert_eq!(row.payload["reason"], "UNKNOWN_DELIVERY");
+    // A late successful answer cannot undo the unknown-effect rejection.
+    store
+        .route_input(InputRouting::Finish {
+            input_id: "I1".into(),
+            attempt: "A1".into(),
+            outcome: InputOutcome::Delivered,
+        })
+        .await?;
+    assert_eq!(
+        store.reader()?.input("I1")?.ok_or("input")?.payload["reason"],
+        "UNKNOWN_DELIVERY"
+    );
+    assert_eq!(
+        Connection::open(&path)?.query_row(
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='I1'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "DEAD_LETTER:1"
     );
     Ok(())
 }

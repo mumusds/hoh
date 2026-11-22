@@ -2449,3 +2449,168 @@ async fn test_017_02_runner_exposes_its_exact_turn_steer_sender() -> R {
     assert!(sender.is_closed(), "finished turns close their input port");
     Ok(())
 }
+
+async fn unanswered_steer_at_end(end: &str) -> R {
+    for seen_item in [false, true] {
+        let world = World::new()?;
+        let recorded = Case::load("app-server-steer")?;
+        let mut case = Case {
+            frames: recorded
+                .frames
+                .iter()
+                .take_while(|f| f["id"] != json!(3))
+                .cloned()
+                .collect(),
+            requests: recorded.requests.clone(),
+        };
+        case.frames
+            .push(json!({"hoh_wait":{"method":"turn/steer","count":1}}));
+        if seen_item {
+            case.frames.extend(
+                recorded
+                    .frames
+                    .iter()
+                    .filter(|f| f["params"]["item"]["type"] == "userMessage")
+                    .cloned(),
+            );
+        }
+        match end {
+            "frame" => case
+                .frames
+                .push(json!({"hoh_raw":{"byte":"x","count":2_000_000}})),
+            "cancel" => case
+                .frames
+                .push(json!({"hoh_wait":{"method":"turn/interrupt","count":1}})),
+            "deadline" => case
+                .frames
+                .push(json!({"hoh_wait":{"method":"never","count":1}})),
+            _ => {}
+        }
+        let fake = world.fake("unanswered", Some(&case), "exec", true)?;
+        let mut turn = world.turn(&fake, "logs/unanswered")?;
+        if end == "deadline" {
+            turn.deadline = Some(Duration::from_secs(3));
+        }
+        let held = codex::start(&world.attempt("A1").await?, &turn, &gate(&world)?)?;
+        let start_id = hoh_agents::identity::start_id(held.pid)?.ok_or("start id")?;
+        let sender = held.steers.as_ref().ok_or("sender")?;
+        let (reply, answer) = oneshot::channel();
+        sender
+            .send(Steer {
+                input_id: "I1".into(),
+                text: "Stop running the command now and reply exactly STEERED.".into(),
+                expected_turn: None,
+                reply,
+            })
+            .await?;
+        held.open.send(()).map_err(|()| "gate")?;
+        if end == "cancel" {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if received(&fake)?.iter().any(|f| f["method"] == "turn/steer") {
+                        return R::Ok(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            held.cancel.notify_one();
+        }
+        if end == "deadline" {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if received(&fake)?
+                        .iter()
+                        .any(|f| f["method"] == "turn/interrupt")
+                    {
+                        return R::Ok(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            // Runner mode delegates the kill ladder to the host; emulate that after observing the deadline interrupt.
+            assert!(hoh_agents::identity::signal_if_same(
+                held.pid,
+                &start_id,
+                rustix::process::Signal::KILL
+            )?);
+        }
+        let facts = tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+        let receipt = answer.await?;
+        assert_eq!(
+            received(&fake)?
+                .iter()
+                .filter(|f| f["method"] == "turn/steer")
+                .count(),
+            1,
+            "{end}"
+        );
+        assert!(facts.state != AttemptState::Settled, "{facts:?}");
+        let observed_item=facts.recorded.iter().any(|r|matches!(r,
+            hoh_agents::adapter::Recorded::Event {kind,payload,..}
+                if kind=="adapter.item" && payload["itemId"]=="01a1a3ff-7ed0-7413-aa9c-227e731c4a91"));
+        assert_eq!(
+            observed_item, seen_item,
+            "{end}: the adapter must actually see the matching item"
+        );
+        assert_eq!(
+            receipt,
+            SteerReceipt::Rejected {
+                reason: "UNKNOWN_DELIVERY".into()
+            },
+            "{end}; item seen: {seen_item}"
+        );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn test_017_02_sent_unanswered_steer_on_process_death_is_unknown() -> R {
+    unanswered_steer_at_end("death").await
+}
+#[tokio::test]
+async fn test_017_02_sent_unanswered_steer_on_deadline_is_unknown() -> R {
+    unanswered_steer_at_end("deadline").await
+}
+#[tokio::test]
+async fn test_017_02_sent_unanswered_steer_on_oversized_frame_is_unknown() -> R {
+    unanswered_steer_at_end("frame").await
+}
+#[tokio::test]
+async fn test_017_02_sent_unanswered_steer_on_cancel_is_unknown() -> R {
+    unanswered_steer_at_end("cancel").await
+}
+
+#[tokio::test]
+async fn test_017_02_never_sent_buffered_steers_are_returned_at_gate_close() -> R {
+    let world = World::new()?;
+    let fake = world.fake(
+        "buffered",
+        Some(&Case::load("app-server-steer")?),
+        "exec",
+        false,
+    )?;
+    let turn = world.turn(&fake, "logs/buffered")?;
+    let held = codex::start(&world.attempt("A1").await?, &turn, &gate(&world)?)?;
+    let sender = held.steers.as_ref().ok_or("sender")?;
+    let mut answers = Vec::new();
+    for n in 0..3 {
+        let (reply, answer) = oneshot::channel();
+        sender
+            .send(Steer {
+                input_id: format!("I{n}"),
+                text: "not sent".into(),
+                expected_turn: None,
+                reply,
+            })
+            .await?;
+        answers.push(answer);
+    }
+    drop(held.open);
+    tokio::time::timeout(Duration::from_secs(20), held.ended).await??;
+    for answer in answers {
+        assert_eq!(answer.await.ok(), Some(SteerReceipt::NotNow));
+    }
+    assert!(received(&fake)?.is_empty());
+    Ok(())
+}
