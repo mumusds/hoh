@@ -647,6 +647,7 @@ fn request(world: &World, digest: &str) -> R<hoh_core::persistence::SpecRequest>
         .collect::<R<Vec<_>>>()?;
     let bytes = std::fs::read(world.project().join(specindex::PATH))?;
     Ok(hoh_core::persistence::SpecRequest {
+        origin: hoh_core::origin::Origin::User,
         action: hoh_core::persistence::SpecAction::Propose(hoh_core::protocol::ProposeSpecChange {
             reason: "change".into(),
             spec_sha256: digest.into(),

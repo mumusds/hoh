@@ -12,7 +12,12 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use futures_util::FutureExt as _;
 use futures_util::stream::{self, Stream};
+
+/// Capture starts on accept, but read-only routes and commands with no approval path need not wait for it.
+type ConnectionPeer =
+    futures_util::future::Shared<futures_util::future::BoxFuture<'static, super::origin::Peer>>;
 use hoh_core::persistence::{
     CommandOutcome, EventRow, FileTeam, Input, Intent, NewEvent, NewOutbox, PersistError, Reader,
     RunTarget, Store, SubmitCommand, TeamChange,
@@ -112,10 +117,29 @@ trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
 
 impl Listener {
-    async fn accept(&self) -> std::io::Result<Box<dyn Io>> {
+    async fn accept(&self) -> std::io::Result<(Box<dyn Io>, super::origin::Transport)> {
+        use super::origin::Transport;
         Ok(match self {
-            Listener::Tcp(l) => Box::new(l.accept().await?.0),
-            Listener::Unix(l) => Box::new(l.accept().await?.0),
+            Listener::Tcp(l) => {
+                let (stream, remote) = l.accept().await?;
+                let local = stream.local_addr()?;
+                (Box::new(stream), Transport::Tcp { local, remote })
+            }
+            Listener::Unix(l) => {
+                let (stream, _) = l.accept().await?;
+                let transport = stream
+                    .peer_cred()
+                    .ok()
+                    .and_then(|cred| {
+                        Some(Transport::Unix {
+                            uid: cred.uid(),
+                            pid: u32::try_from(cred.pid()?).ok()?,
+                            inode: rustix::fs::fstat(&stream).ok()?.st_ino,
+                        })
+                    })
+                    .unwrap_or(Transport::Unknown);
+                (Box::new(stream), transport)
+            }
         })
     }
 }
@@ -137,7 +161,7 @@ pub(super) async fn serve(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let stream = match accepted {
+                let (stream, transport) = match accepted {
                     Ok(stream) => stream,
                     Err(e) if matches!(
                         e.kind(),
@@ -155,11 +179,16 @@ pub(super) async fn serve(
                         continue;
                     }
                 };
-                let service = hyper_util::service::TowerToHyperService::new(router.clone());
+                let router = router.clone();
                 let mut conn_stop = stop.clone();
                 // In the host's scope (super::begun): what a request starts is counted; the connection is not, this
                 // loop joins it (ended after the grace) before it returns.
                 connections.spawn(super::begun::scoped(async move {
+                    let capture = super::begun::spawn_blocking(move || super::origin::Peer::capture(transport));
+                    let peer: ConnectionPeer = async move {
+                        capture.await.unwrap_or_else(|_| super::origin::Peer::capture(super::origin::Transport::Unknown))
+                    }.boxed().shared();
+                    let service = hyper_util::service::TowerToHyperService::new(router.layer(axum::Extension(peer)));
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
                         .timer(hyper_util::rt::TokioTimer::new())
@@ -555,10 +584,22 @@ async fn current_revision(shared: &Arc<Shared>, run_id: &str) -> Option<i64> {
         .map(|(run, _)| run.revision)
 }
 
+fn approval_refused(reason: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "code":"SPEC_APPROVAL_NOT_USER", "message":"only a user may approve a specification",
+            "retryable":false, "current_revision":null, "details":{"reason":reason}
+        })),
+    )
+        .into_response()
+}
+
 /// A store error as the API answers it (ADR-016): conflicts are 409 with the current revision, a busy or full
 /// database is 503 and retryable; the database's own text never reaches the client.
 async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Response {
     match e {
+        PersistError::SpecApprovalNotUser(reason) => approval_refused(reason),
         PersistError::SpecConflict(details) => (
             StatusCode::CONFLICT,
             axum::Json(json!({"code":"SPEC_CONFLICT","message":"specification conflicts with the current sources or approved base",
@@ -714,6 +755,7 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
 /// the other kinds come with their tasks and are refused as not yet supported, with nothing written.
 async fn submit_command(
     State(shared): State<Arc<Shared>>,
+    axum::Extension(peer): axum::Extension<ConnectionPeer>,
     body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let Ok(body) = body else {
@@ -764,6 +806,26 @@ async fn submit_command(
             );
         }
     };
+    // Only these command shapes can become a specification approval (answer/REPLY dispatch is wired in S5).
+    // Everything else carries no approval authority and must not be delayed by /proc observations.
+    let may_approve = matches!(
+        &command.body,
+        CommandBody::ApproveSpec(_) | CommandBody::AnswerQuestion(_)
+    ) || matches!(&command.body, CommandBody::SendInput(input) if input.input_kind == hoh_core::protocol::InputKind::Reply && input.target_role.is_none());
+    let origin = if may_approve {
+        let peer = peer.await;
+        super::begun::spawn_blocking(move || peer.origin())
+            .await
+            .unwrap_or(hoh_core::origin::Origin::Unknown)
+    } else {
+        hoh_core::origin::Origin::Unknown
+    };
+    // Refuse before reading the specification or consulting idempotency. The store repeats this guard.
+    if matches!(command.body, CommandBody::ApproveSpec(_))
+        && let Some(reason) = origin.refusal()
+    {
+        return approval_refused(reason);
+    }
     // A new run takes the project's configuration file as it is now: an invalid one refuses it, the last revision
     // staying (docs/adr/ADR-022.md decision 6, REQ-018 failure mode 5).
     let mut effective = None;
@@ -932,6 +994,7 @@ async fn submit_command(
             (
                 name,
                 RunTarget::Specification(Box::new(hoh_core::persistence::SpecRequest {
+                    origin,
                     action,
                     files,
                 })),

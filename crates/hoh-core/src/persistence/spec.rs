@@ -30,8 +30,20 @@ pub enum SpecAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecRequest {
+    /// Observed by the host for this request; never supplied by a client.
+    pub origin: crate::origin::Origin,
     pub action: SpecAction,
     pub files: Result<SpecFiles, IndexError>,
+}
+
+/// The same guard is used before replay and at the approval application point.
+pub(super) fn guard(input: &SpecRequest) -> Result<(), PersistError> {
+    if matches!(input.action, SpecAction::Approve(_))
+        && let Some(reason) = input.origin.refusal()
+    {
+        return Err(PersistError::SpecApprovalNotUser(reason));
+    }
+    Ok(())
 }
 
 struct Approved {
@@ -62,6 +74,7 @@ pub(super) fn apply(
     input: &SpecRequest,
     ctx: &Ctx<'_>,
 ) -> Result<(i64, i64), PersistError> {
+    guard(input)?;
     let run: Option<(String, i64, String)> = tx
         .query_row(
             "SELECT state,revision,project_id FROM runs WHERE run_id=?1",
@@ -398,3 +411,6 @@ fn insert(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
