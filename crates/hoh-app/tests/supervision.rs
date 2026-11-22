@@ -790,7 +790,8 @@ impl hoh_app::host::HostHooks for HoldSuite {
 
 /// [`HoldSuite`] on `suite`, and one tick held just after its staffing (`RunnerPoint::AfterStaffing`, its snapshot of the
 /// registry taken) once `<gate>/arm` exists: the hold takes the arm, says so in `<gate>/held-tick` and waits for
-/// `<gate>/go`, at most 60 s (its worker's other tasks handed on, block_in_place).
+/// `<gate>/go`, at most 60 s (its worker's other tasks handed on, block_in_place); going on, it takes `go`, then
+/// `held-tick`, so another arm holds another tick.
 #[derive(Debug)]
 struct HoldTick {
     suite: PathBuf,
@@ -813,6 +814,8 @@ impl hoh_app::host::HostHooks for HoldTick {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             });
+            let _ = std::fs::remove_file(self.gate.join("go"));
+            let _ = std::fs::remove_file(self.gate.join("held-tick"));
         }
     }
 }
@@ -881,11 +884,18 @@ fn some(rows: &Value) -> bool {
 }
 
 /// The project's approved specification s1, before its run starts: StartRun adopts it (docs/adr/ADR-031.md decision 1;
-/// a run started with none is BLOCKED on runtime:no_spec, and that claim would hold it however the test moves it).
+/// a run started with none is BLOCKED on runtime:no_spec, and that claim would hold it however the test moves it). With
+/// its CURRENT PASS specification review by a session of no run, as the world's revisions have theirs: without it the
+/// run (the project commits no specification) would wait for its review commit and `spec_review.waiting` would wake the
+/// Commander besides the wakes these tests count (docs/adr/ADR-035.md decision 5).
 fn approved(project: &Path) -> R {
     seed(
         project,
-        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);",
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1',
+           NULL, 'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1,
+           'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings',
+           json_array()), '2026-11-07T00:00:00Z');",
     )
 }
 
@@ -1205,8 +1215,9 @@ async fn a_commanders_unavailable_model_falls_back() -> R {
 
 /// docs/adr/ADR-030.md decision 11 (-53, its test plan's "Commander"): the Commander's agent (claude) changes after its
 /// session was granted, and the new implementation's suite is held: staffing keeps the binding (compat pending), and the
-/// allocation writes supervisor.deferred{COMPAT_UNVERIFIED} for the owed wake instead of a turn, its failures not
-/// growing; once the suite published PASS the Commander is bound again and the wake answered, never failed.
+/// allocation writes supervisor.deferred{COMPAT_UNVERIFIED} for the owed wakes (fp-2's; the stall detector's retrigger
+/// when it is owed too) instead of a turn, its failures not growing; once the suite published PASS the Commander is
+/// bound again and each wake answered at its first turn, never failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification() -> R {
     let fakes = Fakes::new()?;
@@ -1217,9 +1228,14 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
     )?;
     fakes.register(hoh_agents::compat::Agent::Claude)?;
     let hold = fakes.dir.path().join("hold");
+    let gate = fakes.dir.path().join("gate");
     std::fs::create_dir_all(&hold)?;
+    std::fs::create_dir_all(&gate)?;
     let mut config = fakes.config();
-    config.hooks = Arc::new(HoldSuite(hold.clone()));
+    config.hooks = Arc::new(HoldTick {
+        suite: hold.clone(),
+        gate: gate.clone(),
+    });
     let host = start_when_free(config).await?;
     let project = fakes.project();
     let outcome = async {
@@ -1253,10 +1269,56 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
             &|r: &Value| r[0]["s"] == "1/1/0",
         )
         .await?;
-        // Another implementation of claude: not verified until its suite, held here, publishes.
-        fakes.claude("B")?;
+        // Nor is any other wake owed: the run's specification has its review ([`approved`]), so no
+        // spec_review.waiting wakes the Commander (docs/adr/ADR-035.md decision 5). Its wake, owed when claude changes,
+        // could be allocated under A just before the change and refused at its start under B (a counted failure,
+        // docs/adr/ADR-030.md decision 11) instead of waiting uncounted as this test's wake does. The run's pace writes
+        // it before the run's supervisor step, so before either wake above is answered.
+        assert_eq!(
+            rows(
+                &db(&project),
+                &format!(
+                    "SELECT count(*) AS n FROM events WHERE run_id = '{run_id}' AND kind = 'spec_review.waiting'"
+                ),
+            )?,
+            json!([{"n": 0}]),
+            "no other wake owed when claude changes"
+        );
+        // Another implementation of claude, not verified until its suite, held here, publishes: written while a tick
+        // is held after its staffing and no turn of the run is in flight (allocated, not ended), so every allocation
+        // from then on re-judges the snapshot's `verified` against the changed files (docs/adr/ADR-030.md decision 11,
+        // the note of 2026-11-17) and no wake is given a turn under A that its start would refuse under B. A wake may
+        // be owed by then without the test's doing: the stall detector's retrigger after a turn without progress
+        // (docs/adr/ADR-031.md), written after the turns above are answered. It waits uncounted as fp-2's does.
         let limit = Duration::from_secs(60);
         let end = Instant::now() + limit;
+        let unfinished = format!(
+            "SELECT count(*) AS n FROM events e JOIN attempts a ON a.attempt_id = json_extract(e.payload_json, \
+             '$.attempt_id') WHERE e.run_id = '{run_id}' AND e.kind = 'supervisor.allocated' AND a.state NOT IN \
+             ('SETTLED', 'FAILED', 'CANCELLED', 'UNKNOWN_EFFECT')"
+        );
+        loop {
+            std::fs::write(gate.join("arm"), "")?;
+            while !gate.join("held-tick").exists() {
+                if Instant::now() > end {
+                    return Err("no tick was held after its staffing".into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if rows(&db(&project), &unfinished)?[0]["n"] == 0 {
+                break;
+            }
+            // A turn is in flight: the tick goes on and it ends, and another tick is held.
+            std::fs::write(gate.join("go"), "")?;
+            while gate.join("held-tick").exists() {
+                if Instant::now() > end {
+                    return Err("the held tick never went on".into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        fakes.claude("B")?;
+        std::fs::write(gate.join("go"), "")?;
         while !hold.join("held").exists() {
             if Instant::now() > end {
                 return Err("claude's suite never ran".into());
@@ -1275,6 +1337,17 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
             &some,
         )
         .await?;
+        // fp-2's wake owed (woken) while claude awaits its suite.
+        let fp2 = until(
+            &project,
+            &format!(
+                "SELECT t.trigger_id AS wake FROM supervisor_triggers t JOIN events e ON e.kind = 'supervisor.woken' \
+                 AND e.event_id = t.trigger_id || '/woken' WHERE t.run_id = '{run_id}' AND t.fingerprint = 'fp-2'"
+            ),
+            limit,
+            &some,
+        )
+        .await?;
         // Ticks go on meanwhile (one each 200 ms): no turn, no other deferral, no failure.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(rows(&db(&project), &turns(&run_id))?, before, "no turn while unverified");
@@ -1286,10 +1359,15 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
             ),
         )?;
         assert_eq!(again, json!([{"n": 1}]), "{deferred}");
-        let wake: Vec<Value> = serde_json::from_str(deferred[0]["wakes"].as_str().unwrap_or("[]"))?;
-        let [wake] = wake.as_slice() else {
-            return Err(format!("one owed wake: {deferred}").into());
-        };
+        // The wakes owed while unverified: those the deferral names (written once, for the wakes owed then) and
+        // fp-2's.
+        let mut wakes: Vec<Value> = serde_json::from_str(deferred[0]["wakes"].as_str().unwrap_or("[]"))?;
+        if wakes.is_empty() {
+            return Err(format!("no owed wake: {deferred}").into());
+        }
+        if !wakes.contains(&fp2[0]["wake"]) {
+            wakes.push(fp2[0]["wake"].clone());
+        }
         std::fs::write(hold.join("release"), "")?;
         let answered = until(
             &project,
@@ -1297,21 +1375,23 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
             limit,
             &|r: &Value| {
                 r.as_array().is_some_and(|a| {
-                    a.iter().any(|t| t["wake"] == *wake && t["state"] == "SETTLED")
+                    wakes.iter().all(|w| a.iter().any(|t| t["wake"] == *w && t["state"] == "SETTLED"))
                 })
             },
         )
         .await?;
-        let of_wake: Vec<&Value> = answered
-            .as_array()
-            .map(|a| a.iter().filter(|t| t["wake"] == *wake).collect())
-            .unwrap_or_default();
-        assert_eq!(of_wake.len(), 1, "answered at its first turn: {answered}");
-        assert_eq!(
-            (&of_wake[0]["agent"], &of_wake[0]["role_epoch"]),
-            (&json!("claude"), &json!(2)),
-            "bound again to the verified implementation: {answered}"
-        );
+        for wake in &wakes {
+            let of_wake: Vec<&Value> = answered
+                .as_array()
+                .map(|a| a.iter().filter(|t| t["wake"] == *wake).collect())
+                .unwrap_or_default();
+            assert_eq!(of_wake.len(), 1, "{wake} answered at its first turn: {answered}");
+            assert_eq!(
+                (&of_wake[0]["agent"], &of_wake[0]["role_epoch"]),
+                (&json!("claude"), &json!(2)),
+                "bound again to the verified implementation: {answered}"
+            );
+        }
         let failures = rows(
             &db(&project),
             &format!(
@@ -1323,6 +1403,7 @@ async fn a_commanders_wake_waits_uncounted_while_its_agent_awaits_verification()
         R::Ok(())
     }
     .await;
+    let _ = std::fs::write(gate.join("go"), "");
     let _ = std::fs::write(hold.join("release"), "");
     host.shutdown().await;
     fakes.stop_fakes();
