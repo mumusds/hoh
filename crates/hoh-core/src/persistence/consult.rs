@@ -1,7 +1,10 @@
 //! Scoped consultation transactions (REQ-023, ADR-037).
+mod bounds;
 mod children;
 mod listing;
+mod recovery;
 mod returned;
+pub(super) use bounds::{accrue_wall, stop as budget_stop, unreserved_wall};
 pub use listing::TasksPage;
 pub(super) use listing::page;
 pub(super) use returned::{finish, input_current, sweep};

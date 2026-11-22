@@ -5,10 +5,10 @@ Baseline: `487fc2beb07cadc77e5e7dd43ad627c33761c8c0`. Both complementary reviews
 | Finding | Severity | Disposition |
 | --- | --- | --- |
 | M3K-01 | medium | Close the opinion phase at its first escalation; new evidence cannot reopen it. |
-| M3K-50 | medium | Pending scoped budget and deadline repair. |
+| M3K-50 | medium | Reserve default slices on the Run, enforce task bounds in both dispatch paths, account for work and release reservations once; ADR-037. |
 | M3K-51 | medium | Clear reported when a severity decrease breaks the window; persist F then G coverage. |
-| M3K-52 | medium | Pending stronger recovered TaskResult assertions. |
-| M3K-53 | medium | Pending recovery of unconfirmed consultation results. |
+| M3K-52 | medium | Recovered input asserts correlation, kind and the complete TaskResult; wrong-summary mutation fails. |
+| M3K-53 | medium | Regenerate verified result content once after the recipient attempt dies; next parent attempt only, no native resend. SIGKILL and fencing regressions. |
 | M3K-02 | low | Addressed in touched progress test: close a fifth round after reopening. |
 | M3K-03 | low | Backlog for M3 low cleanup: configured StartRun and B's fired trigger coverage. |
 | M3K-04 | low | Backlog for M3 low cleanup: namespace discussion and major-decision fingerprints. |

@@ -449,6 +449,9 @@ fn candidates(
             (user, unblock, risk, info, cost, wait_rounds, first_eligible_seq, open, retry),
         ) = row.map_err(sqlite_error)?;
         let state = writer::parse::<TaskState>(&state)?;
+        if super::consult::budget_stop(tx, &task_id, context.now(), context.wall())?.is_some() {
+            continue;
+        }
         if state == TaskState::Pending && open > 0 {
             continue;
         }

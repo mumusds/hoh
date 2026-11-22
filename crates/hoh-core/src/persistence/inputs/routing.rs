@@ -152,7 +152,9 @@ pub(in super::super) fn route(
                 // A prior sender crossed the external-effect boundary. Never send it a second time blindly.
                 reject(&tx, &mut row, "UNKNOWN_DELIVERY", ctx)?;
             } else if row.state == InputState::Queued {
-                let active = if let Some(id) = attempt.as_ref().filter(|_| row.kind == "STEER") {
+                let active = if let Some(id) = attempt.as_ref().filter(|_| {
+                    row.kind == "STEER" && row.payload.get("consultation_recovery_of").is_none()
+                }) {
                     tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t USING(task_id) JOIN runs r USING(run_id) WHERE a.attempt_id=?1 AND a.state='RUNNING' AND t.run_id=?2 AND t.role=?3 AND a.role_epoch=?4 AND r.state IN ('RUNNING','VERIFYING'))",params![id,row.run_id,claimed.recipient_role,claimed.role_epoch],|r|r.get::<_,bool>(0)).map_err(sqlite_error)?
                 } else {
                     false
@@ -227,7 +229,7 @@ pub(in super::super) fn route(
                 return Ok(result);
             }
             let ids: Vec<String> = {
-                let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE run_id=?1 AND target_role=?2 AND kind IN ('STEER','ASK') AND state='QUEUED' AND json_extract(payload_json,'$.boundary') IS NOT 'turn' AND coalesce(json_extract(payload_json,'$.after_attempt'),0) < ?3 AND (json_extract(payload_json,'$.attempt_id') IS NULL OR json_extract(payload_json,'$.attempt_id')=?4) ORDER BY rowid").map_err(sqlite_error)?;
+                let mut q=tx.prepare("SELECT input_id FROM input_queue WHERE run_id=?1 AND target_role=?2 AND kind IN ('STEER','ASK') AND state='QUEUED' AND json_extract(payload_json,'$.boundary') IS NOT 'turn' AND coalesce(json_extract(payload_json,'$.after_attempt'),0) < ?3 AND (json_extract(payload_json,'$.attempt_id') IS NULL OR json_extract(payload_json,'$.attempt_id')=?4) AND (json_extract(payload_json,'$.consultation_parent_task_id') IS NULL OR json_extract(payload_json,'$.consultation_parent_task_id')=(SELECT task_id FROM attempts WHERE attempt_id=?4)) ORDER BY rowid").map_err(sqlite_error)?;
                 q.query_map(params![run, role, ordinal, attempt], |r| r.get(0))
                     .map_err(sqlite_error)?
                     .collect::<Result<_, _>>()
