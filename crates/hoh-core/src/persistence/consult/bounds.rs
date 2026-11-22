@@ -33,74 +33,88 @@ pub(in super::super) fn stop(
         })
         .map_err(sqlite_error)?;
     for row in rows {
-        let (kind, limit, mut used, reserved, known) = row.map_err(sqlite_error)?;
+        let (kind, limit, used, reserved, known) = row.map_err(sqlite_error)?;
         let Some(limit) = limit else {
             continue;
         };
         if kind == "usd" && !known {
             return Ok(Some("consult_usd_price_unknown".into()));
         }
-        if kind == "attempts" {
-            let attempts: f64 = tx
-                .query_row(
-                    "SELECT count(*) FROM attempts WHERE task_id=?1",
-                    params![task],
-                    |r| r.get(0),
-                )
-                .map_err(sqlite_error)?;
-            used = used.max(attempts);
-        }
-        if kind == "wall_seconds" {
-            let mut q=tx.prepare("SELECT attempt_id,started_at FROM attempts WHERE task_id=?1 AND state IN ('STARTING','RUNNING') AND started_at IS NOT NULL").map_err(sqlite_error)?;
-            for row in q
-                .query_map(params![task], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .map_err(sqlite_error)?
-            {
-                let (attempt, started) = row.map_err(sqlite_error)?;
-                if let Some(started) = crate::time::parse_rfc3339(&started) {
-                    used += super::super::retry::ran(
-                        started,
-                        now,
-                        super::super::retry::observed_end(tx, &attempt)?,
-                    ) as f64;
-                }
-            }
-        }
-        if matches!(kind.as_str(), "tokens" | "usd") {
-            let mut q=tx.prepare("SELECT usage_json,cost_usd FROM attempts WHERE task_id=?1 AND state NOT IN ('PREPARED','STARTING','RUNNING') AND started_at IS NOT NULL").map_err(sqlite_error)?;
-            let mut total = 0.0;
-            for row in q
-                .query_map(params![task], |r| {
-                    Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<f64>>(1)?))
-                })
-                .map_err(sqlite_error)?
-            {
-                let (usage, cost) = row.map_err(sqlite_error)?;
-                let usage: Value = usage
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()
-                    .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?
-                    .unwrap_or(Value::Null);
-                let value = if kind == "usd" {
-                    cost.or_else(|| usage["reported_cost_usd"].as_f64())
-                } else {
-                    tokens(&usage)
-                };
-                let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
-                    return Ok(Some(format!("consult_{kind}_usage_unknown")));
-                };
-                total += value;
-            }
-            used = used.max(total);
-        }
+        let Some(used) = consumed(tx, task, &kind, used, now)? else {
+            return Ok(Some(format!("consult_{kind}_usage_unknown")));
+        };
         if used + reserved >= limit {
             return Ok(Some(format!("consult_{kind}")));
         }
     }
     Ok(None)
 }
+/// Actual task consumption, shared by its limit and its remaining Run reservation.
+fn consumed(
+    tx: &Transaction<'_>,
+    task: &str,
+    kind: &str,
+    mut used: f64,
+    now: SystemTime,
+) -> Result<Option<f64>, PersistError> {
+    if kind == "attempts" {
+        let attempts: f64 = tx
+            .query_row(
+                "SELECT count(*) FROM attempts WHERE task_id=?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        used = used.max(attempts);
+    }
+    if kind == "wall_seconds" {
+        let mut q=tx.prepare("SELECT attempt_id,started_at FROM attempts WHERE task_id=?1 AND state IN ('STARTING','RUNNING') AND started_at IS NOT NULL").map_err(sqlite_error)?;
+        for row in q
+            .query_map(params![task], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_error)?
+        {
+            let (attempt, started) = row.map_err(sqlite_error)?;
+            if let Some(started) = crate::time::parse_rfc3339(&started) {
+                used += super::super::retry::ran(
+                    started,
+                    now,
+                    super::super::retry::observed_end(tx, &attempt)?,
+                ) as f64;
+            }
+        }
+    }
+    if matches!(kind, "tokens" | "usd") {
+        let mut q=tx.prepare("SELECT usage_json,cost_usd FROM attempts WHERE task_id=?1 AND state NOT IN ('PREPARED','STARTING','RUNNING') AND started_at IS NOT NULL").map_err(sqlite_error)?;
+        let mut total = 0.0;
+        for row in q
+            .query_map(params![task], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<f64>>(1)?))
+            })
+            .map_err(sqlite_error)?
+        {
+            let (usage, cost) = row.map_err(sqlite_error)?;
+            let usage: Value = usage
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?
+                .unwrap_or(Value::Null);
+            let value = if kind == "usd" {
+                cost.or_else(|| usage["reported_cost_usd"].as_f64())
+            } else {
+                tokens(&usage)
+            };
+            let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.0) else {
+                return Ok(None);
+            };
+            total += value;
+        }
+        used = used.max(total);
+    }
+    Ok(Some(used))
+}
+
 fn tokens(usage: &Value) -> Option<f64> {
     // Native adapter usage shapes: Codex app-server/exec, Pi, Claude.
     usage
@@ -121,6 +135,53 @@ fn tokens(usage: &Value) -> Option<f64> {
                         .unwrap_or(0.0),
             )
         })
+}
+
+/// Credit only unspent, unreleased allocations in a budget view, never in the ledger.
+/// A target owns only its own credit; Run completion excludes all unspent holds.
+pub(in super::super) fn exclude_unused_holds(
+    tx: &Transaction<'_>,
+    run: &str,
+    task: Option<&str>,
+    now: SystemTime,
+    budget: &mut crate::budget::Budget,
+) -> Result<(), PersistError> {
+    let mut q = tx.prepare(
+        "SELECT b.scope_id,b.kind,json_extract(e.payload_json,'$.reserved_budget.' || b.kind),b.used_value
+         FROM events e JOIN budgets b ON b.scope_kind='task'
+           AND b.scope_id=json_extract(e.payload_json,'$.task_id')
+         WHERE e.run_id=?1 AND e.kind='task.consult' AND (?2 IS NULL OR b.scope_id=?2)
+           AND b.kind IN ('wall_seconds','usd')
+           AND json_extract(e.payload_json,'$.reserved_budget.' || b.kind) IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM events d WHERE d.run_id=e.run_id
+             AND d.kind='task.consult_finished' AND json_extract(d.payload_json,'$.task_id')=b.scope_id)",
+    ).map_err(sqlite_error)?;
+    for row in q
+        .query_map(params![run, task], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+    {
+        let (task, kind, allocated, used) = row.map_err(sqlite_error)?;
+        // Unknown consumption grants no credit; the task's own bound also refuses admission.
+        let Some(used) = consumed(tx, &task, &kind, used, now)? else {
+            continue;
+        };
+        let ledger = if kind == "wall_seconds" {
+            budget.wall_seconds.as_mut()
+        } else {
+            budget.usd.as_mut().map(|(ledger, _)| ledger)
+        };
+        if let Some(ledger) = ledger {
+            ledger.reserved = (ledger.reserved - (allocated - used).max(0.0)).max(0.0);
+        }
+    }
+    Ok(())
 }
 
 /// The part of running time not already covered by this consultation's allocation.

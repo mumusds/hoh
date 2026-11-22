@@ -77,6 +77,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
     let latest:Option<(String,String,i64)>=tx.query_row("SELECT attempt_id,state,role_epoch FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",params![task],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sqlite_error)?;
     let mut actual = None;
     let mut reason = None;
+    let mut detail = None;
     if !parent_current {
         reason = Some("obsolete_parent");
         if !matches!(state.as_str(), "CANCELLED" | "ACCEPTED") {
@@ -99,21 +100,10 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         && let Some(stop) = super::bounds::stop(tx, task, ctx.now(), ctx.wall())?
     {
         reason = Some("budget_exhausted");
-        let event = super::super::need::task_event(
-            tx,
-            super::super::need::TaskNeed {
-                project_id: &project,
-                run_id: &request.run_id,
-                task_id: task,
-                event_id: child_id(&done, "budget"),
-                reason: super::super::need::TaskReason::Work(
-                    super::super::need::WorkReason::AgentBlocked,
-                ),
-                fields: json!({"detail":stop,"origin":"runtime"}),
-            },
-        )?;
+        detail = Some(stop);
+        // The parent receives the Runtime diagnostic; no AgentBlocked question is fabricated.
         tx.execute(
-            "UPDATE tasks SET blocked_reason='NEED_DECISION' WHERE task_id=?1",
+            "UPDATE tasks SET blocked_reason=NULL WHERE task_id=?1",
             params![task],
         )
         .map_err(sqlite_error)?;
@@ -125,7 +115,6 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                     expected_revision: revision,
                     change: Change::Task(TaskState::Blocked),
                 }],
-                events: vec![event],
                 ..Default::default()
             },
             ctx,
@@ -271,7 +260,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 serde_json::to_value(&message).map_err(|e| PersistError::Storage(e.to_string()))?;
             json!({"text":source.to_string(),"source_message":source})
         } else {
-            json!({"text":format!("Consultation {task} ended without a result: {}",reason.unwrap_or("unavailable")),"consultation_diagnostic":{"task_id":task,"correlation_id":request.message_id,"reason":reason,"origin":"runtime"}})
+            json!({"text":format!("Consultation {task} ended without a result: {}{}",reason.unwrap_or("unavailable"),detail.as_ref().map(|s|format!(" ({s})")).unwrap_or_default()),"consultation_diagnostic":{"task_id":task,"correlation_id":request.message_id,"reason":reason,"detail":detail,"origin":"runtime"}})
         };
         payload["consultation_task_id"] = json!(task);
         inputs::enqueue(
@@ -305,7 +294,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         &request,
         done,
         "task.consult_finished",
-        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"status":actual.as_ref().map(|r|r.status)}),
+        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":actual.as_ref().map(|r|r.status)}),
     )?;
     Ok(())
 }

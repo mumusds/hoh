@@ -4,7 +4,7 @@ mod children;
 mod listing;
 mod recovery;
 mod returned;
-pub(super) use bounds::{accrue_wall, stop as budget_stop, unreserved_wall};
+pub(super) use bounds::{accrue_wall, exclude_unused_holds, stop as budget_stop, unreserved_wall};
 pub use listing::TasksPage;
 pub(super) use listing::page;
 pub(super) use returned::{finish, input_current, sweep};

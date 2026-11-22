@@ -424,6 +424,29 @@ pub(super) fn budget_stop(
     })
 }
 
+/// The Run gate for this task: its own unconsumed consult hold is available to it.
+pub(super) fn task_budget_stop(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    task: &str,
+    budget: &Budget,
+    context: &Context,
+) -> Result<Option<String>, PersistError> {
+    let mut available = budget.clone();
+    super::consult::exclude_unused_holds(tx, run_id, Some(task), context.now(), &mut available)?;
+    let stop = if budget::unenforceable(&available) {
+        Some("max_usd with an unknown price")
+    } else {
+        budget::stop(&available, context.wall()).map(budget::Stop::as_str)
+    };
+    Ok(stop.map(str::to_owned).or(super::consult::budget_stop(
+        tx,
+        task,
+        context.now(),
+        context.wall(),
+    )?))
+}
+
 /// What a pace did to a run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Paced {
@@ -1007,7 +1030,9 @@ pub(super) fn budget_and_stop(
     wall: SystemTime,
 ) -> Result<(Budget, Option<budget::Stop>), PersistError> {
     let budget = load_budget(tx, run_id, now)?;
-    let stop = budget::stop(&budget, wall);
+    let mut consumed = budget.clone();
+    super::consult::exclude_unused_holds(tx, run_id, None, now, &mut consumed)?;
+    let stop = budget::stop(&consumed, wall);
     Ok((budget, stop))
 }
 

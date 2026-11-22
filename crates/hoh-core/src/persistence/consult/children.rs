@@ -59,7 +59,8 @@ pub(super) fn create(
             budget.insert(kind.clone(), value.clone());
         }
     } else {
-        let mut q=tx.prepare("SELECT kind,max(0,limit_value-used_value-reserved_value)/10.0 FROM budgets WHERE scope_kind='run' AND scope_id=?1 AND limit_value IS NOT NULL ORDER BY kind").map_err(sqlite_error)?;
+        // Read-only consultations consume work, never candidate/verification iterations.
+        let mut q=tx.prepare("SELECT kind,max(0,limit_value-used_value-reserved_value)/10.0 FROM budgets WHERE scope_kind='run' AND scope_id=?1 AND kind IN ('wall_seconds','attempts','tokens','usd') AND limit_value IS NOT NULL ORDER BY kind").map_err(sqlite_error)?;
         for row in q
             .query_map(params![message.run_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
