@@ -45,6 +45,8 @@ async fn setup() -> R<(tempfile::TempDir, PathBuf)> {
                 mode: "AUTO".to_owned(),
                 budget: Config::default().budget,
                 policy: "balanced".to_owned(),
+                assumptions: Default::default(),
+                unattended: true,
             },
             event: NewEvent {
                 intent: Intent::Progress,

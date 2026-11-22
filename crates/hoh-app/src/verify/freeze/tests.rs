@@ -177,6 +177,8 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
         serde_json::to_vec_pretty(&tampered)?,
     )?;
     git(root, &["commit", "-qam", "manual index edit"])?;
+    // Objects present before the refused freeze (the Run's resource bundle pin writes some, M3-T03): the refusal adds none.
+    let objects_before = object_files(root)?;
     let result = freeze(&store, root, &root.join(".hoh"), "R", &inputs()).await;
     assert!(
         result.is_err(),
@@ -187,8 +189,9 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
         error.contains("SPEC_INVALID") && error.contains("docs/spec/index.json"),
         "{error}"
     );
-    assert!(
-        !root.join(".hoh/objects").exists(),
+    assert_eq!(
+        object_files(root)?,
+        objects_before,
         "refused freeze stores no candidate object"
     );
     assert_eq!(rows(root, "SELECT * FROM candidates")?, json!([]));
@@ -341,4 +344,28 @@ fn test_034_04_freeze_rejects_index_including_ignored_markdown() -> R {
         Err(FreezeError::SpecInvalid(_))
     ));
     Ok(())
+}
+
+/// Every file under the project's object directory (`.hoh/objects`), relative and sorted; empty when it does not exist.
+fn object_files(root: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let base = root.join(".hoh/objects");
+    let mut out = Vec::new();
+    let mut stack = vec![base.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                stack.push(entry.path());
+            } else {
+                out.push(entry.path().strip_prefix(&base)?.display().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
