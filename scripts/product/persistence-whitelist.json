@@ -1,5 +1,5 @@
 {
- "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit. read_as_data (CR-019) lists the JSON or Markdown files a member's literal may name although they mention SQLite: read as data, each with its reason, none holding a SQL write. append_only_allow (docs/adr/ADR-029.md decision 6, check 7) lists, by file, function and statement, the only places a member's Rust source may change or remove a row of acceptance_results or evidence, each with its reason; anywhere else such a write is a hit, and an entry without a reason or no longer used is itself a hit.",
+ "description": "AC-062-05 whitelist configuration (scripts/product/persistence_scan.py check 6). Besides the Persistence module (crates/hoh-core/src/persistence/) and the members' Rust sources (checked by clippy and the literal rules), only the files listed here, and Markdown under docs/ and reports/, may mention SQLite or hold a SQL write statement. Each entry says why; an entry that no longer needs to be here is itself a hit. read_as_data (CR-019) lists the JSON or Markdown files a member's literal may name although they mention SQLite: read as data, each with its reason, none holding a SQL write. embedded_markdown (CR-034) lists the Markdown files under resources/ that product code may embed with include_str!/include_bytes! and name although their prose mentions SQLite: each by its own path (a regular, non-executable file reached through no symbolic link), with its reason, holding no SQL write. append_only_allow (docs/adr/ADR-029.md decision 6, check 7) lists, by file, function and statement, the only places a member's Rust source may change or remove a row of acceptance_results or evidence, each with its reason; anywhere else such a write is a hit, and an entry without a reason or no longer used is itself a hit.",
  "files": {
   "CHANGELOG.md": "release notes describing the store",
   "CONTRACT.md": "architecture contract naming SQLite as the store",
@@ -36,6 +36,7 @@
   "tools/validate_bundle.py": "kit validator checking the SQL contract on a temporary database"
  },
  "read_as_data": {},
+ "embedded_markdown": {},
  "append_only_allow": [
   {
    "file": "crates/hoh-core/src/persistence/evidence.rs",
