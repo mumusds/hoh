@@ -906,6 +906,7 @@ pub type RunProjection = (
     Vec<DegradedTracking>,
     Vec<String>,
     Vec<super::readiness::SpecQuestion>,
+    Option<crate::readiness::Readiness>,
 );
 
 /// An attempt of a run whose processes are tracked by the degraded /proc scan, as its `attempt.tracking` recorded it
@@ -972,6 +973,8 @@ pub(super) fn run_projection(
             .map_err(sqlite_error)?;
         // Its revision's open questions (REQ-031 behaviour 6), in the same read.
         let open_questions = super::readiness::run_questions(conn, run_id)?;
+        // Its readiness now (REQ-031 behaviour 1), none without a specification, in the same read.
+        let readiness = super::readiness::run_readiness(conn, run_id)?;
         Ok::<_, PersistError>(Some((
             run,
             team,
@@ -982,6 +985,7 @@ pub(super) fn run_projection(
             degraded,
             active_roles,
             open_questions,
+            readiness,
         )))
     })();
     // Ends the read transaction either way; nothing was written.

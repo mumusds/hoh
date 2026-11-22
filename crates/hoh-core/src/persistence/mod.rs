@@ -83,7 +83,7 @@ pub use snapshot::{
     AcShown, AcceptanceItem, AcceptancePage, AcceptanceView, CandidateShown, CheckShown, IssueItem,
     IssuesPage, RowShown,
 };
-pub use spec_review::{KeptObject, SpecReviewIntake, SpecReviewTaken};
+pub use spec_review::{KeptObject, ReviewDue, ReviewWork, SpecReviewIntake, SpecReviewTaken};
 pub use staffing::{
     BINDING_BLOCKED, BINDING_EXCLUDED, BINDING_FALLBACK, BINDING_UNBLOCKED, CHANGE_PENDING,
     CHANGE_WITHDRAWN, EXCLUSION_SKIPPED, Evidence, StaffChange, StaffWrite, TASK_UNBLOCKED,
@@ -1761,6 +1761,54 @@ impl Store {
 
     /// Take a specification review's report in through its single intake entry (REQ-031 behaviour 4,
     /// docs/adr/ADR-035.md): every check, then one `spec_review.reported`, CURRENT or REJECTED with its reasons.
+    /// A specification review attempt's end, with its report's intake when its result is COMPLETED (one writer job:
+    /// docs/adr/ADR-035.md decision 7); whether the end applied.
+    pub async fn finish_spec_review(
+        &self,
+        attempt_id: &str,
+        ending: Ending,
+        intake: Option<SpecReviewIntake>,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::FinishedReview {
+            attempt_id: attempt_id.to_owned(),
+            ending: Box::new(ending),
+            intake: intake.map(Box::new),
+        })
+        .await
+    }
+
+    /// Open the specification review due in run `run_id` for revision `spec_id` at its commit `git_commit` (REQ-031
+    /// behaviour 3, docs/adr/ADR-035.md decision 5); whether one was opened (none when it is no longer due).
+    pub async fn open_spec_review(
+        &self,
+        run_id: &str,
+        spec_id: &str,
+        git_commit: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::OpenReview {
+            run_id: run_id.to_owned(),
+            spec_id: spec_id.to_owned(),
+            git_commit: git_commit.to_owned(),
+        })
+        .await
+    }
+
+    /// Record that run `run_id`'s due review of `spec_id` waits for a commit of the revision, seen from `head`
+    /// (`spec_review.waiting`, once per revision and HEAD); whether it was written.
+    pub async fn spec_review_waiting(
+        &self,
+        run_id: &str,
+        spec_id: &str,
+        head: &str,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::ReviewWaiting {
+            run_id: run_id.to_owned(),
+            spec_id: spec_id.to_owned(),
+            head: head.to_owned(),
+        })
+        .await
+    }
+
     pub async fn intake_spec_review(
         &self,
         intake: SpecReviewIntake,
@@ -2495,6 +2543,21 @@ impl Reader {
     /// and its result as of the watermark (docs/adr/ADR-031.md decision 12), read together.
     pub fn run_projection(&self, run_id: &str) -> Result<Option<RunProjection>, PersistError> {
         commands::run_projection(&self.conn, run_id)
+    }
+
+    /// The specification review due in run `run_id`, if one is (REQ-031 behaviour 3).
+    pub fn spec_review_due(&self, run_id: &str) -> Result<Option<ReviewDue>, PersistError> {
+        spec_review::due(&self.conn, run_id)
+    }
+
+    /// Whether run `run_id`'s due review of `spec_id` was already recorded waiting at HEAD `head`.
+    pub fn spec_review_waited(&self, spec_id: &str, head: &str) -> Result<bool, PersistError> {
+        spec_review::waited(&self.conn, spec_id, head)
+    }
+
+    /// What review task `task_id` works on; none for a task that is no specification review's.
+    pub fn spec_review_work(&self, task_id: &str) -> Result<Option<ReviewWork>, PersistError> {
+        spec_review::work_of(&self.conn, task_id)
     }
 
     /// A page of the project's runs, newest first (openapi `listRuns`; ADR-021 decision 6): the runs with their

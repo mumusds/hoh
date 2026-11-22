@@ -1396,6 +1396,7 @@ async fn get_run(
             degraded,
             active_roles,
             open_questions,
+            readiness,
         ))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
@@ -1442,6 +1443,11 @@ async fn get_run(
                     // not answerable questions, so apart from `questions` (docs/adr/ADR-035.md decision 1).
                     "open_questions": open_questions.iter().map(hoh_core::persistence::SpecQuestion::json)
                         .collect::<Vec<_>>(),
+                    // Its readiness now under its revision (REQ-031 behaviour 1; null without a specification).
+                    "readiness": readiness.as_ref().map(|r| json!({
+                        "state": if r.is_ready() { "READY" } else { "NOT_READY" },
+                        "reasons": r.reasons().iter().map(hoh_core::readiness::Reason::json).collect::<Vec<_>>(),
+                    })),
                     // Its attempts tracked by the degraded /proc scan, with why (docs/adr/ADR-021.md decision 8d,
                     // M2T06R-560; a free object, no CR).
                     "degraded_tracking": degraded.iter()

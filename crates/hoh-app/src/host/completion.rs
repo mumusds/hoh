@@ -310,6 +310,122 @@ fn report_of(
     })
 }
 
+/// A specification review attempt's end (REQ-031 behaviour 4, docs/adr/ADR-035.md decision 7): only a COMPLETED
+/// TaskResult is reported, its report and native attempt record built (the report from its final message's hoh-report
+/// block; none without one) and kept as objects, for the store's one intake entry, which checks them; any other result,
+/// or none, fails the attempt (its task retried by a read task's rules) with nothing exported. Without its raw
+/// session log nothing can be reported either: failed too. Blocking (its objects).
+pub(super) fn spec_review_end(
+    project: &Path,
+    identity: &Identity,
+    session_id: &str,
+    review: &hoh_core::persistence::ReviewWork,
+    hooks: &dyn super::HostHooks,
+    mut ending: Ending,
+) -> (Ending, Option<hoh_core::persistence::SpecReviewIntake>) {
+    use hoh_core::verification::{report, spec_report};
+    if !ending.success {
+        return (ending, None);
+    }
+    let fail = |mut ending: Ending, why: String| {
+        ending.success = false;
+        ending.class = hoh_core::retry::FailureClass::Transient { retry_after: None };
+        ending.detail = format!("SPEC_REVIEW_NOT_REPORTED: {why}");
+        (ending, None)
+    };
+    match result_of(identity, &mut ending) {
+        Ok(result) if result.status == TaskStatus::Completed => {}
+        Ok(result) => {
+            let status = serde_json::to_value(result.status).unwrap_or_default();
+            return fail(ending, format!("its TaskResult is {status}"));
+        }
+        Err(why) => return fail(ending, why),
+    }
+    let Some(raw) = ending
+        .observed
+        .artifacts
+        .iter()
+        .find(|a| a.kind.starts_with("raw_log") && a.name.ends_with("stdout.jsonl"))
+        .cloned()
+    else {
+        return fail(ending, "its raw session log was not kept".to_owned());
+    };
+    let raw_sha256 = match hoh_core::objects::hash_file(&project.join(&raw.path)) {
+        Ok((sha256, _)) => sha256,
+        Err(e) => return fail(ending, format!("its raw session log cannot be read: {e}")),
+    };
+    let binding = spec_report::Binding {
+        review_id: review.review_id.clone(),
+        attempt_id: identity.attempt_id.clone(),
+        spec_revision: review.spec_revision,
+        spec_sha256: review.spec_sha256.clone(),
+        git_commit: review.git_commit.clone(),
+    };
+    let mut sessions = vec![session_id.to_owned()];
+    sessions.extend(ending.observed.native_session.clone());
+    let keep = |value: &serde_json::Value,
+                kind: &str,
+                name: &str|
+     -> Result<hoh_core::persistence::KeptObject, String> {
+        let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+        let sha256 = hoh_core::objects::put(project, &bytes)?;
+        Ok(hoh_core::persistence::KeptObject {
+            artifact: hoh_core::persistence::ArtifactRow {
+                path: hoh_core::objects::relative_path(&sha256),
+                sha256,
+                bytes: bytes.len() as u64,
+                mime: "application/json".to_owned(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+            },
+            bytes,
+        })
+    };
+    let built = spec_report::native(&binding, &sessions, &raw.sha256)
+        .map(|native| hooks.spec_review_native(&identity.attempt_id, native))
+        .and_then(|native| {
+            native
+                .map(|n| keep(&n, "spec_review_native_attempt", "spec-review-attempt.json"))
+                .transpose()
+        });
+    let native = match built {
+        Ok(native) => native,
+        Err(why) => return fail(ending, format!("its native attempt record: {why}")),
+    };
+    let reference = |a: &hoh_core::persistence::ArtifactRow| report::ObjectRef {
+        path: a.path.clone(),
+        sha256: a.sha256.clone(),
+    };
+    // The report names the record the host built: a replaced or missing one is the intake's to find.
+    let named = match spec_report::native(&binding, &sessions, &raw.sha256)
+        .and_then(|n| serde_json::to_vec(&n).map_err(|e| e.to_string()))
+    {
+        Ok(bytes) => report::ObjectRef {
+            path: hoh_core::objects::relative_path(&hoh_core::specindex::digest(&bytes)),
+            sha256: hoh_core::specindex::digest(&bytes),
+        },
+        Err(why) => return fail(ending, format!("its native attempt record: {why}")),
+    };
+    let named = native.as_ref().map_or(named, |n| reference(&n.artifact));
+    let text = ending.observed.final_text.clone().unwrap_or_default();
+    // No hoh-report block, or one that cannot be made a report: taken in as none (REJECTED, report_invalid).
+    let report = report::block(&text, "reviewer")
+        .and_then(|body| spec_report::build(&body, session_id, &binding, &reference(&raw), &named))
+        .and_then(|built| keep(&built, "spec_review_report", "spec-review-report.json"))
+        .ok();
+    (
+        ending,
+        Some(hoh_core::persistence::SpecReviewIntake {
+            review_id: review.review_id.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            report,
+            native,
+            raw,
+            raw_sha256,
+        }),
+    )
+}
+
 /// What a successful verifier attempt's bridge decides (decision 11): COMPLETED with a valid report settles it; a
 /// legal FAILED, BLOCKED or INCOMPLETE verifies again within its round; anything else, a missing or invalid report
 /// included, is corrected (decision 15). Blocking (its report's objects).

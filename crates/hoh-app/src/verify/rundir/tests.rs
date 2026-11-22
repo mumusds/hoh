@@ -154,3 +154,34 @@ async fn a_run_directory_a_check_still_reads_is_never_removed_under_it() -> R {
     assert!(!run.exists(), "removed once it ended");
     Ok(())
 }
+
+/// REQ-031 behaviour 3 (docs/adr/ADR-035.md decision 5): a specification review's run directory is its revision's
+/// commit, outside the project, refused when that commit's specification is not the revision; whatever an earlier
+/// preparation of the same attempt left there is replaced.
+#[test]
+fn a_review_directory_is_its_revisions_commit_and_refuses_another_specification() -> R {
+    let dir = tempfile::tempdir()?;
+    let (project, sealed) = frozen(dir.path())?;
+    let commit = sealed.manifest.git_commit.clone();
+    let sources = crate::host::spec::sources(&project)?;
+    let sha = hoh_core::specindex::generate_index(&sources)?.sha256();
+    let review = dir.path().join("runs/p/review-attempt");
+    std::fs::create_dir_all(&review)?;
+    std::fs::write(review.join("left-over"), "x")?;
+    prepare_commit(&project, &review, &commit, &sha).map_err(|e| e.to_string())?;
+    assert!(!review.join("left-over").exists());
+    assert_eq!(run_git(&review, &["rev-parse", "HEAD"])?, commit);
+    assert!(review.join("docs/spec/fixture.md").is_file());
+    assert_eq!(
+        run_git(&project, &["status", "--porcelain"])?,
+        "",
+        "the project is untouched"
+    );
+    match prepare_commit(&project, &review, &commit, &"0".repeat(64)) {
+        Err(Unprepared::Refused(reasons)) => {
+            assert!(reasons[0].contains("regenerates"), "{reasons:?}");
+        }
+        other => return Err(format!("another digest accepted: {other:?}").into()),
+    }
+    Ok(())
+}

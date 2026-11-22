@@ -18,6 +18,280 @@ use std::collections::BTreeSet;
 pub(super) const OPENED: &str = "spec_review.opened";
 /// The event that records a review's report taken in.
 pub(super) const REPORTED: &str = "spec_review.reported";
+/// The event of a review that cannot be opened yet: its revision has no commit of its own (docs/adr/ADR-035.md
+/// decision 5).
+pub(super) const WAITING: &str = "spec_review.waiting";
+/// The event of a review task not dispatched: its reviewer's session is not independent (CR-029).
+pub(super) const DISPATCH_REFUSED: &str = "spec_review.dispatch_refused";
+/// The origin of a review task's dispatch notice: Runtime's, taken in the run's working states only.
+pub(super) const ORIGIN: &str = "spec_review";
+
+/// A specification revision whose review is due in a run (REQ-031 behaviour 3): the run has adopted it, it is in a
+/// working state, and the revision has neither a CURRENT report nor a review in progress (opened, its task not ended).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDue {
+    pub run_id: String,
+    pub project_id: String,
+    pub spec_id: String,
+    pub spec_revision: i64,
+    pub spec_sha256: String,
+}
+
+/// What a review task's attempt works on (its `spec_review.opened`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewWork {
+    pub review_id: String,
+    pub spec_revision: i64,
+    pub spec_sha256: String,
+    pub git_commit: String,
+}
+
+/// The review due in run `run_id`, if one is.
+pub(super) fn due(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Option<ReviewDue>, PersistError> {
+    conn.query_row(
+        "SELECT r.project_id, s.spec_id, s.revision, s.sha256 FROM runs r JOIN specs s ON s.spec_id = r.spec_id \
+         WHERE r.run_id = ?1 AND r.state IN ('SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
+         AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind = ?2 \
+           AND json_extract(e.payload_json, '$.spec_id') = s.spec_id \
+           AND json_extract(e.payload_json, '$.state') = 'CURRENT') \
+         AND NOT EXISTS(SELECT 1 FROM events e JOIN tasks t ON t.task_id = json_extract(e.payload_json, '$.task_id') \
+           WHERE e.kind = ?3 AND json_extract(e.payload_json, '$.spec_id') = s.spec_id \
+           AND t.state NOT IN ('ACCEPTED', 'CANCELLED'))",
+        params![run_id, REPORTED, OPENED],
+        |r| {
+            Ok(ReviewDue {
+                run_id: run_id.to_owned(),
+                project_id: r.get(0)?,
+                spec_id: r.get(1)?,
+                spec_revision: r.get(2)?,
+                spec_sha256: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+/// Open the review due in run `run_id` for revision `spec_id` at its commit `git_commit`, one transaction: due again
+/// (else nothing is written: `None`), a reviewer task READY (`child_id(review, "task")`: a reader in layer 0, the
+/// revision's, no requirement) and `spec_review.opened`; the review id (`child_id(spec_id, "review/<n>")`, n counting
+/// the revision's reviews).
+pub(super) fn open(
+    conn: &mut rusqlite::Connection,
+    run_id: &str,
+    spec_id: &str,
+    git_commit: &str,
+    ctx: &writer::Ctx<'_>,
+) -> Result<Option<String>, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let Some(due) = due(&tx, run_id)?.filter(|d| d.spec_id == spec_id) else {
+        return Ok(None);
+    };
+    let opened: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM events WHERE kind = ?1 AND json_extract(payload_json, '$.spec_id') = ?2",
+            params![OPENED, spec_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let review_id = child_id(spec_id, &format!("review/{}", opened + 1));
+    let task_id = child_id(&review_id, "task");
+    tx.execute(
+        "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, layer) \
+         VALUES (?1, ?2, ?3, 'READY', 0, 'reviewer', 0, \
+         (SELECT coalesce(max(created_seq), 0) + 1 FROM tasks WHERE run_id = ?2), 0)",
+        params![task_id, run_id, spec_id],
+    )
+    .map_err(sqlite_error)?;
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: due.project_id.clone(),
+                event_id: child_id(&review_id, "opened"),
+                run_id: Some(run_id.to_owned()),
+                kind: OPENED.to_owned(),
+                payload: json!({"review_id": review_id, "run_id": run_id, "spec_id": spec_id,
+                    "spec_revision": due.spec_revision, "spec_sha256": due.spec_sha256, "git_commit": git_commit,
+                    "task_id": task_id}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    writer::commit(tx, ctx)?;
+    Ok(Some(review_id))
+}
+
+/// Record once per revision and HEAD that run `run_id`'s due review of `spec_id` waits for a commit of the revision
+/// (`spec_review.waiting{reason: spec_not_committed}`, docs/adr/ADR-035.md decision 5); whether it was written.
+pub(super) fn waiting(
+    conn: &mut rusqlite::Connection,
+    run_id: &str,
+    spec_id: &str,
+    head: &str,
+    ctx: &writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let Some(due) = due(&tx, run_id)?.filter(|d| d.spec_id == spec_id) else {
+        return Ok(false);
+    };
+    let event_id = child_id(spec_id, &format!("review-waiting/{head}"));
+    let seen: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if seen {
+        return Ok(false);
+    }
+    writer::write(
+        &tx,
+        &Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: due.project_id,
+                event_id,
+                run_id: Some(run_id.to_owned()),
+                kind: WAITING.to_owned(),
+                payload: json!({"spec_id": spec_id, "spec_revision": due.spec_revision, "head": head,
+                    "reason": "spec_not_committed"}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    writer::commit(tx, ctx)?;
+    Ok(true)
+}
+
+/// Whether the due review of `spec_id` was recorded waiting at HEAD `head`.
+pub(super) fn waited(
+    conn: &rusqlite::Connection,
+    spec_id: &str,
+    head: &str,
+) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+        params![child_id(spec_id, &format!("review-waiting/{head}"))],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The review tasks of run `run_id`.
+pub(super) fn review_tasks(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<BTreeSet<String>, PersistError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE kind = ?1 AND run_id = ?2",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![OPENED, run_id], |r| r.get(0))
+        .map_err(sqlite_error)?;
+    rows.collect::<Result<_, _>>().map_err(sqlite_error)
+}
+
+/// What review task `task_id` works on; none for a task that is no review's.
+pub(super) fn work_of(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Option<ReviewWork>, PersistError> {
+    conn.query_row(
+        "SELECT json_extract(payload_json, '$.review_id'), json_extract(payload_json, '$.spec_revision'), \
+         json_extract(payload_json, '$.spec_sha256'), json_extract(payload_json, '$.git_commit') FROM events \
+         WHERE kind = ?1 AND json_extract(payload_json, '$.task_id') = ?2 ORDER BY seq LIMIT 1",
+        params![OPENED, task_id],
+        |r| {
+            Ok(ReviewWork {
+                review_id: r.get(0)?,
+                spec_revision: r.get(1)?,
+                spec_sha256: r.get(2)?,
+                git_commit: r.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+/// The identities review task `task_id` of run `run_id` would share, dispatched in reviewer session `session`, with
+/// its revision's drafters and the Commander (CR-029; the rule the intake judges by): none, it may go.
+pub(super) fn shared_at_dispatch(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    task_id: &str,
+    session: Option<&str>,
+) -> Result<Vec<identity::Identity>, PersistError> {
+    let Some(session) = session else {
+        return Ok(Vec::new());
+    };
+    let opened: Option<(String, String)> = conn
+        .query_row(
+            "SELECT project_id, json_extract(payload_json, '$.spec_sha256') FROM events WHERE kind = ?1 \
+             AND json_extract(payload_json, '$.task_id') = ?2 ORDER BY seq LIMIT 1",
+            params![OPENED, task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((project_id, sha256)) = opened else {
+        return Ok(Vec::new());
+    };
+    let reviewer = identities_of(conn, &BTreeSet::from([session.to_owned()]))?;
+    let authors = identities_of(conn, &authors(conn, run_id, &project_id, &sha256)?)?;
+    Ok(identity::shared(&reviewer, &authors))
+}
+
+/// A review task's refused dispatch, once per task and session: `spec_review.dispatch_refused` with the identities
+/// shared, in the round's transaction (the task stays READY: a rebinding lets it go).
+pub(super) fn dispatch_refused(
+    tx: &Transaction<'_>,
+    (project_id, run_id, task_id): (&str, &str, &str),
+    session: &str,
+    shared: &[identity::Identity],
+    ctx: &writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let event_id = child_id(task_id, &format!("dispatch-refused/{session}"));
+    let seen: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if seen {
+        return Ok(());
+    }
+    let named: Vec<String> = shared.iter().map(ToString::to_string).collect();
+    writer::write(
+        tx,
+        &Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: project_id.to_owned(),
+                event_id,
+                run_id: Some(run_id.to_owned()),
+                kind: DISPATCH_REFUSED.to_owned(),
+                payload: json!({"task_id": task_id, "session_id": session, "reason": codes::NOT_INDEPENDENT,
+                    "shared": named}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    Ok(())
+}
+
 /// An object the host kept (`objects::put`) for an intake: its artifact and its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeptObject {
@@ -202,9 +476,36 @@ pub(super) fn intake_in(
     for key in REPLAY_KEYS.iter().filter(|key| **key != "review_id") {
         payload[*key] = identity[*key].clone();
     }
+    // Its review task ends ACCEPTED whatever the report's state (docs/adr/ADR-035.md decision 7): readiness reads the
+    // state, and a revision left without a CURRENT report is reviewed again. A task its finished attempt left
+    // IMPLEMENTED goes there through VERIFYING; one in any other state is left as it is.
+    let mut cas = Vec::new();
+    let task: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT state, revision FROM tasks WHERE task_id = ?1",
+            params![opened.task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some((task_state, revision)) = task
+        && task_state == "IMPLEMENTED"
+    {
+        cas.push(super::writer::StateCas {
+            id: opened.task_id.clone(),
+            expected_revision: revision,
+            change: super::writer::Change::Task(crate::protocol::TaskState::Verifying),
+        });
+        cas.push(super::writer::StateCas {
+            id: opened.task_id.clone(),
+            expected_revision: revision + 1,
+            change: super::writer::Change::Task(crate::protocol::TaskState::Accepted),
+        });
+    }
     writer::write(
         tx,
         &Commit {
+            cas,
             events: vec![NewEvent {
                 intent: Intent::Progress,
                 project_id: opened.project_id.clone(),
@@ -446,3 +747,6 @@ fn replayed(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod open;

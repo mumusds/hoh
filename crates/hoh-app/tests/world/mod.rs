@@ -1251,6 +1251,30 @@ impl World {
         }
     }
 
+    /// [`World::team_host`] with `hooks` as its host's hooks.
+    pub async fn team_host_hooked(
+        &self,
+        team: std::sync::Arc<Team>,
+        hooks: std::sync::Arc<dyn hoh_app::host::HostHooks>,
+    ) -> R<Host> {
+        let mut config = HostConfig::new(&self.project());
+        config.port = 0;
+        config.store.wal_probe = Some(probe());
+        config.hooks = hooks;
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: team,
+            context: hoh_core::decision::Context {
+                required_capabilities: TEAM
+                    .iter()
+                    .map(|(role, _)| ((*role).to_owned(), Default::default()))
+                    .collect(),
+                commander_dir: Some(self.state().join("hoh/commander")),
+                ..hoh_core::decision::Context::default()
+            },
+        });
+        Ok(Host::start(config).await?)
+    }
+
     /// Each vacant role binding of run `run_id` given a session of its own (`world-<run>-<role>`), as staffing gives
     /// it on a host whose executor has an agent registry: the scripted [`Team`] has none, so its host leaves them
     /// vacant and its Commander is never given a turn.
@@ -1850,6 +1874,18 @@ pub struct Turn {
     pub summary: Value,
 }
 
+/// How a [`Team::reviewing`] specification review turn ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// A COMPLETED TaskResult and a final message whose hoh-report block is a PASS without findings.
+    Pass,
+    /// A FAILED TaskResult.
+    Failed,
+}
+
+/// The verdict of each review turn of a [`Team::reviewing`].
+pub type Reviewer = dyn Fn(&hoh_app::host::Work) -> Verdict + Send + Sync;
+
 /// What the scripted Commander decides on a turn: the decision payloads it submits, in order, each at the revision the
 /// one before it leaves (the turn's revision, then one more for each but one marked [`rejected`]).
 pub type Script = dyn Fn(&Turn) -> Vec<Value> + Send + Sync;
@@ -1866,6 +1902,8 @@ pub struct Team {
     answer: Box<Answer>,
     /// How long a work attempt runs when the Team takes work ([`Team::working`]); none: it takes none.
     work: Option<Duration>,
+    /// The project and the verdict of each specification review turn when the Team reviews ([`Team::reviewing`]).
+    reviewer: Option<(PathBuf, Box<Reviewer>)>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1898,6 +1936,7 @@ impl Team {
             answer: Box::new(answer),
             script: Box::new(script),
             work: None,
+            reviewer: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1914,6 +1953,24 @@ impl Team {
             answer: Box::new(|_| None),
             script: Box::new(script),
             work: Some(hold),
+            reviewer: None,
+            turns: std::sync::Mutex::default(),
+            refused: std::sync::Mutex::default(),
+            agents: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A Team whose Commander decides by `script` and that plays the reviewer of the project at `project`'s
+    /// specification reviews: each review turn ends as `verdict` says for it ([`Verdict`]); other work is refused.
+    pub fn reviewing(
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        project: PathBuf,
+        verdict: impl Fn(&hoh_app::host::Work) -> Verdict + Send + Sync + 'static,
+    ) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            script: Box::new(script),
+            work: None,
+            reviewer: Some((project, Box::new(verdict))),
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1955,6 +2012,100 @@ impl Drop for Team {
 }
 
 impl Team {
+    /// A specification review turn of a [`Team::reviewing`]: a process held at its start gate that ends as soon as it
+    /// opens, its raw stdout log written under the project's `.hoh/attempts`, its TaskResult and final message as
+    /// `verdict` says, its native session `N-<attempt>`.
+    fn review(
+        &self,
+        work: &hoh_app::host::Work,
+        project: &Path,
+        verdict: Verdict,
+    ) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let raw = format!(
+            "{}\n",
+            json!({"type": "result", "attempt_id": work.attempt_id})
+        );
+        let path = format!(
+            ".hoh/attempts/team-review-{}/stdout.jsonl",
+            work.attempt_id.replace('/', "%2F")
+        );
+        let file = project.join(&path);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?).map_err(|e| e.to_string())?;
+        std::fs::write(&file, &raw).map_err(|e| e.to_string())?;
+        let artifact = hoh_core::persistence::ArtifactRow {
+            path,
+            sha256: sha256_hex(raw.as_bytes()),
+            bytes: raw.len() as u64,
+            mime: "application/jsonl".to_owned(),
+            kind: "raw_log".to_owned(),
+            name: "stdout.jsonl".to_owned(),
+        };
+        let status = match verdict {
+            Verdict::Pass => "COMPLETED",
+            Verdict::Failed => "FAILED",
+        };
+        let result = json!({"schema_version": "1.0", "run_id": work.run_id, "task_id": work.task_id,
+            "attempt_id": work.attempt_id, "role": work.role, "role_epoch": work.assignment.role_epoch,
+            "status": status, "summary": "规格审查", "candidate_id": null, "evidence": [], "issues": [],
+            "next_action": "none"});
+        let final_text = "规格审查完成。\n```hoh-report\n{\"status\": \"PASS\", \"scope\": [\"docs/spec\"], \"findings\": []}\n```";
+        let mut child = Command::new("sh")
+            .args(["-c", "read -r go; exit 0"])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        if let Ok(mut agents) = self.agents.lock() {
+            agents.push((pid, hoh_agents::identity::start_id(pid).ok().flatten()));
+        }
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        let native = format!("N-{}", work.attempt_id);
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut group_gone = hoh_agents::identity::group_empty(pid);
+            while !group_gone && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+                group_gone = hoh_agents::identity::group_empty(pid);
+            }
+            let _ = end.send(hoh_app::host::Outcome {
+                success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
+                detail: "reviewed".to_owned(),
+                group_gone,
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                observed: hoh_core::persistence::Observed {
+                    messages: vec![result.to_string()],
+                    final_text: Some(final_text.to_owned()),
+                    artifacts: vec![artifact],
+                    native_session: Some(native),
+                    ..Default::default()
+                },
+                unknown_effect: false,
+                retry_at: None,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+
     /// A work attempt of a [`Team::working`]: a process of its own group, held at its start gate, that then runs for
     /// `hold` and ends without a TaskResult.
     fn hold(
@@ -2013,7 +2164,10 @@ impl hoh_app::host::Executor for Team {
         work: &hoh_app::host::Work,
     ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (answer, ack) = tokio::sync::oneshot::channel();
-        if work.role == "commander" || self.work.is_some() {
+        if work.role == "commander"
+            || self.work.is_some()
+            || (work.role == "reviewer" && self.reviewer.is_some())
+        {
             let _ = answer.send(Ok(()));
         } else {
             if let Ok(mut refused) = self.refused.lock() {
@@ -2035,6 +2189,11 @@ impl hoh_app::host::Executor for Team {
             detail,
             details: None,
         };
+        if let (Some((project, verdict)), "reviewer") = (&self.reviewer, work.role.as_str()) {
+            return self
+                .review(work, project, verdict(work))
+                .map_err(|e| refusal("SPAWN", Some(e)));
+        }
         if let (Some(hold), false) = (self.work, work.role == "commander") {
             return self.hold(work, hold).map_err(|e| refusal("SPAWN", Some(e)));
         }

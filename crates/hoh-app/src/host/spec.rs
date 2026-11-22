@@ -119,3 +119,59 @@ pub(crate) fn sources(root: &Path) -> Result<Vec<Source>, IndexError> {
     sources.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(sources)
 }
+
+/// How many commits back a review's commit is looked for (docs/adr/ADR-035.md decision 5).
+const REVIEW_DEPTH: &str = "100";
+
+/// The commit of the project at `root` whose specification is the approved revision of digest `sha256`
+/// (docs/adr/ADR-035.md decision 5): along `git rev-list HEAD -- docs/spec`, newest first, at most 100 back, the first
+/// whose `docs/spec/*.md` regenerate an index of that digest and whose committed `index.json` holds those very
+/// bytes. `Ok(Err(head))`: none is (the HEAD looked from, `none` without one). Blocking.
+pub(crate) fn review_commit(root: &Path, sha256: &str) -> Result<Result<String, String>, String> {
+    let git = |args: &[&str]| super::control::git(root, args);
+    let Ok(head) = git(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) else {
+        return Ok(Err("none".to_owned()));
+    };
+    let head = String::from_utf8_lossy(&head).trim().to_owned();
+    let listed = git(&[
+        "rev-list",
+        "--max-count",
+        REVIEW_DEPTH,
+        &head,
+        "--",
+        "docs/spec",
+    ])?;
+    for commit in String::from_utf8_lossy(&listed).lines() {
+        let names = git(&["ls-tree", "-z", "--name-only", commit, "docs/spec/"])?;
+        let mut sources = Vec::new();
+        for path in names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let path = String::from_utf8_lossy(path).into_owned();
+            let Some(name) = path.strip_prefix("docs/spec/") else {
+                continue;
+            };
+            if !name.ends_with(".md") || name.contains('/') {
+                continue;
+            }
+            let bytes = git(&["cat-file", "blob", &format!("{commit}:{path}")])?;
+            sources.push(Source { path, bytes });
+        }
+        let Ok(index) = hoh_core::specindex::generate_index(&sources) else {
+            continue;
+        };
+        if index.sha256() != sha256 {
+            continue;
+        }
+        let committed = git(&[
+            "cat-file",
+            "blob",
+            &format!("{commit}:{}", hoh_core::specindex::PATH),
+        ]);
+        if committed.is_ok_and(|bytes| bytes == index.bytes()) {
+            return Ok(Ok(commit.to_owned()));
+        }
+    }
+    Ok(Err(head))
+}
+
+#[cfg(test)]
+mod tests;

@@ -175,11 +175,15 @@ async fn project_with(dir: &Path, spec: &str, plan: &str) -> R<(PathBuf, String)
     Ok((project, digest.iter().map(|b| format!("{b:02x}")).collect()))
 }
 
-/// Run R RUNNING on the committed specification with REQ-035 (criterion AC-035-03); every built-in role bound to its
-/// own session at epoch 1; developer task D READY (a writer, REQ-035).
+/// Run R RUNNING on the committed specification with REQ-035 (criterion AC-035-03), its specification review a CURRENT
+/// PASS (no review is due, docs/adr/ADR-035.md); every built-in role bound to its own session at epoch 1; developer
+/// task D READY (a writer, REQ-035).
 fn world(spec: &str) -> String {
     format!(
         "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, '{spec}', 1);
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1', NULL,
+  'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1, 'status', 'PASS',
+  'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings', json_array()), '2026-11-12T00:00:00Z');
 INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
   ('R', :p, 's1', 'RUNNING', 'AUTO', 7, '2026-11-12T00:00:00Z');
 INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-035', 's1', 'r', 1);
@@ -3316,6 +3320,9 @@ const FALLBACK_TEAM: &str = "config_version = \"1.0\"\n\
 fn world_unbound(spec: &str) -> String {
     format!(
         "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, '{spec}', 1);
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1', NULL,
+  'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1, 'status', 'PASS',
+  'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings', json_array()), '2026-11-12T00:00:00Z');
 INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, config_revision, created_at) VALUES
   ('R', :p, 's1', 'RUNNING', 'AUTO', 7, (SELECT max(revision) FROM team_revisions WHERE state = 'APPLIED'),
    '2026-11-12T00:00:00Z');
