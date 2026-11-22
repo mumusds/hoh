@@ -18,7 +18,20 @@
 
 `hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
-没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。本版本还没有在产品里写入或批准规格的途径：API 的 ProposeSpecChange、ApproveSpec 返回 422 CAPABILITY_UNSUPPORTED；规格的生成、批准与追踪属于 M3-T02。
+没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。产品已有 `ProposeSpecChange` 与直接 `ApproveSpec` API；批准会核对当前 Markdown 生成且被 Git 跟踪的索引，内容冲突返回 409 SPEC_CONFLICT。首次起草与批准问题的交互接线仍在 M3-T04 后续切片中。
+
+直接 `ApproveSpec` 只允许用户来源。host 从 TCP/Unix socket 的真实对端确认进程，检查
+Attempt 标记、同 uid 祖先标记和 Attempt cgroup；Agent 工具中的 shell 也在此范围内。
+无法确认对端、同 uid 祖先的环境或 cgroup 不可读、映射不唯一、已识别的服务或代理请求，
+均以 403 SPEC_APPROVAL_NOT_USER 拒绝，details.reason 给出 marker、ancestor_marker、
+attempt_cgroup 或 origin_unknown；持有 token 或重放用户曾成功的批准都不能绕过。
+
+来源检查的剩余风险：同 uid 进程若去掉标记、离开 Attempt cgroup 并脱离 Attempt 祖先链，
+可能无法与用户进程区分。祖先扫描在第一个其他 uid 祖先或 PID 1 停止，因此跨 uid 再返回
+的链（Attempt → sudo/su → 原用户 → approve）对祖先扫描不可见；在 cgroup 模式下，
+仍在 Attempt cgroup 的进程会被成员归属检查识别。服务/代理识别只覆盖可观察到的证据，
+不保证区分任意无标记同 uid 服务；不可读的无关进程若持有被转交的 socket fd，也不能由
+扫描完全排除。此机制不是 OS 身份隔离。
 
 TUI 的 `/plan`、`/build`、`/auto` 切换模式，Shift+Tab 按 `[ui] mode_cycle` 轮换（默认 PLAN→BUILD→AUTO，可配置为两个或三个不重复的合法模式）。未附着时只选择下一次新建 Run 的模式，不改变项目默认；已附着时切换当前 Run。写任务正在执行时，切换会等待安全点，顶栏在生效后更新。未知 Slash 显示错误，不作为普通输入发送；模式切换本身不生成或批准规格。
 

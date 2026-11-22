@@ -20,6 +20,7 @@ pub(crate) use completion::inputs as completion_inputs;
 pub(crate) mod control;
 mod http;
 mod inputs;
+mod origin;
 mod processes;
 pub mod product;
 mod reconcile;

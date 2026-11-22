@@ -155,6 +155,7 @@ async fn propose_change(shared: &Arc<Shared>, row: &OutboxRow) -> Result<String,
             Err(error) => (Err(error), String::new()),
         };
         Some(SpecRequest {
+            origin: hoh_core::origin::Origin::Unknown,
             action: SpecAction::Propose(hoh_core::protocol::ProposeSpecChange {
                 reason: input.payload["text"]
                     .as_str()
