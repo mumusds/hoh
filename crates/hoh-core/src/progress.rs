@@ -74,6 +74,7 @@ impl Window {
         // A severity decrease breaks the consecutive non-decreasing sequence, even without a closed issue.
         if severity_fell {
             self.rounds.clear();
+            self.reported = false;
         }
         self.rounds.push(round);
         if self.rounds.len() > WINDOW {

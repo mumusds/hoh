@@ -153,10 +153,55 @@ async fn test_040_01_third_round_writes_one_no_progress() -> R {
     );
     host.shutdown().await;
     let host = Host::start(config(dir.path())).await?;
+    round(dir.path(), 5)?;
     host.store()
         .reconcile_verification("R", Default::default())
         .await?;
     assert_eq!(events(dir.path(), "no_progress")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_040_01_severity_fall_allows_a_new_persisted_fingerprint_window() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-severity-")
+        .tempdir()?;
+    let mut host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    for n in 1..=7 {
+        round(dir.path(), n)?;
+        if n >= 4 {
+            sql(
+                dir.path(),
+                &format!(
+                    r#"
+UPDATE issues SET severity='low',fingerprint='G' WHERE issue_id='I';
+UPDATE events SET payload_json=json_set(payload_json,'$.fingerprint','G','$.severity','low') WHERE event_id='i{n}';
+"#
+                ),
+                false,
+            )?;
+        }
+        host.store()
+            .reconcile_verification("R", Default::default())
+            .await?;
+        let found = events(dir.path(), "no_progress")?;
+        assert_eq!(
+            found.len(),
+            usize::from(n >= 3) + usize::from(n >= 6),
+            "round {n}"
+        );
+        if n >= 6 {
+            assert_eq!(found[0]["fingerprints"], json!(["F"]));
+            assert_eq!(found[1]["fingerprints"], json!(["G"]));
+            assert_eq!(found[0]["last_progress_seq"], found[1]["last_progress_seq"]);
+        }
+        if n == 5 {
+            host.shutdown().await;
+            host = Host::start(config(dir.path())).await?;
+        }
+    }
     host.shutdown().await;
     Ok(())
 }
@@ -395,6 +440,55 @@ async fn test_023_03_repeated_evidence_and_stale_sender_do_not_add_opinions() ->
         "STALE_ROLE_EPOCH"
     );
     assert_eq!(events(dir.path(), "discussion.opinion")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_023_03_early_stop_closes_the_controversy_across_restart() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-early-stop-")
+        .tempdir()?;
+    let mut host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    sql(
+        dir.path(),
+        "UPDATE runs SET config_snapshot_json=json_set(config_snapshot_json,'$.supervision.max_discussion_rounds',3) WHERE run_id='R';",
+        false,
+    )?;
+    for (n, evidence) in ["e1", "e1", "e2", "e3", "e4"].into_iter().enumerate() {
+        let request = message(
+            &format!("early-{n}"),
+            json!({"intent":"opinion","controversy_id":"early","evidence_sha":evidence}),
+        )?;
+        let reply = host
+            .store()
+            .consult_request(request.clone())
+            .await?
+            .ok_or("opinion")?;
+        assert_eq!(
+            reply["status"],
+            if n == 0 { "accepted" } else { "rejected" },
+            "opinion {n}"
+        );
+        if n > 0 {
+            assert_eq!(reply["reason_code"], "DISCUSSION_LIMIT");
+            assert_eq!(reply["details"]["cause"], "no_new_evidence");
+        }
+        assert_eq!(host.store().consult_request(request).await?, Some(reply));
+        if n == 1 {
+            host.shutdown().await;
+            host = Host::start(config(dir.path())).await?;
+        }
+    }
+    assert_eq!(events(dir.path(), "discussion.opinion")?.len(), 1);
+    let escalation = events(dir.path(), "need_decision")?;
+    assert_eq!(escalation.len(), 1);
+    assert_eq!(
+        escalation[0]["opinions"],
+        json!(["A/consult/early-0/opinion"])
+    );
     host.shutdown().await;
     Ok(())
 }
