@@ -64,7 +64,7 @@ pub enum RunTarget {
     SetMode(crate::protocol::Mode),
     /// An input to the run (AnswerQuestion, SendInput; docs/adr/ADR-031.md decision 7): accepted in any state but a
     /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
-    /// stays stopped.
+    /// stays stopped. Working ASK and unknown CONTROL rejection leave the revision unchanged (ADR-036).
     Input(Input),
     /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
     Specification(Box<super::SpecRequest>),
@@ -299,10 +299,7 @@ pub(super) fn submit_in(
             super::hold::command(tx, &command.run_id)?;
             super::modes::set(tx, command, *mode, ctx)?
         }
-        RunTarget::Input(input) => {
-            super::hold::command(tx, &command.run_id)?;
-            input_command(tx, command, input, ctx)?
-        }
+        RunTarget::Input(input) => input_command(tx, command, input, ctx)?,
         RunTarget::Specification(input) => {
             super::hold::command(tx, &command.run_id)?;
             super::spec::apply(tx, command, input, ctx)?
@@ -582,6 +579,16 @@ fn input_command(
             }
         }
     };
+    // Unknown controls are durable rejection records, not progress commands. Validate
+    // the run/revision above, then leave its stop and result intact (ADR-036, M3I-50).
+    if let Some(queued) = queued.as_ref().filter(|queued| queued.kind == "CONTROL")
+        && let Input::Send { text, .. } = input
+        && super::inputs::runtime::control_kind(text).is_none()
+    {
+        let seq = super::inputs::runtime::reject_control(tx, queued, ctx)?;
+        return Ok((revision, seq));
+    }
+    super::hold::command(tx, &command.run_id)?;
     // A working ASK is read-only (AC-017-01). In a stopped state the accepted
     // command still moves the revision and closes with a fresh result (ADR-031 E3).
     let publish_result = queued.as_ref().is_none_or(|input| input.kind != "CONTROL")
