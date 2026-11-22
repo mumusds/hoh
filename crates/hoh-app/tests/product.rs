@@ -836,36 +836,198 @@ async fn until(project: &Path, sql: &str, want: &str, limit: Duration) -> R {
 const ALL_CODEX: &str = "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n[team.cto]\nagent = \"codex\"\n\
                          [team.qa]\nagent = \"codex\"\n[team.researcher]\nagent = \"codex\"\n";
 
-/// Wait until run `run_id`'s developer is bound and its Commander between turns: its first turn (its adoption's
-/// `spec.changed` wake) ended and none unended. A test that lowers the run's context budget does so right after this
-/// and restores it as soon as its task was refused: the budget is the run's, its Commander's turns included, and a
-/// Commander turn it refused would block the run (COMMANDER_UNAVAILABLE) instead of the task under test. No Commander
-/// turn can start meanwhile: every wake is due at least `supervise::QUIET` (2 s) after its event (docs/adr/ADR-025.md
-/// decision 2), and the only events that wake it here come at the turn's end (its stall re-trigger) or after the
-/// restore (the task's need_decision); [`ALL_CODEX`] staffs every role and the spec has its review, so no
-/// `team.binding_blocked` or `spec_review.waiting` wakes it.
-async fn between_commander_turns(project: &Path, run_id: &str) -> R {
-    let limit = Duration::from_secs(60);
-    until(
-        project,
-        &format!(
-            "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer'"
-        ),
-        "1",
-        limit,
-    )
-    .await?;
-    until(
-        project,
-        &format!(
-            "SELECT count(*) FILTER (WHERE a.state IN ('SETTLED', 'FAILED', 'CANCELLED')) > 0 \
-             AND count(*) FILTER (WHERE a.state NOT IN ('SETTLED', 'FAILED', 'CANCELLED')) = 0 \
-             FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id = '{run_id}' AND t.role = 'commander'"
-        ),
-        "1",
-        limit,
-    )
-    .await
+/// The window of a test that lowers its run's context budget for one task's start (M3J-300). The budget is the
+/// run's, its Commander's turns included, and a Commander turn it refused would block the run (COMMANDER_UNAVAILABLE)
+/// instead of the task under test, so no Commander turn may start while it is low. The barrier is the host's clock
+/// (`HostConfig::clock`), held still from [`BudgetWindow::open`] to [`BudgetWindow::close`]: a wake comes due only
+/// when a supervisor step's time (`Context.now`, this clock) reaches its trigger's `due_at`, at least
+/// `supervise::QUIET` after that trigger's last event was taken in at such a time (docs/adr/ADR-025.md decision 2), so
+/// a trigger formed at the held time never comes due while it is held, however long the window takes; a turn that
+/// fails meanwhile is given again only after its backoff from its end at that time (persistence/wakes.rs, `rearm`).
+/// A trigger due by the held time, an owed wake without a running turn or a Commander attempt not yet RUNNING would
+/// give a turn packed under the low budget: [`BudgetWindow::open`] holds the clock only when none is there, as seen
+/// once every supervisor step of the host runs at the held time. A RUNNING Commander turn packed its prompt before it
+/// started (`ProductExecutor::prepare`), under the run's own budget: this fixture's fake codex never ends the turn of a
+/// thread it resumes (the run's stall re-trigger's), and it may run on. The window also counts the runner's ticks
+/// (`RunnerPoint::AfterStaffing`, once per tick, before its supervisor steps; one tick at a time).
+#[derive(Debug, Default)]
+struct BudgetWindow {
+    clock: hoh_core::delivery::MonotonicClock,
+    held: std::sync::Mutex<Option<std::time::SystemTime>>,
+    ticks: std::sync::atomic::AtomicU64,
+}
+
+impl hoh_core::delivery::Clock for BudgetWindow {
+    fn now(&self) -> std::time::SystemTime {
+        match self.held.lock().ok().and_then(|held| *held) {
+            Some(at) => at,
+            None => self.clock.now(),
+        }
+    }
+
+    fn wall(&self) -> std::time::SystemTime {
+        self.clock.wall()
+    }
+}
+
+impl hoh_app::host::HostHooks for BudgetWindow {
+    fn runner(&self, point: hoh_app::host::RunnerPoint) {
+        if point == hoh_app::host::RunnerPoint::AfterStaffing {
+            self.ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl BudgetWindow {
+    /// The world's product host ([`World::config`]) on this window's clock and hooks.
+    fn config(self: &std::sync::Arc<Self>, world: &World) -> HostConfig {
+        let mut config = world.config();
+        config.clock = hoh_app::host::HostClock(self.clone());
+        config.hooks = self.clone();
+        config
+    }
+
+    /// The count of run `run_id`'s Commander attempts.
+    fn commander_turns(run_id: &str) -> String {
+        format!(
+            "SELECT count(*) FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id = '{run_id}' \
+             AND t.role = 'commander'"
+        )
+    }
+
+    /// Open the window once run `run_id`'s developer is bound and its Commander's first turn (its adoption's
+    /// `spec.changed` wake) ended, within 60 s: the run quiescent ([`common::quiescent::await_quiescent`]: every event
+    /// taken in, no PENDING trigger, no output to dispose of, no attempt in flight project-wide but a RUNNING Commander
+    /// turn, no wake owed but the one it answers), then the clock held, then a tick begun after that (the one before it
+    /// ended, so no supervisor step at an earlier time is left), then, in one snapshot, no PENDING trigger due by the
+    /// held time and the rest as quiet; when it is not (a step before the hold took something in), the clock goes on
+    /// and this again. [`ALL_CODEX`] staffs every role and the spec has its review, so no `team.binding_blocked` or
+    /// `spec_review.waiting` wakes the Commander; the test's own events (an input, the refused task's need_decision)
+    /// form triggers at the held time. Returns how many Commander attempts the run had ([`BudgetWindow::close`]
+    /// checks it).
+    async fn open(&self, project: &Path, run_id: &str) -> R<String> {
+        use common::quiescent::{Quiet, Snapshot, Watermark, await_quiescent, snapshot};
+        use hoh_core::delivery::Clock as _;
+        let end = Instant::now() + Duration::from_secs(60);
+        let reads = vec![
+            (
+                "developer".to_owned(),
+                format!(
+                    "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer'"
+                ),
+            ),
+            (
+                "ended".to_owned(),
+                format!(
+                    "{} AND a.state IN ('SETTLED', 'FAILED', 'CANCELLED')",
+                    Self::commander_turns(run_id)
+                ),
+            ),
+            ("turns".to_owned(), Self::commander_turns(run_id)),
+        ];
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            let (path, run, asked) = (db(project), run_id.to_owned(), reads.clone());
+            let quiet = tokio::task::spawn_blocking(move || {
+                let reads: Vec<(&str, &str)> = asked
+                    .iter()
+                    .map(|(n, s)| (n.as_str(), s.as_str()))
+                    .collect();
+                let quiet = Quiet {
+                    reads: &reads,
+                    running_roles: &["commander"],
+                    ..Quiet::new(&run, Watermark::Latest)
+                };
+                await_quiescent(&path, &quiet, left, |s| {
+                    s.read("developer") == "1" && s.read("ended") != "0"
+                })
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            });
+            quiet.await??;
+            let ticks = self.ticks.load(std::sync::atomic::Ordering::SeqCst);
+            let at = self.clock.now();
+            *self.held.lock().map_err(|e| e.to_string())? = Some(at);
+            while self.ticks.load(std::sync::atomic::Ordering::SeqCst) == ticks {
+                if Instant::now() > end {
+                    *self.held.lock().map_err(|e| e.to_string())? = None;
+                    return Err(
+                        "no runner tick began while the budget window's clock was held".into(),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // From here every supervisor step runs at `at`: what it takes in forms triggers due after it (no
+            // supervisor cursor is waited for). What could still give the Commander a turn: a trigger due by `at` (as
+            // the store compares them, to the millisecond), an owed wake without a running turn, an attempt not yet
+            // RUNNING, an output whose disposal is owed.
+            let (path, run, asked) = (db(project), run_id.to_owned(), reads.clone());
+            let left = end
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_secs(1));
+            let held_at = hoh_core::time::rfc3339_millis_utc(at);
+            let seen = tokio::task::spawn_blocking(move || {
+                let reads: Vec<(&str, &str)> = asked
+                    .iter()
+                    .map(|(n, s)| (n.as_str(), s.as_str()))
+                    .collect();
+                let quiet = Quiet {
+                    reads: &reads,
+                    running_roles: &["commander"],
+                    ..Quiet::new(&run, Watermark::Unsupervised)
+                };
+                snapshot(&path, &quiet, left)
+                    .map(|s| {
+                        let mut unsafe_now: Vec<String> = s
+                            .pending_triggers
+                            .iter()
+                            .filter(|t| t.due_at <= held_at)
+                            .map(|t| {
+                                format!(
+                                    "trigger {} ({}) due at {}, by the held {held_at}",
+                                    t.trigger_id, t.fingerprint, t.due_at
+                                )
+                            })
+                            .collect();
+                        unsafe_now.extend(
+                            Snapshot {
+                                pending_triggers: Vec::new(),
+                                ..s.clone()
+                            }
+                            .differences(&quiet),
+                        );
+                        (unsafe_now, s.read("turns").to_owned())
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .await??;
+            match seen {
+                (unsafe_now, turns) if unsafe_now.is_empty() => return Ok(turns),
+                (unsafe_now, _) => {
+                    *self.held.lock().map_err(|e| e.to_string())? = None;
+                    if Instant::now() > end {
+                        return Err(format!(
+                            "the budget window found no safe hold: {}",
+                            unsafe_now.join("; ")
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Close the window: no Commander attempt began while it was open (`turns`, from [`BudgetWindow::open`]), and the
+    /// clock goes on.
+    fn close(&self, project: &Path, run_id: &str, turns: &str) -> R {
+        let now = query(project, &Self::commander_turns(run_id));
+        *self.held.lock().map_err(|e| e.to_string())? = None;
+        assert_eq!(
+            now?, turns,
+            "a Commander turn began while the run's budget was lowered"
+        );
+        Ok(())
+    }
 }
 
 /// The query of attempt `attempt_id`'s state and failure reason once it ended.
@@ -3771,13 +3933,14 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
     let project = world.project();
     std::fs::create_dir_all(project.join(".hoh"))?;
     std::fs::write(project.join(".hoh/config.toml"), ALL_CODEX)?;
-    let host = start_when_free(world.config()).await?;
+    let window = std::sync::Arc::new(BudgetWindow::default());
+    let host = start_when_free(window.config(&world)).await?;
     let outcome = async {
         let run_id = started(&host, &project, "s1").await?;
         let original = query(&project, &format!("SELECT config_snapshot_json FROM runs WHERE run_id='{run_id}'"))?;
-        // The budget below holds only while T-b starts: from between two Commander turns until T-b's refusal
-        // (restored right after it), see [`between_commander_turns`].
-        between_commander_turns(&project, &run_id).await?;
+        // The budget below holds only while T-b starts, in a window no Commander turn starts in ([`BudgetWindow`]),
+        // restored as soon as T-b was refused.
+        let turns = window.open(&project, &run_id).await?;
         exec(
             &project,
             &format!(
@@ -3788,6 +3951,7 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
         ready(&project, &run_id, &[("T-b", "developer")])?;
         until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
         exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
+        window.close(&project, &run_id, &turns)?;
         let refused: Value = serde_json::from_str(&query(
             &project,
             "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",
@@ -6813,13 +6977,14 @@ async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() ->
     let project = world.project();
     std::fs::create_dir_all(project.join(".hoh"))?;
     std::fs::write(project.join(".hoh/config.toml"), ALL_CODEX)?;
-    let host = start_when_free(world.config()).await?;
+    let window = std::sync::Arc::new(BudgetWindow::default());
+    let host = start_when_free(window.config(&world)).await?;
     let outcome = async {
         let run_id = started(&host, &project, "s1").await?;
         let original = query(&project, &format!("SELECT config_snapshot_json FROM runs WHERE run_id='{run_id}'"))?;
-        // The budget below holds only while T-b starts: from between two Commander turns until T-b's refusal
-        // (restored right after it), see [`between_commander_turns`].
-        between_commander_turns(&project, &run_id).await?;
+        // The budget below holds only while T-b starts, in a window no Commander turn starts in ([`BudgetWindow`]),
+        // restored as soon as T-b was refused.
+        let turns = window.open(&project, &run_id).await?;
         host.store().enqueue_input(hoh_core::persistence::NewInput {
             input_id: "budget-input".into(), run_id: run_id.clone(), kind: "STEER".into(),
             target_role: Some("developer".into()), payload: json!({"text":"UNSTARTED_INPUT_SENTINEL"}),
@@ -6834,6 +6999,7 @@ async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() ->
         ready(&project, &run_id, &[("T-b", "developer")])?;
         until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
         exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
+        window.close(&project, &run_id, &turns)?;
         let refused: Value = serde_json::from_str(&query(
             &project,
             "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",

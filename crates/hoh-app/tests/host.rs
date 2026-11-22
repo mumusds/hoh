@@ -3709,3 +3709,69 @@ fn await_quiescent_does_not_accept_a_snapshot_judged_after_its_bound() -> R {
     );
     Ok(())
 }
+
+/// M3J-300: a role's RUNNING attempt (started, its prompt packed) is quiet under `running_roles`, and so is the wake
+/// it answers; its attempt before RUNNING, another role's RUNNING attempt and a wake whose turn is not running are
+/// not.
+#[test]
+fn await_quiescent_allows_only_the_running_attempts_of_its_running_roles() -> R {
+    use common::quiescent::{Attempt, Snapshot, Wake};
+    let attempt = |id: &str, state: &str, role: &str| Attempt {
+        attempt_id: format!("{id}/attempt-1"),
+        task_id: id.to_owned(),
+        state: state.to_owned(),
+        role: role.to_owned(),
+    };
+    let wake = |id: &str, state: &str, role: &str| Wake {
+        wake: format!("{id}/wake"),
+        attempt_id: format!("{id}/attempt-1"),
+        task_id: id.to_owned(),
+        state: state.to_owned(),
+        role: role.to_owned(),
+    };
+    let quiet = Quiet {
+        running_roles: &["commander"],
+        ..Quiet::new("run-1", Watermark::Unsupervised)
+    };
+    let running = Snapshot {
+        max_seq: 0,
+        cursor: None,
+        run_state: "RUNNING".to_owned(),
+        pending_triggers: Vec::new(),
+        in_flight: vec![attempt("turn-1", "RUNNING", "commander")],
+        unanswered_wakes: vec![wake("turn-1", "RUNNING", "commander")],
+        pending_outputs: Vec::new(),
+        reads: Default::default(),
+        dump: None,
+    };
+    assert_eq!(running.differences(&quiet), Vec::<String>::new());
+    let unquiet = Snapshot {
+        in_flight: vec![
+            attempt("turn-1", "RUNNING", "commander"),
+            attempt("turn-2", "PREPARED", "commander"),
+            attempt("turn-3", "STARTING", "commander"),
+            attempt("T-1", "RUNNING", "developer"),
+        ],
+        unanswered_wakes: vec![
+            wake("turn-1", "RUNNING", "commander"),
+            wake("turn-4", "FAILED", "commander"),
+        ],
+        ..running.clone()
+    };
+    let differences = unquiet.differences(&quiet);
+    assert_eq!(differences.len(), 4, "{differences:#?}");
+    for id in ["turn-2", "turn-3", "T-1", "turn-4"] {
+        assert!(
+            differences.iter().any(|d| d.contains(id)),
+            "{id} not named: {differences:#?}"
+        );
+    }
+    assert!(
+        !differences.iter().any(|d| d.contains("turn-1/")),
+        "{differences:#?}"
+    );
+    // Without the role, its RUNNING attempt and its wake are in flight as any other.
+    let strict = Quiet::new("run-1", Watermark::Unsupervised);
+    assert_eq!(running.differences(&strict).len(), 2);
+    Ok(())
+}
