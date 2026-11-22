@@ -119,13 +119,13 @@ pub(super) fn round(
     if reviews_only {
         rows.retain(|r| reviews.contains(&r.candidate.task_id));
     }
-    // Nor a planned task whose readiness under the run's current revision does not pass, judged in this transaction:
+    // Nor a task the dispatch admission refuses in this transaction (docs/adr/ADR-035.md decision 12): one not of the
+    // run's current specification, or a planned task whose readiness under the run's current revision does not pass —
     // a revision approved after the tick's readiness step moved its tasks to it while they were READY, and they wait
-    // for that step (REQ-031 behaviours 3 and 5, M3J-01: no planned work before the revision's review PASS).
-    if !rows.is_empty() {
-        let unready = super::readiness::unready(&tx, run_id)?;
-        rows.retain(|r| !unready.contains(&r.candidate.task_id));
-    }
+    // for that step (REQ-031 behaviours 3 and 5, M3J-01, M3J-100: no planned work before the revision's review PASS).
+    let ids: Vec<&str> = rows.iter().map(|r| r.candidate.task_id.as_str()).collect();
+    let mut admitted = super::admission::admit(&tx, run_id, &ids, super::admission::By::Round)?;
+    rows.retain(|r| matches!(admitted.get(&r.candidate.task_id), Some(Ok(_))));
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
         readers: u32::from(
@@ -251,6 +251,12 @@ pub(super) fn round(
             role_epoch: binding.role_epoch,
             kind: &kind,
             now,
+            admission: admitted
+                .remove(&selected.task_id)
+                .and_then(Result::ok)
+                .ok_or_else(|| {
+                    PersistError::Storage(format!("{} was not admitted", selected.task_id))
+                })?,
         },
     )?;
     cas.push(StateCas {

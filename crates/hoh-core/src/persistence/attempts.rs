@@ -370,6 +370,21 @@ pub(super) fn create(
     a: &NewAttempt,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
+    // A work attempt goes through the dispatch admission, here too (docs/adr/ADR-035.md decision 12): refused, nothing
+    // is written.
+    let (_, run_id) = owner(tx, &a.task_id)?;
+    if let Err(refusal) =
+        super::admission::admit_one(tx, &run_id, &a.task_id, super::admission::By::Direct)?
+    {
+        let state: String = tx
+            .query_row(
+                "SELECT state FROM tasks WHERE task_id = ?1",
+                params![a.task_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        return Err(refusal.error(&a.task_id, &state));
+    }
     insert_prepared(tx, a)?;
     event(
         tx,

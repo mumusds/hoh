@@ -748,3 +748,219 @@ async fn test_031_04_a_review_dispatched_after_a_newer_approval_keeps_its_own_re
     );
     Ok(())
 }
+
+/// The Commander of [`WORLD`] proposing to dispatch `task` to `role` at the run's current revision and specification.
+fn commander_dispatch(
+    path: &Path,
+    id: &str,
+    task: &str,
+    role: &str,
+) -> R<crate::decision::Proposal> {
+    let (revision, sha): (i64, String) = Connection::open(path)?.query_row(
+        "SELECT r.revision, s.sha256 FROM runs r JOIN specs s ON s.spec_id = r.spec_id",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let message: crate::protocol::Message = serde_json::from_value(json!({
+        "schema_version": "1.0", "message_id": id, "run_id": "R", "task_id": "-", "attempt_id": "-",
+        "sender_role": "commander", "recipient_role": "runtime", "role_epoch": 1, "correlation_id": "c",
+        "causation_id": null, "idempotency_key": id, "expected_revision": revision, "spec_sha256": sha,
+        "candidate_id": null, "kind": "decision",
+        "payload": {"kind": "dispatch", "task_id": task, "role": role}
+    }))?;
+    Ok(crate::decision::Proposal::from_message(&message)?)
+}
+
+/// Each path that creates a work attempt, as the design names them (docs/adr/ADR-035.md decision 12).
+#[derive(Debug, Clone, Copy)]
+enum Path3 {
+    Round,
+    Commander,
+    Direct,
+}
+
+/// M3J-100: a revision approved after the tick's readiness step judged the old one ready, and before a dispatch,
+/// gives planned writer TP no attempt on any path that creates one while the new revision's review is missing,
+/// REJECTED or CURRENT/FAIL (REQ-031 behaviours 3 and 5, docs/adr/ADR-035.md decision 12): the scheduling round
+/// leaves it, the Commander's dispatch is REJECTED ILLEGAL_TRANSITION with the readiness reasons, a direct creation is
+/// refused. With a CURRENT PASS every path admits it (the positive control).
+#[tokio::test]
+async fn test_031_04_every_attempt_creating_path_refuses_a_task_unready_after_an_approval_between_settle_and_dispatch()
+-> R {
+    let reviews = [
+        ("missing", None),
+        ("rejected", Some(("REJECTED", "null"))),
+        ("fail", Some(("CURRENT", "'FAIL'"))),
+        ("pass", Some(("CURRENT", "'PASS'"))),
+    ];
+    for path_kind in [Path3::Round, Path3::Commander, Path3::Direct] {
+        for (name, review) in reviews {
+            let case = format!("{path_kind:?}/{name}");
+            let dir = tempfile::tempdir()?;
+            let (store, path) = world(dir.path())?;
+            exec(&path, PLANNED)?;
+            exec(&path, "UPDATE runs SET state = 'RUNNING'")?;
+            // The tick's readiness step: revision 1 is ready, nothing to change.
+            assert!(!store.settle_readiness("R").await?, "{case}");
+            // Approved before the dispatch: TP migrates to revision 2 and stays READY.
+            approve_revision_2(&store, &path).await?;
+            let spec = text(&path, "SELECT spec_id FROM runs WHERE run_id = 'R'")?;
+            assert_eq!(
+                text(
+                    &path,
+                    "SELECT state || ' ' || spec_id FROM tasks WHERE task_id = 'TP'"
+                )?,
+                format!("READY {spec}"),
+                "{case}"
+            );
+            if let Some((state, status)) = review {
+                exec(
+                    &path,
+                    &format!(
+                        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+                         ('p1', 'new-review', 'R', 'spec_review.reported', json_object('spec_id', '{spec}', \
+                         'spec_revision', 2, 'state', '{state}', 'status', {status}, 'reasons', json_array(), \
+                         'findings', json_array()), '2026-11-22T00:00:02Z');"
+                    ),
+                )?;
+            }
+            let admitted = name == "pass";
+            match path_kind {
+                Path3::Round => {
+                    let dispatched = store.schedule_round("R", context()).await?.dispatched;
+                    assert_eq!(
+                        dispatched.map(|d| d.task_id),
+                        admitted.then(|| "TP".to_owned()),
+                        "{case}"
+                    );
+                }
+                Path3::Commander => {
+                    let decided = store
+                        .decide(
+                            commander_dispatch(&path, &format!("d-{name}"), "TP", "developer")?,
+                            context(),
+                        )
+                        .await?;
+                    if admitted {
+                        assert!(
+                            matches!(decided, crate::persistence::Decided::Applied { .. }),
+                            "{case}: {decided:?}"
+                        );
+                    } else {
+                        let crate::persistence::Decided::Rejected { reason, .. } = decided else {
+                            return Err(format!("{case}: {decided:?}").into());
+                        };
+                        assert_eq!(
+                            reason,
+                            crate::protocol::RejectionReason::IllegalTransition,
+                            "{case}"
+                        );
+                        let rejected = events(&path, "decision.rejected")?;
+                        let reasons = &rejected.last().ok_or("no rejection")?["details"]["reasons"];
+                        assert_eq!(
+                            reasons,
+                            &json!([{"reason": "spec_review", "ids": [], "detail": name}]),
+                            "{case}"
+                        );
+                    }
+                }
+                Path3::Direct => {
+                    let created = store
+                        .create_attempt(crate::persistence::NewAttempt {
+                            attempt_id: "A-direct".to_owned(),
+                            task_id: "TP".to_owned(),
+                            session_id: None,
+                            role_epoch: 1,
+                            host_epoch: 1,
+                            config_revision: 1,
+                            agent: Some("claude".to_owned()),
+                        })
+                        .await;
+                    match created {
+                        Ok(()) => assert!(admitted, "{case}"),
+                        Err(crate::persistence::PersistError::IllegalTransition {
+                            details,
+                            ..
+                        }) => {
+                            assert!(!admitted, "{case}");
+                            assert_eq!(
+                                details.as_deref(),
+                                Some(
+                                    &json!({"reasons": [{"reason": "spec_review", "ids": [], "detail": name}]})
+                                ),
+                                "{case}"
+                            );
+                        }
+                        Err(e) => return Err(format!("{case}: {e:?}").into()),
+                    }
+                }
+            }
+            assert_eq!(
+                text(
+                    &path,
+                    "SELECT count(*) || '' FROM attempts WHERE task_id = 'TP'"
+                )?,
+                if admitted { "1" } else { "0" },
+                "{case}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A review task is the Runtime's (docs/adr/ADR-035.md decision 12): the Commander's dispatch of it is REJECTED
+/// ILLEGAL_TRANSITION and a direct creation refused, both with no attempt, so neither bypasses the round's independence
+/// pre-check; the scheduling round dispatches it.
+#[tokio::test]
+async fn test_031_04_a_review_task_is_dispatched_by_the_round_only() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = world(dir.path())?;
+    exec(
+        &path,
+        "UPDATE tasks SET state = 'ACCEPTED' WHERE task_id = 'TP'",
+    )?;
+    assert!(store.open_spec_review("R", "s1", COMMIT).await?);
+    let task = text(&path, "SELECT task_id FROM tasks WHERE role = 'reviewer'")?;
+    let decided = store
+        .decide(
+            commander_dispatch(&path, "d-review", &task, "reviewer")?,
+            context(),
+        )
+        .await?;
+    let crate::persistence::Decided::Rejected { reason, detail, .. } = decided else {
+        return Err(format!("{decided:?}").into());
+    };
+    assert_eq!(
+        reason,
+        crate::protocol::RejectionReason::IllegalTransition,
+        "{detail}"
+    );
+    let created = store
+        .create_attempt(crate::persistence::NewAttempt {
+            attempt_id: "A-direct".to_owned(),
+            task_id: task.clone(),
+            session_id: None,
+            role_epoch: 1,
+            host_epoch: 1,
+            config_revision: 1,
+            agent: Some("claude".to_owned()),
+        })
+        .await;
+    assert!(
+        matches!(
+            created,
+            Err(crate::persistence::PersistError::IllegalTransition { .. })
+        ),
+        "{created:?}"
+    );
+    assert_eq!(
+        text(
+            &path,
+            &format!("SELECT count(*) || '' FROM attempts WHERE task_id = '{task}'")
+        )?,
+        "0"
+    );
+    let round = store.schedule_round("R", context()).await?;
+    assert_eq!(round.dispatched.ok_or("not dispatched")?.task_id, task);
+    Ok(())
+}

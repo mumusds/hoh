@@ -56,6 +56,7 @@ fn snapshot() -> Snapshot {
         quiet: crate::decision::Quiet::default(),
         assumptions: None,
         readiness: None,
+        admission: None,
     }
 }
 
