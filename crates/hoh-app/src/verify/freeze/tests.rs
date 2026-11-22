@@ -159,6 +159,7 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
             "approve",
             revision,
             RunTarget::Specification(Box::new(SpecRequest {
+                origin: hoh_core::origin::Origin::User,
                 action: SpecAction::Approve(ApproveSpec {
                     spec_sha256: index.sha256(),
                     decision: SpecDecision::ApproveOnly,
@@ -202,6 +203,7 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
         "regenerate",
         revision,
         RunTarget::Specification(Box::new(SpecRequest {
+            origin: hoh_core::origin::Origin::User,
             action: SpecAction::Propose(ProposeSpecChange {
                 spec_sha256: index.sha256(),
                 reason: "repair manual index edit".into(),

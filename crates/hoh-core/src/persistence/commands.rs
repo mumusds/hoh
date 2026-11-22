@@ -1,7 +1,8 @@
 //! Commands accepted through the host API, the host's start, and the reads its queries need (REQ-022, REQ-036,
 //! REQ-041, REQ-062; docs/adr/ADR-016.md).
 //!
-//! A command is one `BEGIN IMMEDIATE` transaction: its idempotency key is looked up first (the same payload hash
+//! A command is one `BEGIN IMMEDIATE` transaction: approval authority is checked before replay; then its idempotency
+//! key is looked up (the same payload hash
 //! returns the stored result byte for byte, another hash is `KEY_REUSE`), then the run moves by compare-and-set with
 //! its event and outbox message, and the exact accepted result is stored with the command. Only accepted commands get
 //! a row (`accepted_at` is required): a rejected command is decided again when it is retried.
@@ -162,6 +163,9 @@ pub(super) fn submit_in(
     command: &SubmitCommand,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<CommandOutcome, PersistError> {
+    if let RunTarget::Specification(input) = &command.target {
+        super::spec::guard(input)?;
+    }
     let stored: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT payload_sha256, result_json FROM commands WHERE idempotency_key = ?1",

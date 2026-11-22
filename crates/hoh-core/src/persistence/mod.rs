@@ -295,6 +295,8 @@ pub enum PersistError {
     BadRequest(String),
     /// A specification command's expected digest or CR base conflicts; no writes (REQ-034).
     SpecConflict(Box<serde_json::Value>),
+    /// Approval authority was not established by the host; no writes, including on replay.
+    SpecApprovalNotUser(&'static str),
     /// Markdown cannot be indexed. Only its diagnostic event may have been recorded (REQ-034).
     SpecInvalid(crate::specindex::IndexError),
     /// A proposed or approved specification states decisions whose sources the project does not hold (`SPEC_INVALID`,
@@ -376,6 +378,7 @@ impl PersistError {
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
+            PersistError::SpecApprovalNotUser(_) => Some(ErrorCode::SpecApprovalNotUser),
             PersistError::SpecConflict(_) => Some(ErrorCode::SpecConflict),
             PersistError::SpecInvalid(_) | PersistError::SpecUnsourced(_) => {
                 Some(ErrorCode::SpecInvalid)
@@ -409,6 +412,9 @@ impl PersistError {
 impl std::fmt::Display for PersistError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PersistError::SpecApprovalNotUser(reason) => {
+                write!(f, "SPEC_APPROVAL_NOT_USER: {reason}")
+            }
             PersistError::SpecConflict(details) => write!(f, "SPEC_CONFLICT: {details}"),
             PersistError::SpecInvalid(error) => write!(f, "SPEC_INVALID: {error}"),
             PersistError::SpecUnsourced(details) => {

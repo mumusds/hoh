@@ -88,3 +88,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[forbid(clippy::disallowed_methods)]
 pub mod resource_bundle;
+
+#[forbid(clippy::disallowed_methods)]
+pub mod origin;
