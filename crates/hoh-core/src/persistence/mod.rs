@@ -59,6 +59,7 @@ mod stall;
 mod suites;
 mod supervise;
 mod team;
+mod trace;
 mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};

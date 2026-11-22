@@ -1460,6 +1460,7 @@ async fn get_run(
             active_roles,
             open_questions,
             readiness,
+            trace,
         ))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
@@ -1516,6 +1517,8 @@ async fn get_run(
                     "degraded_tracking": degraded.iter()
                         .map(|d| json!({"attempt_id": d.attempt_id, "reason": d.reason}))
                         .collect::<Vec<_>>(),
+                    // Its requirement trace (REQ-032; docs/adr/ADR-039.md decision 2; a free object, no CR).
+                    "trace": trace,
                 },
             })),
         )

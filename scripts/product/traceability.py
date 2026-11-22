@@ -40,6 +40,17 @@ class Test:
         self.check, self.degradable = check, degradable
 
 
+def checks_of(spec: dict, root: Path) -> dict[str, str]:
+    """TEST id -> scenario check, the rule the product's trace export shares (hoh_core::trace::checks; REQ-032
+    behaviour 6, docs/adr/ADR-039.md decision 1): a spec file with a `scenarios` key names them there, a TEST missing
+    there (or without a check) has none and is never looked up elsewhere; only a spec file without the key (HoH's own
+    contracts/requirements.json layout) takes contracts/acceptance-scenarios.json."""
+    if 'scenarios' in spec:
+        return {s['id']: s['check_id'] for s in spec['scenarios']
+                if isinstance(s, dict) and isinstance(s.get('id'), str) and isinstance(s.get('check_id'), str)}
+    return {s['id']: s['check_id'] for s in load_json(root / 'contracts/acceptance-scenarios.json')['scenarios']}
+
+
 class World:
     """What members are judged against: the project root, the candidate, its frozen plan, its release policy (when
     the candidate tracks contracts/release-policy.json) and the profile."""
@@ -79,19 +90,17 @@ class World:
         rule = self.rule(check)
         return bool(rule) and rule.get('degradable') is True
 
-    def tests(self) -> dict[str, Test]:
-        """The profile's TESTs: every AC of a requirement that targets the profile, by its declared test_id, with the
-        scenario check contracts/acceptance-scenarios.json names."""
-        requirements = self.requirements
-        if requirements is None:
-            requirements = load_json(safe_path(self.root, self.candidate['spec']['path']))['requirements']
-        scenarios = self.scenarios
-        if scenarios is None:
-            scenarios = {s['id']: s['check_id']
-                         for s in load_json(self.root / 'contracts/acceptance-scenarios.json')['scenarios']}
+    def tests(self, every_profile: bool = False) -> dict[str, Test]:
+        """The profile's TESTs (every profile's with `every_profile`): every AC of a requirement that targets the
+        profile, by its declared test_id, with its scenario check by checks_of (REQ-032 behaviour 6)."""
+        # Requirements given by the caller stand for a spec file without scenarios (HoH's layout).
+        spec = {'requirements': self.requirements} if self.requirements is not None \
+            else load_json(safe_path(self.root, self.candidate['spec']['path']))
+        requirements = spec['requirements']
+        scenarios = self.scenarios if self.scenarios is not None else checks_of(spec, self.root)
         found = {}
         for req in requirements:
-            if self.profile in req['release_targets']:
+            if every_profile or self.profile in req['release_targets']:
                 for ac in req['acceptance']:
                     found[ac['test_id']] = Test(scenarios.get(ac['test_id']), req['release_class'] == 'degradable')
         return found

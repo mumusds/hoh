@@ -911,6 +911,7 @@ pub type RunProjection = (
     Vec<String>,
     Vec<super::readiness::SpecQuestion>,
     Option<crate::readiness::Readiness>,
+    serde_json::Value,
 );
 
 /// An attempt of a run whose processes are tracked by the degraded /proc scan, as its `attempt.tracking` recorded it
@@ -979,6 +980,8 @@ pub(super) fn run_projection(
         let open_questions = super::readiness::run_questions(conn, run_id)?;
         // Its readiness now (REQ-031 behaviour 1), none without a specification, in the same read.
         let readiness = super::readiness::run_readiness(conn, run_id)?;
+        // Its requirement trace (docs/adr/ADR-039.md decision 2), in the same read.
+        let trace = super::trace::export(conn, run_id)?.unwrap_or(serde_json::Value::Null);
         Ok::<_, PersistError>(Some((
             run,
             team,
@@ -990,6 +993,7 @@ pub(super) fn run_projection(
             active_roles,
             open_questions,
             readiness,
+            trace,
         )))
     })();
     // Ends the read transaction either way; nothing was written.

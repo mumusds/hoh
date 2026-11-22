@@ -69,6 +69,7 @@ pub mod schema;
 pub mod spawn;
 #[forbid(clippy::disallowed_methods)]
 pub mod specindex;
+// REQ-032: the requirement trace export (docs/adr/ADR-039.md).
 #[forbid(clippy::disallowed_methods)]
 pub mod staffing;
 #[forbid(clippy::disallowed_methods)]
@@ -77,6 +78,8 @@ pub mod state_dir;
 pub mod supervise;
 #[forbid(clippy::disallowed_methods)]
 pub mod time;
+#[forbid(clippy::disallowed_methods)]
+pub mod trace;
 /// The host's systemd user unit and the installation a running hoh holds (docs/adr/ADR-023.md).
 #[forbid(clippy::disallowed_methods)]
 pub mod unit;
