@@ -217,3 +217,154 @@ async fn test_028_01_baseline_is_read_only() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+/// The Commander's create_tasks of `tasks` (task id, requirement ids, paths) on run `run`.
+fn plan(tasks: &[(&str, &[&str], &[&str])]) -> Value {
+    let tasks: Vec<Value> = tasks
+        .iter()
+        .map(|(id, requirements, paths)| {
+            json!({"task_id": id, "title": id, "role": "developer", "writer": true, "depends_on": [],
+                "requirement_ids": requirements, "paths": paths})
+        })
+        .collect();
+    json!({"kind": "create_tasks", "plan": {"tasks": tasks}})
+}
+
+#[tokio::test]
+async fn test_028_03_empty_req_rejected_and_dirty_blocks() -> R {
+    let world = World::new()?;
+    let index = brownfield(&world)?;
+    let (host, run) = approved(&world, &index).await?;
+    // F: the user's uncommitted change.
+    let f = world.project().join("src/lib.rs");
+    std::fs::write(&f, b"pub fn answer() -> u32 { 41 }\n")?;
+    let digest = || -> R<String> { Ok(world::sha256_hex(&std::fs::read(&f)?)) };
+    let original = digest()?;
+    let entered = decide(
+        &world,
+        &host,
+        &run,
+        "discover",
+        world::transition("DISCOVERING"),
+    )
+    .await?;
+    assert!(
+        matches!(entered, hoh_core::persistence::Decided::Applied { .. }),
+        "{entered:?}"
+    );
+    world
+        .until(
+            &format!("SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline'"),
+            "1",
+            Duration::from_secs(20),
+        )
+        .await?;
+    let specified = decide(
+        &world,
+        &host,
+        &run,
+        "specify",
+        world::transition("SPECIFYING"),
+    )
+    .await?;
+    assert!(
+        matches!(specified, hoh_core::persistence::Decided::Applied { .. }),
+        "{specified:?}"
+    );
+    // P1: T (REQ-A, its scope holding F) and U (no requirement: a refactoring of an existing module): refused whole.
+    let before = (
+        world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+        world.rows("SELECT * FROM task_requirements ORDER BY task_id")?,
+    );
+    let p1 = decide(
+        &world,
+        &host,
+        &run,
+        "p1",
+        plan(&[("T", &["REQ-A"], &["src"]), ("U", &[], &["src/old"])]),
+    )
+    .await;
+    let refusal = format!("{p1:?}");
+    assert!(p1.is_err(), "P1 must be refused: {refusal}");
+    assert!(
+        refusal.contains("task U") && refusal.contains("requirement"),
+        "the refusal names U's missing requirement: {refusal}"
+    );
+    assert_eq!(
+        (
+            world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+            world.rows("SELECT * FROM task_requirements ORDER BY task_id")?,
+        ),
+        before,
+        "nothing of P1 imported"
+    );
+    // P2: only T, accepted and imported.
+    let p2 = decide(
+        &world,
+        &host,
+        &run,
+        "p2",
+        plan(&[("T", &["REQ-A"], &["src"])]),
+    )
+    .await?;
+    assert!(
+        matches!(p2, hoh_core::persistence::Decided::Applied { .. }),
+        "{p2:?}"
+    );
+    assert_eq!(
+        world.query(&format!(
+            "SELECT group_concat(task_id) FROM tasks WHERE run_id='{run}'"
+        ))?,
+        "T"
+    );
+    for (id, to) in [("ready", "READY"), ("running", "RUNNING")] {
+        let moved = decide(&world, &host, &run, id, world::transition(to)).await?;
+        assert!(
+            matches!(moved, hoh_core::persistence::Decided::Applied { .. }),
+            "{moved:?}"
+        );
+    }
+    // The scheduling round: T's scope holds F, so it is held for the user, not dispatched.
+    let outcome = host
+        .store()
+        .schedule_round(&run, hoh_core::decision::Context::default())
+        .await?;
+    assert_eq!(outcome.dispatched, None, "{outcome:?}");
+    assert_eq!(
+        world.query(
+            "SELECT state || '/' || coalesce(blocked_reason, '') FROM tasks WHERE task_id='T'"
+        )?,
+        "BLOCKED/NEED_DECISION"
+    );
+    assert_eq!(
+        world.query("SELECT count(*) FROM attempts WHERE task_id='T'")?,
+        "0"
+    );
+    let need: Value = serde_json::from_str(&world.query(
+        "SELECT payload_json FROM events WHERE kind='need_decision' AND json_extract(payload_json,'$.task_id')='T'",
+    )?)?;
+    assert_eq!(need["reason"], "dirty_workspace", "{need}");
+    assert_eq!(need["paths"], json!(["src/lib.rs"]), "{need}");
+    // The question the user sees lists F.
+    let (_, body) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    let questions = body["projection"]["questions"].to_string();
+    assert!(
+        questions.contains("dirty_workspace") && questions.contains("src/lib.rs"),
+        "{questions}"
+    );
+    // Another round dispatches nothing of T either.
+    let again = host
+        .store()
+        .schedule_round(&run, hoh_core::decision::Context::default())
+        .await?;
+    assert_eq!(again.dispatched, None, "{again:?}");
+    // F was never touched: its digest, no stash, its change still uncommitted.
+    assert_eq!(digest()?, original);
+    assert_eq!(world.git(&["stash", "list"])?, "");
+    assert_eq!(
+        world.git(&["status", "--porcelain", "--", "src/lib.rs"])?,
+        " M src/lib.rs\n"
+    );
+    host.shutdown().await;
+    Ok(())
+}

@@ -1526,7 +1526,7 @@ async fn create_tasks_imports_its_plan_in_its_decisions_transaction_and_moves_th
     let plan = create_tasks(json!([
         planned("P1", &[], &["REQ-1"]),
         planned("P2", &["P1"], &["REQ-1", "REQ-2"]),
-        planned("P3", &["T0"], &[]),
+        planned("P3", &["T0"], &["REQ-2"]),
     ]));
     let before = planned_tables(&path)?;
     seed(
@@ -1580,6 +1580,7 @@ async fn create_tasks_imports_its_plan_in_its_decisions_transaction_and_moves_th
             [json!("P1"), json!("REQ-1"), json!("s2")],
             [json!("P2"), json!("REQ-1"), json!("s2")],
             [json!("P2"), json!("REQ-2"), json!("s2")],
+            [json!("P3"), json!("REQ-2"), json!("s2")],
         ]
     );
     assert_eq!(run, [[json!("RUNNING"), json!(8)]]);

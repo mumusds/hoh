@@ -1,7 +1,7 @@
 //! The questions' writers (docs/adr/ADR-031.md design correction A, E4, E16): every `need_decision` event is built
 //! here, and a question's reason is a variant of a closed enum of its subject, so a pair with no exit cannot be written.
 //!
-//! - A task-level question's reason is a [`TaskReason`]: [`WorkReason`] for a development task's own work (11
+//! - A task-level question's reason is a [`TaskReason`]: [`WorkReason`] for a development task's own work (12
 //!   reasons), [`SourceReason`] for a round's source task held by its round or join (3), [`VerifierReason`] for a
 //!   round's qa or reviewer task (8). A reason that holds only for some subjects has a variant only in their enums:
 //!   there is no `VerifierReason::LocalRepairsExhausted` and no `WorkReason::Flaky`.
@@ -51,6 +51,9 @@ pub enum WorkReason {
     VerificationTeamMissing,
     /// W12: its result names a specification the run does not have.
     SpecMismatch,
+    /// Its path scope holds files the user had not committed at the run's baseline (REQ-028 behaviour 4, O3;
+    /// docs/adr/ADR-039.md decision 7).
+    DirtyWorkspace,
 }
 
 impl WorkReason {
@@ -67,6 +70,7 @@ impl WorkReason {
         WorkReason::NoAcceptanceCriteria,
         WorkReason::VerificationTeamMissing,
         WorkReason::SpecMismatch,
+        WorkReason::DirtyWorkspace,
     ];
 
     /// Its name: the `reason` of its `need_decision` and of its question.
@@ -83,6 +87,7 @@ impl WorkReason {
             WorkReason::NoAcceptanceCriteria => "no_acceptance_criteria",
             WorkReason::VerificationTeamMissing => "verification_team_missing",
             WorkReason::SpecMismatch => "spec_mismatch",
+            WorkReason::DirtyWorkspace => "dirty_workspace",
         }
     }
 
@@ -100,6 +105,7 @@ impl WorkReason {
             WorkReason::NoAcceptanceCriteria => 8,
             WorkReason::VerificationTeamMissing => 9,
             WorkReason::SpecMismatch => 10,
+            WorkReason::DirtyWorkspace => 11,
         }
     }
 

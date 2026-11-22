@@ -94,3 +94,42 @@ pub(super) fn record(
     writer::commit(tx, ctx)?;
     Ok(true)
 }
+
+/// The paths run `run_id`'s baseline lists as uncommitted (its dirty and its untracked files), sorted; none without a
+/// baseline.
+pub(super) fn uncommitted(conn: &Connection, run_id: &str) -> Result<Vec<String>, PersistError> {
+    let payload: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = ?1",
+            params![event_id(run_id)],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(payload) = payload else {
+        return Ok(Vec::new());
+    };
+    let payload: Value = serde_json::from_str(&payload)
+        .map_err(|e| PersistError::IntegrityViolation(format!("run {run_id}'s baseline: {e}")))?;
+    let mut paths: Vec<String> = ["dirty", "untracked"]
+        .iter()
+        .flat_map(|side| payload[*side].as_array().cloned().unwrap_or_default())
+        .filter_map(|f| f["path"].as_str().map(str::to_owned))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Whether task `task_id` was asked about its uncommitted files once already: the user's answer to that question
+/// decides, it is not asked again.
+pub(super) fn asked(conn: &Connection, task_id: &str) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE kind = 'need_decision' \
+           AND json_extract(payload_json, '$.task_id') = ?1 \
+           AND json_extract(payload_json, '$.reason') = 'dirty_workspace')",
+        params![task_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}

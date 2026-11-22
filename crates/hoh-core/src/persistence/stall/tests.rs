@@ -304,7 +304,7 @@ fn lines(path: &PathBuf, turn: &Allocated, answer: &Answer) -> R<Vec<String>> {
             let id = format!("P{n}");
             vec![
                 json!({"kind": "create_tasks", "plan": {"tasks": [{"task_id": id, "title": id,
-                "role": "developer", "writer": true, "depends_on": [], "requirement_ids": []}]}}),
+                "role": "developer", "writer": true, "depends_on": [], "requirement_ids": ["REQ-1"]}]}}),
             ]
         }
         Answer::Advance(states) => {
@@ -752,7 +752,8 @@ async fn a_plan_only_turn_does_not_count_as_progress_and_a_moved_state_does() ->
             &path,
             "SPECIFYING",
             "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq) VALUES
-               ('P1', 'R', 's3', 'READY', 1, 'developer', 1);",
+               ('P1', 'R', 's3', 'READY', 1, 'developer', 1);
+             INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's3', 'one', 1);",
         )?;
         assert_eq!(tick(&store, &clock, 0).await?.0, Detected::Retriggered(1));
         let (turn, at) = next_turn(&store, &clock, 0).await?;

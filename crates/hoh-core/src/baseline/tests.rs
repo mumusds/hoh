@@ -69,3 +69,22 @@ fn documents_are_the_readmes_and_the_existing_doc_directories() {
         ["README.rst", "README.zh.md", "adr/", "docs/"]
     );
 }
+
+#[test]
+fn a_scope_holds_files_along_path_components_and_an_empty_one_none() {
+    let uncommitted = vec![
+        "lib/a.rs".to_owned(),
+        "lib2/b.rs".to_owned(),
+        "notes.txt".to_owned(),
+    ];
+    let scope = |paths: &[&str]| paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    assert_eq!(touched(&scope(&["lib"]), &uncommitted), ["lib/a.rs"]);
+    assert_eq!(touched(&scope(&["lib/"]), &uncommitted), ["lib/a.rs"]);
+    assert_eq!(
+        touched(&scope(&["notes.txt", "lib2"]), &uncommitted),
+        ["lib2/b.rs", "notes.txt"]
+    );
+    assert!(touched(&scope(&[]), &uncommitted).is_empty());
+    assert!(touched(&scope(&[""]), &uncommitted).is_empty());
+    assert!(touched(&scope(&["li"]), &uncommitted).is_empty());
+}

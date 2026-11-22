@@ -86,7 +86,8 @@ pub fn route(reason: TaskReason, candidate_verifying: bool) -> Route {
             | WorkReason::FreezeFailed
             | WorkReason::NoAcceptanceCriteria
             | WorkReason::VerificationTeamMissing
-            | WorkReason::SpecMismatch => Route::Continue,
+            | WorkReason::SpecMismatch
+            | WorkReason::DirtyWorkspace => Route::Continue,
             WorkReason::LocalRepairsExhausted | WorkReason::ProtocolRepairsExhausted => {
                 Route::Rework
             }
@@ -483,6 +484,7 @@ fn describe(reason: TaskReason) -> &'static str {
         TaskReason::Work(WorkReason::NoAcceptanceCriteria) => "在 Run 的规格下没有验收标准",
         TaskReason::Work(WorkReason::VerificationTeamMissing) => "没有绑定 QA 或 Reviewer",
         TaskReason::Work(WorkReason::SpecMismatch) => "结果引用的规格与 Run 的不同",
+        TaskReason::Work(WorkReason::DirtyWorkspace) => "写任务的路径范围含有用户未提交的文件",
         TaskReason::Source(SourceReason::JoinGateRefused) => "汇合的门禁拒绝了该 Task 的需求",
         TaskReason::Source(SourceReason::ReverifyExhausted)
         | TaskReason::Verifier(VerifierReason::ReverifyExhausted) => "重新验证的次数已用尽",

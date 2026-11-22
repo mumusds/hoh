@@ -2103,7 +2103,7 @@ async fn a_turns_plan_is_applied_with_its_decision_and_an_invalid_one_is_dispose
                 1,
                 plan(json!([
                     task("P1", &[], &["REQ-1"]),
-                    task("P2", &["P1"], &[])
+                    task("P2", &["P1"], &["REQ-1"])
                 ])),
             ),
         ),
