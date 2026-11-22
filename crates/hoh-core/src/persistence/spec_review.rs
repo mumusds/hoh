@@ -23,6 +23,8 @@ pub(super) const REPORTED: &str = "spec_review.reported";
 pub(super) const WAITING: &str = "spec_review.waiting";
 /// The event of a review task not dispatched: its reviewer's session is not independent (CR-029).
 pub(super) const DISPATCH_REFUSED: &str = "spec_review.dispatch_refused";
+/// The event of a review task ended without a report taken in (REQ-031 behaviour 3): the revision is reviewed again.
+pub(super) const ENDED: &str = "spec_review.ended";
 /// The origin of a review task's dispatch notice: Runtime's, taken in the run's working states only.
 pub(super) const ORIGIN: &str = "spec_review";
 
@@ -477,35 +479,11 @@ pub(super) fn intake_in(
         payload[*key] = identity[*key].clone();
     }
     // Its review task ends ACCEPTED whatever the report's state (docs/adr/ADR-035.md decision 7): readiness reads the
-    // state, and a revision left without a CURRENT report is reviewed again. A task its finished attempt left
-    // IMPLEMENTED goes there through VERIFYING; one in any other state is left as it is.
-    let mut cas = Vec::new();
-    let task: Option<(String, i64)> = tx
-        .query_row(
-            "SELECT state, revision FROM tasks WHERE task_id = ?1",
-            params![opened.task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
-    if let Some((task_state, revision)) = task
-        && task_state == "IMPLEMENTED"
-    {
-        cas.push(super::writer::StateCas {
-            id: opened.task_id.clone(),
-            expected_revision: revision,
-            change: super::writer::Change::Task(crate::protocol::TaskState::Verifying),
-        });
-        cas.push(super::writer::StateCas {
-            id: opened.task_id.clone(),
-            expected_revision: revision + 1,
-            change: super::writer::Change::Task(crate::protocol::TaskState::Accepted),
-        });
-    }
+    // state, and a revision left without a CURRENT report is reviewed again.
     writer::write(
         tx,
         &Commit {
-            cas,
+            cas: end_task(tx, &opened.task_id)?,
             events: vec![NewEvent {
                 intent: Intent::Progress,
                 project_id: opened.project_id.clone(),
@@ -519,6 +497,148 @@ pub(super) fn intake_in(
         ctx,
     )?;
     Ok(SpecReviewTaken { state, reasons })
+}
+
+/// The moves that end review task `task_id` ACCEPTED: one its finished attempt left IMPLEMENTED goes there through
+/// VERIFYING; one in any other state is left as it is (none).
+fn end_task(
+    tx: &Transaction<'_>,
+    task_id: &str,
+) -> Result<Vec<super::writer::StateCas>, PersistError> {
+    let task: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT state, revision FROM tasks WHERE task_id = ?1",
+            params![task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((_, revision)) = task.filter(|(state, _)| state == "IMPLEMENTED") else {
+        return Ok(Vec::new());
+    };
+    Ok([
+        (revision, crate::protocol::TaskState::Verifying),
+        (revision + 1, crate::protocol::TaskState::Accepted),
+    ]
+    .into_iter()
+    .map(|(expected_revision, to)| super::writer::StateCas {
+        id: task_id.to_owned(),
+        expected_revision,
+        change: super::writer::Change::Task(to),
+    })
+    .collect())
+}
+
+/// A specification review attempt's end and, when it SETTLED, its report's intake, in one transaction (REQ-031
+/// behaviour 3 and 4, docs/adr/ADR-035.md decision 7): a kill leaves all of it or nothing (the attempt still RUNNING,
+/// for the reconcile). Only a settled attempt takes a report in: a cancelled one's task is the cancel's to move, and
+/// one ended with an effect not confirmed leaves its task as a read task's is. A settled attempt with no intake, or
+/// whose intake is refused as inconsistent (an integrity error, the host's to fix), ends its review without a report
+/// ([`ended_without_report`]), so its revision is reviewed again. Whether the end applied.
+pub(super) fn finish(
+    conn: &mut rusqlite::Connection,
+    attempt_id: &str,
+    ending: &super::runner::Ending,
+    intake: Option<&SpecReviewIntake>,
+    ctx: &writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let tx = writer::begin(conn, ctx)?;
+    let applied = super::runner::finished_in(&tx, attempt_id, ending, ctx)?;
+    let refused = if applied && settled(&tx, attempt_id)? {
+        match intake.map(|intake| intake_in(&tx, intake, ctx)) {
+            Some(Ok(_)) => None,
+            Some(Err(e @ (PersistError::IntegrityViolation(_) | PersistError::KeyReuse(_)))) => {
+                Some(format!("intake_refused: {e}"))
+            }
+            Some(Err(e)) => return Err(e),
+            None => {
+                ended_without_report(
+                    &tx,
+                    attempt_id,
+                    "report_not_collected: its attempt settled without a report to take in",
+                    ctx,
+                )?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let Some(reason) = refused else {
+        writer::commit(tx, ctx)?;
+        return Ok(applied);
+    };
+    // Nothing of the refused intake is kept: its end again, and its review ended without a report.
+    drop(tx);
+    let tx = writer::begin(conn, ctx)?;
+    let applied = super::runner::finished_in(&tx, attempt_id, ending, ctx)?;
+    ended_without_report(&tx, attempt_id, &reason, ctx)?;
+    writer::commit(tx, ctx)?;
+    Ok(applied)
+}
+
+/// Whether attempt `attempt_id` is SETTLED.
+fn settled(tx: &Transaction<'_>, attempt_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT state = 'SETTLED' FROM attempts WHERE attempt_id = ?1",
+        params![attempt_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// The review task of settled attempt `attempt_id` ended without a report taken in, in the caller's transaction
+/// (REQ-031 behaviour 3): ACCEPTED as an intake would end it (decision 7; readiness reads the reports, and there is
+/// none), and one `spec_review.ended{review_id, spec_id, spec_revision, task_id, attempt_id, reason}`
+/// (`child_id(attempt, "spec-review/ended")`), so its revision is due again and reviewed under a new review id. Nothing
+/// for an attempt that is no review's, or whose end was recorded before; whether it was written.
+pub(super) fn ended_without_report(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    reason: &str,
+    ctx: &writer::Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let task_id: String = tx
+        .query_row(
+            "SELECT task_id FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let Some(work) = work_of(tx, &task_id)? else {
+        return Ok(false);
+    };
+    let event_id = child_id(attempt_id, "spec-review/ended");
+    let seen: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if seen {
+        return Ok(false);
+    }
+    let opened = opened(tx, &work.review_id)?;
+    writer::write(
+        tx,
+        &Commit {
+            cas: end_task(tx, &task_id)?,
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: opened.project_id.clone(),
+                event_id,
+                run_id: Some(opened.run_id.clone()),
+                kind: ENDED.to_owned(),
+                payload: json!({"review_id": work.review_id, "spec_id": opened.spec_id,
+                    "spec_revision": work.spec_revision, "task_id": task_id, "attempt_id": attempt_id,
+                    "reason": reason}),
+            }],
+            ..Commit::default()
+        },
+        ctx,
+    )?;
+    Ok(true)
 }
 
 /// The `spec_review.opened` of `review_id`.

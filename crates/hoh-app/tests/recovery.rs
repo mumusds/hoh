@@ -27,6 +27,7 @@ mod pty;
 mod recovery {
     use super::*;
     mod spec_change;
+    mod spec_review;
 }
 mod world;
 

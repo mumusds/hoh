@@ -517,6 +517,13 @@ impl Job {
             {
                 "Supervise"
             }
+            // A specification review attempt's end with its report's intake (REQ-031 behaviour 3: a test kills a host
+            // at each point of it).
+            Job::Runner(job, _)
+                if matches!(**job, super::runner::RunnerJob::FinishedReview { .. }) =>
+            {
+                "FinishedReview"
+            }
             Job::Runner(..) => "Runner",
             Job::Suite(job, _) => job.name(),
             Job::Control(..) => "Control",
