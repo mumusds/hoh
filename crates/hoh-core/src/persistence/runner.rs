@@ -1033,6 +1033,18 @@ fn running(
 ) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
     let (task_id, task_state, revision, run_id, project_id) = task_of(&tx, attempt_id)?;
+    // Approval can cancel a STARTING attempt while its process waits at the gate (ADR-033, M3B-150).
+    // Recheck in the start transaction, before recording any effect or allowing the host to open that gate.
+    let can_start: bool = tx
+        .query_row(
+            "SELECT state = 'STARTING' AND cancel_requested = 0 FROM attempts WHERE attempt_id = ?1",
+            params![attempt_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !can_start || task_state == TaskState::Cancelled {
+        return Ok(false);
+    }
     let key = crate::reconcile::work_key(attempt_id);
     let started = tx
         .execute(
