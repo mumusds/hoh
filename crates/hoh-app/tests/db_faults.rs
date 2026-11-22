@@ -11,6 +11,8 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::io::{BufRead as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -197,34 +199,25 @@ impl Project {
         Ok((status, body))
     }
 
-    /// [`Project::dump`] once the running host has gone quiet: the same for a second (its tick is 200 ms), so that
-    /// what its last command set going (the supervisor's cursor, say) is in it and not taken for a fault's write. A
-    /// supervisor trigger fires only once its trailing debounce ends (2 s, docs/adr/ADR-025.md decision 1; longer than
-    /// that second), and in a run without a specification its firing writes the trigger's NO_SPEC deferral
-    /// (docs/adr/ADR-025.md decision 4): so a PENDING trigger of such a run without its deferral is not quiet either.
+    /// [`Project::dump`] once the running host has done what its last command set going, so that none of it (the
+    /// supervisor's cursor, a trigger's NO_SPEC deferral) is taken for a fault's write: the project's one run's
+    /// supervisor has taken in every event committed, nothing is in flight, and its PENDING triggers are all deferred
+    /// for want of a specification (docs/adr/ADR-025.md decisions 2 and 4: a trigger fires, here defers, once its 2 s
+    /// debounce ends). The dump is read in the snapshot that shows it ([`common::quiescent::await_quiescent`]).
     fn quiet_dump(&self) -> R<String> {
-        const QUIET: Duration = Duration::from_secs(1);
-        const UNTOLD: &str = "SELECT count(*) FROM supervisor_triggers t JOIN runs r ON r.run_id = t.run_id \
-                              WHERE t.state = 'PENDING' AND r.spec_id IS NULL AND NOT EXISTS \
-                              (SELECT 1 FROM events e WHERE e.event_id = t.trigger_id || '/deferred/NO_SPEC')";
-        let end = Instant::now() + Duration::from_secs(20);
-        let mut last = self.dump()?;
-        let mut since = Instant::now();
-        loop {
-            if Instant::now() > end {
-                return Err("the host did not go quiet in 20 s".into());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            // Read before the dump it vouches for: a deferral written after this read is in that dump or a later one.
-            let told = self.sql(UNTOLD)? == "0";
-            let now = self.dump()?;
-            if now != last || !told {
-                last = now;
-                since = Instant::now();
-            } else if since.elapsed() >= QUIET {
-                return Ok(last);
-            }
+        use common::quiescent::{Quiet, Watermark, await_quiescent};
+        let runs = self.sql("SELECT group_concat(run_id) FROM runs")?;
+        let run = runs.as_str();
+        if run.is_empty() || run.contains(',') {
+            return Err(format!("quiet_dump judges a project of one run, not {runs:?}").into());
         }
+        let quiet = Quiet {
+            deferrals: &["NO_SPEC"],
+            dump: true,
+            ..Quiet::new(run, Watermark::Latest)
+        };
+        let seen = await_quiescent(&self.db(), &quiet, Duration::from_secs(20), |_| true)?;
+        seen.dump.ok_or_else(|| "no dump in the snapshot".into())
     }
 }
 
