@@ -22,6 +22,7 @@ mod closing;
 pub use baseline::BaselineProcess;
 mod consult;
 mod progress;
+mod drafting;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
 pub use issues::Traced;
@@ -1519,6 +1520,28 @@ impl Store {
     /// Run `run_id`'s readiness step (REQ-031 behaviour 5 and 7; docs/adr/ADR-035.md decisions 4 and 8): its planned
     /// tasks that are not ready BLOCKED(READINESS_NOT_MET), those ready again released, a SPECIFYING run whose
     /// readiness passes moved to READY; whether anything changed.
+    pub async fn draft_step(&self, run_id: &str, discovered: bool) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftStep(run_id.into(), discovered))
+            .await
+    }
+
+    pub async fn dispatch_draft(
+        &self,
+        run_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftDispatch(
+            run_id.into(),
+            Box::new(context),
+        ))
+        .await
+    }
+
+    pub async fn prepare_draft_init(&self, attempt_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftInit(attempt_id.into()))
+            .await
+    }
+
     pub async fn settle_readiness(&self, run_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Readiness(run_id.to_owned()))
             .await
@@ -2701,6 +2724,10 @@ impl Reader {
     }
 
     /// The run `run_id` with the highest event seq, read together.
+    pub fn draft_discovery_due(&self, run: &str) -> Result<bool, PersistError> {
+        drafting::discovery_due(&self.conn, run)
+    }
+
     pub fn snapshot(&self, run_id: &str) -> Result<Option<(RunRow, i64)>, PersistError> {
         commands::snapshot(&self.conn, run_id)
     }

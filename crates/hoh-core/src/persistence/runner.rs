@@ -178,6 +178,9 @@ pub(super) enum RunnerJob {
     },
     /// A run's readiness step (docs/adr/ADR-035.md decisions 4 and 8).
     Readiness(String),
+    DraftStep(String, bool),
+    DraftDispatch(String, Box<crate::decision::Context>),
+    DraftInit(String),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -488,6 +491,15 @@ pub(super) fn run(
             super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Mode(run) => super::modes::step(conn, &run, ctx).map(RunnerDone::Applied),
+        RunnerJob::DraftStep(run, discovered) => {
+            super::drafting::step(conn, &run, discovered, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::DraftDispatch(run, context) => {
+            super::drafting::dispatch(conn, &run, &context, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::DraftInit(attempt) => {
+            super::drafting::prepare_init(conn, &attempt, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Readiness(run_id) => {
             super::readiness::settle(conn, &run_id, ctx).map(RunnerDone::Applied)
         }
@@ -564,7 +576,7 @@ fn waiting(
              AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' \
              AND (r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
                   OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
-                      AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) \
+                      AND json_extract(o.payload_json, '$.origin') NOT IN ('spec_review','spec_draft'))) \
              ORDER BY o.event_seq",
         )
         .map_err(sqlite_error)?;
@@ -788,13 +800,24 @@ fn received(
             "SELECT r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
              OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = ?2 \
                  AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
-                 AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) FROM runs r WHERE r.run_id = ?1",
+                 AND json_extract(o.payload_json, '$.origin') NOT IN ('spec_review','spec_draft'))) FROM runs r WHERE r.run_id = ?1",
             params![notice.run_id, notice.message_id],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(false);
+    if super::drafting::is_draft(&tx, &notice.task_id)?
+        && super::admission::admit_one(
+            &tx,
+            &notice.run_id,
+            &notice.task_id,
+            super::admission::By::Draft,
+        )?
+        .is_err()
+    {
+        return Ok(false);
+    }
     if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) || !working {
         return Ok(false);
     }
@@ -1159,6 +1182,12 @@ fn running(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
+    if super::drafting::is_draft(&tx, &task_id)?
+        && super::admission::admit_one(&tx, &run_id, &task_id, super::admission::By::Draft)?
+            .is_err()
+    {
+        return Ok(false);
+    }
     if !can_start || task_state == TaskState::Cancelled {
         return Ok(false);
     }

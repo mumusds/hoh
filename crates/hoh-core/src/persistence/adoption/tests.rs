@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::persistence::{
     CommandOutcome, Intent, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
 };
+use crate::protocol::AllVariants;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -227,11 +228,11 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
     let question = &written[8];
     assert_eq!(question.3["question_id"], json!(question.1));
     assert_eq!(question.3["reason"], "no_spec");
-    assert_eq!(question.3["choices"], json!(["adopt"]));
+    assert_eq!(question.3["choices"], json!(["adopt", "draft"]));
     assert!(
         question.3["text"]
             .as_str()
-            .is_some_and(|t| t.contains("/plan") && t.contains("已批准的规格")),
+            .is_some_and(|t| t.contains("draft") && t.contains("已批准的规格")),
         "{}",
         question.3
     );
@@ -335,7 +336,7 @@ async fn w13_a_run_without_a_specification_adopts_one_approved_since_by_its_answ
         listed["choices"]
             .as_array()
             .map(|c| c.iter().map(|c| c["choice_id"].clone()).collect::<Vec<_>>()),
-        Some(vec![json!("adopt")])
+        Some(vec![json!("adopt"), json!("draft")])
     );
     // Still no specification.
     let before = events(&path, "R", 0)?.last().map_or(0, |e| e.0);
@@ -401,5 +402,121 @@ async fn w13_a_run_without_a_specification_adopts_one_approved_since_by_its_answ
         json!(["CREATED", 3, "s2", null, null, []])
     );
     assert_eq!(open_questions(&path, "R")?, Vec::<Value>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_draft_answer_requests_plan_without_approving_a_specification() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t04-")
+        .tempdir_in("/home/ai/dev")?;
+    let (store, path) = open(&dir)?;
+    store.submit_command(start("R")).await?;
+    let listed = open_questions(&path, "R")?;
+    assert_eq!(listed[0]["choices"][1]["choice_id"], "draft");
+    let q = listed[0]["question_id"].as_str().ok_or("question")?;
+    let mut cmd = answer_adopt("draft-command", "R", 1, q);
+    cmd.payload = json!({"question_id":q,"answer":"draft","choice_id":"draft"});
+    cmd.target = RunTarget::Input(crate::persistence::Input::Answer {
+        question_id: q.into(),
+        answer: "draft".into(),
+        choice_id: Some("draft".into()),
+    });
+    store.submit_command(cmd.clone()).await?;
+    let conn = Connection::open(&path)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT state||'/'||mode FROM runs WHERE run_id='R'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "CREATED/PLAN"
+    );
+    assert!(open_questions(&path, "R")?.is_empty());
+    for table in ["specs", "tasks", "attempts", "effects"] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))?,
+            0,
+            "{table}"
+        );
+    }
+    store.submit_command(cmd).await?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM events WHERE kind='spec.draft_requested'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_draft_phases_are_idempotent_and_discovery_has_no_effect() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t04-")
+        .tempdir_in("/home/ai/dev")?;
+    let (store, path) = open(&dir)?;
+    store.submit_command(start("R")).await?;
+    let q = open_questions(&path, "R")?[0]["question_id"]
+        .as_str()
+        .ok_or("question")?
+        .to_owned();
+    let mut cmd = answer_adopt("draft-phases", "R", 1, &q);
+    cmd.target = RunTarget::Input(crate::persistence::Input::Answer {
+        question_id: q,
+        answer: "draft".into(),
+        choice_id: Some("draft".into()),
+    });
+    store.submit_command(cmd).await?;
+    assert!(store.draft_step("R", false).await?);
+    assert_eq!(run(&path, "R")?[0], "DISCOVERING");
+    assert!(!store.draft_step("R", false).await?);
+    let conn = Connection::open(&path)?;
+    for table in ["tasks", "attempts", "effects"] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))?,
+            0
+        );
+    }
+    assert!(store.draft_step("R", true).await?);
+    assert!(!store.draft_step("R", true).await?);
+    assert_eq!(run(&path, "R")?[0], "SPECIFYING");
+    let task: String = conn.query_row("SELECT task_id FROM tasks", [], |r| r.get(0))?;
+    for state in crate::protocol::RunState::ALL {
+        use crate::lifecycle::Lifecycle as _;
+        conn.execute("UPDATE runs SET state=?1,blocked_reason=CASE WHEN ?1='BLOCKED' THEN 'NEED_DECISION' END",[state.as_str()])?;
+        for by in [
+            super::super::admission::By::Draft,
+            super::super::admission::By::Round,
+            super::super::admission::By::Commander,
+            super::super::admission::By::Direct,
+        ] {
+            let allowed = super::super::admission::admit_one(&conn, "R", &task, by)?.is_ok();
+            assert_eq!(
+                allowed,
+                by == super::super::admission::By::Draft
+                    && matches!(
+                        state,
+                        crate::protocol::RunState::Specifying
+                            | crate::protocol::RunState::Ready
+                            | crate::protocol::RunState::Running
+                            | crate::protocol::RunState::Verifying
+                    ),
+                "{state:?} {by:?}"
+            );
+        }
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM events WHERE kind='spec.drafting'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
     Ok(())
 }

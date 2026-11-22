@@ -14,6 +14,7 @@ pub(crate) mod begun;
 mod cgroup;
 mod completion;
 mod discovery;
+mod drafting;
 pub mod requests;
 mod verifying;
 #[cfg(test)]
@@ -208,6 +209,11 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// After a command committed, before its response is sent (AC-041-04: a test's implementation drops the
     /// connection here).
     fn after_commit(&self) {}
+
+    /// Read-only drafting discovery finished; T07 supplies the full baseline and leave guard at this seam.
+    fn draft_discovered(&self, _project: &Path, _run: &str) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Input consumed durably, before its outbox ACK (CR-006 recovery barrier).
     fn input_delivered(&self, _message_id: &str) {}

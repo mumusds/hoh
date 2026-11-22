@@ -16,7 +16,7 @@ use serde_json::json;
 /// The question's one choice (`questions::route_run(RunReason::NoSpec)`'s).
 const ADOPT: &str = "adopt";
 
-const TEXT: &str = "项目还没有已批准的规格：先在 TUI 用 /plan 生成并批准规格（M3），或在项目中放入已批准的规格后答复本问题";
+const TEXT: &str = "项目还没有已批准的规格。答复 draft：HoH 先只读地了解项目，再由 Plan 起草规格并请你批准，批准之前不改产品代码；项目有了已批准的规格之后，也可以答复 adopt 采用它。";
 
 /// The `spec.changed{cause: "adopted"}` of run `run_id` adopting project `project_id`'s latest approved specification
 /// (the highest revision), its `spec_id` written into the run's row in the caller's transaction; none, and nothing
@@ -73,7 +73,7 @@ pub(super) fn ask(
             run_id,
             reason: RunReason::NoSpec,
             question_id: child_id(run_id, "no_spec/question"),
-            fields: json!({"text": TEXT, "choices": [ADOPT]}),
+            fields: json!({"text": TEXT, "choices": [ADOPT, "draft"]}),
             at: &at,
             detail: "the project has no approved specification",
         },

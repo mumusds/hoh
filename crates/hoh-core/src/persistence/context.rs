@@ -171,6 +171,10 @@ fn work(
     let (role, writer, kind) = row.unwrap_or_default();
     facts.skill_phase =
         crate::skills::phase(&role, &kind, writer == 1, false, false).map(str::to_owned);
+    if super::drafting::is_draft(conn, task_id)? {
+        facts.scope.push("规格起草任务（Runtime）：仅可写 docs/spec/、docs/、.hoh/；不实施产品代码。起草后提交 Markdown 与一致的 docs/spec/index.json；只请用户批准，不自行批准，不创建候选。完成时交 TaskResult，candidate_id=null。需要用户决定时返回 BLOCKED 并在 summary 说明问题。".to_owned());
+    }
+
     let deps: Vec<String> = {
         let mut statement = conn
             .prepare(
