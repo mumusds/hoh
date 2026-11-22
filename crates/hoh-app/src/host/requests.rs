@@ -1,6 +1,6 @@
-//! A verifier's request bridge (docs/adr/ADR-028.md decisions 7 and 13): two POSIX sh helpers in its attempt
+//! A working attempt's request bridge (ADR-028, ADR-037): two POSIX sh helpers in its attempt
 //! directory, `run-check <check_id>` and `ask <message.json>`, each writing a numbered request under `requests/` and
-//! waiting for its response; the host takes the requests of each running verifier in order, one at a time, while its
+//! waiting for its response; checks require a frozen verifier. The host takes requests in order while the
 //! process runs. Not a `hoh` subcommand (CONTRACT 3): a file bridge of the running attempt.
 
 use hoh_core::persistence::{ChangeRequest, Store, VerifierRequest};
@@ -33,7 +33,7 @@ pub(super) fn check_wait(plan: &Value, grace: std::time::Duration) -> u64 {
     longest + grace.as_secs() + 60
 }
 
-/// A verifier's helpers and the directory its requests go to.
+/// An attempt's helpers and the directory its requests go to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Helpers {
     pub requests: PathBuf,
@@ -190,3 +190,19 @@ pub(super) async fn answer_message(
 
 #[cfg(test)]
 mod tests;
+
+/// Working roles use the same durable routing and consultation transactions; checks remain verifier-only.
+pub(super) async fn answer_work(store: &Store, message: &Message) -> Value {
+    match store.consult_request(message.clone()).await {
+        Ok(Some(reply)) => reply,
+        Ok(None) => match store
+            .verifier_request(VerifierRequest::Route(Box::new(message.clone())))
+            .await
+        {
+            Ok(Some(id)) => json!({"status":"queued","input_id":id}),
+            Ok(None) => json!({"status":"deferred"}),
+            Err(e) => json!({"status":"error","detail":e.to_string()}),
+        },
+        Err(e) => json!({"status":"error","detail":e.to_string()}),
+    }
+}

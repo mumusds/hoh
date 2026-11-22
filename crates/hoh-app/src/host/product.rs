@@ -519,6 +519,11 @@ impl ProductExecutor {
         if let Some(paths) = facts.code_scope.clone() {
             facts.add_scoped_code(scoped_files(&self.project, &paths));
         }
+        if a.handoff.is_none()
+            && let Some(helpers) = &work.helpers
+        {
+            facts.scope.push(format!("运行中角色消息：{} <message.json> 发送本 Attempt 的 HCP query/steer。咨询使用 intent=consult 与 question；讨论使用 intent=opinion、controversy_id。run-check 仅供冻结验证任务使用。",helpers.ask.display()));
+        }
         let lead = package.map(context::lead).unwrap_or_default();
         // A work turn has a bridge file in its attempt's directory (docs/adr/ADR-028.md decision 2), told in its identity
         // header, the values its every output must repeat. A Commander turn is told where the project is (it runs

@@ -72,7 +72,7 @@ fn previous(tx: &Transaction<'_>, id: &str, role: &str) -> Result<Option<String>
 }
 
 fn current(tx: &Transaction<'_>, row: &InputRow) -> Result<bool, PersistError> {
-    tx.query_row(
+    let bound:bool=tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)",
         params![
             row.run_id,
@@ -81,7 +81,8 @@ fn current(tx: &Transaction<'_>, row: &InputRow) -> Result<bool, PersistError> {
         ],
         |r| r.get(0),
     )
-    .map_err(sqlite_error)
+    .map_err(sqlite_error)?;
+    Ok(bound && super::super::consult::input_current(tx, row)?)
 }
 fn reject(
     tx: &Transaction<'_>,
@@ -146,7 +147,7 @@ pub(in super::super) fn route(
                 return Ok(result);
             }
             if !current(&tx, &row)? {
-                reject(&tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+                reject_stale(&tx, &mut row, ctx)?;
             } else if row.payload["delivery_pending"] == true {
                 // A prior sender crossed the external-effect boundary. Never send it a second time blindly.
                 reject(&tx, &mut row, "UNKNOWN_DELIVERY", ctx)?;
@@ -190,7 +191,7 @@ pub(in super::super) fn route(
                 return Ok(result);
             }
             if !current(&tx, &row)? {
-                reject(&tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+                reject_stale(&tx, &mut row, ctx)?;
             } else if row.state == InputState::Queued {
                 match outcome {
                     InputOutcome::Delivered => {
@@ -237,7 +238,7 @@ pub(in super::super) fn route(
                     PersistError::IntegrityViolation("selected input disappeared".into())
                 })?;
                 if row.payload["role_epoch"] != epoch || !current(&tx, &row)? {
-                    reject(&tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+                    reject_stale(&tx, &mut row, ctx)?;
                     continue;
                 }
                 if row.payload["attempt_id"] != *attempt {
@@ -285,7 +286,7 @@ pub(in super::super) fn start_attempt(
         let mut row = read_input(tx, &id)?
             .ok_or_else(|| PersistError::IntegrityViolation("reserved input disappeared".into()))?;
         if !current(tx, &row)? {
-            reject(tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+            reject_stale(tx, &mut row, ctx)?;
         } else {
             change(tx, &row, InputState::Delivered, None, None, ctx)?;
         }
@@ -321,7 +322,7 @@ pub(in super::super) fn finish_attempt(
         let mut row = read_input(tx, &id)?
             .ok_or_else(|| PersistError::IntegrityViolation("selected input disappeared".into()))?;
         if !current(tx, &row)? {
-            reject(tx, &mut row, "STALE_ROLE_EPOCH", ctx)?;
+            reject_stale(tx, &mut row, ctx)?;
         } else if row.state == InputState::Queued {
             // Still reserved: this Attempt never crossed RUNNING, so none of its prompt inputs were sent.
             next(&mut row)?;
@@ -431,4 +432,17 @@ pub(in super::super) fn request(
     )?;
     writer::commit(tx, ctx)?;
     Ok(Some(id))
+}
+
+fn reject_stale(
+    tx: &Transaction<'_>,
+    row: &mut InputRow,
+    ctx: &super::super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let reason = if row.payload["consultation_task_id"].is_string() {
+        "CONSULTATION_OBSOLETE"
+    } else {
+        "STALE_ROLE_EPOCH"
+    };
+    reject(tx, row, reason, ctx)
 }

@@ -853,3 +853,15 @@ fn chain_root(
 
 #[cfg(test)]
 pub(super) mod tests;
+
+/// Read-only work uses the same bounded protocol correction policy as other work, without freezing a candidate.
+pub(super) fn correct_readonly_output(
+    tx: &Transaction<'_>,
+    attempt: &str,
+    task_id: &str,
+    reasons: &[String],
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<RepairVerdict, PersistError> {
+    let task=tx.query_row("SELECT r.project_id,t.run_id,t.revision FROM tasks t JOIN runs r USING(run_id) WHERE t.task_id=?1",params![task_id],|r|Ok(Task {project_id:r.get(0)?,run_id:r.get(1)?,task_id:task_id.into(),revision:r.get(2)?})).map_err(sqlite_error)?;
+    correct_attempt(tx, attempt, &task, reasons, ctx)
+}

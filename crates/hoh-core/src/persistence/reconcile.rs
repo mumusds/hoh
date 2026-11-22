@@ -571,6 +571,7 @@ fn apply(
             ctx,
         )?;
     }
+    super::consult::finish(&tx, &row.attempt_id, ctx)?;
     super::writer::commit_unhooked(tx, ctx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),
