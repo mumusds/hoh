@@ -48,6 +48,7 @@ pub(super) async fn prepare(
     let reader = store.reader()?;
     let (project, held) = (project.to_owned(), dir.clone());
     let candidate = candidate_id.clone();
+    let marker = super::runner::marker(project_id, attempt_id);
     let prepared = super::begun::spawn_blocking(move || {
         // Only a candidate under verification is verified (decision 10, M2T16D-253): one that no longer is ends its
         // attempt for the reconcile to cancel its task, never for a decision (M2T16R-55).
@@ -63,7 +64,9 @@ pub(super) async fn prepare(
         }
         let (sealed, _) = rundir::sealed_of(&reader, &project, &candidate)
             .map_err(|e| Unprepared::Refused(vec![e]))?;
-        let pre_tree = rundir::prepare(&project, &held, &sealed)?;
+        // Its git carries the attempt's marker, as a review's checkout's does (runner.rs).
+        let pre_tree =
+            super::control::as_attempt(&marker, || rundir::prepare(&project, &held, &sealed))?;
         Ok::<_, Unprepared>(Ok((sealed, pre_tree)))
     })
     .await

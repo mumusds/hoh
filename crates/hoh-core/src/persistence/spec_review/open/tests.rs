@@ -567,3 +567,184 @@ async fn test_031_04_only_a_settled_review_attempt_takes_its_report_in() -> R {
     }
     Ok(())
 }
+
+/// [`WORLD`] with TP planned for REQ-A of revision 1, which has a CURRENT PASS review report: TP and the run are
+/// ready.
+const PLANNED: &str = "
+INSERT INTO requirements(requirement_id, spec_id, title, required_release, release_class) VALUES
+  ('REQ-A', 's1', 'A', 1, 'required');
+INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
+  ('AC-A-01', 'REQ-A', 's1', json_object('id', 'AC-A-01', 'given', 'g', 'when', 'w', 'then', 'original',
+   'test_id', 'TEST-A-01'), 'unit');
+INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES ('TP', 'REQ-A', 's1');
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+  ('p1', 'plan', 'R', 'plan.imported', json_object('tasks', json_array(json_object('task_id', 'TP'))),
+   '2026-11-22T00:00:00Z'),
+  ('p1', 'old-pass', 'R', 'spec_review.reported', json_object('spec_id', 's1', 'spec_revision', 1,
+   'state', 'CURRENT', 'status', 'PASS', 'findings', json_array()), '2026-11-22T00:00:00Z');
+";
+
+/// Revision 2 of the project (REQ-A's criterion changed) proposed and approved through the store's command entry, as
+/// the host submits it: the run adopts it and its tasks migrate to it. Its sha256.
+async fn approve_revision_2(store: &Store, path: &Path) -> R<String> {
+    use crate::persistence::{
+        Intent, NewEvent, RunTarget, SpecAction, SpecFiles, SpecRequest, SubmitCommand,
+    };
+    let source = crate::specindex::Source {
+        path: "docs/spec/spec.md".to_owned(),
+        bytes: "# 用户\nu\n# 范围\ns\n# 非目标\nn\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A A\n### AC-A-01\n\
+                given: g\nwhen: w\nthen: revised\ncheck: unit\n"
+            .as_bytes()
+            .to_vec(),
+    };
+    let index = crate::specindex::generate_index(std::slice::from_ref(&source))?;
+    for (id, kind) in [("p2", "ProposeSpecChange"), ("a2", "ApproveSpec")] {
+        let (payload, action) = if kind == "ProposeSpecChange" {
+            let payload = json!({"spec_sha256": index.sha256(), "reason": "revision 2"});
+            let action = SpecAction::Propose(serde_json::from_value(payload.clone())?);
+            (payload, action)
+        } else {
+            let payload = json!({"spec_sha256": index.sha256(), "decision": "APPROVE_ONLY"});
+            let action = SpecAction::Approve(serde_json::from_value(payload.clone())?);
+            (payload, action)
+        };
+        let revision: i64 =
+            Connection::open(path)?.query_row("SELECT revision FROM runs", [], |r| r.get(0))?;
+        let files = SpecFiles {
+            sources: vec![source.clone()],
+            existing_index: Some(index.bytes().to_vec()),
+            tracked_index: Some(index.bytes().to_vec()),
+        };
+        store
+            .submit_command(SubmitCommand {
+                command_id: id.into(),
+                idempotency_key: id.into(),
+                kind: kind.into(),
+                run_id: "R".into(),
+                expected_revision: revision,
+                payload: payload.clone(),
+                payload_sha256: crate::specindex::digest(&serde_json::to_vec(&payload)?),
+                target: RunTarget::Specification(Box::new(SpecRequest {
+                    action,
+                    files: Ok(files),
+                })),
+                event: NewEvent {
+                    intent: Intent::Progress,
+                    project_id: "p1".into(),
+                    event_id: format!("event-{id}"),
+                    run_id: Some("R".into()),
+                    kind: "spec.changed".into(),
+                    payload: json!({}),
+                },
+                outbox: None,
+            })
+            .await?;
+    }
+    assert_eq!(
+        text(
+            path,
+            "SELECT s.revision || '' FROM runs r JOIN specs s ON s.spec_id = r.spec_id"
+        )?,
+        "2"
+    );
+    Ok(index.sha256())
+}
+
+/// M3J-01: a revision approved after the tick's readiness step judged the old one ready, and before the rounds,
+/// dispatches no planned writer before its own review's PASS (REQ-031 behaviours 3 and 5, AC-031-04): the round
+/// judges the task's readiness under the run's current revision in its own transaction. The review task of the new
+/// revision goes; TP stays undispatched, and the next readiness step blocks it.
+#[tokio::test]
+async fn test_031_04_a_revision_approved_between_readiness_and_the_rounds_dispatches_no_writer() -> R
+{
+    let dir = tempfile::tempdir()?;
+    let (store, path) = world(dir.path())?;
+    exec(&path, PLANNED)?;
+    exec(&path, "UPDATE runs SET state = 'RUNNING'")?;
+    // The tick's readiness step: revision 1 is ready, nothing to change.
+    assert!(!store.settle_readiness("R").await?);
+    // Approved before the rounds.
+    approve_revision_2(&store, &path).await?;
+    assert_eq!(
+        text(
+            &path,
+            "SELECT state || ' ' || spec_id FROM tasks WHERE task_id = 'TP'"
+        )?,
+        format!(
+            "READY {}",
+            text(&path, "SELECT spec_id FROM runs WHERE run_id = 'R'")?
+        )
+    );
+    let due = store.reader()?.spec_review_due("R")?.ok_or("not due")?;
+    assert!(store.open_spec_review("R", &due.spec_id, COMMIT).await?);
+    let mut dispatched = Vec::new();
+    for _ in 0..3 {
+        match store.schedule_round("R", context()).await?.dispatched {
+            Some(d) => dispatched.push(d.task_id),
+            None => break,
+        }
+    }
+    let review = text(
+        &path,
+        &format!(
+            "SELECT json_extract(payload_json, '$.task_id') FROM events WHERE kind = 'spec_review.opened' \
+             AND json_extract(payload_json, '$.spec_id') = '{}'",
+            due.spec_id
+        ),
+    )?;
+    assert_eq!(dispatched, [review], "no writer before the review's PASS");
+    assert_eq!(
+        text(&path, "SELECT state FROM tasks WHERE task_id = 'TP'")?,
+        "READY"
+    );
+    // Positive control: the next step blocks it for the missing review.
+    assert!(store.settle_readiness("R").await?);
+    assert_eq!(
+        text(
+            &path,
+            "SELECT state || ' ' || blocked_reason FROM tasks WHERE task_id = 'TP'"
+        )?,
+        "BLOCKED READINESS_NOT_MET"
+    );
+    Ok(())
+}
+
+/// M3J-02: a review task opened for revision 1 and dispatched after revision 2 was approved (its task migrated with
+/// the run) works on revision 1 throughout: its work (target commit, report identity) and its dispatch's context both
+/// name revision 1, never the run's current revision.
+#[tokio::test]
+async fn test_031_04_a_review_dispatched_after_a_newer_approval_keeps_its_own_revision() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = world(dir.path())?;
+    exec(
+        &path,
+        "UPDATE tasks SET state = 'ACCEPTED' WHERE task_id = 'TP'",
+    )?;
+    assert!(store.open_spec_review("R", "s1", COMMIT).await?);
+    let task = text(&path, "SELECT task_id FROM tasks WHERE role = 'reviewer'")?;
+    let new_sha = approve_revision_2(&store, &path).await?;
+    let work = store.reader()?.spec_review_work(&task)?.ok_or("no work")?;
+    assert_eq!(
+        (
+            work.spec_revision,
+            work.spec_sha256.as_str(),
+            work.git_commit.as_str()
+        ),
+        (1, "1".repeat(64).as_str(), COMMIT)
+    );
+    let round = store.schedule_round("R", context()).await?;
+    assert_eq!(round.dispatched.ok_or("not dispatched")?.task_id, task);
+    let waiting = store.runner_waiting("p1").await?;
+    let notice = waiting
+        .dispatches
+        .iter()
+        .find(|n| n.task_id == task)
+        .ok_or("no dispatch")?;
+    let facts = notice.assignment.context.as_ref().ok_or("no context")?;
+    assert_eq!(facts.spec, Some(("1".repeat(64), 1)));
+    assert_ne!(
+        facts.spec.as_ref().map(|s| s.0.as_str()),
+        Some(new_sha.as_str())
+    );
+    Ok(())
+}

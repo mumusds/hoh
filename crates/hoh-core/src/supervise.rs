@@ -135,6 +135,9 @@ pub fn classify(
             });
         }
         "spec.changed" | "milestone_ready" | "release_request" => Severity::Normal,
+        // A due specification review whose revision has no commit of its own: the Commander commits the
+        // specification or asks (docs/adr/ADR-035.md decision 5; once per revision and HEAD by its producer).
+        "spec_review.waiting" => Severity::Normal,
         "iteration.completed" if policy != Policy::Efficient => Severity::Normal,
         "task.implemented"
             if policy == Policy::Intensive

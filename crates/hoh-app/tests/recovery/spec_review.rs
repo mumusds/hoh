@@ -134,6 +134,8 @@ fn review_host() -> R {
                 current: std::sync::Mutex::new(""),
             });
         }
+        // Killed by the fake git of [`killed_in_checkout`] while it makes the review's checkout: no hook here.
+        ("git", "clone") => {}
         other => return Err(format!("no kill point {other:?}").into()),
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -205,6 +207,11 @@ fn given(world: &World) -> R<String> {
 
 /// The child host killed at `kill`: its stderr.
 fn killed_at(world: &World, kill: &str) -> R<String> {
+    killed_with(world, kill, &[])
+}
+
+/// [`killed_at`] with `env` added to the child's environment.
+fn killed_with(world: &World, kill: &str, env: &[(&str, std::ffi::OsString)]) -> R<String> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .args([
@@ -217,6 +224,7 @@ fn killed_at(world: &World, kill: &str) -> R<String> {
         .envs(world.env())
         .env(CHILD_ROOT, world.root())
         .env(CHILD_KILL, kill)
+        .envs(env.iter().map(|(k, v)| (*k, v)))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
     let child = super::ChildGuard(command.spawn()?);
@@ -325,4 +333,145 @@ fn test_031_04_a_review_killed_at_each_point_of_its_end_is_taken_in_or_reopened_
         );
     }
     super::keep("test-031-04-review-kill.json", &json!(kept))
+}
+
+/// A process as `/proc/<pid>/stat` names it: its pid and start time (field 22), if it is there and not a zombie.
+fn alive(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(") ")? + 2..];
+    let fields: Vec<&str> = rest.split(' ').collect();
+    if matches!(fields.first(), Some(&("Z" | "X"))) {
+        return None;
+    }
+    Some((pid, fields.get(19)?.parse().ok()?))
+}
+
+/// Ends process `pid` started at `start` (this test's own fake git), if it is still that process.
+struct EndFake(Option<(u32, u64)>);
+
+impl Drop for EndFake {
+    fn drop(&mut self) {
+        if let Some((pid, start)) = self.0
+            && alive(pid).is_some_and(|(_, s)| s == start)
+            && let Some(pid) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// The program `name` on the test's own PATH.
+fn on_path(name: &str) -> R<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").ok_or("no PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|p| p.is_file())
+        .ok_or_else(|| format!("no {name} on the PATH").into())
+}
+
+#[test]
+fn test_031_04_a_host_killed_while_git_makes_a_reviews_checkout_leaves_no_git_and_no_directory_in_use()
+-> R {
+    // The Grok finding of the S5-S7 review: the review's checkout is made by git in a process group of its own while
+    // its attempt is STARTING with no pid. The host dies by SIGKILL while git works in the checkout (a fake git: the
+    // first shared clone writes its pid and target, enters the target and kills its parent, the host, then sleeps
+    // there). The next host's start must stop that git before the attempt ends and its directory is removed: after
+    // it, the git is gone, the directory is gone, and the revision is reviewed (R READY on a CURRENT report).
+    let world = World::named(PROJECT)?;
+    let run = given(&world)?;
+    let fake = world.root().join("fake-git");
+    std::fs::create_dir_all(&fake)?;
+    let (flag, pid_file, target_file) =
+        (fake.join("killed"), fake.join("pid"), fake.join("target"));
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1 $2 $3 $4\" = \"--no-optional-locks -c core.fsmonitor=false clone\" ] && [ ! -e '{flag}' ]; then\n\
+         \x20 : > '{flag}'\n\
+         \x20 for target; do :; done\n\
+         \x20 mkdir -p \"$target\" && cd \"$target\" || exit 1\n\
+         \x20 echo \"$target\" > '{target_file}'\n\
+         \x20 echo $$ > '{pid_file}'\n\
+         \x20 kill -9 $PPID\n\
+         \x20 exec '{sleep}' 120\n\
+         fi\n\
+         exec '{git}' \"$@\"\n",
+        flag = flag.display(),
+        target_file = target_file.display(),
+        pid_file = pid_file.display(),
+        sleep = on_path("sleep")?.display(),
+        git = world.tools().join("git").display(),
+    );
+    std::fs::write(fake.join("git"), script)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(fake.join("git"), std::fs::Permissions::from_mode(0o755))?;
+    let mut path = fake.clone().into_os_string();
+    path.push(":");
+    path.push(world.path());
+    killed_with(&world, "git:clone", &[("PATH", path)])?;
+    let pid: u32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    let target = PathBuf::from(std::fs::read_to_string(&target_file)?.trim());
+    // The scenario: the git outlived its host, in the review's checkout, its attempt STARTING with no pid.
+    let git = alive(pid).ok_or("the fake git did not outlive its host")?;
+    let _end = EndFake(Some(git));
+    assert_eq!(std::fs::read_link(format!("/proc/{pid}/cwd"))?, target);
+    let before = world.rows(
+        "SELECT a.attempt_id, a.state, a.pid FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+         WHERE t.role = 'reviewer'",
+    )?;
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(before[0]["state"], "STARTING", "{before:?}");
+    assert_eq!(before[0]["pid"], Value::Null, "{before:?}");
+    assert!(
+        target.ends_with(
+            before[0]["attempt_id"]
+                .as_str()
+                .ok_or("attempt")?
+                .replace('%', "%25")
+                .replace('/', "%2F")
+        ),
+        "{target:?} {before:?}"
+    );
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let host = hoh_app::host::Host::start(team_config(world.root())).await?;
+        let outcome = async {
+            let end = Instant::now() + WAIT;
+            let ready = format!("SELECT state FROM runs WHERE run_id = '{run}'");
+            while world.query(&ready)? != "READY" {
+                if Instant::now() > end {
+                    return Err(format!(
+                        "R not READY: {:?}",
+                        world.rows("SELECT task_id, state FROM tasks WHERE role = 'reviewer'")?
+                    )
+                    .into());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        host.shutdown().await;
+        outcome
+    })?;
+    assert_eq!(
+        alive(pid).filter(|&(_, start)| start == git.1),
+        None,
+        "the git of the killed host's checkout still runs"
+    );
+    assert!(
+        std::fs::symlink_metadata(&target).is_err(),
+        "{target:?} is left"
+    );
+    let reported = events(&world, "spec_review.reported")?;
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0]["state"], "CURRENT", "{reported:?}");
+    let after = world.rows(&format!(
+        "SELECT state FROM attempts WHERE attempt_id = '{}'",
+        before[0]["attempt_id"].as_str().ok_or("attempt")?
+    ))?;
+    super::keep(
+        "test-031-04-review-checkout-kill.json",
+        &json!({"before_restart": before, "after_restart": after, "target": target, "reported": reported}),
+    )
 }

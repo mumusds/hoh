@@ -1645,6 +1645,9 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, creat
   ('T1', 'R', 's2', 'READY', 1, 'developer', 0, 1, 1), ('T2', 'R', 's2', 'READY', 1, 'developer', 0, 2, 1),
   ('T3', 'R', 's2', 'READY', 1, 'developer', 0, 3, 1), ('T4', 'R', 's2', 'READY', 1, 'developer', 0, 4, 1),
   ('T5', 'R', 's2', 'READY', 1, 'developer', 0, 5, 1);
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s2', NULL,
+  'spec_review.reported', json_object('review_id', 'rv-s2', 'spec_id', 's2', 'spec_revision', 2, 'status', 'PASS',
+  'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings', json_array()), '2026-11-07T00:00:00Z');
 ";
 
 /// Every task IMPLEMENTED, or left with its attempt UNKNOWN_EFFECT: the run's next stable point.
@@ -5277,7 +5280,11 @@ fn supervised_world(project: &Path) -> R {
          INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
            ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');
          INSERT INTO decisions(decision_id, run_id, role_epoch, expected_revision, payload_json, state) VALUES
-           ('d-before', 'R', 1, 2, '{\"kind\": \"record_assumption\", \"statement\": \"s\", \"basis\": \"b\"}', 'APPLIED');",
+           ('d-before', 'R', 1, 2, '{\"kind\": \"record_assumption\", \"statement\": \"s\", \"basis\": \"b\"}', 'APPLIED');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1', NULL,
+           'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1,
+           'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings',
+           json_array()), '2026-11-07T00:00:00Z');",
     )?;
     seed(
         project,

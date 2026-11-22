@@ -213,6 +213,9 @@ const WORLD: &str = "
 INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES ('s1', :p, printf('%064d', 1), 1);
 INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at) VALUES
   ('R', :p, 's1', 'RUNNING', 'AUTO', 7, '2026-11-07T00:00:00Z');
+INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1', NULL,
+  'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1, 'status', 'PASS',
+  'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings', json_array()), '2026-11-07T00:00:00Z');
 INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
   ('sd', 'claude', 'developer', '1', '{}'), ('sc', 'codex', 'commander', '1', '{}');
 INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
@@ -433,7 +436,11 @@ async fn a_run_its_commander_never_moves_is_retriggered_twice_then_asked_by_the_
          INSERT INTO sessions(session_id, agent, role, agent_version, capabilities_json) VALUES
            ('sc', 'codex', 'commander', '1', '{}');
          INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_revision, bound_at) VALUES
-           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');",
+           ('R', 'commander', 'codex', 'sc', 1, 1, '2026-11-07T00:00:00Z');
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1',
+           NULL, 'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1,
+           'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings',
+           json_array()), '2026-11-07T00:00:00Z');",
     )?;
     let clock = Arc::new(FakeClock::default());
     let mut config = config(&project);

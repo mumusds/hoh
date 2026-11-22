@@ -119,6 +119,13 @@ pub(super) fn round(
     if reviews_only {
         rows.retain(|r| reviews.contains(&r.candidate.task_id));
     }
+    // Nor a planned task whose readiness under the run's current revision does not pass, judged in this transaction:
+    // a revision approved after the tick's readiness step moved its tasks to it while they were READY, and they wait
+    // for that step (REQ-031 behaviours 3 and 5, M3J-01: no planned work before the revision's review PASS).
+    if !rows.is_empty() {
+        let unready = super::readiness::unready(&tx, run_id)?;
+        rows.retain(|r| !unready.contains(&r.candidate.task_id));
+    }
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
         readers: u32::from(
