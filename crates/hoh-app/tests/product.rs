@@ -750,14 +750,25 @@ async fn exchange(host: &Host, method: &str, path: &str, body: Option<&Value>) -
     Ok((status, serde_json::from_str(body)?))
 }
 
+/// The approved specification s1 (revision 1) of the project whose `project_id` the rows `from` give, with its CURRENT
+/// PASS specification review by a session of no run: the world's revisions stand for reviewed ones (docs/adr/ADR-035.md
+/// decision 5). Without the review the run would wait for its review commit (the project commits no specification) and
+/// `spec_review.waiting` would wake the Commander, an extra turn under the run's budget.
+fn spec_s1(from: &str) -> String {
+    format!(
+        "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) \
+         SELECT 's1', project_id, printf('%064d', 1), 1 FROM {from};
+         INSERT OR IGNORE INTO events(project_id, event_id, run_id, kind, payload_json, created_at) \
+         SELECT project_id, 'reviewed-s1', NULL, 'spec_review.reported', json_object('review_id', 'rv-s1', \
+         'spec_id', 's1', 'spec_revision', 1, 'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), \
+         'session_id', 'sv', 'findings', json_array()), '2026-11-07T00:00:00Z' FROM specs WHERE spec_id = 's1';"
+    )
+}
+
 /// A started run's id. The project has an approved specification first (s1, revision 1, the one [`ready`] names): a
 /// run adopts it at its start (docs/adr/ADR-031.md decision 1; with none it would be BLOCKED on runtime:no_spec).
 async fn started(host: &Host, project: &Path, key: &str) -> R<String> {
-    exec(
-        project,
-        "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) \
-         SELECT 's1', project_id, printf('%064d', 1), 1 FROM projects;",
-    )?;
+    exec(project, &spec_s1("projects"))?;
     let body = json!({
         "schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
         "expected_revision": 0, "kind": "StartRun", "run_id": null,
@@ -791,11 +802,10 @@ async fn configure(host: &Host, key: &str, expected: i64, bindings: Value) -> R<
 
 /// Run `run_id` RUNNING on a spec, with `tasks` READY: (task id, role), readers.
 fn ready(project: &Path, run_id: &str, tasks: &[(&str, &str)]) -> R {
-    let mut sql = format!(
-        "INSERT OR IGNORE INTO specs(spec_id, project_id, sha256, revision) \
-         SELECT 's1', project_id, printf('%064d', 1), 1 FROM runs WHERE run_id = '{run_id}';
-         UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
-    );
+    let mut sql = spec_s1(&format!("runs WHERE run_id = '{run_id}'"));
+    sql.push_str(&format!(
+        "UPDATE runs SET state = 'RUNNING', spec_id = 's1' WHERE run_id = '{run_id}';"
+    ));
     for (task, role) in tasks {
         sql.push_str(&format!(
             "INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate) \
@@ -819,6 +829,43 @@ async fn until(project: &Path, sql: &str, want: &str, limit: Duration) -> R {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The project file of a test that lowers its run's context budget: every role on the installed codex, so staffing
+/// blocks none (no `team.binding_blocked` wakes the Commander).
+const ALL_CODEX: &str = "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n[team.cto]\nagent = \"codex\"\n\
+                         [team.qa]\nagent = \"codex\"\n[team.researcher]\nagent = \"codex\"\n";
+
+/// Wait until run `run_id`'s developer is bound and its Commander between turns: its first turn (its adoption's
+/// `spec.changed` wake) ended and none unended. A test that lowers the run's context budget does so right after this
+/// and restores it as soon as its task was refused: the budget is the run's, its Commander's turns included, and a
+/// Commander turn it refused would block the run (COMMANDER_UNAVAILABLE) instead of the task under test. No Commander
+/// turn can start meanwhile: every wake is due at least `supervise::QUIET` (2 s) after its event (docs/adr/ADR-025.md
+/// decision 2), and the only events that wake it here come at the turn's end (its stall re-trigger) or after the
+/// restore (the task's need_decision); [`ALL_CODEX`] staffs every role and the spec has its review, so no
+/// `team.binding_blocked` or `spec_review.waiting` wakes it.
+async fn between_commander_turns(project: &Path, run_id: &str) -> R {
+    let limit = Duration::from_secs(60);
+    until(
+        project,
+        &format!(
+            "SELECT count(*) FROM role_bindings WHERE run_id = '{run_id}' AND role = 'developer'"
+        ),
+        "1",
+        limit,
+    )
+    .await?;
+    until(
+        project,
+        &format!(
+            "SELECT count(*) FILTER (WHERE a.state IN ('SETTLED', 'FAILED', 'CANCELLED')) > 0 \
+             AND count(*) FILTER (WHERE a.state NOT IN ('SETTLED', 'FAILED', 'CANCELLED')) = 0 \
+             FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id = '{run_id}' AND t.role = 'commander'"
+        ),
+        "1",
+        limit,
+    )
+    .await
 }
 
 /// The query of attempt `attempt_id`'s state and failure reason once it ended.
@@ -3723,13 +3770,14 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
     world.codex("gpt-6-astra")?;
     let project = world.project();
     std::fs::create_dir_all(project.join(".hoh"))?;
-    std::fs::write(
-        project.join(".hoh/config.toml"),
-        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
-    )?;
+    std::fs::write(project.join(".hoh/config.toml"), ALL_CODEX)?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
         let run_id = started(&host, &project, "s1").await?;
+        let original = query(&project, &format!("SELECT config_snapshot_json FROM runs WHERE run_id='{run_id}'"))?;
+        // The budget below holds only while T-b starts: from between two Commander turns until T-b's refusal
+        // (restored right after it), see [`between_commander_turns`].
+        between_commander_turns(&project, &run_id).await?;
         exec(
             &project,
             &format!(
@@ -3739,6 +3787,7 @@ async fn a_turn_whose_mandatory_items_exceed_its_runs_budget_is_refused_and_its_
         )?;
         ready(&project, &run_id, &[("T-b", "developer")])?;
         until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
+        exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
         let refused: Value = serde_json::from_str(&query(
             &project,
             "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",
@@ -6763,14 +6812,14 @@ async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() ->
     world.codex("gpt-6-astra")?;
     let project = world.project();
     std::fs::create_dir_all(project.join(".hoh"))?;
-    std::fs::write(
-        project.join(".hoh/config.toml"),
-        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
-    )?;
+    std::fs::write(project.join(".hoh/config.toml"), ALL_CODEX)?;
     let host = start_when_free(world.config()).await?;
     let outcome = async {
         let run_id = started(&host, &project, "s1").await?;
         let original = query(&project, &format!("SELECT config_snapshot_json FROM runs WHERE run_id='{run_id}'"))?;
+        // The budget below holds only while T-b starts: from between two Commander turns until T-b's refusal
+        // (restored right after it), see [`between_commander_turns`].
+        between_commander_turns(&project, &run_id).await?;
         host.store().enqueue_input(hoh_core::persistence::NewInput {
             input_id: "budget-input".into(), run_id: run_id.clone(), kind: "STEER".into(),
             target_role: Some("developer".into()), payload: json!({"text":"UNSTARTED_INPUT_SENTINEL"}),
@@ -6784,6 +6833,7 @@ async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() ->
         )?;
         ready(&project, &run_id, &[("T-b", "developer")])?;
         until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
+        exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
         let refused: Value = serde_json::from_str(&query(
             &project,
             "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",
@@ -6810,7 +6860,6 @@ async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() ->
         );
         assert!(codex_prompts_of(&world, |a| a.starts_with("T-b/"))?.is_empty());
         assert_eq!(host.store().reader()?.input("budget-input")?.ok_or("input")?.state, hoh_core::lifecycle::InputState::Queued);
-        exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
         ready(&project, &run_id, &[("T-next", "developer")])?;
         until(&project, "SELECT state FROM input_queue WHERE input_id='budget-input'", "APPLIED", Duration::from_secs(60)).await?;
         let prompts=codex_prompts_of(&world, |a|a.starts_with("T-next/"))?;
