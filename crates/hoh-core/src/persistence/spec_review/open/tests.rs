@@ -625,6 +625,8 @@ async fn approve_revision_2(store: &Store, path: &Path) -> R<String> {
                 payload: payload.clone(),
                 payload_sha256: crate::specindex::digest(&serde_json::to_vec(&payload)?),
                 target: RunTarget::Specification(Box::new(SpecRequest {
+                    // The approval comes from the user (M3-T04 S2's origin guard admits only User).
+                    origin: crate::origin::Origin::User,
                     action,
                     files: Ok(files),
                 })),
