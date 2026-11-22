@@ -12,6 +12,9 @@
 pub mod bridge;
 #[forbid(clippy::disallowed_methods)]
 pub mod budget;
+// REQ-028: project discovery's pure parts (docs/adr/ADR-039.md).
+#[forbid(clippy::disallowed_methods)]
+pub mod baseline;
 #[forbid(clippy::disallowed_methods)]
 pub mod cancel;
 #[cfg(hoh_clippy_canary)]

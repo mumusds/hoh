@@ -58,6 +58,7 @@ fn snapshot() -> Snapshot {
         assumptions: None,
         readiness: None,
         admission: None,
+        baselined: true,
     }
 }
 
@@ -803,4 +804,28 @@ fn a_transition_to_ready_is_refused_while_readiness_does_not_pass() {
     assert!(validate(&ready, &specifying).is_ok());
     specifying.readiness = None;
     assert!(validate(&ready, &specifying).is_ok());
+}
+
+#[test]
+fn leaving_discovering_before_the_baseline_is_an_illegal_transition() {
+    // REQ-028 behaviour 1 (CR26D-151): the Commander cannot move a run out of DISCOVERING before run.baseline.
+    let mut s = snapshot();
+    s.run.state = RunState::Discovering;
+    s.baselined = false;
+    let specify = proposal(json!({"kind": "transition_run", "to_state": "SPECIFYING"}));
+    assert_eq!(reason(&specify, &s), IllegalTransition);
+    s.baselined = true;
+    assert_eq!(
+        validate(&specify, &s),
+        Ok(Effect::TransitionRun {
+            from: RunState::Discovering,
+            to: RunState::Specifying
+        })
+    );
+    // Entering it needs no baseline.
+    let mut created = snapshot();
+    created.run.state = RunState::Created;
+    created.baselined = false;
+    let discover = proposal(json!({"kind": "transition_run", "to_state": "DISCOVERING"}));
+    assert!(validate(&discover, &created).is_ok());
 }

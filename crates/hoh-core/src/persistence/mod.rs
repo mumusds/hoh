@@ -14,6 +14,7 @@
 mod admission;
 mod adoption;
 mod attempts;
+mod baseline;
 mod blockers;
 mod candidates;
 mod closing;
@@ -1621,6 +1622,20 @@ impl Store {
     }
 
     /// Fulfil the latest SetMode intent once no writer attempt remains in flight (ADR-036).
+    /// Record run `run_id`'s project baseline `payload` (the host's read-only discovery; docs/adr/ADR-039.md decision
+    /// 4): only while the run is in DISCOVERING without one; whether it was written.
+    pub async fn record_baseline(
+        &self,
+        run_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Baseline {
+            run_id: run_id.to_owned(),
+            payload: Box::new(payload),
+        })
+        .await
+    }
+
     pub async fn mode_step(&self, run_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Mode(run_id.to_owned()))
             .await

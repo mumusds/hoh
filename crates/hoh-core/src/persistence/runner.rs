@@ -49,6 +49,8 @@ pub struct Waiting {
     pub pausing: Vec<String>,
     /// Runs with an unfulfilled SetMode command.
     pub mode_changes: Vec<String>,
+    /// Runs in DISCOVERING whose project discovery has not written `run.baseline` yet (docs/adr/ADR-039.md decision 4).
+    pub discovering: Vec<String>,
     pub cancelling: Vec<String>,
     /// Nonterminal runs behind the team revision, or with an idle role behind the host's resource bundle. A resource
     /// upgrade that only waits for in-flight attempts needs no checkpoint transaction yet (CR-026 C14).
@@ -79,6 +81,11 @@ pub struct Waiting {
 #[derive(Debug, Clone)]
 pub(super) enum RunnerJob {
     Waiting(String),
+    /// A run's project baseline from the host's discovery (docs/adr/ADR-039.md decision 4).
+    Baseline {
+        run_id: String,
+        payload: Box<Value>,
+    },
     /// Only the session.start notices waiting in a project (docs/adr/ADR-024.md decision 4), its runner's second look
     /// after a checkpoint or a staffing write (M2T17R-156).
     SessionStarts(String),
@@ -462,6 +469,9 @@ pub(super) fn run(
         RunnerJob::Readiness(run_id) => {
             super::readiness::settle(conn, &run_id, ctx).map(RunnerDone::Applied)
         }
+        RunnerJob::Baseline { run_id, payload } => {
+            super::baseline::record(conn, &run_id, *payload, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
         }
@@ -650,6 +660,7 @@ fn waiting(
         runs,
         pausing: in_state("PAUSE_REQUESTED")?,
         mode_changes: super::modes::waiting(conn, project_id)?,
+        discovering: super::baseline::waiting(conn, project_id)?,
         cancelling: in_state("CANCEL_REQUESTED")?,
         team_behind: {
             let mut statement = conn

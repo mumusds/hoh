@@ -395,6 +395,14 @@ pub struct Snapshot {
     /// For a dispatch, the dispatch admission's refusal of its task, if it refused it (docs/adr/ADR-035.md decision 12:
     /// its revision, who may dispatch it, its readiness under the run's current revision).
     pub admission: Option<Rejection>,
+    /// For a move of the run, whether its project discovery wrote its `run.baseline` (REQ-028 behaviour 1).
+    pub baselined: bool,
+}
+
+/// Whether the run may leave DISCOVERING (REQ-028 behaviour 1, CR26D-151; docs/adr/ADR-039.md decision 5): only once its
+/// discovery wrote `run.baseline`. Readiness gates the move to READY on its own (docs/adr/ADR-035.md decision 4).
+pub fn may_leave_discovering(snapshot: &Snapshot) -> bool {
+    snapshot.baselined
 }
 
 /// What an end of a run waits for (docs/adr/ADR-031.md decision 4): it is ended only when quiet, so nothing of it is
@@ -807,6 +815,15 @@ fn transition_run(
 ) -> Result<Effect, Rejection> {
     let from = snapshot.run.state;
     table(from, to)?;
+    if from == RunState::Discovering && to != from && !may_leave_discovering(snapshot) {
+        return reject(
+            RejectionReason::IllegalTransition,
+            format!(
+                "run DISCOVERING -> {}: its project discovery has not written run.baseline yet",
+                to.as_str()
+            ),
+        );
+    }
     if !(lifecycle::is_working(to)
         || matches!(
             to,
