@@ -80,6 +80,9 @@ async fn approved(world: &World, index: &Index) -> R<(Host, String)> {
     // A new run of the project adopts its approved specification (CREATED).
     let run = world::start_run(&host, "brownfield", "discovery").await?;
     world.staff(&run)?;
+    // Its revision's CURRENT PASS independent review, which readiness needs before READY (REQ-031 behaviour 3,
+    // docs/adr/ADR-035.md decision 4): no reviewer runs here.
+    world.review_spec(&world.query(&format!("SELECT spec_id FROM runs WHERE run_id='{run}'"))?)?;
     Ok((host, run))
 }
 
