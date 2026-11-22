@@ -814,20 +814,46 @@ async fn test_021_06_c_a_check_lost_after_the_assignment_refuses_the_turn_unavai
     world.commit_project(&world::fixture_spec())?;
     world.register()?;
     let registry = quick_registry(&world);
+    // The first Commander attempt prepared (the one the check is lost for) and whether the registry held the check
+    // unavailable before its prepare read it.
+    let lost: std::sync::Arc<std::sync::Mutex<Option<(String, bool)>>> = std::sync::Arc::default();
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hook: hoh_app::host::product::PreparingSeen = {
-        let (registry, fired, mode) = (
+        let (registry, lost, fired, mode) = (
             registry.clone(),
+            lost.clone(),
             fired.clone(),
             world.fakes().join("sandbox"),
         );
-        std::sync::Arc::new(move |role: &str, _attempt: &str| {
-            if role == "commander" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let staged = mode.with_extension("lost");
-                if std::fs::write(&staged, "unavailable").is_ok() {
-                    let _ = std::fs::rename(&staged, &mode);
+        std::sync::Arc::new(move |role: &str, attempt: &str| {
+            if role != "commander" || fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let staged = mode.with_extension("lost");
+            if std::fs::write(&staged, "unavailable").is_ok() {
+                let _ = std::fs::rename(&staged, &mode);
+            }
+            // The registry's own refresh finds it unavailable. Its loop is the registry's only looker, one look at a
+            // time, so once one of its looks recorded unavailable (a check begun after the write) no later look
+            // records the check as it was before. A look of the hook's own raced the loop's: a check of the loop's
+            // begun before the write landed its "unknown" after the hook's "unavailable", and prepare launched the
+            // turn (CI run 44984078273).
+            let end = std::time::Instant::now() + WAIT;
+            let unavailable = loop {
+                let check = registry
+                    .prepared(hoh_agents::compat::Agent::Codex)
+                    .and_then(Result::ok)
+                    .and_then(|current| current.host_check);
+                if check.is_some_and(|check| check["check"] == json!("unavailable")) {
+                    break true;
                 }
-                let _ = registry.look(hoh_agents::compat::Agent::Codex);
+                if std::time::Instant::now() >= end {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if let Ok(mut lost) = lost.lock() {
+                *lost = Some((attempt.to_owned(), unavailable));
             }
         })
     };
@@ -848,11 +874,26 @@ async fn test_021_06_c_a_check_lost_after_the_assignment_refuses_the_turn_unavai
             "SELECT session_id FROM role_bindings WHERE run_id = '{run}' AND role = 'developer'"
         ))?;
         let first = format!("{run}/trigger/");
+        let end = std::time::Instant::now() + WAIT;
+        let (refused, unavailable) = loop {
+            if let Some(seen) = lost.lock().map_err(|e| e.to_string())?.clone() {
+                break seen;
+            }
+            if std::time::Instant::now() >= end {
+                return Err(format!("no Commander turn was prepared within {WAIT:?}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(unavailable, "the refresh did not find the check unavailable before {refused} was prepared");
+        assert_eq!(
+            commander_attempts(&world, &run)?.first(),
+            Some(&refused),
+            "the check is lost for the first Commander turn"
+        );
         world
             .until(
                 &format!(
-                    "SELECT a.state || ' ' || a.failure_reason FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-                     WHERE t.run_id = '{run}' AND t.role = 'commander' ORDER BY a.rowid LIMIT 1"
+                    "SELECT state || ' ' || failure_reason FROM attempts WHERE attempt_id = '{refused}'"
                 ),
                 "FAILED AGENT_UNAVAILABLE",
                 WAIT,
@@ -868,7 +909,6 @@ async fn test_021_06_c_a_check_lost_after_the_assignment_refuses_the_turn_unavai
                     ))
                 )
             })?;
-        assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
         let (_, evidence) = commander_blocked(&world, &run, "codex").await?;
         assert_eq!(evidence["probe"]["host_check"]["check"], json!("unavailable"), "{evidence}");
         assert_eq!(
@@ -876,9 +916,8 @@ async fn test_021_06_c_a_check_lost_after_the_assignment_refuses_the_turn_unavai
             "0"
         );
         let version = world.query(&format!(
-            "SELECT s.agent_version FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-             JOIN sessions s ON s.session_id = a.session_id \
-             WHERE t.run_id = '{run}' AND t.role = 'commander' ORDER BY a.rowid LIMIT 1"
+            "SELECT s.agent_version FROM attempts a JOIN sessions s ON s.session_id = a.session_id \
+             WHERE a.attempt_id = '{refused}'"
         ))?;
         world.sandbox("confined")?;
         world
