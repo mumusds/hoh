@@ -11,7 +11,7 @@ use crate::ids::child_id;
 use crate::lifecycle::Lifecycle as _;
 use crate::protocol::{ApproveSpec, ProposeSpecChange, RunState, SpecDecision};
 use crate::specindex::{self, Index, IndexError, Source};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 /// A workspace snapshot read by the host, including the existing bytes and their Git tracking identity.
@@ -347,7 +347,7 @@ pub(super) fn failed(
 }
 
 /// Reconstruct only the approved semantic index from its derived rows; source-byte digests are not impact edges.
-fn indexed(tx: &Transaction<'_>, spec: &str) -> Result<Value, PersistError> {
+pub(super) fn indexed(tx: &Connection, spec: &str) -> Result<Value, PersistError> {
     let rows = tx.prepare("SELECT requirement_id,title,release_class FROM requirements WHERE spec_id=?1 ORDER BY requirement_id").map_err(sqlite_error)?
         .query_map(params![spec],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))
         .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;

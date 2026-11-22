@@ -519,3 +519,19 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((out/'artifacts/test-results.jsonl').read_text(),'')
 
 if __name__=='__main__':unittest.main()
+
+
+class ScenarioChecks(unittest.TestCase):
+    """REQ-032 behaviour 6, failure mode 3 (docs/adr/ADR-039.md decision 1): the spec file's scenarios name each TEST's
+    check; a missing one has none and is never looked up in contracts/; only a spec without the key reads it."""
+    def test_scenarios_key_is_the_only_source_and_a_missing_test_has_no_check(self):
+        with tempfile.TemporaryDirectory(prefix='hoh-m3t07-scenarios-') as d:
+            root=Path(d)
+            spec={'requirements':[],'scenarios':[{'id':'TEST-A-01','check_id':'unit'},{'id':'TEST-A-02'}]}
+            # No contracts/ at all: reading it would raise.
+            self.assertEqual(tr.checks_of(spec,root),{'TEST-A-01':'unit'})
+            self.assertEqual(tr.checks_of({'requirements':[],'scenarios':[]},root),{})
+            with self.assertRaises(FileNotFoundError):tr.checks_of({'requirements':[]},root)
+            json_file(root,'contracts/acceptance-scenarios.json',{'scenarios':[{'id':'TEST-A-01','check_id':'x'}]})
+            self.assertEqual(tr.checks_of({'requirements':[]},root),{'TEST-A-01':'x'})
+            self.assertEqual(tr.checks_of(spec,root),{'TEST-A-01':'unit'})
