@@ -924,7 +924,10 @@ pub(super) fn allocate(
             }
             continue;
         }
-        if super::retry::budget_stop(&tx, &run_id, context)?.is_some() {
+        if super::budget_view::load(&tx, &run_id, context.now(), context.wall())?
+            .any_stop()
+            .is_some()
+        {
             continue;
         }
         if wakes.iter().any(Wake::in_flight) {
@@ -1234,7 +1237,9 @@ pub(super) fn could_allocate(
         .optional()
         .map_err(sqlite_error)?;
     Ok(bound.is_some_and(|agent| !unverified(context, &agent))
-        && super::retry::budget_stop(tx, run_id, context)?.is_none()
+        && super::budget_view::load(tx, run_id, context.now(), context.wall())?
+            .any_stop()
+            .is_none()
         && not_before.is_none_or(|t| t <= context.now()))
 }
 

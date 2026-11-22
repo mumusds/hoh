@@ -161,7 +161,10 @@ fn judge(
         return Ok(Detected::Nothing);
     }
     // (e) A budget stop is the pace's to settle.
-    if super::retry::budget_stop(tx, run_id, context)?.is_some() {
+    if super::budget_view::load(tx, run_id, context.now(), context.wall())?
+        .any_stop()
+        .is_some()
+    {
         return Ok(Detected::Nothing);
     }
     // (d), the dearer reads last (M2T13R-03): no live recovery obligation of its candidates (the runner's own filter:
