@@ -58,6 +58,8 @@ pub mod spec;
 #[allow(unused_imports)] // each test binary uses a part of it
 pub use output::output_within;
 
+pub mod quiescent;
+
 /// Ends, however the test leaves, every process the records at `.0` name by its pid and start time: `proc <pid>
 /// <start>` (written by a fixture's process at its fork, or for a member as soon as it started), `established <pid>
 /// <sid> <ms> <handled|ignored> <start>` (control.rs's writer) and `w <pid> <sid> <start>` (its W). Each gets SIGKILL

@@ -4797,53 +4797,36 @@ fn test_005_04_a_host_killed_under_its_unit_is_restarted_by_systemd_and_reconcil
             ),
         )?;
         let marker = manager.bin().join("claude.d/completed");
-        let mut waited = Ok(());
-        let end = Instant::now() + Duration::from_secs(60);
-        loop {
-            let t1 = query(
-                &db(&project),
-                "SELECT state FROM attempts WHERE task_id = 'T1'",
-            )?;
-            let effect = query(
-                &db(&project),
-                "SELECT group_concat(e.state) FROM effects e JOIN attempts a USING(attempt_id) WHERE a.task_id = 'T1'",
-            )?;
-            let t2 = query(
-                &db(&project),
-                "SELECT state FROM attempts WHERE task_id = 'T2'",
-            )?;
-            // R's adoption of its specification wakes its Commander once the wake's debounce ends (docs/adr/ADR-031.md
-            // decision 1). That wake taken in and answered (its latest turn SETTLED, docs/adr/ADR-025.md) and nothing
-            // else unfinished, T2's attempt is the only one at the kill whenever the setup ends.
-            let commander = query(
-                &db(&project),
-                &format!(
-                    "SELECT (SELECT coalesce(max(last_handled_seq), 0) FROM supervisor_cursor WHERE run_id = '{run_id}') \
-                     >= (SELECT seq FROM events WHERE run_id = '{run_id}' AND kind = 'spec.changed') \
-                     AND NOT EXISTS (SELECT 1 FROM supervisor_triggers WHERE run_id = '{run_id}' AND state = 'PENDING') \
-                     AND (SELECT state FROM attempts WHERE attempt_id LIKE '{run_id}/trigger/%' ORDER BY rowid DESC LIMIT 1) \
-                       IS 'SETTLED' \
-                     AND NOT EXISTS (SELECT 1 FROM attempts WHERE task_id <> 'T2' \
-                       AND state IN ('PREPARED', 'STARTING', 'RUNNING'))"
+        // T1 SETTLED with its effect COMMITTED and T2 RUNNING, and the host done with everything else it set going:
+        // R's adoption of its specification wakes its Commander once the wake's debounce ends (docs/adr/ADR-031.md
+        // decision 1), so the supervisor has taken in every event committed, that wake is answered (its last turn
+        // SETTLED, docs/adr/ADR-025.md) and its output disposed of, and no attempt but T2's is in flight: T2's
+        // attempt is the only one at the kill whenever the setup ends.
+        let quiet = common::quiescent::Quiet {
+            in_flight_tasks: &["T2"],
+            reads: &[
+                ("t1", "SELECT state FROM attempts WHERE task_id = 'T1'"),
+                (
+                    "effect",
+                    "SELECT group_concat(e.state) FROM effects e JOIN attempts a USING(attempt_id) \
+                     WHERE a.task_id = 'T1'",
                 ),
-            )?;
-            if t1 == "SETTLED"
-                && effect.split(',').any(|e| e == "COMMITTED")
-                && t2 == "RUNNING"
-                && commander == "1"
-                && marker.exists()
-                && manager.bin().join("claude.d/t2.pid").exists()
-            {
-                break;
-            }
-            if Instant::now() > end {
-                waited = Err(format!(
-                    "T1 {t1:?} ({effect:?}), T2 {t2:?}, the Commander's wake over: {commander:?}"
-                ));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+                ("t2", "SELECT state FROM attempts WHERE task_id = 'T2'"),
+            ],
+            ..common::quiescent::Quiet::new(&run_id, common::quiescent::Watermark::Latest)
+        };
+        let waited = common::quiescent::await_quiescent(
+            &db(&project),
+            &quiet,
+            Duration::from_secs(60),
+            |s| {
+                s.read("t1") == "SETTLED"
+                    && s.read("effect").split(',').any(|e| e == "COMMITTED")
+                    && s.read("t2") == "RUNNING"
+                    && marker.exists()
+                    && manager.bin().join("claude.d/t2.pid").exists()
+            },
+        );
         if let Err(why) = waited {
             return Err(format!("{why}: {}", export(&project)?).into());
         }
