@@ -15,7 +15,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 /// A workspace snapshot read by the host, including the existing bytes and their Git tracking identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpecFiles {
     pub sources: Vec<Source>,
     pub existing_index: Option<Vec<u8>>,

@@ -5,7 +5,9 @@ use super::{
     runner::{Executor, TickError, no_run},
 };
 use hoh_core::delivery::{Clock, DeliveryError, Dispatcher, Transport};
-use hoh_core::persistence::{InputOutcome, InputRouting, OutboxRow, PersistError};
+use hoh_core::persistence::{
+    ChangeInput, InputOutcome, InputRouting, OutboxRow, PersistError, SpecAction, SpecRequest,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -51,7 +53,9 @@ impl Transport for HostTransport<'_> {
     }
     async fn deliver(&self, row: &OutboxRow) -> Result<String, DeliveryError> {
         let store = &self.shared.store;
-        let reply = if row.recipient_role == "commander" {
+        let reply = if row.recipient_role == "runtime" && row.payload["kind"] == "CHANGE" {
+            propose_change(self.shared, row).await?
+        } else if row.recipient_role == "commander" {
             store
                 .consume_input(row.clone(), self.clock.now())
                 .await
@@ -129,6 +133,67 @@ impl Transport for HostTransport<'_> {
         Ok(reply)
     }
 }
+
+async fn propose_change(shared: &Arc<Shared>, row: &OutboxRow) -> Result<String, DeliveryError> {
+    let input = shared
+        .store
+        .reader()
+        .map_err(delivery_error)?
+        .input(&row.message_id)
+        .map_err(delivery_error)?
+        .ok_or_else(|| DeliveryError::Lost("missing CHANGE input".into()))?;
+    let request = if input.state == hoh_core::lifecycle::InputState::Queued {
+        let root = shared.root.clone();
+        let files = super::begun::spawn_blocking(move || super::spec::files(&root))
+            .await
+            .map_err(|e| DeliveryError::Lost(e.to_string()))?;
+        let files = files.and_then(|files| {
+            hoh_core::specindex::generate_index(&files.sources).map(|index| (files, index.sha256()))
+        });
+        let (files, digest) = match files {
+            Ok((files, digest)) => (Ok(files), digest),
+            Err(error) => (Err(error), String::new()),
+        };
+        Some(SpecRequest {
+            action: SpecAction::Propose(hoh_core::protocol::ProposeSpecChange {
+                reason: input.payload["text"]
+                    .as_str()
+                    .ok_or_else(|| DeliveryError::Lost("CHANGE has no text".into()))?
+                    .to_owned(),
+                spec_sha256: digest,
+            }),
+            files,
+        })
+    } else {
+        None
+    };
+    let prepared = shared
+        .store
+        .change_input(ChangeInput::Prepare {
+            row: row.clone(),
+            request,
+        })
+        .await
+        .map_err(delivery_error)?;
+    if let Some(reply) = prepared.reply {
+        return Ok(reply);
+    }
+    let snapshot = prepared
+        .publication
+        .ok_or_else(|| DeliveryError::Lost("CHANGE has no publication".into()))?;
+    let root = shared.root.clone();
+    super::begun::spawn_blocking(move || super::spec::publish(&root, &snapshot))
+        .await
+        .map_err(|e| DeliveryError::Lost(e.to_string()))?
+        .map_err(DeliveryError::Lost)?;
+    shared
+        .store
+        .change_input(ChangeInput::Published { row: row.clone() })
+        .await
+        .map_err(delivery_error)?
+        .reply
+        .ok_or_else(|| DeliveryError::Lost("CHANGE has no receipt".into()))
+}
 async fn tick(
     shared: &Arc<Shared>,
     clock: &dyn Clock,
@@ -153,7 +218,12 @@ async fn tick(
             store,
             clock,
             transport: &transport,
-            roles: config.team.keys().cloned().collect(),
+            roles: config
+                .team
+                .keys()
+                .cloned()
+                .chain(std::iter::once("runtime".into()))
+                .collect(),
             max_attempts: i64::from(config.delivery.max_delivery_attempts),
             batch: 32,
         }

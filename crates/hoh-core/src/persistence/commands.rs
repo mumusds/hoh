@@ -140,6 +140,28 @@ pub(super) fn submit(
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<CommandOutcome, PersistError> {
     let tx = super::writer::begin(conn, ctx)?;
+    let outcome = submit_in(&tx, command, ctx);
+    match outcome {
+        Ok(CommandOutcome::Replayed { .. }) => outcome,
+        Ok(_) => {
+            writer::commit(tx, ctx)?;
+            outcome
+        }
+        Err(PersistError::SpecInvalid(error)) => {
+            super::spec::failed(&tx, command, &error, ctx)?;
+            writer::commit(tx, ctx)?;
+            Err(PersistError::SpecInvalid(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The same command path inside a runtime input's accepting transaction.
+pub(super) fn submit_in(
+    tx: &rusqlite::Transaction<'_>,
+    command: &SubmitCommand,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<CommandOutcome, PersistError> {
     let stored: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT payload_sha256, result_json FROM commands WHERE idempotency_key = ?1",
@@ -189,7 +211,7 @@ pub(super) fn submit(
             )
             .map_err(sqlite_error)?;
             super::team::start_run(
-                &tx,
+                tx,
                 &command.run_id,
                 &command.event.project_id,
                 super::team::Frozen {
@@ -213,10 +235,10 @@ pub(super) fn submit(
             // The project's latest approved specification, adopted after run.created; with none, the run is BLOCKED
             // on its question runtime:no_spec in this commit (docs/adr/ADR-031.md decision 1).
             let project_id = &command.event.project_id;
-            let adopted = super::adoption::adopt(&tx, project_id, &command.run_id)?;
+            let adopted = super::adoption::adopt(tx, project_id, &command.run_id)?;
             let asks = adopted.is_none();
             let done = writer::write(
-                &tx,
+                tx,
                 &Commit {
                     events: std::iter::once(command.event.clone())
                         .chain(adopted)
@@ -228,7 +250,7 @@ pub(super) fn submit(
                 ctx,
             )?;
             if asks {
-                super::adoption::ask(&tx, project_id, &command.run_id, ctx)?;
+                super::adoption::ask(tx, project_id, &command.run_id, ctx)?;
             }
             // The 202 body's revision is the run's after this transaction, as for every other run command: 0, or 1
             // once its question blocked it.
@@ -259,11 +281,11 @@ pub(super) fn submit(
                     return Err(PersistError::RunConfigFrozen(command.run_id.clone()));
                 }
             }
-            let made = super::team::configure(&tx, command, change)?;
+            let made = super::team::configure(tx, command, change)?;
             let revision = made.revision;
             team_revision = Some(made);
             let done = writer::write(
-                &tx,
+                tx,
                 &Commit {
                     events: vec![command.event.clone()],
                     outbox: command.outbox.clone().into_iter().collect(),
@@ -274,29 +296,21 @@ pub(super) fn submit(
             (revision, done.event_seqs[0])
         }
         RunTarget::SetMode(mode) => {
-            super::hold::command(&tx, &command.run_id)?;
-            super::modes::set(&tx, command, *mode, ctx)?
+            super::hold::command(tx, &command.run_id)?;
+            super::modes::set(tx, command, *mode, ctx)?
         }
         RunTarget::Input(input) => {
-            super::hold::command(&tx, &command.run_id)?;
-            input_command(&tx, command, input, ctx)?
+            super::hold::command(tx, &command.run_id)?;
+            input_command(tx, command, input, ctx)?
         }
         RunTarget::Specification(input) => {
-            super::hold::command(&tx, &command.run_id)?;
-            match super::spec::apply(&tx, command, input, ctx) {
-                Ok(result) => result,
-                Err(PersistError::SpecInvalid(error)) => {
-                    super::spec::failed(&tx, command, &error, ctx)?;
-                    super::writer::commit(tx, ctx)?;
-                    return Err(PersistError::SpecInvalid(error));
-                }
-                Err(error) => return Err(error),
-            }
+            super::hold::command(tx, &command.run_id)?;
+            super::spec::apply(tx, command, input, ctx)?
         }
         target => {
             // A run command: every event of its run in this transaction is the command's, written even while the run
             // is stopped (docs/adr/ADR-031.md correction D: an INCOMPLETE run takes commands).
-            super::hold::command(&tx, &command.run_id)?;
+            super::hold::command(tx, &command.run_id)?;
             let run: Option<(String, Option<String>, String)> = tx
                 .query_row(
                     "SELECT state, resume_state, project_id FROM runs WHERE run_id = ?1",
@@ -331,8 +345,8 @@ pub(super) fn submit(
                         });
                     };
                     // Reconcile first, then the stop's own predicate (docs/adr/ADR-031.md decision 16 (1), (2)).
-                    events.push(resume_reconcile(&tx, &project_id, from, command)?);
-                    if let Some(details) = still_stopped(&tx, &command.run_id, from, ctx)? {
+                    events.push(resume_reconcile(tx, &project_id, from, command)?);
+                    if let Some(details) = still_stopped(tx, &command.run_id, from, ctx)? {
                         return Err(PersistError::IllegalTransition {
                             entity: writer::Entity::Run,
                             id: command.run_id.clone(),
@@ -359,11 +373,11 @@ pub(super) fn submit(
             let mut to = to;
             let mut cas = Vec::new();
             if *target == RunTarget::Resume {
-                let reasons = super::blockers::recorded(&tx, &command.run_id)?;
+                let reasons = super::blockers::recorded(tx, &command.run_id)?;
                 if !reasons.is_empty() {
                     to = RunState::Blocked;
                     let (moves, withdrawn) = super::control::withdraw(
-                        &tx,
+                        tx,
                         &project_id,
                         &command.run_id,
                         &crate::time::now_rfc3339(),
@@ -407,7 +421,7 @@ pub(super) fn submit(
                 change: Change::Run(to),
             });
             let done = writer::write(
-                &tx,
+                tx,
                 &Commit {
                     cas,
                     events,
@@ -456,9 +470,8 @@ pub(super) fn submit(
     )
     .map_err(sqlite_error)?;
     if let Some(made) = &team_revision {
-        super::team::record(&tx, &command.event.project_id, &command.command_id, made)?;
+        super::team::record(tx, &command.event.project_id, &command.command_id, made)?;
     }
-    super::writer::commit(tx, ctx)?;
     Ok(CommandOutcome::Accepted {
         result_json,
         revision,
@@ -571,8 +584,9 @@ fn input_command(
     };
     // A working ASK is read-only (AC-017-01). In a stopped state the accepted
     // command still moves the revision and closes with a fresh result (ADR-031 E3).
-    let publish_result = queued.as_ref().is_none_or(|input| input.kind != "ASK")
-        || matches!(state.as_str(), "BLOCKED" | "PAUSED" | "INCOMPLETE");
+    let publish_result = queued.as_ref().is_none_or(|input| input.kind != "CONTROL")
+        && (queued.as_ref().is_none_or(|input| input.kind != "ASK")
+            || matches!(state.as_str(), "BLOCKED" | "PAUSED" | "INCOMPLETE"));
     // The acceptance event is the commit's first (decision 9 finds it by its command_id).
     let done = writer::write(
         tx,
@@ -599,6 +613,9 @@ fn input_command(
     } else {
         if let Some(input) = &queued {
             super::inputs::enqueue(tx, input, ctx)?;
+            if input.kind == "CONTROL" {
+                super::inputs::runtime::control(tx, &input.input_id, ctx)?;
+            }
         }
         if publish_result {
             writer::write(

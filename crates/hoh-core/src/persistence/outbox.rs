@@ -107,7 +107,7 @@ pub(super) fn claim_next(
                    AND json_extract(payload_json, '$.payload.handoff_kind') IS NOT 'verification' \
                    AND message_id NOT IN (SELECT value FROM json_each(?3)) \
                    AND (?4 = 0 OR (json_extract(payload_json,'$.notice') = 'input' \
-                     AND json_extract(payload_json,'$.kind') IN ('ASK','STEER'))) \
+                     AND json_extract(payload_json,'$.kind') IN ('ASK','STEER','CHANGE'))) \
                  AND (run_id IS NULL OR (SELECT r.state FROM runs r WHERE r.run_id = outbox.run_id) IS NOT 'INCOMPLETE' \
                    OR {}) \
                  ORDER BY event_seq, message_id LIMIT 1", super::hold::not_held("outbox.run_id")),
