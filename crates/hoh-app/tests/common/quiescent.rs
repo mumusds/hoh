@@ -32,6 +32,10 @@ pub struct Quiet<'a> {
     /// Tasks whose attempts may be in flight (PREPARED, STARTING, RUNNING) at the snapshot: by task, since an
     /// attempt's id is made when it starts. Any other attempt in flight is not quiet.
     pub in_flight_tasks: &'a [&'a str],
+    /// Roles whose attempts may be RUNNING at the snapshot, whatever their task: started, so their prompt is packed
+    /// (a fake Commander's turn that never ends). The wake such a turn answers is not owed another. An attempt of
+    /// theirs before RUNNING (PREPARED, STARTING) is in flight as any other.
+    pub running_roles: &'a [&'a str],
     /// The reasons a PENDING trigger may wait for with its `supervisor.deferred` written (NO_SPEC: a run without a
     /// specification, decision 4). Any other PENDING trigger is owed a firing, due or once its debounce ends.
     pub deferrals: &'a [&'a str],
@@ -49,6 +53,7 @@ impl<'a> Quiet<'a> {
             run,
             watermark,
             in_flight_tasks: &[],
+            running_roles: &[],
             deferrals: &[],
             reads: &[],
             dump: false,
@@ -72,6 +77,9 @@ pub struct Attempt {
     pub attempt_id: String,
     pub task_id: String,
     pub state: String,
+    /// Its task's role ("" for none).
+    #[serde(default)]
+    pub role: String,
 }
 
 /// A wake of the run neither answered (its last turn SETTLED) nor superseded.
@@ -82,6 +90,9 @@ pub struct Wake {
     pub attempt_id: String,
     pub task_id: String,
     pub state: String,
+    /// Its task's role ("" for none).
+    #[serde(default)]
+    pub role: String,
 }
 
 /// What one read-only transaction saw.
@@ -136,16 +147,25 @@ impl Snapshot {
                 ));
             }
         }
+        let allowed = |task: &str, state: &str, role: &str| {
+            quiet.in_flight_tasks.contains(&task)
+                || (state == "RUNNING" && quiet.running_roles.contains(&role))
+        };
         for a in &self.in_flight {
-            if !quiet.in_flight_tasks.contains(&a.task_id.as_str()) {
+            if !allowed(&a.task_id, &a.state, &a.role) {
                 out.push(format!(
-                    "attempt {} of task {} {} (allowed in flight: tasks {:?})",
-                    a.attempt_id, a.task_id, a.state, quiet.in_flight_tasks
+                    "attempt {} of task {} ({}) {} (allowed in flight: tasks {:?}, RUNNING roles {:?})",
+                    a.attempt_id,
+                    a.task_id,
+                    a.role,
+                    a.state,
+                    quiet.in_flight_tasks,
+                    quiet.running_roles
                 ));
             }
         }
         for w in &self.unanswered_wakes {
-            if !quiet.in_flight_tasks.contains(&w.task_id.as_str()) {
+            if !allowed(&w.task_id, &w.state, &w.role) {
                 out.push(format!(
                     "wake {} unanswered: its last turn {:?} of task {:?} {:?}",
                     w.wake, w.attempt_id, w.task_id, w.state
@@ -183,10 +203,11 @@ out["pending_triggers"] = [
     for t, f, d in rows("SELECT trigger_id, fingerprint, due_at FROM supervisor_triggers "
                         "WHERE run_id = ? AND state = 'PENDING' ORDER BY due_at, first_seq", run)
 ]
-attempt = {a: (t, s) for a, t, s in rows("SELECT attempt_id, task_id, state FROM attempts")}
+attempt = {a: (t, s, r or "") for a, t, s, r in rows("SELECT a.attempt_id, a.task_id, a.state, t.role FROM attempts a "
+                                                     "LEFT JOIN tasks t ON t.task_id = a.task_id")}
 out["in_flight"] = [
-    {"attempt_id": a, "task_id": t, "state": s}
-    for a, (t, s) in sorted(attempt.items()) if s in ("PREPARED", "STARTING", "RUNNING")
+    {"attempt_id": a, "task_id": t, "state": s, "role": r}
+    for a, (t, s, r) in sorted(attempt.items()) if s in ("PREPARED", "STARTING", "RUNNING")
 ]
 # The run's wakes after its horizon (closed for good before it), as the product reads them (persistence/wakes.rs).
 horizon = one("SELECT coalesce((SELECT json_extract(payload_json, '$.seq') FROM events WHERE run_id = ? "
@@ -208,9 +229,9 @@ for kind, p in rows("SELECT kind, payload_json FROM events WHERE run_id = ? AND 
 out["unanswered_wakes"] = []
 for wake in woken:
     a = last.get(wake, "")
-    t, s = attempt.get(a, ("", ""))
+    t, s, r = attempt.get(a, ("", "", ""))
     if wake not in superseded and s != "SETTLED":
-        out["unanswered_wakes"].append({"wake": wake, "attempt_id": a, "task_id": t, "state": s})
+        out["unanswered_wakes"].append({"wake": wake, "attempt_id": a, "task_id": t, "state": s, "role": r})
 ended = {o for o, in rows("SELECT json_extract(payload_json, '$.output_id') FROM events WHERE run_id = ? AND seq >= ? "
                           "AND kind IN ('supervisor.output_disposed', 'decision.applied', 'decision.rejected')",
                           run, horizon)}
