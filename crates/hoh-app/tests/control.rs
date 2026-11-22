@@ -3567,8 +3567,13 @@ async fn test_017_01_ask_uses_outbox_and_a_read_only_commander_turn_while_writer
     let project = dir.path().join("p");
     std::fs::create_dir_all(&project)?;
     Host::start(config(&project)).await?.shutdown().await;
+    // The adopted spec has its CURRENT PASS review: without one, the project (no committed spec) waits for its review
+    // commit and `spec_review.waiting` wakes the bound Commander as well (docs/adr/ADR-035.md decision 5).
     seed(&project, &format!("{WORLD}
         DELETE FROM tasks WHERE task_id IN ('T2','T3');
+        INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES (:p, 'reviewed-s1', NULL,
+          'spec_review.reported', json_object('review_id', 'rv-s1', 'spec_id', 's1', 'spec_revision', 1, 'status', 'PASS',
+          'state', 'CURRENT', 'reasons', json_array(), 'session_id', 'sv', 'findings', json_array()), '2026-11-07T00:00:00Z');
         INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sc','codex','commander','1','{{}}');
         INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at)
           VALUES ('R','commander','codex','sc',1,1,'2026-11-21T00:00:00Z');"))?;
