@@ -2050,7 +2050,7 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
             "/paths/~1v1~1runs~1{{run_id}}~1{path}/get/responses/200/content/application~1json/schema"
         ))
     };
-    let (acceptance, issues) = (page("acceptance")?, page("issues")?);
+    let (acceptance, issues, tasks) = (page("acceptance")?, page("issues")?, page("tasks")?);
     let run = openapi_schema(
         "/paths/~1v1~1runs~1{run_id}/get/responses/200/content/application~1json/schema",
     )?;
@@ -2062,9 +2062,15 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
             R::Ok((reply.status, reply.json()?))
         }
     };
-    let item = |candidate: &str, state: &str, ac: &str, label: &str, latest: bool| {
+    // Each item names its TEST (none in this fixture's AC bodies) and the evidence its rows cite (REQ-032).
+    let item = |candidate: &str,
+                state: &str,
+                ac: &str,
+                label: &str,
+                latest: bool,
+                evidence: &[&str]| {
         json!({"spec_id": "s-acc", "spec_revision": 1, "candidate_id": candidate, "candidate_state": state,
-            "ac_id": ac, "label": label, "why": null, "latest": latest})
+            "ac_id": ac, "test_id": null, "label": label, "why": null, "evidence_ids": evidence, "latest": latest})
     };
     let (status, all) = get("/v1/runs/ra/acceptance".to_owned()).await?;
     assert_eq!(status, 200, "{all}");
@@ -2072,10 +2078,10 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
     assert_eq!(
         all["items"],
         json!([
-            item(&c2, "VERIFYING", "AC-1-01", "NOT_RUN", true),
-            item(&c2, "VERIFYING", "AC-1-02", "NOT_RUN", true),
-            item(&c1, "REJECTED", "AC-1-01", "FAIL", false),
-            item(&c1, "REJECTED", "AC-1-02", "NOT_RUN", false),
+            item(&c2, "VERIFYING", "AC-1-01", "NOT_RUN", true, &[]),
+            item(&c2, "VERIFYING", "AC-1-02", "NOT_RUN", true, &[]),
+            item(&c1, "REJECTED", "AC-1-01", "FAIL", false, &["ra/ev"]),
+            item(&c1, "REJECTED", "AC-1-02", "NOT_RUN", false, &[]),
         ])
     );
     assert_eq!(all["next_cursor"], json!(null));
@@ -2130,6 +2136,10 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
             json!(null)
         )
     );
+    // listTasks (docs/adr/ADR-039.md decision 2): a Page, whatever the run's tasks.
+    let (status, listed) = get("/v1/runs/ra/tasks".to_owned()).await?;
+    assert_eq!(status, 200, "{listed}");
+    conforms(&tasks, &listed)?;
     let (status, got) = get("/v1/runs/ra".to_owned()).await?;
     assert_eq!(status, 200);
     conforms(&run, &got)?;
@@ -2145,6 +2155,9 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
         ("/v1/runs/ra/acceptance?cursor=nonsense", "BAD_REQUEST"),
         ("/v1/runs/ra/issues?limit=x", "BAD_REQUEST"),
         ("/v1/runs/ra/issues?cursor=nonsense", "BAD_REQUEST"),
+        ("/v1/runs/missing/tasks", "RUN_NOT_FOUND"),
+        ("/v1/runs/ra/tasks?limit=0", "BAD_REQUEST"),
+        ("/v1/runs/ra/tasks?cursor=nonsense", "BAD_REQUEST"),
     ] {
         let (status, body) = get(path.to_owned()).await?;
         assert_eq!(status, 404, "{path}: {body}");

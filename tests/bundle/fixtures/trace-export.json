@@ -1,0 +1,187 @@
+{
+  "acceptance": [
+    {
+      "ac_id": "AC-A-01",
+      "requirement_id": "REQ-A",
+      "spec_revision": 1,
+      "statuses": [
+        "PASS"
+      ],
+      "test_id": "TEST-A-01"
+    },
+    {
+      "ac_id": "AC-A-02",
+      "requirement_id": "REQ-A",
+      "spec_revision": 1,
+      "statuses": [
+        "PASS"
+      ],
+      "test_id": "TEST-A-02"
+    },
+    {
+      "ac_id": "AC-B-01",
+      "requirement_id": "REQ-B",
+      "spec_revision": 1,
+      "statuses": [
+        "PASS"
+      ],
+      "test_id": "TEST-B-01"
+    },
+    {
+      "ac_id": "AC-B-02",
+      "requirement_id": "REQ-B",
+      "spec_revision": 1,
+      "statuses": [
+        "PASS"
+      ],
+      "test_id": "TEST-B-02"
+    }
+  ],
+  "broken": [],
+  "candidate_id": "CANDIDATE",
+  "candidates": [
+    {
+      "candidate_id": "CANDIDATE",
+      "current": true,
+      "state": "FROZEN",
+      "task_ids": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "candidate_id": "CANDIDATE",
+      "check_id": "unit",
+      "evidence_id": "evidence-AC-A-01",
+      "outcome": "PASS"
+    },
+    {
+      "candidate_id": "CANDIDATE",
+      "check_id": "integration",
+      "evidence_id": "evidence-AC-A-02",
+      "outcome": "PASS"
+    },
+    {
+      "candidate_id": "CANDIDATE",
+      "check_id": "unit",
+      "evidence_id": "evidence-AC-B-01",
+      "outcome": "PASS"
+    },
+    {
+      "candidate_id": "CANDIDATE",
+      "check_id": "unit",
+      "evidence_id": "evidence-AC-B-02",
+      "outcome": "PASS"
+    }
+  ],
+  "orphan": [],
+  "requirements": [
+    {
+      "ac_ids": [
+        "AC-A-01",
+        "AC-A-02"
+      ],
+      "requirement_id": "REQ-A",
+      "task_ids": [
+        "T1",
+        "T3"
+      ]
+    },
+    {
+      "ac_ids": [
+        "AC-B-01",
+        "AC-B-02"
+      ],
+      "requirement_id": "REQ-B",
+      "task_ids": [
+        "T2",
+        "T3"
+      ]
+    }
+  ],
+  "results": [
+    {
+      "ac_id": "AC-A-01",
+      "candidate_id": "CANDIDATE",
+      "evidence_id": "evidence-AC-A-01",
+      "spec_revision": 1,
+      "stale": false,
+      "status": "PASS"
+    },
+    {
+      "ac_id": "AC-A-02",
+      "candidate_id": "CANDIDATE",
+      "evidence_id": "evidence-AC-A-02",
+      "spec_revision": 1,
+      "stale": false,
+      "status": "PASS"
+    },
+    {
+      "ac_id": "AC-B-01",
+      "candidate_id": "CANDIDATE",
+      "evidence_id": "evidence-AC-B-01",
+      "spec_revision": 1,
+      "stale": false,
+      "status": "PASS"
+    },
+    {
+      "ac_id": "AC-B-02",
+      "candidate_id": "CANDIDATE",
+      "evidence_id": "evidence-AC-B-02",
+      "spec_revision": 1,
+      "stale": false,
+      "status": "PASS"
+    }
+  ],
+  "run_id": "RUN",
+  "spec_error": null,
+  "spec_revision": 1,
+  "spec_source": "candidate",
+  "stale": [],
+  "tasks": [
+    {
+      "requirement_ids": [
+        "REQ-A"
+      ],
+      "task_id": "T1"
+    },
+    {
+      "requirement_ids": [
+        "REQ-B"
+      ],
+      "task_id": "T2"
+    },
+    {
+      "requirement_ids": [
+        "REQ-A",
+        "REQ-B"
+      ],
+      "task_id": "T3"
+    }
+  ],
+  "tests": [
+    {
+      "ac_id": "AC-A-01",
+      "check_id": "unit",
+      "test_id": "TEST-A-01"
+    },
+    {
+      "ac_id": "AC-A-02",
+      "check_id": "integration",
+      "test_id": "TEST-A-02"
+    },
+    {
+      "ac_id": "AC-B-01",
+      "check_id": "unit",
+      "test_id": "TEST-B-01"
+    },
+    {
+      "ac_id": "AC-B-02",
+      "check_id": "unit",
+      "test_id": "TEST-B-02"
+    }
+  ]
+}

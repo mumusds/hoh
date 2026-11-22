@@ -91,6 +91,7 @@ fn routes(shared: Arc<Shared>, via: Via) -> Router {
         .route("/v1/runs/{run_id}/team", get(list_team))
         .route("/v1/runs/{run_id}/acceptance", get(list_acceptance))
         .route("/v1/runs/{run_id}/issues", get(list_issues))
+        .route("/v1/runs/{run_id}/tasks", get(list_tasks))
         .route("/v1/events", get(stream_events))
         .route("/healthz", get(health))
         .fallback(no_route)
@@ -1423,6 +1424,59 @@ async fn list_issues(
             axum::Json(json!({
                 "items": page.items,
                 "next_cursor": page.next.map(|n| n.to_string()),
+                "watermark": page.watermark,
+            })),
+        )
+            .into_response(),
+        Ok(None) => no_run(&run_id),
+        Err(e) => store_error(&shared, &run_id, e).await,
+    }
+}
+
+/// `GET /v1/runs/{run_id}/tasks` (openapi `listTasks`; docs/adr/ADR-039.md decision 2): a page of the run's tasks by
+/// creation order, each with its requirements, dependencies and lease, with the watermark it was read at; at most
+/// `limit` (1 to 500, 100 by default) after the opaque `cursor`. A query that cannot be read names no page: 404.
+async fn list_tasks(
+    State(shared): State<Arc<Shared>>,
+    run_id: Result<UrlPath<String>, axum::extract::rejection::PathRejection>,
+    query: Result<Query<TeamQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return unreadable_page();
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return unreadable_page();
+    }
+    // The opaque cursor is the last item's created_seq and task id.
+    let after = match query.cursor.as_deref().map(|c| c.split_once(':')) {
+        None => None,
+        Some(Some((seq, task))) => match seq.parse::<i64>() {
+            Ok(seq) if !task.is_empty() => Some((seq, task.to_owned())),
+            _ => return unreadable_page(),
+        },
+        Some(None) => return unreadable_page(),
+    };
+    let Ok(UrlPath(run_id)) = run_id else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "RUN_NOT_FOUND",
+            "no run has that id",
+            false,
+            None,
+        );
+    };
+    let wanted = run_id.clone();
+    match read(&shared, move |reader| {
+        reader.tasks_page(&wanted, limit, after)
+    })
+    .await
+    {
+        Ok(Some(page)) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "items": page.items,
+                "next_cursor": page.next.map(|(seq, task)| format!("{seq}:{task}")),
                 "watermark": page.watermark,
             })),
         )

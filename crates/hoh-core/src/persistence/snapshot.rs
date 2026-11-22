@@ -81,8 +81,12 @@ pub struct AcceptanceItem {
     pub candidate_id: Option<String>,
     pub candidate_state: Option<String>,
     pub ac_id: String,
+    /// The AC's TEST (its `test_id`; REQ-032 behaviour 4, docs/adr/ADR-039.md decision 2).
+    pub test_id: Option<String>,
     pub label: Label,
     pub why: Option<Why>,
+    /// The evidence its rows on the candidate under this revision cite, in their order (REQ-032 behaviour 4).
+    pub evidence_ids: Vec<String>,
     /// The candidate is the run's latest.
     pub latest: bool,
 }
@@ -160,6 +164,8 @@ fn run_spec(
 struct InScope {
     ac: String,
     requirement: String,
+    /// Its TEST, as its approved body names it.
+    test: Option<String>,
     degradable: bool,
     counted: bool,
 }
@@ -167,7 +173,9 @@ struct InScope {
 /// Every AC of this revision, independently of task mappings or task states (ADR-033 Q4).
 fn scope(conn: &Connection, spec_id: &str) -> Result<Vec<InScope>, PersistError> {
     conn.prepare(
-        "SELECT a.ac_id,a.requirement_id,q.release_class='degradable' FROM acceptance_criteria a \
+        "SELECT a.ac_id,a.requirement_id,q.release_class='degradable',\
+         CASE WHEN json_valid(a.body) THEN json_extract(a.body,'$.test_id') END \
+         FROM acceptance_criteria a \
          JOIN requirements q ON q.requirement_id=a.requirement_id AND q.spec_id=a.spec_id \
          WHERE a.spec_id=?1 ORDER BY a.ac_id",
     )
@@ -177,6 +185,7 @@ fn scope(conn: &Connection, spec_id: &str) -> Result<Vec<InScope>, PersistError>
             ac: r.get(0)?,
             requirement: r.get(1)?,
             degradable: r.get(2)?,
+            test: r.get(3).ok().flatten(),
             counted: true,
         })
     })
@@ -620,8 +629,10 @@ pub(super) fn acceptance_page(
                         candidate_id: None,
                         candidate_state: None,
                         ac_id: a.ac,
+                        test_id: a.test,
                         label: Label::NotRun,
                         why: None,
+                        evidence_ids: Vec::new(),
                         latest: false,
                     },
                 ));
@@ -640,6 +651,10 @@ pub(super) fn acceptance_page(
             }
             for (id, revision) in historical_specs(conn, c, &spec_id, spec_revision)? {
                 let scope = scope(conn, &id)?;
+                let tests: BTreeMap<&str, Option<String>> = scope
+                    .iter()
+                    .map(|a| (a.ac.as_str(), a.test.clone()))
+                    .collect();
                 for a in shown(conn, run_id, &id, c, &scope, &rounds)? {
                     // The opaque cursor includes the revision so an AC retained across revisions cannot be skipped.
                     let order = format!("{:020}:{}", i64::MAX - revision, a.ac_id);
@@ -657,6 +672,8 @@ pub(super) fn acceptance_page(
                             spec_revision: revision,
                             candidate_id: Some(c.id.clone()),
                             candidate_state: Some(c.state.clone()),
+                            test_id: tests.get(a.ac_id.as_str()).cloned().flatten(),
+                            evidence_ids: a.rows.iter().map(|r| r.evidence_id.clone()).collect(),
                             ac_id: a.ac_id,
                             label: if old { Label::Stale } else { a.label },
                             why: if old {
