@@ -485,6 +485,12 @@ pub(super) fn exhausted(
     if let Some(row) = read_input(tx, id)?
         .filter(|r| matches!(r.state, InputState::Queued | InputState::Delivered))
     {
+        // Exhausting transport retries does not prove that a reserved external steer was never delivered.
+        let reason = if reason == "delivery_exhausted" && row.payload["delivery_pending"] == true {
+            "UNKNOWN_DELIVERY"
+        } else {
+            reason
+        };
         change(tx, &row, InputState::Rejected, None, Some(reason), ctx)?;
     }
     Ok(())

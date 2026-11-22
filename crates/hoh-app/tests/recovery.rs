@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 mod common;
+mod input_start;
 mod installed;
 mod pty;
 mod recovery {

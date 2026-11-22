@@ -864,10 +864,24 @@ impl<'a> State<'a> {
         report: Option<crate::process::ExitReport>,
         held: &mut Vec<Steer>,
     ) -> Result<Drove, PersistError> {
-        // Steers nobody answered stay QUEUED.
+        // Once handed to the stdin writer a steer may have reached Codex. Even a matching userMessage item
+        // cannot replace the correlated RPC answer (items are matched by text). Never offer it for blind retry.
         for (_, what) in self.conn.pending.drain() {
             if let Pending::Steer(st) = what {
-                let _ = st.reply.send(SteerReceipt::NotNow);
+                if let Some(store) = self.store {
+                    soft_move(
+                        store,
+                        &self.attempt.attempt_id,
+                        &st.input_id,
+                        InputState::Queued,
+                        InputState::Rejected,
+                        Some("UNKNOWN_DELIVERY".into()),
+                    )
+                    .await?;
+                }
+                let _ = st.reply.send(SteerReceipt::Rejected {
+                    reason: "UNKNOWN_DELIVERY".into(),
+                });
             }
         }
         let logs_incomplete = report.as_ref().is_none_or(|r| {

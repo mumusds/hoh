@@ -300,8 +300,19 @@ pub enum SteerReceipt {
     Rejected { reason: String },
     /// exec cannot take input mid-turn; the input stays QUEUED for a later turn.
     CapabilityUnsupported,
-    /// No turn could take it now; the input stays QUEUED.
+    /// Never submitted to the native writer; the input stays QUEUED for a later Attempt.
     NotNow,
+}
+
+/// Requests still in the inbox provably never reached the native writer, on every exit (including a closed gate).
+struct SteerInbox(mpsc::Receiver<Steer>);
+impl Drop for SteerInbox {
+    fn drop(&mut self) {
+        self.0.close();
+        while let Ok(steer) = self.0.try_recv() {
+            let _ = steer.reply.send(SteerReceipt::NotNow);
+        }
+    }
 }
 
 /// What the end of a turn is judged on (see [`verdict`]).
@@ -424,8 +435,9 @@ pub async fn run(
     attempt: &AttemptRef,
     turn: &Turn,
     cancel: &CancelLatch,
-    mut steers: mpsc::Receiver<Steer>,
+    steers: mpsc::Receiver<Steer>,
 ) -> Result<Outcome, AdapterError> {
+    let mut steers = SteerInbox(steers);
     use AttemptState::*;
     let blocked = |detail: String| async move {
         let state = finish(
@@ -526,7 +538,7 @@ pub async fn run(
     let mut held = Vec::new();
     let reason = match app_server_help {
         Some(help) => {
-            match app_server::run(store, attempt, turn, help, cancel, &mut steers, &mut held)
+            match app_server::run(store, attempt, turn, help, cancel, &mut steers.0, &mut held)
                 .await?
             {
                 app_server::End::Ended(outcome) => return Ok(*outcome),
@@ -597,7 +609,7 @@ pub async fn run(
             });
         }
     };
-    exec::run(store, attempt, turn, args, reason, cancel, &mut steers).await
+    exec::run(store, attempt, turn, args, reason, cancel, &mut steers.0).await
 }
 
 /// Replay `bytes` (the App Server's stdout, with the host's cancel where [`crate::adapter::REPLAY_CANCEL`] stands)
@@ -884,7 +896,8 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
     let raw_log_path = turn.logs.to_string_lossy().into_owned();
     let observer = Observer::new(&attempt.attempt_id, turn.observe.clone());
     let gate = gate.clone();
-    let (steers, mut input_rx) = mpsc::channel::<Steer>(32);
+    let (steers, input_rx) = mpsc::channel::<Steer>(32);
+    let mut input_rx = SteerInbox(input_rx);
     let ended = tokio::spawn(async move {
         if opened.await.is_err() {
             let report = crate::adapter::close_gate(&mut process).await;
@@ -902,7 +915,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
                 &turn,
                 &mut process,
                 Stop::Native(&native),
-                &mut input_rx,
+                &mut input_rx.0,
                 &mut held,
                 Some(gate.go()),
                 &mut watch,
@@ -921,7 +934,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             &mut process,
             input,
             Stop::Native(&native),
-            &mut input_rx,
+            &mut input_rx.0,
             &mut watch,
         )
         .await;

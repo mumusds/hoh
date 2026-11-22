@@ -6753,3 +6753,76 @@ async fn test_017_02_product_host_sends_codex_steer_before_recorded_turn_complet
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test]
+async fn test_017_02_unstarted_input_survives_product_prompt_budget_refusal() -> R {
+    // REQ-039 failure mode 1 (docs/adr/ADR-026.md decision 9): the run's budget (its snapshot) below what the task's
+    // mandatory items need: the attempt fails CONTEXT_BUDGET_TOO_SMALL before anything runs, with both numbers; its
+    // task is BLOCKED for a decision with a need_decision event; no prompt is recorded.
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let run_id = started(&host, &project, "s1").await?;
+        let original = query(&project, &format!("SELECT config_snapshot_json FROM runs WHERE run_id='{run_id}'"))?;
+        host.store().enqueue_input(hoh_core::persistence::NewInput {
+            input_id: "budget-input".into(), run_id: run_id.clone(), kind: "STEER".into(),
+            target_role: Some("developer".into()), payload: json!({"text":"UNSTARTED_INPUT_SENTINEL"}),
+        }).await?;
+        exec(
+            &project,
+            &format!(
+                "UPDATE runs SET config_snapshot_json = json_set(config_snapshot_json, '$.context', \
+                 json('{{\"budget_tokens\": 100, \"shares\": [45, 35, 20]}}')) WHERE run_id = '{run_id}';"
+            ),
+        )?;
+        ready(&project, &run_id, &[("T-b", "developer")])?;
+        until(&project, &ended("T-b/attempt-1"), "FAILED/CONTEXT_BUDGET_TOO_SMALL", Duration::from_secs(60)).await?;
+        let refused: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind = 'attempt.start_refused' AND event_id = 'T-b/attempt-1/start-refused'",
+        )?)?;
+        assert_eq!(refused["details"]["available"], 100, "{refused}");
+        assert!(refused["details"]["required"].as_u64().is_some_and(|r| r > 100), "{refused}");
+        assert_eq!(refused["details"]["estimated"], true);
+        assert_eq!(
+            query(&project, "SELECT state || '/' || blocked_reason FROM tasks WHERE task_id = 'T-b'")?,
+            "BLOCKED/NEED_DECISION"
+        );
+        assert_eq!(
+            query(
+                &project,
+                "SELECT json_extract(payload_json, '$.reason') FROM events WHERE kind = 'need_decision' \
+                 AND json_extract(payload_json, '$.task_id') = 'T-b'"
+            )?,
+            "refused_deterministically"
+        );
+        assert_eq!(
+            query(&project, "SELECT coalesce(prompt_sha256, '') || '/' || coalesce(pid, '') FROM attempts WHERE attempt_id = 'T-b/attempt-1'")?,
+            "/",
+            "nothing sent, no process"
+        );
+        assert!(codex_prompts_of(&world, |a| a.starts_with("T-b/"))?.is_empty());
+        assert_eq!(host.store().reader()?.input("budget-input")?.ok_or("input")?.state, hoh_core::lifecycle::InputState::Queued);
+        exec(&project, &format!("UPDATE runs SET config_snapshot_json='{}' WHERE run_id='{run_id}'", original.replace('\'', "''")))?;
+        ready(&project, &run_id, &[("T-next", "developer")])?;
+        until(&project, "SELECT state FROM input_queue WHERE input_id='budget-input'", "APPLIED", Duration::from_secs(60)).await?;
+        let prompts=codex_prompts_of(&world, |a|a.starts_with("T-next/"))?;
+        assert_eq!(prompts.len(),1);
+        assert_eq!(prompts[0].matches("UNSTARTED_INPUT_SENTINEL").count(),1);
+        for kind in ["input.delivered","input.applied"] {
+            assert_eq!(query(&project,&format!("SELECT count(*) FROM events WHERE kind='{kind}' AND json_extract(payload_json,'$.input_id')='budget-input'"))?,"1");
+        }
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

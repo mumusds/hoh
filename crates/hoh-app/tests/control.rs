@@ -3893,7 +3893,9 @@ async fn input_state_barrier(project: &Path, id: &str, state: &str) -> R {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() -> R {
-    for supported in [true, false] {
+    for outcome in ["delivered", "unsupported", "unknown", "not_now"] {
+        let supported = outcome != "unsupported";
+        let carries = matches!(outcome, "unsupported" | "not_now");
         let dir = tempfile::Builder::new().prefix("m3t09-host-").tempdir()?;
         let project = dir.path().join("p");
         std::fs::create_dir(&project)?;
@@ -3937,8 +3939,14 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
                 .await?
                 .ok_or("steer")?;
             assert_eq!(attempt, first.attempt_id);
-            ack.send(hoh_agents::codex::SteerReceipt::Delivered {
-                turn_id: "native-turn".into(),
+            ack.send(match outcome {
+                "unknown" => hoh_agents::codex::SteerReceipt::Rejected {
+                    reason: "UNKNOWN_DELIVERY".into(),
+                },
+                "not_now" => hoh_agents::codex::SteerReceipt::NotNow,
+                _ => hoh_agents::codex::SteerReceipt::Delivered {
+                    turn_id: "native-turn".into(),
+                },
             })
             .map_err(|_| "lost reply")?;
         }
@@ -3953,7 +3961,13 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
                 &project,
                 &format!("SELECT state FROM input_queue WHERE input_id='{id}'")
             )?,
-            if supported { "DELIVERED" } else { "QUEUED" }
+            if carries {
+                "QUEUED"
+            } else if outcome == "unknown" {
+                "REJECTED"
+            } else {
+                "DELIVERED"
+            }
         );
         use std::io::Write as _;
         release.write_all(b"done\n")?;
@@ -3962,13 +3976,22 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
             .await?
             .ok_or("second turn")?;
         assert_eq!(second.task_id, "T2");
-        assert_eq!(second.assignment.inputs.len(), usize::from(!supported));
-        if !supported {
+        assert_eq!(second.assignment.inputs.len(), usize::from(carries));
+        if carries {
             assert_eq!(second.assignment.inputs[0]["text"], "ordered input");
         }
         release.write_all(b"done\n")?;
         drop(release);
-        input_state_barrier(&project, &id, "APPLIED").await?;
+        input_state_barrier(
+            &project,
+            &id,
+            if outcome == "unknown" {
+                "REJECTED"
+            } else {
+                "APPLIED"
+            },
+        )
+        .await?;
         assert_eq!(
             query(
                 &project,
@@ -3976,7 +3999,7 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
                     "SELECT count(*) FROM events WHERE kind='input.delivered' AND json_extract(payload_json,'$.input_id')='{id}'"
                 )
             )?,
-            "1"
+            if outcome == "unknown" { "0" } else { "1" }
         );
         assert_eq!(
             query(
@@ -3985,8 +4008,20 @@ async fn test_017_02_host_selects_turn_or_next_attempt_with_explicit_barriers() 
                     "SELECT json_extract(payload_json,'$.boundary') FROM events WHERE kind='input.delivered' AND json_extract(payload_json,'$.input_id')='{id}'"
                 )
             )?,
-            if supported { "turn" } else { "next_attempt" }
+            if carries {
+                "next_attempt"
+            } else if outcome == "unknown" {
+                ""
+            } else {
+                "turn"
+            }
         );
+        if outcome == "unknown" {
+            assert_eq!(
+                host.store().reader()?.input(&id)?.ok_or("input")?.payload["reason"],
+                "UNKNOWN_DELIVERY"
+            );
+        }
         assert!(steering.try_recv().is_err());
         host.shutdown().await;
     }
