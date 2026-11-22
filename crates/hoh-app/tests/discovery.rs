@@ -201,6 +201,8 @@ async fn test_028_01_baseline_is_read_only() -> R {
         ))?,
         "1"
     );
+    // The detected tests are not run unconfirmed: the user is asked (REQ-028 behaviour 3); here they decline.
+    answer_tests(&world, &host, &run, "skip").await?;
     // Leaving DISCOVERING after the baseline is a transition like any other.
     let left = decide(
         &world,
@@ -259,6 +261,7 @@ async fn test_028_03_empty_req_rejected_and_dirty_blocks() -> R {
             Duration::from_secs(20),
         )
         .await?;
+    answer_tests(&world, &host, &run, "skip").await?;
     let specified = decide(
         &world,
         &host,
@@ -364,6 +367,151 @@ async fn test_028_03_empty_req_rejected_and_dirty_blocks() -> R {
     assert_eq!(
         world.git(&["status", "--porcelain", "--", "src/lib.rs"])?,
         " M src/lib.rs\n"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// Run `run`'s open question `runtime:baseline_tests` (REQ-028 behaviour 3), once asked: its id.
+async fn tests_question(world: &World, host: &Host, run: &str) -> R<String> {
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='question.asked' \
+                 AND json_extract(payload_json,'$.reason')='baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(20),
+        )
+        .await?;
+    let (_, body) = world::exchange(host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    let question = body["projection"]["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|q| q["reason"] == "baseline_tests")
+        .ok_or_else(|| format!("no baseline_tests question: {body}"))?;
+    assert_eq!(body["state"], "BLOCKED", "{body}");
+    Ok(question["question_id"]
+        .as_str()
+        .ok_or("no question id")?
+        .to_owned())
+}
+
+/// The user's answer `choice` to run `run`'s baseline tests question.
+async fn answer_tests(world: &World, host: &Host, run: &str, choice: &str) -> R {
+    let question = tests_question(world, host, run).await?;
+    let body = command(
+        host,
+        run,
+        &format!("answer-{choice}"),
+        "AnswerQuestion",
+        json!({"question_id": question, "answer": choice, "choice_id": choice}),
+    )
+    .await?;
+    let (status, response) = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(status, 202, "{response}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_confirmed_test_run_excludes_baseline_failures() -> R {
+    let world = World::new()?;
+    let index = brownfield(&world)?;
+    // One test that already fails, and a passing one that counts each run of the project's tests outside it.
+    let runs = world.root().join("test-runs.log");
+    std::fs::write(
+        world.project().join("tests/answer.rs"),
+        format!(
+            "#[test]\nfn answer() {{\n    use std::io::Write as _;\n    let mut f = std::fs::OpenOptions::new().create(true).append(true).open({:?}).unwrap();\n    writeln!(f, \"ran\").unwrap();\n    assert_eq!(fixture::answer(), 42);\n}}\n\n#[test]\nfn fails() {{\n    panic!(\"known before HoH\");\n}}\n",
+            runs.display().to_string()
+        ),
+    )?;
+    std::fs::write(
+        world.project().join(".gitignore"),
+        b".hoh/\n/target/\nCargo.lock\n",
+    )?;
+    world.git(&["add", "."])?;
+    world.git(&["commit", "-qm", "a known failure"])?;
+    let (host, run) = approved(&world, &index).await?;
+    let entered = decide(
+        &world,
+        &host,
+        &run,
+        "discover",
+        world::transition("DISCOVERING"),
+    )
+    .await?;
+    assert!(
+        matches!(entered, hoh_core::persistence::Decided::Applied { .. }),
+        "{entered:?}"
+    );
+    // Asked, not run: no project command before the user confirms.
+    let question = tests_question(&world, &host, &run).await?;
+    assert_eq!(question, format!("{run}/baseline_tests/question"));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !runs.exists(),
+        "a project command ran before the user confirmed"
+    );
+    assert_eq!(
+        world.query(&format!(
+            "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+        ))?,
+        "0"
+    );
+    answer_tests(&world, &host, &run, "run").await?;
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(240),
+        )
+        .await?;
+    let tested: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+    ))?)?;
+    let commands = tested["commands"].as_array().ok_or("no commands")?;
+    assert_eq!(commands.len(), 1, "{tested}");
+    assert_eq!(commands[0]["command"], "cargo test", "{tested}");
+    assert_eq!(commands[0]["status"], "fail", "{tested}");
+    assert_eq!(commands[0]["failed_tests"], json!(["fails"]), "{tested}");
+    // Run once.
+    assert_eq!(std::fs::read_to_string(&runs)?, "ran\n");
+    // A later candidate on which the same test still fails, and one more: only the new one is HoH's regression.
+    let record_dir = world.project().join(".hoh/evidence/fixture/unit/R1");
+    std::fs::create_dir_all(record_dir.join("artifacts"))?;
+    let lines = "{\"schema_version\":\"1.0\",\"test_id\":\"TEST-A-01\",\"name\":\"fails\",\"status\":\"FAIL\"}\n\
+                 {\"schema_version\":\"1.0\",\"test_id\":\"TEST-A-01\",\"name\":\"answer\",\"status\":\"PASS\"}\n\
+                 {\"schema_version\":\"1.0\",\"test_id\":\"TEST-A-01\",\"name\":\"newly_broken\",\"status\":\"FAIL\"}\n";
+    std::fs::write(record_dir.join("artifacts/test-results.jsonl"), lines)?;
+    let results = ".hoh/evidence/fixture/unit/R1/artifacts/test-results.jsonl";
+    let record = json!({"artifacts": [{"name": "test-results.jsonl", "path": results,
+        "sha256": world::sha256_hex(lines.as_bytes())}]});
+    std::fs::write(record_dir.join("execution.json"), record.to_string())?;
+    let candidate = format!("CAND-{}", "c".repeat(64));
+    world.exec(&format!(
+        "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+           SELECT 'T',run_id,spec_id,'IMPLEMENTED','developer',1,1 FROM runs WHERE run_id='{run}';
+         INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision)
+           VALUES('observed','T','SETTLED',1,1,0);
+         INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,created_at)
+           VALUES('{candidate}','{run}','{h}','{h}','{d}','{d}','{d}','fixture','2026-11-22T00:00:00Z');
+         INSERT INTO artifacts(artifact_id,sha256,path,bytes,mime)
+           VALUES('record','{d}','.hoh/evidence/fixture/unit/R1/execution.json',0,'application/json');
+         INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
+           VALUES('e1','{candidate}','observed','record','unit','check','FAIL','mock','2026-11-22T00:00:00Z');",
+        h = "1".repeat(40),
+        d = "0".repeat(64)
+    ))?;
+    let (_, body) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    assert_eq!(
+        body["projection"]["regression"],
+        json!({"candidate_id": candidate, "baseline_failed": ["fails"], "candidate_failed": ["fails", "newly_broken"],
+            "introduced": ["newly_broken"]}),
+        "{body}"
     );
     host.shutdown().await;
     Ok(())

@@ -43,6 +43,54 @@ struct Common {
     project: PathBuf,
     canceller: Canceller,
     cancelling: Mutex<BTreeSet<String>>,
+    /// The runs whose baseline tests run now.
+    testing: Mutex<BTreeSet<String>>,
+    /// Set when the host stops: a baseline test command running then is killed with its group.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Run `run`'s confirmed baseline test `commands` off the async threads and record them; a failure is said and the
+/// next tick tries again (docs/adr/ADR-039.md decision 8).
+async fn baseline_tests(common: &Arc<Common>, run: &str, commands: Vec<String>) {
+    use std::io::Write as _;
+    let project = common.project.clone();
+    let log_dir = project
+        .join(".hoh/baseline")
+        .join(run.replace('%', "%25").replace('/', "%2F"));
+    let stopping = common.stopping.clone();
+    let ran = super::begun::spawn_blocking(move || {
+        super::discovery::run_tests(&project, &log_dir, &commands, &|| {
+            stopping.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    })
+    .await;
+    match ran {
+        Ok(Ok(payload)) => {
+            if let Err(e) = common
+                .shared
+                .store
+                .record_baseline_tests(run, payload)
+                .await
+            {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "hoh host: baseline tests of run {run}: {e}"
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: baseline tests of run {run}: {e}"
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: baseline tests of run {run} stopped: {e}"
+            );
+        }
+    }
 }
 
 /// The loop of `shared`'s project until `stop`.
@@ -64,6 +112,8 @@ pub(super) async fn run(
         project,
         canceller: Canceller::new(graces, LOOK_EVERY),
         cancelling: Mutex::new(BTreeSet::new()),
+        testing: Mutex::new(BTreeSet::new()),
+        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
@@ -82,7 +132,11 @@ pub(super) async fn run(
         }
     }
     // The host stops: a cancel in progress is left to the next host (its reconcile stops the processes and its loop
-    // finishes the cancel).
+    // finishes the cancel); a baseline test command running is killed with its group, unrecorded (the next host runs
+    // it again).
+    common
+        .stopping
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     for task in tasks {
         task.abort();
         let _ = task.await;
@@ -123,6 +177,24 @@ async fn tick(
                     "hoh host: discovery of run {run} stopped: {e}"
                 );
             }
+        }
+    }
+    // Each run whose user confirmed the baseline's test run: its test commands once, in a task of its own (they may
+    // take long; the loop goes on), recorded as run.baseline_tests (docs/adr/ADR-039.md decision 8).
+    for (run, commands) in waiting.baseline_tests {
+        let new = common
+            .testing
+            .lock()
+            .map(|mut t| t.insert(run.clone()))
+            .unwrap_or(false);
+        if new {
+            let common = common.clone();
+            tasks.push(super::begun::spawn(async move {
+                baseline_tests(&common, &run, commands).await;
+                if let Ok(mut t) = common.testing.lock() {
+                    t.remove(&run);
+                }
+            }));
         }
     }
     let mut runs: BTreeSet<String> = waiting.cancelling.into_iter().collect();

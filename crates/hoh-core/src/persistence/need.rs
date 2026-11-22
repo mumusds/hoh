@@ -242,17 +242,25 @@ pub enum RunReason {
     NoSpec,
     /// W14: the Commander's turns moved the run no further (correction C).
     Stalled,
+    /// The project's detected test commands, to run once into the baseline only when the user confirms (REQ-028
+    /// behaviour 3, O3; docs/adr/ADR-039.md decision 8).
+    BaselineTests,
 }
 
 impl RunReason {
     /// Every variant, in order: its [`Self::position`] is its index here.
-    pub const ALL: &'static [RunReason] = &[RunReason::NoSpec, RunReason::Stalled];
+    pub const ALL: &'static [RunReason] = &[
+        RunReason::NoSpec,
+        RunReason::Stalled,
+        RunReason::BaselineTests,
+    ];
 
     /// Its name: the `reason` of its `need_decision` and of its question.
     pub fn as_str(self) -> &'static str {
         match self {
             RunReason::NoSpec => "no_spec",
             RunReason::Stalled => "stalled",
+            RunReason::BaselineTests => "baseline_tests",
         }
     }
 
@@ -261,6 +269,7 @@ impl RunReason {
         match self {
             RunReason::NoSpec => 0,
             RunReason::Stalled => 1,
+            RunReason::BaselineTests => 2,
         }
     }
 

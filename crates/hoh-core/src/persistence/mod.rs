@@ -1234,7 +1234,7 @@ impl Store {
             .runner(runner::RunnerJob::Waiting(project_id.to_owned()))
             .await?
         {
-            runner::RunnerDone::Waiting(waiting) => Ok(waiting),
+            runner::RunnerDone::Waiting(waiting) => Ok(*waiting),
             _ => Err(PersistError::IntegrityViolation(
                 "a runner read answered with a write".to_owned(),
             )),
@@ -1630,6 +1630,20 @@ impl Store {
         payload: serde_json::Value,
     ) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Baseline {
+            run_id: run_id.to_owned(),
+            payload: Box::new(payload),
+        })
+        .await
+    }
+
+    /// Record run `run_id`'s baseline test run `payload` (`{commands}`), once (docs/adr/ADR-039.md decision 8);
+    /// whether it was written.
+    pub async fn record_baseline_tests(
+        &self,
+        run_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::BaselineTests {
             run_id: run_id.to_owned(),
             payload: Box::new(payload),
         })

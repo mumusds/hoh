@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 /// The project root of the store at `conn`: the parent of its `.hoh/` (the host always opens `<project>/.hoh/…`).
-fn project_root(conn: &Connection) -> Option<PathBuf> {
+pub(super) fn project_root(conn: &Connection) -> Option<PathBuf> {
     let db = std::path::Path::new(conn.path()?);
     let state = db.parent()?;
     Some(if state.file_name().is_some_and(|n| n == ".hoh") {

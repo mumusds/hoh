@@ -1736,3 +1736,72 @@ async fn a_commanders_move_out_of_discovering_waits_for_the_baseline_then_applie
     assert_eq!(decisions(&path)?, json!(["APPLIED", "APPLIED"]));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_commanders_move_waits_while_a_question_blocks_the_run_in_discovering() -> R {
+    // docs/adr/ADR-039.md decision 8: the baseline's tests question blocks the run (BLOCKED, resume DISCOVERING); the
+    // Commander's move out of DISCOVERING waits for the answer instead of being refused.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "CREATED", TWO_WAKES)?;
+    const STATES: &[&str] = &["CREATED", "DISCOVERING", "SPECIFYING"];
+    let (_, ms) = drive(&store, &clock, &path, 0, 8, &Answer::Advance(STATES), |p| {
+        Ok(state(p)? == json!("SPECIFYING"))
+    })
+    .await?;
+    assert_eq!(decisions(&path)?, json!(["APPLIED"]));
+    // The host's baseline with detected tests: written with its question, the run BLOCKED in DISCOVERING.
+    assert!(
+        store
+            .record_baseline("R", json!({"test_commands": ["cargo test"]}))
+            .await?
+    );
+    assert_eq!(state(&path)?, json!("BLOCKED/NEED_DECISION"));
+    let (_, ms) = drive(&store, &clock, &path, ms, 3, &Answer::Nothing, |_| {
+        Ok(false)
+    })
+    .await?;
+    assert_eq!(
+        decisions(&path)?,
+        json!(["APPLIED"]),
+        "held while blocked, not refused"
+    );
+    // The user's skip: back in DISCOVERING, nothing run. The question and the answer moved the run's revision, so the
+    // held move ends STALE_REVISION and re-triggers the Commander (REQ-021 behaviour 6), whose next turn moves on.
+    store
+        .submit_command(input(
+            &path,
+            "skip",
+            crate::persistence::RunTarget::Input(crate::persistence::Input::Answer {
+                question_id: "R/baseline_tests/question".to_owned(),
+                answer: "skip".to_owned(),
+                choice_id: Some("skip".to_owned()),
+            }),
+            "AnswerQuestion",
+        )?)
+        .await?;
+    assert_eq!(
+        value(
+            &path,
+            "SELECT json_extract(payload_json, '$.skipped') FROM events WHERE kind = 'run.baseline_tests'"
+        )?,
+        json!(1)
+    );
+    drive(
+        &store,
+        &clock,
+        &path,
+        ms,
+        12,
+        &Answer::Advance(STATES),
+        |p| Ok(state(p)? == json!("SPECIFYING")),
+    )
+    .await?;
+    assert_eq!(state(&path)?, json!("SPECIFYING"), "{}", decisions(&path)?);
+    assert_eq!(
+        decisions(&path)?,
+        json!(["APPLIED", "REJECTED:STALE_REVISION", "APPLIED"])
+    );
+    Ok(())
+}

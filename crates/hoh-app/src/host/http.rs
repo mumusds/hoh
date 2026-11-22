@@ -1515,6 +1515,7 @@ async fn get_run(
             open_questions,
             readiness,
             trace,
+            regression,
         ))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
@@ -1573,6 +1574,9 @@ async fn get_run(
                         .collect::<Vec<_>>(),
                     // Its requirement trace (REQ-032; docs/adr/ADR-039.md decision 2; a free object, no CR).
                     "trace": trace,
+                    // Its latest candidate's regression judgement against its baseline (REQ-028; docs/adr/ADR-039.md
+                    // decision 8; a free object).
+                    "regression": regression,
                 },
             })),
         )

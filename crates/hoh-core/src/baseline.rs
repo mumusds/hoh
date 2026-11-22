@@ -149,5 +149,27 @@ pub fn touched(scope: &[String], uncommitted: &[String]) -> Vec<String> {
     found.into_iter().cloned().collect()
 }
 
+/// The failing tests of `output` (a test runner's), by the `test <name> ... FAILED` lines cargo's harness writes; none
+/// found: empty.
+pub fn failed_tests(output: &str) -> Vec<String> {
+    let found: BTreeSet<String> = output
+        .lines()
+        .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+        .map(str::to_owned)
+        .collect();
+    found.into_iter().collect()
+}
+
+/// The regressions HoH introduced (REQ-028 failure mode 4): the candidate's failing tests that did not already fail
+/// in the baseline, sorted.
+pub fn regressions(baseline_failed: &[String], candidate_failed: &[String]) -> Vec<String> {
+    let before: BTreeSet<&String> = baseline_failed.iter().collect();
+    let found: BTreeSet<&String> = candidate_failed
+        .iter()
+        .filter(|t| !before.contains(t))
+        .collect();
+    found.into_iter().cloned().collect()
+}
+
 #[cfg(test)]
 mod tests;

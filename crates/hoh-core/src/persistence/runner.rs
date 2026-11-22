@@ -51,6 +51,9 @@ pub struct Waiting {
     pub mode_changes: Vec<String>,
     /// Runs in DISCOVERING whose project discovery has not written `run.baseline` yet (docs/adr/ADR-039.md decision 4).
     pub discovering: Vec<String>,
+    /// Runs whose user confirmed the baseline's test run and whose tests have not been recorded, each with its test
+    /// commands (docs/adr/ADR-039.md decision 8).
+    pub baseline_tests: Vec<(String, Vec<String>)>,
     pub cancelling: Vec<String>,
     /// Nonterminal runs behind the team revision, or with an idle role behind the host's resource bundle. A resource
     /// upgrade that only waits for in-flight attempts needs no checkpoint transaction yet (CR-026 C14).
@@ -83,6 +86,11 @@ pub(super) enum RunnerJob {
     Waiting(String),
     /// A run's project baseline from the host's discovery (docs/adr/ADR-039.md decision 4).
     Baseline {
+        run_id: String,
+        payload: Box<Value>,
+    },
+    /// A run's baseline test run, once the user confirmed it (docs/adr/ADR-039.md decision 8).
+    BaselineTests {
         run_id: String,
         payload: Box<Value>,
     },
@@ -194,7 +202,7 @@ pub(super) enum RunnerJob {
 /// What a step gave.
 #[derive(Debug)]
 pub(super) enum RunnerDone {
-    Waiting(Waiting),
+    Waiting(Box<Waiting>),
     SessionStarts(Vec<super::handover::SessionStart>),
     /// Whether the step applied (a dispatch already taken or an attempt no longer PREPARED is not).
     Applied(bool),
@@ -381,7 +389,8 @@ pub(super) fn run(
 ) -> Result<RunnerDone, PersistError> {
     match job {
         RunnerJob::Waiting(project_id) => {
-            waiting(conn, &project_id, &ctx.resource_bundle.version()).map(RunnerDone::Waiting)
+            waiting(conn, &project_id, &ctx.resource_bundle.version())
+                .map(|w| RunnerDone::Waiting(Box::new(w)))
         }
         RunnerJob::SessionStarts(project_id) => {
             super::handover::waiting(conn, &project_id).map(RunnerDone::SessionStarts)
@@ -471,6 +480,9 @@ pub(super) fn run(
         }
         RunnerJob::Baseline { run_id, payload } => {
             super::baseline::record(conn, &run_id, *payload, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::BaselineTests { run_id, payload } => {
+            super::baseline::record_tests(conn, &run_id, *payload, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
@@ -661,6 +673,7 @@ fn waiting(
         pausing: in_state("PAUSE_REQUESTED")?,
         mode_changes: super::modes::waiting(conn, project_id)?,
         discovering: super::baseline::waiting(conn, project_id)?,
+        baseline_tests: super::baseline::tests_waiting(conn, project_id)?,
         cancelling: in_state("CANCEL_REQUESTED")?,
         team_behind: {
             let mut statement = conn
