@@ -249,6 +249,7 @@ pub fn open(conn: &Connection, run_id: &str) -> Result<Vec<Question>, PersistErr
 /// This is explicit so it can also diagnose old or manually seeded stores without changing their history.
 pub(super) fn check_anchors(conn: &Connection) -> Result<(), PersistError> {
     let tx = conn.unchecked_transaction().map_err(sqlite_error)?;
+    super::consult::check_terminals(&tx)?;
     let runs: Vec<(String, bool)> = {
         let mut q = tx.prepare("SELECT run_id,state='BLOCKED' AND blocked_reason='NEED_DECISION' FROM runs ORDER BY run_id")
             .map_err(sqlite_error)?;

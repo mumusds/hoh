@@ -7,7 +7,7 @@ mod returned;
 pub(super) use bounds::{accrue_wall, consumed};
 pub use listing::TasksPage;
 pub(super) use listing::page;
-pub(super) use returned::{finish, input_current, sweep};
+pub(super) use returned::{check_terminals, finish, input_current, sweep};
 
 use super::writer::{self, Ctx, Intent, NewEvent};
 use super::{PersistError, closing, sqlite_error};

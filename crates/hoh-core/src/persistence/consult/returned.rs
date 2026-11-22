@@ -94,9 +94,9 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 ctx,
             )?;
         }
-    } else if state == "CANCELLED" || latest.as_ref().is_some_and(|(_, s, _)| s == "CANCELLED") {
+    } else if state == "CANCELLED" {
         reason = Some("cancelled");
-    } else if matches!(state.as_str(), "READY" | "PENDING")
+    } else if matches!(state.as_str(), "READY" | "PENDING" | "BLOCKED")
         && let Some(stop) =
             super::super::budget_view::load(tx, &request.run_id, ctx.now(), ctx.wall())?
                 .consult_stop(task)
@@ -122,68 +122,26 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
             ctx,
         )?;
     } else if let Some((attempt, attempt_state, epoch)) = &latest {
-        if attempt_state == "UNKNOWN_EFFECT" {
-            reason = Some("unknown_effect");
-        } else if attempt_state == "SETTLED" && state == "IMPLEMENTED" {
+        if attempt_state == "SETTLED" && state == "IMPLEMENTED" {
             let source_current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)",params![request.run_id,request.recipient_role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
             if !source_current {
                 reason = Some("stale_child_epoch");
             } else {
-                let raw: Option<String> = tx
-                    .query_row(
-                        "SELECT payload_json FROM events WHERE event_id=?1",
-                        params![child_id(attempt, "outputs")],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(sqlite_error)?;
-                let output: Value = raw
-                    .map(|s| serde_json::from_str(&s))
-                    .transpose()
-                    .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?
-                    .unwrap_or(Value::Null);
-                let lines: Vec<String> = output["lines"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect();
-                let identity = crate::bridge::Identity {
-                    run_id: request.run_id.clone(),
-                    task_id: task.into(),
-                    attempt_id: attempt.clone(),
-                    role: request.recipient_role.clone(),
-                    role_epoch: u64::try_from(*epoch)
-                        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?,
-                };
-                let parsed = crate::bridge::parse(&lines, &identity);
-                actual = parsed.task_result.filter(|r| {
-                    output["truncated"] != true
-                        && r.candidate_id
-                            .as_ref()
-                            .is_none_or(|c| Some(c) == request.candidate_id.as_ref())
-                });
+                actual = read_result(tx, &request, task, attempt, *epoch)?;
                 if actual.is_none() {
                     let reasons = vec![
                         "Consultation output needs one current, untruncated TaskResult".into(),
                     ];
-                    let verdict = super::super::completion::correct_readonly_output(
+                    super::super::completion::correct_readonly_output(
                         tx, attempt, task, &reasons, ctx,
                     )?;
-                    if matches!(verdict, super::super::RepairVerdict::Granted { .. }) {
-                        return Ok(());
-                    }
-                    reason = Some("invalid_task_result");
+                    // Both a granted correction and its exhausted question leave the consult open.
+                    return Ok(());
                 }
             }
-        } else if state == "BLOCKED" {
-            reason = Some("child_blocked");
         } else {
             return Ok(());
         }
-    } else if state == "BLOCKED" {
-        reason = Some("child_blocked");
     } else {
         return Ok(());
     }
@@ -201,7 +159,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                     project_id: &project,
                     run_id: &request.run_id,
                     task_id: task,
-                    event_id: child_id(&done, "decision"),
+                    event_id: child_id(&result.attempt_id, "consult/decision"),
                     reason: super::super::need::TaskReason::Work(why),
                     fields: json!({"attempt_id":result.attempt_id,"detail":result.summary}),
                 },
@@ -224,8 +182,36 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 },
                 ctx,
             )?;
+            return Ok(());
         }
     }
+    // A stale child result cannot be delivered or retried under its old identity.
+    if reason == Some("stale_child_epoch") {
+        tx.execute(
+            "UPDATE tasks SET blocked_reason=NULL,next_retry_at=NULL WHERE task_id=?1",
+            params![task],
+        )
+        .map_err(sqlite_error)?;
+        writer::write(
+            tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: task.into(),
+                    expected_revision: revision,
+                    change: Change::Task(TaskState::Cancelled),
+                }],
+                ..Default::default()
+            },
+            ctx,
+        )?;
+    }
+    require_terminal(
+        tx,
+        task,
+        actual
+            .as_ref()
+            .is_some_and(|r| r.status == TaskStatus::Completed),
+    )?;
     super::bounds::release(tx, &request.run_id, task, &meta)?;
     let input = child_id(task, "consult/result");
     if parent_current {
@@ -262,7 +248,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
                 serde_json::to_value(&message).map_err(|e| PersistError::Storage(e.to_string()))?;
             json!({"text":source.to_string(),"source_message":source})
         } else {
-            let status = (reason == Some("budget_exhausted")).then_some("CANCELLED");
+            let status = Some("CANCELLED");
             json!({"text":format!("Consultation {task} ended{}: {}{}",status.map(|s|format!(" {s}")).unwrap_or_default(),reason.unwrap_or("unavailable"),detail.as_ref().map(|s|format!(" ({s})")).unwrap_or_default()),"consultation_diagnostic":{"task_id":task,"correlation_id":request.message_id,"reason":reason,"detail":detail,"origin":"runtime","status":status}})
         };
         payload["consultation_task_id"] = json!(task);
@@ -297,7 +283,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         &request,
         done,
         "task.consult_finished",
-        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":if reason == Some("budget_exhausted") { json!("CANCELLED") } else { json!(actual.as_ref().map(|r|r.status)) }}),
+        json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":actual.as_ref().map_or(json!("CANCELLED"), |r|json!(r.status))}),
     )?;
     Ok(())
 }
@@ -318,4 +304,121 @@ pub(super) fn parent_valid(
     child: &str,
 ) -> Result<bool, PersistError> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN tasks t ON t.task_id=json_extract(e.payload_json,'$.parent_task_id') JOIN runs r ON r.run_id=t.run_id WHERE e.run_id=?1 AND e.kind='task.consult' AND json_extract(e.payload_json,'$.task_id')=?2 AND t.state<>'CANCELLED' AND t.spec_id=r.spec_id AND r.spec_id=json_extract(e.payload_json,'$.spec_id'))",params![run,child],|r|r.get(0)).map_err(sqlite_error)
+}
+
+fn read_result(
+    conn: &Connection,
+    request: &Message,
+    task: &str,
+    attempt: &str,
+    epoch: i64,
+) -> Result<Option<crate::protocol::TaskResult>, PersistError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id=?1 AND event_id=?2",
+            params![request.run_id, child_id(attempt, "outputs")],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let output: Value = raw
+        .map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?
+        .unwrap_or(Value::Null);
+    let lines: Vec<String> = output["lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let identity = crate::bridge::Identity {
+        run_id: request.run_id.clone(),
+        task_id: task.into(),
+        attempt_id: attempt.into(),
+        role: request.recipient_role.clone(),
+        role_epoch: u64::try_from(epoch)
+            .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?,
+    };
+    Ok(crate::bridge::parse(&lines, &identity)
+        .task_result
+        .filter(|r| {
+            output["truncated"] != true
+                && r.candidate_id
+                    .as_ref()
+                    .is_none_or(|c| Some(c) == request.candidate_id.as_ref())
+        }))
+}
+
+fn require_terminal(conn: &Connection, task: &str, completed: bool) -> Result<(), PersistError> {
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT state,writer FROM tasks WHERE task_id=?1",
+            params![task],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    // Read-only COMPLETED work remains IMPLEMENTED; it is not acceptance of a candidate or an AC.
+    if row.as_ref().is_some_and(|(state, writer)| {
+        matches!(state.as_str(), "CANCELLED" | "ACCEPTED")
+            || (state == "IMPLEMENTED" && !writer && completed)
+    }) {
+        return Ok(());
+    }
+    Err(PersistError::IntegrityViolation(format!(
+        "consult {task} finished without a terminal child outcome: {row:?}"
+    )))
+}
+
+/// Run alongside the open-question audit in the same read snapshot, including other runs and closed waits.
+pub(in super::super) fn check_terminals(conn: &Connection) -> Result<(), PersistError> {
+    let mut q = conn
+        .prepare(
+            "SELECT e.run_id,e.payload_json,c.payload_json FROM events e
+        LEFT JOIN events c ON c.run_id=e.run_id AND c.kind='task.consult'
+            AND json_extract(c.payload_json,'$.task_id')=json_extract(e.payload_json,'$.task_id')
+        WHERE e.kind='task.consult_finished' ORDER BY e.seq",
+        )
+        .map_err(sqlite_error)?;
+    for row in q
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(sqlite_error)?
+    {
+        let (run, raw, meta) = row.map_err(sqlite_error)?;
+        let finished: Value = serde_json::from_str(&raw)
+            .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+        let task = finished["task_id"].as_str().ok_or_else(|| {
+            PersistError::IntegrityViolation("consult finished without task id".into())
+        })?;
+        let mut completed = false;
+        if finished["status"] == "COMPLETED"
+            && let Some(meta) = meta
+        {
+            let meta: Value = serde_json::from_str(&meta)
+                .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+            let request: Message = serde_json::from_value(meta["source_message"].clone())
+                .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+            let latest: Option<(String, String, i64)> = conn.query_row(
+                "SELECT attempt_id,state,role_epoch FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+                params![task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional().map_err(sqlite_error)?;
+            if let Some((attempt, state, epoch)) = latest {
+                completed = run.as_deref() == Some(&request.run_id)
+                    && state == "SETTLED"
+                    && finished["attempt_id"] == attempt
+                    && read_result(conn, &request, task, &attempt, epoch)?
+                        .is_some_and(|r| r.status == TaskStatus::Completed);
+            }
+        }
+        require_terminal(conn, task, completed)?;
+    }
+    Ok(())
 }

@@ -21,7 +21,11 @@ fn outbox(root: &Path, id: &str) -> R<OutboxRow> {
         next_retry_at: row["next_retry_at"].as_str().map(str::to_owned),
     })
 }
-async fn stage(store: &Store, root: &Path, id: &str) -> R<hoh_core::persistence::InputRouted> {
+pub(super) async fn stage(
+    store: &Store,
+    root: &Path,
+    id: &str,
+) -> R<hoh_core::persistence::InputRouted> {
     Ok(store
         .route_input(InputRouting::Stage {
             row: outbox(root, id)?,

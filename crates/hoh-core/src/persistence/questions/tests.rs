@@ -2627,3 +2627,46 @@ fn test_023_01_dc2_store_audit_requires_open_question_anchors() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_023_01_dc3_store_audit_rejects_finished_nonterminal_consults() -> R {
+    for state in [
+        "PENDING",
+        "READY",
+        "LEASED",
+        "RUNNING",
+        "IMPLEMENTED",
+        "VERIFYING",
+        "BLOCKED",
+    ] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-dc3-invariant-")
+            .tempdir()?;
+        let (store, path) = open_store(&dir)?;
+        world(&path, "RUNNING", &[], &work_task("agent_blocked"))?;
+        if state != "BLOCKED" {
+            exec(
+                &path,
+                &format!("UPDATE tasks SET state='{state}',blocked_reason=NULL WHERE task_id='T'"),
+            )?;
+        }
+        // The existing question anchor is valid even for the BLOCKED negative case.
+        store.reader()?.check_question_anchors()?;
+        exec(&path, "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES
+            ('p1','consult-ended','R','task.consult_finished','{\"task_id\":\"T\",\"status\":\"CANCELLED\"}','2026-11-22T00:00:00Z')")?;
+        let result = store.reader()?.check_question_anchors();
+        assert!(
+            matches!(&result, Err(PersistError::IntegrityViolation(s)) if s.contains("consult") && s.contains("T")),
+            "{state}: {result:?}"
+        );
+        exec(
+            &path,
+            "UPDATE tasks SET state='CANCELLED',blocked_reason=NULL WHERE task_id='T'",
+        )?;
+        store.reader()?.check_question_anchors()?;
+        drop(store);
+        let (store, _) = open_store(&dir)?;
+        store.reader()?.check_question_anchors()?;
+    }
+    Ok(())
+}
