@@ -16,11 +16,12 @@ async fn peer(host: &Host, body: &Value, unix: bool, mode: &str) -> R<(u16, Valu
     };
     let mode = mode.to_owned();
     let script = r#"
-import os, socket, subprocess, sys
+import os, signal, socket, subprocess, sys
+signal.alarm(25)
 if sys.argv[1] == 'ancestor':
     env = os.environ.copy()
     del env['HOH_ATTEMPT_ID']
-    sys.exit(subprocess.run([sys.executable, '-c', sys.argv[2], 'direct', *sys.argv[2:]], env=env).returncode)
+    sys.exit(subprocess.run([sys.executable, '-I', '-c', sys.argv[2], 'direct', *sys.argv[2:]], env=env).returncode)
 s = socket.socket(socket.AF_UNIX if sys.argv[3] == 'unix' else socket.AF_INET)
 s.settimeout(15)
 s.connect(sys.argv[4] if sys.argv[3] == 'unix' else ('127.0.0.1', int(sys.argv[4])))
@@ -44,22 +45,21 @@ if child is not None:
     os.waitpid(child, 0)
 "#;
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new("python3");
+        let environment = match mode.as_str() {
+            "marker" | "ancestor" => vec![("HOH_ATTEMPT_ID", "another-project/another-attempt")],
+            // INVOCATION_ID alone can denote a user scope; socket activation is an explicit
+            // service marker regardless of the cgroup inherited from the test launcher.
+            "service" => vec![("LISTEN_FDS", "1")],
+            _ => vec![],
+        };
+        let mut child = world::approval::python(script, &environment);
         child.args([
-            "-c",
-            script,
-            &mode,
+            mode.as_str(),
             script,
             if unix { "unix" } else { "tcp" },
             &address,
             &request,
         ]);
-        if matches!(mode.as_str(), "marker" | "ancestor") {
-            child.env("HOH_ATTEMPT_ID", "another-project/another-attempt");
-        }
-        if mode == "service" {
-            child.env("INVOCATION_ID", "fixture-service");
-        }
         child.output()
     })
     .await??;
@@ -264,10 +264,8 @@ async fn test_008_05_real_attempt_cgroup_refuses_tcp_and_uds() -> R {
         );
         let path = path.clone();
         let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("python3")
-                .arg("-c")
-                .arg(
-                    r#"
+            world::approval::python(
+                r#"
 import os, socket, sys
 from pathlib import Path
 assert 'HOH_ATTEMPT_ID' not in os.environ
@@ -281,12 +279,13 @@ while True:
     if not data: break
     sys.stdout.buffer.write(data)
 "#,
-                )
-                .arg(path)
-                .arg(if unix { "unix" } else { "tcp" })
-                .arg(address)
-                .arg(request)
-                .output()
+                &[],
+            )
+            .arg(path)
+            .arg(if unix { "unix" } else { "tcp" })
+            .arg(address)
+            .arg(request)
+            .output()
         })
         .await??;
         assert!(
@@ -319,10 +318,8 @@ while True:
         );
         let path = path.clone();
         let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("python3")
-                .arg("-c")
-                .arg(
-                    r#"
+            world::approval::python(
+                r#"
 import json, os, socket, sys
 from pathlib import Path
 s = socket.socket(socket.AF_UNIX if sys.argv[2] == 'unix' else socket.AF_INET)
@@ -346,12 +343,13 @@ Path(sys.argv[1], 'cgroup.procs').write_text(str(os.getpid()))
 second = command()
 print(json.dumps([first, second]))
 "#,
-                )
-                .arg(path)
-                .arg(if unix { "unix" } else { "tcp" })
-                .arg(address)
-                .arg(request)
-                .output()
+                &[],
+            )
+            .arg(path)
+            .arg(if unix { "unix" } else { "tcp" })
+            .arg(address)
+            .arg(request)
+            .output()
         })
         .await??;
         assert!(
