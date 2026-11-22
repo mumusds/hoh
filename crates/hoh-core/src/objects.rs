@@ -71,16 +71,25 @@ static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// bytes there already are taken; other bytes there (a damaged object) are replaced by this write's synced copy, which
 /// its name says is right, then checked again (docs/adr/ADR-026.md decision 6).
 pub fn put(project: &Path, bytes: &[u8]) -> Result<String, String> {
+    put_io(project, bytes).map_err(|e| e.to_string())
+}
+
+/// The same write with its I/O error kind intact, so command transactions can report capacity failures as retryable.
+pub(crate) fn put_io(project: &Path, bytes: &[u8]) -> std::io::Result<String> {
     put_with(project, bytes, &|dir| std::fs::File::open(dir)?.sync_all())
 }
 
+fn io_at(path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
 /// The project's `.hoh/`, made with its `.gitignore` before an object goes under it (docs/adr/ADR-027.md decision 3).
-fn state_dir(project: &Path) -> Result<(), String> {
+fn state_dir(project: &Path) -> std::io::Result<()> {
     let top = project.join(".hoh");
     // Object writes depend on access, not on best-effort legacy mode hardening (diagnosed at host startup).
     crate::state_dir::ensure(&top)
         .map(|_| ())
-        .map_err(|e| format!("{}: {e}", top.display()))
+        .map_err(|e| io_at(&top, e))
 }
 
 /// [`put`] with `sync_dir` syncing a directory: the object's own directory once its link is made (or found), then
@@ -89,14 +98,36 @@ fn put_with(
     project: &Path,
     bytes: &[u8],
     sync_dir: &dyn Fn(&Path) -> std::io::Result<()>,
-) -> Result<String, String> {
+) -> std::io::Result<String> {
+    let sha256 = sha256_hex(bytes);
+    let path = object_path(project, &sha256).map_err(std::io::Error::other)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory"))?;
+    state_dir(project)?;
+    // Reuse only verified bytes. Rewriting a resource already pinned by another Run needlessly requires room and
+    // a writable mount even when the database's open descriptors still work. Damaged or unreadable objects repair
+    // through the usual staged write. Keep the directory syncs below even on reuse (a prior sync may have failed).
+    if !holds(&path, &sha256).unwrap_or(false) {
+        std::fs::create_dir_all(dir).map_err(|e| io_at(dir, e))?;
+        place(&path, &sha256, bytes)?;
+    }
+    let top = project.join(".hoh");
+    let mut at = Some(dir);
+    while let Some(d) = at {
+        sync_dir(d).map_err(|e| io_at(d, e))?;
+        at = if d == top { None } else { d.parent() };
+    }
+    Ok(sha256)
+}
+
+/// Publish only a whole, synced object; remove only this call's staged file, including on write failure.
+fn place(path: &Path, sha256: &str, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::Ordering;
-    let sha256 = sha256_hex(bytes);
-    let path = object_path(project, &sha256)?;
-    let dir = path.parent().ok_or("no directory")?;
-    state_dir(project)?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory"))?;
     let mut tries = 0;
     let (staged, mut file) = loop {
         let staged = dir.join(format!(
@@ -107,44 +138,36 @@ fn put_with(
         match std::fs::File::create_new(&staged) {
             Ok(file) => break (staged, file),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 1_000 => tries += 1,
-            Err(e) => return Err(format!("{}: {e}", staged.display())),
+            Err(e) => return Err(io_at(&staged, e)),
         }
     };
-    let placed = (|| -> Result<(), String> {
-        let at = |e: std::io::Error| format!("{}: {e}", staged.display());
+    let placed = (|| -> std::io::Result<()> {
+        let at = |e: std::io::Error| io_at(&staged, e);
         file.write_all(bytes).map_err(at)?;
         file.sync_all().map_err(at)?;
-        match std::fs::hard_link(&staged, &path) {
+        match std::fs::hard_link(&staged, path) {
             Ok(()) => Ok(()),
             // Made by another write of the same bytes: taken if its bytes match its name. Damaged: its name says
             // what it must hold, so this write's own staged copy (whole and synced) is renamed over it, then read
             // back.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !holds(&path, &sha256).unwrap_or(false) {
-                    std::fs::rename(&staged, &path)
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
-                    if !holds(&path, &sha256)? {
-                        return Err(format!(
+                if !holds(path, sha256).unwrap_or(false) {
+                    std::fs::rename(&staged, path).map_err(|e| io_at(path, e))?;
+                    if !holds(path, sha256).map_err(std::io::Error::other)? {
+                        return Err(std::io::Error::other(format!(
                             "{}: its bytes no longer match its name",
                             path.display()
-                        ));
+                        )));
                     }
                 }
                 Ok(())
             }
-            Err(e) => Err(format!("{}: {e}", path.display())),
+            Err(e) => Err(io_at(path, e)),
         }
     })();
     drop(file);
     let _ = std::fs::remove_file(&staged);
-    placed?;
-    let top = project.join(".hoh");
-    let mut at = Some(dir);
-    while let Some(d) = at {
-        sync_dir(d).map_err(|e| format!("{}: {e}", d.display()))?;
-        at = if d == top { None } else { d.parent() };
-    }
-    Ok(sha256)
+    placed
 }
 
 /// Keeps the file `file` as an object, copied and hashed in pieces (a raw log is not bounded), and returns its sha256
@@ -154,7 +177,7 @@ pub fn put_file(project: &Path, file: &Path) -> Result<(String, u64), String> {
     use std::io::{Read as _, Write as _};
     use std::sync::atomic::Ordering;
     let staging = project.join(".hoh/objects/staging");
-    state_dir(project)?;
+    state_dir(project).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
     let mut tries = 0;
     let (staged, mut out) = loop {

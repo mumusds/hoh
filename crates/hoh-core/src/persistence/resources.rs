@@ -52,7 +52,15 @@ pub(super) fn events(
         }
         let saved = match &pin {
             Some(p) => p,
-            None => pin.insert(bundle.store(root).map_err(PersistError::Storage)?),
+            None => pin.insert(bundle.store_io(root).map_err(|e| {
+                // This is the failed object write's own error, before any SQLite rollback. No room probe or
+                // message parsing is needed; other causes (including a read-only file system) retain their detail.
+                if super::room::none(&e) {
+                    PersistError::Full(e.to_string())
+                } else {
+                    PersistError::Storage(format!("object store disk I/O error: {e}"))
+                }
+            })?),
         };
         let previous_seq: i64 = conn.query_row("SELECT coalesce(max(seq), 0) FROM events WHERE run_id = ?1 AND kind = 'resource.pinned' AND json_extract(payload_json, '$.role') = ?2", params![run,role],|r|r.get(0)).map_err(sqlite_error)?;
         events.push(NewEvent {
