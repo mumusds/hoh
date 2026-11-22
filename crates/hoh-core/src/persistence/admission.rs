@@ -3,7 +3,9 @@
 //! dispatch decision and a direct creation ([`super::attempts::create`]) all call it; `decide::lease_task` takes an
 //! [`Admission`] only [`admit`] (or [`supervision`], for the Commander's own turn) builds, so a leased work attempt
 //! cannot bypass it. Each task is judged in order: its revision (the run's current specification), who may dispatch
-//! it (a review task is the round's), and its readiness under that revision (REQ-031 behaviours 3 and 5). The task's
+//! it (a review task is the round's), its readiness under that revision (REQ-031 behaviours 3 and 5), and whether it
+//! would write files the user had not committed at the run's baseline (REQ-028 behaviour 4, docs/adr/ADR-039.md
+//! decision 7). The task's
 //! state move, its lease and its role's epoch stay where they are judged today, after this, in the same transaction.
 
 use super::{PersistError, sqlite_error};
@@ -50,6 +52,9 @@ pub(super) enum Refusal {
     RuntimeOwned,
     /// A planned task whose readiness under the run's current revision does not pass.
     NotReady { revision: i64, reasons: Vec<Reason> },
+    /// A write task, not asked about them before, whose path scope holds `paths`: files the run's baseline lists as
+    /// uncommitted (docs/adr/ADR-039.md decision 7). The round asks the user; the answer decides.
+    DirtyWorkspace { paths: Vec<String> },
 }
 
 impl Refusal {
@@ -75,6 +80,11 @@ impl Refusal {
                     named.join("; ")
                 )
             }
+            Refusal::DirtyWorkspace { paths } => format!(
+                "{task_id}'s path scope holds files with uncommitted changes at the run's baseline: {}; the user \
+                 decides first",
+                paths.join(", ")
+            ),
         }
     }
 
@@ -83,6 +93,7 @@ impl Refusal {
             Refusal::NotReady { reasons, .. } => Some(json!({
                 "reasons": reasons.iter().map(Reason::json).collect::<Vec<_>>()
             })),
+            Refusal::DirtyWorkspace { paths } => Some(json!({ "paths": paths })),
             _ => None,
         }
     }
@@ -93,9 +104,9 @@ impl Refusal {
         Rejection {
             reason: match self {
                 Refusal::SpecMismatch { .. } => RejectionReason::SpecMismatch,
-                Refusal::RuntimeOwned | Refusal::NotReady { .. } => {
-                    RejectionReason::IllegalTransition
-                }
+                Refusal::RuntimeOwned
+                | Refusal::NotReady { .. }
+                | Refusal::DirtyWorkspace { .. } => RejectionReason::IllegalTransition,
             },
             detail: self.describe(task_id),
             details: self.details(),
@@ -152,16 +163,23 @@ pub(super) fn admit(
         }
         None => None,
     };
+    // The files the run's baseline lists as uncommitted, and the round's verifier tasks (read-only: never held).
+    let uncommitted = super::baseline::uncommitted(tx, run_id)?;
+    let verifiers = if uncommitted.is_empty() {
+        Default::default()
+    } else {
+        super::verification::verifier_tasks(tx, run_id)?
+    };
     for &task_id in tasks {
-        let task: Option<(String, Option<String>)> = tx
+        let task: Option<(String, Option<String>, bool)> = tx
             .query_row(
-                "SELECT run_id, spec_id FROM tasks WHERE task_id = ?1",
+                "SELECT run_id, spec_id, writer FROM tasks WHERE task_id = ?1",
                 params![task_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(sqlite_error)?;
-        let Some((task_run, task_spec)) = task else {
+        let Some((task_run, task_spec, writer)) = task else {
             return Err(PersistError::IntegrityViolation(format!(
                 "no task {task_id}"
             )));
@@ -189,15 +207,40 @@ pub(super) fn admit(
                 Some((revision, Readiness::NotReady(reasons))) => {
                     Err(Refusal::NotReady { revision, reasons })
                 }
-                // 4. M3-T04: the run mode's admission (PLAN/BUILD/AUTO) joins here, as one more refusal.
-                _ => Ok(Admission {
-                    task_id: task_id.to_owned(),
-                }),
+                // 4. Its files: a write task whose path scope holds files uncommitted at the run's baseline waits for
+                // the user, asked once (REQ-028 behaviour 4, O3).
+                _ => match dirty(tx, task_id, writer, &uncommitted, &verifiers)? {
+                    Some(paths) => Err(Refusal::DirtyWorkspace { paths }),
+                    // 5. M3-T04: the run mode's admission (PLAN/BUILD/AUTO) joins here, as one more refusal.
+                    None => Ok(Admission {
+                        task_id: task_id.to_owned(),
+                    }),
+                },
             }
         };
         verdicts.insert(task_id.to_owned(), verdict);
     }
     Ok(verdicts)
+}
+
+/// The uncommitted files of `uncommitted` write task `task_id`'s path scope holds, when it is no verifier and was not
+/// asked about them before (docs/adr/ADR-039.md decision 7); `None` when it is not held.
+fn dirty(
+    tx: &Connection,
+    task_id: &str,
+    writer: bool,
+    uncommitted: &[String],
+    verifiers: &std::collections::BTreeSet<String>,
+) -> Result<Option<Vec<String>>, PersistError> {
+    if uncommitted.is_empty()
+        || !writer
+        || verifiers.contains(task_id)
+        || super::baseline::asked(tx, task_id)?
+    {
+        return Ok(None);
+    }
+    let files = crate::baseline::touched(&super::plan::task_paths(tx, task_id)?, uncommitted);
+    Ok((!files.is_empty()).then_some(files))
 }
 
 /// The verdict on one task `task_id` of run `run_id`.

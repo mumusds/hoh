@@ -125,12 +125,11 @@ pub(super) fn round(
     // for that step (REQ-031 behaviours 3 and 5, M3J-01, M3J-100: no planned work before the revision's review PASS).
     let ids: Vec<&str> = rows.iter().map(|r| r.candidate.task_id.as_str()).collect();
     let mut admitted = super::admission::admit(&tx, run_id, &ids, super::admission::By::Round)?;
+    // A write task the admission holds for files the user had not committed at the run's baseline is BLOCKED
+    // (NEED_DECISION) here with those files, asked once (REQ-028 behaviour 4, O3; docs/adr/ADR-039.md decision 7). Its
+    // answer decides; nothing of the files is written, stashed or reset.
+    let held_dirty = hold_dirty(&tx, &project_id, run_id, &rows, &admitted, ctx)?;
     rows.retain(|r| matches!(admitted.get(&r.candidate.task_id), Some(Ok(_))));
-    // A writer task whose path scope holds files the user had not committed at the run's baseline is not touched: it
-    // is BLOCKED (NEED_DECISION) with those files, asked once (REQ-028 behaviour 4, O3; docs/adr/ADR-039.md decision
-    // 7). Its answer decides; nothing of the files is written, stashed or reset.
-    let held_dirty = dirty(&tx, &project_id, run_id, &rows, &verifiers, ctx)?;
-    rows.retain(|r| !held_dirty.contains(&r.candidate.task_id));
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
         readers: u32::from(
@@ -500,31 +499,27 @@ fn candidates(
     Ok(rows)
 }
 
-/// Each writer task of `rows` (no verifier) whose path scope holds a file run `run_id`'s baseline lists as uncommitted,
-/// not asked about it before: BLOCKED (NEED_DECISION) in `tx` with a `dirty_workspace` question listing those files
-/// (docs/adr/ADR-039.md decision 7). Their ids.
-fn dirty(
+/// Each task of `rows` the dispatch admission refused for its uncommitted files (`admitted`): BLOCKED (NEED_DECISION)
+/// in `tx` with a `dirty_workspace` question listing those files (docs/adr/ADR-039.md decision 7). Their ids.
+fn hold_dirty(
     tx: &rusqlite::Transaction<'_>,
     project_id: &str,
     run_id: &str,
     rows: &[Row],
-    verifiers: &std::collections::BTreeSet<String>,
+    admitted: &std::collections::BTreeMap<
+        String,
+        Result<super::admission::Admission, super::admission::Refusal>,
+    >,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<Vec<String>, PersistError> {
-    let uncommitted = super::baseline::uncommitted(tx, run_id)?;
     let mut held = Vec::new();
-    if uncommitted.is_empty() {
-        return Ok(held);
-    }
     for r in rows {
         let task = &r.candidate.task_id;
-        if !r.candidate.writer || verifiers.contains(task) || super::baseline::asked(tx, task)? {
+        let Some(Err(super::admission::Refusal::DirtyWorkspace { paths: files })) =
+            admitted.get(task)
+        else {
             continue;
-        }
-        let files = crate::baseline::touched(&super::plan::task_paths(tx, task)?, &uncommitted);
-        if files.is_empty() {
-            continue;
-        }
+        };
         tx.execute(
             "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
             params![crate::protocol::BlockedReason::NeedDecision.as_str(), task],
