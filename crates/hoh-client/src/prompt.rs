@@ -330,7 +330,7 @@ fn answer(
     if let Some(event) = watch.first() {
         match event["payload"]["question_id"].as_str() {
             Some(question) => stderr.say(&format!("hoh: 已答复问题 {question}")),
-            None => stderr.say("hoh: 输入已排队，待 M3-T04 投递"),
+            None => stderr.say("hoh: 输入已排队"),
         }
     }
     let code = crate::follow::conclude(&outcome, output, run_id, &stderr, state);

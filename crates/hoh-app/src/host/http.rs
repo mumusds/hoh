@@ -1391,7 +1391,7 @@ async fn get_run(
     };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.run_projection(&wanted)).await {
-        Ok(Some((run, team, acceptance, result, watermark, questions, degraded))) => {
+        Ok(Some((run, team, acceptance, result, watermark, questions, degraded, active_roles))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
                 |s| hoh_core::lifecycle::label(s).to_owned(),
@@ -1423,6 +1423,7 @@ async fn get_run(
                     // docs/adr/ADR-022.md decision 18.
                     "team": team.members,
                     "team_revision": team.team_revision,
+                    "active_roles": active_roles,
                     "resume_state": run.resume_state,
                     "blocked_reason": run.blocked_reason,
                     // CANCEL_REQUESTED is shown as CANCELLING (REQ-043 behaviour 3, ADR-021 decision 8h).

@@ -22,7 +22,7 @@
 
 TUI 的 `/plan`、`/build`、`/auto` 切换模式，Shift+Tab 按 `[ui] mode_cycle` 轮换（默认 PLAN→BUILD→AUTO，可配置为两个或三个不重复的合法模式）。未附着时只选择下一次新建 Run 的模式，不改变项目默认；已附着时切换当前 Run。写任务正在执行时，切换会等待安全点，顶栏在生效后更新。未知 Slash 显示错误，不作为普通输入发送；模式切换本身不生成或批准规格。
 
-不存在hoh plan/hoh mode plan/hoh run子命令。Shell帮助保持短；TUI输入/可搜索命令，低频设置从面板进入。
+不存在hoh plan/hoh mode plan/hoh run子命令。Shell帮助保持短。TUI 输入 `/` 打开命令选择器，列出 `/plan`、`/build`、`/auto`、`/team`、`/model`、`/status`、`/resume`、`/help`；继续输入可模糊筛选，↑↓ 选择、Enter 执行、Esc 返回。未知命令显示“未知命令（unknown command）”，不提交任何命令。`/status` 显示当前 Run 状态，`/help` 显示键位与命令说明。
 
 ## 观察团队
 
@@ -34,11 +34,13 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 ## 与团队交流
 
-默认问Commander。@cto、@qa或@developer定向咨询；品牌名有多个职位会显示实际路由。问进度不会打断编码。优先级调整在下个checkpoint生效；需求变更有CR和影响分析。暂停/取消通过控制面，不等模型同意。
+普通输入默认交给 Commander。`@cto`、`@qa`、`@developer` 指定稳定职位，以 STEER 入队；使用品牌名时，例如 `@claude 先写测试`，客户端读取当前团队和正在运行任务的职位。只有一个匹配的当前职位时直接选择，否则弹出职位选择器；Esc 返回原草稿，不发送。消息栏显示实际目标，例如“→ developer”，队列保存该职位与受理时的 epoch，换绑后的旧输入拒绝为 STALE_ROLE_EPOCH。
+
+HoH 的 Slash 不转给底座。要定向发送底座命令，使用 `/agent developer /compact`；目标必须是当前已绑定的职位，缺目标、缺正文或未知目标均不提交。转发走同一 STEER 通道：支持时在当前 turn 内交付，否则等待该职位下一 Attempt。TUI 不新增 ASK/CHANGE/CONTROL 专门语法，输入种类通过共享 SendInput API 表达；CHANGE/CONTROL 的实现由后续切片交付。ASK 查询不会打断编码。暂停/取消通过控制面，不等模型同意。
 
 ## 团队、模型、Prompt与Skill
 
-/team选择默认职位与Agent/模型，也可新增自定义职位。角色切换提示什么时候生效。设置页可查看默认Prompt、创建覆盖、diff、恢复默认；运行中的attempt用锁定版本。项目内置Skill和文档模板不要求另装Matt工具；Pi原生插件由HoH引导自动准备。
+当前 `/team` 和 `/model` 显示附着 Run 的职位、Agent 与模型，并说明项目设置在 checkpoint 生效；它们不提供编辑入口，TUI 编辑属后续任务。设置页中的自定义职位、Prompt 覆盖、diff 和恢复默认属于后续界面范围；运行中的 attempt 使用锁定版本。项目内置 Skill 和文档模板不要求另装 Matt 工具；Pi 原生插件由 HoH 引导自动准备。
 
 ## 退出与恢复
 
