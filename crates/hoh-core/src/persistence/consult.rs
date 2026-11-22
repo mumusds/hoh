@@ -95,7 +95,18 @@ pub(super) fn request(
         .get("intent")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if message.kind != MessageKind::Query || !matches!(intent, "opinion" | "conclude") {
+    let major = intent == "apply"
+        && matches!(
+            message
+                .payload
+                .get("decision_class")
+                .and_then(Value::as_str),
+            Some("spec" | "adr" | "public_api" | "gate")
+        );
+    if !matches!(message.kind, MessageKind::Query | MessageKind::Steer)
+        || (!major
+            && (message.kind != MessageKind::Query || !matches!(intent, "opinion" | "conclude")))
+    {
         return Ok(None);
     }
     let tx = writer::begin(conn, ctx)?;
@@ -132,6 +143,8 @@ pub(super) fn request(
         .map_err(sqlite_error)?;
     let reply = if let Some(reply) = source(&tx, message)? {
         reply
+    } else if major {
+        major_decision(&tx, &project, message)?
     } else {
         discussion(&tx, &project, message, &key, intent)?
     };
@@ -232,4 +245,30 @@ fn discussion(
         json!({"controversy_id":controversy,"evidence_sha":evidence,"message_id":message.message_id,"opinion":message.payload}),
     )?;
     Ok(json!({"status":"accepted","event_id":id,"round":opinions.len()+1}))
+}
+
+fn major_decision(
+    tx: &Transaction<'_>,
+    project: &str,
+    message: &Message,
+) -> Result<Value, PersistError> {
+    let class = &message.payload["decision_class"];
+    let statement = ["statement", "text", "summary"]
+        .iter()
+        .find_map(|key| message.payload.get(*key).and_then(Value::as_str))
+        .filter(|s| !s.trim().is_empty());
+    let Some(statement) = statement else {
+        return Ok(rejected(
+            "ILLEGAL_TRANSITION",
+            json!({"decision_class":class,"cause":"statement_required"}),
+        ));
+    };
+    let escalation = super::need::major_decision(project, &message.run_id, class, statement);
+    if !closing::exists(tx, &escalation.event_id)? {
+        writer::insert_event(tx, &escalation)?;
+    }
+    Ok(rejected(
+        "ILLEGAL_TRANSITION",
+        json!({"decision_class":class,"cause":"commander_decision_required"}),
+    ))
 }
