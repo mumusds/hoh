@@ -426,9 +426,11 @@ async fn test_031_04_spec_review_gates_ready() -> R {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_031_04_a_revision_approved_during_verification_is_reviewed_in_place() -> R {
-    // Project B: run R2 on revision 1 in VERIFYING with candidate C under verification; the user approves revision 2's
-    // CR. C goes STALE (REQ-033); R2's review of revision 2 is opened after the approval while R2 is VERIFYING or
-    // RUNNING, never SPECIFYING; nothing is dispatched for writing under revision 2 before its PASS.
+    // Project B: run R2 on revision 1 in VERIFYING with candidate C under verification and a planned writer TP of
+    // REQ-1 pending (its dependency TD not yet accepted); the user approves revision 2's CR, and TD is accepted. C goes
+    // STALE (REQ-033); R2's review of revision 2 is opened after the approval while R2 is VERIFYING or RUNNING, never
+    // SPECIFYING; nothing is dispatched for writing under revision 2 before its PASS (M3J-01), and TP is once it
+    // passed (the positive control: TP was held by the review alone).
     let world = World::new()?;
     world.configure(&[], "")?;
     world.commit_project(&[])?;
@@ -456,10 +458,31 @@ async fn test_031_04_a_revision_approved_during_verification_is_reviewed_in_plac
              INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256,
                test_plan_sha256, source_path, state, created_at) VALUES ('C', '{run}', printf('%.40c', 'a'),
                printf('%.40c', 'b'), '{first_sha}', printf('%.64c', 'e'), printf('%.64c', 'f'), '/src', 'VERIFYING',
-               '2026-11-22T00:00:00Z');"
+               '2026-11-22T00:00:00Z');
+             INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq) VALUES
+               ('TD', '{run}', (SELECT spec_id FROM runs WHERE run_id = '{run}'), 'IMPLEMENTED', 0, 'developer', 1,
+                900),
+               ('TP', '{run}', (SELECT spec_id FROM runs WHERE run_id = '{run}'), 'PENDING', 0, 'developer', 1, 901);
+             INSERT INTO task_dependencies(task_id, depends_on) VALUES ('TP', 'TD');
+             INSERT INTO task_requirements(task_id, requirement_id, spec_id) VALUES
+               ('TP', 'REQ-1', (SELECT spec_id FROM runs WHERE run_id = '{run}'));
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ((SELECT project_id FROM runs WHERE run_id = '{run}'), 'plan-b', '{run}', 'plan.imported',
+                json_object('tasks', json_array(json_object('task_id', 'TD'), json_object('task_id', 'TP'))),
+                '2026-11-22T00:00:00Z');"
         ))?;
         let second_sha = commit_spec(&world, &markdown("REQ-1", 2, "记下"))?;
         approve_change(&host, &run, "rev2", &second_sha).await?;
+        // TP's dependency accepted: from here TP waits for revision 2's review alone.
+        world.exec("UPDATE tasks SET state = 'ACCEPTED' WHERE task_id = 'TD'")?;
+        assert_eq!(
+            world.query(&format!(
+                "SELECT count(*) FROM tasks WHERE task_id = 'TP' AND spec_id = \
+                 (SELECT spec_id FROM runs WHERE run_id = '{run}')"
+            ))?,
+            "1",
+            "TP migrated to revision 2"
+        );
         until("revision 2's report", || {
             Ok(reported(&world, 2)?.iter().any(|r| r["state"] == "CURRENT"))
         })
@@ -504,6 +527,14 @@ async fn test_031_04_a_revision_approved_during_verification_is_reviewed_in_plac
             ))?,
             "0"
         );
+        // The positive control: once revision 2 passed its review, TP is dispatched.
+        until("TP dispatched after revision 2's PASS", || {
+            Ok(world.query(&format!(
+                "SELECT count(*) FROM events e WHERE e.kind = 'schedule.round' AND e.run_id = '{run}' \
+                 AND json_extract(e.payload_json, '$.task_id') = 'TP' AND e.seq > {reported_seq}"
+            ))? != "0")
+        })
+        .await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;

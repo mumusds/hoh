@@ -27,6 +27,7 @@ const KINDS: &[&str] = &[
     "team.binding_blocked",
     "supervisor.retrigger",
     "spec.changed",
+    "spec_review.waiting",
     "milestone_ready",
     "release_request",
     "iteration.completed",

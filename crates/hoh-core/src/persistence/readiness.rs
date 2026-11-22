@@ -359,6 +359,34 @@ pub(super) fn run_readiness(
     )))
 }
 
+/// The planned tasks of run `run_id` whose readiness under its current revision does not pass now (none without a
+/// revision), as the readiness step would judge them: what a scheduling round leaves undispatched in its own
+/// transaction, whatever the step last wrote (M3J-01).
+pub(super) fn unready(conn: &Connection, run_id: &str) -> Result<BTreeSet<String>, PersistError> {
+    let spec: Option<String> = conn
+        .query_row(
+            "SELECT spec_id FROM runs WHERE run_id = ?1",
+            params![run_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .flatten();
+    let Some(spec) = spec else {
+        return Ok(BTreeSet::new());
+    };
+    let plan = plan(conn, run_id, &spec)?;
+    if plan.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let (revision, review) = (revision(conn, &spec)?, review(conn, &spec)?);
+    Ok(plan
+        .iter()
+        .filter(|t| !readiness::judge_task(&revision, &plan, &review, &t.task_id).is_ready())
+        .map(|t| t.task_id.clone())
+        .collect())
+}
+
 /// Run `run_id`'s readiness step, one transaction (REQ-031 behaviour 5 and 7): in SPECIFYING, READY, RUNNING and
 /// VERIFYING only. Each planned PENDING or READY task of the run's revision whose readiness does not pass is BLOCKED
 /// (READINESS_NOT_MET, `task.blocked{details: {reasons, paths}}`); each one BLOCKED for it whose readiness passes goes

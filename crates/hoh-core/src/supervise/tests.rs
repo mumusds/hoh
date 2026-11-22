@@ -174,6 +174,10 @@ fn important_events_wake_under_every_policy_and_intensive_wakes_at_least_balance
         ("budget.risk", json!({"kind": "usd"})),
         ("team.binding_blocked", json!({"role": "qa"})),
         ("spec.changed", json!({"spec_revision": 4})),
+        (
+            "spec_review.waiting",
+            json!({"spec_id": "s4", "spec_revision": 4, "head": "h", "reason": "spec_not_committed"}),
+        ),
         ("milestone_ready", json!({"milestone": "M1"})),
         ("release_request", json!({})),
         ("integrity_violation", json!({"reason": "db"})),

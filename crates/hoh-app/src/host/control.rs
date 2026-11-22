@@ -555,6 +555,28 @@ pub(crate) fn git(project: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+thread_local! {
+    /// The attempt whose run directory this thread's git commands make or read, if any (see [`as_attempt`]).
+    static ATTEMPT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every git command it runs on this thread carrying attempt marker `marker` in its environment
+/// (`HOH_ATTEMPT_ID`, as the attempt's own processes do): a run directory's checkout is made while its attempt has no
+/// process recorded, so a git a killed host left working there is found by the attempt's marker and stopped by the
+/// next start's reconcile before the attempt ends and its directory is removed (docs/adr/ADR-035.md, the review's
+/// checkout). The thread's earlier marker is restored after, whatever `f` does.
+pub(crate) fn as_attempt<T>(marker: &str, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let earlier = self.0.take();
+            ATTEMPT.with(|a| *a.borrow_mut() = earlier);
+        }
+    }
+    let _restore = Restore(ATTEMPT.with(|a| a.borrow_mut().replace(marker.to_owned())));
+    f()
+}
+
 /// [`git`] whatever its exit status: the status and the output (`git check-ignore` answers "not ignored" with 1). git
 /// runs in a process group of its own. On every path, its output's reader is joined before this returns, after the
 /// group is killed while git is not yet reaped (so its pid still names that group): the pipe's writers are gone then,
@@ -567,7 +589,11 @@ pub(crate) fn git_run(
     use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
-    let mut child = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    if let Some(marker) = ATTEMPT.with(|a| a.borrow().clone()) {
+        command.env(super::processes::ATTEMPT_ENV, marker);
+    }
+    let mut child = command
         .args(["--no-optional-locks", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(project)

@@ -40,6 +40,20 @@ pub(super) fn facts(
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or((None, None, None));
+    // A specification review's task works on the revision its review was opened for, whichever revision the run
+    // adopted since (its task migrated with the run): its context names that revision, as its checkout and its
+    // report's identity do (REQ-031 behaviour 3, M3J-02).
+    let review = match supervision {
+        Some(_) => None,
+        None => super::spec_review::work_of(conn, task_id)?,
+    };
+    let (spec_id, spec) = match review {
+        Some(work) => (
+            super::spec_review::spec_of(conn, &work.review_id)?.or(spec_id),
+            Some((work.spec_sha256, work.spec_revision)),
+        ),
+        None => (spec_id, spec),
+    };
     let candidate =
         super::outbox::current_candidate(conn, run_id)?.map(|c| (c.id, c.git_commit, c.git_tree));
     let mut facts = Facts {

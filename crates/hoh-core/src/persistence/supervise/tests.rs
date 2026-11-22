@@ -1300,3 +1300,50 @@ async fn evidence_whose_source_changed_wakes_the_commander_in_the_step_that_sees
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_review_waiting_for_its_revisions_commit_wakes_the_commander_once_per_head() -> R {
+    // M3J-03 (docs/adr/ADR-035.md decision 5): a due specification review whose revision has no commit of its own is
+    // recorded waiting once per revision and HEAD, and that record wakes the Commander (to commit the specification or
+    // ask): its trigger fires under the revision's key with the waiting event's seq; the same HEAD again writes no
+    // event and so wakes nothing more.
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    clock.set(0);
+    assert!(store.spec_review_waiting("R", "s3", "h1").await?);
+    let seq = count(
+        &path,
+        "SELECT seq FROM events WHERE kind = 'spec_review.waiting'",
+    )?;
+    let mut fired = Vec::new();
+    for now in (0..=3000).step_by(100) {
+        fired.extend(store.supervise("R", at(&clock, now)).await?.fired);
+    }
+    assert_eq!(
+        fired
+            .iter()
+            .map(|f| (
+                f.fingerprint.as_str(),
+                f.spec_id.as_deref(),
+                f.event_seqs.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [("spec_review.waiting/", Some("s3"), vec![seq])],
+        "the waiting wakes the Commander"
+    );
+    // The same HEAD: no event, no further wake.
+    assert!(!store.spec_review_waiting("R", "s3", "h1").await?);
+    for now in (3100..=6000).step_by(100) {
+        assert!(
+            store
+                .supervise("R", at(&clock, now))
+                .await?
+                .fired
+                .is_empty()
+        );
+    }
+    assert_eq!(count(&path, "SELECT count(*) FROM supervisor_triggers")?, 1);
+    Ok(())
+}

@@ -1353,14 +1353,19 @@ async fn attempt(
     let review_dir = match &review {
         Some(r) => {
             let dir = crate::verify::rundir::dir_of(&common.runs, &work.project_id, &id);
-            let (project, held, commit, sha) = (
+            let (project, held, commit, sha, marker) = (
                 common.shared.root.clone(),
                 dir.clone(),
                 r.git_commit.clone(),
                 r.spec_sha256.clone(),
+                work.marker(),
             );
+            // Its git carries the attempt's marker: one a killed host left in the checkout is stopped by the next
+            // start's reconcile before the directory is removed.
             let prepared = super::begun::spawn_blocking(move || {
-                crate::verify::rundir::prepare_commit(&project, &held, &commit, &sha)
+                super::control::as_attempt(&marker, || {
+                    crate::verify::rundir::prepare_commit(&project, &held, &commit, &sha)
+                })
             })
             .await
             .unwrap_or_else(|e| Err(crate::verify::rundir::Unprepared::Io(e.to_string())));

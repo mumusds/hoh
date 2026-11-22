@@ -226,6 +226,22 @@ pub(super) fn work_of(
     .map_err(sqlite_error)
 }
 
+/// The revision review `review_id` was opened for (its `spec_review.opened`'s `spec_id`).
+pub(super) fn spec_of(
+    conn: &rusqlite::Connection,
+    review_id: &str,
+) -> Result<Option<String>, PersistError> {
+    conn.query_row(
+        "SELECT json_extract(payload_json, '$.spec_id') FROM events WHERE kind = ?1 \
+         AND json_extract(payload_json, '$.review_id') = ?2 ORDER BY seq LIMIT 1",
+        params![OPENED, review_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(sqlite_error)
+    .map(Option::flatten)
+}
+
 /// The identities review task `task_id` of run `run_id` would share, dispatched in reviewer session `session`, with
 /// its revision's drafters and the Commander (CR-029; the rule the intake judges by): none, it may go.
 pub(super) fn shared_at_dispatch(
