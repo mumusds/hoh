@@ -809,75 +809,109 @@ class PersistenceScan(unittest.TestCase):
                           ('persistence-whitelist.json','whitelist','read_as_data contracts/empty.json: no reason given'),
                           ('persistence-whitelist.json','whitelist','read_as_data contracts/writes.json: holds a SQL write'),
                           ('persistence-whitelist.json','whitelist','read_as_data scripts/db.sh: not a JSON or Markdown file')])
-    def test_listed_embedded_markdown_under_resources_is_no_hit_and_nothing_else_is(self):
-        # CR-034: product code may embed (include_str!/include_bytes!) and name a Markdown file under resources/ that
-        # the whitelist's embedded_markdown lists with its reason, identified by its own path (a regular, non-executable
-        # file of the repository reached through no symbolic link), whose prose mentions SQLite and which holds no SQL
-        # write. An unlisted file, a listed file holding a SQL write, a symbolic link to a listed file, a path leaving
-        # the repository, an executable file and a file that is not Markdown under resources/ stay hits.
-        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
-        up='../../../'
-        main=F+('fn main(){ let _ = (include_str!("'+up+'resources/skills/listed/SKILL.md"), "resources/skills/listed/SKILL.md", '
-                'include_bytes!("'+up+'resources/skills/unlisted/SKILL.md"), include_str!("'+up+'resources/skills/writes/SKILL.md"), '
-                'include_str!("'+up+'resources/skills/link.md"), include_str!("'+up+'resources/ext/outside.md"), '
-                'include_str!("'+up+'resources/tools/run.md"), include_str!("'+up+'resources/tools/tool.sh"), '
-                'include_str!("'+up+'contracts/embedded.md"), include_str!("'+up+'../outside.md")); }')
+    # CR-034: product code may embed (include_str!/include_bytes!) and name a Markdown file under resources/ that the
+    # whitelist's embedded_markdown lists with its reason, identified by its own path (a regular, non-executable file of
+    # the repository reached through no symbolic link), whose prose mentions SQLite and which holds no SQL write. The
+    # tests keep three things apart (CR34-51): the allowed case (new), the refusals the exception leaves as they were
+    # (the same included-file, named-file and symlink hits as before CR-034), and the entry diagnostics of check 6 (new).
+    EMBED_F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+    EMBED_UP='../../../'
+    EMBED_KINDS=('included-file','named-file','symlink')
+    def embedded_fixture(self,includes,names=()):
+        """A repository whose whitelist lists resources/skills/listed/SKILL.md (valid) and entries the exception does
+        not cover, and whose crates/hoh-app/src/main.rs embeds `includes` and names `names` (paths as written)."""
+        main=self.EMBED_F+'fn main(){ let _ = ('+', '.join(
+            [f'include_str!("{p}")' for p in includes]+[f'"{p}"' for p in names])+'); }'
         prose={'resources/skills/listed/SKILL.md':'Keep the store in SQLite (WAL mode).\n',
                'resources/skills/unlisted/SKILL.md':'SQLite busy is a failure class.\n',
                'resources/skills/writes/SKILL.md':'SQLite notes.\n\n    INSERT INTO runs VALUES (1);\n',
                'resources/tools/run.md':'SQLite notes, but executable.\n','resources/tools/tool.sh':'sqlite3 x.db\n',
-               'contracts/embedded.md':'SQLite notes outside resources.\n'}
+               'contracts/embedded.md':'SQLite notes outside resources.\n',
+               'resources/skills/noreason/SKILL.md':'SQLite prose.\n'}
         embedded={'resources/skills/listed/SKILL.md':'built-in skill text naming SQLite, embedded as data',
                   'resources/skills/writes/SKILL.md':'listed, but it holds a SQL write',
                   'resources/skills/link.md':'listed, but a symbolic link to a listed file',
+                  'resources/skills/jump/SKILL.md':'listed, but reached through a linked directory',
+                  'resources/skills/jump/../listed/SKILL.md':'listed, but not in normal form',
+                  'resources/skills/missing.md':'listed, but there is no such file',
                   'resources/ext/outside.md':'listed, but reached through a link leaving the repository',
                   'resources/tools/run.md':'listed, but executable','resources/tools/tool.sh':'listed, but a script',
                   'contracts/embedded.md':'listed, but not under resources/',
                   'resources/skills/plain/SKILL.md':'listed, but it mentions no SQLite',
                   'resources/skills/noreason/SKILL.md':''}
-        whitelist={'files':{'clippy.toml':'fixture',**{rel:'fixture' for rel in prose},'resources/skills/noreason/SKILL.md':'fixture'},
-                   'embedded_markdown':embedded}
+        whitelist={'files':{'clippy.toml':'fixture',**{rel:'fixture' for rel in prose}},'embedded_markdown':embedded}
         files={'crates/hoh-app/src/main.rs':main,**prose,'resources/skills/plain/SKILL.md':'No database here.\n',
-               'resources/skills/noreason/SKILL.md':'SQLite prose.\n',
                'scripts/product/persistence-whitelist.json':json.dumps(whitelist)}
-        rc,res=self.run_scan(files,whitelist=False,symlinks={'resources/skills/link.md':'listed/SKILL.md','resources/ext':'../..'},
-                             modes={'resources/tools/run.md':0o755})
-        self.assertEqual(rc,1)
-        mention=': mentions SQLite or holds a SQL write'
-        self.assertEqual(sorted((h['path'],h['kind'],h['match']) for h in res['hits']),sorted(
-            [('crates/hoh-app/src/main.rs','included-file',f'{name}{mention}') for name in ('SKILL.md','SKILL.md','link.md','run.md','tool.sh','embedded.md')]
-            +[('crates/hoh-app/src/main.rs','included-file',f'{up}{rel}: outside the repository') for rel in ('resources/ext/outside.md','../outside.md')]
-            +[('crates/hoh-app/src/main.rs','named-file',f'{up}{rel}{mention}') for rel in
-              ('resources/skills/unlisted/SKILL.md','resources/skills/writes/SKILL.md','resources/skills/link.md',
-               'resources/tools/run.md','resources/tools/tool.sh','contracts/embedded.md')]
-            +[('resources/ext','symlink','-> ../..'),('resources/skills/link.md','symlink','-> listed/SKILL.md')]
-            +[('scripts/product/persistence-whitelist.json','whitelist',f'embedded_markdown {rel}: {problem}') for rel,problem in
-              (('contracts/embedded.md','not a Markdown file under resources/'),
-               ('resources/ext/outside.md','not a regular file of the repository'),
-               ('resources/skills/link.md','not a regular file of the repository'),
-               ('resources/skills/noreason/SKILL.md','no reason given'),
-               ('resources/skills/plain/SKILL.md','mentions no SQLite and holds no SQL write'),
-               ('resources/skills/writes/SKILL.md','holds a SQL write'),
-               ('resources/tools/run.md','executable'),
-               ('resources/tools/tool.sh','not a Markdown file under resources/'))]))
-    def test_listed_embedded_markdown_holding_any_sql_write_is_refused(self):
-        # CR-034: the exception covers prose only; an INSERT, UPDATE or DELETE statement in a listed file keeps the
-        # include and the named file hits, and the entry itself is a hit.
-        F='#![forbid(clippy::disallowed_methods)]\n#![forbid(unsafe_code)]\n'
+        return files,{'symlinks':{'resources/skills/link.md':'listed/SKILL.md','resources/skills/jump':'listed',
+                                  'resources/ext':'../..'},'modes':{'resources/tools/run.md':0o755}}
+    def test_listed_embedded_markdown_under_resources_is_no_hit(self):
+        # The allowed case: the listed file, embedded through a path with `..` that crosses no link and named from the
+        # repository root, is no hit; the whole scan passes (the other entries are not used here, so they are left out).
+        rel='resources/skills/listed/SKILL.md'
+        whitelist={'files':{'clippy.toml':'fixture',rel:'fixture'},'embedded_markdown':{rel:'built-in skill text naming SQLite'}}
+        files={'crates/hoh-app/src/main.rs':self.EMBED_F+'fn main(){ let _ = (include_str!("'+self.EMBED_UP+rel+'"), '
+               'include_bytes!("../../hoh-app/src/'+self.EMBED_UP+rel+'"), "'+rel+'"); }',
+               rel:'Keep the store in SQLite (WAL mode).\n','scripts/product/persistence-whitelist.json':json.dumps(whitelist)}
+        rc,res=self.run_scan(files,whitelist=False)
+        self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))
+    def test_embedded_files_the_exception_does_not_cover_keep_their_hits(self):
+        # Unchanged refusals, the same hits before and after CR-034 (green on both scanners): an unlisted file, a listed
+        # file holding a SQL write, a symbolic link to a listed file, a path leaving the repository through a link, an
+        # executable file, a script, Markdown outside resources/, and (CR34-50) any path crossing a linked directory,
+        # even when `..` after the link lands on the listed file and even when the link is ignored by git.
+        up=self.EMBED_UP;mention=': mentions SQLite or holds a SQL write'
+        refused=['resources/skills/unlisted/SKILL.md','resources/skills/writes/SKILL.md','resources/skills/link.md',
+                 'resources/tools/run.md','resources/tools/tool.sh','contracts/embedded.md',
+                 'resources/skills/jump/SKILL.md','resources/skills/jump/../listed/SKILL.md']
+        outside=['resources/ext/outside.md','../outside.md']
+        for git in (None,'resources/skills/jump\n'):
+            with self.subTest(jump='ignored by git' if git else 'in the candidate'):
+                # Each include's literal names its file too; the last literal names one from the repository root.
+                files,extra=self.embedded_fixture([up+p for p in refused+outside],['resources/skills/jump/../listed/SKILL.md'])
+                rc,res=self.run_scan(files,whitelist=False,git=git,**extra)
+                self.assertEqual(rc,1)
+                symlinks=[('resources/ext','symlink','-> ../..'),('resources/skills/link.md','symlink','-> listed/SKILL.md')]
+                if git is None:
+                    symlinks.append(('resources/skills/jump','symlink','-> listed'))
+                self.assertEqual(sorted((h['path'],h['kind'],h['match']) for h in res['hits'] if h['kind'] in self.EMBED_KINDS),sorted(
+                    [('crates/hoh-app/src/main.rs','included-file',f'{name}{mention}') for name in
+                     ('SKILL.md','SKILL.md','SKILL.md','run.md','tool.sh','embedded.md','SKILL.md','SKILL.md')]
+                    +[('crates/hoh-app/src/main.rs','included-file',f'{up}{rel}: outside the repository') for rel in outside]
+                    +[('crates/hoh-app/src/main.rs','named-file',f'{up}{rel}{mention}') for rel in refused]
+                    +[('crates/hoh-app/src/main.rs','named-file',f'resources/skills/jump/../listed/SKILL.md{mention}')]
+                    +symlinks))
+    def test_embedded_markdown_holding_any_sql_write_keeps_its_hits(self):
+        # Unchanged refusals (green on both scanners): the exception covers prose only; an INSERT, UPDATE or DELETE
+        # statement in a listed file keeps the include and the named file hits.
         for statement in ('INSERT INTO runs VALUES (1)','UPDATE runs SET status = 2','DELETE FROM runs WHERE id = 1'):
             with self.subTest(statement=statement):
                 rel='resources/skills/s/SKILL.md'
                 whitelist={'files':{'clippy.toml':'fixture',rel:'fixture'},'embedded_markdown':{rel:'built-in skill text'}}
-                files={'crates/hoh-app/src/main.rs':F+'const S: &str = include_str!("../../../'+rel+'");\nfn main(){}',
+                files={'crates/hoh-app/src/main.rs':self.EMBED_F+'const S: &str = include_str!("'+self.EMBED_UP+rel+'");\nfn main(){}',
                        rel:'SQLite prose.\n\n'+statement+';\n','scripts/product/persistence-whitelist.json':json.dumps(whitelist)}
                 rc,res=self.run_scan(files,whitelist=False)
-                self.assertEqual((rc,sorted((h['kind'],h['match']) for h in res['hits'])),
+                self.assertEqual((rc,sorted((h['kind'],h['match']) for h in res['hits'] if h['kind'] in self.EMBED_KINDS)),
                                  (1,[('included-file','SKILL.md: mentions SQLite or holds a SQL write'),
-                                     ('named-file','../../../resources/skills/s/SKILL.md: mentions SQLite or holds a SQL write'),
-                                     ('whitelist',f'embedded_markdown {rel}: holds a SQL write')]))
-                files[rel]='SQLite prose only.\n'
-                rc,res=self.run_scan(files,whitelist=False)
-                self.assertEqual((rc,res['status'],res['hits']),(0,'PASS',[]))
+                                     ('named-file',f'{self.EMBED_UP}{rel}: mentions SQLite or holds a SQL write')]))
+    def test_every_embedded_markdown_entry_is_checked(self):
+        # New configuration diagnostics of check 6 (CR-034): every embedded_markdown entry but the valid one is a hit,
+        # whether or not anything embeds it.
+        files,extra=self.embedded_fixture([])
+        rc,res=self.run_scan(files,whitelist=False,**extra)
+        self.assertEqual(rc,1)
+        self.assertEqual(sorted(h['match'] for h in res['hits'] if h['kind']=='whitelist'),sorted(
+            f'embedded_markdown {rel}: {problem}' for rel,problem in
+            (('contracts/embedded.md','not a Markdown file under resources/'),
+             ('resources/ext/outside.md','not a regular file of the repository'),
+             ('resources/skills/jump/../listed/SKILL.md','not a Markdown file under resources/'),
+             ('resources/skills/jump/SKILL.md','not a regular file of the repository'),
+             ('resources/skills/link.md','not a regular file of the repository'),
+             ('resources/skills/missing.md','not a regular file of the repository'),
+             ('resources/skills/noreason/SKILL.md','no reason given'),
+             ('resources/skills/plain/SKILL.md','mentions no SQLite and holds no SQL write'),
+             ('resources/skills/writes/SKILL.md','holds a SQL write'),
+             ('resources/tools/run.md','executable'),
+             ('resources/tools/tool.sh','not a Markdown file under resources/'))))
     def test_writes_to_the_append_only_tables_are_hits_outside_their_allowed_functions(self):
         # docs/adr/ADR-029.md decision 6 (J1; M2T18D-56, -152, -257, -356, -753): anywhere in the members' Rust sources,
         # persistence and tests included, an UPDATE, DELETE, REPLACE or upsert of acceptance_results or evidence is a
