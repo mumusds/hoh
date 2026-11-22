@@ -1968,6 +1968,7 @@ impl Team {
         verdict: impl Fn(&hoh_app::host::Work) -> Verdict + Send + Sync + 'static,
     ) -> std::sync::Arc<Team> {
         std::sync::Arc::new(Team {
+            answer: Box::new(|_| None),
             script: Box::new(script),
             work: None,
             reviewer: Some((project, Box::new(verdict))),
