@@ -73,8 +73,9 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
    Product code may embed (`include_str!`/`include_bytes!`) and name a Markdown file under resources/ that the
    whitelist lists under embedded_markdown with its reason (CR-034; built-in prompts and skills whose prose mentions
-   SQLite), identified by its own path: the path as written leads, through no symbolic link, to that listed regular,
-   non-executable file of the repository, which holds no SQL write. Every embedded_markdown entry is checked: no
+   SQLite), identified by its own path: the path as written leads, through no symbolic link (checked component by
+   component before any `..` is applied, CR34-50), to that listed regular, non-executable file of the repository,
+   which holds no SQL write. Every embedded_markdown entry is checked: no
    reason, not a Markdown file under resources/ (by its normal path), not such a regular file, executable, holding a
    SQL write, or mentioning no SQLite (it needs no entry) are hits; unlisted files, scripts and paths outside the
    repository stay hits as above.
@@ -211,14 +212,9 @@ def embedded_markdown_problem(root: Path, rel, why) -> str | None:
             or os.path.normpath(rel) != rel or '..' in rel.split('/')):
         return 'not a Markdown file under resources/'
     path = root / rel
-    try:
-        mode = os.lstat(path).st_mode
-        real = path.resolve(strict=True)
-    except (OSError, RuntimeError):
+    if linkless_file(root, path) != rel:
         return 'not a regular file of the repository'
-    if real != path or not stat.S_ISREG(mode):
-        return 'not a regular file of the repository'
-    if mode & 0o111:
+    if os.lstat(path).st_mode & 0o111:
         return 'executable'
     text = path.read_bytes().decode('utf-8', errors='replace')
     if SQL_WRITE.search(text):
@@ -228,17 +224,42 @@ def embedded_markdown_problem(root: Path, rel, why) -> str | None:
     return None
 
 
-def is_embedded_markdown(root: Path, lexical: Path, embedded: set) -> bool:
-    """Whether a path as written (joined to its base, not yet resolved) is a usable embedded_markdown entry by its own
-    identity: its normal form lies in the repository, is listed, and is where the path really leads (no symbolic link
-    on the way, CR-034)."""
-    normal = Path(os.path.normpath(lexical))
-    if not normal.is_relative_to(root) or normal.relative_to(root).as_posix() not in embedded:
-        return False
+def linkless_file(root: Path, lexical: Path) -> str | None:
+    """The repository-relative path of the regular file a path as written (joined to its base, not normalised) leads
+    to through no symbolic link, or None (CR-034, CR34-50). The path is walked component by component from the
+    repository root before any `..` is applied: every component up to that point must exist and none, directory or file,
+    may be a symbolic link, so `..` undoes a real directory only; a `..` at the root leaves the repository. Comparing
+    the normal form with the resolved path would not do: `jump/../listed` with jump -> listed resolves to its own
+    normal form."""
+    if not lexical.is_relative_to(root):
+        return None
+    parts: list[str] = []
+    for part in lexical.relative_to(root).parts:
+        if part == '..':
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        if part == '.':
+            continue
+        parts.append(part)
+        try:
+            if stat.S_ISLNK(os.lstat(root.joinpath(*parts)).st_mode):
+                return None
+        except OSError:
+            return None
     try:
-        return lexical.resolve(strict=True) == normal
-    except (OSError, RuntimeError):
-        return False
+        return '/'.join(parts) if parts and stat.S_ISREG(os.lstat(root.joinpath(*parts)).st_mode) else None
+    except OSError:
+        return None
+
+
+def is_embedded_markdown(root: Path, lexical: Path, embedded: set) -> bool:
+    """Whether a path as written (joined to its base, not normalised) leads, through no symbolic link, to a usable
+    embedded_markdown entry (CR-034)."""
+    return linkless_file(root, lexical) in embedded
+
+
 # Markdown here is prose about the system, not something the product runs or embeds.
 DOCUMENTATION = ('docs/', 'reports/')
 
@@ -1105,8 +1126,8 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
 
 def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]], root: Path,
                       skip: list[tuple[int, int]] = ()) -> list[tuple[str, str, Path | None]]:
-    """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file name as written, text,
-    the path as written joined to the source's directory)), read like its literals: an embedded helper run by an
+    """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file name, text, the path as
+    written joined to the source's directory)), read like its literals: an embedded helper run by an
     interpreter is code too (M2T01R-41). A path that is not a plain literal cannot be read here and is reported as
     unverifiable."""
     out = []
@@ -1123,7 +1144,7 @@ def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]
             out.append(('unverifiable', f'{lit[2]}: outside the repository', None))
             continue
         try:
-            out.append((lexical.name, target.read_bytes().decode('utf-8', errors='replace'), lexical))
+            out.append((target.name, target.read_bytes().decode('utf-8', errors='replace'), lexical))
         except OSError as exc:
             out.append(('unverifiable', f'{lit[2]}: {exc}', None))
     return out
