@@ -81,7 +81,18 @@ pub(super) fn enqueue(
     i: &NewInput,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
-    let role = if matches!(i.kind.as_str(), "CONTROL" | "CHANGE") {
+    enqueue_outcome(tx, i, None, ctx).map(drop)
+}
+
+/// Intake can reject without publishing progress or moving a stopped run.
+fn enqueue_outcome(
+    tx: &Transaction<'_>,
+    i: &NewInput,
+    rejection: Option<&str>,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<i64, PersistError> {
+    let internal = matches!(i.kind.as_str(), "CONTROL" | "CHANGE");
+    let role = if internal {
         "runtime"
     } else {
         i.target_role
@@ -92,15 +103,19 @@ pub(super) fn enqueue(
                 "runtime"
             })
     };
-    let epoch: i64 = tx
-        .query_row(
+    // Internal routing is not a user binding, even when a user role is named runtime.
+    let epoch: i64 = if internal {
+        0
+    } else {
+        tx.query_row(
             "SELECT role_epoch FROM role_bindings WHERE run_id=?1 AND role=?2",
             params![i.run_id, role],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?
-        .unwrap_or(0);
+        .unwrap_or(0)
+    };
     let mut payload = i.payload.clone();
     payload
         .as_object_mut()
@@ -108,16 +123,27 @@ pub(super) fn enqueue(
             PersistError::IntegrityViolation("input payload must be an object".to_owned())
         })?
         .insert("role_epoch".to_owned(), json!(epoch));
-    let after: i64 = tx.query_row("SELECT coalesce(max(a.rowid),0) FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id=?1 AND t.role=?2 AND a.state IN ('STARTING','RUNNING')",params![i.run_id,role],|r|r.get(0)).map_err(sqlite_error)?;
+    let after: i64 = if internal {
+        0
+    } else {
+        tx.query_row("SELECT coalesce(max(a.rowid),0) FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id=?1 AND t.role=?2 AND a.state IN ('STARTING','RUNNING')",params![i.run_id,role],|r|r.get(0)).map_err(sqlite_error)?
+    };
     payload["after_attempt"] = json!(after);
+    let state = if let Some(reason) = rejection {
+        payload["reason"] = json!(reason);
+        InputState::Rejected
+    } else {
+        InputState::Queued
+    };
     tx.execute(
         "INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) \
-         VALUES (?1, ?2, ?3, ?4, 'QUEUED', ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             i.input_id,
             i.run_id,
             i.kind,
             i.target_role,
+            state.as_str(),
             payload.to_string()
         ],
     )
@@ -129,15 +155,44 @@ pub(super) fn enqueue(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    writer::write(tx,&Commit {
-        events:vec![NewEvent { intent:Intent::Progress, project_id, run_id:Some(i.run_id.clone()),
-            event_id:child_id(&i.input_id,InputState::Queued.as_str()),kind:"input.queued".to_owned(),
-            payload:json!({"input_id":i.input_id,"kind":i.kind,"to":"QUEUED","target_role":role,"role_epoch":epoch}) }],
-        outbox:vec![NewOutbox { message_id:i.input_id.clone(),event:0,run_id:Some(i.run_id.clone()),
-            recipient_role:role.to_owned(),role_epoch:epoch,
-            payload:json!({"notice":"input","input_id":i.input_id,"kind":i.kind}) }],
-        ..Default::default()
-    },ctx).map(drop)
+    let mut event_payload = json!({"input_id":i.input_id,"kind":i.kind,"to":state.as_str(),"target_role":role,"role_epoch":epoch});
+    if let Some(reason) = rejection {
+        event_payload["from"] = json!("QUEUED");
+        event_payload["reason"] = json!(reason);
+    }
+    let done = writer::write(
+        tx,
+        &Commit {
+            events: vec![NewEvent {
+                intent: if rejection.is_some() {
+                    Intent::Record
+                } else {
+                    Intent::Progress
+                },
+                project_id,
+                run_id: Some(i.run_id.clone()),
+                event_id: child_id(&i.input_id, state.as_str()),
+                kind: if rejection.is_some() {
+                    "input.rejected"
+                } else {
+                    "input.queued"
+                }
+                .to_owned(),
+                payload: event_payload,
+            }],
+            outbox: vec![NewOutbox {
+                message_id: i.input_id.clone(),
+                event: 0,
+                run_id: Some(i.run_id.clone()),
+                recipient_role: role.to_owned(),
+                role_epoch: epoch,
+                payload: json!({"notice":"input","input_id":i.input_id,"kind":i.kind}),
+            }],
+            ..Default::default()
+        },
+        ctx,
+    )?;
+    Ok(done.event_seqs[0])
 }
 
 pub(super) fn move_input(

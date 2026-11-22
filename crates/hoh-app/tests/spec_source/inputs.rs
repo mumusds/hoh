@@ -55,36 +55,298 @@ async fn send(host: &Host, run: &str, key: &str, kind: &str, text: &str) -> R<(V
     Ok((body, response))
 }
 
+async fn stopped(world: &World, host: &Host, run: &str, state: &str) -> R {
+    world.exec(&format!(
+        "UPDATE runs SET state='{state}',resume_state='RUNNING',blocked_reason=CASE WHEN '{state}'='BLOCKED' THEN 'NEED_DECISION' ELSE NULL END,blocked_reasons_json=CASE WHEN '{state}'='BLOCKED' THEN '[\"NEED_DECISION\"]' ELSE '[]' END WHERE run_id='{run}'"
+    ))?;
+    // Publish a result at the current stopped revision through the product command path.
+    send(host, run, "publish-stop", "ASK", "why stopped?").await?;
+    assert_eq!(
+        world.rows("SELECT kind FROM events WHERE run_id IS NOT NULL ORDER BY seq DESC LIMIT 1")?,
+        vec![json!({"kind":"run.result"})]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_017_03_unknown_control_rejected_without_changing_run() -> R {
+    for state in ["RUNNING", "INCOMPLETE", "PAUSED", "BLOCKED"] {
+        let world = World::new()?;
+        let (host, run) = running(&world).await?;
+        if state != "RUNNING" {
+            stopped(&world, &host, &run, state).await?;
+        }
+        let before = world.rows("SELECT * FROM runs")?;
+        let tasks = world.rows("SELECT * FROM tasks")?;
+        let results = world.rows("SELECT * FROM events WHERE kind='run.result'")?;
+        let (body, response) = send(&host, &run, "unknown", "CONTROL", "暂停并删除").await?;
+        let input = world.rows(
+            "SELECT state,payload_json FROM input_queue WHERE input_id='cmd-unknown/input'",
+        )?;
+        assert_eq!(
+            input[0]["state"], "REJECTED",
+            "{state}: reject at acceptance"
+        );
+        let payload: Value =
+            serde_json::from_str(input[0]["payload_json"].as_str().ok_or("no payload")?)?;
+        assert_eq!(payload["reason"], "unknown_control");
+        assert_eq!(world.rows("SELECT * FROM runs")?, before, "{state}");
+        assert_eq!(world.rows("SELECT * FROM tasks")?, tasks);
+        assert_eq!(
+            world.rows("SELECT * FROM events WHERE kind='run.result'")?,
+            results
+        );
+        assert_eq!(
+            world.query(
+                "SELECT count(*) FROM commands WHERE kind IN ('PauseRun','ResumeRun','CancelRun')"
+            )?,
+            "0"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+        assert_eq!(
+            world.query("SELECT state FROM outbox WHERE message_id='cmd-unknown/input'")?,
+            "ACKED"
+        );
+        let records = world.rows("SELECT * FROM events WHERE json_extract(payload_json,'$.input_id')='cmd-unknown/input' ORDER BY seq")?;
+        let rejection = records
+            .iter()
+            .find(|e| e["kind"] == "input.rejected")
+            .ok_or("no rejection")?;
+        let rejected: Value = serde_json::from_str(
+            rejection["payload_json"]
+                .as_str()
+                .ok_or("no rejection payload")?,
+        )?;
+        assert_eq!(rejected["reason"], "unknown_control");
+        if state == "INCOMPLETE" {
+            assert_eq!(
+                records.len(),
+                1,
+                "a stopped run receives only the rejection record"
+            );
+            assert_eq!(rejection["run_id"], Value::Null);
+            assert_eq!(rejected["run_id"], run);
+        }
+        let receipts = world.rows("SELECT * FROM receipts WHERE message_id='cmd-unknown/input'")?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["consumer"], "runtime");
+        let receipt: Value =
+            serde_json::from_str(receipts[0]["result_json"].as_str().ok_or("no receipt")?)?;
+        assert_eq!(receipt["kind"], "rejected");
+        assert_eq!(receipt["reason"], "unknown_control");
+        assert_eq!(
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?,
+            (202, response)
+        );
+        assert_eq!(world.rows("SELECT * FROM events WHERE json_extract(payload_json,'$.input_id')='cmd-unknown/input' ORDER BY seq")?, records);
+        assert_eq!(
+            world.rows("SELECT * FROM receipts WHERE message_id='cmd-unknown/input'")?,
+            receipts
+        );
+        assert_eq!(world.rows("SELECT * FROM runs")?, before);
+        host.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_03_unknown_control_rejection_is_atomic_and_revision_fenced() -> R {
     let world = World::new()?;
     let (host, run) = running(&world).await?;
-    let before = world.rows("SELECT * FROM runs")?;
-    let tasks = world.rows("SELECT * FROM tasks")?;
-    let (body, response) = send(&host, &run, "unknown", "CONTROL", "暂停并删除").await?;
-    let input = world.rows("SELECT state,payload_json FROM input_queue")?;
+    stopped(&world, &host, &run, "INCOMPLETE").await?;
+    let before = snapshot(&world)?;
+    let inputs = world.rows("SELECT * FROM input_queue")?;
+    let receipts = world.rows("SELECT * FROM receipts")?;
+    let body = command(
+        &host,
+        &run,
+        "rejection-rollback",
+        "SendInput",
+        json!({"text":"unknown","input_kind":"CONTROL","target_role":null}),
+    )
+    .await?;
+    let mut stale = body.clone();
+    stale["expected_revision"] = json!(body["expected_revision"].as_i64().ok_or("revision")? - 1);
+    let (status, rejected) = world::exchange(&host, "POST", "/v1/commands", Some(&stale)).await?;
+    assert_eq!(status, 409);
+    assert_eq!(rejected["code"], "STALE_REVISION");
+    assert_eq!(snapshot(&world)?, before);
+    assert_eq!(world.rows("SELECT * FROM input_queue")?, inputs);
+    // Fail after the rejection row/event/outbox have been written, before commit.
+    world.exec("CREATE TRIGGER refuse_rejection BEFORE INSERT ON receipts WHEN NEW.message_id='cmd-rejection-rollback/input' BEGIN SELECT RAISE(ABORT,'rejection test rollback'); END;")?;
     assert_eq!(
-        input[0]["state"], "REJECTED",
-        "unknown CONTROL must be rejected at acceptance"
+        world::exchange(&host, "POST", "/v1/commands", Some(&body))
+            .await?
+            .0,
+        409
     );
-    let payload: Value =
-        serde_json::from_str(input[0]["payload_json"].as_str().ok_or("no payload")?)?;
-    assert_eq!(payload["reason"], "unknown_control");
-    assert_eq!(world.rows("SELECT * FROM runs")?, before);
-    assert_eq!(world.rows("SELECT * FROM tasks")?, tasks);
+    assert_eq!(snapshot(&world)?, before);
+    assert_eq!(world.rows("SELECT * FROM input_queue")?, inputs);
+    assert_eq!(world.rows("SELECT * FROM receipts")?, receipts);
     assert_eq!(
-        world.query(
-            "SELECT count(*) FROM commands WHERE kind IN ('PauseRun','ResumeRun','CancelRun')"
-        )?,
+        world
+            .query("SELECT count(*) FROM outbox WHERE message_id='cmd-rejection-rollback/input'")?,
         "0"
     );
-    assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+    world.exec("DROP TRIGGER refuse_rejection;")?;
     assert_eq!(
-        world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?,
-        (202, response)
+        world::exchange(&host, "POST", "/v1/commands", Some(&body))
+            .await?
+            .0,
+        202
     );
-    assert_eq!(world.query("SELECT count(*) FROM input_queue")?, "1");
+    assert_eq!(
+        world
+            .query("SELECT state FROM input_queue WHERE input_id='cmd-rejection-rollback/input'")?,
+        "REJECTED"
+    );
+    assert_eq!(
+        world.query(
+            "SELECT count(*) FROM receipts WHERE message_id='cmd-rejection-rollback/input'"
+        )?,
+        "1"
+    );
     host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_03_all_input_kinds_obey_stopped_command_boundaries() -> R {
+    use hoh_core::persistence::{
+        CommandOutcome, Input, Intent, NewEvent, RunTarget, SubmitCommand,
+    };
+    for state in ["INCOMPLETE", "PAUSED", "BLOCKED"] {
+        for (kind, target) in [
+            ("ASK", None),
+            ("STEER", None),
+            ("CHANGE", None),
+            ("REPLY", Some("developer")),
+            ("REPLY", None),
+        ] {
+            let world = World::new()?;
+            let (host, run) = running(&world).await?;
+            stopped(&world, &host, &run, state).await?;
+            // Observe the acceptance transaction without racing the host's CHANGE consumer.
+            host.shutdown().await;
+            let store = open_store(&world)?;
+            let protected = protected(&world)?;
+            let results_before = world.rows("SELECT * FROM events WHERE kind='run.result'")?;
+            let before = world.rows("SELECT revision FROM runs")?[0]["revision"]
+                .as_i64()
+                .ok_or("revision")?;
+            let payload =
+                json!({"text":"input while stopped","target_role":target,"input_kind":kind});
+            let input = SubmitCommand {
+                command_id: "cmd-stopped-input".into(),
+                idempotency_key: "stopped-input".into(),
+                kind: "SendInput".into(),
+                run_id: run.clone(),
+                expected_revision: before,
+                payload_sha256: specindex::digest(payload.to_string().as_bytes()),
+                payload,
+                target: RunTarget::Input(Input::Send {
+                    text: "input while stopped".into(),
+                    target_role: target.map(str::to_owned),
+                    input_kind: kind.into(),
+                }),
+                event: NewEvent {
+                    intent: Intent::Progress,
+                    project_id: world.query("SELECT project_id FROM runs")?,
+                    run_id: Some(run.clone()),
+                    event_id: "stopped-input-event".into(),
+                    kind: "input.accepted".into(),
+                    payload: json!({"command_id":"cmd-stopped-input"}),
+                },
+                outbox: None,
+            };
+            let CommandOutcome::Accepted {
+                result_json,
+                revision,
+                ..
+            } = store.submit_command(input.clone()).await?
+            else {
+                return Err("expected acceptance".into());
+            };
+            assert_eq!(revision, before + 1, "{state}/{kind}");
+            // Answering no_spec adopts the already approved specification and releases
+            // BLOCKED; queued inputs do not resume a run (ADR-031 decision 8).
+            let resumes = kind == "REPLY" && target.is_none() && state == "BLOCKED";
+            let after_state = if resumes { "RUNNING" } else { state };
+            assert_eq!(world.query("SELECT state FROM runs")?, after_state);
+            assert_eq!(
+                world.query(
+                    "SELECT state FROM input_queue WHERE input_id='cmd-stopped-input/input'"
+                )?,
+                // Untargeted REPLY answers the fixture's existing no_spec question;
+                // targeted REPLY is queued as STEER, even with that question open.
+                if kind == "REPLY" && target.is_none() {
+                    "APPLIED"
+                } else {
+                    "QUEUED"
+                },
+                "{state}/{kind}/{target:?}"
+            );
+            assert_eq!(
+                world.rows("SELECT * FROM specs ORDER BY revision")?,
+                protected[0]
+            );
+            assert_eq!(
+                world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+                protected[2]
+            );
+            assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+            let events = world
+                .rows("SELECT * FROM events WHERE run_id IS NOT NULL ORDER BY seq DESC LIMIT 1")?;
+            if resumes {
+                assert_eq!(
+                    world.rows("SELECT * FROM events WHERE kind='run.result'")?,
+                    results_before
+                );
+            } else {
+                assert_eq!(events[0]["kind"], "run.result", "{state}/{kind}");
+                let result: Value =
+                    serde_json::from_str(events[0]["payload_json"].as_str().ok_or("result")?)?;
+                assert_eq!(result["state"], state);
+                assert_eq!(result["last_event_seq"], events[0]["seq"]);
+            }
+            assert_eq!(
+                store.submit_command(input).await?,
+                CommandOutcome::Replayed { result_json }
+            );
+            assert_eq!(
+                world.rows(
+                    "SELECT * FROM events WHERE run_id IS NOT NULL ORDER BY seq DESC LIMIT 1"
+                )?,
+                events
+            );
+        }
+        let world = World::new()?;
+        let (host, run) = running(&world).await?;
+        stopped(&world, &host, &run, state).await?;
+        let (body, response) = send(&host, &run, "cancel-stopped", "CONTROL", "cancel").await?;
+        world
+            .until(
+                "SELECT state FROM runs",
+                "CANCELLED",
+                std::time::Duration::from_secs(3),
+            )
+            .await?;
+        assert_eq!(
+            world
+                .query("SELECT state FROM input_queue WHERE input_id='cmd-cancel-stopped/input'")?,
+            "APPLIED"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM commands WHERE kind='CancelRun'")?,
+            "1"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+        assert_eq!(
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?,
+            (202, response)
+        );
+        host.shutdown().await;
+    }
     Ok(())
 }
 
@@ -637,6 +899,109 @@ async fn test_017_03_runtime_routing_keeps_other_input_defaults() -> R {
             role,
             "S7 changes only CHANGE/CONTROL routing"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_03_internal_runtime_routing_ignores_same_named_user_role() -> R {
+    for epoch in [1, 7] {
+        let world = World::new()?;
+        world.configure(
+            &[],
+            "[team.runtime]\nagent = \"claude\"\nprompt = \"builtin:developer\"\n",
+        )?;
+        assert!(
+            hoh_core::config::load(&world.project())?
+                .team
+                .contains_key("runtime")
+        );
+        let (host, run) = running(&world).await?;
+        world.exec(&format!(
+            "UPDATE role_bindings SET role_epoch={epoch} WHERE role='runtime'"
+        ))?;
+        let bindings = world.rows("SELECT * FROM role_bindings WHERE role='runtime'")?;
+        assert_eq!(bindings[0]["role_epoch"], epoch);
+        assert_eq!(bindings[0]["session_id"], Value::Null);
+        // A user role with this name retains its binding and first-input gate.
+        for kind in ["ASK", "STEER"] {
+            let body = command(
+                &host,
+                &run,
+                kind,
+                "SendInput",
+                json!({"input_kind":kind,"target_role":"runtime","text":"user role input"}),
+            )
+            .await?;
+            assert_eq!(
+                world::exchange(&host, "POST", "/v1/commands", Some(&body))
+                    .await?
+                    .0,
+                202
+            );
+        }
+        let protected = protected(&world)?;
+        edit_export(&world)?;
+        let (body, response) = send(&host, &run, "internal-change", "CHANGE", "export CSV").await?;
+        let input = settled(&world, "cmd-internal-change/input").await?;
+        assert_eq!(
+            input["state"], "APPLIED",
+            "internal CHANGE must bypass the user runtime role at epoch {epoch}: {input}"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,
+            "1"
+        );
+        assert_eq!(
+            world.rows("SELECT * FROM specs ORDER BY revision")?,
+            protected[0]
+        );
+        assert_eq!(
+            world.rows("SELECT * FROM tasks ORDER BY task_id")?,
+            protected[2]
+        );
+        assert_eq!(
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?,
+            (202, response)
+        );
+        assert_eq!(world.query("SELECT count(*) FROM change_requests")?, "1");
+        send(&host, &run, "internal-pause", "CONTROL", "pause").await?;
+        world
+            .until(
+                "SELECT state FROM runs",
+                "PAUSED",
+                std::time::Duration::from_secs(3),
+            )
+            .await?;
+        send(&host, &run, "internal-unknown", "CONTROL", "unknown").await?;
+        for (key, state) in [
+            ("internal-change", "APPLIED"),
+            ("internal-pause", "APPLIED"),
+            ("internal-unknown", "REJECTED"),
+        ] {
+            let rows = world.rows(&format!("SELECT i.state,json_extract(i.payload_json,'$.role_epoch') AS input_epoch,json_extract(i.payload_json,'$.after_attempt') AS after_attempt,o.recipient_role,o.role_epoch,o.state AS delivery FROM input_queue i JOIN outbox o ON o.message_id=i.input_id WHERE i.input_id='cmd-{key}/input'"))?;
+            assert_eq!(
+                rows,
+                vec![
+                    json!({"state":state,"input_epoch":0,"after_attempt":0,"recipient_role":"runtime","role_epoch":0,"delivery":"ACKED"})
+                ]
+            );
+        }
+        for kind in ["ASK", "STEER"] {
+            let rows = world.rows(&format!("SELECT i.state,json_extract(i.payload_json,'$.role_epoch') AS input_epoch,o.recipient_role,o.role_epoch,o.attempt_count FROM input_queue i JOIN outbox o ON o.message_id=i.input_id WHERE i.input_id='cmd-{kind}/input'"))?;
+            assert_eq!(
+                rows,
+                vec![
+                    json!({"state":"QUEUED","input_epoch":epoch,"recipient_role":"runtime","role_epoch":epoch,"attempt_count":0})
+                ]
+            );
+        }
+        assert_eq!(
+            world.rows("SELECT * FROM role_bindings WHERE role='runtime'")?,
+            bindings
+        );
+        assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+        host.shutdown().await;
     }
     Ok(())
 }

@@ -158,6 +158,32 @@ pub(in crate::persistence) fn apply_change(
     Ok(done)
 }
 
+pub(in crate::persistence) fn control_kind(text: &str) -> Option<&'static str> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "暂停" | "pause" => Some("PauseRun"),
+        "恢复" | "resume" => Some("ResumeRun"),
+        "取消" | "cancel" => Some("CancelRun"),
+        _ => None,
+    }
+}
+
+pub(in crate::persistence) fn reject_control(
+    tx: &Transaction<'_>,
+    input: &NewInput,
+    ctx: &super::super::writer::Ctx<'_>,
+) -> Result<i64, PersistError> {
+    let seq = enqueue_outcome(tx, input, Some("unknown_control"), ctx)?;
+    let row = read_input(tx, &input.input_id)?
+        .ok_or_else(|| PersistError::IntegrityViolation("missing rejected control input".into()))?;
+    receipt(tx, &row, Some("unknown_control"))?;
+    tx.execute(
+        "UPDATE outbox SET state='ACKED' WHERE message_id=?1",
+        params![input.input_id],
+    )
+    .map_err(sqlite_error)?;
+    Ok(seq)
+}
+
 pub(in crate::persistence) fn control(
     tx: &Transaction<'_>,
     input: &str,
@@ -168,15 +194,15 @@ pub(in crate::persistence) fn control(
     let text = row.payload["text"]
         .as_str()
         .ok_or_else(|| PersistError::IntegrityViolation("control has no text".into()))?;
-    let control = match text.trim().to_ascii_lowercase().as_str() {
-        "暂停" | "pause" => Some((
+    let control = match control_kind(text) {
+        Some("PauseRun") => Some((
             "PauseRun",
             RunTarget::To(RunState::PauseRequested),
             "run.pause_requested",
             "PAUSE_REQUESTED",
         )),
-        "恢复" | "resume" => Some(("ResumeRun", RunTarget::Resume, "run.resumed", "RESUME")),
-        "取消" | "cancel" => Some((
+        Some("ResumeRun") => Some(("ResumeRun", RunTarget::Resume, "run.resumed", "RESUME")),
+        Some("CancelRun") => Some((
             "CancelRun",
             RunTarget::To(RunState::CancelRequested),
             "run.cancel_requested",
@@ -207,15 +233,9 @@ pub(in crate::persistence) fn control(
         change(tx, &row, InputState::Applied, None, None, ctx)?;
         receipt(tx, &row, None)?;
     } else {
-        change(
-            tx,
-            &row,
-            InputState::Rejected,
-            None,
-            Some("unknown_control"),
-            ctx,
-        )?;
-        receipt(tx, &row, Some("unknown_control"))?;
+        return Err(PersistError::IntegrityViolation(
+            "unknown control must be rejected at intake".into(),
+        ));
     }
     tx.execute(
         "UPDATE outbox SET state='ACKED' WHERE message_id=?1",
