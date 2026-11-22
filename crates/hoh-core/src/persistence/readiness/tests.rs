@@ -205,7 +205,7 @@ async fn test_031_03_nonblocking_question_listed_in_the_projection() -> R {
     let projection = reader.run_projection("R")?.ok_or("no run")?;
     assert_eq!(
         projection
-            .7
+            .8
             .iter()
             .map(SpecQuestion::json)
             .collect::<Vec<_>>(),
