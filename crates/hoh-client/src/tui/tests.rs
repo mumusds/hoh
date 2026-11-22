@@ -46,6 +46,160 @@ fn app_in(dir: &std::path::Path) -> App {
     App::new("demo".to_owned(), History::load(dir))
 }
 
+fn role_app(dir: &std::path::Path, active: serde_json::Value) -> App {
+    let mut app = app_in(dir);
+    app.attach("R", "RUNNING");
+    app.projection(&serde_json::json!({
+        "state":"RUNNING", "revision":7,
+        "projection":{"mode":"AUTO", "active_roles":active, "team":[
+            {"role":"cto","agent":"claude","model":"model-c","role_epoch":1},
+            {"role":"developer","agent":"claude","model":"model-d","role_epoch":2}
+        ]}
+    }));
+    app
+}
+
+/// The event loop supplies a fresh projection before resolving; these tests supply role_app's snapshot.
+fn resolve_targets(app: &mut App) -> Vec<Request> {
+    for request in app.take_requests() {
+        let Request::ResolveTarget {
+            name,
+            text,
+            draft,
+            role_only,
+        } = request
+        else {
+            panic!("not a target resolution: {request:?}");
+        };
+        app.target(&name, &text, &draft, role_only);
+    }
+    app.take_requests()
+}
+
+#[test]
+fn test_017_04_agent_alias_uses_the_current_task_role() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!(["developer"]));
+    typed(&mut app, "@claude 先写测试");
+    app.key(key(KeyCode::Enter));
+    let requests = resolve_targets(&mut app);
+    let shown = screen(&app, 110, 24).join("\n");
+    assert!(shown.contains("→ developer"), "{shown}");
+    assert_eq!(
+        requests,
+        vec![Request::InputTo {
+            role: "developer".into(),
+            text: "先写测试".into()
+        }]
+    );
+}
+
+#[test]
+fn test_017_04_ambiguous_alias_requires_a_choice_and_escape_preserves_the_draft() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!(["cto", "developer"]));
+    typed(&mut app, "@claude 先写测试");
+    app.key(key(KeyCode::Enter));
+    assert!(
+        resolve_targets(&mut app).is_empty(),
+        "ambiguous input was submitted"
+    );
+    let shown = screen(&app, 110, 24).join("\n");
+    assert!(
+        shown.contains("选择目标职位") && shown.contains("developer"),
+        "{shown}"
+    );
+    app.key(key(KeyCode::Esc));
+    assert_eq!(app.editor_text(), "@claude 先写测试");
+    assert!(app.take_requests().is_empty());
+}
+
+#[test]
+fn test_017_04_explicit_roles_win_and_unknown_or_empty_targets_submit_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!(["cto"]));
+    typed(&mut app, "@developer /compact");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(
+        resolve_targets(&mut app),
+        vec![Request::InputTo {
+            role: "developer".into(),
+            text: "/compact".into()
+        }]
+    );
+    for text in [
+        "@absent hello",
+        "@claude",
+        "@ hello",
+        "/agent claude /compact",
+    ] {
+        typed(&mut app, text);
+        app.key(key(KeyCode::Enter));
+        assert!(resolve_targets(&mut app).is_empty(), "{text}");
+    }
+    let mut unattached = app_in(dir.path());
+    typed(&mut unattached, "@developer hello");
+    unattached.key(key(KeyCode::Enter));
+    assert!(resolve_targets(&mut unattached).is_empty());
+}
+
+#[test]
+fn test_017_04_target_resolution_observes_the_fresh_projection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!(["developer"]));
+    typed(&mut app, "@claude current task");
+    app.key(key(KeyCode::Enter));
+    // The runtime's GET observes that developer ended and cto started before Enter is performed.
+    app.projection(
+        &serde_json::json!({"projection":{"mode":"AUTO","active_roles":["cto"],"team":[
+            {"role":"cto","agent":"claude"},{"role":"developer","agent":"claude"}
+        ]}}),
+    );
+    assert_eq!(
+        resolve_targets(&mut app),
+        vec![Request::InputTo {
+            role: "cto".into(),
+            text: "current task".into()
+        }]
+    );
+}
+
+#[test]
+fn test_007_03_slash_opens_a_filterable_command_picker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!([]));
+    typed(&mut app, "/");
+    let shown = screen(&app, 110, 24).join("\n");
+    for command in [
+        "/plan", "/build", "/auto", "/team", "/model", "/status", "/resume", "/help",
+    ] {
+        assert!(shown.contains(command), "missing {command}: {shown}");
+    }
+    typed(&mut app, "st");
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Enter));
+    assert!(app.take_requests().is_empty());
+    let shown = screen(&app, 110, 24).join("\n");
+    assert!(shown.contains("状态 RUNNING"), "{shown}");
+}
+
+#[test]
+fn test_007_03_team_and_model_show_current_values_without_editing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = role_app(dir.path(), serde_json::json!([]));
+    for command in ["/team", "/model"] {
+        typed(&mut app, command);
+        app.key(key(KeyCode::Enter));
+        let shown = screen(&app, 110, 24).join("\n");
+        assert!(
+            shown.contains("developer") && shown.contains("model-d"),
+            "{shown}"
+        );
+        assert!(shown.contains("编辑属后续任务"), "{shown}");
+        assert!(app.take_requests().is_empty());
+    }
+}
+
 #[test]
 fn the_editor_moves_by_grapheme_and_measures_display_width() {
     let mut e = Editor::default();

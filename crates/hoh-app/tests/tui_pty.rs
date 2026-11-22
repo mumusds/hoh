@@ -21,6 +21,7 @@
 
 mod prerequisites;
 mod pty;
+mod s5;
 mod world;
 
 use pty::{

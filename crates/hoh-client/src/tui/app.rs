@@ -40,6 +40,15 @@ pub enum Request {
     CycleMode,
     /// SendInput with this text to the attached run (Enter, attached), or to the run a `Start` before it starts.
     Input(String),
+    /// STEER to an explicitly resolved role; the host owns its binding and delivery epoch.
+    InputTo { role: String, text: String },
+    /// Read the latest team and running task roles before resolving a target.
+    ResolveTarget {
+        name: String,
+        text: String,
+        draft: String,
+        role_only: bool,
+    },
     /// Attach this run (chosen in the selector).
     Attach(String),
 }
@@ -129,6 +138,18 @@ struct Picker {
     leaves: bool,
 }
 
+const COMMANDS: &[&str] = &[
+    "/plan", "/build", "/auto", "/team", "/model", "/status", "/resume", "/help",
+];
+
+#[derive(Debug)]
+struct TargetPicker {
+    roles: Vec<String>,
+    selected: usize,
+    text: String,
+    draft: String,
+}
+
 /// The Ctrl+C choice with no run attached.
 const CHOICES: &[(&str, Exit)] = &[("脱离", Exit::Detach)];
 
@@ -143,6 +164,7 @@ const RUN_CHOICES: &[(&str, Exit)] = &[
 /// tracked by the degraded /proc scan (docs/adr/ADR-021.md decision 8d, M2T06R-560).
 #[derive(Debug)]
 struct Attached {
+    snapshot: Value,
     mode: String,
     pending_mode: Option<String>,
     run_id: String,
@@ -189,6 +211,8 @@ pub struct App {
     /// The project's runs, those not ended first and newest first (list_runs, every page).
     runs: Vec<Listed>,
     picker: Option<Picker>,
+    target_picker: Option<TargetPicker>,
+    slash: Option<usize>,
     requests: Vec<Request>,
     /// The commands of inputs sent whose acceptance event has not come yet.
     awaiting: Vec<String>,
@@ -212,6 +236,8 @@ impl App {
             run: None,
             runs: Vec::new(),
             picker: None,
+            target_picker: None,
+            slash: None,
             requests: Vec::new(),
             awaiting: Vec::new(),
         }
@@ -238,12 +264,13 @@ impl App {
     }
 
     pub fn projection(&mut self, value: &Value) {
-        if let Some(run) = self.run.as_mut()
-            && let Some(mode) = value["projection"]["mode"].as_str()
-        {
-            run.mode = mode.to_owned();
-            if run.pending_mode.as_deref() == Some(mode) {
-                run.pending_mode = None;
+        if let Some(run) = self.run.as_mut() {
+            run.snapshot = value.clone();
+            if let Some(mode) = value["projection"]["mode"].as_str() {
+                run.mode = mode.to_owned();
+                if run.pending_mode.as_deref() == Some(mode) {
+                    run.pending_mode = None;
+                }
             }
         }
     }
@@ -287,6 +314,7 @@ impl App {
     /// Bind the shell to run `run_id`, shown as `label`.
     pub fn attach(&mut self, run_id: &str, label: &str) {
         self.run = Some(Attached {
+            snapshot: Value::Null,
             mode: self.mode.clone(),
             pending_mode: None,
             run_id: run_id.to_owned(),
@@ -297,6 +325,7 @@ impl App {
         });
         self.messages.clear();
         self.picker = None;
+        self.target_picker = None;
     }
 
     /// The project's runs as list_runs gives them (every page): listed those not ended first, each group newest first.
@@ -411,6 +440,8 @@ impl App {
                 });
         }
         kind.starts_with("run.")
+            || kind.starts_with("team.")
+            || matches!(kind, "attempt.moved" | "attempt.ended")
     }
 
     /// The attached run's attempts tracked by the degraded /proc scan, as getRun's `projection.degraded_tracking`
@@ -490,6 +521,33 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(key);
         }
+        if self.target_picker.is_some() {
+            self.target_key(key);
+            return None;
+        }
+        if let Some(selected) = self.slash {
+            match key.code {
+                KeyCode::Up => {
+                    self.slash = Some(selected.saturating_sub(1));
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.slash =
+                        Some((selected + 1).min(self.slash_items().len().saturating_sub(1)));
+                    return None;
+                }
+                KeyCode::Esc => {
+                    self.slash = None;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    if let Some(command) = self.slash_items().get(selected) {
+                        self.editor.set(command);
+                    }
+                }
+                _ => {}
+            }
+        }
         if self.search.is_some() && self.search_key(key) {
             return None;
         }
@@ -501,9 +559,11 @@ impl App {
                 } else {
                     self.editor.clear();
                     self.browsing = None;
+                    self.slash = None;
                 }
             }
             KeyCode::Char('r') if ctrl => {
+                self.slash = None;
                 self.search = Some(Search {
                     query: String::new(),
                     found: None,
@@ -513,6 +573,7 @@ impl App {
             KeyCode::Char(c) if plain => {
                 self.editor.insert(c.encode_utf8(&mut [0; 4]));
                 self.browsing = None;
+                self.update_slash();
             }
             KeyCode::BackTab => {
                 if self.has_run() {
@@ -522,8 +583,14 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Backspace => self.editor.backspace(),
-            KeyCode::Delete => self.editor.delete(),
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                self.update_slash();
+            }
+            KeyCode::Delete => {
+                self.editor.delete();
+                self.update_slash();
+            }
             KeyCode::Left => self.editor.left(),
             KeyCode::Right => self.editor.right(),
             KeyCode::Home => self.editor.home(),
@@ -619,12 +686,17 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
-        if self.menu.is_some() || self.picker.is_some() || self.settings.is_some() {
+        if self.menu.is_some()
+            || self.picker.is_some()
+            || self.target_picker.is_some()
+            || self.settings.is_some()
+        {
             return;
         }
         self.search = None;
         self.browsing = None;
         self.editor.insert(text);
+        self.update_slash();
     }
 
     fn submit(&mut self) {
@@ -632,6 +704,7 @@ impl App {
             return;
         }
         let text = self.editor.take();
+        self.slash = None;
         self.browsing = None;
         match self.history.append(&text) {
             Err(e) => self.messages.push(format!("输入历史未能保存：{e}")),
@@ -666,14 +739,196 @@ impl App {
                     self.messages.push("没有可附着的 Run。".to_owned());
                 }
             }
-            _ if command.starts_with('/') => {
-                self.messages.push(format!("未知命令：{command}，未发送。"))
+            "/status" | "/help" | "/team" | "/model" => self.information(command),
+            _ if command.split_whitespace().next() == Some("/agent") => {
+                let rest = command.strip_prefix("/agent").unwrap_or_default().trim();
+                let (role, body) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                self.requests.push(Request::ResolveTarget {
+                    name: role.into(),
+                    text: body.trim().into(),
+                    draft: text.clone(),
+                    role_only: true,
+                });
+            }
+            _ if command.starts_with('/') => self
+                .messages
+                .push(format!("未知命令（unknown command）：{command}，未发送。")),
+            _ if command.starts_with('@') => {
+                let (name, body) = command[1..]
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((&command[1..], ""));
+                self.requests.push(Request::ResolveTarget {
+                    name: name.into(),
+                    text: body.trim().into(),
+                    draft: text.clone(),
+                    role_only: false,
+                });
             }
             _ if self.has_run() => self.requests.push(Request::Input(text)),
             _ => self.requests.push(Request::Start {
                 goal: text,
                 mode: self.mode.clone(),
             }),
+        }
+    }
+
+    fn slash_items(&self) -> Vec<&'static str> {
+        let Some(query) = self.editor.text().strip_prefix('/') else {
+            return Vec::new();
+        };
+        if query.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| {
+                let mut chars = command[1..].chars();
+                query.chars().all(|wanted| chars.any(|c| c == wanted))
+            })
+            .collect()
+    }
+
+    fn update_slash(&mut self) {
+        self.slash = (!self.slash_items().is_empty()).then_some(0);
+    }
+
+    pub fn target(&mut self, name: &str, text: &str, draft: &str, role_only: bool) {
+        let Some(run) = &self.run else {
+            self.say("输入未发送：没有附着的 Run".into());
+            return;
+        };
+        if name.is_empty() || text.is_empty() {
+            self.say("输入未发送：请指定目标和正文（@role 正文 或 /agent <role> <text>）".into());
+            return;
+        }
+        let members: Vec<_> = run.snapshot["projection"]["team"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["removed"] != true && m["agent"].is_string())
+            .collect();
+        let explicit = members.iter().find(|m| m["role"] == name);
+        let mut roles: Vec<String> = if explicit.is_some() {
+            vec![name.to_owned()]
+        } else if role_only {
+            Vec::new()
+        } else {
+            members
+                .iter()
+                .filter(|m| m["agent"] == name)
+                .filter_map(|m| m["role"].as_str().map(str::to_owned))
+                .collect()
+        };
+        roles.sort();
+        roles.dedup();
+        if roles.len() > 1 {
+            let active: Vec<_> = roles
+                .iter()
+                .filter(|r| {
+                    run.snapshot["projection"]["active_roles"]
+                        .as_array()
+                        .is_some_and(|active| active.iter().any(|a| a.as_str() == Some(r.as_str())))
+                })
+                .cloned()
+                .collect();
+            if active.len() == 1 {
+                roles = active;
+            }
+        }
+        match roles.as_slice() {
+            [] => self.say(format!("输入未发送：未知目标 {name}")),
+            [role] => self.send_to(role.clone(), text.to_owned()),
+            _ => {
+                self.target_picker = Some(TargetPicker {
+                    roles,
+                    selected: 0,
+                    text: text.to_owned(),
+                    draft: draft.to_owned(),
+                })
+            }
+        }
+    }
+
+    fn send_to(&mut self, role: String, text: String) {
+        self.say(format!("→ {role}：{text}"));
+        self.requests.push(Request::InputTo { role, text });
+    }
+
+    fn target_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.target_picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(picker.roles.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                if let Some(picker) = self.target_picker.take()
+                    && let Some(role) = picker.roles.get(picker.selected)
+                {
+                    self.send_to(role.clone(), picker.text);
+                }
+            }
+            KeyCode::Esc => {
+                let draft = picker.draft.clone();
+                self.target_picker = None;
+                self.editor.set(&draft);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.target_picker = None;
+                self.editor.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn information(&mut self, command: &str) {
+        if command == "/help" {
+            self.say("键位：Enter 发送 · Shift+Tab 切换模式 · ↑↓ 选择/历史 · Esc 返回 · Ctrl+R 搜索 · Ctrl+C 清空/退出".into());
+            self.say(format!(
+                "命令：{}；/agent <role> <text> 显式转发；@role 正文指定职位",
+                COMMANDS.join(" ")
+            ));
+            return;
+        }
+        let Some(run) = &self.run else {
+            self.say(format!(
+                "当前没有附着的 Run；下次启动模式 {}。",
+                self.mode()
+            ));
+            return;
+        };
+        if command == "/status" {
+            self.say(format!(
+                "Run {} · 状态 {} · 模式 {} · revision {}",
+                run.run_id,
+                run.snapshot["state"].as_str().unwrap_or(&run.label),
+                run.mode,
+                run.snapshot["revision"]
+            ));
+        } else {
+            let lines: Vec<_> = run.snapshot["projection"]["team"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|m| {
+                    format!(
+                        "{} → {} · model {}{}",
+                        m["role"].as_str().unwrap_or("?"),
+                        m["agent"].as_str().unwrap_or("未绑定"),
+                        m["model"].as_str().unwrap_or("底座默认"),
+                        if m["removed"] == true {
+                            "（已移除）"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect();
+            self.messages.extend(lines);
+            self.say("以上为当前 Run 的职位绑定与模型；项目团队/模型设置在 checkpoint 生效。TUI 编辑属后续任务。".into());
         }
     }
 
@@ -797,12 +1052,29 @@ impl App {
         if let Some(picker) = &self.picker {
             Self::draw_picker(frame, body, picker);
         }
+        if let Some(picker) = &self.target_picker {
+            Self::draw_options(
+                frame,
+                body,
+                " 选择目标职位 · ↑↓ 选择 · Enter 发送 · Esc 返回 ",
+                &picker.roles,
+                picker.selected,
+            );
+        } else if let Some(selected) = self.slash {
+            Self::draw_options(
+                frame,
+                body,
+                " 命令 · 输入筛选 · ↑↓ 选择 · Enter 执行 · Esc 返回 ",
+                &self.slash_items(),
+                selected,
+            );
+        }
         if let Some(settings) = &self.settings {
             settings.draw(frame, body);
         }
         match self.menu {
             Some(selected) => self.draw_menu(frame, body, selected),
-            None if self.picker.is_some() => {}
+            None if self.picker.is_some() || self.target_picker.is_some() => {}
             None => {
                 let x = input
                     .x
@@ -810,6 +1082,40 @@ impl App {
                 frame.set_cursor_position((x.min(input.right().saturating_sub(1)), input.y));
             }
         }
+    }
+
+    fn draw_options(
+        frame: &mut Frame,
+        body: Rect,
+        title: &str,
+        options: &[impl AsRef<str>],
+        selected: usize,
+    ) {
+        let block = Block::new().borders(Borders::ALL).title(title);
+        let inner = block.inner(body);
+        let first = selected.saturating_sub(usize::from(inner.height).saturating_sub(1));
+        let lines: Vec<Line> = options
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(usize::from(inner.height))
+            .map(|(i, option)| {
+                Line::from(format!(
+                    "{} {}",
+                    if i == selected { ">" } else { " " },
+                    option.as_ref()
+                ))
+            })
+            .collect();
+        frame.render_widget(Clear, body);
+        frame.render_widget(Paragraph::new(lines).block(block), body);
+        frame.set_cursor_position((
+            inner.x,
+            inner
+                .y
+                .saturating_add(u16::try_from(selected - first).unwrap_or(0))
+                .min(body.bottom().saturating_sub(1)),
+        ));
     }
 
     /// The selector over the whole body, the cursor on the run chosen (every frame sets one, M1T08R-10).

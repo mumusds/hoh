@@ -505,7 +505,18 @@ pub(super) fn sweep(
     let before = tx.total_changes();
     routing::sweep(&tx, project, ctx)?;
     let ids: Vec<String> = {
-        let mut q = tx.prepare("SELECT i.input_id FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND (r.state IN ('COMPLETED','CANCELLED','FAILED') OR (i.state='DELIVERED' AND coalesce(i.target_role,'commander')='commander' AND coalesce((SELECT b.role_epoch FROM role_bindings b WHERE b.run_id=i.run_id AND b.role='commander'),-1) <> json_extract(i.payload_json,'$.role_epoch'))) AND i.state IN ('QUEUED','DELIVERED') ORDER BY i.rowid LIMIT 32").map_err(sqlite_error)?;
+        // A receipt can acknowledge next-attempt routing while the input stays QUEUED. After a rebind no
+        // attempt at the old epoch will take it; reject it here without rewriting the original receipt.
+        let mut q = tx
+            .prepare(
+                "SELECT i.input_id FROM input_queue i JOIN runs r USING(run_id) \
+             WHERE r.project_id=?1 AND i.state IN ('QUEUED','DELIVERED') \
+             AND (r.state IN ('COMPLETED','CANCELLED','FAILED') OR \
+               (i.kind IN ('ASK','STEER') AND coalesce((SELECT b.role_epoch FROM role_bindings b \
+                WHERE b.run_id=i.run_id AND b.role=coalesce(i.target_role,'commander')),-1) \
+                <> json_extract(i.payload_json,'$.role_epoch'))) ORDER BY i.rowid LIMIT 32",
+            )
+            .map_err(sqlite_error)?;
         q.query_map(params![project], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()

@@ -842,6 +842,7 @@ pub type RunProjection = (
     i64,
     Vec<super::questions::Question>,
     Vec<DegradedTracking>,
+    Vec<String>,
 );
 
 /// An attempt of a run whose processes are tracked by the degraded /proc scan, as its `attempt.tracking` recorded it
@@ -895,8 +896,26 @@ pub(super) fn run_projection(
         let questions = super::questions::open(conn, run_id)?;
         // Its attempts tracked degraded (docs/adr/ADR-021.md decision 8d, M2T06R-560), in the same read.
         let degraded = degraded_tracking(conn, run_id)?;
+        // A client resolves a multi-role agent against running tasks at the current binding epoch.
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT t.role FROM tasks t JOIN attempts a ON a.task_id=t.task_id \
+             JOIN role_bindings b ON b.run_id=t.run_id AND b.role=t.role AND b.role_epoch=a.role_epoch \
+             WHERE t.run_id=?1 AND t.state='RUNNING' AND a.state='RUNNING' ORDER BY t.role"
+        ).map_err(sqlite_error)?;
+        let active_roles = statement
+            .query_map(params![run_id], |r| r.get::<_, String>(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?;
         Ok::<_, PersistError>(Some((
-            run, team, acceptance, result, watermark, questions, degraded,
+            run,
+            team,
+            acceptance,
+            result,
+            watermark,
+            questions,
+            degraded,
+            active_roles,
         )))
     })();
     // Ends the read transaction either way; nothing was written.

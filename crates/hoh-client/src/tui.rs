@@ -238,6 +238,10 @@ pub(crate) struct Sent {
 /// INCOMPLETE, ResumeRun at the revision the input left. A resume refused because the run's stop still holds names
 /// that stop; any refusal is said with its code.
 pub(crate) fn input(port: &impl Port, run_id: &str, text: &str) -> Sent {
+    input_to(port, run_id, text, None)
+}
+
+fn input_to(port: &impl Port, run_id: &str, text: &str, role: Option<&str>) -> Sent {
     let said = |line: String| Sent {
         said: vec![line],
         awaiting: None,
@@ -248,6 +252,15 @@ pub(crate) fn input(port: &impl Port, run_id: &str, text: &str) -> Sent {
         Err(f) => return said(format!("输入未发送：{}：{}", f.code, f.message)),
     };
     let read = || port.run();
+    if let Some(role) = role
+        && !run["projection"]["team"].as_array().is_some_and(|members| {
+            members
+                .iter()
+                .any(|m| m["role"] == role && m["agent"].is_string() && m["removed"] != true)
+        })
+    {
+        return said(format!("输入未发送：目标职位 {role} 当前未绑定"));
+    }
     let accepted = match crate::client::fresh(
         |command| port.submit(command),
         read,
@@ -258,7 +271,7 @@ pub(crate) fn input(port: &impl Port, run_id: &str, text: &str) -> Sent {
                 "expected_revision": revision,
                 "kind": "SendInput",
                 "run_id": run_id,
-                "payload": {"text": text, "target_role": null, "input_kind": "REPLY"},
+                "payload": {"text": text, "target_role": role, "input_kind": if role.is_some() { "STEER" } else { "REPLY" }},
             })
         },
     ) {
@@ -577,6 +590,37 @@ fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request
             }
             None => app.say("输入未发送：没有附着的 Run".to_owned()),
         },
+        Request::InputTo { role, text } => match link.as_ref() {
+            Some(link) => {
+                let sent = input_to(link, &link.run_id, &text, Some(&role));
+                for line in sent.said {
+                    app.say(line);
+                }
+                if let Some(command) = sent.awaiting {
+                    app.awaiting(&command);
+                }
+            }
+            None => app.say("输入未发送：没有附着的 Run".into()),
+        },
+        Request::ResolveTarget {
+            name,
+            text,
+            draft,
+            role_only,
+        } => {
+            match link.as_ref().map(|l| l.run()) {
+                Some(Ok(Some(run))) => {
+                    app.projection(&run);
+                    app.target(&name, &text, &draft, role_only);
+                    // Finish this resolution before the next input in the same key batch.
+                    for resolved in app.take_requests() {
+                        perform(app, conn, link, resolved);
+                    }
+                }
+                Some(Err(f)) => app.say(format!("输入未发送：{}：{}", f.code, f.message)),
+                _ => app.say("输入未发送：没有附着的 Run".into()),
+            }
+        }
     }
 }
 
