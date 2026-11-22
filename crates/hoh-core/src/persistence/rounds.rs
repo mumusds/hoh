@@ -338,7 +338,7 @@ fn candidates(
              t.first_eligible_seq, \
              (SELECT count(*) FROM task_dependencies d JOIN tasks u ON u.task_id = d.depends_on \
               WHERE d.task_id = t.task_id AND u.state <> 'ACCEPTED'), t.next_retry_at IS NOT NULL \
-             FROM tasks t WHERE t.run_id = ?1 AND t.state IN ('READY', 'PENDING') \
+             FROM tasks t WHERE t.run_id = ?1 AND t.kind='work' AND t.state IN ('READY', 'PENDING') \
              AND NOT EXISTS (SELECT 1 FROM events o JOIN candidates c \
                  ON c.candidate_id = json_extract(o.payload_json, '$.candidate_id') \
                  WHERE o.run_id = t.run_id AND o.kind = 'verification.round_opened' \
@@ -357,7 +357,7 @@ fn candidates(
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(3)?,
                         r.get::<_, String>(4)?,
                         r.get::<_, bool>(5)?,
                         r.get::<_, i64>(6)?,
@@ -417,7 +417,9 @@ fn candidates(
                 first_eligible_seq,
                 eligibility: Eligibility {
                     dependencies_accepted: open == 0,
-                    current_spec: run_spec == Some(spec_id.as_str()),
+                    current_spec: spec_id
+                        .as_deref()
+                        .is_some_and(|spec| run_spec == Some(spec)),
                     not_leased: true,
                     capable,
                     budget_reservable: context
@@ -432,4 +434,30 @@ fn candidates(
         });
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_008_02_drafts_with_and_without_spec_never_enter_schedule_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = Connection::open_in_memory()?;
+        super::super::migrate(&conn, super::super::MIGRATIONS)?;
+        conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+            INSERT INTO runs(run_id,project_id,state,mode,created_at) VALUES('r','p','RUNNING','PLAN','now');
+            INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,kind)
+              VALUES('draft','r',NULL,'PENDING','cto',1,1,'spec_draft');
+            INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+            INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,kind)
+              VALUES('later','r','s','READY','cto',1,2,'spec_draft');")?;
+        let tx = conn.transaction()?;
+        for spec in [None, Some("s")] {
+            assert!(
+                candidates(&tx, "r", spec, &Context::default(), &writer::Ctx::quiet())?.is_empty()
+            );
+        }
+        Ok(())
+    }
 }

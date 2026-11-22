@@ -1216,7 +1216,7 @@ fn migration_a_database_of_a_newer_binary_is_refused_with_78_naming_both_version
         assert_eq!(out.status.code(), Some(78), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("database schema version 7 is newer than this binary supports (1)"),
+            stderr.contains("database schema version 7 is newer than this binary supports (2)"),
             "{stderr}"
         );
         assert_eq!(project.dump()?, before);
@@ -1243,7 +1243,7 @@ fn migration_a_migration_that_fails_is_rolled_back_and_the_client_says_which_and
     assert_eq!(out.status.code(), Some(69), "{}", text(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("migration 1 failed and was rolled back: table runs already exists"),
+        stderr.contains("migration 1 failed: table runs already exists"),
         "{stderr}"
     );
     assert!(

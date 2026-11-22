@@ -114,7 +114,7 @@ async fn opening_creates_a_migrated_database_with_verified_settings() -> R {
             )?,
         ))
     })?;
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     assert!(tables >= 30, "{tables} tables");
     // Readers cannot write.
     let refused = reader.with(|c| c.execute("INSERT INTO schema_migrations VALUES (9, 'x')", []));
@@ -140,13 +140,13 @@ async fn reopening_keeps_the_schema_and_a_newer_one_is_refused() -> R {
     let applied: i64 = store
         .reader()?
         .with(|c| c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0)))?;
-    assert_eq!(applied, 1, "migration 1 ran once");
+    assert_eq!(applied, 2, "each migration ran once");
     drop(store);
-    Connection::open(&path)?.pragma_update(None, "user_version", 2)?;
+    Connection::open(&path)?.pragma_update(None, "user_version", 3)?;
     match Store::open(&path, test_options()) {
         Err(PersistError::SchemaTooNew {
-            found: 2,
-            supported: 1,
+            found: 3,
+            supported: 2,
         }) => Ok(()),
         other => Err(format!("{other:?}").into()),
     }
@@ -156,7 +156,12 @@ async fn reopening_keeps_the_schema_and_a_newer_one_is_refused() -> R {
 async fn a_failing_migration_is_rolled_back() -> R {
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
-    drop(Store::open(&path, test_options())?);
+    std::fs::create_dir_all(path.parent().ok_or("database parent missing")?)?;
+    drop(Store::open_checked(
+        &path,
+        test_options(),
+        &MIGRATIONS[..1],
+    )?);
     let broken = "BEGIN; CREATE TABLE extra(x); INSERT INTO missing VALUES (1); PRAGMA user_version = 2; COMMIT;";
     let migrations = [MIGRATIONS[0], (2, broken)];
     match Store::open_checked(&path, test_options(), &migrations) {
@@ -318,8 +323,8 @@ fn migration_scripts_keep_trigger_bodies_and_roll_back_a_failed_commit() -> R {
     conn.execute("INSERT INTO a VALUES (7)", [])?;
     let logged: i64 = conn.query_row("SELECT x FROM log", [], |r| r.get(0))?;
     assert_eq!(logged, 7);
-    // COMMIT itself fails on a deferred foreign key: the migration is rolled back and the connection is usable
-    // (M2T01R-12).
+    // The pre-commit foreign_key_check rejects a deferred FK too (ADR-038); the transaction is rolled back.
+    // A real failed COMMIT is separately exercised by migration_tests with a reader's SHARED lock.
     let deferred = "CREATE TABLE p(id INTEGER PRIMARY KEY); \
                     CREATE TABLE c(pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED); \
                     INSERT INTO c VALUES (1); PRAGMA user_version = 2;";
@@ -1224,9 +1229,11 @@ fn names<S: Lifecycle>() -> Vec<String> {
 #[test]
 fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
     // The script the store migrates with, i.e. contracts/sql/001_initial.sql.
-    let [(1, sql)] = MIGRATIONS else {
-        return Err("expected exactly migration 1".into());
-    };
+    let (_, sql) = MIGRATIONS[0];
+    assert_eq!(
+        state_check(MIGRATIONS[1].1, "tasks_new")?,
+        state_check(sql, "tasks")?
+    );
     let sorted = |mut v: Vec<String>| {
         v.sort();
         v

@@ -861,9 +861,9 @@ fn load_task(
     now: std::time::SystemTime,
 ) -> Result<Option<TaskView>, PersistError> {
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, i64, String, String, i64, bool, Option<String>)> = tx
+    let row: Option<(String, i64, Option<String>, String, i64, bool, Option<String>, String)> = tx
         .query_row(
-            "SELECT state, revision, spec_id, role, cost_estimate, writer, next_retry_at FROM tasks \
+            "SELECT state, revision, spec_id, role, cost_estimate, writer, next_retry_at, kind FROM tasks \
              WHERE task_id = ?1 AND run_id = ?2",
             params![task_id, run_id],
             |r| {
@@ -875,14 +875,17 @@ fn load_task(
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((state, rev, spec_id, role, cost, writer, next_retry_at)) = row else {
+    let Some((state, rev, spec_id, role, cost, writer, next_retry_at, kind)) = row else {
         return Ok(None);
     };
+    let kind = crate::decision::TaskKind::from_name(&kind)
+        .ok_or_else(|| PersistError::IntegrityViolation(format!("unknown task kind {kind}")))?;
     let mut statement = tx
         .prepare(
             "SELECT d.depends_on, t.state FROM task_dependencies d JOIN tasks t ON t.task_id = d.depends_on \
@@ -912,6 +915,7 @@ fn load_task(
         state: writer::parse::<TaskState>(&state)?,
         revision: revision(rev)?,
         spec_id,
+        kind,
         role,
         cost_estimate: u32::try_from(cost)
             .map_err(|_| PersistError::IntegrityViolation(format!("cost_estimate {cost}")))?,
@@ -921,7 +925,8 @@ fn load_task(
         // Whole seconds on both sides (the store's form): ahead of `now` until its second has come.
         retry_at: next_retry_at
             .filter(|next| next.as_str() > crate::time::rfc3339_utc(now).as_str()),
-        runtime_owned: super::verification::verifier_tasks(tx, run_id)?.contains(task_id),
+        runtime_owned: kind == crate::decision::TaskKind::SpecDraft
+            || super::verification::verifier_tasks(tx, run_id)?.contains(task_id),
         held_by_open_round: super::verification::held_by_open_rounds(tx, run_id)?.contains(task_id),
     }))
 }

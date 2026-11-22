@@ -12,6 +12,33 @@ use std::path::{Path, PathBuf};
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn test_008_02_nullable_draft_is_a_runtime_owned_task() -> R {
+    let mut conn = Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+        INSERT INTO runs(run_id,project_id,state,mode,created_at) VALUES('r','p','SPECIFYING','PLAN','now');
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,kind)
+          VALUES('draft','r',NULL,'READY','cto',1,1,'spec_draft');")?;
+    let tx = conn.transaction()?;
+    let view = load_task(&tx, "r", "draft", None, std::time::SystemTime::now())?
+        .ok_or("draft was lost")?;
+    assert!(view.runtime_owned, "a draft cannot become Commander-owned");
+    tx.commit()?;
+    conn.execute_batch(
+        "INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,kind)
+          VALUES('later','r','s','READY','cto',1,2,'spec_draft');",
+    )?;
+    let tx = conn.transaction()?;
+    assert!(
+        load_task(&tx, "r", "later", Some("s"), std::time::SystemTime::now())?
+            .ok_or("later draft missing")?
+            .runtime_owned
+    );
+    Ok(())
+}
+
 fn sha(n: u32) -> String {
     format!("{n:064}")
 }

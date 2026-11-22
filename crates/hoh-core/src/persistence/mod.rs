@@ -246,7 +246,7 @@ pub enum PersistError {
     },
     /// The database was written by a newer binary (`user_version` above the latest migration).
     SchemaTooNew { found: i64, supported: i64 },
-    /// A migration failed and was rolled back.
+    /// A migration or its cleanup failed; detail preserves the failure stage and any rollback/restore errors.
     Migration { version: i64, detail: String },
     /// A FOREIGN KEY, CHECK, UNIQUE or NOT NULL constraint failed; nothing of the transaction was written.
     IntegrityViolation(String),
@@ -427,10 +427,7 @@ impl std::fmt::Display for PersistError {
                 "database schema version {found} is newer than this binary supports ({supported})"
             ),
             PersistError::Migration { version, detail } => {
-                write!(
-                    f,
-                    "migration {version} failed and was rolled back: {detail}"
-                )
+                write!(f, "migration {version} failed: {detail}")
             }
             PersistError::IntegrityViolation(detail) => write!(f, "IntegrityViolation: {detail}"),
             PersistError::AppendOnly(table) => {
@@ -714,8 +711,13 @@ pub(crate) fn append_only_error(error: rusqlite::Error) -> PersistError {
 
 /// Schema migrations in order: `(user_version after it, SQL)`. A script sets its own `user_version`; the runner owns
 /// the transaction, so `BEGIN`/`COMMIT` statements in a script (the contract schema has them) are skipped.
-const MIGRATIONS: &[(i64, &str)] =
-    &[(1, include_str!("../../../../contracts/sql/001_initial.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../../../contracts/sql/001_initial.sql")),
+    (
+        2,
+        include_str!("../../../../contracts/sql/002_spec_drafting.sql"),
+    ),
+];
 
 /// The values `CHECK(<column> IN (...))` allows for `table` in the schema this binary migrates to, in schema order;
 /// `None` if the table or the check does not exist. For code that must agree with the stored schema, such as the
@@ -735,45 +737,133 @@ pub fn allowed_values(table: &str, column: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Bring the database to the latest schema version; refuse one newer than this binary. Each migration runs in one
-/// IMMEDIATE transaction that commits only if the script ran without ending it and set `user_version` to its
-/// version (M2T01R-05, -09); any failure, COMMIT included, rolls it back (M2T01R-12).
+/// Apply each migration with FK enforcement off outside its IMMEDIATE transaction, but a full FK check before
+/// commit (ADR-038). Every owned transaction is settled and enforcement restored and verified, including failures.
 fn migrate(conn: &Connection, migrations: &[(i64, &str)]) -> Result<i64, PersistError> {
     let latest = migrations.last().map_or(0, |m| m.0);
-    let mut version = user_version(conn)?;
-    if version > latest {
-        return Err(PersistError::SchemaTooNew {
-            found: version,
-            supported: latest,
+    if !conn.is_autocommit() {
+        return Err(PersistError::Migration {
+            version: latest,
+            detail: "migration requires an idle connection; caller transaction was preserved"
+                .into(),
         });
     }
-    let start = version;
-    for &(target, sql) in migrations.iter().filter(|m| m.0 > start) {
-        let failed = |detail: String| PersistError::Migration {
-            version: target,
-            detail,
-        };
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| failed(e.to_string()))?;
-        let ran = run_script(conn, sql)
-            .and_then(|()| {
-                let after = user_version(conn).map_err(|e| e.to_string())?;
-                if after == target {
-                    Ok(())
-                } else {
-                    Err(format!("user_version is {after} afterwards"))
-                }
-            })
-            .and_then(|()| conn.execute_batch("COMMIT").map_err(|e| e.to_string()));
-        if let Err(detail) = ran {
-            if !conn.is_autocommit() {
-                let _ = conn.execute_batch("ROLLBACK");
+    let result = (|| {
+        let mut version = supported_version(conn, latest)?;
+        for &(target, sql) in migrations {
+            if target <= version {
+                continue;
             }
-            return Err(failed(detail));
+            let failed = |detail| PersistError::Migration {
+                version: target,
+                detail,
+            };
+            let outcome = (|| {
+                foreign_keys(conn, false)?;
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .map_err(sqlite_error)?;
+                // An opener may have migrated while this connection waited for the write lock. A newer schema
+                // must still be refused, including when it overtook this binary while BEGIN was waiting.
+                let observed = supported_version(conn, latest)?;
+                if observed < target {
+                    run_script(conn, sql).map_err(failed)?;
+                    let after = user_version(conn)?;
+                    if after != target {
+                        return Err(failed(format!("user_version is {after} afterwards")));
+                    }
+                    let mut check = conn
+                        .prepare("PRAGMA foreign_key_check")
+                        .map_err(sqlite_error)?;
+                    if check
+                        .query([])
+                        .map_err(sqlite_error)?
+                        .next()
+                        .map_err(sqlite_error)?
+                        .is_some()
+                    {
+                        return Err(failed("foreign_key_check returned a violation".into()));
+                    }
+                }
+                conn.execute_batch("COMMIT").map_err(sqlite_error)?;
+                Ok(observed.max(target))
+            })();
+            // Cleanup errors are part of the failure: never hide a still-open transaction or an unenforced FK.
+            let outcome = if outcome.is_err() && !conn.is_autocommit() {
+                combine_migration(
+                    outcome,
+                    conn.execute_batch("ROLLBACK").map_err(sqlite_error),
+                    target,
+                    "rollback",
+                )
+            } else {
+                outcome
+            };
+            let outcome = combine_migration(
+                outcome,
+                foreign_keys(conn, true),
+                target,
+                "restore foreign_keys",
+            );
+            version = outcome.map_err(|error| match error {
+                PersistError::SchemaTooNew { .. } | PersistError::Migration { .. } => error,
+                other => failed(other.to_string()),
+            })?;
         }
-        version = target;
+        Ok(version)
+    })();
+    // Includes a current database, a too-new one and initial version/read failures.
+    combine_migration(
+        result,
+        foreign_keys(conn, true),
+        latest,
+        "restore foreign_keys",
+    )
+}
+
+fn supported_version(conn: &Connection, latest: i64) -> Result<i64, PersistError> {
+    let version = user_version(conn)?;
+    if version > latest {
+        Err(PersistError::SchemaTooNew {
+            found: version,
+            supported: latest,
+        })
+    } else {
+        Ok(version)
     }
-    Ok(version)
+}
+
+fn foreign_keys(conn: &Connection, enabled: bool) -> Result<(), PersistError> {
+    conn.pragma_update(None, "foreign_keys", enabled)
+        .map_err(sqlite_error)?;
+    let actual: i64 = conn
+        .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+        .map_err(sqlite_error)?;
+    if actual != i64::from(enabled) {
+        return Err(PersistError::Pragma {
+            name: "foreign_keys",
+            expected: i64::from(enabled).to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn combine_migration<T>(
+    result: Result<T, PersistError>,
+    cleanup: Result<(), PersistError>,
+    version: i64,
+    stage: &str,
+) -> Result<T, PersistError> {
+    match cleanup {
+        Ok(()) => result,
+        Err(error) => Err(PersistError::Migration {
+            version,
+            detail: match result {
+                Ok(_) => format!("{stage}: {error}"),
+                Err(original) => format!("{original}; {stage}: {error}"),
+            },
+        }),
+    }
 }
 
 fn user_version(conn: &Connection) -> Result<i64, PersistError> {
@@ -2519,3 +2609,9 @@ impl Reader {
 mod tests;
 
 pub use inputs::routing::{InputOutcome, InputRouted, InputRouting};
+
+#[cfg(test)]
+mod migration {
+    use super::*;
+    mod tests;
+}
