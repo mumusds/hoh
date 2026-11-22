@@ -290,6 +290,20 @@ pub(super) fn dispose(
         if state == RunState::Discovering && !super::baseline::recorded(&tx, run_id)? {
             return Ok(false);
         }
+        // Held too while a question blocks the run in DISCOVERING (the baseline's tests wait for the user's
+        // confirmation, docs/adr/ADR-039.md decision 8): applied once the answer moved the run back.
+        if state == RunState::Blocked {
+            let resume: Option<String> = tx
+                .query_row(
+                    "SELECT resume_state FROM runs WHERE run_id = ?1",
+                    params![run_id],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_error)?;
+            if resume.as_deref() == Some(RunState::Discovering.as_str()) {
+                return Ok(false);
+            }
+        }
         // Ended since the batch's list was read: passed over.
         if ended(&tx, run_id, &output_id)? {
             continue;

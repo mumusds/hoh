@@ -53,9 +53,9 @@ fn need(task_id: &str, reason: TaskReason) -> TaskNeed<'_> {
 }
 
 #[test]
-fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_two_run_reasons() {
+fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_three_run_reasons() {
     // Correction A's guard (1): work 12 (dirty_workspace: docs/adr/ADR-039.md decision 7), source 3, verifier 8; run
-    // no_spec and stalled. Each name parses back to its
+    // no_spec, stalled and baseline_tests. Each name parses back to its
     // variant, and a reason only some subjects have has a variant only in their enums.
     assert_eq!(
         (
@@ -65,7 +65,7 @@ fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_two_run_reasons() {
             TaskReason::all().len(),
             RunReason::ALL.len()
         ),
-        (12, 3, 8, 23, 2)
+        (12, 3, 8, 23, 3)
     );
     // Each ALL holds every variant once, in its position (a variant left out of ALL has a position past its end).
     let positions = |all: Vec<usize>| all.iter().enumerate().all(|(i, p)| i == *p);
@@ -86,9 +86,9 @@ fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_two_run_reasons() {
             WorkReason::DirtyWorkspace.position(),
             SourceReason::Flaky.position(),
             VerifierReason::ReportRejected.position(),
-            RunReason::Stalled.position()
+            RunReason::BaselineTests.position()
         ),
-        (11, 2, 7, 1),
+        (11, 2, 7, 2),
         "the last variant of each closes its ALL"
     );
     for reason in TaskReason::all() {

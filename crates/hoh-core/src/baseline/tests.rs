@@ -88,3 +88,14 @@ fn a_scope_holds_files_along_path_components_and_an_empty_one_none() {
     assert!(touched(&scope(&[""]), &uncommitted).is_empty());
     assert!(touched(&scope(&["li"]), &uncommitted).is_empty());
 }
+
+#[test]
+fn a_test_that_failed_in_the_baseline_is_no_regression() {
+    let out = "running 2 tests\ntest answer ... ok\ntest fails ... FAILED\ntest it::deep ... FAILED\n\nfailures:\n";
+    assert_eq!(failed_tests(out), ["fails", "it::deep"]);
+    assert!(failed_tests("test result: ok").is_empty());
+    let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+    assert_eq!(regressions(&s(&["fails"]), &s(&["fails", "new"])), ["new"]);
+    assert!(regressions(&s(&["fails"]), &s(&["fails"])).is_empty());
+    assert_eq!(regressions(&s(&[]), &s(&["fails"])), ["fails"]);
+}

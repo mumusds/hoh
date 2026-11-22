@@ -39,6 +39,9 @@ pub enum Route {
     Adopt,
     /// `runtime:stalled`: retry or cancel.
     Stalled,
+    /// `runtime:baseline_tests`: run the detected tests once into the baseline, or not (docs/adr/ADR-039.md
+    /// decision 8).
+    BaselineTests,
     /// A work task's own end: continue or cancel.
     Continue,
     /// A work task's repairs used up: rework or cancel.
@@ -57,6 +60,10 @@ impl Route {
         match self {
             Route::Commander => &[],
             Route::Adopt => &[("adopt", "采用项目已批准的规格")],
+            Route::BaselineTests => &[
+                ("run", "运行一次检测到的测试命令，结果记入基线"),
+                ("skip", "不运行"),
+            ],
             Route::Stalled => &[
                 ("retry", "让 Commander 再试（可附指示）"),
                 ("cancel", "取消本 Run"),
@@ -122,6 +129,7 @@ pub fn route_run(reason: RunReason) -> Route {
     match reason {
         RunReason::NoSpec => Route::Adopt,
         RunReason::Stalled => Route::Stalled,
+        RunReason::BaselineTests => Route::BaselineTests,
     }
 }
 
@@ -680,6 +688,14 @@ pub(super) fn answer(
                 claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
             }
         }
+        Route::BaselineTests => {
+            // The claim released, the run back in DISCOVERING by the follow below; `run` leaves the tests to the host's
+            // next tick, `skip` records that none ran (docs/adr/ADR-039.md decision 8).
+            claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
+            if picked == "skip" {
+                super::baseline::skipped(tx, a.project_id, a.run_id, ctx)?;
+            }
+        }
         Route::Stalled => {
             claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
             if picked == "cancel" {
@@ -797,6 +813,8 @@ fn exit_name(route: Route, choice: &str) -> &'static str {
         (Route::Adopt, _) => "adopt",
         (Route::Stalled, "cancel") => "cancel",
         (Route::Stalled, _) => "retry",
+        (Route::BaselineTests, "skip") => "skip",
+        (Route::BaselineTests, _) => "run",
         (Route::Continue | Route::Rework, "cancel") => "cancel",
         (Route::Continue, _) => "continue",
         (Route::Rework | Route::SourceRework, _) => "rework",
@@ -946,7 +964,7 @@ fn task_exit(
             }
             move_task(tx, task, TaskState::Ready, false, Vec::new(), ctx)?;
         }
-        (Route::Commander | Route::Adopt | Route::Stalled, _) => {
+        (Route::Commander | Route::Adopt | Route::Stalled | Route::BaselineTests, _) => {
             return Err(PersistError::IntegrityViolation(format!(
                 "question {} is no task's",
                 q.question_id
