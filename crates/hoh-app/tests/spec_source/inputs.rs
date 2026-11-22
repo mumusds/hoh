@@ -1,6 +1,8 @@
 //! AC-017-03: runtime inputs use the product command path without a model.
 use super::*;
 
+mod matrix;
+
 /// External-agent fixture: no dispatch receives an answer and no model can start.
 #[derive(Debug, Default)]
 struct Unavailable {
@@ -151,6 +153,15 @@ async fn test_017_03_unknown_control_rejected_without_changing_run() -> R {
 
 #[tokio::test]
 async fn test_017_03_unknown_control_rejection_is_atomic_and_revision_fenced() -> R {
+    control_rejection_is_atomic_and_revision_fenced("unknown").await
+}
+
+#[tokio::test]
+async fn test_017_03_illegal_control_rejection_is_atomic_and_revision_fenced() -> R {
+    control_rejection_is_atomic_and_revision_fenced("pause").await
+}
+
+async fn control_rejection_is_atomic_and_revision_fenced(text: &str) -> R {
     let world = World::new()?;
     let (host, run) = running(&world).await?;
     stopped(&world, &host, &run, "INCOMPLETE").await?;
@@ -162,7 +173,7 @@ async fn test_017_03_unknown_control_rejection_is_atomic_and_revision_fenced() -
         &run,
         "rejection-rollback",
         "SendInput",
-        json!({"text":"unknown","input_kind":"CONTROL","target_role":null}),
+        json!({"text":text,"input_kind":"CONTROL","target_role":null}),
     )
     .await?;
     let mut stale = body.clone();

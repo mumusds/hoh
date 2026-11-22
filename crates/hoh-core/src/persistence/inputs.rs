@@ -41,6 +41,76 @@ pub struct InputRow {
     pub payload: Value,
 }
 
+/// A business refusal, distinct from storage errors and state-machine corruption.
+pub(super) struct Rejection {
+    reason: &'static str,
+    details: Option<Value>,
+}
+
+impl Rejection {
+    pub(super) fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            details: None,
+        }
+    }
+
+    pub(super) fn from_error(error: &PersistError, run: &str) -> Option<Self> {
+        let (reason, details) = match error {
+            PersistError::IllegalTransition {
+                entity: Entity::Run,
+                id,
+                from,
+                to,
+                why,
+                details,
+            } if id == run => (
+                "illegal_transition",
+                Some(json!({
+                    "from":from,"to":to,"why":why,"guard":details
+                })),
+            ),
+            PersistError::SpecConflict(details) => ("SPEC_CONFLICT", Some((**details).clone())),
+            PersistError::SpecInvalid(error) => (
+                "SPEC_INVALID",
+                Some(json!({
+                    "path":error.path,"line":error.line,"error":error.error
+                })),
+            ),
+            PersistError::BadRequest(why) => ("BAD_REQUEST", Some(json!({"why":why}))),
+            // A rejected input/attempt transition, stale CAS, storage error or
+            // writer guard is not a business decision about this run's input.
+            _ => return None,
+        };
+        Some(Self { reason, details })
+    }
+
+    fn annotate(&self, payload: &mut Value) {
+        if let Some(details) = &self.details {
+            payload["details"] = details.clone();
+        }
+    }
+}
+
+/// A failed input application leaves no events, effects or temporary writer
+/// registrations behind. The caller classifies business refusals; all other
+/// errors still abort its enclosing transaction.
+pub(super) fn application<T>(
+    tx: &Transaction<'_>,
+    apply: impl FnOnce() -> Result<T, PersistError>,
+) -> Result<T, PersistError> {
+    tx.execute_batch("SAVEPOINT input_application")
+        .map_err(sqlite_error)?;
+    let result = apply();
+    if result.is_err() {
+        tx.execute_batch("ROLLBACK TO SAVEPOINT input_application")
+            .map_err(sqlite_error)?;
+    }
+    tx.execute_batch("RELEASE SAVEPOINT input_application")
+        .map_err(sqlite_error)?;
+    result
+}
+
 fn event(
     tx: &Transaction<'_>,
     ctx: &super::writer::Ctx<'_>,
@@ -49,6 +119,18 @@ fn event(
     kind: &str,
     payload: Value,
 ) -> Result<(), PersistError> {
+    event_with_outbox(tx, ctx, run_id, event_id, kind, payload, None).map(drop)
+}
+
+fn event_with_outbox(
+    tx: &Transaction<'_>,
+    ctx: &super::writer::Ctx<'_>,
+    run_id: &str,
+    event_id: String,
+    kind: &str,
+    payload: Value,
+    outbox: Option<NewOutbox>,
+) -> Result<i64, PersistError> {
     let project_id: String = tx
         .query_row(
             "SELECT project_id FROM runs WHERE run_id = ?1",
@@ -71,9 +153,10 @@ fn event(
             kind: kind.to_owned(),
             payload,
         }],
+        outbox: outbox.into_iter().collect(),
         ..Commit::default()
     };
-    writer::write(tx, &commit, ctx).map(drop)
+    writer::write(tx, &commit, ctx).map(|done| done.event_seqs[0])
 }
 
 pub(super) fn enqueue(
@@ -88,7 +171,7 @@ pub(super) fn enqueue(
 fn enqueue_outcome(
     tx: &Transaction<'_>,
     i: &NewInput,
-    rejection: Option<&str>,
+    rejection: Option<&Rejection>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<i64, PersistError> {
     let internal = matches!(i.kind.as_str(), "CONTROL" | "CHANGE");
@@ -129,12 +212,9 @@ fn enqueue_outcome(
         tx.query_row("SELECT coalesce(max(a.rowid),0) FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id=?1 AND t.role=?2 AND a.state IN ('STARTING','RUNNING')",params![i.run_id,role],|r|r.get(0)).map_err(sqlite_error)?
     };
     payload["after_attempt"] = json!(after);
-    let state = if let Some(reason) = rejection {
-        payload["reason"] = json!(reason);
-        InputState::Rejected
-    } else {
-        InputState::Queued
-    };
+    // Both intake and later delivery reject through the same state/event writer.
+    // A fresh rejection's QUEUED row is never committed or published as progress.
+    let state = InputState::Queued;
     tx.execute(
         "INSERT INTO input_queue(input_id, run_id, kind, target_role, state, payload_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -148,6 +228,34 @@ fn enqueue_outcome(
         ],
     )
     .map_err(sqlite_error)?;
+    let outbox = NewOutbox {
+        message_id: i.input_id.clone(),
+        event: 0,
+        run_id: Some(i.run_id.clone()),
+        recipient_role: role.to_owned(),
+        role_epoch: epoch,
+        payload: json!({"notice":"input","input_id":i.input_id,"kind":i.kind}),
+    };
+    if let Some(rejection) = rejection {
+        rejection.annotate(&mut payload);
+        let row = InputRow {
+            input_id: i.input_id.clone(),
+            run_id: i.run_id.clone(),
+            kind: i.kind.clone(),
+            target_role: i.target_role.clone(),
+            state,
+            payload,
+        };
+        return transition(
+            tx,
+            &row,
+            InputState::Rejected,
+            None,
+            Some(rejection.reason),
+            ctx,
+            Some(outbox),
+        );
+    }
     let project_id: String = tx
         .query_row(
             "SELECT project_id FROM runs WHERE run_id=?1",
@@ -155,39 +263,19 @@ fn enqueue_outcome(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    let mut event_payload = json!({"input_id":i.input_id,"kind":i.kind,"to":state.as_str(),"target_role":role,"role_epoch":epoch});
-    if let Some(reason) = rejection {
-        event_payload["from"] = json!("QUEUED");
-        event_payload["reason"] = json!(reason);
-    }
+    let event_payload = json!({"input_id":i.input_id,"kind":i.kind,"to":state.as_str(),"target_role":role,"role_epoch":epoch});
     let done = writer::write(
         tx,
         &Commit {
             events: vec![NewEvent {
-                intent: if rejection.is_some() {
-                    Intent::Record
-                } else {
-                    Intent::Progress
-                },
+                intent: Intent::Progress,
                 project_id,
                 run_id: Some(i.run_id.clone()),
                 event_id: child_id(&i.input_id, state.as_str()),
-                kind: if rejection.is_some() {
-                    "input.rejected"
-                } else {
-                    "input.queued"
-                }
-                .to_owned(),
+                kind: "input.queued".to_owned(),
                 payload: event_payload,
             }],
-            outbox: vec![NewOutbox {
-                message_id: i.input_id.clone(),
-                event: 0,
-                run_id: Some(i.run_id.clone()),
-                recipient_role: role.to_owned(),
-                role_epoch: epoch,
-                payload: json!({"notice":"input","input_id":i.input_id,"kind":i.kind}),
-            }],
+            outbox: vec![outbox],
             ..Default::default()
         },
         ctx,
@@ -358,6 +446,19 @@ fn change(
     reason: Option<&str>,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
+    transition(tx, row, to, answer, reason, ctx, None).map(drop)
+}
+
+/// The single outcome writer for queued and already delivered inputs.
+fn transition(
+    tx: &Transaction<'_>,
+    row: &InputRow,
+    to: InputState,
+    answer: Option<&str>,
+    reason: Option<&str>,
+    ctx: &super::writer::Ctx<'_>,
+    outbox: Option<NewOutbox>,
+) -> Result<i64, PersistError> {
     let kind = match to {
         InputState::Delivered => "input.delivered",
         InputState::Applied => "input.applied",
@@ -377,13 +478,14 @@ fn change(
         params![row.input_id, to.as_str(), payload.to_string()],
     )
     .map_err(sqlite_error)?;
-    event(
+    event_with_outbox(
         tx,
         ctx,
         &row.run_id,
         child_id(&row.input_id, to.as_str().to_ascii_lowercase().as_str()),
         kind,
-        json!({"input_id":row.input_id,"from":row.state.as_str(),"to":to.as_str(),"answer":answer,"reason":reason,"boundary":payload.get("boundary"),"attempt_id":payload.get("attempt_id")}),
+        json!({"input_id":row.input_id,"from":row.state.as_str(),"to":to.as_str(),"answer":answer,"reason":reason,"details":payload.get("details"),"boundary":payload.get("boundary"),"attempt_id":payload.get("attempt_id")}),
+        outbox,
     )
 }
 
