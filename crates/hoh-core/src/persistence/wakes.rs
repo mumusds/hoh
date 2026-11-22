@@ -1081,6 +1081,8 @@ pub(super) fn allocate(
             role_epoch: chosen.role_epoch,
             kind: &kind,
             now,
+            // The Commander's own turn, not work: no dispatch admission (docs/adr/ADR-035.md decision 12).
+            admission: super::admission::supervision(&tx, &task_id)?,
         },
     )?;
     // The revisions of the tasks it names, as its turn is shown them: the fence of its decisions (decisions 3, 6).

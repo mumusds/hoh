@@ -367,6 +367,9 @@ pub struct Snapshot {
     /// For a transition_run to READY, the run's readiness under its specification revision (REQ-031, C5:
     /// docs/adr/ADR-035.md decision 4); `None` when none is judged (no specification adopted).
     pub readiness: Option<crate::readiness::Readiness>,
+    /// For a dispatch, the dispatch admission's refusal of its task, if it refused it (docs/adr/ADR-035.md decision 12:
+    /// its revision, who may dispatch it, its readiness under the run's current revision).
+    pub admission: Option<Rejection>,
 }
 
 /// What an end of a run waits for (docs/adr/ADR-031.md decision 4): it is ended only when quiet, so nothing of it is
@@ -630,6 +633,9 @@ fn dispatch(snapshot: &Snapshot, task_id: &str, role: &str) -> Result<Effect, Re
     }
     dependencies_accepted(task)?;
     table(task.state, TaskState::Leased)?;
+    if let Some(refused) = &snapshot.admission {
+        return Err(refused.clone());
+    }
     if let Some(next) = &task.retry_at {
         return reject(
             RetryNotDue,

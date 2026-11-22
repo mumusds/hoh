@@ -220,7 +220,26 @@ pub(super) fn decide_in(
         ],
     )
     .map_err(sqlite_error)?;
-    let snapshot = load_snapshot(tx, &project_id, proposal, context, run, ctx)?;
+    let mut snapshot = load_snapshot(tx, &project_id, proposal, context, run, ctx)?;
+    // A dispatch of a task of the run is admitted in this transaction (docs/adr/ADR-035.md decision 12, M3J-100): its
+    // refusal is the verdict's, its admission the lease's.
+    let mut admission = match &proposal.payload {
+        protocol::DecisionPayload::Dispatch { task_id, .. } if snapshot.task.is_some() => {
+            match super::admission::admit_one(
+                tx,
+                &proposal.run_id,
+                task_id,
+                super::admission::By::Commander,
+            )? {
+                Ok(admitted) => Some(admitted),
+                Err(refusal) => {
+                    snapshot.admission = Some(refusal.rejection(task_id));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let turn = match allocation.filter(|a| a["wake"].as_str() == proposal.causation_id.as_deref()) {
         Some(allocation) => Some(answered_by(allocation)?),
         None => answered(tx, &proposal.run_id, proposal.causation_id.as_deref())?,
@@ -278,6 +297,12 @@ pub(super) fn decide_in(
                         role_epoch: *role_epoch,
                         kind: lease_kind,
                         now: context.now(),
+                        admission: admission.take().ok_or_else(|| {
+                            PersistError::IntegrityViolation(format!(
+                                "dispatch {} applied without its admission",
+                                proposal.decision_id
+                            ))
+                        })?,
                     },
                 )?),
                 _ => None,
@@ -601,6 +626,8 @@ pub(super) struct LeaseRequest<'a> {
     pub(super) role_epoch: u64,
     pub(super) kind: &'a str,
     pub(super) now: std::time::SystemTime,
+    /// The task's admission, in this transaction (docs/adr/ADR-035.md decision 12): no attempt without one.
+    pub(super) admission: super::admission::Admission,
 }
 
 /// Create the PREPARED attempt of a dispatch (its row only: the dispatch's event records it) and grant it the lease,
@@ -610,6 +637,13 @@ pub(super) fn lease_task(
     tx: &Transaction<'_>,
     request: &LeaseRequest<'_>,
 ) -> Result<Leased, PersistError> {
+    if request.admission.task_id() != request.task_id {
+        return Err(PersistError::IntegrityViolation(format!(
+            "an attempt of {} under the admission of {}",
+            request.task_id,
+            request.admission.task_id()
+        )));
+    }
     let (host_epoch, config_revision): (i64, i64) = tx
         .query_row(
             "SELECT p.host_epoch, r.config_revision FROM runs r JOIN projects p ON p.project_id = r.project_id \
@@ -818,6 +852,7 @@ fn load_snapshot(
         quiet,
         assumptions,
         readiness,
+        admission: None,
     })
 }
 
