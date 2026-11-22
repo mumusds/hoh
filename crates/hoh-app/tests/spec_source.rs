@@ -4,6 +4,7 @@
 
 mod spec_source {
     use super::*;
+    mod inputs;
     mod tasks;
 }
 

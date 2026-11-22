@@ -111,6 +111,7 @@ pub use commands::{
     RunProjection, RunRow, RunTarget, RunsPage, SubmitCommand,
 };
 pub use decide::{Decided, Fenced};
+pub use inputs::runtime::{ChangeInput, ChangedInput};
 pub use inputs::{InputMove, InputRow, NewInput};
 pub use writer::{
     Change, Claimed, Commit, Committed, Entity, Intent, NewEvent, NewOutbox, StateCas,
@@ -1845,6 +1846,14 @@ impl Store {
             .outbox(writer::OutboxJob::Input(row, now))
             .await
             .map(|done| done.input_reply)
+    }
+
+    /// Runtime CHANGE delivery: proposal/snapshot commit, followed by publication confirmation.
+    pub async fn change_input(&self, request: ChangeInput) -> Result<ChangedInput, PersistError> {
+        self.writer
+            .outbox(writer::OutboxJob::ChangeInput(Box::new(request)))
+            .await
+            .map(|done| done.changed)
     }
 
     /// Settle delivery `generation` (the row's `attempt_count` when it was taken) of `message_id` (ADR-018 decision

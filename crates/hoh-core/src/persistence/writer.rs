@@ -1722,6 +1722,7 @@ pub(super) enum OutboxJob {
     Claim(std::time::SystemTime, Vec<String>, i64, bool),
     Input(super::outbox::OutboxRow, std::time::SystemTime),
     InputSweep(String),
+    ChangeInput(Box<super::ChangeInput>),
     RouteInput(super::InputRouting),
     /// Message id, generation, settlement, the delivery limit.
     Settle(String, i64, super::outbox::Settlement, i64),
@@ -1743,6 +1744,7 @@ pub(super) enum OutboxJob {
 pub(super) struct OutboxDone {
     pub(super) rows: Vec<Claimed>,
     pub(super) input_reply: Option<String>,
+    pub(super) changed: super::ChangedInput,
     pub(super) routed: super::InputRouted,
     pub(super) consumed: Option<super::outbox::Consumed>,
     pub(super) event_seq: Option<i64>,
@@ -1782,6 +1784,10 @@ fn run_outbox(
         }
         OutboxJob::Input(row, now) => OutboxDone {
             input_reply: super::inputs::consume(conn, &row, now, ctx)?,
+            ..Default::default()
+        },
+        OutboxJob::ChangeInput(job) => OutboxDone {
+            changed: super::inputs::runtime::apply_change(conn, *job, ctx)?,
             ..Default::default()
         },
         OutboxJob::Settle(id, generation, settlement, max) => {

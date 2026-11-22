@@ -81,14 +81,17 @@ pub(super) fn enqueue(
     i: &NewInput,
     ctx: &super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
-    let role = i
-        .target_role
-        .as_deref()
-        .unwrap_or(if matches!(i.kind.as_str(), "ASK" | "STEER") {
-            "commander"
-        } else {
-            "runtime"
-        });
+    let role = if matches!(i.kind.as_str(), "CONTROL" | "CHANGE") {
+        "runtime"
+    } else {
+        i.target_role
+            .as_deref()
+            .unwrap_or(if matches!(i.kind.as_str(), "ASK" | "STEER") {
+                "commander"
+            } else {
+                "runtime"
+            })
+    };
     let epoch: i64 = tx
         .query_row(
             "SELECT role_epoch FROM role_bindings WHERE run_id=?1 AND role=?2",
@@ -219,6 +222,7 @@ pub(super) fn read_input(
 }
 
 pub(super) mod routing;
+pub(super) mod runtime;
 
 #[cfg(test)]
 mod tests;
@@ -245,6 +249,13 @@ pub(super) fn delivery_input_wait(
     epoch: Option<i64>,
     payload: &Value,
 ) -> Result<bool, PersistError> {
+    if role == "runtime"
+        && epoch == Some(0)
+        && payload["notice"] == "input"
+        && payload["kind"] == "CHANGE"
+    {
+        return Ok(false);
+    }
     let carries_package = role == "commander"
         && payload["notice"] == "input"
         && matches!(payload["kind"].as_str(), Some("ASK" | "STEER"));

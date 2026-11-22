@@ -10,7 +10,7 @@ pub use impact::impact;
 
 pub const PATH: &str = "docs/spec/index.json";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Source {
     pub path: String,
     pub bytes: Vec<u8>,
