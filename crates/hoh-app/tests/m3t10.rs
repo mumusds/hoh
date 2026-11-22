@@ -413,6 +413,7 @@ impl Clock {
 }
 #[derive(Debug, Default)]
 struct FakeCommander {
+    plan: Option<&'static str>,
     summaries: std::sync::Mutex<Vec<Value>>,
 }
 impl hoh_app::host::Executor for FakeCommander {
@@ -448,7 +449,21 @@ impl hoh_app::host::Executor for FakeCommander {
             .lock()
             .map_err(|e| refused(e.to_string()))?
             .push(input.summary.clone());
-        let message = json!({"schema_version":"1.0","message_id":"answer","run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"sender_role":"commander","recipient_role":"runtime","role_epoch":input.role_epoch,"correlation_id":"c","causation_id":input.wake,"idempotency_key":"k","expected_revision":input.run_revision,"spec_sha256":format!("{:064}",1),"candidate_id":null,"kind":"decision","payload":{"kind":"record_assumption","statement":"Conclusion: docs/adr/ADR-037.md","basis":input.summary.to_string()}});
+        let plan_task = |id: &str, role: &str| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":id,"title":id,"role":role,"writer":false,"depends_on":["D"],"requirement_ids":[]}]}});
+        let payloads = match self.plan {
+            Some("replan") => vec![
+                json!({"kind":"transition_task","task_id":"repeat","to_state":"CANCELLED","reason":"replace repeated failure"}),
+                plan_task("replacement", "developer"),
+            ],
+            Some("research") => vec![plan_task("investigation", "researcher")],
+            _ => vec![
+                json!({"kind":"record_assumption","statement":"Conclusion: docs/adr/ADR-037.md","basis":input.summary.to_string()}),
+            ],
+        };
+        let messages=payloads.into_iter().enumerate().map(|(n,payload)| {
+            let message=json!({"schema_version":"1.0","message_id":format!("answer-{n}"),"run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"sender_role":"commander","recipient_role":"runtime","role_epoch":input.role_epoch,"correlation_id":"c","causation_id":input.wake,"idempotency_key":format!("k-{n}"),"expected_revision":input.run_revision+n as i64,"spec_sha256":format!("{:064}",1),"candidate_id":null,"kind":"decision","payload":payload});
+            json!({"nonce":input.nonce,"message":message}).to_string()
+        }).collect();
         let mut child = std::process::Command::new("sh")
             .args(["-c", "read -r go; exit 0"])
             .process_group(0)
@@ -473,7 +488,7 @@ impl hoh_app::host::Executor for FakeCommander {
                 group_gone: hoh_agents::identity::group_empty(pid),
                 class: hoh_core::retry::FailureClass::Capability,
                 observed: hoh_core::persistence::Observed {
-                    messages: vec![json!({"nonce":input.nonce,"message":message}).to_string()],
+                    messages,
                     ..Default::default()
                 },
                 unknown_effect: false,
@@ -1536,5 +1551,148 @@ async fn test_023_01_queued_result_is_rejected_when_parent_is_cancelled() -> R {
         "a queued answer cannot survive its parent cancellation"
     );
     host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_040_04_commander_replans_or_researches_without_automatic_continue() -> R {
+    for response in ["replan", "research"] {
+        let dir = tempfile::Builder::new().prefix("m3t10-replan-").tempdir()?;
+        let clock = std::sync::Arc::new(Clock::default());
+        let plain = Host::start(config(dir.path())).await?;
+        sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), PARTICIPANTS, false)?;
+        sql(
+            dir.path(),
+            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES ('repeat','R','s1','IMPLEMENTED','developer',2)",
+            false,
+        )?;
+        for n in 1..=3 {
+            round(dir.path(), n)?;
+            plain
+                .store()
+                .reconcile_verification("R", Default::default())
+                .await?;
+        }
+        assert_eq!(events(dir.path(), "no_progress")?.len(), 1);
+        plain.shutdown().await;
+        let fake = std::sync::Arc::new(FakeCommander {
+            plan: Some(response),
+            ..Default::default()
+        });
+        let mut c = config(dir.path());
+        c.clock = hoh_app::host::HostClock(clock.clone());
+        c.runner = Some(hoh_app::host::RunnerConfig {
+            executor: fake.clone(),
+            context: Context::default(),
+        });
+        let host = Host::start(c).await?;
+        let expected = if response == "replan" { 2 } else { 1 };
+        if let Err(e) = wait_sql(
+            dir.path(),
+            &clock,
+            "SELECT count(*) n FROM decisions WHERE state='APPLIED'",
+            |v| v[0]["n"] == expected,
+        )
+        .await
+        {
+            return Err(format!(
+                "{e}; decisions {}; events {}",
+                sql(dir.path(), "SELECT * FROM decisions", true)?,
+                sql(
+                    dir.path(),
+                    "SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 12",
+                    true
+                )?
+            )
+            .into());
+        }
+        wait_sql(
+            dir.path(),
+            &clock,
+            "SELECT a.state FROM attempts a JOIN tasks t USING(task_id) WHERE t.role='commander'",
+            |v| v[0]["state"] == "SETTLED",
+        )
+        .await?;
+        let summaries = fake.summaries.lock().map_err(|e| e.to_string())?.clone();
+        assert_eq!(summaries.len(), 1);
+        let diagnosis = &summaries[0]["events"]
+            .as_array()
+            .ok_or("wake events")?
+            .iter()
+            .find(|e| e["kind"] == "no_progress")
+            .ok_or("diagnosis in wake")?["payload"];
+        assert_eq!(diagnosis["fingerprints"], json!(["F"]));
+        assert_eq!(diagnosis["last_progress_seq"], 0);
+        assert_eq!(diagnosis["suggestions"], json!(["升级", "研究", "改计划"]));
+        let id = if response == "replan" {
+            "replacement"
+        } else {
+            "investigation"
+        };
+        let task = sql(
+            dir.path(),
+            &format!("SELECT role,state FROM tasks WHERE task_id='{id}'"),
+            true,
+        )?;
+        assert_eq!(
+            task[0]["role"],
+            if response == "replan" {
+                "developer"
+            } else {
+                "researcher"
+            }
+        );
+        assert_eq!(
+            task[0]["state"], "PENDING",
+            "ordinary dependency scheduling is retained"
+        );
+        if response == "replan" {
+            assert_eq!(
+                sql(
+                    dir.path(),
+                    "SELECT state FROM tasks WHERE task_id='repeat'",
+                    true
+                )?[0]["state"],
+                "CANCELLED"
+            );
+        }
+        assert_eq!(events(dir.path(), "plan.imported")?.len(), 1);
+        // Work D is still in flight and each new task waits for it: no new stall or work failure can request a different turn.
+        for _ in 0..3 {
+            clock.advance();
+            host.store()
+                .supervise(
+                    "R",
+                    Context {
+                        now: Some(hoh_core::delivery::Clock::now(clock.as_ref())),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert!(
+                host.store()
+                    .allocate_supervision(
+                        &host.project_id,
+                        Context {
+                            now: Some(hoh_core::delivery::Clock::now(clock.as_ref())),
+                            ..Default::default()
+                        }
+                    )
+                    .await?
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            sql(
+                dir.path(),
+                "SELECT count(*) n FROM attempts a JOIN tasks t USING(task_id) WHERE t.role='commander'",
+                true
+            )?[0]["n"],
+            1
+        );
+        assert_eq!(fake.summaries.lock().map_err(|e| e.to_string())?.len(), 1);
+        host.shutdown().await;
+    }
     Ok(())
 }
