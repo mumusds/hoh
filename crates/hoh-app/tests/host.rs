@@ -5,6 +5,9 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 
+mod common;
+
+use common::quiescent::{Quiet, Watermark, await_quiescent};
 use hoh_app::host::{Host, HostConfig, HostHooks};
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand, Step};
 use hoh_core::persistence::{FaultHooks, PersistError, location};
@@ -1034,16 +1037,17 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
             assert!(took <= Duration::from_secs(5), "202 after {took:?}");
         }
         locker.wait()?;
-        // The host's pause step done (no work: PAUSED at once), nothing of it left to write.
-        let end = Instant::now() + Duration::from_secs(10);
-        while !expect_busy
-            && scalar(
-                dir.path(),
-                &format!("SELECT state FROM runs WHERE run_id = '{run}'"),
-            )? != "PAUSED"
-        {
-            assert!(Instant::now() < end, "{run} was not paused");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // The host's pause step done (no work: PAUSED at once), nothing of it left to write. The host has no runner,
+        // so no supervisor: nothing for a cursor to take in.
+        if !expect_busy {
+            let quiet = Quiet::new(run, Watermark::Unsupervised);
+            let db = db(dir.path());
+            tokio::task::block_in_place(|| {
+                await_quiescent(&db, &quiet, Duration::from_secs(10), |s| {
+                    s.run_state == "PAUSED"
+                })
+            })
+            .map_err(|e| e.to_string())?;
         }
     }
     host.shutdown().await;
