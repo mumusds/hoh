@@ -49,6 +49,8 @@ pub enum Request {
         draft: String,
         role_only: bool,
     },
+    /// Answer a particular persisted question with an explicitly selected choice.
+    Answer { question_id: String, choice: String },
     /// Attach this run (chosen in the selector).
     Attach(String),
 }
@@ -212,6 +214,7 @@ pub struct App {
     runs: Vec<Listed>,
     picker: Option<Picker>,
     target_picker: Option<TargetPicker>,
+    question_choice: Option<(String, String)>,
     slash: Option<usize>,
     requests: Vec<Request>,
     /// The commands of inputs sent whose acceptance event has not come yet.
@@ -237,6 +240,7 @@ impl App {
             runs: Vec::new(),
             picker: None,
             target_picker: None,
+            question_choice: None,
             slash: None,
             requests: Vec::new(),
             awaiting: Vec::new(),
@@ -263,6 +267,32 @@ impl App {
         self.run.as_ref().map_or(self.mode.as_str(), |r| &r.mode)
     }
 
+    fn question_options(&self) -> Vec<(String, String, String)> {
+        self.run
+            .as_ref()
+            .into_iter()
+            .flat_map(|r| {
+                r.snapshot["projection"]["questions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .flat_map(|q| {
+                q["choices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| {
+                        Some((
+                            q["question_id"].as_str()?.to_owned(),
+                            c["choice_id"].as_str()?.to_owned(),
+                            c["label"].as_str()?.to_owned(),
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     pub fn projection(&mut self, value: &Value) {
         if let Some(run) = self.run.as_mut() {
             run.snapshot = value.clone();
@@ -272,6 +302,14 @@ impl App {
                     run.pending_mode = None;
                 }
             }
+        }
+        if self.question_choice.as_ref().is_some_and(|selected| {
+            !self
+                .question_options()
+                .iter()
+                .any(|(q, c, _)| q == &selected.0 && c == &selected.1)
+        }) {
+            self.question_choice = None;
         }
     }
 
@@ -439,7 +477,8 @@ impl App {
                     None => "已排队".to_owned(),
                 });
         }
-        kind.starts_with("run.")
+        kind.starts_with("question.")
+            || kind.starts_with("run.")
             || kind.starts_with("team.")
             || matches!(kind, "attempt.moved" | "attempt.ended")
     }
@@ -524,6 +563,48 @@ impl App {
         if self.target_picker.is_some() {
             self.target_key(key);
             return None;
+        }
+        let options = self.question_options();
+        if key.code == KeyCode::Tab && !options.is_empty() {
+            let next = self
+                .question_choice
+                .as_ref()
+                .and_then(|(q, c)| {
+                    options
+                        .iter()
+                        .position(|(id, choice, _)| id == q && choice == c)
+                })
+                .map_or(0, |i| (i + 1) % options.len());
+            self.question_choice = Some((options[next].0.clone(), options[next].1.clone()));
+            return None;
+        }
+        if let Some((q, c)) = self.question_choice.clone() {
+            let selected = options
+                .iter()
+                .position(|(id, choice, _)| id == &q && choice == &c);
+            match (key.code, selected) {
+                (KeyCode::Enter, Some(_)) => {
+                    self.requests.push(Request::Answer {
+                        question_id: q,
+                        choice: c,
+                    });
+                    self.question_choice = None;
+                    return None;
+                }
+                (KeyCode::Up | KeyCode::Down, Some(i)) => {
+                    let next = if key.code == KeyCode::Up {
+                        i.saturating_sub(1)
+                    } else {
+                        (i + 1).min(options.len() - 1)
+                    };
+                    self.question_choice = Some((options[next].0.clone(), options[next].1.clone()));
+                    return None;
+                }
+                _ => self.question_choice = None,
+            }
+            if key.code == KeyCode::Esc {
+                return None;
+            }
         }
         if let Some(selected) = self.slash {
             match key.code {
@@ -1002,6 +1083,33 @@ impl App {
                     .take(usize::from(body.height))
                     .map(|r| Line::from(r.line(width))),
             );
+        }
+        if let Some(run) = &self.run {
+            for q in run.snapshot["projection"]["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                lines.push(Line::from(format!(
+                    "问题：{}",
+                    q["text"].as_str().unwrap_or_default()
+                )));
+                for c in q["choices"].as_array().into_iter().flatten() {
+                    let selected = self.question_choice.as_ref().is_some_and(|(id, choice)| {
+                        q["question_id"] == *id && c["choice_id"] == *choice
+                    });
+                    lines.push(Line::from(format!(
+                        "{} {}",
+                        if selected { ">" } else { " " },
+                        c["label"].as_str().unwrap_or_default()
+                    )));
+                }
+            }
+            if !lines.is_empty() {
+                lines.push(Line::from(
+                    "Tab 选择答复 · ↑↓ 选项 · Enter 确认 · Esc 返回输入",
+                ));
+            }
         }
         let room = usize::from(body.height).saturating_sub(lines.len());
         let shown = room.min(self.messages.len());
