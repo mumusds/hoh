@@ -285,6 +285,11 @@ pub(super) fn dispose(
         {
             return Ok(false);
         }
+        // Held while the run's project discovery has not written its baseline: what the Commander decided after
+        // entering DISCOVERING is applied once it has, in order (docs/adr/ADR-039.md decision 5).
+        if state == RunState::Discovering && !super::baseline::recorded(&tx, run_id)? {
+            return Ok(false);
+        }
         // Ended since the batch's list was read: passed over.
         if ended(&tx, run_id, &output_id)? {
             continue;

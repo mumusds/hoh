@@ -104,6 +104,27 @@ async fn tick(
     for run in &waiting.pausing {
         held.item(store.pause_step(run, common.clock.now()).await)?;
     }
+    // Each run in DISCOVERING without its baseline: the project's read-only discovery, then its run.baseline
+    // (docs/adr/ADR-039.md decision 4). A failed look is said and tried again on the next tick.
+    for run in &waiting.discovering {
+        let project = common.project.clone();
+        match super::begun::spawn_blocking(move || super::discovery::discover(&project)).await {
+            Ok(Ok(payload)) => {
+                held.item(store.record_baseline(run, payload).await)?;
+            }
+            Ok(Err(e)) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "hoh host: discovery of run {run}: {e}");
+            }
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "hoh host: discovery of run {run} stopped: {e}"
+                );
+            }
+        }
+    }
     let mut runs: BTreeSet<String> = waiting.cancelling.into_iter().collect();
     let project = common.shared.project_id.clone();
     runs.extend(

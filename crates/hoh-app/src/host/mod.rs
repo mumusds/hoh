@@ -13,6 +13,7 @@ pub mod agents;
 pub(crate) mod begun;
 mod cgroup;
 mod completion;
+mod discovery;
 pub mod requests;
 mod verifying;
 #[cfg(test)]

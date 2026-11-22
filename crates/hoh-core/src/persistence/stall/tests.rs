@@ -779,7 +779,17 @@ async fn a_plan_only_turn_does_not_count_as_progress_and_a_moved_state_does() ->
     let dir = tempfile::tempdir()?;
     let clock = Arc::new(TestClock::default());
     let (store, path) = open(&dir, &clock)?;
-    world(&path, "CREATED", REVIEWED)?;
+    // Its project discovery's baseline, which the host writes in DISCOVERING (docs/adr/ADR-039.md decision 5): no host
+    // runs here.
+    world(
+        &path,
+        "CREATED",
+        &format!(
+            "{REVIEWED}
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+               ('p1', 'R/baseline', 'R', 'run.baseline', '{{}}', '2026-11-07T00:00:00Z');"
+        ),
+    )?;
     const STATES: &[&str] = &["CREATED", "DISCOVERING", "SPECIFYING", "READY"];
     drive(
         &store,
@@ -1687,5 +1697,41 @@ async fn a_commanders_question_blocks_the_run_and_its_answer_wakes_the_next_turn
             && e["payload"]["decision_id"] == json!(decision)),
         "{shown:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_commanders_move_out_of_discovering_waits_for_the_baseline_then_applies() -> R {
+    // docs/adr/ADR-039.md decision 5: while the run is in DISCOVERING without its run.baseline, the Commander's
+    // outputs wait (not rejected); once the host's discovery wrote it, they are applied in order. Two wakes give two
+    // turns: the first moves the run into DISCOVERING, the second out of it.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "CREATED", TWO_WAKES)?;
+    const STATES: &[&str] = &["CREATED", "DISCOVERING", "SPECIFYING"];
+    let (seen, ms) = drive(&store, &clock, &path, 0, 8, &Answer::Advance(STATES), |p| {
+        Ok(state(p)? == json!("SPECIFYING"))
+    })
+    .await?;
+    let turns = seen.iter().filter(|(_, _, t)| t.is_some()).count();
+    assert_eq!(turns, 2, "{seen:?}");
+    assert_eq!(state(&path)?, json!("DISCOVERING"), "{}", decisions(&path)?);
+    assert_eq!(
+        decisions(&path)?,
+        json!(["APPLIED"]),
+        "the second turn's move waits"
+    );
+    exec(
+        &path,
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'R/baseline', 'R', 'run.baseline', '{}', '2026-11-07T00:00:00Z');",
+    )?;
+    drive(&store, &clock, &path, ms, 4, &Answer::Nothing, |p| {
+        Ok(state(p)? == json!("SPECIFYING"))
+    })
+    .await?;
+    assert_eq!(state(&path)?, json!("SPECIFYING"));
+    assert_eq!(decisions(&path)?, json!(["APPLIED", "APPLIED"]));
     Ok(())
 }

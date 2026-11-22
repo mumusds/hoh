@@ -839,6 +839,7 @@ fn load_snapshot(
         }
         _ => None,
     };
+    let baselined = proposal.kind() == "transition_run" && super::baseline::recorded(tx, run_id)?;
     Ok(Snapshot {
         run,
         commander_epoch,
@@ -853,6 +854,7 @@ fn load_snapshot(
         assumptions,
         readiness,
         admission: None,
+        baselined,
     })
 }
 
