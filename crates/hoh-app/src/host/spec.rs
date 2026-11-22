@@ -175,3 +175,47 @@ pub(crate) fn review_commit(root: &Path, sha256: &str) -> Result<Result<String, 
 
 #[cfg(test)]
 mod tests;
+
+/// Read the specification from exactly this commit, never substituted working-tree bytes.
+pub(crate) fn committed(
+    root: &Path,
+    commit: &str,
+) -> Result<hoh_core::persistence::SpecFiles, String> {
+    let rows = super::control::git(root, &["ls-tree", "-r", "-z", commit, "--", "docs/spec/"])?;
+    let mut sources = Vec::new();
+    for row in rows.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let tab = row
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid Git tree row")?;
+        let path = std::str::from_utf8(&row[tab + 1..]).map_err(|e| e.to_string())?;
+        let name = path
+            .strip_prefix("docs/spec/")
+            .ok_or("unexpected specification path")?;
+        if name.contains('/') || !name.ends_with(".md") {
+            continue;
+        }
+        if !row.starts_with(b"100644 ") && !row.starts_with(b"100755 ") {
+            return Err(format!("committed Markdown is not a regular file: {path}"));
+        }
+        let bytes = super::control::git(root, &["cat-file", "blob", &format!("{commit}:{path}")])?;
+        sources.push(Source {
+            path: path.into(),
+            bytes,
+        });
+    }
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    let index = super::control::git(
+        root,
+        &[
+            "cat-file",
+            "blob",
+            &format!("{commit}:{}", hoh_core::specindex::PATH),
+        ],
+    )?;
+    Ok(hoh_core::persistence::SpecFiles {
+        sources,
+        existing_index: Some(index.clone()),
+        tracked_index: Some(index),
+    })
+}

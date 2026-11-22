@@ -64,3 +64,74 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
     host.shutdown().await;
     outcome
 }
+
+async fn input(
+    host: &hoh_app::host::Host,
+    world: &world::World,
+    run: &str,
+    key: &str,
+    kind: &str,
+    payload: serde_json::Value,
+) -> R<serde_json::Value> {
+    for _ in 0..20 {
+        let revision: i64 = world
+            .query(&format!("SELECT revision FROM runs WHERE run_id='{run}'"))?
+            .parse()?;
+        let body = json!({"schema_version":"1.0","command_id":key,"idempotency_key":key,"expected_revision":revision,"kind":kind,"run_id":run,"payload":payload});
+        let (status, reply) = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+        if status == 409 && reply["code"] == "STALE_REVISION" {
+            continue;
+        }
+        assert_eq!(status, 202, "{reply}");
+        return Ok(reply);
+    }
+    Err("run kept changing".into())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_first_draft_completes_then_all_three_user_entrances_approve() -> R {
+    for kind in ["ApproveSpec", "AnswerQuestion", "SendInput"] {
+        let world = world::World::named("m3t04-draft-approval")?;
+        world.configure(&[], "")?;
+        let host = world
+            .team_host(world::Team::drafting(world.project()), None)
+            .await?;
+        let result: R=async{
+   let run=world::start_run(&host,"start","规格起草").await?;world.staff(&run)?;
+   let second=world::start_run(&host,"second","等待规格").await?;world.staff(&second)?;
+   if kind == "SendInput" {
+    let mut cli=world.command(&["-p","draft","--resume",&run]);
+    let output=tokio::task::spawn_blocking(move ||cli.output()).await??;
+    assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stderr));
+   } else {
+   input(&host,&world,&run,"draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+   }
+   world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(20)).await?;
+   assert_eq!(world.query("SELECT count(*) FROM candidates")?,"0");
+   assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");
+   assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"IMPLEMENTED");
+   assert_eq!(world.query(&format!("SELECT state||'/'||resume_state FROM runs WHERE run_id='{run}'"))?,"BLOCKED/SPECIFYING");
+   let q:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval' ORDER BY seq DESC LIMIT 1")?)?;
+   let payload=match kind{
+    "ApproveSpec"=>json!({"spec_sha256":q["spec_sha256"],"decision":"APPROVE_ONLY"}),
+    "AnswerQuestion"=>json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"}),
+    _=>json!({"text":"approve","target_role":null,"input_kind":"REPLY"}),
+   };
+   if kind == "SendInput" {
+    let mut cli=world.command(&["-p","approve","--resume",&run,"--detach"]);
+    let output=tokio::task::spawn_blocking(move ||cli.output()).await??;
+    assert_eq!(output.status.code(),Some(0),"{}",String::from_utf8_lossy(&output.stderr));
+   } else { input(&host,&world,&run,"approval",kind,payload).await?; }
+   assert_eq!(world.query("SELECT count(*) FROM specs WHERE revision=1")?,"1");
+   assert_eq!(world.query("SELECT state||'/'||coalesce(spec_id,'NULL') FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED/NULL");
+   assert_eq!(world.query("SELECT count(*) FROM commands WHERE kind='ApproveSpec'")?,"1");
+   input(&host,&world,&second,"adopt-draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+   assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"1");
+   assert_eq!(world.query(&format!("SELECT count(*) FROM runs WHERE run_id='{second}' AND spec_id IS NOT NULL"))?,"1");
+   assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.drafting'")?,"1");
+   Ok(())
+  }.await;
+        host.shutdown().await;
+        result?;
+    }
+    Ok(())
+}

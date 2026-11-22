@@ -65,7 +65,7 @@ fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_three_run_reasons() 
             TaskReason::all().len(),
             RunReason::ALL.len()
         ),
-        (12, 3, 8, 23, 3)
+        (12, 3, 8, 23, 5)
     );
     // Each ALL holds every variant once, in its position (a variant left out of ALL has a position past its end).
     let positions = |all: Vec<usize>| all.iter().enumerate().all(|(i, p)| i == *p);
@@ -86,9 +86,9 @@ fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_three_run_reasons() 
             WorkReason::DirtyWorkspace.position(),
             SourceReason::Flaky.position(),
             VerifierReason::ReportRejected.position(),
-            RunReason::BaselineTests.position()
+            RunReason::DraftQuestion.position()
         ),
-        (11, 2, 7, 2),
+        (11, 2, 7, 4),
         "the last variant of each closes its ALL"
     );
     for reason in TaskReason::all() {

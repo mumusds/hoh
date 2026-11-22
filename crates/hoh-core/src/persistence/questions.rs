@@ -42,6 +42,10 @@ pub enum Route {
     /// `runtime:baseline_tests`: run the detected tests once into the baseline, or not (docs/adr/ADR-039.md
     /// decision 8).
     BaselineTests,
+    /// User-only approval, normalized by commands before this dispatcher.
+    SpecApproval,
+    /// A draft agent question, answered as the next attempt’s note.
+    DraftQuestion,
     /// A work task's own end: continue or cancel.
     Continue,
     /// A work task's repairs used up: rework or cancel.
@@ -59,7 +63,7 @@ impl Route {
     /// explicit `run` or `skip` exits (docs/adr/ADR-039.md decision 8, M3N-054); the Commander's have none.
     pub fn default_choice(self) -> Option<&'static str> {
         match self {
-            Route::BaselineTests => None,
+            Route::BaselineTests | Route::SpecApproval | Route::DraftQuestion => None,
             _ => self.choices().first().map(|(id, _)| *id),
         }
     }
@@ -68,7 +72,8 @@ impl Route {
     /// Commander's are its own.
     pub fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Route::Commander => &[],
+            Route::Commander | Route::DraftQuestion => &[],
+            Route::SpecApproval => &[("approve", "批准规格"), ("reject", "退回修改")],
             Route::Adopt => &[
                 ("adopt", "采用项目已批准的规格"),
                 ("draft", "由 Plan 起草规格并请我批准"),
@@ -143,6 +148,8 @@ pub fn route_run(reason: RunReason) -> Route {
         RunReason::NoSpec => Route::Adopt,
         RunReason::Stalled => Route::Stalled,
         RunReason::BaselineTests => Route::BaselineTests,
+        RunReason::SpecApproval => Route::SpecApproval,
+        RunReason::DraftQuestion => Route::DraftQuestion,
     }
 }
 
@@ -416,7 +423,7 @@ fn runtime(
         source: "runtime",
         subject: Some("run"),
         reason: Some(reason.as_str().to_owned()),
-        task_id: None,
+        task_id: payload["task_id"].as_str().map(str::to_owned),
         refusal: false,
         round_id: None,
         round_root: None,
@@ -685,6 +692,9 @@ pub(super) fn answer(
             details: Some(Box::new(json!({"question_id": a.question_id}))),
         });
     };
+    if question.route == Route::SpecApproval {
+        return Err(PersistError::SpecApprovalNotUser("origin_unknown"));
+    }
     let choice = choose(&question, a.choice_id, a.answer)?;
     let picked = choice.as_deref().unwrap_or_default();
     let exit = exit_name(question.route, picked);
@@ -787,6 +797,11 @@ pub(super) fn answer(
                 super::baseline::skipped(tx, a.project_id, a.run_id, ctx)?;
             }
         }
+        Route::DraftQuestion => {
+            super::draft_approval::retry(tx, a, &question, ctx)?;
+            claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
+        }
+        Route::SpecApproval => unreachable!("normalized before answering"),
         Route::Stalled => {
             claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
             if picked == "cancel" {
@@ -901,6 +916,8 @@ fn claims_events(tx: &Transaction<'_>, claims: Claims) -> Result<Vec<NewEvent>, 
 fn exit_name(route: Route, choice: &str) -> &'static str {
     match (route, choice) {
         (Route::Commander, _) => "applied",
+        (Route::SpecApproval, _) => "approval",
+        (Route::DraftQuestion, _) => "draft",
         (Route::Adopt, "draft") => "draft",
         (Route::Adopt, _) => "adopt",
         (Route::Stalled, "cancel") => "cancel",
@@ -1056,7 +1073,15 @@ fn task_exit(
             }
             move_task(tx, task, TaskState::Ready, false, Vec::new(), ctx)?;
         }
-        (Route::Commander | Route::Adopt | Route::Stalled | Route::BaselineTests, _) => {
+        (
+            Route::Commander
+            | Route::BaselineTests
+            | Route::Adopt
+            | Route::Stalled
+            | Route::SpecApproval
+            | Route::DraftQuestion,
+            _,
+        ) => {
             return Err(PersistError::IntegrityViolation(format!(
                 "question {} is no task's",
                 q.question_id
