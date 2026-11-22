@@ -2041,3 +2041,86 @@ fn test_007_01_slash_and_shift_tab_submit_one_setmode_shape() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_008_03_plan_question_is_shown_and_explicit_answer_restores_specifying() -> R {
+    use serde_json::json;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let world = world::World::named("m3t04-question")?;
+    world.configure(&[], "")?;
+    world.commit_project(&[world::Requirement {
+        id: "REQ-A".into(),
+        title: "待规划需求".into(),
+        criteria: Vec::new(),
+    }])?;
+    let team = world::Team::new(|turn| {
+        if turn.state != "CREATED" {
+            return Vec::new();
+        }
+        let mut steps = world::steps("CREATED", "SPECIFYING");
+        let mut ask = world::ask("release-choice", "请选择发布方式");
+        ask["choices"] = json!([
+            {"choice_id":"first","label":"第一种方式"},
+            {"choice_id":"second","label":"第二种方式"}]);
+        steps.push(ask);
+        steps
+    });
+    let host = runtime.block_on(world.team_host(team, None))?;
+    let outcome = (|| -> R {
+        world.seed_spec()?;
+        let body = json!({"schema_version":"1.0", "command_id":"plan-question", "idempotency_key":"plan-question",
+            "expected_revision":0, "kind":"StartRun", "run_id":null,
+            "payload":{"goal":"规划发布", "mode":"PLAN", "interactive":true}});
+        let (status, accepted) =
+            runtime.block_on(world::exchange(&host, "POST", "/v1/commands", Some(&body)))?;
+        assert_eq!(status, 202, "{accepted}");
+        let run = accepted["run_id"].as_str().ok_or("run_id")?;
+        world.staff(run)?;
+        world.wait("SELECT count(*) FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.question')='请选择发布方式'", "1", WAIT)?;
+        let mut pty = Pty::new(30, 120)?;
+        let mut child = world.hoh_pty(&pty, &["attach", run])?;
+        let shown = pty::screen_until(&pty, 30, 120, WAIT, |s| {
+            s.contains("请选择发布方式") && s.contains("第二种方式")
+        })?;
+        assert!(shown.contains("第一种方式"), "{shown}");
+        if let Some(evidence) = std::env::var_os("HOH_EVIDENCE_DIR") {
+            std::fs::write(Path::new(&evidence).join("test-008-03-question.txt"), shown)?;
+        }
+        // The acceptance scenario explicitly requires a ten-second unanswered interval.
+        std::thread::sleep(Duration::from_secs(10));
+        assert_eq!(
+            world.query("SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs")?,
+            "BLOCKED/NEED_DECISION/SPECIFYING"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM events WHERE kind='question.answered'")?,
+            "0"
+        );
+        let question = world.query("SELECT json_extract(payload_json,'$.question_id') FROM events WHERE kind='question.asked' ORDER BY seq DESC LIMIT 1")?;
+        pty.send(b"\t\x1b[B\r")?;
+        world.wait(
+            "SELECT count(*) FROM events WHERE kind='question.answered'",
+            "1",
+            WAIT,
+        )?;
+        assert_eq!(world.query("SELECT state FROM runs")?, "SPECIFYING");
+        let answers =
+            world.rows("SELECT payload_json FROM events WHERE kind='question.answered'")?;
+        let answer: serde_json::Value =
+            serde_json::from_str(answers[0]["payload_json"].as_str().ok_or("payload")?)?;
+        assert_eq!(answer["question_id"], question);
+        assert_eq!(answer["choice_id"], "second");
+        assert_eq!(
+            world.query("SELECT count(*) FROM commands WHERE kind='AnswerQuestion'")?,
+            "1"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='decision.applied' AND json_extract(payload_json,'$.kind')='record_assumption'")?, "0");
+        signal(&child, Signal::TERM)?;
+        assert_eq!(exit_within(&mut child, WAIT)?.code(), Some(143));
+        Ok(())
+    })();
+    runtime.block_on(host.shutdown());
+    outcome
+}

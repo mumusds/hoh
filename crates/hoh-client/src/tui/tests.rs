@@ -1777,3 +1777,42 @@ fn status_counts_the_hosts_trace_and_computes_nothing() {
         Some("追踪 · 规格修订 2 · broken 1 · orphan 2 · stale 0")
     );
 }
+
+#[test]
+fn test_008_03_questions_survive_projection_and_require_explicit_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.attach("R", "BLOCKED");
+    app.projection(&serde_json::json!({"state":"BLOCKED", "projection":{
+        "mode":"PLAN", "questions":[{"question_id":"Q-one", "text":"请选择发布方式",
+        "choices":[{"choice_id":"first","label":"第一种方式"},
+                   {"choice_id":"second","label":"第二种方式"}]}]}}));
+    let shown = screen(&app, 100, 24).join("\n");
+    assert!(shown.contains("请选择发布方式"), "{shown}");
+    assert!(
+        shown.contains("第一种方式") && shown.contains("第二种方式"),
+        "{shown}"
+    );
+    app.key(key(KeyCode::Enter));
+    assert!(
+        app.take_requests().is_empty(),
+        "empty Enter must not approve"
+    );
+    app.key(key(KeyCode::Tab));
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Enter));
+    assert_eq!(
+        app.take_requests(),
+        vec![Request::Answer {
+            question_id: "Q-one".into(),
+            choice: "second".into()
+        }]
+    );
+    app.key(key(KeyCode::Tab));
+    app.projection(&serde_json::json!({"projection":{"questions":[]}}));
+    app.key(key(KeyCode::Enter));
+    assert!(
+        app.take_requests().is_empty(),
+        "replaced questions cannot be answered"
+    );
+}

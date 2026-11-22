@@ -564,6 +564,27 @@ fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request
                 Err(f) => app.say(format!("未提交：{}：{}", f.code, f.message)),
             }
         }
+        Request::Answer {
+            question_id,
+            choice,
+        } => {
+            if let Some(link) = link.as_ref() {
+                let result = link.run().and_then(|run| {
+                    let revision = run.as_ref().and_then(|r| r["revision"].as_i64()).unwrap_or_default();
+                    crate::client::fresh(|c| link.submit(c), || link.run(), &link.run_id, revision, |revision| {
+                        json!({"expected_revision":revision, "kind":"AnswerQuestion", "run_id":link.run_id,
+                            "payload":{"question_id":question_id,"choice_id":choice,"answer":choice}})
+                    })
+                });
+                match result {
+                    Ok(_) => app.say(format!("已答复 {question_id}：{choice}")),
+                    Err(f) => app.say(format!("答复未受理：{}：{}", f.code, f.message)),
+                }
+                if let Ok(Some(run)) = link.run() {
+                    app.projection(&run);
+                }
+            }
+        }
         Request::SetMode(mode) => set_mode(app, link.as_ref(), &mode),
         Request::CycleMode => {
             if let Some(link) = link.as_ref()
