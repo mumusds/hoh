@@ -567,3 +567,62 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
     host.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_023_04_major_decision_escalates_before_dispatch() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t10-major-").tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let tasks = sql(
+        dir.path(),
+        "SELECT task_id FROM tasks ORDER BY task_id",
+        true,
+    )?;
+    for class in ["spec", "adr", "public_api", "gate"] {
+        let request = message(
+            class,
+            json!({"intent":"apply","decision_class":class,"statement":format!("Change {class} signature")}),
+        )?;
+        let reply = host
+            .store()
+            .consult_request(request.clone())
+            .await?
+            .ok_or("major conclusion not handled")?;
+        assert_eq!(reply["status"], "rejected");
+        assert_eq!(reply["reason_code"], "ILLEGAL_TRANSITION");
+        assert_eq!(reply["details"]["decision_class"], class);
+        assert_eq!(host.store().consult_request(request).await?, Some(reply));
+    }
+    assert_eq!(events(dir.path(), "need_decision")?.len(), 4);
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT task_id FROM tasks ORDER BY task_id",
+            true
+        )?,
+        tasks
+    );
+    assert_eq!(
+        sql(
+            dir.path(),
+            "SELECT count(*) n FROM outbox WHERE json_extract(payload_json,'$.kind')='dispatch'",
+            true
+        )?[0]["n"],
+        0
+    );
+    assert_eq!(
+        sql(dir.path(), "SELECT count(*) n FROM decisions", true)?[0]["n"],
+        0
+    );
+    let plain = message(
+        "plain",
+        json!({"question":"Does this public API have a useful name?"}),
+    )?;
+    assert!(
+        host.store().consult_request(plain).await?.is_none(),
+        "free text is not a major-decision classifier"
+    );
+    host.shutdown().await;
+    Ok(())
+}

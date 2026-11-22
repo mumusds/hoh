@@ -520,3 +520,16 @@ pub(super) fn discussion_limit(
         payload: json!({"reason":"discussion_limit","fingerprint":controversy,"controversy_id":controversy,"opinions":opinions,"cause":cause}),
     }
 }
+
+/// Structured changes to adopted interfaces or decisions require Commander deliberation.
+pub(super) fn major_decision(project: &str, run: &str, class: &Value, statement: &str) -> NewEvent {
+    let fingerprint = crate::context::sha256_hex(statement.as_bytes());
+    NewEvent {
+        intent: Intent::Progress,
+        project_id: project.into(),
+        run_id: Some(run.into()),
+        event_id: crate::ids::child_id(run, &format!("major/{fingerprint}")),
+        kind: KIND.into(),
+        payload: json!({"reason":"major_decision","fingerprint":fingerprint,"decision_class":class,"statement":statement}),
+    }
+}
