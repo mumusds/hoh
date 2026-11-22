@@ -558,6 +558,19 @@ fn apply(
         },
         ctx,
     )?;
+    // A specification review's attempt settled here has no report to take in (its final message is not kept across a
+    // restart): its review ends without one and its revision is reviewed again (REQ-031 behaviour 3).
+    if attempt_to == Some(AttemptState::Settled) && task_to == Some(TaskState::Implemented) {
+        super::spec_review::ended_without_report(
+            &tx,
+            &row.attempt_id,
+            &format!(
+                "report_not_collected: its attempt was settled by a {cause}; its final message is not kept across \
+                 a restart"
+            ),
+            ctx,
+        )?;
+    }
     super::writer::commit_unhooked(tx, ctx)?;
     Ok(ReconcileDone::Event(
         done.event_seqs.last().copied().unwrap_or(0),

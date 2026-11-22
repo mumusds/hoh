@@ -280,3 +280,290 @@ async fn an_intake_ends_its_review_task_accepted() -> R {
     assert!(store.reader()?.spec_review_due("R")?.is_some());
     Ok(())
 }
+
+/// Once `counting`, fails the commit of the write that reaches the `nth` EventsWritten point of the runner's writer
+/// jobs (the review end's own job, or the generic runner job it was): what a kill inside that write leaves, the
+/// transaction rolled back.
+#[derive(Debug)]
+struct FailAtEvents {
+    nth: u32,
+    counting: std::sync::atomic::AtomicBool,
+    seen: std::sync::atomic::AtomicU32,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl crate::persistence::FaultHooks for FailAtEvents {
+    fn at(&self, job: &'static str, point: crate::persistence::WritePoint) {
+        use std::sync::atomic::Ordering;
+        if self.counting.load(Ordering::SeqCst)
+            && ["Runner", "FinishedReview"].contains(&job)
+            && point == crate::persistence::WritePoint::EventsWritten
+            && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.nth
+        {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn before_commit(&self) -> Result<(), crate::persistence::PersistError> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::persistence::PersistError::Full(
+                "injected: the review end's write failed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// [`world`] with `faults` in the store.
+fn world_with(
+    dir: &Path,
+    faults: std::sync::Arc<dyn crate::persistence::FaultHooks>,
+) -> R<(Store, PathBuf)> {
+    let path = dir.join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            faults,
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    Connection::open(&path)?.execute_batch(WORLD)?;
+    Ok((store, path))
+}
+
+/// The review opened in `store` with its task RUNNING and its attempt AR RUNNING in the reviewer's session (its work
+/// effect OBSERVED, done); its review id and task id.
+async fn running_review(store: &Store, path: &Path) -> R<(String, String)> {
+    assert!(store.open_spec_review("R", "s1", COMMIT).await?);
+    let (review, task) = (
+        text(
+            path,
+            "SELECT json_extract(payload_json, '$.review_id') FROM events WHERE kind = 'spec_review.opened'",
+        )?,
+        text(path, "SELECT task_id FROM tasks WHERE role = 'reviewer'")?,
+    );
+    exec(
+        path,
+        &format!(
+            "UPDATE tasks SET state = 'RUNNING', revision = 2 WHERE task_id = '{task}';
+             INSERT INTO attempts(attempt_id, task_id, session_id, state, role_epoch, host_epoch, config_revision,
+               started_at) VALUES ('AR', '{task}', 'sr', 'RUNNING', 1, 1, 1, '2026-11-22T00:00:01Z');
+             INSERT INTO effects(effect_key, attempt_id, state) VALUES ('{}', 'AR', 'OBSERVED');",
+            crate::reconcile::work_key("AR")
+        ),
+    )?;
+    Ok((review, task))
+}
+
+/// A review attempt's successful end, as the runner hands it.
+fn ended(unknown_effect: bool) -> crate::persistence::Ending {
+    crate::persistence::Ending {
+        success: true,
+        detail: "reviewed".to_owned(),
+        class: crate::retry::FailureClass::Transient { retry_after: None },
+        at: SystemTime::now(),
+        draw: 0,
+        observed: crate::persistence::Observed::default(),
+        unknown_effect,
+    }
+}
+
+/// Its intake without a report (REJECTED, report_missing) whose raw log is `raw`.
+fn bare_intake(review: &str, raw: &[u8]) -> crate::persistence::SpecReviewIntake {
+    let sha256 = crate::specindex::digest(raw);
+    crate::persistence::SpecReviewIntake {
+        review_id: review.to_owned(),
+        attempt_id: "AR".to_owned(),
+        report: None,
+        native: None,
+        raw: crate::persistence::ArtifactRow {
+            path: ".hoh/attempts/AR/stdout.jsonl".to_owned(),
+            sha256: sha256.clone(),
+            bytes: raw.len() as u64,
+            mime: "application/jsonl".to_owned(),
+            kind: "raw_log".to_owned(),
+            name: "stdout.jsonl".to_owned(),
+        },
+        raw_sha256: sha256,
+    }
+}
+
+/// The attempt's, its task's state and the review events' count: `<attempt> <task> <reported> <ended> <opened>`.
+fn ledger(path: &Path, task: &str) -> R<String> {
+    text(
+        path,
+        &format!(
+            "SELECT (SELECT state FROM attempts WHERE attempt_id = 'AR') || ' ' || \
+             (SELECT state FROM tasks WHERE task_id = '{task}') || ' ' || \
+             (SELECT count(*) FROM events WHERE kind = 'spec_review.reported') || ' ' || \
+             (SELECT count(*) FROM events WHERE kind = 'spec_review.ended') || ' ' || \
+             (SELECT count(*) FROM events WHERE kind = 'spec_review.opened')"
+        ),
+    )
+}
+
+/// A kill at each write of the review end's job (the attempt's move and end, then its report taken in): nothing of the
+/// end is left, so the attempt is still RUNNING for the reconcile, or all of it is; never its task IMPLEMENTED without
+/// a report (REQ-031 behaviour 3).
+#[tokio::test]
+async fn test_031_04_a_review_end_and_its_intake_commit_together() -> R {
+    let mut killed = 0;
+    for nth in 1..=20 {
+        let dir = tempfile::tempdir()?;
+        let faults = std::sync::Arc::new(FailAtEvents {
+            nth,
+            counting: false.into(),
+            seen: 0.into(),
+            armed: false.into(),
+        });
+        let (store, path) = world_with(dir.path(), faults.clone())?;
+        let (review, task) = running_review(&store, &path).await?;
+        faults
+            .counting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ended_at = store
+            .finish_spec_review("AR", ended(false), Some(bare_intake(&review, b"{}\n")))
+            .await;
+        if ended_at.is_ok() {
+            assert_eq!(ledger(&path, &task)?, "SETTLED ACCEPTED 1 0 1", "{nth}");
+            break;
+        }
+        killed += 1;
+        assert_eq!(
+            ledger(&path, &task)?,
+            "RUNNING RUNNING 0 0 1",
+            "write {nth}"
+        );
+        // Ended again: the end and its report together.
+        assert!(
+            store
+                .finish_spec_review("AR", ended(false), Some(bare_intake(&review, b"{}\n")))
+                .await?
+        );
+        assert_eq!(ledger(&path, &task)?, "SETTLED ACCEPTED 1 0 1", "{nth}");
+    }
+    // The end's own writes and the report's.
+    assert!(killed >= 2, "{killed}");
+    Ok(())
+}
+
+/// A review attempt a reconcile settles (its work observed done, its final message lost with its host): the review
+/// task ends without a report (`spec_review.ended`, once), and the revision is reviewed again under a new review id,
+/// once (REQ-031 behaviour 3).
+#[tokio::test]
+async fn test_031_04_a_review_settled_by_a_reconcile_ends_and_is_opened_again_once() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = world(dir.path())?;
+    let (review, task) = running_review(&store, &path).await?;
+    let rows = store.reconcile_scan("p1", SystemTime::now()).await?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.attempt_id == "AR")
+        .ok_or("AR not unfinished")?;
+    let disposition = crate::reconcile::dispose(&crate::reconcile::Unfinished {
+        attempt_id: row.attempt_id.clone(),
+        state: row.state,
+        task_state: row.task_state,
+        process: crate::reconcile::Process::Gone {
+            basis: "no_process".to_owned(),
+        },
+        effects: row
+            .effects
+            .iter()
+            .map(|e| crate::reconcile::Effect {
+                key: e.key.clone(),
+                state: e.state,
+                observation: None,
+            })
+            .collect(),
+        lease_expired: row.lease_expired,
+        work_outcome: Some(true),
+        writer: row.writer,
+        verifier: row.verifier,
+    });
+    assert!(
+        matches!(disposition, crate::reconcile::Disposition::Completed { .. }),
+        "{disposition:?}"
+    );
+    store
+        .reconcile_apply(
+            row,
+            disposition,
+            crate::reconcile::Process::Gone {
+                basis: "no_process".to_owned(),
+            },
+            "reconcile",
+            SystemTime::now(),
+            0,
+        )
+        .await?;
+    assert_eq!(ledger(&path, &task)?, "SETTLED ACCEPTED 0 1 1");
+    let ended = events(&path, "spec_review.ended")?;
+    assert_eq!(ended[0]["review_id"], json!(review));
+    assert_eq!(ended[0]["task_id"], json!(task));
+    assert_eq!(ended[0]["attempt_id"], "AR");
+    assert_eq!(ended[0]["spec_revision"], 1);
+    assert!(
+        ended[0]["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("report_not_collected: ")),
+        "{ended:?}"
+    );
+    // Reviewed again, once: a new review id, then in progress.
+    let reader = store.reader()?;
+    assert!(reader.spec_review_due("R")?.is_some());
+    assert!(store.open_spec_review("R", "s1", COMMIT).await?);
+    assert!(!store.open_spec_review("R", "s1", COMMIT).await?);
+    let opened = events(&path, "spec_review.opened")?;
+    assert_eq!(opened.len(), 2);
+    assert_ne!(opened[1]["review_id"], json!(review));
+    Ok(())
+}
+
+/// A review attempt whose end is not a settle takes no report in: cancelled (its task the cancel's to move) or ended
+/// with an effect not confirmed (its task left as a read task's is); a settled one handed no intake, or one its intake
+/// refuses as inconsistent, ends its review without a report, once (REQ-031 behaviour 3).
+#[tokio::test]
+async fn test_031_04_only_a_settled_review_attempt_takes_its_report_in() -> R {
+    for case in ["cancelled", "unknown_effect", "no_intake", "refused"] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = world(dir.path())?;
+        let (review, task) = running_review(&store, &path).await?;
+        if case == "cancelled" {
+            exec(
+                &path,
+                "UPDATE attempts SET cancel_requested = 1 WHERE attempt_id = 'AR'",
+            )?;
+        }
+        let mut intake = Some(bare_intake(&review, b"{}\n"));
+        if case == "no_intake" {
+            intake = None;
+        }
+        if case == "refused" {
+            // Another review's id: the intake's integrity error, not a reason.
+            intake = Some(bare_intake("no-such-review", b"{}\n"));
+        }
+        store
+            .finish_spec_review("AR", ended(case == "unknown_effect"), intake)
+            .await?;
+        let want = match case {
+            "cancelled" => "CANCELLED RUNNING 0 0 1",
+            "unknown_effect" => "UNKNOWN_EFFECT RUNNING 0 0 1",
+            _ => "SETTLED ACCEPTED 0 1 1",
+        };
+        assert_eq!(ledger(&path, &task)?, want, "{case}");
+        let due = store.reader()?.spec_review_due("R")?;
+        assert_eq!(due.is_some(), want.contains("ACCEPTED"), "{case}");
+        if case == "refused" {
+            let ended = events(&path, "spec_review.ended")?;
+            assert!(
+                ended[0]["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("intake_refused: ")),
+                "{ended:?}"
+            );
+        }
+    }
+    Ok(())
+}

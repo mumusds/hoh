@@ -103,8 +103,8 @@ pub(super) enum RunnerJob {
         attempt_id: String,
         ending: Box<Ending>,
     },
-    /// A specification review attempt's end and, for a COMPLETED result, its report's intake: one job, so nothing of
-    /// the writer comes between them (docs/adr/ADR-035.md decision 7).
+    /// A specification review attempt's end and, for a COMPLETED result, its report's intake: one transaction, so
+    /// neither a kill nor another write comes between them (docs/adr/ADR-035.md decision 7).
     FinishedReview {
         attempt_id: String,
         ending: Box<Ending>,
@@ -403,13 +403,8 @@ pub(super) fn run(
             attempt_id,
             ending,
             intake,
-        } => {
-            let applied = finished(conn, &attempt_id, &ending, ctx)?;
-            if applied && let Some(intake) = intake {
-                super::spec_review::record(conn, &intake, ctx)?;
-            }
-            Ok(RunnerDone::Applied(applied))
-        }
+        } => super::spec_review::finish(conn, &attempt_id, &ending, intake.as_deref(), ctx)
+            .map(RunnerDone::Applied),
         RunnerJob::OpenReview {
             run_id,
             spec_id,
