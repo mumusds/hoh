@@ -71,6 +71,13 @@ The boundary is enforced by the compiler, and this scan checks that nothing swit
    file the product reads as data whose prose mentions SQLite (the specification), holding no SQL write; a listed
    script, a listed file holding a SQL write and an entry without a reason are hits:
    a unit test outside persistence that needs SQLite text belongs under tests/ or in an inline test module. A cargo configuration may not `include` another (M2T01R-62).
+   Product code may embed (`include_str!`/`include_bytes!`) and name a Markdown file under resources/ that the
+   whitelist lists under embedded_markdown with its reason (CR-034; built-in prompts and skills whose prose mentions
+   SQLite), identified by its own path: the path as written leads, through no symbolic link, to that listed regular,
+   non-executable file of the repository, which holds no SQL write. Every embedded_markdown entry is checked: no
+   reason, not a Markdown file under resources/ (by its normal path), not such a regular file, executable, holding a
+   SQL write, or mentioning no SQLite (it needs no entry) are hits; unlisted files, scripts and paths outside the
+   repository stay hits as above.
 7. Append-only tables (docs/adr/ADR-029.md decision 6, J1): anywhere in the members' Rust sources (persistence and
    test code included), a literal (or a concat! run) holding an UPDATE, DELETE, REPLACE (INSERT OR REPLACE) or an
    upsert's DO UPDATE of acceptance_results or evidence is a hit, unless the whitelist's append_only_allow names its
@@ -86,7 +93,7 @@ Scanning no file at all fails (no empty scan). Prints a JSON summary; with --out
 line for TEST-062-05. --metadata reads `cargo metadata` JSON from a file (tests).
 """
 from __future__ import annotations
-import argparse, json, os, re, subprocess, sys, tomllib
+import argparse, json, os, re, stat, subprocess, sys, tomllib
 from pathlib import Path
 
 PERSISTENCE = 'crates/hoh-core/src/persistence/'
@@ -177,6 +184,61 @@ def read_as_data(root: Path) -> dict:
     except (OSError, ValueError, AttributeError):
         return {}
     return listed if isinstance(listed, dict) else {}
+
+
+# What product code may embed (include_str!/include_bytes!) and name although it mentions SQLite (CR-034): a Markdown
+# file under resources/ listed with its reason in the whitelist's embedded_markdown, holding no SQL write.
+EMBEDDED_MARKDOWN = ('resources/', '.md')
+
+
+def embedded_markdown(root: Path) -> dict:
+    """The whitelist's embedded_markdown entries (path -> reason); none when it has none or cannot be read (check 6
+    reports an unreadable whitelist)."""
+    try:
+        listed = json.loads((root / WHITELIST).read_text(encoding='utf-8')).get('embedded_markdown', {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return listed if isinstance(listed, dict) else {}
+
+
+def embedded_markdown_problem(root: Path, rel, why) -> str | None:
+    """Why an embedded_markdown entry may not be embedded (CR-034), or None: it gives a reason, names by its normal
+    path a Markdown file under resources/ that is a regular, non-executable file of the repository reached through no
+    symbolic link, holds no SQL write and mentions SQLite (otherwise it needs no entry)."""
+    if not isinstance(why, str) or not why.strip():
+        return 'no reason given'
+    if (not isinstance(rel, str) or not rel.startswith(EMBEDDED_MARKDOWN[0]) or not rel.endswith(EMBEDDED_MARKDOWN[1])
+            or os.path.normpath(rel) != rel or '..' in rel.split('/')):
+        return 'not a Markdown file under resources/'
+    path = root / rel
+    try:
+        mode = os.lstat(path).st_mode
+        real = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return 'not a regular file of the repository'
+    if real != path or not stat.S_ISREG(mode):
+        return 'not a regular file of the repository'
+    if mode & 0o111:
+        return 'executable'
+    text = path.read_bytes().decode('utf-8', errors='replace')
+    if SQL_WRITE.search(text):
+        return 'holds a SQL write'
+    if not mentions(text):
+        return 'mentions no SQLite and holds no SQL write'
+    return None
+
+
+def is_embedded_markdown(root: Path, lexical: Path, embedded: set) -> bool:
+    """Whether a path as written (joined to its base, not yet resolved) is a usable embedded_markdown entry by its own
+    identity: its normal form lies in the repository, is listed, and is where the path really leads (no symbolic link
+    on the way, CR-034)."""
+    normal = Path(os.path.normpath(lexical))
+    if not normal.is_relative_to(root) or normal.relative_to(root).as_posix() not in embedded:
+        return False
+    try:
+        return lexical.resolve(strict=True) == normal
+    except (OSError, RuntimeError):
+        return False
 # Markdown here is prose about the system, not something the product runs or embeds.
 DOCUMENTATION = ('docs/', 'reports/')
 
@@ -793,6 +855,7 @@ def rel_to(path: Path, root: Path) -> str:
 def scan(root: Path, metadata: dict) -> dict:
     hits = []
     data = read_as_data(root)
+    embedded = {rel for rel, why in embedded_markdown(root).items() if embedded_markdown_problem(root, rel, why) is None}
     allow = append_only_allow(root)
     used_allow: set = set()
     dev_uses = dependency_checks(metadata, hits)
@@ -841,16 +904,20 @@ def scan(root: Path, metadata: dict) -> dict:
         runtime = sorted([lit for lit in runtime_literals(code, literals) if product(lit[0])]
                          + [d for d in doc_comments if product(d[0]) and any(a < d[0] < b for a, b in invocations)])
         docs = documentation_spans(code) + tests
-        for kind, value in included_contents(path, code, literals, root, skip=docs):
+        for kind, value, lexical in included_contents(path, code, literals, root, skip=docs):
             if kind == 'unverifiable':
                 hits.append({'path': rel, 'kind': 'included-file', 'match': value})
+            elif is_embedded_markdown(root, lexical, embedded):
+                continue  # a listed Markdown resource embedded as data (CR-034)
             elif re.search(r'sqlite', value, re.IGNORECASE) or SQL_WRITE.search(value):
                 hits.append({'path': rel, 'kind': 'included-file', 'match': f'{kind}: mentions SQLite or holds a SQL write'})
-        for named, target, text in named_repository_files(root, path, runtime):
+        for named, target, text, lexical in named_repository_files(root, path, runtime):
             # A literal naming a repository file that something runs or reads (`python3 scripts/db_helper.py`) is
             # checked like the literal itself (M2T01R-45), unless it is a data file listed as read as data that holds
-            # no SQL write (CR-019).
+            # no SQL write (CR-019) or a listed Markdown resource the product embeds (CR-034).
             if target in data and target.endswith(DATA_SUFFIXES) and not SQL_WRITE.search(text):
+                continue
+            if is_embedded_markdown(root, lexical, embedded):
                 continue
             if re.search(r'sqlite', text, re.IGNORECASE) or SQL_WRITE.search(text):
                 hits.append({'path': rel, 'kind': 'named-file', 'match': f'{named}: mentions SQLite or holds a SQL write'})
@@ -920,9 +987,11 @@ def canary_verdict(log: str) -> dict:
     return {'refused': len(refused), 'required': len(CANARY_REQUIRED), 'problems': problems}
 
 
-def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int, str]]) -> list[tuple[str, str, str]]:
-    """(literal, the file relative to the repository, contents) for every string literal that names an existing file of
-    the repository, relative to the repository, the source's directory or its member's directory."""
+def named_repository_files(root: Path, path: Path,
+                           literals: list[tuple[int, int, str]]) -> list[tuple[str, str, str, Path]]:
+    """(literal, the file relative to the repository, contents, the path as written joined to its base) for every
+    string literal that names an existing file of the repository, relative to the repository, the source's directory
+    or its member's directory."""
     out = []
     bases = [root, path.parent] + [p for p in path.parents if (p / 'Cargo.toml').is_file()][:1]
     for _, _, value in literals:
@@ -938,7 +1007,8 @@ def named_repository_files(root: Path, path: Path, literals: list[tuple[int, int
                 named = False
             if named:
                 try:
-                    out.append((value, rel_to(candidate, root), candidate.read_bytes().decode('utf-8', errors='replace')))
+                    out.append((value, rel_to(candidate, root), candidate.read_bytes().decode('utf-8', errors='replace'),
+                                base / value))
                 except OSError:
                     pass
                 break
@@ -999,6 +1069,10 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
         else:
             continue
         hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'read_as_data {rel}: {problem}'})
+    # Each embedded_markdown entry (CR-034): see embedded_markdown_problem.
+    for rel, why in sorted(embedded_markdown(root).items()):
+        if problem := embedded_markdown_problem(root, rel, why):
+            hits.append({'path': WHITELIST, 'kind': 'whitelist', 'match': f'embedded_markdown {rel}: {problem}'})
     read = 0
     for path in repository_files(root, metadata):
         rel = rel_to(path, root)
@@ -1030,26 +1104,28 @@ def content_checks(root: Path, metadata: dict, hits: list) -> int:
 
 
 def included_contents(path: Path, code: str, literals: list[tuple[int, int, str]], root: Path,
-                      skip: list[tuple[int, int]] = ()) -> list[tuple[str, str]]:
-    """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file, text) pairs), read like
-    its literals: an embedded helper run by an interpreter is code too (M2T01R-41). A path that is not a plain literal
-    cannot be read here and is reported as unverifiable."""
+                      skip: list[tuple[int, int]] = ()) -> list[tuple[str, str, Path | None]]:
+    """The contents of the files a source embeds with `include_str!`/`include_bytes!` ((file name as written, text,
+    the path as written joined to the source's directory)), read like its literals: an embedded helper run by an
+    interpreter is code too (M2T01R-41). A path that is not a plain literal cannot be read here and is reported as
+    unverifiable."""
     out = []
     for m in re.finditer(r'\binclude_(?:str|bytes)\s*!\s*[(\[{]', code):
         if any(a <= m.start() < b for a, b in skip):
             continue  # embedded into documentation only
         lit = next((l for l in literals if l[0] >= m.end()), None)
         if lit is None or code[m.end():lit[0]].strip():
-            out.append(('unverifiable', 'include_str!/include_bytes! of a computed path'))
+            out.append(('unverifiable', 'include_str!/include_bytes! of a computed path', None))
             continue
-        target = (path.parent / lit[2]).resolve()
+        lexical = path.parent / lit[2]
+        target = lexical.resolve()
         if not target.is_relative_to(root):
-            out.append(('unverifiable', f'{lit[2]}: outside the repository'))
+            out.append(('unverifiable', f'{lit[2]}: outside the repository', None))
             continue
         try:
-            out.append((target.name, target.read_bytes().decode('utf-8', errors='replace')))
+            out.append((lexical.name, target.read_bytes().decode('utf-8', errors='replace'), lexical))
         except OSError as exc:
-            out.append(('unverifiable', f'{lit[2]}: {exc}'))
+            out.append(('unverifiable', f'{lit[2]}: {exc}', None))
     return out
 
 
