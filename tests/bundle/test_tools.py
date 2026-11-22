@@ -880,6 +880,19 @@ class PersistenceScan(unittest.TestCase):
                     +[('crates/hoh-app/src/main.rs','named-file',f'{up}{rel}{mention}') for rel in refused]
                     +[('crates/hoh-app/src/main.rs','named-file',f'resources/skills/jump/../listed/SKILL.md{mention}')]
                     +symlinks))
+    def test_a_dotdot_after_a_file_is_not_a_directory_undone(self):
+        # CR34-100: `..` undoes a real directory only; `<listed file>/../SKILL.md` is no path to the listed file (the
+        # kernel and rustc answer ENOTDIR), so it keeps the include and named-file hits; `<directory>/../<dir>/SKILL.md`
+        # stays a path to it (positive control).
+        rel='resources/skills/listed/SKILL.md'
+        whitelist={'files':{'clippy.toml':'fixture',rel:'fixture'},'embedded_markdown':{rel:'built-in skill text naming SQLite'}}
+        for written,hit in ((rel+'/../SKILL.md',True),('resources/skills/listed/../listed/SKILL.md',False)):
+            with self.subTest(written=written):
+                files={'crates/hoh-app/src/main.rs':self.EMBED_F+'const S: &str = include_str!("'+self.EMBED_UP+written+'");\nfn main(){}',
+                       rel:'Skill prose naming SQLite.\n','scripts/product/persistence-whitelist.json':json.dumps(whitelist)}
+                rc,res=self.run_scan(files,whitelist=False)
+                kinds=sorted(h['kind'] for h in res['hits'] if h['kind'] in self.EMBED_KINDS)
+                self.assertEqual((rc,kinds),(1,['included-file','named-file']) if hit else (0,[]))
     def test_embedded_markdown_holding_any_sql_write_keeps_its_hits(self):
         # Unchanged refusals (green on both scanners): the exception covers prose only; an INSERT, UPDATE or DELETE
         # statement in a listed file keeps the include and the named file hits.

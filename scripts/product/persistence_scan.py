@@ -236,7 +236,11 @@ def linkless_file(root: Path, lexical: Path) -> str | None:
     parts: list[str] = []
     for part in lexical.relative_to(root).parts:
         if part == '..':
-            if not parts:
+            # `..` undoes a real directory only: after a file it names no path (ENOTDIR, CR34-100).
+            try:
+                if not parts or not stat.S_ISDIR(os.lstat(root.joinpath(*parts)).st_mode):
+                    return None
+            except OSError:
                 return None
             parts.pop()
             continue
