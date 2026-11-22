@@ -18,7 +18,6 @@ use std::collections::BTreeSet;
 pub(super) const OPENED: &str = "spec_review.opened";
 /// The event that records a review's report taken in.
 pub(super) const REPORTED: &str = "spec_review.reported";
-
 /// An object the host kept (`objects::put`) for an intake: its artifact and its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeptObject {
@@ -196,6 +195,9 @@ pub(super) fn intake_in(
         "review_id": intake.review_id, "spec_id": opened.spec_id, "spec_revision": opened.binding.spec_revision,
         "status": checked.report.as_ref().map(|r| r["status"].clone()), "state": state.as_str(),
         "reasons": reasons, "session_id": session, "attempt_id": intake.attempt_id,
+        // What readiness judges a PASS by (REQ-031 behaviour 3): each finding's id and severity.
+        "findings": checked.report.as_ref().map(|r| r["findings"].as_array().into_iter().flatten()
+            .map(|f| json!({"id": f["id"], "severity": f["severity"]})).collect::<Vec<_>>()),
     });
     for key in REPLAY_KEYS.iter().filter(|key| **key != "review_id") {
         payload[*key] = identity[*key].clone();
@@ -307,7 +309,15 @@ fn session_reasons(
     {
         reviewer.claim(&agent, id);
     }
-    let authors = identities_of(tx, &authors(tx, opened)?)?;
+    let authors = identities_of(
+        tx,
+        &authors(
+            tx,
+            &opened.run_id,
+            &opened.project_id,
+            &opened.binding.spec_sha256,
+        )?,
+    )?;
     let shared = identity::shared(&reviewer, &authors);
     if !shared.is_empty() {
         let named: Vec<String> = shared.iter().map(ToString::to_string).collect();
@@ -324,7 +334,12 @@ fn session_reasons(
 /// run's Commander and, for each Task `spec.drafting` names with the revision's digest in the project, for that Task's
 /// run and role, the role's current binding, every Attempt of the role's Tasks in that run and the role's sessions
 /// of the run's `session.native` records. Their identities are taken by [`identities_of`].
-fn authors(tx: &Transaction<'_>, opened: &Opened) -> Result<BTreeSet<String>, PersistError> {
+pub(super) fn authors(
+    tx: &rusqlite::Connection,
+    run_id: &str,
+    project_id: &str,
+    spec_sha256: &str,
+) -> Result<BTreeSet<String>, PersistError> {
     let mut statement = tx
         .prepare(
             "WITH roles(run_id, role) AS (\
@@ -342,18 +357,15 @@ fn authors(tx: &Transaction<'_>, opened: &Opened) -> Result<BTreeSet<String>, Pe
         )
         .map_err(sqlite_error)?;
     let rows = statement
-        .query_map(
-            params![opened.run_id, opened.project_id, opened.binding.spec_sha256],
-            |r| r.get(0),
-        )
+        .query_map(params![run_id, project_id, spec_sha256], |r| r.get(0))
         .map_err(sqlite_error)?;
     rows.collect::<Result<_, _>>().map_err(sqlite_error)
 }
 
 /// The identities of `sessions`: each HoH id, and each (agent, native id) its row and its `session.native` records
 /// hold.
-fn identities_of(
-    tx: &Transaction<'_>,
+pub(super) fn identities_of(
+    tx: &rusqlite::Connection,
     sessions: &BTreeSet<String>,
 ) -> Result<Identities, PersistError> {
     let mut ids = Identities::default();

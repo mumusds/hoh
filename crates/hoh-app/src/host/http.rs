@@ -570,6 +570,11 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
                 "current_revision":current_revision(shared,run_id).await,
                 "details":{"path":error.path,"line":error.line,"error":error.error}})),
         ).into_response(),
+        PersistError::SpecUnsourced(details) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({"code":"SPEC_INVALID","message":"decisions of the specification cite no source the project holds",
+                "retryable":false,"current_revision":current_revision(shared,run_id).await,"details":*details})),
+        ).into_response(),
         PersistError::KeyReuse(key) => error(
             StatusCode::CONFLICT,
             "KEY_REUSE",
@@ -1381,7 +1386,17 @@ async fn get_run(
     };
     let wanted = run_id.clone();
     match read(&shared, move |reader| reader.run_projection(&wanted)).await {
-        Ok(Some((run, team, acceptance, result, watermark, questions, degraded, active_roles))) => {
+        Ok(Some((
+            run,
+            team,
+            acceptance,
+            result,
+            watermark,
+            questions,
+            degraded,
+            active_roles,
+            open_questions,
+        ))) => {
             let label = serde_json::from_value::<RunState>(json!(run.state)).map_or_else(
                 |_| run.state.clone(),
                 |s| hoh_core::lifecycle::label(s).to_owned(),
@@ -1422,6 +1437,10 @@ async fn get_run(
                     // Its open questions, what a client lists on exit 3 and the TUI shows (docs/adr/ADR-031.md
                     // decision 6).
                     "questions": questions.iter().map(hoh_core::persistence::questions::Question::json)
+                        .collect::<Vec<_>>(),
+                    // Its specification revision's open questions with their blocking mark (REQ-031 behaviour 6):
+                    // not answerable questions, so apart from `questions` (docs/adr/ADR-035.md decision 1).
+                    "open_questions": open_questions.iter().map(hoh_core::persistence::SpecQuestion::json)
                         .collect::<Vec<_>>(),
                     // Its attempts tracked by the degraded /proc scan, with why (docs/adr/ADR-021.md decision 8d,
                     // M2T06R-560; a free object, no CR).

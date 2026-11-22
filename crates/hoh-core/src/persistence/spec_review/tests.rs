@@ -183,6 +183,7 @@ async fn intake_a_consistent_pass_is_current_and_reported() -> R {
         [json!({
             "review_id": "rv-1", "spec_id": "s3", "spec_revision": 3, "status": "PASS", "state": "CURRENT",
             "reasons": [], "session_id": "srv", "attempt_id": "AR1",
+            "findings": [{"id": "F-1", "severity": "medium"}],
             "report": reference(&report.artifact), "raw_session": reference(&given.raw),
             "native_attempt": reference(&native.artifact), "raw_sha256": sha256_hex(RAW),
         })]

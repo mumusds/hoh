@@ -41,13 +41,45 @@ impl std::fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
+/// An open question of the specification (docs/adr/ADR-035.md decision 1): its id (in the one id set of REQs and
+/// ACs), its text, its blocking mark and where it is written. Not part of index.json: the files' digests cover it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub id: String,
+    pub text: String,
+    pub blocking: bool,
+    pub path: String,
+    pub line: usize,
+}
+
+/// A decision of the specification and its source (`question_id`, `input_id` or `event_id`, REQ-030 behaviour 2),
+/// with where it is written. Not part of index.json.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub text: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub path: String,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     value: Value,
     bytes: Vec<u8>,
+    questions: Vec<Question>,
+    decisions: Vec<Decision>,
 }
 
 impl Index {
+    /// The open questions, by path and line.
+    pub fn questions(&self) -> &[Question] {
+        &self.questions
+    }
+    /// The decisions, by path and line.
+    pub fn decisions(&self) -> &[Decision] {
+        &self.decisions
+    }
     pub fn value(&self) -> &Value {
         &self.value
     }
@@ -102,6 +134,8 @@ pub fn generate_index(sources: &[Source]) -> Result<Index, IndexError> {
     let mut files = Vec::new();
     let mut requirements = Vec::new();
     let mut scenarios = Vec::new();
+    let mut questions = Vec::new();
+    let mut decisions = Vec::new();
     for source in sources {
         let name = source.path.strip_prefix("docs/spec/").unwrap_or("");
         if !name.ends_with(".md")
@@ -119,6 +153,8 @@ pub fn generate_index(sources: &[Source]) -> Result<Index, IndexError> {
         files.push(json!({"path": source.path, "sha256": digest(&source.bytes)}));
         requirements.extend(parsed.requirements);
         scenarios.extend(parsed.scenarios);
+        questions.extend(parsed.questions);
+        decisions.extend(parsed.decisions);
     }
     let sort =
         |items: &mut Vec<Value>| items.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -129,7 +165,12 @@ pub fn generate_index(sources: &[Source]) -> Result<Index, IndexError> {
     let mut bytes =
         serde_json::to_vec_pretty(&value).map_err(|e| IndexError::at(PATH, 1, e.to_string()))?;
     bytes.push(b'\n');
-    Ok(Index { bytes, value })
+    Ok(Index {
+        bytes,
+        value,
+        questions,
+        decisions,
+    })
 }
 
 #[cfg(test)]

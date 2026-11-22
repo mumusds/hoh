@@ -55,6 +55,7 @@ fn snapshot() -> Snapshot {
         },
         quiet: crate::decision::Quiet::default(),
         assumptions: None,
+        readiness: None,
     }
 }
 
@@ -739,4 +740,31 @@ fn an_unattended_assumption_must_cite_a_listed_key() {
         rejection.details,
         Some(json!({"basis": "assumptions.language", "key": "language", "listed": []}))
     );
+}
+
+/// REQ-031 failure mode 3 (docs/adr/ADR-035.md decision 4): a transition_run to READY while readiness does not pass
+/// is ILLEGAL_TRANSITION with its reasons as details; with readiness passed it is applied; a run with no readiness
+/// judged (none read) is not refused for it.
+#[test]
+fn a_transition_to_ready_is_refused_while_readiness_does_not_pass() {
+    use crate::readiness::{Code, Readiness, Reason};
+    let mut specifying = snapshot();
+    specifying.run.state = RunState::Specifying;
+    let ready = proposal(json!({"kind": "transition_run", "to_state": "READY"}));
+    specifying.readiness = Some(Readiness::NotReady(vec![Reason {
+        code: Code::MissingAc,
+        ids: vec!["REQ-B1".to_owned()],
+        detail: None,
+    }]));
+    let refused = validate(&ready, &specifying).expect_err("not ready");
+    assert_eq!(refused.reason, IllegalTransition);
+    assert_eq!(
+        refused.details,
+        Some(json!({"reasons": [{"reason": "missing_ac", "ids": ["REQ-B1"]}]}))
+    );
+    assert!(refused.detail.contains("missing_ac"), "{}", refused.detail);
+    specifying.readiness = Some(Readiness::Ready);
+    assert!(validate(&ready, &specifying).is_ok());
+    specifying.readiness = None;
+    assert!(validate(&ready, &specifying).is_ok());
 }

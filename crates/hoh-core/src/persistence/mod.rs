@@ -37,6 +37,8 @@ mod outbox;
 mod outputs;
 mod plan;
 pub mod questions;
+mod readiness;
+pub use readiness::SpecQuestion;
 mod reconcile;
 mod recovery;
 mod reports;
@@ -49,6 +51,7 @@ mod series;
 mod snapshot;
 mod spec;
 mod spec_review;
+mod spec_sources;
 pub use spec::{SpecAction, SpecFiles, SpecRequest};
 mod staffing;
 mod stall;
@@ -293,6 +296,9 @@ pub enum PersistError {
     SpecConflict(Box<serde_json::Value>),
     /// Markdown cannot be indexed. Only its diagnostic event may have been recorded (REQ-034).
     SpecInvalid(crate::specindex::IndexError),
+    /// A proposed or approved specification states decisions whose sources the project does not hold (`SPEC_INVALID`,
+    /// REQ-030 behaviour 5): `{unsourced: [...]}`; nothing was written.
+    SpecUnsourced(Box<serde_json::Value>),
     /// A scheduler change for a run that exists: a run keeps the parameters of its snapshot (`RUN_CONFIG_FROZEN`,
     /// CR-007); nothing was written.
     RunConfigFrozen(String),
@@ -370,7 +376,9 @@ impl PersistError {
             PersistError::Full(_) => Some(ErrorCode::DbFull),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             PersistError::SpecConflict(_) => Some(ErrorCode::SpecConflict),
-            PersistError::SpecInvalid(_) => Some(ErrorCode::SpecInvalid),
+            PersistError::SpecInvalid(_) | PersistError::SpecUnsourced(_) => {
+                Some(ErrorCode::SpecInvalid)
+            }
             PersistError::InvalidTeamConfig { .. } => Some(ErrorCode::InvalidTeamConfig),
             PersistError::RunConfigFrozen(_) => Some(ErrorCode::RunConfigFrozen),
             PersistError::Plan(plan) => plan.code(),
@@ -402,6 +410,9 @@ impl std::fmt::Display for PersistError {
         match self {
             PersistError::SpecConflict(details) => write!(f, "SPEC_CONFLICT: {details}"),
             PersistError::SpecInvalid(error) => write!(f, "SPEC_INVALID: {error}"),
+            PersistError::SpecUnsourced(details) => {
+                write!(f, "SPEC_INVALID: decisions without their source: {details}")
+            }
             PersistError::OnNetworkFs { path, fstype } => {
                 write!(f, "DB_ON_NETWORK_FS: {} is on {fstype}", path.display())
             }
@@ -1399,6 +1410,14 @@ impl Store {
                 "a pace answered with something else".to_owned(),
             )),
         }
+    }
+
+    /// Run `run_id`'s readiness step (REQ-031 behaviour 5 and 7; docs/adr/ADR-035.md decisions 4 and 8): its planned
+    /// tasks that are not ready BLOCKED(READINESS_NOT_MET), those ready again released, a SPECIFYING run whose
+    /// readiness passes moved to READY; whether anything changed.
+    pub async fn settle_readiness(&self, run_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::Readiness(run_id.to_owned()))
+            .await
     }
 
     /// Run `run_id`'s team checkpoint: the roles the project's current revision changes and that have no live attempt

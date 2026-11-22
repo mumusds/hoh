@@ -1115,6 +1115,27 @@ impl World {
     /// specification has them (docs/adr/ADR-031.md decision 1: the fixture writes them; ADR-028 decision 4: its
     /// sha256 is the digest of the project's `docs/spec/index.json`); the spec_id.
     pub fn seed_spec(&self) -> R<String> {
+        let id = self.seed_spec_unreviewed()?;
+        self.review_spec(&id)?;
+        Ok(id)
+    }
+
+    /// A CURRENT PASS specification review report of revision `spec_id` without findings, by a session of no run
+    /// (`world-spec-reviewer`, not in sessions: independent of everyone): what readiness reads as the revision's
+    /// independent review (REQ-031 behaviour 3, docs/adr/ADR-035.md; the world's revisions stand for reviewed ones).
+    pub fn review_spec(&self, spec_id: &str) -> R {
+        self.exec(&format!(
+            "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
+             (:p, 'world-review-{spec_id}', NULL, 'spec_review.reported', json_object('review_id', \
+             'world-review-{spec_id}', 'spec_id', '{spec_id}', 'spec_revision', \
+             (SELECT revision FROM specs WHERE spec_id = '{spec_id}'), 'status', 'PASS', 'state', 'CURRENT', \
+             'reasons', json_array(), 'session_id', 'world-spec-reviewer', 'findings', json_array()), \
+             strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));"
+        ))
+    }
+
+    /// [`World::seed_spec`] without its review: readiness holds every planned task for `spec_review` until one.
+    pub fn seed_spec_unreviewed(&self) -> R<String> {
         let text = std::fs::read(self.project().join("docs/spec/index.json"))?;
         let spec: Value = serde_json::from_slice(&text)?;
         let id = "spec-world";
@@ -1843,6 +1864,8 @@ type Answer = dyn Fn(&Turn) -> Option<String> + Send + Sync;
 pub struct Team {
     script: Box<Script>,
     answer: Box<Answer>,
+    /// How long a work attempt runs when the Team takes work ([`Team::working`]); none: it takes none.
+    work: Option<Duration>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1874,6 +1897,23 @@ impl Team {
         std::sync::Arc::new(Team {
             answer: Box::new(answer),
             script: Box::new(script),
+            work: None,
+            turns: std::sync::Mutex::default(),
+            refused: std::sync::Mutex::default(),
+            agents: std::sync::Mutex::default(),
+        })
+    }
+
+    /// A Team whose Commander decides by `script` and that takes work: each work attempt is a process that runs for
+    /// `hold` and then ends without a TaskResult (it is never refused, so its run stays at work while it runs).
+    pub fn working(
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        hold: Duration,
+    ) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            answer: Box::new(|_| None),
+            script: Box::new(script),
+            work: Some(hold),
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1914,13 +1954,66 @@ impl Drop for Team {
     }
 }
 
+impl Team {
+    /// A work attempt of a [`Team::working`]: a process of its own group, held at its start gate, that then runs for
+    /// `hold` and ends without a TaskResult.
+    fn hold(
+        &self,
+        work: &hoh_app::host::Work,
+        hold: Duration,
+    ) -> Result<hoh_app::host::Started, String> {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sh")
+            .args(["-c", &format!("read -r go; sleep {}", hold.as_secs_f64())])
+            .process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        if let Ok(mut agents) = self.agents.lock() {
+            agents.push((pid, hoh_agents::identity::start_id(pid).ok().flatten()));
+        }
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("no stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (end, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = end.send(hoh_app::host::Outcome {
+                success: false,
+                detail: "worked without a TaskResult".to_owned(),
+                group_gone: hoh_agents::identity::group_empty(pid),
+                class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                observed: hoh_core::persistence::Observed::default(),
+                unknown_effect: false,
+                retry_at: None,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+
 impl hoh_app::host::Executor for Team {
     fn deliver(
         &self,
         work: &hoh_app::host::Work,
     ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (answer, ack) = tokio::sync::oneshot::channel();
-        if work.role == "commander" {
+        if work.role == "commander" || self.work.is_some() {
             let _ = answer.send(Ok(()));
         } else {
             if let Ok(mut refused) = self.refused.lock() {
@@ -1942,6 +2035,9 @@ impl hoh_app::host::Executor for Team {
             detail,
             details: None,
         };
+        if let (Some(hold), false) = (self.work, work.role == "commander") {
+            return self.hold(work, hold).map_err(|e| refusal("SPAWN", Some(e)));
+        }
         let input = work
             .assignment
             .supervision

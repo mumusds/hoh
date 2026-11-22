@@ -1195,3 +1195,79 @@ async fn test_034_04_known_generated_digests_are_not_manual_drift() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+/// REQ-031 behaviour 6 (docs/adr/ADR-035.md decision 1) on the product path: an approval writes its revision's open
+/// questions once (`spec.open_questions`), and the run's projection lists them with their id and blocking mark, apart
+/// from the answerable `questions`.
+#[tokio::test]
+async fn an_approved_revision_lists_its_open_questions_in_the_run_projection() -> R {
+    let world = World::new()?;
+    let questions = "# 开放问题\n- Q-color 主题颜色\n阻塞：否\n- Q-db 存储引擎\n阻塞：是\n";
+    let files = vec![Source {
+        path: "docs/spec/a.md".into(),
+        bytes: format!("{PREFIX}{}", req("A", 1))
+            .replace("# 开放问题\n无\n", questions)
+            .into_bytes(),
+    }];
+    let index = specindex::generate_index(&files)?;
+    std::fs::create_dir_all(world.project().join("docs/spec"))?;
+    std::fs::write(world.project().join(&files[0].path), &files[0].bytes)?;
+    std::fs::write(world.project().join(specindex::PATH), index.bytes())?;
+    std::fs::write(world.project().join(".gitignore"), ".hoh/\n")?;
+    world.git(&["init", "-q"])?;
+    world.git(&["add", "."])?;
+    world.git(&["commit", "-qm", "specification"])?;
+    let host = world.start_plain_host(None).await?;
+    let outcome = async {
+        let run = world::start_run(&host, "start", "open questions").await?;
+        let body = command(
+            &host,
+            &run,
+            "approve",
+            "ApproveSpec",
+            json!({"spec_sha256": index.sha256(), "decision":"APPROVE_ONLY"}),
+        )
+        .await?;
+        let (status, accepted) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{accepted}");
+        let events = world.rows(
+            "SELECT event_id, payload_json FROM events WHERE kind = 'spec.open_questions'",
+        )?;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let spec_id = world.query("SELECT spec_id FROM specs")?;
+        let payload: Value =
+            serde_json::from_str(events[0]["payload_json"].as_str().ok_or("payload")?)?;
+        assert_eq!(payload["spec_id"], json!(spec_id));
+        assert_eq!(payload["spec_revision"], 1);
+        assert_eq!(
+            payload["questions"],
+            json!([
+                {"id": "Q-color", "text": "主题颜色", "blocking": false, "path": "docs/spec/a.md", "line": 10},
+                {"id": "Q-db", "text": "存储引擎", "blocking": true, "path": "docs/spec/a.md", "line": 12}
+            ])
+        );
+        let (_, got) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+        assert_eq!(
+            got["projection"]["open_questions"],
+            json!([
+                {"id": "Q-color", "text": "主题颜色", "blocking": false, "spec_revision": 1},
+                {"id": "Q-db", "text": "存储引擎", "blocking": true, "spec_revision": 1}
+            ]),
+            "{got}"
+        );
+        // Not answerable questions: none of them is listed among `questions`.
+        assert!(
+            got["projection"]["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|q| !q["question_id"].as_str().unwrap_or_default().contains("Q-")),
+            "{got}"
+        );
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
+}
