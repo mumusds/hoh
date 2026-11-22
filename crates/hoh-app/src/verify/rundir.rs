@@ -57,6 +57,28 @@ pub fn dir_of(root: &Path, project_id: &str, attempt_id: &str) -> PathBuf {
 pub fn prepare(project: &Path, dir: &Path, sealed: &Sealed) -> Result<Value, Unprepared> {
     let io = Unprepared::Io;
     let m = &sealed.manifest;
+    checkout(project, dir, &m.git_commit)?;
+    // The frozen environment, when it is HoH's ignored file rather than a tracked one.
+    if m.environment.path.starts_with(".hoh/") {
+        let bytes = hoh_core::objects::get(project, &m.environment.sha256).map_err(io)?;
+        let file = dir.join(&m.environment.path);
+        std::fs::create_dir_all(file.parent().unwrap_or(dir))
+            .and_then(|()| std::fs::write(&file, bytes))
+            .map_err(|e| io(format!("{}: {e}", file.display())))?;
+    }
+    let reasons = crate::verify::check::differences(dir, m)
+        .map_err(|e| io(crate::verify::check::described(&e)))?;
+    if !reasons.is_empty() {
+        return Err(Unprepared::Refused(reasons));
+    }
+    Ok(workspace(dir))
+}
+
+/// `dir` made afresh as a shared clone of the project at `project` (no object copied, nothing of the project's
+/// repository written) detached at `commit`, its `.hoh/` ignored. Whatever was at `dir` (an attempt's own directory,
+/// [`dir_of`]: a crashed earlier preparation of the same attempt) is removed first. Blocking.
+fn checkout(project: &Path, dir: &Path, commit: &str) -> Result<(), Unprepared> {
+    let io = Unprepared::Io;
     if std::fs::symlink_metadata(dir).is_ok() {
         std::fs::remove_dir_all(dir).map_err(|e| io(format!("{}: {e}", dir.display())))?;
     }
@@ -77,23 +99,36 @@ pub fn prepare(project: &Path, dir: &Path, sealed: &Sealed) -> Result<Value, Unp
         ],
     )
     .map_err(io)?;
-    git(dir, &["checkout", "--quiet", "--detach", &m.git_commit]).map_err(io)?;
+    git(dir, &["checkout", "--quiet", "--detach", commit]).map_err(io)?;
     hoh_core::state_dir::ensure(&dir.join(".hoh"))
-        .map_err(|e| io(format!("{}/.hoh: {e}", dir.display())))?;
-    // The frozen environment, when it is HoH's ignored file rather than a tracked one.
-    if m.environment.path.starts_with(".hoh/") {
-        let bytes = hoh_core::objects::get(project, &m.environment.sha256).map_err(io)?;
-        let file = dir.join(&m.environment.path);
-        std::fs::create_dir_all(file.parent().unwrap_or(dir))
-            .and_then(|()| std::fs::write(&file, bytes))
-            .map_err(|e| io(format!("{}: {e}", file.display())))?;
+        .map(drop)
+        .map_err(|e| io(format!("{}/.hoh: {e}", dir.display())))
+}
+
+/// A specification review's run directory (REQ-031 behaviour 3, docs/adr/ADR-035.md decision 5): the revision's
+/// commit `commit` checked out at `dir` as [`prepare`] checks out a candidate, then its `docs/spec` checked: the index
+/// its Markdown regenerates must have digest `spec_sha256` and be the checkout's `index.json` byte for byte, else it
+/// is refused (the directory removed by the caller). Blocking.
+pub fn prepare_commit(
+    project: &Path,
+    dir: &Path,
+    commit: &str,
+    spec_sha256: &str,
+) -> Result<(), Unprepared> {
+    checkout(project, dir, commit)?;
+    let refused = |why: String| Unprepared::Refused(vec![why]);
+    let sources = crate::host::spec::sources(dir).map_err(|e| refused(e.to_string()))?;
+    let index =
+        hoh_core::specindex::generate_index(&sources).map_err(|e| refused(e.to_string()))?;
+    if index.sha256() != spec_sha256 {
+        return Err(refused(format!(
+            "commit {commit}'s specification regenerates {}, not {spec_sha256}",
+            index.sha256()
+        )));
     }
-    let reasons = crate::verify::check::differences(dir, m)
-        .map_err(|e| io(crate::verify::check::described(&e)))?;
-    if !reasons.is_empty() {
-        return Err(Unprepared::Refused(reasons));
-    }
-    Ok(workspace(dir))
+    let committed = std::fs::read(dir.join(hoh_core::specindex::PATH))
+        .map_err(|e| refused(format!("{}: {e}", hoh_core::specindex::PATH)))?;
+    index.verify(&committed).map_err(|e| refused(e.to_string()))
 }
 
 /// The run directory looked at again (decision 8).

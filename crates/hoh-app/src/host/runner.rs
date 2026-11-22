@@ -613,6 +613,65 @@ async fn remove_unused(common: &Common) -> Result<(), TickError> {
     Ok(())
 }
 
+/// Run `run`'s due specification review opened at its revision's commit, or recorded waiting for one (once per
+/// revision and HEAD; a HEAD already recorded is not looked through again). `None`: the run stopped meanwhile.
+async fn open_review(common: &Common, held: &mut Held, run: &str) -> Result<Option<()>, TickError> {
+    let store = &common.shared.store;
+    let reader = no_run(store.reader())?;
+    let wanted = run.to_owned();
+    let due = joined(
+        super::begun::spawn_blocking(move || reader.spec_review_due(&wanted)).await,
+        "the review's look-up",
+    )?;
+    let Some(due) = due else {
+        return Ok(Some(()));
+    };
+    let reader = no_run(store.reader())?;
+    let (root, spec, sha) = (
+        common.shared.root.clone(),
+        due.spec_id.clone(),
+        due.spec_sha256.clone(),
+    );
+    let found = super::begun::spawn_blocking(move || {
+        let head = super::control::git(
+            &root,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        )
+        .map_or_else(
+            |_| "none".to_owned(),
+            |h| String::from_utf8_lossy(&h).trim().to_owned(),
+        );
+        if reader
+            .spec_review_waited(&spec, &head)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(None);
+        }
+        super::spec::review_commit(&root, &sha).map(Some)
+    })
+    .await
+    .map_err(|e| TickError::Lost(format!("the review's commit look-up ended: {e}")))?;
+    let written = match found {
+        Ok(None) => Some(false),
+        Ok(Some(Ok(commit))) => {
+            held.item(store.open_spec_review(run, &due.spec_id, &commit).await)?
+        }
+        Ok(Some(Err(head))) => {
+            held.item(store.spec_review_waiting(run, &due.spec_id, &head).await)?
+        }
+        Err(e) => {
+            // Git could not be read: looked at again next tick.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: run {run}'s review commit: {e}"
+            );
+            Some(false)
+        }
+    };
+    Ok(written.map(drop))
+}
+
 /// The runs whose verification is reconciled (docs/adr/ADR-028.md decision 11): those the runner paces, those pausing
 /// or being cancelled, and the cancelled ones whose rounds are still open (M2T16R-53).
 async fn verified_runs(
@@ -942,6 +1001,11 @@ async fn tick(
         // planned task that is not ready is BLOCKED before a round could take it; a SPECIFYING run that is ready
         // moves to READY.
         if held.item(store.settle_readiness(run).await)?.is_none() {
+            continue;
+        }
+        // Its revision's specification review when one is due (REQ-031 behaviour 3): opened at the revision's commit
+        // before the rounds dispatch it, or recorded waiting for one (docs/adr/ADR-035.md decision 5).
+        if open_review(common, &mut held, run).await?.is_none() {
             continue;
         }
         while let Some(round) = held.item(store.schedule_round(run, at()).await)?
@@ -1274,16 +1338,63 @@ async fn attempt(
         }
         None => None,
     };
+    // A specification review's run directory: its revision's commit checked out outside the project (REQ-031
+    // behaviour 3, docs/adr/ADR-035.md decision 5); not prepared, nothing starts.
+    let review = match (&verifier, work.role.as_str()) {
+        (None, "reviewer") => {
+            let reader = store.reader()?;
+            let task = work.task_id.clone();
+            super::begun::spawn_blocking(move || reader.spec_review_work(&task))
+                .await
+                .map_err(|e| PersistError::Storage(format!("the review's look-up ended: {e}")))??
+        }
+        _ => None,
+    };
+    let review_dir = match &review {
+        Some(r) => {
+            let dir = crate::verify::rundir::dir_of(&common.runs, &work.project_id, &id);
+            let (project, held, commit, sha) = (
+                common.shared.root.clone(),
+                dir.clone(),
+                r.git_commit.clone(),
+                r.spec_sha256.clone(),
+            );
+            let prepared = super::begun::spawn_blocking(move || {
+                crate::verify::rundir::prepare_commit(&project, &held, &commit, &sha)
+            })
+            .await
+            .unwrap_or_else(|e| Err(crate::verify::rundir::Unprepared::Io(e.to_string())));
+            match prepared {
+                Ok(()) => Some(dir),
+                Err(e) => {
+                    crate::verify::rundir::remove_off_thread(dir).await;
+                    let mut ending = common.failed(format!("RUN_DIR_REFUSED: {e}"));
+                    if matches!(e, crate::verify::rundir::Unprepared::Refused(_)) {
+                        ending.class = FailureClass::Decision;
+                    }
+                    finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+        None => None,
+    };
     let remove_run_dir = || async {
         if let Some(v) = &verifier {
             crate::verify::rundir::remove_off_thread(v.dir.clone()).await;
+        }
+        if let Some(dir) = &review_dir {
+            crate::verify::rundir::remove_off_thread(dir.clone()).await;
         }
     };
     // On a blocking thread: the product's executor writes the turn's packed objects before it starts the process
     // (docs/adr/ADR-026.md decision 6).
     let executor = common.executor.clone();
     let mut held = work.clone();
-    held.run_dir = verifier.as_ref().map(|v| v.dir.clone());
+    held.run_dir = verifier
+        .as_ref()
+        .map(|v| v.dir.clone())
+        .or_else(|| review_dir.clone());
     // A verifier's request helpers, in its attempt directory before it starts (docs/adr/ADR-028.md decision 7).
     let helpers = match &verifier {
         Some(v) => {
@@ -1640,6 +1751,40 @@ async fn attempt(
         let identity = identity_of(&work)?;
         finished(common, &id, ran.as_ref(), ending, |e| {
             super::completion::complete_verifier(store, &identity, e, Some(reporting))
+        })
+        .await?;
+        remove_run_dir().await;
+        return Ok(());
+    }
+    // A specification review's end: its COMPLETED result's report and native record built and taken in with its end,
+    // in one writer job; any other result fails it, nothing exported (docs/adr/ADR-035.md decision 7).
+    if let Some(r) = review.clone().filter(|_| !unknown) {
+        let identity = identity_of(&work)?;
+        let (project, session, hooks) = (
+            common.shared.root.clone(),
+            work.assignment.session_id.clone().unwrap_or_default(),
+            common.shared.hooks.clone(),
+        );
+        let ended = ending.clone();
+        let (ending, intake) = super::begun::spawn_blocking(move || {
+            super::completion::spec_review_end(
+                &project,
+                &identity,
+                &session,
+                &r,
+                hooks.as_ref(),
+                ending,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            let mut ending = ended;
+            ending.success = false;
+            ending.detail = format!("SPEC_REVIEW_NOT_REPORTED: its end was lost: {e}");
+            (ending, None)
+        });
+        finished(common, &id, ran.as_ref(), ending, |e| {
+            store.finish_spec_review(&id, e, intake)
         })
         .await?;
         remove_run_dir().await;

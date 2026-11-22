@@ -238,6 +238,17 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// implementation holds the step here while the host stops).
     fn completing(&self, _attempt_id: &str) {}
 
+    /// The native attempt record the host built for specification review attempt `attempt_id`, before it is kept and
+    /// taken in (REQ-031 behaviour 4): what is kept instead (none: no record). A test's implementation replaces it,
+    /// so a tampered record goes through the one intake entry (AC-031-04).
+    fn spec_review_native(
+        &self,
+        _attempt_id: &str,
+        native: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        Some(native)
+    }
+
     /// In the commit of a candidate's pending check records before a verifier's check runs (check::reconcile's own
     /// task), on a blocking thread before it reads them (a test's implementation holds it here while the host stops).
     fn reconciling(&self, _candidate_id: &str) {}

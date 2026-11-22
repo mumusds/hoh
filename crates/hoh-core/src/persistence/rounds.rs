@@ -72,7 +72,10 @@ pub(super) fn round(
     // (docs/adr/ADR-025.md decisions 3 and 5, CR-003).
     let state = writer::parse::<RunState>(&state)?;
     let retries_only = state == RunState::Blocked;
-    if !WORKING.contains(&state) && !retries_only {
+    // A specification review is dispatched in SPECIFYING and READY too, without moving the run (REQ-031 behaviour 3,
+    // CR26D-201): there it is the only candidate.
+    let reviews_only = matches!(state, RunState::Specifying | RunState::Ready);
+    if !WORKING.contains(&state) && !retries_only && !reviews_only {
         return Ok(RoundOutcome::default());
     }
     // A budget that stops the run, or a cost limit it cannot enforce, dispatches nothing more (REQ-042 behaviour 6
@@ -104,10 +107,17 @@ pub(super) fn round(
             && !refused.contains(task)
             && !recovering.contains(task)
     });
+    // The review tasks: never on a BLOCKED run (no new one is dispatched there, REQ-031 behaviour 3).
+    let reviews = super::spec_review::review_tasks(&tx, run_id)?;
     if retries_only {
         rows.retain(|r| {
-            r.state == TaskState::Ready && (r.retry || verifiers.contains(&r.candidate.task_id))
+            r.state == TaskState::Ready
+                && (r.retry || verifiers.contains(&r.candidate.task_id))
+                && !reviews.contains(&r.candidate.task_id)
         });
+    }
+    if reviews_only {
+        rows.retain(|r| reviews.contains(&r.candidate.task_id));
     }
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),
@@ -179,6 +189,35 @@ pub(super) fn round(
             None => {}
         }
     }
+    // A review task goes in a session independent of its revision's drafters and the Commander (CR-029, the rule its
+    // intake judges by); a refusal is recorded once and nothing is leased: a rebinding lets it go.
+    let review = reviews.contains(&selected.task_id);
+    if review {
+        let session: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM role_bindings WHERE run_id = ?1 AND role = ?2",
+                params![run_id, task.role],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let shared = super::spec_review::shared_at_dispatch(
+            &tx,
+            run_id,
+            &selected.task_id,
+            session.as_deref(),
+        )?;
+        if let (Some(session), false) = (session, shared.is_empty()) {
+            super::spec_review::dispatch_refused(
+                &tx,
+                (&project_id, run_id, &selected.task_id),
+                &session,
+                &shared,
+                ctx,
+            )?;
+            super::writer::commit_unhooked(tx, ctx)?;
+            return Ok(RoundOutcome::default());
+        }
+    }
     let attempts: i64 = tx
         .query_row(
             "SELECT count(*) FROM attempts WHERE task_id = ?1",
@@ -226,6 +265,10 @@ pub(super) fn round(
         notice["origin"] = json!("verification");
         notice["round_id"] = json!(round_id);
         notice["handoff"] = json!(handoff);
+    } else if review {
+        // Runtime's, but for the run's working states only (the runner refuses it on a BLOCKED or WAITING_EXTERNAL
+        // run).
+        notice["origin"] = json!(super::spec_review::ORIGIN);
     } else if task.retry {
         notice["origin"] = json!("retry");
     }

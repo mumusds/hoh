@@ -103,6 +103,25 @@ pub(super) enum RunnerJob {
         attempt_id: String,
         ending: Box<Ending>,
     },
+    /// A specification review attempt's end and, for a COMPLETED result, its report's intake: one job, so nothing of
+    /// the writer comes between them (docs/adr/ADR-035.md decision 7).
+    FinishedReview {
+        attempt_id: String,
+        ending: Box<Ending>,
+        intake: Option<Box<super::spec_review::SpecReviewIntake>>,
+    },
+    /// Open the review due in a run at its revision's commit (REQ-031 behaviour 3).
+    OpenReview {
+        run_id: String,
+        spec_id: String,
+        git_commit: String,
+    },
+    /// A due review that waits for its revision's commit, once per revision and HEAD.
+    ReviewWaiting {
+        run_id: String,
+        spec_id: String,
+        head: String,
+    },
     /// One more repair, or its refusal for a decision (ADR-020 decision 10).
     Repair(Box<super::retry::RepairRequest>),
     /// One step of a run's supervisor (docs/adr/ADR-025.md decision 2).
@@ -380,6 +399,29 @@ pub(super) fn run(
         RunnerJob::Finished { attempt_id, ending } => {
             finished(conn, &attempt_id, &ending, ctx).map(RunnerDone::Applied)
         }
+        RunnerJob::FinishedReview {
+            attempt_id,
+            ending,
+            intake,
+        } => {
+            let applied = finished(conn, &attempt_id, &ending, ctx)?;
+            if applied && let Some(intake) = intake {
+                super::spec_review::record(conn, &intake, ctx)?;
+            }
+            Ok(RunnerDone::Applied(applied))
+        }
+        RunnerJob::OpenReview {
+            run_id,
+            spec_id,
+            git_commit,
+        } => super::spec_review::open(conn, &run_id, &spec_id, &git_commit, ctx)
+            .map(|opened| RunnerDone::Applied(opened.is_some())),
+        RunnerJob::ReviewWaiting {
+            run_id,
+            spec_id,
+            head,
+        } => super::spec_review::waiting(conn, &run_id, &spec_id, &head, ctx)
+            .map(RunnerDone::Applied),
         RunnerJob::Repair(request) => {
             super::retry::request_repair(conn, &request, ctx).map(RunnerDone::Repair)
         }
@@ -482,7 +524,8 @@ fn waiting(
              WHERE r.project_id = ?1 AND o.state = 'PENDING' AND json_extract(o.payload_json, '$.notice') IS 'runtime' \
              AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' \
              AND (r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
-                  OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND json_extract(o.payload_json, '$.origin') IS NOT NULL)) \
+                  OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
+                      AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) \
              ORDER BY o.event_seq",
         )
         .map_err(sqlite_error)?;
@@ -698,12 +741,13 @@ fn received(
         .map_err(sqlite_error)?;
     // Nothing starts for a run that does not work (paused or cancelled meanwhile, docs/adr/ADR-021.md decision 7); a
     // runtime-class dispatch (its notice carries an origin) starts on a BLOCKED or WAITING_EXTERNAL run too
-    // (docs/adr/ADR-025.md decision 3, CR-003).
+    // (docs/adr/ADR-025.md decision 3, CR-003), but a specification review's (REQ-031 behaviour 3).
     let working: bool = tx
         .query_row(
             "SELECT r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
              OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = ?2 \
-                 AND json_extract(o.payload_json, '$.origin') IS NOT NULL)) FROM runs r WHERE r.run_id = ?1",
+                 AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
+                 AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) FROM runs r WHERE r.run_id = ?1",
             params![notice.run_id, notice.message_id],
             |r| r.get(0),
         )
