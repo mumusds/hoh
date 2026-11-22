@@ -69,7 +69,10 @@ impl Route {
     pub fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Route::Commander => &[],
-            Route::Adopt => &[("adopt", "采用项目已批准的规格")],
+            Route::Adopt => &[
+                ("adopt", "采用项目已批准的规格"),
+                ("draft", "由 Plan 起草规格并请我批准"),
+            ],
             Route::BaselineTests => &[
                 ("run", "运行一次检测到的测试命令，结果记入基线"),
                 ("skip", "不运行"),
@@ -771,6 +774,9 @@ pub(super) fn answer(
             // open, its revision touched below and the commit ending with its run.result.
             if super::adoption::adopt_exit(tx, a.project_id, a.run_id, ctx)? {
                 claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
+            } else if picked == "draft" {
+                super::drafting::request(tx, a.project_id, a.run_id, a.command_id, ctx)?;
+                claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
             }
         }
         Route::BaselineTests => {
@@ -895,6 +901,7 @@ fn claims_events(tx: &Transaction<'_>, claims: Claims) -> Result<Vec<NewEvent>, 
 fn exit_name(route: Route, choice: &str) -> &'static str {
     match (route, choice) {
         (Route::Commander, _) => "applied",
+        (Route::Adopt, "draft") => "draft",
         (Route::Adopt, _) => "adopt",
         (Route::Stalled, "cancel") => "cancel",
         (Route::Stalled, _) => "retry",

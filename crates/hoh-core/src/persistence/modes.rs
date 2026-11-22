@@ -150,3 +150,18 @@ pub(super) fn waiting(conn: &Connection, project: &str) -> Result<Vec<String>, P
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error)
 }
+
+/// A mode intent derived by the Runtime from an explicit user action, using SetMode's safe point.
+pub(super) fn intent(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    command: &str,
+    mode: Mode,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let row = super::commands::snapshot_rows(tx, run_id)?
+        .map(|(r, _)| r)
+        .ok_or_else(|| PersistError::RunNotFound(run_id.into()))?;
+    change(tx, &row, command, mode, writing(tx, run_id)?, ctx)?;
+    Ok(())
+}

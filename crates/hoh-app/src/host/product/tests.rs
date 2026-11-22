@@ -14,6 +14,7 @@ fn work(prompt: Option<&str>) -> Work {
         role: "developer".to_owned(),
         effect_key: "k".to_owned(),
         assignment: Assignment {
+            spec_draft: false,
             inputs: Vec::new(),
             context_seq: 0,
             resource_bundle: None,

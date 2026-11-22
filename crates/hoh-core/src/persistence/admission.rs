@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 pub(super) enum By {
     /// The scheduling round (its retries, verifier and review tasks included).
     Round,
+    /// Runtime specification drafting (outside the scheduler).
+    Draft,
     /// A Commander's dispatch decision.
     Commander,
     /// [`super::attempts::create`]: `Store::create_attempt` and a consumer's effect.
@@ -50,6 +52,8 @@ pub(super) enum Refusal {
     },
     /// A review task, which only the scheduling round dispatches (after its independence pre-check).
     RuntimeOwned,
+    /// Drafts only start in the four working states with a settled Plan/Auto intent.
+    DraftStopped,
     /// A planned task whose readiness under the run's current revision does not pass.
     NotReady { revision: i64, reasons: Vec<Reason> },
     /// A write task whose path scope holds `paths`, files the run's baseline lists as uncommitted, and whose user has
@@ -67,6 +71,9 @@ impl Refusal {
             } => format!(
                 "{task_id} belongs to specification {task_spec:?} but the run's is {run_spec:?}"
             ),
+            Refusal::DraftStopped => {
+                format!("{task_id}: specification drafting waits for a working PLAN/AUTO run")
+            }
             Refusal::RuntimeOwned => format!(
                 "{task_id} is a specification review's task: the Runtime dispatches it in a session independent of \
                  its revision's drafters and the Commander"
@@ -106,6 +113,7 @@ impl Refusal {
             reason: match self {
                 Refusal::SpecMismatch { .. } => RejectionReason::SpecMismatch,
                 Refusal::RuntimeOwned
+                | Refusal::DraftStopped
                 | Refusal::NotReady { .. }
                 | Refusal::DirtyWorkspace { .. } => RejectionReason::IllegalTransition,
             },
@@ -138,11 +146,11 @@ pub(super) fn admit(
     if tasks.is_empty() {
         return Ok(verdicts);
     }
-    let run_spec: Option<String> = tx
+    let (run_spec, run_state, run_mode): (Option<String>, String, String) = tx
         .query_row(
-            "SELECT spec_id FROM runs WHERE run_id = ?1",
+            "SELECT spec_id,state,mode FROM runs WHERE run_id = ?1",
             params![run_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?
@@ -185,6 +193,7 @@ pub(super) fn admit(
                 "no task {task_id}"
             )));
         };
+        let draft = super::drafting::is_draft(tx, task_id)?;
         // 1. Its revision: of this run, and of its current specification when it has adopted one.
         let verdict = if task_run != run_id || (run_spec.is_some() && task_spec != run_spec) {
             Err(Refusal::SpecMismatch {
@@ -192,8 +201,19 @@ pub(super) fn admit(
                 run_spec: run_spec.clone(),
             })
         // 2. Who may dispatch it: a review task is the round's (its independence pre-check runs there).
-        } else if by != By::Round && reviews.contains(task_id) {
+        } else if (draft && by != By::Draft)
+            || (!draft && by == By::Draft)
+            || (by != By::Round && reviews.contains(task_id))
+        {
             Err(Refusal::RuntimeOwned)
+        } else if draft
+            && (!matches!(
+                run_state.as_str(),
+                "SPECIFYING" | "READY" | "RUNNING" | "VERIFYING"
+            ) || run_mode == "BUILD"
+                || super::modes::pending(tx, run_id)?.is_some())
+        {
+            Err(Refusal::DraftStopped)
         } else {
             // 3. Its readiness under the run's current revision, when it is a planned task of that revision.
             let readiness = judged.as_ref().and_then(|(revision, plan, review)| {

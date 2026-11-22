@@ -997,6 +997,34 @@ async fn tick(
         if held.item(store.mode_step(run).await)?.is_none() {
             continue;
         }
+        if held.item(store.draft_step(run, false).await)?.is_none() {
+            continue;
+        }
+        let reader = no_run(store.reader())?;
+        let wanted = run.clone();
+        let discovering = joined(
+            super::begun::spawn_blocking(move || reader.draft_discovery_due(&wanted)).await,
+            "draft discovery snapshot",
+        )?;
+        if discovering {
+            let root = common.shared.root.clone();
+            let hooks = common.shared.hooks.clone();
+            let wanted = run.clone();
+            let discovered = super::begun::spawn_blocking(move || {
+                super::drafting::discover(&root, &wanted, hooks.as_ref())
+            })
+            .await
+            .map_err(|e| TickError::failed(PersistError::Storage(e.to_string())))?;
+            if let Err(why) = discovered {
+                return Err(TickError::failed(PersistError::Storage(why)));
+            }
+            if held.item(store.draft_step(run, true).await)?.is_none() {
+                continue;
+            }
+        }
+        if held.item(store.dispatch_draft(run, at()).await)?.is_none() {
+            continue;
+        }
         // Its readiness before its rounds (REQ-031 behaviour 5 and 7, docs/adr/ADR-035.md decisions 4 and 8): a
         // planned task that is not ready is BLOCKED before a round could take it; a SPECIFYING run that is ready
         // moves to READY.
@@ -1293,6 +1321,14 @@ async fn attempt(
         return Ok(());
     }
     let key = work.effect_key.clone();
+    if work.assignment.spec_draft
+        && let Err(why) = super::drafting::prepare(store, &common.shared.root, &work).await
+    {
+        let ending = common.failed(why);
+        finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
+        return Ok(());
+    }
+
     // A verifier's handoff package kept as an object before its process starts: its RUNNING commit delivers it
     // (docs/adr/ADR-028.md decision 9). Not kept, nothing starts: the attempt fails for another.
     let handoff_package = match work.assignment.handoff.clone() {
@@ -1531,6 +1567,14 @@ async fn attempt(
         .await?
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
+        if work.assignment.spec_draft {
+            drop(started);
+            let ending = common.failed("draft start admission changed".into());
+            finished(common, &id, ran.as_ref(), ending, |e| {
+                store.runner_finished(&id, e)
+            })
+            .await?;
+        }
         remove_run_dir().await;
         return Ok(());
     }
