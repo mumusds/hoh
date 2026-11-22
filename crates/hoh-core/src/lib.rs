@@ -51,6 +51,8 @@ pub mod nullable;
 pub mod objects;
 pub mod persistence;
 #[forbid(clippy::disallowed_methods)]
+pub mod progress;
+#[forbid(clippy::disallowed_methods)]
 pub mod prompt;
 #[forbid(clippy::disallowed_methods)]
 pub mod prompt_files;
