@@ -105,7 +105,8 @@ pub(super) fn request(
         );
     if !matches!(message.kind, MessageKind::Query | MessageKind::Steer)
         || (!major
-            && (message.kind != MessageKind::Query || !matches!(intent, "opinion" | "conclude")))
+            && (message.kind != MessageKind::Query
+                || !matches!(intent, "opinion" | "conclude" | "consult")))
     {
         return Ok(None);
     }
@@ -143,6 +144,13 @@ pub(super) fn request(
         .map_err(sqlite_error)?;
     let reply = if let Some(reply) = source(&tx, message)? {
         reply
+    } else if intent == "consult" {
+        let edges = wait_for(&tx, &message.run_id)?;
+        if let Some(members) = cycle(&edges, (&message.sender_role, &message.recipient_role)) {
+            rejected("CONSULT_CYCLE", json!({"members":members}))
+        } else {
+            return Ok(None);
+        }
     } else if major {
         major_decision(&tx, &project, message)?
     } else {
@@ -271,4 +279,56 @@ fn major_decision(
         "ILLEGAL_TRANSITION",
         json!({"decision_class":class,"cause":"commander_decision_required"}),
     ))
+}
+
+/// The shared unfinished role-request view, read inside the same transaction as a new edge.
+pub(super) fn wait_for(
+    conn: &Connection,
+    run: &str,
+) -> Result<Vec<(String, String)>, PersistError> {
+    let mut q=conn.prepare("SELECT DISTINCT json_extract(payload_json,'$.sender_role'),recipient_role FROM outbox WHERE run_id=?1 AND state IN ('PENDING','DELIVERING') AND json_extract(payload_json,'$.kind') IN ('query','steer') AND json_extract(payload_json,'$.sender_role') IS NOT NULL ORDER BY 1,2").map_err(sqlite_error)?;
+    q.query_map(params![run], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)
+}
+fn cycle(edges: &[(String, String)], proposed: (&str, &str)) -> Option<Vec<String>> {
+    use std::collections::{BTreeSet, VecDeque};
+    let (sender, recipient) = proposed;
+    if sender == recipient {
+        return Some(vec![sender.into()]);
+    }
+    let mut queue = VecDeque::from([vec![sender.to_owned(), recipient.to_owned()]]);
+    let mut visited = BTreeSet::new();
+    while let Some(path) = queue.pop_front() {
+        let last = path.last()?;
+        if !visited.insert(last.clone()) {
+            continue;
+        }
+        for (_, to) in edges.iter().filter(|(from, _)| from == last) {
+            if to == sender {
+                return Some(path);
+            }
+            let mut next = path.clone();
+            next.push(to.clone());
+            queue.push_back(next);
+        }
+    }
+    None
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_023_02_cycle_is_ordered_and_ignores_unrelated_cycles() {
+        let edges =
+            [("b", "c"), ("c", "a"), ("x", "y"), ("y", "x")].map(|(a, b)| (a.into(), b.into()));
+        assert_eq!(
+            cycle(&edges, ("a", "b")),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+        assert_eq!(cycle(&edges, ("d", "x")), None);
+        assert_eq!(cycle(&edges, ("a", "a")), Some(vec!["a".into()]));
+        assert_eq!(cycle(&[], ("a", "b")), None);
+    }
 }
