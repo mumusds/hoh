@@ -153,6 +153,22 @@ pub(super) fn check(tx: &Connection, run_id: &str, raw: &Value) -> Result<ValidP
     if !refused.is_empty() {
         return Err(PersistError::Plan(dag::PlanError::Invalid(refused)));
     }
+    // A task that references no requirement makes the whole plan invalid (REQ-028 behaviour 7, REQ-031: no rewrite of
+    // the architecture without a requirement in the user's approved scope; docs/adr/ADR-039.md decision 6).
+    let unreferenced: Vec<String> = plan
+        .tasks
+        .iter()
+        .filter(|t| t.requirement_ids.is_empty())
+        .map(|t| {
+            format!(
+                "task {}: references no requirement of the approved specification",
+                t.task_id
+            )
+        })
+        .collect();
+    if !unreferenced.is_empty() {
+        return Err(PersistError::Plan(dag::PlanError::Invalid(unreferenced)));
+    }
     // A requirement the run's specification does not have makes the plan invalid (M2T03R-55): a bad request, not a
     // constraint failure of the insert.
     let known: BTreeSet<String> = {

@@ -129,5 +129,25 @@ pub fn docs(root: &[String], dirs: &[&str]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// Whether project path `file` is inside task path `scope` along path components (`src` holds `src/lib.rs`, not
+/// `src2/x`; an empty scope holds nothing).
+fn within(scope: &str, file: &str) -> bool {
+    let scope = scope.trim_end_matches('/');
+    !scope.is_empty()
+        && (file == scope
+            || file
+                .strip_prefix(scope)
+                .is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// The files of `uncommitted` some path of `scope` holds (docs/adr/ADR-039.md decision 7), sorted.
+pub fn touched(scope: &[String], uncommitted: &[String]) -> Vec<String> {
+    let found: BTreeSet<&String> = uncommitted
+        .iter()
+        .filter(|f| scope.iter().any(|s| within(s, f)))
+        .collect();
+    found.into_iter().cloned().collect()
+}
+
 #[cfg(test)]
 mod tests;

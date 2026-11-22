@@ -290,9 +290,14 @@ async fn test_038_03_cycle_missing_and_out_of_range_plans_write_nothing() -> R {
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
+    // Every planned task references a requirement of the approved specification (docs/adr/ADR-039.md decision 6).
+    seed(
+        &db,
+        "INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-038', 's2', 'DAG', 1);",
+    )?;
     let task = |id: &str, deps: &[&str]| {
         json!({"task_id": id, "title": id, "role": "developer", "writer": true, "depends_on": deps,
-               "requirement_ids": []})
+               "requirement_ids": ["REQ-038"]})
     };
     let mut high = task("p3", &[]);
     high["user_value"] = json!(7);
