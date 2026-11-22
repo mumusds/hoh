@@ -50,10 +50,15 @@ impl Bundle {
 
     /// Store durable bytes before any transaction publishes a pin. Failed transactions leave only harmless objects.
     pub fn store(&self, project: &Path) -> Result<Pin, String> {
-        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        self.store_io(project).map_err(|e| e.to_string())
+    }
+
+    /// Preserve the write's I/O kind until the persistence boundary classifies it.
+    pub(crate) fn store_io(&self, project: &Path) -> std::io::Result<Pin> {
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
         Ok(Pin {
             resource_bundle_version: self.version(),
-            bundle_sha256: objects::put(project, &bytes)?,
+            bundle_sha256: objects::put_io(project, &bytes)?,
         })
     }
 }
