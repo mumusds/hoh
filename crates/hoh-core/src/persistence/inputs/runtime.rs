@@ -101,20 +101,25 @@ pub(in crate::persistence) fn apply_change(
             RunTarget::Specification(Box::new(request.clone())),
             "spec.proposed",
         )?;
-        match commands::submit_in(&tx, &command, ctx) {
+        match application(&tx, || commands::submit_in(&tx, &command, ctx)) {
             Ok(_) => {}
             Err(error) => {
-                let reason = match &error {
-                    PersistError::SpecConflict(_) => "SPEC_CONFLICT",
-                    PersistError::SpecInvalid(error) => {
-                        super::super::spec::failed(&tx, &command, error, ctx)?;
-                        "SPEC_INVALID"
-                    }
-                    PersistError::BadRequest(_) => "BAD_REQUEST",
-                    _ => return Err(error),
+                let Some(rejection) = Rejection::from_error(&error, &row.run_id) else {
+                    return Err(error);
                 };
-                change(&tx, &row, InputState::Rejected, None, Some(reason), ctx)?;
-                let reply = receipt(&tx, &row, Some(reason))?;
+                if let PersistError::SpecInvalid(error) = &error {
+                    super::super::spec::failed(&tx, &command, error, ctx)?;
+                }
+                rejection.annotate(&mut row.payload);
+                change(
+                    &tx,
+                    &row,
+                    InputState::Rejected,
+                    None,
+                    Some(rejection.reason),
+                    ctx,
+                )?;
+                let reply = receipt(&tx, &row, Some(rejection.reason))?;
                 writer::commit(tx, ctx)?;
                 return Ok(ChangedInput {
                     reply: Some(reply),
@@ -167,15 +172,16 @@ pub(in crate::persistence) fn control_kind(text: &str) -> Option<&'static str> {
     }
 }
 
-pub(in crate::persistence) fn reject_control(
+pub(in crate::persistence) fn reject_input(
     tx: &Transaction<'_>,
     input: &NewInput,
+    rejection: &Rejection,
     ctx: &super::super::writer::Ctx<'_>,
 ) -> Result<i64, PersistError> {
-    let seq = enqueue_outcome(tx, input, Some("unknown_control"), ctx)?;
+    let seq = enqueue_outcome(tx, input, Some(rejection), ctx)?;
     let row = read_input(tx, &input.input_id)?
-        .ok_or_else(|| PersistError::IntegrityViolation("missing rejected control input".into()))?;
-    receipt(tx, &row, Some("unknown_control"))?;
+        .ok_or_else(|| PersistError::IntegrityViolation("missing rejected input".into()))?;
+    receipt(tx, &row, Some(rejection.reason))?;
     tx.execute(
         "UPDATE outbox SET state='ACKED' WHERE message_id=?1",
         params![input.input_id],

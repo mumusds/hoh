@@ -64,7 +64,7 @@ pub enum RunTarget {
     SetMode(crate::protocol::Mode),
     /// An input to the run (AnswerQuestion, SendInput; docs/adr/ADR-031.md decision 7): accepted in any state but a
     /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
-    /// stays stopped. Working ASK and unknown CONTROL rejection leave the revision unchanged (ADR-036).
+    /// stays stopped. Working ASK and business rejection leave the revision unchanged (ADR-036).
     Input(Input),
     /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
     Specification(Box<super::SpecRequest>),
@@ -480,7 +480,8 @@ pub(super) fn submit_in(
 /// exist, not have ended (409 ILLEGAL_TRANSITION with `details.state`) and be at `expected_revision`. Its acceptance
 /// event first (`input.accepted{command_id, input_id, kind, question_id}`, or `question.answer_accepted{command_id,
 /// question_id}`), then the answer's exit (`questions::answer`) or the queued input; the run's revision moved; its
-/// result judged at the end. The run's new revision and the acceptance event's seq.
+/// result judged at the end. SendInput business refusals instead persist a rejection
+/// Record and leave the run unchanged (ADR-036). Returns the revision and event seq.
 fn input_command(
     tx: &rusqlite::Transaction<'_>,
     command: &SubmitCommand,
@@ -516,6 +517,52 @@ fn input_command(
             actual: Some(revision),
         });
     }
+    let apply = || apply_input(tx, command, input, (&state, revision, &project_id), ctx);
+    let Input::Send {
+        text,
+        target_role,
+        input_kind,
+    } = input
+    else {
+        return apply();
+    };
+    let rejected =
+        if input_kind == "CONTROL" && super::inputs::runtime::control_kind(text).is_none() {
+            super::inputs::Rejection::new("unknown_control")
+        } else {
+            match super::inputs::application(tx, apply) {
+                Ok(result) => return Ok(result),
+                Err(error) => match super::inputs::Rejection::from_error(&error, &command.run_id) {
+                    Some(rejection) => rejection,
+                    None => return Err(error),
+                },
+            }
+        };
+    // The failed application (including temp.command_run) is gone. Only a Record
+    // and the durable input/receipt remain; the outer command records its replay.
+    let seq = super::inputs::runtime::reject_input(
+        tx,
+        &super::inputs::NewInput {
+            input_id: crate::ids::child_id(&command.command_id, "input"),
+            run_id: command.run_id.clone(),
+            kind: input_kind.clone(),
+            target_role: target_role.clone(),
+            payload: serde_json::json!({"text":text}),
+        },
+        &rejected,
+        ctx,
+    )?;
+    Ok((revision, seq))
+}
+
+fn apply_input(
+    tx: &rusqlite::Transaction<'_>,
+    command: &SubmitCommand,
+    input: &Input,
+    run: (&str, i64, &str),
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(i64, i64), PersistError> {
+    let (state, revision, project_id) = run;
     // What it answers, if anything, and the input row a SendInput keeps.
     let input_id = crate::ids::child_id(&command.command_id, "input");
     let mut accepted = command.event.clone();
@@ -579,21 +626,12 @@ fn input_command(
             }
         }
     };
-    // Unknown controls are durable rejection records, not progress commands. Validate
-    // the run/revision above, then leave its stop and result intact (ADR-036, M3I-50).
-    if let Some(queued) = queued.as_ref().filter(|queued| queued.kind == "CONTROL")
-        && let Input::Send { text, .. } = input
-        && super::inputs::runtime::control_kind(text).is_none()
-    {
-        let seq = super::inputs::runtime::reject_control(tx, queued, ctx)?;
-        return Ok((revision, seq));
-    }
     super::hold::command(tx, &command.run_id)?;
     // A working ASK is read-only (AC-017-01). In a stopped state the accepted
     // command still moves the revision and closes with a fresh result (ADR-031 E3).
     let publish_result = queued.as_ref().is_none_or(|input| input.kind != "CONTROL")
         && (queued.as_ref().is_none_or(|input| input.kind != "ASK")
-            || matches!(state.as_str(), "BLOCKED" | "PAUSED" | "INCOMPLETE"));
+            || matches!(state, "BLOCKED" | "PAUSED" | "INCOMPLETE"));
     // The acceptance event is the commit's first (decision 9 finds it by its command_id).
     let done = writer::write(
         tx,
@@ -608,7 +646,7 @@ fn input_command(
         super::questions::answer(
             tx,
             &super::questions::Answer {
-                project_id: &project_id,
+                project_id,
                 run_id: &command.run_id,
                 question_id: &question_id,
                 answer: &answer,
