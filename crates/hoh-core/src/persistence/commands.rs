@@ -719,8 +719,10 @@ fn still_stopped(
 ) -> Result<Option<serde_json::Value>, PersistError> {
     let state = from.as_str();
     Ok(match from {
-        RunState::Incomplete => super::retry::budget_and_stop(tx, run_id, ctx.now(), ctx.wall())?
-            .1
+        RunState::Incomplete => super::budget_view::load(tx, run_id, ctx.now(), ctx.wall())?
+            .any_stop()
+            .as_ref()
+            .and_then(super::budget_view::Denied::limit)
             .map(|stop| serde_json::json!({"state": state, "stop": stop.as_str()})),
         RunState::WaitingExternal => super::retry::waiting_until(tx, run_id, ctx.now())?
             .map(|next| serde_json::json!({"state": state, "next_retry_at": next})),

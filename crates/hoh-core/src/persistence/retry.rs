@@ -11,7 +11,7 @@ use super::decide::{child_id, load_binding};
 use super::need::{self, SourceReason, TaskReason, VerifierReason, WorkReason};
 use super::writer::{self, Change, Commit, Ctx, Intent, NewEvent, StateCas};
 use super::{PersistError, sqlite_error};
-use crate::budget::{self, Budget, Ledger};
+use crate::budget::{self, Budget};
 use crate::decision::Context;
 use crate::lifecycle::Lifecycle as _;
 use crate::protocol::{BlockedReason, RunState, TaskState};
@@ -325,128 +325,6 @@ pub(super) fn accrue_wall(
     Ok(())
 }
 
-/// The run's budget at `now`: its run-scope rows and its deadline, the duration its unfinished attempts have run so
-/// far counted as reserved (M2T19R-02: a running attempt's time counts before it ends; settled into `used` when it
-/// does, so nothing is counted twice).
-pub(super) fn load_budget(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    now: SystemTime,
-) -> Result<Budget, PersistError> {
-    let mut budget = Budget::default();
-    let deadline: Option<String> = tx
-        .query_row(
-            "SELECT deadline_at FROM runs WHERE run_id = ?1",
-            params![run_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?
-        .flatten();
-    if let Some(text) = deadline {
-        budget.deadline_at = Some(crate::time::parse_rfc3339(&text).ok_or_else(|| {
-            PersistError::IntegrityViolation(format!("runs.deadline_at of {run_id}: {text}"))
-        })?);
-    }
-    let mut statement = tx
-        .prepare(
-            "SELECT kind, limit_value, used_value, reserved_value, price_known FROM budgets \
-             WHERE scope_kind = 'run' AND scope_id = ?1",
-        )
-        .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<f64>>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, bool>(4)?,
-            ))
-        })
-        .map_err(sqlite_error)?;
-    for row in rows {
-        let (kind, limit, used, reserved, price_known) = row.map_err(sqlite_error)?;
-        let ledger = Ledger {
-            limit,
-            used,
-            reserved,
-        };
-        match kind.as_str() {
-            "iterations" => budget.iterations = Some(ledger),
-            "wall_seconds" => budget.wall_seconds = Some(ledger),
-            "usd" => budget.usd = Some((ledger, price_known)),
-            _ => {}
-        }
-    }
-    drop(statement);
-    if let Some(wall) = &mut budget.wall_seconds {
-        let mut statement = tx
-            .prepare(
-                "SELECT a.attempt_id, a.started_at FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
-                 WHERE t.run_id = ?1 AND a.state IN ('STARTING', 'RUNNING') AND a.started_at IS NOT NULL",
-            )
-            .map_err(sqlite_error)?;
-        let started = statement
-            .query_map(params![run_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(sqlite_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(sqlite_error)?;
-        for (attempt_id, at) in started {
-            if let Some(since) = crate::time::parse_rfc3339(&at) {
-                // As its settlement will count it (M2T19R-450).
-                wall.reserved += super::consult::unreserved_wall(
-                    tx,
-                    &attempt_id,
-                    ran(since, now, observed_end(tx, &attempt_id)?) as f64,
-                )?;
-            }
-        }
-    }
-    Ok(budget)
-}
-
-/// Why run `run_id`'s budget lets nothing more be dispatched at `context`'s time, if it does: a stop (the deadline by
-/// the wall clock) or a cost limit it cannot enforce; one rule for the rounds, the pace and the decide path
-/// (M2T19R-01).
-pub(super) fn budget_stop(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    context: &Context,
-) -> Result<Option<&'static str>, PersistError> {
-    let budget = load_budget(tx, run_id, context.now())?;
-    Ok(if budget::unenforceable(&budget) {
-        Some("max_usd with an unknown price")
-    } else {
-        budget::stop(&budget, context.wall()).map(budget::Stop::as_str)
-    })
-}
-
-/// The Run gate for this task: its own unconsumed consult hold is available to it.
-pub(super) fn task_budget_stop(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    task: &str,
-    budget: &Budget,
-    context: &Context,
-) -> Result<Option<String>, PersistError> {
-    let mut available = budget.clone();
-    super::consult::exclude_unused_holds(tx, run_id, Some(task), context.now(), &mut available)?;
-    let stop = if budget::unenforceable(&available) {
-        Some("max_usd with an unknown price")
-    } else {
-        budget::stop(&available, context.wall()).map(budget::Stop::as_str)
-    };
-    Ok(stop.map(str::to_owned).or(super::consult::budget_stop(
-        tx,
-        task,
-        context.now(),
-        context.wall(),
-    )?))
-}
-
 /// What a pace did to a run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Paced {
@@ -661,7 +539,12 @@ pub(super) fn pace(
     // Which tasks are due and which wait for a retry.
     let due = |t: &TaskRow| is_due(t, &at);
     let waiting = |t: &TaskRow| is_waiting(t, &at);
-    let (budget, stop) = budget_and_stop(&tx, run_id, now, context.wall())?;
+    let view = super::budget_view::load(&tx, run_id, now, context.wall())?;
+    let budget = view.risk_budget();
+    let admission = view.any_stop();
+    let stop = admission
+        .as_ref()
+        .and_then(super::budget_view::Denied::limit);
     let mut paced = Paced::default();
     let mut commit = Commit::default();
     // Budget risk is judged here only, with the stop and in this transaction (REQ-042 behaviour 9, CR-025).
@@ -818,7 +701,7 @@ pub(super) fn pace(
         // Stalled: nothing runs, nothing is in flight, nothing is due and nothing waits for a retry.
         let stalled = unfinished_work == 0 && !in_flight && !any_due && !any_waiting;
         let mut claims = blockers::Claims::load(&tx, &project_id, run_id)?;
-        let unenforceable = budget::unenforceable(&budget);
+        let unenforceable = admission.as_ref().is_some_and(|d| d.limit().is_none());
         claims.set(
             blockers::BUDGET,
             if unenforceable {
@@ -857,13 +740,14 @@ pub(super) fn pace(
                 commit.cas.extend(moves);
                 commit.events.extend(withdrawn);
                 commit.cas.push(run_cas(RunState::Blocked));
-                let detail = if unenforceable {
-                    "a cost limit is set while the price is unknown"
-                } else if state == RunState::WaitingExternal {
-                    "nothing of the run waits any more and no task can move on"
-                } else {
-                    "no task of the run can move on"
-                };
+                let detail =
+                    if let Some(super::budget_view::Denied::Unenforceable(reason)) = &admission {
+                        reason.as_str()
+                    } else if state == RunState::WaitingExternal {
+                        "nothing of the run waits any more and no task can move on"
+                    } else {
+                        "no task of the run can move on"
+                    };
                 commit.events.push(event(
                     &project_id,
                     run_id,
@@ -1018,22 +902,6 @@ pub(super) fn waiting_until(
     now: SystemTime,
 ) -> Result<Option<String>, PersistError> {
     Ok(retry_wait(&load_tasks(tx, run_id)?, &rfc3339_utc(now)))
-}
-
-/// Run `run_id`'s budget at `now` and the first of its stops that holds at the wall-clock time `wall` (REQ-042
-/// behaviour 6): what ends a working run INCOMPLETE in [`pace`], and what keeps an INCOMPLETE run from resuming
-/// (docs/adr/ADR-031.md decision 16). A cost limit that cannot be enforced is no stop (BUDGET_UNENFORCEABLE is a claim).
-pub(super) fn budget_and_stop(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    now: SystemTime,
-    wall: SystemTime,
-) -> Result<(Budget, Option<budget::Stop>), PersistError> {
-    let budget = load_budget(tx, run_id, now)?;
-    let mut consumed = budget.clone();
-    super::consult::exclude_unused_holds(tx, run_id, None, now, &mut consumed)?;
-    let stop = budget::stop(&consumed, wall);
-    Ok((budget, stop))
 }
 
 /// A repair a task asks for (REQ-042 behaviour 5, ADR-020 decision 10).

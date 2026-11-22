@@ -438,14 +438,14 @@ fn candidates(
         .map_err(sqlite_error)?;
     let mut rows = Vec::new();
     let mut bindings = std::collections::BTreeMap::new();
-    let budget = super::retry::load_budget(tx, run_id, context.now())?;
+    let budget = super::budget_view::load(tx, run_id, context.now(), context.wall())?;
     for row in raw {
         let (
             (task_id, state, revision, spec_id, role, writer, created_seq, layer),
             (user, unblock, risk, info, cost, wait_rounds, first_eligible_seq, open, retry),
         ) = row.map_err(sqlite_error)?;
         let state = writer::parse::<TaskState>(&state)?;
-        if super::retry::task_budget_stop(tx, run_id, &task_id, &budget, context)?.is_some() {
+        if budget.task_stop(&task_id).is_some() {
             continue;
         }
         if state == TaskState::Pending && open > 0 {

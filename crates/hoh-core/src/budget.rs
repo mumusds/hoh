@@ -36,6 +36,8 @@ pub struct Budget {
 /// Why a run dispatches nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
+    Attempts,
+    Tokens,
     Deadline,
     Iterations,
     Duration,
@@ -47,6 +49,8 @@ impl Stop {
     pub fn as_str(self) -> &'static str {
         match self {
             Stop::Deadline => "deadline_at",
+            Stop::Attempts => "max_attempts",
+            Stop::Tokens => "max_tokens",
             Stop::Iterations => "max_iterations",
             Stop::Duration => "max_duration_hours",
             Stop::Cost => "max_usd",
@@ -96,6 +100,8 @@ impl Risk {
     pub fn unit(&self) -> &'static str {
         match self.kind {
             Stop::Iterations => "iterations",
+            Stop::Attempts => "attempts",
+            Stop::Tokens => "tokens",
             Stop::Cost => "usd",
             Stop::Duration | Stop::Deadline => "seconds",
         }

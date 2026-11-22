@@ -16,6 +16,7 @@ mod adoption;
 mod attempts;
 mod baseline;
 mod blockers;
+mod budget_view;
 mod candidates;
 mod closing;
 pub use baseline::BaselineProcess;

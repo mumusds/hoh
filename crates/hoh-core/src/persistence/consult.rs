@@ -4,7 +4,7 @@ mod children;
 mod listing;
 mod recovery;
 mod returned;
-pub(super) use bounds::{accrue_wall, exclude_unused_holds, stop as budget_stop, unreserved_wall};
+pub(super) use bounds::{accrue_wall, consumed};
 pub use listing::TasksPage;
 pub(super) use listing::page;
 pub(super) use returned::{finish, input_current, sweep};
@@ -116,7 +116,10 @@ pub(super) fn request(
     if !matches!(message.kind, MessageKind::Query | MessageKind::Steer)
         || (!major
             && (message.kind != MessageKind::Query
-                || !matches!(intent, "opinion" | "conclude" | "consult")))
+                || !matches!(
+                    intent,
+                    "opinion" | "conclude" | "consult" | "dismiss_consult"
+                )))
     {
         return Ok(None);
     }
@@ -154,6 +157,8 @@ pub(super) fn request(
         .map_err(sqlite_error)?;
     let reply = if let Some(reply) = source(&tx, message)? {
         reply
+    } else if intent == "dismiss_consult" {
+        returned::dismiss(&tx, &project, message, ctx)?
     } else if intent == "consult" {
         let edges = wait_for(&tx, &message.run_id)?;
         if let Some(members) = cycle(&edges, (&message.sender_role, &message.recipient_role)) {
