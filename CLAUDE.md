@@ -20,6 +20,7 @@ Language: reply to and ask the user in Simplified Chinese; new documents under `
 
 - Every new shell: `source .hoh-dev/env.sh`. Test infrastructure (once per VM): `bash scripts/dev/test-infra.sh`.
 - Kit self-test, required before every commit: `bash scripts/check.sh --bundle`.
+- Before pushing a PR: `bash scripts/dev/pre-pr.sh` (what CI runs, including the privileged fault matrix `db_faults --ignored` with `sudo -n`, which no frozen check covers: F7-51). Delegated developer briefs require it too.
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo deny --locked check licenses bans sources`.
 - Ledger: `python3 tools/taskboard.py next|claim <id> --owner main-dev|set <id> done --owner main-dev --note "<evidence paths>"`.
 - Candidate and checks: `python3 tools/candidate.py freeze --spec contracts/requirements.json --environment .hoh-dev/environment.json --test-plan tests/check-plan.json --out .hoh-dev/candidates/<id>.json`, then `python3 tools/run_check.py --check-id <check> --candidate-file … --out .hoh-dev/evidence/<id>/<check>` (fresh `--out` each run, no commits in between).
