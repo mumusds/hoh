@@ -233,6 +233,24 @@ fn discussion(
         .filter(|s| !s.is_empty());
     let repeated =
         evidence.is_some_and(|e| opinions.iter().any(|(_, old)| old.as_deref() == Some(e)));
+    // The single escalation closes the opinion phase, including an early evidence stop.
+    let escalation_id =
+        super::need::discussion_limit(project, &message.run_id, controversy, &[], "").event_id;
+    let stopped: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(payload_json,'$.cause') FROM events WHERE event_id=?1",
+            params![escalation_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(cause) = stopped {
+        return Ok(rejected(
+            "DISCUSSION_LIMIT",
+            json!({"cause":cause,"controversy_id":controversy,
+            "opinions":opinions.iter().map(|(id,_)|id).collect::<Vec<_>>(),"max_discussion_rounds":max}),
+        ));
+    }
     if opinions.len() >= max as usize || repeated {
         let cause = if repeated {
             "no_new_evidence"
