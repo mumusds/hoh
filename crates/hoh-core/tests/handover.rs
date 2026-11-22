@@ -123,6 +123,7 @@ async fn world(store: &Store, path: &Path) -> R {
             payload: json!({"goal": "G", "mode": "AUTO", "interactive": false}),
             payload_sha256: format!("{:064}", 7),
             target: RunTarget::Start {
+                max_discussion_rounds: 2,
                 mode: "AUTO".to_owned(),
                 budget: Config::default().budget,
                 policy: "balanced".to_owned(),

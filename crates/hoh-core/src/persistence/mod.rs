@@ -19,6 +19,7 @@ mod blockers;
 mod candidates;
 mod closing;
 pub use baseline::BaselineProcess;
+mod consult;
 mod progress;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
@@ -1984,6 +1985,18 @@ impl Store {
         intake: SpecReviewIntake,
     ) -> Result<SpecReviewTaken, PersistError> {
         self.writer.intake_spec_review(intake).await
+    }
+
+    /// Route a scoped consultation request; None leaves ordinary queries to the input router.
+    pub async fn consult_request(
+        &self,
+        message: crate::protocol::Message,
+    ) -> Result<Option<serde_json::Value>, PersistError> {
+        Ok(self
+            .writer
+            .outbox(writer::OutboxJob::Consult(Box::new(message)))
+            .await?
+            .consult)
     }
 
     /// Answer a verifier's request through its bridge (docs/adr/ADR-028.md decision 13): a change request refused with

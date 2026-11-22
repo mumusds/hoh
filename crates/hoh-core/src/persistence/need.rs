@@ -502,3 +502,21 @@ pub(super) const QUESTION_ASKED: &str = "question.asked";
 
 #[cfg(test)]
 mod tests;
+
+/// A bounded discussion asks Commander once without claiming a blocker or masquerading as a task question.
+pub(super) fn discussion_limit(
+    project: &str,
+    run: &str,
+    controversy: &str,
+    opinions: &[String],
+    cause: &str,
+) -> NewEvent {
+    NewEvent {
+        intent: Intent::Progress,
+        project_id: project.into(),
+        run_id: Some(run.into()),
+        event_id: crate::ids::child_id(run, &format!("discussion/{controversy}/limit")),
+        kind: KIND.into(),
+        payload: json!({"reason":"discussion_limit","fingerprint":controversy,"controversy_id":controversy,"opinions":opinions,"cause":cause}),
+    }
+}

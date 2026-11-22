@@ -47,6 +47,7 @@ agent = "pi"
 agent = "codex"
 independent_session = true
 [supervision]
+max_discussion_rounds = 2
 policy = "balanced"
 [budget]
 max_duration_hours = 120

@@ -170,6 +170,13 @@ pub(super) async fn answer_message(
 ) -> Value {
     let request = classify(message, round_id, candidate_id);
     let rejected = matches!(request, VerifierRequest::RejectChange(_));
+    if !rejected {
+        match store.consult_request(message.clone()).await {
+            Ok(Some(reply)) => return reply,
+            Ok(None) => {}
+            Err(e) => return json!({"status":"error","detail":e.to_string()}),
+        }
+    }
     match store.verifier_request(request).await {
         Ok(issue) if rejected => json!({"status": "rejected", "reason_code": "ILLEGAL_TRANSITION",
             "detail": "the candidate under verification is not changed; an Issue for the next candidate",

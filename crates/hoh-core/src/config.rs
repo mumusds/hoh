@@ -175,6 +175,7 @@ pub struct Persistence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Supervision {
+    pub max_discussion_rounds: u32,
     pub policy: String,
 }
 
@@ -273,6 +274,7 @@ impl Default for Config {
             scheduler: Params::default(),
             team,
             supervision: Supervision {
+                max_discussion_rounds: 2,
                 policy: "balanced".to_owned(),
             },
             budget: Budget {
@@ -668,6 +670,10 @@ impl Reader<'_> {
                 "supervision" => {
                     for (key, at, value) in self.table(name, value)? {
                         match key.as_str() {
+                            "max_discussion_rounds" => {
+                                config.supervision.max_discussion_rounds =
+                                    self.count("supervision.max_discussion_rounds", value, 1, 5)?;
+                            }
                             "policy" => {
                                 config.supervision.policy = self.one_of(
                                     "supervision.policy",

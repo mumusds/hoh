@@ -281,3 +281,289 @@ async fn test_040_03_requirement_growth_resets_persisted_window() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+fn message(id: &str, payload: Value) -> R<hoh_core::protocol::Message> {
+    Ok(serde_json::from_value(
+        json!({"schema_version":"1.0","message_id":id,"run_id":"R","task_id":"D","attempt_id":"A","sender_role":"developer","recipient_role":"researcher","role_epoch":1,"correlation_id":id,"causation_id":null,"idempotency_key":id,"expected_revision":0,"spec_sha256":format!("{:064}",1),"candidate_id":null,"kind":"query","payload":payload}),
+    )?)
+}
+const PARTICIPANTS: &str = r#"
+INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES ('sd','claude','developer','1','{}'),('sr','pi','researcher','1','{}');
+INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES ('R','developer','claude','sd',1,1,'2026-11-22T00:00:00Z'),('R','researcher','pi','sr',1,1,'2026-11-22T00:00:00Z');
+INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('D','R','s1','RUNNING','developer',1,1);
+INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES ('A','D','sd','RUNNING',1,1,1);
+"#;
+
+#[tokio::test]
+async fn test_023_03_discussion_limit_follows_max_rounds() -> R {
+    for max in [2, 3] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-discussion-")
+            .tempdir()?;
+        let host = Host::start(config(dir.path())).await?;
+        sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), PARTICIPANTS, false)?;
+        if max == 3 {
+            sql(
+                dir.path(),
+                "UPDATE runs SET config_snapshot_json=json_set(config_snapshot_json,'$.supervision.max_discussion_rounds',3) WHERE run_id='R';",
+                false,
+            )?;
+        }
+        for n in 1..=max + 2 {
+            let request = message(
+                &format!("opinion-{n}"),
+                json!({"intent":"opinion","controversy_id":"architecture","text":format!("opinion {n}"),"evidence_sha":format!("{n:064}")}),
+            )?;
+            let reply = host
+                .store()
+                .consult_request(request.clone())
+                .await?
+                .ok_or("query not handled")?;
+            assert_eq!(
+                reply["status"],
+                if n <= max { "accepted" } else { "rejected" }
+            );
+            if n > max {
+                assert_eq!(reply["reason_code"], "DISCUSSION_LIMIT");
+            }
+            assert_eq!(host.store().consult_request(request).await?, Some(reply));
+        }
+        let opinions = events(dir.path(), "discussion.opinion")?;
+        assert_eq!(opinions.len(), max as usize);
+        let escalation = events(dir.path(), "need_decision")?;
+        assert_eq!(escalation.len(), 1);
+        assert_eq!(
+            escalation[0]["opinions"].as_array().map(Vec::len),
+            Some(max as usize)
+        );
+        assert_eq!(
+            sql(dir.path(), "SELECT state FROM runs WHERE run_id='R'", true)?[0]["state"],
+            "RUNNING"
+        );
+        let conclude = message(
+            "conclude",
+            json!({"intent":"conclude","controversy_id":"architecture","adr":"docs/adr/ADR-037.md"}),
+        )?;
+        assert_eq!(
+            host.store()
+                .consult_request(conclude)
+                .await?
+                .ok_or("conclude")?["status"],
+            "accepted"
+        );
+        assert_eq!(
+            events(dir.path(), "discussion.opinion")?.len(),
+            max as usize
+        );
+        host.shutdown().await;
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn test_023_03_repeated_evidence_and_stale_sender_do_not_add_opinions() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-evidence-")
+        .tempdir()?;
+    let host = Host::start(config(dir.path())).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    let payload =
+        json!({"intent":"opinion","controversy_id":"c","text":"one","evidence_sha":"same"});
+    assert_eq!(
+        host.store()
+            .consult_request(message("first", payload.clone())?)
+            .await?
+            .ok_or("opinion")?["status"],
+        "accepted"
+    );
+    let reply = host
+        .store()
+        .consult_request(message("again", payload)?)
+        .await?
+        .ok_or("opinion")?;
+    assert_eq!(reply["reason_code"], "DISCUSSION_LIMIT");
+    assert_eq!(reply["details"]["cause"], "no_new_evidence");
+    assert_eq!(events(dir.path(), "discussion.opinion")?.len(), 1);
+    let mut stale = message(
+        "stale",
+        json!({"intent":"opinion","controversy_id":"other","text":"late"}),
+    )?;
+    stale.role_epoch = 2;
+    assert_eq!(
+        host.store().consult_request(stale).await?.ok_or("stale")?["reason_code"],
+        "STALE_ROLE_EPOCH"
+    );
+    assert_eq!(events(dir.path(), "discussion.opinion")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct Clock(std::sync::atomic::AtomicU64);
+impl hoh_core::delivery::Clock for Clock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+impl Clock {
+    fn advance(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Debug, Default)]
+struct FakeCommander {
+    summaries: std::sync::Mutex<Vec<Value>>,
+}
+impl hoh_app::host::Executor for FakeCommander {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send(if work.role == "commander" {
+            Ok(())
+        } else {
+            Err("fixture does not execute work".into())
+        });
+        rx
+    }
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        use std::os::unix::process::CommandExt as _;
+        let refused = |detail: String| hoh_app::host::Refusal {
+            reason: "FIXTURE".into(),
+            class: hoh_core::retry::FailureClass::Capability,
+            detail: Some(detail),
+            details: None,
+        };
+        let input = work
+            .assignment
+            .supervision
+            .clone()
+            .ok_or_else(|| refused("not supervision".into()))?;
+        self.summaries
+            .lock()
+            .map_err(|e| refused(e.to_string()))?
+            .push(input.summary.clone());
+        let message = json!({"schema_version":"1.0","message_id":"answer","run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"sender_role":"commander","recipient_role":"runtime","role_epoch":input.role_epoch,"correlation_id":"c","causation_id":input.wake,"idempotency_key":"k","expected_revision":input.run_revision,"spec_sha256":format!("{:064}",1),"candidate_id":null,"kind":"decision","payload":{"kind":"record_assumption","statement":"Conclusion: docs/adr/ADR-037.md","basis":input.summary.to_string()}});
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r go; exit 0"])
+            .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| refused(e.to_string()))?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let gate = hoh_app::host::Gate::new(move || {
+            use std::io::Write as _;
+            stdin
+                .ok_or("stdin")?
+                .write_all(b"go\n")
+                .map_err(|e| e.to_string())
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = tx.send(hoh_app::host::Outcome {
+                success: status.is_ok_and(|s| s.success()),
+                detail: "scripted decision".into(),
+                group_gone: hoh_agents::identity::group_empty(pid),
+                class: hoh_core::retry::FailureClass::Capability,
+                observed: hoh_core::persistence::Observed {
+                    messages: vec![json!({"nonce":input.nonce,"message":message}).to_string()],
+                    ..Default::default()
+                },
+                unknown_effect: false,
+                retry_at: None,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate,
+            ended: rx,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+async fn wait_sql(
+    root: &Path,
+    clock: &Clock,
+    query: &str,
+    done: impl Fn(&Value) -> bool,
+) -> R<Value> {
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let found = sql(root, query, true)?;
+        if done(&found) {
+            return Ok(found);
+        }
+        if std::time::Instant::now() > until {
+            return Err(format!("waiting for {query}: {found}").into());
+        }
+        clock.advance();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-conclusion-")
+        .tempdir()?;
+    let clock = std::sync::Arc::new(Clock::default());
+    let fake = std::sync::Arc::new(FakeCommander::default());
+    let mut c = config(dir.path());
+    c.clock = hoh_app::host::HostClock(clock.clone());
+    c.runner = Some(hoh_app::host::RunnerConfig {
+        executor: fake.clone(),
+        context: Context::default(),
+    });
+    let host = Host::start(c).await?;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), PARTICIPANTS, false)?;
+    for n in 1..=4 {
+        let reply=host.store().consult_request(message(&format!("opinion-{n}"),json!({"intent":"opinion","controversy_id":"architecture","text":format!("opinion {n}")}))?).await?.expect("discussion request must be handled before waking Commander");
+        assert_eq!(
+            reply["status"],
+            if n <= 2 { "accepted" } else { "rejected" }
+        );
+    }
+    wait_sql(dir.path(), &clock, "SELECT state FROM decisions", |v| {
+        v[0]["state"] == "APPLIED"
+    })
+    .await?;
+    wait_sql(
+        dir.path(),
+        &clock,
+        "SELECT a.state FROM attempts a JOIN tasks t USING(task_id) WHERE t.role='commander'",
+        |v| v[0]["state"] == "SETTLED",
+    )
+    .await?;
+    let refs = sql(
+        dir.path(),
+        "SELECT event_id FROM events WHERE kind='discussion.opinion' ORDER BY seq",
+        true,
+    )?;
+    let summaries = fake.summaries.lock().map_err(|e| e.to_string())?.clone();
+    assert_eq!(summaries.len(), 1);
+    for opinion in refs.as_array().ok_or("refs")? {
+        assert!(
+            summaries[0]
+                .to_string()
+                .contains(opinion["event_id"].as_str().ok_or("id")?)
+        );
+    }
+    let decision = sql(dir.path(), "SELECT payload_json FROM decisions", true)?;
+    assert!(
+        decision[0]["payload_json"]
+            .as_str()
+            .ok_or("decision")?
+            .contains("ADR-037.md")
+    );
+    assert_eq!(events(dir.path(), "need_decision")?.len(), 1);
+    host.shutdown().await;
+    Ok(())
+}

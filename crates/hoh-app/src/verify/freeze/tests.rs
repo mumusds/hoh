@@ -144,6 +144,7 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
             "start",
             0,
             RunTarget::Start {
+                max_discussion_rounds: 2,
                 mode: "PLAN".into(),
                 budget: hoh_core::config::Config::default().budget,
                 policy: "balanced".into(),
