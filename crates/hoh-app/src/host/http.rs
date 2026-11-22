@@ -781,7 +781,6 @@ async fn submit_command(
     }
     // The control commands (docs/adr/ADR-021.md decisions 5, 7, 8): their kind, where the run moves, the event's kind
     // and payload, and the runtime notice for the host loop (ADR-016 decision 5, ADR-018 decision 4).
-    let kind = command.kind();
     let mut regeneration = None;
     let (name, target, event_kind, control, details) = match &command.body {
         CommandBody::StartRun(start) => {
@@ -935,15 +934,6 @@ async fn submit_command(
                 None,
                 json!({}),
             )
-        }
-        _ => {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "CAPABILITY_UNSUPPORTED",
-                format!("{kind:?} is not supported by this host yet"),
-                false,
-                None,
-            );
         }
     };
     // A new run's id is the host's (CR-003); every other control command names its run.

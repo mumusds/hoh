@@ -252,6 +252,7 @@ pub(super) fn decide_in(
                 reason: RejectionReason::IllegalTransition,
                 detail: "mode_change_pending: writer dispatch waits for the mode safe point"
                     .to_owned(),
+                details: None,
             })
         }
         other => other,

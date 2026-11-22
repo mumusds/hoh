@@ -149,6 +149,7 @@ async fn test_034_04_index_drift_refuses_freeze() -> R {
                 policy: "balanced".into(),
                 assumptions: Default::default(),
                 unattended: false,
+                mode_cycle: hoh_core::config::Config::default().ui.mode_cycle,
             },
         ))
         .await?;
