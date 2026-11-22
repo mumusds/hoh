@@ -1764,3 +1764,16 @@ fn a_key_batch_keeps_start_mode_and_ordered_cycles() {
         ]
     );
 }
+
+#[test]
+fn status_counts_the_hosts_trace_and_computes_nothing() {
+    use super::app::trace_summary;
+    use serde_json::json;
+    assert_eq!(trace_summary(&serde_json::Value::Null), None);
+    let trace =
+        json!({"spec_revision": 2, "broken": [{"node": "test"}], "orphan": [{}, {}], "stale": []});
+    assert_eq!(
+        trace_summary(&trace).as_deref(),
+        Some("追踪 · 规格修订 2 · broken 1 · orphan 2 · stale 0")
+    );
+}

@@ -229,8 +229,10 @@ async fn a_rejected_latest_candidate_vetoed_afterwards_is_invalid_in_the_snapsho
             candidate_id: Some(c1.clone()),
             candidate_state: Some("REJECTED".to_owned()),
             ac_id: "AC-1-01".to_owned(),
+            test_id: None,
             label: Label::Invalid,
             why: Some(Why::CandidateInvalid),
+            evidence_ids: vec!["rec-1".to_owned()],
             latest: true,
         }]
     );
@@ -532,22 +534,31 @@ async fn the_lists_give_each_candidates_projection_newest_first_and_each_issues_
     )?;
     assert_eq!(state_of(&path, &acceptance_issue)?, "OPEN");
     let reader = store.reader()?;
-    let item = |candidate: &str, state: &str, label: Label, latest: bool| AcceptanceItem {
-        spec_id: "s1".to_owned(),
-        spec_revision: 1,
-        candidate_id: Some(candidate.to_owned()),
-        candidate_state: Some(state.to_owned()),
-        ac_id: "AC-1-01".to_owned(),
-        label,
-        why: None,
-        latest,
-    };
+    let item =
+        |candidate: &str, state: &str, label: Label, latest: bool, evidence: &str| AcceptanceItem {
+            spec_id: "s1".to_owned(),
+            spec_revision: 1,
+            candidate_id: Some(candidate.to_owned()),
+            candidate_state: Some(state.to_owned()),
+            ac_id: "AC-1-01".to_owned(),
+            test_id: None,
+            label,
+            why: None,
+            evidence_ids: vec![evidence.to_owned()],
+            latest,
+        };
     let first = reader.acceptance_page("R", 1, None)?.ok_or("no run R")?;
-    assert_eq!(first.items, [item(&c2, "VERIFYING", Label::Pass, true)]);
+    assert_eq!(
+        first.items,
+        [item(&c2, "VERIFYING", Label::Pass, true, "rec-2")]
+    );
     let second = reader
         .acceptance_page("R", 1, first.next.clone())?
         .ok_or("no run R")?;
-    assert_eq!(second.items, [item(&c1, "REJECTED", Label::Fail, false)]);
+    assert_eq!(
+        second.items,
+        [item(&c1, "REJECTED", Label::Fail, false, "rec-1")]
+    );
     assert_eq!(second.next, None);
     let whole = reader.acceptance_page("R", 500, None)?.ok_or("no run R")?;
     assert_eq!(whole.items, [first.items, second.items].concat());

@@ -60,6 +60,7 @@ mod suites;
 mod supervise;
 mod team;
 mod trace;
+pub use trace::{TaskItem, TasksPage};
 mod verification;
 mod wakes;
 pub use candidates::{CandidateRow, Freeze, Frozen, RunAcceptance};
@@ -2338,6 +2339,17 @@ impl Reader {
         before: Option<i64>,
     ) -> Result<Option<IssuesPage>, PersistError> {
         snapshot::issues_page(&self.conn, run_id, limit, before)
+    }
+
+    /// A page of run `run_id`'s tasks by creation order (openapi `listTasks`; docs/adr/ADR-039.md decision 2): at most
+    /// `limit` after the cursor `after` (created_seq, task_id); none when there is no such run.
+    pub fn tasks_page(
+        &self,
+        run_id: &str,
+        limit: usize,
+        after: Option<(i64, String)>,
+    ) -> Result<Option<TasksPage>, PersistError> {
+        trace::tasks_page(&self.conn, run_id, limit, after)
     }
 
     /// Issue `issue_id` traced to its report and raw session (docs/adr/ADR-029.md decision 15); none when there is no

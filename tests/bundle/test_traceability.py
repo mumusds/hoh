@@ -517,8 +517,27 @@ class EndToEnd(unittest.TestCase):
         rc,report,out=self.traceability(c)
         self.assertEqual((rc,report['unsatisfied']),(1,[{'id':'TEST-902-01','status':'NOT_RUN'}]))
         self.assertEqual((out/'artifacts/test-results.jsonl').read_text(),'')
-
-if __name__=='__main__':unittest.main()
+    def test_032_01_q15_a_traceability_test_outside_the_profile_runs_and_its_failure_fails(self):
+        """docs/adr/ADR-039.md decision 3 (Q15, tightening ADR-027 decision 10): a TEST whose scenario check is
+        traceability but whose requirement is outside the profile still has its tests/bundle method run; its line is
+        written, a FAIL fails the check, and the report keeps only the profile's TESTs."""
+        scenarios=load_json(self.root/'contracts/acceptance-scenarios.json')
+        for s in scenarios['scenarios']:
+            if s['id']=='TEST-903-01':s['check_id']='traceability'
+        (self.root/'contracts/acceptance-scenarios.json').write_text(json.dumps(scenarios))
+        fixture=(self.root/'tests/bundle/test_fixture.py')
+        fixture.write_text(fixture.read_text()+'    def test_903_01_outside_the_profile(self):pass\n')
+        self.commit('a v1 self-test');c=self.freeze('c');self.check(c,'unit');self.check(c,'integration')
+        rc,report,out=self.traceability(c)
+        self.assertEqual(rc,0,(out/'stderr.log').read_text())
+        lines=[json.loads(l) for l in (out/'artifacts/test-results.jsonl').read_text().splitlines()]
+        self.assertEqual(sorted((l['test_id'],l['status']) for l in lines),[('TEST-902-01','PASS'),('TEST-903-01','PASS')])
+        self.assertNotIn('TEST-903-01',report['tests'])
+        fixture.write_text(fixture.read_text().replace('outside_the_profile(self):pass','outside_the_profile(self):self.fail("x")'))
+        self.commit('it fails');c=self.freeze('c2');self.check(c,'unit');self.check(c,'integration')
+        rc,report,out=self.traceability(c)
+        self.assertEqual(rc,1);self.assertEqual(report['unsatisfied'],[])
+        self.assertIn('FAIL TEST-903-01',(out/'stderr.log').read_text())
 
 
 class ScenarioChecks(unittest.TestCase):
@@ -535,3 +554,5 @@ class ScenarioChecks(unittest.TestCase):
             json_file(root,'contracts/acceptance-scenarios.json',{'scenarios':[{'id':'TEST-A-01','check_id':'x'}]})
             self.assertEqual(tr.checks_of({'requirements':[]},root),{'TEST-A-01':'x'})
             self.assertEqual(tr.checks_of(spec,root),{'TEST-A-01':'unit'})
+
+if __name__=='__main__':unittest.main()

@@ -45,33 +45,7 @@ fn project(world: &World) -> R<Index> {
             bytes: format!("{PREFIX}{}", req("B", &["integration"])).into_bytes(),
         },
     ];
-    let index = specindex::generate_index(&files)?;
-    let check = |name: &str| {
-        json!({"argv": ["sh", "-c", format!("echo {name}")], "mode": "product", "timeout_seconds": 60,
-            "artifacts": ["test-results.jsonl"]})
-    };
-    let plan = json!({"schema_version": "1.0", "plan_id": "trace-fixture",
-        "checks": {"unit": check("unit"), "integration": check("integration")}});
-    let mut written: Vec<(String, Vec<u8>)> =
-        files.into_iter().map(|f| (f.path, f.bytes)).collect();
-    written.extend([
-        (specindex::PATH.to_owned(), index.bytes().to_vec()),
-        (".gitignore".to_owned(), b".hoh/\n".to_vec()),
-        (
-            "tests/check-plan.json".to_owned(),
-            format!("{}\n", serde_json::to_string_pretty(&plan)?).into_bytes(),
-        ),
-        ("environment.json".to_owned(), b"{}\n".to_vec()),
-    ]);
-    for (path, bytes) in written {
-        let file = world.project().join(path);
-        std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
-        std::fs::write(file, bytes)?;
-    }
-    world.git(&["init", "-q"])?;
-    world.git(&["add", "."])?;
-    world.git(&["commit", "-qm", "specification"])?;
-    Ok(index)
+    write_project(world, files)
 }
 
 /// A command of `kind` for run `run` at its current revision.
@@ -268,5 +242,200 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
     assert_eq!(product, tests, "the product export and the World agree");
     assert!(!contracts.exists(), "nothing made the project's contracts/");
     host.shutdown().await;
+    Ok(())
+}
+
+/// The AC-032-01/-02 project: REQ-A (AC-A-01 unit, AC-A-02 integration) and REQ-B (AC-B-01, AC-B-02 unit), the
+/// generated index, a check plan; committed.
+fn chain_project(world: &World) -> R<Index> {
+    let files = vec![Source {
+        path: "docs/spec/spec.md".into(),
+        bytes: format!(
+            "{PREFIX}{}{}",
+            req("A", &["unit", "integration"]),
+            req("B", &["unit", "unit"])
+        )
+        .into_bytes(),
+    }];
+    write_project(world, files)
+}
+
+/// `files`, their index, a check plan and an environment, committed in a new repository.
+fn write_project(world: &World, files: Vec<Source>) -> R<Index> {
+    let index = specindex::generate_index(&files)?;
+    let check = |name: &str| {
+        json!({"argv": ["sh", "-c", format!("echo {name}")], "mode": "product", "timeout_seconds": 60,
+            "artifacts": ["test-results.jsonl"]})
+    };
+    let plan = json!({"schema_version": "1.0", "plan_id": "trace-fixture",
+        "checks": {"unit": check("unit"), "integration": check("integration")}});
+    let mut written: Vec<(String, Vec<u8>)> =
+        files.into_iter().map(|f| (f.path, f.bytes)).collect();
+    written.extend([
+        (specindex::PATH.to_owned(), index.bytes().to_vec()),
+        (".gitignore".to_owned(), b".hoh/\n".to_vec()),
+        (
+            "tests/check-plan.json".to_owned(),
+            format!("{}\n", serde_json::to_string_pretty(&plan)?).into_bytes(),
+        ),
+        ("environment.json".to_owned(), b"{}\n".to_vec()),
+    ]);
+    for (path, bytes) in written {
+        let file = world.project().join(path);
+        std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+        std::fs::write(file, bytes)?;
+    }
+    world.git(&["init", "-q"])?;
+    world.git(&["add", "."])?;
+    world.git(&["commit", "-qm", "specification"])?;
+    Ok(index)
+}
+
+/// Run `run`'s three tasks (T1: REQ-A, T2: REQ-B, T3: both) and, on `candidate`, one PASS row per AC with its own
+/// evidence of the AC's check: a persisted fixture of a verified candidate; no verification process or agent runs.
+fn verified(world: &World, run: &str, candidate: &str) -> R {
+    for (seq, (task, requirements)) in [
+        ("T1", vec!["REQ-A"]),
+        ("T2", vec!["REQ-B"]),
+        ("T3", vec!["REQ-A", "REQ-B"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        world.exec(&format!(
+            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+             SELECT '{task}',run_id,spec_id,'ACCEPTED','developer',1,{seq} FROM runs WHERE run_id='{run}';"
+        ))?;
+        for r in requirements {
+            world.exec(&format!(
+                "INSERT INTO task_requirements(task_id,requirement_id,spec_id)
+                 SELECT '{task}','{r}',spec_id FROM runs WHERE run_id='{run}';"
+            ))?;
+        }
+    }
+    world.exec(&format!(
+        "INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision)
+            VALUES('observed','T1','SETTLED',1,1,0);
+         INSERT INTO artifacts(artifact_id,sha256,path,bytes,mime) VALUES('observed','{hash}','fixture',0,'application/json');
+         INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
+         SELECT 'evidence-'||a.ac_id,'{candidate}','observed','observed',a.check_id,'check','PASS','mock',
+            '2026-11-22T00:00:00Z'
+         FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}' ORDER BY a.ac_id;
+         INSERT INTO acceptance_results(ac_id,spec_id,candidate_id,evidence_id,status)
+         SELECT a.ac_id,a.spec_id,'{candidate}','evidence-'||a.ac_id,'PASS' FROM acceptance_criteria a
+         JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}' ORDER BY a.ac_id;",
+        hash = "0".repeat(64)
+    ))?;
+    Ok(())
+}
+
+/// Every item of the paged list at `path` (`limit` 1 per page, so every cursor is exercised).
+async fn all_pages(host: &Host, path: &str) -> R<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(c) => format!("{path}?limit=1&cursor={c}"),
+            None => format!("{path}?limit=1"),
+        };
+        let (status, page) = world::exchange(host, "GET", &url, None).await?;
+        assert_eq!(status, 200, "{url}: {page}");
+        items.extend(page["items"].as_array().ok_or("no items")?.iter().cloned());
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+        assert!(items.len() < 100, "pagination must advance");
+    }
+    Ok(items)
+}
+
+#[tokio::test]
+async fn test_032_02_acceptance_and_tasks_match_db() -> R {
+    let world = World::new()?;
+    let index = chain_project(&world)?;
+    let (host, run) = approved(&world, &index).await?;
+    let (candidate, _) = frozen(&world, &host, &run).await?;
+    verified(&world, &run, &candidate)?;
+    // Each AC's candidate, TEST and evidence references through the API, all pages.
+    let api: Vec<Value> = all_pages(&host, &format!("/v1/runs/{run}/acceptance"))
+        .await?
+        .iter()
+        .map(|i| {
+            json!({"candidate_id": i["candidate_id"], "ac_id": i["ac_id"], "test_id": i["test_id"],
+                "evidence_ids": i["evidence_ids"]})
+        })
+        .collect();
+    assert_eq!(api.len(), 4, "{api:?}");
+    // The same straight from the store.
+    let db: Vec<Value> = world
+        .rows(&format!(
+            "SELECT r.candidate_id, a.ac_id, json_extract(a.body,'$.test_id') AS test_id,
+                json_group_array(r.evidence_id) AS evidence_ids
+             FROM acceptance_criteria a JOIN runs u ON u.spec_id=a.spec_id
+             JOIN acceptance_results r ON r.ac_id=a.ac_id AND r.spec_id=a.spec_id
+             WHERE u.run_id='{run}' GROUP BY r.candidate_id, a.ac_id ORDER BY a.ac_id"
+        ))?
+        .into_iter()
+        .map(|mut r| {
+            r["evidence_ids"] = serde_json::from_str(r["evidence_ids"].as_str().unwrap_or("[]"))
+                .unwrap_or(Value::Null);
+            r
+        })
+        .collect();
+    assert_eq!(api, db, "acceptance: API and store");
+    assert!(api.iter().all(|i| i["test_id"].is_string()), "{api:?}");
+    // Each task's requirements through the API, all pages, and straight from the store.
+    let tasks: Vec<Value> = all_pages(&host, &format!("/v1/runs/{run}/tasks"))
+        .await?
+        .iter()
+        .map(|t| json!({"task_id": t["task_id"], "requirement_ids": t["requirement_ids"]}))
+        .collect();
+    let db: Vec<Value> = world
+        .rows(&format!(
+            "SELECT t.task_id, (SELECT json_group_array(requirement_id) FROM
+                (SELECT requirement_id FROM task_requirements q WHERE q.task_id=t.task_id ORDER BY requirement_id))
+                AS requirement_ids
+             FROM tasks t WHERE t.run_id='{run}' ORDER BY t.created_seq, t.task_id"
+        ))?
+        .into_iter()
+        .map(|mut r| {
+            r["requirement_ids"] =
+                serde_json::from_str(r["requirement_ids"].as_str().unwrap_or("[]"))
+                    .unwrap_or(Value::Null);
+            r
+        })
+        .collect();
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks, db, "tasks: API and store");
+    host.shutdown().await;
+    Ok(())
+}
+
+/// The product's trace export for TEST-032-01 (docs/adr/ADR-039.md decision 3): what
+/// `tests/bundle/fixtures/trace-export.json` must be, its run and candidate ids replaced by fixed placeholders.
+const TRACE_FIXTURE: &str = "tests/bundle/fixtures/trace-export.json";
+
+#[tokio::test]
+async fn trace_export_fixture_is_the_products_current_export() -> R {
+    let world = World::new()?;
+    let index = chain_project(&world)?;
+    let (host, run) = approved(&world, &index).await?;
+    let (candidate, _) = frozen(&world, &host, &run).await?;
+    verified(&world, &run, &candidate)?;
+    let trace = export(&host, &run).await?;
+    host.shutdown().await;
+    let text = format!("{}\n", serde_json::to_string_pretty(&trace)?)
+        .replace(&run, "RUN")
+        .replace(&candidate, "CANDIDATE");
+    let fixture = hoh_root().join(TRACE_FIXTURE);
+    if std::env::var_os("HOH_BLESS_TRACE").is_some() {
+        std::fs::write(&fixture, &text)?;
+    }
+    let committed = std::fs::read_to_string(&fixture).unwrap_or_default();
+    assert!(
+        committed == text,
+        "{TRACE_FIXTURE} is not the product's current export; rerun with HOH_BLESS_TRACE=1 and review the diff:\n{text}"
+    );
     Ok(())
 }

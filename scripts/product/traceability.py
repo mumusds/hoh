@@ -133,6 +133,61 @@ class World:
                 and all(data[k]['sha256'] == data[k + '_sha256'] for k in ('spec', 'environment', 'test_plan')))
 
 
+def chain(export: dict) -> dict:
+    """The mirror of the product's trace export rules (hoh_core::trace::export; REQ-032 behaviours 2, 3 and 5,
+    docs/adr/ADR-039.md decision 2): from an export's nodes, what is broken (each with the missing link), orphaned and
+    stale. The product writes the same three lists into its export; tests/bundle checks both agree."""
+    revision, current = export['spec_revision'], export['candidate_id']
+    states = {c['candidate_id']: c['state'] for c in export['candidates']}
+    evidence = {e['evidence_id'] for e in export['evidence']}
+    broken = [{'node': 'acceptance', 'id': a['ac_id'], 'missing': 'test'}
+              for a in export['acceptance'] if a.get('test_id') is None]
+    for t in export['tests']:
+        if t.get('check_id') is None:
+            broken.append({'node': 'test', 'id': t['test_id'], 'missing': 'check'})
+        if not any(r['ac_id'] == t['ac_id'] and r['spec_revision'] == revision and r['evidence_id'] in evidence
+                   for r in export['results']):
+            broken.append({'node': 'test', 'id': t['test_id'], 'missing': 'evidence'})
+    broken += [{'node': 'evidence', 'id': e['evidence_id'], 'missing': 'candidate'}
+               for e in export['evidence'] if e['candidate_id'] not in states]
+    broken += [{'node': 'task', 'id': t['task_id'], 'missing': 'requirement'}
+               for t in export['tasks'] if not t['requirement_ids']]
+    fields = ('ac_id', 'spec_revision', 'candidate_id', 'evidence_id', 'status')
+    orphan = [{k: r[k] for k in fields} for r in export['results']
+              if r['status'] in SATISFIED and (r['candidate_id'] != current or r['spec_revision'] != revision)]
+    stale = [{k: r[k] for k in fields} for r in export['results']
+             if r['spec_revision'] != revision or states.get(r['candidate_id']) == 'STALE']
+    return {'broken': broken, 'orphan': orphan, 'stale': stale}
+
+
+def links(export: dict) -> dict[tuple[str, str], set[tuple[str, str]]]:
+    """The export's chain as forward edges between (kind, id) nodes, in the chain's order REQ→AC→Task→candidate→TEST→
+    evidence→result (docs/adr/ADR-039.md decision 2); reverse them for the backward direction."""
+    out: dict[tuple[str, str], set[tuple[str, str]]] = {}
+
+    def edge(a, b):
+        out.setdefault(a, set()).add(b)
+        out.setdefault(b, set())
+    evidence = {e['evidence_id']: e for e in export['evidence']}
+    test_of = {t['ac_id']: t['test_id'] for t in export['tests']}
+    for r in export['requirements']:
+        for ac in r['ac_ids']:
+            edge(('requirement', r['requirement_id']), ('acceptance', ac))
+            for task in r['task_ids']:
+                edge(('acceptance', ac), ('task', task))
+    for c in export['candidates']:
+        for task in c['task_ids']:
+            edge(('task', task), ('candidate', c['candidate_id']))
+    for n, r in enumerate(export['results']):
+        test, e = test_of.get(r['ac_id']), evidence.get(r['evidence_id'])
+        if test is None or e is None:
+            continue
+        edge(('candidate', e['candidate_id']), ('test', test))
+        edge(('test', test), ('evidence', e['evidence_id']))
+        edge(('evidence', e['evidence_id']), ('result', str(n)))
+    return out
+
+
 class Member:
     """An execution record that claims the candidate, or that cannot be read and holds its id (damaged)."""
     def __init__(self, path: Path, rel: str, record: dict | None, damaged: bool):
@@ -557,7 +612,17 @@ def main(argv=None) -> int:
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print(f'traceability: {exc}', file=sys.stderr)
         return 1
-    own = self_test(ROOT, sorted(t for t, test in tests.items() if test.check == world.check_id))
+    # The profile's self-tests, and those of the spec's TESTs on this check outside the profile (docs/adr/ADR-039.md
+    # decision 3, Q15: TEST-032-01 under v0.1): their lines are written too and a FAIL among them fails the check;
+    # the report's tests and unsatisfied stay the profile's.
+    mine = sorted(t for t, test in tests.items() if test.check == world.check_id)
+    try:
+        extra = sorted(t for t, test in world.tests(every_profile=True).items()
+                       if test.check == world.check_id and t not in tests)
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        print(f'traceability: {exc}', file=sys.stderr)
+        return 1
+    own = self_test(ROOT, sorted(mine + extra))
     out_dir = Path(out)
     with (out_dir / world.names['test_results']).open('w', encoding='utf-8') as f:
         for line in own:
@@ -569,7 +634,10 @@ def main(argv=None) -> int:
         print(f"traceability: INVALID {item['path']}: {', '.join(item['reasons'])}", file=sys.stderr)
     for item in result['unsatisfied']:
         print(f"traceability: {item['status']} {item['id']}", file=sys.stderr)
-    ok = not result['unsatisfied'] and not result['invalid']
+    failed = [line['test_id'] for line in own if line['test_id'] in extra and line['status'] == 'FAIL']
+    for test_id in failed:
+        print(f'traceability: FAIL {test_id} (self-test outside the profile)', file=sys.stderr)
+    ok = not result['unsatisfied'] and not result['invalid'] and not failed
     print(f"traceability: {len(tests)} TESTs, {len(found)} members, "
           f"{len(result['unsatisfied'])} unsatisfied, {len(result['invalid'])} invalid", file=sys.stderr)
     return 0 if ok else 1

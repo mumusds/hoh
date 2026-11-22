@@ -901,6 +901,7 @@ impl App {
             return;
         };
         if command == "/status" {
+            let trace = trace_summary(&run.snapshot["projection"]["trace"]);
             self.say(format!(
                 "Run {} · 状态 {} · 模式 {} · revision {}",
                 run.run_id,
@@ -908,6 +909,9 @@ impl App {
                 run.mode,
                 run.snapshot["revision"]
             ));
+            if let Some(line) = trace {
+                self.say(line);
+            }
         } else {
             let lines: Vec<_> = run.snapshot["projection"]["team"]
                 .as_array()
@@ -1191,4 +1195,20 @@ impl App {
             area,
         );
     }
+}
+
+/// The `/status` line of a run's requirement trace (REQ-032 decision 2, docs/adr/ADR-039.md decision 2): the host's
+/// `projection.trace` counted, never computed here. None without one.
+pub(crate) fn trace_summary(trace: &Value) -> Option<String> {
+    let count = |key: &str| trace[key].as_array().map_or(0, Vec::len);
+    trace.as_object()?;
+    Some(format!(
+        "追踪 · 规格修订 {} · broken {} · orphan {} · stale {}",
+        trace["spec_revision"]
+            .as_i64()
+            .map_or("无".to_owned(), |r| r.to_string()),
+        count("broken"),
+        count("orphan"),
+        count("stale")
+    ))
 }
