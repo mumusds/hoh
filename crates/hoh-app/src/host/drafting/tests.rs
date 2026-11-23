@@ -395,3 +395,85 @@ fn test_008_02_m3l203_content_limit_is_a_small_failed_observation() -> R {
     ));
     Ok(())
 }
+
+#[test]
+fn test_008_02_m3l301_large_tracked_repository_does_not_consume_untracked_budget() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::create_dir(root.join("src"))?;
+    for n in 0..30_000 {
+        std::fs::write(
+            root.join(format!("src/existing-brownfield-source-file-{n:05}.c")),
+            "",
+        )?;
+    }
+    git(root, &["add", "src"])?;
+    git(root, &["commit", "-q", "-m", "large existing project"])?;
+    assert!(super::super::control::git(root, &["ls-files", "-z"])?.len() > OBSERVATION_LIMIT);
+    // A literal pathspec must preserve wildcard and non-UTF-8 directory names, too.
+    let prefix = b"vendor[raw]-\xff";
+    let vendor = root.join(std::ffi::OsString::from_vec(prefix.to_vec()));
+    std::fs::create_dir(&vendor)?;
+    for n in 0..FOLD_AT {
+        std::fs::write(vendor.join(format!("file-{n}")), "user data")?;
+    }
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    assert_eq!(
+        start["draft_untracked"].as_object().ok_or("digests")?.len(),
+        1
+    );
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    std::fs::write(vendor.join("file-0"), "changed")?;
+    let expected = named(&[prefix.as_slice(), b"/"].concat());
+    assert!(
+        matches!(checked(root, &start)?, WriterOutcome::DraftBlocked { paths, .. } if paths == [expected])
+    );
+    for n in 0..FOLD_AT {
+        std::fs::write(root.join(format!("src/untracked-{n}.c")), "user source")?;
+    }
+    let mixed = snapshot(root);
+    assert!(mixed.get("draft_error").is_none(), "{mixed}");
+    assert!(matches!(
+        checked(root, &mixed)?,
+        WriterOutcome::Draft { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l301_in_tree_ignored_build_products_do_not_consume_untracked_budget() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "*.o\n")?;
+    std::fs::create_dir(root.join("src"))?;
+    std::fs::write(root.join("src/brownfield.c"), "source")?;
+    git(root, &["add", "."])?;
+    git(root, &["commit", "-q", "-m", "in-tree build project"])?;
+    for n in 0..4100 {
+        std::fs::write(root.join(format!("src/build-{n}.o")), "artifact")?;
+    }
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    assert_eq!(
+        start["draft_ignored_roots"]
+            .as_array()
+            .ok_or("ignored roots")?
+            .len(),
+        4100
+    );
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    std::fs::write(root.join("src/new.o"), "new artifact")?;
+    assert!(
+        matches!(checked(root, &start)?, WriterOutcome::DraftBlocked { paths, .. } if paths == ["src/new.o"])
+    );
+    Ok(())
+}
