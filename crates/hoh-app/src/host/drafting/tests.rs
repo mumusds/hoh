@@ -179,7 +179,7 @@ fn test_008_02_m3l100_greenfield_preserves_existing_untracked_files() -> R {
             _ => {}
         }
         let result = checked(root, &start)?;
-        if matches!(change, "unchanged" | "committed") {
+        if change == "unchanged" {
             assert!(matches!(result, WriterOutcome::Draft { .. }));
             assert_eq!(
                 std::fs::read_to_string(root.join("README.txt"))?,
@@ -191,6 +191,38 @@ fn test_008_02_m3l100_greenfield_preserves_existing_untracked_files() -> R {
                 "{change}"
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l300_add_all_counts_unchanged_product_files_as_committed_writes() -> R {
+    for existing_commit in [false, true] {
+        let dir = repo()?;
+        let root = dir.path();
+        if existing_commit {
+            git(root, &["commit", "--allow-empty", "-q", "-m", "base"])?;
+        }
+        std::fs::create_dir(root.join("src"))?;
+        for path in [".env", "README.txt", "src/brownfield.rs"] {
+            std::fs::write(root.join(path), "existing user content")?;
+        }
+        let start = snapshot(root);
+        git(root, &["add", "-A"])?;
+        docs(root)?;
+        let result = checked(root, &start)?;
+        assert!(
+            matches!(&result, WriterOutcome::DraftBlocked { paths, .. }
+                if paths == &[".env", "README.txt", "src/brownfield.rs"]),
+            "existing_commit={existing_commit}: {result:?}"
+        );
+        for path in [".env", "README.txt", "src/brownfield.rs"] {
+            assert_eq!(
+                std::fs::read_to_string(root.join(path))?,
+                "existing user content"
+            );
+        }
+        git(root, &["cat-file", "-e", "HEAD:.env"])?;
     }
     Ok(())
 }
