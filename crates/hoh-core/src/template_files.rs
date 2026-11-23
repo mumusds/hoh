@@ -5,7 +5,11 @@ use crate::{
 };
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use serde::Serialize;
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Selection {
@@ -91,6 +95,17 @@ fn present(dir: &std::os::fd::OwnedFd, name: &str) -> std::io::Result<bool> {
     }
 }
 fn publish(root: &std::os::fd::OwnedFd, path: &str, text: &str) -> std::io::Result<bool> {
+    publish_with(root, path, text, |old, source, dir, name, flags| {
+        fs::linkat(old, source, dir, name, flags)
+    })
+}
+
+fn publish_with(
+    root: &std::os::fd::OwnedFd,
+    path: &str,
+    text: &str,
+    link: impl FnOnce(BorrowedFd<'_>, &str, BorrowedFd<'_>, &str, AtFlags) -> rustix::io::Result<()>,
+) -> std::io::Result<bool> {
     let mut parts: Vec<_> = path.split('/').collect();
     if parts
         .iter()
@@ -132,14 +147,77 @@ fn publish(root: &std::os::fd::OwnedFd, path: &str, text: &str) -> std::io::Resu
     let mut file = std::fs::File::from(fd);
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
-    let created = match fs::linkat(&file, "", &dir, name, AtFlags::EMPTY_PATH) {
+    // Linux before 6.10 requires CAP_DAC_READ_SEARCH for AT_EMPTY_PATH.
+    // Follow the proc fd link instead, as documented for unprivileged O_TMPFILE publication.
+    let source = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let created = match link(fs::CWD, &source, dir.as_fd(), name, AtFlags::SYMLINK_FOLLOW) {
         Ok(()) => true,
         Err(rustix::io::Errno::EXIST) => {
             present(&dir, name)?;
             false
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::Error::from(e).kind(),
+                format!("anonymous template publication via /proc/self/fd unavailable: {e}"),
+            ));
+        }
     };
     fs::fsync(&dir)?;
     Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn publication_uses_proc_fd_without_empty_path_capability() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = fs::open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        let created = publish_with(
+            &root,
+            "doc.md",
+            "complete document",
+            |old, source, dir, name, flags| {
+                assert_eq!(old.as_raw_fd(), fs::CWD.as_raw_fd());
+                assert!(source.starts_with("/proc/self/fd/"), "{source}");
+                assert_eq!(flags, AtFlags::SYMLINK_FOLLOW);
+                assert_eq!(
+                    std::fs::read_to_string(source).unwrap(),
+                    "complete document"
+                );
+                fs::linkat(old, source, dir, name, flags)
+            },
+        )?;
+        assert!(created);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("doc.md"))?,
+            "complete document"
+        );
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_proc_publication_fails_with_reason_and_no_named_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = fs::open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        let error = publish_with(&root, "doc.md", "complete document", |_, _, _, _, _| {
+            Err(rustix::io::Errno::NOENT)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("/proc/self/fd"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        Ok(())
+    }
 }
