@@ -1,9 +1,11 @@
-"""REQ-032 / AC-032-01 (TEST-032-01, check traceability): the product's trace export checked by its mirror in
-scripts/product/traceability.py (docs/adr/ADR-039.md decision 3). tests/bundle/fixtures/trace-export.json is the
-product's current export of the fixture project (2 REQs, 4 ACs, 3 Tasks, 1 candidate): crates/hoh-app/tests/trace.rs
-regenerates it through the product host and fails while the committed file differs. The defects are injected into a
-copy of it, never into a product store."""
-import copy,json,unittest
+"""REQ-032 / AC-032-01 (TEST-032-01, check traceability): the product's trace exports checked by their mirror in
+scripts/product/traceability.py (docs/adr/ADR-039.md decision 3 and its round 1 corrections, M3N-005).
+tests/bundle/fixtures/trace-export.json holds the product's current exports of the fixture project (2 REQs, 4 ACs, 3
+Tasks, 1 candidate), whole and over three faults written into the product's store: one TEST's evidence missing, a PASS
+on a STALE older candidate, the candidate row missing. crates/hoh-app/tests/trace.rs
+(test_032_01_product_export_over_fault_variants_matches_the_mirror) produces them through the product host, compares
+each with the mirror there, and fails while the committed file differs from what the product exports now."""
+import json,unittest
 from helpers import ROOT,load_json
 from test_traceability import tr
 
@@ -38,28 +40,31 @@ class TraceExport(unittest.TestCase):
         return forward
 
     def test_032_01_export_links_broken_and_orphan(self):
-        e=self.export
+        self.assertEqual(set(self.export),{'whole','missing_evidence','stale_candidate','missing_candidate'})
+        # Every product export, item by item: the mirror computes from its nodes what the product wrote.
+        for name,e in self.export.items():
+            with self.subTest(variant=name):
+                self.assertEqual(tr.chain(e),{k:e[k] for k in ('broken','orphan','stale')})
+        e=self.export['whole']
         self.assertEqual((len(e['requirements']),len(e['acceptance']),len(e['tasks']),len(e['candidates'])),(2,4,3,1))
         self.assertIsNotNone(e['candidate_id'])
-        # The mirror computes from the nodes what the product wrote; the fixture's chains are whole.
-        mirror=tr.chain(e)
-        self.assertEqual(mirror,{k:e[k] for k in ('broken','orphan','stale')})
-        self.assertEqual(mirror,{'broken':[],'orphan':[],'stale':[]})
+        self.assertEqual({k:e[k] for k in ('broken','orphan','stale')},{'broken':[],'orphan':[],'stale':[]})
         forward=self.assert_chains(e)
         self.assertEqual({k for k,_ in forward},set(ORDER))
-        # Inject: drop one TEST's evidence; rebind another AC's PASS to an older candidate.
-        bad=copy.deepcopy(e);gone,moved=bad['tests'][0],bad['tests'][1]
-        dropped=next(r['evidence_id'] for r in bad['results'] if r['ac_id']==gone['ac_id'])
-        bad['evidence']=[x for x in bad['evidence'] if x['evidence_id']!=dropped]
-        rebound=next(r for r in bad['results'] if r['ac_id']==moved['ac_id'])
-        rebound['candidate_id']='CAND-'+'0'*64
-        report=tr.chain(bad)
-        self.assertEqual(report['broken'],[{'node':'test','id':gone['test_id'],'missing':'evidence'}])
-        self.assertEqual(report['orphan'],[{k:rebound[k] for k in ('ac_id','spec_revision','candidate_id','evidence_id',
-                                                                    'status')}])
-        self.assertEqual(report['stale'],[])
-        # The other chains are whole: every node outside the broken TEST's chain still reaches both ways.
-        cut={('test',gone['test_id']),('acceptance',gone['ac_id'])}
-        cut|={n for n in tr.links(bad) if n[0]=='requirement' and gone['ac_id'] in
-              next(r['ac_ids'] for r in bad['requirements'] if r['requirement_id']==n[1])}
+        # One TEST's evidence missing: only that TEST is broken, the other chains are whole both ways.
+        bad=self.export['missing_evidence']
+        self.assertEqual(bad['broken'],[{'node':'test','id':'TEST-A-01','missing':'evidence'}])
+        self.assertEqual((bad['orphan'],bad['stale']),([],[]))
+        cut={('test','TEST-A-01'),('acceptance','AC-A-01'),('requirement','REQ-A')}
         self.assert_chains(bad,skip=cut)
+        # A PASS on an older STALE candidate: an orphan, and stale.
+        old=self.export['stale_candidate']
+        rebound=[{'ac_id':'AC-B-01','spec_revision':1,'candidate_id':'CAND-old','evidence_id':'evidence-AC-B-01',
+                  'status':'PASS'}]
+        self.assertEqual((old['broken'],old['orphan'],old['stale']),([],rebound,rebound))
+        # The candidate row missing: its evidence and results are still there, each evidence names its missing link.
+        gone=self.export['missing_candidate']
+        self.assertIsNone(gone['candidate_id'])
+        self.assertEqual(len(gone['evidence']),4);self.assertEqual(len(gone['results']),4)
+        self.assertEqual(gone['broken'],[{'node':'evidence','id':x['evidence_id'],'missing':'candidate'}
+                                         for x in gone['evidence']])
