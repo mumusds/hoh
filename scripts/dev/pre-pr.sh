@@ -11,25 +11,41 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 deployment=1
 [ "${1:-}" = "--no-deployment" ] && deployment=0
-run() {  # name, command...
+step=
+stop() {  # a signal to pre-pr ends the running step's whole process group and waits for it (PPS-01)
+  if [ -n "$step" ]; then kill -TERM -- "-$step" 2>/dev/null || true; wait "$step" 2>/dev/null || true; fi
+  exit 143
+}
+trap stop TERM HUP INT
+run() {  # name, command...: the step runs in its own session so a signal to pre-pr can end all of it
   local name=$1; shift
   printf '== %s\n' "$name"
-  local start=$SECONDS
-  if python3 -c 'import os, signal, sys
+  local start=$SECONDS code=0
+  setsid python3 -c 'import os, signal, sys
 signal.signal(signal.SIGINT, signal.SIG_DFL); signal.signal(signal.SIGQUIT, signal.SIG_DFL)
-os.execvp(sys.argv[1], sys.argv[1:])' "$@"; then
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" 9>&- &
+  step=$!
+  wait "$step" || code=$?
+  step=
+  if [ "$code" = 0 ]; then
     printf '== %s: ok (%ss)\n' "$name" "$((SECONDS - start))"
   else
-    local code=$?
     printf '== %s: FAILED exit %s (%ss)\n' "$name" "$code" "$((SECONDS - start))"
     exit "$code"
   fi
 }
+# The slot is held on this script's own descriptor 9, which no step inherits (9>&- above): it is released when the
+# step ends, when pre-pr exits on a failure, or when pre-pr is killed, and no left-over descendant can keep it (PPS-02).
 slot=${HOH_TEST_SLOT:-/home/ai/dev/.hoh-test-slot.lock}
+exec 9>"$slot"
 locked() {  # name, command...: run under the machine-wide test slot
   local name=$1; shift
-  printf '== %s: waiting for the test slot %s\n' "$name" "$slot"
-  run "$name" flock "$slot" "$@"
+  if ! flock -n 9; then
+    printf '== %s: waiting for the test slot %s\n' "$name" "$slot"
+    flock 9
+  fi
+  run "$name" "$@"
+  flock -u 9
 }
 run bundle bash scripts/check.sh --bundle
 run static bash scripts/product/static.sh
