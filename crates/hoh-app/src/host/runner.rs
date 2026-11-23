@@ -1574,12 +1574,10 @@ async fn attempt(
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
         if work.assignment.spec_draft {
-            drop(started);
-            let ending = common.failed("draft start admission changed".into());
-            finished(common, &id, ran.as_ref(), ending, |e| {
-                store.runner_finished(&id, e)
-            })
-            .await?;
+            drop(started.gate);
+            refuse_draft_gate(common, &work, &who, &tracking).await?;
+            // The executor reaps only its own child; the identity-bound proof above controls the write lease.
+            drop(started.ended);
         }
         remove_run_dir().await;
         return Ok(());
@@ -1875,6 +1873,83 @@ async fn attempt(
     .await?;
     // Settled: its run directory is no longer needed (decision 6).
     remove_run_dir().await;
+    Ok(())
+}
+
+/// A refused gate still owns a real process. Prove its whole lifetime ended before releasing its slot.
+async fn refuse_draft_gate(
+    common: &Common,
+    work: &Work,
+    who: &identity::Identity,
+    tracking: &Tracking,
+) -> Result<(), PersistError> {
+    let store = &common.shared.store;
+    let Some(mut row) = store
+        .reconcile_scan(&work.project_id, common.clock.now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == work.attempt_id)
+    else {
+        return Ok(());
+    };
+    row.pid = Some(i64::from(who.pid));
+    row.boot_id = Some(who.boot_id.clone());
+    row.process_start_id = Some(who.start_id.clone());
+    let seen = row.clone();
+    let settings = common.settings.clone();
+    let tracking = tracking.clone();
+    let process = super::begun::spawn_blocking(move || {
+        super::reconcile::end(
+            super::reconcile::inspect(&seen),
+            &seen,
+            &tracking,
+            &settings,
+        )
+    })
+    .await
+    .map_err(|e| PersistError::Storage(e.to_string()))?;
+    let disposition = dispose(&Unfinished {
+        attempt_id: row.attempt_id.clone(),
+        state: row.state,
+        task_state: row.task_state,
+        process: process.clone(),
+        effects: row
+            .effects
+            .iter()
+            .map(|e| Effect {
+                key: e.key.clone(),
+                state: e.state,
+                observation: None,
+            })
+            .collect(),
+        lease_expired: row.lease_expired,
+        work_outcome: row.work_outcome,
+        writer: row.writer,
+        verifier: row.verifier,
+    });
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: work.project_id.clone(),
+                run_id: Some(work.run_id.clone()),
+                event_id: hoh_core::ids::child_id(&work.attempt_id, "draft/start-refused"),
+                kind: "spec.draft_start_refused".into(),
+                payload: json!({"attempt_id":work.attempt_id,"proof":format!("{process:?}")}),
+            }],
+            ..Commit::default()
+        })
+        .await?;
+    super::reconcile::apply(
+        store,
+        &common.shared.root,
+        row,
+        (disposition, process),
+        "draft_gate_refused",
+        common.clock.now(),
+        common.jitter.draw(),
+    )
+    .await?;
     Ok(())
 }
 
