@@ -173,11 +173,9 @@ pub(super) fn admit(
     let mode_pending = super::modes::pending(tx, run_id)?.is_some();
     let draft_pending: bool = tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs d ON d.run_id=t.run_id \
-         JOIN runs r ON r.project_id=d.project_id WHERE r.run_id=?1 AND t.kind='spec_draft' \
-         AND t.state NOT IN ('ACCEPTED','CANCELLED')) \
-         OR EXISTS(SELECT 1 FROM change_requests c JOIN runs r ON r.project_id=c.project_id \
-         WHERE r.run_id=?1 AND c.state='PROPOSED' AND c.base_spec_id=r.spec_id)",
+            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs r ON r.run_id=t.run_id \
+         WHERE r.run_id=?1 AND r.state NOT IN ('INCOMPLETE','FAILED','COMPLETED','CANCELLED','CANCEL_REQUESTED') \
+         AND t.kind='spec_draft' AND t.state NOT IN ('ACCEPTED','CANCELLED'))",
             [run_id],
             |r| r.get(0),
         )

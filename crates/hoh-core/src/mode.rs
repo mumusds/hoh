@@ -55,10 +55,10 @@ pub fn product_write(mode: Mode, facts: WriteFacts) -> Result<(), WriteRefusal> 
         Err(WriteRefusal::Plan)
     } else if !facts.approved {
         Err(WriteRefusal::NoSpec)
-    } else if facts.draft_pending {
-        Err(WriteRefusal::PendingDraft)
     } else if !facts.ready {
         Err(WriteRefusal::NotReady)
+    } else if facts.draft_pending {
+        Err(WriteRefusal::PendingDraft)
     } else {
         Ok(())
     }
@@ -142,4 +142,21 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn test_009_02_m3l103_readiness_refusal_precedes_pending_draft() {
+    assert_eq!(
+        product_write(
+            Mode::Build,
+            WriteFacts {
+                approved: true,
+                ready: false,
+                mode_pending: false,
+                draft_pending: true
+            }
+        ),
+        Err(WriteRefusal::NotReady)
+    );
 }
