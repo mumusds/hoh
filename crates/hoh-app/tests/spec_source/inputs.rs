@@ -542,6 +542,17 @@ async fn test_017_03_change_proposes_then_control_pauses_without_models() -> R {
         (202, response)
     );
     assert_eq!(world.query("SELECT count(*) FROM change_requests")?, "1");
+    // The runner's own move after the CHANGE comes first: no task of this fixture's run can move on, so its pace blocks
+    // the run, a new revision, before or after the input is APPLIED. A pause whose expected revision was read before
+    // that commit is refused STALE_REVISION (FLK-07: "expected revision 4, the run is at revision 5"), so its revision
+    // is read once the run is BLOCKED.
+    world
+        .until(
+            &format!("SELECT state FROM runs WHERE run_id='{run}'"),
+            "BLOCKED",
+            std::time::Duration::from_secs(10),
+        )
+        .await?;
     send(&host, &run, "pause", "CONTROL", "暂停").await?;
     world
         .until(
