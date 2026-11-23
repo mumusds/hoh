@@ -506,6 +506,75 @@ async fn test_046_01_short_index_filters_and_injects_tdd_body() -> R {
 
 #[tokio::test]
 async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge() -> R {
+    native_skill_cases(
+        "test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge",
+        &[
+            ("native", "pi", true, false),
+            ("plain", "codex", false, false),
+            ("copy", "codex", true, false),
+            ("native-absent", "pi", false, false),
+            ("native-mismatch", "pi", true, false),
+            ("native-invalid-header", "pi", true, false),
+            ("native-no-flag", "pi", true, false),
+            ("crowded", "codex", true, true),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_skill_collision_uses_only_explicit_session_copy() -> R {
+    native_skill_cases(
+        "native_skill_collision_uses_only_explicit_session_copy",
+        &[("native-collision", "pi", true, false)],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_hidden_skill_is_injected() -> R {
+    native_skill_cases(
+        "native_hidden_skill_is_injected",
+        &[("native-hidden", "pi", true, false)],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_without_isolation_flag_is_injected() -> R {
+    native_skill_cases(
+        "native_without_isolation_flag_is_injected",
+        &[("native-no-isolation-flag", "pi", true, false)],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_copy_read_errors_inject_with_diagnostics() -> R {
+    native_skill_cases(
+        "native_copy_read_errors_inject_with_diagnostics",
+        &[
+            ("native-read-outside", "pi", true, false),
+            ("native-read-directory", "pi", true, false),
+            ("native-read-utf8", "pi", true, false),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_copy_changed_after_pack_injects_original_body() -> R {
+    native_skill_cases(
+        "native_copy_changed_after_pack_injects_original_body",
+        &[
+            ("native-changed-bytes", "pi", true, false),
+            ("native-changed-symlink", "pi", true, false),
+        ],
+    )
+    .await
+}
+
+async fn native_skill_cases(test: &str, cases: &[(&'static str, &'static str, bool, bool)]) -> R {
     type NativeTree = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
     fn native_tree(root: &std::path::Path) -> std::io::Result<NativeTree> {
         fn visit(
@@ -516,7 +585,10 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
             for entry in std::fs::read_dir(path)? {
                 let entry = entry?;
                 let path = entry.path();
-                let key = path.strip_prefix(root).unwrap().to_path_buf();
+                let key = path
+                    .strip_prefix(root)
+                    .map_err(std::io::Error::other)?
+                    .to_path_buf();
                 if entry.file_type()?.is_dir() {
                     result.insert(key, None);
                     visit(root, &path, result)?;
@@ -532,13 +604,18 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
         }
         Ok(result)
     }
-    let test = "test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge";
     if std::env::var("HOH_M3T08_SKILL_TEST").ok().as_deref() != Some(test) {
         let dir = tempfile::Builder::new().prefix("m3t08-home-").tempdir()?;
         for path in [".claude", ".pi/agent/extensions"] {
             std::fs::create_dir_all(dir.path().join(path))?;
             std::fs::write(dir.path().join(path).join("keep"), "native user sentinel")?;
         }
+        let user_skill = dir.path().join(".pi/agent/skills/tdd");
+        std::fs::create_dir_all(&user_skill)?;
+        std::fs::write(
+            user_skill.join("SKILL.md"),
+            "---\nname: tdd\ndescription: Wrong user Skill\n---\nWRONG_USER_BODY",
+        )?;
         let before = native_tree(dir.path())?;
         let output = Command::new(std::env::current_exe()?)
             .env("HOME", dir.path())
@@ -560,26 +637,31 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
         assert_eq!(native_tree(dir.path())?, before);
         return Ok(());
     }
-    for (case, agent, session_copy, crowded) in [
-        ("native", "pi", true, false),
-        ("plain", "codex", false, false),
-        ("copy", "codex", true, false),
-        ("native-absent", "pi", false, false),
-        ("native-mismatch", "pi", true, false),
-        ("native-invalid-header", "pi", true, false),
-        ("native-no-flag", "pi", true, false),
-        ("crowded", "codex", true, true),
-    ] {
+    for &(case, agent, session_copy, crowded) in cases {
         let world = World::new()?;
-        let native = agent == "pi"
-            && session_copy
-            && !["native-mismatch", "native-no-flag", "native-invalid-header"].contains(&case);
+        let native =
+            agent == "pi" && session_copy && ["native", "native-collision"].contains(&case);
         world.codex("gpt-6-astra")?;
         if agent == "pi" {
             let loader = world.bin().join("native-skills.py");
             std::fs::write(
                 &loader,
-                "import json,sys,pathlib\nargs=sys.argv[2:]\nloaded=[{'path':p,'body':pathlib.Path(p,'SKILL.md').read_text()} for i,p in enumerate(args) if i and args[i-1]=='--skill']\npathlib.Path(sys.argv[1]).write_text(json.dumps(loaded))\n",
+                r#"import json,sys,pathlib
+args=sys.argv[2:]
+paths=[] if '--no-skills' in args else list((pathlib.Path.home()/'.pi/agent/skills').glob('*/SKILL.md'))+list((pathlib.Path.cwd()/'.pi/skills').glob('*/SKILL.md'))
+paths += [pathlib.Path(p,'SKILL.md') for i,p in enumerate(args) if i and args[i-1]=='--skill']
+loaded=[]
+names=set()
+for path in paths:
+    body=path.read_text()
+    name=next((l[5:].strip() for l in body.splitlines() if l.startswith('name:')),path.parent.name)
+    if name in names:
+        continue
+    names.add(name)
+    if 'disable-model-invocation: true' not in body:
+        loaded.append({'path':str(path.parent),'body':body})
+pathlib.Path(sys.argv[1]).write_text(json.dumps(loaded))
+"#,
             )?;
             let mut body = world.pi_body("skills")?.replacen(
                 "frames=",
@@ -589,13 +671,19 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
                 ),
                 1,
             );
-            if case == "native-no-flag" {
+            if ["native-no-flag", "native-no-isolation-flag"].contains(&case) {
                 let help = world.bin().join("pi-help.txt");
                 std::fs::write(
                     &help,
                     std::fs::read_to_string(format!("{PROTOCOL}/pi/1.5.0/help.txt"))?
                         .lines()
-                        .filter(|line| !line.contains("--skill "))
+                        .filter(|line| {
+                            !line.contains(if case == "native-no-flag" {
+                                "--skill "
+                            } else {
+                                "--no-skills"
+                            })
+                        })
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )?;
@@ -611,6 +699,8 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
         std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
         let body = if crowded {
             format!("Budget-bound Skill body\n{}", "large ".repeat(5000))
+        } else if case == "native-hidden" {
+            "---\nname: tdd\ndescription: Hidden TDD\ndisable-model-invocation: true\n---\nTask TDD instructions.\n".to_owned()
         } else if case == "native-invalid-header" {
             "A task-specific TDD body without native metadata.\n".to_owned()
         } else {
@@ -618,6 +708,15 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
                 .to_owned()
         };
         std::fs::write(project.join(".hoh/skills/tdd/SKILL.md"), &body)?;
+        if case == "native-collision" {
+            let conflict = project.join(".pi/skills/tdd");
+            std::fs::create_dir_all(&conflict)?;
+            std::fs::write(
+                conflict.join("SKILL.md"),
+                "---\nname: tdd\ndescription: Wrong project Skill\n---\nWRONG_PROJECT_BODY",
+            )?;
+        }
+
         std::fs::write(
             project.join(".hoh/config.toml"),
             format!("config_version = \"1.0\"\n[team.developer]\nagent = \"{agent}\"\n"),
@@ -644,29 +743,85 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
                 body.clone()
             };
             let hook = std::sync::Arc::new(move |role: &str, attempt: &str| {
-                if role == "developer" {
-                    let session = query(
-                        &root,
-                        &format!("SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"),
-                    )
-                    .unwrap();
-                    assert!(!session.is_empty());
-                    let dir = root
-                        .join(".hoh/sessions")
-                        .join(hoh_core::layout::component(&session))
-                        .join("skills/tdd");
-                    std::fs::create_dir_all(&dir).unwrap();
-                    std::fs::write(dir.join("SKILL.md"), &copy).unwrap();
+                let setup = || -> R {
+                    if role == "developer" {
+                        let session = query(
+                            &root,
+                            &format!(
+                                "SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"
+                            ),
+                        )?;
+                        assert!(!session.is_empty());
+                        let dir = root
+                            .join(".hoh/sessions")
+                            .join(hoh_core::layout::component(&session))
+                            .join("skills/tdd");
+                        std::fs::create_dir_all(&dir)?;
+                        let path = dir.join("SKILL.md");
+                        match case {
+                            "native-read-directory" => std::fs::create_dir(&path)?,
+                            "native-read-utf8" => std::fs::write(&path, [0xff])?,
+                            "native-read-outside" => std::os::unix::fs::symlink(
+                                std::env::var_os("HOME").ok_or("missing isolated HOME")?,
+                                &path,
+                            )?,
+                            _ => std::fs::write(&path, &copy)?,
+                        }
+                    }
+                    Ok(())
+                };
+                if let Err(error) = setup() {
+                    panic!("native Skill fixture setup failed: {error}");
                 }
             });
-            config.runner.as_mut().unwrap().executor = std::sync::Arc::new(
+            let mutation_root = project.clone();
+            let changed = std::sync::Arc::new(move |attempt: &str, _key: &str| {
+                let setup = || -> R {
+                    if attempt == "T-budget/attempt-1" && case.starts_with("native-changed-") {
+                        let session = query(
+                            &mutation_root,
+                            &format!(
+                                "SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"
+                            ),
+                        )?;
+                        let path = mutation_root
+                            .join(".hoh/sessions")
+                            .join(hoh_core::layout::component(&session))
+                            .join("skills/tdd/SKILL.md");
+                        if case == "native-changed-symlink" {
+                            std::fs::remove_file(&path)?;
+                            // Even a link to identical selected bytes must be refused by O_NOFOLLOW.
+                            std::os::unix::fs::symlink(
+                                mutation_root.join(".hoh/skills/tdd/SKILL.md"),
+                                &path,
+                            )?;
+                        } else {
+                            std::fs::write(
+                                &path,
+                                "---\nname: tdd\ndescription: Changed\n---\nCHANGED_AFTER_PACK",
+                            )?;
+                            // Fallback must keep the originally selected body, not reread an override.
+                            std::fs::write(
+                                mutation_root.join(".hoh/skills/tdd/SKILL.md"),
+                                "CHANGED_OVERRIDE_AFTER_PACK",
+                            )?;
+                        }
+                    }
+                    Ok(())
+                };
+                if let Err(error) = setup() {
+                    panic!("native Skill fixture setup failed: {error}");
+                }
+            });
+            config.runner.as_mut().ok_or("missing runner")?.executor = std::sync::Arc::new(
                 hoh_app::host::product::ProductExecutor::new(
                     registry,
                     project.clone(),
                     env!("CARGO_BIN_EXE_hoh").into(),
                     (Duration::from_secs(10), Duration::from_secs(5)),
                 )
-                .with_preparing(hook),
+                .with_preparing(hook)
+                .with_keys(changed),
             );
         }
         let host = start_when_free(config).await?;
@@ -681,11 +836,15 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
             let tdd = event["skills"].as_array().ok_or("no skills")?.iter().find(|s|s["id"] == "tdd").ok_or("no tdd")?;
             assert_eq!(tdd["native"],if native {"pi_skill"} else {"injected"});
             assert_eq!(tdd["layer"],"project");
+            if case.starts_with("native-read-") || case.starts_with("native-changed-") {
+                assert!(tdd["native_fallback"].as_str().is_some_and(|s| !s.is_empty()), "missing fallback reason: {tdd}");
+            }
+
             let input = event["inputs"].as_array().ok_or("no inputs")?.iter().find(|s|s["path"] == ".hoh/skills/tdd/SKILL.md" && s["kind"] == "entry");
             if native { assert!(input.is_none(), "native body must not consume knowledge share"); }
             else { assert_eq!(input.ok_or("no knowledge entry")?["class"], "knowledge"); }
             let sent = if agent == "pi" {
-                received_by_attempt(&world.bin().join("pi.d"))?.into_iter().filter(|(a,c)| a == attempt && c["type"] == "prompt").map(|(_,c)| c["message"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+                received_by_attempt(&world.bin().join("pi.d"))?.into_iter().filter(|(a,c)| a == attempt && c["type"] == "prompt").map(|(_,c)| c["message"].as_str().map(str::to_owned).ok_or("missing prompt message")).collect::<Result<Vec<_>,_>>()?
             } else { codex_prompts_of(&world,|a|a == attempt)? };
             assert_eq!(sent.len(),1);
             assert_eq!(sent[0].matches(&body).count(),usize::from(!native && !crowded));
@@ -695,10 +854,10 @@ async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge(
             if native {
                 assert_eq!(tdd["placed"], 0);
                 let loaded: Vec<Value> = std::fs::read_dir(world.bin().join("pi.d"))?.filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("native.")).map(|e| -> R<Value> { Ok(serde_json::from_slice(&std::fs::read(e.path())?)?) }).collect::<R<_>>()?;
-                let loaded: Vec<_> = loaded.iter().flat_map(|v|v.as_array().unwrap()).collect();
+                let loaded: Vec<_> = loaded.iter().map(|v|v.as_array().ok_or("missing native array")).collect::<Result<Vec<_>,_>>()?.into_iter().flatten().collect();
                 assert_eq!(loaded.len(), 1, "fake Agent must load exactly the session's tdd");
                 assert_eq!(loaded[0]["body"], body);
-                assert!(loaded[0]["path"].as_str().unwrap().ends_with("/skills/tdd"));
+                assert!(loaded[0]["path"].as_str().ok_or("missing native path")?.ends_with("/skills/tdd"));
                 assert_eq!(hoh_core::objects::get(&project,tdd["sha256"].as_str().ok_or("no native source")?)?, body.as_bytes());
             }
             let stats = &event["stats"];

@@ -276,7 +276,8 @@ pub fn load_with_diagnostics(
     for layer in crate::prompt_files::override_layers(root, global, run)? {
         match apply_layer(&selected, &layer) {
             Ok(next) => selected = next,
-            Err(error) => rejected.push(Rejected {
+            Err(LayerError::File(error)) => return Err(error),
+            Err(LayerError::Registration(error)) => rejected.push(Rejected {
                 layer: layer.layer.into(),
                 reason: error.to_string(),
             }),
@@ -289,20 +290,34 @@ pub fn load_with_diagnostics(
     })
 }
 
+enum LayerError {
+    File(Error),
+    Registration(Error),
+}
+impl From<Error> for LayerError {
+    fn from(error: Error) -> Self {
+        Self::Registration(error)
+    }
+}
+
 fn apply_layer(
     selected: &BTreeMap<String, Resolved>,
     layer: &crate::prompt_files::OverrideLayer,
-) -> Result<BTreeMap<String, Resolved>, Error> {
-    let read = |path: &str| -> Result<Option<Contract>, Error> {
-        Ok(layer.read(path)?.map(|mut source| {
-            if source.layer == "global" {
-                source.path = format!("global:{path}");
-            }
-            source
-        }))
+) -> Result<BTreeMap<String, Resolved>, LayerError> {
+    let read = |path: &str| -> Result<Option<Contract>, LayerError> {
+        Ok(layer
+            .read(path)
+            .map_err(LayerError::File)?
+            .map(|mut source| {
+                if source.layer == "global" {
+                    source.path = format!("global:{path}");
+                }
+                source
+            }))
     };
     let mut next = selected.clone();
     if let Some(source) = read("skills/registry.json")? {
+        crate::prompt::validate_size(&source.text)?;
         let patch = Registry::parse(&source.text)?;
         for skill in patch.skills {
             let old = next
@@ -362,6 +377,36 @@ pub fn native_path(
         .map(|_| root.join(relative)))
 }
 
+/// Reopen the selected native copy just before spawn, rejecting links and changed bytes.
+/// The caller falls back to the already selected source, never the changed session copy.
+pub fn recheck_native(root: &Path, relative: &Path, expected: &str) -> Result<(), Error> {
+    use rustix::fs::{self, Mode, OFlags};
+    use std::io::Read;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::open(root, flags | OFlags::DIRECTORY, Mode::empty()).map_err(unavailable)?;
+    for part in relative.components() {
+        let std::path::Component::Normal(part) = part else {
+            return Err(unavailable("native Skill path must be relative without .."));
+        };
+        dir = fs::openat(&dir, part, flags | OFlags::DIRECTORY, Mode::empty())
+            .map_err(unavailable)?;
+    }
+    let fd = fs::openat(&dir, "SKILL.md", flags | OFlags::NONBLOCK, Mode::empty())
+        .map_err(unavailable)?;
+    let file = std::fs::File::from(fd);
+    if !file.metadata().map_err(unavailable)?.is_file() {
+        return Err(unavailable("native Skill is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(crate::prompt::MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    if crate::context::sha256_hex(&bytes) != expected {
+        return Err(unavailable("native Skill sha256 changed before spawn"));
+    }
+    Ok(())
+}
+
 // Pi 1.6.0 normalizes BOM/newlines, parses YAML between the first two fences,
 // and ignores a Skill unless its description is a nonempty string.
 fn pi_frontmatter(body: &str) -> bool {
@@ -378,14 +423,17 @@ fn pi_frontmatter(body: &str) -> bool {
     #[derive(Deserialize)]
     struct Header {
         description: serde_json::Value,
+        #[serde(default, rename = "disable-model-invocation")]
+        disable_model_invocation: serde_json::Value,
     }
     let Ok(value) = serde_saphyr::from_str::<Header>(&rest[..end]) else {
         return false;
     };
-    value
-        .description
-        .as_str()
-        .is_some_and(|description| !description.trim().is_empty())
+    value.disable_model_invocation != serde_json::Value::Bool(true)
+        && value
+            .description
+            .as_str()
+            .is_some_and(|description| !description.trim().is_empty())
 }
 
 #[cfg(test)]

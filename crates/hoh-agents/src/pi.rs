@@ -168,8 +168,13 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
             "--no-extensions".to_owned(),
         ]);
     }
-    if !launch.skills.is_empty() && !offers(&launch.help, "--skill") {
-        return Err(Blocked("pi --help offers no --skill".into()));
+    if !launch.skills.is_empty() {
+        for flag in ["--skill", "--no-skills"] {
+            if !offers(&launch.help, flag) {
+                return Err(Blocked(format!("pi --help offers no {flag}")));
+            }
+        }
+        args.push("--no-skills".into());
     }
     for path in &launch.skills {
         args.extend(["--skill".into(), path.to_string_lossy().into_owned()]);

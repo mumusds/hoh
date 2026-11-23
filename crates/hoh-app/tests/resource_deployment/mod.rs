@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[tokio::test]
-async fn test_047_03_and_test_046_01_bundle_pinned_until_checkpoint() -> R {
+async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
     let world = World::named("m3t03-bundle")?;
     world.commander(&world::Commander {
         tasks: Vec::new(),

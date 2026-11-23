@@ -67,7 +67,7 @@ fn test_046_03_registry_validation_rejects_cycle_missing_entry_unknown_phase_and
 }
 
 #[test]
-fn test_046_03_bundle_includes_all_skills_templates_and_catalogs() -> R {
+fn bundle_includes_all_skills_templates_and_catalogs() -> R {
     let bundle = crate::resource_bundle::Bundle::current();
     let registry = Registry::parse(bundle.text("resources/skills/registry.json")?)?;
     registry.validate(|path| bundle.text(path).map(str::to_owned))?;
@@ -142,7 +142,7 @@ fn test_046_03_four_layers_validate_before_becoming_effective() -> R {
 }
 
 #[test]
-fn test_046_01_phase_mapping_and_role_filtering_are_explicit() -> R {
+fn phase_mapping_and_role_filtering_are_explicit() -> R {
     for (role, kind, writer, supervision, rework, expected) in [
         ("developer", "work", true, false, false, Some("implement")),
         ("developer", "work", true, false, true, Some("repair")),
@@ -182,7 +182,7 @@ fn test_046_01_phase_mapping_and_role_filtering_are_explicit() -> R {
 }
 
 #[test]
-fn test_046_01_old_pin_without_registry_has_no_builtin_skills() -> R {
+fn old_pin_without_registry_has_no_builtin_skills() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-old-pin-")
         .tempdir()?;
@@ -213,7 +213,7 @@ fn test_046_03_unknown_extra_fields_are_rejected() -> R {
 }
 
 #[test]
-fn test_046_01_global_skill_sources_use_relative_identifiers() -> R {
+fn global_skill_sources_use_relative_identifiers() -> R {
     let dir = tempfile::Builder::new().prefix("m3t08-global-").tempdir()?;
     let global = dir.path().join("global");
     std::fs::create_dir_all(global.join("skills/tdd"))?;
@@ -238,7 +238,7 @@ fn test_046_01_global_skill_sources_use_relative_identifiers() -> R {
 }
 
 #[test]
-fn test_046_02_native_session_body_must_match_and_stay_inside_project() -> R {
+fn native_session_body_must_match_and_stay_inside_project() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-native-path-")
         .tempdir()?;
@@ -267,7 +267,7 @@ fn test_046_02_native_session_body_must_match_and_stay_inside_project() -> R {
 }
 
 #[test]
-fn test_046_02_native_skill_requires_loadable_pi_frontmatter() -> R {
+fn native_skill_requires_loadable_pi_frontmatter() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-native-metadata-")
         .tempdir()?;
@@ -281,6 +281,14 @@ fn test_046_02_native_skill_requires_loadable_pi_frontmatter() -> R {
         ("---\ndescription: 42\n---\nBody", false),
         ("---\ndescription: [unterminated\n---\nBody", false),
         ("---\ndescription: Test with TDD\n---\nBody", true),
+        (
+            "---\ndescription: Hidden\ndisable-model-invocation: true\n---\nBody",
+            false,
+        ),
+        (
+            "---\ndescription: Visible\ndisable-model-invocation: false\n---\nBody",
+            true,
+        ),
         ("---\ndescription: >\n  Test with\n  TDD\n---\nBody", true),
         (
             "\u{feff}---\r\ndescription: 'Test with TDD'\r\n---\r\nBody",
@@ -294,6 +302,81 @@ fn test_046_02_native_skill_requires_loadable_pi_frontmatter() -> R {
             accepted,
             "{body:?}"
         );
+    }
+    Ok(())
+}
+
+fn registry_io_failure(case: &str, expected: &str) -> R {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for layer in ["global", "project", "run"] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(&root)?;
+        let base = match layer {
+            "global" => global.join("skills"),
+            "project" => root.join(".hoh/skills"),
+            _ => root.join(".hoh/runs/run/skills"),
+        };
+        std::fs::create_dir_all(&base)?;
+        let registry = base.join("registry.json");
+        match case {
+            "outside" => {
+                let outside = dir.path().join("outside.json");
+                std::fs::write(&outside, builtin().to_string())?;
+                symlink(outside, &registry)?;
+            }
+            "directory" => std::fs::create_dir(&registry)?,
+            "unreadable" => {
+                std::fs::write(&registry, builtin().to_string())?;
+                std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o000))?;
+            }
+            _ => unreachable!(),
+        }
+        let result = load_with_diagnostics(&root, Some(&global), "run", &Bundle::current());
+        assert!(
+            result.is_err(),
+            "{layer} {case} must fail explicitly, not reject and continue"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains(expected),
+            "{layer} {case}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn registry_outside_root_fails_explicitly() -> R {
+    registry_io_failure("outside", "outside root")
+}
+#[test]
+fn registry_non_regular_fails_explicitly() -> R {
+    registry_io_failure("directory", "not a regular file")
+}
+#[test]
+fn registry_unreadable_fails_explicitly() -> R {
+    registry_io_failure("unreadable", "Permission denied")
+}
+
+#[test]
+fn malformed_and_oversized_registration_retain_valid_layers() -> R {
+    for bad in [
+        "invalid json".to_owned(),
+        format!("{}{}", " ".repeat(crate::prompt::MAX_BYTES), builtin()),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let base = dir.path().join(".hoh/skills");
+        std::fs::create_dir_all(&base)?;
+        std::fs::write(base.join("registry.json"), &bad)?;
+        let loaded = load_with_diagnostics(dir.path(), None, "run", &Bundle::current())?;
+        assert_eq!(loaded.skills.len(), 13);
+        assert_eq!(
+            loaded.rejected.len(),
+            1,
+            "registration error must be recorded"
+        );
+        assert_eq!(loaded.skills["tdd"].source.layer, "builtin");
     }
     Ok(())
 }
