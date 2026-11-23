@@ -5,11 +5,7 @@ use crate::{
 };
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
 use serde::Serialize;
-use std::{
-    io::Write,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{io::Write, path::Path};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Selection {
@@ -86,7 +82,6 @@ pub fn instantiate(
     }
     Ok(outcome)
 }
-static STAGED: AtomicU64 = AtomicU64::new(0);
 fn present(dir: &std::os::fd::OwnedFd, name: &str) -> std::io::Result<bool> {
     match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => Ok(true),
@@ -120,45 +115,31 @@ fn publish(root: &std::os::fd::OwnedFd, path: &str, text: &str) -> std::io::Resu
         fs::fsync(&dir)?;
         return Ok(false);
     }
-    let (staged, fd) = loop {
-        let staged = format!(
-            ".hoh-template-{}-{}",
-            std::process::id(),
-            STAGED.fetch_add(1, Ordering::Relaxed)
-        );
-        match fs::openat(
-            &dir,
-            &staged,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        ) {
-            Ok(fd) => break (staged, fd),
-            Err(rustix::io::Errno::EXIST) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    };
-    let owned = fs::fstat(&fd)?;
+    // No directory entry exists until the complete, synced inode is published.
+    // Unsupported filesystems fail closed; a named fallback would leave crash debris.
+    let fd = fs::openat(
+        &dir,
+        ".",
+        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .map_err(|e| {
+        std::io::Error::new(
+            std::io::Error::from(e).kind(),
+            format!("anonymous template staging (O_TMPFILE) unavailable: {e}"),
+        )
+    })?;
     let mut file = std::fs::File::from(fd);
-    let result = (|| -> std::io::Result<bool> {
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        // A hard link publishes the complete bytes atomically, without a replacing rename.
-        match fs::linkat(&dir, &staged, &dir, name, AtFlags::empty()) {
-            Ok(()) => Ok(true),
-            Err(rustix::io::Errno::EXIST) => {
-                present(&dir, name)?;
-                Ok(false)
-            }
-            Err(e) => Err(e.into()),
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    let created = match fs::linkat(&file, "", &dir, name, AtFlags::EMPTY_PATH) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::EXIST) => {
+            present(&dir, name)?;
+            false
         }
-    })();
-    let actual = fs::statat(&dir, &staged, AtFlags::SYMLINK_NOFOLLOW)?;
-    if actual.st_dev != owned.st_dev || actual.st_ino != owned.st_ino {
-        return Err(std::io::Error::other(
-            "staged document identity changed; not removed",
-        ));
-    }
-    fs::unlinkat(&dir, &staged, AtFlags::empty())?;
+        Err(e) => return Err(e.into()),
+    };
     fs::fsync(&dir)?;
-    result
+    Ok(created)
 }
