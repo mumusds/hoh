@@ -259,6 +259,16 @@ pub(super) fn decide_in(
             None => verdict,
         },
     };
+    if verdict.is_ok()
+        && let protocol::DecisionPayload::TransitionTask { task_id, .. } = &proposal.payload
+        && super::consult::finished(tx, task_id)?
+    {
+        verdict = Err(Rejection {
+            reason: RejectionReason::IllegalTransition,
+            detail: "finished consult tasks cannot move".into(),
+            details: None,
+        });
+    }
     if let Err(ref mut rejection) = verdict {
         explain_stale_completion(tx, proposal, rejection)?;
     }

@@ -609,7 +609,7 @@ async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
             // Place r1 in `from`, with a resume_state that admits a resume to `to` when `to` is a working state.
             let resume = (!crate::lifecycle::is_working(from) && crate::lifecycle::is_working(to))
                 .then_some(to.as_str());
-            let blocked = (from == RunState::Blocked).then_some("NEED_DECISION");
+            let blocked = (from == RunState::Blocked).then_some("BLOCKED_AUTH");
             conn.execute(
                 "UPDATE runs SET state = ?1, revision = 0, resume_state = ?2, blocked_reason = ?3 WHERE run_id = 'r1'",
                 rusqlite::params![from.as_str(), resume, blocked],
@@ -662,10 +662,10 @@ async fn a_run_is_unblocked_only_from_blocked_with_every_claim_released() -> R {
     seed(&path)?;
     let conn = Connection::open(&path)?;
     conn.execute_batch(
-        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
-         blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'r1';
+        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'BLOCKED_AUTH',
+         blocked_reasons_json = '[\"BLOCKED_AUTH\"]' WHERE run_id = 'r1';
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           ('p1', 'claim-1', 'r1', 'run.blocker_claimed', '{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}',
+           ('p1', 'claim-1', 'r1', 'run.blocker_claimed', '{\"reason\": \"BLOCKED_AUTH\", \"source\": \"pace\"}',
             '2026-11-07T00:00:00Z');",
     )?;
     let unblock = |to, events: Vec<NewEvent>| {
@@ -685,7 +685,7 @@ async fn a_run_is_unblocked_only_from_blocked_with_every_claim_released() -> R {
         event_id: "release-1".to_owned(),
         run_id: Some("r1".to_owned()),
         kind: "run.blocker_released".to_owned(),
-        payload: serde_json::json!({"reason": "NEED_DECISION", "source": "pace"}),
+        payload: serde_json::json!({"reason": "BLOCKED_AUTH", "source": "pace"}),
     };
     match unblock(RunState::Running, Vec::new()).await {
         Err(PersistError::IllegalTransition { why, .. }) => {
@@ -729,7 +729,7 @@ async fn a_run_is_unblocked_only_from_blocked_with_every_claim_released() -> R {
 
 #[tokio::test]
 async fn blockers_survive_a_pause_and_hold_back_work() -> R {
-    // M2T02R-02: a run BLOCKED on NEED_DECISION that is paused and resumed stays blocked; it works again only once
+    // M2T02R-02: a run BLOCKED on BLOCKED_AUTH that is paused and resumed stays blocked; it works again only once
     // its blockers are removed (by the blocking mechanism; here by hand).
     let dir = tempfile::tempdir()?;
     let path = db_in(&dir);
@@ -737,8 +737,8 @@ async fn blockers_survive_a_pause_and_hold_back_work() -> R {
     seed(&path)?;
     let conn = Connection::open(&path)?;
     conn.execute_batch(
-        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
-         blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'r1'",
+        "UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'BLOCKED_AUTH',
+         blocked_reasons_json = '[\"BLOCKED_AUTH\"]' WHERE run_id = 'r1'",
     )?;
     let step = |revision, to| {
         store.commit(Commit {
@@ -758,8 +758,8 @@ async fn blockers_survive_a_pause_and_hold_back_work() -> R {
     assert_eq!(
         blockers(&conn)?,
         (
-            Some("NEED_DECISION".to_owned()),
-            "[\"NEED_DECISION\"]".to_owned()
+            Some("BLOCKED_AUTH".to_owned()),
+            "[\"BLOCKED_AUTH\"]".to_owned()
         )
     );
     match step(2, RunState::Running).await {
@@ -783,7 +783,7 @@ async fn blockers_survive_a_pause_and_hold_back_work() -> R {
         ("[ ]", true),
         ("[\n]", true),
         ("{}", false),
-        ("[\"NEED_DECISION\"]", false),
+        ("[\"BLOCKED_AUTH\"]", false),
     ] {
         conn.execute(
             "UPDATE runs SET state = 'PAUSED', revision = 0, resume_state = 'RUNNING', blocked_reason = NULL, \
@@ -1873,5 +1873,12 @@ fn a_commit_that_failed_writing_is_db_full_only_when_the_stores_directory_has_no
         0,
         "the probe left a file"
     );
+    Ok(())
+}
+
+/// Seed the question that a fixture's manually blocked task is waiting for; never used by product code.
+pub(super) fn seed_task_question(path: &Path, task: &str) -> R {
+    let conn = Connection::open(path)?;
+    conn.execute("INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) SELECT r.project_id,?1,t.run_id,'need_decision',json_object('task_id',t.task_id,'reason','retries_exhausted'),'2026-11-07T00:00:00Z' FROM tasks t JOIN runs r USING(run_id) WHERE t.task_id=?2", rusqlite::params![format!("fixture-question/{task}"),task])?;
     Ok(())
 }

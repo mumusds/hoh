@@ -1069,6 +1069,7 @@ async fn a_blocked_run_is_named_by_its_first_reason_and_waits_behind_a_blocked_d
          UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH',
            missing_json = '[\"claude:BLOCKED_AUTH\"]' WHERE run_id = 'R' AND role = 'developer';"
     ))?;
+    crate::persistence::tests::seed_task_question(&path, "T1")?;
     store
         .pace_run("R", context(at("2026-11-07T00:00:10Z")?))
         .await?;

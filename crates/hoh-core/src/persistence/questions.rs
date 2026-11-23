@@ -249,9 +249,13 @@ pub fn open(conn: &Connection, run_id: &str) -> Result<Vec<Question>, PersistErr
 /// This is explicit so it can also diagnose old or manually seeded stores without changing their history.
 pub(super) fn check_anchors(conn: &Connection) -> Result<(), PersistError> {
     let tx = conn.unchecked_transaction().map_err(sqlite_error)?;
-    super::consult::check_terminals(&tx)?;
+    check_invariants(&tx)
+}
+
+pub(super) fn check_invariants(tx: &Connection) -> Result<(), PersistError> {
+    super::consult::check_terminals(tx)?;
     let runs: Vec<(String, bool)> = {
-        let mut q = tx.prepare("SELECT run_id,state='BLOCKED' AND blocked_reason='NEED_DECISION' FROM runs ORDER BY run_id")
+        let mut q = tx.prepare("SELECT run_id,state='BLOCKED' AND blocked_reason='NEED_DECISION' FROM runs r WHERE (r.state='BLOCKED' AND r.blocked_reason='NEED_DECISION') OR EXISTS(SELECT 1 FROM tasks t WHERE t.run_id=r.run_id AND t.state='BLOCKED' AND t.blocked_reason='NEED_DECISION') ORDER BY run_id")
             .map_err(sqlite_error)?;
         q.query_map([], |r| {
             Ok((r.get(0)?, r.get::<_, Option<bool>>(1)?.unwrap_or(false)))
@@ -262,12 +266,13 @@ pub(super) fn check_anchors(conn: &Connection) -> Result<(), PersistError> {
     };
     for (run, blocked) in runs {
         let mut questions = Vec::new();
-        for question in open(&tx, &run)? {
+        for question in open(tx, &run)? {
             let answered: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind='question.answered' AND seq>?2 AND json_extract(payload_json,'$.question_id')=?3)",
                 params![run, question.seq, question.question_id], |r| r.get(0),
             ).map_err(sqlite_error)?;
-            if !answered {
+            // An adopt answer without an approved specification deliberately retains the same question.
+            if !answered || question.route == Route::Adopt {
                 questions.push(question);
             }
         }
@@ -278,6 +283,11 @@ pub(super) fn check_anchors(conn: &Connection) -> Result<(), PersistError> {
             .map_err(sqlite_error)?
         {
             let task = task.map_err(sqlite_error)?;
+            if super::consult::is_child(tx, &task)? {
+                return Err(PersistError::IntegrityViolation(format!(
+                    "consult {task} cannot have an owner question"
+                )));
+            }
             if !questions
                 .iter()
                 .any(|q| q.task_id.as_deref() == Some(&task))

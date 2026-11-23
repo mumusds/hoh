@@ -2282,6 +2282,7 @@ async fn every_vacancy_reason_marks_a_due_task_and_recovers_it_once_dispatchable
             .await?;
         task(&path, "T1", "developer", "READY", None)?;
         task(&path, "N1", "developer", "BLOCKED", Some("NEED_DECISION"))?;
+        crate::persistence::tests::seed_task_question(&path, "N1")?;
         exec(
             &path,
             "UPDATE tasks SET attempt_count = 2, next_retry_at = '2026-11-13T00:00:00Z' WHERE task_id = 'T1';",
@@ -2579,6 +2580,7 @@ async fn a_blocked_capability_verifier_is_dispatched_once_its_rebound_session_ha
     );
     task(&path, "V1", "reviewer", "READY", None)?;
     task(&path, "N1", "reviewer", "BLOCKED", Some("NEED_DECISION"))?;
+    crate::persistence::tests::seed_task_question(&path, "N1")?;
     // V1's rework context: the failure items a rework took from a round on candidate C1.
     exec(
         &path,

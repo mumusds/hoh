@@ -947,14 +947,38 @@ async fn test_023_01_dc_no_admissible_holder_stops_run() -> R {
                 .dispatched
                 .is_none()
         );
-        assert!(
-            store.pace_run("R", context()).await?.incomplete.is_some(),
-            "{stop}: a run that can admit nothing must stop"
-        );
+        let paced = store.pace_run("R", context()).await?;
         assert_eq!(
-            sql(dir.path(), "SELECT state FROM runs WHERE run_id='R'", true)?[0]["state"],
-            "INCOMPLETE"
+            events(dir.path(), "task.consult_finished")?.len(),
+            2,
+            "{stop}: every exhausted holder ends before pace can stop the run"
         );
+        let reserved = sql(
+            dir.path(),
+            "SELECT reserved_value FROM budgets WHERE scope_kind='run'",
+            true,
+        )?[0]["reserved_value"]
+            .as_f64()
+            .ok_or("reservation")?;
+        if stop == "ordinary_reservation" {
+            assert!(
+                paced.incomplete.is_some(),
+                "ordinary reservations still block the run"
+            );
+            assert_eq!(reserved, 8.0);
+            assert_eq!(
+                sql(dir.path(), "SELECT state FROM runs WHERE run_id='R'", true)?[0]["state"],
+                "INCOMPLETE"
+            );
+        } else {
+            // DC-T10d closes spent/expired holders first, returning their unused budget to normal work.
+            assert!(
+                paced.incomplete.is_none(),
+                "released holds are no longer budget exhaustion"
+            );
+            assert_eq!(reserved, 0.0);
+        }
+        store.reader()?.check_question_anchors()?;
     }
     Ok(())
 }

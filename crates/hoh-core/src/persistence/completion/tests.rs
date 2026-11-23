@@ -2854,6 +2854,7 @@ async fn a_failure_item_of_a_cancelled_owner_is_abandoned_and_of_one_waiting_for
              revision = revision + 1 WHERE task_id = 'D'",
             rusqlite::params![state],
         )?;
+        crate::persistence::tests::seed_task_question(&path, "D")?;
         store
             .reconcile_verification("R", Default::default())
             .await?;
@@ -2902,6 +2903,7 @@ async fn a_blocked_verifier_of_a_superseded_candidate_is_cancelled_and_holds_not
          revision = revision + 1 WHERE task_id = ?1",
         rusqlite::params![qa],
     )?;
+    crate::persistence::tests::seed_task_question(&path, &qa)?;
     second_writer(&path, "E", "AE")?;
     store
         .complete_writer_attempt(WriterCompletion {

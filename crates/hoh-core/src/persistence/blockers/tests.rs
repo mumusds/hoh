@@ -34,6 +34,9 @@ INSERT INTO role_bindings(run_id, role, agent, session_id, role_epoch, config_re
   ('R', 'developer', 'claude', 'sd', 1, 1, '2026-11-07T00:00:00Z');
 INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, created_seq, cost_estimate) VALUES
   ('T1', 'R', 's1', 'READY', 1, 'developer', 1, 1);
+INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES
+ ('p1','fixture-question/T1','R','need_decision','{\"task_id\":\"T1\",\"reason\":\"retries_exhausted\"}','2026-11-07T00:00:00Z'),
+ ('p1','fixture-question/T2','R','need_decision','{\"task_id\":\"T2\",\"reason\":\"retries_exhausted\"}','2026-11-07T00:00:00Z');
 ";
 
 fn context(now: SystemTime) -> Context {
@@ -114,6 +117,12 @@ fn claims(path: &Path) -> R<Vec<String>> {
 /// and the run's set, as that source will write them.
 fn foreign_claim(path: &Path, reason: &str, source: &str) -> R {
     let conn = Connection::open(path)?;
+    if reason == "NEED_DECISION"
+        && let Some(id) = source.strip_prefix("commander:")
+    {
+        conn.execute("INSERT OR IGNORE INTO decisions(decision_id,run_id,role_epoch,expected_revision,payload_json,state) VALUES (?1,'R',1,1,'{\"kind\":\"request_user_decision\",\"question\":\"fixture question\"}','PROPOSED')", [id])?;
+    }
+
     conn.execute(
         "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES \
          ('p1', ?1, 'R', 'run.blocker_claimed', json_object('reason', ?2, 'source', ?3), '2026-11-07T00:00:00Z')",
