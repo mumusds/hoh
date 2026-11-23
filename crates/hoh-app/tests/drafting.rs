@@ -275,3 +275,124 @@ async fn test_008_04_m3l102_failed_draft_checks_committed_product_writes() -> R 
     host.shutdown().await;
     result
 }
+
+#[derive(Debug)]
+struct DraftBarrier {
+    point: hoh_app::host::RunnerPoint,
+    hits: std::sync::atomic::AtomicUsize,
+    release: std::sync::atomic::AtomicBool,
+}
+impl hoh_app::host::HostHooks for DraftBarrier {
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, _attempt: &str) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if point == self.point && self.hits.fetch_add(1, SeqCst) == 0 {
+            tokio::task::block_in_place(|| {
+                while !self.release.load(SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
+    }
+}
+struct ReleaseDraft(std::sync::Arc<DraftBarrier>);
+impl Drop for ReleaseDraft {
+    fn drop(&mut self) {
+        self.0
+            .release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_009_03_m3l150_dispatch_then_set_mode_releases_draft_with_proof() -> R {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    for point in [
+        hoh_app::host::RunnerPoint::AfterAck,
+        hoh_app::host::RunnerPoint::AfterSpawn,
+    ] {
+        let world = world::World::named("m3t04-mode-gate")?;
+        world.configure(&[], "")?;
+        world.git(&["init", "-q"])?;
+        let barrier = std::sync::Arc::new(DraftBarrier {
+            point,
+            hits: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        });
+        let release = ReleaseDraft(barrier.clone());
+        let host = world
+            .team_host_hooked(world::Team::drafting(world.project()), barrier.clone())
+            .await?;
+        let result: R = async {
+            let run = world::start_run(&host, "start", "mode race").await?;
+            world.staff(&run)?;
+            input(
+                &host,
+                &world,
+                &run,
+                "draft",
+                "SendInput",
+                json!({"text":"draft","target_role":null,"input_kind":"REPLY"}),
+            )
+            .await?;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while barrier.hits.load(SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            input(
+                &host,
+                &world,
+                &run,
+                "build",
+                "SetMode",
+                json!({"mode":"BUILD"}),
+            )
+            .await?;
+            assert_eq!(
+                world.query("SELECT count(*) FROM events WHERE kind='run.mode_change_pending'")?,
+                "1"
+            );
+            barrier.release.store(true, SeqCst);
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if barrier.hits.load(SeqCst) > 1
+                        || world
+                            .query("SELECT mode FROM runs")
+                            .is_ok_and(|m| m == "BUILD")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            assert_eq!(world.query("SELECT mode FROM runs")?, "BUILD", "{point:?}");
+            assert_eq!(
+                world.query(
+                    "SELECT count(*) FROM attempts WHERE state IN ('PREPARED','STARTING','RUNNING')"
+                )?,
+                "0"
+            );
+            assert_eq!(
+                world.query("SELECT count(*) FROM events WHERE kind='spec.draft_start_refused'")?,
+                "1",
+                "{point:?} refusal needs a termination proof: {:?}", world.rows("SELECT kind,payload_json FROM events WHERE kind LIKE '%refus%' OR kind='attempt.moved' OR kind='reconcile.attempt'")?
+            );
+            assert_eq!(
+                world.query("SELECT count(*) FROM events WHERE kind='spec.draft_completed'")?,
+                "0"
+            );
+            assert!(
+                !world.project().join("docs/spec/main.md").exists(),
+                "the rejected gate never ran draft code"
+            );
+            Ok(())
+        }
+        .await;
+        drop(release);
+        host.shutdown().await;
+        result?;
+    }
+    Ok(())
+}

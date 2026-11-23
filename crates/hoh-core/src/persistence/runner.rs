@@ -809,18 +809,54 @@ fn received(
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(false);
+    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) {
+        return Ok(false);
+    }
     if super::drafting::is_draft(&tx, &notice.task_id)?
-        && super::admission::admit_one(
+        && let Err(refusal) = super::admission::admit_one(
             &tx,
             &notice.run_id,
             &notice.task_id,
             super::admission::By::Draft,
         )?
-        .is_err()
     {
+        // PREPARED is proof that no process gate opened. End the leased attempt here, atomically with its receipt,
+        // instead of retaining a notice that the pending mode and writer safe point would wait on forever.
+        tx.execute(
+            "INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES(?1,?2,?3,?4)",
+            params![
+                RUNNER,
+                notice.message_id,
+                crate::time::rfc3339_utc(at),
+                json!({"refused":notice.attempt_id}).to_string()
+            ],
+        )
+        .map_err(sqlite_error)?;
+        finished_in(
+            &tx,
+            &notice.attempt_id,
+            &Ending {
+                success: false,
+                detail: format!("draft start admission refused: {refusal:?}"),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at,
+                draw: 0,
+                observed: Observed {
+                    events: vec![(
+                        "draft/start-refused".into(),
+                        "spec.draft_start_refused".into(),
+                        json!({"attempt_id":notice.attempt_id,"proof":"not_started","refusal":format!("{refusal:?}")}),
+                    )],
+                    ..Observed::default()
+                },
+                unknown_effect: false,
+            },
+            ctx,
+        )?;
+        writer::commit(tx, ctx)?;
         return Ok(false);
     }
-    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) || !working {
+    if !working {
         return Ok(false);
     }
     let now = crate::time::rfc3339_utc(at);
