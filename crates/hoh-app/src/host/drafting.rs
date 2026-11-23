@@ -86,7 +86,7 @@ pub(super) async fn prepare(
 
 use hoh_core::persistence::{Ending, WriterOutcome};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStringExt;
 
 fn hex(path: &[u8]) -> String {
@@ -132,7 +132,7 @@ fn head(root: &Path) -> Result<Option<String>, String> {
     }
 }
 fn dirty(root: &Path, committed: bool) -> Result<BTreeSet<Vec<u8>>, String> {
-    let mut all = paths(super::control::git(root, &["ls-files", "--others", "-z"])?);
+    let mut all = untracked(root)?;
     if committed {
         all.extend(paths(super::control::git(
             root,
@@ -159,14 +159,93 @@ fn dirty(root: &Path, committed: bool) -> Result<BTreeSet<Vec<u8>>, String> {
     Ok(all)
 }
 
+fn untracked(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
+    Ok(paths(super::control::git(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?))
+}
+
+// Collapse pre-existing ignored trees (target/, node_modules/, .hoh/) rather than logging every artifact.
+// Their contents are outside this Git observation boundary; newly appearing ignored roots still get checked.
+fn ignored_roots(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
+    Ok(paths(super::control::git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )?))
+}
+
+fn fingerprint(root: &Path, path: &[u8]) -> Result<Value, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    no_link(root, path)?;
+    let at = root.join(std::ffi::OsString::from_vec(path.to_vec()));
+    let mut file = match std::fs::File::open(&at) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(e) => return Err(e.to_string()),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("not a regular draft path: {}", at.display()));
+    }
+    let mut digest = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    Ok(
+        json!({"sha256": digest.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(), "mode": meta.permissions().mode()}),
+    )
+}
+
 /// Saved before opening the process gate. Errors are durable, not mistaken for an empty write set.
 pub(super) fn snapshot(root: &Path) -> Value {
-    match head(root).and_then(|h| dirty(root, h.is_some()).map(|d| (h, d))) {
-        Ok((h, d)) => {
-            json!({"head":h,"draft_dirty":d.iter().map(|p|hex(p)).collect::<Vec<_>>(),"draft_outside":d.iter().filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()})
-        }
-        Err(error) => json!({"draft_error":error}),
-    }
+    let observe = || -> Result<Value, String> {
+        let h = head(root)?;
+        let d = dirty(root, h.is_some())?;
+        let u = untracked(root)?;
+        let fingerprints = u
+            .iter()
+            .map(|p| Ok((hex(p), fingerprint(root, p)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        Ok(
+            json!({"head":h,"draft_dirty":d.iter().map(|p|hex(p)).collect::<Vec<_>>(),
+            "draft_untracked":fingerprints,
+            "draft_ignored_roots":ignored_roots(root)?.iter().map(|p|hex(p)).collect::<Vec<_>>(),
+            "draft_outside":d.difference(&u).filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()}),
+        )
+    };
+    observe().unwrap_or_else(|error| json!({"draft_error":error}))
+}
+
+fn decoded(path: &str) -> Result<Vec<u8>, String> {
+    let bytes = path
+        .strip_prefix("hex:")
+        .ok_or("invalid draft path encoding")?
+        .as_bytes();
+    bytes
+        .chunks(2)
+        .map(|pair| {
+            if pair.len() != 2 {
+                return Err("invalid draft path encoding".into());
+            }
+            let text = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
+            u8::from_str_radix(text, 16).map_err(|e| e.to_string())
+        })
+        .collect()
 }
 
 fn no_link(root: &Path, path: &[u8]) -> Result<(), String> {
@@ -207,6 +286,25 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let current = head(root)?;
     let mut changed = dirty(root, current.is_some())?;
     let uncommitted = changed.clone();
+    let initial = start["draft_untracked"]
+        .as_object()
+        .ok_or("missing untracked start digests")?;
+    for (name, digest) in initial {
+        let path = decoded(name)?;
+        if fingerprint(root, &path)? == *digest {
+            changed.remove(&path);
+        } else {
+            changed.insert(path);
+        }
+    }
+    let ignored = start["draft_ignored_roots"]
+        .as_array()
+        .ok_or("missing ignored roots observation")?
+        .iter()
+        .map(|p| decoded(p.as_str().ok_or("invalid ignored root")?))
+        .collect::<Result<BTreeSet<_>, String>>()?;
+    changed.extend(ignored_roots(root)?.difference(&ignored).cloned());
+
     if let Some(current) = &current {
         let committed = if let Some(base) = start["head"].as_str() {
             super::control::git(root, &["merge-base", "--is-ancestor", base, current])?;
