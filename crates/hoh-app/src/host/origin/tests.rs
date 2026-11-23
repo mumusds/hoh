@@ -421,7 +421,7 @@ fn test_008_05_tcp_mapping_and_socket_ownership_ambiguity() -> R {
 #[derive(Clone, Default)]
 struct HoldIo {
     lists: BTreeMap<PathBuf, Result<Vec<Result<std::ffi::OsString, i32>>, i32>>,
-    files: BTreeMap<PathBuf, Result<String, i32>>,
+    files: BTreeMap<PathBuf, Result<Vec<u8>, i32>>,
     links: BTreeMap<PathBuf, Result<PathBuf, i32>>,
 }
 
@@ -446,13 +446,13 @@ impl ProcIo for HoldIo {
             Err(code) => Err(errno(*code)),
         }
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         match self
             .files
             .get(path)
             .ok_or_else(|| std::io::Error::other(format!("no file {}", path.display())))?
         {
-            Ok(text) => Ok(text.clone()),
+            Ok(bytes) => Ok(bytes.clone()),
             Err(code) => Err(errno(*code)),
         }
     }
@@ -472,11 +472,65 @@ fn srch() -> i32 {
     rustix::io::Errno::SRCH.raw_os_error()
 }
 
+/// `comm` bytes that are not UTF-8, as a kernel `status` file would carry them on the Name line.
+/// The Uid line stays ASCII. 0xC3 must be followed by a continuation byte; 0x28 is not one.
+fn status_with_non_utf8_comm(uid: u32) -> Vec<u8> {
+    let mut bytes = b"Name:\t".to_vec();
+    bytes.extend_from_slice(&[0xc3, 0x28]);
+    bytes.extend_from_slice(format!("\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n").as_bytes());
+    bytes
+}
+
+#[test]
+fn test_008_05_non_utf8_comm_does_not_fail_the_peer_lookup() -> R {
+    // Hold: pid 99 is still alive and its comm is not UTF-8. The scan reads every process's
+    // status before the uid filter, so one such file used to fail the whole lookup (InvalidData)
+    // and refuse every approval. The peer's own status has the same Name line; identity reads it too.
+    let dir = tempfile::Builder::new().prefix("flk05-").tempdir()?;
+    let root = dir.path();
+    for (pid, holds) in [(99u32, false), (30u32, true)] {
+        let path = root.join(pid.to_string());
+        std::fs::create_dir_all(path.join("fd"))?;
+        std::fs::write(path.join("status"), status_with_non_utf8_comm(1000))?;
+        if holds {
+            std::os::unix::fs::symlink("socket:[888]", path.join("fd/3"))?;
+            let mut fields = vec!["0".to_owned(); 20];
+            fields[0] = "S".into();
+            fields[1] = "1".into();
+            fields[19] = "42".into();
+            std::fs::write(path.join("stat"), format!("{pid} (x) {}", fields.join(" ")))?;
+        }
+    }
+    let status_read = std::fs::read_to_string(root.join("99/status")).err();
+    let owner = socket_owner(root, 888, 1000);
+    let identity = ProcFs(root).identity(30);
+    assert_eq!(
+        owner,
+        Some(30),
+        "a non-UTF-8 comm must not hide the user peer; os string read of that status: {status_read:?}; identity={identity:?}"
+    );
+    let identity = identity.ok_or("peer identity")?;
+    assert_eq!(identity.uids, [1000, 1000, 1000, 1000]);
+    assert_eq!(identity.ppid, 1);
+    assert_eq!(identity.start, 42);
+    // The same hold through the scripted proc: the unrelated status is not a string.
+    let (held, io) = peer_with(|root, io| {
+        io.files
+            .insert(root.join("99/status"), Ok(status_with_non_utf8_comm(1000)));
+    });
+    assert_eq!(
+        socket_owner_at(&io, &held, 888, 1000),
+        Some(30),
+        "hold: a non-UTF-8 comm must not hide the user peer"
+    );
+    Ok(())
+}
+
 /// Peer 30 holds `socket:[888]`. `other` is an unrelated same-uid pid the scan also sees.
 fn peer_with(other: impl FnOnce(&Path, &mut HoldIo)) -> (PathBuf, HoldIo) {
     let root = PathBuf::from("/hold");
     let mut io = HoldIo::default();
-    let status = |uid: u32| Ok(format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"));
+    let status = |uid: u32| Ok(format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n").into_bytes());
     io.files.insert(root.join("30/status"), status(1000));
     io.lists.insert(
         root.join("30/fd"),
