@@ -11,9 +11,12 @@ pub(in super::super) fn consumed(
     now: SystemTime,
 ) -> Result<Option<f64>, PersistError> {
     if kind == "attempts" {
+        // Pause/restart withdrawals did no work (ADR-021 decision 7). Keep active allocations,
+        // started attempts and explicit cancellations charged in the shared task/Run budget view.
         let attempts: f64 = tx
             .query_row(
-                "SELECT count(*) FROM attempts WHERE task_id=?1",
+                "SELECT count(*) FROM attempts WHERE task_id=?1 \
+                 AND NOT (state='CANCELLED' AND started_at IS NULL AND cancel_requested=0)",
                 params![task],
                 |r| r.get(0),
             )
