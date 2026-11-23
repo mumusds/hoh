@@ -134,6 +134,11 @@ names = json.loads(os.environ['STUB_EXPORTS'])
 for variant, export in json.loads(snapshot.read_text()).items():
     doc = {'variant': variant, 'nonce': nonce, 'git_tree': tree, 'export': export}
     (Path(os.environ['HOH_TRACE_EXPORT_DIR']) / names[variant]).write_text(json.dumps(doc))
+if mode == 'written-then-failed':
+    sys.exit(101)
+if mode == 'written-then-killed':
+    import signal
+    os.kill(os.getpid(), signal.SIGKILL)
 '''
 
 
@@ -217,6 +222,16 @@ class ProductStep(unittest.TestCase):
         rc,statuses,_,seen,err=self.traceability('failing')
         self.assertIsNotNone(seen,'the check never ran the product step')
         self.assertEqual(statuses,['FAIL'],err);self.assertNotEqual(rc,0)
+
+    def test_a_product_step_failing_after_its_exports_gives_no_pass(self):
+        """M3N-200: valid exports of this run and tree do not make up for the step's own failure (exit or signal)."""
+        for mode in ('written-then-failed','written-then-killed'):
+            with self.subTest(mode=mode):
+                rc,statuses,record,seen,err=self.traceability(mode)
+                self.assertIsNotNone(seen,'the check never ran the product step')
+                self.assertEqual(record['missing_artifacts'],[],'the step wrote no exports: not this boundary')
+                self.assertEqual(statuses,['FAIL'],err);self.assertNotEqual(rc,0)
+                self.assertIn('product step',err)
 
     def test_exports_of_another_tree_or_run_give_no_pass(self):
         for mode in ('another-tree','another-run'):

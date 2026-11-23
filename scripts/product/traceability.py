@@ -542,25 +542,28 @@ PRODUCT_STEPS = {'TEST-032-01': ['cargo', 'test', '--locked', '-p', 'hoh-app', '
                                  'test_032_01_product_export_over_fault_variants_matches_the_mirror']}
 
 
-def product_steps(root: Path, test_ids: list[str], out_dir: Path, candidate: dict) -> None:
+def product_steps(root: Path, test_ids: list[str], out_dir: Path, candidate: dict) -> list[str]:
     """Run the product step of each of `test_ids` that has one, its output to stderr, and name its exports to the
-    self-tests. A step that fails is reported; its tests then find no exports and fail."""
-    steps = [PRODUCT_STEPS[t] for t in test_ids if t in PRODUCT_STEPS]
+    self-tests. Return the TESTs whose step did not exit 0 (a non-zero exit, a signal, not started): their self-tests
+    are FAIL and the check fails whatever exports the step left (M3N-200)."""
+    steps = [(t, PRODUCT_STEPS[t]) for t in test_ids if t in PRODUCT_STEPS]
     if not steps:
-        return
+        return []
     nonce = uuid.uuid4().hex
     os.environ.update({'HOH_TRACE_EXPORTS': str(out_dir), 'HOH_TRACE_NONCE': nonce,
                        'HOH_TRACE_TREE': candidate['git_tree']})
     env = os.environ | {'HOH_TRACE_EXPORT_DIR': str(out_dir), 'HOH_TRACE_EXPORT_NONCE': nonce}
-    for argv in steps:
+    failed = []
+    for test_id, argv in steps:
         sys.stderr.flush()
         try:
             rc = subprocess.run(argv, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=2, stderr=2).returncode
         except OSError as exc:
             rc = f'not started: {exc}'
         if rc != 0:
-            print(f'traceability: product step {" ".join(argv)} failed ({rc}); its self-tests find no exports',
-                  file=sys.stderr)
+            failed.append(test_id)
+            print(f'traceability: product step {" ".join(argv)} failed ({rc}); {test_id} is FAIL', file=sys.stderr)
+    return failed
 
 
 def cases(suite) -> list:
@@ -654,8 +657,10 @@ def main(argv=None) -> int:
         print(f'traceability: {exc}', file=sys.stderr)
         return 1
     out_dir = Path(out)
-    product_steps(ROOT, sorted(mine + extra), out_dir, world.candidate)
-    own = self_test(ROOT, sorted(mine + extra))
+    step_failed = product_steps(ROOT, sorted(mine + extra), out_dir, world.candidate)
+    # A product step that did not exit 0 fails its TEST's self-tests, whatever they found (M3N-200).
+    own = [line | {'status': 'FAIL'} if line['test_id'] in step_failed else line
+           for line in self_test(ROOT, sorted(mine + extra))]
     with (out_dir / world.names['test_results']).open('w', encoding='utf-8') as f:
         for line in own:
             f.write(json.dumps(line, ensure_ascii=False) + '\n')
@@ -669,7 +674,7 @@ def main(argv=None) -> int:
     failed = [line['test_id'] for line in own if line['test_id'] in extra and line['status'] == 'FAIL']
     for test_id in failed:
         print(f'traceability: FAIL {test_id} (self-test outside the profile)', file=sys.stderr)
-    ok = not result['unsatisfied'] and not result['invalid'] and not failed
+    ok = not result['unsatisfied'] and not result['invalid'] and not failed and not step_failed
     print(f"traceability: {len(tests)} TESTs, {len(found)} members, "
           f"{len(result['unsatisfied'])} unsatisfied, {len(result['invalid'])} invalid", file=sys.stderr)
     return 0 if ok else 1
