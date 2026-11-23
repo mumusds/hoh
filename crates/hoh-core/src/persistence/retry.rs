@@ -114,11 +114,29 @@ pub(super) fn fail_task(
     let failures = u32::try_from(count.saturating_add(1)).unwrap_or(u32::MAX);
     // A refused repair standing: the attempt's end is never a retry, the task waits for the decision
     // (docs/adr/ADR-028.md decision 12, M2T16R-02).
-    let after = if super::verification::refused(tx, task.run_id)?.contains(task.task_id) {
+    let consult = super::consult::is_child(tx, task.task_id)?;
+    let after = if consult {
+        let class = match failure.class {
+            FailureClass::Transient { .. } => failure.class,
+            _ => FailureClass::Transient { retry_after: None },
+        };
+        crate::retry::after_failure(class, failures, failure.at, failure.draw)
+    } else if super::verification::refused(tx, task.run_id)?.contains(task.task_id) {
         AfterFailure::Blocked(crate::protocol::BlockedReason::NeedDecision)
     } else {
         crate::retry::after_failure(failure.class, failures, failure.at, failure.draw)
     };
+    if consult && matches!(after, AfterFailure::Exhausted) {
+        tx.execute(
+            "UPDATE tasks SET attempt_count=?1 WHERE task_id=?2",
+            params![i64::from(failures), task.task_id],
+        )
+        .map_err(sqlite_error)?;
+        return Ok(Failed {
+            cas: None,
+            events: binding,
+        });
+    }
     let mut events = Vec::new();
     let (to, next, reason) = match after {
         AfterFailure::Retry {
@@ -535,6 +553,7 @@ pub(super) fn pace(
     if !working && !blocked && state != RunState::WaitingExternal && !commander_stage {
         return Ok(Paced::default());
     }
+    super::consult::sweep_run(&tx, &project_id, run_id, ctx)?;
     let mut tasks = load_tasks(&tx, run_id)?;
     // Which tasks are due and which wait for a retry.
     let due = |t: &TaskRow| is_due(t, &at);
@@ -1094,6 +1113,9 @@ pub(super) fn repair_in(
             }),
         ));
         RepairVerdict::Granted { count: n }
+    } else if super::consult::is_child(tx, &request.task_id)? {
+        // The consult lifecycle turns exhausted corrections into a diagnostic, never a question.
+        RepairVerdict::Refused { count }
     } else {
         let reason =
             request

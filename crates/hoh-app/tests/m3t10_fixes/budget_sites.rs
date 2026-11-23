@@ -287,12 +287,14 @@ fn audit(sources: &[(String, String)]) -> R {
     );
     assert_eq!(
         task_stops,
-        expected(&[("budget_view.rs", 1), ("decide.rs", 1), ("rounds.rs", 1)])
+        expected(&[
+            ("budget_view.rs", 1),
+            ("consult/returned.rs", 1),
+            ("decide.rs", 1),
+            ("rounds.rs", 1)
+        ])
     );
-    assert_eq!(
-        consult_stops,
-        expected(&[("budget_view.rs", 1), ("consult/returned.rs", 1)])
-    );
+    assert_eq!(consult_stops, expected(&[("budget_view.rs", 1)]));
     Ok(())
 }
 
@@ -366,6 +368,76 @@ fn after_const() {}
     }
     for name in ["mod inline", "mod external", "fn helper", "const HELPER"] {
         assert!(!kept.contains(name), "test item {name} retained: {kept}");
+    }
+    Ok(())
+}
+
+// Every task state SQL writer is enumerated as a statement, not as a file-wide exemption.
+fn consult_writers(sources: &[(String, String)]) -> R {
+    let mut writes = Vec::new();
+    let mut gateway = false;
+    let mut commit_audit = false;
+    for (name, source) in sources {
+        let text = product(source)?;
+        let compact: String = text
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\\')
+            .collect();
+        for part in compact.split('"') {
+            let sql = part.to_ascii_lowercase();
+            if sql.contains("update")
+                && (sql.contains("tasksset") || sql.contains("{table}set"))
+                && sql.contains("state=")
+            {
+                writes.push((name.clone(), part.to_owned()));
+            }
+        }
+        if name == "writer.rs" {
+            gateway = compact.contains("super::consult::move_task(tx,cas,to,ctx)?");
+            commit_audit = source.contains("super::questions::check_invariants(tx)?")
+                && source.matches("check_test_invariants(&tx)?").count() == 2;
+        }
+    }
+    writes.sort();
+    let mut expected = vec![
+        ("consult/returned.rs".to_owned(), "UPDATEtasksSETstate=?1,revision=revision+1,blocked_reason=NULL,next_retry_at=NULLWHEREtask_id=?2ANDrevision=?3".to_owned()),
+        ("consult/state.rs".to_owned(), "UPDATEtasksSETstate=?1,revision=revision+1WHEREtask_id=?2ANDrevision=?3AND?1IN('PENDING','READY','LEASED','RUNNING','BLOCKED')".to_owned()),
+        ("writer.rs".to_owned(), "UPDATEtasksSETstate=?1,revision=revision+1WHEREtask_id=?2ANDrevision=?3ANDstate=?4ANDNOTEXISTS(SELECT1FROMeventsWHEREkind='task.consult'ANDjson_extract(payload_json,'$.task_id')=?2)".to_owned()),
+        ("writer.rs".to_owned(), "UPDATErunsSETstate=?1,revision=revision+1,resume_state=?2WHERErun_id=?3ANDrevision=?4ANDstate=?5".to_owned()),
+        ("writer.rs".to_owned(), "UPDATErunsSETstate=?1,revision=revision+1,resume_state=?2,blocked_reason=NULL,blocked_reasons_json='[]'WHERErun_id=?3ANDrevision=?4ANDstate=?5".to_owned()),
+    ];
+    // The dynamic table Touch statement changes only revision; Run writes cannot address a child.
+    expected.retain(|(_, sql)| sql.starts_with("UPDATEtasks"));
+    expected.sort();
+    assert_eq!(writes, expected, "consult child state writers changed");
+    assert!(
+        gateway,
+        "task CAS must delegate every consult move to its lifecycle"
+    );
+    assert!(
+        commit_audit,
+        "all persistence test commits must check the invariants"
+    );
+    Ok(())
+}
+#[test]
+fn test_023_01_dc4_consult_state_writer_pin() -> R {
+    consult_writers(&sources()?)
+}
+#[test]
+fn test_023_01_dc4_injected_state_writer_is_refused() -> R {
+    for file in ["writer.rs", "inputs.rs", "consult/returned.rs"] {
+        let mut all = sources()?;
+        let (_, source) = all
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .ok_or("source")?;
+        source.push_str("\nfn bypass() { tx.execute(\"UPDATE tasks SET title='bypass',state='READY' WHERE task_id=?1\", params![task]); }\n");
+        let failure = std::panic::catch_unwind(|| consult_writers(&all));
+        assert!(
+            failure.is_err(),
+            "unowned child state write in {file} escaped"
+        );
     }
     Ok(())
 }

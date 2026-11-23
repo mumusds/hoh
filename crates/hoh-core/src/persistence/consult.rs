@@ -4,10 +4,12 @@ mod children;
 mod listing;
 mod recovery;
 mod returned;
+mod state;
 pub(super) use bounds::{accrue_wall, consumed};
 pub use listing::TasksPage;
 pub(super) use listing::page;
-pub(super) use returned::{check_terminals, finish, input_current, sweep};
+pub(super) use returned::{check_terminals, finish, input_current, sweep, sweep_run};
+pub(super) use state::{finished, is_child, move_task};
 
 use super::writer::{self, Ctx, Intent, NewEvent};
 use super::{PersistError, closing, sqlite_error};

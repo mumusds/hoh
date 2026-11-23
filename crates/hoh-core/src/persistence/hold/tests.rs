@@ -29,7 +29,7 @@ fn world(path: &Path, state: &str) -> R {
         "INSERT INTO projects(project_id, repo_path, created_at) VALUES ('p1', '/repo', '2026-11-15T00:00:00Z');
          INSERT INTO runs(run_id, project_id, state, mode, revision, created_at, blocked_reason) VALUES
            ('R', 'p1', '{state}', 'AUTO', 1, '2026-11-15T00:00:00Z',
-            CASE WHEN '{state}' = 'BLOCKED' THEN 'NEED_DECISION' END);"
+            CASE WHEN '{state}' = 'BLOCKED' THEN 'BLOCKED_AUTH' END);"
     ))?;
     Ok(())
 }
@@ -120,7 +120,7 @@ async fn stopped_world(dir: &tempfile::TempDir, state: RunState) -> R<(Store, Pa
     if state == RunState::Blocked {
         // A BLOCKED run has its reason recorded before it moves (blockers.rs).
         Connection::open(&path)?
-            .execute_batch("UPDATE runs SET blocked_reason = 'NEED_DECISION' WHERE run_id = 'R'")?;
+            .execute_batch("UPDATE runs SET blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R'")?;
     }
     for (n, to) in through.into_iter().enumerate() {
         enter(&store, &path, to, &format!("move-{n}")).await?;

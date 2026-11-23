@@ -2670,3 +2670,31 @@ fn test_023_01_dc3_store_audit_rejects_finished_nonterminal_consults() -> R {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_023_01_dc4_every_persistence_commit_audits_anchors_and_consults() -> R {
+    for broken in ["anchor", "open_terminal", "finished_nonterminal"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t10-dc4-audit-")
+            .tempdir_in("/home/ai/dev")?;
+        let (store, path) = open_store(&dir)?;
+        world(&path, "RUNNING", &[], &work_task("agent_blocked"))?;
+        match broken {
+            "anchor" => exec(&path, "DELETE FROM events WHERE event_id='T/need'")?,
+            "open_terminal" => exec(
+                &path,
+                "UPDATE tasks SET state='CANCELLED',blocked_reason=NULL WHERE task_id='T'; INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES ('p1','consult-start','R','task.consult','{\"task_id\":\"T\"}','2026-11-22T00:00:00Z')",
+            )?,
+            _ => exec(
+                &path,
+                "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES ('p1','consult-end','R','task.consult_finished','{\"task_id\":\"T\",\"status\":\"CANCELLED\"}','2026-11-22T00:00:00Z')",
+            )?,
+        }
+        let result = store.commit(Default::default()).await;
+        assert!(
+            matches!(result, Err(PersistError::IntegrityViolation(_))),
+            "{broken}: {result:?}"
+        );
+    }
+    Ok(())
+}

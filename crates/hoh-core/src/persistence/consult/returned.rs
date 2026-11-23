@@ -1,10 +1,6 @@
 //! Consultation completion and replay share the caller's transaction and the existing input outbox.
-use super::super::{
-    inputs::{self, NewInput},
-    writer::{Change, Commit, StateCas},
-};
+use super::super::inputs::{self, NewInput};
 use super::*;
-use crate::protocol::{TaskState, TaskStatus};
 
 pub(in super::super) fn finish(
     tx: &Transaction<'_>,
@@ -24,14 +20,15 @@ pub(in super::super) fn finish(
     }
     Ok(())
 }
-pub(in super::super) fn sweep(
+pub(in super::super) fn sweep_open(
     tx: &Transaction<'_>,
     project: &str,
+    run: Option<&str>,
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tasks: Vec<String> = {
-        let mut q=tx.prepare("SELECT json_extract(e.payload_json,'$.task_id') FROM events e JOIN outbox o ON o.message_id=json_extract(e.payload_json,'$.waiting_id') WHERE e.project_id=?1 AND e.kind='task.consult' AND o.state IN ('PENDING','DELIVERING') ORDER BY e.seq").map_err(sqlite_error)?;
-        q.query_map(params![project], |r| r.get(0))
+        let mut q=tx.prepare("SELECT json_extract(e.payload_json,'$.task_id') FROM events e JOIN outbox o ON o.message_id=json_extract(e.payload_json,'$.waiting_id') WHERE e.project_id=?1 AND (?2 IS NULL OR e.run_id=?2) AND e.kind='task.consult' AND o.state IN ('PENDING','DELIVERING') ORDER BY e.seq").map_err(sqlite_error)?;
+        q.query_map(params![project, run], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
             .map_err(sqlite_error)?
@@ -39,6 +36,22 @@ pub(in super::super) fn sweep(
     for task in tasks {
         settle(tx, &task, ctx)?;
     }
+    Ok(())
+}
+pub(in super::super) fn sweep_run(
+    tx: &Transaction<'_>,
+    project: &str,
+    run: &str,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    sweep_open(tx, project, Some(run), ctx)
+}
+pub(in super::super) fn sweep(
+    tx: &Transaction<'_>,
+    project: &str,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    sweep_open(tx, project, None, ctx)?;
     let pending: Vec<(String, String, String)> = {
         let mut q=tx.prepare("SELECT input_id,i.run_id,json_extract(i.payload_json,'$.consultation_task_id') FROM input_queue i JOIN runs r USING(run_id) WHERE r.project_id=?1 AND i.state IN ('QUEUED','DELIVERED') AND json_extract(i.payload_json,'$.consultation_task_id') IS NOT NULL ORDER BY i.rowid").map_err(sqlite_error)?;
         q.query_map(params![project], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -53,165 +66,136 @@ pub(in super::super) fn sweep(
     }
     super::recovery::sweep(tx, project, ctx)
 }
+fn metadata(tx: &Connection, task: &str) -> Result<Option<(String, Value, Message)>, PersistError> {
+    let raw: Option<(String, String)> = tx.query_row("SELECT project_id,payload_json FROM events WHERE kind='task.consult' AND json_extract(payload_json,'$.task_id')=?1 ORDER BY seq LIMIT 1", params![task], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(sqlite_error)?;
+    raw.map(|(project, raw)| {
+        let meta: Value = serde_json::from_str(&raw)
+            .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+        let request: Message = serde_json::from_value(meta["source_message"].clone())
+            .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+        Ok((project, meta, request))
+    })
+    .transpose()
+}
+fn current(tx: &Connection, request: &Message, meta: &Value) -> Result<bool, PersistError> {
+    tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs r USING(run_id) JOIN role_bindings b ON b.run_id=r.run_id AND b.role=t.role WHERE t.task_id=?1 AND t.state<>'CANCELLED' AND r.state NOT IN ('CANCEL_REQUESTED','CANCELLED','COMPLETED','FAILED') AND r.spec_id=?2 AND t.spec_id=?2 AND b.role_epoch=?3)",params![request.task_id,meta["spec_id"].as_str(),meta["parent_epoch"].as_i64()],|r|r.get(0)).map_err(sqlite_error)
+}
 fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), PersistError> {
-    let raw:Option<(String,String)>=tx.query_row("SELECT project_id,payload_json FROM events WHERE kind='task.consult' AND json_extract(payload_json,'$.task_id')=?1 ORDER BY seq LIMIT 1",params![task],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
-    let Some((project, raw)) = raw else {
-        return Ok(());
-    };
-    let meta: Value =
-        serde_json::from_str(&raw).map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
-    let request: Message = serde_json::from_value(meta["source_message"].clone())
-        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
-    let done = child_id(task, "consult/finished");
-    if closing::exists(tx, &done)? {
+    if super::state::finished(tx, task)? {
         return Ok(());
     }
-    let parent_current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs r USING(run_id) JOIN role_bindings b ON b.run_id=r.run_id AND b.role=t.role WHERE t.task_id=?1 AND t.state<>'CANCELLED' AND r.state NOT IN ('CANCEL_REQUESTED','CANCELLED','COMPLETED','FAILED') AND r.spec_id=?2 AND t.spec_id=?2 AND b.role_epoch=?3)",params![request.task_id,meta["spec_id"].as_str(),meta["parent_epoch"].as_i64()],|r|r.get(0)).map_err(sqlite_error)?;
-    let (state, revision): (String, i64) = tx
+    let Some((_, meta, request)) = metadata(tx, task)? else {
+        return Ok(());
+    };
+    let (state, failures): (String, i64) = tx
         .query_row(
-            "SELECT state,revision FROM tasks WHERE task_id=?1",
+            "SELECT state,attempt_count FROM tasks WHERE task_id=?1",
             params![task],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
-    let latest:Option<(String,String,i64)>=tx.query_row("SELECT attempt_id,state,role_epoch FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",params![task],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sqlite_error)?;
-    let mut actual = None;
+    let latest: Option<(String, String, i64)> = tx.query_row("SELECT attempt_id,state,role_epoch FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1", params![task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(sqlite_error)?;
     let mut reason = None;
     let mut detail = None;
-    if !parent_current {
+    let mut actual = None;
+    if !current(tx, &request, &meta)? {
         reason = Some("obsolete_parent");
-        if !matches!(state.as_str(), "CANCELLED" | "ACCEPTED") {
-            writer::write(
-                tx,
-                &Commit {
-                    cas: vec![StateCas {
-                        id: task.into(),
-                        expected_revision: revision,
-                        change: Change::Task(TaskState::Cancelled),
-                    }],
-                    ..Default::default()
-                },
-                ctx,
-            )?;
-        }
     } else if state == "CANCELLED" {
         reason = Some("cancelled");
-    } else if matches!(state.as_str(), "READY" | "PENDING" | "BLOCKED")
-        && let Some(stop) =
-            super::super::budget_view::load(tx, &request.run_id, ctx.now(), ctx.wall())?
-                .consult_stop(task)
+    } else if latest.as_ref().is_some_and(|a| a.1 == "UNKNOWN_EFFECT") {
+        reason = Some("unknown_effect");
+    } else if let Some((attempt, attempt_state, epoch)) = &latest
+        && matches!(attempt_state.as_str(), "SETTLED" | "FAILED" | "CANCELLED")
     {
-        reason = Some("budget_exhausted");
-        detail = Some(stop);
-        // A Runtime stop is terminal; only real Agent questions use BLOCKED(NEED_DECISION).
-        tx.execute(
-            "UPDATE tasks SET blocked_reason=NULL,next_retry_at=NULL WHERE task_id=?1",
-            params![task],
-        )
-        .map_err(sqlite_error)?;
-        writer::write(
-            tx,
-            &Commit {
-                cas: vec![StateCas {
-                    id: task.into(),
-                    expected_revision: revision,
-                    change: Change::Task(TaskState::Cancelled),
-                }],
-                ..Default::default()
-            },
-            ctx,
-        )?;
-    } else if let Some((attempt, attempt_state, epoch)) = &latest {
-        if attempt_state == "SETTLED" && state == "IMPLEMENTED" {
-            let source_current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)",params![request.run_id,request.recipient_role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
-            if !source_current {
-                reason = Some("stale_child_epoch");
-            } else {
-                actual = read_result(tx, &request, task, attempt, *epoch)?;
-                if actual.is_none() {
-                    let reasons = vec![
-                        "Consultation output needs one current, untruncated TaskResult".into(),
-                    ];
-                    super::super::completion::correct_readonly_output(
-                        tx, attempt, task, &reasons, ctx,
-                    )?;
-                    // Both a granted correction and its exhausted question leave the consult open.
-                    return Ok(());
-                }
-            }
+        let source_current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)", params![request.run_id,request.recipient_role,epoch], |r| r.get(0)).map_err(sqlite_error)?;
+        if !source_current {
+            reason = Some("stale_child_epoch");
+        } else if attempt_state == "CANCELLED" {
+            reason = Some("cancelled");
         } else {
-            return Ok(());
-        }
-    } else {
-        return Ok(());
-    }
-    if let Some(result) = &actual {
-        let why = match result.status {
-            TaskStatus::Completed => None,
-            TaskStatus::Failed => Some(super::super::need::WorkReason::AgentFailed),
-            TaskStatus::Blocked => Some(super::super::need::WorkReason::AgentBlocked),
-            TaskStatus::Incomplete => Some(super::super::need::WorkReason::AgentIncomplete),
-        };
-        if let Some(why) = why {
-            let event = super::super::need::task_event(
-                tx,
-                super::super::need::TaskNeed {
-                    project_id: &project,
-                    run_id: &request.run_id,
-                    task_id: task,
-                    event_id: child_id(&result.attempt_id, "consult/decision"),
-                    reason: super::super::need::TaskReason::Work(why),
-                    fields: json!({"attempt_id":result.attempt_id,"detail":result.summary}),
-                },
-            )?;
-            tx.execute(
-                "UPDATE tasks SET blocked_reason='NEED_DECISION' WHERE task_id=?1",
-                params![task],
-            )
-            .map_err(sqlite_error)?;
-            writer::write(
-                tx,
-                &Commit {
-                    cas: vec![StateCas {
-                        id: task.into(),
-                        expected_revision: revision,
-                        change: Change::Task(TaskState::Blocked),
-                    }],
-                    events: vec![event],
-                    ..Default::default()
-                },
-                ctx,
-            )?;
-            return Ok(());
+            actual = read_result(tx, &request, task, attempt, *epoch)?;
         }
     }
-    // A stale child result cannot be delivered or retried under its old identity.
-    if reason == Some("stale_child_epoch") {
-        tx.execute(
-            "UPDATE tasks SET blocked_reason=NULL,next_retry_at=NULL WHERE task_id=?1",
+    let active = latest
+        .as_ref()
+        .is_some_and(|a| matches!(a.1.as_str(), "PREPARED" | "STARTING" | "RUNNING"));
+    if reason.is_none() && actual.is_none() && !active {
+        if let Some(stop) =
+            super::super::budget_view::load(tx, &request.run_id, ctx.now(), ctx.wall())?
+                .task_stop(task)
+        {
+            reason = Some("budget_exhausted");
+            detail = Some(stop.to_string());
+        } else if failures > i64::from(crate::retry::MAX_RETRIES) {
+            reason = Some("retries_exhausted");
+        } else if let Some((attempt, attempt_state, _)) = &latest
+            && attempt_state == "SETTLED"
+            && !closing::exists(tx, &child_id(attempt, "protocol_correction"))?
+        {
+            let reasons =
+                vec!["Consultation output needs one current, untruncated TaskResult".into()];
+            let verdict = super::super::completion::correct_readonly_output(
+                tx, attempt, task, &reasons, ctx,
+            )?;
+            if matches!(verdict, super::super::retry::RepairVerdict::Refused { .. }) {
+                reason = Some("protocol_corrections_exhausted");
+            }
+        }
+    }
+    if reason.is_some() || actual.is_some() {
+        end(tx, task, actual, reason, detail, ctx)?;
+    }
+    Ok(())
+}
+
+/// The only terminal-state writer for consult children. All effects roll back together.
+pub(super) fn end(
+    tx: &Transaction<'_>,
+    task: &str,
+    actual: Option<crate::protocol::TaskResult>,
+    reason: Option<&str>,
+    detail: Option<String>,
+    ctx: &Ctx<'_>,
+) -> Result<i64, PersistError> {
+    let revision: i64 = tx
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id=?1",
             params![task],
+            |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-        writer::write(
-            tx,
-            &Commit {
-                cas: vec![StateCas {
-                    id: task.into(),
-                    expected_revision: revision,
-                    change: Change::Task(TaskState::Cancelled),
-                }],
-                ..Default::default()
-            },
-            ctx,
-        )?;
+    let done = child_id(task, "consult/finished");
+    if super::state::finished(tx, task)? {
+        return Ok(revision);
     }
-    require_terminal(
-        tx,
-        task,
-        actual
-            .as_ref()
-            .is_some_and(|r| r.status == TaskStatus::Completed),
-    )?;
+    let (project, meta, request) = metadata(tx, task)?
+        .ok_or_else(|| PersistError::IntegrityViolation(format!("missing consult {task}")))?;
+    let parent_current = current(tx, &request, &meta)?;
+    let actual = actual.filter(|_| parent_current);
+    let reason = if parent_current {
+        reason
+    } else {
+        Some("obsolete_parent")
+    };
+    let latest: Option<(String,)> = tx
+        .query_row(
+            "SELECT attempt_id FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+            params![task],
+            |r| Ok((r.get(0)?,)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let terminal = if actual.is_some() {
+        "IMPLEMENTED"
+    } else {
+        "CANCELLED"
+    };
+    let changed = tx.execute("UPDATE tasks SET state=?1,revision=revision+1,blocked_reason=NULL,next_retry_at=NULL WHERE task_id=?2 AND revision=?3", params![terminal,task,revision]).map_err(sqlite_error)?;
+    if changed != 1 {
+        return Err(PersistError::IntegrityViolation(format!(
+            "consult {task} lost its terminal CAS"
+        )));
+    }
     super::bounds::release(tx, &request.run_id, task, &meta)?;
     let input = child_id(task, "consult/result");
     if parent_current {
@@ -285,7 +269,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
         "task.consult_finished",
         json!({"task_id":task,"parent_task_id":request.task_id,"attempt_id":latest.as_ref().map(|a|&a.0),"input_id":parent_current.then_some(input),"reason":reason,"detail":detail,"status":actual.as_ref().map_or(json!("CANCELLED"), |r|json!(r.status))}),
     )?;
-    Ok(())
+    Ok(revision + 1)
 }
 
 /// Recheck the original task and specification at each delivery boundary, not just when the answer was enqueued.
@@ -351,7 +335,7 @@ fn read_result(
         }))
 }
 
-fn require_terminal(conn: &Connection, task: &str, completed: bool) -> Result<(), PersistError> {
+fn require_terminal(conn: &Connection, task: &str, has_result: bool) -> Result<(), PersistError> {
     let row: Option<(String, bool)> = conn
         .query_row(
             "SELECT state,writer FROM tasks WHERE task_id=?1",
@@ -360,10 +344,10 @@ fn require_terminal(conn: &Connection, task: &str, completed: bool) -> Result<()
         )
         .optional()
         .map_err(sqlite_error)?;
-    // Read-only COMPLETED work remains IMPLEMENTED; it is not acceptance of a candidate or an AC.
+    // Read-only work with any valid TaskResult remains IMPLEMENTED; it is not acceptance of a candidate or an AC.
     if row.as_ref().is_some_and(|(state, writer)| {
         matches!(state.as_str(), "CANCELLED" | "ACCEPTED")
-            || (state == "IMPLEMENTED" && !writer && completed)
+            || (state == "IMPLEMENTED" && !writer && has_result)
     }) {
         return Ok(());
     }
@@ -374,6 +358,13 @@ fn require_terminal(conn: &Connection, task: &str, completed: bool) -> Result<()
 
 /// Run alongside the open-question audit in the same read snapshot, including other runs and closed waits.
 pub(in super::super) fn check_terminals(conn: &Connection) -> Result<(), PersistError> {
+    let open_terminal: Option<String> = conn.query_row("SELECT t.task_id FROM tasks t JOIN events c ON c.kind='task.consult' AND json_extract(c.payload_json,'$.task_id')=t.task_id WHERE t.state IN ('IMPLEMENTED','ACCEPTED','CANCELLED') AND NOT EXISTS(SELECT 1 FROM events f WHERE f.kind='task.consult_finished' AND json_extract(f.payload_json,'$.task_id')=t.task_id) LIMIT 1", [], |r| r.get(0)).optional().map_err(sqlite_error)?;
+    if let Some(task) = open_terminal {
+        return Err(PersistError::IntegrityViolation(format!(
+            "consult {task} is open with a terminal child"
+        )));
+    }
+
     let mut q = conn
         .prepare(
             "SELECT e.run_id,e.payload_json,c.payload_json FROM events e
@@ -398,8 +389,8 @@ pub(in super::super) fn check_terminals(conn: &Connection) -> Result<(), Persist
         let task = finished["task_id"].as_str().ok_or_else(|| {
             PersistError::IntegrityViolation("consult finished without task id".into())
         })?;
-        let mut completed = false;
-        if finished["status"] == "COMPLETED"
+        let mut has_result = false;
+        if finished["status"] != "CANCELLED"
             && let Some(meta) = meta
         {
             let meta: Value = serde_json::from_str(&meta)
@@ -411,14 +402,14 @@ pub(in super::super) fn check_terminals(conn: &Connection) -> Result<(), Persist
                 params![task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             ).optional().map_err(sqlite_error)?;
             if let Some((attempt, state, epoch)) = latest {
-                completed = run.as_deref() == Some(&request.run_id)
-                    && state == "SETTLED"
+                has_result = run.as_deref() == Some(&request.run_id)
+                    && matches!(state.as_str(), "SETTLED" | "FAILED")
                     && finished["attempt_id"] == attempt
                     && read_result(conn, &request, task, &attempt, epoch)?
-                        .is_some_and(|r| r.status == TaskStatus::Completed);
+                        .is_some_and(|r| json!(r.status) == finished["status"]);
             }
         }
-        require_terminal(conn, task, completed)?;
+        require_terminal(conn, task, has_result)?;
     }
     Ok(())
 }

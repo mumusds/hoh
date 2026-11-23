@@ -515,10 +515,10 @@ async fn a_resume_with_blockers_claimed_returns_to_blocked_and_keeps_its_resume_
     Connection::open(&path)?.execute_batch(&format!(
         "{WORLD}
          UPDATE attempts SET state = 'FAILED', ended_at = '2026-11-07T00:00:05Z' WHERE attempt_id = 'A1';
-         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'NEED_DECISION',
-           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'BLOCKED_CAPABILITY',
+           blocked_reasons_json = '[\"BLOCKED_CAPABILITY\"]' WHERE run_id = 'R';
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}}',
+           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"BLOCKED_CAPABILITY\", \"source\": \"pace\"}}',
             '2026-11-07T00:00:00Z');"
     ))?;
     let resumed = store
@@ -537,7 +537,7 @@ async fn a_resume_with_blockers_claimed_returns_to_blocked_and_keeps_its_resume_
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(reasons, "[\"NEED_DECISION\"]");
+    assert_eq!(reasons, "[\"BLOCKED_CAPABILITY\"]");
     Ok(())
 }
 
@@ -728,10 +728,10 @@ async fn a_resume_of_an_incomplete_run_with_blockers_claimed_is_blocked_until_th
     let (store, path) = open_at(&dir, clock.clone(), Arc::new(crate::persistence::NoFaults))?;
     Connection::open(&path)?.execute_batch(&format!(
         "{WORLD}{QUIET}
-         UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'NEED_DECISION',
-           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';
+         UPDATE runs SET state = 'BLOCKED', resume_state = 'RUNNING', blocked_reason = 'BLOCKED_CAPABILITY',
+           blocked_reasons_json = '[\"BLOCKED_CAPABILITY\"]' WHERE run_id = 'R';
          INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
-           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"NEED_DECISION\", \"source\": \"pace\"}}',
+           ('p1', 'claim-1', 'R', 'run.blocker_claimed', '{{\"reason\": \"BLOCKED_CAPABILITY\", \"source\": \"pace\"}}',
             '2026-11-07T00:00:00Z');"
     ))?;
     move_r(&store, 1, RunState::Incomplete).await?;
@@ -763,10 +763,10 @@ async fn a_resume_of_an_incomplete_run_with_blockers_claimed_is_blocked_until_th
         ]
     );
     assert_eq!(events[0].1["from"], "INCOMPLETE");
-    assert_eq!(events[2].1["reasons"], json!(["NEED_DECISION"]));
+    assert_eq!(events[2].1["reasons"], json!(["BLOCKED_CAPABILITY"]));
     let result =
         crate::persistence::results::assert_ends_with_result(&path, before, "R", "BLOCKED")?;
-    assert_eq!(result["blocked_reason"], "NEED_DECISION");
+    assert_eq!(result["blocked_reason"], "BLOCKED_CAPABILITY");
     let context = crate::decision::Context {
         now: Some(clock.now()),
         wall: Some(clock.now()),
@@ -892,12 +892,12 @@ async fn a_resume_of_a_blocked_run_or_one_with_attempts_unfinished_or_in_another
     // `from` that state (not PAUSED). Any other state (RUNNING, COMPLETED) keeps its 409 with details {state}. Nothing is
     // written by any of them.
     let blocked = "UPDATE runs SET blocked_reason = 'BLOCKED_AUTH', \
-                   blocked_reasons_json = '[\"BLOCKED_AUTH\", \"NEED_DECISION\"]' WHERE run_id = 'R';";
+                   blocked_reasons_json = '[\"BLOCKED_AUTH\", \"BLOCKED_CAPABILITY\"]' WHERE run_id = 'R';";
     let cases = [
         (
             "BLOCKED",
             QUIET,
-            Some(json!({"state": "BLOCKED", "reasons": ["BLOCKED_AUTH", "NEED_DECISION"]})),
+            Some(json!({"state": "BLOCKED", "reasons": ["BLOCKED_AUTH", "BLOCKED_CAPABILITY"]})),
         ),
         ("PAUSED", "", None),
         ("INCOMPLETE", "", None),
@@ -2117,8 +2117,8 @@ async fn a_pause_a_cancel_and_a_resume_into_blocked_each_end_their_commit_with_a
     let (store, path) = open(&dir)?;
     Connection::open(&path)?.execute_batch(&format!(
         "{WORLD}{ended}
-         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'NEED_DECISION',
-           blocked_reasons_json = '[\"NEED_DECISION\"]' WHERE run_id = 'R';"
+         UPDATE runs SET state = 'PAUSED', resume_state = 'RUNNING', revision = 4, blocked_reason = 'BLOCKED_CAPABILITY',
+           blocked_reasons_json = '[\"BLOCKED_CAPABILITY\"]' WHERE run_id = 'R';"
     ))?;
     let before = max(&path)?;
     store
@@ -2128,7 +2128,7 @@ async fn a_pause_a_cancel_and_a_resume_into_blocked_each_end_their_commit_with_a
         crate::persistence::results::assert_ends_with_result(&path, before, "R", "BLOCKED")?;
     assert_eq!(
         (&blocked["exit_code"], &blocked["blocked_reason"]),
-        (&json!(3), &json!("NEED_DECISION"))
+        (&json!(3), &json!("BLOCKED_CAPABILITY"))
     );
     Ok(())
 }

@@ -538,7 +538,7 @@ fn finish_cancel(
     let tasks: Vec<(String, i64)> = {
         let mut statement = tx
             .prepare(
-                "SELECT task_id, revision FROM tasks WHERE run_id = ?1 AND state NOT IN ('ACCEPTED', 'CANCELLED') \
+                "SELECT task_id, revision FROM tasks t WHERE run_id = ?1 AND state NOT IN ('ACCEPTED', 'CANCELLED') AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='task.consult_finished' AND json_extract(e.payload_json,'$.task_id')=t.task_id) \
                  ORDER BY created_seq, task_id",
             )
             .map_err(sqlite_error)?;

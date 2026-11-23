@@ -1255,7 +1255,7 @@ pub(super) fn write(
 ) -> Result<Committed, PersistError> {
     let mut revisions = Vec::with_capacity(commit.cas.len());
     for cas in &commit.cas {
-        revisions.push(compare_and_set(tx, cas)?);
+        revisions.push(compare_and_set(tx, cas, ctx)?);
         // A run that enters a stopping state gets its run.result at the end of the transaction, if it is still in one
         // then (docs/adr/ADR-031.md decision 3); so does a run in G moved without a change of state (a Touch): its
         // revision moved, and a stopped run is read by its result of the revision it is at (hold.rs, M2T13R-02).
@@ -1363,6 +1363,8 @@ pub(super) fn result_due(tx: &Transaction<'_>, run_id: &str) -> Result<(), Persi
 /// word (an error fails the commit and the transaction rolls back), then the commit.
 pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     finish(&tx, ctx)?;
+    #[cfg(test)]
+    check_test_invariants(&tx)?;
     ctx.before_commit()?;
     let db = tx.path().map(std::path::PathBuf::from);
     tx.commit().map_err(|e| commit_error(e, db.as_deref()))
@@ -1372,6 +1374,8 @@ pub(super) fn commit(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistEr
 /// commit is mapped as [`commit`] maps it ([`commit_error`]).
 pub(super) fn commit_unhooked(tx: Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     finish(&tx, ctx)?;
+    #[cfg(test)]
+    check_test_invariants(&tx)?;
     let db = tx.path().map(std::path::PathBuf::from);
     tx.commit().map_err(|e| commit_error(e, db.as_deref()))
 }
@@ -1582,7 +1586,11 @@ fn project_scoped(event: &NewEvent, run: &str) -> Result<serde_json::Value, Pers
 
 /// One compare-and-set inside `tx`: read the row, check the revision and the move, then write it guarded by the
 /// state and revision just read. Returns the new revision.
-fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistError> {
+fn compare_and_set(
+    tx: &Transaction<'_>,
+    cas: &StateCas,
+    ctx: &Ctx<'_>,
+) -> Result<i64, PersistError> {
     let entity = cas.change.entity();
     if matches!(entity, Entity::Attempt | Entity::Input) {
         return Err(PersistError::IntegrityViolation(format!(
@@ -1700,8 +1708,9 @@ fn compare_and_set(tx: &Transaction<'_>, cas: &StateCas) -> Result<i64, PersistE
             if matches!(to, TaskState::Pending | TaskState::Ready) && blocked {
                 return Err(illegal(from.as_str(), to.as_str(), unresolved()));
             }
+            if let Some(revision) = super::consult::move_task(tx, cas, to, ctx)? { return Ok(revision); }
             tx.execute(
-                "UPDATE tasks SET state = ?1, revision = revision + 1 WHERE task_id = ?2 AND revision = ?3 AND state = ?4",
+                "UPDATE tasks SET state = ?1, revision = revision + 1 WHERE task_id = ?2 AND revision = ?3 AND state = ?4 AND NOT EXISTS(SELECT 1 FROM events WHERE kind='task.consult' AND json_extract(payload_json,'$.task_id')=?2)",
                 params![to.as_str(), cas.id, revision, state],
             )
         }
@@ -1956,4 +1965,10 @@ impl Drop for Claimed {
             claims.returned.push(row);
         }
     }
+}
+
+#[cfg(test)]
+fn check_test_invariants(tx: &Transaction<'_>) -> Result<(), PersistError> {
+    super::questions::check_invariants(tx)?;
+    Ok(())
 }

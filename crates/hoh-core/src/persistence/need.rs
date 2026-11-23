@@ -353,6 +353,13 @@ pub(super) fn is_verifier(
 /// for a task that is no verifier. Any other pair is an IntegrityViolation: nothing is built, the caller's transaction
 /// rolls back.
 pub(super) fn task_event(conn: &Connection, need: TaskNeed<'_>) -> Result<NewEvent, PersistError> {
+    if super::consult::is_child(conn, need.task_id)? {
+        return Err(PersistError::IntegrityViolation(format!(
+            "consult {} cannot ask the owner",
+            need.task_id
+        )));
+    }
+
     let verifier = is_verifier(conn, need.run_id, need.task_id)?;
     let fits = match need.reason {
         TaskReason::Verifier(_) => verifier,

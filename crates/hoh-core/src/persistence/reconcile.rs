@@ -478,7 +478,9 @@ fn apply(
         });
         task_moves.extend(failed.cas);
         task_events = failed.events;
-    } else if let Some(to) = task_to {
+    } else if let Some(to) = task_to
+        && !(to == TaskState::Implemented && super::consult::is_child(&tx, &row.task_id)?)
+    {
         // A supervision turn's task never goes back to READY: CANCELLED, its wake rearmed (docs/adr/ADR-025.md
         // decision 3).
         let to = if to == TaskState::Ready && super::wakes::is_supervision(&tx, &row.task_id)? {
@@ -493,6 +495,7 @@ fn apply(
             change: Change::Task(to),
         });
     } else if attempt_to == Some(AttemptState::UnknownEffect)
+        && !super::consult::is_child(&tx, &row.task_id)?
         && let Some((cas, decision)) = super::verification::unknown_effect(
             &tx,
             (&row.project_id, &row.run_id, &row.task_id),

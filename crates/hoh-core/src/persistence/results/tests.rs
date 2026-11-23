@@ -140,7 +140,7 @@ async fn each_stopping_state_ends_its_commit_with_one_valid_run_result() -> R {
         world(&path, &["R"], from)?;
         if state == RunState::Blocked {
             Connection::open(&path)?.execute(
-                "UPDATE runs SET blocked_reason = 'NEED_DECISION' WHERE run_id = 'R'",
+                "UPDATE runs SET blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R'",
                 [],
             )?;
         }
@@ -180,7 +180,7 @@ async fn each_stopping_state_ends_its_commit_with_one_valid_run_result() -> R {
             assert_eq!(
                 payload["blocked_reason"],
                 if *to == RunState::Blocked {
-                    json!("NEED_DECISION")
+                    json!("BLOCKED_AUTH")
                 } else {
                     Value::Null
                 }
@@ -204,7 +204,7 @@ async fn a_touch_an_unblock_and_a_run_that_leaves_e_in_the_same_commit_write_no_
         })
         .await?;
     Connection::open(&path)?.execute(
-        "UPDATE runs SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION', blocked_reasons_json = '[]', \
+        "UPDATE runs SET state = 'BLOCKED', blocked_reason = 'BLOCKED_AUTH', blocked_reasons_json = '[]', \
          resume_state = 'VERIFYING' WHERE run_id = 'R'",
         [],
     )?;
@@ -226,7 +226,7 @@ async fn a_touch_an_unblock_and_a_run_that_leaves_e_in_the_same_commit_write_no_
         .await?;
     // Into BLOCKED and out of it again in one commit.
     Connection::open(&path)?.execute(
-        "UPDATE runs SET blocked_reason = 'NEED_DECISION' WHERE run_id = 'R'",
+        "UPDATE runs SET blocked_reason = 'BLOCKED_AUTH' WHERE run_id = 'R'",
         [],
     )?;
     let r = revision(&path, "R")?;

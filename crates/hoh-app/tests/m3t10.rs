@@ -1431,7 +1431,6 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
                 )),
             )
             .await?;
-        let waiting = matches!(scenario, "failed" | "blocked" | "incomplete");
         let rows = sql(
             dir.path(),
             "SELECT payload_json FROM input_queue WHERE target_role='developer'",
@@ -1439,9 +1438,9 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
         )?;
         assert_eq!(
             rows.as_array().ok_or("rows")?.len(),
-            usize::from(!waiting && scenario != "stale_parent")
+            usize::from(scenario != "stale_parent")
         );
-        if !waiting && scenario != "stale_parent" {
+        if scenario != "stale_parent" {
             let payload: Value =
                 serde_json::from_str(rows[0]["payload_json"].as_str().ok_or("payload")?)?;
             if scenario == "cancelled" {
@@ -1459,31 +1458,19 @@ async fn test_023_01_return_is_atomic_replayable_and_rejects_obsolete_parent() -
                 );
             }
         }
-        assert_eq!(
-            host.store().reader()?.wait_for("R")?.len(),
-            usize::from(waiting)
-        );
+        assert_eq!(host.store().reader()?.wait_for("R")?.len(), 0);
         let ended = events(dir.path(), "task.consult_finished")?;
-        assert_eq!(ended.len(), usize::from(!waiting));
-        if waiting {
-            let projection = host.store().reader()?.run_projection("R")?.ok_or("run")?;
-            assert_eq!(
-                projection
-                    .5
-                    .iter()
-                    .filter(|q| q.task_id.as_deref() == Some(child))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                sql(
-                    dir.path(),
-                    &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
-                    true
-                )?[0]["state"],
-                "BLOCKED"
-            );
-        }
+        assert_eq!(ended.len(), 1);
+        assert!(
+            !host
+                .store()
+                .reader()?
+                .run_projection("R")?
+                .ok_or("run")?
+                .5
+                .iter()
+                .any(|q| q.task_id.as_deref() == Some(child))
+        );
         host.store().reader()?.check_question_anchors()?;
         host.shutdown().await;
         let restarted = Host::start(config(dir.path())).await?;
@@ -1530,22 +1517,22 @@ async fn test_023_01_bad_result_uses_bounded_protocol_repairs() -> R {
                 &format!("SELECT state FROM tasks WHERE task_id='{child}'"),
                 true
             )?[0]["state"],
-            if n < 3 { "READY" } else { "BLOCKED" }
+            if n < 3 { "READY" } else { "CANCELLED" }
         );
         assert_eq!(
             events(dir.path(), "task.consult_finished")?.len(),
-            0,
-            "corrections and the exhausted question keep the consult open"
+            usize::from(n == 3),
+            "corrections keep the consult open only while its correction bound allows"
         );
     }
-    assert_eq!(host.store().reader()?.wait_for("R")?.len(), 1);
+    assert_eq!(host.store().reader()?.wait_for("R")?.len(), 0);
     assert_eq!(
         sql(
             dir.path(),
             "SELECT count(*) n FROM input_queue WHERE target_role='developer'",
             true
         )?[0]["n"],
-        0
+        1
     );
     host.store().reader()?.check_question_anchors()?;
     host.shutdown().await;

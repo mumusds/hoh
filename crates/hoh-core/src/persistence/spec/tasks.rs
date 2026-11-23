@@ -52,7 +52,7 @@ pub(super) fn migrate(
     let mut cancelled = Vec::new();
     let questions = questions::open(tx, run)?;
     // NULL belongs to the first draft's history and must never be rewritten by adoption (ADR-038).
-    let tasks = tx.prepare("SELECT task_id,spec_id,state,revision,created_seq,writer FROM tasks WHERE run_id=?1 AND state NOT IN ('ACCEPTED','CANCELLED') AND spec_id IS NOT NULL AND spec_id<>?2 ORDER BY task_id")
+    let tasks = tx.prepare("SELECT task_id,spec_id,state,revision,created_seq,writer FROM tasks t WHERE run_id=?1 AND state NOT IN ('ACCEPTED','CANCELLED') AND spec_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM events e WHERE e.kind='task.consult_finished' AND json_extract(e.payload_json,'$.task_id')=t.task_id) AND spec_id<>?2 ORDER BY task_id")
         .map_err(sqlite_error)?.query_map(params![run,spec_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,bool>(5)?)))
         .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
     for (task, old, state, revision, created_seq, writer) in tasks {

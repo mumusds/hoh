@@ -398,10 +398,19 @@ async fn a_supervision_turn_moves_neither_its_runs_state_nor_its_revision() -> R
              UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION' WHERE task_id = 'D';"
         ),
     )?;
+    crate::persistence::tests::seed_task_question(&path, "D")?;
     store.pace_run("R", context(&clock, 0)).await?;
     let blocked = run_state(&path, "R")?;
     assert_eq!(blocked.0, "BLOCKED");
-    wake(&store, &clock, "R", "D", "fp", 100).await?;
+    // The fixture's real question anchor already supplies the wake.
+    assert_eq!(
+        store
+            .supervise("R", context(&clock, 2100))
+            .await?
+            .fired
+            .len(),
+        1
+    );
     let a = store
         .allocate_supervision("p1", context(&clock, 3000))
         .await?
