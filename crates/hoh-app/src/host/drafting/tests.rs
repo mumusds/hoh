@@ -32,7 +32,7 @@ fn docs(root: &Path) -> R {
     std::fs::write(root.join(&source.path), &source.bytes)?;
     let index = hoh_core::specindex::generate_index(&[source])?;
     std::fs::write(root.join(hoh_core::specindex::PATH), index.bytes())?;
-    git(root, &["add", "docs"])?;
+    git(root, &["add", "docs/spec"])?;
     git(root, &["commit", "-q", "-m", "draft"])
 }
 #[test]
@@ -179,7 +179,7 @@ fn test_008_02_m3l100_greenfield_preserves_existing_untracked_files() -> R {
             _ => {}
         }
         let result = checked(root, &start)?;
-        if change == "unchanged" {
+        if matches!(change, "unchanged" | "committed") {
             assert!(matches!(result, WriterOutcome::Draft { .. }));
             assert_eq!(
                 std::fs::read_to_string(root.join("README.txt"))?,
@@ -226,6 +226,140 @@ fn test_008_02_s8_git_init_observation_requires_the_exact_local_repository() -> 
     assert!(matches!(
         observe_init(linked.path(), "A", &key),
         Some(Observation::Unavailable { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l250_unchanged_untracked_docs_need_no_commit() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::create_dir(root.join("docs"))?;
+    std::fs::write(root.join("docs/user-notes.txt"), "user notes")?;
+    let start = snapshot(root);
+    // Commit only the draft, leaving the existing document untracked.
+    let notes = root.join("docs/user-notes.txt");
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    std::fs::write(&notes, "draft changed these notes")?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Correct { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l203_untracked_observation_is_bounded_and_folded() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::create_dir(root.join("vendor"))?;
+    for n in 0..128 {
+        std::fs::write(root.join(format!("vendor/file-{n}")), "existing")?;
+    }
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    assert!(
+        serde_json::to_vec(&start)?.len() < 4096,
+        "large trees must be folded"
+    );
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    assert!(
+        super::super::control::git_bounded(root, &["ls-files", "--others", "-z"], 8)
+            .unwrap_err()
+            .contains("limit")
+    );
+    std::fs::write(root.join(".git/info/exclude"), "vendor/hidden\n")?;
+    std::fs::write(root.join("vendor/hidden"), "new ignored product file")?;
+    assert!(
+        matches!(checked(root, &start)?, WriterOutcome::DraftBlocked { paths, .. } if paths.contains(&"vendor/hidden".to_owned()))
+    );
+    std::fs::write(root.join(".git/info/exclude"), "")?;
+    std::fs::write(root.join("vendor/file-7"), "changed")?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::DraftBlocked { .. }
+    ));
+    for n in 128..4097 {
+        std::fs::write(root.join(format!("vendor/file-{n}")), "existing")?;
+    }
+    let failed = snapshot(root);
+    assert!(
+        failed["draft_error"]
+            .as_str()
+            .is_some_and(|s| s.contains("limit")),
+        "{failed}"
+    );
+    assert!(checked(root, &failed).is_err());
+    assert!(
+        checked(root, &start).is_err(),
+        "end observation must enforce the same cap"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "subprocess WAL probe for the boundary read test"]
+fn draft_boundary_probe() {
+    assert_eq!(hoh_core::persistence::selftest::probe_main(), 0);
+}
+
+#[tokio::test]
+async fn test_008_04_m3l202_boundary_read_error_is_an_observation_failure() -> R {
+    use hoh_core::persistence::{Options, selftest::ProbeCommand};
+    let dir = repo()?;
+    let store = Store::open(
+        &dir.path().join(".hoh/state.db"),
+        Options {
+            wal_probe: Some(ProbeCommand {
+                program: std::env::current_exe()?,
+                args: [
+                    "--exact",
+                    "host::drafting::tests::draft_boundary_probe",
+                    "--ignored",
+                    "--nocapture",
+                ]
+                .map(Into::into)
+                .to_vec(),
+                env: vec![],
+                answer_timeout: std::time::Duration::from_secs(10),
+            }),
+            ..Options::new(hoh_core::spawn::Direct::shared())
+        },
+    )?;
+    // Missing identity makes the durable boundary read fail, independently of Git.
+    let result = boundary(&store, dir.path(), "missing-attempt").await;
+    assert!(
+        matches!(result, Some((_, ref paths)) if paths.is_empty()),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l203_content_limit_is_a_small_failed_observation() -> R {
+    let dir = repo()?;
+    let start = snapshot(dir.path());
+    std::fs::File::create(dir.path().join("large-user-file"))?.set_len(CONTENT_LIMIT + 1)?;
+    let failed = snapshot(dir.path());
+    assert!(
+        failed["draft_error"]
+            .as_str()
+            .is_some_and(|s| s.contains("limit"))
+    );
+    assert!(serde_json::to_vec(&failed)?.len() < 1024);
+    assert!(checked(dir.path(), &failed).is_err());
+    // New product paths are refused without reading their contents.
+    assert!(matches!(
+        checked(dir.path(), &start)?,
+        WriterOutcome::DraftBlocked { .. }
     ));
     Ok(())
 }

@@ -543,3 +543,176 @@ async fn test_008_01_s8_stop_between_dispatch_and_gate_starts_no_draft() -> R {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_01_m3l201_http_input_requests_next_draft_only_in_plan() -> R {
+    for mode in ["PLAN", "AUTO"] {
+        for (kind, target) in [
+            ("REPLY", None),
+            ("STEER", None),
+            ("STEER", Some("cto")),
+            ("ASK", None),
+        ] {
+            let world = world::World::named("m3t04-input-generation")?;
+            world.configure(&[], "")?;
+            world.commit_project(&world::fixture_spec())?;
+            world.init_store().await?;
+            world.seed_spec()?;
+            let host = world.start_plain_host(None).await?;
+            let result: R = async {
+                let run = world::start_run(&host, "start", "request next draft").await?;
+                world.staff(&run)?;
+                // An accepted generation with an approved base and no open question.
+                world.exec(&format!("UPDATE runs SET state='RUNNING',mode='{mode}' WHERE run_id='{run}';
+                    INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,kind,created_seq)
+                    SELECT 'previous','{run}',spec_id,'ACCEPTED','cto',1,'spec_draft',1 FROM runs WHERE run_id='{run}';
+                    INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at)
+                    VALUES('previous-request',:p,'{run}','spec.draft_requested','{{}}','now');"))?;
+                input(&host, &world, &run, "next", "SendInput", json!({"text":"继续修改规格", "target_role":target, "input_kind":kind})).await?;
+                let stored = if kind == "REPLY" { "STEER" } else { kind };
+                assert_eq!(world.query("SELECT kind FROM input_queue")?, stored);
+                assert_eq!(host.store().draft_step(&run, false).await?, mode == "PLAN" && stored == "STEER" && target.is_none(), "{mode} {kind} {target:?}");
+                assert!(!host.store().draft_step(&run, false).await?, "one input, one generation");
+                if mode == "PLAN" && stored == "STEER" && target.is_none() {
+                    assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?, "2");
+                    assert_eq!(world.query("SELECT json_extract(payload_json,'$.note.text') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?, "继续修改规格");
+                }
+                Ok(())
+            }.await;
+            host.shutdown().await;
+            result?;
+        }
+    }
+    Ok(())
+}
+
+// A scripted product writer in a second Run; it commits through its own gated, marked process.
+#[derive(Debug)]
+struct ProductBetweenDrafts {
+    team: std::sync::Arc<world::Team>,
+    root: std::path::PathBuf,
+}
+impl hoh_app::host::Executor for ProductBetweenDrafts {
+    fn deliver(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        self.team.deliver(work)
+    }
+    fn start(
+        &self,
+        work: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        if work.task_id != "other-work" {
+            return self.team.start(work);
+        }
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r go || exit 1; set -e; echo 'pub fn other_run() {}' > src/lib.rs; git add src/lib.rs; git -c user.name=test -c user.email=test@example.invalid commit -qm other-run"])
+            .current_dir(&self.root).process_group(0)
+            .env(hoh_app::host::ATTEMPT_ENV, work.marker())
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().map_err(|e| hoh_app::host::Refusal {reason:e.to_string(),class:hoh_core::retry::FailureClass::Transient{retry_after:None},detail:None,details:None})?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let (send, ended) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = send.send(hoh_app::host::Outcome {
+                success: false,
+                detail: format!("scripted product commit: {status:?}"),
+                group_gone: hoh_agents::identity::group_empty(pid),
+                class: hoh_core::retry::FailureClass::Auth,
+                observed: Default::default(),
+                unknown_effect: false,
+                retry_at: None,
+            });
+        });
+        Ok(hoh_app::host::Started {
+            pid,
+            gate: hoh_app::host::Gate::new(move || {
+                stdin
+                    .ok_or("stdin")?
+                    .write_all(b"go\n")
+                    .map_err(|e| e.to_string())
+            }),
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_04_m3l200_other_run_commits_between_draft_attempts() -> R {
+    let world = world::World::named("m3t04-window")?;
+    world.configure(&[], "")?;
+    world.commit_project(&world::fixture_spec())?;
+    world.init_store().await?;
+    let spec = world.seed_spec()?;
+    let indexed: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        world.project().join("docs/spec/index.json"),
+    )?)?;
+    let ac = indexed["requirements"][0]["acceptance"][0]
+        .to_string()
+        .replace('\'', "''");
+    world.exec(&format!(
+        "UPDATE acceptance_criteria SET body='{ac}' WHERE spec_id='{spec}';"
+    ))?;
+    let setup = world.start_plain_host(None).await?;
+    let run = world::start_run(&setup, "draft-run", "draft windows").await?;
+    let other = world::start_run(&setup, "other-run", "product writer").await?;
+    world.staff(&run)?;
+    world.exec(&format!("UPDATE runs SET state='RUNNING',mode='PLAN' WHERE run_id='{run}'; UPDATE runs SET state='RUNNING',mode='BUILD' WHERE run_id='{other}';"))?;
+    setup.shutdown().await;
+    let source = hoh_core::specindex::Source {
+        path: "docs/spec/fixture.md".into(),
+        bytes: std::fs::read_to_string(world.project().join("docs/spec/fixture.md"))?
+            .replace("fixture 目标已完成", "fixture 目标与边界已完成")
+            .into_bytes(),
+    };
+    let team = world::Team::planning(
+        world.project(),
+        source,
+        |_| vec![],
+        Some(Duration::from_secs(1)),
+    );
+    let mut config = hoh_app::host::HostConfig::new(&world.project());
+    config.port = 0;
+    config.store.wal_probe = Some(world::probe());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: std::sync::Arc::new(ProductBetweenDrafts {
+            team,
+            root: world.project(),
+        }),
+        context: hoh_core::decision::Context {
+            required_capabilities: world::TEAM
+                .iter()
+                .map(|(role, _)| ((*role).to_owned(), Default::default()))
+                .collect(),
+            ..Default::default()
+        },
+    });
+    let host = hoh_app::host::Host::start(config).await?;
+    let result:R=async {
+        if let Err(e)=world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(20)).await {return Err(format!("{e}; {:?}",world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 12")?).into());}
+        let first=world.git(&["rev-parse","HEAD"])?;
+        world.staff(&other)?;
+        world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('other-work','{other}','{spec}','READY','developer',1,1,1);
+            INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('other-work','REQ-901','{spec}');"))?;
+        world.until("SELECT count(*) FROM attempts WHERE task_id='other-work' AND state='FAILED'","1",Duration::from_secs(20)).await?;
+        let second=world.git(&["rev-parse","HEAD"])?;
+        assert_ne!(first,second,"the other Run must really commit");
+        assert!(std::fs::read_to_string(world.project().join("src/lib.rs"))?.contains("other_run"));
+        let q=world.query(&format!("SELECT json_extract(payload_json,'$.question_id') FROM events WHERE kind='question.asked' AND run_id='{run}' ORDER BY seq DESC LIMIT 1"))?;
+        input(&host,&world,&run,"reject","AnswerQuestion",json!({"question_id":q,"choice_id":"reject","answer":"再检查文档"})).await?;
+        world.until(&format!("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.run_id='{run}' AND t.kind='spec_draft' AND a.state IN ('SETTLED','FAILED')"),"2",Duration::from_secs(20)).await?;
+        assert_eq!(world.query(&format!("SELECT count(*) FROM events WHERE run_id='{run}' AND kind='plan.write_violation'"))?,"0");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.draft_completed'")?,"2");
+        assert_eq!(world.git(&["diff","--name-only",second.trim(),"HEAD","--","src/"])?,"");
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    result
+}

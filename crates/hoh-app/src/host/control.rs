@@ -837,6 +837,23 @@ pub(crate) fn git_run(
     project: &Path,
     args: &[&str],
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    git_run_limited(project, args, None)
+}
+
+/// Bounded Git output for draft path observations. Never accept a truncated path set.
+pub(super) fn git_bounded(project: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, String> {
+    let (status, out) = git_run_limited(project, args, Some(limit))?;
+    if !status.success() {
+        return Err(format!("git {}: {status}", args.join(" ")));
+    }
+    Ok(out)
+}
+
+fn git_run_limited(
+    project: &Path,
+    args: &[&str],
+    limit: Option<usize>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
@@ -859,10 +876,14 @@ pub(crate) fn git_run(
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
+        let stdout = stdout.ok_or_else(|| std::io::Error::other("no stdout"))?;
         stdout
-            .ok_or_else(|| std::io::Error::other("no stdout"))?
-            .read_to_end(&mut out)
-            .map(|_| out)
+            .take(limit.map_or(u64::MAX, |n| n as u64 + 1))
+            .read_to_end(&mut out)?;
+        if limit.is_some_and(|n| out.len() > n) {
+            return Err(std::io::Error::other("draft path output limit exceeded"));
+        }
+        Ok(out)
     });
     let end = Instant::now() + GIT_LIMIT;
     // Its end is seen without reaping it: its pid, which names its group, stays its own until the wait below.

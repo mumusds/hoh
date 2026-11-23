@@ -497,17 +497,21 @@ async fn test_008_02_completion_and_blocked_draft_are_idempotent_user_questions(
 }
 
 #[tokio::test]
-async fn test_008_04_m3l102_draft_start_survives_attempt_retries() -> R {
+async fn test_008_04_m3l200_each_attempt_owns_its_start() -> R {
     let (_dir, store, db, _) = approval_world().await?;
     db.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
       INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES
       ('A1','D','SD','FAILED',1,1,1),('A2','D','SD','RUNNING',1,1,1);")?;
-    for (attempt, head) in [("A1", "original"), ("A2", "after-violation")] {
+    for (attempt, head) in [("A1", "original"), ("A2", "after-other-run")] {
         db.execute("INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES(?1,'P','R','attempt.workspace_start',?2,'now')",
             params![child_id(attempt,"workspace_start"),json!({"attempt_id":attempt,"head":head}).to_string()])?;
     }
     assert_eq!(
         store.reader()?.draft_start("A2")?.ok_or("start")?["head"],
+        "after-other-run"
+    );
+    assert_eq!(
+        store.reader()?.draft_start("A1")?.ok_or("start")?["head"],
         "original"
     );
     Ok(())
@@ -586,11 +590,6 @@ async fn test_008_01_s8_applied_change_does_not_open_another_draft() -> R {
         )?,
         "PROPOSED"
     );
-    // A distinct user request still creates the next generation (Q3); handling CHANGE must not disable it.
-    db.execute_batch("INSERT INTO input_queue VALUES('next','R','REPLY',NULL,'APPLIED','{\"text\":\"继续修改规格\"}');
-        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('queued-next','P','R','input.queued','{\"input_id\":\"next\"}','now');")?;
-    assert!(store.draft_step("R", false).await?);
-    assert!(!store.draft_step("R", false).await?);
     Ok(())
 }
 
@@ -667,5 +666,104 @@ async fn test_008_02_s8_refused_draft_dispatch_has_a_run_question() -> R {
             0
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_m3l251_failed_observation_is_local_to_attempt() -> R {
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+      INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES
+      ('A1','D','SD','FAILED',1,1,1),('A2','D','SD','RUNNING',1,1,1);")?;
+    for (attempt, payload) in [
+        ("A1", json!({"draft_error":"unreadable"})),
+        ("A2", json!({"head":"recovered","draft_dirty":[]})),
+    ] {
+        let mut payload = payload;
+        payload["attempt_id"] = json!(attempt);
+        db.execute("INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES(?1,'P','R','attempt.workspace_start',?2,'now')",
+            params![child_id(attempt,"workspace_start"),payload.to_string()])?;
+    }
+    assert_eq!(
+        store.reader()?.draft_start("A1")?.ok_or("start")?["draft_error"],
+        "unreadable"
+    );
+    assert_eq!(
+        store.reader()?.draft_start("A2")?.ok_or("start")?["head"],
+        "recovered"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_009_03_m3l252_refused_gate_retains_process_identity_when_unreaped() -> R {
+    use crate::persistence::AttemptFacts;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("UPDATE runs SET state='SPECIFYING',mode='BUILD'; UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO effects(effect_key,attempt_id,state) VALUES('work/A','A','PREPARED');
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    let tracking = json!({"attempt_id":"A","mode":"proc"});
+    assert!(
+        !store
+            .runner_running(
+                "A",
+                AttemptFacts {
+                    pid: Some(123),
+                    boot_id: Some("boot".into()),
+                    process_start_id: Some("start".into()),
+                    ..Default::default()
+                },
+                tracking.clone()
+            )
+            .await?
+    );
+    assert_eq!(db.query_row("SELECT coalesce(pid,0)||'/'||coalesce(boot_id,'')||'/'||coalesce(process_start_id,'')||'/'||state FROM attempts WHERE attempt_id='A'",[],|r|r.get::<_,String>(0))?, "123/boot/start/STARTING");
+    let row = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("attempt")?;
+    assert_eq!(row.pid, Some(123), "a later reconcile must not infer NoPid");
+    store
+        .reconcile_apply(
+            row,
+            crate::reconcile::Disposition::Unreaped,
+            crate::reconcile::Process::Uncertain {
+                basis: "injected proof unavailable".into(),
+            },
+            "draft_gate_refused",
+            std::time::SystemTime::now(),
+            0,
+        )
+        .await?;
+    let later = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("still unfinished")?;
+    assert_eq!(later.pid, Some(123));
+    assert_eq!(later.state, crate::lifecycle::AttemptState::Starting);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM leases WHERE attempt_id='A'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        store.reader()?.attempt_event("attempt.tracking", "A")?,
+        Some(tracking)
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM effects WHERE attempt_id='A'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "PREPARED"
+    );
     Ok(())
 }

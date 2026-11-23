@@ -1220,13 +1220,41 @@ fn running(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    if super::drafting::is_draft(&tx, &task_id)?
-        && super::admission::admit_one(&tx, &run_id, &task_id, super::admission::By::Draft)?
-            .is_err()
-    {
-        return Ok(false);
-    }
-    if !can_start || task_state == TaskState::Cancelled {
+    let draft = super::drafting::is_draft(&tx, &task_id)?;
+    let refused = !can_start
+        || task_state == TaskState::Cancelled
+        || (draft
+            && super::admission::admit_one(&tx, &run_id, &task_id, super::admission::By::Draft)?
+                .is_err());
+    if refused {
+        // A closed gate still has a process. Preserve its identity before any termination attempt (M3L-252),
+        // without marking work STARTED or changing the Attempt state. Reconcile must never infer NoPid here.
+        if draft
+            && let (Some(pid), Some(boot), Some(start)) =
+                (facts.pid, &facts.boot_id, &facts.process_start_id)
+        {
+            let changed = tx.execute(
+                "UPDATE attempts SET pid=?2,boot_id=?3,process_start_id=?4 WHERE attempt_id=?1 AND state='STARTING' \
+                 AND (pid IS NULL OR (pid=?2 AND boot_id=?3 AND process_start_id=?4))",
+                params![attempt_id,pid,boot,start]).map_err(sqlite_error)?;
+            if changed == 1 {
+                writer::write(
+                    &tx,
+                    &Commit {
+                        events: vec![event(
+                            &project_id,
+                            &run_id,
+                            child_id(attempt_id, "tracking"),
+                            "attempt.tracking",
+                            tracking,
+                        )],
+                        ..Commit::default()
+                    },
+                    ctx,
+                )?;
+                writer::commit(tx, ctx)?;
+            }
+        }
         return Ok(false);
     }
     let key = crate::reconcile::work_key(attempt_id);
@@ -1534,6 +1562,7 @@ pub(super) fn finished_in(
     if !cancelled
         && task_state == TaskState::Running
         && let Some((detail, paths)) = &ending.observed.draft_boundary
+        && super::drafting::is_draft(tx, &task_id)?
     {
         super::drafting::blocked(tx, attempt_id, detail, Some(paths), ctx)?;
         (_, task_state, revision, _, _) = task_of(tx, attempt_id)?;

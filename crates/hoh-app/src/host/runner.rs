@@ -1884,7 +1884,7 @@ async fn refuse_draft_gate(
     tracking: &Tracking,
 ) -> Result<(), PersistError> {
     let store = &common.shared.store;
-    let Some(mut row) = store
+    let Some(row) = store
         .reconcile_scan(&work.project_id, common.clock.now())
         .await?
         .into_iter()
@@ -1892,9 +1892,14 @@ async fn refuse_draft_gate(
     else {
         return Ok(());
     };
-    row.pid = Some(i64::from(who.pid));
-    row.boot_id = Some(who.boot_id.clone());
-    row.process_start_id = Some(who.start_id.clone());
+    if row.pid != Some(i64::from(who.pid))
+        || row.boot_id.as_deref() != Some(&who.boot_id)
+        || row.process_start_id.as_deref() != Some(&who.start_id)
+    {
+        return Err(PersistError::IntegrityViolation(
+            "refused draft process identity was not persisted".into(),
+        ));
+    }
     let seen = row.clone();
     let settings = common.settings.clone();
     let tracking = tracking.clone();
@@ -1981,7 +1986,7 @@ where
     }
     if !ending.success || ending.unknown_effect {
         ending.observed.draft_boundary =
-            super::drafting::boundary(&common.shared.store, &common.shared.root, id).await?;
+            super::drafting::boundary(&common.shared.store, &common.shared.root, id).await;
     }
     hand(ending).await
 }

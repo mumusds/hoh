@@ -407,7 +407,8 @@ fn apply(
             disposition,
             Disposition::Unreaped | Disposition::Redeliver | Disposition::Complete { .. }
         )
-        && row.draft_boundary.is_some();
+        && row.draft_boundary.is_some()
+        && super::drafting::is_draft(&tx, &row.task_id)?;
     let task_to = if draft_blocked {
         if let Some((detail, paths)) = &row.draft_boundary {
             super::drafting::blocked(&tx, &row.attempt_id, detail, Some(paths), ctx)?;
