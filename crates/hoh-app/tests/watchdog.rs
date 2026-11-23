@@ -10,6 +10,7 @@ use hoh_app::host::{
     Work,
 };
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -86,11 +87,15 @@ INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, creat
 ";
 
 /// An executor whose turn is `sh` reading two lines (its gate's `go`, then `stop`, which ends it), and whose output
-/// look blocks until released: a look held on its blocking thread.
+/// look blocks until released: a look held on its blocking thread. `release` lets every look return. `released` lets
+/// one attempt's look return, so T1 can be let go while the Commander turn dispatched after it stays held.
 #[derive(Debug, Default)]
 struct HeldLook {
     looking: AtomicBool,
     release: AtomicBool,
+    released: Mutex<BTreeSet<String>>,
+    /// Attempt ids currently inside `output_bytes`.
+    inside: Mutex<BTreeSet<String>>,
     ended: Arc<AtomicBool>,
     input: Arc<Mutex<Option<ChildStdin>>>,
 }
@@ -146,13 +151,60 @@ impl Executor for HeldLook {
         })
     }
 
-    fn output_bytes(&self, _: &Work) -> Option<u64> {
+    fn output_bytes(&self, work: &Work) -> Option<u64> {
         self.looking.store(true, Ordering::SeqCst);
+        if let Ok(mut inside) = self.inside.lock() {
+            inside.insert(work.attempt_id.clone());
+        }
         while !self.release.load(Ordering::SeqCst) {
+            let allowed = self
+                .released
+                .lock()
+                .map(|set| set.contains(&work.attempt_id))
+                .unwrap_or(true);
+            if allowed {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Ok(mut inside) = self.inside.lock() {
+            inside.remove(&work.attempt_id);
         }
         Some(0)
     }
+}
+
+impl HeldLook {
+    /// Let attempt `attempt_id`'s look return. Other attempts stay held until `release` is set.
+    fn release_attempt(&self, attempt_id: &str) {
+        if let Ok(mut released) = self.released.lock() {
+            released.insert(attempt_id.to_owned());
+        }
+    }
+
+    /// Attempt ids whose look is inside `output_bytes` now.
+    fn attempts_looking(&self) -> Vec<String> {
+        self.inside
+            .lock()
+            .map(|inside| inside.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// `attempt.inactive` events, or only those of `attempt_id` when it is `Some`.
+fn inactive_count_sql(attempt_id: Option<&str>) -> String {
+    let mut sql = "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%'".to_owned();
+    if let Some(id) = attempt_id {
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-' | '~')),
+            "attempt id {id}"
+        );
+        sql.push_str(&format!(
+            " AND json_extract(payload_json, '$.attempt_id') = '{id}'"
+        ));
+    }
+    sql
 }
 
 async fn until(what: &str, limit: Duration, mut done: impl FnMut() -> R<bool>) -> R {
@@ -170,6 +222,10 @@ async fn until(what: &str, limit: Duration, mut done: impl FnMut() -> R<bool>) -
 async fn a_look_held_on_its_thread_neither_holds_up_its_attempts_end_nor_records_after_it() -> R {
     // WD-01: the watchdog's look (here held on its blocking thread) is in flight when the agent ends. The attempt
     // settles at once, the look's result is dropped, and once the look is let go nothing of it is recorded.
+    // The count is T1 only. After task.implemented the supervisor dispatches a Commander turn through this same
+    // executor; that turn's own look records attempt.inactive (historically R/trigger/5/turn/0/attempt-1, quiet 50 ms,
+    // since about 100 ms). An unscoped project count saw that one record. The Commander look is held, then released,
+    // so the record is in the database before T1 is counted.
     let dir = tempfile::tempdir()?;
     let project = dir.path();
     let first = Host::start(config(project)).await?;
@@ -212,21 +268,45 @@ async fn a_look_held_on_its_thread_neither_holds_up_its_attempts_end_nor_records
             || Ok(query(project, attempt)? == "SETTLED"),
         )
         .await?;
-        held.release.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // T1's look may return. Hold the Commander turn's look, then let it record before T1 is counted.
+        let t1 = query(project, "SELECT attempt_id FROM attempts WHERE task_id = 'T1'")?;
+        if t1.is_empty() {
+            return Err("T1 has no attempt".into());
+        }
+        held.release_attempt(&t1);
+        let look_by = Instant::now() + Duration::from_secs(30);
+        let commander = loop {
+            if let Some(id) = held.attempts_looking().into_iter().find(|id| id != &t1) {
+                break id;
+            }
+            if Instant::now() > look_by {
+                let events = query(
+                    project,
+                    "SELECT coalesce(group_concat(kind || ' ' || payload_json, char(10)), '') FROM events",
+                )?;
+                return Err(format!("no Commander look within 30s; events:\n{events}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        held.release_attempt(&commander);
+        until("the Commander turn's own inactive record", Duration::from_secs(10), || {
+            Ok(query(project, &inactive_count_sql(Some(&commander)))? != "0")
+        })
+        .await?;
+        let payloads = query(
+            project,
+            "SELECT coalesce(group_concat(payload_json, char(10)), '') FROM events WHERE kind LIKE 'attempt.inactive%'",
+        )?;
         assert_eq!(
-            query(
-                project,
-                "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%'"
-            )?,
-            "0"
+            query(project, &inactive_count_sql(Some(&t1)))?,
+            "0",
+            "T1 {t1} recorded after it ended; commander {commander} payloads: {payloads}"
         );
         R::Ok(())
     }
     .await;
     held.release.store(true, Ordering::SeqCst);
-    if !held.ended.load(Ordering::SeqCst)
-        && let Ok(mut input) = held.input.lock()
+    if let Ok(mut input) = held.input.lock()
         && let Some(stdin) = input.as_mut()
     {
         let _ = stdin.write_all(b"stop\n");
@@ -262,6 +342,8 @@ fn hold_until(what: &str, done: impl Fn() -> bool) -> R {
 /// not polled since either became ready. `select!` without a bias polls the look first about three times in four,
 /// and polling it enqueues `runner_watched` before the end is chosen; the record then commits while the attempt is
 /// still RUNNING. The end is listed first so a bias keeps the look from being polled once the end is ready.
+/// The count is T1's attempt only: the Commander turn dispatched after task.implemented records its own
+/// attempt.inactive through this same executor, and an unscoped count would see it.
 fn a_finished_look_records_nothing_when_its_end_is_already_ready() -> R {
     let rt = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
@@ -319,11 +401,15 @@ fn a_finished_look_records_nothing_when_its_end_is_already_ready() -> R {
                 Ok(query(project, "SELECT state FROM attempts WHERE task_id = 'T1'")? == "SETTLED")
             })
             .await?;
+            let t1 = query(
+                project,
+                "SELECT attempt_id FROM attempts WHERE task_id = 'T1'",
+            )?;
+            if t1.is_empty() {
+                return Err("T1 has no attempt".into());
+            }
             assert_eq!(
-                query(
-                    project,
-                    "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%'"
-                )?,
+                query(project, &inactive_count_sql(Some(&t1)))?,
                 "0",
                 "a look whose sample had finished was recorded after its end was already ready"
             );
@@ -331,8 +417,7 @@ fn a_finished_look_records_nothing_when_its_end_is_already_ready() -> R {
         }
         .await;
         held.release.store(true, Ordering::SeqCst);
-        if !held.ended.load(Ordering::SeqCst)
-            && let Ok(mut input) = held.input.lock()
+        if let Ok(mut input) = held.input.lock()
             && let Some(stdin) = input.as_mut()
         {
             let _ = stdin.write_all(b"stop\n");
