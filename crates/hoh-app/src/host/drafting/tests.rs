@@ -113,6 +113,9 @@ fn test_008_04_uncertain_start_and_allowed_directory_links_fail_closed() -> R {
     let dir = repo()?;
     let root = dir.path();
     std::fs::write(root.join("existing.rs"), "user work")?;
+    git(root, &["add", "existing.rs"])?;
+    git(root, &["commit", "-q", "-m", "base"])?;
+    std::fs::write(root.join("existing.rs"), "dirty user work")?;
     let start = snapshot(root);
     docs(root)?;
     assert!(
@@ -131,5 +134,63 @@ fn test_008_04_uncertain_start_and_allowed_directory_links_fail_closed() -> R {
             .unwrap_err()
             .contains("link in draft path")
     );
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l100_ignored_artifacts_do_not_block_drafting() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "target/\n.env\n")?;
+    git(root, &["add", ".gitignore"])?;
+    git(root, &["commit", "-q", "-m", "ignore artifacts"])?;
+    std::fs::create_dir(root.join("target"))?;
+    std::fs::write(root.join("target/a.o"), "artifact")?;
+    std::fs::write(root.join(".env"), "existing environment")?;
+    let start = snapshot(root);
+    assert_eq!(start["draft_dirty"], json!([]));
+    docs(root)?;
+    std::fs::write(root.join("target/b.o"), "another artifact")?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l100_greenfield_preserves_existing_untracked_files() -> R {
+    for change in ["unchanged", "modified", "deleted", "committed"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3t04-greenfield-")
+            .tempdir()?;
+        let root = dir.path();
+        std::fs::write(root.join("README.txt"), "user file")?;
+        git(root, &["init", "-q"])?;
+        let start = snapshot(root);
+        docs(root)?;
+        match change {
+            "modified" => std::fs::write(root.join("README.txt"), "overwritten")?,
+            "deleted" => std::fs::remove_file(root.join("README.txt"))?,
+            "committed" => {
+                git(root, &["add", "README.txt"])?;
+                git(root, &["commit", "-q", "-m", "outside boundary"])?;
+            }
+            _ => {}
+        }
+        let result = checked(root, &start)?;
+        if change == "unchanged" {
+            assert!(matches!(result, WriterOutcome::Draft { .. }));
+            assert_eq!(
+                std::fs::read_to_string(root.join("README.txt"))?,
+                "user file"
+            );
+        } else {
+            assert!(
+                matches!(result, WriterOutcome::DraftBlocked { paths, .. } if paths == ["README.txt"]),
+                "{change}"
+            );
+        }
+    }
     Ok(())
 }
