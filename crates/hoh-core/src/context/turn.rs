@@ -21,6 +21,8 @@ pub const CONTEXT_V1: Params = Params {
 /// its candidate entries. The executor adds what only it knows: a first input owed and a Commander's bridge file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
+    /// Runtime-derived phase for Skill selection; unknown phases have an empty index (ADR-040).
+    pub skill_phase: Option<String>,
     /// The run's goal (its StartRun command); none or blank: not given.
     pub goal: Option<String>,
     /// A Commander turn's question: the wake it answers.

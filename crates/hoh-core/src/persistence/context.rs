@@ -57,6 +57,7 @@ pub(super) fn facts(
     let candidate =
         super::outbox::current_candidate(conn, run_id)?.map(|c| (c.id, c.git_commit, c.git_tree));
     let mut facts = Facts {
+        skill_phase: supervision.map(|_| "plan".to_owned()),
         goal,
         spec,
         candidate,
@@ -155,15 +156,17 @@ fn work(
     spec_id: Option<&str>,
     titles: &BTreeMap<String, String>,
 ) -> Result<(), PersistError> {
-    let row: Option<(String, i64)> = conn
+    let row: Option<(String, i64, String)> = conn
         .query_row(
-            "SELECT role, writer FROM tasks WHERE task_id = ?1",
+            "SELECT role, writer, kind FROM tasks WHERE task_id = ?1",
             params![task_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let (role, writer) = row.unwrap_or_default();
+    let (role, writer, kind) = row.unwrap_or_default();
+    facts.skill_phase =
+        crate::skills::phase(&role, &kind, writer == 1, false, false).map(str::to_owned);
     let deps: Vec<String> = {
         let mut statement = conn
             .prepare(
@@ -216,7 +219,12 @@ fn work(
     facts.acceptance = acceptance(conn, task_id, spec_id)?;
     // What its previous attempt is to correct or do again (docs/adr/ADR-028.md decisions 3, 11 and 12, M2T16R-07): the
     // reasons the Runtime gave, in the mandatory scope, so the next turn knows them whatever the budget.
-    facts.scope.extend(corrections(conn, task_id, attempt_id)?);
+    let corrections = corrections(conn, task_id, attempt_id)?;
+    if !corrections.is_empty() {
+        facts.skill_phase =
+            crate::skills::phase(&role, &kind, writer == 1, false, true).map(str::to_owned);
+    }
+    facts.scope.extend(corrections);
     // What a person answered its question with since an earlier attempt of it last ran (docs/adr/ADR-031.md decision
     // 8): the user's instruction, in the mandatory scope.
     facts.scope.extend(answers(conn, task_id, attempt_id)?);
@@ -254,6 +262,8 @@ fn work(
     // A reworked task's next attempt: what its round found and the rejected candidate's changes (docs/adr/ADR-028.md
     // decisions 12 and 14).
     if let Some(r) = rework(conn, task_id)? {
+        facts.skill_phase =
+            crate::skills::phase(&role, &kind, writer == 1, false, true).map(str::to_owned);
         let evidence = |path: String, text: String| Entry {
             class: Class::Evidence,
             kind: Kind::Plain,

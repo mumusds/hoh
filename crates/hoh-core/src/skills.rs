@@ -291,5 +291,8 @@ pub fn load(
     Ok(selected)
 }
 
+mod turn;
+pub use turn::{Source, for_turn, phase, with_dependencies};
+
 #[cfg(test)]
 mod tests;
