@@ -64,48 +64,84 @@ pub fn load_with_bundle(
         )));
     }
     let role = crate::layout::component(role);
-    let run = crate::layout::component(run);
-    if [role.as_str(), run.as_str()]
-        .iter()
-        .any(|s| s.is_empty() || *s == "." || *s == "..")
-    {
-        return Err(prompt::unavailable("invalid role or run path component"));
-    }
-    if let Some(global) = global {
-        let relative = format!("prompts/{role}.md");
-        if let Some(text) = read_optional(global, &relative)? {
-            sources.push(Contract {
-                layer: "global",
-                path: global.join(relative).display().to_string(),
-                text,
-            });
-        }
+    if role.is_empty() || role == "." || role == ".." {
+        return Err(prompt::unavailable("invalid role path component"));
     }
     let explicit = configured.filter(|p| !p.starts_with(config::BUILTIN_PROMPT));
-    let conventional = format!(".hoh/prompts/{role}.md");
-    let project = explicit.unwrap_or(&conventional);
-    match read_optional(root, project)? {
-        Some(text) => sources.push(Contract {
-            layer: "project",
-            path: project.to_owned(),
-            text,
-        }),
-        None if explicit.is_some() => {
-            return Err(prompt::unavailable(format!(
-                "{project}: configured contract is missing"
-            )));
+    for layer in override_layers(root, global, run)? {
+        let relative = format!("prompts/{role}.md");
+        let source = if layer.layer == "project" && explicit.is_some() {
+            let path = explicit.unwrap_or_default();
+            Some(Contract {
+                layer: "project",
+                path: path.to_owned(),
+                text: read_optional(root, path)?.ok_or_else(|| {
+                    prompt::unavailable(format!("{path}: configured contract is missing"))
+                })?,
+            })
+        } else {
+            layer.read(&relative)?
+        };
+        if let Some(source) = source {
+            sources.push(source);
         }
-        None => (),
-    }
-    let relative = format!(".hoh/runs/{run}/prompts/{role}.md");
-    if let Some(text) = read_optional(root, &relative)? {
-        sources.push(Contract {
-            layer: "run",
-            path: relative,
-            text,
-        });
     }
     prompt::resolve(sources)
+}
+
+/// Shared directory chain for role contracts, skills and templates (ADR-034, ADR-040).
+#[derive(Debug, Clone)]
+pub struct OverrideLayer {
+    pub layer: &'static str,
+    root: PathBuf,
+    prefix: String,
+}
+
+impl OverrideLayer {
+    pub fn read(&self, relative: &str) -> Result<Option<crate::config::Contract>, Error> {
+        let relative = format!("{}{relative}", self.prefix);
+        Ok(
+            read_optional(&self.root, &relative)?.map(|text| crate::config::Contract {
+                layer: self.layer,
+                path: if self.layer == "global" {
+                    self.root.join(&relative).display().to_string()
+                } else {
+                    relative
+                },
+                text,
+            }),
+        )
+    }
+}
+
+pub fn override_layers(
+    root: &Path,
+    global: Option<&Path>,
+    run: &str,
+) -> Result<Vec<OverrideLayer>, Error> {
+    let run = crate::layout::component(run);
+    if run.is_empty() || run == "." || run == ".." {
+        return Err(prompt::unavailable("invalid run path component"));
+    }
+    let mut layers = Vec::new();
+    if let Some(global) = global {
+        layers.push(OverrideLayer {
+            layer: "global",
+            root: global.to_owned(),
+            prefix: String::new(),
+        });
+    }
+    layers.push(OverrideLayer {
+        layer: "project",
+        root: root.to_owned(),
+        prefix: ".hoh/".into(),
+    });
+    layers.push(OverrideLayer {
+        layer: "run",
+        root: root.to_owned(),
+        prefix: format!(".hoh/runs/{run}/"),
+    });
+    Ok(layers)
 }
 
 /// Missing is the only condition that means an absent layer. Check existing ancestors, including links, first.
