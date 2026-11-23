@@ -153,14 +153,9 @@ impl Processes for ProcFs<'_> {
     fn identity(&self, pid: u32) -> Option<Identity> {
         let directory = self.0.join(pid.to_string());
         // status, not directory ownership: a non-dumpable same-uid process has a root-owned /proc directory.
-        let status = std::fs::read_to_string(directory.join("status")).ok()?;
-        let uids = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))?
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<Vec<u32>, _>>()
-            .ok()?;
+        // Name is the comm and need not be UTF-8, so the file is bytes and only the Uid line is decoded.
+        let status = std::fs::read(directory.join("status")).ok()?;
+        let uids = status_uid_fields(&status)?;
         let stat = std::fs::read(directory.join("stat")).ok()?;
         let end = stat.windows(2).rposition(|w| w == b") ")?;
         let fields = std::str::from_utf8(stat.get(end + 2..)?)
@@ -313,7 +308,7 @@ fn tcp_match(text: &str, local: &str, remote: &str, uid: u32) -> Option<u64> {
 /// "the listing itself failed".
 trait ProcIo {
     fn list(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>>;
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
     fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
 }
 
@@ -327,8 +322,8 @@ impl ProcIo for StdProc {
         }
         Ok(names)
     }
-    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-        std::fs::read_to_string(path)
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
     }
     fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
         std::fs::read_link(path)
@@ -337,6 +332,23 @@ impl ProcIo for StdProc {
 
 fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
     socket_owner_at(&StdProc, root, inode, uid)
+}
+
+/// The decimal fields of the `Uid:` line. The rest of `status`, including `Name`, stays bytes:
+/// a live process whose comm is not UTF-8 must not fail this read.
+fn status_uid_fields(bytes: &[u8]) -> Option<Vec<u32>> {
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Some(rest) = line.strip_prefix(b"Uid:") else {
+            continue;
+        };
+        let text = std::str::from_utf8(rest).ok()?;
+        return text
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .ok();
+    }
+    None
 }
 
 /// A pid that is no longer there. A task reaped between the directory read and the follow-up is
@@ -362,18 +374,12 @@ fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Optio
             continue;
         };
         let directory = root.join(pid.to_string());
-        let status = match io.read_to_string(&directory.join("status")) {
+        let status = match io.read(&directory.join("status")) {
             Ok(status) => status,
             Err(error) if process_gone(&error) => continue,
             Err(_) => return None,
         };
-        let uids = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Uid:"))?
-            .split_whitespace()
-            .map(str::parse)
-            .collect::<Result<Vec<u32>, _>>()
-            .ok()?;
+        let uids = status_uid_fields(&status)?;
         if uids.get(1) != Some(&uid) {
             continue;
         }
