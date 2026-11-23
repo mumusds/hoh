@@ -101,3 +101,6 @@ pub mod resource_bundle;
 
 #[forbid(clippy::disallowed_methods)]
 pub mod origin;
+
+#[forbid(clippy::disallowed_methods)]
+pub mod templates;

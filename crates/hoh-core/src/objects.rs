@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Every resource built into the binary that a packed prompt can depend on, by its path in the source tree: the
 /// built-in role contracts and the schemas the output contracts come from.
-pub const RESOURCES: [(&str, &str); 40] = [
+pub const RESOURCES: [(&str, &str); 41] = [
     (
         "resources/prompts/commander.md",
         include_str!("../../../resources/prompts/commander.md"),
@@ -96,6 +96,10 @@ pub const RESOURCES: [(&str, &str); 40] = [
     (
         "resources/skills/ux-validation/SKILL.md",
         include_str!("../../../resources/skills/ux-validation/SKILL.md"),
+    ),
+    (
+        "resources/templates/spec.md",
+        include_str!("../../../resources/templates/spec.md"),
     ),
     (
         "resources/templates/acceptance.md",

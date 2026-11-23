@@ -1,8 +1,10 @@
 # {{PROJECT_NAME}} · ux
 
 文档ID：{{DOCUMENT_ID}}
+标题：{{TITLE}}
 版本：{{REVISION}}
 状态：DRAFT
+负责人：{{OWNERS}}
 关联需求：{{REQUIREMENT_IDS}}
 来源/假设：{{SOURCES}}
 
