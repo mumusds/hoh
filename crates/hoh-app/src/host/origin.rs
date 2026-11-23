@@ -254,15 +254,28 @@ impl Transport {
                 uid: peer_uid,
                 pid,
                 inode,
-            } if *peer_uid == uid => (unix_peer_inode(*inode)?, Some(*pid)),
-            _ => return None,
+            } if *peer_uid == uid => {
+                let Some(peer) = unix_peer_inode(*inode) else {
+                    return origin_miss("unix-peer-inode");
+                };
+                (peer, Some(*pid))
+            }
+            _ => return origin_miss("transport"),
         };
-        let pid = socket_owner(Path::new("/proc"), inode, uid)?;
-        if expected_pid.is_some_and(|expected| expected != pid) {
+        let Some(pid) = socket_owner(Path::new("/proc"), inode, uid) else {
+            // `socket_owner` already recorded the step that returned none.
             return None;
+        };
+        if expected_pid.is_some_and(|expected| expected != pid) {
+            return origin_miss("peercred-pid");
         }
-        let identity = ProcFs(Path::new("/proc")).identity(pid)?;
-        (identity.uids == [uid; 4]).then_some((identity, inode))
+        let Some(identity) = ProcFs(Path::new("/proc")).identity(pid) else {
+            return origin_miss(&format!("identity pid={pid}"));
+        };
+        if identity.uids != [uid; 4] {
+            return origin_miss("identity-uid");
+        }
+        Some((identity, inode))
     }
 }
 
@@ -270,7 +283,7 @@ fn tcp_inode(local: std::net::SocketAddr, remote: std::net::SocketAddr, uid: u32
     // This host binds only IPv4 loopback. The endpoints come from the accepted socket, never HTTP headers.
     let (std::net::SocketAddr::V4(local), std::net::SocketAddr::V4(remote)) = (local, remote)
     else {
-        return None;
+        return origin_miss("tcp-not-v4");
     };
     let address = |a: std::net::SocketAddrV4| {
         format!(
@@ -279,7 +292,10 @@ fn tcp_inode(local: std::net::SocketAddr, remote: std::net::SocketAddr, uid: u32
             a.port()
         )
     };
-    let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let text = match std::fs::read_to_string("/proc/net/tcp") {
+        Ok(text) => text,
+        Err(error) => return origin_miss(&io_step("tcp-table", &error)),
+    };
     tcp_match(&text, &address(remote), &address(local), uid)
 }
 
@@ -288,20 +304,28 @@ fn tcp_match(text: &str, local: &str, remote: &str, uid: u32) -> Option<u64> {
     for line in text.lines().skip(1) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.get(1) == Some(&local) && fields.get(2) == Some(&remote) {
-            if fields.get(3) != Some(&"01")
-                || fields.get(7)?.parse::<u32>().ok()? != uid
-                || found.is_some()
-            {
-                return None;
+            if fields.get(3) != Some(&"01") {
+                return origin_miss("tcp_match not-established");
             }
-            let inode = fields.get(9)?.parse::<u64>().ok()?;
+            let Some(row_uid) = fields.get(7).and_then(|value| value.parse::<u32>().ok()) else {
+                return origin_miss("tcp_match uid-unreadable");
+            };
+            if row_uid != uid {
+                return origin_miss("tcp_match uid");
+            }
+            if found.is_some() {
+                return origin_miss("tcp_match duplicate");
+            }
+            let Some(inode) = fields.get(9).and_then(|value| value.parse::<u64>().ok()) else {
+                return origin_miss("tcp_match inode-unreadable");
+            };
             if inode == 0 {
-                return None;
+                return origin_miss("tcp_match inode-zero");
             }
             found = Some(inode);
         }
     }
-    found
+    found.or_else(|| origin_miss("tcp_match missing"))
 }
 
 /// One directory read. A per-entry error is kept. The `/proc` root refuses on any of them,
@@ -334,6 +358,26 @@ fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
     socket_owner_at(&StdProc, root, inode, uid)
 }
 
+/// One line on the host's stderr. `hoh __host` moves that descriptor to `.hoh/host.log` once ready.
+/// A step that returns none is recorded here so a later `origin_unknown` names the step. Skipped
+/// pids (already gone, or an unreadable fd of a process that is not the peer) are not recorded.
+fn origin_miss<T>(step: &str) -> Option<T> {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "hoh host: origin lookup returned none: {step}"
+    );
+    None
+}
+
+fn io_step(step: &str, error: &std::io::Error) -> String {
+    format!(
+        "{step} kind={:?} raw={:?}",
+        error.kind(),
+        error.raw_os_error()
+    )
+}
+
 /// The decimal fields of the `Uid:` line. The rest of `status`, including `Name`, stays bytes:
 /// a live process whose comm is not UTF-8 must not fail this read.
 fn status_uid_fields(bytes: &[u8]) -> Option<Vec<u32>> {
@@ -364,12 +408,17 @@ fn process_gone(error: &std::io::Error) -> bool {
 fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Option<u32> {
     let target = PathBuf::from(format!("socket:[{inode}]"));
     let mut owner = None;
-    for entry in io.list(root).ok()? {
+    let entries = match io.list(root) {
+        Ok(entries) => entries,
+        Err(error) => return origin_miss(&io_step("proc-root-open", &error)),
+    };
+    for entry in entries {
         // A root entry error ends the directory stream, so the names after it are missing.
         // Skipping it would truncate the scan and return an owner found before the gap.
         // A pid that disappears is skipped only on the per-pid reads below.
-        let Ok(name) = entry else {
-            return None;
+        let name = match entry {
+            Ok(name) => name,
+            Err(error) => return origin_miss(&io_step("proc-root", &error)),
         };
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
@@ -378,9 +427,13 @@ fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Optio
         let status = match io.read(&directory.join("status")) {
             Ok(status) => status,
             Err(error) if process_gone(&error) => continue,
-            Err(_) => return None,
+            Err(error) => {
+                return origin_miss(&io_step(&format!("status pid={pid}"), &error));
+            }
         };
-        let uids = status_uid_fields(&status)?;
+        let Some(uids) = status_uid_fields(&status) else {
+            return origin_miss(&format!("status pid={pid} uid-line"));
+        };
         if uids.get(1) != Some(&uid) {
             continue;
         }
@@ -393,18 +446,20 @@ fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Optio
             {
                 continue;
             }
-            Err(_) => return None,
+            Err(error) => return origin_miss(&io_step(&format!("fd-list pid={pid}"), &error)),
         };
         for descriptor in descriptors {
             let descriptor = match descriptor {
                 Ok(descriptor) => descriptor,
                 Err(error) if process_gone(&error) => continue,
-                Err(_) => return None,
+                Err(error) => {
+                    return origin_miss(&io_step(&format!("fd-entry pid={pid}"), &error));
+                }
             };
             match io.read_link(&directory.join("fd").join(descriptor)) {
                 Ok(link) if link == target => {
                     if owner.is_some_and(|old| old != pid) {
-                        return None;
+                        return origin_miss("owner-ambiguous");
                     }
                     owner = Some(pid);
                 }
@@ -412,11 +467,13 @@ fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Optio
                 Err(error)
                     if process_gone(&error)
                         || error.kind() == std::io::ErrorKind::PermissionDenied => {}
-                Err(_) => return None,
+                Err(error) => {
+                    return origin_miss(&io_step(&format!("readlink pid={pid}"), &error));
+                }
             }
         }
     }
-    owner
+    owner.or_else(|| origin_miss("socket-owner-missing"))
 }
 
 /// UNIX_DIAG_PEER links the accepted UDS inode to its peer inode; SO_PEERCRED alone survives fd handoff.
