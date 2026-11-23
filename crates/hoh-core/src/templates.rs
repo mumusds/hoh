@@ -208,7 +208,7 @@ fn render_one(id: &str, source: &Contract, inputs: &Inputs) -> Result<String, Er
         .goal
         .lines()
         .map(|line| {
-            if line.starts_with('#') {
+            if line.trim_start().starts_with('#') {
                 format!("> {line}")
             } else {
                 line.to_owned()
@@ -224,6 +224,9 @@ fn render_one(id: &str, source: &Contract, inputs: &Inputs) -> Result<String, Er
         }
         let mut rest = line;
         while let Some(start) = rest.find("{{") {
+            if rest[..start].contains("}}") {
+                return Err(error(&source.path, n + 1, "unresolved placeholder"));
+            }
             output.push_str(&rest[..start]);
             let tail = &rest[start + 2..];
             let end = tail
@@ -264,10 +267,12 @@ fn render_one(id: &str, source: &Contract, inputs: &Inputs) -> Result<String, Er
             output.push_str(&value);
             rest = &tail[end + 2..];
         }
+        if rest.contains("}}") {
+            return Err(error(&source.path, n + 1, "unresolved placeholder"));
+        }
         output.push_str(rest);
         output.push('\n');
     }
-    placeholders(&source.path, &output)?;
     if id == "spec" {
         crate::specindex::generate_index(&[crate::specindex::Source {
             path: "docs/spec/spec.md".into(),
@@ -275,7 +280,7 @@ fn render_one(id: &str, source: &Contract, inputs: &Inputs) -> Result<String, Er
         }])
         .map_err(|e| error(&source.path, e.line, e.error))?;
     } else {
-        validate(&source.path, &output)?;
+        validate_metadata(&source.path, &output)?;
     }
     Ok(output)
 }
@@ -289,6 +294,9 @@ fn placeholders(path: &str, text: &str) -> Result<(), Error> {
 }
 pub fn validate(path: &str, text: &str) -> Result<(), Error> {
     placeholders(path, text)?;
+    validate_metadata(path, text)
+}
+fn validate_metadata(path: &str, text: &str) -> Result<(), Error> {
     // Report empty values at their actual line before reporting a missing field.
     for (n, line) in text.lines().enumerate() {
         for field in FIELDS {

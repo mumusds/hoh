@@ -393,7 +393,7 @@ async fn test_029_02_run_snapshot_pins_profile_and_source() -> R {
             )?;
         }
         let host = start_when_free(world.config()).await?;
-        let outcome: R = async {
+        let outcome: R<(String, Value)> = async {
             let run_id = started(&host, &project, "template-profile").await?;
             let snapshot: Value = serde_json::from_str(&query(
                 &project,
@@ -407,12 +407,36 @@ async fn test_029_02_run_snapshot_pins_profile_and_source() -> R {
                 snapshot["project"]["document_profile_source"],
                 if explicit { "project" } else { "default" }
             );
-            Ok(())
+            Ok((run_id, snapshot))
         }
         .await;
         host.shutdown().await;
+        let (run_id, snapshot) = outcome?;
+        std::fs::write(
+            project.join(".hoh/config.toml"),
+            "config_version = \"1.0\"\n[project]\ndocument_profile = \"standard\"\n",
+        )?;
+        let restarted = start_when_free(world.config()).await?;
+        let resumed: R = (|| {
+            let after: Value = serde_json::from_str(&query(
+                &project,
+                &format!("SELECT config_snapshot_json FROM runs WHERE run_id = '{run_id}'"),
+            )?)?;
+            assert_eq!(
+                after, snapshot,
+                "restart must not replace the Run's document selection"
+            );
+            let selected = hoh_core::template_files::Selection::from_snapshot(&after)?;
+            assert_eq!(selected.profile, if explicit { "lite" } else { "full" });
+            assert_eq!(
+                selected.source,
+                if explicit { "project" } else { "default" }
+            );
+            Ok(())
+        })();
+        restarted.shutdown().await;
         world.stop_fakes()?;
-        outcome?;
+        resumed?;
     }
     Ok(())
 }

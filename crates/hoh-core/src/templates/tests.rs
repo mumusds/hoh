@@ -2,6 +2,75 @@ use super::*;
 type R = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
+fn test_029_01_user_braces_are_literal_values_not_template_residue() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t08-braces-").tempdir()?;
+    let templates = load(
+        dir.path(),
+        None,
+        "run",
+        &crate::resource_bundle::Bundle::current(),
+    )?;
+    let goal = "Explain {{VARIABLE}} and unmatched {{ or }}";
+    let files = templates.render(
+        "full",
+        &Inputs {
+            goal: goal.into(),
+            owners: "{{owner}}".into(),
+        },
+    )?;
+    assert!(files["docs/spec/spec.md"].contains(goal));
+    assert!(files["docs/feature.md"].contains(&format!("标题：{goal}")));
+    assert!(files["docs/feature.md"].contains("负责人：{{owner}}"));
+    // Template-owned residue must still fail, even when user values contain braces.
+    let mut broken = templates;
+    broken
+        .sources
+        .get_mut("feature")
+        .unwrap()
+        .text
+        .push_str("\nstray }}\n");
+    let error = broken
+        .render(
+            "full",
+            &Inputs {
+                goal: goal.into(),
+                owners: "owner".into(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("feature.md") && error.contains("line") && error.contains("placeholder"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_029_01_indented_goal_headings_are_quoted() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t08-headings-")
+        .tempdir()?;
+    let templates = load(
+        dir.path(),
+        None,
+        "run",
+        &crate::resource_bundle::Bundle::current(),
+    )?;
+    let files = templates.render(
+        "lite",
+        &Inputs {
+            goal: "Goal\n  # comment\n\t## detail\n# literal".into(),
+            owners: "developer".into(),
+        },
+    )?;
+    assert!(
+        files["docs/spec/spec.md"].contains("Goal\n>   # comment\n> \t## detail\n> # literal\n")
+    );
+    Ok(())
+}
+
+#[test]
 fn test_029_01_profiles_instantiate_all_templates_without_placeholders() -> R {
     let bundle = crate::resource_bundle::Bundle::current();
     for profile in ["lite", "standard", "full"] {
