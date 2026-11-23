@@ -34,7 +34,11 @@ fn test_018_01_no_config_and_the_example_give_the_same_effective_config() -> R {
     let text = example()?;
     std::fs::write(copied.path().join(FILE), &text)?;
     assert_eq!(std::fs::read_to_string(copied.path().join(FILE))?, text);
-    let b = load(copied.path())?;
+    let mut b = load(copied.path())?;
+    assert_eq!(a.project.document_profile_source, "default");
+    assert_eq!(b.project.document_profile_source, "project");
+    // Provenance differs; every effective setting must still be identical (REQ-029, C16).
+    b.project.document_profile_source = a.project.document_profile_source.clone();
     assert_eq!(a, b);
     let agents: Vec<(&str, Agent)> = a.team.iter().map(|(n, r)| (n.as_str(), r.agent)).collect();
     assert_eq!(

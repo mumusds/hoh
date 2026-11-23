@@ -973,6 +973,7 @@ async fn a_started_run_is_created_with_its_exact_accepted_body_and_replayed_byte
                 policy: "balanced".to_owned(),
                 assumptions: std::collections::BTreeMap::new(),
                 unattended: false,
+                project: crate::config::Config::default().project,
                 mode_cycle: crate::config::Config::default().ui.mode_cycle,
             },
         )
