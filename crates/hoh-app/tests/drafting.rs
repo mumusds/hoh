@@ -396,3 +396,58 @@ async fn test_009_03_m3l150_dispatch_then_set_mode_releases_draft_with_proof() -
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
+    for (mode, interactive) in [("AUTO", true), ("AUTO", false), ("BUILD", false)] {
+        let world = world::World::named("m3t04-s7-readiness")?;
+        world.configure(&[], "")?;
+        let original = world.commit_project(&[world::Requirement {
+            id: "REQ-A".into(),
+            title: "标题".into(),
+            criteria: vec![],
+        }])?;
+        world.init_store().await?;
+        let spec = world.seed_spec()?;
+        let setup = world.start_plain_host(None).await?;
+        let body = json!({"schema_version":"1.0","command_id":"start","idempotency_key":"start","expected_revision":0,"kind":"StartRun","run_id":null,"payload":{"goal":"补齐 AC","mode":mode,"interactive":interactive}});
+        let (status, accepted) =
+            world::exchange(&setup, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{accepted}");
+        let run = accepted["run_id"].as_str().ok_or("run")?.to_owned();
+        world.staff(&run)?;
+        world.exec(&format!("UPDATE runs SET state='RUNNING' WHERE run_id='{run}'; INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('work','{run}','{spec}','READY','developer',1,1,1); INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('work','REQ-A','{spec}'); INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES(:p,'{run}','s7-plan','plan.imported',json_object('run_id','{run}','tasks',json_array(json_object('task_id','work','paths',json_array('src/lib.rs')))),'2026-11-23T00:00:00Z');"))?;
+        setup.shutdown().await;
+        let source=hoh_core::specindex::Source{path:"docs/spec/fixture.md".into(),bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec()};
+        let host = world
+            .team_host(
+                world::Team::planning(world.project(), source, |_| vec![], None),
+                None,
+            )
+            .await?;
+        let result:R=async {
+            let cli = if !interactive {let mut cli=world.command(&["-p","请补齐缺少的验收条件","--resume",&run]);Some(tokio::task::spawn_blocking(move||cli.output()))} else {None};
+            if mode=="AUTO" {
+                if let Err(e)=world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(25)).await {
+                    return Err(format!("{e}; mode={mode}, interactive={interactive}; runs={:?}; tasks={:?}; events={:?}",world.rows("SELECT state,mode,blocked_reasons_json FROM runs")?,world.rows("SELECT task_id,kind,state,blocked_reason FROM tasks")?,world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 18")?).into());
+                }
+                assert_eq!(world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,"1");
+                assert_eq!(world.query("SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs")?,"BLOCKED/NEED_DECISION/RUNNING");
+                assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.kind='spec_draft'")?,"1");
+                input(&host,&world,&run,"build","SetMode",json!({"mode":"BUILD"})).await?;
+            } else {
+                world.until("SELECT state||'/'||blocked_reason FROM tasks WHERE task_id='work'","BLOCKED/READINESS_NOT_MET",Duration::from_secs(20)).await?;
+                world.until("SELECT count(*) FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='build_readiness'","1",Duration::from_secs(20)).await?;
+                assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"0");
+                let question=world.query("SELECT payload_json FROM events WHERE kind='question.asked' ORDER BY seq DESC LIMIT 1")?;assert!(question.contains("AUTO")&&question.contains("PLAN"),"{question}");
+            }
+            assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");assert_eq!(world.query("SELECT sha256 FROM specs")?,original);assert_eq!(world.query("SELECT spec_id FROM runs")?,spec);
+            assert_eq!(world.query("SELECT count(*) FROM attempts WHERE task_id='work'")?,"0");
+            if let Some(cli)=cli {let output=cli.await??;assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stderr));}
+            Ok(())
+        }.await;
+        host.shutdown().await;
+        result?;
+    }
+    Ok(())
+}

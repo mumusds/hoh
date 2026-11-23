@@ -1904,10 +1904,12 @@ pub struct Team {
     answer: Box<Answer>,
     /// How long a work attempt runs when the Team takes work ([`Team::working`]); none: it takes none.
     work: Option<Duration>,
+    work_gate: Option<(String, PathBuf)>,
     /// The project and the verdict of each specification review turn when the Team reviews ([`Team::reviewing`]).
     reviewer: Option<(PathBuf, Box<Reviewer>)>,
     /// A scripted specification drafter, restricted to this test project.
     drafter: Option<PathBuf>,
+    draft_source: Option<hoh_core::specindex::Source>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1940,8 +1942,10 @@ impl Team {
             answer: Box::new(answer),
             script: Box::new(script),
             work: None,
+            work_gate: None,
             reviewer: None,
             drafter: None,
+            draft_source: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1958,8 +1962,10 @@ impl Team {
             answer: Box::new(|_| None),
             script: Box::new(script),
             work: Some(hold),
+            work_gate: None,
             reviewer: None,
             drafter: None,
+            draft_source: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1977,8 +1983,10 @@ impl Team {
             answer: Box::new(|_| None),
             script: Box::new(script),
             work: None,
+            work_gate: None,
             reviewer: Some((project, Box::new(verdict))),
             drafter: None,
+            draft_source: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1991,8 +1999,43 @@ impl Team {
             script: Box::new(|_| Vec::new()),
             answer: Box::new(|_| None),
             work: None,
+            work_gate: None,
             reviewer: None,
             drafter: Some(project),
+            draft_source: None,
+            turns: Default::default(),
+            refused: Default::default(),
+            agents: Default::default(),
+        })
+    }
+
+    /// A scripted team for planning on an existing revision (mock agents, real host and Git).
+    pub fn planning(
+        project: PathBuf,
+        source: hoh_core::specindex::Source,
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        hold: Option<Duration>,
+    ) -> std::sync::Arc<Team> {
+        Self::planning_with_review(project, source, script, hold, None, |_| Verdict::Pass)
+    }
+
+    /// As planning, with a controlled independent reviewer.
+    pub fn planning_with_review(
+        project: PathBuf,
+        source: hoh_core::specindex::Source,
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        hold: Option<Duration>,
+        work_gate: Option<(String, PathBuf)>,
+        verdict: impl Fn(&hoh_app::host::Work) -> Verdict + Send + Sync + 'static,
+    ) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            script: Box::new(script),
+            answer: Box::new(|_| None),
+            work: hold,
+            work_gate,
+            reviewer: Some((project.clone(), Box::new(verdict))),
+            drafter: Some(project),
+            draft_source: Some(source),
             turns: Default::default(),
             refused: Default::default(),
             agents: Default::default(),
@@ -2075,18 +2118,25 @@ impl Team {
         let prepared = file.parent().ok_or("no parent")?;
         let script = if work.assignment.spec_draft {
             let source=hoh_core::specindex::Source { path:"docs/spec/main.md".into(), bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec() };
+            let source = self.draft_source.clone().unwrap_or(source);
             let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))
                 .map_err(|e| e.to_string())?;
             std::fs::write(prepared.join("main.md"), source.bytes).map_err(|e| e.to_string())?;
             std::fs::write(prepared.join("index.json"), index.bytes())
                 .map_err(|e| e.to_string())?;
-            "read -r go || exit 1; set -e; mkdir -p docs/spec; cp -- \"$DRAFT_INPUT/main.md\" docs/spec/main.md; cp -- \"$DRAFT_INPUT/index.json\" docs/spec/index.json; git add docs/spec; git -c user.name=test -c user.email=test@example.invalid commit --allow-empty -qm draft"
+            "read -r go || exit 1; set -e; mkdir -p docs/spec; cp -- \"$DRAFT_INPUT/main.md\" \"$DRAFT_PATH\"; cp -- \"$DRAFT_INPUT/index.json\" docs/spec/index.json; git add docs/spec; git -c user.name=test -c user.email=test@example.invalid commit --allow-empty -qm draft"
         } else {
             "read -r go; exit 0"
         };
         let mut child = Command::new("sh")
             .current_dir(project)
             .env("DRAFT_INPUT", prepared)
+            .env(
+                "DRAFT_PATH",
+                self.draft_source
+                    .as_ref()
+                    .map_or("docs/spec/main.md", |s| &s.path),
+            )
             .args(["-c", script])
             .process_group(0)
             .env(hoh_app::host::ATTEMPT_ENV, work.marker())
@@ -2150,8 +2200,22 @@ impl Team {
         hold: Duration,
     ) -> Result<hoh_app::host::Started, String> {
         use std::os::unix::process::CommandExt as _;
+        let release = self
+            .work_gate
+            .as_ref()
+            .filter(|(task, _)| task == &work.task_id)
+            .map(|(_, path)| path);
+        let script = if release.is_some() {
+            "read -r go || exit 1; while [ ! -f \"$WORK_RELEASE\" ]; do sleep 0.01; done".to_owned()
+        } else {
+            format!("read -r go || exit 1; sleep {}", hold.as_secs_f64())
+        };
         let mut child = Command::new("sh")
-            .args(["-c", &format!("read -r go; sleep {}", hold.as_secs_f64())])
+            .args(["-c", &script])
+            .env(
+                "WORK_RELEASE",
+                release.map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+            )
             .process_group(0)
             .env(hoh_app::host::ATTEMPT_ENV, work.marker())
             .stdin(Stdio::piped())

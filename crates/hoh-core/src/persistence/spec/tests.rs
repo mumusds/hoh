@@ -512,3 +512,55 @@ async fn test_008_04_m3l102_draft_start_survives_attempt_retries() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_008_01_s7_plan_entry_generates_one_draft_without_rewinding_run() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    store.submit_command(command).await?;
+    db.execute_batch("UPDATE runs SET state='RUNNING',mode='PLAN';
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('plan-entry','P','R','run.mode_changed','{\"to\":\"PLAN\",\"command_id\":\"plan-entry\"}','now');")?;
+    assert!(store.draft_step("R", false).await?);
+    assert!(!store.draft_step("R", false).await?);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM tasks WHERE kind='spec_draft' AND spec_id IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM runs", [], |r| r.get::<_, String>(0))?,
+        "RUNNING"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_009_02_s7_auto_only_drafts_content_gaps_once_per_base() -> R {
+    for mode in ["AUTO", "BUILD"] {
+        let (_dir, store, db, command) = approval_world().await?;
+        store.submit_command(command).await?;
+        db.execute("UPDATE runs SET state='RUNNING',mode=?1", [mode])?;
+        // Only the independent review is missing: no draft is appropriate.
+        assert!(!store.draft_step("R", false).await?);
+        db.execute("DELETE FROM acceptance_criteria", [])?;
+        assert_eq!(store.draft_step("R", false).await?, mode == "AUTO");
+        assert!(!store.draft_step("R", false).await?);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        if mode == "AUTO" {
+            db.execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE spec_id IS NOT NULL",
+                [],
+            )?;
+            assert!(
+                !store.draft_step("R", false).await?,
+                "same base and cause must not spin"
+            );
+        }
+    }
+    Ok(())
+}

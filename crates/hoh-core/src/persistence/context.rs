@@ -173,6 +173,10 @@ fn work(
         crate::skills::phase(&role, &kind, writer == 1, false, false).map(str::to_owned);
     if super::drafting::is_draft(conn, task_id)? {
         facts.scope.push("规格起草任务（Runtime）：仅可写 docs/spec/、docs/、.hoh/；不实施产品代码。起草后提交 Markdown 与一致的 docs/spec/index.json；只请用户批准，不自行批准，不创建候选。完成时交 TaskResult，candidate_id=null。需要用户决定时返回 BLOCKED 并在 summary 说明问题。".to_owned());
+        let requested:Option<String> = conn.query_row("SELECT payload_json FROM events WHERE kind='spec.draft_requested' AND json_extract(payload_json,'$.task_id')=?1 ORDER BY seq DESC LIMIT 1",[task_id],|r|r.get(0)).optional().map_err(sqlite_error)?;
+        if let Some(requested) = requested {
+            facts.scope.push(format!("起草原因与用户输入：{requested}"));
+        }
     }
 
     let deps: Vec<String> = {

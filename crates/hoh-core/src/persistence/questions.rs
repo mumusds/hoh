@@ -46,6 +46,8 @@ pub enum Route {
     SpecApproval,
     /// A draft agent question, answered as the next attempt’s note.
     DraftQuestion,
+    /// Choose how to resolve BUILD content readiness, without clearing task blockers.
+    BuildReadiness,
     /// A work task's own end: continue or cancel.
     Continue,
     /// A work task's repairs used up: rework or cancel.
@@ -73,6 +75,11 @@ impl Route {
     pub fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Route::Commander | Route::DraftQuestion => &[],
+            Route::BuildReadiness => &[
+                ("plan", "切到 PLAN 补规格"),
+                ("auto", "切到 AUTO 补规格"),
+                ("retry", "保持 BUILD，重新检查"),
+            ],
             Route::SpecApproval => &[("approve", "批准规格"), ("reject", "退回修改")],
             Route::Adopt => &[
                 ("adopt", "采用项目已批准的规格"),
@@ -150,6 +157,7 @@ pub fn route_run(reason: RunReason) -> Route {
         RunReason::BaselineTests => Route::BaselineTests,
         RunReason::SpecApproval => Route::SpecApproval,
         RunReason::DraftQuestion => Route::DraftQuestion,
+        RunReason::BuildReadiness => Route::BuildReadiness,
     }
 }
 
@@ -797,6 +805,17 @@ pub(super) fn answer(
                 super::baseline::skipped(tx, a.project_id, a.run_id, ctx)?;
             }
         }
+        Route::BuildReadiness => {
+            let mode = match picked {
+                "plan" => Some(crate::protocol::Mode::Plan),
+                "auto" => Some(crate::protocol::Mode::Auto),
+                _ => None,
+            };
+            if let Some(mode) = mode {
+                super::modes::intent(tx, a.run_id, a.command_id, mode, ctx)?;
+            }
+            claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
+        }
         Route::DraftQuestion => {
             super::draft_approval::retry(tx, a, &question, ctx)?;
             claims.set(question.claim.as_deref().unwrap_or_default(), &[]);
@@ -918,6 +937,7 @@ fn exit_name(route: Route, choice: &str) -> &'static str {
         (Route::Commander, _) => "applied",
         (Route::SpecApproval, _) => "approval",
         (Route::DraftQuestion, _) => "draft",
+        (Route::BuildReadiness, _) => "readiness",
         (Route::Adopt, "draft") => "draft",
         (Route::Adopt, _) => "adopt",
         (Route::Stalled, "cancel") => "cancel",
@@ -1079,7 +1099,8 @@ fn task_exit(
             | Route::Adopt
             | Route::Stalled
             | Route::SpecApproval
-            | Route::DraftQuestion,
+            | Route::DraftQuestion
+            | Route::BuildReadiness,
             _,
         ) => {
             return Err(PersistError::IntegrityViolation(format!(
