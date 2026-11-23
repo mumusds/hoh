@@ -632,7 +632,8 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
         executor: fake.clone(),
         context: Context::default(),
     });
-    let host = Host::start(c).await?;
+    // Seed the complete discussion before a runner can observe the partially built world and wake for STALLED.
+    let host = Host::start(config(dir.path())).await?;
     sql(dir.path(), WORLD, false)?;
     sql(dir.path(), PARTICIPANTS, false)?;
     for n in 1..=4 {
@@ -642,6 +643,8 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
             if n <= 2 { "accepted" } else { "rejected" }
         );
     }
+    host.shutdown().await;
+    let host = Host::start(c).await?;
     wait_sql(dir.path(), &clock, "SELECT state FROM decisions", |v| {
         v[0]["state"] == "APPLIED"
     })
