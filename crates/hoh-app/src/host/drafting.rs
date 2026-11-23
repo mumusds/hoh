@@ -421,7 +421,6 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     }
     let current = head(root)?;
     let mut changed = dirty(root, current.is_some())?;
-    let uncommitted = changed.clone();
     let ignored = start["draft_ignored_roots"]
         .as_array()
         .ok_or("missing ignored roots observation")?
@@ -430,7 +429,7 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
         .collect::<Result<BTreeSet<_>, String>>()?;
     let newly_ignored: BTreeSet<_> = ignored_roots(root)?.difference(&ignored).cloned().collect();
 
-    if let Some(current) = &current {
+    let committed = if let Some(current) = &current {
         let committed = if let Some(base) = start["head"].as_str() {
             super::control::git(root, &["merge-base", "--is-ancestor", base, current])?;
             super::control::git_bounded(
@@ -453,8 +452,10 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
                 OBSERVATION_LIMIT,
             )?
         };
-        changed.extend(paths(committed));
-    }
+        paths(committed)
+    } else {
+        BTreeSet::new()
+    };
     let initial = start["draft_untracked"]
         .as_object()
         .ok_or("missing untracked start digests")?;
@@ -504,6 +505,10 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
             changed.insert(path);
         }
     }
+    // Unchanged start digests exclude only uncommitted paths. A commit inside this Attempt's window
+    // is a write even when it merely adds a pre-existing user file (M3L-300).
+    let uncommitted = changed.clone();
+    changed.extend(committed);
     // Ignored roots are not in a folded digest; newly ignored files must still be checked.
     changed.extend(newly_ignored);
     let outside: Vec<_> = changed
@@ -520,11 +525,7 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     for path in &changed {
         no_link(root, path)?;
     }
-    if uncommitted
-        .iter()
-        .any(|p| p.starts_with(b"docs/") && changed.contains(p))
-        || current.is_none()
-    {
+    if uncommitted.iter().any(|p| p.starts_with(b"docs/")) || current.is_none() {
         return Ok(WriterOutcome::Correct {
             reasons: vec!["draft Markdown and index must be committed before completion".into()],
         });
