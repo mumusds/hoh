@@ -3,7 +3,7 @@
 //! Every path that ends an attempt or releases its writer lease (the cancel, the executor's report of its leader's
 //! end, the settle of an expired lease or a lost executor, a host's start reconcile) first proves none of them alive.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -510,7 +510,8 @@ impl Outside {
         self.scanned = Some(Instant::now());
         // The listing, then every pid allocated since it began, each batch's environments read before the next look
         // at the allocations, until none was allocated meanwhile (decision 8d v4, M2T06R-200): a marked process alive
-        // at the end was either looked at here or forked by a marked process looked at here.
+        // at the end was either looked at here or forked by a marked process looked at here. The unreadable ones that
+        // are ending are let end before that last look, so what they fork meanwhile is looked at too (FLK07-01).
         let Some(mut last) = last_pid(&self.root) else {
             self.quiet = 0;
             return Proof::Incomplete;
@@ -520,8 +521,11 @@ impl Outside {
         if let Some(hook) = self.after_listing.as_mut() {
             hook();
         }
-        let mut seen: BTreeSet<u32> = processes.iter().map(|p| p.pid).collect();
-        let mut by_marker: BTreeSet<u32> = BTreeSet::new();
+        // Each pid looked at, with the start time of the process last looked at there: a pid allocated again during the
+        // scan (pid_max wrapped) names another process, looked at in its turn.
+        let mut seen: BTreeMap<u32, u64> = processes.iter().map(|p| (p.pid, p.start)).collect();
+        // The processes found by their marker (their places in `processes`).
+        let mut by_marker: BTreeSet<usize> = BTreeSet::new();
         let mut batch: Vec<usize> = (0..processes.len()).collect();
         let mut settled = false;
         // The unreadable ones that are ending, let end below (their places in `processes`).
@@ -532,7 +536,7 @@ impl Outside {
                 let process = &processes[at];
                 match marked_tri(&self.root, process, &self.marker, me) {
                     Some(true) => {
-                        by_marker.insert(process.pid);
+                        by_marker.insert(at);
                     }
                     Some(false) => {}
                     // Neither its environment nor a thread's could be read, and it is this user's (a non-dumpable or
@@ -562,18 +566,33 @@ impl Outside {
                 break;
             };
             if now == last {
-                settled = true;
-                break;
+                if ending.is_empty() {
+                    settled = true;
+                    break;
+                }
+                // None allocated since the last batch, but some refused because they are ending. One whose main thread
+                // is a zombie may run on in another thread, which can fork while it is let end (FLK07-01): an ending
+                // process holds the proof unless one read shows its end within the settle time, and what was allocated
+                // meanwhile is looked at next, until a look at the allocations shows none since. Nothing is waited for
+                // when the scan is already incomplete.
+                if !complete {
+                    break;
+                }
+                complete = self::settled(
+                    &self.root,
+                    ending.drain(..).map(|at| &processes[at]).collect(),
+                    wait,
+                );
+                continue;
             }
             let Some(pids) = allocated(&self.root, last, now) else {
                 break;
             };
             for pid in pids {
-                if !seen.insert(pid) {
-                    continue;
-                }
                 match stat_process(&self.root, pid) {
+                    Stat::Read(process) if seen.get(&pid) == Some(&process.start) => {}
                     Stat::Read(process) => {
+                        seen.insert(pid, process.start);
                         batch.push(processes.len());
                         processes.push(process);
                     }
@@ -584,16 +603,8 @@ impl Outside {
             last = now;
         }
         complete = complete && settled;
-        // An ending process holds the proof only if one read shows no end of it within the settle time; nothing is
-        // waited for when the scan is already incomplete.
-        if complete && !ending.is_empty() {
-            complete = self::settled(
-                &self.root,
-                ending.iter().map(|at| &processes[*at]).collect(),
-                wait,
-            );
-        }
-        let mut found: BTreeSet<u32> = BTreeSet::new();
+        // The processes found (their places in `processes`: a pid may name two of them, one after the other).
+        let mut found: BTreeSet<usize> = BTreeSet::new();
         let mut parents: Vec<u32> = self
             .leader
             .iter()
@@ -602,8 +613,8 @@ impl Outside {
             .map(|p| p.pid)
             .collect();
         while let Some(parent) = parents.pop() {
-            for process in processes.iter().filter(|p| p.ppid == parent) {
-                if found.insert(process.pid) {
+            for (at, process) in processes.iter().enumerate() {
+                if process.ppid == parent && found.insert(at) {
                     parents.push(process.pid);
                 }
             }
@@ -613,7 +624,7 @@ impl Outside {
         if let Some(hook) = self.after_finding.as_mut() {
             hook();
         }
-        for process in processes.iter().filter(|p| found.contains(&p.pid)) {
+        for process in found.iter().map(|at| &processes[*at]) {
             if self
                 .leader
                 .as_ref()
@@ -1636,6 +1647,132 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
             }
         });
         (found, waits)
+    }
+
+    #[test]
+    fn a_process_forked_while_the_scan_lets_an_exiting_one_end_is_looked_at_before_the_round_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLK07-01 (FLK-07 review round 1): a process whose environment cannot be read and whose main thread is a
+        // zombie may run on in another thread (Z with 2 threads, as a real one showed with every thread's environment
+        // refused).
+        // The scan lets it end after its last look at the allocations; while it waits, the live thread forks a marked
+        // child and the group ends. The child must be looked at before the round counts as quiet: else two such rounds
+        // in a row (the child doing the same) say Done while a marked descendant lives. Covered here: the reviewer's
+        // two-round chain, a child given a pid the scan listed before (pid_max wraps: another identity at a seen pid),
+        // and a control where only an unrelated process is allocated during the wait (the round stays quiet, as the
+        // load that FLK-07 fixed needs). A marked process of a tree of its own is found but cannot be pinned (no real
+        // process has its pid and start), so a round that found one is Incomplete here: never Done.
+        type Step = Box<dyn FnOnce(&Path) -> std::io::Result<()>>;
+        // Scans of a tree holding an unrelated process (250), each `(before, during)`: what happens before the scan and
+        // at its first pause; their proofs, and the tree.
+        fn rounds(
+            plan: Vec<(Option<Step>, Option<Step>)>,
+        ) -> std::io::Result<(Vec<Proof>, tempfile::TempDir)> {
+            let root = tempfile::tempdir()?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+            std::fs::write(root.path().join("sys/kernel/pid_max"), b"400\n")?;
+            put(root.path(), 250, 750, false, b"PATH=/bin\0")?;
+            let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+            outside.set_leader(Some(100), Some("500"));
+            let mut proofs = Vec::new();
+            for (before, during) in plan {
+                if let Some(before) = before {
+                    before(root.path())?;
+                }
+                let mut during = during;
+                let mut failed = Ok(());
+                proofs.push(outside.scan_with(&mut |_| {
+                    if let Some(during) = during.take() {
+                        failed = during(root.path());
+                    }
+                }));
+                failed?;
+            }
+            Ok((proofs, root))
+        }
+        let ending = |pid: u32, start: u64| -> Option<Step> {
+            Some(Box::new(move |root: &Path| {
+                put(root, pid, start, true, b"")
+            }))
+        };
+        // During the wait: `parent` forks `child` (the allocation shows in ns_last_pid) with `environ`, and ends.
+        let fork = |parent: u32, child: u32, environ: &'static [u8]| -> Option<Step> {
+            Some(Box::new(move |root: &Path| {
+                put(root, child, 2000 + u64::from(child), false, environ)?;
+                std::fs::write(root.join("sys/kernel/ns_last_pid"), format!("{child}\n"))?;
+                std::fs::remove_dir_all(root.join(parent.to_string()))
+            }))
+        };
+        // The reviewer's chain: 300 ending forks marked 301 and ends; 301, ending in its turn, forks marked 302 and
+        // ends.
+        let (chain, root) = rounds(vec![
+            (ending(300, 1200), fork(300, 301, MARKED)),
+            (ending(301, 2301), fork(301, 302, MARKED)),
+            (None, None),
+        ])?;
+        let alive = std::fs::read(root.path().join("302/environ"))? == MARKED;
+        // A quiet round, then 300 ending forks its marked child at a fresh pid (301) and ends.
+        let (fresh, _root) = rounds(vec![
+            (None, None),
+            (ending(300, 1200), fork(300, 301, MARKED)),
+        ])?;
+        // As above, but the child's pid is 250, one the listing showed as an unrelated process that has exited since
+        // (pid_max 400: the allocations wrap from 300 to 250).
+        let (reused, _root) = rounds(vec![
+            (None, None),
+            (ending(300, 1200), fork(300, 250, MARKED)),
+        ])?;
+        // Control: during the wait an unrelated process (no marker) is allocated and 300 ends: the round is quiet.
+        let (unrelated, _root) = rounds(vec![
+            (None, None),
+            (ending(300, 1200), fork(300, 301, b"PATH=/bin\0")),
+        ])?;
+        // In order: the chain (and whether its marked descendant lives), a child forked during the wait, a child at a
+        // pid listed before, an unrelated allocation during the wait.
+        assert_eq!(
+            ((chain, alive), fresh, reused, unrelated),
+            (
+                (vec![Proof::Incomplete; 3], true),
+                vec![Proof::Pending, Proof::Incomplete],
+                vec![Proof::Pending, Proof::Incomplete],
+                vec![Proof::Pending, Proof::Done],
+            )
+        );
+        Ok(())
+    }
+
+    /// `pid` started at `start` in the /proc tree `root`, the host's user's: ending (its main thread a zombie, another
+    /// thread running, no environment readable) or running with `environ`.
+    fn put(root: &Path, pid: u32, start: u64, ending: bool, environ: &[u8]) -> std::io::Result<()> {
+        let me = rustix::process::getuid().as_raw();
+        let dir = root.join(pid.to_string());
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let (state, flags, threads) = if ending {
+            ("Z", 0x40_800C, 2)
+        } else {
+            ("S", 0x40_0000, 1)
+        };
+        std::fs::write(
+            dir.join("stat"),
+            format!(
+                "{pid} (probe) {state} 1 {pid} {pid} 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 {start} 0"
+            ),
+        )?;
+        std::fs::write(
+            dir.join("status"),
+            format!(
+                "Name:\tprobe\nTgid:\t{pid}\nUid:\t{me}\t{me}\t{me}\t{me}\nThreads:\t{threads}\n"
+            ),
+        )?;
+        if ending {
+            std::fs::create_dir_all(dir.join("environ"))
+        } else {
+            std::fs::write(dir.join("environ"), environ)
+        }
     }
 
     #[test]
