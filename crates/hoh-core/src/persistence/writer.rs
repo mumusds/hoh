@@ -1433,6 +1433,7 @@ fn finish(tx: &Transaction<'_>, ctx: &Ctx<'_>) -> Result<(), PersistError> {
     let mut ended = Vec::new();
     for run in &due {
         if let Some(state) = ended_state(tx, run)? {
+            super::consult::finish_run(tx, run, ctx)?;
             super::supervise::tail(tx, run, state, ctx)?;
             ended.push(run);
         }

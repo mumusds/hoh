@@ -27,7 +27,7 @@ pub(in super::super) fn sweep_open(
     ctx: &Ctx<'_>,
 ) -> Result<(), PersistError> {
     let tasks: Vec<String> = {
-        let mut q=tx.prepare("SELECT json_extract(e.payload_json,'$.task_id') FROM events e JOIN outbox o ON o.message_id=json_extract(e.payload_json,'$.waiting_id') WHERE e.project_id=?1 AND (?2 IS NULL OR e.run_id=?2) AND e.kind='task.consult' AND o.state IN ('PENDING','DELIVERING') ORDER BY e.seq").map_err(sqlite_error)?;
+        let mut q=tx.prepare(&format!("SELECT json_extract(e.payload_json,'$.task_id') FROM events e JOIN outbox o ON o.message_id=json_extract(e.payload_json,'$.waiting_id') WHERE e.project_id=?1 AND (?2 IS NULL OR e.run_id=?2) AND e.kind='task.consult' AND o.state IN ('PENDING','DELIVERING') AND {} ORDER BY e.seq", super::super::hold::not_held("e.run_id"))).map_err(sqlite_error)?;
         q.query_map(params![project, run], |r| r.get(0))
             .map_err(sqlite_error)?
             .collect::<Result<_, _>>()
@@ -35,6 +35,25 @@ pub(in super::super) fn sweep_open(
     };
     for task in tasks {
         settle(tx, &task, ctx)?;
+    }
+    Ok(())
+}
+
+/// Close open consultations before the terminal Run's result publishes its stop, in that same transaction.
+pub(in super::super) fn finish_run(
+    tx: &Transaction<'_>,
+    run: &str,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let tasks: Vec<String> = {
+        let mut q = tx.prepare("SELECT t.task_id FROM tasks t JOIN events e ON e.run_id=t.run_id AND e.kind='task.consult' AND json_extract(e.payload_json,'$.task_id')=t.task_id WHERE t.run_id=?1 AND NOT EXISTS(SELECT 1 FROM events f WHERE f.run_id=t.run_id AND f.kind='task.consult_finished' AND json_extract(f.payload_json,'$.task_id')=t.task_id) ORDER BY e.seq").map_err(sqlite_error)?;
+        q.query_map(params![run], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)?
+    };
+    for task in tasks {
+        end(tx, &task, None, Some("run_ended"), None, ctx)?;
     }
     Ok(())
 }
@@ -94,24 +113,25 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(sqlite_error)?;
-    let latest: Option<(String, String, i64)> = tx.query_row("SELECT attempt_id,state,role_epoch FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1", params![task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional().map_err(sqlite_error)?;
+    let latest: Option<(String, String, i64, bool)> = tx.query_row("SELECT attempt_id,state,role_epoch,cancel_requested FROM attempts WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1", params![task], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional().map_err(sqlite_error)?;
     let mut reason = None;
     let mut detail = None;
     let mut actual = None;
+    // A cancelled allocation without a task cancellation request (pause/block/restart) is still open work.
     if !current(tx, &request, &meta)? {
         reason = Some("obsolete_parent");
     } else if state == "CANCELLED" {
         reason = Some("cancelled");
     } else if latest.as_ref().is_some_and(|a| a.1 == "UNKNOWN_EFFECT") {
         reason = Some("unknown_effect");
-    } else if let Some((attempt, attempt_state, epoch)) = &latest
-        && matches!(attempt_state.as_str(), "SETTLED" | "FAILED" | "CANCELLED")
+    } else if latest.as_ref().is_some_and(|a| a.1 == "CANCELLED" && a.3) {
+        reason = Some("cancelled");
+    } else if let Some((attempt, attempt_state, epoch, _)) = &latest
+        && matches!(attempt_state.as_str(), "SETTLED" | "FAILED")
     {
         let source_current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role=?2 AND role_epoch=?3)", params![request.run_id,request.recipient_role,epoch], |r| r.get(0)).map_err(sqlite_error)?;
         if !source_current {
             reason = Some("stale_child_epoch");
-        } else if attempt_state == "CANCELLED" {
-            reason = Some("cancelled");
         } else {
             actual = read_result(tx, &request, task, attempt, *epoch)?;
         }
@@ -128,7 +148,7 @@ fn settle(tx: &Transaction<'_>, task: &str, ctx: &Ctx<'_>) -> Result<(), Persist
             detail = Some(stop.to_string());
         } else if failures > i64::from(crate::retry::MAX_RETRIES) {
             reason = Some("retries_exhausted");
-        } else if let Some((attempt, attempt_state, _)) = &latest
+        } else if let Some((attempt, attempt_state, _, _)) = &latest
             && attempt_state == "SETTLED"
             && !closing::exists(tx, &child_id(attempt, "protocol_correction"))?
         {

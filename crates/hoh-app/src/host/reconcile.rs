@@ -357,15 +357,12 @@ async fn answer_left_messages(
         role_epoch: u64::try_from(row.role_epoch).unwrap_or_default(),
     };
     for message in &hoh_core::bridge::parse(&lines, &identity).messages {
-        let reply = match &round {
+        match &round {
             Some((round_id, candidate_id)) => {
                 super::requests::answer_message(store, message, round_id, candidate_id).await
             }
             None => super::requests::answer_work(store, message).await,
-        };
-        if reply["status"] == "error" {
-            return Err(PersistError::Storage(reply.to_string()));
-        }
+        }?;
     }
     Ok(())
 }
