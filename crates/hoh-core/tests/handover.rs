@@ -129,6 +129,7 @@ async fn world(store: &Store, path: &Path) -> R {
                 policy: "balanced".to_owned(),
                 assumptions: std::collections::BTreeMap::new(),
                 unattended: true,
+                project: hoh_core::config::Config::default().project,
                 mode_cycle: hoh_core::config::Config::default().ui.mode_cycle,
             },
             event: NewEvent {

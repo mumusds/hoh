@@ -47,6 +47,7 @@ pub enum RunTarget {
     /// approved specification, or is BLOCKED on its question `runtime:no_spec` when there is none
     /// (docs/adr/ADR-031.md decision 1).
     Start {
+        project: crate::config::Project,
         mode: String,
         budget: crate::config::Budget,
         /// `supervision.policy`, frozen into the run's snapshot (docs/adr/ADR-025.md decision 9).
@@ -190,6 +191,7 @@ pub(super) fn submit_in(
     let mut team_revision = None;
     let (revision, event_seq) = match &command.target {
         RunTarget::Start {
+            project,
             mode,
             budget,
             policy,
@@ -221,6 +223,7 @@ pub(super) fn submit_in(
                 &command.run_id,
                 &command.event.project_id,
                 super::team::Frozen {
+                    project,
                     mode_cycle,
                     budget,
                     policy,

@@ -151,6 +151,7 @@ impl Role {
 pub struct Project {
     pub default_mode: String,
     pub document_profile: String,
+    pub document_profile_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -256,6 +257,7 @@ impl Default for Config {
             project: Project {
                 default_mode: "AUTO".to_owned(),
                 document_profile: "full".to_owned(),
+                document_profile_source: "default".to_owned(),
             },
             execution: Execution {
                 profile: "yolo-vm".to_owned(),
@@ -708,6 +710,7 @@ impl Reader<'_> {
                 }
                 // REQ-029: the document profiles by project size.
                 "document_profile" => {
+                    project.document_profile_source = "project".to_owned();
                     project.document_profile = self.one_of(
                         "project.document_profile",
                         value,

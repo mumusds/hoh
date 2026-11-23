@@ -860,6 +860,10 @@ async fn submit_command(
                         .as_ref()
                         .map_or(2, |config| config.supervision.max_discussion_rounds),
                     mode: mode.clone(),
+                    project: effective.as_ref().map_or_else(
+                        || hoh_core::config::Config::default().project,
+                        |c| c.project.clone(),
+                    ),
                     mode_cycle: effective.as_ref().map_or_else(
                         || hoh_core::config::Config::default().ui.mode_cycle,
                         |config| config.ui.mode_cycle.clone(),

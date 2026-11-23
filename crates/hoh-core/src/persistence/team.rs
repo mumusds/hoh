@@ -81,6 +81,7 @@ pub(super) fn revision(conn: &Connection, project_id: &str) -> Result<i64, Persi
 
 /// What StartRun freezes of the configuration into a new run (its snapshot, budget and deadline).
 pub(super) struct Frozen<'a> {
+    pub project: &'a crate::config::Project,
     pub mode_cycle: &'a [String],
     pub budget: &'a Budget,
     pub policy: &'a str,
@@ -99,6 +100,7 @@ pub(super) fn start_run(
     frozen: Frozen<'_>,
 ) -> Result<(), PersistError> {
     let Frozen {
+        project,
         mode_cycle,
         budget,
         policy,
@@ -126,6 +128,7 @@ pub(super) fn start_run(
     // The run's packing parameters, frozen for its life (docs/adr/ADR-026.md decision 7).
     let context = crate::context::CONTEXT_V1;
     let snapshot = serde_json::json!({
+        "project": project,
         "scheduler": settings(&Params::from_settings(Some(&config.scheduler))),
         "supervision": {"policy": policy, "max_discussion_rounds": max_discussion_rounds},
         "ui": {"mode_cycle": mode_cycle},

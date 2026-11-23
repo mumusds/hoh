@@ -55,6 +55,7 @@ fn start(run_id: &str) -> SubmitCommand {
             policy: "balanced".to_owned(),
             assumptions: std::collections::BTreeMap::new(),
             unattended: true,
+            project: crate::config::Config::default().project,
             mode_cycle: crate::config::Config::default().ui.mode_cycle,
         },
         event: NewEvent {

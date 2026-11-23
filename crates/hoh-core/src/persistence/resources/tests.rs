@@ -44,6 +44,7 @@ async fn setup() -> R<(tempfile::TempDir, PathBuf)> {
             target: RunTarget::Start {
                 max_discussion_rounds: 2,
                 mode: "AUTO".to_owned(),
+                project: Config::default().project,
                 mode_cycle: Config::default().ui.mode_cycle,
                 budget: Config::default().budget,
                 policy: "balanced".to_owned(),

@@ -379,3 +379,40 @@ async fn test_045_01_replay_records_layers_and_revision() -> R {
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test]
+async fn test_029_02_run_snapshot_pins_profile_and_source() -> R {
+    for explicit in [false, true] {
+        let world = World::new()?;
+        let project = world.project();
+        std::fs::create_dir_all(project.join(".hoh"))?;
+        if explicit {
+            std::fs::write(
+                project.join(".hoh/config.toml"),
+                "config_version = \"1.0\"\n[project]\ndocument_profile = \"lite\"\n",
+            )?;
+        }
+        let host = start_when_free(world.config()).await?;
+        let outcome: R = async {
+            let run_id = started(&host, &project, "template-profile").await?;
+            let snapshot: Value = serde_json::from_str(&query(
+                &project,
+                &format!("SELECT config_snapshot_json FROM runs WHERE run_id = '{run_id}'"),
+            )?)?;
+            assert_eq!(
+                snapshot["project"]["document_profile"],
+                if explicit { "lite" } else { "full" }
+            );
+            assert_eq!(
+                snapshot["project"]["document_profile_source"],
+                if explicit { "project" } else { "default" }
+            );
+            Ok(())
+        }
+        .await;
+        host.shutdown().await;
+        world.stop_fakes()?;
+        outcome?;
+    }
+    Ok(())
+}
