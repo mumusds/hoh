@@ -1907,9 +1907,9 @@ async fn serve_request(
                                     round,
                                     &v.candidate_id,
                                 )
-                                .await
+                                .await?
                             }
-                            None => super::requests::answer_work(store, message).await,
+                            None => super::requests::answer_work(store, message).await?,
                         }
                     }
                     (None, refused) => json!({"status": "refused",
@@ -2038,7 +2038,7 @@ async fn answer_bridge_messages(
         .as_ref()
         .map_or("", |h| h.round_id.as_str());
     for message in &parsed.messages {
-        let reply = match v {
+        match v {
             Some(v) => {
                 super::requests::answer_message(
                     &common.shared.store,
@@ -2049,10 +2049,7 @@ async fn answer_bridge_messages(
                 .await
             }
             None => super::requests::answer_work(&common.shared.store, message).await,
-        };
-        if reply["status"] == "error" {
-            return Err(PersistError::Storage(reply.to_string()));
-        }
+        }?;
     }
     Ok(())
 }

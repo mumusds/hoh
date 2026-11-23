@@ -3,8 +3,10 @@
 //! waiting for its response; checks require a frozen verifier. The host takes requests in order while the
 //! process runs. Not a `hoh` subcommand (CONTRACT 3): a file bridge of the running attempt.
 
-use hoh_core::persistence::{ChangeRequest, Store, VerifierRequest};
-use hoh_core::protocol::{Message, MessageKind};
+use hoh_core::persistence::{
+    ChangeRequest, Commit, Intent, NewEvent, PersistError, Store, VerifierRequest,
+};
+use hoh_core::protocol::{Message, MessageKind, RejectionReason};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -167,24 +169,26 @@ pub(super) async fn answer_message(
     message: &Message,
     round_id: &str,
     candidate_id: &str,
-) -> Value {
+) -> Result<Value, PersistError> {
     let request = classify(message, round_id, candidate_id);
     let rejected = matches!(request, VerifierRequest::RejectChange(_));
     if !rejected {
         match store.consult_request(message.clone()).await {
-            Ok(Some(reply)) => return reply,
+            Ok(Some(reply)) => return Ok(reply),
             Ok(None) => {}
-            Err(e) => return json!({"status":"error","detail":e.to_string()}),
+            Err(e) => return rejected_message(store, message, e).await,
         }
     }
     match store.verifier_request(request).await {
-        Ok(issue) if rejected => json!({"status": "rejected", "reason_code": "ILLEGAL_TRANSITION",
+        Ok(issue) if rejected => Ok(
+            json!({"status": "rejected", "reason_code": "ILLEGAL_TRANSITION",
             "detail": "the candidate under verification is not changed; an Issue for the next candidate",
             "issue_id": issue}),
-        Ok(Some(input)) => json!({"status":"queued","input_id":input}),
-        Ok(None) => json!({"status": "deferred",
-            "detail": "this historical request was deferred before routing was available; it is not replayed"}),
-        Err(e) => json!({"status": "error", "detail": e.to_string()}),
+        ),
+        Ok(Some(input)) => Ok(json!({"status":"queued","input_id":input})),
+        Ok(None) => Ok(json!({"status": "deferred",
+            "detail": "this historical request was deferred before routing was available; it is not replayed"})),
+        Err(e) => rejected_message(store, message, e).await,
     }
 }
 
@@ -192,17 +196,77 @@ pub(super) async fn answer_message(
 mod tests;
 
 /// Working roles use the same durable routing and consultation transactions; checks remain verifier-only.
-pub(super) async fn answer_work(store: &Store, message: &Message) -> Value {
+pub(super) async fn answer_work(store: &Store, message: &Message) -> Result<Value, PersistError> {
     match store.consult_request(message.clone()).await {
-        Ok(Some(reply)) => reply,
+        Ok(Some(reply)) => Ok(reply),
         Ok(None) => match store
             .verifier_request(VerifierRequest::Route(Box::new(message.clone())))
             .await
         {
-            Ok(Some(id)) => json!({"status":"queued","input_id":id}),
-            Ok(None) => json!({"status":"deferred"}),
-            Err(e) => json!({"status":"error","detail":e.to_string()}),
+            Ok(Some(id)) => Ok(json!({"status":"queued","input_id":id})),
+            Ok(None) => Ok(json!({"status":"deferred"})),
+            Err(e) => rejected_message(store, message, e).await,
         },
-        Err(e) => json!({"status":"error","detail":e.to_string()}),
+        Err(e) => rejected_message(store, message, e).await,
     }
+}
+
+/// Business refusals belong to the message; infrastructure and invariant failures remain typed errors.
+fn message_refusal(error: &PersistError) -> Option<Value> {
+    let reason = error.rejection().or(match error {
+        PersistError::Held { .. }
+        | PersistError::RunStopped { .. }
+        | PersistError::BadRequest(_)
+        | PersistError::RunNotFound(_)
+        | PersistError::InvalidProposal(_) => Some(RejectionReason::IllegalTransition),
+        _ => None,
+    })?;
+    Some(json!({"status":"rejected","reason_code":reason,"detail":error.to_string()}))
+}
+
+async fn rejected_message(
+    store: &Store,
+    message: &Message,
+    error: PersistError,
+) -> Result<Value, PersistError> {
+    let Some(reply) = message_refusal(&error) else {
+        return Err(error);
+    };
+    // Hash the entire submitted message so KEY_REUSE does not collide with the original accepted request.
+    // A Record remains writable (project-scoped) after a Run's stop; replay writes this diagnostic only once.
+    let source = serde_json::to_vec(message).map_err(|e| PersistError::Storage(e.to_string()))?;
+    let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&source)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let event_id = hoh_core::ids::child_id(
+        &message.attempt_id,
+        &format!(
+            "bridge/rejected/{digest}/{}",
+            reply["reason_code"].as_str().unwrap_or_default()
+        ),
+    );
+    let reader = store.reader()?;
+    let (project_id, _) = reader
+        .task_run(&message.task_id)?
+        .ok_or_else(|| PersistError::IntegrityViolation("bridge source task disappeared".into()))?;
+    let exists = reader.event_exists(&project_id, &event_id)?;
+    drop(reader);
+    if !exists {
+        store
+            .commit(Commit {
+                events: vec![NewEvent {
+                    project_id,
+                    run_id: Some(message.run_id.clone()),
+                    event_id,
+                    kind: "runner.diagnostic".into(),
+                    intent: Intent::Record,
+                    payload: json!({"attempt_id":message.attempt_id,"message_id":message.message_id,
+                    "source_message":message,"reply":reply,"cause":"bridge_message_rejected"}),
+                }],
+                ..Commit::default()
+            })
+            .await?;
+    }
+    Ok(reply)
 }

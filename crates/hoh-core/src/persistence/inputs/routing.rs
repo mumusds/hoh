@@ -395,7 +395,7 @@ pub(in super::super) fn request(
     super::super::hold::writable(&tx, &message.run_id)?;
     let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t USING(task_id) JOIN role_bindings b ON b.run_id=t.run_id AND b.role=t.role WHERE a.attempt_id=?1 AND t.run_id=?2 AND t.role=?3 AND a.role_epoch=?4 AND b.role_epoch=a.role_epoch AND a.state='RUNNING')",params![message.attempt_id,message.run_id,message.sender_role,i64::try_from(message.role_epoch).unwrap_or(-1)],|r|r.get(0)).map_err(sqlite_error)?;
     if !valid {
-        return Err(PersistError::IntegrityViolation(
+        return Err(PersistError::BadRequest(
             "request sender is no longer current and running".into(),
         ));
     }
@@ -403,7 +403,7 @@ pub(in super::super) fn request(
         crate::protocol::MessageKind::Query => "ASK",
         crate::protocol::MessageKind::Steer => "STEER",
         _ => {
-            return Err(PersistError::IntegrityViolation(
+            return Err(PersistError::BadRequest(
                 "only query/steer can be routed".into(),
             ));
         }

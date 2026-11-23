@@ -6,6 +6,43 @@ use std::time::{Duration, Instant};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+fn message_refusals_do_not_mask_storage_failures() {
+    use hoh_core::protocol::RunState;
+    for error in [
+        PersistError::KeyReuse("duplicate-message".into()),
+        PersistError::Held {
+            run: "R".into(),
+            state: RunState::Completed,
+        },
+        PersistError::RunStopped {
+            run: "R".into(),
+            state: RunState::Incomplete,
+        },
+        PersistError::BadRequest("sender is no longer current".into()),
+        PersistError::StaleRevision {
+            entity: hoh_core::persistence::Entity::Task,
+            id: "T".into(),
+            expected: 1,
+            actual: Some(2),
+        },
+    ] {
+        let reply = message_refusal(&error).expect("deterministic refusal");
+        assert_eq!(reply["status"], "rejected");
+        assert_eq!(reply["detail"], error.to_string());
+        assert!(reply["reason_code"].is_string());
+    }
+    for error in [
+        PersistError::Storage("disk I/O".into()),
+        PersistError::Full("disk full".into()),
+        PersistError::Busy("writer busy".into()),
+        PersistError::WriterStopped,
+        PersistError::IntegrityViolation("stored result corrupted".into()),
+    ] {
+        assert!(message_refusal(&error).is_none(), "must propagate {error}");
+    }
+}
+
 /// `make()`'s command spawned, again while the kernel says the helper just written is busy: another test's child,
 /// forked while the helper was open for writing, holds it until that child execs (ETXTBSY; the product's agent runs a
 /// helper long after it was written).

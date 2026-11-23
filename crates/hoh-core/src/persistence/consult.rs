@@ -8,7 +8,7 @@ mod state;
 pub(super) use bounds::{accrue_wall, consumed};
 pub use listing::TasksPage;
 pub(super) use listing::page;
-pub(super) use returned::{check_terminals, finish, input_current, sweep, sweep_run};
+pub(super) use returned::{check_terminals, finish, finish_run, input_current, sweep, sweep_run};
 pub(super) use state::{finished, is_child, move_task};
 
 use super::writer::{self, Ctx, Intent, NewEvent};
