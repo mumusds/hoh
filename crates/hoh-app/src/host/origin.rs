@@ -309,22 +309,62 @@ fn tcp_match(text: &str, local: &str, remote: &str, uid: u32) -> Option<u64> {
     found
 }
 
+/// One directory read. A per-entry error is kept so the caller can tell "this pid is gone" from
+/// "the listing itself failed".
+trait ProcIo {
+    fn list(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>>;
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf>;
+}
+
+struct StdProc;
+
+impl ProcIo for StdProc {
+    fn list(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            names.push(entry.map(|entry| entry.file_name()));
+        }
+        Ok(names)
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
+}
+
 fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
+    socket_owner_at(&StdProc, root, inode, uid)
+}
+
+/// A pid that is no longer there. A task reaped between the directory read and the follow-up is
+/// ESRCH (errno 3). `ErrorKind` does not map that to `NotFound` (ENOENT). Both mean this pid is
+/// not a socket holder, so an unrelated exit must not fail the lookup. Any other status error
+/// still fails closed. An unreadable same-uid ancestor is judged in `observe`, not here
+/// (CTO 2026-11-22): that evidence is not retried and is not a user.
+fn process_gone(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Option<u32> {
     let target = PathBuf::from(format!("socket:[{inode}]"));
     let mut owner = None;
-    for entry in std::fs::read_dir(root).ok()? {
-        let entry = entry.ok()?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
+    for entry in io.list(root).ok()? {
+        let name = match entry {
+            Ok(name) => name,
+            Err(error) if process_gone(&error) => continue,
+            Err(_) => return None,
+        };
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        let directory = entry.path();
-        let status = match std::fs::read_to_string(directory.join("status")) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+        let directory = root.join(pid.to_string());
+        let status = match io.read_to_string(&directory.join("status")) {
+            Ok(status) => status,
+            Err(error) if process_gone(&error) => continue,
             Err(_) => return None,
         };
         let uids = status
@@ -337,23 +377,24 @@ fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
         if uids.get(1) != Some(&uid) {
             continue;
         }
-        let descriptors = match std::fs::read_dir(directory.join("fd")) {
-            Ok(d) => d,
+        let descriptors = match io.list(&directory.join("fd")) {
+            Ok(descriptors) => descriptors,
             // An unrelated non-dumpable process (e.g. systemd --user) is not a peer candidate.
             // The selected peer's evidence still has to be readable. See ADR-038's fd visibility limit.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
+            Err(error)
+                if process_gone(&error) || error.kind() == std::io::ErrorKind::PermissionDenied =>
             {
                 continue;
             }
             Err(_) => return None,
         };
         for descriptor in descriptors {
-            let descriptor = descriptor.ok()?;
-            match std::fs::read_link(descriptor.path()) {
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if process_gone(&error) => continue,
+                Err(_) => return None,
+            };
+            match io.read_link(&directory.join("fd").join(descriptor)) {
                 Ok(link) if link == target => {
                     if owner.is_some_and(|old| old != pid) {
                         return None;
@@ -361,11 +402,9 @@ fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
                     owner = Some(pid);
                 }
                 Ok(_) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                    ) => {}
+                Err(error)
+                    if process_gone(&error)
+                        || error.kind() == std::io::ErrorKind::PermissionDenied => {}
                 Err(_) => return None,
             }
         }
