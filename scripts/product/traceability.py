@@ -4,7 +4,9 @@
 Run by tools/run_check.py as `bash scripts/product/traceability.sh <profile>`, in this order:
 1. the self-tests: a TEST of the profile whose scenario check is this one is satisfied only by this run's own lines.
    The tests under tests/bundle whose names hold `test_NNN_MM` for such a TEST run, and their results are written to
-   $HOH_EVIDENCE_DIR/test-results.jsonl (none found: no line, and the TEST is NOT_RUN);
+   $HOH_EVIDENCE_DIR/test-results.jsonl (none found: no line, and the TEST is NOT_RUN). Before them, a TEST with a
+   product step (TEST-032-01, docs/adr/ADR-039.md DC-T07b) has the product run on the candidate's tree, writing the
+   exports its test reads into $HOH_EVIDENCE_DIR;
 2. the members: every execution.json under .hoh-dev/ and .hoh/evidence/ that claims the candidate (or that cannot be
    read and holds its id) is judged by principle one: the rule table (veto), the outcome function, and the conclusion
    function per member and TEST. Each TEST's status follows from them over all members;
@@ -14,7 +16,7 @@ Like tools/release_gate.py it checks that recorded files are consistent and belo
 were not forged. The same functions are the product's (hoh_core::verification) less the rules that need its store.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, re, sys, unittest
+import argparse, hashlib, json, os, re, subprocess, sys, unittest, uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -532,6 +534,35 @@ def report(world: World, found: list[Member], own: list[dict]) -> dict:
             'invalid': invalid}
 
 
+# The product steps of self-tests (docs/adr/ADR-039.md DC-T07b): before a selected TEST's tests run, the product's own
+# test that exports what they read, on the candidate's tree. It writes into HOH_TRACE_EXPORT_DIR, each export with
+# HOH_TRACE_EXPORT_NONCE and the tree it ran on; the tests read them through HOH_TRACE_EXPORTS, HOH_TRACE_NONCE and
+# HOH_TRACE_TREE (the candidate's tree), and fail on any export missing, unreadable or not this run's of that tree.
+PRODUCT_STEPS = {'TEST-032-01': ['cargo', 'test', '--locked', '-p', 'hoh-app', '--test', 'trace', '--', '--exact',
+                                 'test_032_01_product_export_over_fault_variants_matches_the_mirror']}
+
+
+def product_steps(root: Path, test_ids: list[str], out_dir: Path, candidate: dict) -> None:
+    """Run the product step of each of `test_ids` that has one, its output to stderr, and name its exports to the
+    self-tests. A step that fails is reported; its tests then find no exports and fail."""
+    steps = [PRODUCT_STEPS[t] for t in test_ids if t in PRODUCT_STEPS]
+    if not steps:
+        return
+    nonce = uuid.uuid4().hex
+    os.environ.update({'HOH_TRACE_EXPORTS': str(out_dir), 'HOH_TRACE_NONCE': nonce,
+                       'HOH_TRACE_TREE': candidate['git_tree']})
+    env = os.environ | {'HOH_TRACE_EXPORT_DIR': str(out_dir), 'HOH_TRACE_EXPORT_NONCE': nonce}
+    for argv in steps:
+        sys.stderr.flush()
+        try:
+            rc = subprocess.run(argv, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=2, stderr=2).returncode
+        except OSError as exc:
+            rc = f'not started: {exc}'
+        if rc != 0:
+            print(f'traceability: product step {" ".join(argv)} failed ({rc}); its self-tests find no exports',
+                  file=sys.stderr)
+
+
 def cases(suite) -> list:
     if isinstance(suite, unittest.TestCase):
         return [suite]
@@ -622,8 +653,9 @@ def main(argv=None) -> int:
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print(f'traceability: {exc}', file=sys.stderr)
         return 1
-    own = self_test(ROOT, sorted(mine + extra))
     out_dir = Path(out)
+    product_steps(ROOT, sorted(mine + extra), out_dir, world.candidate)
+    own = self_test(ROOT, sorted(mine + extra))
     with (out_dir / world.names['test_results']).open('w', encoding='utf-8') as f:
         for line in own:
             f.write(json.dumps(line, ensure_ascii=False) + '\n')
