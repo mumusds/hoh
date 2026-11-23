@@ -125,9 +125,7 @@ fn test_031_04_every_attempt_creating_path_goes_through_the_admission() -> R {
     assert!(body(text(DECIDE)?, "decide_in")?.contains("admission::admit_one("));
     let draft = body(text("hoh-core/src/persistence/drafting.rs")?, "dispatch")?;
     assert!(
-        draft
-            .find("admission::admit_one(")
-            .ok_or("draft admission")?
+        draft.find("admission::admit(").ok_or("draft admission")?
             < draft.find("decide::lease_task(").ok_or("draft lease")?
     );
     assert!(

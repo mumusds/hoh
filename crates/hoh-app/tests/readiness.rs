@@ -39,50 +39,38 @@ fn spec() -> Vec<world::Requirement> {
     ]
 }
 
-/// The Commander plans TA (REQ-A) and TB (REQ-B1) at its first turn and decides nothing else.
-fn planning_commander() -> std::sync::Arc<world::Team> {
-    world::Team::working(
-        |turn| match turn.state.as_str() {
-            "CREATED" => {
-                let mut decided = world::steps("CREATED", "SPECIFYING");
-                let task = |id: &str, requirement: &str| {
-                    json!({"task_id": format!("{}-{id}", turn.run_id), "title": id, "role": "developer",
-                           "writer": true, "depends_on": [], "requirement_ids": [requirement]})
-                };
-                decided.push(json!({"kind": "create_tasks", "plan": {"tasks": [
-                    task("TA", "REQ-A"), task("TB", "REQ-B1")]}}));
-                decided
-            }
-            _ => Vec::new(),
-        },
-        Duration::from_secs(60),
-    )
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_031_02_unready_task_blocks_alone() -> R {
     let world = World::new()?;
     world.configure(&[], "")?;
     world.commit_project(&spec())?;
-    let team = planning_commander();
-    let host = world.team_host(team.clone(), None).await?;
+    // AC-031-02 starts with an already-running plan. A live SPECIFYING prologue with a missing AC now correctly
+    // starts AUTO drafting, so establish the given state before enabling the runner.
+    world.init_store().await?;
+    let spec_id = world.seed_spec()?;
+    let setup = world.start_plain_host(None).await?;
+    let run = world::start_run(&setup, "readiness", "做 A 与 B").await?;
+    world.staff(&run)?;
+    let (ta, tb) = (format!("{run}-TA"), format!("{run}-TB"));
+    world.exec(&format!(
+        "UPDATE runs SET state='RUNNING',revision=revision+1 WHERE run_id='{run}';
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES
+           ('{ta}','{run}','{spec_id}','READY','developer',1,1),('{tb}','{run}','{spec_id}','READY','developer',1,2);
+         INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES
+           ('{ta}','REQ-A','{spec_id}'),('{tb}','REQ-B1','{spec_id}');
+         INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES
+           (:p,'{run}','readiness-plan','plan.imported',json_object('run_id','{run}','tasks',json_array(
+             json_object('task_id','{ta}','paths',json_array('src/a')),
+             json_object('task_id','{tb}','paths',json_array('src/b')))),'2026-11-23T00:00:00Z');"
+    ))?;
+    setup.shutdown().await;
+    let host = world
+        .team_host(
+            world::Team::working(|_| Vec::new(), Duration::from_secs(60)),
+            None,
+        )
+        .await?;
     let outcome = async {
-        world.seed_spec()?;
-        let run = world::start_run(&host, "readiness", "做 A 与 B").await?;
-        world.staff(&run)?;
-        let (ta, tb) = (format!("{run}-TA"), format!("{run}-TB"));
-        // The plan imported in SPECIFYING: the run cannot be READY (REQ-B1 has no criterion).
-        world
-            .until(
-                &format!("SELECT count(*) FROM tasks WHERE run_id = '{run}' AND role = 'developer'"),
-                "2",
-                WAIT,
-            )
-            .await?;
-        // Given: the run at work (RUNNING), as one that started before REQ-B1 was approved without a criterion.
-        world.exec(&format!(
-            "UPDATE runs SET state = 'RUNNING', revision = revision + 1 WHERE run_id = '{run}'"
-        ))?;
         // Rounds run: TA is dispatched; three more ticks' worth of rounds go by.
         world
             .until(

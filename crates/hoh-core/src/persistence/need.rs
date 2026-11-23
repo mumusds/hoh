@@ -251,6 +251,8 @@ pub enum RunReason {
     DraftQuestion,
     /// BUILD cannot repair content gaps without the user choosing another mode.
     BuildReadiness,
+    /// A deterministic draft dispatch refusal, retryable after user repair.
+    DraftUnavailable,
 }
 
 impl RunReason {
@@ -262,6 +264,7 @@ impl RunReason {
         RunReason::SpecApproval,
         RunReason::DraftQuestion,
         RunReason::BuildReadiness,
+        RunReason::DraftUnavailable,
     ];
 
     /// Its name: the `reason` of its `need_decision` and of its question.
@@ -273,6 +276,7 @@ impl RunReason {
             RunReason::SpecApproval => "spec_approval",
             RunReason::DraftQuestion => "draft_question",
             RunReason::BuildReadiness => "build_readiness",
+            RunReason::DraftUnavailable => "draft_unavailable",
         }
     }
 
@@ -285,6 +289,7 @@ impl RunReason {
             RunReason::SpecApproval => 3,
             RunReason::DraftQuestion => 4,
             RunReason::BuildReadiness => 5,
+            RunReason::DraftUnavailable => 6,
         }
     }
 

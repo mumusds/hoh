@@ -36,6 +36,10 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
         assert!(!std::fs::read_to_string(world.project().join(".git/config"))?.contains("[remote"));
         let phases=world.rows("SELECT json_extract(payload_json,'$.to') AS state FROM events WHERE kind='run.transitioned'")?;
         assert_eq!(phases,vec![json!({"state":"DISCOVERING"}),json!({"state":"SPECIFYING"})]);
+        std::fs::create_dir_all(world.project().join("docs/spec"))?;
+        std::fs::write(world.project().join("docs/spec/kept.md"),"用户要求保留的起草内容")?;
+        world.git(&["add","docs/spec/kept.md"])?;world.git(&["commit","-m","draft before cancellation"])?;
+        let kept_commit=world.git(&["rev-parse","HEAD"])?;
         let second=world::start_run(&host,"draft-second","另一起草").await?;
         world.staff(&second)?;
         let revision:i64=world.query(&format!("SELECT revision FROM runs WHERE run_id='{second}'"))?.parse()?;
@@ -52,6 +56,8 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
         world.until(&format!("SELECT state FROM runs WHERE run_id='{run}'"),"CANCELLED",Duration::from_secs(15)).await?;
         assert_eq!(world.query(&format!("SELECT state FROM tasks WHERE kind='spec_draft' AND run_id='{run}'"))?,"CANCELLED");
         assert!(world.project().join(".git").exists(),"cancellation preserves the workspace");
+        assert_eq!(std::fs::read_to_string(world.project().join("docs/spec/kept.md"))?,"用户要求保留的起草内容");
+        assert_eq!(world.git(&["rev-parse","HEAD"])?,kept_commit,"cancel must not reset commits");
         world.until(&format!("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.run_id='{second}' AND a.state='RUNNING'"),"1",Duration::from_secs(15)).await?;
         assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED'")?,"1","existing repository is not initialized again");
         let revision:i64=world.query(&format!("SELECT revision FROM runs WHERE run_id='{second}'"))?.parse()?;
@@ -426,7 +432,9 @@ async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
             )
             .await?;
         let result:R=async {
-            let cli = if !interactive {let mut cli=world.command(&["-p","请补齐缺少的验收条件","--resume",&run]);Some(tokio::task::spawn_blocking(move||cli.output()))} else {None};
+            // Only unattended AUTO needs the CLI exit here. Sending a free answer to BUILD's open question
+            // explicitly chooses its default PLAN, so it would no longer be the unchanged-BUILD scenario.
+            let cli = if !interactive && mode=="AUTO" {let mut cli=world.command(&["-p","请补齐缺少的验收条件","--resume",&run]);Some(tokio::task::spawn_blocking(move||cli.output()))} else {None};
             if mode=="AUTO" {
                 if let Err(e)=world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(25)).await {
                     return Err(format!("{e}; mode={mode}, interactive={interactive}; runs={:?}; tasks={:?}; events={:?}",world.rows("SELECT state,mode,blocked_reasons_json FROM runs")?,world.rows("SELECT task_id,kind,state,blocked_reason FROM tasks")?,world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 18")?).into());
@@ -448,6 +456,90 @@ async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
         }.await;
         host.shutdown().await;
         result?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_05_s8_pending_cr_rejects_all_attempt_entries_then_user_cli_approves() -> R {
+    let world = world::World::named("m3t04-cr-origin")?;
+    world.configure(&[], "")?;
+    world.commit_project(&[world::Requirement {
+        id: "REQ-A".into(),
+        title: "标题".into(),
+        criteria: vec![],
+    }])?;
+    world.init_store().await?;
+    world.seed_spec()?;
+    let setup = world.start_plain_host(None).await?;
+    let run = world::start_run(&setup, "start", "补规格").await?;
+    world.staff(&run)?;
+    world.exec(&format!(
+        "UPDATE runs SET state='RUNNING',mode='PLAN' WHERE run_id='{run}';"
+    ))?;
+    setup.shutdown().await;
+    let source=hoh_core::specindex::Source{path:"docs/spec/fixture.md".into(),bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec()};
+    let host = world
+        .team_host(
+            world::Team::planning(world.project(), source, |_| vec![], None),
+            None,
+        )
+        .await?;
+    let result:R=async {
+        world.until("SELECT count(*) FROM change_requests WHERE state='PROPOSED'","1",Duration::from_secs(25)).await?;
+        world.until("SELECT state FROM runs","BLOCKED",Duration::from_secs(10)).await?;
+        let q:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval' ORDER BY seq DESC LIMIT 1")?)?;
+        let before=world.rows("SELECT kind,count(*) AS n FROM commands GROUP BY kind ORDER BY kind")?;
+        for kind in ["ApproveSpec","AnswerQuestion","SendInput"] {
+            let revision:i64=world.query("SELECT revision FROM runs")?.parse()?;
+            let payload=match kind {"ApproveSpec"=>json!({"spec_sha256":q["spec_sha256"],"decision":"APPROVE_ONLY"}),"AnswerQuestion"=>json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"}),_=>json!({"text":"approve","target_role":null,"input_kind":"REPLY"})};
+            let body=json!({"schema_version":"1.0","command_id":kind,"idempotency_key":kind,"expected_revision":revision,"kind":kind,"run_id":run,"payload":payload});
+            let (status,reply)=marked_request(&host,&body).await?;assert_eq!(status,403,"{reply}");assert_eq!(reply["code"],"SPEC_APPROVAL_NOT_USER");
+        }
+        let mut cli=world.command(&["-p","approve","--resume",&run,"--detach"]);cli.env(hoh_app::host::ATTEMPT_ENV,"m3t04-scripted-attempt");
+        let output=tokio::task::spawn_blocking(move||cli.output()).await??;assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("SPEC_APPROVAL_NOT_USER"),"{}",String::from_utf8_lossy(&output.stderr));
+        assert_eq!(world.rows("SELECT kind,count(*) AS n FROM commands GROUP BY kind ORDER BY kind")?,before);
+        assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");assert_eq!(world.query("SELECT count(*) FROM input_queue")?,"0");assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"IMPLEMENTED");
+        let mut cli=world.command(&["-p","approve","--resume",&run,"--detach"]);let output=tokio::task::spawn_blocking(move||cli.output()).await??;assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        assert_eq!(world.query("SELECT count(*) FROM specs")?,"2");assert_eq!(world.query("SELECT state FROM change_requests")?,"APPLIED");assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED");Ok(())
+    }.await;
+    host.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_01_s8_stop_between_dispatch_and_gate_starts_no_draft() -> R {
+    use hoh_app::host::RunnerPoint;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+    };
+    for point in [RunnerPoint::AfterAck, RunnerPoint::AfterSpawn] {
+        for (kind, state) in [("PauseRun", "PAUSED"), ("CancelRun", "CANCELLED")] {
+            let world = world::World::named("m3t04-stop-gate")?;
+            world.configure(&[], "")?;
+            let barrier = Arc::new(DraftBarrier {
+                point,
+                hits: AtomicUsize::new(0),
+                release: AtomicBool::new(false),
+            });
+            let release = ReleaseDraft(barrier.clone());
+            let host = world
+                .team_host_hooked(world::Team::drafting(world.project()), barrier.clone())
+                .await?;
+            let result:R=async {
+                let run=world::start_run(&host,"start","停止窗口").await?;world.staff(&run)?;
+                input(&host,&world,&run,"draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+                let end=std::time::Instant::now()+Duration::from_secs(15);while barrier.hits.load(SeqCst)==0 {if std::time::Instant::now()>end{return Err("draft did not reach barrier".into())}tokio::time::sleep(Duration::from_millis(5)).await;}
+                input(&host,&world,&run,"stop",kind,json!({"reason":"fixture stop"})).await?;barrier.release.store(true,SeqCst);
+                world.until("SELECT state FROM runs",state,Duration::from_secs(20)).await?;
+                assert_eq!(world.query("SELECT count(*) FROM attempts WHERE state IN ('PREPARED','STARTING','RUNNING')")?,"0","{point:?}/{kind}");
+                assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.draft_completed'")?,"0");assert!(!world.project().join("docs/spec/main.md").exists());Ok(())
+            }.await;
+            drop(release);
+            host.shutdown().await;
+            result?;
+        }
     }
     Ok(())
 }

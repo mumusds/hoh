@@ -110,7 +110,7 @@ pub(super) fn round(
     // a revision approved after the tick's readiness step moved its tasks to it while they were READY, and they wait
     // for that step (REQ-031 behaviours 3 and 5, M3J-01, M3J-100: no planned work before the revision's review PASS).
     let ids: Vec<&str> = rows.iter().map(|r| r.candidate.task_id.as_str()).collect();
-    let mut admitted = super::admission::admit(&tx, run_id, &ids, super::admission::By::Round)?;
+    let mut admitted = super::admission::admit(&tx, run_id, &ids, super::admission::By::Round, None)?;
     // A write task the admission holds for files the user had not committed at the run's baseline is BLOCKED
     // (NEED_DECISION) here with those files, asked once (REQ-028 behaviour 4, O3; docs/adr/ADR-039.md decision 7). Its
     // answer decides; nothing of the files is written, stashed or reset.

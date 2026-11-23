@@ -988,7 +988,7 @@ fn load_task(
 }
 
 pub(super) fn load_binding(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     run_id: &str,
     role: &str,
     resource_version: &str,

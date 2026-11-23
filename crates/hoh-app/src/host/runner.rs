@@ -2354,13 +2354,22 @@ async fn settle(
         })
         .await?;
     let observer = common.settings.observer.clone();
+    let draft = store.reader()?.draft_start(id)?.is_some();
     let effects = row
         .effects
         .iter()
         .map(|e| Effect {
             key: e.key.clone(),
             state: e.state,
-            observation: (e.state == EffectState::Started).then(|| observer.observe(id, &e.key)),
+            observation: (e.state == EffectState::Started).then(|| {
+                if draft
+                    && let Some(found) =
+                        super::drafting::observe_init(&common.shared.root, id, &e.key)
+                {
+                    return found;
+                }
+                observer.observe(id, &e.key)
+            }),
         })
         .collect();
     let disposition = dispose(&Unfinished {

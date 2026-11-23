@@ -403,6 +403,8 @@ pub(super) async fn run(
         let (process, effects) = {
             let row = row.clone();
             let settings = settings.clone();
+            let project = project.to_path_buf();
+            let draft = store.reader()?.draft_start(&row.attempt_id)?.is_some();
             let tracking = trackings
                 .get(&row.attempt_id)
                 .cloned()
@@ -415,8 +417,15 @@ pub(super) async fn run(
                     .map(|e| Effect {
                         key: e.key.clone(),
                         state: e.state,
-                        observation: (e.state == EffectState::Started)
-                            .then(|| settings.observer.observe(&row.attempt_id, &e.key)),
+                        observation: (e.state == EffectState::Started).then(|| {
+                            if draft
+                                && let Some(found) =
+                                    super::drafting::observe_init(&project, &row.attempt_id, &e.key)
+                            {
+                                return found;
+                            }
+                            settings.observer.observe(&row.attempt_id, &e.key)
+                        }),
                     })
                     .collect();
                 Ok((process, effects))

@@ -18,10 +18,11 @@ fn requested(conn: &Connection, run: &str) -> Result<Option<Request>, PersistErr
         return Ok(None);
     };
     let last: i64 = conn.query_row("SELECT coalesce(max(seq),0) FROM events WHERE run_id=?1 AND kind='spec.draft_requested'",[run],|r|r.get(0)).map_err(sqlite_error)?;
-    // Answering a question is not a new drafting request. Inputs after the most recent answer can be.
+    // Answering a question is not a new drafting request. New REPLY input may request another generation (Q3).
+    // CHANGE already proposes its CR (REQ-017); creating another draft would turn a CR into a write hold (M3L-103).
     let input: Option<(String,String)> = conn.query_row(
         "SELECT i.input_id,i.payload_json FROM input_queue i JOIN events e ON json_extract(e.payload_json,'$.input_id')=i.input_id \
-         WHERE i.run_id=?1 AND i.kind IN ('CHANGE','REPLY') AND i.state<>'REJECTED' AND i.target_role IS NULL \
+         WHERE i.run_id=?1 AND i.kind='REPLY' AND i.state<>'REJECTED' AND i.target_role IS NULL \
          AND e.kind='input.queued' AND e.seq>?2 AND e.seq>(SELECT coalesce(max(seq),0) FROM events WHERE run_id=?1 AND kind='question.answered') \
          ORDER BY e.seq DESC LIMIT 1",params![run,last],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
     let mode_entry: Option<String> = conn.query_row(
@@ -44,6 +45,9 @@ fn requested(conn: &Connection, run: &str) -> Result<Option<Request>, PersistErr
             json!({"text":"根据当前已批准的规格与用户目标起草变更；只提出 CR 并请用户批准。"}),
         )
     } else {
+        if super::super::admission::product_work_progressing(conn, run)? {
+            return Ok(None);
+        }
         let reasons = match super::super::readiness::run_readiness(conn, run)? {
             Some(crate::readiness::Readiness::NotReady(reasons)) => reasons
                 .into_iter()

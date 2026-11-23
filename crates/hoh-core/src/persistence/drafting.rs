@@ -141,40 +141,52 @@ pub(super) fn dispatch(
 ) -> Result<bool, PersistError> {
     let read = |conn: &Connection| {
         conn.query_row(
-        "SELECT t.task_id,t.revision,r.project_id,r.revision,t.cost_estimate FROM tasks t JOIN runs r ON r.run_id=t.run_id \
+        "SELECT t.task_id,t.revision,r.project_id,r.revision FROM tasks t JOIN runs r ON r.run_id=t.run_id \
          WHERE t.run_id=?1 AND t.kind='spec_draft' AND t.state='READY' \
          AND (t.next_retry_at IS NULL OR t.next_retry_at<=?2) ORDER BY t.created_seq LIMIT 1",
-        params![run,crate::time::rfc3339_utc(context.now())],|r|Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?))).optional().map_err(sqlite_error)
+        params![run,crate::time::rfc3339_utc(context.now())],|r|Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?))).optional().map_err(sqlite_error)
     };
     if read(conn)?.is_none() {
         return Ok(false);
     }
     let tx = writer::begin(conn, ctx)?;
-    let Some((task, revision, project, run_revision, cost)) = read(&tx)? else {
+    let Some((task, revision, project, run_revision)) = read(&tx)? else {
         return Ok(false);
     };
-    let Ok(admission) = super::admission::admit_one(&tx, run, &task, super::admission::By::Draft)?
-    else {
-        return Ok(false);
+    let admission = super::admission::admit(
+        &tx,
+        run,
+        &[&task],
+        super::admission::By::Draft,
+        Some((context, &ctx.resource_bundle.version())),
+    )?
+    .remove(&task)
+    .ok_or_else(|| PersistError::IntegrityViolation("draft admission absent".into()))?;
+    let admission = match admission {
+        Ok(admission) => admission,
+        Err(super::admission::Refusal::DraftUnavailable(detail)) => {
+            let commit = super::need::run_question(
+                &tx,
+                super::need::RunQuestion {
+                    project_id: &project,
+                    run_id: run,
+                    reason: super::need::RunReason::DraftUnavailable,
+                    question_id: child_id(&task, &format!("unavailable/{run_revision}")),
+                    fields: json!({"task_id":task,"text":detail}),
+                    at: &crate::time::rfc3339_utc(ctx.now()),
+                    detail: "draft dispatch refused",
+                },
+                ctx,
+            )?;
+            writer::write(&tx, &commit, ctx)?;
+            writer::commit(tx, ctx)?;
+            return Ok(true);
+        }
+        Err(_) => return Ok(false),
     };
-    if super::retry::budget_stop(&tx, run, context)?.is_some()
-        || context.budget_headroom.is_some_and(|h| i64::from(h) < cost)
-    {
-        return Ok(false);
-    }
-    let Some(binding) =
-        super::decide::load_binding(&tx, run, "cto", &ctx.resource_bundle.version())?
-    else {
-        return Ok(false);
-    };
-    if !binding.active
-        || !context
-            .required_capabilities
-            .get("cto")
-            .is_some_and(|required| required.is_subset(&binding.capabilities))
-    {
-        return Ok(false);
-    }
+    let role_epoch = admission.draft_role_epoch.ok_or_else(|| {
+        PersistError::IntegrityViolation("draft admission has no role epoch".into())
+    })?;
     let Some(kind) =
         super::leases::free_slot(&tx, &project, true, context.reader_slots(), context.now())?
     else {
@@ -195,7 +207,7 @@ pub(super) fn dispatch(
             task_id: &task,
             attempt_id: child_id(&task, &format!("attempt-{}", attempts + 1)),
             role: "cto",
-            role_epoch: binding.role_epoch,
+            role_epoch,
             kind: &kind,
             now: context.now(),
             admission,
@@ -229,7 +241,7 @@ pub(super) fn dispatch(
                 event: 0,
                 run_id: Some(run.into()),
                 recipient_role: "cto".into(),
-                role_epoch: super::decide::to_i64(binding.role_epoch, "role_epoch")?,
+                role_epoch: super::decide::to_i64(role_epoch, "role_epoch")?,
                 payload: json!({"notice":"runtime","kind":"dispatch","origin":"spec_draft","task_id":task,"attempt_id":leased.attempt_id,"role":"cto","lease":lease}),
             }],
         },

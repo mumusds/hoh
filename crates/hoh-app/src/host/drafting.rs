@@ -84,6 +84,45 @@ pub(super) async fn prepare(
     Ok(())
 }
 
+/// Read-only observer for Runtime's own git-init effect. Other effects retain their configured observer.
+pub(super) fn observe_init(
+    root: &Path,
+    attempt: &str,
+    key: &str,
+) -> Option<hoh_core::reconcile::Observation> {
+    use hoh_core::reconcile::Observation;
+    if key != hoh_core::ids::child_id(attempt, "git-init") {
+        return None;
+    }
+    let found = || -> Result<Observation, String> {
+        let path = root.join(".git");
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Observation::Absent),
+            Err(e) => return Err(e.to_string()),
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err("git-init observation is not a local .git directory".into());
+            }
+            Ok(_) => (),
+        }
+        let actual = super::control::git(root, &["rev-parse", "--absolute-git-dir"])?;
+        let actual = std::str::from_utf8(&actual)
+            .map_err(|e| e.to_string())?
+            .trim();
+        if std::fs::canonicalize(actual).map_err(|e| e.to_string())?
+            != std::fs::canonicalize(&path).map_err(|e| e.to_string())?
+        {
+            return Err("git-init resolves outside its recorded project".into());
+        }
+        if super::control::git(root, &["rev-parse", "--is-inside-work-tree"])? != b"true\n" {
+            return Err("git-init has no working tree".into());
+        }
+        Ok(Observation::Found {
+            external_ref: ".git".into(),
+        })
+    };
+    Some(found().unwrap_or_else(|detail| Observation::Unavailable { detail }))
+}
+
 use hoh_core::persistence::{Ending, WriterOutcome};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};

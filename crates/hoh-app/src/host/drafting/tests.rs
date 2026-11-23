@@ -194,3 +194,38 @@ fn test_008_02_m3l100_greenfield_preserves_existing_untracked_files() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_008_02_s8_git_init_observation_requires_the_exact_local_repository() -> R {
+    use hoh_core::reconcile::Observation;
+    let root = tempfile::Builder::new()
+        .prefix("m3t04-init-observer-")
+        .tempdir()?;
+    let key = hoh_core::ids::child_id("A", "git-init");
+    assert!(observe_init(root.path(), "A", "other").is_none());
+    assert_eq!(
+        observe_init(root.path(), "A", &key),
+        Some(Observation::Absent)
+    );
+    std::fs::create_dir(root.path().join(".git"))?;
+    assert!(matches!(
+        observe_init(root.path(), "A", &key),
+        Some(Observation::Unavailable { .. })
+    ));
+    git(root.path(), &["init", "-q"])?;
+    assert_eq!(
+        observe_init(root.path(), "A", &key),
+        Some(Observation::Found {
+            external_ref: ".git".into()
+        })
+    );
+    let linked = tempfile::Builder::new()
+        .prefix("m3t04-linked-init-")
+        .tempdir()?;
+    std::os::unix::fs::symlink(root.path().join(".git"), linked.path().join(".git"))?;
+    assert!(matches!(
+        observe_init(linked.path(), "A", &key),
+        Some(Observation::Unavailable { .. })
+    ));
+    Ok(())
+}

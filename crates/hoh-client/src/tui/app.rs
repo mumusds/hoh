@@ -51,6 +51,8 @@ pub enum Request {
     },
     /// Answer a particular persisted question with an explicitly selected choice.
     Answer { question_id: String, choice: String },
+    /// A specification rejection with the user's requested changes.
+    RejectDraft { question_id: String, note: String },
     /// Attach this run (chosen in the selector).
     Attach(String),
 }
@@ -215,6 +217,7 @@ pub struct App {
     picker: Option<Picker>,
     target_picker: Option<TargetPicker>,
     question_choice: Option<(String, String)>,
+    reject_note: Option<String>,
     slash: Option<usize>,
     requests: Vec<Request>,
     /// The commands of inputs sent whose acceptance event has not come yet.
@@ -241,6 +244,7 @@ impl App {
             picker: None,
             target_picker: None,
             question_choice: None,
+            reject_note: None,
             slash: None,
             requests: Vec::new(),
             awaiting: Vec::new(),
@@ -564,6 +568,33 @@ impl App {
             self.target_key(key);
             return None;
         }
+        if let Some(q) = self.reject_note.clone() {
+            if !self
+                .question_options()
+                .iter()
+                .any(|(id, choice, _)| id == &q && choice == "reject")
+            {
+                self.reject_note = None;
+                self.say("问题已更新，请重新选择".into());
+                return None;
+            }
+            if key.code == KeyCode::Esc {
+                self.reject_note = None;
+                return None;
+            }
+            if key.code == KeyCode::Enter {
+                let note = self.editor.text().trim().to_owned();
+                if !note.is_empty() {
+                    self.requests.push(Request::RejectDraft {
+                        question_id: q,
+                        note,
+                    });
+                    self.reject_note = None;
+                    self.editor.clear();
+                }
+                return None;
+            }
+        }
         let options = self.question_options();
         if key.code == KeyCode::Tab && !options.is_empty() {
             let next = self
@@ -584,6 +615,23 @@ impl App {
                 .position(|(id, choice, _)| id == &q && choice == &c);
             match (key.code, selected) {
                 (KeyCode::Enter, Some(_)) => {
+                    if c == "reject"
+                        && self.run.as_ref().is_some_and(|r| {
+                            r.snapshot["projection"]["questions"]
+                                .as_array()
+                                .is_some_and(|qs| {
+                                    qs.iter().any(|v| {
+                                        v["question_id"] == q && v["reason"] == "spec_approval"
+                                    })
+                                })
+                        })
+                    {
+                        self.reject_note = Some(q);
+                        self.question_choice = None;
+                        self.editor.clear();
+                        self.say("请输入修改意见；Enter 提交，Esc 返回".into());
+                        return None;
+                    }
                     self.requests.push(Request::Answer {
                         question_id: q,
                         choice: c,

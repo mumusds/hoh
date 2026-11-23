@@ -1816,3 +1816,30 @@ fn test_008_03_questions_survive_projection_and_require_explicit_selection() {
         "replaced questions cannot be answered"
     );
 }
+
+#[test]
+fn test_008_03_s8_reject_requests_a_note_before_answering() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app_in(dir.path());
+    app.attach("R", "BLOCKED");
+    app.projection(&serde_json::json!({"state":"BLOCKED","projection":{"mode":"PLAN","questions":[{"question_id":"Q","reason":"spec_approval","text":"批准草稿","choices":[{"choice_id":"approve","label":"批准"},{"choice_id":"reject","label":"退回修改"}]}]}}));
+    app.key(key(KeyCode::Tab));
+    app.key(key(KeyCode::Down));
+    app.key(key(KeyCode::Enter));
+    assert!(
+        app.take_requests().is_empty(),
+        "reject must wait for the user's note"
+    );
+    assert!(screen(&app, 100, 24).join("\n").contains("修改意见"));
+    app.key(key(KeyCode::Enter));
+    assert!(app.take_requests().is_empty(), "empty note must not submit");
+    typed(&mut app, "补充边界条件");
+    app.key(key(KeyCode::Enter));
+    assert_eq!(
+        app.take_requests(),
+        vec![Request::RejectDraft {
+            question_id: "Q".into(),
+            note: "补充边界条件".into()
+        }]
+    );
+}
