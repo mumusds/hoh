@@ -386,6 +386,55 @@ pub(super) fn settle(
         .map_err(sqlite_error)?;
     }
     writer::write(&tx, &commit, ctx)?;
+    let build: bool = tx
+        .query_row(
+            "SELECT mode='BUILD' FROM runs WHERE run_id=?1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let content_gap = commit.events.iter().any(|e| {
+        e.kind == "task.blocked"
+            && e.payload["details"]["reasons"]
+                .as_array()
+                .is_some_and(|rs| {
+                    rs.iter().any(|r| {
+                        matches!(
+                            r["reason"].as_str(),
+                            Some("missing_ac" | "unobservable" | "undecided")
+                        )
+                    })
+                })
+    });
+    if build && content_gap {
+        let project: String = tx
+            .query_row(
+                "SELECT project_id FROM runs WHERE run_id=?1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let revision: i64 = tx
+            .query_row("SELECT revision FROM runs WHERE run_id=?1", [run_id], |r| {
+                r.get(0)
+            })
+            .map_err(sqlite_error)?;
+        let question = super::need::run_question(
+            &tx,
+            super::need::RunQuestion {
+                project_id: &project,
+                run_id,
+                reason: super::need::RunReason::BuildReadiness,
+                question_id: child_id(run_id, &format!("build-readiness/{revision}")),
+                fields: json!({"text":"BUILD 的任务因必需规格缺项而 BLOCKED(READINESS_NOT_MET)。可切到 AUTO 或 PLAN 补充规格，批准前不实施。","reasons":commit.events.iter().filter(|e|e.kind=="task.blocked").map(|e|&e.payload).collect::<Vec<_>>()}),
+                at: &crate::time::rfc3339_utc(ctx.now()),
+                detail: "BUILD content readiness requires user choice",
+            },
+            ctx,
+        )?;
+        writer::write(&tx, &question, ctx)?;
+    }
+
     writer::commit(tx, ctx)?;
     Ok(true)
 }

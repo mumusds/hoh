@@ -249,6 +249,8 @@ pub enum RunReason {
     SpecApproval,
     /// The drafter needs user input before another attempt.
     DraftQuestion,
+    /// BUILD cannot repair content gaps without the user choosing another mode.
+    BuildReadiness,
 }
 
 impl RunReason {
@@ -259,6 +261,7 @@ impl RunReason {
         RunReason::BaselineTests,
         RunReason::SpecApproval,
         RunReason::DraftQuestion,
+        RunReason::BuildReadiness,
     ];
 
     /// Its name: the `reason` of its `need_decision` and of its question.
@@ -269,6 +272,7 @@ impl RunReason {
             RunReason::BaselineTests => "baseline_tests",
             RunReason::SpecApproval => "spec_approval",
             RunReason::DraftQuestion => "draft_question",
+            RunReason::BuildReadiness => "build_readiness",
         }
     }
 
@@ -280,6 +284,7 @@ impl RunReason {
             RunReason::BaselineTests => 2,
             RunReason::SpecApproval => 3,
             RunReason::DraftQuestion => 4,
+            RunReason::BuildReadiness => 5,
         }
     }
 

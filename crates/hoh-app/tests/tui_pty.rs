@@ -2124,3 +2124,172 @@ fn test_008_03_plan_question_is_shown_and_explicit_answer_restores_specifying() 
     runtime.block_on(host.shutdown());
     outcome
 }
+
+#[test]
+fn test_008_01_running_plan_pause_resume_approval_review() -> R {
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::SeqCst},
+    };
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, SeqCst);
+        }
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    let world = world::World::named("m3t04-running-plan")?;
+    world.configure(&[], "")?;
+    world.commit_project(&world::fixture_spec())?;
+    runtime.block_on(world.init_store())?;
+    let spec = world.seed_spec()?;
+    let indexed: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        world.project().join("docs/spec/index.json"),
+    )?)?;
+    let ac = indexed["requirements"][0]["acceptance"][0]
+        .to_string()
+        .replace('\'', "''");
+    world.exec(&format!(
+        "UPDATE acceptance_criteria SET body='{ac}' WHERE spec_id='{spec}';"
+    ))?;
+    let setup = runtime.block_on(world.start_plain_host(None))?;
+    let run = runtime.block_on(world::start_run(&setup, "start", "规划边界"))?;
+    world.staff(&run)?;
+    world.exec(&format!("UPDATE runs SET state='RUNNING',mode='BUILD' WHERE run_id='{run}'; INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('work','{run}','{spec}','READY','developer',1,1,1); INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('work','REQ-901','{spec}'); INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES(:p,'{run}','s7-plan','plan.imported',json_object('run_id','{run}','tasks',json_array(json_object('task_id','work','paths',json_array('src/lib.rs')))),'2026-11-23T00:00:00Z');"))?;
+    runtime.block_on(setup.shutdown());
+    let source = hoh_core::specindex::Source {
+        path: "docs/spec/fixture.md".into(),
+        bytes: std::fs::read_to_string(world.project().join("docs/spec/fixture.md"))?
+            .replace("fixture 目标已完成", "fixture 目标与边界已完成")
+            .into_bytes(),
+    };
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let drop_release = Release(release.clone());
+    let r = release.clone();
+    let e = entered.clone();
+    let team = world::Team::planning_with_review(
+        world.project(),
+        source,
+        |_| vec![],
+        Some(Duration::from_secs(60)),
+        Some(("work".into(), world.root().join("writer-release"))),
+        move |_| {
+            e.store(true, SeqCst);
+            while !r.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            world::Verdict::Pass
+        },
+    );
+    let host = runtime.block_on(world.team_host(team, None))?;
+    let request = |key: &str, kind: &str, payload: serde_json::Value| -> R {
+        for _ in 0..20 {
+            let rev: i64 = world
+                .query(&format!("SELECT revision FROM runs WHERE run_id='{run}'"))?
+                .parse()?;
+            let body = json!({"schema_version":"1.0","command_id":key,"idempotency_key":key,"expected_revision":rev,"kind":kind,"run_id":run,"payload":payload});
+            let (status, reply) =
+                runtime.block_on(world::exchange(&host, "POST", "/v1/commands", Some(&body)))?;
+            if status == 409 && reply["code"] == "STALE_REVISION" {
+                continue;
+            }
+            assert_eq!(status, 202, "{reply}");
+            return Ok(());
+        }
+        Err("stale command".into())
+    };
+    let result = (|| -> R {
+        world.wait(
+            "SELECT count(*) FROM attempts WHERE task_id='work' AND state='RUNNING'",
+            "1",
+            Duration::from_secs(20),
+        )?;
+        let product = std::fs::read(world.project().join("src/lib.rs"))?;
+        let mut pty = Pty::new(34, 140)?;
+        let mut child = world.hoh_pty(&pty, &["attach", &run])?;
+        pty::screen_until(&pty, 34, 140, WAIT, |s| s.contains("模式 BUILD"))?;
+        pty.send(b"/plan\r")?;
+        world.wait(
+            "SELECT count(*) FROM events WHERE kind='run.mode_change_pending'",
+            "1",
+            WAIT,
+        )?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,
+            "0"
+        );
+        request("pause", "PauseRun", json!({"reason":"规划暂停"}))?;
+        std::fs::write(
+            world.root().join("writer-release"),
+            "release this fixture writer",
+        )?;
+        world.wait("SELECT state FROM runs", "PAUSED", Duration::from_secs(20))?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,
+            "0"
+        );
+        request("resume", "ResumeRun", json!({"reason":"继续规划"}))?;
+        world.wait(
+            "SELECT count(*) FROM events WHERE kind='spec.draft_completed'",
+            "1",
+            Duration::from_secs(25),
+        )?;
+        assert_eq!(
+            world.query("SELECT state||'/'||resume_state FROM runs")?,
+            "BLOCKED/RUNNING"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,
+            "1"
+        );
+        pty::screen_until(&pty, 34, 140, WAIT, |s| s.contains("批准规格"))?;
+        pty.send(b"\t\r")?;
+        if let Err(e) = world.wait("SELECT count(*) FROM specs WHERE revision=2", "1", WAIT) {
+            let shown = pty::screen_until(&pty, 34, 140, WAIT, |_| true)?;
+            return Err(format!("{e}; screen={shown}; commands={:?}; questions={:?}",world.rows("SELECT kind,payload_json FROM commands")?,world.rows("SELECT kind,payload_json FROM events WHERE kind LIKE 'question.%' OR kind='input.rejected'")?).into());
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while !entered.load(SeqCst) {
+            if std::time::Instant::now() > end {
+                return Err("review not dispatched after approval in RUNNING".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        request("build", "SetMode", json!({"mode":"BUILD"}))?;
+        let spec2 = world.query("SELECT spec_id FROM specs WHERE revision=2")?;
+        world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('new-work','{run}','{spec2}','READY','developer',1,0,1); INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('new-work','REQ-901','{spec2}'); INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES(:p,'{run}','s7-new-plan','plan.imported',json_object('run_id','{run}','tasks',json_array(json_object('task_id','new-work','paths',json_array('src/lib.rs')))),'2026-11-23T00:00:00Z');"))?;
+        world.wait(
+            "SELECT blocked_reason FROM tasks WHERE task_id='new-work'",
+            "READINESS_NOT_MET",
+            WAIT,
+        )?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM attempts WHERE task_id='new-work'")?,
+            "0"
+        );
+        release.store(true, SeqCst);
+        world.wait("SELECT count(*) FROM events WHERE kind='spec_review.reported' AND json_extract(payload_json,'$.spec_revision')=2 AND json_extract(payload_json,'$.state')='CURRENT'","1",Duration::from_secs(20))?;
+        world.wait(
+            "SELECT count(*) FROM attempts WHERE task_id='new-work' AND state='RUNNING'",
+            "1",
+            Duration::from_secs(20),
+        )?;
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='run.transitioned' AND json_extract(payload_json,'$.to')='SPECIFYING'")?,"0");
+        assert_eq!(std::fs::read(world.project().join("src/lib.rs"))?, product);
+        assert_eq!(
+            world
+                .git(&["diff", "--name-only", "HEAD~1", "HEAD", "--", "src"])?
+                .trim(),
+            ""
+        );
+        request("cancel", "CancelRun", json!({"reason":"fixture done"}))?;
+        signal(&child, Signal::TERM)?;
+        assert_eq!(exit_within(&mut child, WAIT)?.code(), Some(143));
+        Ok(())
+    })();
+    drop(drop_release);
+    runtime.block_on(host.shutdown());
+    result
+}

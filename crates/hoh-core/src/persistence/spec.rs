@@ -185,6 +185,16 @@ pub(super) fn apply(
         }
         SpecAction::Approve(approval) => approve(tx, command, approval, &index, base.as_ref())?,
     };
+    // Accept the completed draft before migrating non-terminal tasks. Otherwise migrate's saved Task revision
+    // would be stale after IMPLEMENTED -> VERIFYING -> ACCEPTED, and every CR approval would roll back.
+    let draft_follow = if let (Some(q), SpecAction::Approve(approval)) = (&question, &input.action)
+    {
+        Some(super::draft_approval::answered(
+            tx, command, q, approval, ctx,
+        )?)
+    } else {
+        None
+    };
     // Approvals may update other non-terminal runs (Q3). Their touches fence decisions against the old revision.
     let mut cas = vec![StateCas {
         id: command.run_id.clone(),
@@ -231,8 +241,7 @@ pub(super) fn apply(
             }
         }
     }
-    if let (Some(q), SpecAction::Approve(approval)) = (&question, &input.action) {
-        let follow = super::draft_approval::answered(tx, command, q, approval, ctx)?;
+    if let Some(follow) = draft_follow {
         if follow.cas.iter().any(|c| c.id == command.run_id) {
             cas.retain(|c| c.id != command.run_id);
         }

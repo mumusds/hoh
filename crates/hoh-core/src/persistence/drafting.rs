@@ -7,6 +7,8 @@ use crate::protocol::{Mode, RunState, TaskState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
+mod revisions;
+
 fn event(project: &str, run: &str, id: String, kind: &str, payload: Value) -> NewEvent {
     NewEvent {
         intent: Intent::Progress,
@@ -50,6 +52,9 @@ pub(super) fn step(
     discovered: bool,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
+    if revisions::step(conn, run, ctx)? {
+        return Ok(true);
+    }
     let read = |conn: &Connection| -> Result<Option<(String, String, i64)>, PersistError> {
         conn.query_row(
             "SELECT project_id,state,revision FROM runs r WHERE run_id=?1 AND spec_id IS NULL \

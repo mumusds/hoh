@@ -228,3 +228,26 @@ async fn test_031_03_nonblocking_question_listed_in_the_projection() -> R {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_009_02_s7_build_preserves_readiness_block_and_asks_for_mode() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t04-build-").tempdir()?;
+    let (store, path) = world(dir.path())?;
+    let db = Connection::open(&path)?;
+    db.execute("UPDATE runs SET mode='BUILD'", [])?;
+    pass(&path, "s1", "independent")?;
+    store.settle_readiness("R").await?;
+    assert!(states(&path)?.contains(&"TB BLOCKED READINESS_NOT_MET".to_owned()));
+    let questions = super::super::questions::open(&db, "R")?;
+    assert_eq!(questions.len(), 1);
+    assert!(questions[0].text.contains("AUTO") && questions[0].text.contains("PLAN"));
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM tasks WHERE kind='spec_draft'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    Ok(())
+}
