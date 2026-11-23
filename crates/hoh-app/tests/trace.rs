@@ -200,9 +200,8 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
         .map(|(t, c)| (t.clone(), c.as_str().unwrap_or("<none>").to_owned()))
         .collect();
     assert_eq!(tests, expected, "World.tests()");
-    // No member evidence: each TEST is reported without a result, not an error. ADR-027 decision 10 names a TEST
-    // whose scenario check has no member at all MISSING (NOT_RUN needs a member of its check); docs/adr/ADR-039.md
-    // records this reading of AC-032-04's "NOT_RUN".
+    // No member evidence: each TEST is MISSING, without a result and not an error (AC-032-04 as CR-035 corrected it:
+    // ADR-027 decision 10 names a TEST whose scenario check has no member at all MISSING; NOT_RUN needs a member).
     assert_eq!(
         python["status"],
         json!({"TEST-A-01": "MISSING", "TEST-A-02": "MISSING", "TEST-B-01": "MISSING"}),
