@@ -65,6 +65,9 @@ pub(super) fn export(conn: &Connection, run_id: &str) -> Result<Option<Value>, P
         },
         (None, None) => (SpecSource::Revision, Value::Null),
     };
+    // Evidence and results belong to the run by their candidate, or, when that candidate's row is missing, by the
+    // task of the attempt that produced them: a dangling node stays in the export with its missing link reported
+    // (REQ-032 behaviour 2 and failure mode 1; docs/adr/ADR-039.md, round 1 corrections, M3N-004).
     Ok(Some(crate::trace::export(&Input {
         run_id: run_id.to_owned(),
         spec_revision,
@@ -87,7 +90,9 @@ pub(super) fn export(conn: &Connection, run_id: &str) -> Result<Option<Value>, P
         evidence: rows(
             conn,
             "SELECT e.evidence_id, e.candidate_id, e.check_id, e.outcome FROM evidence e \
-             JOIN candidates c ON c.candidate_id = e.candidate_id WHERE c.run_id = ?1 ORDER BY e.rowid",
+             LEFT JOIN candidates c ON c.candidate_id = e.candidate_id \
+             LEFT JOIN attempts p ON p.attempt_id = e.attempt_id LEFT JOIN tasks t ON t.task_id = p.task_id \
+             WHERE c.run_id = ?1 OR (c.candidate_id IS NULL AND t.run_id = ?1) ORDER BY e.rowid",
             run_id,
             |r| {
                 Ok(EvidenceRow {
@@ -101,8 +106,10 @@ pub(super) fn export(conn: &Connection, run_id: &str) -> Result<Option<Value>, P
         results: rows(
             conn,
             "SELECT a.ac_id, s.revision, a.candidate_id, a.evidence_id, a.status FROM acceptance_results a \
-             JOIN candidates c ON c.candidate_id = a.candidate_id JOIN specs s ON s.spec_id = a.spec_id \
-             WHERE c.run_id = ?1 ORDER BY a.rowid",
+             JOIN specs s ON s.spec_id = a.spec_id LEFT JOIN candidates c ON c.candidate_id = a.candidate_id \
+             LEFT JOIN evidence e ON e.evidence_id = a.evidence_id LEFT JOIN attempts p ON p.attempt_id = e.attempt_id \
+             LEFT JOIN tasks t ON t.task_id = p.task_id \
+             WHERE c.run_id = ?1 OR (c.candidate_id IS NULL AND t.run_id = ?1) ORDER BY a.rowid",
             run_id,
             |r| {
                 Ok(ResultRow {

@@ -294,6 +294,24 @@ fn write_project(world: &World, files: Vec<Source>) -> R<Index> {
 /// Run `run`'s three tasks (T1: REQ-A, T2: REQ-B, T3: both) and, on `candidate`, one PASS row per AC with its own
 /// evidence of the AC's check: a persisted fixture of a verified candidate; no verification process or agent runs.
 fn verified(world: &World, run: &str, candidate: &str) -> R {
+    verified_with(world, run, candidate, Fault::None)
+}
+
+/// A fault of TEST-032-01's fixture, written as the fixture is persisted (inserts only: evidence and acceptance
+/// results are append-only, docs/adr/ADR-029.md decision 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    /// AC-A-01's PASS cites evidence that is not there.
+    MissingEvidence,
+    /// AC-B-01's PASS is on an older candidate `CAND-old`, STALE.
+    StaleCandidate,
+    /// The candidate's row is missing.
+    MissingCandidate,
+}
+
+/// [`verified`] with `fault`.
+fn verified_with(world: &World, run: &str, candidate: &str, fault: Fault) -> R {
     for (seq, (task, requirements)) in [
         ("T1", vec!["REQ-A"]),
         ("T2", vec!["REQ-B"]),
@@ -313,6 +331,24 @@ fn verified(world: &World, run: &str, candidate: &str) -> R {
             ))?;
         }
     }
+    if fault == Fault::StaleCandidate {
+        world.exec(&format!(
+            "INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,
+               test_plan_sha256,source_path,state,created_at)
+             SELECT 'CAND-old',run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,
+               'STALE',created_at FROM candidates WHERE candidate_id='{candidate}';"
+        ))?;
+    }
+    let skipped = if fault == Fault::MissingEvidence {
+        "AND a.ac_id <> 'AC-A-01'"
+    } else {
+        ""
+    };
+    let result_candidate = if fault == Fault::StaleCandidate {
+        format!("CASE a.ac_id WHEN 'AC-B-01' THEN 'CAND-old' ELSE '{candidate}' END")
+    } else {
+        format!("'{candidate}'")
+    };
     world.exec(&format!(
         "INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision)
             VALUES('observed','T1','SETTLED',1,1,0);
@@ -320,12 +356,18 @@ fn verified(world: &World, run: &str, candidate: &str) -> R {
          INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
          SELECT 'evidence-'||a.ac_id,'{candidate}','observed','observed',a.check_id,'check','PASS','mock',
             '2026-11-22T00:00:00Z'
-         FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}' ORDER BY a.ac_id;
+         FROM acceptance_criteria a JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}' {skipped}
+         ORDER BY a.ac_id;
          INSERT INTO acceptance_results(ac_id,spec_id,candidate_id,evidence_id,status)
-         SELECT a.ac_id,a.spec_id,'{candidate}','evidence-'||a.ac_id,'PASS' FROM acceptance_criteria a
+         SELECT a.ac_id,a.spec_id,{result_candidate},'evidence-'||a.ac_id,'PASS' FROM acceptance_criteria a
          JOIN runs r ON r.spec_id=a.spec_id WHERE r.run_id='{run}' ORDER BY a.ac_id;",
         hash = "0".repeat(64)
     ))?;
+    if fault == Fault::MissingCandidate {
+        world.exec(&format!(
+            "DELETE FROM candidates WHERE candidate_id='{candidate}';"
+        ))?;
+    }
     Ok(())
 }
 
@@ -412,22 +454,138 @@ async fn test_032_02_acceptance_and_tasks_match_db() -> R {
     Ok(())
 }
 
-/// The product's trace export for TEST-032-01 (docs/adr/ADR-039.md decision 3): what
-/// `tests/bundle/fixtures/trace-export.json` must be, its run and candidate ids replaced by fixed placeholders.
+/// The product's trace exports for TEST-032-01 (docs/adr/ADR-039.md decision 3 and its round 1 corrections): what
+/// `tests/bundle/fixtures/trace-export.json` must be, `{whole, missing_evidence, stale_candidate, missing_candidate}`,
+/// its run and candidate ids replaced by fixed placeholders.
 const TRACE_FIXTURE: &str = "tests/bundle/fixtures/trace-export.json";
 
-#[tokio::test]
-async fn trace_export_fixture_is_the_products_current_export() -> R {
+/// The mirror's `chain` (scripts/product/traceability.py) on `export`: its broken, orphan and stale.
+fn mirror_chain(export: &Value) -> R<Value> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import json, sys\nsys.path.insert(0, sys.argv[1] + '/scripts/product')\nimport traceability\n\
+             print(json.dumps(traceability.chain(json.load(sys.stdin))))",
+        )
+        .arg(hoh_root())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(&serde_json::to_vec(export)?)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(format!(
+            "traceability.chain: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+/// The product's current export of TEST-032-01's fixture persisted with `fault` in a store of its own, through the
+/// product host, checked item by item against the mirror's chain on the same export; with its run and candidate ids.
+async fn export_with(fault: Fault) -> R<(Value, String, String)> {
     let world = World::new()?;
     let index = chain_project(&world)?;
     let (host, run) = approved(&world, &index).await?;
     let (candidate, _) = frozen(&world, &host, &run).await?;
-    verified(&world, &run, &candidate)?;
+    verified_with(&world, &run, &candidate, fault)?;
     let trace = export(&host, &run).await?;
     host.shutdown().await;
-    let text = format!("{}\n", serde_json::to_string_pretty(&trace)?)
-        .replace(&run, "RUN")
-        .replace(&candidate, "CANDIDATE");
+    let mirror = mirror_chain(&trace)?;
+    for list in ["broken", "orphan", "stale"] {
+        assert_eq!(
+            mirror[list], trace[list],
+            "{fault:?} {list}: the mirror and the product's export differ"
+        );
+    }
+    Ok((trace, run, candidate))
+}
+
+/// REQ-032 / AC-032-01 (TEST-032-01; docs/adr/ADR-039.md decision 3, round 1 corrections M3N-004, M3N-005): the
+/// product's current trace export, through the product host, of the fixture whole and over three faults persisted in
+/// its store — one TEST's evidence missing, a PASS on a STALE older candidate, the candidate row missing — each
+/// compared item by item with the mirror (`traceability.chain`), with the exact entries each fault must report. The
+/// four exports are pinned byte for byte in `tests/bundle/fixtures/trace-export.json` (rewritten with
+/// `HOH_BLESS_TRACE=1`), which the bundle's `test_032_01` checks against the mirror too.
+#[tokio::test]
+async fn test_032_01_product_export_over_fault_variants_matches_the_mirror() -> R {
+    let mut exports = serde_json::Map::new();
+    let mut placeholders = Vec::new();
+    for (name, fault) in [
+        ("whole", Fault::None),
+        ("missing_evidence", Fault::MissingEvidence),
+        ("stale_candidate", Fault::StaleCandidate),
+        ("missing_candidate", Fault::MissingCandidate),
+    ] {
+        let (trace, run, candidate) = export_with(fault).await?;
+        placeholders.push((run, candidate));
+        exports.insert(name.to_owned(), trace);
+    }
+    let whole = &exports["whole"];
+    assert_eq!(
+        (&whole["broken"], &whole["orphan"], &whole["stale"]),
+        (&json!([]), &json!([]), &json!([])),
+        "{whole}"
+    );
+    assert!(whole["candidate_id"].is_string(), "{whole}");
+    // One TEST's evidence missing: that TEST is broken (missing evidence), nothing else.
+    let missing_evidence = &exports["missing_evidence"];
+    assert_eq!(
+        missing_evidence["broken"],
+        json!([{"node": "test", "id": "TEST-A-01", "missing": "evidence"}]),
+        "{missing_evidence}"
+    );
+    assert_eq!(
+        (&missing_evidence["orphan"], &missing_evidence["stale"]),
+        (&json!([]), &json!([]))
+    );
+    // AC-B-01's PASS on an older STALE candidate: an orphan (not the current candidate) and stale.
+    let stale_candidate = &exports["stale_candidate"];
+    let rebound = json!([{"ac_id": "AC-B-01", "spec_revision": 1, "candidate_id": "CAND-old",
+        "evidence_id": "evidence-AC-B-01", "status": "PASS"}]);
+    assert_eq!(
+        (
+            &stale_candidate["broken"],
+            &stale_candidate["orphan"],
+            &stale_candidate["stale"]
+        ),
+        (&json!([]), &rebound, &rebound),
+        "{stale_candidate}"
+    );
+    // The candidate row missing: its evidence and results stay reachable through their producer attempt's task, and
+    // each evidence reports its missing candidate (M3N-004).
+    let missing_candidate = &exports["missing_candidate"];
+    let acs = ["AC-A-01", "AC-A-02", "AC-B-01", "AC-B-02"];
+    assert_eq!(
+        missing_candidate["broken"],
+        json!(
+            acs.iter()
+                .map(|ac| json!({"node": "evidence", "id": format!("evidence-{ac}"), "missing": "candidate"}))
+                .collect::<Vec<_>>()
+        ),
+        "{missing_candidate}"
+    );
+    for nodes in ["evidence", "results"] {
+        assert_eq!(
+            missing_candidate[nodes].as_array().map(Vec::len),
+            Some(4),
+            "{nodes}: {missing_candidate}"
+        );
+    }
+    assert_eq!(missing_candidate["candidate_id"], Value::Null);
+    let mut text = format!("{}\n", serde_json::to_string_pretty(&exports)?);
+    for (run, candidate) in &placeholders {
+        text = text.replace(run, "RUN").replace(candidate, "CANDIDATE");
+    }
     let fixture = hoh_root().join(TRACE_FIXTURE);
     if std::env::var_os("HOH_BLESS_TRACE").is_some() {
         std::fs::write(&fixture, &text)?;
