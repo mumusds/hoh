@@ -482,16 +482,46 @@ impl ProductExecutor {
         )
     }
 
-    /// The prompt `work` is sent, packed from its four layers within its run's budget, its inputs kept as objects, and
-    /// the record of it (docs/adr/ADR-026.md decisions 3 to 7); or why it cannot start: CONTEXT_BUDGET_TOO_SMALL with
-    /// what the mandatory items need and the budget (decision 9), PROMPT_UNAVAILABLE for a contract whose placeholders
-    /// are malformed (both deterministic), CONTEXT_UNAVAILABLE when the objects cannot be written (transient).
+    fn load_skills(&self, work: &Work) -> Result<hoh_core::skills::Loaded, Refusal> {
+        hoh_core::skills::load_with_diagnostics(
+            &self.project,
+            hoh_core::prompt_files::global_root().as_deref(),
+            &work.run_id,
+            &self.bundle(work)?,
+        )
+        .map_err(prompt_refusal)
+    }
+
+    #[cfg(test)]
     fn pack(
         &self,
         work: &Work,
         resolved: &hoh_core::prompt::Resolved,
         package: Option<&serde_json::Value>,
         native_skills: bool,
+    ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
+        self.pack_selected(
+            work,
+            resolved,
+            package,
+            &self.load_skills(work)?,
+            native_skills,
+            &Default::default(),
+        )
+    }
+
+    /// The prompt `work` is sent, packed from its four layers within its run's budget, its inputs kept as objects, and
+    /// the record of it (docs/adr/ADR-026.md decisions 3 to 7); or why it cannot start: CONTEXT_BUDGET_TOO_SMALL with
+    /// what the mandatory items need and the budget (decision 9), PROMPT_UNAVAILABLE for a contract whose placeholders
+    /// are malformed (both deterministic), CONTEXT_UNAVAILABLE when the objects cannot be written (transient).
+    fn pack_selected(
+        &self,
+        work: &Work,
+        resolved: &hoh_core::prompt::Resolved,
+        package: Option<&serde_json::Value>,
+        skills: &hoh_core::skills::Loaded,
+        native_skills: bool,
+        fallbacks: &std::collections::BTreeMap<String, String>,
     ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
         use hoh_core::context;
         let bundle = self.bundle(work)?;
@@ -612,13 +642,6 @@ impl ProductExecutor {
                 conventions["sha256"].as_str().unwrap_or_default()
             ));
         }
-        let skills = hoh_core::skills::load_with_diagnostics(
-            &self.project,
-            hoh_core::prompt_files::global_root().as_deref(),
-            &work.run_id,
-            &bundle,
-        )
-        .map_err(prompt_refusal)?;
         let matched =
             hoh_core::skills::for_turn(&skills.skills, &work.role, facts.skill_phase.as_deref());
         mandatory.project.push_str(&format!(
@@ -633,13 +656,21 @@ impl ProductExecutor {
         let selected = hoh_core::skills::with_dependencies(&skills.skills, &matched)
             .map_err(prompt_refusal)?;
         let mut native = std::collections::BTreeMap::new();
+        let mut fallback_reasons = fallbacks.clone();
         let mut skill_sources = Vec::new();
         for skill in &selected {
             let indexed = matched.iter().any(|s| s.skill.id == skill.skill.id);
-            let path = if native_skills {
+            let path = if native_skills && !fallback_reasons.contains_key(&skill.skill.id) {
                 match a.session_id.as_deref() {
-                    Some(session) => hoh_core::skills::native_path(&self.project, session, skill)
-                        .map_err(prompt_refusal)?,
+                    Some(session) => {
+                        match hoh_core::skills::native_path(&self.project, session, skill) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                fallback_reasons.insert(skill.skill.id.clone(), error.to_string());
+                                None
+                            }
+                        }
+                    }
                     None => None,
                 }
             } else {
@@ -716,6 +747,9 @@ impl ProductExecutor {
                 value["native"] = serde_json::json!("injected");
                 value["tokens"] = serde_json::json!(input.tokens);
                 value["placed"] = serde_json::json!(input.placed);
+            }
+            if let Some(reason) = fallback_reasons.get(&source.id) {
+                value["native_fallback"] = serde_json::json!(reason);
             }
             skill_records.push(value);
         }
@@ -809,6 +843,67 @@ impl ProductExecutor {
         ))
     }
 
+    /// Each failure permanently switches that Skill to the pinned source's knowledge entry.
+    /// Repacking can take time, so recheck remaining native copies again before spawn.
+    fn recheck_skills(
+        &self,
+        work: &Work,
+        inputs: &SkillRepack,
+        turn: &mut hoh_agents::pi::Turn,
+        record: &mut PromptRecord,
+    ) -> Result<(), Refusal> {
+        let deterministic =
+            |why: String| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why);
+        let mut fallbacks = std::collections::BTreeMap::new();
+        loop {
+            let event = &record
+                .packed
+                .as_ref()
+                .ok_or_else(|| deterministic("missing Skill packing record".into()))?
+                .event;
+            let mut changed = false;
+            for skill in event["skills"]
+                .as_array()
+                .ok_or_else(|| deterministic("missing Skill records".into()))?
+            {
+                if skill["native"] != "pi_skill" {
+                    continue;
+                }
+                let field = |key: &str| {
+                    skill[key]
+                        .as_str()
+                        .ok_or_else(|| deterministic(format!("missing Skill {key}")))
+                };
+                if let Err(error) = hoh_core::skills::recheck_native(
+                    &self.project,
+                    Path::new(field("native_path")?),
+                    field("sha256")?,
+                ) {
+                    fallbacks.insert(field("id")?.to_owned(), error.to_string());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            let read_only = event.get("read_only").cloned();
+            let (text, mut next, paths) = self.pack_selected(
+                work,
+                &inputs.contract,
+                inputs.package.as_ref(),
+                &inputs.skills,
+                true,
+                &fallbacks,
+            )?;
+            if let (Some(value), Some(packed)) = (read_only, next.packed.as_mut()) {
+                packed.event["read_only"] = value;
+            }
+            turn.prompt = text;
+            turn.launch.skills = paths;
+            *record = next;
+        }
+    }
+
     /// The turn `work` runs, what it runs as, the fact it was checked against and the record of its prompt, or why it
     /// cannot start: an agent the binding does not name, or that its last look found unusable, is AGENT_UNAVAILABLE in
     /// the Unavailable class (docs/adr/ADR-030.md decision 6; its task waits for its role's vacancy to end, decision
@@ -887,9 +982,21 @@ impl ProductExecutor {
             },
             _ => None,
         };
-        let native_skills = matches!(&ready.facts, hoh_agents::launch::Facts::Pi { help } if hoh_agents::adapter::offers(help, "--skill"));
-        let (text, mut record, pi_skills) =
-            self.pack(work, &contract, package.as_ref(), native_skills)?;
+        let native_skills = matches!(&ready.facts, hoh_agents::launch::Facts::Pi { help } if ["--skill", "--no-skills"].iter().all(|flag| hoh_agents::adapter::offers(help, flag)));
+        let skills = self.load_skills(work)?;
+        let (text, mut record, pi_skills) = self.pack_selected(
+            work,
+            &contract,
+            package.as_ref(),
+            &skills,
+            native_skills,
+            &Default::default(),
+        )?;
+        let skill_repack = (!pi_skills.is_empty()).then_some(SkillRepack {
+            contract,
+            package,
+            skills,
+        });
         // A supervision turn's own record says what it launched in, and with codex this host's check of its sandbox
         // with its reason as prepare saw it, so an unknown check is kept with the attempt (docs/adr/ADR-032.md
         // decision 4, R2): in its context.packed, written in its RUNNING commit.
@@ -944,6 +1051,7 @@ impl ProductExecutor {
             usable,
             prepared,
             record,
+            skill_repack,
         })
     }
 
@@ -1002,6 +1110,13 @@ struct Turn {
     usable: Box<Usable>,
     prepared: Prepared,
     record: PromptRecord,
+    skill_repack: Option<SkillRepack>,
+}
+
+struct SkillRepack {
+    contract: hoh_core::prompt::Resolved,
+    package: Option<serde_json::Value>,
+    skills: hoh_core::skills::Loaded,
 }
 
 /// Decision 9's checks of `work`'s turn of `agent` (docs/adr/ADR-030.md, "prepare 的核对", M2T15D-100), in order and
@@ -1137,7 +1252,8 @@ impl Executor for ProductExecutor {
             ran,
             usable,
             mut prepared,
-            record,
+            mut record,
+            skill_repack,
         } = self.prepare(work)?;
         match &mut prepared {
             Prepared::Claude(turn) => turn.observe = self.observe.clone(),
@@ -1155,6 +1271,9 @@ impl Executor for ProductExecutor {
                 .clone()
                 .unwrap_or_else(|| ready.version.clone()),
         };
+        if let (Prepared::Pi(turn), Some(inputs)) = (&mut prepared, skill_repack) {
+            self.recheck_skills(work, &inputs, turn, &mut record)?;
+        }
         let held = match &prepared {
             Prepared::Claude(turn) => hoh_agents::claude::start(&attempt, turn, &gate),
             Prepared::Codex(turn) => hoh_agents::codex::start(&attempt, turn, &gate),

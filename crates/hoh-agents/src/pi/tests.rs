@@ -518,7 +518,7 @@ fn the_session_check_is_one_function() {
 }
 
 #[test]
-fn test_046_02_native_skill_flags_require_the_probed_option_and_keep_read_only_profile() {
+fn native_skill_flags_require_the_probed_option_and_keep_read_only_profile() {
     let mut l = launch();
     l.skills = vec![
         l.session_dir.join("skills/tdd"),
@@ -539,6 +539,7 @@ fn test_046_02_native_skill_flags_require_the_probed_option_and_keep_read_only_p
         ]
     );
     assert!(argv.iter().any(|a| a == "--no-extensions"));
+    assert!(argv.iter().any(|a| a == "--no-skills"));
     assert!(
         argv.windows(2)
             .any(|p| p == ["--tools", "read,grep,find,ls"])
@@ -550,6 +551,9 @@ fn test_046_02_native_skill_flags_require_the_probed_option_and_keep_read_only_p
         .collect::<Vec<_>>()
         .join("\n");
     assert!(matches!(args(&l), Err(Blocked(why)) if why.contains("--skill")));
+    l.help = launch().help;
+    l.help = without_declaration(&l.help, "--no-skills");
+    assert!(matches!(args(&l), Err(Blocked(why)) if why.contains("--no-skills")));
     l.skills.clear();
     assert!(args(&l).is_ok());
 }

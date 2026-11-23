@@ -547,7 +547,7 @@ async fn intake_replay_is_bound_to_the_review_and_the_computed_digest() -> R {
 }
 
 #[test]
-fn test_046_01_spec_review_work_uses_readiness_skill_phase() -> R {
+fn spec_review_work_uses_readiness_skill_phase() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-review-phase-")
         .tempdir()?;
