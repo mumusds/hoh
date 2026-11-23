@@ -209,3 +209,69 @@ async fn test_008_05_answer_and_reply_refuse_attempt_origin_before_application_a
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_04_m3l102_failed_draft_checks_committed_product_writes() -> R {
+    let world = world::World::named("m3t04-failed-draft")?;
+    world.configure(&[], "")?;
+    let host = world
+        .team_host(
+            world::Team::working(|_| Vec::new(), Duration::from_secs(3)),
+            None,
+        )
+        .await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "draft boundary on failure").await?;
+        world.staff(&run)?;
+        input(
+            &host,
+            &world,
+            &run,
+            "draft",
+            "SendInput",
+            json!({"text":"draft","target_role":null,"input_kind":"REPLY"}),
+        )
+        .await?;
+        world
+            .until(
+                "SELECT count(*) FROM attempts WHERE state='RUNNING'",
+                "1",
+                Duration::from_secs(15),
+            )
+            .await?;
+        std::fs::write(
+            world.project().join("product.rs"),
+            "outside the draft boundary",
+        )?;
+        world.git(&["add", "product.rs"])?;
+        world.git(&["commit", "-m", "scripted draft violates boundary"])?;
+        world
+            .until(
+                "SELECT count(*) FROM attempts WHERE state='FAILED'",
+                "1",
+                Duration::from_secs(15),
+            )
+            .await?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM events WHERE kind='plan.write_violation'")?,
+            "1"
+        );
+        assert_eq!(
+            world.query("SELECT state||'/'||resume_state FROM runs")?,
+            "BLOCKED/SPECIFYING"
+        );
+        assert_eq!(
+            world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,
+            "BLOCKED"
+        );
+        assert_eq!(world.query("SELECT count(*) FROM leases l JOIN attempts a ON a.attempt_id=l.attempt_id WHERE a.state IN ('PREPARED','STARTING','RUNNING')")?, "0");
+        assert_eq!(
+            std::fs::read_to_string(world.project().join("product.rs"))?,
+            "outside the draft boundary"
+        );
+        Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    result
+}

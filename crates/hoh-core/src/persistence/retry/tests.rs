@@ -418,6 +418,7 @@ async fn a_work_attempts_lines_are_kept_once_whether_or_not_its_work_was_observe
                         at: at("2026-11-07T00:00:05Z")?,
                         draw: 0,
                         observed: crate::persistence::Observed {
+                            draft_boundary: None,
                             messages: lines.clone(),
                             messages_truncated: true,
                             ..Default::default()
@@ -729,6 +730,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                 at: start + Duration::from_secs(3),
                 draw: 0,
                 observed: crate::persistence::Observed {
+                    draft_boundary: None,
                     resolved_model: Some("m-test".to_owned()),
                     usage: Some(json!({"input_tokens": 3})),
                     native_session: Some("native-1".to_owned()),
@@ -1216,6 +1218,7 @@ async fn reconcile_a1_at(at: SystemTime, records: &str) -> R<(String, f64, Strin
     // A1 holds the writer lease: its end from RUNNING carries the workspace's record, as the host gives it when the
     // store asks (REQ-019 behaviour 6, docs/adr/ADR-024.md decision 9 after round 1).
     let row = crate::persistence::UnfinishedRow {
+        draft_boundary: None,
         workspace: Some(json!({"workspace_sha256": "test"})),
         ..row.clone()
     };
@@ -1474,6 +1477,7 @@ async fn an_unknown_effect_ends_the_attempt_and_runs_nothing_again() -> R {
                 at: start + Duration::from_secs(3),
                 draw: 0,
                 observed: crate::persistence::Observed {
+                    draft_boundary: None,
                     resolved_model: Some("m-test".to_owned()),
                     ..Default::default()
                 },

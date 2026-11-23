@@ -428,6 +428,7 @@ fn outcome(facts: Facts) -> Outcome {
         group_gone: facts.group_reaped,
         class,
         observed: Observed {
+            draft_boundary: None,
             resolved_model: facts.resolved_model,
             usage: facts.usage,
             native_session,

@@ -255,6 +255,8 @@ pub struct Ending {
 /// so a full writer queue cannot lose it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
+    /// The host's Task-level draft boundary observation, applied atomically with the ending.
+    pub draft_boundary: Option<(String, Vec<String>)>,
     /// The model the agent ran (REQ-018: recorded after the attempt).
     pub resolved_model: Option<String>,
     pub usage: Option<serde_json::Value>,
@@ -1484,7 +1486,7 @@ pub(super) fn finished_in(
     ending: &Ending,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let (task_id, task_state, revision, run_id, project_id) = task_of(tx, attempt_id)?;
+    let (task_id, mut task_state, mut revision, run_id, project_id) = task_of(tx, attempt_id)?;
     let (from, cancelled): (String, bool) = tx
         .query_row(
             "SELECT state, cancel_requested FROM attempts WHERE attempt_id = ?1",
@@ -1493,6 +1495,13 @@ pub(super) fn finished_in(
         )
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
+    if !cancelled
+        && task_state == TaskState::Running
+        && let Some((detail, paths)) = &ending.observed.draft_boundary
+    {
+        super::drafting::blocked(tx, attempt_id, detail, Some(paths), ctx)?;
+        (_, task_state, revision, _, _) = task_of(tx, attempt_id)?;
+    }
     // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
     // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
     // Its effects still STARTED: none was observed (the runner observes and commits the work it saw end first).

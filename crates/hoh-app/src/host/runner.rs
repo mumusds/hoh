@@ -1904,6 +1904,10 @@ where
             json!({"attempt_id": id, "agent": ran.agent.as_str(), "detail": said.detail}),
         ));
     }
+    if !ending.success || ending.unknown_effect {
+        ending.observed.draft_boundary =
+            super::drafting::boundary(&common.shared.store, &common.shared.root, id).await?;
+    }
     hand(ending).await
 }
 
