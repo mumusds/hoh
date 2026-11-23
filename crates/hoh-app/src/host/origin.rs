@@ -304,8 +304,8 @@ fn tcp_match(text: &str, local: &str, remote: &str, uid: u32) -> Option<u64> {
     found
 }
 
-/// One directory read. A per-entry error is kept so the caller can tell "this pid is gone" from
-/// "the listing itself failed".
+/// One directory read. A per-entry error is kept. The `/proc` root refuses on any of them,
+/// because the stream ends there. A per-pid fd listing still skips a pid that is gone.
 trait ProcIo {
     fn list(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>>;
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
@@ -365,10 +365,11 @@ fn socket_owner_at(io: &impl ProcIo, root: &Path, inode: u64, uid: u32) -> Optio
     let target = PathBuf::from(format!("socket:[{inode}]"));
     let mut owner = None;
     for entry in io.list(root).ok()? {
-        let name = match entry {
-            Ok(name) => name,
-            Err(error) if process_gone(&error) => continue,
-            Err(_) => return None,
+        // A root entry error ends the directory stream, so the names after it are missing.
+        // Skipping it would truncate the scan and return an owner found before the gap.
+        // A pid that disappears is skipped only on the per-pid reads below.
+        let Ok(name) = entry else {
+            return None;
         };
         let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
