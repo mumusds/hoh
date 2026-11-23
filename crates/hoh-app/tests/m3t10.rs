@@ -341,6 +341,14 @@ INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES (
 INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES ('A','D','sd','RUNNING',1,1,1);
 "#;
 
+// Scripted prerequisite, as in supervision.rs: these tests start after the specification's review,
+// so no spec_review.waiting wake competes with the consultation/no_progress wake they count exactly.
+const CURRENT_SPEC_REVIEW: &str = r#"
+INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES (:p,'reviewed-s1',NULL,
+ 'spec_review.reported',json_object('review_id','rv-s1','spec_id','s1','spec_revision',1,'status','PASS',
+ 'state','CURRENT','reasons',json_array(),'session_id','sv','findings',json_array()),'2026-11-22T00:00:00Z');
+"#;
+
 #[tokio::test]
 async fn test_023_03_discussion_limit_follows_max_rounds() -> R {
     for max in [2, 3] {
@@ -545,7 +553,7 @@ impl hoh_app::host::Executor for FakeCommander {
             .lock()
             .map_err(|e| refused(e.to_string()))?
             .push(input.summary.clone());
-        let plan_task = |id: &str, role: &str| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":id,"title":id,"role":role,"writer":false,"depends_on":["D"],"requirement_ids":[]}]}});
+        let plan_task = |id: &str, role: &str| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":id,"title":id,"role":role,"writer":false,"depends_on":["D"],"requirement_ids":["REQ-040"]}]}});
         let payloads = match self.plan {
             Some("replan") => vec![
                 json!({"kind":"transition_task","task_id":"repeat","to_state":"CANCELLED","reason":"replace repeated failure"}),
@@ -635,6 +643,7 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
     // Seed the complete discussion before a runner can observe the partially built world and wake for STALLED.
     let host = Host::start(config(dir.path())).await?;
     sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), CURRENT_SPEC_REVIEW, false)?;
     sql(dir.path(), PARTICIPANTS, false)?;
     for n in 1..=4 {
         let reply=host.store().consult_request(message(&format!("opinion-{n}"),json!({"intent":"opinion","controversy_id":"architecture","text":format!("opinion {n}")}))?).await?.expect("discussion request must be handled before waking Commander");
@@ -662,7 +671,7 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
         true,
     )?;
     let summaries = fake.summaries.lock().map_err(|e| e.to_string())?.clone();
-    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries.len(), 1, "{summaries:#?}");
     for opinion in refs.as_array().ok_or("refs")? {
         assert!(
             summaries[0]
@@ -927,6 +936,10 @@ async fn test_023_01_consult_becomes_child_task() -> R {
         .iter()
         .find(|i| i["task_id"] == child)
         .ok_or("child on task list")?;
+    assert_eq!(shown["requirement_ids"], json!([]));
+    assert_eq!(shown["depends_on"], json!([]));
+    assert_eq!(shown["lease"], Value::Null);
+    assert_eq!(shown["revision"], tasks[0]["revision"]);
     assert_eq!(shown["parent_task_id"], "D");
     assert_eq!(shown["deadline"], "2098-01-01T00:00:00Z");
     assert_eq!(shown["budget"]["wall_seconds"], 30.0);
@@ -1789,12 +1802,20 @@ async fn test_040_04_commander_replans_or_researches_without_automatic_continue(
         let clock = std::sync::Arc::new(Clock::default());
         let plain = Host::start(config(dir.path())).await?;
         sql(dir.path(), WORLD, false)?;
+        sql(dir.path(), CURRENT_SPEC_REVIEW, false)?;
         sql(dir.path(), PARTICIPANTS, false)?;
         sql(
             dir.path(),
-            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES ('repeat','R','s1','IMPLEMENTED','developer',2)",
+            "INSERT INTO requirements(requirement_id,spec_id,title,required_release) VALUES ('REQ-040','s1','Diagnose no progress',1);
+             INSERT INTO acceptance_criteria(ac_id,requirement_id,spec_id,body,check_id) VALUES ('AC-040-04','REQ-040','s1','A diagnosis imports one replacement or research task','integration');
+             INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES ('D','REQ-040','s1');
+             INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES (:p,'initial-plan','R','plan.imported','{\"tasks\":[{\"task_id\":\"D\"}]}','2026-11-22T00:00:00Z');
+             INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES ('repeat','R','s1','IMPLEMENTED','developer',2)",
             false,
         )?;
+        // D is an existing planned dependency with observable acceptance criteria (ADR-035, ADR-039).
+        let initial_plans = events(dir.path(), "plan.imported")?.len();
+        assert_eq!(initial_plans, 1);
         for n in 1..=3 {
             round(dir.path(), n)?;
             plain
@@ -1885,7 +1906,18 @@ async fn test_040_04_commander_replans_or_researches_without_automatic_continue(
                 "CANCELLED"
             );
         }
-        assert_eq!(events(dir.path(), "plan.imported")?.len(), 1);
+        assert_eq!(
+            events(dir.path(), "plan.imported")?.len(),
+            initial_plans + 1
+        );
+        assert_eq!(
+            sql(
+                dir.path(),
+                &format!("SELECT requirement_id FROM task_requirements WHERE task_id='{id}'"),
+                true,
+            )?,
+            json!([{"requirement_id":"REQ-040"}])
+        );
         // Work D is still in flight and each new task waits for it: no new stall or work failure can request a different turn.
         for _ in 0..3 {
             clock.advance();
