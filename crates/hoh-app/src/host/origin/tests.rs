@@ -2,6 +2,7 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 type R = Result<(), Box<dyn std::error::Error>>;
@@ -414,6 +415,145 @@ fn test_008_05_tcp_mapping_and_socket_ownership_ambiguity() -> R {
     );
     assert_eq!(Peer::capture(Transport::Unknown).origin(), Origin::Unknown);
     Ok(())
+}
+
+/// One scripted `/proc`. `i32` is an errno returned to the lookup at that hold.
+#[derive(Clone, Default)]
+struct HoldIo {
+    lists: BTreeMap<PathBuf, Result<Vec<Result<std::ffi::OsString, i32>>, i32>>,
+    files: BTreeMap<PathBuf, Result<String, i32>>,
+    links: BTreeMap<PathBuf, Result<PathBuf, i32>>,
+}
+
+fn errno(code: i32) -> std::io::Error {
+    std::io::Error::from_raw_os_error(code)
+}
+
+impl ProcIo for HoldIo {
+    fn list(&self, dir: &Path) -> std::io::Result<Vec<std::io::Result<std::ffi::OsString>>> {
+        let scripted = self
+            .lists
+            .get(dir)
+            .ok_or_else(|| std::io::Error::other(format!("no list {}", dir.display())))?;
+        match scripted {
+            Ok(names) => Ok(names
+                .iter()
+                .map(|name| match name {
+                    Ok(name) => Ok(name.clone()),
+                    Err(code) => Err(errno(*code)),
+                })
+                .collect()),
+            Err(code) => Err(errno(*code)),
+        }
+    }
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        match self
+            .files
+            .get(path)
+            .ok_or_else(|| std::io::Error::other(format!("no file {}", path.display())))?
+        {
+            Ok(text) => Ok(text.clone()),
+            Err(code) => Err(errno(*code)),
+        }
+    }
+    fn read_link(&self, path: &Path) -> std::io::Result<PathBuf> {
+        match self
+            .links
+            .get(path)
+            .ok_or_else(|| std::io::Error::other(format!("no link {}", path.display())))?
+        {
+            Ok(target) => Ok(target.clone()),
+            Err(code) => Err(errno(*code)),
+        }
+    }
+}
+
+fn srch() -> i32 {
+    rustix::io::Errno::SRCH.raw_os_error()
+}
+
+/// Peer 30 holds `socket:[888]`. `other` is an unrelated same-uid pid the scan also sees.
+fn peer_with(other: impl FnOnce(&Path, &mut HoldIo)) -> (PathBuf, HoldIo) {
+    let root = PathBuf::from("/hold");
+    let mut io = HoldIo::default();
+    let status = |uid: u32| Ok(format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"));
+    io.files.insert(root.join("30/status"), status(1000));
+    io.lists.insert(
+        root.join("30/fd"),
+        Ok(vec![Ok(std::ffi::OsString::from("3"))]),
+    );
+    io.links
+        .insert(root.join("30/fd/3"), Ok(PathBuf::from("socket:[888]")));
+    io.files.insert(root.join("99/status"), status(1000));
+    io.lists.insert(
+        root.join("99/fd"),
+        Ok(vec![Ok(std::ffi::OsString::from("4"))]),
+    );
+    io.links
+        .insert(root.join("99/fd/4"), Ok(PathBuf::from("socket:[1]")));
+    io.lists.insert(
+        root.clone(),
+        Ok(vec![
+            Ok(std::ffi::OsString::from("99")),
+            Ok(std::ffi::OsString::from("30")),
+        ]),
+    );
+    other(&root, &mut io);
+    (root, io)
+}
+
+#[test]
+fn test_008_05_reaped_unrelated_process_does_not_fail_the_peer_lookup() {
+    // AC-008-05: a live user peer stays identifiable when an unrelated process is reaped during
+    // the scan. Linux reports that as ESRCH, which is not ErrorKind::NotFound. Each hold is the
+    // read that races with the exit. The peer's own reap, and a status that is unreadable for
+    // another reason, still fail closed.
+    let expect_peer = |label: &str, other: fn(&Path, &mut HoldIo)| {
+        let (root, io) = peer_with(other);
+        assert_eq!(
+            socket_owner_at(&io, &root, 888, 1000),
+            Some(30),
+            "{label}: an unrelated reap must not hide the user peer"
+        );
+    };
+    expect_peer("status", |root, io| {
+        io.files.insert(root.join("99/status"), Err(srch()));
+    });
+    expect_peer("proc-entry", |root, io| {
+        io.lists.insert(
+            root.to_path_buf(),
+            Ok(vec![Err(srch()), Ok(std::ffi::OsString::from("30"))]),
+        );
+    });
+    expect_peer("fd-dir", |root, io| {
+        io.lists.insert(root.join("99/fd"), Err(srch()));
+    });
+    expect_peer("fd-entry", |root, io| {
+        io.lists.insert(root.join("99/fd"), Ok(vec![Err(srch())]));
+    });
+    expect_peer("read-link", |root, io| {
+        io.links.insert(root.join("99/fd/4"), Err(srch()));
+    });
+    let (root, mut io) = peer_with(|_, _| {});
+    io.files.insert(root.join("30/status"), Err(srch()));
+    io.lists
+        .insert(root.clone(), Ok(vec![Ok(std::ffi::OsString::from("30"))]));
+    assert_eq!(
+        socket_owner_at(&io, &root, 888, 1000),
+        None,
+        "the peer itself being reaped is not a user"
+    );
+    let (root, io) = peer_with(|root, io| {
+        io.files.insert(
+            root.join("99/status"),
+            Err(rustix::io::Errno::ACCESS.raw_os_error()),
+        );
+    });
+    assert_eq!(
+        socket_owner_at(&io, &root, 888, 1000),
+        None,
+        "an unreadable status is not a reap; the lookup still fails closed"
+    );
 }
 
 #[tokio::test]
