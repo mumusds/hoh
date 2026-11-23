@@ -81,7 +81,7 @@
       "item": "std::process::Command::spawn",
       "count": 1,
       "owner": "host-only",
-      "reason": "run_tests, the project's detected test commands run once after the user confirms (docs/adr/ADR-039.md decision 8): its own process group, bounded, killed with it on the host's stop"
+      "reason": "run_tests, the project's detected test commands run once after the user confirms (docs/adr/ADR-039.md decision 8, DC-T07): behind a start gate until its identity is recorded against its run, its own process group, bounded, killed with it on its run's cancel or pause and on the host's stop, a group a killed host left settled by the next"
     },
     {
       "file": "crates/hoh-app/src/host/mod.rs",

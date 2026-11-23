@@ -18,6 +18,7 @@ mod baseline;
 mod blockers;
 mod candidates;
 mod closing;
+pub use baseline::BaselineProcess;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
 pub use issues::Traced;
@@ -1650,6 +1651,46 @@ impl Store {
         .await
     }
 
+    /// Record run `run_id`'s baseline test process `payload` (`{index, nonce, command, pid, boot_id,
+    /// process_start_id, log}`) before its gate opens (docs/adr/ADR-039.md decision 8, DC-T07 (1)): its event id, none
+    /// when the run no longer owns its tests (paused, pausing, cancelling, ended, or its tests recorded) and the
+    /// command must not run.
+    pub async fn baseline_process_started(
+        &self,
+        run_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<Option<String>, PersistError> {
+        match self
+            .writer
+            .runner(runner::RunnerJob::BaselineProcess {
+                run_id: run_id.to_owned(),
+                payload: Box::new(payload),
+            })
+            .await?
+        {
+            runner::RunnerDone::Process(id) => Ok(id),
+            _ => Err(PersistError::IntegrityViolation(
+                "the runner answered a baseline process record with something else".to_owned(),
+            )),
+        }
+    }
+
+    /// Record that run `run_id`'s baseline test process `process` ended, with how (`payload`), once (DC-T07 (3));
+    /// whether it was written.
+    pub async fn baseline_process_ended(
+        &self,
+        run_id: &str,
+        process: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::BaselineProcessEnded {
+            run_id: run_id.to_owned(),
+            process: process.to_owned(),
+            payload: Box::new(payload),
+        })
+        .await
+    }
+
     pub async fn mode_step(&self, run_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Mode(run_id.to_owned()))
             .await
@@ -2608,6 +2649,15 @@ impl Reader {
     /// The attempts of run `run_id` that start or run, oldest first (what a cancel must stop, ADR-021 decision 8).
     pub fn running_attempts(&self, run_id: &str) -> Result<Vec<AttemptRow>, PersistError> {
         control::running_attempts(&self.conn, run_id)
+    }
+
+    /// The project's recorded baseline test processes not known to have ended (docs/adr/ADR-039.md decision 8,
+    /// DC-T07 (3)), oldest first.
+    pub fn unsettled_baseline_processes(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<BaselineProcess>, PersistError> {
+        baseline::unsettled(&self.conn, Some(project_id), None)
     }
 
     /// The project's active attempt cancellation requests, as (run id, attempt id), without a writer job.

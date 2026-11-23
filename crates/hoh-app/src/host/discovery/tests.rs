@@ -1,5 +1,53 @@
 use super::*;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// A test's owner: it records every process (unless `refuse`), stops when `stop` says so, and keeps what it saw.
+struct Owner<'a> {
+    stop: &'a dyn Fn() -> bool,
+    refuse: bool,
+    started: Mutex<Vec<(u32, String)>>,
+    ended: Mutex<Vec<String>>,
+}
+
+impl<'a> Owner<'a> {
+    fn new(stop: &'a dyn Fn() -> bool) -> Owner<'a> {
+        Owner {
+            stop,
+            refuse: false,
+            started: Mutex::default(),
+            ended: Mutex::default(),
+        }
+    }
+}
+
+impl TestOwner for Owner<'_> {
+    fn stopping(&self) -> bool {
+        (self.stop)()
+    }
+
+    fn started(
+        &self,
+        index: usize,
+        _nonce: &str,
+        _command: &str,
+        identity: &hoh_agents::identity::Identity,
+        log: &str,
+    ) -> Result<Option<String>, String> {
+        if self.refuse {
+            return Ok(None);
+        }
+        self.started
+            .lock()
+            .expect("started")
+            .push((identity.pid, log.to_owned()));
+        Ok(Some(format!("process-{index}")))
+    }
+
+    fn ended(&self, process: &str) {
+        self.ended.lock().expect("ended").push(process.to_owned());
+    }
+}
 
 /// Whether process `pid` is gone (or a zombie no one waits for yet).
 fn gone(pid: u32) -> bool {
@@ -27,18 +75,24 @@ fn a_test_command_is_judged_by_its_exit_and_leaves_nothing_of_its_group_running(
     // docs/adr/ADR-039.md decision 8: what the command left in its group ends with it.
     let dir = tempfile::tempdir().expect("dir");
     let project = dir.path();
+    let owner = Owner::new(&|| false);
     let ran = run_tests(
         project,
-        &project.join("logs"),
+        Path::new("logs"),
         &["sleep 30 & echo $! > left.pid; echo 'test a ... FAILED'; echo 'test b ... ok'; exit 101".to_owned()],
-        &|| false,
+        &owner,
     )
     .expect("ran");
+    let log = owner.started.lock().expect("started")[0].1.clone();
+    assert!(log.starts_with("logs/0-") && log.ends_with(".log"), "{log}");
     assert_eq!(
         ran,
         json!({"commands": [{"command": "sleep 30 & echo $! > left.pid; echo 'test a ... FAILED'; echo 'test b ... ok'; exit 101",
-            "exit_code": 101, "timed_out": false, "status": "fail", "failed_tests": ["a"]}]})
+            "exit_code": 101, "timed_out": false, "incomplete": false, "status": "fail", "failed_tests": ["a"],
+            "log": log}]})
     );
+    // Recorded before it ran, its end recorded once its group was seen empty (docs/adr/ADR-039.md, DC-T07 (1), (2)).
+    assert_eq!(*owner.ended.lock().expect("ended"), ["process-0"]);
     let left: u32 = std::fs::read_to_string(project.join("left.pid"))
         .expect("pid")
         .trim()
@@ -50,9 +104,9 @@ fn a_test_command_is_judged_by_its_exit_and_leaves_nothing_of_its_group_running(
     );
     let passed = run_tests(
         project,
-        &project.join("logs2"),
+        Path::new("logs2"),
         &["true".to_owned()],
-        &|| false,
+        &Owner::new(&|| false),
     )
     .expect("ran");
     assert_eq!(passed["commands"][0]["status"], "pass");
@@ -64,18 +118,19 @@ fn the_hosts_stop_kills_a_running_test_command_with_its_group_and_records_nothin
     let dir = tempfile::tempdir().expect("dir");
     let project = dir.path();
     let start = Instant::now();
+    let stop = || start.elapsed() > Duration::from_millis(500);
+    let owner = Owner::new(&stop);
     let stopped = run_tests(
         project,
-        &project.join("logs"),
+        Path::new("logs"),
         &["sleep 30 & echo $! > left.pid; sleep 30".to_owned()],
-        &|| start.elapsed() > Duration::from_millis(500),
+        &owner,
     );
     assert!(
-        stopped
-            .as_ref()
-            .is_err_and(|e| e.contains("the host stops")),
+        stopped.as_ref().is_err_and(|e| e.contains("stopped")),
         "{stopped:?}"
     );
+    assert_eq!(*owner.ended.lock().expect("ended"), ["process-0"]);
     assert!(start.elapsed() < Duration::from_secs(10));
     let left: u32 = std::fs::read_to_string(project.join("left.pid"))
         .expect("pid")
@@ -86,4 +141,66 @@ fn the_hosts_stop_kills_a_running_test_command_with_its_group_and_records_nothin
         wait_gone(left),
         "the group's other process {left} still runs"
     );
+}
+
+#[test]
+fn a_command_whose_record_the_run_refuses_runs_nothing() {
+    // DC-T07 (1), (4): the gate opens only after the record; a run that no longer owns its tests records none, and the
+    // command behind the closed gate never runs.
+    let dir = tempfile::tempdir().expect("dir");
+    let project = dir.path();
+    let stop = || false;
+    let owner = Owner {
+        refuse: true,
+        ..Owner::new(&stop)
+    };
+    let refused = run_tests(
+        project,
+        Path::new("logs"),
+        &["touch ran".to_owned()],
+        &owner,
+    );
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("no longer owns")),
+        "{refused:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !project.join("ran").exists(),
+        "the command ran behind a closed gate"
+    );
+}
+
+#[test]
+fn a_rerun_never_truncates_an_earlier_log() {
+    // DC-T07 (3): each start writes a new log file.
+    let dir = tempfile::tempdir().expect("dir");
+    let project = dir.path();
+    let owner = Owner::new(&|| false);
+    for _ in 0..2 {
+        run_tests(
+            project,
+            Path::new("logs"),
+            &["echo once".to_owned()],
+            &owner,
+        )
+        .expect("ran");
+    }
+    let logs: Vec<String> = owner
+        .started
+        .lock()
+        .expect("started")
+        .iter()
+        .map(|(_, l)| l.clone())
+        .collect();
+    assert_eq!(logs.len(), 2);
+    assert_ne!(logs[0], logs[1]);
+    for log in &logs {
+        assert_eq!(
+            std::fs::read_to_string(project.join(log)).expect("log"),
+            "once\n"
+        );
+    }
 }
