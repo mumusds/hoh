@@ -573,12 +573,6 @@ fn test_008_05_reaped_unrelated_process_does_not_fail_the_peer_lookup() {
     expect_peer("status", |root, io| {
         io.files.insert(root.join("99/status"), Err(srch()));
     });
-    expect_peer("proc-entry", |root, io| {
-        io.lists.insert(
-            root.to_path_buf(),
-            Ok(vec![Err(srch()), Ok(std::ffi::OsString::from("30"))]),
-        );
-    });
     expect_peer("fd-dir", |root, io| {
         io.lists.insert(root.join("99/fd"), Err(srch()));
     });
@@ -607,6 +601,37 @@ fn test_008_05_reaped_unrelated_process_does_not_fail_the_peer_lookup() {
         socket_owner_at(&io, &root, 888, 1000),
         None,
         "an unreadable status is not a reap; the lookup still fails closed"
+    );
+}
+
+#[test]
+fn test_008_05_proc_root_entry_error_refuses_the_scan() {
+    // A root entry error is not a reaped pid. `ReadDir` ends the listing at that error, so
+    // skipping it would truncate the scan and could return an owner found before the gap.
+    // Gone pids are skipped only on the per-pid reads (status, fd, readlink).
+    let refuse = |label: &str, code: i32, peer_first: bool| {
+        let (root, io) = peer_with(|root, io| {
+            let peer = Ok(std::ffi::OsString::from("30"));
+            let broken = Err(code);
+            let names = if peer_first {
+                vec![peer, broken]
+            } else {
+                vec![broken, peer]
+            };
+            io.lists.insert(root.to_path_buf(), Ok(names));
+        });
+        assert_eq!(
+            socket_owner_at(&io, &root, 888, 1000),
+            None,
+            "{label}: a /proc root entry error refuses the scan"
+        );
+    };
+    refuse("esrch-after-peer", srch(), true);
+    refuse("esrch-before-peer", srch(), false);
+    refuse(
+        "enoent-before-peer",
+        rustix::io::Errno::NOENT.raw_os_error(),
+        false,
     );
 }
 
