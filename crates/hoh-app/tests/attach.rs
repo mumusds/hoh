@@ -1204,6 +1204,71 @@ fn a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended() -> R 
 }
 
 #[test]
+fn a_helper_spawn_that_failed_is_not_held_as_spawned() -> R {
+    // FLK-07 (the hold points of docs/adr/ADR-031.md, 设计修正 2): `helper-spawned` holds a helper once its spawn
+    // returned it, before its hand-off; a spawn that failed returned none and is not held there. Here this process holds
+    // the fake systemd-run open for writing, so each exec of it fails ETXTBSY, as when another test's child forked while
+    // the script was being written still holds that descriptor before its own exec (the race the probe retries, now and
+    // then under load): the probe gives up within its 2 s bound and the client goes on to launch the host
+    // (`before-launch`), never at `helper-spawned`. Before, the first failed spawn was held there for 30 s, so
+    // a_signal_between_a_helpers_spawn_and_its_registration_leaves_it_ended took it for its probe and waited in vain for
+    // the stand-in ("the stand-in never started", m3t10 frozen integration retry 1).
+    let Some(user) = lingering_user() else {
+        return prerequisites::missing("no linger record for this user, or no cgroup v2, here");
+    };
+    let env = Env::new()?;
+    let _daemons = Daemons(env.project());
+    let (path, runtime, pid_file) = sleeping_systemd_run(&env)?;
+    let busy = std::fs::OpenOptions::new()
+        .append(true)
+        .open(env.dir.path().join("bin/systemd-run"))?;
+    let holds = env.dir.path().join("holds");
+    std::fs::create_dir_all(&holds)?;
+    for hold in ["helper-spawned", "before-launch"] {
+        std::fs::write(holds.join(hold), "")?;
+    }
+    let mut client = Kid(Some(
+        env.command(&["-p", "x", "--output", "json"])
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("USER", &user)
+            .env("PATH", env.path(&path))
+            .env("HOH_DEBUG_HOLD_DIR", &holds)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    ));
+    let first = (|| -> R<&str> {
+        let end = Instant::now() + LIMIT;
+        loop {
+            for hold in ["helper-spawned", "before-launch"] {
+                if holds.join(format!("{hold}.reached")).exists() {
+                    return Ok(hold);
+                }
+            }
+            if let Some(status) = client.get_mut()?.try_wait()? {
+                return Err(format!("the client ended before either hold: {status}").into());
+            }
+            if Instant::now() > end {
+                return Err("neither hold was reached".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    // Ended while still held, so it launches nothing; then nothing stays held.
+    drop(client);
+    for hold in ["helper-spawned", "before-launch"] {
+        let _ = std::fs::remove_file(holds.join(hold));
+    }
+    drop(busy);
+    assert_eq!(first?, "before-launch");
+    assert!(
+        !pid_file.exists(),
+        "the fake systemd-run ran though it was busy"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_helper_start_in_flight_past_the_stops_bound_is_said_and_the_client_ends() -> R {
     // ADR-031, 设计修正 2, A and D (CLT-400; verification 2): `hoh -p`'s probe start is held with its ticket taken,
     // before its spawn, past the stop's 1.5 s bound; SIGINT ends the client with 130 within its bounds, and its exit
