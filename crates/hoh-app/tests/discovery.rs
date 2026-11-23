@@ -8,6 +8,7 @@ mod world;
 use hoh_app::host::Host;
 use hoh_core::specindex::{self, Index, Source};
 use serde_json::{Value, json};
+use std::path::Path;
 use std::time::Duration;
 use world::{R, World};
 
@@ -481,6 +482,23 @@ async fn test_028_02_confirmed_test_run_excludes_baseline_failures() -> R {
     assert_eq!(commands[0]["command"], "cargo test", "{tested}");
     assert_eq!(commands[0]["status"], "fail", "{tested}");
     assert_eq!(commands[0]["failed_tests"], json!(["fails"]), "{tested}");
+    assert_eq!(commands[0]["incomplete"], json!(false), "{tested}");
+    // Its process was recorded before it ran and its end once its group was gone (DC-T07 (1), (2)).
+    let log = commands[0]["log"].as_str().ok_or("no log")?;
+    assert!(world.project().join(log).is_file(), "{tested}");
+    assert_eq!(
+        world.query(&format!(
+            "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_process' \
+             AND json_extract(payload_json,'$.log')='{log}'"
+        ))?,
+        "1"
+    );
+    assert!(
+        host.store()
+            .reader()?
+            .unsettled_baseline_processes(&world.query("SELECT project_id FROM projects")?)?
+            .is_empty()
+    );
     // Run once.
     assert_eq!(std::fs::read_to_string(&runs)?, "ran\n");
     // A later candidate on which the same test still fails, and one more: only the new one is HoH's regression.
@@ -512,9 +530,322 @@ async fn test_028_02_confirmed_test_run_excludes_baseline_failures() -> R {
     let (_, body) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
     assert_eq!(
         body["projection"]["regression"],
-        json!({"candidate_id": candidate, "baseline_failed": ["fails"], "candidate_failed": ["fails", "newly_broken"],
-            "introduced": ["newly_broken"]}),
+        json!({"candidate_id": candidate, "baseline_complete": true, "baseline_failed": ["fails"],
+            "candidate_failed": ["fails", "newly_broken"], "introduced": ["newly_broken"],
+            "not_in_baseline": ["newly_broken"]}),
         "{body}"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+/// A project whose only detected test command is `make test`: its recipe appends its shell's pid to `marker`, says one
+/// line, waits until `release` exists, then reports one failing test. Committed.
+fn make_project(world: &World, marker: &Path, release: &Path) -> R<Index> {
+    let index = brownfield(world)?;
+    std::fs::remove_file(world.project().join("Cargo.toml"))?;
+    std::fs::write(
+        world.project().join("Makefile"),
+        format!(
+            "test:\n\t@sh -c 'echo $$$$ >> {}; echo partial; while [ ! -f {} ]; do sleep 0.1; done; \
+             echo \"test known ... FAILED\"; exit 1'\n",
+            marker.display(),
+            release.display()
+        ),
+    )?;
+    world.git(&["add", "-A"])?;
+    world.git(&["commit", "-qm", "make test"])?;
+    Ok(index)
+}
+
+/// The pids `marker` lists, one per run of the test command.
+fn started(marker: &Path) -> Vec<u32> {
+    std::fs::read_to_string(marker)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+/// Wait (at most 60 s) until `marker` lists `n` runs: the last one's process group.
+async fn nth_started(marker: &Path, n: usize) -> R<u32> {
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let pids = started(marker);
+        if pids.len() >= n {
+            let pid = pids[n - 1];
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+            let (_, rest) = stat.rsplit_once(") ").ok_or("no stat")?;
+            return Ok(rest.split_whitespace().nth(2).ok_or("no pgrp")?.parse()?);
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("the test command did not start {n} times: {pids:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// SIGKILLs a process group when dropped, however the test ends (cleanup only).
+struct GroupGuard(u32);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = i32::try_from(self.0)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+/// Run `run`'s `kind` control command (PauseRun, ResumeRun, CancelRun), accepted.
+async fn control(host: &Host, run: &str, kind: &str) -> R {
+    let body = command(host, run, kind, kind, json!({"reason": kind})).await?;
+    let (status, response) = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(status, 202, "{kind}: {response}");
+    Ok(())
+}
+
+/// Wait (at most `limit`) until run `run` is in `state`; whether group `pgid` was empty when it first was.
+async fn group_empty_at(
+    world: &World,
+    run: &str,
+    state: &str,
+    pgid: u32,
+    limit: Duration,
+) -> R<bool> {
+    let end = std::time::Instant::now() + limit;
+    loop {
+        let now = world.query(&format!("SELECT state FROM runs WHERE run_id='{run}'"))?;
+        if now == state {
+            return Ok(hoh_agents::identity::group_empty(pgid));
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!("run {run} is {now}, not {state}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The user's confirmed baseline test run of a fresh `make test` project, its run in DISCOVERING: the host, the run.
+async fn confirmed(world: &World, marker: &Path, release: &Path) -> R<(Host, String)> {
+    let index = make_project(world, marker, release)?;
+    let (host, run) = approved(world, &index).await?;
+    let entered = decide(
+        world,
+        &host,
+        &run,
+        "discover",
+        world::transition("DISCOVERING"),
+    )
+    .await?;
+    assert!(
+        matches!(entered, hoh_core::persistence::Decided::Applied { .. }),
+        "{entered:?}"
+    );
+    answer_tests(world, &host, &run, "run").await?;
+    Ok((host, run))
+}
+
+fn count(world: &World, run: &str, kind: &str) -> R<String> {
+    world.query(&format!(
+        "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='{kind}'"
+    ))
+}
+
+#[tokio::test]
+async fn test_028_02_a_cancel_ends_the_baseline_test_command_before_the_run_is_cancelled() -> R {
+    // M3N-003 (docs/adr/ADR-039.md decision 8, DC-T07 (2)): CancelRun while the confirmed `make test` runs is not
+    // CANCELLED until the command's process group is gone; nothing of the interrupted run is recorded.
+    let world = World::new()?;
+    let (marker, release) = (world.root().join("started"), world.root().join("release"));
+    let (host, run) = confirmed(&world, &marker, &release).await?;
+    let pgid = nth_started(&marker, 1).await?;
+    let _guard = GroupGuard(pgid);
+    control(&host, &run, "CancelRun").await?;
+    assert!(
+        group_empty_at(&world, &run, "CANCELLED", pgid, Duration::from_secs(60)).await?,
+        "the run is CANCELLED while its baseline test command's group {pgid} lives"
+    );
+    assert_eq!(count(&world, &run, "run.baseline_tests")?, "0");
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_a_pause_ends_the_baseline_test_command_and_the_resumed_run_reruns_it() -> R {
+    // M3N-051 (DC-T07 (2), (3), (4)): PauseRun while the command runs is not PAUSED until its group is gone; the paused
+    // run starts nothing; resumed, the command runs again with a new log, the interrupted run's log kept.
+    let world = World::new()?;
+    let (marker, release) = (world.root().join("started"), world.root().join("release"));
+    let (host, run) = confirmed(&world, &marker, &release).await?;
+    let pgid = nth_started(&marker, 1).await?;
+    let _guard = GroupGuard(pgid);
+    control(&host, &run, "PauseRun").await?;
+    assert!(
+        group_empty_at(&world, &run, "PAUSED", pgid, Duration::from_secs(60)).await?,
+        "the run is PAUSED while its baseline test command's group {pgid} lives"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(started(&marker).len(), 1, "a paused run started its tests");
+    assert_eq!(count(&world, &run, "run.baseline_tests")?, "0");
+    let first: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_process' ORDER BY seq LIMIT 1"
+    ))?)?;
+    let first_log = world.project().join(first["log"].as_str().ok_or("no log")?);
+    std::fs::write(&release, b"")?;
+    control(&host, &run, "ResumeRun").await?;
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(60),
+        )
+        .await?;
+    assert_eq!(started(&marker).len(), 2);
+    let tested: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+    ))?)?;
+    assert_eq!(
+        tested["commands"][0]["failed_tests"],
+        json!(["known"]),
+        "{tested}"
+    );
+    assert_eq!(
+        tested["commands"][0]["incomplete"],
+        json!(false),
+        "{tested}"
+    );
+    let second = world
+        .project()
+        .join(tested["commands"][0]["log"].as_str().ok_or("no log")?);
+    assert_ne!(second, first_log);
+    assert_eq!(
+        std::fs::read_to_string(&first_log)?,
+        "partial\n",
+        "the interrupted run's log is kept"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_a_new_host_kills_the_group_a_killed_host_left_and_keeps_its_log() -> R {
+    // M3N-050 (DC-T07 (1), (3)): the product records its baseline test process before the command can run. A host
+    // SIGKILLed while it ran left that group running, not its child: here the state such a host leaves, a live group
+    // in a process group of its own, its identity recorded as the product records it, its partial log. The next host
+    // kills and reaps it before it reruns the command, keeps that log and writes the rerun's to a new one.
+    let world = World::new()?;
+    let (marker, release) = (world.root().join("started"), world.root().join("release"));
+    let (host, run) = confirmed(&world, &marker, &release).await?;
+    let pgid = nth_started(&marker, 1).await?;
+    let _first = GroupGuard(pgid);
+    let recorded: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_process'"
+    ))?)?;
+    assert_eq!(recorded["pid"], json!(pgid), "{recorded}");
+    assert!(
+        recorded["boot_id"].is_string() && recorded["process_start_id"].is_string(),
+        "{recorded}"
+    );
+    host.shutdown().await;
+    // What a host killed at this point leaves: the group alive, recorded, not ended.
+    let log = format!(".hoh/baseline/{run}/0-crashed.log");
+    let out = std::fs::File::create(world.project().join(&log))?;
+    let mut left = {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo $$ >> \"$1\"; echo partial; while :; do sleep 0.1; done",
+                "left",
+            ])
+            .arg(&marker)
+            .current_dir(world.project())
+            .stdin(std::process::Stdio::null())
+            .stdout(out.try_clone()?)
+            .stderr(out)
+            .process_group(0)
+            .spawn()?
+    };
+    let left_pid = left.id();
+    let _left = GroupGuard(left_pid);
+    nth_started(&marker, 2).await?;
+    let identity = hoh_agents::identity::of(left_pid)?.ok_or("no identity")?;
+    world.exec(&format!(
+        "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at)
+         VALUES(:p,'{run}/baseline/process/0/crashed','{run}','run.baseline_process',
+           json_object('run_id','{run}','index',0,'nonce','crashed','command','make test','pid',{pid},
+             'boot_id','{boot}','process_start_id','{start}','log','{log}'),'2026-11-22T00:00:00Z');",
+        pid = identity.pid,
+        boot = identity.boot_id,
+        start = identity.start_id,
+    ))?;
+    let reaped = std::thread::spawn(move || left.wait());
+    let host = world.start_plain_host(None).await?;
+    // Killed and reaped before the rerun starts; its log kept as it was.
+    let status = tokio::task::spawn_blocking(move || reaped.join())
+        .await?
+        .map_err(|_| "the reaper panicked")??;
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(9),
+        "{status:?}"
+    );
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_process_ended' \
+                 AND json_extract(payload_json,'$.process')='{run}/baseline/process/0/crashed'"
+            ),
+            "1",
+            Duration::from_secs(20),
+        )
+        .await?;
+    let settled: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_process_ended' \
+         AND json_extract(payload_json,'$.process')='{run}/baseline/process/0/crashed'"
+    ))?)?;
+    assert_eq!(settled["settled_by"], "reconcile", "{settled}");
+    assert_eq!(settled["partial"], true, "{settled}");
+    assert_eq!(
+        std::fs::read_to_string(world.project().join(&log))?,
+        "partial\n"
+    );
+    std::fs::write(&release, b"")?;
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(60),
+        )
+        .await?;
+    assert_eq!(started(&marker).len(), 3, "the rerun ran once");
+    let order: Vec<Value> = world.rows(&format!(
+        "SELECT kind, json_extract(payload_json,'$.process') AS process, json_extract(payload_json,'$.log') AS log
+         FROM events WHERE run_id='{run}' AND kind LIKE 'run.baseline_process%' ORDER BY seq"
+    ))?;
+    let ended = order
+        .iter()
+        .position(|e| e["process"] == json!(format!("{run}/baseline/process/0/crashed")))
+        .ok_or("not ended")?;
+    let rerun = order
+        .iter()
+        .rposition(|e| e["kind"] == "run.baseline_process")
+        .ok_or("no rerun")?;
+    assert!(
+        ended < rerun,
+        "the group was settled before the rerun started: {order:?}"
+    );
+    assert_ne!(order[rerun]["log"], json!(log));
+    assert_eq!(
+        std::fs::read_to_string(world.project().join(&log))?,
+        "partial\n"
     );
     host.shutdown().await;
     Ok(())

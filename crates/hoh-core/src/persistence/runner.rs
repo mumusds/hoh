@@ -94,6 +94,17 @@ pub(super) enum RunnerJob {
         run_id: String,
         payload: Box<Value>,
     },
+    /// A baseline test command's process, recorded before its gate opens (docs/adr/ADR-039.md decision 8, DC-T07).
+    BaselineProcess {
+        run_id: String,
+        payload: Box<Value>,
+    },
+    /// A recorded baseline test process that ended.
+    BaselineProcessEnded {
+        run_id: String,
+        process: String,
+        payload: Box<Value>,
+    },
     /// Only the session.start notices waiting in a project (docs/adr/ADR-024.md decision 4), its runner's second look
     /// after a checkpoint or a staffing write (M2T17R-156).
     SessionStarts(String),
@@ -215,6 +226,8 @@ pub(super) enum RunnerDone {
     Stops(Vec<super::wakes::Stop>),
     Repair(super::retry::RepairVerdict),
     Stall(super::stall::Detected),
+    /// A baseline test process's record: its event id, none when the run no longer owns its tests.
+    Process(Option<String>),
 }
 
 /// How an attempt ended, as the runner reports it (ADR-020 decisions 1 and 3).
@@ -484,6 +497,15 @@ pub(super) fn run(
         RunnerJob::BaselineTests { run_id, payload } => {
             super::baseline::record_tests(conn, &run_id, *payload, ctx).map(RunnerDone::Applied)
         }
+        RunnerJob::BaselineProcess { run_id, payload } => {
+            super::baseline::process_started(conn, &run_id, *payload, ctx).map(RunnerDone::Process)
+        }
+        RunnerJob::BaselineProcessEnded {
+            run_id,
+            process,
+            payload,
+        } => super::baseline::process_ended(conn, &run_id, &process, *payload, ctx)
+            .map(RunnerDone::Applied),
         RunnerJob::Pace { run_id, context } => {
             super::retry::pace(conn, &run_id, &context, ctx).map(RunnerDone::Paced)
         }

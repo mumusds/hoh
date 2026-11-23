@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -43,25 +44,164 @@ struct Common {
     project: PathBuf,
     canceller: Canceller,
     cancelling: Mutex<BTreeSet<String>>,
-    /// The runs whose baseline tests run now.
-    testing: Mutex<BTreeSet<String>>,
+    /// The runs whose baseline tests this host runs now, each with its stop: set by the run's cancel or pause, the
+    /// command is killed with its group (docs/adr/ADR-039.md decision 8, DC-T07 (2)).
+    testing: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
     /// Set when the host stops: a baseline test command running then is killed with its group.
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
-/// Run `run`'s confirmed baseline test `commands` off the async threads and record them; a failure is said and the
-/// next tick tries again (docs/adr/ADR-039.md decision 8).
-async fn baseline_tests(common: &Arc<Common>, run: &str, commands: Vec<String>) {
+/// How long a recorded baseline test group a settle killed may take to empty.
+const BASELINE_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// The owner of a run's baseline test commands on this host (DC-T07): it records their processes through the store
+/// from the blocking thread that runs them.
+struct BaselineOwner {
+    common: Arc<Common>,
+    run: String,
+    stop: Arc<AtomicBool>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl super::discovery::TestOwner for BaselineOwner {
+    fn stopping(&self) -> bool {
+        self.common.stopping.load(Ordering::SeqCst) || self.stop.load(Ordering::SeqCst)
+    }
+
+    fn started(
+        &self,
+        index: usize,
+        nonce: &str,
+        command: &str,
+        identity: &identity::Identity,
+        log: &str,
+    ) -> Result<Option<String>, String> {
+        let payload = json!({"index": index, "nonce": nonce, "command": command, "pid": identity.pid,
+            "boot_id": identity.boot_id, "process_start_id": identity.start_id, "log": log});
+        self.runtime
+            .block_on(
+                self.common
+                    .shared
+                    .store
+                    .baseline_process_started(&self.run, payload),
+            )
+            .map_err(|e| format!("{command}: its process could not be recorded: {e}"))
+    }
+
+    fn ended(&self, process: &str) {
+        if let Err(e) = self
+            .runtime
+            .block_on(self.common.shared.store.baseline_process_ended(
+                &self.run,
+                process,
+                json!({"settled_by": "host"}),
+            ))
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: the end of baseline process {process}: {e}"
+            );
+        }
+    }
+}
+
+/// Settle the project's recorded baseline test processes not known to have ended, but those of the runs this host
+/// tests now (docs/adr/ADR-039.md decision 8, DC-T07 (3)): one whose whole recorded identity still matches is killed
+/// with its group (SIGKILL) and its group must be seen empty; one gone is recorded ended; one whose presence cannot be
+/// told (its leader gone with members left, an incomplete record, a failed look) gets no signal and stays open. Its
+/// log is kept as it is.
+async fn settle_baseline(common: &Arc<Common>) {
+    use std::io::Write as _;
+    let project = common.shared.project_id.clone();
+    let unsettled = match super::http::read(&common.shared, move |reader| {
+        reader.unsettled_baseline_processes(&project)
+    })
+    .await
+    {
+        Ok(unsettled) => unsettled,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "hoh host: baseline processes: {e}");
+            return;
+        }
+    };
+    let testing: BTreeSet<String> = common
+        .testing
+        .lock()
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    for process in unsettled {
+        if testing.contains(&process.run_id) {
+            continue;
+        }
+        let (pid, boot, start) = (
+            process.pid,
+            process.boot_id.clone(),
+            process.process_start_id.clone(),
+        );
+        let seen = super::begun::spawn_blocking(move || {
+            match identity::presence(pid, boot.as_deref(), start.as_deref()) {
+                Ok(Presence::Ours(found)) => {
+                    found.kill();
+                    (found.wait(BASELINE_KILL_GRACE) == identity::Group::Empty)
+                        .then(|| json!({"ours": "killed"}))
+                }
+                Ok(Presence::Gone(gone)) => Some(json!({"gone": gone.basis()})),
+                Ok(Presence::Leaderless(_) | Presence::Unverifiable) | Err(_) => None,
+            }
+        })
+        .await;
+        let Ok(Some(seen)) = seen else {
+            continue;
+        };
+        if let Err(e) = common
+            .shared
+            .store
+            .baseline_process_ended(
+                &process.run_id,
+                &process.process_id,
+                json!({"settled_by": "reconcile", "seen": seen, "partial": true, "log": process.log}),
+            )
+            .await
+        {
+            let _ = writeln!(
+                std::io::stderr(),
+                "hoh host: the end of baseline process {}: {e}",
+                process.process_id
+            );
+        }
+    }
+}
+
+/// Ask this host's baseline test commands of run `run`, if any, to stop (its cancel or pause, DC-T07 (2)).
+fn stop_baseline(common: &Common, run: &str) {
+    if let Ok(testing) = common.testing.lock()
+        && let Some(stop) = testing.get(run)
+    {
+        stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Run `run`'s confirmed baseline test `commands` off the async threads, owned by this host until `stop` (its cancel or
+/// pause) or the host's stop, and record them; a failure is said and the next tick tries again while the run owns
+/// them (docs/adr/ADR-039.md decision 8, DC-T07).
+async fn baseline_tests(
+    common: &Arc<Common>,
+    run: &str,
+    commands: Vec<String>,
+    stop: Arc<AtomicBool>,
+) {
     use std::io::Write as _;
     let project = common.project.clone();
-    let log_dir = project
-        .join(".hoh/baseline")
-        .join(run.replace('%', "%25").replace('/', "%2F"));
-    let stopping = common.stopping.clone();
+    let log_dir = PathBuf::from(".hoh/baseline").join(run.replace('%', "%25").replace('/', "%2F"));
+    let owner = BaselineOwner {
+        common: common.clone(),
+        run: run.to_owned(),
+        stop,
+        runtime: tokio::runtime::Handle::current(),
+    };
     let ran = super::begun::spawn_blocking(move || {
-        super::discovery::run_tests(&project, &log_dir, &commands, &|| {
-            stopping.load(std::sync::atomic::Ordering::SeqCst)
-        })
+        super::discovery::run_tests(&project, &log_dir, &commands, &owner)
     })
     .await;
     match ran {
@@ -112,9 +252,12 @@ pub(super) async fn run(
         project,
         canceller: Canceller::new(graces, LOOK_EVERY),
         cancelling: Mutex::new(BTreeSet::new()),
-        testing: Mutex::new(BTreeSet::new()),
-        stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        testing: Mutex::new(BTreeMap::new()),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
+    // A recorded baseline test group an earlier host left is settled before anything else touches the baseline
+    // (DC-T07 (3)); each tick settles again what could not be told then.
+    settle_baseline(&common).await;
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         if *stop.borrow() {
@@ -132,11 +275,9 @@ pub(super) async fn run(
         }
     }
     // The host stops: a cancel in progress is left to the next host (its reconcile stops the processes and its loop
-    // finishes the cancel); a baseline test command running is killed with its group, unrecorded (the next host runs
-    // it again).
-    common
-        .stopping
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // finishes the cancel); a baseline test command running is killed with its group, its tests unrecorded (the next
+    // host runs them again).
+    common.stopping.store(true, Ordering::SeqCst);
     for task in tasks {
         task.abort();
         let _ = task.await;
@@ -155,7 +296,12 @@ async fn tick(
     for run in &waiting.mode_changes {
         held.item(store.mode_step(run).await)?;
     }
+    // A recorded baseline test group of no command this host runs: settled (DC-T07 (3)).
+    settle_baseline(common).await;
+    // A pausing run's baseline test command is stopped first: the run is PAUSED only once its group is gone (the store
+    // counts its record until its end is recorded, DC-T07 (2)).
     for run in &waiting.pausing {
+        stop_baseline(common, run);
         held.item(store.pause_step(run, common.clock.now()).await)?;
     }
     // Each run in DISCOVERING without its baseline: the project's read-only discovery, then its run.baseline
@@ -182,15 +328,22 @@ async fn tick(
     // Each run whose user confirmed the baseline's test run: its test commands once, in a task of its own (they may
     // take long; the loop goes on), recorded as run.baseline_tests (docs/adr/ADR-039.md decision 8).
     for (run, commands) in waiting.baseline_tests {
+        let stop = Arc::new(AtomicBool::new(false));
         let new = common
             .testing
             .lock()
-            .map(|mut t| t.insert(run.clone()))
+            .map(|mut t| match t.entry(run.clone()) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(stop.clone());
+                    true
+                }
+                std::collections::btree_map::Entry::Occupied(_) => false,
+            })
             .unwrap_or(false);
         if new {
             let common = common.clone();
             tasks.push(super::begun::spawn(async move {
-                baseline_tests(&common, &run, commands).await;
+                baseline_tests(&common, &run, commands, stop).await;
                 if let Ok(mut t) = common.testing.lock() {
                     t.remove(&run);
                 }
@@ -266,6 +419,11 @@ async fn cancel(common: &Arc<Common>, run_id: &str) {
         };
         if !whole_run && ids.is_empty() {
             return;
+        }
+        // The run's baseline test command stops first: the run is CANCELLED only once its group is gone (the store
+        // counts its record until its end is recorded, DC-T07 (2)).
+        if whole_run {
+            stop_baseline(common, run_id);
         }
         // What this host runs for the run stops first, so the cancel alone ends its attempts (one writer, ADR-021
         // decision 8c); a native interrupt goes to the work it was given.

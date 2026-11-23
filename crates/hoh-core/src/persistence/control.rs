@@ -275,6 +275,11 @@ fn pause_step(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
+    // A baseline test command of the run counts while its process is not known to have ended: the run is not PAUSED
+    // while it can still write the project (docs/adr/ADR-039.md decision 8, DC-T07 (2)).
+    let running = running.saturating_add(
+        i64::try_from(super::baseline::unsettled_count(&tx, run_id)?).unwrap_or(i64::MAX),
+    );
     let step = if running > 0 {
         PauseStep::Running(usize::try_from(running).unwrap_or(usize::MAX))
     } else {
@@ -493,6 +498,10 @@ fn finish_cancel(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
+    // Nor CANCELLED while a baseline test process of the run is not known to have ended (DC-T07 (2), CONTRACT 13).
+    let running = running.saturating_add(
+        i64::try_from(super::baseline::unsettled_count(&tx, run_id)?).unwrap_or(i64::MAX),
+    );
     if running > 0 {
         return Ok(Finished::Running(
             usize::try_from(running).unwrap_or(usize::MAX),
