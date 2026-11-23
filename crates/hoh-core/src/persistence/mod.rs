@@ -73,7 +73,6 @@ pub use completion::{
     SelfTests, VerifierCompleted, VerifierCompletion, VerifierOutcome, VerifierReport,
     WriterCompleted, WriterCompletion, WriterOutcome,
 };
-pub use consult::TasksPage;
 pub use control::{CancelPass, Finished, PauseStep};
 pub use evidence::{AcceptanceKey, AcceptanceRow, Recording, RecordingSource};
 pub use handover::{SessionStart, package_bytes};
@@ -2408,16 +2407,6 @@ impl Reader {
     /// transaction; none when there is no such run.
     pub fn acceptance(&self, run_id: &str) -> Result<Option<AcceptanceView>, PersistError> {
         snapshot::acceptance(&self.conn, run_id)
-    }
-
-    /// A page of ledger tasks, including consultation parent, bounds, dependencies and lease holder.
-    pub fn tasks_page(
-        &self,
-        run_id: &str,
-        limit: usize,
-        after: Option<i64>,
-    ) -> Result<Option<TasksPage>, PersistError> {
-        consult::page(&self.conn, run_id, limit, after)
     }
 
     /// A page of run `run_id`'s acceptance projection, newest candidate first (openapi `listAcceptance`): at most

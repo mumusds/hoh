@@ -170,6 +170,12 @@ pub struct TaskItem {
     pub depends_on: Vec<String>,
     /// `{kind, attempt_id}` of the lease one of its attempts holds.
     pub lease: Option<Value>,
+    /// The consultation projection's aliases retain the same dependencies and lease holder.
+    pub dependencies: Vec<String>,
+    pub lease_holder: Option<String>,
+    /// Revision, parent, deadline and budget from the consultation ledger (ADR-037).
+    #[serde(flatten)]
+    pub details: Value,
 }
 
 /// A page of [`TaskItem`]s by creation order: the next page's cursor (the last item's created_seq and id) when there
@@ -224,6 +230,8 @@ pub(super) fn tasks_page(
                         Ok(serde_json::from_str(&r.get::<_, String>(i)?).unwrap_or_default())
                     };
                     let lease: Option<String> = r.get(8)?;
+                    let lease = lease.and_then(|l| serde_json::from_str::<Value>(&l).ok());
+                    let dependencies = text(7)?;
                     Ok((
                         r.get::<_, i64>(5)?,
                         TaskItem {
@@ -233,8 +241,14 @@ pub(super) fn tasks_page(
                             writer: r.get(3)?,
                             spec_id: r.get(4)?,
                             requirement_ids: text(6)?,
-                            depends_on: text(7)?,
-                            lease: lease.and_then(|l| serde_json::from_str(&l).ok()),
+                            depends_on: dependencies.clone(),
+                            dependencies,
+                            lease_holder: lease
+                                .as_ref()
+                                .and_then(|l| l["attempt_id"].as_str())
+                                .map(str::to_owned),
+                            lease,
+                            details: Value::Null,
                         },
                     ))
                 },
@@ -250,6 +264,9 @@ pub(super) fn tasks_page(
             })
             .flatten();
         items.truncate(limit);
+        for (_, item) in &mut items {
+            item.details = super::consult::task_details(conn, &item.task_id)?;
+        }
         Ok(Some(TasksPage {
             items: items.into_iter().map(|(_, t)| t).collect(),
             next,
