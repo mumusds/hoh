@@ -16,7 +16,6 @@ pub fn phase(
     }
     match kind {
         "spec_draft" => Some("specify"),
-        "spec_review" => Some("readiness"),
         "work" => match role {
             "developer" if writer => Some(if rework { "repair" } else { "implement" }),
             "qa" => Some("verify"),

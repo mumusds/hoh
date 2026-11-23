@@ -94,6 +94,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
         cwd: repo.clone(),
         session_dir: world.dir.path().join(".hoh/pi-sessions/S1"),
         session_id: session_id.clone(),
+        skills: Vec::new(),
         resume: false,
         provider: None,
         model: None,

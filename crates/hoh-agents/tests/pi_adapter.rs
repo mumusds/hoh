@@ -148,6 +148,7 @@ impl Fakes for World {
             cwd: self.dir.path().to_path_buf(),
             session_dir: self.dir.path().join(".hoh/pi-sessions").join(session),
             session_id: format!("01a1-hoh-{session}"),
+            skills: Vec::new(),
             resume: false,
             provider: None,
             model: None,

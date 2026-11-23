@@ -111,6 +111,7 @@ pub(super) fn prepare(
                 program: launcher.to_path_buf(),
                 help: launch::stdout_of(launcher, &["--help"], env)?,
                 cwd: work.to_path_buf(),
+                skills: Vec::new(),
                 session_dir: work.join("..").join("pi-sessions"),
                 session_id: std::fs::read_to_string("/proc/sys/kernel/random/uuid")
                     .map(|s| s.trim().to_owned())

@@ -55,6 +55,8 @@ pub struct Launch {
     pub session_dir: PathBuf,
     /// The session's id, chosen by HoH and kept for every turn of it.
     pub session_id: String,
+    /// Explicit session-local Skills selected by the host; never installed in user directories.
+    pub skills: Vec<PathBuf>,
     /// The session existed before: its file must be in `session_dir`.
     pub resume: bool,
     pub provider: Option<String>,
@@ -165,6 +167,12 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
             "--no-mcp".to_owned(),
             "--no-extensions".to_owned(),
         ]);
+    }
+    if !launch.skills.is_empty() && !offers(&launch.help, "--skill") {
+        return Err(Blocked("pi --help offers no --skill".into()));
+    }
+    for path in &launch.skills {
+        args.extend(["--skill".into(), path.to_string_lossy().into_owned()]);
     }
     for (flag, value) in [("--provider", &launch.provider), ("--model", &launch.model)] {
         if let Some(value) = value {
@@ -1471,6 +1479,7 @@ fn replay_turn(version: &str) -> Turn {
             cwd: PathBuf::from(crate::compat::SUITE_CWD),
             session_dir: PathBuf::from(crate::compat::SUITE_PI_SESSION_DIR),
             session_id: crate::compat::SUITE_SESSION.to_owned(),
+            skills: Vec::new(),
             resume: false,
             provider: None,
             model: None,

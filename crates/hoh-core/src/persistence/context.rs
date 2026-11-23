@@ -47,6 +47,7 @@ pub(super) fn facts(
         Some(_) => None,
         None => super::spec_review::work_of(conn, task_id)?,
     };
+    let is_spec_review = review.is_some();
     let (spec_id, spec) = match review {
         Some(work) => (
             super::spec_review::spec_of(conn, &work.review_id)?.or(spec_id),
@@ -82,6 +83,9 @@ pub(super) fn facts(
             spec_id.as_deref(),
             &titles,
         )?,
+    }
+    if is_spec_review {
+        facts.skill_phase = Some("readiness".into());
     }
     Ok(facts)
 }

@@ -118,6 +118,10 @@ fn isolated_xdg(test: &str) -> R<bool> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated subprocess did not run exactly one test"
+    );
     Ok(true)
 }
 
@@ -501,7 +505,7 @@ async fn test_046_01_short_index_filters_and_injects_tdd_body() -> R {
 }
 
 #[tokio::test]
-async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_copy() -> R {
+async fn test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge() -> R {
     type NativeTree = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
     fn native_tree(root: &std::path::Path) -> std::io::Result<NativeTree> {
         fn visit(
@@ -528,7 +532,7 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
         }
         Ok(result)
     }
-    let test = "test_046_02_injection_counts_knowledge_even_with_unverified_session_copy";
+    let test = "test_046_02_native_skill_is_not_injected_and_fallback_counts_knowledge";
     if std::env::var("HOH_M3T08_SKILL_TEST").ok().as_deref() != Some(test) {
         let dir = tempfile::Builder::new().prefix("m3t08-home-").tempdir()?;
         for path in [".claude", ".pi/agent/extensions"] {
@@ -556,13 +560,49 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
         assert_eq!(native_tree(dir.path())?, before);
         return Ok(());
     }
-    for (case, session_copy, crowded) in [
-        ("plain", false, false),
-        ("copy", true, false),
-        ("crowded", true, true),
+    for (case, agent, session_copy, crowded) in [
+        ("native", "pi", true, false),
+        ("plain", "codex", false, false),
+        ("copy", "codex", true, false),
+        ("native-absent", "pi", false, false),
+        ("native-mismatch", "pi", true, false),
+        ("native-invalid-header", "pi", true, false),
+        ("native-no-flag", "pi", true, false),
+        ("crowded", "codex", true, true),
     ] {
         let world = World::new()?;
+        let native = agent == "pi"
+            && session_copy
+            && !["native-mismatch", "native-no-flag", "native-invalid-header"].contains(&case);
         world.codex("gpt-6-astra")?;
+        if agent == "pi" {
+            let loader = world.bin().join("native-skills.py");
+            std::fs::write(
+                &loader,
+                "import json,sys,pathlib\nargs=sys.argv[2:]\nloaded=[{'path':p,'body':pathlib.Path(p,'SKILL.md').read_text()} for i,p in enumerate(args) if i and args[i-1]=='--skill']\npathlib.Path(sys.argv[1]).write_text(json.dumps(loaded))\n",
+            )?;
+            let mut body = world.pi_body("skills")?.replacen(
+                "frames=",
+                &format!(
+                    "python3 '{}' \"$d/native.$$.json\" \"$@\"\nframes=",
+                    loader.display()
+                ),
+                1,
+            );
+            if case == "native-no-flag" {
+                let help = world.bin().join("pi-help.txt");
+                std::fs::write(
+                    &help,
+                    std::fs::read_to_string(format!("{PROTOCOL}/pi/1.5.0/help.txt"))?
+                        .lines()
+                        .filter(|line| !line.contains("--skill "))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )?;
+                body = body.replace("cat \"$f/help.txt\"", &format!("cat '{}'", help.display()));
+            }
+            world.script("pi", &body)?;
+        }
         let project = world.project();
         git(&project, &["init", "-q"])?;
         std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
@@ -571,14 +611,24 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
         std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
         let body = if crowded {
             format!("Budget-bound Skill body\n{}", "large ".repeat(5000))
+        } else if case == "native-invalid-header" {
+            "A task-specific TDD body without native metadata.\n".to_owned()
         } else {
-            "A task-specific TDD body.\n".to_owned()
+            "---\nname: tdd\ndescription: Task-specific TDD steps\n---\nA task-specific TDD body.\n"
+                .to_owned()
         };
         std::fs::write(project.join(".hoh/skills/tdd/SKILL.md"), &body)?;
         std::fs::write(
             project.join(".hoh/config.toml"),
-            "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+            format!("config_version = \"1.0\"\n[team.developer]\nagent = \"{agent}\"\n"),
         )?;
+        if agent == "pi" {
+            hoh_app::compat::register(
+                &project,
+                hoh_agents::compat::Agent::Pi,
+                std::ffi::OsStr::new(&world.path()),
+            )?;
+        }
         let registry = world.registry();
         let mut config = world.config_with(
             hoh_core::config::Config::default(),
@@ -588,7 +638,11 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
         );
         if session_copy {
             let root = project.clone();
-            let copy = body.clone();
+            let copy = if case == "native-mismatch" {
+                "stale session body".to_owned()
+            } else {
+                body.clone()
+            };
             let hook = std::sync::Arc::new(move |role: &str, attempt: &str| {
                 if role == "developer" {
                     let session = query(
@@ -600,7 +654,7 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
                     let dir = root
                         .join(".hoh/sessions")
                         .join(hoh_core::layout::component(&session))
-                        .join(".pi/skills/tdd");
+                        .join("skills/tdd");
                     std::fs::create_dir_all(&dir).unwrap();
                     std::fs::write(dir.join("SKILL.md"), &copy).unwrap();
                 }
@@ -622,20 +676,34 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
             exec(&project,&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,revision,role,writer,created_seq,cost_estimate) VALUES ('T-budget','{run_id}','s1','READY',1,'developer',1,1,1)"))?;
             let attempt = "T-budget/attempt-1";
             until(&project,&format!("SELECT count(*) FROM attempts WHERE attempt_id = '{attempt}' AND ended_at IS NOT NULL"),"1",Duration::from_secs(45)).await?;
+            assert_eq!(query(&project, &format!("SELECT count(*) FROM events WHERE event_id='{attempt}/context.packed'"))?, "1", "case {case}: {:?}", query(&project, "SELECT json_group_array(json_object('kind',kind,'payload',json(payload_json))) FROM events WHERE kind LIKE 'attempt.%'"));
             let event = packed_event(&project,attempt)?;
             let tdd = event["skills"].as_array().ok_or("no skills")?.iter().find(|s|s["id"] == "tdd").ok_or("no tdd")?;
-            assert_eq!(tdd["native"],"unverified_always_injected");
+            assert_eq!(tdd["native"],if native {"pi_skill"} else {"injected"});
             assert_eq!(tdd["layer"],"project");
-            let input = event["inputs"].as_array().ok_or("no inputs")?.iter().find(|s|s["path"] == ".hoh/skills/tdd/SKILL.md" && s["kind"] == "entry").ok_or("no knowledge entry")?;
-            assert_eq!(input["class"],"knowledge");
-            let sent = codex_prompts_of(&world,|a|a == attempt)?;
+            let input = event["inputs"].as_array().ok_or("no inputs")?.iter().find(|s|s["path"] == ".hoh/skills/tdd/SKILL.md" && s["kind"] == "entry");
+            if native { assert!(input.is_none(), "native body must not consume knowledge share"); }
+            else { assert_eq!(input.ok_or("no knowledge entry")?["class"], "knowledge"); }
+            let sent = if agent == "pi" {
+                received_by_attempt(&world.bin().join("pi.d"))?.into_iter().filter(|(a,c)| a == attempt && c["type"] == "prompt").map(|(_,c)| c["message"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+            } else { codex_prompts_of(&world,|a|a == attempt)? };
             assert_eq!(sent.len(),1);
-            assert_eq!(sent[0].matches(&body).count(),usize::from(!crowded));
-            assert_eq!(tdd["state"],if crowded {"reference"} else {"full"});
+            assert_eq!(sent[0].matches(&body).count(),usize::from(!native && !crowded));
+            assert!(sent[0].contains("- tdd 1.1.0"), "native Skill keeps its short index");
+            assert_eq!(tdd["state"],if native {"native"} else if crowded {"reference"} else {"full"});
             assert_eq!(tdd["tokens"],hoh_core::context::estimate(&body));
+            if native {
+                assert_eq!(tdd["placed"], 0);
+                let loaded: Vec<Value> = std::fs::read_dir(world.bin().join("pi.d"))?.filter_map(Result::ok).filter(|e|e.file_name().to_string_lossy().starts_with("native.")).map(|e| -> R<Value> { Ok(serde_json::from_slice(&std::fs::read(e.path())?)?) }).collect::<R<_>>()?;
+                let loaded: Vec<_> = loaded.iter().flat_map(|v|v.as_array().unwrap()).collect();
+                assert_eq!(loaded.len(), 1, "fake Agent must load exactly the session's tdd");
+                assert_eq!(loaded[0]["body"], body);
+                assert!(loaded[0]["path"].as_str().unwrap().ends_with("/skills/tdd"));
+                assert_eq!(hoh_core::objects::get(&project,tdd["sha256"].as_str().ok_or("no native source")?)?, body.as_bytes());
+            }
             let stats = &event["stats"];
             assert!(stats["knowledge"].as_u64().ok_or("no knowledge count")? <= stats["shares"][2].as_u64().ok_or("no share")?);
-            if !crowded {assert!(tdd["placed"].as_u64().ok_or("no placed count")? >= hoh_core::context::estimate(&body));}
+            if !crowded && !native {assert!(tdd["placed"].as_u64().ok_or("no placed count")? >= hoh_core::context::estimate(&body));}
             assert_eq!(hoh_core::objects::repack(&project,event["manifest"].as_str().ok_or("no manifest")?)?.prompt,sent[0]);
             Ok(())
         }.await;
@@ -644,4 +712,74 @@ async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_cop
         outcome?;
     }
     Ok(())
+}
+
+#[test]
+fn isolated_xdg_rejects_a_test_name_that_matches_nothing() {
+    assert!(
+        std::panic::catch_unwind(|| isolated_xdg("m3t08_deliberately_absent_test")).is_err(),
+        "a zero-test subprocess must fail"
+    );
+}
+
+#[tokio::test]
+async fn test_046_03_invalid_registration_keeps_the_attempts_valid_skill_set() -> R {
+    if isolated_xdg("test_046_03_invalid_registration_keeps_the_attempts_valid_skill_set")? {
+        return Ok(());
+    }
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    git(&project, &["init", "-q"])?;
+    std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
+    git(&project, &["add", ".gitignore"])?;
+    git(&project, &["commit", "-q", "-m", "fixture"])?;
+    std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
+    let global = hoh_core::prompt_files::global_root().ok_or("no private global root")?;
+    std::fs::create_dir_all(global.join("skills/tdd"))?;
+    std::fs::write(global.join("skills/tdd/SKILL.md"), "VALID_GLOBAL_TDD_BODY")?;
+    std::fs::write(
+        project.join(".hoh/skills/tdd/SKILL.md"),
+        "REJECTED_PROJECT_TDD_BODY",
+    )?;
+    let mut registry: Value = serde_json::from_str(
+        hoh_core::resource_bundle::Bundle::current().text("resources/skills/registry.json")?,
+    )?;
+    for skill in registry["skills"].as_array_mut().unwrap() {
+        if skill["id"] == "tdd" {
+            skill["dependencies"] = json!(["tdd"]);
+        }
+    }
+    std::fs::write(
+        project.join(".hoh/skills/registry.json"),
+        registry.to_string(),
+    )?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome: R = async {
+        let run_id = started(&host, &project, "invalid-skill").await?;
+        ready(&project,&run_id,&[])?;
+        exec(&project,&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,revision,role,writer,created_seq,cost_estimate) VALUES ('T-valid-skills','{run_id}','s1','READY',1,'developer',1,1,1)"))?;
+        let attempt = "T-valid-skills/attempt-1";
+        until(&project,&format!("SELECT EXISTS(SELECT 1 FROM events WHERE event_id IN ('{attempt}/context.packed','{attempt}/start-refused'))"),"1",Duration::from_secs(45)).await?;
+        assert_eq!(query(&project,&format!("SELECT count(*) FROM events WHERE event_id='{attempt}/context.packed'"))?,"1", "invalid registration must not refuse the Attempt");
+        until(&project,&format!("SELECT count(*) FROM attempts WHERE attempt_id='{attempt}' AND ended_at IS NOT NULL"),"1",Duration::from_secs(45)).await?;
+        let sent = codex_prompts_of(&world, |a|a == attempt)?;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("VALID_GLOBAL_TDD_BODY"));
+        assert!(!sent[0].contains("REJECTED_PROJECT_TDD_BODY"));
+        assert!(sent[0].contains("global:skills/tdd/SKILL.md"));
+        let event = packed_event(&project,attempt)?;
+        let rejected = event["skill_registry"]["rejected"].as_array().ok_or("missing rejection diagnostics")?;
+        assert_eq!(rejected.len(),1);
+        assert_eq!(rejected[0]["layer"], "project");
+        assert!(rejected[0]["reason"].as_str().unwrap().contains("cycle"));
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
 }

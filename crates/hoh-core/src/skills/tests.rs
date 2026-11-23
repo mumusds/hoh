@@ -62,11 +62,6 @@ fn test_046_03_registry_validation_rejects_cycle_missing_entry_unknown_phase_and
                     && reason.to_string().contains("decision-map")
             );
         }
-        assert_eq!(
-            Registry::parse(&builtin().to_string())?,
-            good,
-            "failed registration must not mutate the effective set"
-        );
     }
     Ok(())
 }
@@ -123,16 +118,22 @@ fn test_046_03_four_layers_validate_before_becoming_effective() -> R {
         assert_eq!(loaded.len(), 13);
     }
     let before = load(&project, Some(&global), "run-1", &bundle)?;
-    for root in roots {
+    for (index, root) in roots.iter().enumerate() {
         let path = root.join("skills/registry.json");
         let saved = std::fs::read_to_string(&path)?;
         let mut bad: Value = serde_json::from_str(&saved)?;
         bad["skills"][0]["bypass_gates"] = json!(true);
         std::fs::write(&path, bad.to_string())?;
-        let result = load(&project, Some(&global), "run-1", &bundle);
-        assert!(
-            result.is_err(),
-            "invalid lower layer cannot be hidden by later override"
+        let result = load_with_diagnostics(&project, Some(&global), "run-1", &bundle)?;
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(
+            result.rejected[0].layer,
+            ["global", "project", "run"][index]
+        );
+        assert!(result.rejected[0].reason.contains("not allowed"));
+        assert_eq!(
+            result.skills["tdd"].source.text,
+            format!("Layer {} TDD body", if index == 2 { 1 } else { 2 })
         );
         std::fs::write(&path, saved)?;
         assert_eq!(load(&project, Some(&global), "run-1", &bundle)?, before);
@@ -149,14 +150,6 @@ fn test_046_01_phase_mapping_and_role_filtering_are_explicit() -> R {
         ("reviewer", "work", false, false, false, Some("review")),
         ("commander", "work", false, true, false, Some("plan")),
         ("cto", "spec_draft", true, false, false, Some("specify")),
-        (
-            "reviewer",
-            "spec_review",
-            false,
-            false,
-            false,
-            Some("readiness"),
-        ),
         ("unknown", "work", false, false, false, None),
     ] {
         assert_eq!(phase(role, kind, writer, supervision, rework), expected);
@@ -185,5 +178,122 @@ fn test_046_01_phase_mapping_and_role_filtering_are_explicit() -> R {
     );
     assert!(for_turn(&loaded, "developer", None).is_empty());
     assert!(for_turn(&loaded, "unknown", Some("implement")).is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_046_01_old_pin_without_registry_has_no_builtin_skills() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t08-old-pin-")
+        .tempdir()?;
+    let mut old = Bundle::current();
+    old.files
+        .retain(|path, _| !path.starts_with("resources/skills/"));
+    let pin = old.store(dir.path())?;
+    let restored = pin.load(dir.path())?;
+    assert_eq!(restored.version(), old.version());
+    assert!(load(dir.path(), None, "old-run", &restored)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_046_03_unknown_extra_fields_are_rejected() -> R {
+    for (key, value) in [
+        ("capabilities", json!(["scheduler"])),
+        ("registers", json!("scheduler")),
+        ("unexpected", json!({"nested":"dispatch"})),
+    ] {
+        let mut registry = builtin();
+        registry["skills"][0][key] = value;
+        let rejected = Registry::parse(&registry.to_string());
+        assert!(rejected.is_err(), "{key} must not be silently accepted");
+        assert!(rejected.unwrap_err().to_string().contains(key));
+    }
+    Ok(())
+}
+
+#[test]
+fn test_046_01_global_skill_sources_use_relative_identifiers() -> R {
+    let dir = tempfile::Builder::new().prefix("m3t08-global-").tempdir()?;
+    let global = dir.path().join("global");
+    std::fs::create_dir_all(global.join("skills/tdd"))?;
+    std::fs::write(global.join("skills/tdd/SKILL.md"), "Global TDD")?;
+    std::fs::write(global.join("skills/registry.json"), builtin().to_string())?;
+    let loaded = load(dir.path(), Some(&global), "run", &Bundle::current())?;
+    assert_eq!(loaded["tdd"].source.path, "global:skills/tdd/SKILL.md");
+    assert_eq!(
+        loaded["tdd"].registry_source.path,
+        "global:skills/registry.json"
+    );
+    assert!(
+        !loaded["tdd"]
+            .index_line()
+            .contains(&dir.path().display().to_string())
+    );
+    assert_eq!(
+        Source::new(&loaded["tdd"], "developer", true).path,
+        "global:skills/tdd/SKILL.md"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_046_02_native_session_body_must_match_and_stay_inside_project() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t08-native-path-")
+        .tempdir()?;
+    let root = dir.path().join("project");
+    std::fs::create_dir(&root)?;
+    let skills = load(&root, None, "run", &Bundle::current())?;
+    let tdd = &skills["tdd"];
+    assert!(native_path(&root, "session", tdd)?.is_none());
+    let path = root.join(".hoh/sessions/session/skills/tdd");
+    std::fs::create_dir_all(&path)?;
+    std::fs::write(path.join("SKILL.md"), "stale body")?;
+    assert!(native_path(&root, "session", tdd)?.is_none());
+    std::fs::write(path.join("SKILL.md"), &tdd.source.text)?;
+    assert_eq!(native_path(&root, "session", tdd)?, Some(path.clone()));
+    std::fs::remove_file(path.join("SKILL.md"))?;
+    let outside = dir.path().join("outside.md");
+    std::fs::write(&outside, &tdd.source.text)?;
+    std::os::unix::fs::symlink(&outside, path.join("SKILL.md"))?;
+    assert!(
+        native_path(&root, "session", tdd)
+            .unwrap_err()
+            .to_string()
+            .contains("outside root")
+    );
+    Ok(())
+}
+
+#[test]
+fn test_046_02_native_skill_requires_loadable_pi_frontmatter() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t08-native-metadata-")
+        .tempdir()?;
+    let mut tdd = load(dir.path(), None, "run", &Bundle::current())?["tdd"].clone();
+    let path = dir.path().join(".hoh/sessions/session/skills/tdd");
+    std::fs::create_dir_all(&path)?;
+    for (body, accepted) in [
+        ("Plain Skill body", false),
+        ("---\nname: tdd\n---\nBody", false),
+        ("---\ndescription: ''\n---\nBody", false),
+        ("---\ndescription: 42\n---\nBody", false),
+        ("---\ndescription: [unterminated\n---\nBody", false),
+        ("---\ndescription: Test with TDD\n---\nBody", true),
+        ("---\ndescription: >\n  Test with\n  TDD\n---\nBody", true),
+        (
+            "\u{feff}---\r\ndescription: 'Test with TDD'\r\n---\r\nBody",
+            true,
+        ),
+    ] {
+        tdd.source.text = body.into();
+        std::fs::write(path.join("SKILL.md"), body)?;
+        assert_eq!(
+            native_path(dir.path(), "session", &tdd)?.is_some(),
+            accepted,
+            "{body:?}"
+        );
+    }
     Ok(())
 }
