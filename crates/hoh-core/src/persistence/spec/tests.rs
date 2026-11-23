@@ -495,3 +495,20 @@ async fn test_008_02_completion_and_blocked_draft_are_idempotent_user_questions(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_008_04_m3l102_draft_start_survives_attempt_retries() -> R {
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+      INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES
+      ('A1','D','SD','FAILED',1,1,1),('A2','D','SD','RUNNING',1,1,1);")?;
+    for (attempt, head) in [("A1", "original"), ("A2", "after-violation")] {
+        db.execute("INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES(?1,'P','R','attempt.workspace_start',?2,'now')",
+            params![child_id(attempt,"workspace_start"),json!({"attempt_id":attempt,"head":head}).to_string()])?;
+    }
+    assert_eq!(
+        store.reader()?.draft_start("A2")?.ok_or("start")?["head"],
+        "original"
+    );
+    Ok(())
+}

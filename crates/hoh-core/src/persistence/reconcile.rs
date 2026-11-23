@@ -23,6 +23,8 @@ pub struct EffectRow {
 /// An unfinished attempt (PREPARED, STARTING or RUNNING) with its task, its process record and its effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnfinishedRow {
+    /// Host-observed draft boundary, after process termination and before the ending transaction.
+    pub draft_boundary: Option<(String, Vec<String>)>,
     pub project_id: String,
     pub run_id: String,
     pub attempt_id: String,
@@ -222,6 +224,7 @@ fn scan(
             .map_err(sqlite_error)?;
         let verifier = super::verification::round_of_task(conn, &run_id, &task_id)?.is_some();
         rows.push(UnfinishedRow {
+            draft_boundary: None,
             project_id: project_id.to_owned(),
             run_id,
             state: writer::parse::<AttemptState>(&state)?,
@@ -398,6 +401,21 @@ fn apply(
     } else {
         (attempt_to, task_to)
     };
+    let draft_blocked = !cancelled
+        && row.task_state == TaskState::Running
+        && !matches!(
+            disposition,
+            Disposition::Unreaped | Disposition::Redeliver | Disposition::Complete { .. }
+        )
+        && row.draft_boundary.is_some();
+    let task_to = if draft_blocked {
+        if let Some((detail, paths)) = &row.draft_boundary {
+            super::drafting::blocked(&tx, &row.attempt_id, detail, Some(paths), ctx)?;
+        }
+        None
+    } else {
+        task_to
+    };
     // An attempt left unfinished (redelivered, unreaped) is disposed of again later: each pass its own event ids.
     let pass: i64 = tx
         .query_row(
@@ -494,7 +512,8 @@ fn apply(
             expected_revision: row.task_revision,
             change: Change::Task(to),
         });
-    } else if attempt_to == Some(AttemptState::UnknownEffect)
+    } else if !draft_blocked
+        && attempt_to == Some(AttemptState::UnknownEffect)
         && !super::consult::is_child(&tx, &row.task_id)?
         && let Some((cas, decision)) = super::verification::unknown_effect(
             &tx,

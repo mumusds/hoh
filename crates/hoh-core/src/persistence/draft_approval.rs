@@ -247,8 +247,10 @@ pub(super) fn start(conn: &Connection, attempt: &str) -> Result<Option<Value>, P
     };
     let payload: Option<String> = conn
         .query_row(
-            "SELECT payload_json FROM events WHERE event_id=?1",
-            [child_id(attempt, "workspace_start")],
+            "SELECT e.payload_json FROM events e JOIN attempts a ON a.attempt_id=json_extract(e.payload_json,'$.attempt_id') \
+             WHERE e.kind='attempt.workspace_start' AND a.task_id=(SELECT task_id FROM attempts WHERE attempt_id=?1) \
+             ORDER BY e.seq LIMIT 1",
+            [attempt],
             |r| r.get(0),
         )
         .optional()

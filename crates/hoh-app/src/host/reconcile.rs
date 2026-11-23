@@ -285,7 +285,7 @@ fn step_names(steps: &[StopStep]) -> Vec<String> {
 pub(super) async fn apply(
     store: &Store,
     project: &std::path::Path,
-    row: UnfinishedRow,
+    mut row: UnfinishedRow,
     (disposition, process): (Disposition, reconcile::Process),
     cause: &'static str,
     at: std::time::SystemTime,
@@ -314,6 +314,9 @@ pub(super) async fn apply(
     // Working attempts' messages left in their bridge use the same request path before their source is settled.
     if ends && (row.verifier || (row.role != "commander" && !row.cancel_requested)) {
         answer_left_messages(store, project, &row).await?;
+    }
+    if ends {
+        row.draft_boundary = super::drafting::boundary(store, project, &row.attempt_id).await?;
     }
     let found = row.clone();
     let seq = super::control::recorded_end(project, move |workspace| {
@@ -612,6 +615,7 @@ mod tests {
         // M2T06R-900: whatever this host finds of it (here nothing: a record whose pid names no process), an attempt
         // recorded by a host that saw other namespaces stays uncertain.
         let row = UnfinishedRow {
+            draft_boundary: None,
             project_id: "p".to_owned(),
             run_id: "R".to_owned(),
             attempt_id: "A1".to_owned(),

@@ -428,5 +428,26 @@ pub(super) fn outcome(
     checked
 }
 
+/// Read once the process has ended, before its durable ending releases the write lease.
+pub(super) async fn boundary(
+    store: &Store,
+    root: &Path,
+    attempt: &str,
+) -> Result<Option<(String, Vec<String>)>, hoh_core::persistence::PersistError> {
+    let start = store.reader()?.draft_start(attempt)?;
+    // No process gate ever opened: git init alone cannot have written product files.
+    let Some(start) = start.filter(|s| !s.is_null()) else {
+        return Ok(None);
+    };
+    let root = root.to_path_buf();
+    super::begun::spawn_blocking(move || match checked(&root, &start) {
+        Ok(WriterOutcome::DraftBlocked { detail, paths }) => Some((detail, paths)),
+        Err(detail) => Some((detail, vec![])),
+        _ => None,
+    })
+    .await
+    .map_err(|e| hoh_core::persistence::PersistError::Storage(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests;
