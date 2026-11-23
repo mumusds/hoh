@@ -1373,6 +1373,39 @@ pub(super) fn record_prompt(
         return Ok(Vec::new());
     };
     register(tx, &packed.artifacts)?;
+    if let Some(skills) = packed.event.get("skills") {
+        let sources: Vec<crate::skills::Source> =
+            serde_json::from_value(skills.clone()).map_err(|e| {
+                PersistError::IntegrityViolation(format!("invalid Skill provenance: {e}"))
+            })?;
+        for source in sources {
+            if source.revision_id != source.identity(&prompt.role)
+                || [&source.sha256, &source.registry_sha256]
+                    .iter()
+                    .any(|sha| !packed.artifacts.iter().any(|a| a.sha256 == **sha))
+            {
+                return Err(PersistError::IntegrityViolation(
+                    "Skill identity or source object mismatch".to_owned(),
+                ));
+            }
+            tx.execute("INSERT OR IGNORE INTO prompt_revisions(revision_id, layer, role, content_sha256, path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![source.revision_id,source.layer,prompt.role,source.sha256,source.path,at]).map_err(sqlite_error)?;
+            let stored: (String,String,String,String,Option<String>) = tx.query_row("SELECT layer,role,content_sha256,path,parent_revision FROM prompt_revisions WHERE revision_id = ?1",[&source.revision_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(sqlite_error)?;
+            if stored
+                != (
+                    source.layer,
+                    prompt.role.clone(),
+                    source.sha256,
+                    source.path,
+                    None,
+                )
+            {
+                return Err(PersistError::IntegrityViolation(
+                    "stored Skill revision differs from its source".to_owned(),
+                ));
+            }
+        }
+    }
     let mut payload = packed.event.clone();
     if let Some(object) = payload.as_object_mut() {
         object.insert("attempt_id".to_owned(), json!(attempt_id));

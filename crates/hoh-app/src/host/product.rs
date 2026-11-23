@@ -611,8 +611,35 @@ impl ProductExecutor {
                 conventions["sha256"].as_str().unwrap_or_default()
             ));
         }
+        let skills = hoh_core::skills::load(
+            &self.project,
+            hoh_core::prompt_files::global_root().as_deref(),
+            &work.run_id,
+            &bundle,
+        )
+        .map_err(prompt_refusal)?;
+        let matched = hoh_core::skills::for_turn(&skills, &work.role, facts.skill_phase.as_deref());
+        mandatory.project.push_str(&format!(
+            "\nSkill 资源包：{}\nSkill 索引：\n",
+            bundle.version()
+        ));
+        for skill in &matched {
+            mandatory.project.push_str(&skill.index_line());
+            mandatory.project.push('\n');
+        }
+        mandatory.project.push_str("Skill 索引结束");
+        let selected =
+            hoh_core::skills::with_dependencies(&skills, &matched).map_err(prompt_refusal)?;
+        let skill_sources: Vec<_> = selected
+            .iter()
+            .map(|skill| {
+                let indexed = matched.iter().any(|s| s.skill.id == skill.skill.id);
+                facts.entries.push(skill.entry(indexed));
+                hoh_core::skills::Source::new(skill, &work.role, indexed)
+            })
+            .collect();
         let sources = serde_json::json!({
-            "role_contract": resolved.revisions(&work.role), "project": project_sources,
+            "role_contract": resolved.revisions(&work.role), "project": project_sources, "skills": skill_sources,
             "task": {"run_id": work.run_id, "task_id": work.task_id, "attempt_id": work.attempt_id, "role_epoch": a.role_epoch},
             "evidence": facts.entries.iter().filter(|e| e.class == context::Class::Evidence)
                 .map(|e| serde_json::json!({"path": e.path, "sha256": sha256_hex(e.text.as_bytes())})).collect::<Vec<_>>()
@@ -644,6 +671,36 @@ impl ProductExecutor {
             },
             other => deterministic(other.to_string()),
         })?;
+        let mut skill_records = Vec::new();
+        for source in &skill_sources {
+            let mut value =
+                serde_json::to_value(source).map_err(|e| deterministic(e.to_string()))?;
+            let input = recorded
+                .packed
+                .inputs
+                .iter()
+                .find(|i| {
+                    i.class == context::Class::Knowledge
+                        && i.path == source.path
+                        && i.sha256 == source.sha256
+                })
+                .ok_or_else(|| {
+                    deterministic(format!("Skill {} missing from packing record", source.id))
+                })?;
+            value["state"] = serde_json::json!(input.disposition);
+            value["tokens"] = serde_json::json!(input.tokens);
+            value["placed"] = serde_json::json!(input.placed);
+            skill_records.push(value);
+        }
+        recorded.event["skills"] = serde_json::json!(skill_records);
+        for skill in &selected {
+            recorded.objects.push(context::Object {
+                bytes: skill.registry_source.text.as_bytes().to_vec(),
+                mime: "application/json",
+                kind: "skill_registry",
+                name: skill.registry_source.path.clone(),
+            });
+        }
         // A verifier's delivery, fixed with its packing: the Issue ids its mandatory scope gave with their description
         // (docs/adr/ADR-029.md decision 10).
         if let (Some(ids), Some(event)) = (&facts.confirm_ids, recorded.event.as_object_mut()) {

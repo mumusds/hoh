@@ -139,3 +139,51 @@ fn test_046_03_four_layers_validate_before_becoming_effective() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_046_01_phase_mapping_and_role_filtering_are_explicit() -> R {
+    for (role, kind, writer, supervision, rework, expected) in [
+        ("developer", "work", true, false, false, Some("implement")),
+        ("developer", "work", true, false, true, Some("repair")),
+        ("qa", "work", false, false, false, Some("verify")),
+        ("reviewer", "work", false, false, false, Some("review")),
+        ("commander", "work", false, true, false, Some("plan")),
+        ("cto", "spec_draft", true, false, false, Some("specify")),
+        (
+            "reviewer",
+            "spec_review",
+            false,
+            false,
+            false,
+            Some("readiness"),
+        ),
+        ("unknown", "work", false, false, false, None),
+    ] {
+        assert_eq!(phase(role, kind, writer, supervision, rework), expected);
+    }
+    let root = tempfile::Builder::new().prefix("m3t08-phase-").tempdir()?;
+    let loaded = load(
+        root.path(),
+        None,
+        "run",
+        &crate::resource_bundle::Bundle::current(),
+    )?;
+    let matched = for_turn(&loaded, "developer", Some("implement"));
+    assert_eq!(
+        matched
+            .iter()
+            .map(|s| s.skill.id.as_str())
+            .collect::<Vec<_>>(),
+        ["domain-modeling", "implementation", "tdd"]
+    );
+    assert_eq!(
+        with_dependencies(&loaded, &matched)?
+            .iter()
+            .map(|s| s.skill.id.as_str())
+            .collect::<Vec<_>>(),
+        ["domain-modeling", "implementation", "requirements", "tdd"]
+    );
+    assert!(for_turn(&loaded, "developer", None).is_empty());
+    assert!(for_turn(&loaded, "unknown", Some("implement")).is_empty());
+    Ok(())
+}

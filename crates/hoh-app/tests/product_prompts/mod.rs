@@ -416,3 +416,62 @@ async fn test_029_02_run_snapshot_pins_profile_and_source() -> R {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_046_01_short_index_filters_and_injects_tdd_body() -> R {
+    if isolated_xdg("test_046_01_short_index_filters_and_injects_tdd_body")? {
+        return Ok(());
+    }
+    let world = World::new()?;
+    world.codex("gpt-6-astra")?;
+    let project = world.project();
+    git(&project, &["init", "-q"])?;
+    std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
+    git(&project, &["add", ".gitignore"])?;
+    git(&project, &["commit", "-q", "-m", "fixture"])?;
+    std::fs::create_dir_all(project.join(".hoh"))?;
+    std::fs::write(
+        project.join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+    )?;
+    let host = start_when_free(world.config()).await?;
+    let outcome: R = async {
+        let run_id = started(&host, &project, "skill-input").await?;
+        ready(&project,&run_id,&[])?;
+        exec(&project,&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,revision,role,writer,created_seq,cost_estimate) VALUES ('T-tdd','{run_id}','s1','READY',1,'developer',1,1,1)"))?;
+        let attempt = "T-tdd/attempt-1";
+        until(&project,&format!("SELECT count(*) FROM events WHERE kind = 'context.packed' AND json_extract(payload_json,'$.attempt_id') = '{attempt}'"),"1",Duration::from_secs(45)).await?;
+        // Wait for the fake to have consumed the prompt, after the durable RUNNING record.
+        until(&project,&format!("SELECT count(*) FROM attempts WHERE attempt_id = '{attempt}' AND ended_at IS NOT NULL"),"1",Duration::from_secs(45)).await?;
+        let sent = codex_prompts_of(&world, |a| a == attempt)?;
+        assert_eq!(sent.len(),1);
+        let index = sent[0].split("Skill 索引：\n").nth(1).ok_or("missing Skill index")?.split("\nSkill 索引结束").next().unwrap();
+        let builtin = hoh_core::resource_bundle::Bundle::current();
+        let registry = hoh_core::skills::Registry::parse(builtin.text("resources/skills/registry.json")?)?;
+        let mut expected: Vec<_> = registry.skills.iter().filter(|s|s.roles.iter().any(|r|r == "developer") && s.phases.iter().any(|p|p == "implement")).map(|s|s.id.clone()).collect();
+        expected.sort();
+        let actual: Vec<_> = index.lines().map(|s|s.strip_prefix("- ").unwrap().split_whitespace().next().unwrap().to_owned()).collect();
+        assert_eq!(actual,expected);
+        let body = builtin.text("resources/skills/tdd/SKILL.md")?;
+        assert!(sent[0].contains(body));
+        let event = packed_event(&project,attempt)?;
+        let skills = event["skills"].as_array().ok_or("missing skills record")?;
+        let tdd = skills.iter().find(|s|s["id"] == "tdd").ok_or("missing tdd provenance")?;
+        assert_eq!(tdd["version"],"1.1.0");
+        assert_eq!(tdd["layer"],"builtin");
+        assert_eq!(tdd["path"],"resources/skills/tdd/SKILL.md");
+        assert_eq!(tdd["sha256"],digest(body.as_bytes()));
+        assert_eq!(tdd["state"],"full");
+        let revision = tdd["revision_id"].as_str().ok_or("no revision")?;
+        assert_eq!(query(&project,&format!("SELECT path || ':' || content_sha256 FROM prompt_revisions WHERE revision_id = '{revision}'"))?,format!("resources/skills/tdd/SKILL.md:{}",digest(body.as_bytes())));
+        assert_eq!(query(&project,&format!("SELECT count(*) FROM prompt_revisions WHERE revision_id = '{revision}' AND parent_revision IS NULL"))?,"1");
+        let manifest_sha = event["manifest"].as_str().ok_or("no manifest")?;
+        std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
+        std::fs::write(project.join(".hoh/skills/tdd/SKILL.md"), "Changed after the turn.")?;
+        assert_eq!(hoh_core::objects::repack(&project,manifest_sha)?.prompt,sent[0]);
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
