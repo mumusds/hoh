@@ -475,3 +475,149 @@ async fn test_046_01_short_index_filters_and_injects_tdd_body() -> R {
     world.stop_fakes()?;
     outcome
 }
+
+#[tokio::test]
+async fn test_046_02_injection_counts_knowledge_even_with_unverified_session_copy() -> R {
+    type NativeTree = std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>;
+    fn native_tree(root: &std::path::Path) -> std::io::Result<NativeTree> {
+        fn visit(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            result: &mut NativeTree,
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let path = entry.path();
+                let key = path.strip_prefix(root).unwrap().to_path_buf();
+                if entry.file_type()?.is_dir() {
+                    result.insert(key, None);
+                    visit(root, &path, result)?;
+                } else {
+                    result.insert(key, Some(std::fs::read(path)?));
+                }
+            }
+            Ok(())
+        }
+        let mut result = std::collections::BTreeMap::new();
+        for path in [".claude", ".pi"] {
+            visit(root, &root.join(path), &mut result)?;
+        }
+        Ok(result)
+    }
+    let test = "test_046_02_injection_counts_knowledge_even_with_unverified_session_copy";
+    if std::env::var("HOH_M3T08_SKILL_TEST").ok().as_deref() != Some(test) {
+        let dir = tempfile::Builder::new().prefix("m3t08-home-").tempdir()?;
+        for path in [".claude", ".pi/agent/extensions"] {
+            std::fs::create_dir_all(dir.path().join(path))?;
+            std::fs::write(dir.path().join(path).join("keep"), "native user sentinel")?;
+        }
+        let before = native_tree(dir.path())?;
+        let output = Command::new(std::env::current_exe()?)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("HOH_M3T08_SKILL_TEST", test)
+            .args([
+                "--exact",
+                &format!("product_prompts::{test}"),
+                "--nocapture",
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert_eq!(native_tree(dir.path())?, before);
+        return Ok(());
+    }
+    for (case, session_copy, crowded) in [
+        ("plain", false, false),
+        ("copy", true, false),
+        ("crowded", true, true),
+    ] {
+        let world = World::new()?;
+        world.codex("gpt-6-astra")?;
+        let project = world.project();
+        git(&project, &["init", "-q"])?;
+        std::fs::write(project.join(".gitignore"), ".hoh/\n")?;
+        git(&project, &["add", ".gitignore"])?;
+        git(&project, &["commit", "-q", "-m", "fixture"])?;
+        std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
+        let body = if crowded {
+            format!("Budget-bound Skill body\n{}", "large ".repeat(5000))
+        } else {
+            "A task-specific TDD body.\n".to_owned()
+        };
+        std::fs::write(project.join(".hoh/skills/tdd/SKILL.md"), &body)?;
+        std::fs::write(
+            project.join(".hoh/config.toml"),
+            "config_version = \"1.0\"\n[team.developer]\nagent = \"codex\"\n",
+        )?;
+        let registry = world.registry();
+        let mut config = world.config_with(
+            hoh_core::config::Config::default(),
+            registry.clone(),
+            None,
+            None,
+        );
+        if session_copy {
+            let root = project.clone();
+            let copy = body.clone();
+            let hook = std::sync::Arc::new(move |role: &str, attempt: &str| {
+                if role == "developer" {
+                    let session = query(
+                        &root,
+                        &format!("SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"),
+                    )
+                    .unwrap();
+                    assert!(!session.is_empty());
+                    let dir = root
+                        .join(".hoh/sessions")
+                        .join(hoh_core::layout::component(&session))
+                        .join(".pi/skills/tdd");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(dir.join("SKILL.md"), &copy).unwrap();
+                }
+            });
+            config.runner.as_mut().unwrap().executor = std::sync::Arc::new(
+                hoh_app::host::product::ProductExecutor::new(
+                    registry,
+                    project.clone(),
+                    env!("CARGO_BIN_EXE_hoh").into(),
+                    (Duration::from_secs(10), Duration::from_secs(5)),
+                )
+                .with_preparing(hook),
+            );
+        }
+        let host = start_when_free(config).await?;
+        let outcome: R = async {
+            let run_id = started(&host,&project,case).await?;
+            ready(&project,&run_id,&[])?;
+            exec(&project,&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,revision,role,writer,created_seq,cost_estimate) VALUES ('T-budget','{run_id}','s1','READY',1,'developer',1,1,1)"))?;
+            let attempt = "T-budget/attempt-1";
+            until(&project,&format!("SELECT count(*) FROM attempts WHERE attempt_id = '{attempt}' AND ended_at IS NOT NULL"),"1",Duration::from_secs(45)).await?;
+            let event = packed_event(&project,attempt)?;
+            let tdd = event["skills"].as_array().ok_or("no skills")?.iter().find(|s|s["id"] == "tdd").ok_or("no tdd")?;
+            assert_eq!(tdd["native"],"unverified_always_injected");
+            assert_eq!(tdd["layer"],"project");
+            let input = event["inputs"].as_array().ok_or("no inputs")?.iter().find(|s|s["path"] == ".hoh/skills/tdd/SKILL.md" && s["kind"] == "entry").ok_or("no knowledge entry")?;
+            assert_eq!(input["class"],"knowledge");
+            let sent = codex_prompts_of(&world,|a|a == attempt)?;
+            assert_eq!(sent.len(),1);
+            assert_eq!(sent[0].matches(&body).count(),usize::from(!crowded));
+            assert_eq!(tdd["state"],if crowded {"reference"} else {"full"});
+            assert_eq!(tdd["tokens"],hoh_core::context::estimate(&body));
+            let stats = &event["stats"];
+            assert!(stats["knowledge"].as_u64().ok_or("no knowledge count")? <= stats["shares"][2].as_u64().ok_or("no share")?);
+            if !crowded {assert!(tdd["placed"].as_u64().ok_or("no placed count")? >= hoh_core::context::estimate(&body));}
+            assert_eq!(hoh_core::objects::repack(&project,event["manifest"].as_str().ok_or("no manifest")?)?.prompt,sent[0]);
+            Ok(())
+        }.await;
+        host.shutdown().await;
+        world.stop_fakes()?;
+        outcome?;
+    }
+    Ok(())
+}
