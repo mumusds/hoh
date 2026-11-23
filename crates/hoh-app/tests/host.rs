@@ -1803,7 +1803,7 @@ async fn inputs_and_answers_are_accepted_and_refused_as_the_contract_says() -> R
 
 /// W13 through the host (docs/adr/ADR-031.md decisions 1, 6 and 8): StartRun in a project with no approved
 /// specification is 202 at revision 1, the run BLOCKED and getRun's `projection.questions` its one question
-/// runtime:no_spec (run-level, the one choice adopt, its default); AnswerQuestion adopt while there is still none is
+/// runtime:no_spec (run-level, adopt/draft per CR-026, with adopt its default); AnswerQuestion adopt while there is still none is
 /// 202 at the next revision, the run BLOCKED and the question still listed; once a specification is approved, adopt
 /// again: 202 at the next revision, the run CREATED on it and no question left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1861,7 +1861,10 @@ async fn a_run_without_a_spec_lists_its_no_spec_question_and_its_adopt_answer_ta
             &json!("runtime"),
             &json!("run"),
             &json!("no_spec"),
-            &json!([{"choice_id": "adopt", "label": "采用项目已批准的规格"}]),
+            &json!([
+                {"choice_id": "adopt", "label": "采用项目已批准的规格"},
+                {"choice_id": "draft", "label": "由 Plan 起草规格并请我批准"}
+            ]),
             &json!("adopt")
         ),
         "{got}"

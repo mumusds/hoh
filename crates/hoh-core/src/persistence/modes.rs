@@ -41,7 +41,15 @@ pub(super) fn set(
     let run = super::commands::snapshot_rows(tx, &command.run_id)?
         .map(|(run, _)| run)
         .ok_or_else(|| PersistError::RunNotFound(command.run_id.clone()))?;
-    if writer::parse::<RunState>(&run.state)?.is_terminal() {
+    let from: Mode = serde_json::from_value(json!(run.mode))
+        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+    let transition = crate::mode::transition(
+        writer::parse::<RunState>(&run.state)?,
+        from,
+        mode,
+        writing(tx, &run.run_id)?,
+    );
+    if transition == crate::mode::Transition::Refused {
         return Err(PersistError::IllegalTransition {
             entity: Entity::Run,
             id: run.run_id,
@@ -59,7 +67,7 @@ pub(super) fn set(
             actual: Some(run.revision),
         });
     }
-    let waiting = writing(tx, &run.run_id)?;
+    let waiting = transition == crate::mode::Transition::Pending;
     change(tx, &run, &command.command_id, mode, waiting, true, ctx)
 }
 

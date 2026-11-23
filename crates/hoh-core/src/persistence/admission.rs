@@ -54,6 +54,8 @@ pub(super) enum Refusal {
     RuntimeOwned,
     /// Drafts only start in the four working states with a settled Plan/Auto intent.
     DraftStopped,
+    /// Ordinary product writes obey mode intent and pending approval.
+    Mode(crate::mode::WriteRefusal),
     /// A planned task whose readiness under the run's current revision does not pass.
     NotReady { revision: i64, reasons: Vec<Reason> },
     /// A write task whose path scope holds `paths`, files the run's baseline lists as uncommitted, and whose user has
@@ -70,6 +72,15 @@ impl Refusal {
                 run_spec,
             } => format!(
                 "{task_id} belongs to specification {task_spec:?} but the run's is {run_spec:?}"
+            ),
+            Refusal::Mode(reason) => format!(
+                "{task_id}: {} — {}",
+                reason.code(),
+                if *reason == crate::mode::WriteRefusal::Plan {
+                    "PLAN 不实施"
+                } else {
+                    "产品写入等待模式、批准与 readiness"
+                }
             ),
             Refusal::DraftStopped => {
                 format!("{task_id}: specification drafting waits for a working PLAN/AUTO run")
@@ -98,6 +109,7 @@ impl Refusal {
 
     fn details(&self) -> Option<serde_json::Value> {
         match self {
+            Refusal::Mode(reason) => Some(json!({"reason":reason.code()})),
             Refusal::NotReady { reasons, .. } => Some(json!({
                 "reasons": reasons.iter().map(Reason::json).collect::<Vec<_>>()
             })),
@@ -114,6 +126,7 @@ impl Refusal {
                 Refusal::SpecMismatch { .. } => RejectionReason::SpecMismatch,
                 Refusal::RuntimeOwned
                 | Refusal::DraftStopped
+                | Refusal::Mode(_)
                 | Refusal::NotReady { .. }
                 | Refusal::DirtyWorkspace { .. } => RejectionReason::IllegalTransition,
             },
@@ -155,6 +168,20 @@ pub(super) fn admit(
         .optional()
         .map_err(sqlite_error)?
         .ok_or_else(|| PersistError::RunNotFound(run_id.to_owned()))?;
+    let mode: crate::protocol::Mode = serde_json::from_value(json!(run_mode))
+        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+    let mode_pending = super::modes::pending(tx, run_id)?.is_some();
+    let draft_pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs d ON d.run_id=t.run_id \
+         JOIN runs r ON r.project_id=d.project_id WHERE r.run_id=?1 AND t.kind='spec_draft' \
+         AND t.state NOT IN ('ACCEPTED','CANCELLED')) \
+         OR EXISTS(SELECT 1 FROM change_requests c JOIN runs r ON r.project_id=c.project_id \
+         WHERE r.run_id=?1 AND c.state='PROPOSED' AND c.base_spec_id=r.spec_id)",
+            [run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
     let reviews = super::spec_review::review_tasks(tx, run_id)?;
     // The run's revision, plan and review, read once for every task (none without a specification).
     let judged = match &run_spec {
@@ -213,7 +240,7 @@ pub(super) fn admit(
                 run_state.as_str(),
                 "SPECIFYING" | "READY" | "RUNNING" | "VERIFYING"
             ) || run_mode == "BUILD"
-                || super::modes::pending(tx, run_id)?.is_some())
+                || mode_pending)
         {
             Err(Refusal::DraftStopped)
         } else {
@@ -226,8 +253,25 @@ pub(super) fn admit(
                     )
                 })
             });
-            match readiness {
-                Some((revision, Readiness::NotReady(reasons))) => {
+            let mode_refusal = if writer && !draft {
+                crate::mode::product_write(
+                    mode,
+                    crate::mode::WriteFacts {
+                        approved: run_spec.is_some(),
+                        ready: !matches!(&readiness, Some((_, Readiness::NotReady(_)))),
+                        mode_pending,
+                        draft_pending,
+                    },
+                )
+                .err()
+            } else {
+                None
+            };
+            match (mode_refusal, readiness) {
+                (Some(reason), _) if reason != crate::mode::WriteRefusal::NotReady => {
+                    Err(Refusal::Mode(reason))
+                }
+                (_, Some((revision, Readiness::NotReady(reasons)))) => {
                     Err(Refusal::NotReady { revision, reasons })
                 }
                 // 4. Its files: a write task whose path scope holds files uncommitted at the run's baseline waits for

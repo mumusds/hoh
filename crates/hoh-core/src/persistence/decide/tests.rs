@@ -2027,3 +2027,70 @@ async fn plan_paths_are_stored_with_the_import_and_refused_outside_the_project()
     assert!(reader.task_paths("T1")?.is_empty(), "a task of no import");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_009_01_build_rejects_the_whole_unapproved_requirement_plan_durably() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(&path, REQUIREMENTS)?;
+    seed(&path, "UPDATE runs SET mode='BUILD' WHERE run_id='R'")?;
+    let mut commander = FakeCommander {
+        sent: 0,
+        candidate: None,
+    };
+    let proposal = commander.decide(
+        3,
+        7,
+        create_tasks(json!([
+            planned("P1", &[], &["REQ-1"]),
+            planned("PZ", &[], &["REQ-Z"])
+        ])),
+    );
+    let verdict = store.decide(proposal, context()).await;
+    assert!(
+        matches!(
+            &verdict,
+            Ok(Decided::Rejected {
+                reason: RejectionReason::IllegalTransition,
+                ..
+            })
+        ),
+        "{verdict:?}"
+    );
+    assert!(
+        rows(
+            &path,
+            "SELECT task_id FROM tasks WHERE task_id IN ('P1','PZ')"
+        )?
+        .is_empty()
+    );
+    let refused = rows(
+        &path,
+        "SELECT payload_json FROM events WHERE kind='decision.rejected'",
+    )?;
+    assert!(format!("{refused:?}").contains("BUILD 不改规格，用 /plan 或 CR"));
+    assert!(format!("{refused:?}").contains("REQ-Z"));
+    let revision = rows(&path, "SELECT revision FROM runs WHERE run_id='R'")?[0][0]
+        .as_i64()
+        .ok_or("revision")?;
+    let good = store
+        .decide(
+            commander.decide(
+                3,
+                revision as u64,
+                create_tasks(json!([planned("P1", &[], &["REQ-1"])])),
+            ),
+            context(),
+        )
+        .await?;
+    assert!(matches!(good, Decided::Applied { .. }));
+    assert_eq!(
+        rows(
+            &path,
+            "SELECT requirement_id FROM task_requirements WHERE task_id='P1'"
+        )?,
+        vec![vec![json!("REQ-1")]]
+    );
+    Ok(())
+}

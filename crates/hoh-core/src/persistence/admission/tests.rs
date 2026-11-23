@@ -601,3 +601,24 @@ async fn a_direct_creation_of_a_blocked_task_is_refused() -> R {
     assert_eq!(attempts_of(&conn, "W2")?, 0);
     Ok(())
 }
+
+#[test]
+fn test_008_04_plan_blocks_every_ordinary_writer_dispatch_path() -> R {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+      INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+      INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','PLAN','now');
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES('w','r','s','READY','developer',1,1),('q','r','s','READY','qa',0,2);")?;
+    for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+        assert!(
+            super::admit_one(&conn, "r", "w", by)?.is_err(),
+            "PLAN writer admitted by {by:?}"
+        );
+        assert!(
+            super::admit_one(&conn, "r", "q", by)?.is_ok(),
+            "read-only work blocked by PLAN"
+        );
+    }
+    Ok(())
+}
