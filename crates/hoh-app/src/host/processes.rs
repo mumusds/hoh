@@ -735,6 +735,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         // M2T06R-151: a process with a child, unmarked. Named as the leader with another start time (a pid reused), it
         // roots nothing; named with its own, its child is found and pinned.
+        // FLK-03: the marker is this test's own. A fixed `p/A1` is what the adapter gates put on live processes
+        // (`HOH_ATTEMPT_ID=p/A1`); a scan of real /proc then pins those too (one such process turned (0, 1) into
+        // (1, 2); two, the (2, 3) seen under a full parallel run). The decoy keeps that fixed marker and must not
+        // be pinned.
         use std::os::unix::process::CommandExt as _;
         let mut parent = std::process::Command::new("sh")
             .args(["-c", "sleep 30 & wait"])
@@ -753,13 +757,44 @@ mod tests {
             Stat::Read(p) => p.start,
             _ => 0,
         };
-        let mut reused = Outside::new("p/A1");
+        // Held until its environment shows the foreign marker, then for the whole scan.
+        let mut decoy = std::process::Command::new("sleep")
+            .args(["60"])
+            .env(ATTEMPT_ENV, "p/A1")
+            .spawn()?;
+        let decoy_pid = decoy.id();
+        let needle = format!("{ATTEMPT_ENV}=p/A1").into_bytes();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut visible = false;
+        while Instant::now() < deadline {
+            if std::fs::read(format!("/proc/{decoy_pid}/environ"))
+                .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == needle))
+            {
+                visible = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !visible {
+            return Err(format!("decoy {decoy_pid} never showed {ATTEMPT_ENV}=p/A1").into());
+        }
+        let marker = format!("flk03-{}-{pid}", std::process::id());
+        let mut reused = Outside::new(&marker);
         reused.set_leader(Some(i64::from(pid)), Some(&(start + 1).to_string()));
         let _ = reused.scan();
-        let mut recorded = Outside::new("p/A1");
+        let mut recorded = Outside::new(&marker);
         recorded.set_leader(Some(i64::from(pid)), Some(&start.to_string()));
         let _ = recorded.scan();
         let pinned = (reused.pins.len(), recorded.pins.len());
+        let reused_pids: Vec<u32> = reused.pins.iter().map(|p| p.pid).collect();
+        let recorded_pids: Vec<u32> = recorded.pins.iter().map(|p| p.pid).collect();
+        if let Some(p) = i32::try_from(decoy_pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
+        }
+        let _ = decoy.wait();
         if let Some(group) = i32::try_from(pid)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -767,7 +802,15 @@ mod tests {
             let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
         let _ = parent.wait();
-        assert_eq!(pinned, (0, 1));
+        assert!(
+            !reused_pids.contains(&decoy_pid) && !recorded_pids.contains(&decoy_pid),
+            "the foreign p/A1 process {decoy_pid} was pinned: reused {reused_pids:?} recorded {recorded_pids:?}"
+        );
+        assert_eq!(
+            pinned,
+            (0, 1),
+            "decoy {decoy_pid} reused {reused_pids:?} recorded {recorded_pids:?}"
+        );
         Ok(())
     }
 
