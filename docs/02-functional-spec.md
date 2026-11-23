@@ -1125,8 +1125,8 @@ REQ→TASK→candidate→TEST→EVIDENCE→acceptance 可双向查找
   - 判定：两份清单逐项相等
 - **AC-032-03**（TEST-032-03 · 检查 `integration`）Given 修订 1 的追踪链完整，REQ-A 与 REQ-B 都已验收；批准只改写 REQ-A 的修订 2；When 再次导出追踪报告；Then REQ-A 与未改动的 REQ-B 两条链上的验收节点都标为 stale，历史结果仍可查；修订 2 下没有节点沿用修订 1 的 PASS
   - 判定：REQ-A 与 REQ-B 的验收节点都 stale；历史可查；无沿用修订 1 的 PASS
-- **AC-032-04**（TEST-032-04 · 检查 `integration`）Given 一个没有 contracts/ 目录的夹具 git 项目：docs/spec/ 下两份 Markdown 共 2 条 REQ、3 条 AC（check 行依次为 unit、unit、integration）与生成的 index.json，tests/check-plan.json 列出 unit 与 integration；项目还没有已批准修订；When 用户以 ApproveSpec 批准，经产品冻结一个候选，随后对该候选运行追踪（scripts/product/traceability.py 的 World，档 project），并读取产品对同一候选的追踪导出；Then 候选的 spec 为指向 docs/spec/index.json 的单个 FileRef；World.tests() 恰得到 3 个 TEST，check 依次为 unit、unit、integration，等于 index.json 的 scenarios，也等于 acceptance_criteria.check_id；没有成员证据时 3 个 TEST 都是 NOT_RUN 而不是错误；追踪与导出期间没有打开项目根下 contracts/ 中的任何路径；产品导出的 TEST→check 与 World 的逐项相同
-  - 判定：candidate.spec 为指向 index.json 的单个 FileRef；3 个 TEST 的 check 依次为 unit、unit、integration 且等于 scenarios 与 acceptance_criteria.check_id；无证据时为 NOT_RUN；未打开项目根下 contracts/ 的路径；产品导出与 World 逐项相同
+- **AC-032-04**（TEST-032-04 · 检查 `integration`）Given 一个没有 contracts/ 目录的夹具 git 项目：docs/spec/ 下两份 Markdown 共 2 条 REQ、3 条 AC（check 行依次为 unit、unit、integration）与生成的 index.json，tests/check-plan.json 列出 unit 与 integration；项目还没有已批准修订；When 用户以 ApproveSpec 批准，经产品冻结一个候选，随后对该候选运行追踪（scripts/product/traceability.py 的 World，档 project），并读取产品对同一候选的追踪导出；Then 候选的 spec 为指向 docs/spec/index.json 的单个 FileRef；World.tests() 恰得到 3 个 TEST，check 依次为 unit、unit、integration，等于 index.json 的 scenarios，也等于 acceptance_criteria.check_id；没有成员证据时 3 个 TEST 都是 MISSING（ADR-027 原则一：场景检查没有任何成员时的状态；与 NOT_RUN 一样是无结论、未满足）而不是错误；追踪与导出期间没有打开项目根下 contracts/ 中的任何路径；产品导出的 TEST→check 与 World 的逐项相同
+  - 判定：candidate.spec 为指向 index.json 的单个 FileRef；3 个 TEST 的 check 依次为 unit、unit、integration 且等于 scenarios 与 acceptance_criteria.check_id；无成员证据时为 MISSING（不是错误）；未打开项目根下 contracts/ 的路径；产品导出与 World 逐项相同
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 

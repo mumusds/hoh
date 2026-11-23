@@ -2606,7 +2606,7 @@
    "pass_criteria": [
     "candidate.spec 为指向 index.json 的单个 FileRef",
     "3 个 TEST 的 check 依次为 unit、unit、integration 且等于 scenarios 与 acceptance_criteria.check_id",
-    "无证据时为 NOT_RUN",
+    "无成员证据时为 MISSING（不是错误）",
     "未打开项目根下 contracts/ 的路径",
     "产品导出与 World 逐项相同"
    ],

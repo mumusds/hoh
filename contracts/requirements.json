@@ -2045,7 +2045,7 @@
      "id": "AC-032-04",
      "given": "一个没有 contracts/ 目录的夹具 git 项目：docs/spec/ 下两份 Markdown 共 2 条 REQ、3 条 AC（check 行依次为 unit、unit、integration）与生成的 index.json，tests/check-plan.json 列出 unit 与 integration；项目还没有已批准修订",
      "when": "用户以 ApproveSpec 批准，经产品冻结一个候选，随后对该候选运行追踪（scripts/product/traceability.py 的 World，档 project），并读取产品对同一候选的追踪导出",
-     "then": "候选的 spec 为指向 docs/spec/index.json 的单个 FileRef；World.tests() 恰得到 3 个 TEST，check 依次为 unit、unit、integration，等于 index.json 的 scenarios，也等于 acceptance_criteria.check_id；没有成员证据时 3 个 TEST 都是 NOT_RUN 而不是错误；追踪与导出期间没有打开项目根下 contracts/ 中的任何路径；产品导出的 TEST→check 与 World 的逐项相同",
+     "then": "候选的 spec 为指向 docs/spec/index.json 的单个 FileRef；World.tests() 恰得到 3 个 TEST，check 依次为 unit、unit、integration，等于 index.json 的 scenarios，也等于 acceptance_criteria.check_id；没有成员证据时 3 个 TEST 都是 MISSING（ADR-027 原则一：场景检查没有任何成员时的状态；与 NOT_RUN 一样是无结论、未满足）而不是错误；追踪与导出期间没有打开项目根下 contracts/ 中的任何路径；产品导出的 TEST→check 与 World 的逐项相同",
      "test_id": "TEST-032-04"
     }
    ],
