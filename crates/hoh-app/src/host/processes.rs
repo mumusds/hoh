@@ -730,6 +730,138 @@ mod tests {
         assert!(parse_stat(44, b"44 no name").is_none());
     }
 
+    /// Kills and reaps a process this test spawned. `group` signals the process group, so a shell and the child it
+    /// backgrounded both end. Drop covers every return, including `?` and an early `Err`.
+    struct Reap {
+        child: std::process::Child,
+        group: bool,
+    }
+
+    impl Reap {
+        fn process(child: std::process::Child) -> Self {
+            Self {
+                child,
+                group: false,
+            }
+        }
+
+        fn group(child: std::process::Child) -> Self {
+            Self { child, group: true }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let pid = self.child.id();
+            if let Some(raw) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                let signal = rustix::process::Signal::KILL;
+                if self.group {
+                    let _ = rustix::process::kill_process_group(raw, signal);
+                } else {
+                    let _ = rustix::process::kill_process(raw, signal);
+                }
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    fn same_process(pid: u32, start: u64) -> bool {
+        match stat(Path::new("/proc"), pid) {
+            Stat::Read(p) => p.start == start,
+            _ => false,
+        }
+    }
+
+    /// The start time of `pid` once `/proc` shows it, or an error when it never does.
+    fn start_of(pid: u32) -> Result<u64, String> {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Stat::Read(p) = stat(Path::new("/proc"), pid) {
+                return Ok(p.start);
+            }
+            if Instant::now() > end {
+                return Err(format!("pid {pid} had no stat"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_drop_guard_kills_and_waits_the_decoy_and_the_parent_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLK34-52 / FLK34-01: letting the guard go, with no later kill, ends the decoy and the parent group and
+        // reaps the children this process spawned. A zombie still has its start time, so a kill without a wait fails.
+        use std::os::unix::process::CommandExt as _;
+        let parent = Reap::group(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30 & wait"])
+                .process_group(0)
+                .spawn()?,
+        );
+        let parent_pid = parent.id();
+        let parent_start = start_of(parent_pid)?;
+        let end = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            let (all, _) = processes(Path::new("/proc"));
+            if let Some(child) = all.iter().find(|p| p.ppid == parent_pid) {
+                break child.pid;
+            }
+            if Instant::now() > end {
+                return Err(format!("parent {parent_pid} grew no child").into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let child_start = start_of(child_pid)?;
+        let decoy = Reap::process(std::process::Command::new("sleep").args(["60"]).spawn()?);
+        let decoy_pid = decoy.id();
+        let decoy_start = start_of(decoy_pid)?;
+        drop(decoy);
+        drop(parent);
+        // The shell and the decoy are this process's children: `wait` in the guard has reaped them. The shell's
+        // sleep is not; the group signal has it exiting, and init reaps it. A kill that missed it leaves it running.
+        let parent_alive = same_process(parent_pid, parent_start);
+        let decoy_alive = same_process(decoy_pid, decoy_start);
+        let child_by = Instant::now() + Duration::from_secs(2);
+        let mut child_alive = same_process(child_pid, child_start);
+        while child_alive && Instant::now() < child_by {
+            std::thread::sleep(Duration::from_millis(10));
+            child_alive = same_process(child_pid, child_start);
+        }
+        // The assertion is about the guard. If it did not reap, kill these exact pids so the red leaves nothing.
+        for (pid, start, group) in [
+            (parent_pid, parent_start, true),
+            (child_pid, child_start, false),
+            (decoy_pid, decoy_start, false),
+        ] {
+            if !same_process(pid, start) {
+                continue;
+            }
+            if let Some(raw) = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+            {
+                if group {
+                    let _ = rustix::process::kill_process_group(raw, rustix::process::Signal::KILL);
+                } else {
+                    let _ = rustix::process::kill_process(raw, rustix::process::Signal::KILL);
+                }
+                let _ = rustix::process::waitpid(Some(raw), rustix::process::WaitOptions::empty());
+            }
+        }
+        assert!(
+            !parent_alive && !child_alive && !decoy_alive,
+            "drop left parent {parent_pid} alive={parent_alive} child {child_pid} alive={child_alive} decoy {decoy_pid} alive={decoy_alive}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn the_leader_roots_the_parent_chain_only_as_the_process_recorded()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -740,10 +872,12 @@ mod tests {
         // (1, 2); two, the (2, 3) seen under a full parallel run). The decoy keeps that fixed marker and must not
         // be pinned.
         use std::os::unix::process::CommandExt as _;
-        let mut parent = std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & wait"])
-            .process_group(0)
-            .spawn()?;
+        let parent = Reap::group(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30 & wait"])
+                .process_group(0)
+                .spawn()?,
+        );
         let pid = parent.id();
         let end = Instant::now() + Duration::from_secs(5);
         let has_child = || {
@@ -758,10 +892,12 @@ mod tests {
             _ => 0,
         };
         // Held until its environment shows the foreign marker, then for the whole scan.
-        let mut decoy = std::process::Command::new("sleep")
-            .args(["60"])
-            .env(ATTEMPT_ENV, "p/A1")
-            .spawn()?;
+        let decoy = Reap::process(
+            std::process::Command::new("sleep")
+                .args(["60"])
+                .env(ATTEMPT_ENV, "p/A1")
+                .spawn()?,
+        );
         let decoy_pid = decoy.id();
         let needle = format!("{ATTEMPT_ENV}=p/A1").into_bytes();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -788,20 +924,9 @@ mod tests {
         let pinned = (reused.pins.len(), recorded.pins.len());
         let reused_pids: Vec<u32> = reused.pins.iter().map(|p| p.pid).collect();
         let recorded_pids: Vec<u32> = recorded.pins.iter().map(|p| p.pid).collect();
-        if let Some(p) = i32::try_from(decoy_pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
-        }
-        let _ = decoy.wait();
-        if let Some(group) = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
-        let _ = parent.wait();
+        // `parent` and `decoy` are reaped by their drop guard, on this path and on every earlier return.
+        drop(decoy);
+        drop(parent);
         assert!(
             !reused_pids.contains(&decoy_pid) && !recorded_pids.contains(&decoy_pid),
             "the foreign p/A1 process {decoy_pid} was pinned: reused {reused_pids:?} recorded {recorded_pids:?}"
