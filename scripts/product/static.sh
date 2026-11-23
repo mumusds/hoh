@@ -36,6 +36,12 @@ cargo deny --locked check licenses bans sources
 scan=(python3 scripts/product/persistence_scan.py --canary-log "$logs/canary.log")
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then scan+=(--out "$HOH_EVIDENCE_DIR/test-results.jsonl"); fi
 "${scan[@]}"
+# No Rust source names a machine-specific home directory: tests that created their temporary directories under one
+# developer's /home path passed on that machine and failed in CI (M3L-101, PR #108); use tempfile's defaults.
+if grep -rnE 'tempdir_in\("/home|"/home/ai/' --include='*.rs' crates; then
+  echo 'static: a Rust source names a machine-specific /home path; use tempfile defaults' >&2
+  exit 1
+fi
 # docs/adr/ADR-031.md, 设计修正 2, E: the client crate does not depend on the host's, every place that starts a process
 # or makes the plain spawner is listed with its owner, and every direct stderr write outside the host is listed.
 python3 scripts/product/spawn_scan.py
