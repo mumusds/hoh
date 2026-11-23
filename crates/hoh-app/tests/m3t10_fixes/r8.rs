@@ -11,9 +11,7 @@ fn context() -> Context {
 }
 
 async fn withdrawn(restart: bool, run_limit: bool) -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t10-r8-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t10-r8-").tempdir()?;
     let host = Host::start(config(dir.path())).await?;
     let project = host.project_id.clone();
     host.shutdown().await;

@@ -4,9 +4,7 @@ use hoh_core::persistence::{Change, Commit, Decided, PersistError, StateCas, Sto
 use hoh_core::protocol::{DecisionPayload, TaskState};
 
 async fn setup() -> R<(tempfile::TempDir, Store, String, String)> {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t10-dc4-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t10-dc4-").tempdir()?;
     let host = Host::start(config(dir.path())).await?;
     let project = host.project_id.clone();
     host.shutdown().await;

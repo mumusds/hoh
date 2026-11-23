@@ -2676,7 +2676,7 @@ async fn test_023_01_dc4_every_persistence_commit_audits_anchors_and_consults() 
     for broken in ["anchor", "open_terminal", "finished_nonterminal"] {
         let dir = tempfile::Builder::new()
             .prefix("m3t10-dc4-audit-")
-            .tempdir_in("/home/ai/dev")?;
+            .tempdir()?;
         let (store, path) = open_store(&dir)?;
         world(&path, "RUNNING", &[], &work_task("agent_blocked"))?;
         match broken {
