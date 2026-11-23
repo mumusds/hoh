@@ -316,7 +316,7 @@ pub(super) async fn apply(
         answer_left_messages(store, project, &row).await?;
     }
     if ends {
-        row.draft_boundary = super::drafting::boundary(store, project, &row.attempt_id).await?;
+        row.draft_boundary = super::drafting::boundary(store, project, &row.attempt_id).await;
     }
     let found = row.clone();
     let seq = super::control::recorded_end(project, move |workspace| {

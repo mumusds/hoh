@@ -173,11 +173,11 @@ fn head(root: &Path) -> Result<Option<String>, String> {
 fn dirty(root: &Path, committed: bool) -> Result<BTreeSet<Vec<u8>>, String> {
     let mut all = untracked(root)?;
     if committed {
-        all.extend(paths(super::control::git(
+        all.extend(git_paths(
             root,
             &["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
-        )?));
-        all.extend(paths(super::control::git(
+        )?);
+        all.extend(git_paths(
             root,
             &[
                 "diff",
@@ -188,27 +188,35 @@ fn dirty(root: &Path, committed: bool) -> Result<BTreeSet<Vec<u8>>, String> {
                 "HEAD",
                 "--",
             ],
-        )?));
+        )?);
     } else {
-        all.extend(paths(super::control::git(
-            root,
-            &["ls-files", "--cached", "-z"],
-        )?));
+        all.extend(git_paths(root, &["ls-files", "--cached", "-z"])?);
     }
     Ok(all)
 }
 
+const PATH_LIMIT: usize = 4096;
+const PATH_BYTES_LIMIT: usize = 256 * 1024;
+const CONTENT_LIMIT: u64 = 64 * 1024 * 1024;
+const OBSERVATION_LIMIT: usize = 1024 * 1024;
+const FOLD_AT: usize = 64;
+
+fn git_paths(root: &Path, args: &[&str]) -> Result<BTreeSet<Vec<u8>>, String> {
+    let found = paths(super::control::git_bounded(root, args, OBSERVATION_LIMIT)?);
+    if found.len() > PATH_LIMIT || found.iter().map(Vec::len).sum::<usize>() > PATH_BYTES_LIMIT {
+        return Err("draft path observation limit exceeded".into());
+    }
+    Ok(found)
+}
+
 fn untracked(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
-    Ok(paths(super::control::git(
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )?))
+    git_paths(root, &["ls-files", "--others", "--exclude-standard", "-z"])
 }
 
 // Collapse pre-existing ignored trees (target/, node_modules/, .hoh/) rather than logging every artifact.
 // Their contents are outside this Git observation boundary; newly appearing ignored roots still get checked.
 fn ignored_roots(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
-    Ok(paths(super::control::git(
+    git_paths(
         root,
         &[
             "ls-files",
@@ -218,36 +226,88 @@ fn ignored_roots(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
             "--directory",
             "-z",
         ],
-    )?))
+    )
 }
 
-fn fingerprint(root: &Path, path: &[u8]) -> Result<Value, String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    no_link(root, path)?;
-    let at = root.join(std::ffi::OsString::from_vec(path.to_vec()));
-    let mut file = match std::fs::File::open(&at) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
-        Err(e) => return Err(e.to_string()),
-    };
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err(format!("not a regular draft path: {}", at.display()));
-    }
-    let mut digest = Sha256::new();
-    let mut buf = [0; 65536];
-    loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
+struct Observation {
+    bytes_left: u64,
+    digests: BTreeMap<Vec<u8>, Value>,
+}
+impl Observation {
+    fn new() -> Self {
+        Self {
+            bytes_left: CONTENT_LIMIT,
+            digests: BTreeMap::new(),
         }
-        digest.update(&buf[..n]);
     }
-    use std::os::unix::fs::PermissionsExt;
-    Ok(
-        json!({"sha256": digest.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(), "mode": meta.permissions().mode()}),
-    )
+    fn file(&mut self, root: &Path, path: &[u8]) -> Result<Value, String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Some(digest) = self.digests.get(path) {
+            return Ok(digest.clone());
+        }
+        if self.digests.len() >= PATH_LIMIT {
+            return Err("draft file observation limit exceeded".into());
+        }
+        no_link(root, path)?;
+        let at = root.join(std::ffi::OsString::from_vec(path.to_vec()));
+        let mut file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(&at)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Value::Null),
+            Err(e) => return Err(e.to_string()),
+        };
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err(format!("not a regular draft path: {}", at.display()));
+        }
+        if meta.len() > self.bytes_left {
+            return Err("draft content observation limit exceeded".into());
+        }
+        let mut digest = Sha256::new();
+        let mut buf = [0; 65536];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            self.bytes_left = self
+                .bytes_left
+                .checked_sub(n as u64)
+                .ok_or("draft content observation limit exceeded")?;
+            digest.update(&buf[..n]);
+        }
+        let value = json!({"sha256": digest.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(), "mode": meta.permissions().mode()});
+        self.digests.insert(path.to_vec(), value.clone());
+        Ok(value)
+    }
+    fn tree(
+        &mut self,
+        root: &Path,
+        prefix: &[u8],
+        files: &BTreeSet<Vec<u8>>,
+    ) -> Result<Value, String> {
+        use sha2::{Digest, Sha256};
+        no_link(root, prefix)?;
+        let mut hash = Sha256::new();
+        let mut count = 0;
+        for path in files.iter().filter(|p| p.starts_with(prefix)) {
+            let digest = self.file(root, path)?;
+            hash.update((path.len() as u64).to_le_bytes());
+            hash.update(path);
+            hash.update(serde_json::to_vec(&digest).map_err(|e| e.to_string())?);
+            count += 1;
+        }
+        Ok(
+            json!({"tree_sha256": hash.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>(), "files":count}),
+        )
+    }
 }
 
 /// Saved before opening the process gate. Errors are durable, not mistaken for an empty write set.
@@ -256,16 +316,53 @@ pub(super) fn snapshot(root: &Path) -> Value {
         let h = head(root)?;
         let d = dirty(root, h.is_some())?;
         let u = untracked(root)?;
-        let fingerprints = u
+        let mut observation = Observation::new();
+        let mut groups: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        for path in &u {
+            if !allowed(path)
+                && let Some(slash) = path.iter().position(|b| *b == b'/')
+            {
+                *groups.entry(path[..=slash].to_vec()).or_default() += 1;
+            }
+        }
+        // Fold only wholly untracked product trees. Allowed docs keep per-file digests, so an unchanged user
+        // document can be excluded even when its directory gains newly committed draft files (M3L-250).
+        let tracked = if groups.values().any(|n| *n >= FOLD_AT) {
+            paths(super::control::git_bounded(
+                root,
+                &["ls-files", "--cached", "-z"],
+                OBSERVATION_LIMIT,
+            )?)
+        } else {
+            BTreeSet::new()
+        };
+        let mut fingerprints = BTreeMap::new();
+        let folded: Vec<_> = groups
+            .into_iter()
+            .filter(|(p, n)| *n >= FOLD_AT && !tracked.iter().any(|t| t.starts_with(p)))
+            .map(|(p, _)| p)
+            .collect();
+        for prefix in &folded {
+            fingerprints.insert(hex(prefix), observation.tree(root, prefix, &u)?);
+        }
+        for path in u
             .iter()
-            .map(|p| Ok((hex(p), fingerprint(root, p)?)))
-            .collect::<Result<BTreeMap<_, _>, String>>()?;
-        Ok(
-            json!({"head":h,"draft_dirty":d.iter().map(|p|hex(p)).collect::<Vec<_>>(),
-            "draft_untracked":fingerprints,
+            .filter(|p| !folded.iter().any(|prefix| p.starts_with(prefix)))
+        {
+            fingerprints.insert(hex(path), observation.file(root, path)?);
+        }
+        let dirty: BTreeSet<_> = d
+            .difference(&u)
+            .map(|p| hex(p))
+            .chain(fingerprints.keys().cloned())
+            .collect();
+        let value = json!({"head":h,"draft_dirty":dirty,"draft_untracked":fingerprints,
             "draft_ignored_roots":ignored_roots(root)?.iter().map(|p|hex(p)).collect::<Vec<_>>(),
-            "draft_outside":d.difference(&u).filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()}),
-        )
+            "draft_outside":d.difference(&u).filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()});
+        if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > OBSERVATION_LIMIT {
+            return Err("draft snapshot observation limit exceeded".into());
+        }
+        Ok(value)
     };
     observe().unwrap_or_else(|error| json!({"draft_error":error}))
 }
@@ -325,29 +422,18 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let current = head(root)?;
     let mut changed = dirty(root, current.is_some())?;
     let uncommitted = changed.clone();
-    let initial = start["draft_untracked"]
-        .as_object()
-        .ok_or("missing untracked start digests")?;
-    for (name, digest) in initial {
-        let path = decoded(name)?;
-        if fingerprint(root, &path)? == *digest {
-            changed.remove(&path);
-        } else {
-            changed.insert(path);
-        }
-    }
     let ignored = start["draft_ignored_roots"]
         .as_array()
         .ok_or("missing ignored roots observation")?
         .iter()
         .map(|p| decoded(p.as_str().ok_or("invalid ignored root")?))
         .collect::<Result<BTreeSet<_>, String>>()?;
-    changed.extend(ignored_roots(root)?.difference(&ignored).cloned());
+    let newly_ignored: BTreeSet<_> = ignored_roots(root)?.difference(&ignored).cloned().collect();
 
     if let Some(current) = &current {
         let committed = if let Some(base) = start["head"].as_str() {
             super::control::git(root, &["merge-base", "--is-ancestor", base, current])?;
-            super::control::git(
+            super::control::git_bounded(
                 root,
                 &[
                     "diff",
@@ -358,12 +444,68 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
                     current,
                     "--",
                 ],
+                OBSERVATION_LIMIT,
             )?
         } else {
-            super::control::git(root, &["ls-tree", "-r", "-z", "--name-only", current])?
+            super::control::git_bounded(
+                root,
+                &["ls-tree", "-r", "-z", "--name-only", current],
+                OBSERVATION_LIMIT,
+            )?
         };
         changed.extend(paths(committed));
     }
+    let initial = start["draft_untracked"]
+        .as_object()
+        .ok_or("missing untracked start digests")?;
+    let mut observation = Observation::new();
+    let tree_files = if initial.values().any(|v| v.get("tree_sha256").is_some()) {
+        let prefixes = initial
+            .iter()
+            .filter(|(_, v)| v.get("tree_sha256").is_some())
+            .map(|(k, _)| decoded(k))
+            .collect::<Result<Vec<_>, _>>()?;
+        let files: BTreeSet<_> = paths(super::control::git_bounded(
+            root,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            OBSERVATION_LIMIT,
+        )?)
+        .into_iter()
+        .filter(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)))
+        .collect();
+        if files.len() > PATH_LIMIT || files.iter().map(Vec::len).sum::<usize>() > PATH_BYTES_LIMIT
+        {
+            return Err("draft tree observation limit exceeded".into());
+        }
+        files
+    } else {
+        BTreeSet::new()
+    };
+    for (name, digest) in initial {
+        let path = decoded(name)?;
+        let tree = digest.get("tree_sha256").is_some();
+        let now = if tree {
+            observation.tree(root, &path, &tree_files)?
+        } else {
+            observation.file(root, &path)?
+        };
+        if tree {
+            changed.retain(|p| !p.starts_with(&path));
+        }
+        if now == *digest {
+            changed.remove(&path);
+        } else {
+            changed.insert(path);
+        }
+    }
+    // Ignored roots are not in a folded digest; newly ignored files must still be checked.
+    changed.extend(newly_ignored);
     let outside: Vec<_> = changed
         .iter()
         .filter(|p| !allowed(p))
@@ -378,7 +520,11 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     for path in &changed {
         no_link(root, path)?;
     }
-    if uncommitted.iter().any(|p| p.starts_with(b"docs/")) || current.is_none() {
+    if uncommitted
+        .iter()
+        .any(|p| p.starts_with(b"docs/") && changed.contains(p))
+        || current.is_none()
+    {
         return Ok(WriterOutcome::Correct {
             reasons: vec!["draft Markdown and index must be committed before completion".into()],
         });
@@ -472,20 +618,29 @@ pub(super) async fn boundary(
     store: &Store,
     root: &Path,
     attempt: &str,
-) -> Result<Option<(String, Vec<String>)>, hoh_core::persistence::PersistError> {
-    let start = store.reader()?.draft_start(attempt)?;
-    // No process gate ever opened: git init alone cannot have written product files.
-    let Some(start) = start.filter(|s| !s.is_null()) else {
-        return Ok(None);
+) -> Option<(String, Vec<String>)> {
+    let observe = async {
+        let start = store.reader()?.draft_start(attempt)?;
+        // No process gate ever opened: git init alone cannot have written product files.
+        let Some(start) = start.filter(|s| !s.is_null()) else {
+            return Ok(None);
+        };
+        let root = root.to_path_buf();
+        super::begun::spawn_blocking(move || match checked(&root, &start) {
+            Ok(WriterOutcome::DraftBlocked { detail, paths }) => Some((detail, paths)),
+            Err(detail) => Some((detail, vec![])),
+            _ => None,
+        })
+        .await
+        .map_err(|e| hoh_core::persistence::PersistError::Storage(e.to_string()))
     };
-    let root = root.to_path_buf();
-    super::begun::spawn_blocking(move || match checked(&root, &start) {
-        Ok(WriterOutcome::DraftBlocked { detail, paths }) => Some((detail, paths)),
-        Err(detail) => Some((detail, vec![])),
-        _ => None,
+    // Ending must be handed over even when its boundary cannot be read. The transaction rechecks task kind.
+    observe.await.unwrap_or_else(|error| {
+        Some((
+            format!("draft boundary observation failed: {error}"),
+            vec![],
+        ))
     })
-    .await
-    .map_err(|e| hoh_core::persistence::PersistError::Storage(e.to_string()))
 }
 
 #[cfg(test)]
