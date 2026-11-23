@@ -75,6 +75,12 @@ NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --res
 
 `hoh` 与 `hoh -p` 的退出码（REQ-004）：0 COMPLETED；1 FAILED；3 BLOCKED；4 INCOMPLETE；5 CANCELLED；6 PAUSED；64 用法错误；69 host 不可用；78 配置错误；130 被 SIGINT 中断（后台任务继续）；143 被 SIGTERM 中断。
 
+### 已有规格时继续规划
+
+运行中输入 `/plan`，模式会在当前写入安全结束后生效。HoH 保持 Run 的工作阶段，以当前已批准规格起草变更；暂停期间不开始新草稿，恢复后继续。起草完成会提出 CR 并等待你批准；切换到 BUILD 不会替你批准，也不会跳过新修订的独立规格审查。
+
+已经运行的 Run 中，不受规格缺项影响的就绪任务和在途工作继续推进；这些工作结束后，再处理尚未解决的缺项。AUTO 遇到缺少验收条件、无法观察的条件或待定内容时会请求补充规格，并停在批准问题前；无人值守的 `-p` 此时以 3 退出。BUILD 遇到这些缺项会保留 readiness 阻塞，提示切到 PLAN/AUTO 或修复后重试。TUI 选择退回草稿时，先输入非空修改意见再按 Enter；Esc 返回选择。取消草稿会保留已写入的文件和提交。
+
 ## 最终报告
 
 包含产物版本、发布状态（COMPLETED / COMPLETED_DEGRADED 及降级清单 / INTERIM_RELEASED / INCOMPLETE / BLOCKED / FAILED）、已验收范围、未解决事项、测试真实/模拟/未运行分类、费用实际/估算/未知、部署与回滚步骤。不能只给一句完成。模型退出与HoH完成分别显示。

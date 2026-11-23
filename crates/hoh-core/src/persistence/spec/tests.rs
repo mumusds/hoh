@@ -564,3 +564,108 @@ async fn test_009_02_s7_auto_only_drafts_content_gaps_once_per_base() -> R {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_008_01_s8_applied_change_does_not_open_another_draft() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    store.submit_command(command).await?;
+    db.execute("UPDATE runs SET state='RUNNING',mode='AUTO'", [])?;
+    db.execute_batch("INSERT INTO input_queue VALUES('I','R','CHANGE',NULL,'APPLIED','{\"text\":\"更新说明\"}');
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('queued-I','P','R','input.queued','{\"input_id\":\"I\"}','now');
+        INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at)
+        SELECT 'CR','P',spec_id,'PROPOSED','用户变更','{}','now' FROM runs WHERE run_id='R';")?;
+    assert!(
+        !store.draft_step("R", false).await?,
+        "CHANGE already proposes its CR; it must not introduce a pending-draft hold"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM change_requests WHERE cr_id='CR'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "PROPOSED"
+    );
+    // A distinct user request still creates the next generation (Q3); handling CHANGE must not disable it.
+    db.execute_batch("INSERT INTO input_queue VALUES('next','R','REPLY',NULL,'APPLIED','{\"text\":\"继续修改规格\"}');
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('queued-next','P','R','input.queued','{\"input_id\":\"next\"}','now');")?;
+    assert!(store.draft_step("R", false).await?);
+    assert!(!store.draft_step("R", false).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_s8_identical_competing_draft_can_be_explicitly_accepted() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    db.execute_batch("INSERT INTO runs(run_id,project_id,state,mode,revision,created_at) VALUES('R2','P','SPECIFYING','PLAN',0,'2026-11-22T00:00:00Z');")?;
+    let mut other = command.clone();
+    other.command_id = "other".into();
+    other.idempotency_key = "other".into();
+    other.event.event_id = "other-event".into();
+    other.event.run_id = Some("R2".into());
+    other.run_id = "R2".into();
+    other.expected_revision = 0;
+    store.submit_command(other).await?;
+    store.submit_command(command.clone()).await?;
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "IMPLEMENTED",
+        "old approval must not cross a base"
+    );
+    let mut fresh = command;
+    fresh.command_id = "fresh".into();
+    fresh.idempotency_key = "fresh".into();
+    fresh.event.event_id = "fresh-event".into();
+    fresh.expected_revision =
+        db.query_row("SELECT revision FROM runs WHERE run_id='R'", [], |r| {
+            r.get(0)
+        })?;
+    store.submit_command(fresh).await?;
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "ACCEPTED"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM change_requests", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert!(super::super::draft_approval::pending(&db, "R")?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_s8_refused_draft_dispatch_has_a_run_question() -> R {
+    for mode in ["PLAN", "BUILD"] {
+        let (_dir, store, db, _) = approval_world().await?;
+        db.execute_batch(&format!("DELETE FROM events; UPDATE runs SET state='SPECIFYING',mode='{mode}',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL; UPDATE tasks SET state='READY';"))?;
+        assert!(
+            store
+                .dispatch_draft("R", crate::decision::Context::default())
+                .await?,
+            "a deterministic refusal must make durable progress"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "BLOCKED/NEED_DECISION/SPECIFYING"
+        );
+        let questions = super::super::questions::open(&db, "R")?;
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].reason.as_deref(), Some("draft_unavailable"));
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+    }
+    Ok(())
+}

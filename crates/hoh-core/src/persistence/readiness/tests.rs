@@ -235,6 +235,11 @@ async fn test_009_02_s7_build_preserves_readiness_block_and_asks_for_mode() -> R
     let (store, path) = world(dir.path())?;
     let db = Connection::open(&path)?;
     db.execute("UPDATE runs SET mode='BUILD'", [])?;
+    // AC-009-02 has no ready product work. Mixed ready/unready work is covered separately by AC-031-02.
+    db.execute(
+        "UPDATE tasks SET state='ACCEPTED' WHERE task_id IN ('TA','TC')",
+        [],
+    )?;
     pass(&path, "s1", "independent")?;
     store.settle_readiness("R").await?;
     assert!(states(&path)?.contains(&"TB BLOCKED READINESS_NOT_MET".to_owned()));
@@ -249,5 +254,56 @@ async fn test_009_02_s7_build_preserves_readiness_block_and_asks_for_mode() -> R
         )?,
         0
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_031_02_s8_content_gap_does_not_stop_ready_or_running_product_work() -> R {
+    for mode in ["AUTO", "BUILD"] {
+        let dir = tempfile::tempdir()?;
+        let (store, path) = world(dir.path())?;
+        let db = Connection::open(&path)?;
+        db.execute("UPDATE runs SET mode=?1", [mode])?;
+        pass(&path, "s1", "independent")?;
+        assert!(
+            !store.draft_step("R", false).await?,
+            "{mode}: ready work must continue"
+        );
+        store.settle_readiness("R").await?;
+        assert!(
+            super::super::questions::open(&db, "R")?.is_empty(),
+            "{mode}"
+        );
+        assert_eq!(
+            states(&path)?,
+            ["TA READY -", "TB BLOCKED READINESS_NOT_MET", "TC PENDING -"]
+        );
+        db.execute("UPDATE tasks SET state='RUNNING' WHERE task_id='TA'", [])?;
+        assert!(
+            !store.draft_step("R", false).await?,
+            "{mode}: running work must continue"
+        );
+        assert!(!store.settle_readiness("R").await?);
+        assert_eq!(
+            texts(
+                &path,
+                "SELECT state || ' ' || blocked_reasons_json FROM runs"
+            )?,
+            ["RUNNING []"]
+        );
+        // Once that work ends, the already-blocked task still triggers the appropriate mode's decision.
+        db.execute(
+            "UPDATE tasks SET state='ACCEPTED' WHERE task_id IN ('TA','TC')",
+            [],
+        )?;
+        if mode == "AUTO" {
+            assert!(store.draft_step("R", false).await?);
+        } else {
+            assert!(store.settle_readiness("R").await?);
+            let questions = super::super::questions::open(&db, "R")?;
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].reason.as_deref(), Some("build_readiness"));
+        }
+    }
     Ok(())
 }

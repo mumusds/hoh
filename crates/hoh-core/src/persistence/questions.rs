@@ -48,6 +48,8 @@ pub enum Route {
     DraftQuestion,
     /// Choose how to resolve BUILD content readiness, without clearing task blockers.
     BuildReadiness,
+    /// Repair a refused drafting dispatch or choose a drafting mode.
+    DraftUnavailable,
     /// A work task's own end: continue or cancel.
     Continue,
     /// A work task's repairs used up: rework or cancel.
@@ -75,6 +77,11 @@ impl Route {
     pub fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Route::Commander | Route::DraftQuestion => &[],
+            Route::DraftUnavailable => &[
+                ("retry", "修复后重试起草"),
+                ("plan", "切到 PLAN"),
+                ("auto", "切到 AUTO"),
+            ],
             Route::BuildReadiness => &[
                 ("plan", "切到 PLAN 补规格"),
                 ("auto", "切到 AUTO 补规格"),
@@ -158,6 +165,7 @@ pub fn route_run(reason: RunReason) -> Route {
         RunReason::SpecApproval => Route::SpecApproval,
         RunReason::DraftQuestion => Route::DraftQuestion,
         RunReason::BuildReadiness => Route::BuildReadiness,
+        RunReason::DraftUnavailable => Route::DraftUnavailable,
     }
 }
 
@@ -805,7 +813,7 @@ pub(super) fn answer(
                 super::baseline::skipped(tx, a.project_id, a.run_id, ctx)?;
             }
         }
-        Route::BuildReadiness => {
+        Route::BuildReadiness | Route::DraftUnavailable => {
             let mode = match picked {
                 "plan" => Some(crate::protocol::Mode::Plan),
                 "auto" => Some(crate::protocol::Mode::Auto),
@@ -937,7 +945,7 @@ fn exit_name(route: Route, choice: &str) -> &'static str {
         (Route::Commander, _) => "applied",
         (Route::SpecApproval, _) => "approval",
         (Route::DraftQuestion, _) => "draft",
-        (Route::BuildReadiness, _) => "readiness",
+        (Route::BuildReadiness | Route::DraftUnavailable, _) => "readiness",
         (Route::Adopt, "draft") => "draft",
         (Route::Adopt, _) => "adopt",
         (Route::Stalled, "cancel") => "cancel",
@@ -1100,7 +1108,8 @@ fn task_exit(
             | Route::Stalled
             | Route::SpecApproval
             | Route::DraftQuestion
-            | Route::BuildReadiness,
+            | Route::BuildReadiness
+            | Route::DraftUnavailable,
             _,
         ) => {
             return Err(PersistError::IntegrityViolation(format!(

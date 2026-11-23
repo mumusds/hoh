@@ -156,7 +156,7 @@ pub(super) fn apply(
         event.payload["question_id"] = json!(event.event_id);
         event.payload["base_spec_id"] = json!(new_base);
         event.payload["text"] = json!(
-            "项目已批准了另一修订，草稿已按当前 base 重新提出。请重新确认；旧批准未生效。若内容相同，可退回修改并说明无需变更。"
+            "项目已批准了另一修订，草稿已按当前 base 重新提出。请重新确认；旧批准未生效。若内容相同，可明确批准并结束草稿，无需新修订。"
         );
         events.push(event);
         let done = writer::write(
@@ -173,6 +173,34 @@ pub(super) fn apply(
             ctx,
         )?;
         return Ok((done.revisions[0], done.event_seqs[0]));
+    }
+    // Reconfirmation has already fenced the digest and base above. Explicit acceptance of unchanged content
+    // closes only this draft; ADR-033 forbids an empty CR or another identical revision.
+    if let (Some(q), SpecAction::Approve(approval), Some(base)) = (&question, &input.action, &base)
+        && approval.decision != SpecDecision::Reject
+        && base.sha256 == actual
+    {
+        let mut follow = super::draft_approval::answered(tx, command, q, approval, ctx)?;
+        if !follow.cas.iter().any(|c| c.id == command.run_id) {
+            follow.cas.push(StateCas {
+                id: command.run_id.clone(),
+                expected_revision: revision,
+                change: Change::Touch(Entity::Run),
+            });
+        }
+        let mut event = command.event.clone();
+        event.kind = "spec.draft_unchanged".into();
+        event.payload = json!({"command_id":command.command_id,"spec_id":base.id,"spec_sha256":actual,"task_id":q.anchor["task_id"]});
+        follow.events.push(event);
+        let done = writer::write(tx, &follow, ctx)?;
+        let revision = tx
+            .query_row(
+                "SELECT revision FROM runs WHERE run_id=?1",
+                [&command.run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        return Ok((revision, done.event_seqs[0]));
     }
     let mut events = match &input.action {
         SpecAction::Propose(proposal) => {

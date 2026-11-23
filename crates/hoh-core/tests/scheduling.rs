@@ -974,7 +974,8 @@ async fn test_008_04_all_dispatch_paths_obey_plan_pending_mode_and_unapproved_dr
                 )?,
                 _ => {}
             }
-            let permitted = matches!(case, "BUILD" | "AUTO");
+            // M3L-103: a proposed CR alone keeps the approved work dispatchable; only its own pending draft holds it.
+            let permitted = matches!(case, "BUILD" | "AUTO" | "cr_pending");
             match route {
                 "round" => assert_eq!(
                     store
