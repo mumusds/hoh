@@ -1555,7 +1555,12 @@ async fn attempt(
     let mut look = None;
     let end = loop {
         let serving = verifier.as_ref().zip(helpers.as_ref());
+        // The end is polled first. A finished sample is still an in-flight look until its record commits, and polling
+        // it enqueues that record (WD-01): `select!` would otherwise start at a random branch and, when the end is
+        // already ready, poll the look first about three times in four. A request already entered is not cut off; its
+        // arm runs to the end before this select is reached again.
         tokio::select! {
+            biased;
             outcome = &mut ended => break outcome,
             () = tokio::time::sleep(Duration::from_millis(200)), if serving.is_some() => {
                 if let Some((v, helpers)) = serving {

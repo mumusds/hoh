@@ -6,7 +6,8 @@
 #![forbid(unsafe_code)]
 
 use hoh_app::host::{
-    Executor, Gate, Host, HostConfig, Outcome, Refusal, RunnerConfig, Started, Watchdog, Work,
+    Executor, Gate, Host, HostConfig, HostHooks, Outcome, Refusal, RunnerConfig, Started, Watchdog,
+    Work,
 };
 use hoh_core::persistence::selftest::{PROBE_ARG, ProbeCommand};
 use std::io::Write as _;
@@ -232,4 +233,120 @@ async fn a_look_held_on_its_thread_neither_holds_up_its_attempts_end_nor_records
     }
     assert!(host.shutdown().await, "the host's stop was not clean");
     outcome
+}
+
+/// A proc tree with no processes and a stable `ns_last_pid`: the look's tools are absent, and the termination proof
+/// reaches Done after two quiet scans.
+#[derive(Debug)]
+struct EmptyProc(PathBuf);
+
+impl HostHooks for EmptyProc {
+    fn proc_root(&self) -> Option<PathBuf> {
+        Some(self.0.clone())
+    }
+}
+
+/// Spin until `done`, without yielding to the runtime. A deadline only bounds a missed signal.
+fn hold_until(what: &str, done: impl Fn() -> bool) -> R {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        if Instant::now() > end {
+            return Err(format!("not {what} within 10s").into());
+        }
+        std::hint::spin_loop();
+    }
+    Ok(())
+}
+
+/// WD-01, the other order: the sample has finished and the end is already in the oneshot, and the attempt task has
+/// not polled since either became ready. `select!` without a bias polls the look first about three times in four,
+/// and polling it enqueues `runner_watched` before the end is chosen; the record then commits while the attempt is
+/// still RUNNING. The end is listed first so a bias keeps the look from being polled once the end is ready.
+fn a_finished_look_records_nothing_when_its_end_is_already_ready() -> R {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path();
+        let proc_root = project.join("empty-proc");
+        std::fs::create_dir_all(proc_root.join("sys/kernel"))?;
+        std::fs::write(proc_root.join("sys/kernel/ns_last_pid"), "1\n")?;
+        let first = Host::start(config(project)).await?;
+        assert!(first.shutdown().await);
+        seed(project, WORLD)?;
+        let held = Arc::new(HeldLook::default());
+        let mut config = config(project);
+        config.hooks = Arc::new(EmptyProc(proc_root));
+        config.runner = Some(RunnerConfig {
+            executor: held.clone(),
+            context: hoh_core::decision::Context {
+                required_capabilities: [(
+                    "developer".to_owned(),
+                    ["structured_events".to_owned(), "command_exec".to_owned()].into(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        });
+        config.watchdog = Watchdog {
+            quiet: Duration::from_millis(1),
+            every: Duration::from_millis(20),
+        };
+        let host = Host::start(config).await?;
+        let outcome = async {
+            until("looking", Duration::from_secs(30), || {
+                Ok(held.looking.load(Ordering::SeqCst))
+            })
+            .await?;
+            // The only blocking thread is inside the look. The next blocking job runs only after that closure has
+            // returned and its join handle has been woken, so `sampled` means the sample is ready to poll.
+            let sampled = Arc::new(AtomicBool::new(false));
+            let flag = sampled.clone();
+            let sentinel = tokio::task::spawn_blocking(move || {
+                flag.store(true, Ordering::SeqCst);
+            });
+            if let Some(stdin) = held.input.lock().map_err(|e| e.to_string())?.as_mut() {
+                stdin.write_all(b"stop\n")?;
+            }
+            // Stay on this worker: the attempt task stays queued while the end is sent and the sample then finishes.
+            hold_until("ended", || held.ended.load(Ordering::SeqCst))?;
+            held.release.store(true, Ordering::SeqCst);
+            hold_until("sample joined", || sampled.load(Ordering::SeqCst))?;
+            drop(sentinel);
+            until("settled", Duration::from_secs(3), || {
+                Ok(query(project, "SELECT state FROM attempts WHERE task_id = 'T1'")? == "SETTLED")
+            })
+            .await?;
+            assert_eq!(
+                query(
+                    project,
+                    "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%'"
+                )?,
+                "0",
+                "a look whose sample had finished was recorded after its end was already ready"
+            );
+            R::Ok(())
+        }
+        .await;
+        held.release.store(true, Ordering::SeqCst);
+        if !held.ended.load(Ordering::SeqCst)
+            && let Ok(mut input) = held.input.lock()
+            && let Some(stdin) = input.as_mut()
+        {
+            let _ = stdin.write_all(b"stop\n");
+        }
+        assert!(host.shutdown().await, "the host's stop was not clean");
+        outcome
+    })
+}
+
+#[test]
+fn a_finished_look_records_nothing_when_its_end_is_already_ready_on_one_worker() {
+    // Several passes: without a bias each one records about three times in four, so a regression fails the set.
+    for pass in 0..8 {
+        a_finished_look_records_nothing_when_its_end_is_already_ready()
+            .unwrap_or_else(|e| panic!("pass {pass}: {e}"));
+    }
 }
