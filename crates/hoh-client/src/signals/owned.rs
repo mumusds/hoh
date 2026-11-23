@@ -285,12 +285,15 @@ impl Spawner for Gate {
     fn helper(&self, command: &mut Command, stderr: HelperStderr) -> std::io::Result<Helper> {
         let stderr = std::cell::Cell::new(Some(stderr));
         self.helper_by(command, &|command| {
-            // Where a test holds a helper start with its ticket taken, before its spawn; and once its spawn returned,
-            // before its hand-off (debug builds only).
+            // Where a test holds a helper start with its ticket taken, before its spawn; and once its spawn returned the
+            // helper, before its hand-off (debug builds only). A spawn that failed returned none: it is not held as
+            // spawned (FLK-07: an ETXTBSY retried by the probe was taken for its spawned helper).
             crate::debug_hold::at("helper-before-spawn");
             let policy = stderr.take().unwrap_or(HelperStderr::Null);
             let spawned = Direct::plain().helper(command, policy);
-            crate::debug_hold::at("helper-spawned");
+            if spawned.is_ok() {
+                crate::debug_hold::at("helper-spawned");
+            }
             spawned
         })
     }
