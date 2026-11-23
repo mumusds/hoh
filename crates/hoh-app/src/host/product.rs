@@ -688,6 +688,7 @@ impl ProductExecutor {
                     deterministic(format!("Skill {} missing from packing record", source.id))
                 })?;
             value["state"] = serde_json::json!(input.disposition);
+            value["native"] = serde_json::json!("unverified_always_injected");
             value["tokens"] = serde_json::json!(input.tokens);
             value["placed"] = serde_json::json!(input.placed);
             skill_records.push(value);
