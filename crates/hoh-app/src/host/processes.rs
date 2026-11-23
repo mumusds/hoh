@@ -502,6 +502,11 @@ impl Outside {
 
     /// Look for them now: pin the new ones (sending them the strongest signal so far) and say where the proof stands.
     pub(super) fn scan(&mut self) -> Proof {
+        self.scan_with(&mut std::thread::sleep)
+    }
+
+    /// [`Outside::scan`], `wait` its pause between looks at the processes it lets end (a test's seam).
+    fn scan_with(&mut self, wait: &mut dyn FnMut(Duration)) -> Proof {
         self.scanned = Some(Instant::now());
         // The listing, then every pid allocated since it began, each batch's environments read before the next look
         // at the allocations, until none was allocated meanwhile (decision 8d v4, M2T06R-200): a marked process alive
@@ -519,6 +524,8 @@ impl Outside {
         let mut by_marker: BTreeSet<u32> = BTreeSet::new();
         let mut batch: Vec<usize> = (0..processes.len()).collect();
         let mut settled = false;
+        // The unreadable ones that are ending, let end below (their places in `processes`).
+        let mut ending: Vec<usize> = Vec::new();
         let me = rustix::process::getuid().as_raw();
         for _ in 0..=SWEEPS {
             for at in batch.drain(..) {
@@ -538,7 +545,17 @@ impl Outside {
                         || has_ended(process) => {}
                     // With the attempt's cgroup, only one that could have moved there from it ([`Outside::by_cgroup`]).
                     None if self.by_cgroup && !in_users_manager(&self.root, process.pid, me) => {}
-                    None => complete = false,
+                    // Exiting or a zombie, as listed or as read again now: it refused because it is ending (an
+                    // exiting process refuses its environment, and this user's unrelated processes exit all the
+                    // time), and it is let end as the watchdog lets it (WD-03's rule with its corrections of
+                    // 2026-11-17, docs/adr/ADR-022.md decision 19, WDF-100; FLK-07). One that runs stays unknown.
+                    None if process.zombie || process.exiting => ending.push(at),
+                    None => match stat(&self.root, process.pid) {
+                        Stat::Gone => {}
+                        Stat::Read(now) if now.start != process.start || has_ended(&now) => {}
+                        Stat::Read(now) if now.zombie || now.exiting => ending.push(at),
+                        Stat::Read(_) | Stat::Unreadable => complete = false,
+                    },
                 }
             }
             let Some(now) = last_pid(&self.root) else {
@@ -567,6 +584,15 @@ impl Outside {
             last = now;
         }
         complete = complete && settled;
+        // An ending process holds the proof only if one read shows no end of it within the settle time; nothing is
+        // waited for when the scan is already incomplete.
+        if complete && !ending.is_empty() {
+            complete = self::settled(
+                &self.root,
+                ending.iter().map(|at| &processes[*at]).collect(),
+                wait,
+            );
+        }
         let mut found: BTreeSet<u32> = BTreeSet::new();
         let mut parents: Vec<u32> = self
             .leader
@@ -1610,6 +1636,81 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
             }
         });
         (found, waits)
+    }
+
+    #[test]
+    fn an_exiting_process_that_cannot_be_read_holds_no_proof_once_one_read_shows_it_ended_within_the_settle_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLK-07 (docs/adr/ADR-021.md decision 8d, M2R-500: "the same rule as the watchdog's WD-03"; its corrections of
+        // 2026-11-17 in docs/adr/ADR-022.md decision 19, WDF-100): a process of the host's user started after the
+        // leader that is exiting (PF_EXITING, 0x4 in its stat's flags; past its memory, not yet a zombie) refuses
+        // /proc/<pid>/environ, and unrelated processes of that user exit all the time: under load every scan of a
+        // product test run met one, so the attempt's proof stayed incomplete through its stop, the runner recorded
+        // runner.unreaped and the attempt stayed RUNNING with its slot (product.rs cases that never settled). Such a
+        // process is let end as the watchdog lets it: no part of the proof once one stat read shows it gone, its pid
+        // another's, or a zombie with one thread, within the settle time; else the scan proves nothing, as before.
+        // Process 300 here, started at 900, after the leader recorded at 500; the settle wait is the hold point.
+        let me = rustix::process::getuid().as_raw();
+        let exiting = 0x40_000C;
+        const ZOMBIE: u64 = 0x40_800C;
+        let proofs = |(state, flags, threads): (&str, u64, u32),
+                      then: fn(&Path)|
+         -> std::io::Result<([Proof; 2], usize)> {
+            let root = tree(&[])?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+            let dir = root.path().join("300");
+            std::fs::create_dir_all(dir.join("environ"))?;
+            std::fs::write(dir.join("stat"), stat_of(state, flags, threads, 900))?;
+            std::fs::write(
+                dir.join("status"),
+                format!("Name:\tprobe\nUid:\t{me}\t{me}\t{me}\t{me}\nThreads:\t{threads}\n"),
+            )?;
+            let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+            outside.set_leader(Some(100), Some("500"));
+            let mut waits = 0;
+            let mut then = Some(then);
+            let first = outside.scan_with(&mut |_| {
+                waits += 1;
+                if let Some(then) = then.take() {
+                    then(&dir);
+                }
+            });
+            let second = outside.scan_with(&mut |_| waits += 1);
+            Ok(([first, second], waits))
+        };
+        let cases = [
+            // Exiting, then a zombie with one thread.
+            proofs(("R", exiting, 1), |d| {
+                let _ = std::fs::write(d.join("stat"), stat_of("Z", ZOMBIE, 1, 900));
+            })?,
+            // Exiting, then reaped.
+            proofs(("R", exiting, 1), |d| {
+                let _ = std::fs::remove_dir_all(d);
+            })?,
+            // Exiting, then reaped and its pid given to another process, one whose environment reads.
+            proofs(("R", exiting, 1), |d| {
+                let _ = std::fs::remove_dir_all(d.join("environ"));
+                let _ = std::fs::write(d.join("environ"), b"PATH=/bin\0");
+                let _ = std::fs::write(d.join("stat"), stat_of("S", 0, 1, 950));
+            })?,
+            // Its main thread exiting while another thread runs on: never ends within the settle time.
+            proofs(("R", exiting, 2), |_| {})?,
+            // Not exiting at all (PR_SET_DUMPABLE=0 refuses the same way): incomplete at once, no wait.
+            proofs(("S", 0x40_0000, 1), |_| {})?,
+        ];
+        let steps = (SETTLE_WITHIN.as_millis() / SETTLE_STEP.as_millis()) as usize;
+        assert_eq!(
+            cases,
+            [
+                ([Proof::Pending, Proof::Done], 1),
+                ([Proof::Pending, Proof::Done], 1),
+                ([Proof::Pending, Proof::Done], 1),
+                ([Proof::Incomplete, Proof::Incomplete], 2 * steps),
+                ([Proof::Incomplete, Proof::Incomplete], 0),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
