@@ -12,7 +12,7 @@ use std::{sync::Arc, time::Duration};
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[tokio::test]
-async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
+async fn test_047_03_and_test_046_01_bundle_pinned_until_checkpoint() -> R {
     let world = World::named("m3t03-bundle")?;
     world.commander(&world::Commander {
         tasks: Vec::new(),
@@ -24,6 +24,8 @@ async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
     let spec = world.seed_spec()?;
     let project = world.project();
     let mut old = Bundle::current();
+    old.files
+        .retain(|path, _| !path.starts_with("resources/skills/"));
     old.files.insert(
         "resources/prompts/developer.md".to_owned(),
         "OLD BUILTIN DEVELOPER\n".to_owned(),
@@ -75,6 +77,9 @@ async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
         world.until("SELECT count(*) FROM events WHERE event_id='T-old/attempt-1/context.packed'","1",Duration::from_secs(45)).await?;
         assert_eq!(world.query("SELECT resource_bundle_version FROM attempts WHERE attempt_id='T-old/attempt-1'")?,old.version());
         let packed:Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE event_id='T-old/attempt-1/context.packed'")?)?;
+        assert_eq!(packed["skills"], serde_json::json!([]));
+        assert_eq!(packed["skill_registry"]["builtin"], "missing");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE event_id='T-old/attempt-1/context.packed'")?, "1");
         let first=&packed["override_chain"][0];
         assert_eq!(first["layer"],"builtin");
         assert_eq!(first["sha256"],crate::installed::sha256(b"OLD BUILTIN DEVELOPER\n"));

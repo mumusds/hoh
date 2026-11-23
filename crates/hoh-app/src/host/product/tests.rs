@@ -71,8 +71,8 @@ fn a_work_turn_is_told_its_identity_and_its_bridge_file() -> Result<(), Box<dyn 
     // repeat and the bridge file in its own attempt directory; the directory exists before the turn.
     let dir = tempfile::tempdir()?;
     let w = work(None);
-    let (text, _) = executor(dir.path())
-        .pack(&w, &contract("Contract.\n\n"), None)
+    let (text, _, _) = executor(dir.path())
+        .pack(&w, &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     let bridge = attempt_logs(dir.path(), &w.attempt_id).join(BRIDGE);
     for want in [
@@ -219,8 +219,8 @@ fn work_context_selects_code_by_task_paths_at_the_workspaces_head()
     if let Some(facts) = w.assignment.context.as_mut() {
         facts.code_scope = Some(vec!["src/".to_owned()]);
     }
-    let (text, _) = executor(root)
-        .pack(&w, &contract("Contract.\n\n"), None)
+    let (text, _, _) = executor(root)
+        .pack(&w, &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     let task = text.find("### 任务上下文").ok_or("no task layer")?;
     let code = text.find("fn deep_in_scope()").ok_or("no scoped file")?;
@@ -264,8 +264,8 @@ fn a_turns_loads_and_code_source_are_read_into_its_prompt() -> Result<(), Box<dy
         });
         facts.code = Some(hoh_core::context::CodeSource { base, commit });
     }
-    let (text, _) = executor(root)
-        .pack(&w, &contract("Contract.\n\n"), None)
+    let (text, _, _) = executor(root)
+        .pack(&w, &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     let evidence = text.find("### 证据上下文").ok_or("no evidence layer")?;
     let task = text.find("### 任务上下文").ok_or("no task layer")?;
@@ -289,8 +289,8 @@ fn a_turn_is_sent_its_roles_contract_then_its_layers() -> Result<(), Box<dyn std
     // then the four layers (the run's goal, the task's id and title, the role); every input kept as an object and the
     // record names them.
     let dir = tempfile::tempdir()?;
-    let (text, record) = executor(dir.path())
-        .pack(&work(None), &contract("Contract.\n\n"), None)
+    let (text, record, _) = executor(dir.path())
+        .pack(&work(None), &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     assert!(text.starts_with("Contract.\n\n### 当前目标\n"), "{text}");
     for part in ["Ship it", "T1 Write the parser", "developer", "TaskResult"] {
@@ -321,8 +321,13 @@ fn a_sessions_first_turn_is_sent_its_whole_handover_package_before_every_other_c
     let dir = tempfile::tempdir()?;
     let package =
         serde_json::json!({"handoff_kind": "role_change", "role": "developer", "run_id": "R9"});
-    let (text, _) = executor(dir.path())
-        .pack(&work(None), &contract("Contract.\n\n"), Some(&package))
+    let (text, _, _) = executor(dir.path())
+        .pack(
+            &work(None),
+            &contract("Contract.\n\n"),
+            Some(&package),
+            false,
+        )
         .map_err(|r| format!("{r:?}"))?;
     let (contract_at, goal, package_at, task) = (
         text.find("Contract.").ok_or("no contract")?,
@@ -357,7 +362,7 @@ fn a_turn_whose_mandatory_items_exceed_its_budget_is_refused_with_both_numbers()
         });
     }
     let refusal = executor(dir.path())
-        .pack(&tight, &contract("Contract.\n\n"), None)
+        .pack(&tight, &contract("Contract.\n\n"), None, false)
         .err()
         .ok_or("packed within 10 tokens")?;
     assert_eq!(refusal.reason, "CONTEXT_BUDGET_TOO_SMALL");
@@ -375,7 +380,7 @@ fn a_turn_whose_mandatory_items_exceed_its_budget_is_refused_with_both_numbers()
     );
     // A contract with only some placeholders is refused the same way, as PROMPT_UNAVAILABLE.
     let refusal = executor(dir.path())
-        .pack(&work(None), &contract("{{GOAL}} only"), None)
+        .pack(&work(None), &contract("{{GOAL}} only"), None, false)
         .err()
         .ok_or("packed a malformed contract")?;
     assert_eq!(
@@ -711,7 +716,7 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_decisi
             .ok_or("no commander")?
             .to_owned(),
     };
-    let (text, _) = executor(dir.path())
+    let (text, _, _) = executor(dir.path())
         .pack(
             &work,
             &hoh_core::prompt::Resolved {
@@ -719,6 +724,7 @@ fn a_commander_turn_is_told_its_wake_the_values_to_name_its_nonce_and_its_decisi
                 conflicts: Vec::new(),
             },
             None,
+            false,
         )
         .map_err(|r| format!("{r:?}"))?;
     // docs/adr/ADR-032.md decision 1: the decisions are the final message's block, and no output file is named.
@@ -866,14 +872,14 @@ fn a_verifiers_confirm_ids_are_recorded_in_its_context_packed_and_its_entries_ar
             .push("请确认已修复：Issue I-1（critical）：SENTINEL 越界".to_owned());
         facts.confirm_ids = Some(vec!["I-1".to_owned()]);
     }
-    let (text, record) = executor(dir.path())
-        .pack(&w, &contract("Contract.\n\n"), None)
+    let (text, record, _) = executor(dir.path())
+        .pack(&w, &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     assert!(text.contains("SENTINEL 越界"), "{text}");
     let packed = record.packed.ok_or("no packing")?;
     assert_eq!(packed.event["confirm_ids"], serde_json::json!(["I-1"]));
-    let (_, plain) = executor(dir.path())
-        .pack(&work(None), &contract("Contract.\n\n"), None)
+    let (_, plain, _) = executor(dir.path())
+        .pack(&work(None), &contract("Contract.\n\n"), None, false)
         .map_err(|r| format!("{r:?}"))?;
     assert!(
         plain
@@ -1455,8 +1461,8 @@ fn test_047_03_packing_uses_the_attempt_pin_not_the_current_binary()
     );
     let mut w = work(None);
     w.assignment.resource_bundle = Some(old.store(dir.path())?);
-    let (_, record) = executor(dir.path())
-        .pack(&w, &contract("old developer\n"), None)
+    let (_, record, _) = executor(dir.path())
+        .pack(&w, &contract("old developer\n"), None, false)
         .map_err(|r| r.reason)?;
     assert_eq!(
         record.packed.ok_or("no packing")?.resource_bundle_version,
@@ -1481,8 +1487,8 @@ fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::erro
         &old,
     )?;
     let resolved = hoh_core::prompt_files::load(dir.path(), None, "R1", "developer", None)?;
-    let (_, record) = executor(dir.path())
-        .pack(&work(None), &resolved, None)
+    let (_, record, _) = executor(dir.path())
+        .pack(&work(None), &resolved, None, false)
         .map_err(|r| r.reason)?;
     let packing = record.packed.ok_or("no packing")?;
     assert!(

@@ -233,6 +233,7 @@ pub fn argv(
             program: PathBuf::from("pi"),
             help: help.to_owned(),
             cwd: PathBuf::from(SUITE_CWD),
+            skills: Vec::new(),
             session_dir: PathBuf::from(SUITE_PI_SESSION_DIR),
             session_id: SUITE_SESSION.to_owned(),
             resume: variant.resume,

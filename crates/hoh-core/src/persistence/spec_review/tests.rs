@@ -545,3 +545,23 @@ async fn intake_replay_is_bound_to_the_review_and_the_computed_digest() -> R {
     assert_eq!(events[0]["raw_sha256"], json!(sha256_hex(RAW)));
     Ok(())
 }
+
+#[test]
+fn test_046_01_spec_review_work_uses_readiness_skill_phase() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t08-review-phase-")
+        .tempdir()?;
+    let (_store, path) = world(dir.path())?;
+    attempt(&path, "AR1", "RV", "srv")?;
+    let conn = Connection::open(path)?;
+    assert_eq!(
+        conn.query_row("SELECT kind FROM tasks WHERE task_id='RV'", [], |r| r
+            .get::<_, String>(0))?,
+        "work"
+    );
+    let review = crate::persistence::context::facts(&conn, "R", "RV", "AR1", None)?;
+    assert_eq!(review.skill_phase.as_deref(), Some("readiness"));
+    let ordinary = crate::persistence::context::facts(&conn, "R", "OT", "AO", None)?;
+    assert_eq!(ordinary.skill_phase.as_deref(), Some("review"));
+    Ok(())
+}

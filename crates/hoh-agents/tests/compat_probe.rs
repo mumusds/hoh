@@ -340,6 +340,7 @@ fn every_option_an_adapter_passes_is_declared_and_the_probe_refuses_exactly_what
             program: "pi".into(),
             help: help.to_owned(),
             cwd: "/".into(),
+            skills: Vec::new(),
             session_dir: "/hoh-dir".into(),
             session_id: "hoh-id".to_owned(),
             resume: full,

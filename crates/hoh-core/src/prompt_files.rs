@@ -193,7 +193,7 @@ fn optional_file(root: &Path, relative: &str) -> Result<Option<PathBuf>, Error> 
     Ok(Some(path))
 }
 
-fn read_optional(root: &Path, relative: &str) -> Result<Option<String>, Error> {
+pub(crate) fn read_optional(root: &Path, relative: &str) -> Result<Option<String>, Error> {
     optional_file(root, relative)?
         .map(|path| {
             std::fs::read_to_string(&path)

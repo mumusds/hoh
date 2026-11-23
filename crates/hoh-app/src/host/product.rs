@@ -491,7 +491,8 @@ impl ProductExecutor {
         work: &Work,
         resolved: &hoh_core::prompt::Resolved,
         package: Option<&serde_json::Value>,
-    ) -> Result<(String, PromptRecord), Refusal> {
+        native_skills: bool,
+    ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
         use hoh_core::context;
         let bundle = self.bundle(work)?;
         let contract = resolved.effective().map_err(prompt_refusal)?;
@@ -611,14 +612,15 @@ impl ProductExecutor {
                 conventions["sha256"].as_str().unwrap_or_default()
             ));
         }
-        let skills = hoh_core::skills::load(
+        let skills = hoh_core::skills::load_with_diagnostics(
             &self.project,
             hoh_core::prompt_files::global_root().as_deref(),
             &work.run_id,
             &bundle,
         )
         .map_err(prompt_refusal)?;
-        let matched = hoh_core::skills::for_turn(&skills, &work.role, facts.skill_phase.as_deref());
+        let matched =
+            hoh_core::skills::for_turn(&skills.skills, &work.role, facts.skill_phase.as_deref());
         mandatory.project.push_str(&format!(
             "\nSkill 资源包：{}\nSkill 索引：\n",
             bundle.version()
@@ -628,16 +630,28 @@ impl ProductExecutor {
             mandatory.project.push('\n');
         }
         mandatory.project.push_str("Skill 索引结束");
-        let selected =
-            hoh_core::skills::with_dependencies(&skills, &matched).map_err(prompt_refusal)?;
-        let skill_sources: Vec<_> = selected
-            .iter()
-            .map(|skill| {
-                let indexed = matched.iter().any(|s| s.skill.id == skill.skill.id);
+        let selected = hoh_core::skills::with_dependencies(&skills.skills, &matched)
+            .map_err(prompt_refusal)?;
+        let mut native = std::collections::BTreeMap::new();
+        let mut skill_sources = Vec::new();
+        for skill in &selected {
+            let indexed = matched.iter().any(|s| s.skill.id == skill.skill.id);
+            let path = if native_skills {
+                match a.session_id.as_deref() {
+                    Some(session) => hoh_core::skills::native_path(&self.project, session, skill)
+                        .map_err(prompt_refusal)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let Some(path) = path {
+                native.insert(skill.skill.id.clone(), path);
+            } else {
                 facts.entries.push(skill.entry(indexed));
-                hoh_core::skills::Source::new(skill, &work.role, indexed)
-            })
-            .collect();
+            }
+            skill_sources.push(hoh_core::skills::Source::new(skill, &work.role, indexed));
+        }
         let sources = serde_json::json!({
             "role_contract": resolved.revisions(&work.role), "project": project_sources, "skills": skill_sources,
             "task": {"run_id": work.run_id, "task_id": work.task_id, "attempt_id": work.attempt_id, "role_epoch": a.role_epoch},
@@ -675,26 +689,46 @@ impl ProductExecutor {
         for source in &skill_sources {
             let mut value =
                 serde_json::to_value(source).map_err(|e| deterministic(e.to_string()))?;
-            let input = recorded
-                .packed
-                .inputs
-                .iter()
-                .find(|i| {
-                    i.class == context::Class::Knowledge
-                        && i.path == source.path
-                        && i.sha256 == source.sha256
-                })
-                .ok_or_else(|| {
-                    deterministic(format!("Skill {} missing from packing record", source.id))
-                })?;
-            value["state"] = serde_json::json!(input.disposition);
-            value["native"] = serde_json::json!("unverified_always_injected");
-            value["tokens"] = serde_json::json!(input.tokens);
-            value["placed"] = serde_json::json!(input.placed);
+            if let Some(path) = native.get(&source.id) {
+                value["state"] = serde_json::json!("native");
+                value["native"] = serde_json::json!("pi_skill");
+                value["native_path"] = serde_json::json!(
+                    path.strip_prefix(&self.project)
+                        .map_err(|e| deterministic(e.to_string()))?
+                );
+                let skill = &skills.skills[&source.id];
+                value["tokens"] = serde_json::json!(context::estimate(&skill.source.text));
+                value["placed"] = serde_json::json!(0);
+            } else {
+                let input = recorded
+                    .packed
+                    .inputs
+                    .iter()
+                    .find(|i| {
+                        i.class == context::Class::Knowledge
+                            && i.path == source.path
+                            && i.sha256 == source.sha256
+                    })
+                    .ok_or_else(|| {
+                        deterministic(format!("Skill {} missing from packing record", source.id))
+                    })?;
+                value["state"] = serde_json::json!(input.disposition);
+                value["native"] = serde_json::json!("injected");
+                value["tokens"] = serde_json::json!(input.tokens);
+                value["placed"] = serde_json::json!(input.placed);
+            }
             skill_records.push(value);
         }
         recorded.event["skills"] = serde_json::json!(skill_records);
+        recorded.event["skill_registry"] = serde_json::json!({"builtin": if skills.builtin_registry { "present" } else { "missing" }, "rejected": skills.rejected});
         for skill in &selected {
+            // Native bodies also have immutable source objects and prompt revisions, without a packing entry.
+            recorded.objects.push(context::Object {
+                bytes: skill.source.text.as_bytes().to_vec(),
+                mime: "text/markdown",
+                kind: "skill",
+                name: skill.source.path.clone(),
+            });
             recorded.objects.push(context::Object {
                 bytes: skill.registry_source.text.as_bytes().to_vec(),
                 mime: "application/json",
@@ -768,7 +802,11 @@ impl ProductExecutor {
                 artifacts,
             }),
         };
-        Ok((recorded.packed.prompt, record))
+        Ok((
+            recorded.packed.prompt,
+            record,
+            native.into_values().collect(),
+        ))
     }
 
     /// The turn `work` runs, what it runs as, the fact it was checked against and the record of its prompt, or why it
@@ -849,7 +887,9 @@ impl ProductExecutor {
             },
             _ => None,
         };
-        let (text, mut record) = self.pack(work, &contract, package.as_ref())?;
+        let native_skills = matches!(&ready.facts, hoh_agents::launch::Facts::Pi { help } if hoh_agents::adapter::offers(help, "--skill"));
+        let (text, mut record, pi_skills) =
+            self.pack(work, &contract, package.as_ref(), native_skills)?;
         // A supervision turn's own record says what it launched in, and with codex this host's check of its sandbox
         // with its reason as prepare saw it, so an unknown check is kept with the attempt (docs/adr/ADR-032.md
         // decision 4, R2): in its context.packed, written in its RUNNING commit.
@@ -885,6 +925,7 @@ impl ProductExecutor {
             resume: a.native_session.clone(),
             prompt: text,
             logs: attempt_logs(&self.project, &work.attempt_id),
+            pi_skills,
             pi_session: (
                 hoh.join("sessions").join(component(&session_id)),
                 pi_session_id(&session_id),

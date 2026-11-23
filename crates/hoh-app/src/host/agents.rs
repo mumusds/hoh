@@ -1314,6 +1314,7 @@ pub(super) struct Spec {
     pub logs: PathBuf,
     /// Pi's session directory and, for a new session, the id HoH gives it (kept for every turn of the session).
     pub pi_session: (PathBuf, String),
+    pub pi_skills: Vec<PathBuf>,
     /// Codex's App Server is not to be used: it degraded on this implementation (decision 15).
     pub exec_only: bool,
     /// The launch profile: `ReadOnly` for a supervision turn, `Yolo` for every other (docs/adr/ADR-032.md decision 2).
@@ -1400,6 +1401,7 @@ impl Ready {
                     help: help.clone(),
                     cwd: spec.cwd.clone(),
                     session_dir: spec.pi_session.0.clone(),
+                    skills: spec.pi_skills.clone(),
                     session_id: spec
                         .resume
                         .clone()
@@ -1470,6 +1472,7 @@ impl Ready {
             resume: None,
             prompt: String::new(),
             logs: cwd.to_path_buf(),
+            pi_skills: Vec::new(),
             pi_session: (cwd.join(".hoh/sessions"), String::new()),
             exec_only: false,
             graces: (Duration::from_secs(10), Duration::from_secs(5)),

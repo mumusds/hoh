@@ -753,6 +753,7 @@ async fn live_round(
                     program: inst.program.clone(),
                     help: help.clone(),
                     cwd: project.w.clone(),
+                    skills: Vec::new(),
                     session_dir: session_dir.clone(),
                     session_id: session.pi_session.clone(),
                     resume: resumed,

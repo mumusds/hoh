@@ -14,6 +14,7 @@ fn launch() -> Launch {
         cwd: PathBuf::from("/tmp"),
         session_dir: PathBuf::from("/repo/.hoh/pi-sessions/S1"),
         session_id: "sid-1".to_owned(),
+        skills: Vec::new(),
         resume: false,
         provider: None,
         model: None,
@@ -514,4 +515,41 @@ fn the_session_check_is_one_function() {
         Some(&(PathBuf::from("/s/a.jsonl"), 1, 3))
     ));
     assert!(!session_matches(&l, &[], Some("sid-1"), Some(&file)));
+}
+
+#[test]
+fn test_046_02_native_skill_flags_require_the_probed_option_and_keep_read_only_profile() {
+    let mut l = launch();
+    l.skills = vec![
+        l.session_dir.join("skills/tdd"),
+        l.session_dir.join("skills/implementation"),
+    ];
+    l.profile = crate::Profile::ReadOnly;
+    let argv = args(&l).unwrap();
+    let loaded: Vec<_> = argv
+        .windows(2)
+        .filter(|p| p[0] == "--skill")
+        .map(|p| p[1].as_str())
+        .collect();
+    assert_eq!(
+        loaded,
+        [
+            "/repo/.hoh/pi-sessions/S1/skills/tdd",
+            "/repo/.hoh/pi-sessions/S1/skills/implementation"
+        ]
+    );
+    assert!(argv.iter().any(|a| a == "--no-extensions"));
+    assert!(
+        argv.windows(2)
+            .any(|p| p == ["--tools", "read,grep,find,ls"])
+    );
+    l.help = l
+        .help
+        .lines()
+        .filter(|line| !line.contains("--skill "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(matches!(args(&l), Err(Blocked(why)) if why.contains("--skill")));
+    l.skills.clear();
+    assert!(args(&l).is_ok());
 }

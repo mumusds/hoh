@@ -103,6 +103,13 @@ impl Registry {
         }
         let mut ids = BTreeSet::new();
         for skill in &self.skills {
+            // No extension fields have defined semantics. Reject claims, including capabilities expressed as values.
+            if let Some(key) = skill.extra.keys().next() {
+                return Err(unavailable(format!(
+                    "{}: field {key} is not allowed",
+                    skill.id
+                )));
+            }
             if !valid_id(&skill.id) || !ids.insert(&skill.id) {
                 return Err(unavailable(format!(
                     "invalid or duplicate skill id {}",
@@ -211,88 +218,175 @@ impl Registry {
     }
 }
 
-/// Resolve atomically: a rejected layer returns an error and never publishes a partially changed set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Rejected {
+    pub layer: String,
+    pub reason: String,
+}
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    pub skills: BTreeMap<String, Resolved>,
+    pub builtin_registry: bool,
+    pub rejected: Vec<Rejected>,
+}
+
 pub fn load(
     root: &Path,
     global: Option<&Path>,
     run: &str,
     bundle: &Bundle,
 ) -> Result<BTreeMap<String, Resolved>, Error> {
-    let source = Contract {
-        layer: "builtin",
-        path: "resources/skills/registry.json".into(),
-        text: bundle
-            .text("resources/skills/registry.json")
-            .map_err(unavailable)?
-            .into(),
-    };
-    let registry = Registry::parse(&source.text)?;
-    registry.validate(|path| bundle.text(path).map(str::to_owned))?;
-    let mut selected: BTreeMap<String, Resolved> = registry
-        .skills
-        .iter()
-        .map(|skill| {
+    Ok(load_with_diagnostics(root, global, run, bundle)?.skills)
+}
+
+/// Reject each invalid layer atomically, retaining the valid set for this Attempt and a visible reason.
+pub fn load_with_diagnostics(
+    root: &Path,
+    global: Option<&Path>,
+    run: &str,
+    bundle: &Bundle,
+) -> Result<Loaded, Error> {
+    let mut selected = BTreeMap::new();
+    let builtin = bundle.files.get("resources/skills/registry.json");
+    if let Some(text) = builtin {
+        let source = Contract {
+            layer: "builtin",
+            path: "resources/skills/registry.json".into(),
+            text: text.clone(),
+        };
+        let registry = Registry::parse(&source.text)?;
+        registry.validate(|path| bundle.text(path).map(str::to_owned))?;
+        for skill in registry.skills {
             let body = Contract {
                 layer: "builtin",
                 path: skill.entry.clone(),
                 text: bundle.text(&skill.entry).map_err(unavailable)?.into(),
             };
-            Ok((
+            selected.insert(
                 skill.id.clone(),
                 Resolved {
-                    skill: skill.clone(),
+                    skill,
                     source: body,
                     registry_source: source.clone(),
                 },
-            ))
-        })
-        .collect::<Result<_, Error>>()?;
-    for layer in crate::prompt_files::override_layers(root, global, run)? {
-        let mut next = selected.clone();
-        if let Some(source) = layer.read("skills/registry.json")? {
-            let patch = Registry::parse(&source.text)?;
-            for skill in patch.skills {
-                let old = next
-                    .get(&skill.id)
-                    .filter(|s| s.skill.entry == skill.entry)
-                    .map(|s| s.source.clone());
-                let body = layer
-                    .read(skill.entry.trim_start_matches("resources/"))?
-                    .or(old)
-                    .ok_or_else(|| unavailable(format!("{}: missing entry", skill.entry)))?;
-                next.insert(
-                    skill.id.clone(),
-                    Resolved {
-                        skill,
-                        source: body,
-                        registry_source: source.clone(),
-                    },
-                );
-            }
+            );
         }
-        for resolved in next.values_mut() {
-            if let Some(body) = layer.read(resolved.skill.entry.trim_start_matches("resources/"))? {
-                resolved.source = body;
-            }
-        }
-        let merged = Registry {
-            schema_version: "1.0".into(),
-            known_phases: PHASES.iter().map(|p| (*p).into()).collect(),
-            skills: next.values().map(|s| s.skill.clone()).collect(),
-        };
-        merged.validate(|path| {
-            next.values()
-                .find(|s| s.skill.entry == path)
-                .map(|s| s.source.text.clone())
-                .ok_or_else(|| format!("{path}: missing entry"))
-        })?;
-        selected = next;
     }
-    Ok(selected)
+    let mut rejected = Vec::new();
+    for layer in crate::prompt_files::override_layers(root, global, run)? {
+        match apply_layer(&selected, &layer) {
+            Ok(next) => selected = next,
+            Err(error) => rejected.push(Rejected {
+                layer: layer.layer.into(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    Ok(Loaded {
+        skills: selected,
+        builtin_registry: builtin.is_some(),
+        rejected,
+    })
+}
+
+fn apply_layer(
+    selected: &BTreeMap<String, Resolved>,
+    layer: &crate::prompt_files::OverrideLayer,
+) -> Result<BTreeMap<String, Resolved>, Error> {
+    let read = |path: &str| -> Result<Option<Contract>, Error> {
+        Ok(layer.read(path)?.map(|mut source| {
+            if source.layer == "global" {
+                source.path = format!("global:{path}");
+            }
+            source
+        }))
+    };
+    let mut next = selected.clone();
+    if let Some(source) = read("skills/registry.json")? {
+        let patch = Registry::parse(&source.text)?;
+        for skill in patch.skills {
+            let old = next
+                .get(&skill.id)
+                .filter(|s| s.skill.entry == skill.entry)
+                .map(|s| s.source.clone());
+            let body = read(skill.entry.trim_start_matches("resources/"))?
+                .or(old)
+                .ok_or_else(|| unavailable(format!("{}: missing entry", skill.entry)))?;
+            next.insert(
+                skill.id.clone(),
+                Resolved {
+                    skill,
+                    source: body,
+                    registry_source: source.clone(),
+                },
+            );
+        }
+    }
+    for resolved in next.values_mut() {
+        if let Some(body) = read(resolved.skill.entry.trim_start_matches("resources/"))? {
+            resolved.source = body;
+        }
+    }
+    let merged = Registry {
+        schema_version: "1.0".into(),
+        known_phases: PHASES.iter().map(|p| (*p).into()).collect(),
+        skills: next.values().map(|s| s.skill.clone()).collect(),
+    };
+    merged.validate(|path| {
+        next.values()
+            .find(|s| s.skill.entry == path)
+            .map(|s| s.source.text.clone())
+            .ok_or_else(|| format!("{path}: missing entry"))
+    })?;
+    Ok(next)
 }
 
 mod turn;
 pub use turn::{Source, for_turn, phase, with_dependencies};
+
+/// Only an identical, loadable session-local body can replace the selected body in HoH's prompt.
+/// The shared reader rejects paths escaping the project and non-regular entries.
+pub fn native_path(
+    root: &Path,
+    session: &str,
+    skill: &Resolved,
+) -> Result<Option<std::path::PathBuf>, Error> {
+    let relative = format!(
+        ".hoh/sessions/{}/skills/{}",
+        crate::layout::component(session),
+        skill.skill.id
+    );
+    let body = crate::prompt_files::read_optional(root, &format!("{relative}/SKILL.md"))?;
+    Ok(body
+        .filter(|body| *body == skill.source.text && pi_frontmatter(body))
+        .map(|_| root.join(relative)))
+}
+
+// Pi 1.6.0 normalizes BOM/newlines, parses YAML between the first two fences,
+// and ignores a Skill unless its description is a nonempty string.
+fn pi_frontmatter(body: &str) -> bool {
+    let normalized = body
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let Some(rest) = normalized.strip_prefix("---\n") else {
+        return false;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return false;
+    };
+    #[derive(Deserialize)]
+    struct Header {
+        description: serde_json::Value,
+    }
+    let Ok(value) = serde_saphyr::from_str::<Header>(&rest[..end]) else {
+        return false;
+    };
+    value
+        .description
+        .as_str()
+        .is_some_and(|description| !description.trim().is_empty())
+}
 
 #[cfg(test)]
 mod tests;
