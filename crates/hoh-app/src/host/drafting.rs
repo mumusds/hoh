@@ -199,6 +199,7 @@ const PATH_LIMIT: usize = 4096;
 const PATH_BYTES_LIMIT: usize = 256 * 1024;
 const CONTENT_LIMIT: u64 = 64 * 1024 * 1024;
 const OBSERVATION_LIMIT: usize = 1024 * 1024;
+const IGNORED_LIST_LIMIT: usize = 16 * 1024 * 1024;
 const FOLD_AT: usize = 64;
 
 fn git_paths(root: &Path, args: &[&str]) -> Result<BTreeSet<Vec<u8>>, String> {
@@ -216,7 +217,9 @@ fn untracked(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
 // Collapse pre-existing ignored trees (target/, node_modules/, .hoh/) rather than logging every artifact.
 // Their contents are outside this Git observation boundary; newly appearing ignored roots still get checked.
 fn ignored_roots(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
-    git_paths(
+    // These names are compared as a set, not read as untracked file contents. In-tree build
+    // products cannot always be collapsed by Git's --directory (M3L-301).
+    Ok(paths(super::control::git_bounded(
         root,
         &[
             "ls-files",
@@ -226,7 +229,22 @@ fn ignored_roots(root: &Path) -> Result<BTreeSet<Vec<u8>>, String> {
             "--directory",
             "-z",
         ],
-    )
+        IGNORED_LIST_LIMIT,
+    )?))
+}
+
+fn prefix_output(root: &Path, args: &[&str], prefixes: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if prefixes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+    args.push("--".into());
+    for prefix in prefixes {
+        let mut pathspec = b":(top,literal)".to_vec();
+        pathspec.extend(prefix);
+        args.push(std::ffi::OsString::from_vec(pathspec));
+    }
+    super::control::git_bounded(root, &args, OBSERVATION_LIMIT)
 }
 
 struct Observation {
@@ -327,21 +345,23 @@ pub(super) fn snapshot(root: &Path) -> Value {
         }
         // Fold only wholly untracked product trees. Allowed docs keep per-file digests, so an unchanged user
         // document can be excluded even when its directory gains newly committed draft files (M3L-250).
-        let tracked = if groups.values().any(|n| *n >= FOLD_AT) {
-            paths(super::control::git_bounded(
+        let mut folded = Vec::new();
+        for (prefix, count) in groups {
+            if count < FOLD_AT {
+                continue;
+            }
+            // Only presence matters here. One NUL per tracked file avoids reading all its path bytes;
+            // neither tracked files nor unrelated directories consume the untracked content budget.
+            let tracked = prefix_output(
                 root,
-                &["ls-files", "--cached", "-z"],
-                OBSERVATION_LIMIT,
-            )?)
-        } else {
-            BTreeSet::new()
-        };
+                &["ls-files", "--cached", "--format=", "-z"],
+                std::slice::from_ref(&prefix),
+            )?;
+            if tracked.is_empty() {
+                folded.push(prefix);
+            }
+        }
         let mut fingerprints = BTreeMap::new();
-        let folded: Vec<_> = groups
-            .into_iter()
-            .filter(|(p, n)| *n >= FOLD_AT && !tracked.iter().any(|t| t.starts_with(p)))
-            .map(|(p, _)| p)
-            .collect();
         for prefix in &folded {
             fingerprints.insert(hex(prefix), observation.tree(root, prefix, &u)?);
         }
@@ -466,7 +486,7 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
             .filter(|(_, v)| v.get("tree_sha256").is_some())
             .map(|(k, _)| decoded(k))
             .collect::<Result<Vec<_>, _>>()?;
-        let files: BTreeSet<_> = paths(super::control::git_bounded(
+        let files = paths(prefix_output(
             root,
             &[
                 "ls-files",
@@ -475,11 +495,8 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
                 "--exclude-standard",
                 "-z",
             ],
-            OBSERVATION_LIMIT,
-        )?)
-        .into_iter()
-        .filter(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)))
-        .collect();
+            &prefixes,
+        )?);
         if files.len() > PATH_LIMIT || files.iter().map(Vec::len).sum::<usize>() > PATH_BYTES_LIMIT
         {
             return Err("draft tree observation limit exceeded".into());

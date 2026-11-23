@@ -841,22 +841,37 @@ pub(crate) fn git_run(
 }
 
 /// Bounded Git output for draft path observations. Never accept a truncated path set.
-pub(super) fn git_bounded(project: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, String> {
+pub(super) fn git_bounded<S: AsRef<std::ffi::OsStr>>(
+    project: &Path,
+    args: &[S],
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let (status, out) = git_run_limited(project, args, Some(limit))?;
     if !status.success() {
-        return Err(format!("git {}: {status}", args.join(" ")));
+        return Err(format!(
+            "git {}: {status}",
+            args.iter()
+                .map(|a| a.as_ref().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
     }
     Ok(out)
 }
 
-fn git_run_limited(
+fn git_run_limited<S: AsRef<std::ffi::OsStr>>(
     project: &Path,
-    args: &[&str],
+    args: &[S],
     limit: Option<usize>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
+    let label = args
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut command = std::process::Command::new("git");
     if let Some(marker) = ATTEMPT.with(|a| a.borrow().clone()) {
         command.env(super::processes::ATTEMPT_ENV, marker);
@@ -871,7 +886,7 @@ fn git_run_limited(
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("git {}: {e}", label))?;
     let git = rustix::process::Pid::from_child(&child);
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -894,8 +909,12 @@ fn git_run_limited(
         ) {
             Ok(Some(_)) => break Ok(()),
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break Err(format!("git {}: over {GIT_LIMIT:?}", args.join(" "))),
-            Err(e) => break Err(format!("git {}: {e}", args.join(" "))),
+            Ok(None) => {
+                break Err(format!("git {}: over {GIT_LIMIT:?}", label));
+            }
+            Err(e) => {
+                break Err(format!("git {}: {e}", label));
+            }
         }
     };
     // What git started and left in its group ends with it (and git, past the limit); then git is reaped, then the
@@ -907,10 +926,10 @@ fn git_run_limited(
     let status = child.wait();
     let read = reader.join();
     ended?;
-    let status = status.map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let status = status.map_err(|e| format!("git {}: {e}", label))?;
     let out = read
         .map_err(|_| "git: its output was lost".to_owned())?
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("git {}: {e}", label))?;
     Ok((status, out))
 }
 
