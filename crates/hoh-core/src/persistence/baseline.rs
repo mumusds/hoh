@@ -455,6 +455,18 @@ pub(super) fn unsettled(
     .map_err(sqlite_error)
 }
 
+/// Whether run `run_id`'s baseline tests question was asked or answered.
+fn tests_asked(conn: &Connection, run_id: &str) -> Result<bool, PersistError> {
+    let question = child_id(run_id, "baseline_tests/question");
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE run_id = ?1 AND (event_id = ?2 OR (kind = 'question.answered' \
+           AND json_extract(payload_json, '$.question_id') = ?2)))",
+        params![run_id, question],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// The regression judgement of run `run_id`'s latest candidate against its baseline (REQ-028 failure mode 4;
 /// docs/adr/ADR-039.md decision 8): the tests that failed in the baseline's test run, those its evidence's
 /// `test-results.jsonl` records as FAIL, of those the ones not in the baseline's failed set, and whether that set is
@@ -484,14 +496,18 @@ pub(super) fn regression(conn: &Connection, run_id: &str) -> Result<Value, Persi
         .unwrap_or_default();
     baseline_failed.sort();
     baseline_failed.dedup();
-    // A command killed past its limit, or whose log could not be read, leaves its failed tests incomplete (DC-T07 (5),
-    // M3N-053): the partial list is no baseline's whole failed set.
-    let complete =
-        tested.as_ref().is_none_or(|t| {
-            t["commands"].as_array().into_iter().flatten().all(|c| {
+    // Judged explicitly (DC-T07 (5), M3N-053, M3N-102): a baseline process not known to have ended, or tests asked
+    // for (the question asked or answered) and not recorded (not started, running, or interrupted by a pause or a
+    // cancel), leave no complete failed set; recorded tests are complete unless a command was killed past its limit,
+    // ended by a signal or had its log unread (an explicit skip records none and is complete); a run never asked (no
+    // tests detected) stays as it is.
+    let complete = unsettled(conn, None, Some(run_id))?.is_empty()
+        && match &tested {
+            Some(t) => t["commands"].as_array().into_iter().flatten().all(|c| {
                 c["incomplete"] != Value::Bool(true) && c["timed_out"] != Value::Bool(true)
-            })
-        });
+            }),
+            None => !tests_asked(conn, run_id)?,
+        };
     let latest: Option<String> = conn
         .query_row(
             "SELECT c.candidate_id FROM candidates c WHERE c.run_id = ?1 ORDER BY coalesce((SELECT max(e.seq) \

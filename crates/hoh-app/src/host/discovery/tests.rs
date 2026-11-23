@@ -204,3 +204,34 @@ fn a_rerun_never_truncates_an_earlier_log() {
         );
     }
 }
+
+#[test]
+fn a_test_command_ended_by_a_signal_is_incomplete() {
+    // M3N-101 (docs/adr/ADR-039.md, round 2): a real command killed by a signal, the command itself (its leader) or a
+    // process its shell reports as killed (128 + the signal), leaves its failed tests incomplete.
+    let dir = tempfile::tempdir().expect("dir");
+    let project = dir.path();
+    for command in [
+        "echo 'test a ... FAILED'; kill -KILL $$",
+        "sh -c 'echo \"test a ... FAILED\"; kill -KILL $$'",
+    ] {
+        let ran = run_tests(
+            project,
+            Path::new("logs"),
+            &[command.to_owned()],
+            &Owner::new(&|| false),
+        )
+        .expect("ran");
+        let ran = &ran["commands"][0];
+        assert_eq!(
+            (
+                &ran["incomplete"],
+                &ran["timed_out"],
+                &ran["status"],
+                &ran["failed_tests"]
+            ),
+            (&json!(true), &json!(false), &json!("fail"), &json!(["a"])),
+            "{command}: {ran}"
+        );
+    }
+}

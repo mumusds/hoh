@@ -595,6 +595,50 @@ async fn test_032_01_product_export_over_fault_variants_matches_the_mirror() -> 
         committed == text,
         "{TRACE_FIXTURE} is not the product's current export; rerun with HOH_BLESS_TRACE=1 and review the diff:\n{text}"
     );
+    // Run by the traceability check (docs/adr/ADR-039.md DC-T07b): the exports, as the product wrote them, for its
+    // self-test, each with the check's nonce and the tree they were produced on.
+    if let Some(dir) = std::env::var_os("HOH_TRACE_EXPORT_DIR") {
+        write_exports(Path::new(&dir), &exports)?;
+    }
+    Ok(())
+}
+
+/// The file each variant's export is written to in the traceability check's evidence directory (its check plan
+/// declares them).
+const EXPORT_FILES: [(&str, &str); 4] = [
+    ("whole", "trace-export-whole.json"),
+    ("missing_evidence", "trace-export-missing-evidence.json"),
+    ("stale_candidate", "trace-export-stale-candidate.json"),
+    ("missing_candidate", "trace-export-missing-candidate.json"),
+];
+
+/// Write `exports` into `dir` as `{variant, nonce, git_tree, export}` (DC-T07b (1)): the nonce is the check's
+/// `HOH_TRACE_EXPORT_NONCE`, the tree HoH's checkout's `HEAD^{tree}`, refused when the checkout has uncommitted changes.
+fn write_exports(dir: &Path, exports: &serde_json::Map<String, Value>) -> R {
+    let nonce = std::env::var("HOH_TRACE_EXPORT_NONCE")
+        .map_err(|_| "HOH_TRACE_EXPORT_DIR without HOH_TRACE_EXPORT_NONCE")?;
+    let git = |args: &[&str]| -> R<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(hoh_root())
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            return Err(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr)).into());
+        }
+        Ok(String::from_utf8(out.stdout)?)
+    };
+    let dirty = git(&["status", "--porcelain=v1", "--untracked-files=normal"])?;
+    if !dirty.is_empty() {
+        return Err(
+            format!("HoH's checkout has uncommitted changes, no export written:\n{dirty}").into(),
+        );
+    }
+    let tree = git(&["rev-parse", "HEAD^{tree}"])?.trim().to_owned();
+    for (variant, file) in EXPORT_FILES {
+        let doc = json!({"variant": variant, "nonce": nonce, "git_tree": tree, "export": exports[variant]});
+        std::fs::write(dir.join(file), serde_json::to_vec_pretty(&doc)?)?;
+    }
     Ok(())
 }
 

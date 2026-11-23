@@ -196,3 +196,140 @@ async fn test_028_02_a_timed_out_baseline_run_is_no_complete_failed_set() -> R {
     );
     Ok(())
 }
+
+/// Candidate C of run R, frozen before or after its baseline's tests.
+fn candidate(conn: &rusqlite::Connection) -> R {
+    conn.execute_batch(
+        "INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,
+           test_plan_sha256,source_path,created_at)
+         VALUES('C','R',printf('%.40c','1'),printf('%.40c','1'),printf('%.64c','0'),printf('%.64c','0'),
+           printf('%.64c','0'),'fixture','2026-11-22T00:00:00Z');",
+    )?;
+    Ok(())
+}
+
+/// The regression's `(baseline_complete, introduced)` of run R.
+fn judged(conn: &rusqlite::Connection) -> R<(Value, Value)> {
+    let regression = super::regression(conn, "R")?;
+    Ok((
+        regression["baseline_complete"].clone(),
+        regression["introduced"].clone(),
+    ))
+}
+
+#[tokio::test]
+async fn test_028_02_after_a_run_answer_no_recorded_tests_is_no_complete_baseline() -> R {
+    // M3N-102, M3N-150 (docs/adr/ADR-039.md, round 2): the user answered `run` and a candidate exists before the tests
+    // are recorded: while none ran yet, while one runs, and once a pause interrupted it, the baseline is incomplete and
+    // nothing is said to be introduced; resumed, its recorded tests complete it.
+    let dir = tempfile::tempdir()?;
+    let (store, conn) = open(dir.path(), "DISCOVERING")?;
+    candidate(&conn)?;
+    assert_eq!(
+        judged(&conn)?,
+        (json!(false), Value::Null),
+        "before it runs"
+    );
+    let id = store
+        .baseline_process_started("R", process(0, "n1"))
+        .await?
+        .ok_or("not recorded")?;
+    assert_eq!(judged(&conn)?, (json!(false), Value::Null), "while it runs");
+    conn.execute("UPDATE runs SET state = 'PAUSE_REQUESTED'", [])?;
+    store
+        .baseline_process_ended("R", &id, json!({"settled_by": "host"}))
+        .await?;
+    assert_eq!(
+        format!(
+            "{:?}",
+            store.pause_step("R", std::time::SystemTime::now()).await?
+        ),
+        format!("{:?}", PauseStep::Paused)
+    );
+    assert_eq!(
+        judged(&conn)?,
+        (json!(false), Value::Null),
+        "paused, interrupted"
+    );
+    conn.execute("UPDATE runs SET state = 'DISCOVERING'", [])?;
+    let id = store
+        .baseline_process_started("R", process(0, "n2"))
+        .await?
+        .ok_or("not recorded")?;
+    store
+        .baseline_process_ended("R", &id, json!({"settled_by": "host"}))
+        .await?;
+    store
+        .record_baseline_tests(
+            "R",
+            json!({"commands": [{"command": "make test", "exit_code": 1, "timed_out": false, "incomplete": false,
+                "status": "fail", "failed_tests": ["a"]}]}),
+        )
+        .await?;
+    assert_eq!(
+        judged(&conn)?,
+        (json!(true), json!([])),
+        "resumed and recorded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_a_recorded_run_with_a_live_process_is_no_complete_baseline() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, conn) = open(dir.path(), "DISCOVERING")?;
+    candidate(&conn)?;
+    store
+        .baseline_process_started("R", process(0, "n"))
+        .await?
+        .ok_or("not recorded")?;
+    store
+        .record_baseline_tests("R", json!({"commands": []}))
+        .await?;
+    assert_eq!(judged(&conn)?, (json!(false), Value::Null));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_a_skip_is_complete_and_a_run_never_asked_stays_as_it_is() -> R {
+    // An explicit skip is a complete (empty) baseline.
+    let dir = tempfile::tempdir()?;
+    let (store, conn) = open(dir.path(), "DISCOVERING")?;
+    conn.execute(
+        "UPDATE events SET payload_json = json_set(payload_json, '$.choice_id', 'skip') WHERE event_id = 'answered'",
+        [],
+    )?;
+    candidate(&conn)?;
+    assert_eq!(
+        judged(&conn)?,
+        (json!(false), Value::Null),
+        "skip not yet recorded"
+    );
+    store
+        .record_baseline_tests("R", json!({"commands": [], "skipped": true}))
+        .await?;
+    assert_eq!(judged(&conn)?, (json!(true), json!([])), "skipped");
+    // Asked and not answered: no baseline yet (the run's state does not matter to the judgement).
+    let dir = tempfile::tempdir()?;
+    let (_store, conn) = open(dir.path(), "DISCOVERING")?;
+    conn.execute_batch(
+        "DELETE FROM events WHERE event_id = 'answered';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'R/baseline_tests/question', 'R', 'question.asked',
+            json_object('question_id', 'R/baseline_tests/question', 'reason', 'baseline_tests'),
+            '2026-11-22T00:00:00Z');",
+    )?;
+    candidate(&conn)?;
+    assert_eq!(
+        judged(&conn)?,
+        (json!(false), Value::Null),
+        "asked, not answered"
+    );
+    // Never asked (no tests detected): as it is.
+    let dir = tempfile::tempdir()?;
+    let (_store, conn) = open(dir.path(), "DISCOVERING")?;
+    conn.execute("DELETE FROM events WHERE event_id = 'answered'", [])?;
+    candidate(&conn)?;
+    assert_eq!(judged(&conn)?, (json!(true), json!([])), "never asked");
+    Ok(())
+}

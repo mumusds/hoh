@@ -121,8 +121,9 @@ pub(crate) trait TestOwner {
 /// under `log_dir` (project-relative, HoH's state, never the project's tree; never an existing file). Its identity is
 /// recorded through `owner` before the gate opens; past [`TEST_LIMIT`], or when the owner stops it, its group is killed
 /// and reaped and its group seen empty. Each command's `{command, exit_code, timed_out, incomplete, status: pass|fail,
-/// failed_tests, log}`; an error when the owner stopped it, the run no longer owns it, or a command could not be
-/// started, and then nothing is recorded as the run's tests.
+/// failed_tests, log}` (`incomplete` past its limit, ended by a signal, or its log unreadable); an error when the owner
+/// stopped it, the run no longer owns it, or a command could not be started, and then nothing is recorded as the run's
+/// tests.
 pub(crate) fn run_tests(
     project: &Path,
     log_dir: &Path,
@@ -131,7 +132,7 @@ pub(crate) fn run_tests(
 ) -> Result<Value, String> {
     use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Write as _;
-    use std::os::unix::process::CommandExt as _;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
     let dir = project.join(log_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut ran = Vec::new();
@@ -240,7 +241,12 @@ pub(crate) fn run_tests(
         let status = waited.map_err(|e| format!("{command}: {e}"))?;
         let status = finished.then_some(status);
         let output = hoh_core::objects::read_regular(&log);
-        let incomplete = status.is_none() || output.is_err();
+        // Ended by a signal, itself or as its shell reports it (128 + the signal), its failed tests are a partial list
+        // (docs/adr/ADR-039.md, round 2, M3N-101).
+        let signalled = status.is_some_and(|s| {
+            s.signal().is_some() || s.code().is_some_and(|c| (129..=192).contains(&c))
+        });
+        let incomplete = status.is_none() || signalled || output.is_err();
         let output = output.unwrap_or_default();
         let output = String::from_utf8_lossy(&output);
         let passed = status.is_some_and(|s| s.success());

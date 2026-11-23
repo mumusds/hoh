@@ -178,7 +178,11 @@
       "timeout_seconds": 1800,
       "artifacts": [
         "test-results.jsonl",
-        "traceability-report.json"
+        "traceability-report.json",
+        "trace-export-whole.json",
+        "trace-export-missing-evidence.json",
+        "trace-export-stale-candidate.json",
+        "trace-export-missing-candidate.json"
       ]
     }
   }

@@ -850,3 +850,151 @@ async fn test_028_02_a_new_host_kills_the_group_a_killed_host_left_and_keeps_its
     host.shutdown().await;
     Ok(())
 }
+
+/// A candidate `CAND-<c>` of run `run` whose only evidence's `test-results.jsonl` fails `failed` (a persisted fixture of
+/// a verified candidate; no check runs): its id.
+fn failing_candidate(world: &World, run: &str, c: char, failed: &[&str]) -> R<String> {
+    let candidate = format!("CAND-{}", c.to_string().repeat(64));
+    let dir = format!(".hoh/evidence/fixture/unit/{c}");
+    let record_dir = world.project().join(&dir);
+    std::fs::create_dir_all(record_dir.join("artifacts"))?;
+    let lines: String = failed
+        .iter()
+        .map(|n| {
+            format!(
+                "{{\"schema_version\":\"1.0\",\"test_id\":\"TEST-A-01\",\"name\":\"{n}\",\"status\":\"FAIL\"}}\n"
+            )
+        })
+        .collect();
+    std::fs::write(record_dir.join("artifacts/test-results.jsonl"), &lines)?;
+    let record = json!({"artifacts": [{"name": "test-results.jsonl",
+        "path": format!("{dir}/artifacts/test-results.jsonl"), "sha256": world::sha256_hex(lines.as_bytes())}]});
+    std::fs::write(record_dir.join("execution.json"), record.to_string())?;
+    world.exec(&format!(
+        "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+           SELECT 'T{c}',run_id,spec_id,'IMPLEMENTED','developer',1,1 FROM runs WHERE run_id='{run}';
+         INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision)
+           VALUES('observed-{c}','T{c}','SETTLED',1,1,0);
+         INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,created_at)
+           VALUES('{candidate}','{run}','{h}','{h}','{d}','{d}','{d}','fixture','2026-11-22T00:00:00Z');
+         INSERT INTO artifacts(artifact_id,sha256,path,bytes,mime)
+           VALUES('record-{c}','{d}','{dir}/execution.json',0,'application/json');
+         INSERT INTO evidence(evidence_id,candidate_id,attempt_id,artifact_id,check_id,kind,outcome,mode,created_at)
+           VALUES('e-{c}','{candidate}','observed-{c}','record-{c}','unit','check','FAIL','mock','2026-11-22T00:00:00Z');",
+        h = "1".repeat(40),
+        d = "0".repeat(64)
+    ))?;
+    Ok(candidate)
+}
+
+/// Run `run`'s regression projection through the API (`GET /v1/runs/{run}`).
+async fn regression(host: &Host, run: &str) -> R<Value> {
+    let (status, body) = world::exchange(host, "GET", &format!("/v1/runs/{run}"), None).await?;
+    assert_eq!(status, 200, "{body}");
+    Ok(body["projection"]["regression"].clone())
+}
+
+#[tokio::test]
+async fn test_028_02_no_complete_baseline_until_its_tests_are_recorded() -> R {
+    // M3N-102, M3N-150 (docs/adr/ADR-039.md, round 2): after the user's `run`, with a candidate frozen before the
+    // baseline's tests are recorded, the regression says the baseline is incomplete and introduces nothing while the
+    // command runs and once a pause interrupted it; resumed, the recorded tests complete it.
+    let world = World::new()?;
+    let (marker, release) = (world.root().join("started"), world.root().join("release"));
+    let (host, run) = confirmed(&world, &marker, &release).await?;
+    let pgid = nth_started(&marker, 1).await?;
+    let _guard = GroupGuard(pgid);
+    let candidate = failing_candidate(&world, &run, 'c', &["known", "newly_broken"])?;
+    let incomplete = json!({"candidate_id": candidate, "baseline_complete": false, "baseline_failed": [],
+        "candidate_failed": ["known", "newly_broken"], "introduced": null,
+        "not_in_baseline": ["known", "newly_broken"]});
+    assert_eq!(regression(&host, &run).await?, incomplete, "while it runs");
+    control(&host, &run, "PauseRun").await?;
+    group_empty_at(&world, &run, "PAUSED", pgid, Duration::from_secs(60)).await?;
+    assert_eq!(regression(&host, &run).await?, incomplete, "paused");
+    std::fs::write(&release, b"")?;
+    control(&host, &run, "ResumeRun").await?;
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(60),
+        )
+        .await?;
+    assert_eq!(
+        regression(&host, &run).await?,
+        json!({"candidate_id": candidate, "baseline_complete": true, "baseline_failed": ["known"],
+            "candidate_failed": ["known", "newly_broken"], "introduced": ["newly_broken"],
+            "not_in_baseline": ["newly_broken"]}),
+        "resumed and recorded"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_028_02_a_baseline_test_command_killed_by_a_signal_is_incomplete() -> R {
+    // M3N-101 (docs/adr/ADR-039.md, round 2): the confirmed `make test` reports one failure, then a signal kills make;
+    // its shell reports it killed. Its failed tests are incomplete and the regression introduces nothing.
+    let world = World::new()?;
+    let index = brownfield(&world)?;
+    std::fs::remove_file(world.project().join("Cargo.toml"))?;
+    std::fs::write(
+        world.project().join("Makefile"),
+        "test:\n\t@echo \"test known ... FAILED\"; kill -KILL $$PPID\n",
+    )?;
+    world.git(&["add", "-A"])?;
+    world.git(&["commit", "-qm", "make test killed"])?;
+    let (host, run) = approved(&world, &index).await?;
+    let entered = decide(
+        &world,
+        &host,
+        &run,
+        "discover",
+        world::transition("DISCOVERING"),
+    )
+    .await?;
+    assert!(
+        matches!(entered, hoh_core::persistence::Decided::Applied { .. }),
+        "{entered:?}"
+    );
+    answer_tests(&world, &host, &run, "run").await?;
+    world
+        .until(
+            &format!(
+                "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+            ),
+            "1",
+            Duration::from_secs(60),
+        )
+        .await?;
+    let tested: Value = serde_json::from_str(&world.query(&format!(
+        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='run.baseline_tests'"
+    ))?)?;
+    let ran = &tested["commands"][0];
+    assert_eq!(
+        (
+            &ran["command"],
+            &ran["incomplete"],
+            &ran["timed_out"],
+            &ran["failed_tests"]
+        ),
+        (
+            &json!("make test"),
+            &json!(true),
+            &json!(false),
+            &json!(["known"])
+        ),
+        "{tested}"
+    );
+    let candidate = failing_candidate(&world, &run, 'k', &["known", "other"])?;
+    assert_eq!(
+        regression(&host, &run).await?,
+        json!({"candidate_id": candidate, "baseline_complete": false, "baseline_failed": ["known"],
+            "candidate_failed": ["known", "other"], "introduced": null, "not_in_baseline": ["other"]})
+    );
+    host.shutdown().await;
+    Ok(())
+}
