@@ -232,9 +232,12 @@ impl Peer {
 
 impl Transport {
     fn resolve(&self) -> Option<(Identity, u64)> {
-        // fork temporarily duplicates even CLOEXEC descriptors before exec closes them. Take a fresh bounded
-        // observation after that window; persistent ambiguity still yields Unknown. Never retry a changed
-        // captured identity or unreadable ancestor evidence: those checks remain outside this lookup.
+        // A fork can duplicate a CLOEXEC descriptor until exec closes it. For TCP the inode is the
+        // client's socket: the approval helper creates it after exec and does not fork, and a child of
+        // the test binary inherits only the accepted server socket, a different inode. Lengthening this
+        // retry is not a fix for those fixtures (ADR-038, 2026-11-23). Persistent ambiguity is still
+        // Unknown. Never retry a changed captured identity or unreadable ancestor evidence: those checks
+        // remain outside this lookup.
         for observation in 0..3 {
             if let Some(peer) = self.resolve_once() {
                 return Some(peer);
