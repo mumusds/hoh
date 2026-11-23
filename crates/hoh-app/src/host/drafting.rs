@@ -450,29 +450,29 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let newly_ignored: BTreeSet<_> = ignored_roots(root)?.difference(&ignored).cloned().collect();
 
     let committed = if let Some(current) = &current {
-        let committed = if let Some(base) = start["head"].as_str() {
+        let range = if let Some(base) = start["head"].as_str() {
             super::control::git(root, &["merge-base", "--is-ancestor", base, current])?;
-            super::control::git_bounded(
-                root,
-                &[
-                    "diff",
-                    "--name-only",
-                    "--no-renames",
-                    "-z",
-                    base,
-                    current,
-                    "--",
-                ],
-                OBSERVATION_LIMIT,
-            )?
+            format!("{base}..{current}")
         } else {
-            super::control::git_bounded(
-                root,
-                &["ls-tree", "-r", "-z", "--name-only", current],
-                OBSERVATION_LIMIT,
-            )?
+            current.clone()
         };
-        paths(committed)
+        // Keep every committed path, even when another commit restores the start tree (M3L-300).
+        // Include root commits and each merge parent; retain Git's raw NUL-delimited path bytes.
+        paths(super::control::git_bounded(
+            root,
+            &[
+                "log",
+                "--format=",
+                "--name-only",
+                "--no-renames",
+                "--root",
+                "-m",
+                "-z",
+                &range,
+                "--",
+            ],
+            OBSERVATION_LIMIT,
+        )?)
     } else {
         BTreeSet::new()
     };

@@ -716,3 +716,142 @@ async fn test_008_04_m3l200_other_run_commits_between_draft_attempts() -> R {
     host.shutdown().await;
     result
 }
+
+struct DraftStartReadFailure {
+    world: std::sync::Arc<world::World>,
+    reached: tokio::sync::Notify,
+}
+impl std::fmt::Debug for DraftStartReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DraftStartReadFailure")
+    }
+}
+impl DraftStartReadFailure {
+    fn restore(&self) -> R {
+        self.world.exec("UPDATE events SET payload_json=CAST(payload_json AS TEXT) WHERE kind='attempt.workspace_start'")
+    }
+}
+impl hoh_app::host::HostHooks for DraftStartReadFailure {
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, attempt: &str) {
+        if point == hoh_app::host::RunnerPoint::AfterEffectCommitted {
+            // Valid JSON stored as a BLOB makes draft_start's String read fail. The completion hook restores
+            // the fixture before the writer transaction, so this isolates the read boundary from write failures.
+            let result = self.world.exec(&format!("UPDATE events SET payload_json=CAST(payload_json AS BLOB) WHERE kind='attempt.workspace_start' AND json_extract(payload_json,'$.attempt_id')='{attempt}'"));
+            assert!(result.is_ok(), "inject start read error: {result:?}");
+        }
+    }
+    fn completing(&self, _attempt: &str) {
+        let result = self.restore();
+        assert!(
+            result.is_ok(),
+            "restore after failed start read: {result:?}"
+        );
+    }
+    fn writer_completion_returned(&self, _attempt: &str) {
+        let result = self.restore();
+        assert!(
+            result.is_ok(),
+            "restore after completion returned: {result:?}"
+        );
+        self.reached.notify_one();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_04_m3l302_successful_draft_settles_after_start_read_failure() -> R {
+    let world = std::sync::Arc::new(world::World::named("m3t04-start-read")?);
+    world.configure(&[], "")?;
+    let hooks = std::sync::Arc::new(DraftStartReadFailure {
+        world: world.clone(),
+        reached: tokio::sync::Notify::new(),
+    });
+    let team = world::Team::drafting(world.project());
+    let host = world.team_host_hooked(team, hooks.clone()).await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "completion read failure").await?;
+        world.staff(&run)?;
+        input(
+            &host,
+            &world,
+            &run,
+            "draft",
+            "SendInput",
+            json!({"text":"draft","input_kind":"REPLY","target_role":null}),
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(15), hooks.reached.notified()).await?;
+        Ok(())
+    }
+    .await;
+    // The return hook observes both success and error. Shutdown only after the call returned;
+    // stopping earlier aborts in-flight attempts for the next host's reconcile.
+    let drained = host.shutdown().await;
+    hooks.restore()?;
+    result?;
+    assert!(drained);
+    assert_eq!(
+        world.query("SELECT count(*) FROM events WHERE kind='plan.write_observation_failed'")?,
+        "1",
+        "the successful ending must reach its transaction despite a start read error; attempts={:?}; events={:?}",
+        world.rows("SELECT attempt_id,state FROM attempts")?,
+        world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 8")?
+    );
+    assert_eq!(world.query("SELECT a.state||'/'||t.state FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.kind='spec_draft'")?, "SETTLED/BLOCKED");
+    assert_eq!(
+        world.query("SELECT state||'/'||resume_state FROM runs")?,
+        "BLOCKED/SPECIFYING"
+    );
+    // Lease rows preserve their epoch history; release expires the row at the holder's end.
+    assert_eq!(
+        world.query("SELECT count(*) FROM leases WHERE kind='writer'")?,
+        "1"
+    );
+    assert_eq!(
+        world.query("SELECT count(*) FROM leases l JOIN attempts a ON a.attempt_id=l.attempt_id WHERE l.kind='writer' AND (a.ended_at IS NULL OR l.expires_at>a.ended_at OR a.state<>'SETTLED')")?,
+        "0"
+    );
+    assert_eq!(world.query("SELECT count(*) FROM candidates")?, "0");
+    assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval'")?, "0");
+    assert!(world.query("SELECT json_extract(payload_json,'$.detail') FROM events WHERE kind='plan.write_observation_failed'")?.contains("start observation failed"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_01_m3l304_only_steer_after_latest_plan_entry_becomes_draft_note() -> R {
+    for old_mode in ["BUILD", "AUTO"] {
+        let world = world::World::named("m3t04-plan-input-window")?;
+        world.configure(&[], "")?;
+        world.commit_project(&world::fixture_spec())?;
+        world.init_store().await?;
+        world.seed_spec()?;
+        let host = world.start_plain_host(None).await?;
+        let result: R = async {
+            let run = world::start_run(&host, "start", "plan input window").await?;
+            world.staff(&run)?;
+            world.exec(&format!("UPDATE runs SET state='RUNNING',mode='{old_mode}' WHERE run_id='{run}';
+                INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,kind,created_seq) SELECT 'previous','{run}',spec_id,'ACCEPTED','cto',1,'spec_draft',1 FROM runs WHERE run_id='{run}';
+                INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('previous-request',:p,'{run}','spec.draft_requested','{{}}','now');"))?;
+            input(&host, &world, &run, "old-input", "SendInput", json!({"text":"old product instruction","target_role":null,"input_kind":"STEER"})).await?;
+            input(&host, &world, &run, "plan", "SetMode", json!({"mode":"PLAN"})).await?;
+            assert!(host.store().draft_step(&run, false).await?);
+            assert!(world.query("SELECT json_extract(payload_json,'$.cause') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?.starts_with("plan/"), "{old_mode}: a preceding product steer is not a planning request");
+            world.exec("UPDATE tasks SET state='ACCEPTED' WHERE kind='spec_draft'")?;
+            // A steer from the preceding PLAN interval also cannot cross a later PLAN entry.
+            input(&host, &world, &run, "previous-plan-input", "SendInput", json!({"text":"previous planning interval","target_role":null,"input_kind":"STEER"})).await?;
+            input(&host, &world, &run, "build", "SetMode", json!({"mode":"BUILD"})).await?;
+            input(&host, &world, &run, "plan-again", "SetMode", json!({"mode":"PLAN"})).await?;
+            assert!(host.store().draft_step(&run, false).await?);
+            assert!(world.query("SELECT json_extract(payload_json,'$.cause') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?.starts_with("plan/"));
+            world.exec("UPDATE tasks SET state='ACCEPTED' WHERE kind='spec_draft'")?;
+            input(&host, &world, &run, "new-input", "SendInput", json!({"text":"current planning request","target_role":null,"input_kind":"STEER"})).await?;
+            assert!(host.store().draft_step(&run, false).await?);
+            assert!(world.query("SELECT json_extract(payload_json,'$.cause') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?.starts_with("input/"));
+            assert_eq!(world.query("SELECT json_extract(payload_json,'$.note.text') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?, "current planning request");
+            assert!(!host.store().draft_step(&run, false).await?);
+            Ok(())
+        }.await;
+        host.shutdown().await;
+        result?;
+    }
+    Ok(())
+}

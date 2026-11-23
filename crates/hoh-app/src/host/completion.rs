@@ -507,16 +507,21 @@ pub(super) async fn complete(
 ) -> Result<WriterCompleted, PersistError> {
     let held = project.to_path_buf();
     let attempt_id = identity.attempt_id.clone();
-    let draft = {
-        let reader = store.reader()?;
-        reader.draft_start(&attempt_id)?
-    };
+    let draft = store
+        .reader()
+        .and_then(|reader| reader.draft_start(&attempt_id));
     let (outcome, ending) = super::begun::spawn_blocking(move || {
         hooks.completing(&identity.attempt_id);
         let mut ending = ending;
         let outcome = match draft {
-            Some(start) => super::drafting::outcome(&held, &identity, &mut ending, &start),
-            None => outcome(&held, &identity, &mut ending),
+            Ok(Some(start)) => super::drafting::outcome(&held, &identity, &mut ending, &start),
+            Ok(None) => outcome(&held, &identity, &mut ending),
+            // Hand the ending to its transaction even if the start could not be read (M3L-302).
+            // The draft blocker rechecks task kind there; a read error cannot authorize a freeze.
+            Err(error) => WriterOutcome::DraftBlocked {
+                detail: format!("draft start observation failed: {error}"),
+                paths: vec![],
+            },
         };
         (outcome, ending)
     })

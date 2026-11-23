@@ -1797,7 +1797,7 @@ async fn attempt(
     // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
     if work.assignment.writer && ending.success && !unknown {
         let identity = identity_of(&work)?;
-        finished(common, &id, ran.as_ref(), ending, |e| {
+        let completed = finished(common, &id, ran.as_ref(), ending, |e| {
             super::completion::complete(
                 store,
                 &common.shared.root,
@@ -1806,7 +1806,9 @@ async fn attempt(
                 common.shared.hooks.clone(),
             )
         })
-        .await?;
+        .await;
+        common.shared.hooks.writer_completion_returned(&id);
+        completed?;
         return Ok(());
     }
     // A verifier's success is settled, corrected or verified again by the result in its bridge (decision 11).

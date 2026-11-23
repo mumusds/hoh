@@ -1226,8 +1226,18 @@ fn running(
         || (draft
             && super::admission::admit_one(&tx, &run_id, &task_id, super::admission::By::Draft)?
                 .is_err());
-    if refused {
-        // A closed gate still has a process. Preserve its identity before any termination attempt (M3L-252),
+    let key = crate::reconcile::work_key(attempt_id);
+    let started = if refused {
+        0
+    } else {
+        tx.execute(
+            "UPDATE effects SET state = 'STARTED' WHERE effect_key = ?1 AND attempt_id = ?2 AND state = 'PREPARED'",
+            params![key, attempt_id],
+        ).map_err(sqlite_error)?
+    };
+    if started != 1 {
+        // A closed gate still has a process, including when the work effect changed (M3L-303).
+        // Preserve its identity before any termination attempt (M3L-252),
         // without marking work STARTED or changing the Attempt state. Reconcile must never infer NoPid here.
         if draft
             && let (Some(pid), Some(boot), Some(start)) =
@@ -1255,16 +1265,6 @@ fn running(
                 writer::commit(tx, ctx)?;
             }
         }
-        return Ok(false);
-    }
-    let key = crate::reconcile::work_key(attempt_id);
-    let started = tx
-        .execute(
-            "UPDATE effects SET state = 'STARTED' WHERE effect_key = ?1 AND attempt_id = ?2 AND state = 'PREPARED'",
-            params![key, attempt_id],
-        )
-        .map_err(sqlite_error)?;
-    if started != 1 {
         return Ok(false);
     }
     let at = facts
