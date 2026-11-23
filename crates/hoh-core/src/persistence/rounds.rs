@@ -520,6 +520,10 @@ fn hold_dirty(
         else {
             continue;
         };
+        // Asked once: until the user answers, the task is only kept out of the round (M3N-052).
+        if super::baseline::asked(tx, task)? {
+            continue;
+        }
         tx.execute(
             "UPDATE tasks SET blocked_reason = ?1, next_retry_at = NULL WHERE task_id = ?2",
             params![crate::protocol::BlockedReason::NeedDecision.as_str(), task],

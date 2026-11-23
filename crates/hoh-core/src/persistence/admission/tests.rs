@@ -234,8 +234,8 @@ fn dirty_dispatch(
 /// path scope holds a file the run's baseline lists as uncommitted, on every path that creates a work attempt. `admit`
 /// refuses W with those files (readers and writers outside the files pass); the Commander's dispatch of W is REJECTED
 /// ILLEGAL_TRANSITION with `details.paths`, W left READY; a direct creation is refused; the scheduling round blocks W
-/// for the user's decision (`dirty_workspace`, asked once) and dispatches none of it. Once asked, the answer decides:
-/// the admission no longer holds W.
+/// for the user's decision (`dirty_workspace`, asked once) and dispatches none of it. Asked, W is still held: only the
+/// answer releases it (`test_028_03_asking_is_no_consent_until_the_user_answers`).
 #[tokio::test]
 async fn test_028_03_the_admission_holds_a_write_task_on_dirty_files_on_every_dispatch_path() -> R {
     use crate::persistence::{Decided, NewAttempt, Options, PersistError, Store, selftest};
@@ -347,8 +347,8 @@ async fn test_028_03_the_admission_holds_a_write_task_on_dirty_files_on_every_di
         )?,
         0
     );
-    // Asked once: the user's answer decides, the admission no longer holds W.
-    assert!(super::admit_one(&conn, "R", "W", super::By::Commander)?.is_ok());
+    // Asked once: asking is no consent, the admission still holds W until the user answers (M3N-052).
+    assert!(super::admit_one(&conn, "R", "W", super::By::Commander)?.is_err());
     Ok(())
 }
 
@@ -365,5 +365,231 @@ fn test_028_03_the_dirty_file_hold_is_judged_in_the_admission_only() -> R {
         occurrences(&sources, "baseline::touched(", false),
         listed(&[("hoh-core/src/persistence/admission.rs", 1)])
     );
+    Ok(())
+}
+
+/// A store at `dir` holding [`DIRTY_WORLD`] with W's path scope `scope`, and a connection to it.
+fn dirty_store(
+    dir: &Path,
+    scope: &str,
+) -> Result<(crate::persistence::Store, rusqlite::Connection), Box<dyn std::error::Error>> {
+    use crate::persistence::{Options, Store, selftest};
+    let path = dir.join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    let conn = rusqlite::Connection::open(&path)?;
+    let world = DIRTY_WORLD.replace(
+        "json_object('task_id', 'W', 'paths', json_array('src'))",
+        &format!("json_object('task_id', 'W', 'paths', json_array('{scope}'))"),
+    );
+    assert!(
+        scope == "src" || world != DIRTY_WORLD,
+        "W's scope is replaced"
+    );
+    conn.execute_batch(&world)?;
+    Ok((store, conn))
+}
+
+fn dirty_context() -> crate::decision::Context {
+    crate::decision::Context {
+        required_capabilities: ["developer"]
+            .map(|role| (role.to_owned(), Default::default()))
+            .into(),
+        now: Some(std::time::SystemTime::now()),
+        ..crate::decision::Context::default()
+    }
+}
+
+/// A direct creation of an attempt `id` of `task`.
+async fn create_direct(
+    store: &crate::persistence::Store,
+    id: &str,
+    task: &str,
+) -> Result<(), crate::persistence::PersistError> {
+    store
+        .create_attempt(crate::persistence::NewAttempt {
+            attempt_id: id.to_owned(),
+            task_id: task.to_owned(),
+            session_id: None,
+            role_epoch: 1,
+            host_epoch: 1,
+            config_revision: 1,
+            agent: Some("claude".to_owned()),
+        })
+        .await
+}
+
+fn attempts_of(conn: &rusqlite::Connection, task: &str) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT count(*) FROM attempts WHERE task_id = ?1",
+        [task],
+        |r| r.get(0),
+    )
+}
+
+/// M3N-001 (docs/adr/ADR-039.md, round 1 corrections): a write task whose scope names the dirty file in another
+/// spelling (`./src`, `.` the project root, `src//lib.rs`) is held on every dispatch path, as `src` is.
+#[tokio::test]
+async fn test_028_03_every_dispatch_path_holds_a_scope_in_any_spelling() -> R {
+    use crate::persistence::{Decided, PersistError};
+    for scope in ["./src", ".", "src//lib.rs", "src/./lib.rs/"] {
+        let dir = tempfile::tempdir()?;
+        let (store, conn) = dirty_store(dir.path(), scope)?;
+        for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+            let verdict = super::admit_one(&conn, "R", "W", by)?;
+            assert!(
+                matches!(verdict, Err(super::Refusal::DirtyWorkspace { ref paths }) if paths == &["src/lib.rs"]),
+                "{scope} {by:?}: {verdict:?}"
+            );
+        }
+        let decided = store
+            .decide(dirty_dispatch(&conn, "d-W", "W")?, dirty_context())
+            .await?;
+        assert!(
+            matches!(decided, Decided::Rejected { .. }),
+            "{scope}: the Commander's dispatch {decided:?}"
+        );
+        let created = create_direct(&store, "A-direct", "W").await;
+        assert!(
+            matches!(created, Err(PersistError::IllegalTransition { .. })),
+            "{scope}: a direct creation {created:?}"
+        );
+        store.schedule_round("R", dirty_context()).await?;
+        let state: String = conn.query_row(
+            "SELECT state || '/' || coalesce(blocked_reason, '') FROM tasks WHERE task_id = 'W'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(state, "BLOCKED/NEED_DECISION", "{scope}");
+        assert_eq!(attempts_of(&conn, "W")?, 0, "{scope}");
+    }
+    Ok(())
+}
+
+/// The user's AnswerQuestion of run R's question `question` with choice `choice`.
+async fn answer_question(
+    store: &crate::persistence::Store,
+    conn: &rusqlite::Connection,
+    id: &str,
+    question: &str,
+    choice: &str,
+) -> R {
+    use crate::persistence::writer::{Intent, NewEvent};
+    use crate::persistence::{Input, RunTarget, SubmitCommand};
+    let revision: i64 =
+        conn.query_row("SELECT revision FROM runs WHERE run_id = 'R'", [], |r| {
+            r.get(0)
+        })?;
+    store
+        .submit_command(SubmitCommand {
+            command_id: id.to_owned(),
+            idempotency_key: format!("k-{id}"),
+            kind: "AnswerQuestion".to_owned(),
+            run_id: "R".to_owned(),
+            expected_revision: revision,
+            payload: serde_json::json!({"question_id": question, "choice_id": choice}),
+            payload_sha256: crate::context::sha256_hex(id.as_bytes()),
+            target: RunTarget::Input(Input::Answer {
+                question_id: question.to_owned(),
+                answer: choice.to_owned(),
+                choice_id: Some(choice.to_owned()),
+            }),
+            event: NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".to_owned(),
+                event_id: format!("e-{id}"),
+                run_id: Some("R".to_owned()),
+                kind: "question.answer_accepted".to_owned(),
+                payload: serde_json::json!({"command_id": id, "question_id": question}),
+            },
+            outbox: None,
+        })
+        .await?;
+    Ok(())
+}
+
+/// M3N-002, M3N-052 (docs/adr/ADR-039.md, round 1 corrections): asking is no consent. After the round asked about
+/// W's dirty files and before the user answers, every attempt-creating path refuses W and writes nothing (a direct
+/// creation included, W being BLOCKED); only the user's answer `continue` releases the hold.
+#[tokio::test]
+async fn test_028_03_asking_is_no_consent_until_the_user_answers() -> R {
+    use crate::persistence::PersistError;
+    let dir = tempfile::tempdir()?;
+    let (store, conn) = dirty_store(dir.path(), "src")?;
+    store.schedule_round("R", dirty_context()).await?;
+    let question: String = conn.query_row(
+        "SELECT event_id FROM events WHERE kind = 'need_decision' AND json_extract(payload_json, '$.task_id') = 'W'",
+        [],
+        |r| r.get(0),
+    )?;
+    // Asked, not answered: refused on every path, nothing written by a direct creation.
+    for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+        let verdict = super::admit_one(&conn, "R", "W", by)?;
+        assert!(
+            matches!(verdict, Err(super::Refusal::DirtyWorkspace { .. })),
+            "{by:?} before the answer: {verdict:?}"
+        );
+    }
+    let seq: i64 = conn.query_row("SELECT max(seq) FROM events", [], |r| r.get(0))?;
+    let created = create_direct(&store, "A-early", "W").await;
+    assert!(
+        matches!(created, Err(PersistError::IllegalTransition { .. })),
+        "a direct creation before the answer: {created:?}"
+    );
+    assert_eq!(attempts_of(&conn, "W")?, 0);
+    assert_eq!(
+        conn.query_row("SELECT max(seq) FROM events", [], |r| r.get::<_, i64>(0))?,
+        seq,
+        "a refused direct creation writes nothing"
+    );
+    // The round asks once: a second round neither asks again nor dispatches W.
+    store.schedule_round("R", dirty_context()).await?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM events WHERE kind = 'need_decision' \
+             AND json_extract(payload_json, '$.task_id') = 'W'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(attempts_of(&conn, "W")?, 0);
+    // The answer continue: W READY, the hold released for every path.
+    answer_question(&store, &conn, "c-continue", &question, "continue").await?;
+    let state: String = conn.query_row("SELECT state FROM tasks WHERE task_id = 'W'", [], |r| {
+        r.get(0)
+    })?;
+    assert_eq!(state, "READY");
+    for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+        assert!(
+            super::admit_one(&conn, "R", "W", by)?.is_ok(),
+            "{by:?} after the answer"
+        );
+    }
+    create_direct(&store, "A-after", "W").await?;
+    assert_eq!(attempts_of(&conn, "W")?, 1);
+    Ok(())
+}
+
+/// M3N-052: a direct creation of an attempt of a BLOCKED task is refused and writes nothing, whatever blocked it.
+#[tokio::test]
+async fn a_direct_creation_of_a_blocked_task_is_refused() -> R {
+    use crate::persistence::PersistError;
+    let dir = tempfile::tempdir()?;
+    let (store, conn) = dirty_store(dir.path(), "docs/none")?;
+    conn.execute_batch(
+        "UPDATE tasks SET state = 'BLOCKED', blocked_reason = 'NEED_DECISION' WHERE task_id = 'W2'",
+    )?;
+    let created = create_direct(&store, "A-blocked", "W2").await;
+    assert!(
+        matches!(created, Err(PersistError::IllegalTransition { .. })),
+        "{created:?}"
+    );
+    assert_eq!(attempts_of(&conn, "W2")?, 0);
     Ok(())
 }

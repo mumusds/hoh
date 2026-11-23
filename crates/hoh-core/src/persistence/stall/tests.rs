@@ -1805,3 +1805,55 @@ async fn a_commanders_move_waits_while_a_question_blocks_the_run_in_discovering(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn the_baseline_tests_question_has_no_default_choice() -> R {
+    // M3N-054 (docs/adr/ADR-039.md decision 8): an answer that picks neither run nor skip starts no project command:
+    // it is refused (400) and nothing is written; only an explicit choice exits.
+    let dir = tempfile::tempdir()?;
+    let clock = Arc::new(TestClock::default());
+    let (store, path) = open(&dir, &clock)?;
+    world(&path, "DISCOVERING", TWO_WAKES)?;
+    assert!(
+        store
+            .record_baseline("R", json!({"test_commands": ["cargo test"]}))
+            .await?
+    );
+    let question = {
+        let conn = Connection::open(&path)?;
+        crate::persistence::questions::open(&conn, "R")?
+            .into_iter()
+            .find(|q| q.reason.as_deref() == Some("baseline_tests"))
+            .ok_or("no baseline_tests question")?
+    };
+    assert_eq!(question.default, None, "{:?}", question.choices);
+    let free = |id: &str| {
+        input(
+            &path,
+            id,
+            crate::persistence::RunTarget::Input(crate::persistence::Input::Answer {
+                question_id: "R/baseline_tests/question".to_owned(),
+                answer: "好的".to_owned(),
+                choice_id: None,
+            }),
+            "AnswerQuestion",
+        )
+    };
+    let refused = store.submit_command(free("free")?).await;
+    assert!(
+        matches!(
+            refused,
+            Err(crate::persistence::PersistError::BadRequest(_))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind IN ('question.answered', 'run.baseline_tests')"
+        )?,
+        json!(0)
+    );
+    assert_eq!(state(&path)?, json!("BLOCKED/NEED_DECISION"));
+    Ok(())
+}
