@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Every resource built into the binary that a packed prompt can depend on, by its path in the source tree: the
 /// built-in role contracts and the schemas the output contracts come from.
-pub const RESOURCES: [(&str, &str); 9] = [
+pub const RESOURCES: [(&str, &str); 40] = [
     (
         "resources/prompts/commander.md",
         include_str!("../../../resources/prompts/commander.md"),
@@ -44,6 +44,130 @@ pub const RESOURCES: [(&str, &str); 9] = [
     (
         "contracts/acceptance-observation.schema.json",
         include_str!("../../../contracts/acceptance-observation.schema.json"),
+    ),
+    (
+        "resources/skills/architecture/SKILL.md",
+        include_str!("../../../resources/skills/architecture/SKILL.md"),
+    ),
+    (
+        "resources/skills/code-review/SKILL.md",
+        include_str!("../../../resources/skills/code-review/SKILL.md"),
+    ),
+    (
+        "resources/skills/decision-map/SKILL.md",
+        include_str!("../../../resources/skills/decision-map/SKILL.md"),
+    ),
+    (
+        "resources/skills/domain-modeling/SKILL.md",
+        include_str!("../../../resources/skills/domain-modeling/SKILL.md"),
+    ),
+    (
+        "resources/skills/implementation/SKILL.md",
+        include_str!("../../../resources/skills/implementation/SKILL.md"),
+    ),
+    (
+        "resources/skills/independent-qa/SKILL.md",
+        include_str!("../../../resources/skills/independent-qa/SKILL.md"),
+    ),
+    (
+        "resources/skills/recovery/SKILL.md",
+        include_str!("../../../resources/skills/recovery/SKILL.md"),
+    ),
+    (
+        "resources/skills/release/SKILL.md",
+        include_str!("../../../resources/skills/release/SKILL.md"),
+    ),
+    (
+        "resources/skills/requirements/SKILL.md",
+        include_str!("../../../resources/skills/requirements/SKILL.md"),
+    ),
+    (
+        "resources/skills/research/SKILL.md",
+        include_str!("../../../resources/skills/research/SKILL.md"),
+    ),
+    (
+        "resources/skills/task-planning/SKILL.md",
+        include_str!("../../../resources/skills/task-planning/SKILL.md"),
+    ),
+    (
+        "resources/skills/tdd/SKILL.md",
+        include_str!("../../../resources/skills/tdd/SKILL.md"),
+    ),
+    (
+        "resources/skills/ux-validation/SKILL.md",
+        include_str!("../../../resources/skills/ux-validation/SKILL.md"),
+    ),
+    (
+        "resources/templates/acceptance.md",
+        include_str!("../../../resources/templates/acceptance.md"),
+    ),
+    (
+        "resources/templates/adr.md",
+        include_str!("../../../resources/templates/adr.md"),
+    ),
+    (
+        "resources/templates/api-data.md",
+        include_str!("../../../resources/templates/api-data.md"),
+    ),
+    (
+        "resources/templates/architecture.md",
+        include_str!("../../../resources/templates/architecture.md"),
+    ),
+    (
+        "resources/templates/change-request.md",
+        include_str!("../../../resources/templates/change-request.md"),
+    ),
+    (
+        "resources/templates/changelog.md",
+        include_str!("../../../resources/templates/changelog.md"),
+    ),
+    (
+        "resources/templates/contributing.md",
+        include_str!("../../../resources/templates/contributing.md"),
+    ),
+    (
+        "resources/templates/deployment.md",
+        include_str!("../../../resources/templates/deployment.md"),
+    ),
+    (
+        "resources/templates/development-plan.md",
+        include_str!("../../../resources/templates/development-plan.md"),
+    ),
+    (
+        "resources/templates/feature.md",
+        include_str!("../../../resources/templates/feature.md"),
+    ),
+    (
+        "resources/templates/milestone-report.md",
+        include_str!("../../../resources/templates/milestone-report.md"),
+    ),
+    (
+        "resources/templates/prd.md",
+        include_str!("../../../resources/templates/prd.md"),
+    ),
+    (
+        "resources/templates/product-definition.md",
+        include_str!("../../../resources/templates/product-definition.md"),
+    ),
+    (
+        "resources/templates/test-plan.md",
+        include_str!("../../../resources/templates/test-plan.md"),
+    ),
+    (
+        "resources/templates/user-guide.md",
+        include_str!("../../../resources/templates/user-guide.md"),
+    ),
+    (
+        "resources/templates/ux.md",
+        include_str!("../../../resources/templates/ux.md"),
+    ),
+    (
+        "resources/skills/registry.json",
+        include_str!("../../../resources/skills/registry.json"),
+    ),
+    (
+        "resources/templates/profiles.json",
+        include_str!("../../../resources/templates/profiles.json"),
     ),
 ];
 

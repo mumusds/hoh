@@ -36,7 +36,11 @@
   "tools/validate_bundle.py": "kit validator checking the SQL contract on a temporary database"
  },
  "read_as_data": {},
- "embedded_markdown": {},
+ "embedded_markdown": {
+  "resources/skills/architecture/SKILL.md": "REQ-046 built-in architecture Skill embedded as prompt prose; SQLite is a technology name, never executable SQL (CR-034)",
+  "resources/skills/recovery/SKILL.md": "REQ-046 built-in recovery Skill embedded as prompt prose; SQLite busy names a failure class, never executable SQL (CR-034)",
+  "resources/skills/requirements/SKILL.md": "REQ-046 built-in requirements Skill embedded as prompt prose; SQLite is a technology name, never executable SQL (CR-034)"
+ },
  "append_only_allow": [
   {
    "file": "crates/hoh-core/src/persistence/evidence.rs",
