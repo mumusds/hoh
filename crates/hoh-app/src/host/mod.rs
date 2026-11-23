@@ -246,6 +246,9 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// implementation holds the step here while the host stops).
     fn completing(&self, _attempt_id: &str) {}
 
+    /// After a writer's completion call returned, including an error (CR-006 test observation boundary).
+    fn writer_completion_returned(&self, _attempt_id: &str) {}
+
     /// The native attempt record the host built for specification review attempt `attempt_id`, before it is kept and
     /// taken in (REQ-031 behaviour 4): what is kept instead (none: no record). A test's implementation replaces it,
     /// so a tampered record goes through the one intake entry (AC-031-04).

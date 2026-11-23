@@ -767,3 +767,80 @@ async fn test_009_03_m3l252_refused_gate_retains_process_identity_when_unreaped(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_009_03_m3l303_changed_work_effect_keeps_refused_process_identity() -> R {
+    use crate::persistence::AttemptFacts;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("UPDATE runs SET state='SPECIFYING',mode='PLAN'; UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    db.execute(
+        "INSERT INTO effects(effect_key,attempt_id,state) VALUES(?1,'A','OBSERVED')",
+        [crate::reconcile::work_key("A")],
+    )?;
+    assert!(
+        super::super::admission::admit_one(&db, "R", "D", super::super::admission::By::Draft)?
+            .is_ok()
+    );
+    let tracking = json!({"attempt_id":"A","mode":"proc"});
+    assert!(
+        !store
+            .runner_running(
+                "A",
+                AttemptFacts {
+                    pid: Some(123),
+                    boot_id: Some("boot".into()),
+                    process_start_id: Some("start".into()),
+                    ..Default::default()
+                },
+                tracking.clone()
+            )
+            .await?
+    );
+    assert_eq!(db.query_row("SELECT coalesce(pid,0)||'/'||coalesce(boot_id,'')||'/'||coalesce(process_start_id,'')||'/'||state FROM attempts WHERE attempt_id='A'",[],|r|r.get::<_,String>(0))?, "123/boot/start/STARTING");
+    assert_eq!(
+        store.reader()?.attempt_event("attempt.tracking", "A")?,
+        Some(tracking)
+    );
+    let row = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("attempt")?;
+    assert_eq!(row.pid, Some(123));
+    store
+        .reconcile_apply(
+            row,
+            crate::reconcile::Disposition::Unreaped,
+            crate::reconcile::Process::Uncertain {
+                basis: "injected proof unavailable".into(),
+            },
+            "draft_gate_refused",
+            std::time::SystemTime::now(),
+            0,
+        )
+        .await?;
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM leases WHERE attempt_id='A'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM attempts WHERE attempt_id='A'", [], |r| r
+            .get::<_, String>(0))?,
+        "STARTING"
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM effects WHERE attempt_id='A'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "OBSERVED"
+    );
+    Ok(())
+}

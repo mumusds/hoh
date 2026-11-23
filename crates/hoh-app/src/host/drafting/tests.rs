@@ -397,6 +397,45 @@ fn test_008_02_m3l203_content_limit_is_a_small_failed_observation() -> R {
 }
 
 #[test]
+fn test_008_04_m3l300_reverted_committed_product_write_remains_in_attempt_window() -> R {
+    for unborn in [false, true] {
+        let dir = repo()?;
+        let root = dir.path();
+        if !unborn {
+            std::fs::write(root.join("product.txt"), "original")?;
+            git(root, &["add", "product.txt"])?;
+            git(root, &["commit", "-q", "-m", "base"])?;
+        }
+        let start = snapshot(root);
+        std::fs::write(root.join("product.txt"), "changed")?;
+        git(root, &["add", "product.txt"])?;
+        git(root, &["commit", "-q", "-m", "product write"])?;
+        if unborn {
+            std::fs::remove_file(root.join("product.txt"))?;
+        } else {
+            std::fs::write(root.join("product.txt"), "original")?;
+        }
+        git(root, &["add", "-u"])?;
+        git(root, &["commit", "-q", "-m", "restore product"])?;
+        docs(root)?;
+        let before = head(root)?;
+        assert!(
+            matches!(checked(root, &start)?, WriterOutcome::DraftBlocked { paths, .. } if paths == ["product.txt"]),
+            "committed product write disappeared, unborn={unborn}"
+        );
+        assert_eq!(head(root)?, before);
+        assert_eq!(root.join("product.txt").exists(), !unborn);
+        if !unborn {
+            assert_eq!(
+                std::fs::read_to_string(root.join("product.txt"))?,
+                "original"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_008_02_m3l301_large_tracked_repository_does_not_consume_untracked_budget() -> R {
     let dir = repo()?;
     let root = dir.path();
