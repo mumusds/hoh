@@ -622,3 +622,38 @@ fn test_008_04_plan_blocks_every_ordinary_writer_dispatch_path() -> R {
     }
     Ok(())
 }
+
+#[test]
+fn test_009_02_m3l103_only_own_active_draft_holds_product_writes() -> R {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+      INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+      INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES
+      ('r','p','s','RUNNING','BUILD','now'),('other','p','s','RUNNING','PLAN','now');
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES('w','r','s','READY','developer',1,1);
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,kind,created_seq) VALUES('d','other','s','IMPLEMENTED','cto',1,'spec_draft',1);")?;
+    for state in ["RUNNING", "INCOMPLETE", "FAILED", "COMPLETED", "CANCELLED"] {
+        conn.execute("UPDATE runs SET state=?1 WHERE run_id='other'", [state])?;
+        for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+            assert!(
+                super::admit_one(&conn, "r", "w", by)?.is_ok(),
+                "unrelated {state} run held {by:?}"
+            );
+        }
+    }
+    conn.execute("UPDATE tasks SET run_id='r' WHERE task_id='d'", [])?;
+    assert!(matches!(
+        super::admit_one(&conn, "r", "w", super::By::Round)?,
+        Err(super::Refusal::Mode(
+            crate::mode::WriteRefusal::PendingDraft
+        ))
+    ));
+    conn.execute("UPDATE tasks SET state='ACCEPTED' WHERE task_id='d'", [])?;
+    conn.execute("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES('cr','p','s','PROPOSED','change','{}','now')", [])?;
+    assert!(
+        super::admit_one(&conn, "r", "w", super::By::Round)?.is_ok(),
+        "a proposed CR leaves work on the approved revision unchanged"
+    );
+    Ok(())
+}
