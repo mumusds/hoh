@@ -135,3 +135,77 @@ async fn test_008_02_first_draft_completes_then_all_three_user_entrances_approve
     }
     Ok(())
 }
+
+async fn marked_request(
+    host: &hoh_app::host::Host,
+    body: &serde_json::Value,
+) -> R<(u16, serde_json::Value)> {
+    let request = format!(
+        "POST /v1/commands HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-HoH-Token: {}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        host.port,
+        host.token,
+        body.to_string().len(),
+        body
+    );
+    let port = host.port.to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        world::approval::python(
+            r#"
+import socket,sys
+s=socket.create_connection(('127.0.0.1',int(sys.argv[1])),15)
+s.sendall(sys.argv[2].encode())
+while True:
+ data=s.recv(65536)
+ if not data: break
+ sys.stdout.buffer.write(data)
+"#,
+            &[("HOH_ATTEMPT_ID", "another-project/attempt")],
+        )
+        .args([port, request])
+        .output()
+    })
+    .await??;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = String::from_utf8(output.stdout)?;
+    let (header, body) = response.split_once("\r\n\r\n").ok_or("response")?;
+    Ok((
+        header.split_whitespace().nth(1).ok_or("status")?.parse()?,
+        serde_json::from_str(body)?,
+    ))
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_05_answer_and_reply_refuse_attempt_origin_before_application_and_replay() -> R {
+    for kind in ["AnswerQuestion", "SendInput"] {
+        let world = world::World::named("m3t04-draft-origin")?;
+        world.configure(&[], "")?;
+        let host = world
+            .team_host(world::Team::drafting(world.project()), None)
+            .await?;
+        let result:R=async{
+   let run=world::start_run(&host,"start","draft authority").await?;world.staff(&run)?;
+   input(&host,&world,&run,"draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+   world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(20)).await?;
+   let q:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval'")?)?;
+   let payload=if kind=="AnswerQuestion"{json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"})}else{json!({"text":"approve","target_role":null,"input_kind":"REPLY"})};
+   let revision:i64=world.query("SELECT revision FROM runs")?.parse()?;
+   let body=json!({"schema_version":"1.0","command_id":"approve","idempotency_key":"approve","run_id":run,"expected_revision":revision,"kind":kind,"payload":payload});
+   for _ in 0..2{
+    let (status,rejected)=marked_request(&host,&body).await?;
+    assert_eq!(status,403,"{rejected}");assert_eq!(rejected["code"],"SPEC_APPROVAL_NOT_USER");assert_eq!(rejected["details"]["reason"],"marker");
+    assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");assert_eq!(world.query("SELECT count(*) FROM commands WHERE command_id='approve'")?,"0");
+    assert_eq!(world.query("SELECT revision FROM runs")?,revision.to_string());
+   }
+   assert_eq!(world::exchange(&host,"POST","/v1/commands",Some(&body)).await?.0,202);
+   assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");
+   assert_eq!(marked_request(&host,&body).await?.0,403,"origin guard precedes the user's accepted replay");
+   assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");Ok(())
+  }.await;
+        host.shutdown().await;
+        result?;
+    }
+    Ok(())
+}

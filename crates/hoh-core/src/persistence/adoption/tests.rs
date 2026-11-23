@@ -260,7 +260,7 @@ async fn a_started_run_without_a_specification_is_blocked_by_its_no_spec_questio
     Ok(())
 }
 
-/// AnswerQuestion of run `run`'s question `question` with its one choice, adopt, at `revision`, as the host submits it.
+/// AnswerQuestion of run `run`'s question `question` with adopt at `revision`, as the host submits it.
 fn answer_adopt(id: &str, run: &str, revision: i64, question: &str) -> SubmitCommand {
     SubmitCommand {
         command_id: id.to_owned(),
@@ -299,7 +299,7 @@ fn open_questions(path: &Path, run: &str) -> R<Vec<Value>> {
 #[tokio::test]
 async fn w13_a_run_without_a_specification_adopts_one_approved_since_by_its_answer() -> R {
     // W13's real path (decision 1; decision 8's row runtime:no_spec): StartRun without a specification -> BLOCKED,
-    // its question listed by questions::open (run-level, reason no_spec, the one choice adopt, the default); answered
+    // its question listed by questions::open (run-level, reason no_spec, adopt/draft with adopt the default); answered
     // adopt while there is still none: the run stays BLOCKED, its revision moved once (a Touch), the answer's commit
     // ends with its run.result BLOCKED NEED_DECISION, the question still open; a specification approved, answered adopt
     // again: runs.spec_id names it, spec.changed{cause: adopted, from: null}, the claim released, run.resumed BLOCKED

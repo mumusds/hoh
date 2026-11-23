@@ -50,9 +50,8 @@ pub(super) fn step(
     discovered: bool,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let tx = writer::begin(conn, ctx)?;
-    let row: Option<(String, String, i64)> = tx
-        .query_row(
+    let read = |conn: &Connection| -> Result<Option<(String, String, i64)>, PersistError> {
+        conn.query_row(
             "SELECT project_id,state,revision FROM runs r WHERE run_id=?1 AND spec_id IS NULL \
          AND EXISTS(SELECT 1 FROM events WHERE run_id=r.run_id AND kind='spec.draft_requested') \
          AND NOT EXISTS(SELECT 1 FROM tasks WHERE run_id=r.run_id AND kind='spec_draft')",
@@ -60,8 +59,15 @@ pub(super) fn step(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
-        .map_err(sqlite_error)?;
-    let Some((project, state, revision)) = row else {
+        .map_err(sqlite_error)
+    };
+    // An ordinary run has no draft work. Do not open an empty writer transaction: its Begun hook would consume
+    // a runner fault intended for a real receipt/effect. Re-read under the write lock before changing anything.
+    if read(conn)?.is_none() {
+        return Ok(false);
+    }
+    let tx = writer::begin(conn, ctx)?;
+    let Some((project, state, revision)) = read(&tx)? else {
         return Ok(false);
     };
     let to = match state.as_str() {
@@ -128,13 +134,18 @@ pub(super) fn dispatch(
     context: &crate::decision::Context,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let tx = writer::begin(conn, ctx)?;
-    let row:Option<(String,i64,String,i64,i64)> = tx.query_row(
+    let read = |conn: &Connection| {
+        conn.query_row(
         "SELECT t.task_id,t.revision,r.project_id,r.revision,t.cost_estimate FROM tasks t JOIN runs r ON r.run_id=t.run_id \
          WHERE t.run_id=?1 AND t.kind='spec_draft' AND t.state='READY' \
          AND (t.next_retry_at IS NULL OR t.next_retry_at<=?2) ORDER BY t.created_seq LIMIT 1",
-        params![run,crate::time::rfc3339_utc(context.now())],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(sqlite_error)?;
-    let Some((task, revision, project, run_revision, cost)) = row else {
+        params![run,crate::time::rfc3339_utc(context.now())],|r|Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, String>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?))).optional().map_err(sqlite_error)
+    };
+    if read(conn)?.is_none() {
+        return Ok(false);
+    }
+    let tx = writer::begin(conn, ctx)?;
+    let Some((task, revision, project, run_revision, cost)) = read(&tx)? else {
         return Ok(false);
     };
     let Ok(admission) = super::admission::admit_one(&tx, run, &task, super::admission::By::Draft)?
