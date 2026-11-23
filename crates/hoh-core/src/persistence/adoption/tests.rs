@@ -407,9 +407,12 @@ async fn w13_a_run_without_a_specification_adopts_one_approved_since_by_its_answ
 
 #[tokio::test]
 async fn test_008_02_draft_answer_requests_plan_without_approving_a_specification() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t04-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t04-").tempdir()?;
+    assert_eq!(
+        dir.path().parent(),
+        Some(std::env::temp_dir().as_path()),
+        "fixture must honor the configured temporary root"
+    );
     let (store, path) = open(&dir)?;
     store.submit_command(start("R")).await?;
     let listed = open_questions(&path, "R")?;
@@ -455,9 +458,12 @@ async fn test_008_02_draft_answer_requests_plan_without_approving_a_specificatio
 
 #[tokio::test]
 async fn test_008_02_draft_phases_are_idempotent_and_discovery_has_no_effect() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t04-")
-        .tempdir_in("/home/ai/dev")?;
+    let dir = tempfile::Builder::new().prefix("m3t04-").tempdir()?;
+    assert_eq!(
+        dir.path().parent(),
+        Some(std::env::temp_dir().as_path()),
+        "fixture must honor the configured temporary root"
+    );
     let (store, path) = open(&dir)?;
     store.submit_command(start("R")).await?;
     let q = open_questions(&path, "R")?[0]["question_id"]
