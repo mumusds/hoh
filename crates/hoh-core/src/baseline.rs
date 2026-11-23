@@ -129,15 +129,24 @@ pub fn docs(root: &[String], dirs: &[&str]) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// Whether project path `file` is inside task path `scope` along path components (`src` holds `src/lib.rs`, not
-/// `src2/x`; an empty scope holds nothing).
+/// The project-relative components of `path`: empty and `.` components dropped, so `./x`, `x//y` and `x/` name what
+/// `x` and `x/y` name, and `.` names the project root (no components). `..` never reaches here: a plan's paths are
+/// refused with it (`dag::validate`, CR-033 decision 1) and git names no file so.
+fn components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect()
+}
+
+/// Whether project path `file` is inside task path `scope` along their normalized components (`src` and `./src`
+/// hold `src/lib.rs`, not `src2/x`; `.` is the project root and holds every file; an empty scope holds nothing;
+/// docs/adr/ADR-039.md, round 1 corrections, M3N-001).
 fn within(scope: &str, file: &str) -> bool {
-    let scope = scope.trim_end_matches('/');
-    !scope.is_empty()
-        && (file == scope
-            || file
-                .strip_prefix(scope)
-                .is_some_and(|rest| rest.starts_with('/')))
+    if scope.is_empty() {
+        return false;
+    }
+    let (scope, file) = (components(scope), components(file));
+    !file.is_empty() && file.starts_with(&scope)
 }
 
 /// The files of `uncommitted` some path of `scope` holds (docs/adr/ADR-039.md decision 7), sorted.

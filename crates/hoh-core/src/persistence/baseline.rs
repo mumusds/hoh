@@ -383,13 +383,26 @@ pub(super) fn uncommitted(conn: &Connection, run_id: &str) -> Result<Vec<String>
     Ok(paths)
 }
 
-/// Whether task `task_id` was asked about its uncommitted files once already: the user's answer to that question
-/// decides, it is not asked again.
+/// Whether task `task_id` was asked about its uncommitted files once already (the round asks only once).
 pub(super) fn asked(conn: &Connection, task_id: &str) -> Result<bool, PersistError> {
     conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE kind = 'need_decision' \
            AND json_extract(payload_json, '$.task_id') = ?1 \
            AND json_extract(payload_json, '$.reason') = 'dirty_workspace')",
+        params![task_id],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
+/// Whether the user answered `continue` to task `task_id`'s question about its uncommitted files: only that answer
+/// releases the hold; asking is no consent (docs/adr/ADR-039.md, round 1 corrections, M3N-002, M3N-052).
+pub(super) fn consented(conn: &Connection, task_id: &str) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE kind = 'question.answered' \
+           AND json_extract(payload_json, '$.task_id') = ?1 \
+           AND json_extract(payload_json, '$.reason') = 'dirty_workspace' \
+           AND json_extract(payload_json, '$.choice_id') = 'continue')",
         params![task_id],
         |r| r.get(0),
     )

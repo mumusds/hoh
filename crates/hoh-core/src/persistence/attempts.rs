@@ -373,16 +373,27 @@ pub(super) fn create(
     // A work attempt goes through the dispatch admission, here too (docs/adr/ADR-035.md decision 12): refused, nothing
     // is written.
     let (_, run_id) = owner(tx, &a.task_id)?;
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM tasks WHERE task_id = ?1",
+            params![a.task_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    // A BLOCKED task waits for its decision: no attempt of it is created directly, nothing is written (M3N-052).
+    if state == crate::protocol::TaskState::Blocked.as_str() {
+        return Err(PersistError::IllegalTransition {
+            entity: Entity::Task,
+            id: a.task_id.clone(),
+            from: state,
+            to: "LEASED".to_owned(),
+            why: format!("{} is BLOCKED: it waits for its decision", a.task_id),
+            details: None,
+        });
+    }
     if let Err(refusal) =
         super::admission::admit_one(tx, &run_id, &a.task_id, super::admission::By::Direct)?
     {
-        let state: String = tx
-            .query_row(
-                "SELECT state FROM tasks WHERE task_id = ?1",
-                params![a.task_id],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_error)?;
         return Err(refusal.error(&a.task_id, &state));
     }
     insert_prepared(tx, a)?;

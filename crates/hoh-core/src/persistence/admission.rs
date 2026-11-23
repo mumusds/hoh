@@ -52,8 +52,9 @@ pub(super) enum Refusal {
     RuntimeOwned,
     /// A planned task whose readiness under the run's current revision does not pass.
     NotReady { revision: i64, reasons: Vec<Reason> },
-    /// A write task, not asked about them before, whose path scope holds `paths`: files the run's baseline lists as
-    /// uncommitted (docs/adr/ADR-039.md decision 7). The round asks the user; the answer decides.
+    /// A write task whose path scope holds `paths`, files the run's baseline lists as uncommitted, and whose user has
+    /// not answered `continue` about them (docs/adr/ADR-039.md decision 7). The round asks the user once; only the
+    /// answer releases it.
     DirtyWorkspace { paths: Vec<String> },
 }
 
@@ -208,7 +209,7 @@ pub(super) fn admit(
                     Err(Refusal::NotReady { revision, reasons })
                 }
                 // 4. Its files: a write task whose path scope holds files uncommitted at the run's baseline waits for
-                // the user, asked once (REQ-028 behaviour 4, O3).
+                // the user's answer, asked once (REQ-028 behaviour 4, O3).
                 _ => match dirty(tx, task_id, writer, &uncommitted, &verifiers)? {
                     Some(paths) => Err(Refusal::DirtyWorkspace { paths }),
                     // 5. M3-T04: the run mode's admission (PLAN/BUILD/AUTO) joins here, as one more refusal.
@@ -223,8 +224,9 @@ pub(super) fn admit(
     Ok(verdicts)
 }
 
-/// The uncommitted files of `uncommitted` write task `task_id`'s path scope holds, when it is no verifier and was not
-/// asked about them before (docs/adr/ADR-039.md decision 7); `None` when it is not held.
+/// The uncommitted files of `uncommitted` write task `task_id`'s path scope holds, when it is no verifier and the user
+/// has not answered `continue` to its question about them (docs/adr/ADR-039.md decision 7 and its round 1
+/// corrections: asking is no consent); `None` when it is not held.
 fn dirty(
     tx: &Connection,
     task_id: &str,
@@ -235,7 +237,7 @@ fn dirty(
     if uncommitted.is_empty()
         || !writer
         || verifiers.contains(task_id)
-        || super::baseline::asked(tx, task_id)?
+        || super::baseline::consented(tx, task_id)?
     {
         return Ok(None);
     }

@@ -89,6 +89,35 @@ fn a_scope_holds_files_along_path_components_and_an_empty_one_none() {
     assert!(touched(&scope(&["li"]), &uncommitted).is_empty());
 }
 
+/// M3N-001 (docs/adr/ADR-039.md, round 1 corrections): plan scopes and baseline files compare by their normalized
+/// project-relative components: `.` is the project root, `./x`, `x//y` and a trailing `/` name what `x`, `x/y` name.
+#[test]
+fn test_028_03_scopes_and_files_compare_by_normalized_components() {
+    let uncommitted = vec!["app/page.md".to_owned(), "app2/x".to_owned()];
+    let scope = |paths: &[&str]| paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    for held in ["./app", "app//page.md", "./app/", "app/./page.md", "app//"] {
+        assert_eq!(
+            touched(&scope(&[held]), &uncommitted),
+            ["app/page.md"],
+            "{held}"
+        );
+    }
+    for root in [".", "./", ".//."] {
+        assert_eq!(
+            touched(&scope(&[root]), &uncommitted),
+            ["app/page.md", "app2/x"],
+            "{root}"
+        );
+    }
+    // A file named in another spelling is the same file.
+    assert_eq!(
+        touched(&scope(&["app"]), &scope(&["./app//page.md"])),
+        ["./app//page.md"]
+    );
+    assert!(touched(&scope(&["./ap"]), &uncommitted).is_empty());
+    assert!(touched(&scope(&[""]), &uncommitted).is_empty());
+}
+
 #[test]
 fn a_test_that_failed_in_the_baseline_is_no_regression() {
     let out = "running 2 tests\ntest answer ... ok\ntest fails ... FAILED\ntest it::deep ... FAILED\n\nfailures:\n";

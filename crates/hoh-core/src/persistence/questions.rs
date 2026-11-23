@@ -55,7 +55,17 @@ pub enum Route {
 }
 
 impl Route {
-    /// Its choices (id, label), the first the default; the Commander's are its own.
+    /// Its default choice, taken by an answer that names none: the first, except the baseline's tests, which only an
+    /// explicit `run` or `skip` exits (docs/adr/ADR-039.md decision 8, M3N-054); the Commander's have none.
+    pub fn default_choice(self) -> Option<&'static str> {
+        match self {
+            Route::BaselineTests => None,
+            _ => self.choices().first().map(|(id, _)| *id),
+        }
+    }
+
+    /// Its choices (id, label), the first the default but where [`Route::default_choice`] says otherwise; the
+    /// Commander's are its own.
     pub fn choices(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Route::Commander => &[],
@@ -352,7 +362,7 @@ fn runtime(
         candidate_state: None,
         text: payload["text"].as_str().unwrap_or_default().to_owned(),
         choices: owned(route.choices()),
-        default: route.choices().first().map(|(id, _)| (*id).to_owned()),
+        default: route.default_choice().map(str::to_owned),
         route,
         claim: Some(source.to_owned()),
         anchor: payload,
@@ -464,7 +474,7 @@ fn task_question(
             anchor["detail"].as_str().unwrap_or_default()
         ),
         choices: owned(route.choices()),
-        default: route.choices().first().map(|(id, _)| (*id).to_owned()),
+        default: route.default_choice().map(str::to_owned),
         route,
         claim: None,
         anchor,
@@ -559,12 +569,26 @@ fn choose(
         };
     }
     let said = text.trim().to_lowercase();
-    Ok(question
+    let chosen = question
         .choices
         .iter()
         .find(|(id, label)| id.to_lowercase() == said || label.trim().to_lowercase() == said)
         .map(|(id, _)| id.clone())
-        .or_else(|| question.default.clone()))
+        .or_else(|| question.default.clone());
+    // A question of the Runtime's own with no default takes only one of its choices (M3N-054).
+    if chosen.is_none() && question.route != Route::Commander && !question.choices.is_empty() {
+        return Err(PersistError::BadRequest(format!(
+            "question {} takes one of its choices explicitly: {}",
+            question.question_id,
+            question
+                .choices
+                .iter()
+                .map(|(c, _)| c.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(chosen)
 }
 
 /// Apply `a` in the command's transaction (decisions 7 and 8, E5): the question must be open (409 otherwise), the
