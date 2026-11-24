@@ -1,0 +1,25 @@
+{
+  "agent": "pi",
+  "cli_version": "1.6.0",
+  "case": "rpc-no-provider",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-24T06:08:30.877411+00:00",
+  "mode": "live",
+  "notes": "empty PI_CODING_AGENT_DIR, no provider key variables, PI_OFFLINE=1: get_state then prompt",
+  "env_overrides": [
+    "PI_CODING_AGENT_DIR=<temp>/empty-agent-dir",
+    "PI_OFFLINE=1",
+    "provider key variables removed"
+  ],
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
