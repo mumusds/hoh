@@ -1793,6 +1793,68 @@ fn test_047_03_settings_drift_follows_the_injected_bundle() {
         !shown.contains("漂移"),
         "injected bundle matches the saved base: {shown}"
     );
+    assert!(shown.contains("-host developer"), "{shown}");
+    assert!(shown.contains("+custom"), "{shown}");
+}
+
+#[test]
+fn test_047_02_settings_noop_restore_reloads_externally_deleted_override() {
+    let dir = tempfile::Builder::new()
+        .prefix("m3low-c-noop-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join(".hoh/prompts/developer.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "external delete sentinel\n").unwrap();
+    let mut app = App::open(dir.path());
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    assert!(
+        screen(&app, 120, 400)
+            .join("\n")
+            .contains("+external delete sentinel")
+    );
+    std::fs::remove_file(&path).unwrap();
+    app.key(key(KeyCode::Char('r')));
+    let shown = screen(&app, 120, 400).join("\n");
+    assert!(shown.contains("没有 project 覆盖可删除"), "{shown}");
+    assert!(!shown.contains("+++ project"), "{shown}");
+    assert!(!shown.contains("external delete sentinel"), "{shown}");
+}
+
+#[test]
+fn test_047_02_settings_restore_keeps_injected_builtin_diff_base() {
+    let dir = tempfile::Builder::new()
+        .prefix("m3low-c-settings-")
+        .tempdir()
+        .unwrap();
+    let project = dir.path().join(".hoh/prompts/developer.md");
+    let run = dir.path().join(".hoh/runs/R/prompts/developer.md");
+    for (path, text) in [(&project, "project override\n"), (&run, "run override\n")] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let mut host = hoh_core::resource_bundle::Bundle::current();
+    host.insert_file(
+        "resources/prompts/developer.md",
+        "HOST_CUSTOM_BUILTIN_SENTINEL\n",
+    );
+    let mut app = App::open(dir.path());
+    app.set_resource_bundle(host);
+    app.attach("R", "RUNNING");
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    app.key(key(KeyCode::Char('r')));
+    let shown = screen(&app, 120, 400).join("\n");
+    assert!(!project.exists());
+    assert!(shown.contains("+++ run"), "{shown}");
+    // Main diff, before any drift report, must use the injected old-side bytes.
+    let main_diff = shown.split("覆盖漂移：").next().unwrap();
+    assert!(
+        main_diff.contains("-HOST_CUSTOM_BUILTIN_SENTINEL"),
+        "{shown}"
+    );
+    assert!(main_diff.contains("+run override"), "{shown}");
 }
 
 #[test]
