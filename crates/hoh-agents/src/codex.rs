@@ -309,8 +309,16 @@ struct SteerInbox(mpsc::Receiver<Steer>);
 impl Drop for SteerInbox {
     fn drop(&mut self) {
         self.0.close();
-        while let Ok(steer) = self.0.try_recv() {
-            let _ = steer.reply.send(SteerReceipt::NotNow);
+        loop {
+            match self.0.try_recv() {
+                Ok(steer) => {
+                    let _ = steer.reply.send(SteerReceipt::NotNow);
+                }
+                // A concurrent try_send may have reserved capacity before close and not published yet.
+                // Producers only use try_send: no permit is held across an await or external work.
+                Err(mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
     }
 }
