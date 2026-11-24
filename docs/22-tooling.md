@@ -22,7 +22,8 @@ Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--ap
 source .hoh-dev/env.sh
 python3 tools/render_prompt.py --role reviewer --context .hoh-dev/review-context.json --output .hoh-dev/reviewer-prompt.md
 python3 tools/agent_task.py --agent codex --role reviewer --prompt-file .hoh-dev/reviewer-prompt.md --timeout 3600
-# --agent 可选 codex、claude、pi、grok；grok 以无头单轮方式运行（--prompt-file /dev/stdin --output-format streaming-messages-json --always-approve），
+# --agent 可选 codex、claude、pi、grok；grok 以无头单轮方式运行（--prompt-file /dev/stdin --output-format streaming-messages-json --always-approve
+# --background-wait-timeout <向上取整的 --timeout>），
 # 只能在检查之外使用：live-session schema 不接受 grok，在 run_check 内调用会以 64 拒绝
 ```
 
@@ -31,6 +32,10 @@ python3 tools/agent_task.py --agent codex --role reviewer --prompt-file .hoh-dev
 桥默认插入局部任务信封，并给子进程设置 `HOH_BOOTSTRAP_PARENT`，阻止下级会话递归启动顶层会话；委派会话（非 `--top-level`）另设 `HOH_DELEGATED_TASK=<role>`；顶层会话（`scripts/start.sh` 与 `--top-level`）不设它，而把 `HOH_TOP_LEVEL_SESSION` 设为与自己的 `HOH_BOOTSTRAP_PARENT` 相同的标识，并由其下的会话继承。`HOH_BOOTSTRAP_PARENT` 只表示“已在自举会话之内，不能再启动顶层会话”，顶层会话自己也带它，所以不能单凭它判断是否为委派会话；委派会话是带 `HOH_DELEGATED_TASK`，或 `HOH_BOOTSTRAP_PARENT` 指向别的会话（不等于 `HOH_TOP_LEVEL_SESSION`）的会话，后一条也覆盖旧版桥启动的会话。`--top-level` 只允许 commander/developer 角色，且只能在不处于任何自举会话中时使用。桥不重试、不调度下一任务、不充当总指挥。原生子进程的完成记录永远是 `product_accepted:false`。成功判定只看终态：Codex 的 `turn.completed`/`turn.failed`，Claude 的 `result`，Pi 的最后一条助手消息与 `auto_retry_end`；原生 CLI 自己重试的瞬时错误计入 `transient_errors`，不判失败。Pi JSON 模式的会话 id 取自首行 `{"type":"session","id":…}`。
 
 **独立报告（`--report-out`，仅 qa/reviewer）：** 会话结束后，桥从最后一条助手消息的 ```hoh-report 代码块读取 `{role, status, scope, findings}`，补上 session_id（必须恰好一个）、candidate_id 与 spec_sha256（来自 run_check 设置的 `HOH_CANDIDATE_ID`、`HOH_SPEC_SHA256`）、raw_session 与 native_attempt 的路径和哈希，按 `contracts/independent-report.schema.json` 校验后写出。Agent 自己写身份或哈希字段会被拒绝（退出码 65，原因写入 attempt.json 的 `report_error`）。超时会终止本次进程组并保存失败；收到 SIGTERM 时记录 INTERRUPTED。在 `run_check` 之下运行时（存在 `HOH_EVIDENCE_DIR`），attempt 目录默认放在该检查的证据目录内，记录被测 candidate_id 与 check_id，并把观察到的会话追加到该检查的 `live-sessions.json`。这正是独立 QA/Review 检查应有的运行方式。SIGTERM/SIGHUP 会先停止原生进程组，再写入 INTERRUPTED 记录。
+
+**Grok 的后台等待：** 无头 Grok 在最后一轮结束后只等它启动的后台工作（后台 shell、monitor、子 Agent）600 s，到时停止这些工作并以 1 退出（grok 1.0.89 的 attempt df2c4c5c 如此丢失了工作，1.0.92 的内置文档仍写 10 分钟，BT-02）。桥因此给 Grok 加 `--background-wait-timeout`，取本次 `--timeout` 向上取整，让桥自己的截止时间生效。该参数不在 `grok --help` 中，桥先用 `grok --background-wait-timeout 1 --version` 探测；不支持它的 Grok 以 78 拒绝，不会静默丢失后台工作。桥的 `--timeout` 仍是整次会话的上限：比它更长的命令即便放在前台也会随会话被终止。
+
+**审查块（qa/reviewer，未给 `--report-out`）：** 检查之外没有候选绑定，不能用 `--report-out`，桥输出的 `report` 因此为 null（BT-01）。这时桥把最后一条助手消息里的 ```hoh-report 代码块按 Agent 给出的原样（只做与 `--report-out` 相同的块、字段与 role 校验）写成 attempt 目录下的 `hoh-report.json`，并在输出的指针里给出 `"hoh_report": <路径>`；没有可用的块时为 null，原因写入 attempt.json 的 `hoh_report_error` 与 stderr，退出码不变。它只是 Agent 的陈述，不是独立报告，也不能作为验收证据。
 
 ## 检查计划、冻结候选与执行检查
 

@@ -14,6 +14,8 @@ from agent_task import CHECK_VARIABLES as CHECK_VARS
 FAKE=r"""#!/usr/bin/env python3
 import json,os,sys,time
 name=os.path.basename(sys.argv[0]);args=sys.argv[1:]
+if name=='grok' and os.getenv('FAKE_MODE')=='old-grok' and '--background-wait-timeout' in args:
+ print("error: unexpected argument '--background-wait-timeout' found",file=sys.stderr);sys.exit(2)
 if '--help' in args:
  print('--json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-format --verbose --dangerously-skip-permissions --mode --session-dir --approve --model --prompt-file --always-approve');sys.exit(0)
 if '--version' in args:print('MOCK_AGENT_VERSION');sys.exit(0)
@@ -30,11 +32,11 @@ if mode=='no-terminal':print(json.dumps({'type':'message','text':'done'}));sys.e
 if name=='codex':
  print(json.dumps({'type':'thread.started','thread_id':'mock-thread'}))
  print(json.dumps({'type':'turn.failed' if mode=='semantic-error' else 'turn.completed','usage':{}}))
-elif name=='claude':print(json.dumps({'type':'result','subtype':'success','is_error':mode=='semantic-error','session_id':'mock-claude'}))
+elif name=='claude':print(json.dumps({'type':'result','subtype':'success','is_error':mode=='semantic-error','session_id':'mock-claude','result':os.getenv('FAKE_RESULT','')}))
 elif name=='grok':
  print(json.dumps({'type':'system','subtype':'init','session_id':'mock-grok','model':'grok-mock'}))
  print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'done'}]},'session_id':'mock-grok'}))
- print(json.dumps({'type':'result','subtype':'error_during_execution' if mode=='semantic-error' else 'success','is_error':mode=='semantic-error','result':'done','session_id':'mock-grok'}))
+ print(json.dumps({'type':'result','subtype':'error_during_execution' if mode=='semantic-error' else 'success','is_error':mode=='semantic-error','result':os.getenv('FAKE_RESULT','done'),'session_id':'mock-grok'}))
 else:
  print(json.dumps({'type':'message_end','message':{'content':'Unicode \u2028 record not separator','stopReason':'error' if mode=='semantic-error' else 'stop'}},ensure_ascii=False))
  print(json.dumps({'type':'agent_end'}))
@@ -156,6 +158,44 @@ class NativeBridge(unittest.TestCase):
         [unittest_run]=[r for r in runs if r['argv'][:2]==['-m','unittest']]
         self.assertFalse(set(CHECK_VARS)&set(unittest_run['env']),unittest_run['env'])
         self.assertTrue(all(set(CHECK_VARS)<=set(r['env']) for r in runs if r is not unittest_run),'the other steps keep the environment')
+    def test_grok_waits_for_its_background_work_as_long_as_the_bridge_does(self):
+        # BT-02: headless Grok stops its background tasks 600 s after a turn ends unless --background-wait-timeout says
+        # otherwise (grok 1.0.92; attempt df2c4c5c died so); the bridge's own --timeout is the limit that applies.
+        for timeout,wait in (('10','10'),('0.5','1'),('3600','3600')):
+            with self.subTest(timeout=timeout):
+                shutil.rmtree(self.root/'attempt',ignore_errors=True)
+                p,out=self.bridge(agent='grok',timeout=timeout);self.assertEqual(p.returncode,0,p.stderr);argv=load_json(out/'attempt.json')['argv']
+                self.assertEqual(argv[argv.index('--background-wait-timeout')+1],wait)
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','grok','--prompt-file',str(self.prompt),'--timeout','90.5','--dry-run'],capture_output=True,text=True,env=self.env)
+        argv=json.loads(p.stdout)['argv'];self.assertEqual(argv[argv.index('--background-wait-timeout')+1],'91')
+    def test_a_grok_without_the_background_wait_flag_is_refused_before_it_starts(self):
+        # The flag is hidden from grok --help, so the bridge probes it; without it long background work would be lost.
+        p,out=self.bridge(agent='grok',mode='old-grok');self.assertEqual(p.returncode,78,p.stderr)
+        self.assertIn('--background-wait-timeout',p.stderr);self.assertFalse(out.exists());self.assertFalse((self.root/'trace.json').exists())
+    def review(self,result,role='reviewer'):
+        env=self.env|{'FAKE_RESULT':result};out=self.root/'review';shutil.rmtree(out,ignore_errors=True)
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','claude','--role',role,'--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(out),'--timeout','10'],
+                         capture_output=True,text=True,env=env,timeout=20)
+        return p,out,json.loads(p.stdout.splitlines()[-1])
+    def test_a_review_outside_a_check_captures_its_report_block(self):
+        # BT-01: without --report-out (which needs run_check's candidate binding) the pointer said "report": null and the
+        # lead parsed stdout.jsonl by hand. The agent's block is kept as it gave it, unbound: a claim, not the independent report.
+        p,out,pointer=self.review(REPORT_BLOCK);self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(pointer['report'],None);self.assertEqual(pointer['hoh_report'],str(out/'hoh-report.json'))
+        self.assertEqual(load_json(out/'hoh-report.json'),json.loads(agent_report_body(REPORT_BLOCK)))
+        self.assertNotIn('hoh_report_error',load_json(out/'attempt.json'))
+    def test_a_review_without_a_usable_block_says_why_and_still_completes(self):
+        for result,reason in (('All good, PASS.','no ```hoh-report'),(REPORT_BLOCK.replace('"role"','"session_id": "x", "role"',1),'may only contain'),
+                              (REPORT_BLOCK,'differs from --role')):
+            role='qa' if reason=='differs from --role' else 'reviewer'
+            with self.subTest(reason=reason):
+                p,out,pointer=self.review(result,role=role);self.assertEqual(p.returncode,0,p.stderr)
+                self.assertIsNone(pointer['hoh_report']);self.assertFalse((out/'hoh-report.json').exists())
+                self.assertIn(reason,load_json(out/'attempt.json')['hoh_report_error']);self.assertIn(reason,p.stderr)
+    def test_other_roles_capture_no_report_block(self):
+        p,out,pointer=self.review(REPORT_BLOCK,role='developer');self.assertEqual(p.returncode,0,p.stderr)
+        self.assertIsNone(pointer['hoh_report']);self.assertFalse((out/'hoh-report.json').exists())
+        self.assertNotIn('hoh_report_error',load_json(out/'attempt.json'))
     def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
         p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
@@ -293,6 +333,8 @@ class NativeBridge(unittest.TestCase):
     def test_dry_run_no_attempt_dir(self):
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'unused'),'--dry-run'],capture_output=True,text=True,env=self.env)
         self.assertEqual(p.returncode,0,p.stderr);self.assertFalse((self.root/'unused').exists())
+
+def agent_report_body(text:str)->str:return text.split('```hoh-report\n',1)[1].split('\n```',1)[0]
 
 REPORT_BLOCK='Review done.\n```hoh-report\n'+json.dumps({'role':'reviewer','status':'FAIL','scope':['AC-001-01'],'findings':[{'id':'F1','severity':'high','summary':'AC-001-01 FAIL: x'}]})+'\n```\n'
 
