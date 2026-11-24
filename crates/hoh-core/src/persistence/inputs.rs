@@ -378,7 +378,7 @@ pub(super) fn first_input_wait(
     role: &str,
     epoch: Option<i64>,
 ) -> Result<bool, PersistError> {
-    first_input_gate(conn, run, role, epoch, false)
+    first_input_gate(conn, run, role, epoch, false, false)
 }
 
 /// Commander ASK/STEER is carried by a new supervision turn, which also carries
@@ -402,7 +402,14 @@ pub(super) fn delivery_input_wait(
     let carries_package = role == "commander"
         && payload["notice"] == "input"
         && matches!(payload["kind"].as_str(), Some("ASK" | "STEER"));
-    first_input_gate(conn, run, role, epoch, carries_package)
+    first_input_gate(
+        conn,
+        run,
+        role,
+        epoch,
+        carries_package,
+        payload["notice"] == "input",
+    )
 }
 
 fn first_input_gate(
@@ -411,6 +418,7 @@ fn first_input_gate(
     role: &str,
     epoch: Option<i64>,
     carries_package: bool,
+    input: bool,
 ) -> Result<bool, PersistError> {
     let binding: Option<(i64, Option<String>)> = conn
         .query_row(
@@ -434,7 +442,9 @@ fn first_input_gate(
             super::handover::first_input_in_flight(conn, run, role, current, &session)
         }
         Some(session) => super::handover::first_input_owed(conn, run, role, current, &session),
-        None => Ok(true),
+        // Staffing alone is not a handoff debt. An unacknowledged session.start was checked above;
+        // without one, the ordinary consumer may record its result even before a session is bound.
+        None => Ok(input),
     }
 }
 
@@ -653,8 +663,8 @@ pub(super) fn exhausted(
     if let Some(row) = read_input(tx, id)?
         .filter(|r| matches!(r.state, InputState::Queued | InputState::Delivered))
     {
-        // Exhausting transport retries does not prove that a reserved external steer was never delivered.
-        let reason = if reason == "delivery_exhausted" && row.payload["delivery_pending"] == true {
+        // No terminal transport reason proves that a reserved external steer was never delivered.
+        let reason = if row.payload["delivery_pending"] == true {
             "UNKNOWN_DELIVERY"
         } else {
             reason

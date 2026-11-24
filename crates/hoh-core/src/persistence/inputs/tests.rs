@@ -350,6 +350,71 @@ async fn inputs_ride_outbox_and_wait_for_the_first_input_without_spending_delive
 }
 
 #[tokio::test]
+async fn test_017_02_unstaffed_binding_without_handoff_does_not_hold_hcp() -> R {
+    use crate::persistence::{Claimed, ConsumeEffect};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("INSERT INTO role_bindings(run_id,role,agent,role_epoch,config_revision,bound_at) VALUES ('R','developer','claude',1,1,'2026-11-24T00:00:00Z');
+        INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES ('T','R','s1','READY','developer',0,1);")?;
+    let message: crate::protocol::Message = serde_json::from_value(json!({
+        "schema_version":"1.0", "message_id":"hcp", "run_id":"R", "task_id":"T",
+        "attempt_id":"A", "sender_role":"cto", "recipient_role":"developer", "role_epoch":1,
+        "correlation_id":"hcp", "causation_id":null, "idempotency_key":"hcp", "expected_revision":0,
+        "spec_sha256":format!("{:064}",1), "candidate_id":null, "kind":"dispatch",
+        "payload":{"objective":"record dispatch"}
+    }))?;
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: "p1".into(),
+                run_id: Some("R".into()),
+                event_id: "dispatch".into(),
+                kind: "dispatch.queued".into(),
+                payload: json!({}),
+            }],
+            outbox: vec![NewOutbox::hcp(0, &message)?],
+            ..Default::default()
+        })
+        .await?;
+    store.enqueue_input(steer("I1")).await?;
+    let now = std::time::SystemTime::now();
+    assert!(
+        !first_input_wait(&conn, "R", "developer", None)?,
+        "staffing is not a handoff debt for HCP"
+    );
+    let row = store
+        .claim_outbox(now, vec!["developer".into()], 3)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("HCP held without handoff")?;
+    assert_eq!(row.message_id, "hcp");
+    let consumed = store
+        .consume("developer", message, ConsumeEffect::default(), now)
+        .await?;
+    assert_eq!(consumed.rejected, None);
+    assert!(!consumed.replayed);
+    assert!(
+        store
+            .claim_inputs(now, vec!["developer".into()], 3)
+            .await?
+            .is_none(),
+        "native role input still waits for a session"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM receipts WHERE message_id='hcp'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_017_02_role_inputs_are_claimed_for_the_host_router() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t09-routing-")
@@ -1129,6 +1194,75 @@ async fn test_017_05_unanswered_turn_reservation_cannot_be_sent_again_or_merged(
     let row = store.reader()?.input("I1")?.ok_or("input")?;
     assert_eq!(row.state, InputState::Rejected);
     assert_eq!(row.payload["reason"], "UNKNOWN_DELIVERY");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_ended_run_preserves_unknown_turn_delivery() -> R {
+    use crate::persistence::{Claimed, InputOutcome, InputRouting};
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("reserved")).await?;
+    store.enqueue_input(steer("unsent")).await?;
+    let now = std::time::SystemTime::now();
+    let row = store
+        .claim_inputs(now, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim")?;
+    assert_eq!(row.message_id, "reserved");
+    assert!(
+        store
+            .route_input(InputRouting::Stage {
+                row,
+                attempt: Some("A1".into()),
+                now,
+            })
+            .await?
+            .steer
+            .is_some()
+    );
+    Connection::open(&path)?.execute_batch("UPDATE runs SET state='CANCELLED' WHERE run_id='R';
+        INSERT INTO events(event_id, project_id, run_id, kind, payload_json, created_at)
+        SELECT 'R/result/' || revision, 'p1', 'R', 'run.result', '{\"state\":\"CANCELLED\"}', '2026-11-24T00:00:00Z' FROM runs WHERE run_id='R';")?;
+    assert!(
+        store
+            .claim_inputs(
+                now + std::time::Duration::from_secs(60),
+                vec!["developer".into()],
+                5
+            )
+            .await?
+            .is_none()
+    );
+    let reader = store.reader()?;
+    let reserved = reader.input("reserved")?.ok_or("reserved")?;
+    assert_eq!(reserved.state, InputState::Rejected);
+    assert_eq!(reserved.payload["reason"], "UNKNOWN_DELIVERY");
+    assert_eq!(
+        reader.input("unsent")?.ok_or("unsent")?.payload["reason"],
+        "run_ended"
+    );
+    store
+        .route_input(InputRouting::Finish {
+            input_id: "reserved".into(),
+            attempt: "A1".into(),
+            outcome: InputOutcome::Delivered,
+        })
+        .await?;
+    store.settle_ended_inputs("p1").await?;
+    assert_eq!(reader.input("reserved")?, Some(reserved));
+    let conn = Connection::open(&path)?;
+    assert_eq!(
+        conn.query_row(
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='reserved'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "DEAD_LETTER:1"
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='reserved'", [], |r|r.get::<_,i64>(0))?, 1);
     Ok(())
 }
 

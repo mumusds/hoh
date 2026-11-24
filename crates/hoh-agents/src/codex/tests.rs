@@ -2,6 +2,28 @@
 
 use super::*;
 
+#[test]
+fn test_017_02_inbox_close_returns_a_concurrently_reserved_steer() {
+    let (sender, receiver) = mpsc::channel(1);
+    let permit = sender.clone().try_reserve_owned().expect("capacity");
+    let (reply, mut received) = oneshot::channel();
+    std::thread::scope(|scope| {
+        let draining = scope.spawn(move || drop(SteerInbox(receiver)));
+        while !sender.is_closed() {
+            std::thread::yield_now();
+        }
+        // close() cannot revoke the permit acquired by a concurrent try_send. Its publication may follow close.
+        permit.send(Steer {
+            input_id: "reserved".into(),
+            text: "never sent".into(),
+            expected_turn: None,
+            reply,
+        });
+        draining.join().expect("inbox drain");
+    });
+    assert_eq!(received.try_recv(), Ok(SteerReceipt::NotNow));
+}
+
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/protocol/codex/0.166.0"

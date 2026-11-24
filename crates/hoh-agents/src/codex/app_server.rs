@@ -884,6 +884,10 @@ impl<'a> State<'a> {
                 });
             }
         }
+        // These requests were held during the handshake and never submitted, including on Degrade.
+        for st in held.drain(..) {
+            let _ = st.reply.send(SteerReceipt::NotNow);
+        }
         let logs_incomplete = report.as_ref().is_none_or(|r| {
             r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
         });
@@ -903,9 +907,6 @@ impl<'a> State<'a> {
                 report,
                 recorded: self.take_recorded(),
             })));
-        }
-        for st in held.drain(..) {
-            let _ = st.reply.send(SteerReceipt::NotNow);
         }
         // This thread's notifications still waiting for a turn that was never confirmed: a tool among them may have
         // acted.
@@ -1433,6 +1434,36 @@ fn drove(bytes: &[u8], turn: &Turn) -> Result<Drove, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_017_02_handshake_degrade_returns_never_sent_steers() {
+        let attempt = AttemptRef {
+            attempt_id: "attempt".into(),
+            session_id: "session".into(),
+            role: "developer".into(),
+            agent_version: String::new(),
+        };
+        let turn = super::super::replay_turn();
+        let (lines, _written) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut state = State::new(None, &attempt, &turn, lines, 0, true, false);
+        state.degrade = Some("initialize: method not found".into());
+        state.conn.close();
+        let (reply, mut received) = tokio::sync::oneshot::channel();
+        let mut held = vec![Steer {
+            input_id: "never-sent".into(),
+            text: "steer".into(),
+            expected_turn: None,
+            reply,
+        }];
+        assert!(matches!(
+            state
+                .conclude(Some(crate::adapter::replayed_exit()), &mut held)
+                .await,
+            Ok(Drove::Degrade(_))
+        ));
+        assert_eq!(received.try_recv(), Ok(SteerReceipt::NotNow));
+        assert!(held.is_empty());
+    }
 
     #[tokio::test]
     async fn a_failure_decided_on_the_handshakes_answer_is_no_degrade() {
