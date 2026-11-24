@@ -82,10 +82,12 @@
             "$ref": "#/components/responses/Error"
           },
           "422": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "Invalid specification content or shape is SPEC_INVALID (not retryable); the existing index failure diagnostic is retained (CR-036)."
           },
           "503": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "Service unavailable. SPEC_SOURCE_UNAVAILABLE means Git enumeration or filesystem reads needed to index the specification failed; retryable=true, current_revision is preserved, and no command, CR, revision or spec.index_failed is written. Uses the same Error body and no Retry-After header as DB_BUSY (CR-036)."
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
