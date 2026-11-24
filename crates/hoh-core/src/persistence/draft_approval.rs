@@ -81,7 +81,7 @@ pub(super) fn apply_answer(
     command: &SubmitCommand,
     input: &Input,
     origin: crate::origin::Origin,
-    files: &Result<SpecFiles, crate::specindex::IndexError>,
+    files: &Result<SpecFiles, super::SpecReadError>,
     ctx: &Ctx<'_>,
 ) -> Result<Option<(i64, i64)>, PersistError> {
     let Some((q, text)) = answer(tx, &command.run_id, input)? else {

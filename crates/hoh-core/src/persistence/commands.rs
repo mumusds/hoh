@@ -73,7 +73,7 @@ pub enum RunTarget {
     ObservedInput {
         input: Input,
         origin: crate::origin::Origin,
-        files: Box<Result<super::SpecFiles, crate::specindex::IndexError>>,
+        files: Box<Result<super::SpecFiles, super::SpecReadError>>,
     },
     /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
     Specification(Box<super::SpecRequest>),

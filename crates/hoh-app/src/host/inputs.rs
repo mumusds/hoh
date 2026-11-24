@@ -207,7 +207,9 @@ async fn propose_change(shared: &Arc<Shared>, row: &OutboxRow) -> Result<String,
             .await
             .map_err(|e| DeliveryError::Lost(e.to_string()))?;
         let files = files.and_then(|files| {
-            hoh_core::specindex::generate_index(&files.sources).map(|index| (files, index.sha256()))
+            hoh_core::specindex::generate_index(&files.sources)
+                .map(|index| (files, index.sha256()))
+                .map_err(Into::into)
         });
         let (files, digest) = match files {
             Ok((files, digest)) => (Ok(files), digest),

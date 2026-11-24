@@ -22,6 +22,46 @@ pub struct SpecFiles {
     pub tracked_index: Option<Vec<u8>>,
 }
 
+/// Reading a specification can fail before there are bytes to validate. Keep source failures out of the invalid
+/// index diagnostic transaction so callers can retry the same command after restoring access (CR-036).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecReadError {
+    Invalid(IndexError),
+    Unavailable(String),
+}
+
+impl SpecReadError {
+    pub fn unavailable(path: &str, error: impl std::fmt::Display) -> Self {
+        Self::Unavailable(format!("{path}: {error}"))
+    }
+}
+
+impl From<IndexError> for SpecReadError {
+    fn from(error: IndexError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl std::fmt::Display for SpecReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(error) => error.fmt(f),
+            Self::Unavailable(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SpecReadError {}
+
+impl From<SpecReadError> for PersistError {
+    fn from(error: SpecReadError) -> Self {
+        match error {
+            SpecReadError::Invalid(error) => Self::SpecInvalid(error),
+            SpecReadError::Unavailable(detail) => Self::SpecSourceUnavailable(detail),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecAction {
     Approve(ApproveSpec),
@@ -33,7 +73,7 @@ pub struct SpecRequest {
     /// Observed by the host for this request; never supplied by a client.
     pub origin: crate::origin::Origin,
     pub action: SpecAction,
-    pub files: Result<SpecFiles, IndexError>,
+    pub files: Result<SpecFiles, SpecReadError>,
 }
 
 /// The same guard is used before replay and at the approval application point.
@@ -107,7 +147,7 @@ pub(super) fn apply(
     let files = input
         .files
         .as_ref()
-        .map_err(|e| PersistError::SpecInvalid(e.clone()))?;
+        .map_err(|e| PersistError::from(e.clone()))?;
     let index = specindex::generate_index(&files.sources).map_err(PersistError::SpecInvalid)?;
     let expected = match &input.action {
         SpecAction::Approve(a) => &a.spec_sha256,

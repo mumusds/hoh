@@ -672,6 +672,68 @@ fn request(world: &World, digest: &str) -> R<hoh_core::persistence::SpecRequest>
 }
 
 #[tokio::test]
+async fn test_034_03_m3b07_change_source_failure_stays_queued_until_retry() -> R {
+    use hoh_core::persistence::{ChangeInput, PersistError, SpecReadError};
+    let world = World::new()?;
+    let (host, run) = running(&world).await?;
+    host.shutdown().await;
+    let index = revise_a(&world)?;
+    let store = open_store(&world)?;
+    let row = queued_change(&store, &run, "unavailable").await?;
+    let valid = request(&world, &index.sha256())?;
+    let mut fault = valid.clone();
+    fault.files = Err(SpecReadError::unavailable(
+        "docs/spec/a.md",
+        "injected read failure",
+    ));
+    let before = snapshot(&world)?;
+    let input_before = store.reader()?.input("unavailable")?.ok_or("no input")?;
+    let error = store
+        .change_input(ChangeInput::Prepare {
+            row: row.clone(),
+            request: Some(fault),
+        })
+        .await
+        .expect_err("source failure must not become a business rejection");
+    assert!(
+        matches!(error, PersistError::SpecSourceUnavailable(_)),
+        "{error}"
+    );
+    assert_eq!(
+        error.error_code(),
+        Some(hoh_core::protocol::ErrorCode::SpecSourceUnavailable)
+    );
+    assert_eq!(snapshot(&world)?, before);
+    let input = store.reader()?.input("unavailable")?.ok_or("no input")?;
+    assert_eq!(input.state, hoh_core::lifecycle::InputState::Queued);
+    assert_eq!(input.payload, input_before.payload);
+    assert_eq!(
+        world.query("SELECT count(*) FROM receipts WHERE message_id='unavailable'")?,
+        "0"
+    );
+    let result = store
+        .change_input(ChangeInput::Prepare {
+            row,
+            request: Some(valid),
+        })
+        .await?;
+    assert!(result.publication.is_some());
+    assert_eq!(
+        world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,
+        "1"
+    );
+    assert_eq!(
+        store
+            .reader()?
+            .input("unavailable")?
+            .ok_or("no input")?
+            .state,
+        hoh_core::lifecycle::InputState::Delivered
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_017_03_spec_conflict_rejected_with_same_reason_and_replayed_receipt() -> R {
     use hoh_core::persistence::ChangeInput;
     let world = World::new()?;

@@ -1518,6 +1518,33 @@ fn a_refused_input_is_said_with_its_code_and_nothing_follows() {
     );
 }
 
+#[test]
+fn test_034_03_m3b07_tui_preserves_source_failure_code() {
+    // Mock host port after the product client's retry budget: the message bar must retain the source diagnosis.
+    let port = Scripted::new(
+        vec![serde_json::json!({"run_id":"R","state":"INCOMPLETE","revision":2})],
+        vec![Err(refused(
+            503,
+            "SPEC_SOURCE_UNAVAILABLE",
+            serde_json::Value::Null,
+        ))],
+    );
+    let sent = super::input(&port, "R", "approve");
+    assert_eq!(
+        port.sent.borrow().len(),
+        1,
+        "a failed approval cannot resume the run"
+    );
+    assert_eq!(sent.awaiting, None);
+    assert!(
+        sent.said
+            .iter()
+            .any(|s| s.contains("SPEC_SOURCE_UNAVAILABLE")),
+        "{:?}",
+        sent.said
+    );
+}
+
 /// A host that answers `/healthz` and serves one event stream of `events` (SSE blocks), then keeps it open; how many
 /// event streams were asked for. Named by the project's `host.json`, so a link that looks for its host again finds
 /// this one (never starts one).

@@ -127,7 +127,7 @@ pub(in crate::persistence) fn apply_change(
                 });
             }
         }
-        let files = request.files.map_err(PersistError::SpecInvalid)?;
+        let files = request.files.map_err(PersistError::from)?;
         row.payload["spec_files"] =
             serde_json::to_value(files).map_err(|e| PersistError::Storage(e.to_string()))?;
         row.payload["command_id"] = json!(command.command_id);

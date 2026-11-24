@@ -60,7 +60,7 @@ mod snapshot;
 mod spec;
 mod spec_review;
 mod spec_sources;
-pub use spec::{SpecAction, SpecFiles, SpecRequest};
+pub use spec::{SpecAction, SpecFiles, SpecReadError, SpecRequest};
 mod staffing;
 mod stall;
 mod suites;
@@ -308,6 +308,8 @@ pub enum PersistError {
     SpecApprovalNotUser(&'static str),
     /// Markdown cannot be indexed. Only its diagnostic event may have been recorded (REQ-034).
     SpecInvalid(crate::specindex::IndexError),
+    /// Git enumeration or a filesystem read could not supply specification bytes; retryable, nothing written.
+    SpecSourceUnavailable(String),
     /// A proposed or approved specification states decisions whose sources the project does not hold (`SPEC_INVALID`,
     /// REQ-030 behaviour 5): `{unsourced: [...]}`; nothing was written.
     SpecUnsourced(Box<serde_json::Value>),
@@ -389,6 +391,7 @@ impl PersistError {
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             PersistError::SpecApprovalNotUser(_) => Some(ErrorCode::SpecApprovalNotUser),
             PersistError::SpecConflict(_) => Some(ErrorCode::SpecConflict),
+            PersistError::SpecSourceUnavailable(_) => Some(ErrorCode::SpecSourceUnavailable),
             PersistError::SpecInvalid(_) | PersistError::SpecUnsourced(_) => {
                 Some(ErrorCode::SpecInvalid)
             }
@@ -426,6 +429,9 @@ impl std::fmt::Display for PersistError {
             }
             PersistError::SpecConflict(details) => write!(f, "SPEC_CONFLICT: {details}"),
             PersistError::SpecInvalid(error) => write!(f, "SPEC_INVALID: {error}"),
+            PersistError::SpecSourceUnavailable(detail) => {
+                write!(f, "SPEC_SOURCE_UNAVAILABLE: {detail}")
+            }
             PersistError::SpecUnsourced(details) => {
                 write!(f, "SPEC_INVALID: decisions without their source: {details}")
             }
