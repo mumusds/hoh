@@ -103,3 +103,25 @@ passing rerun) with a recommended design correction: an execution record field f
 code. That changes ADR-027 and the locked run_check/release_gate semantics, so it goes through its own CR (next
 verification task). Deferred low: none new. Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on
 `05910c80`; after the rebase onto main see the PR.
+## L4 (resource bundles and prompts), L5 (consult and supervision), PI16-B2 and PI16-B3
+
+Developer: Grok (fix rounds: Codex). Items fixed: M3E-02, M3G-01, M3G-51, M3G-52, M3G-54, M3G-100, M3G-101, M3K-03 (tests
+only), M3K-04, M3K-06, M3K-07 (comment: CONSULTATION_OBSOLETE only reaches input.rejected, never a Message reason_code, so
+no CR), M3K-103, PI16-B2, PI16-B3. M3G-53 kept as the documented residual of ADR-034 decision 9 (repack uses the current
+bundle version; relaxing it would change AC-045-01's replay claim). Two reviewers in round 1.
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `4eb78f66` | Codex codex-cli 0.171.0, `01a20e7c-3f66-7002-91b4-d611f816fc9d` (`82ebfd04-0059-44a1-9ba2-f0438a7f162c`) | PASS: M3LC-01 medium (bundle version cache not invalidated on release/format edits), M3LC-02 medium (old-pin compatibility checked after prepare had already refused as Decision), M3LC-03 medium (CARGO_MANIFEST_DIR dropped the product's HOME fallback), M3LC-05 medium (old-pin load errors other than one string were Transient), M3LC-04 low (settings diff used Bundle::current) |
+| 1 | `4eb78f66` | Claude 2.1.331 (Claude Code), `797a2b1a-55d1-4ca7-9cfa-394c3017a616` (`9af39d0c-4321-42b7-90c8-047f204db459`) | PASS: M3LC-50 medium (= M3LC-05), M3LC-51 low (compatibility checked on the role's own template, not the resolved builtin), M3LC-52 low (ADR-012 PI16 note), M3LC-53 low (= M3LC-03), M3LC-54 low (restore Ok(false) kept a stale diff) |
+| 2 (fix diff, after a conflict-free rebase onto `06332d8a`) | `6048a983` | Claude 2.1.331 (Claude Code), `50c06896-a542-4ac1-8ec7-d3c00a7b5312` (`d535a6e1-9642-4782-8180-4f7ec208ffcc`) | PASS, every round-1 finding resolved: M3LC-100 medium (only one test helper injected a global root; other unit, host and settings tests read the real ~/.config/hoh), M3LC-101 low |
+
+Round 1 fixes (Codex, red-first): "M3LC-01 invalidate every bundle identity input", "M3LC-02 M3LC-05 M3LC-50 M3LC-51 classify
+verified old pins before resolving prompts" (typed load errors: missing object, digest mismatch, decode failure and identity
+mismatch stay Decision; only a loaded old pin the renderer cannot render is Transient, decided before template resolution on
+the resolved builtin path), "M3LC-03 M3LC-53 restore XDG to HOME resolution", "M3LC-04 M3LC-54 refresh settings against the
+host bundle", "M3LC-52 align Pi recording notes and doctor hints". Round 2 medium fixed red-first by Codex ("M3LC-100
+M3LC-101 tests resolve prompts against an injected global root") and checked by the lead without another round: every
+in-process ProductExecutor construction in the tests (product_prompts, world, host_stop, product) injects the World's
+temporary root; the only uninjected call is the product's own HostConfig path. Deferred low: none. Final checks: `bash
+scripts/dev/pre-pr.sh --no-deployment` all ok on `7ae6492b`; after the rebase onto main see the PR.
