@@ -916,13 +916,14 @@ pub(super) fn snapshot_rows(
 pub(super) fn run_view(
     conn: &Connection,
     run_id: &str,
+    resource_version: &str,
 ) -> Result<Option<(RunRow, super::team::TeamView, i64)>, PersistError> {
     conn.execute_batch("BEGIN").map_err(sqlite_error)?;
     let read = (|| {
         let Some((run, _)) = snapshot_rows(conn, run_id)? else {
             return Ok(None);
         };
-        let team = super::team::view(conn, run_id, &run.project_id)?;
+        let team = super::team::view(conn, run_id, &run.project_id, resource_version)?;
         Ok::<_, PersistError>(Some((run, team, max_seq(conn)?)))
     })();
     // Ends the read transaction either way; nothing was written.
@@ -981,13 +982,14 @@ fn degraded_tracking(
 pub(super) fn run_projection(
     conn: &Connection,
     run_id: &str,
+    resource_version: &str,
 ) -> Result<Option<RunProjection>, PersistError> {
     conn.execute_batch("BEGIN").map_err(sqlite_error)?;
     let read = (|| {
         let Some((run, _)) = snapshot_rows(conn, run_id)? else {
             return Ok(None);
         };
-        let team = super::team::view(conn, run_id, &run.project_id)?;
+        let team = super::team::view(conn, run_id, &run.project_id, resource_version)?;
         let watermark = max_seq(conn)?;
         let Some(acceptance) = super::snapshot::view_in(conn, run_id, watermark)? else {
             return Ok(None);

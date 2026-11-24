@@ -295,6 +295,7 @@ fn a_binding_changing_by_itself_is_role_binding_pending_in_the_crs_order() {
     let lacking = ["structured_events"];
     for one in [
         TeamChange,
+        ResourceUpgrade,
         Rebind,
         NoSession,
         HandoverUndelivered,
@@ -331,6 +332,7 @@ fn a_binding_changing_by_itself_is_role_binding_pending_in_the_crs_order() {
         (vec![HandoverUndelivered], RoleCapabilityMissing),
         (vec![FirstInputInFlight], RoleCapabilityMissing),
         (vec![TeamChange], RoleBindingPending),
+        (vec![ResourceUpgrade], RoleBindingPending),
         (vec![Rebind], RoleBindingPending),
         (vec![NoSession], RoleBindingPending),
         (vec![TeamChange, FirstInputInFlight], RoleBindingPending),

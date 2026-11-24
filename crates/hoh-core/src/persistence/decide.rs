@@ -1020,8 +1020,11 @@ pub(super) fn load_binding(
     use crate::decision::Pending;
     let mut pending = Vec::new();
     if state == "ACTIVE" {
-        if super::team::pending(tx, run_id, role, resource_version)? {
+        if super::team::config_lag(tx, run_id, role)? {
             pending.push(Pending::TeamChange);
+        }
+        if super::team::resource_lag(tx, run_id, role, resource_version)? {
+            pending.push(Pending::ResourceUpgrade);
         }
         if super::staffing::pending_change(tx, run_id, role, epoch)?
             .is_some_and(|(change, _)| change.cause == crate::staffing::Cause::Rebind)

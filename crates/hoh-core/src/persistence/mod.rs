@@ -1002,7 +1002,10 @@ fn open_reader(path: &Path, options: &Options) -> Result<Reader, PersistError> {
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let conn = Connection::open_with_flags(path, flags).map_err(sqlite_error)?;
     configure(&conn, options, false)?;
-    Ok(Reader { conn })
+    Ok(Reader {
+        conn,
+        resource_version: options.resource_bundle.version(),
+    })
 }
 
 /// What a check's finishing task holds so that it judges and records its run even when its caller has gone
@@ -2399,6 +2402,8 @@ impl Store {
 #[derive(Debug)]
 pub struct Reader {
     conn: Connection,
+    /// The host bundle this connection was opened with. Team views name a resource lag against it (M3G-100).
+    resource_version: String,
 }
 
 impl Reader {
@@ -2817,13 +2822,13 @@ impl Reader {
 
     /// The run `run_id`, its team (docs/adr/ADR-022.md decision 18) and the highest event seq, read together.
     pub fn run_view(&self, run_id: &str) -> Result<Option<(RunRow, TeamView, i64)>, PersistError> {
-        commands::run_view(&self.conn, run_id)
+        commands::run_view(&self.conn, run_id, &self.resource_version)
     }
 
     /// [`Reader::run_view`] with the run's acceptance snapshot (getRun's projection, docs/adr/ADR-029.md decision 5)
     /// and its result as of the watermark (docs/adr/ADR-031.md decision 12), read together.
     pub fn run_projection(&self, run_id: &str) -> Result<Option<RunProjection>, PersistError> {
-        commands::run_projection(&self.conn, run_id)
+        commands::run_projection(&self.conn, run_id, &self.resource_version)
     }
 
     /// The specification review due in run `run_id`, if one is (REQ-031 behaviour 3).

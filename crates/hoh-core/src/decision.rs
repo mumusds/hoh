@@ -273,11 +273,14 @@ pub struct BindingView {
 }
 
 /// A change of an ACTIVE binding that keeps it from being dispatched now and ends by itself, rejected as
-/// ROLE_BINDING_PENDING (CR-025): exactly the cases that made such a binding not active before that code.
+/// ROLE_BINDING_PENDING (CR-025). The five CR-025 cases are unchanged. `ResourceUpgrade` is the same
+/// rejection, previously folded into `TeamChange` (M3G-100). It is not a new `RejectionReason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pending {
     /// A team change of the role waits for its checkpoint (REQ-018, docs/adr/ADR-022.md decision 8).
     TeamChange,
+    /// Only the role's resource pin lags the host bundle. Same rejection as [`Pending::TeamChange`].
+    ResourceUpgrade,
     /// Staffing holds a rebind of the role pending for the attempt in flight (REQ-020, docs/adr/ADR-030.md decision 5).
     Rebind,
     /// The binding has no session yet.
@@ -304,6 +307,7 @@ impl Pending {
     pub fn describe(self) -> &'static str {
         match self {
             Pending::TeamChange => "a team change of it waits for its checkpoint",
+            Pending::ResourceUpgrade => "a resource upgrade of it waits for its checkpoint",
             Pending::Rebind => "staffing holds a rebind of it for the attempt in flight",
             Pending::NoSession => "it has no session yet",
             Pending::HandoverUndelivered => {

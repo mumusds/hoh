@@ -435,6 +435,53 @@ async fn test_047_03_checkpoint_failure_rolls_back_before_dispatch() -> R {
 }
 
 #[tokio::test]
+async fn test_047_03_resource_only_lag_is_not_a_team_change() -> R {
+    // M3G-100: a pin behind the host bundle, with no config change, is a resource upgrade.
+    let (_dir, path) = setup().await?;
+    let store = Store::open(&path, options(Bundle::current()))?;
+    let viewed = store.reader()?.run_view("R")?.ok_or("no run")?;
+    let developer = viewed
+        .1
+        .members
+        .iter()
+        .find(|member| member.role == "developer")
+        .ok_or("no developer")?;
+    assert_eq!(
+        developer
+            .pending
+            .as_ref()
+            .and_then(|pending| pending["cause"].as_str()),
+        Some("resource"),
+        "{:?}",
+        developer.pending
+    );
+    let mut conn = Connection::open(&path)?;
+    let tx = conn.transaction()?;
+    let binding = crate::persistence::decide::load_binding(
+        &tx,
+        "R",
+        "developer",
+        &Bundle::current().version(),
+    )?
+    .ok_or("no binding")?;
+    assert!(
+        binding
+            .pending
+            .contains(&crate::decision::Pending::ResourceUpgrade),
+        "{:?}",
+        binding.pending
+    );
+    assert!(
+        !binding
+            .pending
+            .contains(&crate::decision::Pending::TeamChange),
+        "{:?}",
+        binding.pending
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_047_03_return_to_prior_bundle_appends_a_new_pin() -> R {
     let (_dir, path) = setup().await?;
     let store = Store::open(&path, options(Bundle::current()))?;

@@ -1944,9 +1944,10 @@ fn probe(
 const DEFER_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// Why run `run_id`'s Commander is not active: no session (`NO_SESSION`), its handover's session.start not delivered
-/// (`FIRST_INPUT_UNDELIVERED`), a team change waiting for its checkpoint (`CHANGE_PENDING`), or its first input in
-/// a turn now (`FIRST_INPUT_IN_FLIGHT`); none for a BLOCKED binding (that is unavailability, decision 5).
-fn inactive_reason(
+/// (`FIRST_INPUT_UNDELIVERED`), a team change waiting for its checkpoint (`CHANGE_PENDING`), only a resource pin
+/// behind the host bundle (`RESOURCE_PENDING`, M3G-100), or its first input in a turn now (`FIRST_INPUT_IN_FLIGHT`);
+/// none for a BLOCKED binding (that is unavailability, decision 5). A configuration lag wins over a resource lag.
+pub(super) fn inactive_reason(
     conn: &Connection,
     run_id: &str,
     resource_version: &str,
@@ -1970,8 +1971,9 @@ fn inactive_reason(
         Some(_) if super::handover::first_input_pending(conn, run_id, COMMANDER, epoch)? => {
             Some("FIRST_INPUT_UNDELIVERED")
         }
-        Some(_) if super::team::pending(conn, run_id, COMMANDER, resource_version)? => {
-            Some("CHANGE_PENDING")
+        Some(_) if super::team::config_lag(conn, run_id, COMMANDER)? => Some("CHANGE_PENDING"),
+        Some(_) if super::team::resource_lag(conn, run_id, COMMANDER, resource_version)? => {
+            Some("RESOURCE_PENDING")
         }
         Some(_) => Some("FIRST_INPUT_IN_FLIGHT"),
     })
