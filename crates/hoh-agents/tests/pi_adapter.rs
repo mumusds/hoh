@@ -863,8 +863,8 @@ async fn pi_1_6_0_recorded_traffic_settles_refuses_and_cancels() -> R {
 }
 
 /// PI16-01: a prompt pi took whose run then failed at the provider, as recorded against a fake provider
-/// (record_faults.py): pi 1.6.0's 429, 503 and rejected 5-hour limit after its three retries, and a billing error it
-/// does not retry; pi 1.5.0's 429 after its retries. With `agent_settled` relied on by the version rule
+/// (record_faults.py): for pi 1.6.0 and 1.5.0 alike (PI16-B1), the 429, 503 and rejected 5-hour limit after its three
+/// retries, and a billing error it does not retry. With `agent_settled` relied on by the version rule
 /// ([`pi::emits_settled`]) each ends FAILED on pi's own `agent_settled`: no state query, no timer, the final error text
 /// kept with its class (PERMANENT_EXTERNAL; pi's stream carries no structured Retry-After, so none is recorded).
 #[tokio::test]
@@ -876,6 +876,9 @@ async fn pi_recorded_provider_faults_fail_on_agent_settled() -> R {
         ("1.6.0", "rpc-fault-usage-limit", "429"),
         ("1.6.0", "rpc-fault-billing-no-retry", "400"),
         ("1.5.0", "rpc-fault-429-retry-after", "429"),
+        ("1.5.0", "rpc-fault-503-retry-after", "503"),
+        ("1.5.0", "rpc-fault-usage-limit", "429"),
+        ("1.5.0", "rpc-fault-billing-no-retry", "400"),
     ] {
         let name = format!("{version}-{case}");
         let recorded = Case::load_at(&format!("{FAULTS}/{version}"), case)?;

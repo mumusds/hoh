@@ -1,7 +1,7 @@
 {
   "cli_version": "1.5.0",
-  "recording_started_at": "2026-11-16T11:18:39.938020+00:00",
-  "recorded_at": "2026-11-16T11:18:55.113292+00:00",
+  "recording_started_at": "2026-11-24T19:31:12.680860+00:00",
+  "recorded_at": "2026-11-24T19:31:58.248552+00:00",
   "recorder": "tests/fixtures/protocol/record_faults.py",
   "namespace": {
     "how": "sudo -n unshare -n; ip link set lo up; setpriv back to the calling user",
@@ -15,8 +15,8 @@
     ]
   },
   "provider": "FakeProvider of record_faults.py on 127.0.0.1",
-  "entry_path": "/home/ai/.pi/agent/bin/pi",
+  "entry_path": "/home/ai/dev/m3low-f-3fA4Mi/pi150/agent/bin/pi",
   "entry_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
-  "package_path": "/home/ai/.pi/agent/install/releases/1.5.0/node_modules/@earendil-works/pi-coding-agent",
+  "package_path": "/home/ai/dev/m3low-f-3fA4Mi/pi150/agent/install/releases/1.5.0/node_modules/@earendil-works/pi-coding-agent",
   "package_tree_sha256": "5f4fb490ce2523a59f7f3dae1f2b88e211b56ea3d3f6d1b7b7e51dee06c790d2"
 }

@@ -94,8 +94,19 @@ keeps the directory out of `compat-manifest.json` and of the live recorder's cas
 | codex 0.166.0 | `app-server-fault-503-retry-after` | 503 `server_is_overloaded`, `retry-after: 2`: thirty requests 2 s apart, then `serverOverloaded`; no value |
 | codex 0.166.0 | `app-server-fault-usage-limit` | 429 `usage_limit_reached` with `x-codex-*` window headers: `account/rateLimits/updated` (primary `usedPercent: 100`, `resetsAt`), then `usageLimitExceeded` |
 | codex 0.166.0 | `exec-fault-usage-limit` | the same through `exec --json`: `turn.failed` with message text only |
-| pi 1.5.0 | `rpc-fault-429-retry-after` | 429 `retry-after: 3`: pi's own `auto_retry_start` delays 2/4/8 s, then a text `errorMessage`; nothing structured |
+| pi 1.5.0 | `rpc-fault-429-retry-after` | 429 `retry-after: 3`: pi's own `auto_retry_start` delays 2/4/8 s, `auto_retry_end` `success: false`, then a text `errorMessage`; nothing structured; `agent_settled` `aborted: false` as the last record |
+| pi 1.5.0 | `rpc-fault-503-retry-after` | 503 `overloaded_error`, `retry-after: 3`: the same retries and end, a text `errorMessage` `503 …` (PI16-B1) |
+| pi 1.5.0 | `rpc-fault-usage-limit` | 429 with a rejected 5-hour `anthropic-ratelimit-unified-*`: retried as a rate limit (2/4/8 s), the same end; no reset on the stream (PI16-B1) |
+| pi 1.5.0 | `rpc-fault-billing-no-retry` | 400 billing: one request, no `auto_retry_*`, `agent_end`, then `agent_settled` (PI16-B1) |
 | pi 1.6.0 | `rpc-fault-429-retry-after` | the same as 1.5.0: four requests, `auto_retry_start` 2/4/8 s, `auto_retry_end` `success: false`, then `agent_settled` `aborted: false` as the last record (PI16-01) |
 | pi 1.6.0 | `rpc-fault-503-retry-after` | 503 `overloaded_error`, `retry-after: 3`: the same retries and end, a text `errorMessage` `503 …`; nothing structured |
 | pi 1.6.0 | `rpc-fault-usage-limit` | 429 with a rejected 5-hour `anthropic-ratelimit-unified-*` (the claude case's answer): pi retries it as a rate limit (2/4/8 s) and ends the same way; no reset on the stream |
 | pi 1.6.0 | `rpc-fault-billing-no-retry` | 400 `invalid_request_error` "credit balance is too low … Billing": one request, no `auto_retry_*` (pi's retry rule excludes billing), `agent_end`, then `agent_settled` |
+
+The pi 1.5.0 set was re-recorded whole on 2026-11-24 (PI16-B1; the 2026-11-16 set had only the 429 case) after the
+VM's managed pi moved to 1.6.0: `record_faults.py --agents pi` ran with `PATH` starting at a private copy of the managed
+launcher whose `install/current-version` is 1.5.0 and whose release directory was installed by `npm ci --prefix` from
+the managed 1.5.0 release's own `package.json` and `package-lock.json` (private npm cache; the operator's `~/.pi` was
+not changed). `provenance.json` names that private, since removed, location; its `entry_sha256` and
+`package_tree_sha256` equal the 2026-11-16 recording's, so the same launcher and package produced both. The 429 case
+has the same frame types as before.
