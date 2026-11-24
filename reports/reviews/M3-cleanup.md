@@ -53,3 +53,18 @@ the steer had no effect) keeps the stale/stopped reason. The one changed expecta
 input (it pinned the defect); the not-sent case keeps STALE_ROLE_EPOCH. Deferred low: M3LB-01 (M3 low backlog; ADR-036
 records the per-role keying). Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `e2650b86`; after the
 rebase onto main see the PR.
+## L2 (spec commands) and CR-036
+
+Developer: Codex. Items: M3B-06 (REJECT allowed after the CR's files reverted), M3B-07 (I/O errors while indexing a spec
+answer 503 SPEC_SOURCE_UNAVAILABLE, retryable; a genuinely invalid index stays 422 SPEC_INVALID), M2R-501 (CR-029's outdated
+"not relocked / stays DRAFT" text corrected in CR-036, CR-029 unchanged). CR-036 adds the missing reason code under CR-003
+D1 item 1 (baseline revision 25); its review is recorded here because a relocked CR file cannot change after its commit.
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `3c216c1f` | Pi 1.6.0, `01a20e7c-eee6-76ec-9151-ac662cd97941` (`de10131e-ba60-4cf0-8e5a-6f202cdb1b3b`) | PASS: M3LE-01 low (ENOENT on the spec root and "not a git repository" also answer the retryable 503), M3LE-02 low (a spawn_blocking JoinError still answers 503 code UNPROCESSABLE), M3LE-03 low (CR-036's own review table is empty: this section is that record) |
+
+The CTO approves CR-036 under CR-003 D1 on this PASS: it only adds a missing reason code and corrects CR-029's status text; no
+requirement or AC is removed, no gate, check or evidence rule is loosened, no CONTRACT decision changes. Deferred low:
+M3LE-01, M3LE-02 (M3 low backlog). Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `3c216c1f`; after
+the rebase onto main see the PR.
