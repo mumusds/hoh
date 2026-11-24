@@ -22,6 +22,76 @@ use world::World;
 /// How long a smoke test waits for the product to get where it looks.
 const WAIT: Duration = Duration::from_secs(120);
 
+#[tokio::test]
+async fn test_047_01_world_hosts_use_the_world_global_root() -> R {
+    const CHILD: &str = "HOH_M3LC_WORLD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::Builder::new()
+            .prefix("m3lc-100-world-home-")
+            .tempdir()?;
+        let global = dir.path().join(".config/hoh/prompts");
+        std::fs::create_dir_all(&global)?;
+        std::fs::write(global.join("commander.md"), "PROCESS_GLOBAL_SENTINEL\n")?;
+        for xdg in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "test_047_01_world_hosts_use_the_world_global_root",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", dir.path())
+                .env_remove("XDG_CONFIG_HOME");
+            if xdg {
+                child.env("XDG_CONFIG_HOME", dir.path().join(".config"));
+            }
+            let output = child.output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "XDG={xdg}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "child ran no test: {stdout}");
+        }
+        return Ok(());
+    }
+    for constructor in ["default", "registry", "preparing"] {
+        let world = World::new()?;
+        let global = world.home().join(".config/hoh/prompts/commander.md");
+        std::fs::create_dir_all(global.parent().unwrap())?;
+        std::fs::write(&global, "WORLD_GLOBAL_SENTINEL\n")?;
+        world.commit_project(&world::fixture_spec())?;
+        world.register()?;
+        let config = match constructor {
+            "default" => world.host_config()?,
+            "registry" => world.host_config_with(std::sync::Arc::new(world.registry()), None)?,
+            _ => world.host_config_with(
+                std::sync::Arc::new(world.registry()),
+                Some(std::sync::Arc::new(|_, _| {})),
+            )?,
+        };
+        let host = world.start_host_with(config).await?;
+        let outcome: R<String> = async {
+            world.seed_spec()?;
+            world::start_run(&host, "global-isolation", "fixture goal").await?;
+            world
+                .until("SELECT count(*) > 0 FROM prompt_revisions", "1", WAIT)
+                .await?;
+            world.query("SELECT DISTINCT path FROM prompt_revisions WHERE layer = 'global'")
+        }
+        .await;
+        host.shutdown().await;
+        assert_eq!(
+            outcome?,
+            global.to_string_lossy(),
+            "{constructor} used the process global instead of the world"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn the_screen_snapshot_shows_only_what_erases_and_overwrites_left() -> R {
     // Decision 14: the snapshot executes cursor moves, erases and overwrites, so text that is no longer on the screen

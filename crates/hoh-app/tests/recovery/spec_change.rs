@@ -503,6 +503,7 @@ fn s6_host() -> R {
             hoh_core::config::load(&project)?,
             world::HOH.into(),
             registry,
+            None,
         )
     };
     config.port = 0;

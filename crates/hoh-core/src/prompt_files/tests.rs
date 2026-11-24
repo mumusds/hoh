@@ -322,4 +322,8 @@ fn test_047_01_cargo_launch_keeps_home_fallback() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated subprocess did not run exactly one test"
+    );
 }

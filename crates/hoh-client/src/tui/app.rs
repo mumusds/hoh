@@ -224,6 +224,7 @@ pub struct App {
     awaiting: Vec<String>,
     /// Bundle the settings screen diffs against. Production uses the binary's bundle (M3G-54).
     resources: hoh_core::resource_bundle::Bundle,
+    global_root: Option<Option<std::path::PathBuf>>,
 }
 
 impl App {
@@ -251,7 +252,15 @@ impl App {
             requests: Vec::new(),
             awaiting: Vec::new(),
             resources: hoh_core::resource_bundle::Bundle::current(),
+            global_root: None,
         }
+    }
+
+    /// Isolate settings tests from the process configuration without changing its environment.
+    #[cfg(test)]
+    pub fn with_global_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.global_root = Some(root);
+        self
     }
 
     /// Settings diffs against `bundle` instead of the binary's bundle (M3G-54).
@@ -861,6 +870,9 @@ impl App {
                     self.run.as_ref().map_or("settings", |r| r.run_id.as_str()),
                     role,
                     &self.resources,
+                    self.global_root
+                        .clone()
+                        .unwrap_or_else(hoh_core::prompt_files::global_root),
                 ) {
                     Ok(settings) => self.settings = Some(settings),
                     Err(e) => self.messages.push(format!("设置无法打开：{e}")),

@@ -5,13 +5,14 @@ use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, Paragraph},
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(super) struct Settings {
     role: String,
     run: String,
     configured: Option<String>,
+    global_root: Option<PathBuf>,
     diff: String,
     scroll: u16,
     notice: String,
@@ -25,12 +26,13 @@ impl Settings {
         run: &str,
         role: &str,
         bundle: &hoh_core::resource_bundle::Bundle,
+        global_root: Option<PathBuf>,
     ) -> Result<Self, prompt::Error> {
         let config = config::load(root).map_err(prompt::unavailable)?;
         let configured = config.team.get(role).and_then(|r| r.prompt.clone());
         let resolved = prompt_files::load_with_bundle(
             root,
-            prompt_files::global_root().as_deref(),
+            global_root.as_deref(),
             run,
             role,
             configured.as_deref(),
@@ -63,6 +65,7 @@ impl Settings {
             role: role.to_owned(),
             run: run.to_owned(),
             configured,
+            global_root,
             diff,
             scroll: 0,
             bundle: bundle.clone(),
@@ -100,7 +103,7 @@ impl Settings {
     fn reload_diff(&mut self, root: &Path) -> Result<(), prompt::Error> {
         let resolved = prompt_files::load_with_bundle(
             root,
-            prompt_files::global_root().as_deref(),
+            self.global_root.as_deref(),
             &self.run,
             &self.role,
             self.configured.as_deref(),

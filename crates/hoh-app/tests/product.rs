@@ -150,6 +150,10 @@ impl World {
         Ok(World { dir })
     }
 
+    fn global_root(&self) -> PathBuf {
+        self.dir.path().join("global")
+    }
+
     fn project(&self) -> PathBuf {
         self.dir.path().join("project")
     }
@@ -206,6 +210,7 @@ impl World {
             effective,
             env!("CARGO_BIN_EXE_hoh").into(),
             registry.clone(),
+            Some(self.global_root()),
         );
         if let Some(runner) = config.runner.as_mut()
             && (keys.is_some() || observe.is_some())
@@ -215,7 +220,8 @@ impl World {
                 self.project(),
                 env!("CARGO_BIN_EXE_hoh").into(),
                 graces,
-            );
+            )
+            .with_global_root(Some(self.global_root()));
             if let Some(keys) = keys {
                 executor = executor.with_keys(keys);
             }
@@ -2702,7 +2708,13 @@ fn the_configured_cancel_graces_reach_every_step_of_the_products_host() {
     let mut effective = hoh_core::config::Config::default();
     effective.execution.cancel_native_grace_seconds = 3;
     effective.execution.cancel_term_grace_seconds = 4;
-    let config = HostConfig::product(Path::new("/p"), effective, "hoh".into(), "".into());
+    let config = HostConfig::product_with(
+        Path::new("/p"),
+        effective,
+        "hoh".into(),
+        std::sync::Arc::new(hoh_app::host::agents::Registry::new("".into())),
+        None,
+    );
     let (native, term) = (Duration::from_secs(3), Duration::from_secs(4));
     assert_eq!(
         (config.reconcile.native_grace, config.reconcile.term_grace),

@@ -312,6 +312,7 @@ async fn a_finished_turns_logs_being_kept_at_the_stop_are_kept_before_the_stop_r
             world::HOH.into(),
             (config.reconcile.native_grace, config.reconcile.term_grace),
         )
+        .with_global_root(Some(world.global_root()))
         .with_keeping(std::sync::Arc::new(move |attempt: &str| {
             if attempt.ends_with("-develop/attempt-1") {
                 held.hold();
@@ -551,6 +552,7 @@ async fn logs_kept_past_both_bounds_keep_the_project_locked_and_the_stop_is_not_
             world::HOH.into(),
             (config.reconcile.native_grace, config.reconcile.term_grace),
         )
+        .with_global_root(Some(world.global_root()))
         .with_keeping(std::sync::Arc::new(move |attempt: &str| {
             if attempt.ends_with("-develop/attempt-1") {
                 held.hold();
