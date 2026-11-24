@@ -24,6 +24,28 @@ mod prerequisites;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+#[test]
+fn doctor_lists_the_embedded_template_bundle_in_both_formats() -> R {
+    let sandbox = Sandbox::new()?;
+    let (_, report, _) = sandbox.doctor()?;
+    assert_eq!(
+        report["resources"]["resource_bundle_version"],
+        hoh_core::objects::resource_bundle_version()
+    );
+    assert_eq!(report["resources"]["templates"], 16);
+    assert_eq!(report["resources"]["skills"], 13);
+    let (output, _) = sandbox.doctor_in(&[], &[], &[])?;
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.contains(&format!(
+            "模板包版本：{}",
+            hoh_core::objects::resource_bundle_version()
+        )),
+        "{text}"
+    );
+    Ok(())
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/protocol")
 }
@@ -1410,7 +1432,7 @@ fn a_signal_after_doctors_report_is_written_says_it_was_written() -> R {
     assert_eq!(out.status.code(), Some(143), "{:?}: {said}", out.status);
     assert!(took < Duration::from_secs(4), "{took:?}");
     let report: Value = serde_json::from_slice(&out.stdout)?;
-    assert_eq!(report["schema_version"], "1.0", "{report}");
+    assert_eq!(report["schema_version"], "1.1", "{report}");
     assert_eq!(said, "hoh: 收到信号，报告已经写出\n");
     Ok(())
 }

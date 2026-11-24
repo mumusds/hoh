@@ -181,6 +181,7 @@ pub(super) enum RunnerJob {
     DraftStep(String, bool),
     DraftDispatch(String, Box<crate::decision::Context>),
     DraftInit(String),
+    DraftTemplates(String),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -501,6 +502,10 @@ pub(super) fn run(
         }
         RunnerJob::DraftInit(attempt) => {
             super::drafting::prepare_init(conn, &attempt, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::DraftTemplates(attempt) => {
+            super::drafting::prepare_effect(conn, &attempt, "templates", ctx)
+                .map(RunnerDone::Applied)
         }
         RunnerJob::Readiness(run_id) => {
             super::readiness::settle(conn, &run_id, ctx).map(RunnerDone::Applied)
@@ -1053,6 +1058,18 @@ fn effect(
         &kind,
         json!({"effect_key": key, "attempt_id": attempt_id, "from": from.as_str(), "detail": detail}),
     )];
+    if to == EffectState::Observed && key == child_id(attempt_id, "templates") {
+        let mut payload = detail.clone();
+        payload["attempt_id"] = json!(attempt_id);
+        payload["effect_key"] = json!(key);
+        events.push(event(
+            &project_id,
+            &run_id,
+            child_id(key, "instantiated"),
+            "templates.instantiated",
+            payload,
+        ));
+    }
     if to == EffectState::Observed
         && key == crate::reconcile::work_key(attempt_id)
         && (!artifacts.is_empty() || !failed.is_empty())

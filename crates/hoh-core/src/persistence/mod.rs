@@ -1576,6 +1576,11 @@ impl Store {
             .await
     }
 
+    pub async fn prepare_draft_templates(&self, attempt_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftTemplates(attempt_id.into()))
+            .await
+    }
+
     pub async fn settle_readiness(&self, run_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Readiness(run_id.to_owned()))
             .await
@@ -2782,6 +2787,20 @@ impl Reader {
     /// A draft attempt's durable start observation (also used by reconcile).
     pub fn draft_start(&self, attempt: &str) -> Result<Option<serde_json::Value>, PersistError> {
         draft_approval::start(&self.conn, attempt)
+    }
+
+    pub fn draft_templates(
+        &self,
+        attempt: &str,
+    ) -> Result<Option<serde_json::Value>, PersistError> {
+        drafting::templates(&self.conn, attempt)
+    }
+
+    pub fn draft_template_selection(
+        &self,
+        run: &str,
+    ) -> Result<crate::template_files::Selection, PersistError> {
+        drafting::template_selection(&self.conn, run)
     }
 
     /// Whether the host must take the read-only discovery observation.

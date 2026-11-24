@@ -52,6 +52,18 @@ pub(super) async fn prepare(
     project: &Path,
     work: &super::runner::Work,
 ) -> Result<(), String> {
+    prepare_git(store, project, work).await?;
+    templates::prepare(store, project, work).await
+}
+
+mod templates;
+pub(super) use templates::attribute as attribute_templates;
+
+async fn prepare_git(
+    store: &Store,
+    project: &Path,
+    work: &super::runner::Work,
+) -> Result<(), String> {
     let root = project.to_path_buf();
     let existing =
         super::begun::spawn_blocking(move || match std::fs::symlink_metadata(root.join(".git")) {
@@ -654,6 +666,7 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let initial = start["draft_untracked"]
         .as_object()
         .ok_or("missing untracked start digests")?;
+    let owned = start.get("draft_templates").and_then(Value::as_object);
     let prefixes = initial
         .iter()
         .filter(|(_, v)| v.get("tree_sha256").is_some())
@@ -712,6 +725,12 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let start_paths = start_dirty
         .iter()
         .map(|name| decoded(name.as_str().ok_or("invalid draft start path")?))
+        .chain(
+            owned
+                .into_iter()
+                .flat_map(|m| m.keys())
+                .map(|name| decoded(name)),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     let end_index = index_snapshot(root, &start_paths)
         .map_err(|error| format!("draft index unreadable; ownership uncertain: {error}"))?;
@@ -738,7 +757,9 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let mut observation = Observation::new();
     for path in start_paths {
         let name = hex(&path);
-        let untracked = initial.get(&name);
+        let untracked = initial
+            .get(&name)
+            .or_else(|| owned.and_then(|m| m.get(&name)));
         let digest = untracked
             .or_else(|| start["draft_tracked"].get(&name))
             .ok_or_else(|| {

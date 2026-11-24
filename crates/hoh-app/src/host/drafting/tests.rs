@@ -1165,3 +1165,48 @@ fn test_008_04_dc_t04c_write_set_exclusion_has_one_pinned_predicate() {
         assert!(!untouched_exclusion_is_pinned(&mutation));
     }
 }
+
+#[test]
+fn template_owned_paths_use_the_same_digest_index_and_commit_predicate() -> R {
+    for action in ["unchanged", "stage", "edit", "commit", "missing_index"] {
+        let dir = repo()?;
+        let root = dir.path();
+        std::fs::create_dir(root.join("docs"))?;
+        std::fs::write(root.join("docs/feature.md"), "Runtime template")?;
+        let mut start = snapshot(root);
+        attribute_templates(&mut start, Some(&json!({"created":["docs/feature.md"]})))?;
+        assert_eq!(start["draft_dirty"], json!([]));
+        assert_eq!(
+            start["draft_templates"].as_object().map(|o| o.len()),
+            Some(1)
+        );
+        docs(root)?;
+        match action {
+            "stage" => git(root, &["add", "docs/feature.md"])?,
+            "edit" => std::fs::write(root.join("docs/feature.md"), "draft edit")?,
+            "commit" => {
+                git(root, &["add", "docs/feature.md"])?;
+                git(root, &["commit", "-qm", "include template"])?;
+            }
+            "missing_index" => {
+                start["draft_index"] = json!({});
+            }
+            _ => (),
+        }
+        let checked = checked(root, &start);
+        match action {
+            "unchanged" | "commit" => {
+                assert!(matches!(checked?, WriterOutcome::Draft { .. }), "{action}")
+            }
+            "stage" | "edit" => assert!(
+                matches!(checked?, WriterOutcome::Correct { .. }),
+                "{action}"
+            ),
+            _ => assert!(
+                checked.is_err(),
+                "a missing Runtime template index cannot establish ownership"
+            ),
+        }
+    }
+    Ok(())
+}

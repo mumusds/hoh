@@ -2138,8 +2138,17 @@ impl Team {
         let script = if work.assignment.spec_draft {
             let source=hoh_core::specindex::Source { path:"docs/spec/main.md".into(), bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec() };
             let source = self.draft_source.clone().unwrap_or(source);
-            let index = hoh_core::specindex::generate_index(std::slice::from_ref(&source))
-                .map_err(|e| e.to_string())?;
+            // S6 creates the independent skeleton before this fake turn; its committed
+            // index must cover that file too, just as the product's completion check does.
+            let mut sources = vec![source.clone()];
+            let skeleton = project.join("docs/spec/spec.md");
+            if skeleton.exists() && source.path != "docs/spec/spec.md" {
+                sources.push(hoh_core::specindex::Source {
+                    path: "docs/spec/spec.md".into(),
+                    bytes: std::fs::read(&skeleton).map_err(|e| e.to_string())?,
+                });
+            }
+            let index = hoh_core::specindex::generate_index(&sources).map_err(|e| e.to_string())?;
             std::fs::write(prepared.join("main.md"), source.bytes).map_err(|e| e.to_string())?;
             std::fs::write(prepared.join("index.json"), index.bytes())
                 .map_err(|e| e.to_string())?;

@@ -12,7 +12,9 @@ mod installed;
 mod pty;
 mod resource_deployment;
 mod resource_upgrade;
+mod template_deployment;
 mod world;
+use template_deployment::offline_instantiation;
 
 use installed::{Manager, R};
 use serde_json::{Value, json};
@@ -20,6 +22,12 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Output;
+
+#[test]
+#[ignore = "runs in deployment with the installed release, isolated networking and strace"]
+fn test_029_03_offline_instantiation_in_installed_release() -> R {
+    offline_instantiation()
+}
 
 fn text(out: &Output) -> String {
     format!(
