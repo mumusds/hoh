@@ -1325,3 +1325,40 @@ class PromptRenderer(unittest.TestCase):
         c=load_json(ROOT/'examples/prompt-context.json')
         for p in (ROOT/'resources/prompts').glob('*.md'):
             with self.subTest(role=p.name):self.assertNotIn('{{',render(p.read_text(),c))
+
+class PrePr(unittest.TestCase):
+    """scripts/dev/pre-pr.sh runs what CI's bundle job runs (PREPR-01, PREPR-02) and refuses arguments it does not know (PREPR-04)."""
+    STEPS={'scripts/check.sh','scripts/bootstrap.sh','scripts/product/static.sh','scripts/product/deployment.sh'}
+    def setUp(self):
+        self.t=tempfile.TemporaryDirectory(prefix='hoh-prepr-');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
+        (self.root/'scripts/dev').mkdir(parents=True);(self.root/'scripts/product').mkdir()
+        shutil.copy(ROOT/'scripts/dev/pre-pr.sh',self.root/'scripts/dev/pre-pr.sh')
+        self.calls=self.root/'calls';bin_=self.root/'bin';bin_.mkdir()
+        recorder='#!/bin/sh\nprintf \'%s CI=%s\\n\' "$0 $*" "${CI-unset}" >>"$CALLS"\n'
+        for step in self.STEPS:(self.root/step).write_text(recorder)
+        for name in ['cargo','sudo','shellcheck']:
+            p=bin_/name;p.write_text(recorder);p.chmod(0o755)
+        env={k:v for k,v in os.environ.items() if k!='CI'}
+        self.env=env|{'PATH':str(bin_)+os.pathsep+env.get('PATH',''),'CALLS':str(self.calls),'HOH_TEST_SLOT':str(self.root/'slot.lock')}
+    def pre_pr(self,*args):
+        return subprocess.run(['bash',str(self.root/'scripts/dev/pre-pr.sh'),*args],capture_output=True,text=True,env=self.env,timeout=60)
+    def recorded(self):
+        return [l.replace(str(self.root/'bin')+'/','').replace(str(self.root)+'/','') for l in self.calls.read_text().splitlines()] if self.calls.exists() else []
+    def test_unknown_arguments_are_refused_before_any_step(self):
+        for args in (['--no-deploymnet'],['--no-deployment','extra'],['-h']):
+            with self.subTest(args=args):
+                p=self.pre_pr(*args);self.assertEqual(p.returncode,64,p.stdout+p.stderr);self.assertIn('Usage',p.stderr)
+                self.assertEqual(self.recorded(),[]);self.assertFalse((self.root/'slot.lock').exists())
+    def test_it_runs_the_bundle_jobs_shellcheck_and_bootstrap_dry_run_like_ci(self):
+        p=self.pre_pr('--no-deployment');self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        calls=self.recorded()
+        self.assertIn('shellcheck -S warning scripts/bootstrap.sh scripts/check.sh scripts/product/deployment.sh scripts/product/static.sh scripts/dev/pre-pr.sh CI=unset',calls)
+        self.assertIn('scripts/bootstrap.sh --yolo --dry-run CI=unset',calls)
+        self.assertLess(calls.index('scripts/bootstrap.sh --yolo --dry-run CI=unset'),calls.index('scripts/check.sh --bundle CI=1'))
+        self.assertNotIn('scripts/product/deployment.sh  CI=unset',calls)
+    def test_the_bundle_step_runs_as_in_ci_so_missing_user_scopes_fail_instead_of_skipping(self):
+        # tests/bundle/test_record.py skips its scope tests without a user manager unless CI is set (PREPR-02).
+        p=self.pre_pr();self.assertEqual(p.returncode,0,p.stdout+p.stderr)
+        calls=self.recorded();self.assertIn('scripts/check.sh --bundle CI=1',calls)
+        self.assertIn('scripts/product/deployment.sh  CI=unset',calls)
+        self.assertTrue(all(c.endswith('CI=unset') for c in calls if 'check.sh --bundle' not in c),calls)
