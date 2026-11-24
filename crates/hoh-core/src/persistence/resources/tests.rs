@@ -20,7 +20,7 @@ fn options(bundle: Bundle) -> Options {
 }
 fn old() -> Bundle {
     let mut b = Bundle::current();
-    b.files.insert(
+    b.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "old developer contract\n".to_owned(),
     );

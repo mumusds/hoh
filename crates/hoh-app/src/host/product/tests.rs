@@ -1456,7 +1456,7 @@ fn test_047_03_packing_uses_the_attempt_pin_not_the_current_binary()
         .prefix("m3t03-pack-pin-")
         .tempdir()?;
     let mut old = hoh_core::resource_bundle::Bundle::current();
-    old.files.insert(
+    old.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "old developer\n".to_owned(),
     );
@@ -1480,7 +1480,7 @@ fn test_047_03_unpinned_pack_and_drift_use_the_host_bundle()
         .prefix("m3t03-host-bundle-")
         .tempdir()?;
     let mut host = hoh_core::resource_bundle::Bundle::current();
-    host.files.insert(
+    host.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "host developer\n".to_owned(),
     );
@@ -1526,7 +1526,7 @@ fn test_047_03_incompatible_old_pin_is_transient_and_the_host_bundle_stays_decis
         .as_object_mut()
         .ok_or("no defs")?
         .remove("TaskResult");
-    broken.files.insert(
+    broken.insert_file(
         "contracts/protocol.schema.json".to_owned(),
         serde_json::to_string(&schema)?,
     );
@@ -1567,7 +1567,7 @@ fn test_047_03_incompatible_old_pin_is_transient_and_the_host_bundle_stays_decis
 fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::Builder::new().prefix("m3t03-drift-").tempdir()?;
     let mut old = hoh_core::resource_bundle::Bundle::current();
-    old.files.insert(
+    old.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "old developer\n".to_owned(),
     );

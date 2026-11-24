@@ -1742,7 +1742,7 @@ fn test_047_03_settings_exposes_drift_and_both_diffs() {
         .tempdir()
         .unwrap();
     let mut old = hoh_core::resource_bundle::Bundle::current();
-    old.files.insert(
+    old.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "old developer\n".to_owned(),
     );
@@ -1772,7 +1772,7 @@ fn test_047_03_settings_drift_follows_the_injected_bundle() {
         .tempdir()
         .unwrap();
     let mut host = hoh_core::resource_bundle::Bundle::current();
-    host.files.insert(
+    host.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "host developer\n".to_owned(),
     );

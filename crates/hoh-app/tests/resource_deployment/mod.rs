@@ -24,9 +24,8 @@ async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
     let spec = world.seed_spec()?;
     let project = world.project();
     let mut old = Bundle::current();
-    old.files
-        .retain(|path, _| !path.starts_with("resources/skills/"));
-    old.files.insert(
+    old.retain_files(|path, _| !path.starts_with("resources/skills/"));
+    old.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "OLD BUILTIN DEVELOPER\n".to_owned(),
     );

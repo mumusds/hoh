@@ -152,7 +152,7 @@ fn test_047_03_drift_missing_mismatched_and_unchanged_bases_are_explicit() -> R 
     save_override(dir.path(), file, "custom\n")?;
     assert!(drift_reports(dir.path(), &read()?, &Bundle::current())?.is_empty());
     let mut changed_schema = Bundle::current();
-    changed_schema.files.insert(
+    changed_schema.insert_file(
         "contracts/protocol.schema.json".to_owned(),
         "changed schema".to_owned(),
     );
@@ -189,7 +189,7 @@ fn test_047_03_pinned_bytes_survive_override_restore_and_corruption_refuses_load
         .tempdir()?;
     let mut old = Bundle::current();
     assert_eq!(old.version(), crate::objects::resource_bundle_version());
-    old.files.insert(
+    old.insert_file(
         "resources/prompts/developer.md".to_owned(),
         "old contract\n".to_owned(),
     );

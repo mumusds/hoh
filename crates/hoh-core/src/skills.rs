@@ -247,7 +247,7 @@ pub fn load_with_diagnostics(
     bundle: &Bundle,
 ) -> Result<Loaded, Error> {
     let mut selected = BTreeMap::new();
-    let builtin = bundle.files.get("resources/skills/registry.json");
+    let builtin = bundle.files().get("resources/skills/registry.json");
     if let Some(text) = builtin {
         let source = Contract {
             layer: "builtin",

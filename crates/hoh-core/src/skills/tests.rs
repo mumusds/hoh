@@ -187,8 +187,7 @@ fn old_pin_without_registry_has_no_builtin_skills() -> R {
         .prefix("m3t08-old-pin-")
         .tempdir()?;
     let mut old = Bundle::current();
-    old.files
-        .retain(|path, _| !path.starts_with("resources/skills/"));
+    old.retain_files(|path, _| !path.starts_with("resources/skills/"));
     let pin = old.store(dir.path())?;
     let restored = pin.load(dir.path())?;
     assert_eq!(restored.version(), old.version());

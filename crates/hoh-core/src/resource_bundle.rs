@@ -7,24 +7,25 @@ use std::{collections::BTreeMap, path::Path};
 pub struct Bundle {
     pub release: String,
     pub format: String,
-    pub files: BTreeMap<String, String>,
-    /// Filled on the first [`Bundle::version`] call. Not part of the stored bytes or of equality.
-    /// Do not change `files` after that call: the cached digest would no longer match them (M3G-101).
+    files: BTreeMap<String, String>,
+    /// The digest of the current `files`, filled by [`Bundle::version`]. Not part of the stored
+    /// bytes or of equality. [`Bundle::insert_file`] and [`Bundle::retain_files`] drop it (M3G-101).
     #[serde(skip, default)]
-    version_cache: std::sync::OnceLock<String>,
+    version_cache: std::sync::Mutex<Option<String>>,
 }
 
 impl Clone for Bundle {
     fn clone(&self) -> Self {
-        let version_cache = std::sync::OnceLock::new();
-        if let Some(version) = self.version_cache.get() {
-            let _ = version_cache.set(version.clone());
-        }
+        let version_cache = self
+            .version_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         Self {
             release: self.release.clone(),
             format: self.format.clone(),
             files: self.files.clone(),
-            version_cache,
+            version_cache: std::sync::Mutex::new(version_cache),
         }
     }
 }
@@ -52,25 +53,66 @@ impl Bundle {
                 .iter()
                 .map(|(p, s)| ((*p).to_owned(), (*s).to_owned()))
                 .collect(),
-            version_cache: std::sync::OnceLock::new(),
+            version_cache: std::sync::Mutex::new(None),
         }
     }
 
+    /// The bundle's files. Mutate them with [`Bundle::insert_file`] or [`Bundle::retain_files`]
+    /// so a later [`Bundle::version`] hashes the bytes that will be stored.
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
+
+    /// Replace one file and drop a cached digest (M3G-101).
+    pub fn insert_file(&mut self, path: impl Into<String>, text: impl Into<String>) {
+        self.files.insert(path.into(), text.into());
+        self.clear_version();
+    }
+
+    /// Keep the files `keep` accepts and drop a cached digest (M3G-101).
+    pub fn retain_files(&mut self, mut keep: impl FnMut(&String, &mut String) -> bool) {
+        self.files.retain(|path, text| keep(path, text));
+        self.clear_version();
+    }
+
+    fn clear_version(&self) {
+        *self
+            .version_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn compute_version(&self) -> String {
+        let files: Vec<_> = self
+            .files
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        format!(
+            "{}+{}",
+            self.release,
+            objects::digest_of(&objects::with_format(&files, &self.format))
+        )
+    }
+
     pub fn version(&self) -> String {
-        self.version_cache
-            .get_or_init(|| {
-                let files: Vec<_> = self
-                    .files
-                    .iter()
-                    .map(|(p, s)| (p.as_str(), s.as_str()))
-                    .collect();
-                format!(
-                    "{}+{}",
-                    self.release,
-                    objects::digest_of(&objects::with_format(&files, &self.format))
-                )
-            })
+        if let Some(hit) = self
+            .version_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+        {
+            return hit;
+        }
+        let computed = self.compute_version();
+        let mut slot = self
+            .version_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(computed.clone());
+        }
+        computed
     }
 
     /// Whether this binary can render `role` from these bytes (M3G-52): the context format matches,
@@ -140,12 +182,12 @@ mod tests {
             release: "0.0.0".to_owned(),
             format: context::FORMAT.to_owned(),
             files,
-            version_cache: std::sync::OnceLock::new(),
+            version_cache: std::sync::Mutex::new(None),
         }
     }
 
     /// The cached digest is not part of the stored object or of equality (M3G-101).
-    /// Callers must not change `files` after the first `version` call.
+    /// Replacing a file drops the cache, so a later store pins the new bytes.
     #[test]
     fn version_cache_does_not_change_identity_bytes_or_equality() {
         let fresh = sample();
@@ -163,5 +205,9 @@ mod tests {
         assert_eq!(restored, cached);
         assert_eq!(restored.version(), once);
         assert_eq!(cached.clone().version(), once);
+        let mut changed = cached.clone();
+        changed.insert_file("resources/prompts/developer.md", "other\n");
+        assert_ne!(changed.version(), once);
+        assert_eq!(changed.version(), changed.version());
     }
 }
