@@ -7,6 +7,136 @@ use pty::R;
 use serde_json::json;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy)]
+enum EarlyDraftFailure {
+    Prepare,
+    Identity,
+    Refusal,
+}
+
+// Fault-only executor: it creates no process and never opens a work gate.
+#[derive(Debug)]
+struct FailingDraftStart {
+    failure: EarlyDraftFailure,
+    starts: std::sync::atomic::AtomicUsize,
+}
+impl hoh_app::host::Executor for FailingDraftStart {
+    fn deliver(
+        &self,
+        _: &hoh_app::host::Work,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (send, ack) = tokio::sync::oneshot::channel();
+        let _ = send.send(Ok(()));
+        ack
+    }
+    fn start(
+        &self,
+        _: &hoh_app::host::Work,
+    ) -> Result<hoh_app::host::Started, hoh_app::host::Refusal> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if matches!(self.failure, EarlyDraftFailure::Refusal) {
+            return Err(hoh_app::host::Refusal {
+                reason: "scripted auth refusal".into(),
+                class: hoh_core::retry::FailureClass::Auth,
+                detail: None,
+                details: None,
+            });
+        }
+        let (_, ended) = tokio::sync::oneshot::channel();
+        Ok(hoh_app::host::Started {
+            pid: u32::MAX, // No such /proc identity; this fixture spawned nothing.
+            gate: hoh_app::host::Gate::new(|| panic!("invalid identity must never open a gate")),
+            ended,
+            prompt: None,
+            ran: None,
+        })
+    }
+}
+
+async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
+    #[derive(Debug)]
+    struct FixedClock(std::time::SystemTime);
+    impl hoh_core::delivery::Clock for FixedClock {
+        fn now(&self) -> std::time::SystemTime {
+            self.0
+        }
+    }
+    let world = world::World::named("m3t04-start-failure")?;
+    world.configure(&[], "")?;
+    if matches!(failure, EarlyDraftFailure::Prepare) {
+        std::fs::create_dir(world.project().join(".git"))?; // Incomplete local repository.
+    } else {
+        world.git(&["init", "-q"])?;
+    }
+    let executor = std::sync::Arc::new(FailingDraftStart {
+        failure,
+        starts: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut config = hoh_app::host::HostConfig::new(&world.project());
+    config.port = 0;
+    config.store.wal_probe = Some(world::probe());
+    let now = std::time::SystemTime::now();
+    config.clock = hoh_app::host::HostClock(std::sync::Arc::new(FixedClock(now)));
+    config.jitter_seed = Some(7);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: hoh_core::decision::Context {
+            required_capabilities: world::TEAM
+                .iter()
+                .map(|(role, _)| ((*role).into(), Default::default()))
+                .collect(),
+            ..Default::default()
+        },
+    });
+    let host = hoh_app::host::Host::start(config).await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "scripted start failure").await?;
+        world.staff(&run)?;
+        input(&host, &world, &run, "draft", "SendInput", json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+        world.until("SELECT count(*)>0 FROM attempts WHERE ended_at IS NOT NULL", "1", Duration::from_secs(15)).await?;
+        assert_eq!(world.query("SELECT state FROM attempts ORDER BY rowid LIMIT 1")?, "FAILED");
+        assert_eq!(world.query("SELECT attempt_count FROM tasks WHERE kind='spec_draft'")?, "1");
+        match failure {
+            EarlyDraftFailure::Refusal => {
+                assert_eq!(world.query("SELECT state||'/'||blocked_reason FROM tasks WHERE kind='spec_draft'")?, "BLOCKED/BLOCKED_AUTH");
+                assert_eq!(world.query("SELECT count(*) FROM tasks WHERE next_retry_at IS NOT NULL")?, "0");
+            }
+            _ => {
+                assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?, "READY");
+                assert_eq!(world.query("SELECT count(*) FROM tasks t JOIN attempts a USING(task_id) WHERE t.next_retry_at>a.ended_at")?, "1");
+                let detail = world.query("SELECT failure_reason FROM attempts")?;
+                assert!(match failure {
+                    EarlyDraftFailure::Prepare => detail.contains("rev-parse --show-toplevel: exit status: 128"),
+                    _ => detail.contains("identity of its process could not be read"),
+                }, "{detail}");
+            }
+        }
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='attempt.workspace_start'")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state<>'PREPARED'")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM leases l JOIN attempts a USING(attempt_id) WHERE l.expires_at<=a.ended_at")?, "1");
+        assert!(!host.store().dispatch_draft(&run, hoh_core::decision::Context { now: Some(now), ..Default::default() }).await?);
+        assert_eq!(world.query("SELECT count(*) FROM attempts")?, "1");
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), usize::from(!matches!(failure, EarlyDraftFailure::Prepare)));
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_m3l500_prepare_failure_keeps_backoff() -> R {
+    early_draft_failure(EarlyDraftFailure::Prepare).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_m3l500_identity_failure_keeps_backoff() -> R {
+    early_draft_failure(EarlyDraftFailure::Identity).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_m3l500_executor_refusal_keeps_class() -> R {
+    early_draft_failure(EarlyDraftFailure::Refusal).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R {
     let world = world::World::named("m3t04-drafting")?;
