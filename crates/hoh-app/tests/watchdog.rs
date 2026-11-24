@@ -191,20 +191,18 @@ impl HeldLook {
     }
 }
 
-/// `attempt.inactive` events, or only those of `attempt_id` when it is `Some`.
-fn inactive_count_sql(attempt_id: Option<&str>) -> String {
-    let mut sql = "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%'".to_owned();
-    if let Some(id) = attempt_id {
-        assert!(
-            id.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-' | '~')),
-            "attempt id {id}"
-        );
-        sql.push_str(&format!(
-            " AND json_extract(payload_json, '$.attempt_id') = '{id}'"
-        ));
-    }
-    sql
+/// The `attempt.inactive` events of `attempt_id`.
+fn inactive_count_sql(attempt_id: &str) -> String {
+    assert!(
+        attempt_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-' | '~')),
+        "attempt id {attempt_id}"
+    );
+    format!(
+        "SELECT count(*) FROM events WHERE kind LIKE 'attempt.inactive%' \
+         AND json_extract(payload_json, '$.attempt_id') = '{attempt_id}'"
+    )
 }
 
 async fn until(what: &str, limit: Duration, mut done: impl FnMut() -> R<bool>) -> R {
@@ -274,6 +272,15 @@ async fn a_look_held_on_its_thread_neither_holds_up_its_attempts_end_nor_records
             return Err("T1 has no attempt".into());
         }
         held.release_attempt(&t1);
+        // FLK34-100: T1's look has returned (left `output_bytes`) before anything is counted, and the count comes at
+        // least COUNT_AFTER after that return as well as after the Commander record: a T1 record that lands late has
+        // that long to show, however soon the Commander turn's look is found.
+        const COUNT_AFTER: Duration = Duration::from_secs(1);
+        until("T1's look returned", Duration::from_secs(10), || {
+            Ok(!held.attempts_looking().contains(&t1))
+        })
+        .await?;
+        let t1_returned = Instant::now();
         let look_by = Instant::now() + Duration::from_secs(30);
         let commander = loop {
             if let Some(id) = held.attempts_looking().into_iter().find(|id| id != &t1) {
@@ -290,15 +297,16 @@ async fn a_look_held_on_its_thread_neither_holds_up_its_attempts_end_nor_records
         };
         held.release_attempt(&commander);
         until("the Commander turn's own inactive record", Duration::from_secs(10), || {
-            Ok(query(project, &inactive_count_sql(Some(&commander)))? != "0")
+            Ok(query(project, &inactive_count_sql(&commander))? != "0")
         })
         .await?;
+        tokio::time::sleep(COUNT_AFTER.saturating_sub(t1_returned.elapsed())).await;
         let payloads = query(
             project,
             "SELECT coalesce(group_concat(payload_json, char(10)), '') FROM events WHERE kind LIKE 'attempt.inactive%'",
         )?;
         assert_eq!(
-            query(project, &inactive_count_sql(Some(&t1)))?,
+            query(project, &inactive_count_sql(&t1))?,
             "0",
             "T1 {t1} recorded after it ended; commander {commander} payloads: {payloads}"
         );
@@ -409,7 +417,7 @@ fn a_finished_look_records_nothing_when_its_end_is_already_ready() -> R {
                 return Err("T1 has no attempt".into());
             }
             assert_eq!(
-                query(project, &inactive_count_sql(Some(&t1)))?,
+                query(project, &inactive_count_sql(&t1))?,
                 "0",
                 "a look whose sample had finished was recorded after its end was already ready"
             );
