@@ -137,6 +137,33 @@ fn identifier(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-.:/".contains(&b))
 }
 
+/// Split on LF. Strip one trailing CR only when it is the CR of a CRLF: every
+/// segment but the last, and the last only when the text itself ends in LF.
+/// A leftover CR (a bare CR, or a second CR before LF) is not a line ending.
+/// The empty segment `split` yields after a final LF is dropped so line numbers
+/// match `str::lines` for ordinary files (M3B-08).
+fn split_lines(text: &str) -> Result<Vec<(usize, &str)>, usize> {
+    let ends_with_lf = text.ends_with('\n');
+    let parts: Vec<&str> = text.split('\n').collect();
+    let mut out = Vec::new();
+    for (index, line) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        let body = if !last || ends_with_lf {
+            line.strip_suffix('\r').unwrap_or(line)
+        } else {
+            *line
+        };
+        if body.contains('\r') {
+            return Err(index + 1);
+        }
+        if last && ends_with_lf && body.is_empty() {
+            continue;
+        }
+        out.push((index + 1, body));
+    }
+    Ok(out)
+}
+
 pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Parsed, IndexError> {
     let text = std::str::from_utf8(&source.bytes).map_err(|e| {
         let line = source.bytes[..e.valid_up_to()]
@@ -146,16 +173,17 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
             + 1;
         IndexError::at(&source.path, line, "specification must be UTF-8")
     })?;
+    let split = split_lines(text)
+        .map_err(|line| IndexError::at(&source.path, line, "a value must be a single line"))?;
+    let end = split.len().max(1);
     let mut lines = Lines {
         path: &source.path,
-        lines: text
-            .lines()
-            .enumerate()
+        lines: split
+            .into_iter()
             .filter(|(_, l)| !l.trim().is_empty())
-            .map(|(i, l)| (i + 1, l))
             .collect(),
         at: 0,
-        end: text.lines().count().max(1),
+        end,
     };
     for heading in ["# 用户", "# 范围", "# 非目标"] {
         lines.take(heading)?;

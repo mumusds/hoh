@@ -171,6 +171,61 @@ fn test_034_04_decisions_questions_crlf_and_empty_sections() -> R {
     Ok(())
 }
 
+/// M3B-08: strip one CR only when it is the CR of a CRLF. Any other CR stays in
+/// the line and is rejected, including a file that ends in a bare CR.
+#[test]
+fn test_034_04_bare_cr_in_a_value_is_rejected() -> R {
+    let valid = source("docs/spec/a.md", &requirement("A", ""));
+    let text = String::from_utf8(valid.bytes.clone())?;
+    let embedded = Source {
+        path: valid.path.clone(),
+        bytes: text.replace("given: 前提", "given: 前\r提").into_bytes(),
+    };
+    let error =
+        generate_index(std::slice::from_ref(&embedded)).expect_err("bare CR inside a value");
+    assert!(
+        error.error.contains("a value must be a single line"),
+        "{error}"
+    );
+    assert_eq!(error.path, valid.path);
+    assert_eq!(error.line, 14, "{error}");
+
+    let trailing = Source {
+        path: valid.path.clone(),
+        bytes: format!("{}\r", text.trim_end_matches('\n')).into_bytes(),
+    };
+    let error = generate_index(std::slice::from_ref(&trailing)).expect_err("trailing bare CR");
+    assert!(
+        error.error.contains("a value must be a single line"),
+        "{error}"
+    );
+    assert_eq!(error.line, 17, "{error}");
+
+    let doubled = Source {
+        path: valid.path.clone(),
+        bytes: text
+            .replace("given: 前提\n", "given: 前提\r\r\n")
+            .into_bytes(),
+    };
+    let error = generate_index(std::slice::from_ref(&doubled)).expect_err("CR CR LF");
+    assert!(
+        error.error.contains("a value must be a single line"),
+        "{error}"
+    );
+    assert_eq!(error.line, 14, "{error}");
+
+    let crlf = Source {
+        path: valid.path.clone(),
+        bytes: text.replace('\n', "\r\n").into_bytes(),
+    };
+    let index = generate_index(&[crlf])?;
+    assert_eq!(
+        index.value()["requirements"][0]["acceptance"][0]["given"],
+        "前提"
+    );
+    Ok(())
+}
+
 /// Q1 (docs/adr/ADR-035.md decision 1): open questions carry ids from the REQ/AC id set and their blocking mark;
 /// decisions carry their source; both are exposed with their source positions and never enter index.json.
 #[test]
