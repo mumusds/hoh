@@ -2465,7 +2465,10 @@ fn ended(pid: u32) -> R<bool> {
 }
 
 /// One HTTP exchange with an in-process host over its TCP port: the status and the JSON body.
-/// Ordinary ApproveSpec fixtures use a known user peer; origin rejection tests supply their own peers.
+/// Ordinary fixtures send every command shape that may approve a specification (ApproveSpec,
+/// AnswerQuestion, an untargeted REPLY: http.rs `may_approve`) from a known user peer, so the
+/// verdict never depends on the test runner's own ancestry (a CI runner is a systemd service);
+/// origin rejection tests supply their own peers.
 pub async fn exchange(
     host: &Host,
     method: &str,
@@ -2475,7 +2478,14 @@ pub async fn exchange(
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let approving = method == "POST"
         && path == "/v1/commands"
-        && body.is_some_and(|body| body["kind"] == "ApproveSpec");
+        && body.is_some_and(|body| {
+            matches!(
+                body["kind"].as_str(),
+                Some("ApproveSpec" | "AnswerQuestion")
+            ) || (body["kind"] == "SendInput"
+                && body["payload"]["input_kind"] == "REPLY"
+                && body["payload"]["target_role"].is_null())
+        });
     let body = body.map(Value::to_string).unwrap_or_default();
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nX-HoH-Token: {token}\r\n",
