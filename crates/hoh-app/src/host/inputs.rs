@@ -4,11 +4,12 @@ use super::{
     http::Shared,
     runner::{Executor, TickError, no_run},
 };
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use hoh_core::delivery::{Clock, DeliveryError, Dispatcher, Transport};
 use hoh_core::persistence::{
     ChangeInput, InputOutcome, InputRouting, OutboxRow, PersistError, SpecAction, SpecRequest,
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 pub(super) async fn run(
@@ -17,8 +18,20 @@ pub(super) async fn run(
     executor: Option<Arc<dyn Executor>>,
     inflight: Inflight,
     mut stop: watch::Receiver<bool>,
+    max_attempts: i64,
 ) {
     let mut watermark = shared.store.watermark();
+    let transport = HostTransport {
+        shared: &shared,
+        clock: clock.as_ref(),
+        executor: executor.as_deref(),
+        inflight: &inflight,
+    };
+    let mut deliveries: FuturesUnordered<BoxFuture<'_, (String, Result<(), TickError>)>> =
+        FuturesUnordered::new();
+    let mut active = BTreeSet::new();
+    let mut poll = tokio::time::interval(Duration::from_millis(200));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow() {
             break;
@@ -26,11 +39,57 @@ pub(super) async fn run(
         tokio::select! {
             biased;
             _=stop.changed()=>break,
-            outcome=tick(&shared,clock.as_ref(),executor.as_deref(),&inflight)=> {
-                if let Err(e)=outcome {eprintln!("hoh host: input delivery: {e}");}
-            }
+            Some((role, outcome))=deliveries.next(), if !deliveries.is_empty()=> {
+                active.remove(&role);
+                if let Err(e)=outcome {eprintln!("hoh host: input delivery ({role}): {e}");}
+                continue;
+            },
+            changed=watermark.changed()=>{if changed.is_err(){break;}},
+            _=poll.tick()=>{}
         }
-        tokio::select! {_=stop.changed()=>break,changed=watermark.changed()=>{if changed.is_err(){break;}},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
+        let roles = tokio::select! {
+            biased;
+            _=stop.changed()=>break,
+            result=async {
+                no_run(shared.store.settle_ended_inputs(&shared.project_id).await)?;
+                no_run(no_run(shared.store.reader())?.input_roles(&shared.project_id))
+            }=>match result {
+                Ok(roles)=>roles,
+                Err(e)=>{eprintln!("hoh host: input delivery: {e}");continue;}
+            },
+        };
+        for role in roles {
+            // One serial dispatcher per role; a bounded set of borrowed futures, owned by this loop.
+            // No detached deliveries survive shutdown. Claim/start/settle and their generation fences stay intact.
+            if active.len() == 32 {
+                break;
+            }
+            if !active.insert(role.clone()) {
+                continue;
+            }
+            let transport = &transport;
+            let store = &shared.store;
+            let clock = clock.as_ref();
+            deliveries.push(
+                async move {
+                    let result = no_run(
+                        Dispatcher {
+                            store,
+                            clock,
+                            transport,
+                            roles: vec![role.clone()],
+                            max_attempts,
+                            batch: 32,
+                        }
+                        .tick()
+                        .await,
+                    )
+                    .map(drop);
+                    (role, result)
+                }
+                .boxed(),
+            );
+        }
     }
 }
 fn delivery_error(error: PersistError) -> DeliveryError {
@@ -194,42 +253,4 @@ async fn propose_change(shared: &Arc<Shared>, row: &OutboxRow) -> Result<String,
         .map_err(delivery_error)?
         .reply
         .ok_or_else(|| DeliveryError::Lost("CHANGE has no receipt".into()))
-}
-async fn tick(
-    shared: &Arc<Shared>,
-    clock: &dyn Clock,
-    executor: Option<&dyn Executor>,
-    inflight: &Inflight,
-) -> Result<(), TickError> {
-    let store = &shared.store;
-    no_run(store.settle_ended_inputs(&shared.project_id).await)?;
-    let root = shared.root.clone();
-    let config = super::begun::spawn_blocking(move || hoh_core::config::load(&root))
-        .await
-        .map_err(|e| TickError::Lost(format!("input delivery configuration: {e}")))?
-        .map_err(|e| TickError::Lost(format!("input delivery configuration: {e}")))?;
-    let transport = HostTransport {
-        shared,
-        clock,
-        executor,
-        inflight,
-    };
-    no_run(
-        Dispatcher {
-            store,
-            clock,
-            transport: &transport,
-            roles: config
-                .team
-                .keys()
-                .cloned()
-                .chain(std::iter::once("runtime".into()))
-                .collect(),
-            max_attempts: i64::from(config.delivery.max_delivery_attempts),
-            batch: 32,
-        }
-        .tick()
-        .await,
-    )?;
-    Ok(())
 }

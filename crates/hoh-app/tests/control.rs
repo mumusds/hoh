@@ -3880,6 +3880,70 @@ impl hoh_app::host::HostHooks for InputBarrier {
         false
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_017_05_delivery_keeps_start_settings_and_uses_durable_roles() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path();
+    Host::start(config(project)).await?.shutdown().await;
+    seed(
+        project,
+        &format!("{WORLD} UPDATE role_bindings SET role='custom_role',session_id=NULL;"),
+    )?;
+    let (notified, mut delivered) = tokio::sync::mpsc::unbounded_channel();
+    let mut settings = config(project);
+    settings.config.delivery.max_delivery_attempts = 1;
+    settings.hooks = Arc::new(InputBarrier(notified));
+    let host = start_when_free(settings).await?;
+    // A broken file after start must not disable existing-run delivery or change its retry cap.
+    std::fs::write(project.join(hoh_core::config::FILE), "invalid = [")?;
+    for id in ["routed", "exhausted"] {
+        host.store()
+            .enqueue_input(hoh_core::persistence::NewInput {
+                input_id: id.into(),
+                run_id: "R".into(),
+                kind: "ASK".into(),
+                target_role: Some("custom_role".into()),
+                payload: json!({"text":"pending input"}),
+            })
+            .await?;
+    }
+    // A persisted failed delivery has spent the startup cap, irrespective of later disk configuration.
+    seed(
+        project,
+        "UPDATE outbox SET attempt_count=1 WHERE message_id='exhausted'; UPDATE role_bindings SET session_id='sd' WHERE role='custom_role';",
+    )?;
+    let observed = tokio::time::timeout(Duration::from_secs(3), delivered.recv()).await;
+    assert!(
+        matches!(observed, Ok(Some(ref id)) if id == "routed"),
+        "custom role input must route despite an invalid configuration file: {observed:?}"
+    );
+    input_state_barrier(project, "exhausted", "REJECTED").await?;
+    assert_eq!(
+        query(
+            project,
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='routed'"
+        )?,
+        "ACKED:1"
+    );
+    assert_eq!(
+        query(
+            project,
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='exhausted'"
+        )?,
+        "DEAD_LETTER:1"
+    );
+    assert_eq!(
+        host.store()
+            .reader()?
+            .input("exhausted")?
+            .ok_or("input")?
+            .payload["reason"],
+        "delivery_exhausted"
+    );
+    host.shutdown().await;
+    Ok(())
+}
 async fn input_state_barrier(project: &Path, id: &str, state: &str) -> R {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -4112,5 +4176,104 @@ async fn test_017_02_cancel_completes_while_steer_ack_is_held() -> R {
         "0"
     );
     host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_017_02_held_steer_does_not_hold_other_roles_or_sweep() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path();
+    Host::start(config(project)).await?.shutdown().await;
+    seed(project, &format!("{WORLD} DELETE FROM tasks WHERE task_id<>'T1'; UPDATE tasks SET writer=0;
+        UPDATE sessions SET capabilities_json=json_set(capabilities_json,'$.mid_turn_steer',json('true'));
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at)
+        VALUES ('R','qa','pi','sd',1,1,'2026-11-24T00:00:00Z'),('R','commander','codex','sd',1,1,'2026-11-24T00:00:00Z');"))?;
+    let (started, mut turns) = tokio::sync::mpsc::unbounded_channel();
+    let (steers, mut steering) = tokio::sync::mpsc::unbounded_channel();
+    let leaders = Arc::default();
+    let _cleanup = Leaders(Arc::clone(&leaders));
+    let mut settings = config(project);
+    settings.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(RoutingAgent {
+            started,
+            steers,
+            leaders,
+        }),
+        context: context(),
+    });
+    let host = start_when_free(settings).await?;
+    let (_, _release) = tokio::time::timeout(Duration::from_secs(20), turns.recv())
+        .await?
+        .ok_or("work")?;
+    host.store()
+        .enqueue_input(hoh_core::persistence::NewInput {
+            input_id: "held".into(),
+            run_id: "R".into(),
+            kind: "STEER".into(),
+            target_role: Some("developer".into()),
+            payload: json!({"text":"held"}),
+        })
+        .await?;
+    let (_, ack) = tokio::time::timeout(Duration::from_secs(20), steering.recv())
+        .await?
+        .ok_or("steer")?;
+    for (id, role) in [
+        ("same-role", "developer"),
+        ("other-role", "qa"),
+        ("ask", "commander"),
+        ("stale", "qa"),
+    ] {
+        host.store()
+            .enqueue_input(hoh_core::persistence::NewInput {
+                input_id: id.into(),
+                run_id: "R".into(),
+                kind: "ASK".into(),
+                target_role: Some(role.into()),
+                payload: json!({"text":id}),
+            })
+            .await?;
+    }
+    // Make only this input obsolete, after its acceptance; the sweep must run while the steer is held.
+    seed(
+        project,
+        "UPDATE input_queue SET payload_json=json_set(payload_json,'$.role_epoch',0) WHERE input_id='stale'",
+    )?;
+    let ready = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let reader = host.store().reader()?;
+            if reader
+                .input("other-role")?
+                .is_some_and(|i| i.payload["boundary"] == "next_attempt")
+                && reader
+                    .input("ask")?
+                    .is_some_and(|i| i.state != hoh_core::lifecycle::InputState::Queued)
+                && reader
+                    .input("stale")?
+                    .is_some_and(|i| i.state == hoh_core::lifecycle::InputState::Rejected)
+            {
+                return R::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        matches!(ready, Ok(Ok(()))),
+        "other-role delivery and sweep waited on the held steer: {ready:?}"
+    );
+    assert_eq!(
+        query(
+            project,
+            "SELECT state||':'||attempt_count FROM outbox WHERE message_id='same-role'"
+        )?,
+        "PENDING:0"
+    );
+    assert!(
+        steering.try_recv().is_err(),
+        "same-role deliveries must remain serial"
+    );
+    // Dropping the loop on shutdown leaves the durable reservation to recovery, with no detached delivery task.
+    tokio::time::timeout(Duration::from_secs(3), host.shutdown()).await?;
+    assert!(ack.is_closed());
     Ok(())
 }

@@ -622,6 +622,7 @@ impl Host {
                     config.runner.as_ref().map(|r| r.executor.clone()),
                     inflight.clone(),
                     stopped.clone(),
+                    i64::from(config.config.delivery.max_delivery_attempts),
                 )));
             })
             .await;

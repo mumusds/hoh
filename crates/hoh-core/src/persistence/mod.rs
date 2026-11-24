@@ -2739,6 +2739,26 @@ impl Reader {
         inputs::read_input(&self.conn, input_id)
     }
 
+    /// Recipients with outstanding host input deliveries, including roles kept by older run bindings.
+    pub fn input_roles(&self, project_id: &str) -> Result<Vec<String>, PersistError> {
+        let mut query = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT o.recipient_role FROM outbox o JOIN runs r USING(run_id) \
+             WHERE r.project_id=?1 AND o.state IN ('PENDING','DELIVERING') \
+             AND json_extract(o.payload_json,'$.notice')='input' \
+             AND json_extract(o.payload_json,'$.kind') IN ('ASK','STEER','CHANGE') \
+             AND json_extract(o.payload_json,'$.payload.handoff_kind') IS NOT 'verification' \
+             ORDER BY o.recipient_role",
+            )
+            .map_err(sqlite_error)?;
+        query
+            .query_map([project_id], |r| r.get(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<_, _>>()
+            .map_err(sqlite_error)
+    }
+
     /// The project's leases as of `now`, by kind (REQ-037).
     pub fn leases(
         &self,
