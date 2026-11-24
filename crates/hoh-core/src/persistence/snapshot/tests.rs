@@ -13,7 +13,7 @@ use crate::persistence::issues::tests::{
 use crate::persistence::join::tests::{attempts_of, two_sources, verify};
 use crate::verification::acceptance::{Label, Why};
 use crate::verification::classify::Report;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use std::path::Path;
 
@@ -839,4 +839,83 @@ async fn test_033_04_rowless_candidate_stays_on_the_revision_it_froze_against() 
         "{page:?}"
     );
     Ok(())
+}
+
+/// M3LA-01 / M3LA-51: the row-less binding looks up `candidate.frozen` inside the candidate's run.
+/// An unrelated run's events do not change the page, and the plan uses `events_run_kind`
+/// (no `SCAN frozen`).
+#[tokio::test]
+async fn test_033_04_rowless_binding_uses_the_run_index_beside_another_runs_events() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES
+           ('s2', 'p1', printf('%.64c', '2'), 2),
+           ('s3', 'p1', printf('%.64c', '1'), 3);
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's3', 'r', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id)
+           VALUES ('AC-1-01', 'REQ-1', 's3', 'b', 'unit');
+         UPDATE runs SET spec_id = 's3' WHERE run_id = 'R';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'changed-s1', 'R', 'spec.changed', '{\"spec_id\":\"s1\",\"spec_revision\":1}', '2026-11-12T00:00:03Z'),
+           ('p1', 'frozen-cold', 'R', 'candidate.frozen', '{\"candidate_id\":\"cold\"}', '2026-11-12T00:00:04Z'),
+           ('p1', 'changed-s2', 'R', 'spec.changed', '{\"spec_id\":\"s2\",\"spec_revision\":2}', '2026-11-12T00:00:05Z'),
+           ('p1', 'changed-s3', 'R', 'spec.changed', '{\"spec_id\":\"s3\",\"spec_revision\":3}', '2026-11-12T00:00:06Z'),
+           ('p1', 'frozen-warm', 'R', 'candidate.frozen', '{\"candidate_id\":\"warm\"}', '2026-11-12T00:00:07Z');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256, source_path, state, created_at) VALUES
+           ('cold', 'R', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', printf('%.64c', '1'), printf('%.64c', 'e'), printf('%.64c', 'f'), 'cold', 'FROZEN', '2026-11-12T00:00:04Z'),
+           ('warm', 'R', 'cccccccccccccccccccccccccccccccccccccccc', 'dddddddddddddddddddddddddddddddddddddddd', printf('%.64c', '1'), printf('%.64c', 'e'), printf('%.64c', 'f'), 'warm', 'FROZEN', '2026-11-12T00:00:07Z');",
+    )?;
+    let before = store
+        .reader()?
+        .acceptance_page("R", 100, None)?
+        .ok_or("no run R")?;
+    // 100×100 events on another run. A recursive CTE alone stops at SQLite's recursion depth.
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO runs(run_id, project_id, spec_id, state, mode, revision, created_at)
+           VALUES ('other', 'p1', 's1', 'RUNNING', 'AUTO', 1, '2026-11-12T00:00:08Z');
+         WITH RECURSIVE
+           a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM a WHERE n < 100),
+           b(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 100)
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
+         SELECT 'p1', 'noise-' || a.n || '-' || b.n, 'other', 'tick', '{}', '2026-11-12T00:00:09Z'
+         FROM a, b;",
+    )?;
+    let after = store
+        .reader()?
+        .acceptance_page("R", 100, None)?
+        .ok_or("no run R")?;
+    assert_eq!(
+        (after.items.clone(), after.next.clone()),
+        (before.items, before.next),
+        "another run's events must not change the binding: {after:?}"
+    );
+    assert_eq!(after.items.len(), 2, "{after:?}");
+    assert_eq!(after.items[0].candidate_id.as_deref(), Some("warm"));
+    assert_eq!(after.items[0].spec_id, "s3");
+    assert_eq!(after.items[1].candidate_id.as_deref(), Some("cold"));
+    assert_eq!(after.items[1].spec_id, "s1");
+    assert_eq!(after.items[1].label, Label::Stale);
+    let plan = binding_plan(&path, "cold")?;
+    let frozen: Vec<_> = plan.iter().filter(|step| step.contains("frozen")).collect();
+    assert!(
+        !frozen.is_empty() && frozen.iter().all(|step| !step.contains("SCAN")),
+        "candidate.frozen lookups must not scan every run: {plan:?}"
+    );
+    assert!(
+        frozen.iter().all(|step| step.contains("events_run_kind")),
+        "candidate.frozen lookups must use the run index: {plan:?}"
+    );
+    Ok(())
+}
+
+fn binding_plan(path: &Path, candidate: &str) -> R<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut statement = conn.prepare(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::ROWLESS_BINDING_SQL
+    ))?;
+    Ok(statement
+        .query_map(params![candidate], |row| row.get(3))?
+        .collect::<Result<Vec<_>, _>>()?)
 }

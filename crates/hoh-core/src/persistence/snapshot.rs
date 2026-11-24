@@ -568,6 +568,31 @@ fn canonical_revision_order(order: &str) -> bool {
     revision.len() == 20 && revision.bytes().all(|b| b.is_ascii_digit()) && !ac.is_empty()
 }
 
+/// Row-less binding of a candidate to the revision current at its freeze (M3B-53).
+/// `?1` is the candidate id. The two `candidate.frozen` subqueries are limited to `c.run_id`
+/// so they use `events_run_kind` instead of scanning every run (M3LA-01 / M3LA-51).
+const ROWLESS_BINDING_SQL: &str = "SELECT s.spec_id, s.revision FROM specs s \
+     JOIN runs r ON r.project_id = s.project_id \
+     JOIN candidates c ON c.run_id = r.run_id \
+     WHERE c.candidate_id = ?1 AND s.sha256 = c.spec_sha256 AND ( \
+       NOT EXISTS ( \
+         SELECT 1 FROM events frozen WHERE frozen.run_id = c.run_id \
+           AND frozen.kind = 'candidate.frozen' \
+           AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
+       ) OR s.revision <= ( \
+         SELECT bound.revision FROM events changed \
+         JOIN specs bound ON bound.spec_id = json_extract(changed.payload_json, '$.spec_id') \
+           AND bound.project_id = r.project_id \
+         WHERE changed.kind = 'spec.changed' AND changed.run_id = c.run_id \
+           AND changed.seq <= ( \
+             SELECT max(frozen.seq) FROM events frozen \
+             WHERE frozen.run_id = c.run_id AND frozen.kind = 'candidate.frozen' \
+               AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
+           ) \
+         ORDER BY changed.seq DESC LIMIT 1 \
+       ) \
+     ) ORDER BY s.revision DESC LIMIT 1";
+
 /// Revisions with actual rows on this candidate. Before any observation, bind the digest to the
 /// revision current when the candidate froze (the latest `spec.changed` at or before that event).
 /// With no freeze event, keep the newest matching digest. With no spec to bind, the current revision.
@@ -582,32 +607,14 @@ fn historical_specs(
         .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
     if found.is_empty() {
         // A later revision that restores the same bytes must not relabel a candidate frozen earlier.
-        let bound = conn.query_row(
-            "SELECT s.spec_id, s.revision FROM specs s \
-             JOIN runs r ON r.project_id = s.project_id \
-             JOIN candidates c ON c.run_id = r.run_id \
-             WHERE c.candidate_id = ?1 AND s.sha256 = c.spec_sha256 AND ( \
-               NOT EXISTS ( \
-                 SELECT 1 FROM events frozen WHERE frozen.kind = 'candidate.frozen' \
-                   AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
-               ) OR s.revision <= ( \
-                 SELECT bound.revision FROM events changed \
-                 JOIN specs bound ON bound.spec_id = json_extract(changed.payload_json, '$.spec_id') \
-                   AND bound.project_id = r.project_id \
-                 WHERE changed.kind = 'spec.changed' AND changed.run_id = c.run_id \
-                   AND changed.seq <= ( \
-                     SELECT max(frozen.seq) FROM events frozen \
-                     WHERE frozen.kind = 'candidate.frozen' \
-                       AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
-                   ) \
-                 ORDER BY changed.seq DESC LIMIT 1 \
-               ) \
-             ) ORDER BY s.revision DESC LIMIT 1",
-            params![c.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(sqlite_error)?;
+        // Both candidate.frozen lookups stay inside this run (events_run_kind). Without the run
+        // predicate each one scans every run's events (M3LA-01 / M3LA-51).
+        let bound = conn
+            .query_row(ROWLESS_BINDING_SQL, params![c.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .map_err(sqlite_error)?;
         found.push(bound.unwrap_or_else(|| (current.to_owned(), revision)));
     }
     Ok(found)
