@@ -10,6 +10,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy)]
 enum EarlyDraftFailure {
     Prepare,
+    GitInit,
     Identity,
     Refusal,
 }
@@ -66,7 +67,7 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
     world.configure(&[], "")?;
     if matches!(failure, EarlyDraftFailure::Prepare) {
         std::fs::create_dir(world.project().join(".git"))?; // Incomplete local repository.
-    } else {
+    } else if !matches!(failure, EarlyDraftFailure::GitInit) {
         world.git(&["init", "-q"])?;
     }
     let executor = std::sync::Arc::new(FailingDraftStart {
@@ -90,11 +91,35 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
         },
     });
     let host = hoh_app::host::Host::start(config).await?;
+    let permissions = std::fs::metadata(world.project())?.permissions();
     let result: R = async {
         let run = world::start_run(&host, "start", "scripted start failure").await?;
         world.staff(&run)?;
+        if matches!(failure, EarlyDraftFailure::GitInit) {
+            use std::os::unix::fs::PermissionsExt;
+            // The host's existing .hoh directory remains writable; only git init's creation
+            // of .git fails, after the Runtime has recorded its STARTED effect.
+            std::fs::set_permissions(world.project(), std::fs::Permissions::from_mode(0o555))?;
+        }
         input(&host, &world, &run, "draft", "SendInput", json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
         world.until("SELECT count(*)>0 FROM attempts WHERE ended_at IS NOT NULL", "1", Duration::from_secs(15)).await?;
+        std::fs::set_permissions(world.project(), permissions.clone())?;
+        if matches!(failure, EarlyDraftFailure::GitInit) {
+            let detail = world.query("SELECT failure_reason FROM attempts")?;
+            assert!(detail.contains("git init --quiet: exit status: 1"), "{detail}");
+            assert_eq!(world.query("SELECT state FROM attempts")?, "UNKNOWN_EFFECT");
+            let key = hoh_core::ids::child_id(&world.query("SELECT attempt_id FROM attempts")?, "git-init");
+            assert_eq!(world.query(&format!("SELECT state FROM effects WHERE effect_key='{key}'"))?, "UNKNOWN");
+            assert_eq!(world.query("SELECT state||'/'||attempt_count FROM tasks WHERE kind='spec_draft'")?, "LEASED/0");
+            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE next_retry_at IS NOT NULL")?, "0");
+            assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='runner.diagnostic' AND json_extract(payload_json,'$.code')='UNKNOWN_EFFECT'")?, "1");
+            assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='attempt.workspace' AND json_extract(payload_json,'$.from')='STARTING' AND json_extract(payload_json,'$.to')='UNKNOWN_EFFECT'")?, "1");
+            assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='PREPARED'")?, "1");
+            assert!(!host.store().dispatch_draft(&run, hoh_core::decision::Context { now: Some(now + Duration::from_secs(3600)), ..Default::default() }).await?);
+            assert_eq!(world.query("SELECT count(*) FROM attempts")?, "1");
+            assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            return Ok(());
+        }
         assert_eq!(world.query("SELECT state FROM attempts ORDER BY rowid LIMIT 1")?, "FAILED");
         assert_eq!(world.query("SELECT attempt_count FROM tasks WHERE kind='spec_draft'")?, "1");
         match failure {
@@ -120,8 +145,14 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
         assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), usize::from(!matches!(failure, EarlyDraftFailure::Prepare)));
         Ok(())
     }.await;
+    std::fs::set_permissions(world.project(), permissions)?;
     host.shutdown().await;
     result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_m3l600_failed_git_init_keeps_unknown_effect() -> R {
+    early_draft_failure(EarlyDraftFailure::GitInit).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

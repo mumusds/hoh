@@ -1323,7 +1323,17 @@ async fn attempt(
         && let Err(why) = super::drafting::prepare(store, &common.shared.root, &work).await
     {
         let ending = common.failed(why);
-        finished(common, &id, None, ending, |e| store.runner_finished(&id, e)).await?;
+        // Preparation may already have started git-init. Preserve the workspace with
+        // its ending so an unknown effect can stop the writer without losing evidence.
+        let id = id.as_str();
+        finished(common, id, None, ending, |ending| {
+            super::control::recorded_end(&common.shared.root, move |workspace| {
+                let mut ending = ending.clone();
+                ending.observed.workspace = workspace;
+                store.runner_finished(id, ending)
+            })
+        })
+        .await?;
         return Ok(());
     }
 

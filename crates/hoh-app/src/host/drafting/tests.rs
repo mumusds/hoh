@@ -387,6 +387,66 @@ fn assert_predirty_ownership_uncertain(root: &Path, start: &Value) -> R {
 }
 
 #[test]
+fn test_008_04_m3l601_replaced_predirty_index_blob_has_uncertain_owner() -> R {
+    let dir = predirty_doc(true)?;
+    let root = dir.path();
+    std::fs::write(root.join("docs/notes.md"), "user worktree B")?;
+    let start = snapshot(root);
+    git(root, &["add", "docs"])?;
+    docs_with_commit(
+        root,
+        &["commit", "-qm", "draft", "--only", "--", "docs/spec"],
+    )?;
+    assert_eq!(
+        observe_git(root, &["show", ":docs/notes.md"], OBSERVATION_LIMIT)?,
+        b"user worktree B"
+    );
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
+fn test_008_04_m3l601_changed_predirty_index_mode_has_uncertain_owner() -> R {
+    let dir = predirty_doc(true)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    git(root, &["update-index", "--chmod=+x", "docs/notes.md"])?;
+    docs_with_commit(
+        root,
+        &["commit", "-qm", "draft", "--only", "--", "docs/spec"],
+    )?;
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
+fn test_008_04_m3l601_removed_predirty_index_entry_has_uncertain_owner() -> R {
+    let dir = predirty_doc(true)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    git(root, &["update-index", "--force-remove", "docs/notes.md"])?;
+    docs_with_commit(
+        root,
+        &["commit", "-qm", "draft", "--only", "--", "docs/spec"],
+    )?;
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
+fn test_008_04_m3l601_missing_predirty_index_snapshot_has_uncertain_owner() -> R {
+    let dir = predirty_doc(true)?;
+    let root = dir.path();
+    let mut start = snapshot(root);
+    start
+        .as_object_mut()
+        .ok_or("snapshot")?
+        .remove("draft_index");
+    docs_with_commit(
+        root,
+        &["commit", "-qm", "draft", "--only", "--", "docs/spec"],
+    )?;
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
 fn test_008_04_m3l502_changed_predirty_tracked_doc_has_uncertain_owner() -> R {
     let dir = predirty_doc(false)?;
     let root = dir.path();

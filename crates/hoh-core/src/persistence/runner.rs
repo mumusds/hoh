@@ -1595,10 +1595,16 @@ fn finish_in(
     let started = super::attempts::started_effects(tx, attempt_id)?;
     // A turn that started an effect it never reported, or an effect left STARTED at all: what it did is unknown, so
     // nothing runs it again and its task stays, by the rule a reconcile applies too (ADR-019 decision 5; ADR-022
-    // decision 12 v3, M2T07R-200, -451). Only a RUNNING attempt can have started one.
-    let unknown = (ending.unknown_effect || !started.is_empty())
-        && from == AttemptState::Running
-        && !cancelled;
+    // decision 12 v3, M2T07R-200, -451). Draft preparation can start non-work effects
+    // before the process gate opens (M3L-600); a classified failure cannot retry those.
+    let unknown = !cancelled
+        && ((from == AttemptState::Running && (ending.unknown_effect || !started.is_empty()))
+            || (from == AttemptState::Starting
+                && draft_end.is_some()
+                && started
+                    .iter()
+                    .any(|key| key != &crate::reconcile::work_key(attempt_id))));
+    let retry_draft = retry_draft && !unknown;
     let success = ending.success && from == AttemptState::Running && !cancelled && !unknown;
     let to = if cancelled || retry_draft {
         AttemptState::Cancelled
