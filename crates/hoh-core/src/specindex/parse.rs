@@ -22,6 +22,13 @@ impl<'a> Lines<'a> {
     fn peek(&self) -> &'a str {
         self.lines.get(self.at).map_or("", |(_, text)| text)
     }
+    /// A leftover CR is not a line ending. Value and structure lines stay one line (ADR-033).
+    fn bare_cr(&self) -> Result<(), IndexError> {
+        if self.peek().contains('\r') {
+            return Err(self.error("a value must be a single line"));
+        }
+        Ok(())
+    }
     fn error(&self, error: impl Into<String>) -> IndexError {
         IndexError::at(
             self.path,
@@ -30,6 +37,7 @@ impl<'a> Lines<'a> {
         )
     }
     fn take(&mut self, want: &str) -> Result<(), IndexError> {
+        self.bare_cr()?;
         if self.peek() != want {
             return Err(self.error(format!("expected {want}")));
         }
@@ -37,6 +45,7 @@ impl<'a> Lines<'a> {
         Ok(())
     }
     fn field(&mut self, name: &str) -> Result<String, IndexError> {
+        self.bare_cr()?;
         let Some(value) = self
             .peek()
             .strip_prefix(name)
@@ -57,11 +66,13 @@ impl<'a> Lines<'a> {
         self.lines.get(self.at).map_or(self.end, |(line, _)| *line)
     }
     fn decisions(&mut self, parsed: &mut Parsed) -> Result<(), IndexError> {
+        self.bare_cr()?;
         if self.peek() == "无" {
             self.at += 1;
             return Ok(());
         }
         while !self.peek().is_empty() && !self.peek().starts_with('#') {
+            self.bare_cr()?;
             let line = self.line();
             let text = self.field("- ")?;
             let at = self.at;
@@ -88,11 +99,13 @@ impl<'a> Lines<'a> {
         parsed: &mut Parsed,
         ids: &mut BTreeSet<String>,
     ) -> Result<(), IndexError> {
+        self.bare_cr()?;
         if self.peek() == "无" {
             self.at += 1;
             return Ok(());
         }
         while !self.peek().is_empty() && !self.peek().starts_with('#') {
+            self.bare_cr()?;
             let line = self.line();
             let Some((qid, text)) = self
                 .peek()
@@ -106,6 +119,7 @@ impl<'a> Lines<'a> {
             self.id(ids, &id)?;
             let text = text.to_owned();
             self.at += 1;
+            self.bare_cr()?;
             let blocking = match self.peek() {
                 "阻塞：是" => true,
                 "阻塞：否" => false,
@@ -139,10 +153,11 @@ fn identifier(s: &str) -> bool {
 
 /// Split on LF. Strip one trailing CR only when it is the CR of a CRLF: every
 /// segment but the last, and the last only when the text itself ends in LF.
-/// A leftover CR (a bare CR, or a second CR before LF) is not a line ending.
-/// The empty segment `split` yields after a final LF is dropped so line numbers
-/// match `str::lines` for ordinary files (M3B-08).
-fn split_lines(text: &str) -> Result<Vec<(usize, &str)>, usize> {
+/// A leftover CR (a bare CR, or a second CR before LF) stays in the line. Value
+/// and structure lines reject it; prose keeps it (ADR-033, M3LA-50). The empty
+/// segment `split` yields after a final LF is dropped so line numbers match
+/// `str::lines` for ordinary files (M3B-08).
+fn split_lines(text: &str) -> Vec<(usize, &str)> {
     let ends_with_lf = text.ends_with('\n');
     let parts: Vec<&str> = text.split('\n').collect();
     let mut out = Vec::new();
@@ -153,15 +168,12 @@ fn split_lines(text: &str) -> Result<Vec<(usize, &str)>, usize> {
         } else {
             *line
         };
-        if body.contains('\r') {
-            return Err(index + 1);
-        }
         if last && ends_with_lf && body.is_empty() {
             continue;
         }
         out.push((index + 1, body));
     }
-    Ok(out)
+    out
 }
 
 pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Parsed, IndexError> {
@@ -173,8 +185,7 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
             + 1;
         IndexError::at(&source.path, line, "specification must be UTF-8")
     })?;
-    let split = split_lines(text)
-        .map_err(|line| IndexError::at(&source.path, line, "a value must be a single line"))?;
+    let split = split_lines(text);
     let end = split.len().max(1);
     let mut lines = Lines {
         path: &source.path,
@@ -206,6 +217,7 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
     lines.questions(&mut parsed, ids)?;
     lines.take("# 需求")?;
     while !lines.peek().is_empty() {
+        lines.bare_cr()?;
         let Some((req, title)) = lines
             .peek()
             .strip_prefix("## REQ-")
@@ -230,6 +242,7 @@ pub(super) fn document(source: &Source, ids: &mut BTreeSet<String>) -> Result<Pa
         };
         let mut acceptance = Vec::new();
         while lines.peek().starts_with("### ") {
+            lines.bare_cr()?;
             let Some(ac) = lines.peek().strip_prefix("### AC-") else {
                 return Err(lines.error("expected ### AC-<req>-<nn>"));
             };
