@@ -254,3 +254,41 @@ fn test_047_03_read_between_base_and_override_rename_never_trusts_mixed_bytes() 
     );
     Ok(())
 }
+
+/// A cargo test process must not fall back to `$HOME/.config/hoh` (M3E-02). Paths come from the
+/// caller; this test does not read or write the process environment.
+#[test]
+fn global_root_for_skips_home_when_cargo_manifest_is_set() {
+    let dir = tempfile::Builder::new()
+        .prefix("m3e02-global-")
+        .tempdir()
+        .unwrap();
+    let xdg = dir.path().join("xdg");
+    let home = dir.path().join("home");
+    let cargo = std::ffi::OsStr::new("crate");
+    assert!(
+        global_root_for(Some(cargo), None, Some(home.as_os_str())).is_none(),
+        "cargo without XDG must not use HOME"
+    );
+    assert!(
+        global_root_for(
+            Some(cargo),
+            Some(std::ffi::OsStr::new("")),
+            Some(home.as_os_str())
+        )
+        .is_none(),
+        "an empty XDG is unset"
+    );
+    assert_eq!(
+        global_root_for(Some(cargo), Some(xdg.as_os_str()), Some(home.as_os_str())).as_deref(),
+        Some(xdg.join("hoh").as_path())
+    );
+    assert_eq!(
+        global_root_for(None, None, Some(home.as_os_str())).as_deref(),
+        Some(home.join(".config").join("hoh").as_path())
+    );
+    assert_eq!(
+        global_root_for(None, Some(xdg.as_os_str()), Some(home.as_os_str())).as_deref(),
+        Some(xdg.join("hoh").as_path())
+    );
+}

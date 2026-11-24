@@ -486,7 +486,7 @@ impl ProductExecutor {
     fn load_skills(&self, work: &Work) -> Result<hoh_core::skills::Loaded, Refusal> {
         hoh_core::skills::load_with_diagnostics(
             &self.project,
-            hoh_core::prompt_files::global_root().as_deref(),
+            hoh_core::prompt_files::product_global_root().as_deref(),
             &work.run_id,
             &self.bundle(work)?,
         )
@@ -967,7 +967,7 @@ impl ProductExecutor {
         let bundle = self.bundle(work)?;
         let contract = hoh_core::prompt_files::load_with_bundle(
             &self.project,
-            hoh_core::prompt_files::global_root().as_deref(),
+            hoh_core::prompt_files::product_global_root().as_deref(),
             &work.run_id,
             &work.role,
             a.prompt.as_deref(),
