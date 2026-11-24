@@ -1,0 +1,100 @@
+{
+  "agent": "pi",
+  "cli_version": "1.6.0",
+  "case": "rpc-fault-billing-no-retry",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions",
+    "--provider",
+    "fake",
+    "--model",
+    "fake-model"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-24T07:50:30.169540+00:00",
+  "mode": "fake-provider",
+  "notes": "models.json provider \"fake\" (anthropic-messages) at the fake provider; every request answered 400 invalid_request_error: credit balance too low (billing); get_state then one prompt until agent_settled",
+  "env_overrides": [
+    "PI_CODING_AGENT_DIR=<fresh temp dir> holding only models.json",
+    "PI_OFFLINE=1",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "PATH: pi's own node first"
+  ],
+  "provider": {
+    "scenario": "pi-billing",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 400,
+              "headers": {
+                "request-id": "req_fake_pi_billing"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "invalid_request_error",
+                  "message": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1795506629.6703637,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 400,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_pi_billing"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

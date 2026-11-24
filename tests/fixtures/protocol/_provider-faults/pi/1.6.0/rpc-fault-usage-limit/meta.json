@@ -1,0 +1,251 @@
+{
+  "agent": "pi",
+  "cli_version": "1.6.0",
+  "case": "rpc-fault-usage-limit",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions",
+    "--provider",
+    "fake",
+    "--model",
+    "fake-model"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-24T07:50:29.389521+00:00",
+  "mode": "fake-provider",
+  "notes": "models.json provider \"fake\" (anthropic-messages) at the fake provider; every request answered 429 with the unified headers of a rejected 5-hour limit; get_state then one prompt until agent_settled",
+  "env_overrides": [
+    "PI_CODING_AGENT_DIR=<fresh temp dir> holding only models.json",
+    "PI_OFFLINE=1",
+    "HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>",
+    "PATH: pi's own node first"
+  ],
+  "provider": {
+    "scenario": "pi-usage-limit",
+    "answers": {
+      "routes": [
+        {
+          "method": "POST",
+          "path_prefix": "/v1/messages",
+          "responses": [
+            {
+              "status": 429,
+              "headers": {
+                "request-id": "req_fake_pi_usage_limit",
+                "anthropic-ratelimit-unified-status": "rejected",
+                "anthropic-ratelimit-unified-reset": "{now+7200}",
+                "anthropic-ratelimit-unified-representative-claim": "five_hour",
+                "anthropic-ratelimit-unified-5h-status": "rejected",
+                "anthropic-ratelimit-unified-5h-reset": "{now+7200}",
+                "anthropic-ratelimit-unified-5h-utilization": "1.0",
+                "anthropic-ratelimit-unified-7d-status": "allowed",
+                "anthropic-ratelimit-unified-7d-reset": "{now+400000}",
+                "anthropic-ratelimit-unified-7d-utilization": "0.4",
+                "anthropic-ratelimit-unified-overage-status": "rejected",
+                "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+              },
+              "body": {
+                "type": "error",
+                "error": {
+                  "type": "rate_limit_error",
+                  "message": "This request would exceed your account's rate limit. Please try again later."
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "default": {
+        "status": 404,
+        "body": {
+          "type": "error",
+          "error": {
+            "type": "not_found_error",
+            "message": "fake provider: no route"
+          }
+        }
+      }
+    },
+    "requests": [
+      {
+        "at": 1795506614.8578057,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_pi_usage_limit",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": "1795513814",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-5h-status": "rejected",
+          "anthropic-ratelimit-unified-5h-reset": "1795513814",
+          "anthropic-ratelimit-unified-5h-utilization": "1.0",
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-reset": "1795906614",
+          "anthropic-ratelimit-unified-7d-utilization": "0.4",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1795506616.8697767,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_pi_usage_limit",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": "1795513816",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-5h-status": "rejected",
+          "anthropic-ratelimit-unified-5h-reset": "1795513816",
+          "anthropic-ratelimit-unified-5h-utilization": "1.0",
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-reset": "1795906616",
+          "anthropic-ratelimit-unified-7d-utilization": "0.4",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1795506620.8797941,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_pi_usage_limit",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": "1795513820",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-5h-status": "rejected",
+          "anthropic-ratelimit-unified-5h-reset": "1795513820",
+          "anthropic-ratelimit-unified-5h-utilization": "1.0",
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-reset": "1795906620",
+          "anthropic-ratelimit-unified-7d-utilization": "0.4",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      },
+      {
+        "at": 1795506628.8885727,
+        "method": "POST",
+        "path": "/v1/messages?beta=true",
+        "status": 429,
+        "headers": {
+          "content-type": "application/json",
+          "request-id": "req_fake_pi_usage_limit",
+          "anthropic-ratelimit-unified-status": "rejected",
+          "anthropic-ratelimit-unified-reset": "1795513828",
+          "anthropic-ratelimit-unified-representative-claim": "five_hour",
+          "anthropic-ratelimit-unified-5h-status": "rejected",
+          "anthropic-ratelimit-unified-5h-reset": "1795513828",
+          "anthropic-ratelimit-unified-5h-utilization": "1.0",
+          "anthropic-ratelimit-unified-7d-status": "allowed",
+          "anthropic-ratelimit-unified-7d-reset": "1795906628",
+          "anthropic-ratelimit-unified-7d-utilization": "0.4",
+          "anthropic-ratelimit-unified-overage-status": "rejected",
+          "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+        },
+        "model": "fake-model",
+        "request_headers": [
+          "accept",
+          "accept-encoding",
+          "accept-language",
+          "anthropic-dangerous-direct-browser-access",
+          "anthropic-version",
+          "connection",
+          "content-length",
+          "content-type",
+          "host",
+          "sec-fetch-mode",
+          "user-agent",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version",
+          "x-stainless-timeout"
+        ]
+      }
+    ]
+  },
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

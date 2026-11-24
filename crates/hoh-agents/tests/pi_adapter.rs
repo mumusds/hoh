@@ -33,6 +33,11 @@ const FIXTURES_1_6_0: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/protocol/pi/1.6.0"
 );
+/// The provider-fault recordings of pi (tests/fixtures/protocol/_provider-faults, record_faults.py).
+const FAULTS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/_provider-faults/pi"
+);
 
 fn read(path: impl AsRef<Path>) -> R<String> {
     Ok(std::fs::read_to_string(path)?)
@@ -854,6 +859,86 @@ async fn pi_1_6_0_recorded_traffic_settles_refuses_and_cancels() -> R {
     );
     assert!(received(&fake)?.iter().any(|m| m["type"] == "abort"));
     assert!(group_empty(outcome.pid.ok_or("no pid")?));
+    Ok(())
+}
+
+/// PI16-01: a prompt pi took whose run then failed at the provider, as recorded against a fake provider
+/// (record_faults.py): pi 1.6.0's 429, 503 and rejected 5-hour limit after its three retries, and a billing error it
+/// does not retry; pi 1.5.0's 429 after its retries. With `agent_settled` relied on by the version rule
+/// ([`pi::emits_settled`]) each ends FAILED on pi's own `agent_settled`: no state query, no timer, the final error text
+/// kept with its class (PERMANENT_EXTERNAL; pi's stream carries no structured Retry-After, so none is recorded).
+#[tokio::test]
+async fn pi_recorded_provider_faults_fail_on_agent_settled() -> R {
+    let world = World::new()?;
+    for (version, case, status) in [
+        ("1.6.0", "rpc-fault-429-retry-after", "429"),
+        ("1.6.0", "rpc-fault-503-retry-after", "503"),
+        ("1.6.0", "rpc-fault-usage-limit", "429"),
+        ("1.6.0", "rpc-fault-billing-no-retry", "400"),
+        ("1.5.0", "rpc-fault-429-retry-after", "429"),
+    ] {
+        let name = format!("{version}-{case}");
+        let recorded = Case::load_at(&format!("{FAULTS}/{version}"), case)?;
+        assert_eq!(
+            recorded.frames.last().map(|f| f["type"].clone()),
+            Some(json!("agent_settled")),
+            "{name}: the recording ends on agent_settled"
+        );
+        let error = recorded
+            .frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "message_end" && f["message"]["role"] == "assistant")
+            .and_then(|f| f["message"]["errorMessage"].as_str())
+            .ok_or(format!("{name}: no final error"))?
+            .to_owned();
+        assert!(error.starts_with(&format!("{status} ")), "{name}: {error}");
+        let fake = world.fake(&name, &recorded)?;
+        let attempt = world.attempt_in("pi", &name, &name, version).await?;
+        let mut turn = world.turn(&fake, &format!("logs/{name}"))?;
+        if version == "1.6.0" {
+            turn.launch.help = read(format!("{FIXTURES_1_6_0}/help.txt"))?;
+        }
+        turn.launch.settled_event = pi::emits_settled(Some(version));
+        assert!(
+            turn.launch.settled_event,
+            "{name}: the version rule trusts agent_settled"
+        );
+        let clock = Arc::new(FrozenClock::default());
+        turn.clock = clock.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run(&world, &attempt, &turn))
+            .await
+            .map_err(|_| format!("{name}: the turn did not end"))??;
+        let failed = (AttemptState::Failed, Some("PERMANENT_EXTERNAL"));
+        assert_eq!(
+            (
+                (outcome.state, outcome.failure.as_deref()),
+                outcome.settled_by,
+                outcome.state_queries,
+                outcome.parse_errors,
+                clock.timers.load(Ordering::SeqCst),
+            ),
+            (failed, Some(SettledBy::AgentSettled), 0, 0, 0),
+            "{name}"
+        );
+        let row = world.store.reader()?.attempt(&name)?.ok_or("no attempt")?;
+        assert_eq!(
+            (row.state, row.failure_reason.as_deref()),
+            failed,
+            "{name} in the store"
+        );
+        let kept: Vec<Value> = events(&world, "adapter.turn_failed")?
+            .into_iter()
+            .filter(|p| p["attempt_id"] == name.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            [json!({"attempt_id": name, "reason": "PERMANENT_EXTERNAL", "errorMessage": error})],
+            "{name}: the final error is kept with its class and nothing else"
+        );
+        let sent_kinds: Vec<Value> = received(&fake)?.iter().map(|m| m["type"].clone()).collect();
+        assert_eq!(sent_kinds, [json!("get_state"), json!("prompt")], "{name}");
+    }
     Ok(())
 }
 
