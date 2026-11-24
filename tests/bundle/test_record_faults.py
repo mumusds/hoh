@@ -7,8 +7,8 @@ spec=importlib.util.spec_from_file_location('record_faults',ROOT/'tests/fixtures
 faults=importlib.util.module_from_spec(spec);spec.loader.exec_module(faults)
 FAULTS=ROOT/'tests/fixtures/protocol/_provider-faults'
 
-def load(agent:str,case:str):
-    d=next(FAULTS.glob(f'{agent}/*/{case}'))
+def load(agent:str,case:str,version:str='*'):
+    d=next(FAULTS.glob(f'{agent}/{version}/{case}'))
     return faults.record.frames((d/'stdout.jsonl').read_bytes()),json.loads((d/'meta.json').read_text()),faults.record.sent_messages((d/'stdin.txt').read_bytes())
 
 def check(agent,case,fs,meta,sent=()):
@@ -16,11 +16,13 @@ def check(agent,case,fs,meta,sent=()):
 
 class Recordings(unittest.TestCase):
     def test_every_declared_case_is_committed_and_valid(self):
-        committed={(m.parts[-4],m.parts[-2]) for m in FAULTS.glob('*/*/*/meta.json')}
+        # Every version directory's cases, each judged (an agent may keep an older version with fewer cases).
+        recorded={(m.parts[-4],m.parts[-3],m.parts[-2]) for m in FAULTS.glob('*/*/*/meta.json')}
+        committed={(agent,case) for agent,_,case in recorded}
         self.assertEqual(committed,set(faults.VALIDATORS))
-        for agent,case in sorted(committed):
-            with self.subTest(case=f'{agent}/{case}'):
-                fs,meta,sent=load(agent,case)
+        for agent,version,case in sorted(recorded):
+            with self.subTest(case=f'{agent}/{version}/{case}'):
+                fs,meta,sent=load(agent,case,version)
                 self.assertEqual(meta['mode'],'fake-provider')
                 self.assertTrue(meta['valid'])
                 self.assertEqual(check(agent,case,fs,meta,sent),[])
@@ -66,6 +68,22 @@ class Validators(unittest.TestCase):
         fs,meta,sent=load('pi','rpc-fault-429-retry-after')
         server=[f|{'delayMs':3000} if f.get('type')=='auto_retry_start' else f for f in fs]
         self.assertTrue(any('delayMs' in p for p in check('pi','rpc-fault-429-retry-after',server,meta,sent)))
+    def test_pi_in_turn_errors_need_their_settled_end(self):
+        # PI16-01: each recorded in-turn error (pi 1.6.0) ends with one agent_settled, not aborted, as its last frame.
+        for case in ('rpc-fault-429-retry-after','rpc-fault-503-retry-after','rpc-fault-usage-limit','rpc-fault-billing-no-retry'):
+            with self.subTest(case=case):
+                fs,meta,sent=load('pi',case,'1.6.0')
+                self.assertEqual(check('pi',case,fs,meta,sent),[])
+                unsettled=[f for f in fs if f.get('type')!='agent_settled']
+                self.assertTrue(any('no agent_settled' in p for p in check('pi',case,unsettled,meta,sent)))
+                early=[*unsettled[:-1],fs[-1],unsettled[-1]]
+                self.assertTrue(any('last frame' in p for p in check('pi',case,early,meta,sent)))
+                aborted=[f|{'aborted':True} if f.get('type')=='agent_settled' else f for f in fs]
+                self.assertTrue(any('agent_settled' in p for p in check('pi',case,aborted,meta,sent)))
+    def test_a_pi_billing_error_is_not_retried(self):
+        fs,meta,sent=load('pi','rpc-fault-billing-no-retry','1.6.0')
+        retry={'type':'auto_retry_start','attempt':1,'maxAttempts':3,'delayMs':2000,'errorMessage':'400'}
+        self.assertTrue(any('retried' in p for p in check('pi','rpc-fault-billing-no-retry',[*fs[:-1],retry,fs[-1]],meta,sent)))
     def test_a_request_log_that_does_not_match_fails(self):
         fs,meta,sent=load('codex','app-server-fault-429-retry-after')
         other=copy.deepcopy(meta);other['provider']['requests']=other['provider']['requests'][:1]

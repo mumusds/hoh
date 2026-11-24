@@ -193,7 +193,8 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
 /// Dialog UI methods: they wait for an answer, which headless HoH gives as `cancelled`.
 pub const DIALOGS: &[&str] = &["select", "confirm", "input", "editor"];
 
-/// The pi versions whose recorded traffic has `agent_settled` (`tests/fixtures/protocol/pi/<version>/`).
+/// The pi versions whose recorded traffic has `agent_settled` (`tests/fixtures/protocol/pi/<version>/`), after a run
+/// that failed at the provider too (`tests/fixtures/protocol/_provider-faults/pi/<version>/`).
 const SETTLED_EVENT_VERSIONS: &[&str] = &["1.5.0", "1.6.0"];
 
 /// Whether a turn of the pi whose `--version` says `version` can rely on `agent_settled` ([`Launch::settled_event`]):

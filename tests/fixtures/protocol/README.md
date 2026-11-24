@@ -95,3 +95,7 @@ keeps the directory out of `compat-manifest.json` and of the live recorder's cas
 | codex 0.166.0 | `app-server-fault-usage-limit` | 429 `usage_limit_reached` with `x-codex-*` window headers: `account/rateLimits/updated` (primary `usedPercent: 100`, `resetsAt`), then `usageLimitExceeded` |
 | codex 0.166.0 | `exec-fault-usage-limit` | the same through `exec --json`: `turn.failed` with message text only |
 | pi 1.5.0 | `rpc-fault-429-retry-after` | 429 `retry-after: 3`: pi's own `auto_retry_start` delays 2/4/8 s, then a text `errorMessage`; nothing structured |
+| pi 1.6.0 | `rpc-fault-429-retry-after` | the same as 1.5.0: four requests, `auto_retry_start` 2/4/8 s, `auto_retry_end` `success: false`, then `agent_settled` `aborted: false` as the last record (PI16-01) |
+| pi 1.6.0 | `rpc-fault-503-retry-after` | 503 `overloaded_error`, `retry-after: 3`: the same retries and end, a text `errorMessage` `503 …`; nothing structured |
+| pi 1.6.0 | `rpc-fault-usage-limit` | 429 with a rejected 5-hour `anthropic-ratelimit-unified-*` (the claude case's answer): pi retries it as a rate limit (2/4/8 s) and ends the same way; no reset on the stream |
+| pi 1.6.0 | `rpc-fault-billing-no-retry` | 400 `invalid_request_error` "credit balance is too low … Billing": one request, no `auto_retry_*` (pi's retry rule excludes billing), `agent_end`, then `agent_settled` |

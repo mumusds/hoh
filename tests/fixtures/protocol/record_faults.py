@@ -158,7 +158,15 @@ SCENARIOS = {
         {'type': 'usage_limit_reached', 'message': 'The usage limit has been reached', 'plan_type': 'pro',
          'resets_at': '{now+7200}', 'resets_in_seconds': 7200}),
     'pi-429': anthropic(429, {'retry-after': '3', 'request-id': 'req_fake_pi_429'}, 'rate_limit_error', TPM),
+    'pi-503': anthropic(503, {'retry-after': '3', 'request-id': 'req_fake_pi_503'}, 'overloaded_error', 'Overloaded'),
 }
+# Pi with an Anthropic subscriber's rejected 5-hour limit: the claude case's answer, its own request id.
+SCENARIOS['pi-usage-limit'] = json.loads(json.dumps(SCENARIOS['claude-usage-limit']).replace('req_fake_usage_limit', 'req_fake_pi_usage_limit'))
+# An exhausted credit balance: a provider limit pi's own retry rule does not retry ("billing"), so the run that took the
+# prompt ends in error with no auto_retry at all.
+SCENARIOS['pi-billing'] = anthropic(400, {'request-id': 'req_fake_pi_billing'}, 'invalid_request_error',
+                                    'Your credit balance is too low to access the Anthropic API. '
+                                    'Please go to Plans & Billing to upgrade or purchase credits.')
 
 # --- validators: each case's own check of the outcome it claims ----------------------------------------------------
 
@@ -327,18 +335,56 @@ def v_codex_exec_usage_limit(fs, rc, meta, sent, ctx):
     return out
 
 
-def v_pi_429(fs, rc, meta, sent, ctx):
-    out: list[str] = []
+def pi_failed_run(fs: list[dict], meta: dict, out: list[str], status: int, retried: bool) -> None:
+    """A prompt pi took (`started`) whose run ended in a provider error: with `retried`, pi's own 2/4/8 s backoff (not
+    the Retry-After) and a failed auto_retry_end, else no retry at all; the final assistant message in error with no
+    structured reset or retry field; and one agent_settled, not aborted, as the last frame (REQ-026: the turn's end)."""
+    responses = [f for f in typed(fs, 'response') if f.get('id') == 'p1']
+    expect(out, len(responses) == 1 and responses[0].get('success') is True
+           and (responses[0].get('data') or {}).get('disposition') == 'started', f'prompt response {responses}')
     starts = typed(fs, 'auto_retry_start')
-    expect(out, [f.get('delayMs') for f in starts] == [2000, 4000, 8000],
-           f'auto_retry_start delayMs {[f.get("delayMs") for f in starts]}: not pi\'s own 2/4/8 s backoff')
     ends = typed(fs, 'auto_retry_end')
-    expect(out, len(ends) == 1 and ends[0].get('success') is False, f'auto_retry_end {ends}')
+    if retried:
+        expect(out, [f.get('delayMs') for f in starts] == [2000, 4000, 8000],
+               f'auto_retry_start delayMs {[f.get("delayMs") for f in starts]}: not pi\'s own 2/4/8 s backoff')
+        expect(out, len(ends) == 1 and ends[0].get('success') is False, f'auto_retry_end {ends}')
+    else:
+        expect(out, not starts and not ends, f'pi retried: {len(starts)} auto_retry_start, {len(ends)} auto_retry_end')
     final = [m for m in record.pi_assistant(fs) if m.get('stopReason') == 'error']
     expect(out, bool(final), 'no assistant message ended in error')
+    expect(out, all(str(m.get('errorMessage', '')).startswith(f'{status} ') for m in final),
+           f'error messages {[m.get("errorMessage") for m in final]} do not start with {status}')
     expect(out, not (keys(final) & RESET_KEYS), f'the error message has structured fields: {sorted(keys(final) & RESET_KEYS)}')
-    expect(out, bool(typed(fs, 'agent_settled')), 'no agent_settled')
-    expect(out, statuses(meta) == [429] * 4, f'the fake provider answered {statuses(meta)}, not four 429s')
+    settled = typed(fs, 'agent_settled')
+    expect(out, bool(settled), 'no agent_settled')
+    expect(out, len(settled) == 1 and settled[0].get('aborted') is False, f'agent_settled {settled}')
+    expect(out, bool(fs) and fs[-1].get('type') == 'agent_settled', f'the last frame is {fs[-1].get("type") if fs else None}')
+    expect(out, statuses(meta) == [status] * (4 if retried else 1),
+           f'the fake provider answered {statuses(meta)}, not {4 if retried else 1} {status}s')
+
+
+def v_pi_429(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    pi_failed_run(fs, meta, out, 429, retried=True)
+    return out
+
+
+def v_pi_503(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    pi_failed_run(fs, meta, out, 503, retried=True)
+    return out
+
+
+def v_pi_usage_limit(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    pi_failed_run(fs, meta, out, 429, retried=True)
+    expect(out, sent_header(meta, 'anthropic-ratelimit-unified-reset') is not None, 'the fake provider sent no unified reset')
+    return out
+
+
+def v_pi_billing(fs, rc, meta, sent, ctx):
+    out: list[str] = []
+    pi_failed_run(fs, meta, out, 400, retried=False)
     return out
 
 
@@ -352,6 +398,9 @@ VALIDATORS = {
     ('codex', 'app-server-fault-usage-limit'): v_codex_app_usage_limit,
     ('codex', 'exec-fault-usage-limit'): v_codex_exec_usage_limit,
     ('pi', 'rpc-fault-429-retry-after'): v_pi_429,
+    ('pi', 'rpc-fault-503-retry-after'): v_pi_503,
+    ('pi', 'rpc-fault-usage-limit'): v_pi_usage_limit,
+    ('pi', 'rpc-fault-billing-no-retry'): v_pi_billing,
 }
 record.VALIDATORS.update(VALIDATORS)  # record.Recording.save judges each case by its validator (this module's copy)
 
@@ -521,11 +570,18 @@ def pi(rec) -> None:
         shown = ['pi', '--mode', 'rpc', '--session-dir', '<temp>/pi-sessions', '--provider', 'fake', '--model', 'fake-model']
         return shown, p.sent, p.out, p.err, p.returncode, how
 
+    shown = ['PI_CODING_AGENT_DIR=<fresh temp dir> holding only models.json', 'PI_OFFLINE=1',
+             'HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>', "PATH: pi's own node first"]
+    common = 'models.json provider "fake" (anthropic-messages) at the fake provider; '
+    until = '; get_state then one prompt until agent_settled'
     case(rec, 'rpc-fault-429-retry-after', 'pi-429', run,
-         'models.json provider "fake" (anthropic-messages) at the fake provider; every request answered 429 with '
-         'Retry-After: 3; get_state then one prompt until agent_settled',
-         ['PI_CODING_AGENT_DIR=<fresh temp dir> holding only models.json', 'PI_OFFLINE=1',
-          'HOME, XDG_*_HOME and TMPDIR=<fresh empty temp dirs>', "PATH: pi's own node first"])
+         common + 'every request answered 429 with Retry-After: 3' + until, shown)
+    case(rec, 'rpc-fault-503-retry-after', 'pi-503', run,
+         common + 'every request answered 503 overloaded_error with Retry-After: 3' + until, shown)
+    case(rec, 'rpc-fault-usage-limit', 'pi-usage-limit', run,
+         common + 'every request answered 429 with the unified headers of a rejected 5-hour limit' + until, shown)
+    case(rec, 'rpc-fault-billing-no-retry', 'pi-billing', run,
+         common + 'every request answered 400 invalid_request_error: credit balance too low (billing)' + until, shown)
 
 
 AGENTS = {'claude': claude, 'codex': codex, 'pi': pi}
