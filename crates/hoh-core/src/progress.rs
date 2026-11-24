@@ -25,6 +25,9 @@ pub struct Round {
     pub fingerprints: BTreeSet<String>,
     pub spec_added_requirement_ids: BTreeSet<String>,
     pub release_stable: bool,
+    /// In memory only. The persisted round is a fact vector; a commit count is not one of its components
+    /// (REQ-040). Old events that still carry the field deserialize; new events omit it and read as 0 (M3K-06).
+    #[serde(default, skip_serializing)]
     pub commit_count: u64,
 }
 
@@ -155,6 +158,26 @@ mod tests {
             json!({"accepted":0,"closed_issues":0,"reopened_issues":0,"new_critical_high":0,"decision_risks":0})
         );
         assert!(answers[0]["vector"].get("commit_count").is_none());
+    }
+
+    #[test]
+    fn test_040_02_persisted_round_omits_commit_count() {
+        // M3K-06: progress.observed.round is serialized from Round. commit_count is not a fact.
+        let mut fact = round(1);
+        fact.commit_count = 7;
+        let value = serde_json::to_value(&fact).expect("round");
+        assert!(
+            value.get("commit_count").is_none(),
+            "serialized round must omit commit_count: {value}"
+        );
+        let mut old = serde_json::to_value(round(3)).expect("round");
+        old["commit_count"] = json!(4);
+        let restored: Round =
+            serde_json::from_value(old).expect("old events still carry the field");
+        assert_eq!((restored.seq, restored.commit_count), (3, 4));
+        let fresh = serde_json::to_value(round(2)).expect("round");
+        let omitted: Round = serde_json::from_value(fresh).expect("new events omit the field");
+        assert_eq!(omitted.commit_count, 0);
     }
 
     #[test]
