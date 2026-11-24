@@ -813,3 +813,64 @@ async fn test_033_04_stale_candidate_source_returns_ready_on_new_revision() -> R
     host.shutdown().await;
     Ok(())
 }
+
+/// M3B-52: a plan import consumes replacement openings of its own run only.
+#[tokio::test]
+async fn test_033_04_plan_import_pairs_replacements_per_run() -> R {
+    let world = World::new()?;
+    let (host, run, _) = approved(&world).await?;
+    let other = world::start_run(&host, "other-import", "other work").await?;
+    blocked(&world, &run, "main-c", "C", 1, "spec_mismatch", true)?;
+    blocked(&world, &other, "other-c", "C", 1, "spec_mismatch", true)?;
+    let next = remove_c(&world)?;
+    submit_spec(&host, &run, "pair-propose", "ProposeSpecChange", &next).await?;
+    submit_spec(&host, &run, "pair-approve", "ApproveSpec", &next).await?;
+    for id in [&run, &other] {
+        assert_eq!(
+            world.query(&format!(
+                "SELECT count(*) FROM events WHERE run_id='{id}' AND kind='spec.task_replacements_opened'"
+            ))?,
+            "1",
+            "{id}"
+        );
+    }
+    host.store().import_plan(&run, plan(&["main-new"])).await?;
+    assert_eq!(
+        world.rows(&format!(
+            "SELECT json_extract(payload_json,'$.from') AS \"from\", json_extract(payload_json,'$.to') AS \"to\" \
+             FROM events WHERE run_id='{run}' AND kind='task.replaced' ORDER BY seq"
+        ))?,
+        vec![json!({"from": "main-c", "to": "main-new"})]
+    );
+    assert_eq!(
+        world.query(&format!(
+            "SELECT count(*) FROM events WHERE run_id='{other}' AND kind='spec.task_replacements_consumed'"
+        ))?,
+        "0",
+        "importing one run must leave the other run's opening unconsumed"
+    );
+    assert_eq!(
+        world.query(&format!(
+            "SELECT count(*) FROM events WHERE run_id='{other}' AND kind='task.replaced'"
+        ))?,
+        "0"
+    );
+    host.store()
+        .import_plan(&other, plan(&["other-new"]))
+        .await?;
+    assert_eq!(
+        world.rows(&format!(
+            "SELECT json_extract(payload_json,'$.from') AS \"from\", json_extract(payload_json,'$.to') AS \"to\" \
+             FROM events WHERE run_id='{other}' AND kind='task.replaced' ORDER BY seq"
+        ))?,
+        vec![json!({"from": "other-c", "to": "other-new"})]
+    );
+    assert_eq!(
+        world.query(&format!(
+            "SELECT count(*) FROM events WHERE run_id='{other}' AND kind='spec.task_replacements_consumed'"
+        ))?,
+        "1"
+    );
+    host.shutdown().await;
+    Ok(())
+}
