@@ -359,6 +359,9 @@ class CodeMode(unittest.TestCase):
                     'text(ALL_TOOLS.filter(t => /w/x.test(t.name)));','text(ALL_TOOLS.filter(t => /a\\\nb/.test(t.name)));',
                     '/w/.test("x");','text(await tools.exec_command({cmd:"\\ud800"}));'):
             self.assertIsNone(J.code_mode_script(src),src)
+        # M3C-02: the regex at the script's start is refused by the lexer's operand-position rule itself, not only by the
+        # statement grammar after it.
+        with self.assertRaisesRegex(J._NotScript,'no regex literal'):J._tokens('/w/.test("x");')
         self.assertEqual(J.code_mode_script('text(ALL_TOOLS.filter(t => /w/gi.test(t.name)));'),[('discovery',)])
         self.assertEqual(J.code_mode_script('text(await tools.exec_command({cmd:"\\ud83d\\ude00"}));'),[('exec','\U0001F600')])
         none=Path('/nonexistent')
