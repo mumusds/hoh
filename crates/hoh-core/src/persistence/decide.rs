@@ -200,10 +200,18 @@ pub(super) fn decide_in(
         });
     }
     let (project_id, run) = load_run(tx, &proposal.run_id)?;
-    // A create_tasks's plan is checked before its decisions row: an invalid plan is no decision, refused with its
-    // plan error (docs/adr/ADR-031.md decision 2); a valid one is imported if the decision is applied.
+    // Mode refusals are durable decisions (REQ-008/009). Other invalid plans still fail before a decisions row
+    // (ADR-031 decision 2); a valid plan is imported only when its decision is applied.
+    let plan_refusal = if matches!(
+        proposal.payload,
+        protocol::DecisionPayload::CreateTasks { .. }
+    ) {
+        super::plan::mode_refusal(tx, &proposal.run_id, &payload["plan"])?
+    } else {
+        None
+    };
     let mut plan = match &proposal.payload {
-        protocol::DecisionPayload::CreateTasks { .. } => {
+        protocol::DecisionPayload::CreateTasks { .. } if plan_refusal.is_none() => {
             Some(super::plan::check(tx, &proposal.run_id, &payload["plan"])?)
         }
         _ => None,
@@ -272,19 +280,9 @@ pub(super) fn decide_in(
     if let Err(ref mut rejection) = verdict {
         explain_stale_completion(tx, proposal, rejection)?;
     }
-    let verdict = match verdict {
-        Ok(Effect::Dispatch { .. })
-            if snapshot.task.as_ref().is_some_and(|task| task.writer)
-                && super::modes::pending(tx, &proposal.run_id)?.is_some() =>
-        {
-            Err(Rejection {
-                reason: RejectionReason::IllegalTransition,
-                detail: "mode_change_pending: writer dispatch waits for the mode safe point"
-                    .to_owned(),
-                details: None,
-            })
-        }
-        other => other,
+    let verdict = match (verdict, plan_refusal) {
+        (Ok(_), Some(refusal)) => Err(refusal),
+        (verdict, _) => verdict,
     };
     let decided = match verdict {
         Ok(Effect::Unsupported(kind)) => return Ok(Decided::Unsupported { kind }),
@@ -990,7 +988,7 @@ fn load_task(
 }
 
 pub(super) fn load_binding(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     run_id: &str,
     role: &str,
     resource_version: &str,

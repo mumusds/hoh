@@ -69,6 +69,12 @@ pub enum RunTarget {
     /// terminal one, the run's revision moved (its move or a touch), its `run.result` at the end of the commit when it
     /// stays stopped. Working ASK and business rejection leave the revision unchanged (ADR-036).
     Input(Input),
+    /// Host-observed approval authority and current Markdown, never client assertions.
+    ObservedInput {
+        input: Input,
+        origin: crate::origin::Origin,
+        files: Box<Result<super::SpecFiles, crate::specindex::IndexError>>,
+    },
     /// Approve the host's Markdown snapshot in the command transaction (ADR-033).
     Specification(Box<super::SpecRequest>),
 }
@@ -167,6 +173,15 @@ pub(super) fn submit_in(
 ) -> Result<CommandOutcome, PersistError> {
     if let RunTarget::Specification(input) = &command.target {
         super::spec::guard(input)?;
+    }
+    match &command.target {
+        RunTarget::Input(input) => {
+            super::draft_approval::guard(tx, command, input, crate::origin::Origin::Unknown)?
+        }
+        RunTarget::ObservedInput { input, origin, .. } => {
+            super::draft_approval::guard(tx, command, input, *origin)?
+        }
+        _ => {}
     }
     let stored: Option<(String, Option<String>)> = tx
         .query_row(
@@ -310,6 +325,14 @@ pub(super) fn submit_in(
             super::modes::set(tx, command, *mode, ctx)?
         }
         RunTarget::Input(input) => input_command(tx, command, input, ctx)?,
+        RunTarget::ObservedInput {
+            input,
+            origin,
+            files,
+        } => match super::draft_approval::apply_answer(tx, command, input, *origin, files, ctx)? {
+            Some(done) => done,
+            None => input_command(tx, command, input, ctx)?,
+        },
         RunTarget::Specification(input) => {
             super::hold::command(tx, &command.run_id)?;
             super::spec::apply(tx, command, input, ctx)?
@@ -368,6 +391,7 @@ pub(super) fn submit_in(
                 RunTarget::Start { .. }
                 | RunTarget::Team(_)
                 | RunTarget::Input(_)
+                | RunTarget::ObservedInput { .. }
                 | RunTarget::Specification(_)
                 | RunTarget::SetMode(_) => {
                     unreachable!("handled above")

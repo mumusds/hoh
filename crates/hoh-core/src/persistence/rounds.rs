@@ -89,18 +89,9 @@ pub(super) fn round(
     let refused = super::verification::refused(&tx, run_id)?;
     // Nor a verifier of a candidate whose pending records failed to recover (decision 16).
     let recovering = super::closing::held_by_recovery(&tx, run_id)?;
-    let mode_pending = super::modes::pending(&tx, run_id)?.is_some();
-    let held_by_mode: Vec<String> = rows
-        .iter()
-        .filter(|r| mode_pending && r.candidate.writer)
-        .map(|r| r.candidate.task_id.clone())
-        .collect();
     rows.retain(|r| {
         let task = &r.candidate.task_id;
-        !(mode_pending && r.candidate.writer)
-            && !held.contains(task)
-            && !refused.contains(task)
-            && !recovering.contains(task)
+        !held.contains(task) && !refused.contains(task) && !recovering.contains(task)
     });
     // The review tasks: never on a BLOCKED run (no new one is dispatched there, REQ-031 behaviour 3).
     let reviews = super::spec_review::review_tasks(&tx, run_id)?;
@@ -119,11 +110,24 @@ pub(super) fn round(
     // a revision approved after the tick's readiness step moved its tasks to it while they were READY, and they wait
     // for that step (REQ-031 behaviours 3 and 5, M3J-01, M3J-100: no planned work before the revision's review PASS).
     let ids: Vec<&str> = rows.iter().map(|r| r.candidate.task_id.as_str()).collect();
-    let mut admitted = super::admission::admit(&tx, run_id, &ids, super::admission::By::Round)?;
+    let mut admitted =
+        super::admission::admit(&tx, run_id, &ids, super::admission::By::Round, None)?;
     // A write task the admission holds for files the user had not committed at the run's baseline is BLOCKED
     // (NEED_DECISION) here with those files, asked once (REQ-028 behaviour 4, O3; docs/adr/ADR-039.md decision 7). Its
     // answer decides; nothing of the files is written, stashed or reset.
     let held_dirty = hold_dirty(&tx, &project_id, run_id, &rows, &admitted, ctx)?;
+    let held_by_mode: Vec<String> = admitted
+        .iter()
+        .filter(|(_, verdict)| {
+            matches!(
+                verdict,
+                Err(super::admission::Refusal::Mode(
+                    crate::mode::WriteRefusal::PendingMode
+                ))
+            )
+        })
+        .map(|(task, _)| task.clone())
+        .collect();
     rows.retain(|r| matches!(admitted.get(&r.candidate.task_id), Some(Ok(_))));
     let slots = Slots {
         writer: leases::free_slot(&tx, &project_id, true, context.reader_slots(), now)?.is_some(),

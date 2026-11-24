@@ -285,7 +285,7 @@ fn step_names(steps: &[StopStep]) -> Vec<String> {
 pub(super) async fn apply(
     store: &Store,
     project: &std::path::Path,
-    row: UnfinishedRow,
+    mut row: UnfinishedRow,
     (disposition, process): (Disposition, reconcile::Process),
     cause: &'static str,
     at: std::time::SystemTime,
@@ -314,6 +314,9 @@ pub(super) async fn apply(
     // Working attempts' messages left in their bridge use the same request path before their source is settled.
     if ends && (row.verifier || (row.role != "commander" && !row.cancel_requested)) {
         answer_left_messages(store, project, &row).await?;
+    }
+    if ends {
+        row.draft_boundary = super::drafting::boundary(store, project, &row.attempt_id).await;
     }
     let found = row.clone();
     let seq = super::control::recorded_end(project, move |workspace| {
@@ -400,6 +403,8 @@ pub(super) async fn run(
         let (process, effects) = {
             let row = row.clone();
             let settings = settings.clone();
+            let project = project.to_path_buf();
+            let draft = store.reader()?.draft_start(&row.attempt_id)?.is_some();
             let tracking = trackings
                 .get(&row.attempt_id)
                 .cloned()
@@ -412,8 +417,15 @@ pub(super) async fn run(
                     .map(|e| Effect {
                         key: e.key.clone(),
                         state: e.state,
-                        observation: (e.state == EffectState::Started)
-                            .then(|| settings.observer.observe(&row.attempt_id, &e.key)),
+                        observation: (e.state == EffectState::Started).then(|| {
+                            if draft
+                                && let Some(found) =
+                                    super::drafting::observe_init(&project, &row.attempt_id, &e.key)
+                            {
+                                return found;
+                            }
+                            settings.observer.observe(&row.attempt_id, &e.key)
+                        }),
                     })
                     .collect();
                 Ok((process, effects))
@@ -421,17 +433,21 @@ pub(super) async fn run(
             .await
             .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??
         };
-        let disposition = reconcile::dispose(&Unfinished {
-            attempt_id: row.attempt_id.clone(),
-            state: row.state,
-            task_state: row.task_state,
-            process: process.clone(),
-            effects,
-            lease_expired: row.lease_expired,
-            work_outcome: row.work_outcome,
-            writer: row.writer,
-            verifier: row.verifier,
-        });
+        let disposition = super::drafting::disposition(
+            store,
+            &Unfinished {
+                attempt_id: row.attempt_id.clone(),
+                state: row.state,
+                task_state: row.task_state,
+                process: process.clone(),
+                effects,
+                lease_expired: row.lease_expired,
+                work_outcome: row.work_outcome,
+                writer: row.writer,
+                verifier: row.verifier,
+            },
+        )
+        .await?;
         *counts
             .entry(match disposition {
                 Disposition::Redeliver => "redeliver",
@@ -612,6 +628,7 @@ mod tests {
         // M2T06R-900: whatever this host finds of it (here nothing: a record whose pid names no process), an attempt
         // recorded by a host that saw other namespaces stays uncertain.
         let row = UnfinishedRow {
+            draft_boundary: None,
             project_id: "p".to_owned(),
             run_id: "R".to_owned(),
             attempt_id: "A1".to_owned(),

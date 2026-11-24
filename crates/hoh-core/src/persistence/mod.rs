@@ -21,6 +21,8 @@ mod candidates;
 mod closing;
 pub use baseline::BaselineProcess;
 mod consult;
+mod draft_approval;
+mod drafting;
 mod progress;
 pub use closing::{Reconciled, RecoveryOutcome};
 pub use context::ReworkContext;
@@ -1519,6 +1521,28 @@ impl Store {
     /// Run `run_id`'s readiness step (REQ-031 behaviour 5 and 7; docs/adr/ADR-035.md decisions 4 and 8): its planned
     /// tasks that are not ready BLOCKED(READINESS_NOT_MET), those ready again released, a SPECIFYING run whose
     /// readiness passes moved to READY; whether anything changed.
+    pub async fn draft_step(&self, run_id: &str, discovered: bool) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftStep(run_id.into(), discovered))
+            .await
+    }
+
+    pub async fn dispatch_draft(
+        &self,
+        run_id: &str,
+        context: crate::decision::Context,
+    ) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftDispatch(
+            run_id.into(),
+            Box::new(context),
+        ))
+        .await
+    }
+
+    pub async fn prepare_draft_init(&self, attempt_id: &str) -> Result<bool, PersistError> {
+        self.runner_step(runner::RunnerJob::DraftInit(attempt_id.into()))
+            .await
+    }
+
     pub async fn settle_readiness(&self, run_id: &str) -> Result<bool, PersistError> {
         self.runner_step(runner::RunnerJob::Readiness(run_id.to_owned()))
             .await
@@ -2698,6 +2722,16 @@ impl Reader {
         now: std::time::SystemTime,
     ) -> Result<Vec<LeaseView>, PersistError> {
         leases::held(&self.conn, project_id, now)
+    }
+
+    /// A draft attempt's durable start observation (also used by reconcile).
+    pub fn draft_start(&self, attempt: &str) -> Result<Option<serde_json::Value>, PersistError> {
+        draft_approval::start(&self.conn, attempt)
+    }
+
+    /// Whether the host must take the read-only discovery observation.
+    pub fn draft_discovery_due(&self, run: &str) -> Result<bool, PersistError> {
+        drafting::discovery_due(&self.conn, run)
     }
 
     /// The run `run_id` with the highest event seq, read together.

@@ -4,7 +4,7 @@
 Audit only: a native turn completing never means the product passed acceptance.
 """
 from __future__ import annotations
-import argparse, fcntl, json, os, re, shutil, subprocess, sys, uuid
+import argparse, fcntl, json, math, os, re, shutil, subprocess, sys, uuid
 from pathlib import Path
 from common import ROOT, Terminated, atomic_json, execute, flag_supported, install_termination_handlers, load_json, restore_handlers, running_as_root, sha256, utcnow
 from install_pi_plugins import verify_installed
@@ -51,7 +51,16 @@ def help_text(agent:str,cwd:Path)->str:
     if r.returncode:raise RuntimeError(f'{agent} help failed ({r.returncode})')
     return r.stdout.decode('utf-8',errors='replace')
 
-def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=None)->list[str]:
+# Headless Grok waits for the background work a turn started (shells, monitors, subagents) only up to 600 s after the
+# latest turn ends, then stops it and exits 1 (grok 1.0.89/1.0.92; attempt df2c4c5c lost a session's work so, BT-02).
+# The bridge raises that wait to its own --timeout, so the bridge's deadline is the one that applies. The flag is
+# hidden from grok --help, so it is probed: a Grok without it is refused rather than silently losing background work.
+GROK_BACKGROUND_WAIT='--background-wait-timeout'
+def grok_background_wait_supported(cwd:Path)->bool:
+    r=subprocess.run(['grok',GROK_BACKGROUND_WAIT,'1','--version'],cwd=cwd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20,check=False,env=child_env())
+    return r.returncode==0
+
+def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=None,timeout:float|None=None)->list[str]:
     if help_output is not None:
         missing=[x for x in REQUIRED[agent] if not flag_supported(help_output,x)]
         if missing:raise ValueError('unsupported native CLI flags: '+','.join(missing))
@@ -59,7 +68,9 @@ def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=N
     elif agent=='claude':cmd=['claude','-p','--dangerously-skip-permissions','--output-format','stream-json','--verbose']
     # Grok's headless single turn reads its prompt from a file; the bridge sends it on stdin like the others.
     # streaming-messages-json is Claude-style: system/init with session_id, messages, a final result.
-    elif agent=='grok':cmd=['grok','--prompt-file','/dev/stdin','--output-format','streaming-messages-json','--always-approve']
+    elif agent=='grok':
+        cmd=['grok','--prompt-file','/dev/stdin','--output-format','streaming-messages-json','--always-approve']
+        if timeout is not None:cmd+=[GROK_BACKGROUND_WAIT,str(math.ceil(timeout))]
     else:
         cmd=['pi','--mode','json','--session-dir',str(session_dir)]
         if help_output and flag_supported(help_output,'--approve'):cmd+=['--approve']
@@ -128,17 +139,23 @@ def inspect_output(agent:str,path:Path)->dict:
     return {'records':records,'malformed_records':malformed,'terminal_observed':terminal,'native_error_observed':failed,'transient_errors':transient,
             'session_ids':sorted(session_ids),'resolved_models':sorted(models),'assistant_text_tail':'\n'.join(assistant_text)[-8192:],'_final_text':final_text}
 
-def build_report(role:str,final_text:str,session_ids:list[str],stdout:Path,attempt:Path)->dict:
-    """Independent report from the agent's final `hoh-report` block. Identity and hashes are filled here,
-    after the native process exited, so the agent can neither know nor forge them."""
+def report_block(role:str,final_text:str)->dict:
+    """The agent's own last `hoh-report` block: role, status, scope, findings as the agent gave them (a claim)."""
     blocks=REPORT_FENCE.findall(final_text)
     if not blocks:raise ValueError('final assistant message has no ```hoh-report block')
     try:body=json.loads(blocks[-1])
     except ValueError as exc:raise ValueError(f'hoh-report block is not JSON: {exc}') from None
+    except RecursionError:raise ValueError('hoh-report block is too deeply nested') from None  # L10-01
     if not isinstance(body,dict):raise ValueError('hoh-report block must be a JSON object')
     extra=set(body)-{'role','status','scope','findings'}
     if extra:raise ValueError('hoh-report block may only contain role, status, scope, findings; got '+', '.join(sorted(extra)))
     if body.get('role',role)!=role:raise ValueError(f'hoh-report role {body.get("role")!r} differs from --role {role}')
+    return body
+
+def build_report(role:str,final_text:str,session_ids:list[str],stdout:Path,attempt:Path)->dict:
+    """Independent report from the agent's final `hoh-report` block. Identity and hashes are filled here,
+    after the native process exited, so the agent can neither know nor forge them."""
+    body=report_block(role,final_text)
     if len(session_ids)!=1:raise ValueError(f'expected exactly one native session id, observed {len(session_ids)}')
     candidate=os.getenv('HOH_CANDIDATE_ID');spec=os.getenv('HOH_SPEC_SHA256')
     if not candidate or not spec:raise ValueError('--report-out needs HOH_CANDIDATE_ID and HOH_SPEC_SHA256 (run it under tools/run_check.py)')
@@ -209,12 +226,15 @@ def main(argv=None)->int:
     out=(a.output_dir or base/attempt_id).resolve()
     model=a.model or os.getenv('HOH_MODEL_'+a.agent.upper()) or None
     if a.dry_run:
-        print(json.dumps({'dry_run':True,'capabilities_validated':False,'cwd':str(a.cwd.resolve()),'argv':command_for(a.agent,out/'sessions',model),'prompt_bytes':len(data)},ensure_ascii=False,indent=2));return 0
+        print(json.dumps({'dry_run':True,'capabilities_validated':False,'cwd':str(a.cwd.resolve()),'argv':command_for(a.agent,out/'sessions',model,timeout=a.timeout),'prompt_bytes':len(data)},ensure_ascii=False,indent=2));return 0
     if out.exists():print(f'Attempt directory already exists: {out}; attempts are append-only.',file=sys.stderr);return 64
     if not shutil.which(a.agent):print(f'Missing native CLI: {a.agent}',file=sys.stderr);return 127
     if running_as_root():
         print('Native agents run with bypass/YOLO flags; use the VM non-root development user, not root.',file=sys.stderr);return 78
-    try:help_output=help_text(a.agent,a.cwd);cmd=command_for(a.agent,out/'sessions',model,help_output)
+    try:
+        help_output=help_text(a.agent,a.cwd);cmd=command_for(a.agent,out/'sessions',model,help_output,timeout=a.timeout)
+        if a.agent=='grok' and not grok_background_wait_supported(a.cwd):
+            raise ValueError(f'unsupported native CLI flags: {GROK_BACKGROUND_WAIT} (without it headless Grok stops its background work 600 s after a turn ends)')
     except (RuntimeError,ValueError,subprocess.TimeoutExpired) as exc:print(str(exc),file=sys.stderr);return 78
     env=child_env(attempt_id);pi_packages=None
     env.pop(DELEGATED_ENV,None)
@@ -251,10 +271,22 @@ def main(argv=None)->int:
         report_error=None
         if ok and a.report_out:
             try:atomic_json(a.report_out,build_report(a.role,final_text,observed['session_ids'],out/'stdout.jsonl',out/'attempt.json'))
-            except (ValueError,OSError) as exc:
+            except (ValueError,OSError,RecursionError) as exc:  # RecursionError: L10-01
                 report_error=str(exc);print('independent report not written: '+report_error,file=sys.stderr)
                 record['report_error']=report_error;atomic_json(out/'attempt.json',record)
-        print(json.dumps({'attempt_record':str(out/'attempt.json'),'native_completed':ok,'report':str(a.report_out) if a.report_out and not report_error and ok else None,'product_accepted':False},ensure_ascii=False))
+        # BT-01: without --report-out (which needs run_check's candidate binding) a qa/reviewer session's own block is
+        # kept as the agent gave it, unbound: the lead's structured findings, never an independent report or acceptance.
+        hoh_report=None
+        if ok and a.role in REPORT_ROLES and not a.report_out:
+            try:atomic_json(out/'hoh-report.json',report_block(a.role,final_text));hoh_report=str(out/'hoh-report.json')
+            except RecursionError:  # L10-01: json.dump's encoder recurses deeper than json.loads
+                exc=ValueError('hoh-report block is too deeply nested')
+                print('hoh-report block not captured: '+str(exc),file=sys.stderr)
+                record['hoh_report_error']=str(exc);atomic_json(out/'attempt.json',record)
+            except (ValueError,OSError) as exc:
+                print('hoh-report block not captured: '+str(exc),file=sys.stderr)
+                record['hoh_report_error']=str(exc);atomic_json(out/'attempt.json',record)
+        print(json.dumps({'attempt_record':str(out/'attempt.json'),'native_completed':ok,'report':str(a.report_out) if a.report_out and not report_error and ok else None,'hoh_report':hoh_report,'product_accepted':False},ensure_ascii=False))
         if report_error:return 65
         return 0 if ok else (rc if 1<=rc<=125 else 1)
     except (KeyboardInterrupt,Terminated) as exc:

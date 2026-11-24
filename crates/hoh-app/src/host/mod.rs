@@ -14,6 +14,7 @@ pub(crate) mod begun;
 mod cgroup;
 mod completion;
 mod discovery;
+mod drafting;
 pub mod requests;
 mod verifying;
 #[cfg(test)]
@@ -209,6 +210,11 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// connection here).
     fn after_commit(&self) {}
 
+    /// Read-only drafting discovery finished; T07 supplies the full baseline and leave guard at this seam.
+    fn draft_discovered(&self, _project: &Path, _run: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Input consumed durably, before its outbox ACK (CR-006 recovery barrier).
     fn input_delivered(&self, _message_id: &str) {}
 
@@ -239,6 +245,9 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     /// In a writer attempt's completion on its blocking thread, before its outcome (its freeze) is decided (a test's
     /// implementation holds the step here while the host stops).
     fn completing(&self, _attempt_id: &str) {}
+
+    /// After a writer's completion call returned, including an error (CR-006 test observation boundary).
+    fn writer_completion_returned(&self, _attempt_id: &str) {}
 
     /// The native attempt record the host built for specification review attempt `attempt_id`, before it is kept and
     /// taken in (REQ-031 behaviour 4): what is kept instead (none: no record). A test's implementation replaces it,

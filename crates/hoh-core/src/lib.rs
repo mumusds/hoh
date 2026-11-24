@@ -107,3 +107,6 @@ pub mod templates;
 
 #[forbid(clippy::disallowed_methods)]
 pub mod template_files;
+
+#[forbid(clippy::disallowed_methods)]
+pub mod mode;

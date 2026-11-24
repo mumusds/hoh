@@ -26,6 +26,7 @@ mod installed;
 mod pty;
 mod recovery {
     use super::*;
+    mod drafting;
     mod spec_change;
     mod spec_review;
 }

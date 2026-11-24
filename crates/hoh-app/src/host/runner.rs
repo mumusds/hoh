@@ -25,9 +25,7 @@ use hoh_core::persistence::{
     AttemptFacts, Commit, DispatchNotice, Ending, Intent, NewEvent, PersistError, SessionStart,
     UnfinishedRow,
 };
-use hoh_core::reconcile::{
-    Disposition, Effect, EffectState, Process, Unfinished, dispose, work_key,
-};
+use hoh_core::reconcile::{Disposition, Effect, EffectState, Process, Unfinished, work_key};
 use hoh_core::retry::{FailureClass, SplitMix64};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -997,6 +995,34 @@ async fn tick(
         if held.item(store.mode_step(run).await)?.is_none() {
             continue;
         }
+        if held.item(store.draft_step(run, false).await)?.is_none() {
+            continue;
+        }
+        let reader = no_run(store.reader())?;
+        let wanted = run.clone();
+        let discovering = joined(
+            super::begun::spawn_blocking(move || reader.draft_discovery_due(&wanted)).await,
+            "draft discovery snapshot",
+        )?;
+        if discovering {
+            let root = common.shared.root.clone();
+            let hooks = common.shared.hooks.clone();
+            let wanted = run.clone();
+            let discovered = super::begun::spawn_blocking(move || {
+                super::drafting::discover(&root, &wanted, hooks.as_ref())
+            })
+            .await
+            .map_err(|e| TickError::failed(PersistError::Storage(e.to_string())))?;
+            if let Err(why) = discovered {
+                return Err(TickError::failed(PersistError::Storage(why)));
+            }
+            if held.item(store.draft_step(run, true).await)?.is_none() {
+                continue;
+            }
+        }
+        if held.item(store.dispatch_draft(run, at()).await)?.is_none() {
+            continue;
+        }
         // Its readiness before its rounds (REQ-031 behaviour 5 and 7, docs/adr/ADR-035.md decisions 4 and 8): a
         // planned task that is not ready is BLOCKED before a round could take it; a SPECIFYING run that is ready
         // moves to READY.
@@ -1293,6 +1319,24 @@ async fn attempt(
         return Ok(());
     }
     let key = work.effect_key.clone();
+    if work.assignment.spec_draft
+        && let Err(why) = super::drafting::prepare(store, &common.shared.root, &work).await
+    {
+        let ending = common.failed(why);
+        // Preparation may already have started git-init. Preserve the workspace with
+        // its ending so an unknown effect can stop the writer without losing evidence.
+        let id = id.as_str();
+        finished(common, id, None, ending, |ending| {
+            super::control::recorded_end(&common.shared.root, move |workspace| {
+                let mut ending = ending.clone();
+                ending.observed.workspace = workspace;
+                store.runner_finished(id, ending)
+            })
+        })
+        .await?;
+        return Ok(());
+    }
+
     // A verifier's handoff package kept as an object before its process starts: its RUNNING commit delivers it
     // (docs/adr/ADR-028.md decision 9). Not kept, nothing starts: the attempt fails for another.
     let handoff_package = match work.assignment.handoff.clone() {
@@ -1486,8 +1530,14 @@ async fn attempt(
     // With the watermark of the context its prompt was packed from: failures attached after it were not seen
     // (decision 3's row, M2T16R-01).
     let context_seq = work.assignment.context_seq;
+    let draft = work.assignment.spec_draft;
     let (who, tracking, start) = super::begun::spawn_blocking(move || {
         let start = root.map(|root| {
+            if draft {
+                let mut start = super::drafting::snapshot(&root);
+                start["context_seq"] = json!(context_seq);
+                return start;
+            }
             let head = super::control::git(&root, &["rev-parse", "--verify", "HEAD"])
                 .ok()
                 .map(|out| String::from_utf8_lossy(&out).trim().to_owned());
@@ -1531,6 +1581,12 @@ async fn attempt(
         .await?
     {
         // Disposed of meanwhile: the gate is dropped unopened, so the process ends without running anything.
+        if work.assignment.spec_draft {
+            drop(started.gate);
+            refuse_draft_gate(common, &work, &who, &tracking).await?;
+            // The executor reaps only its own child; the identity-bound proof above controls the write lease.
+            drop(started.ended);
+        }
         remove_run_dir().await;
         return Ok(());
     }
@@ -1749,7 +1805,7 @@ async fn attempt(
     // accepted, corrected or decided by its bridge, and settled, in one commit (docs/adr/ADR-028.md decisions 3, 4).
     if work.assignment.writer && ending.success && !unknown {
         let identity = identity_of(&work)?;
-        finished(common, &id, ran.as_ref(), ending, |e| {
+        let completed = finished(common, &id, ran.as_ref(), ending, |e| {
             super::completion::complete(
                 store,
                 &common.shared.root,
@@ -1758,7 +1814,9 @@ async fn attempt(
                 common.shared.hooks.clone(),
             )
         })
-        .await?;
+        .await;
+        common.shared.hooks.writer_completion_returned(&id);
+        completed?;
         return Ok(());
     }
     // A verifier's success is settled, corrected or verified again by the result in its bridge (decision 11).
@@ -1828,6 +1886,92 @@ async fn attempt(
     Ok(())
 }
 
+/// A refused gate still owns a real process. Prove its whole lifetime ended before releasing its slot.
+async fn refuse_draft_gate(
+    common: &Common,
+    work: &Work,
+    who: &identity::Identity,
+    tracking: &Tracking,
+) -> Result<(), PersistError> {
+    let store = &common.shared.store;
+    let Some(row) = store
+        .reconcile_scan(&work.project_id, common.clock.now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == work.attempt_id)
+    else {
+        return Ok(());
+    };
+    if row.pid != Some(i64::from(who.pid))
+        || row.boot_id.as_deref() != Some(&who.boot_id)
+        || row.process_start_id.as_deref() != Some(&who.start_id)
+    {
+        return Err(PersistError::IntegrityViolation(
+            "refused draft process identity was not persisted".into(),
+        ));
+    }
+    let seen = row.clone();
+    let settings = common.settings.clone();
+    let tracking = tracking.clone();
+    let process = super::begun::spawn_blocking(move || {
+        super::reconcile::end(
+            super::reconcile::inspect(&seen),
+            &seen,
+            &tracking,
+            &settings,
+        )
+    })
+    .await
+    .map_err(|e| PersistError::Storage(e.to_string()))?;
+    let disposition = super::drafting::disposition(
+        store,
+        &Unfinished {
+            attempt_id: row.attempt_id.clone(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects: row
+                .effects
+                .iter()
+                .map(|e| Effect {
+                    key: e.key.clone(),
+                    state: e.state,
+                    observation: None,
+                })
+                .collect(),
+            lease_expired: row.lease_expired,
+            work_outcome: row.work_outcome,
+            writer: row.writer,
+            verifier: row.verifier,
+        },
+    )
+    .await?;
+    store
+        .commit(Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: work.project_id.clone(),
+                run_id: Some(work.run_id.clone()),
+                event_id: hoh_core::ids::child_id(&work.attempt_id, "draft/start-refused"),
+                kind: "spec.draft_start_refused".into(),
+                payload: json!({"attempt_id":work.attempt_id,"proof":format!("{process:?}")}),
+            }],
+            ..Commit::default()
+        })
+        .await?;
+    super::reconcile::apply(
+        store,
+        &common.shared.root,
+        row,
+        (disposition, process),
+        "draft_gate_refused",
+        common.clock.now(),
+        common.jitter.draw(),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Hand attempt `id`'s `ending` to the store by `hand`: every runner path that ends an attempt goes through here
 /// (docs/adr/ADR-030.md decision 2, M2T15D-07). A failure of the Auth class first goes to the registry as what the turn
 /// that `ran` found: latched as its agent's fact only when it ran under the agent's current identity no earlier than
@@ -1853,6 +1997,10 @@ where
             said.kind.to_owned(),
             json!({"attempt_id": id, "agent": ran.agent.as_str(), "detail": said.detail}),
         ));
+    }
+    if !ending.success || ending.unknown_effect {
+        ending.observed.draft_boundary =
+            super::drafting::boundary(&common.shared.store, &common.shared.root, id).await;
     }
     hand(ending).await
 }
@@ -2225,26 +2373,39 @@ async fn settle(
         })
         .await?;
     let observer = common.settings.observer.clone();
+    let draft = store.reader()?.draft_start(id)?.is_some();
     let effects = row
         .effects
         .iter()
         .map(|e| Effect {
             key: e.key.clone(),
             state: e.state,
-            observation: (e.state == EffectState::Started).then(|| observer.observe(id, &e.key)),
+            observation: (e.state == EffectState::Started).then(|| {
+                if draft
+                    && let Some(found) =
+                        super::drafting::observe_init(&common.shared.root, id, &e.key)
+                {
+                    return found;
+                }
+                observer.observe(id, &e.key)
+            }),
         })
         .collect();
-    let disposition = dispose(&Unfinished {
-        attempt_id: id.to_owned(),
-        state: row.state,
-        task_state: row.task_state,
-        process: process.clone(),
-        effects,
-        lease_expired: cause == "lease_expired" || row.lease_expired,
-        work_outcome: row.work_outcome,
-        writer: row.writer,
-        verifier: row.verifier,
-    });
+    let disposition = super::drafting::disposition(
+        store,
+        &Unfinished {
+            attempt_id: id.to_owned(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects,
+            lease_expired: cause == "lease_expired" || row.lease_expired,
+            work_outcome: row.work_outcome,
+            writer: row.writer,
+            verifier: row.verifier,
+        },
+    )
+    .await?;
     super::reconcile::apply(
         store,
         &common.shared.root,

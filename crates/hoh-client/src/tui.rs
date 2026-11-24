@@ -564,6 +564,16 @@ fn perform(app: &mut App, conn: &Conn, link: &mut Option<Link>, request: Request
                 Err(f) => app.say(format!("未提交：{}：{}", f.code, f.message)),
             }
         }
+        Request::Answer {
+            question_id,
+            choice,
+        } => {
+            answer_question(app, link.as_ref(), &question_id, &choice, &choice);
+        }
+        Request::RejectDraft { question_id, note } => {
+            answer_question(app, link.as_ref(), &question_id, "reject", &note);
+        }
+
         Request::SetMode(mode) => set_mode(app, link.as_ref(), &mode),
         Request::CycleMode => {
             if let Some(link) = link.as_ref()
@@ -853,5 +863,27 @@ fn debug_panic() {
     #[cfg(debug_assertions)]
     if std::env::var_os("HOH_DEBUG_TUI_PANIC").is_some() {
         panic!("HOH_DEBUG_TUI_PANIC: a panic asked for by the PTY test");
+    }
+}
+
+fn answer_question(
+    app: &mut App,
+    link: Option<&Link>,
+    question_id: &str,
+    choice: &str,
+    answer: &str,
+) {
+    if let Some(link) = link {
+        let result=link.run().and_then(|run| {
+            let revision=run.as_ref().and_then(|r|r["revision"].as_i64()).unwrap_or_default();
+            crate::client::fresh(|c|link.submit(c),||link.run(),&link.run_id,revision,|revision|json!({"expected_revision":revision,"kind":"AnswerQuestion","run_id":link.run_id,"payload":{"question_id":question_id,"choice_id":choice,"answer":answer}}))
+        });
+        match result {
+            Ok(_) => app.say(format!("已答复 {question_id}：{choice}")),
+            Err(f) => app.say(format!("答复未受理：{}：{}", f.code, f.message)),
+        }
+        if let Ok(Some(run)) = link.run() {
+            app.projection(&run);
+        }
     }
 }

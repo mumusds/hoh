@@ -41,7 +41,15 @@ pub(super) fn set(
     let run = super::commands::snapshot_rows(tx, &command.run_id)?
         .map(|(run, _)| run)
         .ok_or_else(|| PersistError::RunNotFound(command.run_id.clone()))?;
-    if writer::parse::<RunState>(&run.state)?.is_terminal() {
+    let from: Mode = serde_json::from_value(json!(run.mode))
+        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+    let transition = crate::mode::transition(
+        writer::parse::<RunState>(&run.state)?,
+        from,
+        mode,
+        writing(tx, &run.run_id)?,
+    );
+    if transition == crate::mode::Transition::Refused {
         return Err(PersistError::IllegalTransition {
             entity: Entity::Run,
             id: run.run_id,
@@ -59,8 +67,8 @@ pub(super) fn set(
             actual: Some(run.revision),
         });
     }
-    let waiting = writing(tx, &run.run_id)?;
-    change(tx, &run, &command.command_id, mode, waiting, ctx)
+    let waiting = transition == crate::mode::Transition::Pending;
+    change(tx, &run, &command.command_id, mode, waiting, true, ctx)
 }
 
 fn change(
@@ -69,6 +77,7 @@ fn change(
     command: &str,
     mode: Mode,
     waiting: bool,
+    touch: bool,
     ctx: &Ctx<'_>,
 ) -> Result<(i64, i64), PersistError> {
     let to = match mode {
@@ -86,11 +95,15 @@ fn change(
     let done = writer::write(
         tx,
         &Commit {
-            cas: vec![StateCas {
-                id: run.run_id.clone(),
-                expected_revision: run.revision,
-                change: Change::Touch(Entity::Run),
-            }],
+            cas: if touch {
+                vec![StateCas {
+                    id: run.run_id.clone(),
+                    expected_revision: run.revision,
+                    change: Change::Touch(Entity::Run),
+                }]
+            } else {
+                Vec::new()
+            },
             events: vec![NewEvent {
                 intent: Intent::Progress,
                 project_id: run.project_id.clone(),
@@ -115,7 +128,10 @@ fn change(
         },
         ctx,
     )?;
-    Ok((done.revisions[0], done.event_seqs[0]))
+    Ok((
+        done.revisions.first().copied().unwrap_or(run.revision),
+        done.event_seqs[0],
+    ))
 }
 
 pub(super) fn step(conn: &mut Connection, run: &str, ctx: &Ctx<'_>) -> Result<bool, PersistError> {
@@ -134,7 +150,7 @@ pub(super) fn step(conn: &mut Connection, run: &str, ctx: &Ctx<'_>) -> Result<bo
     })?;
     let mode: Mode = serde_json::from_value(pending["to"].clone())
         .map_err(|e| PersistError::IntegrityViolation(format!("pending mode: {e}")))?;
-    change(&tx, &row, command, mode, false, ctx)?;
+    change(&tx, &row, command, mode, false, true, ctx)?;
     writer::commit(tx, ctx)?;
     Ok(true)
 }
@@ -149,4 +165,19 @@ pub(super) fn waiting(conn: &Connection, project: &str) -> Result<Vec<String>, P
         .map_err(sqlite_error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sqlite_error)
+}
+
+/// A mode intent derived by the Runtime from an explicit user action, using SetMode's safe point.
+pub(super) fn intent(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    command: &str,
+    mode: Mode,
+    ctx: &Ctx<'_>,
+) -> Result<(), PersistError> {
+    let row = super::commands::snapshot_rows(tx, run_id)?
+        .map(|(r, _)| r)
+        .ok_or_else(|| PersistError::RunNotFound(run_id.into()))?;
+    change(tx, &row, command, mode, writing(tx, run_id)?, false, ctx)?;
+    Ok(())
 }
