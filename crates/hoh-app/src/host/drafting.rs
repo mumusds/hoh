@@ -512,12 +512,17 @@ pub(super) fn snapshot(root: &Path) -> Value {
         {
             fingerprints.insert(hex(path), observation.file(root, path)?);
         }
-        let dirty: BTreeSet<_> = d
-            .difference(&u)
-            .map(|p| hex(p))
+        let mut tracked = BTreeMap::new();
+        for path in d.difference(&u) {
+            tracked.insert(hex(path), observation.file(root, path)?);
+        }
+        let dirty: BTreeSet<_> = tracked
+            .keys()
+            .cloned()
             .chain(fingerprints.keys().cloned())
             .collect();
         let value = json!({"head":h,"draft_dirty":dirty,"draft_untracked":fingerprints,
+            "draft_tracked":tracked,
             "draft_ignored_roots":ignored_snapshot(&ignored_roots(root)?),
             "draft_outside":d.difference(&u).filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()});
         if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > OBSERVATION_LIMIT {
@@ -566,11 +571,11 @@ fn no_link(root: &Path, path: &[u8]) -> Result<(), String> {
 }
 
 fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
-    if start.get("draft_dirty").and_then(Value::as_array).is_none() {
+    let Some(start_dirty) = start.get("draft_dirty").and_then(Value::as_array) else {
         return Err(format!(
             "missing or failed draft start observation: {start}"
         ));
-    }
+    };
     if start["draft_outside"]
         .as_array()
         .is_none_or(|p| !p.is_empty())
@@ -620,6 +625,30 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
         .as_object()
         .ok_or("missing untracked start digests")?;
     let mut observation = Observation::new();
+    for name in start_dirty {
+        let name = name.as_str().ok_or("invalid draft start path")?;
+        if initial.contains_key(name) {
+            continue;
+        }
+        let path = decoded(name)?;
+        let digest = start["draft_tracked"]
+            .as_object()
+            .and_then(|tracked| tracked.get(name))
+            .ok_or_else(|| {
+                format!(
+                    "pre-dirty tracked path {}; ownership uncertain: missing start digest",
+                    named(&path)
+                )
+            })?;
+        if observation.file(root, &path)? != *digest || committed.contains(&path) {
+            return Err(format!(
+                "pre-dirty tracked path {} changed or was committed; ownership uncertain",
+                named(&path)
+            ));
+        }
+        // An untouched user delta is neither this draft's write nor its must-commit obligation.
+        changed.remove(&path);
+    }
     let tree_files = if initial.values().any(|v| v.get("tree_sha256").is_some()) {
         let prefixes = initial
             .iter()
