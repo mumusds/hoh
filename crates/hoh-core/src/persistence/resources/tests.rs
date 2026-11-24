@@ -308,6 +308,8 @@ struct Gate {
     wake: std::sync::Condvar,
     fail: std::sync::atomic::AtomicBool,
     checkpoint: std::sync::atomic::AtomicBool,
+    /// Job names the writer took, in order (M3G-51).
+    jobs: std::sync::Mutex<Vec<&'static str>>,
 }
 impl Gate {
     fn release(&self) {
@@ -317,6 +319,7 @@ impl Gate {
 }
 impl crate::persistence::FaultHooks for Gate {
     fn before_job(&self, job: &'static str) {
+        self.jobs.lock().unwrap().push(job);
         self.checkpoint
             .store(job == "Checkpoint", std::sync::atomic::Ordering::SeqCst);
     }
@@ -373,15 +376,29 @@ async fn race(fail: bool) -> R {
         old().version()
     );
     let mut dispatch = Box::pin(store.create_attempt(attempt("A")));
-    std::future::poll_fn(|cx| {
-        use std::future::Future;
+    // Enqueue Attempt and give the writer a chance to take it. It is inside the checkpoint
+    // transaction (blocked at EventsWritten), so before_job("Attempt") must not run yet.
+    // `poll` being pending only means the request is queued, which is true of every writer call.
+    for _ in 0..32 {
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let _ = dispatch.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::task::yield_now().await;
+    }
+    {
+        let jobs = gate.jobs.lock().unwrap();
         assert!(
-            dispatch.as_mut().poll(cx).is_pending(),
-            "dispatch cannot commit through the checkpoint transaction"
+            !jobs.iter().any(|j| *j == "Attempt"),
+            "the writer must not take Attempt while Checkpoint holds the transaction: {jobs:?}"
         );
-        std::task::Poll::Ready(())
-    })
-    .await;
+        assert!(
+            jobs.iter().any(|j| *j == "Checkpoint"),
+            "the checkpoint job was taken: {jobs:?}"
+        );
+    }
     gate.release();
     assert_eq!(checkpoint.await?.is_err(), fail);
     gate.fail.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -393,6 +410,19 @@ async fn race(fail: bool) -> R {
     };
     assert_eq!(assigned(&path, "A")?, Some(want.clone()));
     assert_eq!(pin(&path, "developer")?.resource_bundle_version, want);
+    let jobs = gate.jobs.lock().unwrap().clone();
+    let checkpoint_at = jobs
+        .iter()
+        .position(|j| *j == "Checkpoint")
+        .ok_or("checkpoint was not taken")?;
+    let attempt_at = jobs
+        .iter()
+        .position(|j| *j == "Attempt")
+        .ok_or("attempt was not taken")?;
+    assert!(
+        checkpoint_at < attempt_at,
+        "Checkpoint must be taken before Attempt: {jobs:?}"
+    );
     Ok(())
 }
 #[tokio::test]
