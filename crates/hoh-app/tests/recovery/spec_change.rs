@@ -1046,9 +1046,24 @@ fn live(restart: bool) -> R {
             )?)?;
     }
     // A second host startup repeats recovery/round reconciliation without another closure.
+    // host.json only says the process announced itself; verification_start runs after that.
     child.0.kill()?;
     child.0.wait()?;
     let _again = child_host(&world)?;
+    let host: Value = serde_json::from_str(&std::fs::read_to_string(
+        world.project().join(".hoh/host.json"),
+    )?)?;
+    let epoch = host["host_epoch"].as_i64().ok_or("host_epoch")?;
+    let line = format!("hoh host: verification reconciled host_epoch={epoch}");
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_to_string(world.root().join("host.log"))?.contains(&line) {
+        if std::time::Instant::now() > until {
+            return Err(
+                format!("host_epoch {epoch} did not finish its verification reconcile").into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     world.wait(
         "SELECT count(*) FROM events WHERE kind='verification.round_closed'",
         "1",
