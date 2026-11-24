@@ -287,6 +287,50 @@ fn test_008_05_ancestor_scan_end_and_marker_priority() -> R {
     Ok(())
 }
 
+/// M3L-50: PID 1 is a boundary even when it shares the host uid. Its environ and cgroup stay unread,
+/// and a chain with no marker is still a user. Stepping into init would read pid 1 and then ask
+/// `identity(0)`.
+#[test]
+fn test_008_05_same_uid_pid_1_is_a_scan_boundary() -> R {
+    let mut f = Fixture::new();
+    f.identities.insert(
+        40,
+        Identity {
+            pid: 40,
+            ppid: 1,
+            start: 40,
+            uids: [1000; 4],
+        },
+    );
+    f.identities.insert(
+        1,
+        Identity {
+            pid: 1,
+            ppid: 0,
+            start: 1,
+            uids: [1000; 4],
+        },
+    );
+    f.evidence.insert(
+        40,
+        Evidence {
+            environ: b"PATH=/usr/bin\0".to_vec(),
+            cgroup: b"0::/user.slice/session-1.scope\n".to_vec(),
+            executable: "/usr/bin/bash".into(),
+        },
+    );
+    let peer = f.identities.get(&40).ok_or("peer")?.clone();
+    let origin = classify(&f, &peer, 1000);
+    let read_pid_1 = f.reads.borrow().contains(&1);
+    assert_eq!(
+        (origin, read_pid_1),
+        (Origin::User, false),
+        "pid 1 stays unread even when it shares the host uid; reads={:?}",
+        f.reads.borrow()
+    );
+    Ok(())
+}
+
 #[test]
 fn test_008_05_origin_unknown_unreadable_same_uid_proxy_service_and_identity_races() -> R {
     for pid in [30, 20] {
