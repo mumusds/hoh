@@ -1,6 +1,6 @@
 //! M1-T05 Pi adapter against a fake `pi --mode rpc` replaying recorded pi 1.5.0 traffic (TEST-026-01..03,
-//! tests/fakes/pi_rpc.py). The adapter's results are checked in the store it wrote and in the records it hands to its
-//! subscriber.
+//! tests/fakes/pi_rpc.py), and pi 1.6.0's in one test (PI16). The adapter's results are checked in the store it wrote
+//! and in the records it hands to its subscriber.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -28,6 +28,11 @@ const FIXTURES: &str = concat!(
     "/../../tests/fixtures/protocol/pi/1.5.0"
 );
 const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/pi_rpc.py");
+/// The recorded pi 1.6.0 traffic (PI16).
+const FIXTURES_1_6_0: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/protocol/pi/1.6.0"
+);
 
 fn read(path: impl AsRef<Path>) -> R<String> {
     Ok(std::fs::read_to_string(path)?)
@@ -64,12 +69,17 @@ struct Case {
 
 impl Case {
     fn load(name: &str) -> R<Case> {
-        let frames = read(format!("{FIXTURES}/{name}/stdout.jsonl"))?
+        Case::load_at(FIXTURES, name)
+    }
+
+    /// The case `name` recorded under `root` (one pi version's fixtures).
+    fn load_at(root: &str, name: &str) -> R<Case> {
+        let frames = read(format!("{root}/{name}/stdout.jsonl"))?
             .lines()
             .map(serde_json::from_str)
             .collect::<Result<Vec<Value>, _>>()?;
         let mut commands = Vec::new();
-        for line in read(format!("{FIXTURES}/{name}/stdin.txt"))?.lines() {
+        for line in read(format!("{root}/{name}/stdin.txt"))?.lines() {
             let Ok(c) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
@@ -733,6 +743,117 @@ async fn a_refused_prompt_fails_at_once_and_rejects_its_input() -> R {
         world.store.reader()?.input("I9")?.map(|r| r.state),
         Some(InputState::Applied)
     );
+    Ok(())
+}
+
+/// The recorded pi 1.6.0 traffic (PI16) through the adapter as the product launches that version (its recorded help;
+/// `agent_settled` relied on by the version rule, [`pi::emits_settled`]): the reply settles on `agent_settled` with no
+/// state query, and the extensions' status requests in it get no answer and are no unknown record; a prompt refused for
+/// want of a key fails BLOCKED_AUTH at once; a cancel sends `abort` and Pi's aborted `agent_settled` ends it CANCELLED.
+#[tokio::test]
+async fn pi_1_6_0_recorded_traffic_settles_refuses_and_cancels() -> R {
+    let world = World::new()?;
+    let turn_of = |fake: &Path, logs: &str| -> R<Turn> {
+        let mut turn = world.turn(fake, logs)?;
+        turn.launch.help = read(format!("{FIXTURES_1_6_0}/help.txt"))?;
+        turn.launch.settled_event = pi::emits_settled(Some("1.6.0"));
+        Ok(turn)
+    };
+
+    let case = Case::load_at(FIXTURES_1_6_0, "rpc-prompt")?;
+    assert!(
+        case.frames
+            .iter()
+            .any(|f| f["type"] == "extension_ui_request" && f["method"] == "setStatus"),
+        "the recording has the extensions' status requests"
+    );
+    let fake = world.fake("v160-prompt", &case)?;
+    let attempt = world.attempt_in("pi", "V1", "V1", "1.6.0").await?;
+    let mut turn = turn_of(&fake, "logs/V1")?;
+    let clock = Arc::new(FrozenClock::default());
+    turn.clock = clock.clone();
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        (
+            outcome.state,
+            outcome.failure.as_deref(),
+            outcome.settled_by,
+            outcome.state_queries,
+            outcome.parse_errors,
+            outcome.reply.as_deref(),
+            clock.timers.load(Ordering::SeqCst),
+        ),
+        (
+            AttemptState::Settled,
+            None,
+            Some(SettledBy::AgentSettled),
+            0,
+            0,
+            Some("HOH_SAMPLE_OK"),
+            0
+        )
+    );
+    let sent_kinds: Vec<Value> = received(&fake)?.iter().map(|m| m["type"].clone()).collect();
+    assert_eq!(sent_kinds, [json!("get_state"), json!("prompt")]);
+    assert!(
+        world
+            .store
+            .reader()?
+            .events("R")?
+            .iter()
+            .all(|(k, p)| !(k == "adapter.unknown_event" && p["attempt_id"] == "V1"))
+    );
+
+    let fake = world.fake(
+        "v160-no-provider",
+        &Case::load_at(FIXTURES_1_6_0, "rpc-no-provider")?,
+    )?;
+    let attempt = world.attempt_in("pi", "V2", "V2", "1.6.0").await?;
+    let outcome = run(&world, &attempt, &turn_of(&fake, "logs/V2")?).await?;
+    assert_eq!(
+        (outcome.state, outcome.failure.as_deref()),
+        (AttemptState::Failed, Some("BLOCKED_AUTH"))
+    );
+
+    // The abort case was recorded without a get_state: the prompt case's answer goes in front.
+    let mut case = Case::load_at(FIXTURES_1_6_0, "rpc-abort")?;
+    let prompt = Case::load_at(FIXTURES_1_6_0, "rpc-prompt")?;
+    case.frames
+        .insert(0, prompt.frames[prompt.response("s1")?].clone());
+    case.commands
+        .insert(0, ("s1".to_owned(), "get_state".to_owned()));
+    let start = case.position("agent_start")?;
+    case.frames.insert(
+        start + 1,
+        json!({"hoh_wait": {"command": "abort", "count": 1}}),
+    );
+    let fake = world.fake("v160-abort", &case)?;
+    let attempt = world.attempt_in("pi", "V3", "V3", "1.6.0").await?;
+    let mut turn = turn_of(&fake, "logs/V3")?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    turn.events = Some(tx);
+    let latch = CancelLatch::new();
+    let running = pi::run(&world.store, &attempt, &turn, &latch);
+    let trigger = async {
+        while let Some(record) = rx.recv().await {
+            if record["type"] == "agent_start" {
+                return Ok::<CancelReceipt, Box<dyn std::error::Error>>(latch.request());
+            }
+        }
+        Err("no agent_start".into())
+    };
+    let (outcome, receipt) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(running, trigger)
+    })
+    .await?;
+    let (outcome, receipt) = (outcome?, receipt?);
+    assert_eq!(receipt, CancelReceipt::Accepted);
+    assert_eq!(
+        (outcome.state, outcome.settled_by, outcome.state_queries),
+        (AttemptState::Cancelled, Some(SettledBy::AgentSettled), 0)
+    );
+    assert!(received(&fake)?.iter().any(|m| m["type"] == "abort"));
+    assert!(group_empty(outcome.pid.ok_or("no pid")?));
     Ok(())
 }
 

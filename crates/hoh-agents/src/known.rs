@@ -173,4 +173,42 @@ mod tests {
         );
         assert!(!is_known(claude(), Some("system/hoh_future")));
     }
+
+    /// pi 1.6.0's registry (its recordings and its docs, PI16) has the keys of the built-in pi registry, so the one
+    /// built-in registry judges 1.6.0's records as it judges 1.5.0's (REQ-027), and every record type 1.6.0 was
+    /// recorded writing is in it.
+    #[test]
+    fn pi_1_6_0_has_the_built_in_registry_and_its_recordings_are_known() {
+        let root = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/protocol/pi/1.6.0"
+        );
+        let registry = Registry::parse(
+            &std::fs::read_to_string(format!("{root}/known-frames.json"))
+                .expect("pi 1.6.0 known-frames.json"),
+            &[&["frames"]],
+        );
+        assert_eq!(
+            registry.keys().collect::<Vec<_>>(),
+            pi().keys().collect::<Vec<_>>()
+        );
+        let mut recorded = 0;
+        for case in [
+            "rpc-prompt",
+            "rpc-resume",
+            "rpc-abort",
+            "rpc-invalid-model",
+            "rpc-no-provider",
+        ] {
+            let stdout =
+                std::fs::read_to_string(format!("{root}/{case}/stdout.jsonl")).expect(case);
+            for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+                let frame: serde_json::Value = serde_json::from_str(line).expect(case);
+                let key = pi_key(&frame);
+                assert!(is_known(pi(), key.as_deref()), "{case}: {key:?}");
+                recorded += 1;
+            }
+        }
+        assert!(recorded > 0);
+    }
 }
