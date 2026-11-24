@@ -835,19 +835,51 @@ fn start_child(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<ChildGuard
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut guard = ChildGuard(command.spawn()?);
-    let own = u64::from(guard.0.id());
-    let end = Instant::now() + Duration::from_secs(30);
-    while announced(project) != Some(own) {
-        if let Some(status) = guard.0.try_wait()? {
-            return Err(ended_before_serving(&mut guard, status, project).into());
-        }
-        if Instant::now() > end {
-            return Err("the host did not start".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let guard = serving(project, &mut command)?;
     Ok(guard)
+}
+
+/// Start the host child `command` and wait until it serves (its own host.json). A refusal because another host holds
+/// the project (69) is tried again for a moment when that host, the one host.lock names, is gone (FLK-08): a host
+/// killed while one of its threads was starting a process leaves the child, until it execs, holding the start lock it
+/// inherited with every open file (the lock goes with the last descriptor, not with its holder's death); seen once in
+/// 60 kill-and-restart runs under load, the holders gone by the time they were listed. Any other end before serving,
+/// and a refusal by a host still alive, fail at once with the child's stderr.
+fn serving(project: &Path, command: &mut Command) -> R<ChildGuard> {
+    let transient_until = Instant::now() + Duration::from_secs(5);
+    'start: loop {
+        let mut guard = ChildGuard(command.spawn()?);
+        let own = u64::from(guard.0.id());
+        let end = Instant::now() + Duration::from_secs(30);
+        while announced(project) != Some(own) {
+            if let Some(status) = guard.0.try_wait()? {
+                let why = ended_before_serving(&mut guard, status, project);
+                if status.code() == Some(69)
+                    && why.contains("another host holds")
+                    && holder_gone(project)
+                    && Instant::now() < transient_until
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue 'start;
+                }
+                return Err(why.into());
+            }
+            if Instant::now() > end {
+                return Err("the host did not start".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return Ok(guard);
+    }
+}
+
+/// Whether the host host.lock names is no longer running (it was killed, and reaped by the test).
+fn holder_gone(project: &Path) -> bool {
+    std::fs::read_to_string(project.join(".hoh/host.lock"))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH))
 }
 
 /// Why a host child ended before it served (FLK-08): its status, its stderr (the host says why it would not start), and
@@ -957,18 +989,7 @@ fn serve_and_stop_with(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<(i
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut guard = ChildGuard(command.spawn()?);
-    let own = u64::from(guard.0.id());
-    let end = Instant::now() + Duration::from_secs(30);
-    while announced(project) != Some(own) {
-        if let Some(status) = guard.0.try_wait()? {
-            return Err(ended_before_serving(&mut guard, status, project).into());
-        }
-        if Instant::now() > end {
-            return Err("the host did not start".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let guard = serving(project, &mut command)?;
     let pid = rustix::process::Pid::from_raw(i32::try_from(guard.0.id())?).ok_or("no pid")?;
     rustix::process::kill_process(pid, rustix::process::Signal::TERM)?;
     let (status, stderr) = wait(guard, Duration::from_secs(30))?;
@@ -1643,18 +1664,7 @@ fn serve_until(
     for (name, value) in env {
         command.env(name, value);
     }
-    let mut guard = ChildGuard(command.spawn()?);
-    let own = u64::from(guard.0.id());
-    let end = Instant::now() + Duration::from_secs(30);
-    while announced(project) != Some(own) {
-        if let Some(status) = guard.0.try_wait()? {
-            return Err(ended_before_serving(&mut guard, status, project).into());
-        }
-        if Instant::now() > end {
-            return Err("the host did not start".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let guard = serving(project, &mut command)?;
     let end = Instant::now() + limit;
     let mut held = done();
     while !held && Instant::now() < end {
