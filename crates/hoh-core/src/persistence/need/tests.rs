@@ -53,9 +53,10 @@ fn need(task_id: &str, reason: TaskReason) -> TaskNeed<'_> {
 }
 
 #[test]
-fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_three_run_reasons() {
+fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_seven_run_reasons() {
     // Correction A's guard (1): work 12 (dirty_workspace: docs/adr/ADR-039.md decision 7), source 3, verifier 8; run
-    // no_spec, stalled and baseline_tests. Each name parses back to its
+    // no_spec, stalled, baseline_tests, spec_approval, draft_question, build_readiness and draft_unavailable.
+    // Each name parses back to its
     // variant, and a reason only some subjects have has a variant only in their enums.
     assert_eq!(
         (

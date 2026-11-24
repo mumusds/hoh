@@ -488,6 +488,14 @@ async fn test_008_02_draft_phases_are_idempotent_and_discovery_has_no_effect() -
             0
         );
     }
+    // The discovery seam alone cannot bypass T07's durable baseline prerequisite.
+    assert!(!store.draft_step("R", true).await?);
+    assert_eq!(run(&path, "R")?[0], "DISCOVERING");
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))?,
+        0
+    );
+    assert!(store.record_baseline("R", json!({"head":null,"tree":null,"dirty":[],"untracked":[],"build_commands":["unknown"],"test_commands":["unknown"],"docs":[]})).await?);
     assert!(store.draft_step("R", true).await?);
     assert!(!store.draft_step("R", true).await?);
     assert_eq!(run(&path, "R")?[0], "SPECIFYING");

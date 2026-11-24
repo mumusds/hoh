@@ -260,7 +260,7 @@ async fn test_028_03_the_admission_holds_a_write_task_on_dirty_files_on_every_di
     let held = json!({"paths": ["src/lib.rs"]});
     // The admission itself, for the round and the Commander alike.
     for by in [super::By::Round, super::By::Commander, super::By::Direct] {
-        let verdicts = super::admit(&conn, "R", &["W", "Rd", "W2"], by)?;
+        let verdicts = super::admit(&conn, "R", &["W", "Rd", "W2"], by, None)?;
         let refusal = verdicts["W"]
             .as_ref()
             .err()

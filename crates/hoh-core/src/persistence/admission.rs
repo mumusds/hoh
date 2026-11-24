@@ -197,13 +197,20 @@ pub(super) fn product_work_progressing(
         .any(Result::is_ok))
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct DraftContext<'a> {
+    pub context: &'a crate::decision::Context,
+    pub version: &'a str,
+    pub budget: &'a super::budget_view::View,
+}
+
 /// The verdict on each of `tasks` of run `run_id`, created by `by`, read in the caller's transaction `tx`.
 pub(super) fn admit(
     tx: &Connection,
     run_id: &str,
     tasks: &[&str],
     by: By,
-    draft_context: Option<(&crate::decision::Context, &str)>,
+    draft_context: Option<DraftContext<'_>>,
 ) -> Result<BTreeMap<String, Result<Admission, Refusal>>, PersistError> {
     let mut verdicts = BTreeMap::new();
     if tasks.is_empty() {
@@ -337,7 +344,15 @@ pub(super) fn admit(
             }
         };
         let verdict = match (verdict, draft, draft_context) {
-            (Ok(mut admitted), true, Some((context, version))) => {
+            (
+                Ok(mut admitted),
+                true,
+                Some(DraftContext {
+                    context,
+                    version,
+                    budget,
+                }),
+            ) => {
                 let cost: i64 = tx
                     .query_row(
                         "SELECT cost_estimate FROM tasks WHERE task_id=?1",
@@ -345,7 +360,7 @@ pub(super) fn admit(
                         |r| r.get(0),
                     )
                     .map_err(sqlite_error)?;
-                if super::retry::budget_stop(tx, run_id, context)?.is_some()
+                if budget.task_stop(task_id).is_some()
                     || context.budget_headroom.is_some_and(|h| i64::from(h) < cost)
                 {
                     Err(Refusal::DraftUnavailable(

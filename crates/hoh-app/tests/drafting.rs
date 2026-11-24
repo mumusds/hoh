@@ -15,6 +15,17 @@ enum EarlyDraftFailure {
     Refusal,
 }
 
+impl hoh_app::host::HostHooks for EarlyDraftFailure {
+    fn draft_discovered(&self, project: &std::path::Path, _: &str) -> Result<(), String> {
+        if matches!(self, Self::Prepare) {
+            // Inject only after the read-only baseline, so this exercises prepare,
+            // not discovery's refusal to inspect a malformed Git repository.
+            std::fs::create_dir(project.join(".git")).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 // Fault-only executor: it creates no process and never opens a work gate.
 #[derive(Debug)]
 struct FailingDraftStart {
@@ -65,9 +76,10 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
     }
     let world = world::World::named("m3t04-start-failure")?;
     world.configure(&[], "")?;
-    if matches!(failure, EarlyDraftFailure::Prepare) {
-        std::fs::create_dir(world.project().join(".git"))?; // Incomplete local repository.
-    } else if !matches!(failure, EarlyDraftFailure::GitInit) {
+    if !matches!(
+        failure,
+        EarlyDraftFailure::Prepare | EarlyDraftFailure::GitInit
+    ) {
         world.git(&["init", "-q"])?;
     }
     let executor = std::sync::Arc::new(FailingDraftStart {
@@ -76,6 +88,7 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
     });
     let mut config = hoh_app::host::HostConfig::new(&world.project());
     config.port = 0;
+    config.hooks = std::sync::Arc::new(failure);
     config.store.wal_probe = Some(world::probe());
     let now = std::time::SystemTime::now();
     config.clock = hoh_app::host::HostClock(std::sync::Arc::new(FixedClock(now)));
@@ -192,6 +205,8 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.drafting'")?,"1");
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='schedule.round'")?,"0");
         assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED'")?,"1");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='run.baseline'")?,"1");
+        assert_eq!(world.query("SELECT (SELECT seq FROM events WHERE kind='run.baseline') < (SELECT min(seq) FROM events WHERE kind IN ('spec.drafting','spec.draft_dispatched'))")?,"1");
         assert_eq!(world.query("SELECT count(*) FROM leases WHERE kind='writer'")?,"1");
         assert!(world.project().join(".git").is_dir());
         assert!(!std::fs::read_to_string(world.project().join(".git/config"))?.contains("[remote"));
