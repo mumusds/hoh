@@ -600,8 +600,9 @@ async fn a_held_staffing_write_in_a_host_with_a_registry() -> R {
 fn a_held_staffing_write_skips_its_binding_and_the_tick_goes_on() -> R {
     // docs/adr/ADR-031.md correction D rule 2 (b), M2T13R-01: a host with an agent registry; R1's cancel lands between
     // the tick's read of the staffing list and R1's staffing write. That write is Held: R1's binding is skipped and
-    // marked held, the tick goes on (R2's staffing, the steps after staffing), nothing is said on stderr, and R1 gets
-    // no event after its run.result.
+    // marked held, the tick goes on (R2's staffing, the steps after staffing), Held writes nothing on stderr, and R1
+    // gets no event after its run.result. The verification reconcile line (M3B-151) is the one host line a normal
+    // tick records; any other `hoh host:` line is still a fault.
     let out = Command::new(std::env::current_exe()?)
         .args([
             "a_held_staffing_write_in_a_host_with_a_registry",
@@ -617,6 +618,22 @@ fn a_held_staffing_write_skips_its_binding_and_the_tick_goes_on() -> R {
         "{}\n{stderr}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert!(!stderr.contains("hoh host:"), "a diagnostic: {stderr}");
+    let unexpected: Vec<&str> = stderr
+        .lines()
+        .filter(
+            |line| match line.strip_prefix("hoh host: verification reconciled host_epoch=") {
+                Some(epoch)
+                    if !epoch.is_empty() && epoch.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    false
+                }
+                _ => line.contains("hoh host:"),
+            },
+        )
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a diagnostic: {unexpected:?}\n{stderr}"
+    );
     Ok(())
 }
