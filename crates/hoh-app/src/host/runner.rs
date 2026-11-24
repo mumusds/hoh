@@ -591,6 +591,13 @@ async fn verification_start(common: &Common) -> Result<(), TickError> {
         }
         held.item(store.reconcile_verification(&run, pending.clone()).await)?;
     }
+    // After host.json: a restart can observe this epoch's round sweep before comparing closures (M3B-151).
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr(),
+        "hoh host: verification reconciled host_epoch={}",
+        common.host_epoch
+    );
     Ok(())
 }
 
