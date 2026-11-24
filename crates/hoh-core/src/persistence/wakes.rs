@@ -204,11 +204,20 @@ pub(super) fn of_run(tx: &Connection, run_id: &str) -> Result<Vec<Wake>, Persist
     let mut wakes = wakes_of(tx, run_id, rows)?;
     for wake in &mut wakes {
         if wake.fingerprint.starts_with("user_input/")
-            && super::inputs::for_wake(tx, &wake.event_seqs)?
-                .is_some_and(|i| i.state == crate::lifecycle::InputState::Rejected)
+            && let Some(input) = super::inputs::for_wake(tx, &wake.event_seqs)?
+            && input.state == crate::lifecycle::InputState::Rejected
         {
+            // Finishing the input must not erase the Commander's exhausted retry budget (ADR-025).
+            // Keep that failed wake until a new epoch; allocation also refuses its rejected input.
+            let capped = input.payload["reason"] == "commander_retries_exhausted"
+                && tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM role_bindings WHERE run_id=?1 AND role='commander' AND role_epoch=?2)",
+                    params![run_id, input.payload["role_epoch"].as_i64()], |r|r.get::<_,bool>(0),
+                ).map_err(sqlite_error)?;
             // The input's persisted rejection closes its wake, including before a first turn.
-            wake.superseded = true;
+            if !capped {
+                wake.superseded = true;
+            }
         }
     }
     Ok(wakes)
@@ -403,6 +412,7 @@ pub(super) fn rearm(
     run_id: &str,
     wakes: &mut [Wake],
     now: std::time::SystemTime,
+    ctx: &super::writer::Ctx<'_>,
 ) -> Result<(Vec<StateCas>, Vec<NewEvent>), PersistError> {
     let mut cas = Vec::new();
     let mut events = Vec::new();
@@ -494,6 +504,9 @@ pub(super) fn rearm(
             role_epoch: epoch,
             retry_not_before,
         });
+        if failures > i64::from(crate::retry::MAX_RETRIES) {
+            super::inputs::close_wake(tx, &wake.event_seqs, "commander_retries_exhausted", ctx)?;
+        }
     }
     Ok((cas, events))
 }
@@ -887,7 +900,7 @@ pub(super) fn allocate(
         };
         let mut wakes = of_run(&tx, &run_id)?;
         let epoch = decide::to_i64(binding.role_epoch, "role_epoch")?;
-        let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, now)?;
+        let (moves, events) = rearm(&tx, project_id, &run_id, &mut wakes, now, ctx)?;
         // Preempts whose target has ended name the wake that takes the slot next, while it is still to be allocated
         // (decision 3, -800, -850): this run's, after its horizon, by the wake they name (v20, M2T08R-402).
         let named: BTreeMap<String, i64> = {

@@ -848,12 +848,14 @@ pub(super) fn supersede_in(
         .map_err(sqlite_error)?;
         let mut payload = record(run_id, &t, now, ctx);
         payload["reason"] = json!(state.as_str());
+        super::inputs::close_wake(tx, &t.seqs, "commander_wake_closed", ctx)?;
         events.push(event(child_id(&t.trigger_id, "superseded"), payload));
     }
     for wake in wakes::of_run(tx, run_id)?
         .into_iter()
         .filter(wakes::Wake::owed)
     {
+        super::inputs::close_wake(tx, &wake.event_seqs, "commander_wake_closed", ctx)?;
         events.push(event(
             child_id(&wake.id, "superseded"),
             json!({"wake": wake.id, "reason": state.as_str()}),
@@ -940,7 +942,7 @@ fn fire(
     // allocation's count the same failures (v14, M2T08R-102); then the step's one verdict, before anything fires
     // (v13, M2T08R-05, -08).
     let mut ended = wakes::of_run(tx, run_id)?;
-    let (cas, rearmed) = wakes::rearm(tx, project_id, run_id, &mut ended, now)?;
+    let (cas, rearmed) = wakes::rearm(tx, project_id, run_id, &mut ended, now, ctx)?;
     if !cas.is_empty() || !rearmed.is_empty() {
         writer::write(
             tx,
@@ -984,6 +986,7 @@ fn fire(
             .map_err(sqlite_error)?;
             let mut payload = record(run_id, &t, now, ctx);
             payload["reason"] = json!("COMMANDER_UNAVAILABLE");
+            super::inputs::close_wake(tx, &t.seqs, "commander_unavailable", ctx)?;
             events.push(event(
                 child_id(&t.trigger_id, "superseded"),
                 wakes::SUPERSEDED,

@@ -592,6 +592,19 @@ pub(super) fn for_wake(conn: &Connection, seqs: &[i64]) -> Result<Option<InputRo
         .map(Option::flatten)
 }
 
+/// A wake or trigger that will never answer its input must close that input in the same transaction.
+pub(super) fn close_wake(
+    tx: &Transaction<'_>,
+    seqs: &[i64],
+    reason: &str,
+    ctx: &super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    if let Some(input) = for_wake(tx, seqs)? {
+        exhausted(tx, &input.input_id, reason, ctx)?;
+    }
+    Ok(())
+}
+
 pub(super) fn for_attempt(
     conn: &Connection,
     attempt: &str,

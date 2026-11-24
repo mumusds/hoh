@@ -5925,3 +5925,148 @@ async fn a_budget_at_risk_wakes_the_commander_and_gets_a_turn_while_the_budget_a
     }
     Ok(())
 }
+
+async fn delivered_ask(store: &Store, clock: &TestClock, id: &str) -> R {
+    use crate::persistence::{Claimed, NewInput, Settlement};
+    store
+        .enqueue_input(NewInput {
+            input_id: id.into(),
+            run_id: "R".into(),
+            kind: "ASK".into(),
+            target_role: None,
+            payload: json!({"text":"progress?"}),
+        })
+        .await?;
+    let row = store
+        .claim_inputs(clock.now(), vec!["commander".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim ask")?;
+    assert_eq!(row.message_id, id);
+    assert!(
+        store
+            .consume_input(row.clone(), clock.now())
+            .await?
+            .is_some()
+    );
+    store
+        .settle_outbox(id, row.attempt_count, Settlement::Delivered, 5)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_01_commander_input_rejects_only_after_the_last_retry() -> R {
+    use crate::lifecycle::InputState;
+    let dir = tempfile::tempdir()?;
+    let clock = std::sync::Arc::new(TestClock::default());
+    let (mut store, path) = open(&dir, &clock)?;
+    exec(&path, WORLD)?;
+    delivered_ask(&store, &clock, "ask").await?;
+    let mut ms = 3_000;
+    for count in 0..=crate::retry::MAX_RETRIES {
+        store.supervise("R", context(&clock, ms)).await?;
+        let a = store
+            .allocate_supervision("p1", context(&clock, ms))
+            .await?
+            .ok_or(format!("turn {count}"))?;
+        run_turn(&store, &clock, &a.attempt_id, ms, false, TRANSIENT).await?;
+        store.supervise("R", context(&clock, ms + 1000)).await?;
+        assert_eq!(
+            store.reader()?.input("ask")?.ok_or("ask")?.state,
+            if count == crate::retry::MAX_RETRIES {
+                InputState::Rejected
+            } else {
+                InputState::Delivered
+            },
+            "only the last failed turn may terminate the input, count={count}"
+        );
+        ms += 601_000;
+    }
+    assert_eq!(
+        store.reader()?.input("ask")?.ok_or("ask")?.payload["reason"],
+        "commander_retries_exhausted"
+    );
+    drop(store);
+    store = open(&dir, &clock)?.0;
+    for at in [ms, ms + 90_000_000] {
+        store.supervise("R", context(&clock, at)).await?;
+        assert!(
+            store
+                .allocate_supervision("p1", context(&clock, at))
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            run_state(&path, "R")?.0,
+            "BLOCKED",
+            "input rejection must not clear capped Commander failures"
+        );
+    }
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM events WHERE kind='input.rejected'"
+        )?,
+        json!(1)
+    );
+    assert_eq!(
+        value(
+            &path,
+            "SELECT count(*) FROM receipts WHERE message_id='ask'"
+        )?,
+        json!(1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_01_dropped_commander_wake_rejects_input_but_withdrawal_retries() -> R {
+    use crate::lifecycle::InputState;
+    for cancel_run in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let clock = std::sync::Arc::new(TestClock::default());
+        let (store, path) = open(&dir, &clock)?;
+        exec(&path, WORLD)?;
+        delivered_ask(&store, &clock, "ask").await?;
+        store.supervise("R", context(&clock, 3000)).await?;
+        let turn = store
+            .allocate_supervision("p1", context(&clock, 3000))
+            .await?
+            .ok_or("turn")?;
+        end(&path, &turn.attempt_id, "CANCELLED")?;
+        store.supervise("R", context(&clock, 4000)).await?;
+        assert_eq!(
+            store.reader()?.input("ask")?.ok_or("ask")?.state,
+            InputState::Delivered
+        );
+        if cancel_run {
+            exec(
+                &path,
+                "UPDATE runs SET state='CANCEL_REQUESTED' WHERE run_id='R'",
+            )?;
+        } else {
+            // A routine user-input trigger is superseded while the Commander is unavailable.
+            delivered_ask(&store, &clock, "dropped").await?;
+            exec(
+                &path,
+                "UPDATE role_bindings SET state='BLOCKED',blocked_reason='unavailable' WHERE run_id='R' AND role='commander'",
+            )?;
+        }
+        store.supervise("R", context(&clock, 7000)).await?;
+        let id = if cancel_run { "ask" } else { "dropped" };
+        let row = store.reader()?.input(id)?.ok_or("input")?;
+        assert_eq!(row.state, InputState::Rejected);
+        assert_eq!(
+            row.payload["reason"],
+            if cancel_run {
+                "commander_wake_closed"
+            } else {
+                "commander_unavailable"
+            }
+        );
+        store.supervise("R", context(&clock, 9000)).await?;
+        assert_eq!(store.reader()?.input(id)?, Some(row));
+    }
+    Ok(())
+}
