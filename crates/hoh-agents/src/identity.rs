@@ -1460,15 +1460,23 @@ mod tests {
                     && owner.is_some_and(|uid| uid != mine)
                     && group_empty(pid)
             });
-        let Some(other) = other else {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "SKIP: no other user's process outside a group of its pid"
-            );
-            return Ok(());
-        };
-        assert!(!number_free(other), "{other}");
+        if let Some(other) = other {
+            assert!(!number_free(other), "{other}");
+        }
+        // CLN1S-a: whether such a process of another user is visible depends on the machine (none in a pid namespace
+        // of its own), so the same case is always made here as well: a child of this test, in this test's group, so
+        // that no group has its pid as its number (the kernel does not ask whose the process is).
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read -r x"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let leads_no_group = group_empty(pid);
+        let free = number_free(pid);
+        drop(child.stdin.take());
+        let _ = child.wait();
+        assert!(leads_no_group, "{pid} leads a group");
+        assert!(!free, "{pid}");
         Ok(())
     }
 
