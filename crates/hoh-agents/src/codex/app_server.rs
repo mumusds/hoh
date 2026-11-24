@@ -884,10 +884,6 @@ impl<'a> State<'a> {
                 });
             }
         }
-        // These requests were held during the handshake and never submitted, including on Degrade.
-        for st in held.drain(..) {
-            let _ = st.reply.send(SteerReceipt::NotNow);
-        }
         let logs_incomplete = report.as_ref().is_none_or(|r| {
             r.stdout.error.is_some() || r.stderr.error.is_some() || !r.stdout.eof || !r.stderr.eof
         });
@@ -895,13 +891,21 @@ impl<'a> State<'a> {
         // happened: a cancel, a frame too large, the deadline, a raw log cut short (M1R-02); and never once the
         // handshake's answer decided the turn's failure (a refused initialize, the re-check before the first input:
         // docs/adr/ADR-030.md decision 9, M2T15R-02).
-        if let Some(reason) = self.degrade.clone().filter(|_| {
+        let degrade = self.degrade.clone().filter(|_| {
             !self.cancelled
                 && !self.too_large
                 && !self.deadline
                 && !logs_incomplete
                 && self.failure.is_none()
-        }) {
+        });
+        // The runner has no exec fallback in this Attempt, so return its never-submitted held requests.
+        // The legacy store-backed run retains them for its exec fallback's CapabilityUnsupported replies.
+        if self.store.is_none() || degrade.is_none() {
+            for st in held.drain(..) {
+                let _ = st.reply.send(SteerReceipt::NotNow);
+            }
+        }
+        if let Some(reason) = degrade {
             return Ok(Drove::Degrade(Box::new(Degraded {
                 reason,
                 report,
