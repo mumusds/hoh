@@ -253,13 +253,20 @@ fn only_a_recorded_version_is_trusted_to_send_agent_settled() {
     }
     assert!(emits_settled(Some("1.5.0")));
     assert!(emits_settled(Some("1.5.0\n")));
+    // 1.6.0's recorded traffic has the event too (tests/fixtures/protocol/pi/1.6.0, PI16).
+    assert!(emits_settled(Some("1.6.0")));
+    assert!(emits_settled(Some("1.6.0\n")));
     for other in [
         None,
         Some(""),
         Some("1.5.1"),
-        Some("1.6.0"),
+        Some("1.5.2"),
+        Some("1.6.1"),
+        Some("1.7.0"),
         Some("pi 1.5.0"),
+        Some("pi 1.6.0"),
         Some("1.5.0-beta"),
+        Some("1.6.0-beta"),
     ] {
         assert!(!emits_settled(other), "{other:?}");
     }
