@@ -525,6 +525,13 @@ fn status_with_non_utf8_comm(uid: u32) -> Vec<u8> {
     bytes
 }
 
+/// FLK05-100: `Uid:` inside the Name line is not the uid line. Only a line that starts with `Uid:` counts.
+#[test]
+fn test_008_05_uid_token_inside_the_name_line_is_not_the_uid_line() {
+    let bytes = b"Name:\tUid:\t0\t0\t0\t0\nUid:\t1000\t1000\t1000\t1000\n";
+    assert_eq!(status_uid_fields(bytes), Some(vec![1000, 1000, 1000, 1000]));
+}
+
 #[test]
 fn test_008_05_non_utf8_comm_does_not_fail_the_peer_lookup() -> R {
     // Hold: pid 99 is still alive and its comm is not UTF-8. The scan reads every process's
