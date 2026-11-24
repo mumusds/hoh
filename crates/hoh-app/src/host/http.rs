@@ -1358,6 +1358,14 @@ fn no_run(run_id: &str) -> Response {
     )
 }
 
+/// The acceptance cursor's third part, as this host writes it: 20 digits, ':', a non-empty AC id (M3B-53).
+fn canonical_revision_order(order: &str) -> bool {
+    let Some((revision, ac)) = order.split_once(':') else {
+        return false;
+    };
+    revision.len() == 20 && revision.bytes().all(|b| b.is_ascii_digit()) && !ac.is_empty()
+}
+
 /// `GET /v1/runs/{run_id}/acceptance` (openapi `listAcceptance`; docs/adr/ADR-029.md decision 5): a page of the run's
 /// acceptance projection, each AC in its scope on each of its candidates, the latest candidate first, with the
 /// watermark it was read at; at most `limit` (1 to 500, 100 by default) after the opaque `cursor`. A query that cannot
@@ -1382,7 +1390,7 @@ async fn list_acceptance(
     }) {
         None => None,
         Some((Some(seq), Some(row), Some(ac))) => match (seq.parse::<i64>(), row.parse::<i64>()) {
-            (Ok(seq), Ok(row)) if seq >= 0 && row >= 0 && !ac.is_empty() => {
+            (Ok(seq), Ok(row)) if seq >= 0 && row >= 0 && canonical_revision_order(ac) => {
                 Some((seq, row, ac.to_owned()))
             }
             _ => return unreadable_page(),
