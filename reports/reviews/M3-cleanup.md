@@ -140,3 +140,30 @@ commits had finished, so the host's own commit took it; it and two privileged ne
 | 1 | `4f5a834d` | Codex codex-cli 0.171.0, `01a20f2f-0d85-7ff1-8080-e1367269bd11` (`396d93c3-8c61-4cfb-a4c5-8d23b4a104a6`) | PASS, no findings |
 
 Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `4f5a834d`; after the rebase onto main see the PR.
+
+## FLK-11 (the scripted writer's process-group exit)
+
+Developer diagnostics from `7dec042f`, REQ-008 / AC-008-04, test
+`test_008_04_m3l200_other_run_commits_between_draft_attempts`. The test's `ProductBetweenDrafts` executor reaped its
+shell and sampled `group_empty(pid)` once. Under load that sample could still be false, even though Git had committed
+successfully. The Runtime correctly recorded `runner.unreaped`, kept the attempt RUNNING and retained its writer
+lease; the test then waited in vain for FAILED. This is a fixture race, not slow drafting or a product state defect.
+
+The fixture now waits for the process-group exit before sending its outcome, as `world::Team::review` already does.
+The 5 s bound limits that cleanup observation; it does not assert that a surviving group is gone. The original 20 s
+assertion deadline, required FAILED state, real intervening Git commit, two drafts and no product-write violation
+assertions are unchanged. Failure output now includes attempt and event diagnostics.
+
+All loops held `/home/ai/dev/.hoh-test-slot.lock`, used the dedicated `m3flk-target`, and ran only scripted agents.
+With 12 CPU burners and the entire drafting binary (`cargo test -p hoh-app --locked --test drafting -- --nocapture`),
+the failure rate was **1/4 before, 0/8 after**. The red log shows `other-work/attempt-1` RUNNING, a successful Git exit,
+and `runner.unreaped`. Two green samples needed the new barrier for 12.014 ms and 10.197 ms; the other six observed an
+empty group immediately. The bound is not a longer timeout hiding the old failure: without the barrier the false
+observation is final and 20 s of further polling cannot settle the attempt. Earlier runs with 6 burners (8 single-test
+runs and 8 full-binary runs), and a 1 s pause between staffing and task creation (3 runs), did not reproduce it.
+
+Evidence: `.hoh-dev/self-tests/m3flk/flk11-binary-heavy-before-{01..04}.log`,
+`flk11-binary-heavy-after-{01..08}.log`, their `*-results.json` command/exit/duration/hash records, and
+`flk11-green.patch` under the same directory. Self-tests, not acceptance. Similar single-sample helpers remain in
+`tests/world/mod.rs` (`Team::hold`), `tests/s5/mod.rs`, `tests/tui_pty.rs`, `tests/m3t10.rs` and recovery fixtures;
+these are unconfirmed out-of-scope risks, not failures reproduced here.
