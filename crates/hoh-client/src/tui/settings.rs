@@ -28,12 +28,13 @@ impl Settings {
     ) -> Result<Self, prompt::Error> {
         let config = config::load(root).map_err(prompt::unavailable)?;
         let configured = config.team.get(role).and_then(|r| r.prompt.clone());
-        let resolved = prompt_files::load(
+        let resolved = prompt_files::load_with_bundle(
             root,
             prompt_files::global_root().as_deref(),
             run,
             role,
             configured.as_deref(),
+            bundle,
         )?;
         let builtin = resolved
             .chain
@@ -80,7 +81,10 @@ impl Settings {
         self.notice =
             match prompt_files::restore_project(root, &self.role, self.configured.as_deref()) {
                 // Ok(false) is the idempotent path: the conventional file was already absent (M3G-01).
-                Ok(false) => "没有 project 覆盖可删除。Esc 返回".to_owned(),
+                Ok(false) => match self.reload_diff(root) {
+                    Ok(()) => "没有 project 覆盖可删除。Esc 返回".to_owned(),
+                    Err(e) => format!("恢复失败：{e}"),
+                },
                 Ok(true) => match self.reload_diff(root) {
                     Ok(()) => {
                         "已恢复默认：project 覆盖已删除；下次 Attempt 重新读取覆盖链。Esc 返回"
@@ -94,12 +98,13 @@ impl Settings {
 
     /// Rebuild the diff from the files on disk. A successful restore otherwise keeps the deleted override on screen.
     fn reload_diff(&mut self, root: &Path) -> Result<(), prompt::Error> {
-        let resolved = prompt_files::load(
+        let resolved = prompt_files::load_with_bundle(
             root,
             prompt_files::global_root().as_deref(),
             &self.run,
             &self.role,
             self.configured.as_deref(),
+            &self.bundle,
         )?;
         let builtin = resolved
             .chain
