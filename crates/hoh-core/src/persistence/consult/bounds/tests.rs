@@ -1,4 +1,3 @@
-
 use super::accrue_wall;
 use crate::persistence::{Options, Store, selftest};
 use rusqlite::Connection;
