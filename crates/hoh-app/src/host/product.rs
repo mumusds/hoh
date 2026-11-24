@@ -42,6 +42,8 @@ pub struct ProductExecutor {
     stopping: tokio::sync::watch::Sender<bool>,
     /// The task that waits for each turn's end and keeps its raw logs, until the host stops.
     watchers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The host's installed bundle. Absent means [`hoh_core::resource_bundle::Bundle::current`] (M3G-54).
+    resources: Option<hoh_core::resource_bundle::Bundle>,
 }
 
 /// How long the host's stop waits for a turn's raw logs being kept as objects when it stops (a blocking copy).
@@ -113,7 +115,15 @@ impl ProductExecutor {
             preparing: None,
             stopping: tokio::sync::watch::Sender::new(false),
             watchers: Mutex::default(),
+            resources: None,
         }
+    }
+
+    /// Pack and drift against `bundle` when the attempt has no pin. The product host passes the
+    /// store's bundle (M3G-54).
+    pub fn with_resources(mut self, bundle: hoh_core::resource_bundle::Bundle) -> Self {
+        self.resources = Some(bundle);
+        self
     }
 
     /// The executor calling `hook` with (attempt id, key) for each gate key it draws: a test's way to the key of an
@@ -473,9 +483,15 @@ fn keep_diagnostics(outcome: &Outcome) {
 }
 
 impl ProductExecutor {
+    fn host_bundle(&self) -> hoh_core::resource_bundle::Bundle {
+        self.resources
+            .clone()
+            .unwrap_or_else(hoh_core::resource_bundle::Bundle::current)
+    }
+
     fn bundle(&self, work: &Work) -> Result<hoh_core::resource_bundle::Bundle, Refusal> {
         work.assignment.resource_bundle.as_ref().map_or_else(
-            || Ok(hoh_core::resource_bundle::Bundle::current()),
+            || Ok(self.host_bundle()),
             |pin| {
                 pin.load(&self.project)
                     .map_err(|why| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why))
@@ -802,12 +818,9 @@ impl ProductExecutor {
             });
         }
         let mut drift_refs = Vec::new();
-        for report in hoh_core::prompt_files::drift_reports(
-            &self.project,
-            resolved,
-            &hoh_core::resource_bundle::Bundle::current(),
-        )
-        .map_err(prompt_refusal)?
+        for report in
+            hoh_core::prompt_files::drift_reports(&self.project, resolved, &self.host_bundle())
+                .map_err(prompt_refusal)?
         {
             let bytes = report.to_string().into_bytes();
             let sha = hoh_core::objects::put(&self.project, &bytes).map_err(|why| {

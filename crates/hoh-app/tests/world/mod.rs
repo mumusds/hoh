@@ -1332,6 +1332,7 @@ impl World {
             HostConfig::product_with(&self.project(), effective, HOH.into(), registry.clone());
         config.port = 0;
         config.store.wal_probe = Some(probe());
+        let resources = (*config.store.resource_bundle).clone();
         if let Some(runner) = config.runner.as_mut() {
             runner.context.commander_dir = Some(self.state().join("hoh/commander"));
             if let Some(hook) = preparing {
@@ -1342,6 +1343,7 @@ impl World {
                         HOH.into(),
                         graces,
                     )
+                    .with_resources(resources)
                     .with_preparing(hook),
                 );
             }

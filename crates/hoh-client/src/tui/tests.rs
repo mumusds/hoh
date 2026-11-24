@@ -1765,6 +1765,37 @@ fn test_047_03_settings_exposes_drift_and_both_diffs() {
 }
 
 #[test]
+fn test_047_03_settings_drift_follows_the_injected_bundle() {
+    // M3G-54: an override saved against the host bundle is not drift when settings uses that bundle.
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-drift-host-")
+        .tempdir()
+        .unwrap();
+    let mut host = hoh_core::resource_bundle::Bundle::current();
+    host.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "host developer\n".to_owned(),
+    );
+    hoh_core::prompt_files::save_override_based_on(
+        dir.path(),
+        ".hoh/prompts/developer.md",
+        "custom\n",
+        "developer",
+        &host,
+    )
+    .unwrap();
+    let mut app = App::open(dir.path());
+    app.set_resource_bundle(host);
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    let shown = screen(&app, 120, 400).join("\n");
+    assert!(
+        !shown.contains("漂移"),
+        "injected bundle matches the saved base: {shown}"
+    );
+}
+
+#[test]
 fn unattached_modes_are_local_and_slashes_never_become_input() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut app = App::open(dir.path());

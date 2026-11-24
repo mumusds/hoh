@@ -167,13 +167,12 @@ impl HostConfig {
             term: graces.1,
             ..hoh_core::cancel::GRACES
         };
+        let resources = (*host.store.resource_bundle).clone();
         host.runner = Some(RunnerConfig {
-            executor: Arc::new(product::ProductExecutor::new(
-                registry,
-                project.to_path_buf(),
-                gate,
-                graces,
-            )),
+            executor: Arc::new(
+                product::ProductExecutor::new(registry, project.to_path_buf(), gate, graces)
+                    .with_resources(resources),
+            ),
             context: hoh_core::decision::Context {
                 reader_slots: Some(execution.reader_slots),
                 // The supervisor's own slot, or a reader slot (docs/adr/ADR-025.md decision 3).
