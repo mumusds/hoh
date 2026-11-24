@@ -388,6 +388,25 @@ fn prefix_output(root: &Path, args: &[&str], prefixes: &[Vec<u8>]) -> Result<Vec
     observe_git(root, &args, OBSERVATION_LIMIT)
 }
 
+/// Keep the mode, blob and stage for each pre-dirty tracked path, including an
+/// empty entry list for a staged deletion. Read only these literal byte paths.
+fn index_snapshot(root: &Path, tracked: &[Vec<u8>]) -> Result<Value, String> {
+    let mut entries: BTreeMap<String, Vec<String>> =
+        tracked.iter().map(|path| (hex(path), Vec::new())).collect();
+    let output = prefix_output(root, &["ls-files", "-s", "-z"], tracked)?;
+    for entry in output.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid Git index entry")?;
+        let metadata = std::str::from_utf8(&entry[..tab]).map_err(|e| e.to_string())?;
+        if let Some(values) = entries.get_mut(&hex(&entry[tab + 1..])) {
+            values.push(metadata.to_owned());
+        }
+    }
+    Ok(json!(entries))
+}
+
 struct Observation {
     bytes_left: u64,
     digests: BTreeMap<Vec<u8>, Value>,
@@ -516,13 +535,14 @@ pub(super) fn snapshot(root: &Path) -> Value {
         for path in d.difference(&u) {
             tracked.insert(hex(path), observation.file(root, path)?);
         }
+        let index = index_snapshot(root, &d.difference(&u).cloned().collect::<Vec<_>>())?;
         let dirty: BTreeSet<_> = tracked
             .keys()
             .cloned()
             .chain(fingerprints.keys().cloned())
             .collect();
         let value = json!({"head":h,"draft_dirty":dirty,"draft_untracked":fingerprints,
-            "draft_tracked":tracked,
+            "draft_tracked":tracked,"draft_index":index,
             "draft_ignored_roots":ignored_snapshot(&ignored_roots(root)?),
             "draft_outside":d.difference(&u).filter(|p|!allowed(p)).map(|p|named(p)).collect::<Vec<_>>()});
         if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > OBSERVATION_LIMIT {
@@ -624,6 +644,15 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
     let initial = start["draft_untracked"]
         .as_object()
         .ok_or("missing untracked start digests")?;
+    let tracked = start_dirty
+        .iter()
+        .map(|name| name.as_str().ok_or("invalid draft start path"))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|name| !initial.contains_key(*name))
+        .map(decoded)
+        .collect::<Result<Vec<_>, _>>()?;
+    let end_index = index_snapshot(root, &tracked)?;
     let mut observation = Observation::new();
     for name in start_dirty {
         let name = name.as_str().ok_or("invalid draft start path")?;
@@ -640,9 +669,18 @@ fn checked(root: &Path, start: &Value) -> Result<WriterOutcome, String> {
                     named(&path)
                 )
             })?;
-        if observation.file(root, &path)? != *digest || committed.contains(&path) {
+        let index = start["draft_index"].get(name).ok_or_else(|| {
+            format!(
+                "pre-dirty tracked path {}; ownership uncertain: missing start index",
+                named(&path)
+            )
+        })?;
+        if observation.file(root, &path)? != *digest
+            || end_index.get(name) != Some(index)
+            || committed.contains(&path)
+        {
             return Err(format!(
-                "pre-dirty tracked path {} changed or was committed; ownership uncertain",
+                "pre-dirty tracked path {} changed in worktree/index or was committed; ownership uncertain",
                 named(&path)
             ));
         }
