@@ -222,7 +222,9 @@ fn tools_with(
             },
         }
     }
-    if !unknown && !ending.is_empty() && !settled(root, ending, wait) {
+    // One look, one budget.
+    let mut budget = SETTLE_WITHIN;
+    if !unknown && !ending.is_empty() && !settled(root, ending, wait, &mut budget) {
         unknown = true;
     }
     if unknown {
@@ -252,16 +254,21 @@ fn ended(root: &Path, process: &Proc) -> bool {
     }
 }
 
-/// Whether every process of `ending` ends by [`ended`] within [`SETTLE_WITHIN`], looked at every [`SETTLE_STEP`]; at most
-/// [`SETTLE_AT_MOST`] of them are waited for.
-fn settled(root: &Path, mut ending: Vec<&Proc>, wait: &mut dyn FnMut(Duration)) -> bool {
+/// Whether every process of `ending` ends by [`ended`] within what is left of `budget` (taken from it), looked at every
+/// [`SETTLE_STEP`]; at most [`SETTLE_AT_MOST`] of them are waited for. One observation's waits share one budget of
+/// [`SETTLE_WITHIN`] (WDF-100, FLK07-101).
+fn settled(
+    root: &Path,
+    mut ending: Vec<&Proc>,
+    wait: &mut dyn FnMut(Duration),
+    budget: &mut Duration,
+) -> bool {
     if ending.len() > SETTLE_AT_MOST {
         return false;
     }
-    let mut waited = Duration::ZERO;
-    while waited < SETTLE_WITHIN {
+    while *budget >= SETTLE_STEP {
         wait(SETTLE_STEP);
-        waited += SETTLE_STEP;
+        *budget -= SETTLE_STEP;
         ending.retain(|process| !ended(root, process));
         if ending.is_empty() {
             return true;
@@ -431,6 +438,18 @@ pub(super) struct Outside {
     after_finding: Option<Box<dyn FnMut() + Send>>,
 }
 
+/// What one pass of [`Outside::scan`] saw.
+struct Pass {
+    /// Every process looked at, in the order looked at (a pid may name two of them, one after the other).
+    processes: Vec<Proc>,
+    /// The ones found by their marker (their places in `processes`).
+    by_marker: BTreeSet<usize>,
+    /// The unreadable ones that are ending, to be let end (their places in `processes`).
+    ending: Vec<usize>,
+    /// Whether every process was read and the sweep of the allocations settled.
+    complete: bool,
+}
+
 impl Outside {
     pub(super) fn new(marker: &str) -> Outside {
         Outside {
@@ -508,101 +527,26 @@ impl Outside {
     /// [`Outside::scan`], `wait` its pause between looks at the processes it lets end (a test's seam).
     fn scan_with(&mut self, wait: &mut dyn FnMut(Duration)) -> Proof {
         self.scanned = Some(Instant::now());
-        // The listing, then every pid allocated since it began, each batch's environments read before the next look
-        // at the allocations, until none was allocated meanwhile (decision 8d v4, M2T06R-200): a marked process alive
-        // at the end was either looked at here or forked by a marked process looked at here. The unreadable ones that
-        // are ending are let end before that last look, so what they fork meanwhile is looked at too (FLK07-01).
-        let Some(mut last) = last_pid(&self.root) else {
-            self.quiet = 0;
-            return Proof::Incomplete;
+        // A full pass (the listing and the allocations swept after it); when it met unreadable processes that are
+        // ending, they are let end and the pass is thrown away for a full one from a new listing (DC-FLK07): what they
+        // or anything else forked while the scan waited is in that listing, whatever the pid cursor did meanwhile
+        // (FLK07-01, FLK07-100). All the waits of one scan come out of one budget (WDF-100, FLK07-101): once it is
+        // spent, a pass that still meets one ending proves nothing.
+        let mut budget = SETTLE_WITHIN;
+        let (processes, by_marker, mut complete) = loop {
+            let Some(pass) = self.pass() else {
+                self.quiet = 0;
+                return Proof::Incomplete;
+            };
+            // Nothing is waited for when the pass is incomplete anyway.
+            if !pass.complete || pass.ending.is_empty() {
+                break (pass.processes, pass.by_marker, pass.complete);
+            }
+            let ending = pass.ending.iter().map(|at| &pass.processes[*at]).collect();
+            if !settled(&self.root, ending, wait, &mut budget) {
+                break (pass.processes, pass.by_marker, false);
+            }
         };
-        let (mut processes, mut complete) = processes(&self.root);
-        #[cfg(test)]
-        if let Some(hook) = self.after_listing.as_mut() {
-            hook();
-        }
-        // Each pid looked at, with the start time of the process last looked at there: a pid allocated again during the
-        // scan (pid_max wrapped) names another process, looked at in its turn.
-        let mut seen: BTreeMap<u32, u64> = processes.iter().map(|p| (p.pid, p.start)).collect();
-        // The processes found by their marker (their places in `processes`).
-        let mut by_marker: BTreeSet<usize> = BTreeSet::new();
-        let mut batch: Vec<usize> = (0..processes.len()).collect();
-        let mut settled = false;
-        // The unreadable ones that are ending, let end below (their places in `processes`).
-        let mut ending: Vec<usize> = Vec::new();
-        let me = rustix::process::getuid().as_raw();
-        for _ in 0..=SWEEPS {
-            for at in batch.drain(..) {
-                let process = &processes[at];
-                match marked_tri(&self.root, process, &self.marker, me) {
-                    Some(true) => {
-                        by_marker.insert(at);
-                    }
-                    Some(false) => {}
-                    // Neither its environment nor a thread's could be read, and it is this user's (a non-dumpable or
-                    // set-user-id process refuses its environment, M2R-500): unrelated only if it started before the
-                    // leader or has ended; else it may be the attempt's, and the scan proves nothing (as WD-03). With
-                    // no leader start recorded nothing bounds it (the user's own service manager refuses its
-                    // environment too): not counted, the stated residual of such a record (a STARTING attempt with no
-                    // process, held at its gate, has none outside; a pid recorded without a start is a legacy row).
-                    None if self.born.is_none_or(|born| process.start < born)
-                        || has_ended(process) => {}
-                    // With the attempt's cgroup, only one that could have moved there from it ([`Outside::by_cgroup`]).
-                    None if self.by_cgroup && !in_users_manager(&self.root, process.pid, me) => {}
-                    // Exiting or a zombie, as listed or as read again now: it refused because it is ending (an
-                    // exiting process refuses its environment, and this user's unrelated processes exit all the
-                    // time), and it is let end as the watchdog lets it (WD-03's rule with its corrections of
-                    // 2026-11-17, docs/adr/ADR-022.md decision 19, WDF-100; FLK-07). One that runs stays unknown.
-                    None if process.zombie || process.exiting => ending.push(at),
-                    None => match stat(&self.root, process.pid) {
-                        Stat::Gone => {}
-                        Stat::Read(now) if now.start != process.start || has_ended(&now) => {}
-                        Stat::Read(now) if now.zombie || now.exiting => ending.push(at),
-                        Stat::Read(_) | Stat::Unreadable => complete = false,
-                    },
-                }
-            }
-            let Some(now) = last_pid(&self.root) else {
-                break;
-            };
-            if now == last {
-                if ending.is_empty() {
-                    settled = true;
-                    break;
-                }
-                // None allocated since the last batch, but some refused because they are ending. One whose main thread
-                // is a zombie may run on in another thread, which can fork while it is let end (FLK07-01): an ending
-                // process holds the proof unless one read shows its end within the settle time, and what was allocated
-                // meanwhile is looked at next, until a look at the allocations shows none since. Nothing is waited for
-                // when the scan is already incomplete.
-                if !complete {
-                    break;
-                }
-                complete = self::settled(
-                    &self.root,
-                    ending.drain(..).map(|at| &processes[at]).collect(),
-                    wait,
-                );
-                continue;
-            }
-            let Some(pids) = allocated(&self.root, last, now) else {
-                break;
-            };
-            for pid in pids {
-                match stat_process(&self.root, pid) {
-                    Stat::Read(process) if seen.get(&pid) == Some(&process.start) => {}
-                    Stat::Read(process) => {
-                        seen.insert(pid, process.start);
-                        batch.push(processes.len());
-                        processes.push(process);
-                    }
-                    Stat::Gone => {}
-                    Stat::Unreadable => complete = false,
-                }
-            }
-            last = now;
-        }
-        complete = complete && settled;
         // The processes found (their places in `processes`: a pid may name two of them, one after the other).
         let mut found: BTreeSet<usize> = BTreeSet::new();
         let mut parents: Vec<u32> = self
@@ -668,6 +612,88 @@ impl Outside {
         } else {
             Proof::Pending
         }
+    }
+
+    /// One pass of a scan: the listing, then every pid allocated since it began, each batch's environments read before
+    /// the next look at the allocations, until none was allocated meanwhile (decision 8d v4, M2T06R-200): a marked
+    /// process alive at its end was either looked at here or forked by a marked process looked at here, unless one
+    /// it let pass as ending (in [`Pass::ending`]) forked it. `None` when the allocations cannot be read.
+    fn pass(&mut self) -> Option<Pass> {
+        let mut last = last_pid(&self.root)?;
+        let (mut processes, mut complete) = processes(&self.root);
+        #[cfg(test)]
+        if let Some(hook) = self.after_listing.as_mut() {
+            hook();
+        }
+        // Each pid looked at, with the start time of the process last looked at there: a pid allocated again during the
+        // pass (pid_max wrapped) names another process, looked at in its turn.
+        let mut seen: BTreeMap<u32, u64> = processes.iter().map(|p| (p.pid, p.start)).collect();
+        let mut by_marker: BTreeSet<usize> = BTreeSet::new();
+        let mut batch: Vec<usize> = (0..processes.len()).collect();
+        let mut settled = false;
+        let mut ending: Vec<usize> = Vec::new();
+        let me = rustix::process::getuid().as_raw();
+        for _ in 0..=SWEEPS {
+            for at in batch.drain(..) {
+                let process = &processes[at];
+                match marked_tri(&self.root, process, &self.marker, me) {
+                    Some(true) => {
+                        by_marker.insert(at);
+                    }
+                    Some(false) => {}
+                    // Neither its environment nor a thread's could be read, and it is this user's (a non-dumpable or
+                    // set-user-id process refuses its environment, M2R-500): unrelated only if it started before the
+                    // leader or has ended; else it may be the attempt's, and the scan proves nothing (as WD-03). With
+                    // no leader start recorded nothing bounds it (the user's own service manager refuses its
+                    // environment too): not counted, the stated residual of such a record (a STARTING attempt with no
+                    // process, held at its gate, has none outside; a pid recorded without a start is a legacy row).
+                    None if self.born.is_none_or(|born| process.start < born)
+                        || has_ended(process) => {}
+                    // With the attempt's cgroup, only one that could have moved there from it ([`Outside::by_cgroup`]).
+                    None if self.by_cgroup && !in_users_manager(&self.root, process.pid, me) => {}
+                    // Exiting or a zombie, as listed or as read again now: it refused because it is ending (an
+                    // exiting process refuses its environment, and this user's unrelated processes exit all the
+                    // time), and it is let end as the watchdog lets it (WD-03's rule with its corrections of
+                    // 2026-11-17, docs/adr/ADR-022.md decision 19, WDF-100; FLK-07). One that runs stays unknown.
+                    None if process.zombie || process.exiting => ending.push(at),
+                    None => match stat(&self.root, process.pid) {
+                        Stat::Gone => {}
+                        Stat::Read(now) if now.start != process.start || has_ended(&now) => {}
+                        Stat::Read(now) if now.zombie || now.exiting => ending.push(at),
+                        Stat::Read(_) | Stat::Unreadable => complete = false,
+                    },
+                }
+            }
+            let Some(now) = last_pid(&self.root) else {
+                break;
+            };
+            if now == last {
+                settled = true;
+                break;
+            }
+            let Some(pids) = allocated(&self.root, last, now) else {
+                break;
+            };
+            for pid in pids {
+                match stat_process(&self.root, pid) {
+                    Stat::Read(process) if seen.get(&pid) == Some(&process.start) => {}
+                    Stat::Read(process) => {
+                        seen.insert(pid, process.start);
+                        batch.push(processes.len());
+                        processes.push(process);
+                    }
+                    Stat::Gone => {}
+                    Stat::Unreadable => complete = false,
+                }
+            }
+            last = now;
+        }
+        Some(Pass {
+            processes,
+            by_marker,
+            ending,
+            complete: complete && settled,
+        })
     }
 
     /// Scan if the last scan is older than [`RESCAN`]; whether a pinned one lives.
@@ -1662,48 +1688,6 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
         // and a control where only an unrelated process is allocated during the wait (the round stays quiet, as the
         // load that FLK-07 fixed needs). A marked process of a tree of its own is found but cannot be pinned (no real
         // process has its pid and start), so a round that found one is Incomplete here: never Done.
-        type Step = Box<dyn FnOnce(&Path) -> std::io::Result<()>>;
-        // Scans of a tree holding an unrelated process (250), each `(before, during)`: what happens before the scan and
-        // at its first pause; their proofs, and the tree.
-        fn rounds(
-            plan: Vec<(Option<Step>, Option<Step>)>,
-        ) -> std::io::Result<(Vec<Proof>, tempfile::TempDir)> {
-            let root = tempfile::tempdir()?;
-            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
-            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
-            std::fs::write(root.path().join("sys/kernel/pid_max"), b"400\n")?;
-            put(root.path(), 250, 750, false, b"PATH=/bin\0")?;
-            let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
-            outside.set_leader(Some(100), Some("500"));
-            let mut proofs = Vec::new();
-            for (before, during) in plan {
-                if let Some(before) = before {
-                    before(root.path())?;
-                }
-                let mut during = during;
-                let mut failed = Ok(());
-                proofs.push(outside.scan_with(&mut |_| {
-                    if let Some(during) = during.take() {
-                        failed = during(root.path());
-                    }
-                }));
-                failed?;
-            }
-            Ok((proofs, root))
-        }
-        let ending = |pid: u32, start: u64| -> Option<Step> {
-            Some(Box::new(move |root: &Path| {
-                put(root, pid, start, true, b"")
-            }))
-        };
-        // During the wait: `parent` forks `child` (the allocation shows in ns_last_pid) with `environ`, and ends.
-        let fork = |parent: u32, child: u32, environ: &'static [u8]| -> Option<Step> {
-            Some(Box::new(move |root: &Path| {
-                put(root, child, 2000 + u64::from(child), false, environ)?;
-                std::fs::write(root.join("sys/kernel/ns_last_pid"), format!("{child}\n"))?;
-                std::fs::remove_dir_all(root.join(parent.to_string()))
-            }))
-        };
         // The reviewer's chain: 300 ending forks marked 301 and ends; 301, ending in its turn, forks marked 302 and
         // ends.
         let (chain, root) = rounds(vec![
@@ -1740,6 +1724,158 @@ ctypes.CDLL(None).syscall(ctypes.c_long({'x86_64': 60, 'aarch64': 93}[platform.m
             )
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_process_forked_while_the_scan_waits_is_looked_at_whatever_the_pid_cursor_did_meanwhile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLK07-100 (FLK-07 review round 2): ns_last_pid is a cyclic allocation cursor. While a scan lets an ending
+        // process end, the allocator may wrap round pid_max back to the same value (no change seen) or past it (only
+        // the span since the old value looked at), and a marked child forked meanwhile sits outside what any reasoning
+        // about the cursor looks at. After a wait the scan starts again from the listing (DC-FLK07), so the child is
+        // looked at whatever the cursor did. The reviewer's two-round chains: 300 (ending) forks marked 290 and ends,
+        // then 290 (ending in its turn) forks marked 291 and ends; the cursor stays at 300, or moves past it to 305,
+        // then 310 (pid_max 400). Never Done while 291 lives (found but not pinnable in a tree of its own: Incomplete).
+        let chain = |first: u32, second: u32| -> std::io::Result<(Vec<Proof>, bool)> {
+            let (proofs, root) = rounds(vec![
+                (ending(300, 1200), fork_to(300, 290, first, MARKED)),
+                (ending(290, 2290), fork_to(290, 291, second, MARKED)),
+                (None, None),
+            ])?;
+            let alive = std::fs::read(root.path().join("291/environ"))? == MARKED;
+            Ok((proofs, alive))
+        };
+        let same = chain(300, 300)?;
+        let past = chain(305, 310)?;
+        // One round: a quiet round, then 300 forks marked 290 while the cursor wraps back to 300.
+        let (once, _root) = rounds(vec![
+            (None, None),
+            (ending(300, 1200), fork_to(300, 290, 300, MARKED)),
+        ])?;
+        assert_eq!(
+            (same, past, once),
+            (
+                (vec![Proof::Incomplete; 3], true),
+                (vec![Proof::Incomplete; 3], true),
+                vec![Proof::Pending, Proof::Incomplete],
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_waits_of_one_scan_share_one_settle_budget_however_many_times_it_starts_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLK07-101 (FLK-07 review round 2): the waits for ending processes are bounded per observation (100 ms,
+        // docs/adr/ADR-022.md decision 19, WDF-100), not per batch. Here each ending process, at every `every`-th
+        // pause, forks another unrelated ending one and ends, `generations` times; the last one then ends. Every wait
+        // of the scan comes out of one budget: once it is spent and a pass still meets one ending, the scan is
+        // Incomplete (as before FLK-07), never quiet. Gives the proof and the time waited in all.
+        let scan = |generations: u32, every: u32| -> std::io::Result<(Proof, Duration)> {
+            let root = tempfile::tempdir()?;
+            std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+            std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+            std::fs::write(root.path().join("sys/kernel/pid_max"), b"4000\n")?;
+            put(root.path(), 300, 1200, true, b"")?;
+            let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+            outside.set_leader(Some(100), Some("500"));
+            let (mut current, mut pauses, mut waited) = (300, 0, Duration::ZERO);
+            let mut failed = Ok(());
+            let proof = outside.scan_with(&mut |step| {
+                waited += step;
+                pauses += 1;
+                if pauses % every != 0 || current == 0 {
+                    return;
+                }
+                let next = || -> std::io::Result<u32> {
+                    std::fs::remove_dir_all(root.path().join(current.to_string()))?;
+                    if current - 300 >= generations {
+                        return Ok(0);
+                    }
+                    let child = current + 1;
+                    put(root.path(), child, 2000 + u64::from(child), true, b"")?;
+                    std::fs::write(
+                        root.path().join("sys/kernel/ns_last_pid"),
+                        format!("{child}\n"),
+                    )?;
+                    Ok(child)
+                };
+                match next() {
+                    Ok(child) => current = child,
+                    Err(e) => failed = Err(e),
+                }
+            });
+            failed?;
+            Ok((proof, waited))
+        };
+        let step = SETTLE_STEP;
+        assert_eq!(
+            [scan(3, 1)?, scan(32, 1)?, scan(3, 10)?],
+            [
+                // Four waits of one step each, then a pass that meets none ending: the first quiet scan.
+                (Proof::Pending, 4 * step),
+                // The budget is spent after ten passes; the eleventh still meets one ending.
+                (Proof::Incomplete, SETTLE_WITHIN),
+                // The first one ends at the budget's last step; the pass after it meets the next one.
+                (Proof::Incomplete, SETTLE_WITHIN),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A change to a /proc tree, made before a scan or at its first pause.
+    type Step = Box<dyn FnOnce(&Path) -> std::io::Result<()>>;
+
+    /// Scans of a tree holding an unrelated process (250; ns_last_pid 300, pid_max 400) for the attempt with leader 100
+    /// started at 500, each `(before, during)`: what happens before the scan and at its first pause; their proofs, and
+    /// the tree.
+    fn rounds(
+        plan: Vec<(Option<Step>, Option<Step>)>,
+    ) -> std::io::Result<(Vec<Proof>, tempfile::TempDir)> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("sys/kernel"))?;
+        std::fs::write(root.path().join("sys/kernel/ns_last_pid"), b"300\n")?;
+        std::fs::write(root.path().join("sys/kernel/pid_max"), b"400\n")?;
+        put(root.path(), 250, 750, false, b"PATH=/bin\0")?;
+        let mut outside = Outside::new("p/A1").with_root(Some(root.path().to_owned()));
+        outside.set_leader(Some(100), Some("500"));
+        let mut proofs = Vec::new();
+        for (before, during) in plan {
+            if let Some(before) = before {
+                before(root.path())?;
+            }
+            let mut during = during;
+            let mut failed = Ok(());
+            proofs.push(outside.scan_with(&mut |_| {
+                if let Some(during) = during.take() {
+                    failed = during(root.path());
+                }
+            }));
+            failed?;
+        }
+        Ok((proofs, root))
+    }
+
+    /// `pid`, started at `start`, ending: its main thread a zombie, another thread running, no environment readable.
+    fn ending(pid: u32, start: u64) -> Option<Step> {
+        Some(Box::new(move |root: &Path| {
+            put(root, pid, start, true, b"")
+        }))
+    }
+
+    /// `parent` forks `child` with `environ` (the allocation shows in ns_last_pid) and ends.
+    fn fork(parent: u32, child: u32, environ: &'static [u8]) -> Option<Step> {
+        fork_to(parent, child, child, environ)
+    }
+
+    /// [`fork`], ns_last_pid reading `cursor` afterwards: the allocator may have wrapped round pid_max meanwhile, to the
+    /// same value or past it (FLK07-100).
+    fn fork_to(parent: u32, child: u32, cursor: u32, environ: &'static [u8]) -> Option<Step> {
+        Some(Box::new(move |root: &Path| {
+            put(root, child, 2000 + u64::from(child), false, environ)?;
+            std::fs::write(root.join("sys/kernel/ns_last_pid"), format!("{cursor}\n"))?;
+            std::fs::remove_dir_all(root.join(parent.to_string()))
+        }))
     }
 
     /// `pid` started at `start` in the /proc tree `root`, the host's user's: ending (its main thread a zombie, another
