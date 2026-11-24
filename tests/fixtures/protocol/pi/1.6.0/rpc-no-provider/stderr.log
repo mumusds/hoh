@@ -1,0 +1,3 @@
+Warning: No models available. Use /login to log into a provider via OAuth or API key. See:
+  /home/ai/.pi/agent/install/releases/1.6.0/node_modules/@earendil-works/pi-coding-agent/docs/providers.md
+  /home/ai/.pi/agent/install/releases/1.6.0/node_modules/@earendil-works/pi-coding-agent/docs/models.md

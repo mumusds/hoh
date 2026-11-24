@@ -1,0 +1,23 @@
+{
+  "agent": "pi",
+  "cli_version": "1.6.0",
+  "case": "rpc-resume",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions",
+    "--session-id",
+    "<session id of rpc-prompt>"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-24T06:08:45.603629+00:00",
+  "mode": "live",
+  "notes": "new process with the same --session-dir and --session-id",
+  "resumed_session_id": "01a20c2b-a66f-7673-952e-5e0be90ae8de",
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}

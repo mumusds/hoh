@@ -1,0 +1,25 @@
+{
+  "agent": "pi",
+  "cli_version": "1.6.0",
+  "case": "rpc-abort",
+  "argv": [
+    "pi",
+    "--mode",
+    "rpc",
+    "--session-dir",
+    "<temp>/pi-sessions",
+    "--session-id",
+    "<session id of rpc-prompt>"
+  ],
+  "cwd": "fresh temp Git repo outside the checkout",
+  "exit_code": 0,
+  "recorded_at": "2026-11-24T06:08:49.829082+00:00",
+  "mode": "live",
+  "notes": "abort command sent on the first message_update",
+  "assistant_stop_reasons": [
+    "aborted"
+  ],
+  "stopped": "exited",
+  "valid": true,
+  "problems": []
+}
