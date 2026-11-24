@@ -262,9 +262,15 @@ fn test_008_04_s8_reconcile_checks_failed_draft_writes_and_keeps_files() -> R {
 
 /// The caller supplies a separately built, fixed pre-002 product binary and records its commit/hash.
 /// This deliberately cannot substitute the current binary or an emulated migration list for the old product.
+/// No TEST id: this optional ignored diagnostic is not evidence for the drafting recovery scenario.
+/// Executed coverage of refusing a newer schema lives in persistence/migration/tests.rs:
+/// test_008_02_v1_to_v2_preserves_every_original_column_and_row and
+/// test_008_02_fk_off_precedes_begin_and_on_follows_every_outcome (SchemaTooNew, v2 vs v1), and in
+/// tests/db_faults.rs: migration_a_database_of_a_newer_binary_is_refused_with_78_naming_both_versions_and_left_as_it_was
+/// (the product binary refuses a newer schema without changing it).
 #[test]
 #[ignore = "requires HOH_TEST_PRE_002_BINARY pointing at a recorded pre-002 product build"]
-fn test_008_02_old_binary_refuses_v2_database() -> R {
+fn old_binary_refuses_v2_database() -> R {
     let old =
         PathBuf::from(std::env::var_os("HOH_TEST_PRE_002_BINARY").ok_or("old binary missing")?);
     assert!(old.is_absolute() && old.is_file());
