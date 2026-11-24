@@ -396,6 +396,56 @@ async fn test_023_03_discussion_limit_follows_max_rounds() -> R {
             sql(dir.path(), "SELECT state FROM runs WHERE run_id='R'", true)?[0]["state"],
             "RUNNING"
         );
+        if max == 3 {
+            // M3K-03: the discussion-limit event fires once. Other wakes may fire; count this seq.
+            let seq = sql(
+                dir.path(),
+                "SELECT seq FROM events WHERE kind='need_decision' AND run_id='R'",
+                true,
+            )?[0]["seq"]
+                .as_i64()
+                .ok_or("discussion seq")?;
+            // Quiet is 2s (supervise::QUIET). The step's clock must be past the trigger's due time.
+            let now = SystemTime::now() + Duration::from_secs(20);
+            let first = host
+                .store()
+                .supervise(
+                    "R",
+                    Context {
+                        now: Some(now),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            let second = host
+                .store()
+                .supervise(
+                    "R",
+                    Context {
+                        now: Some(now + Duration::from_secs(3)),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(
+                first
+                    .fired
+                    .iter()
+                    .filter(|fired| fired.event_seqs.contains(&seq))
+                    .count(),
+                1,
+                "discussion limit fires once: {:?}",
+                first.fired
+            );
+            assert!(
+                !second
+                    .fired
+                    .iter()
+                    .any(|fired| fired.event_seqs.contains(&seq)),
+                "a second supervise must not re-fire it: {:?}",
+                second.fired
+            );
+        }
         let conclude = message(
             "conclude",
             json!({"intent":"conclude","controversy_id":"architecture","adr":"docs/adr/ADR-037.md"}),

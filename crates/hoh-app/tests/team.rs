@@ -160,6 +160,34 @@ async fn a_started_run_shows_its_team_in_its_snapshot_and_its_team_page() -> R {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_023_03_start_run_freezes_configured_discussion_limit() -> R {
+    // M3K-03: StartRun copies supervision.max_discussion_rounds from the project file into the snapshot.
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(dir.path().join(".hoh"))?;
+    std::fs::write(
+        dir.path().join(".hoh/config.toml"),
+        "config_version = \"1.0\"\n[supervision]\nmax_discussion_rounds = 4\n",
+    )?;
+    let host = start_when_free(config(dir.path())).await?;
+    let (status, accepted) =
+        exchange(&host, "POST", "/v1/commands", Some(&start_run("limit"))).await?;
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = accepted["run_id"].as_str().ok_or("no run_id")?;
+    assert_eq!(
+        query(
+            dir.path(),
+            &format!(
+                "SELECT json_extract(config_snapshot_json,'$.supervision.max_discussion_rounds') \
+                 FROM runs WHERE run_id = '{run_id}'"
+            )
+        )?,
+        "4"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
 /// A ConfigureTeam body with idempotency key `key`.
 fn configure(key: &str, run_id: Option<&str>, expected: i64, payload: Value) -> Value {
     json!({
