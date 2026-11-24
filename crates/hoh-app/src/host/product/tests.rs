@@ -1514,6 +1514,56 @@ fn test_047_03_unpinned_pack_and_drift_use_the_host_bundle()
 }
 
 #[test]
+fn test_047_03_incompatible_old_pin_is_transient_and_the_host_bundle_stays_decision()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M3G-52: a pin this binary cannot render is transient so the checkpoint can move on.
+    // The same bytes as the host bundle stay a decision. An identity mismatch stays a decision.
+    let dir = tempfile::Builder::new().prefix("m3g52-schema-").tempdir()?;
+    let mut broken = hoh_core::resource_bundle::Bundle::current();
+    let mut schema: serde_json::Value =
+        serde_json::from_str(broken.text("contracts/protocol.schema.json")?)?;
+    schema["$defs"]
+        .as_object_mut()
+        .ok_or("no defs")?
+        .remove("TaskResult");
+    broken.files.insert(
+        "contracts/protocol.schema.json".to_owned(),
+        serde_json::to_string(&schema)?,
+    );
+    let mut pinned = work(None);
+    pinned.assignment.resource_bundle = Some(broken.store(dir.path())?);
+    let err = executor(dir.path())
+        .pack(&pinned, &contract("old developer\n"), None, false)
+        .err()
+        .ok_or("old pin packed")?;
+    assert_eq!(err.reason, "PROMPT_UNAVAILABLE");
+    assert_eq!(
+        err.class,
+        FailureClass::Transient { retry_after: None },
+        "{err:?}"
+    );
+    let err = executor(dir.path())
+        .with_resources(broken.clone())
+        .pack(&work(None), &contract("host developer\n"), None, false)
+        .err()
+        .ok_or("host bundle packed")?;
+    assert_eq!(err.reason, "PROMPT_UNAVAILABLE");
+    assert_eq!(err.class, FailureClass::Decision, "{err:?}");
+    let stored = broken.store(dir.path())?;
+    let mut mismatch = work(None);
+    mismatch.assignment.resource_bundle = Some(hoh_core::resource_bundle::Pin {
+        resource_bundle_version: "not-the-bytes".to_owned(),
+        bundle_sha256: stored.bundle_sha256,
+    });
+    let err = executor(dir.path())
+        .pack(&mismatch, &contract("x\n"), None, false)
+        .err()
+        .ok_or("identity mismatch packed")?;
+    assert_eq!(err.class, FailureClass::Decision, "{err:?}");
+    Ok(())
+}
+
+#[test]
 fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::Builder::new().prefix("m3t03-drift-").tempdir()?;
     let mut old = hoh_core::resource_bundle::Bundle::current();

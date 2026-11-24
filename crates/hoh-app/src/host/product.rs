@@ -489,12 +489,28 @@ impl ProductExecutor {
             .unwrap_or_else(hoh_core::resource_bundle::Bundle::current)
     }
 
+    /// An old pin this binary cannot render is transient, so its checkpoint can still move.
+    /// The host bundle's own failure, and an identity mismatch, stay a decision (M3G-52).
+    fn bundle_refusal(&self, work: &Work, why: String) -> Refusal {
+        let old_pin = work
+            .assignment
+            .resource_bundle
+            .as_ref()
+            .is_some_and(|pin| pin.resource_bundle_version != self.host_bundle().version());
+        let class = if old_pin && why != "resource bundle identity mismatch" {
+            FailureClass::Transient { retry_after: None }
+        } else {
+            FailureClass::Decision
+        };
+        refused("PROMPT_UNAVAILABLE", class, why)
+    }
+
     fn bundle(&self, work: &Work) -> Result<hoh_core::resource_bundle::Bundle, Refusal> {
         work.assignment.resource_bundle.as_ref().map_or_else(
             || Ok(self.host_bundle()),
             |pin| {
                 pin.load(&self.project)
-                    .map_err(|why| refused("PROMPT_UNAVAILABLE", FailureClass::Decision, why))
+                    .map_err(|why| self.bundle_refusal(work, why))
             },
         )
     }
@@ -542,6 +558,9 @@ impl ProductExecutor {
     ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
         use hoh_core::context;
         let bundle = self.bundle(work)?;
+        if let Err(why) = bundle.renderer_compatible(&work.role) {
+            return Err(self.bundle_refusal(work, why));
+        }
         let contract = resolved.effective().map_err(prompt_refusal)?;
         hoh_core::prompt::validate_variables(&resolved.template().map_err(prompt_refusal)?)
             .map_err(|error| Refusal {

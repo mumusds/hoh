@@ -73,6 +73,23 @@ impl Bundle {
             .clone()
     }
 
+    /// Whether this binary can render `role` from these bytes (M3G-52): the context format matches,
+    /// the role's output schemas resolve, and its contract template parses when the bundle has one.
+    /// A prompt with no placeholders is compatible. This does not reject an old prompt's wording.
+    pub fn renderer_compatible(&self, role: &str) -> Result<(), String> {
+        if self.format != context::FORMAT {
+            return Err("pinned context format cannot be rendered by this binary".to_owned());
+        }
+        context::output_schemas_with(role, |path| {
+            serde_json::from_str(self.text(path)?).map_err(|error| error.to_string())
+        })?;
+        let prompt = format!("resources/prompts/{role}.md");
+        if let Ok(text) = self.text(&prompt) {
+            context::contract_template_ok(text)?;
+        }
+        Ok(())
+    }
+
     pub fn text(&self, path: &str) -> Result<&str, String> {
         self.files
             .get(path)

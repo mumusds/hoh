@@ -476,6 +476,14 @@ pub fn output_schemas_with(
     Ok(out)
 }
 
+/// Whether `template` is renderable by this binary: no placeholders, or all four once.
+/// A partial, unknown, or repeated placeholder is refused. Empty is allowed (M3G-52).
+pub fn contract_template_ok(template: &str) -> Result<(), String> {
+    Template::parse(template)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 /// An entry's block as it goes into its layer: a heading line with its class, path and sha256, then its full text
 /// or its own summary.
 pub(crate) fn block(entry: &Entry, disposition: Disposition) -> String {
