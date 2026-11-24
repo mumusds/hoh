@@ -917,8 +917,13 @@ async fn test_008_04_plan_refuses_product_tasks_but_keeps_read_only_planning() -
     let dir = tempfile::tempdir()?;
     let (store, db) = open(&dir)?;
     seed(&db, WORLD)?;
-    seed(&db, "UPDATE runs SET mode='PLAN';")?;
-    let payload = |writer| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":"planned","title":"planned","role":"developer","writer":writer,"depends_on":[],"requirement_ids":[]}]}});
+    // Read-only planning still references the approved scope (ADR-039 decision 6).
+    seed(
+        &db,
+        "UPDATE runs SET mode='PLAN';
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-008', 's2', 'Plan', 1);",
+    )?;
+    let payload = |writer| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":"planned","title":"planned","role":"developer","writer":writer,"depends_on":[],"requirement_ids":["REQ-008"]}]}});
     let no = store
         .decide(proposal("plan-writer", 7, payload(true))?, context())
         .await?;
@@ -926,6 +931,7 @@ async fn test_008_04_plan_refuses_product_tasks_but_keeps_read_only_planning() -
         matches!(no,Decided::Rejected{reason:RejectionReason::IllegalTransition,ref detail,..} if detail.contains("PLAN 不实施"))
     );
     assert_eq!(count(&db, "tasks")?, 3);
+    assert_eq!(count(&db, "task_requirements")?, 0);
     assert!(matches!(
         store
             .decide(proposal("plan-read", 7, payload(false))?, context())
@@ -935,6 +941,10 @@ async fn test_008_04_plan_refuses_product_tasks_but_keeps_read_only_planning() -
     assert_eq!(
         rows(&db, "SELECT writer FROM tasks WHERE task_id='planned'")?,
         vec![vec![json!(0)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT task_id,requirement_id FROM task_requirements")?,
+        vec![vec![json!("planned"), json!("REQ-008")]]
     );
     Ok(())
 }
