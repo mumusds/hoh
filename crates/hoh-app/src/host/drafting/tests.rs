@@ -974,3 +974,194 @@ fn test_008_04_m3l451_merge_observes_first_parent_and_actual_product_changes() -
     }
     Ok(())
 }
+
+fn staged_initial_untracked(path: &str, folded: bool) -> R<(tempfile::TempDir, Value)> {
+    let dir = repo()?;
+    let root = dir.path();
+    git(root, &["commit", "--allow-empty", "-qm", "base"])?;
+    let parent = Path::new(path).parent().ok_or("parent")?;
+    std::fs::create_dir_all(root.join(parent))?;
+    std::fs::write(root.join(path), "user content")?;
+    if folded {
+        for n in 1..FOLD_AT {
+            std::fs::write(root.join(parent).join(format!("file-{n}")), "user content")?;
+        }
+    }
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    let observed = if folded { "src/" } else { path };
+    assert_eq!(start["draft_dirty"], json!([hex(observed.as_bytes())]));
+    git(root, &["add", path])?;
+    docs_with_commit(
+        root,
+        &["commit", "-qm", "draft", "--only", "--", "docs/spec"],
+    )?;
+    let staged = git_paths(root, &["diff", "--cached", "--name-only", "-z", "HEAD"])?;
+    assert_eq!(staged, BTreeSet::from([path.as_bytes().to_vec()]));
+    assert_eq!(std::fs::read_to_string(root.join(path))?, "user content");
+    Ok((dir, start))
+}
+
+#[test]
+fn test_008_04_m3l700_staged_initial_untracked_product_is_a_write() -> R {
+    let (dir, start) = staged_initial_untracked("src/user.rs", false)?;
+    let result = checked(dir.path(), &start)?;
+    assert!(
+        matches!(&result, WriterOutcome::DraftBlocked { paths, .. } if paths == &["src/user.rs"]),
+        "staging the user's source is a product write: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/user.rs"))?,
+        "user content"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l700_staged_initial_untracked_doc_must_be_committed() -> R {
+    let (dir, start) = staged_initial_untracked("docs/notes.md", false)?;
+    let result = checked(dir.path(), &start)?;
+    assert!(
+        matches!(&result, WriterOutcome::Correct { reasons }
+            if reasons == &["draft Markdown and index must be committed before completion"]),
+        "staging the user's untracked doc joins the draft's must-commit write set: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("docs/notes.md"))?,
+        "user content"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l700_staged_child_of_folded_untracked_prefix_is_a_write() -> R {
+    let (dir, start) = staged_initial_untracked("src/user.rs", true)?;
+    let result = checked(dir.path(), &start)?;
+    assert!(
+        matches!(&result, WriterOutcome::DraftBlocked { paths, .. } if paths == &["src/"]),
+        "staging a child must not disappear in a folded tree: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/user.rs"))?,
+        "user content"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_dc_t04c_missing_untracked_start_index_has_uncertain_owner() -> R {
+    let dir = repo()?;
+    std::fs::create_dir(dir.path().join("docs"))?;
+    std::fs::write(dir.path().join("docs/notes.md"), "user content")?;
+    let mut start = snapshot(dir.path());
+    start
+        .as_object_mut()
+        .ok_or("snapshot")?
+        .remove("draft_index");
+    docs(dir.path())?;
+    assert_predirty_ownership_uncertain(dir.path(), &start)
+}
+
+#[test]
+fn test_008_04_dc_t04c_missing_folded_start_index_has_uncertain_owner() -> R {
+    let (dir, mut start) = staged_initial_untracked("src/user.rs", true)?;
+    git(dir.path(), &["reset", "-q", "HEAD", "--", "src/user.rs"])?;
+    start
+        .as_object_mut()
+        .ok_or("snapshot")?
+        .remove("draft_index");
+    let error = checked(dir.path(), &start).unwrap_err();
+    assert!(
+        error.contains("ownership uncertain") && error.contains("src/"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_dc_t04c_unreadable_end_index_has_uncertain_owner() -> R {
+    let (dir, start) = staged_initial_untracked("docs/notes.md", false)?;
+    std::fs::write(dir.path().join(".git/index"), "broken index")?;
+    let error = checked(dir.path(), &start).unwrap_err();
+    assert!(error.contains("ownership uncertain"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn test_008_02_dc_t04c_snapshot_records_all_start_dirty_index_entries() -> R {
+    let dir = predirty_doc(true)?;
+    let root = dir.path();
+    std::fs::write(root.join("docs/user.md"), "untracked notes")?;
+    std::fs::create_dir(root.join("src"))?;
+    for n in 0..FOLD_AT {
+        std::fs::write(root.join(format!("src/file-{n}")), "user content")?;
+    }
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    assert_eq!(start["draft_index"][hex(b"docs/user.md")], json!([]));
+    assert_eq!(start["draft_index"][hex(b"src/")], json!([]));
+    let entries = start["draft_index"][hex(b"docs/notes.md")]
+        .as_array()
+        .ok_or("tracked index entries")?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]
+            .as_str()
+            .ok_or("entry")?
+            .split_whitespace()
+            .count(),
+        3
+    );
+    assert_eq!(start["draft_index"].as_object().ok_or("index")?.len(), 3);
+    Ok(())
+}
+
+// Pin the complete write-set use inventory as well as the sole exclusion's guard. Any new
+// mutation, alias or replacement must fail this pin before it can bypass the shared predicate.
+fn untouched_exclusion_is_pinned(source: &str) -> bool {
+    let lines: Vec<_> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| {
+            line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| word == "changed")
+        })
+        .collect();
+    let expected = [
+        // Existing diagnostics also contain this token; pin them explicitly so no source
+        // line is silently omitted from the inventory by a syntax heuristic.
+        "Err(\"draft git-init effect changed; reconcile before continuing\".into())",
+        "Err(\"ignored path inventory changed or is missing; cannot attribute draft writes\".into())",
+        "let mut changed = end_dirty.clone();",
+        "changed.remove(&path);",
+        "changed.insert(path);",
+        "let uncommitted: BTreeSet<_> = end_dirty.intersection(&changed).cloned().collect();",
+        "changed.extend(committed);",
+        "changed.extend(newly_ignored);",
+        "let outside: Vec<_> = changed",
+        "for path in &changed {",
+    ];
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    lines == expected
+        && compact.contains("ifuntouched_at_start(&path,digest,index,&end_index,&committed,&now)?{changed.remove(&path);}")
+}
+
+#[test]
+fn test_008_04_dc_t04c_write_set_exclusion_has_one_pinned_predicate() {
+    let source = include_str!("../drafting.rs");
+    assert!(
+        untouched_exclusion_is_pinned(source),
+        "every write-set exclusion must go through untouched_at_start"
+    );
+    for mutation in [
+        source.replace("changed.remove(&path);", "changed.clear();"),
+        source.replace(
+            "changed.remove(&path);",
+            "changed.remove(&path); changed.retain(|_| false);",
+        ),
+        source.replace("if untouched_at_start(", "if bypass_untouched_at_start("),
+    ] {
+        assert!(!untouched_exclusion_is_pinned(&mutation));
+    }
+}
