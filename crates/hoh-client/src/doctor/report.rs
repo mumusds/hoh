@@ -154,12 +154,40 @@ pub struct Report {
     pub mode: &'static str,
     pub agents: BTreeMap<&'static str, AgentItem>,
     pub runtime: Runtime,
+    pub resources: Resources,
     pub summary: Summary,
     /// Every command doctor ran.
     pub probes: Vec<Run>,
     /// Every file doctor hashed for an agent's identity, within its limit (docs/adr/ADR-015.md note of package G2):
     /// not commands, so not among `probes` (decision 5, AC-006-03).
     pub hashes: Vec<Hashed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Resources {
+    pub resource_bundle_version: String,
+    pub templates: usize,
+    pub skills: usize,
+}
+
+impl Resources {
+    pub fn embedded() -> Self {
+        let paths = hoh_core::objects::RESOURCES.iter().map(|(path, _)| *path);
+        Self {
+            resource_bundle_version: hoh_core::objects::resource_bundle_version(),
+            templates: paths
+                .clone()
+                .filter(|path| {
+                    path.starts_with("resources/templates/")
+                        && path.ends_with(".md")
+                        && *path != "resources/templates/spec.md"
+                })
+                .count(),
+            skills: paths
+                .filter(|path| path.starts_with("resources/skills/") && path.ends_with("/SKILL.md"))
+                .count(),
+        }
+    }
 }
 
 /// One JSON object and one LF; U+2028 and U+2029 escaped (REQ-004), by every client output's one serializer
@@ -187,6 +215,12 @@ pub fn text(report: &Report) -> String {
             "默认：不调用模型；退出码 0 只表示没有阻断项，不表示已认证"
         }
     );
+    out.push_str(&format!(
+        "模板包版本：{}（{} 份文档模板，{} 个 Skill）\n",
+        report.resources.resource_bundle_version,
+        report.resources.templates,
+        report.resources.skills
+    ));
     for (name, item) in &report.agents {
         if item.installed {
             out.push_str(&format!(

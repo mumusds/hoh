@@ -270,6 +270,15 @@ pub(super) fn prepare_init(
     attempt: &str,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
+    prepare_effect(conn, attempt, "git-init", ctx)
+}
+
+pub(super) fn prepare_effect(
+    conn: &mut Connection,
+    attempt: &str,
+    kind: &str,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
     let tx = writer::begin(conn, ctx)?;
     let allowed: bool = tx
         .query_row(
@@ -289,11 +298,41 @@ pub(super) fn prepare_init(
     let n = tx
         .execute(
             "INSERT OR IGNORE INTO effects(effect_key,attempt_id,state) VALUES(?1,?2,'PREPARED')",
-            params![child_id(attempt, "git-init"), attempt],
+            params![child_id(attempt, kind), attempt],
         )
         .map_err(sqlite_error)?;
     writer::commit(tx, ctx)?;
     Ok(n == 1)
+}
+
+/// Preparation belongs to the draft Task, across retries and host restarts. An OBSERVED
+/// result is durable too; reconciliation only needs to commit its effect, not republish files.
+pub(super) fn templates(conn: &Connection, attempt: &str) -> Result<Option<Value>, PersistError> {
+    let text: Option<String> = conn.query_row(
+        "SELECT e.payload_json FROM events e JOIN attempts a ON a.attempt_id=json_extract(e.payload_json,'$.attempt_id') \
+         JOIN effects f ON f.effect_key=json_extract(e.payload_json,'$.effect_key') AND f.attempt_id=a.attempt_id \
+         WHERE e.kind='templates.instantiated' AND a.task_id=(SELECT task_id FROM attempts WHERE attempt_id=?1) \
+         AND f.state IN ('OBSERVED','COMMITTED') ORDER BY e.seq LIMIT 1",
+        [attempt], |r| r.get(0),
+    ).optional().map_err(sqlite_error)?;
+    text.map(|s| serde_json::from_str(&s).map_err(|e| PersistError::Storage(e.to_string())))
+        .transpose()
+}
+
+pub(super) fn template_selection(
+    conn: &Connection,
+    run: &str,
+) -> Result<crate::template_files::Selection, PersistError> {
+    let text: String = conn
+        .query_row(
+            "SELECT config_snapshot_json FROM runs WHERE run_id=?1",
+            [run],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let snapshot = serde_json::from_str(&text).map_err(|e| PersistError::Storage(e.to_string()))?;
+    crate::template_files::Selection::from_snapshot(&snapshot)
+        .map_err(|e| PersistError::Storage(e.to_string()))
 }
 
 pub(super) fn discovery_due(conn: &Connection, run: &str) -> Result<bool, PersistError> {

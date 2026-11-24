@@ -1556,10 +1556,20 @@ async fn attempt(
     // (decision 3's row, M2T16R-01).
     let context_seq = work.assignment.context_seq;
     let draft = work.assignment.spec_draft;
+    let templates = if draft {
+        store.reader()?.draft_templates(&id)?
+    } else {
+        None
+    };
     let (who, tracking, start) = super::begun::spawn_blocking(move || {
         let start = root.map(|root| {
             if draft {
                 let mut start = super::drafting::snapshot(&root);
+                if let Err(error) =
+                    super::drafting::attribute_templates(&mut start, templates.as_ref())
+                {
+                    start["draft_error"] = json!(error);
+                }
                 start["context_seq"] = json!(context_seq);
                 return start;
             }

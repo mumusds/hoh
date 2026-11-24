@@ -430,10 +430,11 @@ fn examine(project: &Path, live: bool) -> Report {
         .map(|records| records.clone())
         .unwrap_or_default();
     Report {
-        schema_version: "1.0",
+        schema_version: "1.1",
         mode: if live { "live" } else { "default" },
         agents,
         runtime,
+        resources: report::Resources::embedded(),
         summary,
         probes: records.runs,
         hashes: records.hashes,

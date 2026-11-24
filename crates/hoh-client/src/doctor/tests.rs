@@ -214,6 +214,7 @@ fn the_json_form_is_one_line_with_line_separators_escaped() {
     let report = Report {
         schema_version: "1.0",
         mode: "default",
+        resources: super::report::Resources::embedded(),
         agents: BTreeMap::new(),
         runtime: Runtime {
             git: none.clone(),

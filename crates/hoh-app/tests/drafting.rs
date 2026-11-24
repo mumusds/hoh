@@ -2,6 +2,7 @@
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 mod pty;
+mod template_drafting;
 mod world;
 use pty::R;
 use serde_json::json;
@@ -151,7 +152,10 @@ async fn early_draft_failure(failure: EarlyDraftFailure) -> R {
             }
         }
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='attempt.workspace_start'")?, "0");
-        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state<>'PREPARED'")?, "0");
+        // S6 adds a completed preparation before executor.start; the original work must
+        // still be PREPARED, with no other effects started by the failed agent.
+        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state<>'PREPARED' AND effect_key NOT IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='templates.instantiated')")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED' AND effect_key IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='templates.instantiated')")?, usize::from(!matches!(failure, EarlyDraftFailure::Prepare)).to_string());
         assert_eq!(world.query("SELECT count(*) FROM leases l JOIN attempts a USING(attempt_id) WHERE l.expires_at<=a.ended_at")?, "1");
         assert!(!host.store().dispatch_draft(&run, hoh_core::decision::Context { now: Some(now), ..Default::default() }).await?);
         assert_eq!(world.query("SELECT count(*) FROM attempts")?, "1");
@@ -204,7 +208,8 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
         assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.drafting'")?,"1");
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='schedule.round'")?,"0");
-        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED'")?,"1");
+        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED' AND effect_key NOT IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='templates.instantiated')")?,"1");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='templates.instantiated'")?,"1");
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='run.baseline'")?,"1");
         assert_eq!(world.query("SELECT (SELECT seq FROM events WHERE kind='run.baseline') < (SELECT min(seq) FROM events WHERE kind IN ('spec.drafting','spec.draft_dispatched'))")?,"1");
         assert_eq!(world.query("SELECT count(*) FROM leases WHERE kind='writer'")?,"1");
@@ -235,7 +240,8 @@ async fn test_008_02_first_draft_uses_runtime_writer_and_git_init_effect() -> R 
         assert_eq!(std::fs::read_to_string(world.project().join("docs/spec/kept.md"))?,"用户要求保留的起草内容");
         assert_eq!(world.git(&["rev-parse","HEAD"])?,kept_commit,"cancel must not reset commits");
         world.until(&format!("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.run_id='{second}' AND a.state='RUNNING'"),"1",Duration::from_secs(15)).await?;
-        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED'")?,"1","existing repository is not initialized again");
+        assert_eq!(world.query("SELECT count(*) FROM effects WHERE state='COMMITTED' AND effect_key NOT IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='templates.instantiated')")?,"1","existing repository is not initialized again");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='templates.instantiated'")?,"2");
         let revision:i64=world.query(&format!("SELECT revision FROM runs WHERE run_id='{second}'"))?.parse()?;
         let cancel=json!({"schema_version":"1.0","command_id":"cancel-second","idempotency_key":"cancel-second",
             "expected_revision":revision,"kind":"CancelRun","run_id":second,"payload":{"reason":"test"}});
