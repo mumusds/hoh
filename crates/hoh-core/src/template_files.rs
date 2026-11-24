@@ -57,6 +57,35 @@ pub struct Outcome {
     pub skipped: Vec<String>,
 }
 
+/// Read-only target validation before the caller prepares an effect. Existing regular
+/// files are preserved; links, directories and inaccessible parents fail explicitly.
+/// Publication must still recheck each path because the filesystem can change afterwards.
+pub fn validate_targets<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Error> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root = fs::open(root, flags, Mode::empty()).map_err(unavailable)?;
+    for path in paths {
+        let check = || -> std::io::Result<()> {
+            let (parts, name) = document_path(path)?;
+            let mut dir = fs::openat(&root, ".", flags, Mode::empty())?;
+            for part in parts {
+                dir = match fs::openat(&dir, part, flags, Mode::empty()) {
+                    Ok(dir) => dir,
+                    // A missing ancestor means the target is absent. Do not create it here.
+                    Err(rustix::io::Errno::NOENT) => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                };
+            }
+            present(&dir, name)?;
+            Ok(())
+        };
+        check().map_err(|e| unavailable(format!("{path}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Validate the complete set before publishing. On I/O failure, already published complete files remain;
 /// a retry preserves them. The caller owns the Attempt lease and effect (the S6 drafting hook).
 pub fn instantiate(
@@ -106,16 +135,7 @@ fn publish_with(
     text: &str,
     link: impl FnOnce(BorrowedFd<'_>, &str, BorrowedFd<'_>, &str, AtFlags) -> rustix::io::Result<()>,
 ) -> std::io::Result<bool> {
-    let mut parts: Vec<_> = path.split('/').collect();
-    if parts
-        .iter()
-        .any(|p| p.is_empty() || *p == "." || *p == "..")
-    {
-        return Err(std::io::Error::other("invalid document path"));
-    }
-    let name = parts
-        .pop()
-        .ok_or_else(|| std::io::Error::other("empty document path"))?;
+    let (parts, name) = document_path(path)?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut dir = fs::openat(root, ".", flags, Mode::empty())?;
     for part in parts {
@@ -165,6 +185,20 @@ fn publish_with(
     };
     fs::fsync(&dir)?;
     Ok(created)
+}
+
+fn document_path(path: &str) -> std::io::Result<(Vec<&str>, &str)> {
+    let mut parts: Vec<_> = path.split('/').collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
+        return Err(std::io::Error::other("invalid document path"));
+    }
+    let name = parts
+        .pop()
+        .ok_or_else(|| std::io::Error::other("empty document path"))?;
+    Ok((parts, name))
 }
 
 #[cfg(test)]

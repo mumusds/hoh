@@ -8,6 +8,14 @@ pub(super) async fn prepare(
     project: &Path,
     work: &crate::host::runner::Work,
 ) -> Result<(), String> {
+    if !store
+        .reader()
+        .map_err(|e| e.to_string())?
+        .draft_templates_due(&work.attempt_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
     if store
         .reader()
         .map_err(|e| e.to_string())?
@@ -40,9 +48,12 @@ pub(super) async fn prepare(
             goal: held.assignment.goal.clone().ok_or("draft has no goal")?,
             owners: held.role.clone(),
         };
-        // Validate before recording STARTED; a bad override has produced no external effect.
-        templates
+        // Validate content and every target before PREPARED/STARTED. A known path
+        // conflict has no template effect and must never become a partial publication.
+        let files = templates
             .render(&selection.profile, &inputs)
+            .map_err(|e| e.to_string())?;
+        hoh_core::template_files::validate_targets(&root, files.keys().map(String::as_str))
             .map_err(|e| e.to_string())?;
         Ok::<_, String>((templates, selection, inputs, bundle.version()))
     })

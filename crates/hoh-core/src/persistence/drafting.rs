@@ -305,6 +305,19 @@ pub(super) fn prepare_effect(
     Ok(n == 1)
 }
 
+/// Revision drafting must preserve deletions made after the project's first approval.
+pub(super) fn templates_due(conn: &Connection, attempt: &str) -> Result<bool, PersistError> {
+    conn.query_row(
+        "SELECT t.kind='spec_draft' AND t.spec_id IS NULL \
+         AND NOT EXISTS(SELECT 1 FROM specs s WHERE s.project_id=r.project_id) \
+         FROM attempts a JOIN tasks t ON t.task_id=a.task_id \
+         JOIN runs r ON r.run_id=t.run_id WHERE a.attempt_id=?1",
+        [attempt],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// Preparation belongs to the draft Task, across retries and host restarts. An OBSERVED
 /// result is durable too; reconciliation only needs to commit its effect, not republish files.
 pub(super) fn templates(conn: &Connection, attempt: &str) -> Result<Option<Value>, PersistError> {

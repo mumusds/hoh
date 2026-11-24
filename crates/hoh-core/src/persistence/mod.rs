@@ -2789,6 +2789,11 @@ impl Reader {
         draft_approval::start(&self.conn, attempt)
     }
 
+    /// Templates are only prepared before the project's first approved specification.
+    pub fn draft_templates_due(&self, attempt: &str) -> Result<bool, PersistError> {
+        drafting::templates_due(&self.conn, attempt)
+    }
+
     pub fn draft_templates(
         &self,
         attempt: &str,
