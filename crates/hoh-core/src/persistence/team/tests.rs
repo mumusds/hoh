@@ -691,12 +691,17 @@ async fn a_removed_role_is_blocked_at_a_new_epoch_and_one_added_again_does_not_r
          WHERE run_id = 'R1' AND role = 'developer'",
     )?;
     let removed = || -> R<Vec<(String, bool)>> {
-        Ok(super::view(&Connection::open(&path)?, "R1", "p1")?
-            .members
-            .into_iter()
-            .filter(|m| m.state == "BLOCKED")
-            .map(|m| (m.role, m.removed))
-            .collect())
+        Ok(super::view(
+            &Connection::open(&path)?,
+            "R1",
+            "p1",
+            &crate::resource_bundle::Bundle::current().version(),
+        )?
+        .members
+        .into_iter()
+        .filter(|m| m.state == "BLOCKED")
+        .map(|m| (m.role, m.removed))
+        .collect())
     };
     assert_eq!(
         removed()?,
@@ -972,7 +977,12 @@ async fn a_change_to_an_unavailable_agent_keeps_the_old_binding_until_the_agent_
 
 /// The developer of R1 as the team view shows it: its agent, epoch and what is pending for it.
 fn shown_developer(path: &PathBuf) -> R<Value> {
-    let view = super::view(&Connection::open(path)?, "R1", "p1")?;
+    let view = super::view(
+        &Connection::open(path)?,
+        "R1",
+        "p1",
+        &crate::resource_bundle::Bundle::current().version(),
+    )?;
     let member = view
         .members
         .into_iter()
@@ -2861,7 +2871,12 @@ async fn a_first_input_the_executor_did_not_take_is_recorded_once_and_shown_pend
         .team_checkpoint("R1", crate::persistence::Availability::default())
         .await?;
     let shown = |path: &PathBuf| -> R<bool> {
-        let view = super::view(&Connection::open(path)?, "R1", "p1")?;
+        let view = super::view(
+            &Connection::open(path)?,
+            "R1",
+            "p1",
+            &crate::resource_bundle::Bundle::current().version(),
+        )?;
         Ok(view
             .members
             .iter()
@@ -2974,7 +2989,12 @@ async fn a_refused_change_is_recorded_again_when_its_reason_changes_and_only_the
         "one refusal per reason or detail seen, in order"
     );
     // The team page says why as the last refusal does, not AGENT_UNAVAILABLE whatever the reason.
-    let view = super::view(&Connection::open(&path)?, "R1", "p1")?;
+    let view = super::view(
+        &Connection::open(&path)?,
+        "R1",
+        "p1",
+        &crate::resource_bundle::Bundle::current().version(),
+    )?;
     let commander = view
         .members
         .into_iter()

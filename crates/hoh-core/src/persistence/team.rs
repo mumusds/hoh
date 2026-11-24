@@ -486,16 +486,13 @@ fn verdicts(
     Ok((written, refused))
 }
 
-/// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): the project's current revision
-/// changes it and that change is not refused, or its resource pin differs from the host bundle (CR-026 C14). Such a
-/// role is not dispatched, so no new attempt prolongs the old binding or pin. A refused configuration change alone
-/// leaves the old binding working (M2T07R-150); it does not waive a pending resource upgrade.
-pub(super) fn pending(
+/// The run's project and its binding of `role`, or none when the run has no project or no such binding.
+/// A pin mismatch on a run with no project stays false (M3G-100).
+fn lag_scope(
     conn: &Connection,
     run_id: &str,
     role: &str,
-    resource_version: &str,
-) -> Result<bool, PersistError> {
+) -> Result<Option<(String, Bound)>, PersistError> {
     let project_id: Option<String> = conn
         .query_row(
             "SELECT project_id FROM runs WHERE run_id = ?1",
@@ -505,18 +502,38 @@ pub(super) fn pending(
         .optional()
         .map_err(sqlite_error)?;
     let Some(project_id) = project_id else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(binding) = bound(conn, run_id, Some(role))?.pop() else {
+    Ok(bound(conn, run_id, Some(role))?
+        .pop()
+        .map(|binding| (project_id, binding)))
+}
+
+/// Whether `role`'s pin differs from the host bundle (CR-026 C14). Runs predating pins keep their compatibility
+/// path until the first idle checkpoint.
+pub(super) fn resource_lag(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    resource_version: &str,
+) -> Result<bool, PersistError> {
+    if lag_scope(conn, run_id, role)?.is_none() {
         return Ok(false);
-    };
-    // CR-026 C14: drain the role's old attempts before upgrading, just as for a team change. Runs predating pins
-    // retain their compatibility path until their first idle checkpoint; there are no old bytes to preserve.
-    if super::resources::latest(conn, run_id, role, None)?
-        .is_some_and(|pin| pin.resource_bundle_version != resource_version)
-    {
-        return Ok(true);
     }
+    Ok(super::resources::latest(conn, run_id, role, None)?
+        .is_some_and(|pin| pin.resource_bundle_version != resource_version))
+}
+
+/// Whether the project's current revision changes `role` and that change is not refused (decision 8).
+/// A refused configuration change alone leaves the old binding working (M2T07R-150).
+pub(super) fn config_lag(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+) -> Result<bool, PersistError> {
+    let Some((project_id, binding)) = lag_scope(conn, run_id, role)? else {
+        return Ok(false);
+    };
     let Some((revision, wanted)) = latest(conn, &project_id)? else {
         return Ok(false);
     };
@@ -524,6 +541,18 @@ pub(super) fn pending(
         return Ok(false);
     }
     Ok(verdicts(conn, run_id, role, revision)?.1.is_none())
+}
+
+/// Whether run `run_id`'s binding of `role` waits for its checkpoint (decision 8): a configuration change or a
+/// resource pin behind the host bundle. Such a role is not dispatched, so no new attempt prolongs the old binding
+/// or pin. A refused configuration change does not waive a pending resource upgrade.
+pub(super) fn pending(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+    resource_version: &str,
+) -> Result<bool, PersistError> {
+    Ok(resource_lag(conn, run_id, role, resource_version)? || config_lag(conn, run_id, role)?)
 }
 
 /// What the host's registry knows of the agents, for a checkpoint (decisions 8 and 10): the agents it found available,
@@ -1250,9 +1279,10 @@ pub struct TeamMember {
     pub missing: Vec<String>,
     /// A change waiting for this role, with its `cause`: `"config"`, what the project's current revision changes for
     /// it, applied at its next checkpoint (decision 8), `agent` null when the role is removed, `refused` the reason while
-    /// the change is refused (the old binding works on), else null; or `"fallback"` or `"rebind"`, a change staffing
-    /// holds pending while the role's attempt is in flight (docs/adr/ADR-030.md decision 5). `{"cause", "agent",
-    /// "model", "config_revision", "refused"}`.
+    /// the change is refused (the old binding works on), else null; `"fallback"` or `"rebind"`, a change staffing
+    /// holds pending while the role's attempt is in flight (docs/adr/ADR-030.md decision 5); or `"resource"`, only the
+    /// resource pin lags the host bundle (M3G-100). A configuration or staffing change keeps its own cause when the
+    /// pin lags too. `{"cause", "agent", "model", "config_revision", "refused"}`.
     pub pending: Option<serde_json::Value>,
     /// The role was removed from the team (its row stays, BLOCKED, so an old epoch stays fenced): not an availability
     /// block.
@@ -1284,6 +1314,7 @@ pub(super) fn view(
     conn: &Connection,
     run_id: &str,
     project_id: &str,
+    resource_version: &str,
 ) -> Result<TeamView, PersistError> {
     let latest: Option<(i64, String)> = conn
         .query_row(
@@ -1361,6 +1392,15 @@ pub(super) fn view(
                 "cause": change.cause.as_str(),
                 "agent": change.to,
                 "model": model,
+                "config_revision": member.config_revision,
+                "refused": null,
+            }));
+        }
+        if member.pending.is_none() && resource_lag(conn, run_id, &member.role, resource_version)? {
+            member.pending = Some(serde_json::json!({
+                "cause": "resource",
+                "agent": member.agent,
+                "model": member.model,
                 "config_revision": member.config_revision,
                 "refused": null,
             }));

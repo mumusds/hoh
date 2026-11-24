@@ -281,7 +281,12 @@ fn active(path: &PathBuf, role: &str) -> R<bool> {
 
 /// Run R1's `role` as the team view shows it: its missing lines and pending change.
 fn shown(path: &PathBuf, role: &str) -> R<(Vec<String>, Option<Value>)> {
-    let view = crate::persistence::team::view(&Connection::open(path)?, "R1", "p1")?;
+    let view = crate::persistence::team::view(
+        &Connection::open(path)?,
+        "R1",
+        "p1",
+        &crate::resource_bundle::Bundle::current().version(),
+    )?;
     let member = view
         .members
         .into_iter()
