@@ -366,6 +366,23 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
     ))?;
     assert!(reply.steer.is_none());
     let project_id = world.query("SELECT project_id FROM projects")?;
+    for (id, kind) in [("current-ask", "ASK"), ("current-steer", "STEER")] {
+        runtime.block_on(host.store().enqueue_input(hoh_core::persistence::NewInput {
+            input_id: id.into(),
+            run_id: "R".into(),
+            kind: kind.into(),
+            target_role: Some("developer".into()),
+            payload: json!({"text":id}),
+        }))?;
+        assert_eq!(
+            host.store()
+                .reader()?
+                .input(id)?
+                .ok_or("current input")?
+                .payload["role_epoch"],
+            2
+        );
+    }
     runtime.block_on(host.store().settle_ended_inputs(&project_id))?;
     assert_eq!(
         world.query(&format!(
@@ -376,6 +393,17 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
     );
     assert_eq!(world.query(&format!("SELECT json_extract(payload_json,'$.reason') FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{id}'"))?, "STALE_ROLE_EPOCH");
     runtime.block_on(host.store().settle_ended_inputs(&project_id))?;
+    for id in ["current-ask", "current-steer"] {
+        assert_eq!(
+            host.store()
+                .reader()?
+                .input(id)?
+                .ok_or("current input")?
+                .state,
+            hoh_core::lifecycle::InputState::Queued,
+            "the sweep must keep current-epoch {id}"
+        );
+    }
     assert_eq!(world.query(&format!("SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{id}'"))?, "1");
     assert_eq!(
         world.query(&format!(
