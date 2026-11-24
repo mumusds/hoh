@@ -3974,7 +3974,7 @@ async fn a_late_auth_failure_of_a_replaced_pi_does_not_block_qa() -> R {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turns_auth_failure_while_pi_says_logged_in_switches_qa_to_its_fallback() -> R {
-    turn_auth_failure_switches_qa(false).await
+    turn_auth_failure_switches_qa(Latch::Plain).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3983,7 +3983,27 @@ async fn a_turns_auth_failure_is_the_turns_block_even_when_ticks_pass_between_it
     // FLK-09: the end of qa's failed turn is held for 700 ms (over three runner ticks) after the registry latched its
     // BLOCKED_AUTH and before the end is committed. No tick's staffing judges the latched fact before that commit, so
     // pi's binding is blocked by the turn (`cause: "turn"`, with its attempt), not first by staffing.
-    turn_auth_failure_switches_qa(true).await
+    turn_auth_failure_switches_qa(Latch::Held).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block() -> R {
+    // M3LD-50: the commit of qa's failed turn's end fails after the registry latched its BLOCKED_AUTH, so the latch's
+    // lock is released before the end is committed; the end is committed by the runner_error settle, held 700 ms
+    // (over three runner ticks) before it. A tick's staffing may block pi's binding first (cause staffing); the
+    // settle's end still writes the turn's `team.binding_blocked{cause: "turn"}` with its attempt.
+    turn_auth_failure_switches_qa(Latch::EndFails).await
+}
+
+/// How qa's failed turn's end goes from the registry's latch to its commit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Latch {
+    /// Committed at once.
+    Plain,
+    /// Held for 700 ms between the latch and the commit ([`HoldLatch`]).
+    Held,
+    /// The commit fails; the runner_error settle commits it, held for 700 ms first ([`FailEnd`]).
+    EndFails,
 }
 
 /// Holds an attempt's end for 700 ms where its turn's BLOCKED_AUTH was latched and its end is not committed yet.
@@ -3996,9 +4016,60 @@ impl hoh_app::host::HostHooks for HoldLatch {
     }
 }
 
+/// Fails the commit of the turn's end once its BLOCKED_AUTH was latched (the store's next runner request), then holds
+/// that attempt's runner_error settle for 700 ms before it begins.
+#[derive(Debug, Default)]
+struct FailEnd {
+    latched: std::sync::Mutex<Option<String>>,
+    armed: AtomicBool,
+    failing: AtomicBool,
+    failed: AtomicBool,
+}
+
+impl hoh_app::host::HostHooks for FailEnd {
+    fn turn_auth_latched(&self, attempt_id: &str) {
+        if let Ok(mut latched) = self.latched.lock()
+            && latched.is_none()
+        {
+            *latched = Some(attempt_id.to_owned());
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, attempt_id: &str) {
+        if matches!(point, hoh_app::host::RunnerPoint::Settling)
+            && self
+                .latched
+                .lock()
+                .is_ok_and(|l| l.as_deref() == Some(attempt_id))
+        {
+            std::thread::sleep(Duration::from_millis(700));
+        }
+    }
+}
+
+impl hoh_core::persistence::FaultHooks for FailEnd {
+    fn before_job(&self, job: &'static str) {
+        self.failing.store(
+            job == "Runner" && self.armed.swap(false, Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+    }
+
+    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
+        if self.failing.swap(false, Ordering::SeqCst) {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(hoh_core::persistence::PersistError::Storage(
+                "injected failure of the turn's end".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// TEST-020-03's world with TEST-020-02's team: qa's turn as pi fails BLOCKED_AUTH while pi's status command says it is
-/// logged in; with `hold_latch`, its end is held between the latch and the commit ([`HoldLatch`]).
-async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
+/// logged in; its end goes from the latch to its commit as `latch` says.
+async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
     // AC-020-05's then-clause on the product path (docs/adr/ADR-030.md decisions 2 and 4 to 7, M2T15R-50):
     // TEST-020-03's world with TEST-020-02's team (qa pi falling back to claude), pi logged in and registered. qa's
     // turn runs as pi and fails BLOCKED_AUTH under pi's current identity while pi's status command keeps saying it is
@@ -4018,7 +4089,8 @@ async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
         *fails_as = Some("pi".to_owned());
     }
     let registry = hoh_app::host::Executor::registry(&*team).ok_or("no registry")?;
-    let host = if hold_latch {
+    let fail_end = Arc::new(FailEnd::default());
+    let host = if latch != Latch::Plain {
         let mut config = config(&project);
         config.clock = hoh_app::host::HostClock(clock.clone());
         config.runner = Some(hoh_app::host::RunnerConfig {
@@ -4031,7 +4103,12 @@ async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
                 ..Context::default()
             },
         });
-        config.hooks = Arc::new(HoldLatch);
+        if latch == Latch::Held {
+            config.hooks = Arc::new(HoldLatch);
+        } else {
+            config.hooks = fail_end.clone();
+            config.store.faults = fail_end.clone();
+        }
         Host::start(config).await?
     } else {
         host(&project, team.clone(), clock.clone()).await?
@@ -4069,7 +4146,25 @@ async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
             &format!("SELECT state, failure_reason FROM attempts WHERE attempt_id = '{a_attempt}'"),
             &|r| r[0]["state"] == "FAILED",
         )?;
-        assert_eq!(a_end[0]["failure_reason"], "BLOCKED_AUTH", "{a_end}");
+        // A settle's end (a reconcile's disposition) records no failure_reason of its own; the turn's class is the
+        // effect's, which its task's failure reads (asserted by the binding's block below).
+        if latch != Latch::EndFails {
+            assert_eq!(a_end[0]["failure_reason"], "BLOCKED_AUTH", "{a_end}");
+        } else {
+            // The injected failure hit this turn's end, which the runner_error settle then committed.
+            assert!(fail_end.failed.load(Ordering::SeqCst), "no commit failed");
+            assert_eq!(
+                rows(
+                    &project,
+                    &format!(
+                        "SELECT count(*) AS n FROM events WHERE kind = 'runner.inspected' \
+                         AND json_extract(payload_json, '$.attempt_id') = '{a_attempt}' \
+                         AND json_extract(payload_json, '$.cause') = 'runner_error'"
+                    ),
+                )?,
+                json!([{"n": 1}])
+            );
+        }
         // The turn blocked pi's binding, and its failure was latched (not only said, as an older identity's is).
         assert_eq!(
             rows(
@@ -4215,10 +4310,10 @@ async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
             )))
         );
         keep(
-            if hold_latch {
-                "auth-latch-product-path-held"
-            } else {
-                "auth-latch-product-path"
+            match latch {
+                Latch::Plain => "auth-latch-product-path",
+                Latch::Held => "auth-latch-product-path-held",
+                Latch::EndFails => "auth-latch-product-path-end-fails",
             },
             &json!({
                 "probe": probe,

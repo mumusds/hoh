@@ -716,12 +716,31 @@ struct TurnRow {
     config_revision: i64,
 }
 
+/// Whether attempt `attempt_id`'s turn already wrote its `team.binding_blocked{cause: "turn"}` in staffing series
+/// `stem`.
+fn turn_recorded(tx: &Connection, stem: &str, attempt_id: &str) -> Result<bool, PersistError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_id >= ?1 AND event_id < ?2 AND kind = ?3 \
+         AND json_extract(payload_json, '$.cause') = 'turn' \
+         AND json_extract(payload_json, '$.attempt_id') = ?4)",
+        params![
+            format!("{stem}/"),
+            format!("{stem}0"),
+            BINDING_BLOCKED,
+            attempt_id
+        ],
+        |r| r.get(0),
+    )
+    .map_err(sqlite_error)
+}
+
 /// What a turn's failure of `class` writes for its binding (decision 6), in the transaction that settles its attempt
 /// `attempt_id` of task `task_id` (the runner's settle or a reconcile, the same input: both read it here). For the
 /// Auth, Capability and Model classes, a supervision turn's too (M2T15D-05): the binding of the task's role at the
 /// attempt's epoch to the attempt's agent BLOCKED for the class's reason, missing `["<agent>:<CODE>"]`, and its
 /// `team.binding_blocked{cause: "turn", attempt_id}` in the epoch's staffing series (on entering BLOCKED or when its
-/// reason or missing changes); a binding that is no longer that one is left alone. Capability and Model also write
+/// reason or missing changes, and once for an attempt that has none yet when staffing blocked it first, M3LD-50); a
+/// binding that is no longer that one is left alone. Capability and Model also write
 /// the exclusion record `team.binding_excluded`, its version and identity the attempt's session's (`sessions` and its
 /// `team.session_bound`, never the runner's memory, M2T15D-103), once per attempt; a session without an identity writes
 /// `team.exclusion_skipped` instead. The binding's columns are written here; the events are for the caller's commit.
@@ -793,7 +812,9 @@ pub(super) fn turn_failed(
     if let Some((state, blocked, held)) = bound {
         let blocked = (state == "BLOCKED").then_some(blocked).flatten();
         let held: Vec<String> = serde_json::from_str(&held).unwrap_or_default();
-        if blocked.as_deref() != Some(reason.as_str()) || held != missing {
+        let stem = stem(run_id, &role, role_epoch);
+        let changes = blocked.as_deref() != Some(reason.as_str()) || held != missing;
+        if changes {
             tx.execute(
                 "UPDATE role_bindings SET state = 'BLOCKED', blocked_reason = ?5, missing_json = ?6 \
                  WHERE run_id = ?1 AND role = ?2 AND role_epoch = ?3 AND agent = ?4",
@@ -807,7 +828,11 @@ pub(super) fn turn_failed(
                 ],
             )
             .map_err(sqlite_error)?;
-            let stem = stem(run_id, &role, role_epoch);
+        }
+        // A binding already blocked for this reason by staffing (a tick that judged the turn's latched fact before its
+        // end was committed: an end whose commit failed and a settle committed, M3LD-50) still gets the turn's event,
+        // once per attempt.
+        if changes || !turn_recorded(tx, &stem, attempt_id)? {
             let n = super::series::count(tx, &stem)? + 1;
             events.push(event(
                 member(&stem, n),
