@@ -2153,6 +2153,8 @@ async fn acceptance_and_issues_follow_the_openapi_contract() -> R {
         ("/v1/runs/ra/acceptance?limit=0", "BAD_REQUEST"),
         ("/v1/runs/ra/acceptance?limit=501", "BAD_REQUEST"),
         ("/v1/runs/ra/acceptance?cursor=nonsense", "BAD_REQUEST"),
+        // M3B-53a: the third part is the revision order, not a bare AC id.
+        ("/v1/runs/ra/acceptance?cursor=1:1:AC-1-01", "BAD_REQUEST"),
         ("/v1/runs/ra/issues?limit=x", "BAD_REQUEST"),
         ("/v1/runs/ra/issues?cursor=nonsense", "BAD_REQUEST"),
         ("/v1/runs/missing/tasks", "RUN_NOT_FOUND"),

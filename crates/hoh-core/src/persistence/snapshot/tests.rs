@@ -730,3 +730,113 @@ async fn an_issues_chain_names_its_report_and_the_raw_session_and_native_attempt
     }
     Ok(())
 }
+
+fn candidate_place(path: &Path, id: &str) -> R<(i64, i64)> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT coalesce((SELECT max(seq) FROM events WHERE kind = 'candidate.frozen' \
+         AND json_extract(payload_json, '$.candidate_id') = ?1), 0), rowid \
+         FROM candidates WHERE candidate_id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
+}
+
+/// M3B-53a: an old cursor whose third part is a bare AC id must not skip the page.
+/// A canonical `20 digits:ac` cursor still skips that item.
+#[tokio::test]
+async fn test_033_04_old_acceptance_cursor_does_not_skip_the_page() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'changed-s1', 'R', 'spec.changed', '{\"spec_id\":\"s1\",\"spec_revision\":1}', '2026-11-12T00:00:03Z'),
+           ('p1', 'frozen-cold', 'R', 'candidate.frozen', '{\"candidate_id\":\"cold\"}', '2026-11-12T00:00:05Z');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256, source_path, state, created_at)
+         VALUES ('cold', 'R', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', printf('%.64c', '1'), printf('%.64c', 'e'), printf('%.64c', 'f'), 'export', 'FROZEN', '2026-11-12T00:00:04Z');",
+    )?;
+    let (seq, row) = candidate_place(&path, "cold")?;
+    let reader = store.reader()?;
+    let bare = reader
+        .acceptance_page("R", 100, Some((seq, row, "AC-1-01".to_owned())))?
+        .ok_or("no run R")?;
+    assert_eq!(
+        bare.items.len(),
+        1,
+        "a pre-revision cursor must not drop the item: {bare:?}"
+    );
+    assert_eq!(bare.items[0].ac_id, "AC-1-01");
+    let order = format!("{:020}:{}", i64::MAX - 1, "AC-1-01");
+    let skipped = reader
+        .acceptance_page("R", 100, Some((seq, row, order)))?
+        .ok_or("no run R")?;
+    assert!(
+        skipped.items.is_empty(),
+        "the canonical cursor still skips that item: {skipped:?}"
+    );
+    Ok(())
+}
+
+/// M3B-53b: a row-less candidate keeps the revision whose bytes it froze against.
+/// A later revision that restores those bytes does not relabel it as current.
+#[tokio::test]
+async fn test_033_04_rowless_candidate_stays_on_the_revision_it_froze_against() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(dir.path())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO specs(spec_id, project_id, sha256, revision) VALUES
+           ('s2', 'p1', printf('%.64c', '2'), 2),
+           ('s3', 'p1', printf('%.64c', '1'), 3);
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-1', 's3', 'r', 1);
+         INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id)
+           VALUES ('AC-1-01', 'REQ-1', 's3', 'b', 'unit');
+         UPDATE runs SET spec_id = 's3' WHERE run_id = 'R';
+         INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) VALUES
+           ('p1', 'changed-s1', 'R', 'spec.changed', '{\"spec_id\":\"s1\",\"spec_revision\":1}', '2026-11-12T00:00:03Z'),
+           ('p1', 'frozen-cold', 'R', 'candidate.frozen', '{\"candidate_id\":\"cold\"}', '2026-11-12T00:00:04Z'),
+           ('p1', 'changed-s2', 'R', 'spec.changed', '{\"spec_id\":\"s2\",\"spec_revision\":2}', '2026-11-12T00:00:05Z'),
+           ('p1', 'changed-s3', 'R', 'spec.changed', '{\"spec_id\":\"s3\",\"spec_revision\":3}', '2026-11-12T00:00:06Z'),
+           ('p1', 'frozen-warm', 'R', 'candidate.frozen', '{\"candidate_id\":\"warm\"}', '2026-11-12T00:00:07Z');
+         INSERT INTO candidates(candidate_id, run_id, git_commit, git_tree, spec_sha256, environment_sha256, test_plan_sha256, source_path, state, created_at) VALUES
+           ('cold', 'R', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', printf('%.64c', '1'), printf('%.64c', 'e'), printf('%.64c', 'f'), 'cold', 'FROZEN', '2026-11-12T00:00:04Z'),
+           ('warm', 'R', 'cccccccccccccccccccccccccccccccccccccccc', 'dddddddddddddddddddddddddddddddddddddddd', printf('%.64c', '1'), printf('%.64c', 'e'), printf('%.64c', 'f'), 'warm', 'FROZEN', '2026-11-12T00:00:07Z');",
+    )?;
+    let page = store
+        .reader()?
+        .acceptance_page("R", 100, None)?
+        .ok_or("no run R")?;
+    let item = |candidate: &str,
+                spec: &str,
+                revision: i64,
+                label: Label,
+                why: Option<Why>,
+                latest: bool| {
+        AcceptanceItem {
+            spec_id: spec.to_owned(),
+            spec_revision: revision,
+            candidate_id: Some(candidate.to_owned()),
+            candidate_state: Some("FROZEN".to_owned()),
+            ac_id: "AC-1-01".to_owned(),
+            test_id: None,
+            label,
+            why,
+            evidence_ids: Vec::new(),
+            latest,
+        }
+    };
+    assert_eq!(
+        page.items,
+        vec![
+            item("warm", "s3", 3, Label::NotRun, None, true),
+            item(
+                "cold",
+                "s1",
+                1,
+                Label::Stale,
+                Some(Why::CandidateStale),
+                false
+            ),
+        ],
+        "{page:?}"
+    );
+    Ok(())
+}

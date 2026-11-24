@@ -559,8 +559,18 @@ pub(super) fn acceptance(
     })
 }
 
-/// Revisions with actual rows on this candidate. Before any observation, use its bound digest;
-/// legacy imported candidates with no matching spec retain the current revision's empty projection.
+/// The cursor's third part is the revision order this host writes: 20 digits, ':', a non-empty AC id.
+/// An older third part that is only the AC id sorts before every such order and must not skip (M3B-53).
+fn canonical_revision_order(order: &str) -> bool {
+    let Some((revision, ac)) = order.split_once(':') else {
+        return false;
+    };
+    revision.len() == 20 && revision.bytes().all(|b| b.is_ascii_digit()) && !ac.is_empty()
+}
+
+/// Revisions with actual rows on this candidate. Before any observation, bind the digest to the
+/// revision current when the candidate froze (the latest `spec.changed` at or before that event).
+/// With no freeze event, keep the newest matching digest. With no spec to bind, the current revision.
 fn historical_specs(
     conn: &Connection,
     c: &Frozen,
@@ -571,7 +581,33 @@ fn historical_specs(
         .map_err(sqlite_error)?.query_map(params![c.id], |r| Ok((r.get(0)?,r.get(1)?)))
         .map_err(sqlite_error)?.collect::<Result<Vec<_>,_>>().map_err(sqlite_error)?;
     if found.is_empty() {
-        let bound = conn.query_row("SELECT s.spec_id,s.revision FROM specs s JOIN runs r ON r.project_id=s.project_id JOIN candidates c ON c.run_id=r.run_id WHERE c.candidate_id=?1 AND s.sha256=c.spec_sha256 ORDER BY s.revision DESC LIMIT 1",params![c.id], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
+        // A later revision that restores the same bytes must not relabel a candidate frozen earlier.
+        let bound = conn.query_row(
+            "SELECT s.spec_id, s.revision FROM specs s \
+             JOIN runs r ON r.project_id = s.project_id \
+             JOIN candidates c ON c.run_id = r.run_id \
+             WHERE c.candidate_id = ?1 AND s.sha256 = c.spec_sha256 AND ( \
+               NOT EXISTS ( \
+                 SELECT 1 FROM events frozen WHERE frozen.kind = 'candidate.frozen' \
+                   AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
+               ) OR s.revision <= ( \
+                 SELECT bound.revision FROM events changed \
+                 JOIN specs bound ON bound.spec_id = json_extract(changed.payload_json, '$.spec_id') \
+                   AND bound.project_id = r.project_id \
+                 WHERE changed.kind = 'spec.changed' AND changed.run_id = c.run_id \
+                   AND changed.seq <= ( \
+                     SELECT max(frozen.seq) FROM events frozen \
+                     WHERE frozen.kind = 'candidate.frozen' \
+                       AND json_extract(frozen.payload_json, '$.candidate_id') = c.candidate_id \
+                   ) \
+                 ORDER BY changed.seq DESC LIMIT 1 \
+               ) \
+             ) ORDER BY s.revision DESC LIMIT 1",
+            params![c.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
         found.push(bound.unwrap_or_else(|| (current.to_owned(), revision)));
     }
     Ok(found)
@@ -617,7 +653,9 @@ pub(super) fn acceptance_page(
                 let key = (i64::MAX, 0, order);
                 if after.as_ref().is_some_and(|(seq, row, ac)| {
                     (key.0, key.1) > (*seq, *row)
-                        || ((key.0, key.1) == (*seq, *row) && key.2 <= *ac)
+                        || ((key.0, key.1) == (*seq, *row)
+                            && canonical_revision_order(ac)
+                            && key.2 <= *ac)
                 }) {
                     continue;
                 }
@@ -660,7 +698,9 @@ pub(super) fn acceptance_page(
                     let order = format!("{:020}:{}", i64::MAX - revision, a.ac_id);
                     let key = (c.seq, c.rowid, order.clone());
                     if after.as_ref().is_some_and(|(seq, row, ac)| {
-                        (c.seq, c.rowid) == (*seq, *row) && order <= *ac
+                        (c.seq, c.rowid) == (*seq, *row)
+                            && canonical_revision_order(ac)
+                            && order <= *ac
                     }) {
                         continue;
                     }
