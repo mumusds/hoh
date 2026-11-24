@@ -5,11 +5,11 @@ use std::{collections::BTreeMap, path::Path};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Bundle {
-    pub release: String,
-    pub format: String,
+    release: String,
+    format: String,
     files: BTreeMap<String, String>,
-    /// The digest of the current `files`, filled by [`Bundle::version`]. Not part of the stored
-    /// bytes or of equality. [`Bundle::insert_file`] and [`Bundle::retain_files`] drop it (M3G-101).
+    /// The digest of release, format and files, filled by [`Bundle::version`]. All mutation
+    /// accessors invalidate it. The cache is not part of stored bytes or equality.
     #[serde(skip, default)]
     version_cache: std::sync::Mutex<Option<String>>,
 }
@@ -57,6 +57,24 @@ impl Bundle {
         }
     }
 
+    pub fn release(&self) -> &str {
+        &self.release
+    }
+
+    pub fn set_release(&mut self, release: impl Into<String>) {
+        self.clear_version();
+        self.release = release.into();
+    }
+
+    pub fn format(&self) -> &str {
+        &self.format
+    }
+
+    pub fn set_format(&mut self, format: impl Into<String>) {
+        self.clear_version();
+        self.format = format.into();
+    }
+
     /// The bundle's files. Mutate them with [`Bundle::insert_file`] or [`Bundle::retain_files`]
     /// so a later [`Bundle::version`] hashes the bytes that will be stored.
     pub fn files(&self) -> &BTreeMap<String, String> {
@@ -65,14 +83,14 @@ impl Bundle {
 
     /// Replace one file and drop a cached digest (M3G-101).
     pub fn insert_file(&mut self, path: impl Into<String>, text: impl Into<String>) {
-        self.files.insert(path.into(), text.into());
         self.clear_version();
+        self.files.insert(path.into(), text.into());
     }
 
     /// Keep the files `keep` accepts and drop a cached digest (M3G-101).
     pub fn retain_files(&mut self, mut keep: impl FnMut(&String, &mut String) -> bool) {
-        self.files.retain(|path, text| keep(path, text));
         self.clear_version();
+        self.files.retain(|path, text| keep(path, text));
     }
 
     fn clear_version(&self) {
@@ -184,6 +202,39 @@ mod tests {
             files,
             version_cache: std::sync::Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn test_047_03_release_change_after_version_round_trips() {
+        let dir = tempfile::Builder::new()
+            .prefix("m3low-c-release-")
+            .tempdir()
+            .unwrap();
+        let mut bundle = sample();
+        let before = bundle.version();
+        bundle.set_release("0.0.1");
+        let pin = bundle.store(dir.path()).unwrap();
+        let loaded = pin.load(dir.path()).unwrap();
+        assert_ne!(before, pin.resource_bundle_version);
+        assert_eq!(loaded, bundle);
+        assert_eq!(loaded.version(), pin.resource_bundle_version);
+    }
+
+    #[test]
+    fn test_047_03_format_change_after_version_round_trips() {
+        let dir = tempfile::Builder::new()
+            .prefix("m3low-c-format-")
+            .tempdir()
+            .unwrap();
+        let mut bundle = sample();
+        bundle.set_format("legacy-format");
+        let before = bundle.version();
+        bundle.set_format(context::FORMAT);
+        let pin = bundle.store(dir.path()).unwrap();
+        let loaded = pin.load(dir.path()).unwrap();
+        assert_ne!(before, pin.resource_bundle_version);
+        assert_eq!(loaded, bundle);
+        assert_eq!(loaded.version(), pin.resource_bundle_version);
     }
 
     /// The cached digest is not part of the stored object or of equality (M3G-101).
