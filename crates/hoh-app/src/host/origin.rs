@@ -205,7 +205,7 @@ pub(super) struct Peer {
 
 impl Peer {
     pub(super) fn capture(transport: Transport) -> Self {
-        let captured = transport.resolve();
+        let captured = transport.resolve("capture");
         Self {
             transport,
             captured,
@@ -215,7 +215,7 @@ impl Peer {
         let Some((identity, inode)) = &self.captured else {
             return Origin::Unknown;
         };
-        if self.transport.resolve().as_ref() != self.captured.as_ref() {
+        if self.transport.resolve("origin").as_ref() != self.captured.as_ref() {
             return Origin::Unknown;
         }
         let origin = classify(
@@ -223,7 +223,7 @@ impl Peer {
             identity,
             rustix::process::getuid().as_raw(),
         );
-        if self.transport.resolve().as_ref() != Some(&(identity.clone(), *inode)) {
+        if self.transport.resolve("origin").as_ref() != Some(&(identity.clone(), *inode)) {
             return Origin::Unknown;
         }
         origin
@@ -231,7 +231,22 @@ impl Peer {
 }
 
 impl Transport {
-    fn resolve(&self) -> Option<(Identity, u64)> {
+    /// TCP client port or UDS inode. No address, path, or environment (FLK05-101).
+    fn diag_key(&self) -> String {
+        match self {
+            Self::Tcp { remote, .. } => format!("tcp port={}", remote.port()),
+            Self::Unix { inode, .. } => format!("uds inode={inode}"),
+            Self::Unknown => "transport=unknown".to_owned(),
+        }
+    }
+
+    fn resolve(&self, stage: &'static str) -> Option<(Identity, u64)> {
+        MISS_SITE.with(|site| *site.borrow_mut() = Some((stage, self.diag_key())));
+        let _site = MissSite;
+        self.resolve_attempts()
+    }
+
+    fn resolve_attempts(&self) -> Option<(Identity, u64)> {
         // A fork can duplicate a CLOEXEC descriptor until exec closes it. For TCP the inode is the
         // client's socket: the approval helper creates it after exec and does not fork, and a child of
         // the test binary inherits only the accepted server socket, a different inode. Lengthening this
@@ -361,15 +376,56 @@ fn socket_owner(root: &Path, inode: u64, uid: u32) -> Option<u32> {
     socket_owner_at(&StdProc, root, inode, uid)
 }
 
+std::thread_local! {
+    static MISS_SITE: std::cell::RefCell<Option<(&'static str, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+std::thread_local! {
+    static LAST_MISS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static MISS_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Clears the miss site when `resolve` returns, including on an early `Some`.
+struct MissSite;
+
+impl Drop for MissSite {
+    fn drop(&mut self) {
+        MISS_SITE.with(|site| *site.borrow_mut() = None);
+    }
+}
+
+fn miss_line(step: &str) -> String {
+    let site = MISS_SITE.with(|site| site.borrow().clone());
+    match site {
+        Some((stage, key)) => {
+            format!("hoh host: origin lookup returned none: stage={stage} {key}: {step}")
+        }
+        None => format!("hoh host: origin lookup returned none: {step}"),
+    }
+}
+
+#[cfg(test)]
+fn take_origin_miss_record() -> (u32, Option<String>) {
+    let count = MISS_COUNT.with(|count| count.replace(0));
+    let line = LAST_MISS.with(|slot| slot.borrow_mut().take());
+    (count, line)
+}
+
 /// One line on the host's stderr. `hoh __host` moves that descriptor to `.hoh/host.log` once ready.
 /// A step that returns none is recorded here so a later `origin_unknown` names the step. Skipped
 /// pids (already gone, or an unreadable fd of a process that is not the peer) are not recorded.
+/// `resolve` adds the stage (`capture` or `origin`) and a transport key: the TCP client port or the
+/// UDS inode. The line has no address, path, or environment. A write error does not fail the lookup.
 fn origin_miss<T>(step: &str) -> Option<T> {
     use std::io::Write as _;
-    let _ = writeln!(
-        std::io::stderr(),
-        "hoh host: origin lookup returned none: {step}"
-    );
+    let line = miss_line(step);
+    #[cfg(test)]
+    {
+        LAST_MISS.with(|slot| *slot.borrow_mut() = Some(line.clone()));
+        MISS_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    }
+    let _ = writeln!(std::io::stderr(), "{line}");
     None
 }
 
