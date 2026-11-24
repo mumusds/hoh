@@ -100,105 +100,48 @@ fn until(what: &str, limit: Duration, mut ready: impl FnMut() -> R<bool>) -> R {
 }
 
 /// AC-047-03's three-way diff (ADR-034 decision 10: old builtin -> new builtin, old builtin -> override), checked
-/// without the product's diff code (M3PD-01): `report` is the drift report's `diff`, and each of its two parts must be a
-/// unified diff with the expected headers that, applied to the old builtin, gives the new builtin or the override.
+/// without the product's diff code (DC-PD): `report` is the drift report's `diff` and must be exactly the two
+/// whole-file unified diffs built here from the documented format (`--- old-builtin`, `+++ new-builtin` or
+/// `+++ override`, one hunk `@@ -1,N +1,M @@` with every old line as '-' and every new line as '+').
 pub fn assert_three_way_diff(report: &Value, old: &str, new: &str, custom: &str) -> R {
-    for (part, to, want) in [
-        ("builtin", "new-builtin", new),
-        ("override", "override", custom),
+    // Non-empty texts ending in a newline that differ from the old builtin: one hunk, no no-newline marker.
+    for (name, text) in [
+        ("old builtin", old),
+        ("new builtin", new),
+        ("override", custom),
     ] {
-        let diff = report[part]
-            .as_str()
-            .ok_or(format!("three-way diff has no {part} part: {report}"))?;
-        let got = apply_unified(diff, "old-builtin", to, old)
-            .map_err(|why| format!("{part} part: {why}\n{diff}"))?;
-        if got != want {
-            return Err(
-                format!("{part} part applied to the old builtin is not its {to}:\n{diff}").into(),
-            );
+        if text.is_empty() || !text.ends_with('\n') {
+            return Err(format!("fixture {name} is empty or does not end with a newline").into());
         }
+    }
+    if new == old || custom == old {
+        return Err("fixture new builtin or override equals the old builtin".into());
+    }
+    let expected = |to: &str, text: &str| {
+        let mut diff = format!(
+            "--- old-builtin\n+++ {to}\n@@ -1,{} +1,{} @@\n",
+            old.split_inclusive('\n').count(),
+            text.split_inclusive('\n').count()
+        );
+        for (sign, side) in [('-', old), ('+', text)] {
+            for line in side.split_inclusive('\n') {
+                diff.push(sign);
+                diff.push_str(line);
+            }
+        }
+        diff
+    };
+    let want =
+        json!({"builtin": expected("new-builtin", new), "override": expected("override", custom)});
+    if *report != want {
+        return Err(format!(
+            "three-way diff is not the expected text:\n got: {report}\nwant: {want}"
+        )
+        .into());
     }
     Ok(())
 }
 
-/// `diff` applied to `old`: a unified diff `--- from` / `+++ to` with at least one hunk, whose hunk headers count its
-/// lines and whose context and '-' lines are `old`'s lines at the hunk's position. Every text ends with a newline.
-fn apply_unified(diff: &str, from: &str, to: &str, old: &str) -> R<String> {
-    let old: Vec<&str> = old.split_inclusive('\n').collect();
-    let mut lines = diff.split_inclusive('\n').peekable();
-    if lines.next() != Some(&format!("--- {from}\n"))
-        || lines.next() != Some(&format!("+++ {to}\n"))
-    {
-        return Err(format!("headers are not `--- {from}` / `+++ {to}`").into());
-    }
-    let (mut out, mut at, mut hunks) = (Vec::<&str>::new(), 0usize, 0);
-    while let Some(header) = lines.next() {
-        let range = |side: &str| -> R<(usize, usize)> {
-            let (start, count) = side.split_once(',').unwrap_or((side, "1"));
-            Ok((start.parse()?, count.parse()?))
-        };
-        let (old_range, new_range) = header
-            .strip_prefix("@@ -")
-            .and_then(|h| h.strip_suffix(" @@\n"))
-            .and_then(|h| h.split_once(" +"))
-            .ok_or(format!("not a hunk header: {header:?}"))?;
-        let ((old_start, old_count), (new_start, new_count)) =
-            (range(old_range)?, range(new_range)?);
-        // A hunk starts at its first old line (an empty one after line `old_start`); lines before it are unchanged.
-        let first = if old_count == 0 {
-            old_start
-        } else {
-            old_start.checked_sub(1).ok_or("old start 0")?
-        };
-        if first < at || first > old.len() {
-            return Err(format!("hunk {header:?} out of order or past the old text").into());
-        }
-        out.extend(&old[at..first]);
-        at = first;
-        if (if new_count == 0 {
-            new_start
-        } else {
-            new_start.wrapping_sub(1)
-        }) != out.len()
-        {
-            return Err(
-                format!("hunk {header:?} new start does not follow the lines before it").into(),
-            );
-        }
-        let (mut seen_old, mut seen_new) = (0, 0);
-        while let Some(line) = lines.next_if(|l| !l.starts_with("@@")) {
-            let (kind, text) = line.split_at(1);
-            if matches!(kind, " " | "-") {
-                if old.get(at) != Some(&text) {
-                    return Err(format!("line {line:?} is not old line {}", at + 1).into());
-                }
-                at += 1;
-                seen_old += 1;
-            }
-            match kind {
-                " " | "+" => {
-                    out.push(text);
-                    seen_new += 1;
-                }
-                "-" => {}
-                _ => return Err(format!("unexpected diff line {line:?}").into()),
-            }
-        }
-        if (seen_old, seen_new) != (old_count, new_count) {
-            return Err(
-                format!("hunk {header:?} has {seen_old} old and {seen_new} new lines").into(),
-            );
-        }
-        hunks += 1;
-    }
-    if hunks == 0 {
-        return Err("no hunk".into());
-    }
-    out.extend(&old[at..]);
-    Ok(out.concat())
-}
-
-/// The release bundle `bundle` unpacked under `at`: its `hoh/` directory.
 fn unpack(bundle: &Path, at: &Path) -> R<PathBuf> {
     std::fs::create_dir_all(at)?;
     let status = Command::new("tar")
