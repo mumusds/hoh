@@ -114,6 +114,11 @@ class Independent(unittest.TestCase):
         self.assertEqual(Path(calls[0]['cwd']).resolve(),self.root.resolve())
         judgement=load_json(artifacts/'judgement.json');self.assertEqual(judgement['candidate_id'],self.candidate['candidate_id'])
         self.assertIn('TEST-901-01',judgement['tests'])
+    def test_the_prompt_never_sends_a_writable_copy_to_tmp(self):
+        # CLN1S-b: /tmp has a small per-user quota shared by every session; a writable copy goes under observations.
+        self.agents('codex');record,artifacts,err=self.check('independent-review',{'codex':'pass'});self.assertEqual(record['exit_code'],0,err)
+        prompt=self.calls()[0]['prompt'];observations=artifacts.parent.parent/f'{artifacts.parent.name}-observations'
+        self.assertNotIn('a copy under /tmp',prompt);self.assertIn(f'git clone of the candidate commit under {observations}',prompt)
     def test_the_judgement_counts_an_earlier_traceability_run(self):
         # M2T10R-51: the independent check judges as itself, so a traceability run that passed is counted, not taken
         # for its own missing self-test.
