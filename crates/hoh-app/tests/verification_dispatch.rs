@@ -3987,7 +3987,8 @@ async fn a_turns_auth_failure_is_the_turns_block_even_when_ticks_pass_between_it
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_turns_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block() -> R {
+async fn test_020_05_flk12_turn_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block()
+-> R {
     // M3LD-50: the commit of qa's failed turn's end fails after the registry latched its BLOCKED_AUTH, so the latch's
     // lock is released before the end is committed; the end is committed by the runner_error settle, held 700 ms
     // (over three runner ticks) before it. A tick's staffing may block pi's binding first (cause staffing); the
@@ -4016,14 +4017,23 @@ impl hoh_app::host::HostHooks for HoldLatch {
     }
 }
 
-/// Fails the commit of the turn's end once its BLOCKED_AUTH was latched (the store's next runner request), then holds
-/// that attempt's runner_error settle for 700 ms before it begins.
+/// Fails only the latched attempt's end transaction, then holds its runner_error settle for 700 ms.
+/// A trigger scoped to that attempt cannot be consumed by a read-only Runner job or another attempt's commit.
 #[derive(Debug, Default)]
 struct FailEnd {
+    project: PathBuf,
     latched: std::sync::Mutex<Option<String>>,
-    armed: AtomicBool,
-    failing: AtomicBool,
-    failed: AtomicBool,
+    reached: tokio::sync::Notify,
+    released: (std::sync::Mutex<bool>, std::sync::Condvar),
+    rollback_observed: AtomicBool,
+}
+
+impl FailEnd {
+    fn release(&self) -> R {
+        *self.released.0.lock().map_err(|e| e.to_string())? = true;
+        self.released.1.notify_one();
+        Ok(())
+    }
 }
 
 impl hoh_app::host::HostHooks for FailEnd {
@@ -4032,7 +4042,27 @@ impl hoh_app::host::HostHooks for FailEnd {
             && latched.is_none()
         {
             *latched = Some(attempt_id.to_owned());
-            self.armed.store(true, Ordering::SeqCst);
+            let armed = seed(
+                &self.project,
+                &format!(
+                    "CREATE TRIGGER flk12_fail_end AFTER UPDATE OF state ON attempts \
+                 WHEN NEW.attempt_id='{}' AND NEW.state='FAILED' \
+                 BEGIN SELECT RAISE(ABORT, 'FLK-12 injected failure of the turn end'); END;",
+                    attempt_id.replace('\'', "''")
+                ),
+            );
+            assert!(armed.is_ok(), "arm the target end transaction: {armed:?}");
+            self.reached.notify_one();
+            let (lock, ready) = &self.released;
+            let waited = lock.lock().map_err(|e| e.to_string()).and_then(|released| {
+                ready
+                    .wait_timeout_while(released, Duration::from_secs(20), |go| !*go)
+                    .map_err(|e| e.to_string())
+            });
+            assert!(
+                waited.as_ref().is_ok_and(|(released, _)| **released),
+                "test did not release the latched end: {waited:?}"
+            );
         }
     }
 
@@ -4043,27 +4073,26 @@ impl hoh_app::host::HostHooks for FailEnd {
                 .lock()
                 .is_ok_and(|l| l.as_deref() == Some(attempt_id))
         {
+            let before = rows(
+                &self.project,
+                &format!(
+                    "SELECT state, failure_reason FROM attempts WHERE attempt_id='{attempt_id}'"
+                ),
+            );
+            assert!(
+                before
+                    .as_ref()
+                    .is_ok_and(|r| *r == json!([{"state": "RUNNING", "failure_reason": null}])),
+                "the failed end must roll back before runner_error settles it: {before:?}"
+            );
+            let disarmed = seed(&self.project, "DROP TRIGGER flk12_fail_end;");
+            assert!(disarmed.is_ok(), "disarm before recovery: {disarmed:?}");
+            assert!(
+                !self.rollback_observed.swap(true, Ordering::SeqCst),
+                "end failed twice"
+            );
             std::thread::sleep(Duration::from_millis(700));
         }
-    }
-}
-
-impl hoh_core::persistence::FaultHooks for FailEnd {
-    fn before_job(&self, job: &'static str) {
-        self.failing.store(
-            job == "Runner" && self.armed.swap(false, Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-    }
-
-    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
-        if self.failing.swap(false, Ordering::SeqCst) {
-            self.failed.store(true, Ordering::SeqCst);
-            return Err(hoh_core::persistence::PersistError::Storage(
-                "injected failure of the turn's end".to_owned(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -4089,7 +4118,10 @@ async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
         *fails_as = Some("pi".to_owned());
     }
     let registry = hoh_app::host::Executor::registry(&*team).ok_or("no registry")?;
-    let fail_end = Arc::new(FailEnd::default());
+    let fail_end = Arc::new(FailEnd {
+        project: project.clone(),
+        ..Default::default()
+    });
     let host = if latch != Latch::Plain {
         let mut config = config(&project);
         config.clock = hoh_app::host::HostClock(clock.clone());
@@ -4107,7 +4139,6 @@ async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
             config.hooks = Arc::new(HoldLatch);
         } else {
             config.hooks = fail_end.clone();
-            config.store.faults = fail_end.clone();
         }
         Host::start(config).await?
     } else {
@@ -4139,6 +4170,14 @@ async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
             "{before:?}"
         );
         team.release.store(true, Ordering::SeqCst);
+        if latch == Latch::EndFails {
+            tokio::time::timeout(Duration::from_secs(20), fail_end.reached.notified()).await?;
+            // FLK-12: read-only Runner jobs must not consume a fault meant for this attempt's end.
+            for _ in 0..2 {
+                host.store().runner_waiting(&host.project_id).await?;
+            }
+            fail_end.release()?;
+        }
         let a_end = wait_for(
             &project,
             &clock,
@@ -4152,7 +4191,7 @@ async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
             assert_eq!(a_end[0]["failure_reason"], "BLOCKED_AUTH", "{a_end}");
         } else {
             // The injected failure hit this turn's end, which the runner_error settle then committed.
-            assert!(fail_end.failed.load(Ordering::SeqCst), "no commit failed");
+            assert!(fail_end.rollback_observed.load(Ordering::SeqCst), "no end rolled back");
             assert_eq!(
                 rows(
                     &project,
@@ -4325,8 +4364,11 @@ async fn turn_auth_failure_switches_qa(latch: Latch) -> R {
         R::Ok(())
     }
     .await;
+    // Also unblock the hook if a read failed, so shutdown never waits for the barrier's failure bound.
+    let released = fail_end.release();
     host.shutdown().await;
     team.end_agents();
+    released?;
     outcome
 }
 
