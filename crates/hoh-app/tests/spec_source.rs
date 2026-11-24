@@ -8,6 +8,7 @@ mod spec_source {
     mod origin;
     mod rejection;
     mod tasks;
+    mod unavailable;
 }
 
 mod pty;

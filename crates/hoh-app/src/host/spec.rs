@@ -1,26 +1,23 @@
 //! The host owns specification files; the core only receives bytes (ADR-033).
 
+use hoh_core::persistence::SpecReadError;
 use hoh_core::specindex::{IndexError, Source};
 use std::path::Path;
 
-pub(crate) fn files(root: &Path) -> Result<hoh_core::persistence::SpecFiles, IndexError> {
+pub(crate) fn files(root: &Path) -> Result<hoh_core::persistence::SpecFiles, SpecReadError> {
     let sources = sources(root)?;
     let path = hoh_core::specindex::PATH;
     let tracked = super::control::git(root, &["ls-files", "-z", "--", path])
-        .map_err(|e| IndexError::at(path, 1, e))?;
+        .map_err(|e| SpecReadError::unavailable(path, e))?;
     let existing_index = match std::fs::symlink_metadata(root.join(path)) {
-        Ok(meta) if meta.is_file() => Some(
-            std::fs::read(root.join(path)).map_err(|e| IndexError::at(path, 1, e.to_string()))?,
-        ),
+        Ok(meta) if meta.is_file() => {
+            Some(std::fs::read(root.join(path)).map_err(|e| SpecReadError::unavailable(path, e))?)
+        }
         Ok(_) => {
-            return Err(IndexError::at(
-                path,
-                1,
-                "index must be a regular file, not a link",
-            ));
+            return Err(IndexError::at(path, 1, "index must be a regular file, not a link").into());
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(IndexError::at(path, 1, e.to_string())),
+        Err(e) => return Err(SpecReadError::unavailable(path, e)),
     };
     Ok(hoh_core::persistence::SpecFiles {
         sources,
@@ -81,19 +78,19 @@ pub(crate) fn publish(
 }
 
 /// The direct Markdown children of docs/spec, without following directory or file links.
-pub(crate) fn sources(root: &Path) -> Result<Vec<Source>, IndexError> {
+pub(crate) fn sources(root: &Path) -> Result<Vec<Source>, SpecReadError> {
     for path in ["docs", "docs/spec"] {
         let meta = std::fs::symlink_metadata(root.join(path))
-            .map_err(|e| IndexError::at(path, 1, e.to_string()))?;
+            .map_err(|e| SpecReadError::unavailable(path, e))?;
         if !meta.is_dir() {
-            return Err(IndexError::at(path, 1, "expected a directory, not a link"));
+            return Err(IndexError::at(path, 1, "expected a directory, not a link").into());
         }
     }
     let mut sources = Vec::new();
     for entry in std::fs::read_dir(root.join("docs/spec"))
-        .map_err(|e| IndexError::at("docs/spec", 1, e.to_string()))?
+        .map_err(|e| SpecReadError::unavailable("docs/spec", e))?
     {
-        let entry = entry.map_err(|e| IndexError::at("docs/spec", 1, e.to_string()))?;
+        let entry = entry.map_err(|e| SpecReadError::unavailable("docs/spec", e))?;
         let name = entry
             .file_name()
             .into_string()
@@ -104,16 +101,14 @@ pub(crate) fn sources(root: &Path) -> Result<Vec<Source>, IndexError> {
         let path = format!("docs/spec/{name}");
         let kind = entry
             .file_type()
-            .map_err(|e| IndexError::at(&path, 1, e.to_string()))?;
+            .map_err(|e| SpecReadError::unavailable(&path, e))?;
         if !kind.is_file() {
-            return Err(IndexError::at(
-                &path,
-                1,
-                "expected a regular Markdown file, not a link",
-            ));
+            return Err(
+                IndexError::at(&path, 1, "expected a regular Markdown file, not a link").into(),
+            );
         }
         let bytes =
-            std::fs::read(entry.path()).map_err(|e| IndexError::at(&path, 1, e.to_string()))?;
+            std::fs::read(entry.path()).map_err(|e| SpecReadError::unavailable(&path, e))?;
         sources.push(Source { path, bytes });
     }
     sources.sort_by(|a, b| a.path.cmp(&b.path));

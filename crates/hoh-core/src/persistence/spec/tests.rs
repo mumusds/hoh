@@ -399,6 +399,42 @@ fn input_approval(
     command
 }
 #[tokio::test]
+async fn test_034_03_m3b07_approval_answers_retry_source_failure_without_writes() -> R {
+    for answer in [true, false] {
+        let (_dir, store, db, command) = approval_world().await?;
+        let valid = input_approval(command, answer, Origin::User, "approve");
+        let mut fault = valid.clone();
+        if let RunTarget::ObservedInput { files, .. } = &mut fault.target {
+            **files = Err(SpecReadError::unavailable(
+                "docs/spec/main.md",
+                "injected read failure",
+            ));
+        }
+        let before = db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?;
+        let error = store
+            .submit_command(fault)
+            .await
+            .expect_err("unavailable source");
+        assert_eq!(
+            error.error_code(),
+            Some(crate::protocol::ErrorCode::SpecSourceUnavailable)
+        );
+        assert_eq!(
+            db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?,
+            before
+        );
+        assert!(super::super::draft_approval::pending(&db, "R")?.is_some());
+        store.submit_command(valid).await?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        assert!(super::super::draft_approval::pending(&db, "R")?.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_008_05_all_answer_entrances_guard_before_replay_and_rollback_conflict() -> R {
     for answer in [true, false] {
         let (_dir, store, db, command) = approval_world().await?;

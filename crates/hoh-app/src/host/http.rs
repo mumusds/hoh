@@ -707,6 +707,13 @@ async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Res
             true,
             current_revision(shared, run_id).await,
         ),
+        PersistError::SpecSourceUnavailable(detail) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SPEC_SOURCE_UNAVAILABLE",
+            format!("specification source could not be read; nothing was written: {detail}"),
+            true,
+            current_revision(shared, run_id).await,
+        ),
         // The writer ended (a panic): this host can write no more and stops; the next one can (M2T12R-150).
         PersistError::WriterStopped => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1018,18 +1025,13 @@ async fn submit_command(
             super::begun::spawn_blocking(move || super::spec::files(&root))
                 .await
                 .unwrap_or_else(|e| {
-                    Err(hoh_core::specindex::IndexError::at(
+                    Err(hoh_core::persistence::SpecReadError::unavailable(
                         "docs/spec",
-                        1,
                         e.to_string(),
                     ))
                 })
         } else {
-            Err(hoh_core::specindex::IndexError::at(
-                "docs/spec",
-                1,
-                "not an approval input",
-            ))
+            Err(hoh_core::specindex::IndexError::at("docs/spec", 1, "not an approval input").into())
         };
         RunTarget::ObservedInput {
             input,

@@ -1429,6 +1429,10 @@ pub(crate) mod tests {
         assert_eq!(refusal_exit(409, "STALE_REVISION", &json!(null)), 1);
         assert_eq!(refusal_exit(422, "CAPABILITY_UNSUPPORTED", &json!(null)), 1);
         assert_eq!(refusal_exit(503, "UNPROCESSABLE", &json!(null)), 69);
+        assert_eq!(
+            refusal_exit(503, "SPEC_SOURCE_UNAVAILABLE", &json!(null)),
+            69
+        );
     }
 
     /// A host on a socket of `dir` that answers each request with the next of `replies` (status, body), then closes.
@@ -1472,6 +1476,32 @@ pub(crate) mod tests {
             },
             served,
         ))
+    }
+
+    #[test]
+    fn test_034_03_m3b07_client_retries_spec_source_unavailable() -> R {
+        // Mock HTTP transport, product client retry loop: a retryable source failure uses the existing 503 path.
+        let dir = tempfile::tempdir()?;
+        let accepted = json!({"command_id":"C","run_id":"R","revision":2,"status":"ACCEPTED"});
+        let (host, served) = scripted(
+            dir.path(),
+            vec![
+                (
+                    503,
+                    json!({"code":"SPEC_SOURCE_UNAVAILABLE","message":"source read failed",
+                "retryable":true,"current_revision":1}),
+                ),
+                (202, accepted.clone()),
+            ],
+        )?;
+        let result = submit(
+            dir.path(),
+            &host,
+            json!({"kind":"ApproveSpec","run_id":"R"}),
+        );
+        served.join().map_err(|_| "the scripted host panicked")?;
+        assert_eq!(result, Ok(accepted));
+        Ok(())
     }
 
     #[test]
