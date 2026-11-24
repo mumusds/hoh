@@ -385,3 +385,81 @@ fn test_008_02_waiting_opener_rereads_version_after_write_lock() -> R {
     }
     Ok(())
 }
+
+/// M3L-01: SIGKILL after migration 002 has copied `tasks` into `tasks_new`, and before it commits,
+/// reopens at user_version 1 with the v1 row, then migrates to kind `work`.
+#[test]
+fn test_008_02_kill_during_migration_002_rolls_back_to_version_1() -> R {
+    use std::os::unix::process::ExitStatusExt as _;
+    if std::env::var_os("HOH_M3L01_CRASH").is_some() {
+        let path = std::env::var("HOH_M3L01_CRASH_DB")?;
+        let conn = Connection::open(path)?;
+        let outcome = migrate(&conn, MIGRATIONS);
+        eprintln!("migration finished without a crash: {outcome:?}");
+        std::process::exit(2);
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("crash.db");
+    let conn = Connection::open(&path)?;
+    migrate(&conn, &MIGRATIONS[..1])?;
+    conn.execute_batch(
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/project','now');
+         INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+         INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','AUTO','now');
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','READY','developer',1);",
+    )?;
+    drop(conn);
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "persistence::migration::tests::test_008_02_kill_during_migration_002_rolls_back_to_version_1",
+            "--nocapture",
+        ])
+        .env("HOH_M3L01_CRASH", "1")
+        .env("HOH_M3L01_CRASH_DB", &path)
+        .output()?;
+    assert_eq!(
+        child.status.signal(),
+        Some(9),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let conn = Connection::open(&path)?;
+    assert_eq!(user_version(&conn)?, 1);
+    assert_eq!(
+        conn.query_row("SELECT task_id,state FROM tasks", [], |r| Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?
+        )))?,
+        ("t".to_owned(), "READY".to_owned())
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='kind'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0,
+        "the rebuild must not be visible after the crash"
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?,
+        "ok"
+    );
+    assert_eq!(migrate(&conn, MIGRATIONS)?, 2);
+    assert_eq!(
+        conn.query_row("SELECT kind FROM tasks WHERE task_id='t'", [], |r| r
+            .get::<_, String>(0))?,
+        "work"
+    );
+    let fk: i64 = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    assert_eq!(fk, 1);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get::<_, i64>(0)
+        })?,
+        0
+    );
+    Ok(())
+}

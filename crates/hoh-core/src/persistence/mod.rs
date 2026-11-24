@@ -924,6 +924,10 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
             _ => {}
         }
         statement.raw_execute().map_err(statement_error)?;
+        // The test process asks to die here, after `tasks_new` has the copied rows and before COMMIT.
+        // Workspace lint forbids unsafe, so the test cannot install sqlite3_update_hook (M3L-01).
+        #[cfg(test)]
+        crash_during_tasks_rebuild(&text);
         if conn.is_autocommit() {
             return Err(format!(
                 "the statement `{}` ended the transaction",
@@ -932,6 +936,26 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// SIGKILL this process once migration 002 has inserted into `tasks_new` and not yet committed.
+/// Only the M3L-01 child sets `HOH_M3L01_CRASH`. Absent from the product binary (`cfg(test)`).
+#[cfg(test)]
+fn crash_during_tasks_rebuild(sql: &str) {
+    if std::env::var_os("HOH_M3L01_CRASH").is_none() {
+        return;
+    }
+    let lower = sql.to_ascii_lowercase();
+    if leading_keyword(sql) != "INSERT" || !lower.contains("into tasks_new") {
+        return;
+    }
+    let Ok(raw) = i32::try_from(std::process::id()) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return;
+    };
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
 }
 
 /// A script statement's error without the script: the error of one SQLite could not prepare carries the rest of the
