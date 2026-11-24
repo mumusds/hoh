@@ -1700,6 +1700,42 @@ fn test_047_02_settings_diff_restore_and_cancel() {
 }
 
 #[test]
+fn test_047_02_restore_says_when_nothing_was_deleted_and_drops_the_override_diff() {
+    // M3G-01: Ok(false) is not "the project override was deleted", and a real delete
+    // recomputes the diff so the removed override is no longer shown.
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-settings-none-")
+        .tempdir()
+        .unwrap();
+    let mut app = App::open(dir.path());
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    app.key(key(KeyCode::Char('r')));
+    let shown = screen(&app, 110, 30).join("\n");
+    assert!(
+        !shown.contains("project 覆盖已删除"),
+        "nothing was deleted: {shown}"
+    );
+    assert!(shown.contains("没有 project 覆盖可删除"), "{shown}");
+
+    let path = dir.path().join(".hoh/prompts/developer.md");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "custom developer\n").unwrap();
+    let mut app = App::open(dir.path());
+    typed(&mut app, "/settings developer");
+    app.key(key(KeyCode::Enter));
+    app.key(key(KeyCode::Char('r')));
+    let shown = screen(&app, 110, 30).join("\n");
+    assert!(!path.exists());
+    assert!(shown.contains("已恢复默认"), "{shown}");
+    assert!(
+        !shown.contains("custom developer"),
+        "diff must be recomputed after the delete: {shown}"
+    );
+    assert!(!shown.contains("+++ project"), "{shown}");
+}
+
+#[test]
 fn test_047_03_settings_exposes_drift_and_both_diffs() {
     let dir = tempfile::Builder::new()
         .prefix("m3t03-drift-ui-")

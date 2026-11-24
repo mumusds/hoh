@@ -10,6 +10,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub(super) struct Settings {
     role: String,
+    run: String,
     configured: Option<String>,
     diff: String,
     scroll: u16,
@@ -56,6 +57,7 @@ impl Settings {
         }
         Ok(Self {
             role: role.to_owned(),
+            run: run.to_owned(),
             configured,
             diff,
             scroll: 0,
@@ -73,10 +75,57 @@ impl Settings {
     pub fn restore(&mut self, root: &Path) {
         self.notice =
             match prompt_files::restore_project(root, &self.role, self.configured.as_deref()) {
-                Ok(_) => "已恢复默认：project 覆盖已删除；下次 Attempt 重新读取覆盖链。Esc 返回"
-                    .to_owned(),
+                // Ok(false) is the idempotent path: the conventional file was already absent (M3G-01).
+                Ok(false) => "没有 project 覆盖可删除。Esc 返回".to_owned(),
+                Ok(true) => match self.reload_diff(root) {
+                    Ok(()) => {
+                        "已恢复默认：project 覆盖已删除；下次 Attempt 重新读取覆盖链。Esc 返回"
+                            .to_owned()
+                    }
+                    Err(e) => format!("恢复失败：{e}"),
+                },
                 Err(e) => format!("恢复失败：{e}"),
             };
+    }
+
+    /// Rebuild the diff from the files on disk. A successful restore otherwise keeps the deleted override on screen.
+    fn reload_diff(&mut self, root: &Path) -> Result<(), prompt::Error> {
+        let resolved = prompt_files::load(
+            root,
+            prompt_files::global_root().as_deref(),
+            &self.run,
+            &self.role,
+            self.configured.as_deref(),
+        )?;
+        let builtin = resolved
+            .chain
+            .iter()
+            .find(|c| c.layer == "builtin")
+            .ok_or_else(|| prompt::unavailable("该职位没有内置默认契约"))?;
+        let effective = resolved.effective()?;
+        let reports = prompt_files::drift_reports(
+            root,
+            &resolved,
+            &hoh_core::resource_bundle::Bundle::current(),
+        )?;
+        let mut diff =
+            prompt::unified_diff(&builtin.text, &effective.text, "builtin", effective.layer);
+        for report in &reports {
+            diff.push_str(&format!(
+                "\n覆盖漂移：{}\n",
+                report["path"].as_str().unwrap_or_default()
+            ));
+            if report["base_status"] == "known" {
+                for name in ["builtin", "override"] {
+                    diff.push_str(report["diff"][name].as_str().unwrap_or_default());
+                }
+            } else {
+                diff.push_str("基准缺失或与覆盖不匹配，旧内置未知；仅显示当前内置对照。\n");
+                diff.push_str(report["current_diff"].as_str().unwrap_or_default());
+            }
+        }
+        self.diff = diff;
+        Ok(())
     }
 
     pub fn scroll(&mut self, amount: i16) {
