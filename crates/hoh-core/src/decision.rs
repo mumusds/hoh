@@ -212,6 +212,9 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
+    /// Every stored kind. Migration 002's `CHECK(kind IN (...))` is compared with this (M3L-02).
+    pub const ALL: &'static [Self] = &[Self::Work, Self::SpecDraft];
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "work" => Some(Self::Work),
