@@ -61,7 +61,7 @@ pub struct Launch {
     pub resume: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
-    /// This version emits `agent_settled` (pi 1.5.0 does); otherwise `get_state` checks for idle.
+    /// This version emits `agent_settled` (pi 1.5.0 and 1.6.0 do); otherwise `get_state` checks for idle.
     pub settled_event: bool,
     /// The launch profile (docs/adr/ADR-032.md decision 2); pi has no bypass, so `Yolo` and `Plain` start alike.
     pub profile: crate::Profile,
@@ -194,7 +194,7 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
 pub const DIALOGS: &[&str] = &["select", "confirm", "input", "editor"];
 
 /// The pi versions whose recorded traffic has `agent_settled` (`tests/fixtures/protocol/pi/<version>/`).
-const SETTLED_EVENT_VERSIONS: &[&str] = &["1.5.0"];
+const SETTLED_EVENT_VERSIONS: &[&str] = &["1.5.0", "1.6.0"];
 
 /// Whether a turn of the pi whose `--version` says `version` can rely on `agent_settled` ([`Launch::settled_event`]):
 /// only a recorded version; any other checks for idle with `get_state` (ADR-013 decision 3), which ends a turn on
