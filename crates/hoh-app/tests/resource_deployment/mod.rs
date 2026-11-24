@@ -1,4 +1,6 @@
-//! AC-047-03's adopted single-binary fixture: v1 seeded by the product API; the current binary is v2.
+//! AC-047-03's single-binary fixture: v1 seeded by the product API; the current binary is v2. It covers what the real
+//! upgrade (`resource_upgrade`, same check) cannot reach: a v2 host running an attempt still pinned to v1 (a PREPARED
+//! barrier holds the checkpoint).
 #![forbid(clippy::disallowed_methods)]
 #![forbid(unsafe_code)]
 use crate::world::{self, World};
