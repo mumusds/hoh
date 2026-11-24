@@ -186,7 +186,9 @@ class NativeBridge(unittest.TestCase):
         self.assertNotIn('hoh_report_error',load_json(out/'attempt.json'))
     def test_a_review_without_a_usable_block_says_why_and_still_completes(self):
         for result,reason in (('All good, PASS.','no ```hoh-report'),(REPORT_BLOCK.replace('"role"','"session_id": "x", "role"',1),'may only contain'),
-                              (REPORT_BLOCK,'differs from --role')):
+                              (REPORT_BLOCK,'differs from --role'),
+                              # L10-01: a block nested past Python's recursion limit is a bad block, not a bridge failure.
+                              ('```hoh-report\n{"role": "reviewer", "status": "PASS", "scope": [], "findings": '+'['*1100+']'*1100+'}\n```','too deeply nested')):
             role='qa' if reason=='differs from --role' else 'reviewer'
             with self.subTest(reason=reason):
                 p,out,pointer=self.review(result,role=role);self.assertEqual(p.returncode,0,p.stderr)

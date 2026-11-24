@@ -145,6 +145,7 @@ def report_block(role:str,final_text:str)->dict:
     if not blocks:raise ValueError('final assistant message has no ```hoh-report block')
     try:body=json.loads(blocks[-1])
     except ValueError as exc:raise ValueError(f'hoh-report block is not JSON: {exc}') from None
+    except RecursionError:raise ValueError('hoh-report block is too deeply nested') from None  # L10-01
     if not isinstance(body,dict):raise ValueError('hoh-report block must be a JSON object')
     extra=set(body)-{'role','status','scope','findings'}
     if extra:raise ValueError('hoh-report block may only contain role, status, scope, findings; got '+', '.join(sorted(extra)))
@@ -270,7 +271,7 @@ def main(argv=None)->int:
         report_error=None
         if ok and a.report_out:
             try:atomic_json(a.report_out,build_report(a.role,final_text,observed['session_ids'],out/'stdout.jsonl',out/'attempt.json'))
-            except (ValueError,OSError) as exc:
+            except (ValueError,OSError,RecursionError) as exc:  # RecursionError: L10-01
                 report_error=str(exc);print('independent report not written: '+report_error,file=sys.stderr)
                 record['report_error']=report_error;atomic_json(out/'attempt.json',record)
         # BT-01: without --report-out (which needs run_check's candidate binding) a qa/reviewer session's own block is
@@ -278,6 +279,10 @@ def main(argv=None)->int:
         hoh_report=None
         if ok and a.role in REPORT_ROLES and not a.report_out:
             try:atomic_json(out/'hoh-report.json',report_block(a.role,final_text));hoh_report=str(out/'hoh-report.json')
+            except RecursionError:  # L10-01: json.dump's encoder recurses deeper than json.loads
+                exc=ValueError('hoh-report block is too deeply nested')
+                print('hoh-report block not captured: '+str(exc),file=sys.stderr)
+                record['hoh_report_error']=str(exc);atomic_json(out/'attempt.json',record)
             except (ValueError,OSError) as exc:
                 print('hoh-report block not captured: '+str(exc),file=sys.stderr)
                 record['hoh_report_error']=str(exc);atomic_json(out/'attempt.json',record)
