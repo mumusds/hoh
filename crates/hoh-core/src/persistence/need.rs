@@ -544,7 +544,7 @@ pub(super) fn discussion_limit(
         run_id: Some(run.into()),
         event_id: crate::ids::child_id(run, &format!("discussion/{controversy}/limit")),
         kind: KIND.into(),
-        payload: json!({"reason":"discussion_limit","fingerprint":controversy,"controversy_id":controversy,"opinions":opinions,"cause":cause}),
+        payload: json!({"reason":"discussion_limit","fingerprint":format!("discussion/{controversy}"),"controversy_id":controversy,"opinions":opinions,"cause":cause}),
     }
 }
 
@@ -557,6 +557,6 @@ pub(super) fn major_decision(project: &str, run: &str, class: &Value, statement:
         run_id: Some(run.into()),
         event_id: crate::ids::child_id(run, &format!("major/{fingerprint}")),
         kind: KIND.into(),
-        payload: json!({"reason":"major_decision","fingerprint":fingerprint,"decision_class":class,"statement":statement}),
+        payload: json!({"reason":"major_decision","fingerprint":format!("major/{fingerprint}"),"decision_class":class,"statement":statement}),
     }
 }
