@@ -86,7 +86,7 @@ async fn test_047_03_bundle_pinned_until_checkpoint() -> R {
         assert_eq!(first["sha256"],crate::installed::sha256(b"OLD BUILTIN DEVELOPER\n"));
         let drift:Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE event_id='T-old/attempt-1/resource.drift'")?)?;
         let report:Value=serde_json::from_slice(&hoh_core::objects::get(&project,drift["reports"][0]["sha256"].as_str().ok_or("no report")?)?)?;
-        assert_eq!(report["diff"],hoh_core::prompt::three_way_diff("OLD BUILTIN DEVELOPER\n",hoh_core::config::builtin_contract("developer").unwrap(),"PROJECT OVERRIDE\n"));
+        crate::resource_upgrade::assert_three_way_diff(&report["diff"],"OLD BUILTIN DEVELOPER\n",hoh_core::config::builtin_contract("developer").unwrap(),"PROJECT OVERRIDE\n")?;
         world.until("SELECT state FROM attempts WHERE attempt_id='T-old/attempt-1'","SETTLED",Duration::from_secs(45)).await?;
         assert_eq!(world.query("SELECT count(*) FROM attempts WHERE task_id='T-new'")?,"0");
         assert_eq!(world.query("SELECT state FROM tasks WHERE task_id='T-new'")?,"READY");
