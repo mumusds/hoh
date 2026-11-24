@@ -832,7 +832,7 @@ fn received(
             ],
         )
         .map_err(sqlite_error)?;
-        finished_in(
+        finish_in(
             &tx,
             &notice.attempt_id,
             &Ending {
@@ -851,6 +851,7 @@ fn received(
                 },
                 unknown_effect: false,
             },
+            true,
             ctx,
         )?;
         writer::commit(tx, ctx)?;
@@ -1550,6 +1551,16 @@ pub(super) fn finished_in(
     ending: &Ending,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
+    finish_in(tx, attempt_id, ending, false, ctx)
+}
+
+fn finish_in(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    ending: &Ending,
+    refused_draft_gate: bool,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
     let (task_id, mut task_state, mut revision, run_id, project_id) = task_of(tx, attempt_id)?;
     let (from, cancelled): (String, bool) = tx
         .query_row(
@@ -1559,8 +1570,8 @@ pub(super) fn finished_in(
         )
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
-    // Every normal ending already has a termination proof. Use the same draft table as
-    // gate refusal and reconcile; never charge an unstarted draft to the retry budget.
+    // Every normal ending has a termination proof. STARTING failures still carry a class:
+    // only an explicit admission refusal without a failure gets a free retry (M3L-500).
     let draft_end = super::drafting::is_draft(tx, &task_id)?.then(|| {
         crate::reconcile::draft_end(
             from == AttemptState::Running,
@@ -1569,7 +1580,7 @@ pub(super) fn finished_in(
             },
         )
     });
-    let retry_draft = draft_end == Some(crate::reconcile::DraftEnd::Retry);
+    let retry_draft = refused_draft_gate && draft_end == Some(crate::reconcile::DraftEnd::Retry);
     if !cancelled
         && task_state == TaskState::Running
         && let Some((detail, paths)) = &ending.observed.draft_boundary

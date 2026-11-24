@@ -5,6 +5,177 @@ use crate::protocol::SpecDecision;
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
+// Product persistence with a synthetic STARTING attempt: no native agent is launched.
+async fn starting_draft_failure(class: crate::retry::FailureClass, reason: Option<&str>) -> R {
+    use crate::persistence::Ending;
+    use std::time::Duration;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("DELETE FROM events;
+        UPDATE runs SET state='SPECIFYING',resume_state=NULL,blocked_reason=NULL,blocked_reasons_json='[]';
+        UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES('R','cto','claude','SD',1,1,'2026-11-22T00:00:00Z');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    let work = crate::reconcile::work_key("A");
+    db.execute(
+        "INSERT INTO effects(effect_key,attempt_id,state) VALUES(?1,'A','PREPARED')",
+        [&work],
+    )?;
+    let at = crate::time::parse_rfc3339("2026-11-22T00:00:00Z").ok_or("time")?;
+    assert!(
+        store
+            .runner_finished(
+                "A",
+                Ending {
+                    success: false,
+                    detail: "scripted executor start refusal".into(),
+                    class,
+                    at,
+                    draw: u32::MAX,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                }
+            )
+            .await?
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM attempts WHERE attempt_id='A'", [], |r| r
+            .get::<_, String>(0))?,
+        "FAILED"
+    );
+    let (state, count, blocked, next): (String, i64, Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT state,attempt_count,blocked_reason,next_retry_at FROM tasks WHERE task_id='D'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    assert_eq!(count, 1);
+    assert_eq!(blocked.as_deref(), reason);
+    if reason.is_some() {
+        assert_eq!(state, "BLOCKED");
+        assert_eq!(next, None);
+        let payload: String = db.query_row(
+            "SELECT payload_json FROM events WHERE kind='task.blocked'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload)?["failure"],
+            class.to_json()
+        );
+        if class == crate::retry::FailureClass::Decision {
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM events WHERE kind='need_decision'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+        }
+    } else {
+        assert_eq!(state, "READY");
+        let wait = match class {
+            crate::retry::FailureClass::Transient {
+                retry_after: Some(wait),
+            } => wait,
+            _ => Duration::from_secs(2),
+        };
+        assert_eq!(next, Some(crate::time::rfc3339_utc(at + wait)));
+        let payload: String = db.query_row(
+            "SELECT payload_json FROM events WHERE kind='task.retry_scheduled'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload)?["failure"],
+            class.to_json()
+        );
+    }
+    assert!(
+        !store
+            .dispatch_draft(
+                "R",
+                crate::decision::Context {
+                    now: Some(at),
+                    ..Default::default()
+                }
+            )
+            .await?,
+        "no immediate redispatch"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM effects WHERE effect_key=?1",
+            [&work],
+            |r| r.get::<_, String>(0)
+        )?,
+        "PREPARED"
+    );
+    assert_eq!(db.query_row("SELECT count(*) FROM leases l JOIN attempts a USING(attempt_id) WHERE l.expires_at<=a.ended_at", [], |r| r.get::<_,i64>(0))?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_m3l500_starting_auth_blocks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Auth, Some("BLOCKED_AUTH")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_capability_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Capability,
+        Some("BLOCKED_CAPABILITY"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_model_blocks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Model, Some("MODEL_UNAVAILABLE")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_unavailable_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Unavailable,
+        Some("AGENT_UNAVAILABLE"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_compat_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Compat,
+        Some("COMPAT_UNVERIFIED"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_decision_asks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Decision, Some("NEED_DECISION")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_transient_waits_retry_after() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Transient {
+            retry_after: Some(std::time::Duration::from_secs(3600)),
+        },
+        None,
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_transient_waits_jitter() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Transient { retry_after: None },
+        None,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn test_008_05_store_origin_guard_precedes_replay_conflict_and_parse() -> R {
     let dir = tempfile::Builder::new().prefix("m3t04-").tempdir()?;
