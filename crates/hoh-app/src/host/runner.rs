@@ -999,7 +999,10 @@ async fn tick(
         if held.contains(run) || held.item(store.pace_run(run, at()).await)?.is_none() {
             continue;
         }
-        if held.item(store.mode_step(run).await)?.is_none() {
+        // SetMode's safe point, only for a run whose mode change is pending (M3F-03): any other run's step would be a
+        // writer transaction that changes nothing. A change made pending after `waiting` was read is the next tick's;
+        // until then the dispatch admission reads the pending change in its own transaction (admission.rs).
+        if waiting.mode_changes.contains(run) && held.item(store.mode_step(run).await)?.is_none() {
             continue;
         }
         if held.item(store.draft_step(run, false).await)?.is_none() {
