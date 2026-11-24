@@ -177,6 +177,13 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The start gate program (`hoh`) a verifier attempt's check command is held at until it has joined the attempt's
+    /// cgroup (`hoh __check-gate`, docs/adr/ADR-028.md decision 7, M3B-201): the product's, the program its agents start
+    /// through. None (a test's executor): the command starts directly and joins right after its start.
+    fn check_gate(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Hand `work` over; the answer says the executor has it (the ACK).
     fn deliver(&self, work: &Work) -> oneshot::Receiver<Result<(), String>>;
     /// Start `work`'s process held at its start gate: nothing of the agent may run before [`Started::gate`] opens.
@@ -2168,6 +2175,7 @@ async fn run_check(
         Launch {
             env: vec![(super::ATTEMPT_ENV.to_owned(), marker)],
             adopt,
+            gate: common.executor.check_gate(),
             reconciling: {
                 let (hooks, candidate) = (common.shared.hooks.clone(), v.candidate_id.clone());
                 Some(Box::new(move || hooks.reconciling(&candidate)))

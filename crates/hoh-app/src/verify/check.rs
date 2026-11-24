@@ -509,6 +509,10 @@ fn planned_of(entry: &Value) -> Planned {
 pub struct Launch {
     pub env: Vec<(String, String)>,
     pub adopt: Option<Box<dyn FnOnce(u32) + Send>>,
+    /// The start gate program (`hoh`, run as `hoh __check-gate`) that holds the command until `adopt` has returned, so
+    /// nothing of it runs, nor forks, outside the attempt's cgroup (docs/adr/ADR-028.md decision 7, M3B-201); none:
+    /// the command starts directly and `adopt` follows its start.
+    pub gate: Option<std::path::PathBuf>,
     /// Called in the commit of the candidate's pending records before the command ([`reconcile`]'s own task), before
     /// it reads them: a test's hold there while the host stops (CR-006); none in the product.
     pub reconciling: Option<Box<dyn FnOnce() + Send>>,
@@ -519,6 +523,7 @@ impl std::fmt::Debug for Launch {
         f.debug_struct("Launch")
             .field("env", &self.env)
             .field("adopt", &self.adopt.is_some())
+            .field("gate", &self.gate)
             .field("reconciling", &self.reconciling.is_some())
             .finish()
     }
@@ -735,9 +740,23 @@ async fn finish(
     // Started on the wall clock, measured on the monotonic clock (docs/05; docs/adr/ADR-027.md decision 6).
     let started = std::time::SystemTime::now();
     let began = std::time::Instant::now();
-    let mut command = std::process::Command::new(&ready.planned.argv[0]);
+    // With an attempt's cgroup to join, the command is held at its start gate until the adoption has returned, so
+    // nothing of it runs, nor forks, outside that cgroup (docs/adr/ADR-028.md decision 7, M3B-201); the gate execs it in
+    // its own place (the same pid, process group and environment).
+    let gated = launch.gate.clone().filter(|_| launch.adopt.is_some());
+    let mut command = match &gated {
+        Some(gate) => {
+            let mut command = std::process::Command::new(gate);
+            command.arg("__check-gate").args(&ready.planned.argv);
+            command
+        }
+        None => {
+            let mut command = std::process::Command::new(&ready.planned.argv[0]);
+            command.args(&ready.planned.argv[1..]);
+            command
+        }
+    };
     command
-        .args(&ready.planned.argv[1..])
         .current_dir(checkout.join(&ready.planned.cwd))
         .envs(check_env(
             &artifacts_dir,
@@ -768,6 +787,19 @@ async fn finish(
                 if let Some(adopt) = launch.adopt {
                     adopt(process.pid());
                 }
+                // Only now the gate opens. Its stdin is the command's after it, held open as the substrate held it.
+                let _stdin = match gated {
+                    Some(_) => {
+                        use tokio::io::AsyncWriteExt as _;
+                        let mut stdin = process.take_stdin();
+                        if let Some(pipe) = stdin.as_mut() {
+                            // A gate that cannot be written to has ended: its end is the command's, recorded below.
+                            let _ = pipe.write_all(b"go\n").await;
+                        }
+                        stdin
+                    }
+                    None => None,
+                };
                 let mut report = None;
                 let mut cancelling = false;
                 loop {

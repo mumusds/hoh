@@ -1224,6 +1224,10 @@ impl Executor for ProductExecutor {
         Some(self.registry.clone())
     }
 
+    fn check_gate(&self) -> Option<PathBuf> {
+        Some(self.gate.clone())
+    }
+
     /// Taken once the registry has looked at the work's agent (at once, but for a binding made before this host's
     /// first look, as after a restart): a turn is never failed for an agent not looked at yet (M2T07R-250). Not taken
     /// by then, the runner hands it again.

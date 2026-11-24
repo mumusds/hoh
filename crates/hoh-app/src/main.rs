@@ -49,6 +49,11 @@ fn main() {
     if args.first().map(OsString::as_os_str) == Some("__gate".as_ref()) {
         std::process::exit(hoh_app::gate::main(&args[1..]));
     }
+    // Internal mode: the start gate a verifier's check command is started through (docs/adr/ADR-028.md decision 7); not
+    // a user command and in no help text.
+    if args.first().map(OsString::as_os_str) == Some("__check-gate".as_ref()) {
+        std::process::exit(hoh_app::gate::check_main(&args[1..]));
+    }
     // Internal mode: what the installer asks of the binary (docs/adr/ADR-023.md decision 5); not a user command and in
     // no help text.
     if args.first().map(OsString::as_os_str) == Some("__unit".as_ref()) {

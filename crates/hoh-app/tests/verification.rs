@@ -1286,6 +1286,7 @@ async fn a_check_holds_its_checkout_from_its_command_to_its_record() -> R {
                     *d = Some(checkouts_in_flight().contains(&held));
                 }
             })),
+            gate: None,
             reconciling: None,
         },
     )
@@ -1301,6 +1302,49 @@ async fn a_check_holds_its_checkout_from_its_command_to_its_record() -> R {
         !checkouts_in_flight().contains(&checkout),
         "released after its record"
     );
+    Ok(())
+}
+
+/// The fixture's qa check when it must not run before its adoption: it fails (9) unless the file `$ADOPTED` names is
+/// there at its first step, then passes as [`QA_PASSES`].
+const QA_AFTER_ADOPTION: &str = r#"[ -f "$ADOPTED" ] || exit 9
+printf '%s\n' '{"schema_version": "1.0", "test_id": "TEST-001-01", "name": "test_001_01_works", "status": "PASS"}' > "$HOH_EVIDENCE_DIR/test-results.jsonl"
+"#;
+
+#[tokio::test]
+async fn a_gated_check_runs_nothing_before_its_adoption_has_returned() -> R {
+    // M3B-201 (docs/adr/ADR-028.md decision 7): a verifier's check command starts through the same kind of start gate
+    // as the attempt's process; the gate opens only once `adopt` (joining the attempt's cgroup) has returned. Here
+    // `adopt` takes 300 ms and then leaves a file; the command's first step needs that file.
+    let f = Fixture::with_qa(QA_AFTER_ADOPTION).await?;
+    let c = f.frozen().await?;
+    let adopted = f.dir.path().join("adopted");
+    let marker = adopted.clone();
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c.clone(),
+            check_id: "qa".to_owned(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".to_owned(),
+        },
+        Launch {
+            env: vec![("ADOPTED".to_owned(), adopted.display().to_string())],
+            adopt: Some(Box::new(move |_pid| {
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = std::fs::write(&marker, "");
+            })),
+            gate: Some(env!("CARGO_BIN_EXE_hoh").into()),
+            reconciling: None,
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&ran)?;
+    assert_eq!(record["exit_code"], 0, "{record}");
+    assert_eq!(ran.outcome.status.code(), "PASS", "{:?}", ran.reasons);
     Ok(())
 }
 
