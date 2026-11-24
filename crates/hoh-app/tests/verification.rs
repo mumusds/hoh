@@ -1402,6 +1402,57 @@ async fn a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_star
 }
 
 #[tokio::test]
+async fn an_ungated_check_whose_adoption_failed_is_cancelled_and_recorded_not_started() -> R {
+    // M3LD-01 without a start gate (a test executor's direct start: adopt follows the command's start): the command,
+    // already running, is cancelled (its process group ended and reaped, long before its own 30 s end) and the run is
+    // recorded as a command that did not start (exit 127, FAIL NOT_STARTED, the adoption's error as its stderr).
+    let f = Fixture::with_qa(&format!("sleep 30\n{QA_PASSES}")).await?;
+    let c = f.frozen().await?;
+    let began = std::time::Instant::now();
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c.clone(),
+            check_id: "qa".to_owned(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".to_owned(),
+        },
+        Launch {
+            adopt: Some(Box::new(|_pid| {
+                Err("its attempt's cgroup could not be joined: Permission denied".to_owned())
+            })),
+            gate: None,
+            ..Launch::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "not cancelled: {:?}",
+        began.elapsed()
+    );
+    let record = f.record(&ran)?;
+    assert_eq!(record["exit_code"], 127, "{record}");
+    assert_eq!(record["timed_out"], false, "{record}");
+    let stderr = std::fs::read_to_string(ran.record_dir.join("stderr.log"))?;
+    assert!(
+        stderr.contains("its attempt's cgroup could not be joined: Permission denied"),
+        "{stderr}"
+    );
+    assert_eq!(
+        (ran.outcome.status.code(), ran.outcome.reason),
+        ("FAIL", Some("NOT_STARTED")),
+        "{:?}",
+        ran.reasons
+    );
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["FAIL"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_cancelled_checks_finishing_keeps_its_checkout_until_its_record() -> R {
     // docs/adr/ADR-028.md test plan -158 (M2T16R-150, -251): the attempt's check is cancelled (its run dropped, as an
     // attempt's cancel drops it); the finishing that stops the command and records it interrupted still holds the
