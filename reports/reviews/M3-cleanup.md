@@ -68,3 +68,38 @@ The CTO approves CR-036 under CR-003 D1 on this PASS: it only adds a missing rea
 requirement or AC is removed, no gate, check or evidence rule is loosened, no CONTRACT decision changes. Deferred low:
 M3LE-01, M3LE-02 (M3 low backlog). Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `3c216c1f`; after
 the rebase onto main see the PR.
+
+## L7 (process lifetime around checks), L8 (test hygiene), L9 and flakes FLK-08, FLK-09
+
+Developer: Claude. Items fixed: M3B-201 (a verifier's check command waits at `hoh __check-gate` until it joined the
+attempt's cgroup), M3J-250, M3F-03b, FLK34-100/101, M3C-01, M3C-02, CLN1S-a, M2QA-002, M2QA-003, FLK-08 (a host restart
+refused by a killed host's child that still holds the start lock is retried for up to 5 s, only when the pid in host.lock is
+gone), FLK-09 (a turn's BLOCKED_AUTH latch and its end commit exclude a tick's staffing); M3J-251 and M3J-R2-notes recorded as
+residuals in ADR-035; M3J-52 dropped (a gated, never-opened process only reads stdin and exits 0 at EOF; it never touches
+the run directory); FLK05-103 (0/120 under load) and DC4-DIAG-02 (not seen) recorded only. Two reviewers (process lifetime
+and concurrency changed).
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `660e1f2f` | Codex codex-cli 0.171.0, `01a20e06-8045-75f3-b579-dd7fa7147d83` (`e80e1129-f646-4f2a-849b-d8f20a8375b2`) | FAIL: M3LD-01 high (the runner dropped AttemptGroup::adopt's error and the gate opened anyway: a check could run outside the attempt's cgroup) |
+| 1 | `660e1f2f` | Grok grok 1.0.92 (b06756fd6256), `01a20e06-8d97-7e11-a816-7f6a83ab577b` (`263c7c1f-6093-46c3-a41d-635b92271f0c`) | PASS: M3LD-50 medium (the turn's BLOCKED_AUTH latch was kept when hand() failed; staffing could block the binding first and the cause=turn event was lost) |
+| 2 (fix diff) | `05910c80` | Codex codex-cli 0.171.0, `01a20ec4-d2c9-7120-9ddb-1a7983d476e5` (`5b5ef59c-a8dd-43d9-8112-f56a9760a7f6`) | FAIL on M3LD-100 (see below); M3LD-01, M3LD-50 and M3LD-L1 resolved |
+| 2 (fix diff) | `05910c80` | Grok grok 1.0.92 (b06756fd6256), `01a20ec4-e126-7041-8422-92fce87c8cff` (`6df2b658-3a91-4c48-8a86-49f828f947f8`) | PASS, no findings |
+
+Fixes by fresh Claude sessions, each red-first: "M3LD-01 a check command whose cgroup adoption failed never runs and is
+recorded not started", "M3LD-50 a turn's end committed after staffing blocked its binding still writes the turn's block"
+(the latch is kept: undoing it would let staffing unblock pi against AC-020-05), and "M3LD-L1 a check of a /proc-tracked
+attempt runs under /proc tracking, not refused" (M3LD-L1, medium, found by the lead's check of the M3LD-01 fix: an attempt
+degraded to /proc under CR-011 option A had every check recorded NOT_STARTED; the check now follows the attempt's recorded
+tracking).
+
+M3LD-100 (Codex round 2, reported high): an adoption failure is recorded as exit 127, the same dimension as a check that ran
+and exited 127 itself, and every 127 labels FAIL/NOT_STARTED (inconclusive), so a check that ran, exited 127 and then passed
+on a rerun is PASS rather than FLAKY. Lead ruling: pre-existing and by specification, not introduced by the fix diff:
+ADR-027 (its run_check table: "command could not start" is 127, and 127 is an inconclusive FAIL/NOT_STARTED) and the label
+in verification.rs (M2T10D-753) predate this branch, and the M3LD-01 fix records an unstarted command exactly as run_with's
+spawn failure already does. Moved to the backlog as medium (it needs a check that really ran and exited 127 followed by a
+passing rerun) with a recommended design correction: an execution record field for "started" independent of the exit
+code. That changes ADR-027 and the locked run_check/release_gate semantics, so it goes through its own CR (next
+verification task). Deferred low: none new. Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on
+`05910c80`; after the rebase onto main see the PR.
