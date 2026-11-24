@@ -293,6 +293,59 @@ fn test_034_04_bare_cr_in_a_value_is_rejected() -> R {
     Ok(())
 }
 
+/// M3LA-50: ADR-033 requires single-line values and structure lines. A stray CR in prose
+/// (previously accepted; `str::lines` kept it) must still generate an index. A bare CR on a
+/// structure line is rejected, same as a value.
+#[test]
+fn test_034_04_bare_cr_in_prose_is_kept_and_in_a_structure_line_is_rejected() -> R {
+    let valid = source("docs/spec/a.md", &requirement("A", ""));
+    let text = String::from_utf8(valid.bytes.clone())?;
+    let clean = generate_index(std::slice::from_ref(&valid))?;
+
+    let prose = Source {
+        path: valid.path.clone(),
+        bytes: text
+            .replace("# 用户\n用户\n", "# 用户\n用\r户\n")
+            .into_bytes(),
+    };
+    let index = generate_index(std::slice::from_ref(&prose))?;
+    assert_eq!(index.value()["requirements"], clean.value()["requirements"]);
+    assert_eq!(index.value()["scenarios"], clean.value()["scenarios"]);
+    assert_ne!(
+        index.value()["files"][0]["sha256"],
+        clean.value()["files"][0]["sha256"],
+        "the prose bytes stay in the source digest"
+    );
+
+    let heading = Source {
+        path: valid.path.clone(),
+        bytes: text.replacen("# 决策\n", "# 决\r策\n", 1).into_bytes(),
+    };
+    let error = generate_index(std::slice::from_ref(&heading))
+        .expect_err("bare CR inside a structure heading");
+    assert!(
+        error.error.contains("a value must be a single line"),
+        "{error}"
+    );
+    assert_eq!(error.path, valid.path);
+    assert_eq!(error.line, 7, "{error}");
+
+    let ac = Source {
+        path: valid.path.clone(),
+        bytes: text
+            .replacen("### AC-A-01\n", "### AC-A-\r01\n", 1)
+            .into_bytes(),
+    };
+    let error =
+        generate_index(std::slice::from_ref(&ac)).expect_err("bare CR inside an AC heading");
+    assert!(
+        error.error.contains("a value must be a single line"),
+        "{error}"
+    );
+    assert_eq!(error.line, 13, "{error}");
+    Ok(())
+}
+
 /// Q1 (docs/adr/ADR-035.md decision 1): open questions carry ids from the REQ/AC id set and their blocking mark;
 /// decisions carry their source; both are exposed with their source positions and never enter index.json.
 #[test]
