@@ -44,7 +44,8 @@ fn sources() -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
     Ok(found)
 }
 
-/// How often each file contains `needle` (`text` is lowercased with whitespace collapsed when `sql`).
+/// How often each file contains `needle` (`text` is lowercased with whitespace collapsed when `sql`). A call
+/// (`needle` ending in `(`) is counted with any whitespace, line breaks included, before its parenthesis (M3J-250).
 fn occurrences(sources: &[(String, String)], needle: &str, sql: bool) -> BTreeMap<String, usize> {
     sources
         .iter()
@@ -56,12 +57,30 @@ fn occurrences(sources: &[(String, String)], needle: &str, sql: bool) -> BTreeMa
                     .join(" ")
                     .matches(needle)
                     .count()
+            } else if let Some(name) = needle.strip_suffix('(') {
+                text.match_indices(name)
+                    .filter(|(at, _)| text[at + name.len()..].trim_start().starts_with('('))
+                    .count()
             } else {
                 text.matches(needle).count()
             };
             (n > 0).then(|| (path.clone(), n))
         })
         .collect()
+}
+
+#[test]
+fn a_call_is_counted_whatever_the_whitespace_before_its_parenthesis() {
+    // M3J-250: a call written with a space or a line break before `(` is still one call of the pinned path.
+    let sources = vec![(
+        "a.rs".to_owned(),
+        "attempts::insert_prepared (x);\nattempts::insert_prepared\n    (y);\ninsert_prepared(z);\ninsert_prepared_more(w);\n"
+            .to_owned(),
+    )];
+    assert_eq!(
+        occurrences(&sources, "insert_prepared(", false),
+        listed(&[("a.rs", 3)])
+    );
 }
 
 fn listed(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
