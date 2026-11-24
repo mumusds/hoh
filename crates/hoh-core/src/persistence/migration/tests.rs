@@ -333,37 +333,55 @@ fn test_008_02_waiting_opener_rereads_version_after_write_lock() -> R {
         first.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
         let (waiting, wait) = channel();
         let (release, resume) = channel();
-        let other = std::thread::spawn(move || {
-            let mut second = Connection::open(path).unwrap();
-            BARRIER.with(|b| *b.borrow_mut() = Some((waiting, resume)));
-            second.busy_handler(Some(busy)).unwrap();
-            let outcome = migrate(&second, &[MIGRATIONS[0], (2, V2)]);
-            let fk: i64 = second
-                .pragma_query_value(None, "foreign_keys", |r| r.get(0))
-                .unwrap();
-            (outcome, fk)
-        });
-        wait.recv_timeout(Duration::from_secs(10))?;
-        run_script(&first, V2)?;
-        first.pragma_update(None, "user_version", ahead)?;
-        first.execute_batch("COMMIT; PRAGMA foreign_keys=ON;")?;
-        release.send(())?;
-        let (outcome, fk) = other.join().expect("opener joined");
-        if ahead == 2 {
-            assert_eq!(outcome?, 2);
-        } else {
-            assert!(
-                matches!(
-                    outcome,
-                    Err(PersistError::SchemaTooNew {
-                        found: 3,
-                        supported: 2
-                    })
-                ),
-                "{outcome:?}"
-            );
-        }
-        assert_eq!(fk, 1);
+        // Join even when the parent returns an error. Dropping a JoinHandle detaches the opener,
+        // which is still blocked in its busy handler (M3T04O-100).
+        std::thread::scope(|scope| -> R {
+            let other = scope.spawn(move || {
+                let mut second = Connection::open(path).unwrap();
+                BARRIER.with(|b| *b.borrow_mut() = Some((waiting, resume)));
+                second.busy_handler(Some(busy)).unwrap();
+                let outcome = migrate(&second, &[MIGRATIONS[0], (2, V2)]);
+                let fk: i64 = second
+                    .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+                    .unwrap();
+                (outcome, fk)
+            });
+            let waited = wait.recv_timeout(Duration::from_secs(10));
+            let scripted = if waited.is_ok() {
+                run_script(&first, V2).and_then(|_| {
+                    first
+                        .pragma_update(None, "user_version", ahead)
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| {
+                            first
+                                .execute_batch("COMMIT; PRAGMA foreign_keys=ON;")
+                                .map_err(|e| e.to_string())
+                        })
+                })
+            } else {
+                Ok(())
+            };
+            let _ = release.send(());
+            let (outcome, fk) = other.join().expect("opener joined");
+            waited?;
+            scripted?;
+            if ahead == 2 {
+                assert_eq!(outcome?, 2);
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(PersistError::SchemaTooNew {
+                            found: 3,
+                            supported: 2
+                        })
+                    ),
+                    "{outcome:?}"
+                );
+            }
+            assert_eq!(fk, 1);
+            Ok(())
+        })?;
     }
     Ok(())
 }
