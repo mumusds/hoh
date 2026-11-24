@@ -16,9 +16,9 @@ fn install(agent: Agent) -> &'static str {
         Agent::Claude => {
             "安装 Claude Code 后重试：下载 https://claude.ai/install.sh 并运行 bash install.sh stable"
         }
-        // Recorded suite traffic is 1.5.0; the installed CLI recorded in ADR-040 is 1.6.0 (PI16-B2).
+        // PI16 records both settled-event versions; installation targets 1.6.0.
         Agent::Pi => {
-            "安装 pi 后重试：npm install -g @earendil-works/pi-coding-agent@1.6.0（兼容套件录制为 1.5.0）"
+            "安装 pi 后重试：npm install -g @earendil-works/pi-coding-agent@1.6.0（兼容套件录制为 1.5.0、1.6.0）"
         }
     }
 }
@@ -308,10 +308,11 @@ mod install_hint {
 
     #[test]
     fn pi_install_hint_names_recorded_1_5_0_and_installed_1_6_0() {
-        // PI16-B2: the recorded suite is pi 1.5.0 and the installed CLI is 1.6.0 (ADR-040).
+        // PI16-B2/M3LC-52: preserve both recordings beside the 1.6.0 install target.
         let hint = install(Agent::Pi);
         assert!(hint.contains("@earendil-works/pi-coding-agent"), "{hint}");
         assert!(hint.contains("1.5.0"), "{hint}");
         assert!(hint.contains("1.6.0"), "{hint}");
+        assert!(hint.contains("兼容套件录制为 1.5.0、1.6.0"), "{hint}");
     }
 }
