@@ -15,7 +15,7 @@
   ],
   "cwd": "fresh temp Git repo outside the checkout",
   "exit_code": 0,
-  "recorded_at": "2026-11-16T11:18:54.743325+00:00",
+  "recorded_at": "2026-11-24T19:31:27.490278+00:00",
   "mode": "fake-provider",
   "notes": "models.json provider \"fake\" (anthropic-messages) at the fake provider; every request answered 429 with Retry-After: 3; get_state then one prompt until agent_settled",
   "env_overrides": [
@@ -62,7 +62,7 @@
     },
     "requests": [
       {
-        "at": 1794827920.200552,
+        "at": 1795548672.9571123,
         "method": "POST",
         "path": "/v1/messages?beta=true",
         "status": 429,
@@ -95,7 +95,7 @@
         ]
       },
       {
-        "at": 1794827922.209765,
+        "at": 1795548674.9680393,
         "method": "POST",
         "path": "/v1/messages?beta=true",
         "status": 429,
@@ -128,7 +128,7 @@
         ]
       },
       {
-        "at": 1794827926.2205834,
+        "at": 1795548678.9784584,
         "method": "POST",
         "path": "/v1/messages?beta=true",
         "status": 429,
@@ -161,7 +161,7 @@
         ]
       },
       {
-        "at": 1794827934.2303374,
+        "at": 1795548686.989052,
         "method": "POST",
         "path": "/v1/messages?beta=true",
         "status": 429,

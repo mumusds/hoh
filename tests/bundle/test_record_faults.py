@@ -69,10 +69,12 @@ class Validators(unittest.TestCase):
         server=[f|{'delayMs':3000} if f.get('type')=='auto_retry_start' else f for f in fs]
         self.assertTrue(any('delayMs' in p for p in check('pi','rpc-fault-429-retry-after',server,meta,sent)))
     def test_pi_in_turn_errors_need_their_settled_end(self):
-        # PI16-01: each recorded in-turn error (pi 1.6.0) ends with one agent_settled, not aborted, as its last frame.
-        for case in ('rpc-fault-429-retry-after','rpc-fault-503-retry-after','rpc-fault-usage-limit','rpc-fault-billing-no-retry'):
-            with self.subTest(case=case):
-                fs,meta,sent=load('pi',case,'1.6.0')
+        # PI16-01, PI16-B1: each recorded in-turn error of every pi version whose agent_settled HoH trusts (1.5.0 and
+        # 1.6.0) ends with one agent_settled, not aborted, as its last frame.
+        cases=('rpc-fault-429-retry-after','rpc-fault-503-retry-after','rpc-fault-usage-limit','rpc-fault-billing-no-retry')
+        for version,case in [(v,c) for v in ('1.5.0','1.6.0') for c in cases]:
+            with self.subTest(version=version,case=case):
+                fs,meta,sent=load('pi',case,version)
                 self.assertEqual(check('pi',case,fs,meta,sent),[])
                 unsettled=[f for f in fs if f.get('type')!='agent_settled']
                 self.assertTrue(any('no agent_settled' in p for p in check('pi',case,unsettled,meta,sent)))
@@ -81,9 +83,11 @@ class Validators(unittest.TestCase):
                 aborted=[f|{'aborted':True} if f.get('type')=='agent_settled' else f for f in fs]
                 self.assertTrue(any('agent_settled' in p for p in check('pi',case,aborted,meta,sent)))
     def test_a_pi_billing_error_is_not_retried(self):
-        fs,meta,sent=load('pi','rpc-fault-billing-no-retry','1.6.0')
         retry={'type':'auto_retry_start','attempt':1,'maxAttempts':3,'delayMs':2000,'errorMessage':'400'}
-        self.assertTrue(any('retried' in p for p in check('pi','rpc-fault-billing-no-retry',[*fs[:-1],retry,fs[-1]],meta,sent)))
+        for version in ('1.5.0','1.6.0'):
+            with self.subTest(version=version):
+                fs,meta,sent=load('pi','rpc-fault-billing-no-retry',version)
+                self.assertTrue(any('retried' in p for p in check('pi','rpc-fault-billing-no-retry',[*fs[:-1],retry,fs[-1]],meta,sent)))
     def test_a_request_log_that_does_not_match_fails(self):
         fs,meta,sent=load('codex','app-server-fault-429-retry-after')
         other=copy.deepcopy(meta);other['provider']['requests']=other['provider']['requests'][:1]
