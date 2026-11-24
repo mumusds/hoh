@@ -213,6 +213,26 @@ pub fn main(args: &[OsString]) -> i32 {
     }
 }
 
+/// `hoh __check-gate <program> <args…>`: the start gate a verifier attempt's check command is started through
+/// (docs/adr/ADR-028.md decision 7, M3B-201), so the host joins it to the attempt's cgroup before anything of the
+/// command runs. As the unchecked gate: one line on stdin, `go` execs the program in its own place (pid, process group,
+/// cgroup) with every signal at its default; at the end of its input or any other line it exits 0 and the command never
+/// runs; 64 without a program, 127 when the program cannot be executed. Unlike an agent's gate it keeps its whole
+/// environment: the check's six variables (docs/adr/ADR-027.md decision 6) are the command's own.
+pub fn check_main(args: &[OsString]) -> i32 {
+    let Some((program, rest)) = args.split_first() else {
+        return USAGE;
+    };
+    match read_line() {
+        Line::Read(line) if line == b"go" => {}
+        _ => return 0,
+    }
+    defaults();
+    let error = std::process::Command::new(program).args(rest).exec();
+    say(&format!("{}: {error}", program.to_string_lossy()));
+    EXEC_FAILED
+}
+
 /// One line on stderr, for a person.
 fn say(what: &str) {
     use std::io::Write as _;

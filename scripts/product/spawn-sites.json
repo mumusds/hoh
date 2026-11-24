@@ -58,9 +58,9 @@
     {
       "file": "crates/hoh-app/src/gate.rs",
       "item": "std::os::unix::process::CommandExt::exec",
-      "count": 2,
+      "count": 3,
       "owner": "host-only",
-      "reason": "`hoh __gate`, the agent start gate the host runs (ADR-022 decision 13), replaces itself with the agent"
+      "reason": "`hoh __gate`, the agent start gate the host runs (ADR-022 decision 13), replaces itself with the agent; `hoh __check-gate`, a verifier's check command's (ADR-028 decision 7, M3B-201), with the check"
     },
     {
       "file": "crates/hoh-app/src/host/agents.rs",

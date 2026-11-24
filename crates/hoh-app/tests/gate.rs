@@ -210,3 +210,60 @@ fn output_within_names_the_bound_that_ended_its_wait() -> R {
     );
     Ok(())
 }
+
+/// `hoh __check-gate <argv>` with `env` set, given `input` on stdin (then closed), in an isolated environment: its exit
+/// code and stdout, and its pid.
+fn check_gate(argv: &[&str], env: &[(&str, &str)], input: &[u8]) -> R<(Option<i32>, String, u32)> {
+    let dir = tempfile::tempdir()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hoh"));
+    isolated(&mut command, dir.path())?;
+    let mut child = command
+        .arg("__check-gate")
+        .args(argv)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    match stdin.write_all(input) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
+        _ => {}
+    }
+    drop(stdin);
+    let out = common::output_within(child, std::time::Duration::from_secs(60))?;
+    Ok((out.status.code(), String::from_utf8(out.stdout)?, pid))
+}
+
+#[test]
+fn a_check_gate_execs_the_check_in_its_place_with_its_whole_environment_only_on_go() -> R {
+    // M3B-201 (docs/adr/ADR-028.md decision 7): a verifier's check command is held at `hoh __check-gate` until the host
+    // has joined it to the attempt's cgroup. On "go" the command is the gate's process (same pid) and keeps the
+    // check's variables, which an agent's gate removes; at the end of its input or on another line it never runs.
+    let env = [
+        ("HOH_EVIDENCE_DIR", "/the/artifacts"),
+        ("HOH_CHECK_ID", "qa"),
+        ("HOH_CANDIDATE_ID", "CAND-1"),
+    ];
+    let (code, out, pid) = check_gate(
+        &[
+            "sh",
+            "-c",
+            "echo $$ $HOH_EVIDENCE_DIR $HOH_CHECK_ID $HOH_CANDIDATE_ID",
+        ],
+        &env,
+        b"go\n",
+    )?;
+    assert_eq!(code, Some(0));
+    assert_eq!(out, format!("{pid} /the/artifacts qa CAND-1\n"));
+    for input in [&b""[..], b"stop\n", b"go"] {
+        let (code, out, _) = check_gate(&["sh", "-c", "echo ran"], &env, input)?;
+        assert_eq!((code, out.as_str()), (Some(0), ""), "{input:?}");
+    }
+    let (code, _, _) = check_gate(&[], &env, b"go\n")?;
+    assert_eq!(code, Some(64));
+    let (code, _, _) = check_gate(&["/nonexistent/check"], &env, b"go\n")?;
+    assert_eq!(code, Some(127));
+    Ok(())
+}
