@@ -160,8 +160,7 @@ async fn test_047_01_override_chain_run_then_project() -> R {
     let world = World::new()?;
     world.codex("gpt-6-astra")?;
     let project = world.project();
-    let global = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").ok_or("no test XDG")?)
-        .join("hoh/prompts/developer.md");
+    let global = world.global_root().join("prompts/developer.md");
     std::fs::create_dir_all(global.parent().unwrap())?;
     std::fs::write(&global, "Global contract v1.\n")?;
     std::fs::create_dir_all(project.join(".hoh/prompts"))?;
@@ -820,6 +819,7 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(loaded))
                     env!("CARGO_BIN_EXE_hoh").into(),
                     (Duration::from_secs(10), Duration::from_secs(5)),
                 )
+                .with_global_root(Some(world.global_root()))
                 .with_preparing(hook)
                 .with_keys(changed),
             );
@@ -899,7 +899,7 @@ async fn invalid_registration_keeps_the_attempts_valid_skill_set() -> R {
     git(&project, &["add", ".gitignore"])?;
     git(&project, &["commit", "-q", "-m", "fixture"])?;
     std::fs::create_dir_all(project.join(".hoh/skills/tdd"))?;
-    let global = hoh_core::prompt_files::global_root().ok_or("no private global root")?;
+    let global = world.global_root();
     std::fs::create_dir_all(global.join("skills/tdd"))?;
     std::fs::write(global.join("skills/tdd/SKILL.md"), "VALID_GLOBAL_TDD_BODY")?;
     std::fs::write(

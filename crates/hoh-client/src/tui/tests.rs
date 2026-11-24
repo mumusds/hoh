@@ -43,7 +43,69 @@ fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
 }
 
 fn app_in(dir: &std::path::Path) -> App {
-    App::new("demo".to_owned(), History::load(dir))
+    App::new("demo".to_owned(), History::load(dir)).with_global_root(None)
+}
+
+fn open_app(dir: &std::path::Path) -> App {
+    App::open(dir).with_global_root(None)
+}
+
+#[test]
+fn test_047_02_settings_fixture_ignores_process_global_on_open_and_restore() {
+    const CHILD: &str = "HOH_M3LC_SETTINGS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::Builder::new()
+            .prefix("m3lc-100-settings-home-")
+            .tempdir()
+            .unwrap();
+        let global = dir.path().join(".config/hoh/prompts");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("developer.md"), "USER_GLOBAL_LEAK\n").unwrap();
+        for xdg in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "tui::tests::test_047_02_settings_fixture_ignores_process_global_on_open_and_restore", "--nocapture"])
+                .env(CHILD, "1").env("HOME", dir.path()).env_remove("XDG_CONFIG_HOME");
+            if xdg {
+                child.env("XDG_CONFIG_HOME", dir.path().join(".config"));
+            }
+            let output = child.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "XDG={xdg}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "child ran no test: {stdout}");
+        }
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("m3lc-100-settings-project-")
+        .tempdir()
+        .unwrap();
+    for project_override in [false, true] {
+        let path = dir.path().join(".hoh/prompts/developer.md");
+        if project_override {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "PROJECT_OVERRIDE\n").unwrap();
+        }
+        let mut app = open_app(dir.path());
+        typed(&mut app, "/settings developer");
+        app.key(key(KeyCode::Enter));
+        let shown = screen(&app, 110, 30).join("\n");
+        assert!(shown.contains("设置：developer"), "{shown}");
+        assert!(
+            !shown.contains("+++ global"),
+            "open read the process global: {shown}"
+        );
+        app.key(key(KeyCode::Char('r')));
+        let shown = screen(&app, 110, 30).join("\n");
+        assert!(
+            !shown.contains("+++ global"),
+            "restore read the process global: {shown}"
+        );
+        assert!(!path.exists());
+    }
 }
 
 fn role_app(dir: &std::path::Path, active: serde_json::Value) -> App {
@@ -275,7 +337,7 @@ fn an_unreadable_history_is_reported_and_the_shell_still_opens() {
     let h = History::load(dir.path());
     assert!(h.entries().is_empty());
     assert!(h.notice().is_some());
-    let app = App::new("demo".to_owned(), h);
+    let app = App::new("demo".to_owned(), h).with_global_root(None);
     assert!(
         screen(&app, 100, 30)
             .iter()
@@ -353,7 +415,7 @@ fn up_and_down_browse_the_history_and_restore_the_draft() {
     let mut h = History::load(dir.path());
     h.append("first").expect("append");
     h.append("second").expect("append");
-    let mut app = App::new("demo".to_owned(), h);
+    let mut app = App::new("demo".to_owned(), h).with_global_root(None);
     typed(&mut app, "draft");
     app.key(key(KeyCode::Up));
     assert_eq!(app.editor_text(), "second");
@@ -374,7 +436,7 @@ fn ctrl_r_fills_the_editor_and_neither_enter_nor_esc_sends() {
     for line in ["hello", "other", "help me"] {
         h.append(line).expect("append");
     }
-    let mut app = App::new("demo".to_owned(), h);
+    let mut app = App::new("demo".to_owned(), h).with_global_root(None);
     typed(&mut app, "draft");
     app.key(ctrl('r'));
     typed(&mut app, "hel");
@@ -820,7 +882,7 @@ fn a_frame_cut_short_is_ended_before_a_diagnostic() {
 fn a_signal_ends_a_batch_between_two_events() {
     use super::{End, handle, input::Decoder};
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut app = App::new("p".to_owned(), History::load(dir.path()));
+    let mut app = App::new("p".to_owned(), History::load(dir.path())).with_global_root(None);
     let mut decoder = Decoder::default();
     decoder.feed(b"x\ry\rz\r");
     // The flag is raised once two events (x, Enter) have been handled.
@@ -1016,7 +1078,7 @@ fn the_top_bar_shows_the_projects_configured_mode() {
     )
     .expect("write");
     assert_eq!(mode_of(dir.path()), "PLAN");
-    let app = App::open(dir.path());
+    let app = open_app(dir.path());
     assert!(
         screen(&app, 100, 30)[0].contains("模式 PLAN"),
         "{:?}",
@@ -1678,7 +1740,7 @@ fn test_047_02_settings_diff_restore_and_cancel() {
     let path = dir.path().join(".hoh/prompts/developer.md");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "custom developer\n").unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     app.attach("R", "RUNNING");
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
@@ -1707,7 +1769,7 @@ fn test_047_02_restore_says_when_nothing_was_deleted_and_drops_the_override_diff
         .prefix("m3t03-settings-none-")
         .tempdir()
         .unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
     app.key(key(KeyCode::Char('r')));
@@ -1721,7 +1783,7 @@ fn test_047_02_restore_says_when_nothing_was_deleted_and_drops_the_override_diff
     let path = dir.path().join(".hoh/prompts/developer.md");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "custom developer\n").unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
     app.key(key(KeyCode::Char('r')));
@@ -1754,7 +1816,7 @@ fn test_047_03_settings_exposes_drift_and_both_diffs() {
         &old,
     )
     .unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
     let shown = screen(&app, 120, 400).join("\n");
@@ -1784,7 +1846,7 @@ fn test_047_03_settings_drift_follows_the_injected_bundle() {
         &host,
     )
     .unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     app.set_resource_bundle(host);
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
@@ -1806,7 +1868,7 @@ fn test_047_02_settings_noop_restore_reloads_externally_deleted_override() {
     let path = dir.path().join(".hoh/prompts/developer.md");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "external delete sentinel\n").unwrap();
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     typed(&mut app, "/settings developer");
     app.key(key(KeyCode::Enter));
     assert!(
@@ -1839,7 +1901,7 @@ fn test_047_02_settings_restore_keeps_injected_builtin_diff_base() {
         "resources/prompts/developer.md",
         "HOST_CUSTOM_BUILTIN_SENTINEL\n",
     );
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     app.set_resource_bundle(host);
     app.attach("R", "RUNNING");
     typed(&mut app, "/settings developer");
@@ -1860,7 +1922,7 @@ fn test_047_02_settings_restore_keeps_injected_builtin_diff_base() {
 #[test]
 fn unattached_modes_are_local_and_slashes_never_become_input() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     typed(&mut app, "/plan");
     app.key(key(KeyCode::Enter));
     assert_eq!(app.mode(), "PLAN");
@@ -1891,7 +1953,7 @@ fn unattached_modes_are_local_and_slashes_never_become_input() {
 #[test]
 fn top_bar_follows_the_attached_runs_mode_event() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     app.attach("R", "RUNNING");
     app.event(&serde_json::json!({"seq":1, "kind":"run.mode_changed", "payload":{"from":"AUTO", "to":"PLAN"}}));
     assert!(screen(&app, 120, 30)[0].contains("模式 PLAN"));
@@ -1900,7 +1962,7 @@ fn top_bar_follows_the_attached_runs_mode_event() {
 #[test]
 fn a_key_batch_keeps_start_mode_and_ordered_cycles() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut app = App::open(dir.path());
+    let mut app = open_app(dir.path());
     for line in ["/plan", "goal", "/auto"] {
         typed(&mut app, line);
         app.key(key(KeyCode::Enter));

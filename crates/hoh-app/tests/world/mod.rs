@@ -784,6 +784,11 @@ impl World {
         self.dir.path()
     }
 
+    /// Global resources shared by the in-process host and this world's child HOME.
+    pub fn global_root(&self) -> PathBuf {
+        self.home().join(".config/hoh")
+    }
+
     /// The project.
     pub fn project(&self) -> PathBuf {
         self.root().join(&self.name)
@@ -1299,7 +1304,13 @@ impl World {
             self.path(),
             Some(self.root().join("pi-agent")),
         ));
-        let mut config = HostConfig::product_with(&self.project(), effective, HOH.into(), registry);
+        let mut config = HostConfig::product_with(
+            &self.project(),
+            effective,
+            HOH.into(),
+            registry,
+            Some(self.global_root()),
+        );
         config.port = 0;
         config.store.wal_probe = Some(probe());
         if let Some(runner) = config.runner.as_mut() {
@@ -1328,8 +1339,13 @@ impl World {
             Duration::from_secs(u64::from(effective.execution.cancel_native_grace_seconds)),
             Duration::from_secs(u64::from(effective.execution.cancel_term_grace_seconds)),
         );
-        let mut config =
-            HostConfig::product_with(&self.project(), effective, HOH.into(), registry.clone());
+        let mut config = HostConfig::product_with(
+            &self.project(),
+            effective,
+            HOH.into(),
+            registry.clone(),
+            Some(self.global_root()),
+        );
         config.port = 0;
         config.store.wal_probe = Some(probe());
         let resources = (*config.store.resource_bundle).clone();
@@ -1343,6 +1359,7 @@ impl World {
                         HOH.into(),
                         graces,
                     )
+                    .with_global_root(Some(self.global_root()))
                     .with_resources(resources)
                     .with_preparing(hook),
                 );

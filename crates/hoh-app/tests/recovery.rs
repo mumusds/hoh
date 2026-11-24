@@ -653,6 +653,7 @@ fn recovery_host() {
             hoh_core::config::Config::default(),
             env!("CARGO_BIN_EXE_hoh").into(),
             registry,
+            None,
         );
         product.port = 0;
         product.store.wal_probe = Some(probe());

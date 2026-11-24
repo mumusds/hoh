@@ -139,17 +139,24 @@ impl HostConfig {
         gate: std::path::PathBuf,
         path: std::ffi::OsString,
     ) -> HostConfig {
-        HostConfig::product_with(project, config, gate, Arc::new(agents::Registry::new(path)))
+        HostConfig::product_with(
+            project,
+            config,
+            gate,
+            Arc::new(agents::Registry::new(path)),
+            hoh_core::prompt_files::global_root(),
+        )
     }
 
     /// The product's host as [`HostConfig::product`], its agents those of `registry` (tests give one whose pi settings
-    /// are their own, M2T17R-59).
+    /// are their own, M2T17R-59). `global_root` is explicit for embedded hosts and tests; None disables it.
     #[doc(hidden)]
     pub fn product_with(
         project: &Path,
         config: hoh_core::config::Config,
         gate: std::path::PathBuf,
         registry: Arc<agents::Registry>,
+        global_root: Option<std::path::PathBuf>,
     ) -> HostConfig {
         let mut host = HostConfig::new(project);
         let execution = &config.execution;
@@ -171,6 +178,7 @@ impl HostConfig {
         host.runner = Some(RunnerConfig {
             executor: Arc::new(
                 product::ProductExecutor::new(registry, project.to_path_buf(), gate, graces)
+                    .with_global_root(global_root)
                     .with_resources(resources),
             ),
             context: hoh_core::decision::Context {

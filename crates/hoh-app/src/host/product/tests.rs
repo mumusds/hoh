@@ -45,14 +45,70 @@ fn work(prompt: Option<&str>) -> Work {
     }
 }
 
+// All unit-test constructors share the same explicit global-layer isolation.
+fn test_executor(
+    registry: Arc<Registry>,
+    project: PathBuf,
+    gate: PathBuf,
+    graces: (Duration, Duration),
+) -> ProductExecutor {
+    ProductExecutor::new(registry, project, gate, graces).with_global_root(None)
+}
+
 fn executor(project: &Path) -> ProductExecutor {
-    ProductExecutor::new(
+    test_executor(
         Arc::new(Registry::new(std::ffi::OsString::new())),
         project.to_owned(),
         PathBuf::from("hoh"),
         (Duration::from_secs(10), Duration::from_secs(5)),
     )
-    .with_global_root(None)
+}
+
+#[test]
+fn test_047_01_prepare_fixtures_ignore_process_global_overrides()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Only child processes see this HOME/XDG; parallel tests never mutate their environment.
+    let dir = tempfile::Builder::new()
+        .prefix("m3lc-100-prepare-")
+        .tempdir()?;
+    let global = dir.path().join(".config/hoh");
+    std::fs::create_dir_all(global.join("prompts"))?;
+    for role in ["developer", "commander"] {
+        std::fs::write(
+            global.join(format!("prompts/{role}.md")),
+            "{{USER_GLOBAL_LEAK}}",
+        )?;
+    }
+    for test in [
+        "prepare_refuses_a_session_granted_for_another_identity",
+        "prepare_refuses_a_pi_whose_current_version_moved_since_the_last_look",
+        "one_degradation_fact_decides_both_the_read_only_profile_and_the_transport",
+        "a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_by_its_source",
+    ] {
+        for xdg in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    &format!("host::product::tests::{test}"),
+                    "--nocapture",
+                ])
+                .env("HOME", dir.path())
+                .env_remove("XDG_CONFIG_HOME");
+            if xdg {
+                child.env("XDG_CONFIG_HOME", dir.path().join(".config"));
+            }
+            let output = child.output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{test}, XDG={xdg}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed"), "child ran no test: {stdout}");
+        }
+    }
+    Ok(())
 }
 
 fn contract(text: &str) -> hoh_core::prompt::Resolved {
@@ -597,7 +653,7 @@ fn a_native_cancel_says_whether_it_reached_a_turn_the_executor_holds() {
     // M2T07R-453 (docs/adr/ADR-022.md decision 17): the cancel reaches only a turn still held: one the executor holds
     // (its notifier registered) is asked and the answer is true; once the turn ended (or for work it never started)
     // nothing is asked and the answer is false, so the settle waits the SIGTERM grace and records no native cancel.
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         Arc::new(Registry::new(std::ffi::OsString::new())),
         PathBuf::from("/nonexistent"),
         PathBuf::from("hoh"),
@@ -1004,7 +1060,7 @@ async fn prepare_refuses_a_session_granted_for_another_identity()
         ),
     )?;
     std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755))?;
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry.clone(),
         project.path().to_owned(),
         gate,
@@ -1136,7 +1192,7 @@ fn prepare_refuses_a_pi_whose_current_version_moved_since_the_last_look()
         Some(Fact::Usable(usable)) if usable.compat == Compat::Verified => *usable,
         other => return Err(format!("not verified: {other:?}").into()),
     };
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry.clone(),
         project.path().to_owned(),
         PathBuf::from("hoh"),
@@ -1301,7 +1357,7 @@ async fn one_degradation_fact_decides_both_the_read_only_profile_and_the_transpo
         Some(Fact::Usable(usable)) => *usable,
         other => return Err(format!("not usable: {other:?}").into()),
     };
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry.clone(),
         project.path().to_owned(),
         PathBuf::from("/bin/true"),
@@ -1342,7 +1398,7 @@ async fn one_degradation_fact_decides_both_the_read_only_profile_and_the_transpo
         other => return Err(format!("not usable: {other:?}").into()),
     };
     registry.exec_degraded(Agent::Codex, b.identity.clone());
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry,
         project.path().to_owned(),
         PathBuf::from("/bin/true"),
@@ -1382,7 +1438,7 @@ async fn a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_
         other => return Err(format!("not usable: {other:?}").into()),
     };
     assert!(b.granted.contains("read_only_workspace"), "{:?}", b.granted);
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry.clone(),
         project.path().to_owned(),
         PathBuf::from("/bin/true"),
@@ -1429,7 +1485,7 @@ async fn a_supervision_turn_launches_read_only_and_a_missing_profile_is_refused_
         other => return Err(format!("not usable: {other:?}").into()),
     };
     assert!(!c.granted.contains("read_only_workspace") && c.withheld.is_empty());
-    let executor = ProductExecutor::new(
+    let executor = test_executor(
         registry,
         project.path().to_owned(),
         PathBuf::from("/bin/true"),
@@ -1657,7 +1713,7 @@ fn prepare_fixture(root: &Path) -> Result<(ProductExecutor, Work), Box<dyn std::
     w.assignment.session_capabilities = Some(b.session);
     w.assignment.session_identity = Some(b.identity);
     Ok((
-        ProductExecutor::new(
+        test_executor(
             registry,
             root.to_owned(),
             PathBuf::from("hoh"),

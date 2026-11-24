@@ -388,6 +388,7 @@ async fn live(out: &Path, path: &OsString, team: &Team, dir: &Path) -> R<Found> 
         hoh_core::config::Config::default(),
         env!("CARGO_BIN_EXE_hoh").into(),
         Arc::new(hoh_app::host::agents::Registry::new(path.clone())),
+        None,
     );
     config.port = 0;
     config.store.wal_probe = Some(probe());
