@@ -580,6 +580,98 @@ async fn test_009_03_m3l150_dispatch_then_set_mode_releases_draft_with_proof() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_009_01_build_host_rejects_unknown_req_then_imports_approved_plan() -> R {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use world::Team as FakeCommander;
+
+    let world = world::World::named("m3preqa-g5-build-plan")?;
+    world.configure(&[], "")?;
+    world.commit_project(&[world::Requirement {
+        id: "REQ-A".into(),
+        title: "Approved requirement".into(),
+        criteria: vec![world::Criterion {
+            id: "AC-A-01".into(),
+            body: "Approved behavior".into(),
+            test_id: "TEST-A-01".into(),
+            passes: true,
+        }],
+    }])?;
+    world.init_store().await?;
+    let spec = world.seed_spec()?;
+    // Team supplies a fake Commander through the real runner and message bridge; it takes no developer work.
+    // Hold the second proposal until the test has observed the first decision's durable, empty import.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let script_phase = phase.clone();
+    let commander = FakeCommander::new(move |_| {
+        let task = |id, req| {
+            json!({"task_id":id,"title":id,"role":"developer","writer":true,
+            "depends_on":[],"requirement_ids":[req]})
+        };
+        if script_phase
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            vec![world::rejected(
+                json!({"kind":"create_tasks","plan":{"tasks":[
+                    task("A", "REQ-A"), task("Z", "REQ-Z")
+                ]}}),
+            )]
+        } else if script_phase
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            vec![json!({"kind":"create_tasks","plan":{"tasks":[task("A", "REQ-A")]}})]
+        } else {
+            Vec::new()
+        }
+    });
+    let host = world.team_host(commander, None).await?;
+    let result: R = async {
+        let body = json!({"schema_version":"1.0","command_id":"start","idempotency_key":"start",
+            "expected_revision":0,"kind":"StartRun","run_id":null,
+            "payload":{"goal":"Build approved scope","mode":"BUILD","interactive":false}});
+        let (status, accepted) = world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{accepted}");
+        let run = accepted["run_id"].as_str().ok_or("run")?;
+        world.staff(run)?;
+        assert_eq!(world.query("SELECT mode FROM runs")?, "BUILD");
+        assert_eq!(world.query("SELECT spec_id FROM runs")?, spec);
+        assert_eq!(world.query("SELECT requirement_id FROM requirements")?, "REQ-A");
+        let decisions = "SELECT state,reason_code FROM decisions WHERE json_extract(payload_json,'$.kind')='create_tasks' ORDER BY rowid";
+        world.until("SELECT count(*) FROM decisions WHERE json_extract(payload_json,'$.kind')='create_tasks'", "1", Duration::from_secs(30)).await?;
+        assert_eq!(world.rows(decisions)?, vec![json!({"state":"REJECTED","reason_code":"ILLEGAL_TRANSITION"})]);
+        let details: serde_json::Value = serde_json::from_str(&world.query(
+            "SELECT json_extract(payload_json,'$.details') FROM events WHERE kind='decision.rejected'"
+        )?)?;
+        assert!(details.to_string().contains("BUILD 不改规格，用 /plan 或 CR"), "{details}");
+        assert!(details.to_string().contains("REQ-Z"), "{details}");
+        // Supervisor bookkeeping is the only task the host has created; neither proposed work task was imported.
+        assert_eq!(world.query("SELECT count(*) FROM tasks WHERE role<>'commander'")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM task_requirements")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='plan.imported'")?, "0");
+
+        phase.store(2, Ordering::SeqCst);
+        input(&host, &world, run, "approved-only", "SendInput",
+            json!({"text":"Plan only REQ-A","target_role":"commander","input_kind":"STEER"})).await?;
+        world.until("SELECT count(*) FROM decisions WHERE json_extract(payload_json,'$.kind')='create_tasks'", "2", Duration::from_secs(30)).await?;
+        assert_eq!(world.rows(decisions)?, vec![
+            json!({"state":"REJECTED","reason_code":"ILLEGAL_TRANSITION"}),
+            json!({"state":"APPLIED","reason_code":null}),
+        ]);
+        assert_eq!(world.rows("SELECT task_id FROM tasks WHERE role<>'commander'")?, vec![json!({"task_id":"A"})]);
+        assert_eq!(world.rows("SELECT task_id,requirement_id,spec_id FROM task_requirements")?,
+            vec![json!({"task_id":"A","requirement_id":"REQ-A","spec_id":spec})]);
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='plan.imported'")?, "1");
+        assert_eq!(world.query("SELECT mode FROM runs")?, "BUILD");
+        assert_eq!(world.query("SELECT count(*) FROM specs")?, "1");
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
     for (mode, interactive) in [("AUTO", true), ("AUTO", false), ("BUILD", false)] {
         let world = world::World::named("m3t04-s7-readiness")?;
