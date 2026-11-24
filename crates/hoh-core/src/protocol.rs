@@ -161,7 +161,8 @@ schema_enum!(
     ErrorCode, "SCREAMING_SNAKE_CASE",
     [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
      ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired,
-     DagDuplicateTask, RunConfigFrozen, SpecConflict, SpecInvalid, SpecApprovalNotUser, PromptVariableMissing, PromptTooLong]
+     DagDuplicateTask, RunConfigFrozen, SpecConflict, SpecInvalid, SpecApprovalNotUser, PromptVariableMissing, PromptTooLong,
+     SpecSourceUnavailable]
 );
 schema_enum!(
     /// Task states (`transition_task.to_state`).
