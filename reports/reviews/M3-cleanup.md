@@ -125,3 +125,18 @@ M3LC-101 tests resolve prompts against an injected global root") and checked by 
 in-process ProductExecutor construction in the tests (product_prompts, world, host_stop, product) injects the World's
 temporary root; the only uninjected call is the product's own HostConfig path. Deferred low: none. Final checks: `bash
 scripts/dev/pre-pr.sh --no-deployment` all ok on `7ae6492b`; after the rebase onto main see the PR.
+
+## PI16-B1 and FLK-10
+
+Developer: Claude. PI16-B1: the pi 1.5.0 provider-fault set re-recorded with `record_faults.py` against the local fake
+provider (no credentials, no model calls) from a private install whose launcher and package tree hashes equal the
+2026-11-16 recording's: 429, 503, usage limit and billing, each ending with `agent_settled`; the bundle and adapter replay
+tests now cover 1.5.0 and 1.6.0. FLK-10: the db_faults test armed its one-shot commit fault before the first run's staffing
+commits had finished, so the host's own commit took it; it and two privileged neighbours now wait for
+`staffing_deferred()` first (reproduced every time with a pause after arming, 0/240 under load after the fix).
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `4f5a834d` | Codex codex-cli 0.171.0, `01a20f2f-0d85-7ff1-8080-e1367269bd11` (`396d93c3-8c61-4cfb-a4c5-8d23b4a104a6`) | PASS, no findings |
+
+Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `4f5a834d`; after the rebase onto main see the PR.
