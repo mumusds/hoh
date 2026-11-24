@@ -887,10 +887,22 @@ impl hoh_app::host::Executor for ProductBetweenDrafts {
         let (send, ended) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let status = child.wait();
+            // FLK-11: reaping the leader can precede the kernel releasing its process group. As in Team::review,
+            // report the outcome only after the group-exit barrier; false would leave the writer RUNNING/unreaped.
+            let started = std::time::Instant::now();
+            let mut group_gone = hoh_agents::identity::group_empty(pid);
+            while !group_gone && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(10));
+                group_gone = hoh_agents::identity::group_empty(pid);
+            }
+            eprintln!(
+                "FLK-11 group-exit barrier: {:?}, gone={group_gone}",
+                started.elapsed()
+            );
             let _ = send.send(hoh_app::host::Outcome {
                 success: false,
                 detail: format!("scripted product commit: {status:?}"),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone,
                 class: hoh_core::retry::FailureClass::Auth,
                 observed: Default::default(),
                 unknown_effect: false,
@@ -969,7 +981,13 @@ async fn test_008_04_m3l200_other_run_commits_between_draft_attempts() -> R {
         world.staff(&other)?;
         world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('other-work','{other}','{spec}','READY','developer',1,1,1);
             INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('other-work','REQ-901','{spec}');"))?;
-        world.until("SELECT count(*) FROM attempts WHERE task_id='other-work' AND state='FAILED'","1",Duration::from_secs(20)).await?;
+        if let Err(e) = world.until("SELECT count(*) FROM attempts WHERE task_id='other-work' AND state='FAILED'","1",Duration::from_secs(20)).await {
+            return Err(format!("{e}; runs={:?}; tasks={:?}; attempts={:?}; events={:?}",
+                world.rows("SELECT run_id,state,blocked_reason FROM runs")?,
+                world.rows("SELECT task_id,state,blocked_reason FROM tasks")?,
+                world.rows("SELECT task_id,state,failure_reason FROM attempts")?,
+                world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 30")?).into());
+        }
         let second=world.git(&["rev-parse","HEAD"])?;
         assert_ne!(first,second,"the other Run must really commit");
         assert!(std::fs::read_to_string(world.project().join("src/lib.rs"))?.contains("other_run"));
