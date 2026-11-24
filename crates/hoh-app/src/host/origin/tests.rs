@@ -54,7 +54,7 @@ fn peer_diagnostic(peer: &Peer) -> String {
     format!(
         "captured={:?}, resolved={:?}, classification={classified:?}, trace={:?}",
         peer.captured,
-        peer.transport.resolve(),
+        peer.transport.resolve("origin"),
         proc.0.borrow(),
     )
 }
@@ -530,6 +530,54 @@ fn status_with_non_utf8_comm(uid: u32) -> Vec<u8> {
 fn test_008_05_uid_token_inside_the_name_line_is_not_the_uid_line() {
     let bytes = b"Name:\tUid:\t0\t0\t0\t0\nUid:\t1000\t1000\t1000\t1000\n";
     assert_eq!(status_uid_fields(bytes), Some(vec![1000, 1000, 1000, 1000]));
+}
+
+/// FLK05-101: a miss names the stage and the transport key (client port or UDS inode), not an address.
+/// A capture that already returned none does not look up again from `origin`. Retries stay at three.
+#[test]
+fn test_008_05_origin_miss_names_stage_and_transport_key() -> R {
+    let _ = take_origin_miss_record();
+    let unix = Transport::Unix {
+        uid: rustix::process::getuid().as_raw().wrapping_add(1),
+        pid: 7,
+        inode: 4242,
+    };
+    assert!(unix.resolve("capture").is_none());
+    let (count, line) = take_origin_miss_record();
+    assert_eq!(count, 3, "a miss still retries three times");
+    assert_eq!(
+        line.as_deref(),
+        Some("hoh host: origin lookup returned none: stage=capture uds inode=4242: transport")
+    );
+    let peer = Peer::capture(unix.clone());
+    assert!(peer.captured.is_none());
+    let (count, line) = take_origin_miss_record();
+    assert_eq!(count, 3);
+    assert_eq!(
+        line.as_deref(),
+        Some("hoh host: origin lookup returned none: stage=capture uds inode=4242: transport")
+    );
+    assert_eq!(peer.origin(), Origin::Unknown);
+    let (count, extra) = take_origin_miss_record();
+    assert_eq!(
+        (count, extra),
+        (0, None),
+        "a capture miss does not look up again in origin()"
+    );
+    assert!(unix.resolve("origin").is_none());
+    let (count, line) = take_origin_miss_record();
+    assert_eq!(count, 3);
+    assert_eq!(
+        line.as_deref(),
+        Some("hoh host: origin lookup returned none: stage=origin uds inode=4242: transport")
+    );
+    let remote: std::net::SocketAddr = "10.1.2.3:43210".parse()?;
+    let local: std::net::SocketAddr = "127.0.0.1:9".parse()?;
+    let tcp = Transport::Tcp { local, remote };
+    let key = tcp.diag_key();
+    assert_eq!(key, "tcp port=43210");
+    assert!(!key.contains("10.1.2.3") && !key.contains("127.0.0.1"));
+    Ok(())
 }
 
 #[test]
