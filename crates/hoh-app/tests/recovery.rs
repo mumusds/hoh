@@ -840,7 +840,7 @@ fn start_child(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<ChildGuard
     let end = Instant::now() + Duration::from_secs(30);
     while announced(project) != Some(own) {
         if let Some(status) = guard.0.try_wait()? {
-            return Err(format!("the host ended before it served: {status:?}").into());
+            return Err(ended_before_serving(&mut guard, status, project).into());
         }
         if Instant::now() > end {
             return Err("the host did not start".into());
@@ -848,6 +848,48 @@ fn start_child(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<ChildGuard
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(guard)
+}
+
+/// Why a host child ended before it served (FLK-08): its status, its stderr (the host says why it would not start), and
+/// every process that still has `project`'s `.hoh` directory open, which is where the host's start lock is taken.
+fn ended_before_serving(
+    guard: &mut ChildGuard,
+    status: std::process::ExitStatus,
+    project: &Path,
+) -> String {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = guard.0.stderr.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    format!(
+        "the host ended before it served: {status}: {}; processes with {} open: {:?}",
+        stderr.trim_end(),
+        project.join(".hoh").display(),
+        holding(&project.join(".hoh"))
+    )
+}
+
+/// The processes (pid, command line) with a descriptor on `path`, as far as /proc shows them.
+fn holding(path: &Path) -> Vec<(u32, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_dir(format!("/proc/{pid}/fd")).is_ok_and(|fds| {
+                fds.filter_map(Result::ok)
+                    .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == path))
+            })
+        })
+        .map(|pid| {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+                .unwrap_or_default();
+            (pid, cmdline)
+        })
+        .collect()
 }
 
 /// A child process that is always ended and reaped, whatever the test does.
@@ -920,7 +962,7 @@ fn serve_and_stop_with(project: &Path, env: &[(&str, &std::ffi::OsStr)]) -> R<(i
     let end = Instant::now() + Duration::from_secs(30);
     while announced(project) != Some(own) {
         if let Some(status) = guard.0.try_wait()? {
-            return Err(format!("the host ended before it served: {status:?}").into());
+            return Err(ended_before_serving(&mut guard, status, project).into());
         }
         if Instant::now() > end {
             return Err("the host did not start".into());
@@ -1606,7 +1648,7 @@ fn serve_until(
     let end = Instant::now() + Duration::from_secs(30);
     while announced(project) != Some(own) {
         if let Some(status) = guard.0.try_wait()? {
-            return Err(format!("the host ended before it served: {status:?}").into());
+            return Err(ended_before_serving(&mut guard, status, project).into());
         }
         if Instant::now() > end {
             return Err("the host did not start".into());
@@ -6106,4 +6148,30 @@ fn test_017_05_delivery_redelivers_once_after_kill9() -> R {
             "verification_outbox":"PENDING:0","dead_letters":0
         }),
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_child_that_ends_before_it_serves_is_reported_with_its_stderr() -> R {
+    // FLK-08: the helper that waits for a host child to serve reports why the child would not start (its stderr), not
+    // only its exit code. Here another host holds the project, so the child is refused with 69.
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    let host = Host::start(config(&project)).await?;
+    let started = tokio::task::spawn_blocking({
+        let project = project.clone();
+        move || {
+            start_child(&project, &[])
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await?;
+    host.shutdown().await;
+    let Err(why) = started else {
+        return Err("a second host served the held project".into());
+    };
+    assert!(why.contains("exit status: 69"), "{why}");
+    assert!(why.contains("another host holds"), "{why}");
+    Ok(())
 }
