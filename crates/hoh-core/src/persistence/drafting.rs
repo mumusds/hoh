@@ -77,7 +77,7 @@ pub(super) fn step(
     };
     let to = match state.as_str() {
         "CREATED" => RunState::Discovering,
-        "DISCOVERING" if discovered => RunState::Specifying,
+        "DISCOVERING" if discovered && super::baseline::recorded(&tx, run)? => RunState::Specifying,
         _ => return Ok(false),
     };
     // Another run's approval may have arrived after the user's draft answer. Adopt it before a NULL task is made.
@@ -153,12 +153,17 @@ pub(super) fn dispatch(
     let Some((task, revision, project, run_revision)) = read(&tx)? else {
         return Ok(false);
     };
+    let budget = super::budget_view::load(&tx, run, context.now(), context.wall())?;
     let admission = super::admission::admit(
         &tx,
         run,
         &[&task],
         super::admission::By::Draft,
-        Some((context, &ctx.resource_bundle.version())),
+        Some(super::admission::DraftContext {
+            context,
+            version: &ctx.resource_bundle.version(),
+            budget: &budget,
+        }),
     )?
     .remove(&task)
     .ok_or_else(|| PersistError::IntegrityViolation("draft admission absent".into()))?;
@@ -292,6 +297,9 @@ pub(super) fn prepare_init(
 }
 
 pub(super) fn discovery_due(conn: &Connection, run: &str) -> Result<bool, PersistError> {
+    if !super::baseline::recorded(conn, run)? {
+        return Ok(false);
+    }
     conn.query_row("SELECT EXISTS(SELECT 1 FROM runs r WHERE run_id=?1 AND state='DISCOVERING' AND spec_id IS NULL \
         AND EXISTS(SELECT 1 FROM events WHERE run_id=r.run_id AND kind='spec.draft_requested'))",[run],|r|r.get(0)).map_err(sqlite_error)
 }
