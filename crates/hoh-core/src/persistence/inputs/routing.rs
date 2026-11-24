@@ -97,6 +97,21 @@ fn reject(
     }
     Ok(())
 }
+/// ADR-036 M3H-56: a turn reservation whose external effect is not disproved ends UNKNOWN_DELIVERY,
+/// whichever terminal cause (stale epoch, obsolete consultation, stopped run) or ordering reached it.
+fn reject_ended(
+    tx: &Transaction<'_>,
+    row: &mut InputRow,
+    reason: &str,
+    ctx: &super::super::writer::Ctx<'_>,
+) -> Result<(), PersistError> {
+    let reason = if row.payload["delivery_pending"] == true {
+        "UNKNOWN_DELIVERY"
+    } else {
+        reason
+    };
+    reject(tx, row, reason, ctx)
+}
 fn next(row: &mut InputRow) -> Result<(), PersistError> {
     let payload = row
         .payload
@@ -192,6 +207,16 @@ pub(in super::super) fn route(
             if row.payload["attempt_id"] != *attempt {
                 return Ok(result);
             }
+            // Only an explicit not-sent or refused answer settles the reservation without an external effect.
+            if row.state == InputState::Queued
+                && match outcome {
+                    InputOutcome::NextAttempt => true,
+                    InputOutcome::Rejected(why) => why != "UNKNOWN_DELIVERY",
+                    InputOutcome::Delivered => false,
+                }
+            {
+                row.payload["delivery_pending"] = json!(false);
+            }
             if !current(&tx, &row)? {
                 reject_stale(&tx, &mut row, ctx)?;
             } else if row.state == InputState::Queued {
@@ -199,7 +224,7 @@ pub(in super::super) fn route(
                     InputOutcome::Delivered => {
                         let cancelled:bool=tx.query_row("SELECT state IN ('CANCEL_REQUESTED','CANCELLED','FAILED','COMPLETED','INCOMPLETE') FROM runs WHERE run_id=?1",params![row.run_id],|r|r.get(0)).map_err(sqlite_error)?;
                         if cancelled {
-                            reject(&tx, &mut row, "run_stopped", ctx)?;
+                            reject_ended(&tx, &mut row, "run_stopped", ctx)?;
                         } else {
                             row.payload["delivery_pending"] = json!(false);
                             save(&tx, &row)?;
@@ -446,5 +471,5 @@ fn reject_stale(
     } else {
         "STALE_ROLE_EPOCH"
     };
-    reject(tx, row, reason, ctx)
+    reject_ended(tx, row, reason, ctx)
 }

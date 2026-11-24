@@ -854,9 +854,11 @@ async fn test_017_02_end_before_stage_falls_back_but_epoch_change_before_ack_rej
                     outcome: InputOutcome::Delivered,
                 })
                 .await?;
+            // The reservation was sent and acknowledged: its external effect exists, so it ends
+            // UNKNOWN_DELIVERY, not STALE_ROLE_EPOCH (ADR-036 M3H-56, M3LB-50).
             let input = store.reader()?.input("I1")?.ok_or("input")?;
             assert_eq!(input.state, InputState::Rejected);
-            assert_eq!(input.payload["reason"], "STALE_ROLE_EPOCH");
+            assert_eq!(input.payload["reason"], "UNKNOWN_DELIVERY");
         } else {
             assert!(staged.steer.is_none());
             assert!(staged.reply.is_some());
@@ -1263,6 +1265,157 @@ async fn test_017_05_ended_run_preserves_unknown_turn_delivery() -> R {
         "DEAD_LETTER:1"
     );
     assert_eq!(conn.query_row("SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='reserved'", [], |r|r.get::<_,i64>(0))?, 1);
+    Ok(())
+}
+
+/// Stage one STEER as a reserved turn of A1 (`delivery_pending=true`).
+async fn reserved_turn(
+    prefix: &str,
+) -> Result<(tempfile::TempDir, Store, PathBuf), Box<dyn std::error::Error>> {
+    use crate::persistence::{Claimed, InputRouting};
+    let dir = tempfile::Builder::new().prefix(prefix).tempdir()?;
+    let (store, path) = open(&dir)?;
+    routed_world(&path)?;
+    store.enqueue_input(steer("I1")).await?;
+    let now = std::time::SystemTime::now();
+    let row = store
+        .claim_inputs(now, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("claim")?;
+    let staged = store
+        .route_input(InputRouting::Stage {
+            row,
+            attempt: Some("A1".into()),
+            now,
+        })
+        .await?;
+    assert!(staged.steer.is_some(), "the turn is reserved");
+    Ok((dir, store, path))
+}
+
+fn rejections(path: &Path) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(Connection::open(path)?.query_row(
+        "SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='I1'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+#[tokio::test]
+async fn test_017_05_pending_turn_ends_unknown_in_both_orders_on_cancel_and_rebind() -> R {
+    use crate::persistence::{InputOutcome, InputRouting};
+    for cancel in [true, false] {
+        for receipt_first in [true, false] {
+            for outcome in [
+                InputOutcome::Delivered,
+                InputOutcome::Rejected("UNKNOWN_DELIVERY".into()),
+            ] {
+                let case = format!("cancel={cancel} receipt_first={receipt_first} {outcome:?}");
+                let (_dir, store, path) = reserved_turn("m3lb50-order-").await?;
+                let conn = Connection::open(&path)?;
+                if cancel {
+                    conn.execute(
+                        "UPDATE runs SET state='CANCEL_REQUESTED' WHERE run_id='R'",
+                        [],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE role_bindings SET role_epoch=2 WHERE role='developer'",
+                        [],
+                    )?;
+                }
+                let finish = InputRouting::Finish {
+                    input_id: "I1".into(),
+                    attempt: "A1".into(),
+                    outcome: outcome.clone(),
+                };
+                let mut replies = Vec::new();
+                if receipt_first {
+                    replies.push(store.route_input(finish.clone()).await?.reply);
+                }
+                if cancel {
+                    conn.execute_batch("UPDATE runs SET state='CANCELLED' WHERE run_id='R';
+                        INSERT INTO events(event_id, project_id, run_id, kind, payload_json, created_at)
+                        SELECT 'R/result/' || revision, 'p1', 'R', 'run.result', '{\"state\":\"CANCELLED\"}', '2026-11-24T00:00:00Z' FROM runs WHERE run_id='R';")?;
+                }
+                store.settle_ended_inputs("p1").await?;
+                replies.push(store.route_input(finish.clone()).await?.reply);
+                store.settle_ended_inputs("p1").await?;
+                let input = store.reader()?.input("I1")?.ok_or("input")?;
+                assert_eq!(input.state, InputState::Rejected, "{case}");
+                assert_eq!(input.payload["reason"], "UNKNOWN_DELIVERY", "{case}");
+                assert_eq!(rejections(&path)?, 1, "{case}");
+                for reply in replies {
+                    let reply: Value = serde_json::from_str(&reply.ok_or("reply")?)?;
+                    assert_eq!(reply["kind"], "rejected", "{case}");
+                    assert_eq!(reply["reason"], "UNKNOWN_DELIVERY", "{case}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_redelivered_pending_turn_after_rebind_stays_unknown() -> R {
+    use crate::persistence::Claimed;
+    use crate::persistence::InputRouting;
+    let (_dir, store, path) = reserved_turn("m3lb50-stage-").await?;
+    Connection::open(&path)?.execute(
+        "UPDATE role_bindings SET role_epoch=2 WHERE role='developer'",
+        [],
+    )?;
+    // The host crashed after Stage; the lease expires and the notice is claimed again.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let row = store
+        .claim_inputs(later, vec!["developer".into()], 5)
+        .await?
+        .and_then(Claimed::start)
+        .ok_or("redelivery")?;
+    let routed = store
+        .route_input(InputRouting::Stage {
+            row,
+            attempt: Some("A1".into()),
+            now: later,
+        })
+        .await?;
+    assert!(routed.steer.is_none(), "never sent a second time");
+    let reply: Value = serde_json::from_str(&routed.reply.ok_or("reply")?)?;
+    assert_eq!(reply["reason"], "UNKNOWN_DELIVERY");
+    let input = store.reader()?.input("I1")?.ok_or("input")?;
+    assert_eq!(input.state, InputState::Rejected);
+    assert_eq!(input.payload["reason"], "UNKNOWN_DELIVERY");
+    store.settle_ended_inputs("p1").await?;
+    assert_eq!(rejections(&path)?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_017_05_receipt_that_disproves_the_effect_keeps_the_stale_reason() -> R {
+    use crate::persistence::{InputOutcome, InputRouting};
+    for outcome in [
+        InputOutcome::NextAttempt,
+        InputOutcome::Rejected("steer refused".into()),
+    ] {
+        let (_dir, store, path) = reserved_turn("m3lb50-unsent-").await?;
+        Connection::open(&path)?.execute(
+            "UPDATE role_bindings SET role_epoch=2 WHERE role='developer'",
+            [],
+        )?;
+        store
+            .route_input(InputRouting::Finish {
+                input_id: "I1".into(),
+                attempt: "A1".into(),
+                outcome: outcome.clone(),
+            })
+            .await?;
+        store.settle_ended_inputs("p1").await?;
+        let input = store.reader()?.input("I1")?.ok_or("input")?;
+        assert_eq!(input.state, InputState::Rejected, "{outcome:?}");
+        assert_eq!(input.payload["reason"], "STALE_ROLE_EPOCH", "{outcome:?}");
+        assert_eq!(rejections(&path)?, 1, "{outcome:?}");
+    }
     Ok(())
 }
 
