@@ -722,6 +722,9 @@ fn swap_leaves_the_outside_alone(
         env.push(("F7_IO_ARM", arm.clone().into_os_string()));
         let out = project.hoh_with(&["-p", "first", "--detach", "--output", "json"], &env)?;
         assert_eq!(out.status.code(), Some(0), "{why}: {}", text(&out));
+        // FLK-10: the fault is armed only once the first run's staffing has settled; a commit of the host's own still
+        // under way would otherwise take it, its leftover told in the host's log, not to this command's client.
+        project.staffing_deferred()?;
         project.quiet_dump()?;
         std::fs::write(&arm, "")?;
         let out = project.submit("second")?;
@@ -1611,9 +1614,11 @@ fn full_a_full_file_system_is_db_full_and_retryable_writes_nothing_and_writes_re
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
-        // The supervisor's work for "first" (its cursor, the trigger's NO_SPEC deferral) is waited for while the
-        // store can still write: on the full file system it cannot commit, so a wait begun after the fill never ends
-        // (the cursor stays short of the last event), and what it did write there would depend on the race.
+        // The supervisor's work for "first" (its staffing failures, its cursor, the triggers' NO_SPEC deferrals) is
+        // waited for while the store can still write: on the full file system it cannot commit, so a wait begun after
+        // the fill never ends (the cursor stays short of the last event), and what it did write there would depend on
+        // the race (FLK-10's class: a quiet interval can come before the staffing failures).
+        project.staffing_deferred()?;
         project.quiet_dump()?;
         let filler = mount.fill()?;
         // Still quiet on the full file system: the cursor is at the last event and nothing new was committed.
@@ -1710,6 +1715,8 @@ fn read_only_a_file_system_that_turns_read_only_under_its_host_fails_commands_wi
     let project = Project::in_dir(&mount.point)?;
     let outcome = (|| -> R {
         project.accepted("first")?;
+        // FLK-10's class: the first run's staffing settled, so no commit of the host's own lands after `before`.
+        project.staffing_deferred()?;
         let before = project.quiet_dump()?;
         Mount::sudo(&[
             "sh",
