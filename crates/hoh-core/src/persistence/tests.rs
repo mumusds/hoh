@@ -1226,6 +1226,24 @@ fn names<S: Lifecycle>() -> Vec<String> {
     S::ALL.iter().map(|s| s.as_str().to_owned()).collect()
 }
 
+/// The values of `CHECK(<column> IN (...))` in the CREATE TABLE statement of `table`.
+fn column_check(sql: &str, table: &str, column: &str) -> Result<Vec<String>, String> {
+    let start = sql
+        .find(&format!("CREATE TABLE {table}("))
+        .ok_or(format!("no table {table}"))?;
+    let statement = &sql[start..start + sql[start..].find(");").ok_or("unterminated")?];
+    let open = format!("CHECK({column} IN (");
+    let list = &statement[statement
+        .find(&open)
+        .ok_or(format!("{table}: no {column} CHECK"))?
+        + open.len()..];
+    let list = &list[..list.find(')').ok_or("unterminated list")?];
+    Ok(list
+        .split(',')
+        .map(|v| v.trim().trim_matches('\'').to_owned())
+        .collect())
+}
+
 #[test]
 fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
     // The script the store migrates with, i.e. contracts/sql/001_initial.sql.
@@ -1252,6 +1270,17 @@ fn test_036_01_state_sets_equal_the_sql_check_enumerations() -> R {
             "{table}: SQL CHECK and transition table differ"
         );
     }
+    // Migration 002's kind CHECK, both directions against TaskKind (M3L-02).
+    let kind_sql = column_check(MIGRATIONS[1].1, "tasks_new", "kind")?;
+    let kind_rust: Vec<String> = crate::decision::TaskKind::ALL
+        .iter()
+        .map(|kind| kind.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        sorted(kind_sql),
+        sorted(kind_rust),
+        "tasks.kind: SQL CHECK and TaskKind differ"
+    );
     Ok(())
 }
 
