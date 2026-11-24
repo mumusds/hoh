@@ -466,6 +466,11 @@ fn reject_stale(
     row: &mut InputRow,
     ctx: &super::super::writer::Ctx<'_>,
 ) -> Result<(), PersistError> {
+    // M3K-07: these strings are `input.rejected` payload `reason` values (inputs::transition).
+    // They are not `protocol::RejectionReason` and are not copied onto an HCP Message
+    // `kind=rejected` `reason_code` (that field is written only by outbox fence/reply).
+    // CONSULTATION_OBSOLETE therefore does not belong in the locked enum unless a later CR
+    // starts putting it on a Message.
     let reason = if row.payload["consultation_task_id"].is_string() {
         "CONSULTATION_OBSOLETE"
     } else {

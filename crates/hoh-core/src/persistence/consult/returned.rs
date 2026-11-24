@@ -80,6 +80,7 @@ pub(in super::super) fn sweep(
     };
     for (input, run, child) in pending {
         if !parent_valid(tx, &run, &child)? {
+            // Same input-queue reason as routing::reject_stale. Not a Message reason_code (M3K-07).
             inputs::exhausted(tx, &input, "CONSULTATION_OBSOLETE", ctx)?;
         }
     }
