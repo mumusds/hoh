@@ -855,3 +855,76 @@ async fn test_008_01_m3l304_only_steer_after_latest_plan_entry_becomes_draft_not
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_02_m3l450_refuse_draft_gate_ends_retryable_and_releases_lease() -> R {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let world = world::World::named("m3t04-refused-gate")?;
+    world.configure(&[], "")?;
+    world.git(&["init", "-q"])?;
+    let barrier = std::sync::Arc::new(DraftBarrier {
+        point: hoh_app::host::RunnerPoint::AfterSpawn,
+        hits: AtomicUsize::new(0),
+        release: AtomicBool::new(false),
+    });
+    let release = ReleaseDraft(barrier.clone());
+    let host = world
+        .team_host_hooked(world::Team::drafting(world.project()), barrier.clone())
+        .await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "refuse gate after effect changed").await?;
+        world.staff(&run)?;
+        input(&host, &world, &run, "draft", "SendInput", json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while barrier.hits.load(SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+        }).await?;
+        let attempt = world.query("SELECT attempt_id FROM attempts WHERE state='STARTING'")?;
+        let effect = hoh_core::reconcile::work_key(&attempt);
+        world.exec(&format!("UPDATE effects SET state='OBSERVED' WHERE effect_key='{effect}'"))?;
+        assert_eq!(world.query(&format!("SELECT state FROM effects WHERE effect_key='{effect}'"))?, "OBSERVED");
+        // Hold the Run so a retry cannot hide the refused Attempt's resulting Task state.
+        input(&host, &world, &run, "pause", "PauseRun", json!({"reason":"inspect refused attempt"})).await?;
+        barrier.release.store(true, SeqCst);
+        world.until(&format!("SELECT count(*) FROM events WHERE kind='reconcile.attempt' AND json_extract(payload_json,'$.attempt_id')='{attempt}'"), "1", Duration::from_secs(20)).await?;
+        assert_eq!(world.query(&format!("SELECT a.state||'/'||t.state FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE a.attempt_id='{attempt}'"))?, "CANCELLED/READY");
+        assert_eq!(world.query(&format!("SELECT count(*) FROM leases l JOIN attempts a ON a.attempt_id=l.attempt_id WHERE a.attempt_id='{attempt}' AND l.expires_at<=a.ended_at"))?, "1");
+        assert_eq!(world.query(&format!("SELECT count(*) FROM attempts WHERE attempt_id='{attempt}' AND pid IS NOT NULL AND boot_id IS NOT NULL AND process_start_id IS NOT NULL"))?, "1");
+        assert_eq!(world.query(&format!("SELECT state FROM effects WHERE effect_key='{effect}'"))?, "OBSERVED");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.draft_start_refused'" )?, "1");
+        assert_eq!(world.query("SELECT count(*) FROM candidates" )?, "0");
+        assert!(!world.project().join("docs/spec/main.md").exists());
+        Ok(())
+    }.await;
+    drop(release);
+    host.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_01_m3l452_plan_to_plan_keeps_current_steer_window() -> R {
+    let world = world::World::named("m3t04-plan-noop")?;
+    world.configure(&[], "")?;
+    world.commit_project(&world::fixture_spec())?;
+    world.init_store().await?;
+    world.seed_spec()?;
+    let host = world.start_plain_host(None).await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "plan noop").await?;
+        world.staff(&run)?;
+        world.exec(&format!("UPDATE runs SET state='RUNNING',mode='BUILD' WHERE run_id='{run}';"))?;
+        input(&host, &world, &run, "plan", "SetMode", json!({"mode":"PLAN"})).await?;
+        assert!(host.store().draft_step(&run, false).await?);
+        world.exec("UPDATE tasks SET state='ACCEPTED' WHERE kind='spec_draft'")?;
+        input(&host, &world, &run, "steer", "SendInput", json!({"text":"keep this planning request","target_role":null,"input_kind":"STEER"})).await?;
+        input(&host, &world, &run, "plan-noop", "SetMode", json!({"mode":"PLAN"})).await?;
+        assert!(host.store().draft_step(&run, false).await?);
+        assert_eq!(world.query("SELECT json_extract(payload_json,'$.note.text') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?, "keep this planning request");
+        assert!(world.query("SELECT json_extract(payload_json,'$.cause') FROM events WHERE kind='spec.draft_requested' ORDER BY seq DESC LIMIT 1")?.starts_with("input/"));
+        world.exec("UPDATE tasks SET state='ACCEPTED' WHERE kind='spec_draft'")?;
+        input(&host, &world, &run, "another-noop", "SetMode", json!({"mode":"PLAN"})).await?;
+        assert!(!host.store().draft_step(&run, false).await?, "PLAN to PLAN alone is not a new generation");
+        Ok(())
+    }.await;
+    host.shutdown().await;
+    result
+}

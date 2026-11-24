@@ -433,17 +433,21 @@ pub(super) async fn run(
             .await
             .map_err(|e| PersistError::Storage(format!("the reconcile's look-up ended: {e}")))??
         };
-        let disposition = reconcile::dispose(&Unfinished {
-            attempt_id: row.attempt_id.clone(),
-            state: row.state,
-            task_state: row.task_state,
-            process: process.clone(),
-            effects,
-            lease_expired: row.lease_expired,
-            work_outcome: row.work_outcome,
-            writer: row.writer,
-            verifier: row.verifier,
-        });
+        let disposition = super::drafting::disposition(
+            store,
+            &Unfinished {
+                attempt_id: row.attempt_id.clone(),
+                state: row.state,
+                task_state: row.task_state,
+                process: process.clone(),
+                effects,
+                lease_expired: row.lease_expired,
+                work_outcome: row.work_outcome,
+                writer: row.writer,
+                verifier: row.verifier,
+            },
+        )
+        .await?;
         *counts
             .entry(match disposition {
                 Disposition::Redeliver => "redeliver",

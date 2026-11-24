@@ -831,6 +831,7 @@ async fn test_009_03_m3l303_changed_work_effect_keeps_refused_process_identity()
         )?,
         1
     );
+    assert_eq!(db.query_row("SELECT t.state||'/'||l.expires_at FROM tasks t JOIN attempts a ON a.task_id=t.task_id JOIN leases l ON l.attempt_id=a.attempt_id WHERE a.attempt_id='A'", [], |r| r.get::<_, String>(0))?, "LEASED/2100-01-01T00:00:00Z");
     assert_eq!(
         db.query_row("SELECT state FROM attempts WHERE attempt_id='A'", [], |r| r
             .get::<_, String>(0))?,
