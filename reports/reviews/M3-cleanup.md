@@ -33,3 +33,23 @@ Developer: Claude; PR "M3 cleanup L10: development tooling (PREPR-01..04, BT-01,
 
 L10-01 fixed red-first by the lead ("M3 cleanup: L10-01 a too deeply nested hoh-report block is a bad block, not a
 bridge failure"); pre-pr all ok on `b983d900`.
+
+## L3 (input delivery)
+
+Developer: Codex. Items: M3F-03a, M3F-04, M3F-05, M3F-06, M3H-53, M3H-54, M3H-55, M3H-56, M3I-01; all still applied and were
+fixed (M3F-06 docs only). Two reviewers (concurrent delivery changed).
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `d0f6f567` | Claude 2.1.331 (Claude Code), `72b9ffe9-5640-4cdc-9bca-6cca9146eefd` (`72f5137d-af9e-4a2f-8d72-b5ffca2eb412`) | PASS: M3LB-01 low (per-role delivery concurrency keyed by role name only: a held steer in one run delays the same-named role in another run; latency only) |
+| 1 | `d0f6f567` | Grok grok 1.0.92 (b06756fd6256), `01a20e07-f05d-71b3-bf02-ac56a632625a` (`260b4b9c-8531-4cd1-9ec5-51337bda1835`) | FAIL: M3LB-50 high (Finish's stale and run-stopped branches dropped delivery_pending, so a pending turn's terminal reason depended on which transaction won against the sweep) |
+| 2 (fix diff) | `e2650b86` | Grok grok 1.0.92 (b06756fd6256), `01a20e7c-929b-7972-a4ea-1af976868374` (`7f86ea99-4b11-4255-9225-b68fe34d47a1`) | PASS, M3LB-50 resolved, no findings |
+
+M3LB-50 fixed red-first by a fresh Claude session ("M3 cleanup: M3LB-50 a pending delivery ends UNKNOWN_DELIVERY on every
+terminal path"): a reserved turn ends UNKNOWN_DELIVERY whatever stopped it, in both orderings, for cancel and rebind; only a
+receipt proving nothing reached the agent (NextAttempt, or an explicit native refusal: lead decision, the RPC error means
+the steer had no effect) keeps the stale/stopped reason. The one changed expectation in
+`test_017_02_end_before_stage_falls_back_but_epoch_change_before_ack_rejects` applies only to the reserved, acknowledged
+input (it pinned the defect); the not-sent case keeps STALE_ROLE_EPOCH. Deferred low: M3LB-01 (M3 low backlog; ADR-036
+records the per-role keying). Final checks: `bash scripts/dev/pre-pr.sh --no-deployment` all ok on `e2650b86`; after the
+rebase onto main see the PR.
