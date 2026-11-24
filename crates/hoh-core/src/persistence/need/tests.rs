@@ -112,6 +112,31 @@ fn the_typed_reasons_are_the_writers_twenty_three_pairs_and_seven_run_reasons() 
 }
 
 #[test]
+fn discussion_and_major_wake_fingerprints_do_not_collide() {
+    // M3K-04: a controversy id equal to another trigger's fingerprint must not merge wakes.
+    let statement = "ship the parser";
+    let sha = crate::context::sha256_hex(statement.as_bytes());
+    let discussion = discussion_limit("p", "R", &sha, &["o".to_owned()], "limit");
+    let major = major_decision("p", "R", &json!({"class": "spec"}), statement);
+    assert_eq!(
+        discussion.payload["fingerprint"],
+        format!("discussion/{sha}")
+    );
+    assert_eq!(major.payload["fingerprint"], format!("major/{sha}"));
+    assert!(
+        !discussion.event_id.contains("discussion/discussion/"),
+        "event id is already namespaced: {}",
+        discussion.event_id
+    );
+    let policy = crate::supervise::Policy::Efficient;
+    let left = crate::supervise::classify(policy, "need_decision", &discussion.payload, Some(1))
+        .expect("discussion wake");
+    let right = crate::supervise::classify(policy, "need_decision", &major.payload, Some(1))
+        .expect("major wake");
+    assert_ne!(left.key.fingerprint, right.key.fingerprint);
+}
+
+#[test]
 fn a_variant_that_does_not_fit_its_task_is_refused_and_nothing_is_written() -> R {
     // Correction A's runtime mutation: a test-only caller passes a work reason for a verifier task, a source reason for
     // a task no round names, a verifier reason for a development task: IntegrityViolation, nothing written (the
