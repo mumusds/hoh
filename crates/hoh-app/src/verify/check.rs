@@ -502,13 +502,18 @@ fn planned_of(entry: &Value) -> Planned {
     }
 }
 
+/// What joins a check's command, by its pid, to its attempt's cgroup: the error when it could not.
+pub type Adopt = Box<dyn FnOnce(u32) -> Result<(), String> + Send>;
+
 /// How a check's command is started beyond what its plan says: variables of its own (a verifier attempt's marker, so
 /// the attempt's stop and a reconcile find it, docs/adr/ADR-021.md decision 8d) and what to do with its pid as soon as
 /// it exists (join the attempt's cgroup; docs/adr/ADR-028.md decision 7).
 #[derive(Default)]
 pub struct Launch {
     pub env: Vec<(String, String)>,
-    pub adopt: Option<Box<dyn FnOnce(u32) + Send>>,
+    /// Join the command's pid to the attempt's cgroup. One that fails never lets the command run: its gate stays closed,
+    /// its process group is ended, and the run is recorded as one whose command did not start (exit 127, M3LD-01).
+    pub adopt: Option<Adopt>,
     /// The start gate program (`hoh`, run as `hoh __check-gate`) that holds the command until `adopt` has returned, so
     /// nothing of it runs, nor forks, outside the attempt's cgroup (docs/adr/ADR-028.md decision 7, M3B-201); none:
     /// the command starts directly and `adopt` follows its start.
@@ -784,12 +789,12 @@ async fn finish(
     let (exit_code, timed_out) =
         match Process::spawn(command, config, &hoh_core::spawn::Direct::plain()) {
             Ok(mut process) => {
-                if let Some(adopt) = launch.adopt {
-                    adopt(process.pid());
-                }
-                // Only now the gate opens. Its stdin is the command's after it, held open as the substrate held it.
-                let _stdin = match gated {
-                    Some(_) => {
+                // An adoption that failed leaves the command outside the attempt's cgroup: it must not run (M3LD-01).
+                let refused = launch.adopt.and_then(|adopt| adopt(process.pid()).err());
+                // Only now, and only once adopted, the gate opens. Its stdin is the command's after it, held open as
+                // the substrate held it. Not adopted: its stdin is closed, so the gate ends without running anything.
+                let _stdin = match (&gated, &refused) {
+                    (Some(_), None) => {
                         use tokio::io::AsyncWriteExt as _;
                         let mut stdin = process.take_stdin();
                         if let Some(pipe) = stdin.as_mut() {
@@ -798,10 +803,18 @@ async fn finish(
                         }
                         stdin
                     }
-                    None => None,
+                    (Some(_), Some(_)) => {
+                        drop(process.take_stdin());
+                        None
+                    }
+                    (None, _) => None,
                 };
+                // Not adopted, its process group is ended (an ungated command has already started) and reaped below.
+                let mut cancelling = refused.is_some();
+                if cancelling {
+                    process.cancel(Escalation::default());
+                }
                 let mut report = None;
-                let mut cancelling = false;
                 loop {
                     tokio::select! {
                         event = process.next() => match event {
@@ -817,7 +830,23 @@ async fn finish(
                 }
                 let report = report
                     .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
-                recorded_exit(report.status, report.cause)
+                match refused {
+                    // As a command that cannot start (below): 127, recorded FAIL NOT_STARTED, a failure of HoH's
+                    // own start and not of the check; never the gate's clean exit (0) once it found no "go". The
+                    // adoption's error is added to its stderr.
+                    Some(error) => {
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&stderr)
+                            .and_then(|mut file| {
+                                writeln!(file, "hoh: the check's command was not started: {error}")
+                            })
+                            .map_err(|e| io(format!("{}: {e}", stderr.display())))?;
+                        (127, false)
+                    }
+                    None => recorded_exit(report.status, report.cause),
+                }
             }
             Err(e) => {
                 // As run_check does when the command cannot start: 127, the error as its stderr.

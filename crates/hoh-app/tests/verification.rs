@@ -1285,6 +1285,7 @@ async fn a_check_holds_its_checkout_from_its_command_to_its_record() -> R {
                 if let Ok(mut d) = during.lock() {
                     *d = Some(checkouts_in_flight().contains(&held));
                 }
+                Ok(())
             })),
             gate: None,
             reconciling: None,
@@ -1335,6 +1336,7 @@ async fn a_gated_check_runs_nothing_before_its_adoption_has_returned() -> R {
             adopt: Some(Box::new(move |_pid| {
                 std::thread::sleep(Duration::from_millis(300));
                 let _ = std::fs::write(&marker, "");
+                Ok(())
             })),
             gate: Some(env!("CARGO_BIN_EXE_hoh").into()),
             reconciling: None,
@@ -1345,6 +1347,57 @@ async fn a_gated_check_runs_nothing_before_its_adoption_has_returned() -> R {
     let record = f.record(&ran)?;
     assert_eq!(record["exit_code"], 0, "{record}");
     assert_eq!(ran.outcome.status.code(), "PASS", "{:?}", ran.reasons);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_started() -> R {
+    // M3LD-01 (docs/adr/ADR-028.md decision 7): when joining the attempt's cgroup fails (its cgroup.procs write refused,
+    // say), the gate is never opened: the command does not run outside the attempt's cgroup, its process group is ended
+    // and reaped, and the run is recorded as a command that did not start (exit 127, FAIL NOT_STARTED, the adoption's
+    // error as its stderr), never as the gate's own clean exit (which would read as PASS).
+    let f = Fixture::with_qa(&format!(": > \"$RAN\"\n{QA_PASSES}")).await?;
+    let c = f.frozen().await?;
+    let ran_marker = f.dir.path().join("ran");
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c.clone(),
+            check_id: "qa".to_owned(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".to_owned(),
+        },
+        Launch {
+            env: vec![("RAN".to_owned(), ran_marker.display().to_string())],
+            adopt: Some(Box::new(|_pid| {
+                Err("its attempt's cgroup could not be joined: Permission denied".to_owned())
+            })),
+            gate: Some(env!("CARGO_BIN_EXE_hoh").into()),
+            reconciling: None,
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    // Give a command that escaped the gate time to leave its marker.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!ran_marker.exists(), "the check's command ran");
+    let record = f.record(&ran)?;
+    assert_eq!(record["exit_code"], 127, "{record}");
+    assert_eq!(record["timed_out"], false, "{record}");
+    let stderr = std::fs::read_to_string(ran.record_dir.join("stderr.log"))?;
+    assert!(
+        stderr.contains("its attempt's cgroup could not be joined: Permission denied"),
+        "{stderr}"
+    );
+    assert_eq!(
+        (ran.outcome.status.code(), ran.outcome.reason),
+        ("FAIL", Some("NOT_STARTED")),
+        "{:?}",
+        ran.reasons
+    );
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["FAIL"]);
     Ok(())
 }
 
