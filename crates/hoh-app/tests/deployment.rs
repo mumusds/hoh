@@ -2,6 +2,7 @@
 //! installed into a fresh temporary HOME under a private user manager (`installed`), runs a detached run in a Git
 //! fixture project and uninstalls, with no root and no sudo. `scripts/product/deployment.sh` builds the bundle from
 //! the candidate and runs this with HOH_RELEASE_BUNDLE and HOH_EXPECTED_COMMIT; without them it fails, never passes.
+//! TEST-047-03's upgrade (`resource_upgrade`) also installs the second release it builds, HOH_RELEASE_BUNDLE_V2.
 
 // No SQLite outside hoh-core::persistence (AC-062-05; see clippy.toml), and no unsafe code (no FFI way around it).
 #![forbid(clippy::disallowed_methods)]
@@ -10,6 +11,7 @@
 mod installed;
 mod pty;
 mod resource_deployment;
+mod resource_upgrade;
 mod world;
 
 use installed::{Manager, R};
