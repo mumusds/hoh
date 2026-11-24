@@ -7,10 +7,20 @@
 # Test runs take one machine-wide slot (flock on HOH_TEST_SLOT, default /home/ai/dev/.hoh-test-slot.lock); builds run
 # outside it. Several sessions running the workspace suite at once drove the load to 50 and exhausted ephemeral ports,
 # which failed unrelated timing and bind tests (FLK-05 evidence, 2026-11-23); queueing the runs keeps them comparable to CI.
+# The bundle steps are CI's bundle job: shellcheck, the bootstrap dry run, then the bundle self-test with CI=1 as in CI, so
+# tests/bundle/test_record.py fails rather than skips its scope tests without a systemd user manager (PREPR-01, PREPR-02).
+# Prerequisite: a user manager for this user (`sudo loginctl enable-linger "$USER"`; scripts/dev/test-infra.sh).
+# CI runs that job on Python 3.11 to 3.14; pre-pr runs it on this machine's python3 only (PREPR-03), so a construct
+# another of those versions rejects can still turn CI red.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+usage='Usage: bash scripts/dev/pre-pr.sh [--no-deployment]'
 deployment=1
-[ "${1:-}" = "--no-deployment" ] && deployment=0
+case "$#:${1:-}" in
+  0:) ;;
+  1:--no-deployment) deployment=0 ;;
+  *) printf '%s\n' "$usage" >&2; exit 64 ;;
+esac
 run() {  # name, command...
   local name=$1; shift
   printf '== %s\n' "$name"
@@ -41,7 +51,9 @@ locked() {  # name, command...: run under the machine-wide test slot
   run "$name" "$@"
   flock -u 9
 }
-run bundle bash scripts/check.sh --bundle
+run shellcheck shellcheck -S warning scripts/*.sh scripts/product/*.sh scripts/dev/*.sh
+run bootstrap-dry-run bash scripts/bootstrap.sh --yolo --dry-run
+run bundle env CI=1 bash scripts/check.sh --bundle
 run static bash scripts/product/static.sh
 run build cargo test --workspace --locked --no-run
 locked workspace cargo test --workspace --locked
