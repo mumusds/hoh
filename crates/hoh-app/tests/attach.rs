@@ -2956,14 +2956,8 @@ fn a_host_whose_scope_is_refused_is_started_directly_and_records_the_proc_scan()
     let record: Value = serde_json::from_str(&std::fs::read_to_string(
         env.project().join(".hoh/host.json"),
     )?)?;
-    assert_eq!(record["process_tracking"], "proc", "{record}");
     // CR12-03: the host records why it was started directly.
-    assert!(
-        record["process_tracking_reason"]
-            .as_str()
-            .is_some_and(|why| why.contains("systemd-run did not start it")),
-        "{record}"
-    );
+    started_directly(&record, |why| why.contains("systemd-run did not start it"))?;
     Ok(())
 }
 
@@ -2993,13 +2987,7 @@ fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() ->
     let record: Value = serde_json::from_str(&std::fs::read_to_string(
         env.project().join(".hoh/host.json"),
     )?)?;
-    assert_eq!(record["process_tracking"], "proc", "{record}");
-    assert!(
-        record["process_tracking_reason"]
-            .as_str()
-            .is_some_and(|why| why.contains("does not linger")),
-        "{record}"
-    );
+    started_directly(&record, |why| why.contains("does not linger"))?;
     // CR12-03: doctor, run while that host runs (as the user this test runs as, whose check before a start may well
     // pass), reports the running host's own reason.
     let mut doctor = with_manager(&env, &["doctor", "--output", "json"], &path);
@@ -3022,6 +3010,47 @@ fn a_host_is_not_started_in_the_users_manager_when_the_user_does_not_linger() ->
     });
     assert!(said, "{}", report["summary"]);
     drop(_daemons);
+    Ok(())
+}
+
+/// How a host this test's client starts directly tracks its processes: it inherits the test's cgroup, so `cgroup` when
+/// that cgroup is delegated to this user (a cgroup with `cgroup.kill` can be made below it and removed, the host's own
+/// check), else `proc`.
+fn direct_start_tracking() -> R<&'static str> {
+    static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let text = std::fs::read_to_string("/proc/self/cgroup")?;
+    let Some(path) = text.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return Ok("proc");
+    };
+    let probe = Path::new("/sys/fs/cgroup")
+        .join(path.trim().trim_start_matches('/'))
+        .join(format!(
+            "hoh-attach-probe-{}-{}",
+            std::process::id(),
+            PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+    if std::fs::create_dir(&probe).is_err() {
+        return Ok("proc");
+    }
+    let kills = probe.join("cgroup.kill").exists();
+    std::fs::remove_dir(&probe)?;
+    Ok(if kills { "cgroup" } else { "proc" })
+}
+
+/// `record` (host.json) is that of a host the client started directly (M2QA-002): where the test's cgroup is not
+/// delegated (the planned checks) it records the proc scan and why it was started directly (`why`, CR12-03); inside a
+/// delegated scope it tracks by cgroups, its reason the delegation, and no degradation is recorded.
+fn started_directly(record: &Value, why: impl Fn(&str) -> bool) -> R {
+    let tracking = direct_start_tracking()?;
+    assert_eq!(record["process_tracking"], tracking, "{record}");
+    let reason = record["process_tracking_reason"]
+        .as_str()
+        .unwrap_or_default();
+    if tracking == "proc" {
+        assert!(why(reason), "{record}");
+    } else {
+        assert!(reason.contains("delegated"), "{record}");
+    }
     Ok(())
 }
 
@@ -3141,13 +3170,7 @@ fn a_host_start_does_not_wait_on_a_systemd_run_that_does_not_answer() -> R {
     let record: Value = serde_json::from_str(&std::fs::read_to_string(
         env.project().join(".hoh/host.json"),
     )?)?;
-    assert_eq!(record["process_tracking"], "proc", "{record}");
-    assert!(
-        record["process_tracking_reason"]
-            .as_str()
-            .is_some_and(|why| why.contains("systemd-run --version")),
-        "{record}"
-    );
+    started_directly(&record, |why| why.contains("systemd-run --version"))?;
     Ok(())
 }
 
@@ -3215,11 +3238,7 @@ fn doctor_and_the_hosts_record_say_how_systemd_run_failed() -> R {
     let record: Value = serde_json::from_str(&std::fs::read_to_string(
         env.project().join(".hoh/host.json"),
     )?)?;
-    assert_eq!(record["process_tracking"], "proc", "{record}");
-    assert!(
-        record["process_tracking_reason"].as_str().is_some_and(said),
-        "{record}"
-    );
+    started_directly(&record, said)?;
     Ok(())
 }
 
