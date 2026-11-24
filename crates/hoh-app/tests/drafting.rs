@@ -1104,3 +1104,137 @@ async fn test_008_01_m3l452_plan_to_plan_keeps_current_steer_window() -> R {
     host.shutdown().await;
     result
 }
+
+/// The project-relative paths commit `commit` changes (a root commit: every path it adds).
+fn changed(world: &world::World, commit: &str) -> R<Vec<String>> {
+    Ok(world
+        .git(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            commit,
+        ])?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// AC-028-04 for one project shape: an empty directory (`history` false) or a Git repository with commits, neither with
+/// an approved specification; the user answers runtime:no_spec with draft and the scripted cto (no live agent) writes
+/// only docs/spec/ and commits.
+async fn draft_from_no_spec(history: bool) -> R {
+    use std::os::unix::fs::MetadataExt as _;
+    let world = world::World::named(if history {
+        "m3t07-history"
+    } else {
+        "m3t07-empty"
+    })?;
+    world.configure(&[], "")?;
+    let before = if history {
+        world.git(&["init", "-q"])?;
+        for (path, body, message) in [
+            ("README.md", "# 已有项目\n", "first"),
+            ("src/lib.rs", "pub fn kept() {}\n", "second"),
+        ] {
+            let file = world.project().join(path);
+            std::fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+            std::fs::write(file, body)?;
+            world.git(&["add", path])?;
+            world.git(&["commit", "-q", "-m", message])?;
+        }
+        let git = std::fs::metadata(world.project().join(".git"))?;
+        Some((world.git(&["rev-list", "HEAD"])?, git.ino()))
+    } else {
+        None
+    };
+    let host = world
+        .team_host(world::Team::drafting(world.project()), None)
+        .await?;
+    let result: R = async {
+        let run = world::start_run(&host, "start", "规格起草").await?;
+        world.staff(&run)?;
+        world
+            .until(
+                &format!("SELECT count(*) FROM events WHERE run_id='{run}' AND kind='question.asked' AND json_extract(payload_json,'$.reason')='no_spec'"),
+                "1",
+                Duration::from_secs(15),
+            )
+            .await?;
+        input(&host, &world, &run, "draft", "SendInput", json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
+        world
+            .until(&format!("SELECT count(*) FROM events WHERE run_id='{run}' AND kind='spec.draft_completed'"), "1", Duration::from_secs(20))
+            .await?;
+        assert_eq!(world.query(&format!("SELECT state FROM tasks WHERE run_id='{run}' AND kind='spec_draft'"))?, "IMPLEMENTED");
+        let attempt = world.query(&format!("SELECT a.attempt_id FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id='{run}' AND t.kind='spec_draft'"))?;
+        let attempts = format!("(SELECT a.attempt_id FROM attempts a JOIN tasks t USING(task_id) WHERE t.run_id='{run}')");
+
+        // The baseline: one, with the project's HEAD then (none in the empty directory), before every Attempt and effect
+        // record of the Run.
+        assert_eq!(world.query(&format!("SELECT count(*) FROM events WHERE run_id='{run}' AND kind='run.baseline'"))?, "1");
+        let baseline: i64 = world.query(&format!("SELECT seq FROM events WHERE run_id='{run}' AND kind='run.baseline'"))?.parse()?;
+        let head = world.query(&format!("SELECT coalesce(json_extract(payload_json,'$.head'),'NULL') FROM events WHERE seq={baseline}"))?;
+        match &before {
+            None => assert_eq!(head, "NULL"),
+            Some((list, _)) => assert_eq!(head, list.lines().next().ok_or("no history")?),
+        }
+        let records = format!("events WHERE (json_extract(payload_json,'$.attempt_id') IN {attempts} OR json_extract(payload_json,'$.effect_key') IN (SELECT effect_key FROM effects WHERE attempt_id IN {attempts}) OR (run_id='{run}' AND (kind GLOB 'attempt.*' OR kind GLOB 'effect.*')))");
+        assert!(world.query(&format!("SELECT count(*) FROM {records}"))?.parse::<i64>()? > 0);
+        assert_eq!(world.query(&format!("SELECT count(*) FROM {records} AND seq<={baseline}"))?, "0", "no Attempt or effect record before the baseline");
+        assert_eq!(world.query(&format!("SELECT count(*) FROM attempts WHERE attempt_id IN {attempts} AND NOT EXISTS (SELECT 1 FROM events WHERE json_extract(payload_json,'$.attempt_id')=attempts.attempt_id AND seq>{baseline})"))?, "0", "every Attempt is recorded after the baseline");
+        assert_eq!(world.query(&format!("SELECT count(*) FROM effects WHERE attempt_id IN {attempts} AND NOT EXISTS (SELECT 1 FROM events WHERE kind GLOB 'effect.*' AND json_extract(payload_json,'$.effect_key')=effects.effect_key AND seq>{baseline})"))?, "0", "every effect is recorded after the baseline");
+
+        // git init: the drafting Attempt's own effect in its preparation (dispatched, before its workspace start), local only.
+        let init = hoh_core::ids::child_id(&attempt, "git-init");
+        let inits = world.query(&format!("SELECT count(*) FROM effects WHERE attempt_id IN {attempts} AND effect_key GLOB '*/git-init'"))?;
+        match &before {
+            None => {
+                assert_eq!(inits, "1");
+                assert_eq!(world.query(&format!("SELECT attempt_id||'/'||state FROM effects WHERE effect_key='{init}'"))?, format!("{attempt}/COMMITTED"));
+                let seq = |kind: &str, key: &str, value: &str| world.query(&format!("SELECT coalesce(min(seq),-1) FROM events WHERE kind='{kind}' AND json_extract(payload_json,'$.{key}')='{value}'"));
+                let (dispatched, started, committed, workspace) = (
+                    seq("spec.draft_dispatched", "attempt_id", &attempt)?.parse::<i64>()?,
+                    seq("effect.started", "effect_key", &init)?.parse::<i64>()?,
+                    seq("effect.committed", "effect_key", &init)?.parse::<i64>()?,
+                    seq("attempt.workspace_start", "attempt_id", &attempt)?.parse::<i64>()?,
+                );
+                assert!(baseline < dispatched && dispatched < started && started < committed && committed < workspace, "{baseline} {dispatched} {started} {committed} {workspace}");
+            }
+            Some(_) => assert_eq!(inits, "0", "an existing repository is not initialised again"),
+        }
+        assert_eq!(world.git(&["remote"])?, "", "no remote");
+        assert!(!std::fs::read_to_string(world.project().join(".git/config"))?.contains("[remote"));
+
+        // Commits: the draft's commit is HEAD; the history is kept; every new commit touches only docs/spec/, docs/, .hoh/.
+        let drafted = world.query(&format!("SELECT json_extract(payload_json,'$.git_commit') FROM events WHERE run_id='{run}' AND kind='spec.draft_completed'"))?;
+        let list = world.git(&["rev-list", "HEAD"])?;
+        assert_eq!(list.lines().next(), Some(drafted.as_str()));
+        let new: Vec<&str> = match &before {
+            None => list.lines().collect(),
+            Some((old, ino)) => {
+                assert!(list.ends_with(old.as_str()), "history kept: {list} / {old}");
+                assert_eq!(std::fs::metadata(world.project().join(".git"))?.ino(), *ino, "the same .git directory");
+                list[..list.len() - old.len()].lines().collect()
+            }
+        };
+        assert!(!new.is_empty());
+        for commit in new {
+            let paths = changed(&world, commit)?;
+            assert!(!paths.is_empty(), "{commit}");
+            for path in paths {
+                assert!(["docs/spec/", "docs/", ".hoh/"].iter().any(|p| path.starts_with(p)), "{commit} touches {path}");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_028_04_draft_from_empty_directory_and_existing_history_after_baseline() -> R {
+    draft_from_no_spec(false).await?;
+    draft_from_no_spec(true).await
+}
