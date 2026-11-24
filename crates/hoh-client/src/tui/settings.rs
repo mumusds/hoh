@@ -15,10 +15,17 @@ pub(super) struct Settings {
     diff: String,
     scroll: u16,
     notice: String,
+    /// The host bundle the diff is measured against. The TUI binary uses `Bundle::current` (M3G-54).
+    bundle: hoh_core::resource_bundle::Bundle,
 }
 
 impl Settings {
-    pub fn open(root: &Path, run: &str, role: &str) -> Result<Self, prompt::Error> {
+    pub fn open(
+        root: &Path,
+        run: &str,
+        role: &str,
+        bundle: &hoh_core::resource_bundle::Bundle,
+    ) -> Result<Self, prompt::Error> {
         let config = config::load(root).map_err(prompt::unavailable)?;
         let configured = config.team.get(role).and_then(|r| r.prompt.clone());
         let resolved = prompt_files::load(
@@ -34,11 +41,7 @@ impl Settings {
             .find(|c| c.layer == "builtin")
             .ok_or_else(|| prompt::unavailable("该职位没有内置默认契约"))?;
         let effective = resolved.effective()?;
-        let reports = prompt_files::drift_reports(
-            root,
-            &resolved,
-            &hoh_core::resource_bundle::Bundle::current(),
-        )?;
+        let reports = prompt_files::drift_reports(root, &resolved, bundle)?;
         let mut diff =
             prompt::unified_diff(&builtin.text, &effective.text, "builtin", effective.layer);
         for report in &reports {
@@ -61,6 +64,7 @@ impl Settings {
             configured,
             diff,
             scroll: 0,
+            bundle: bundle.clone(),
             notice: format!(
                 "{}↑↓ / PgUp PgDn 浏览 · r 恢复默认（删除 project 覆盖）· Esc 返回",
                 if reports.is_empty() {
@@ -103,11 +107,7 @@ impl Settings {
             .find(|c| c.layer == "builtin")
             .ok_or_else(|| prompt::unavailable("该职位没有内置默认契约"))?;
         let effective = resolved.effective()?;
-        let reports = prompt_files::drift_reports(
-            root,
-            &resolved,
-            &hoh_core::resource_bundle::Bundle::current(),
-        )?;
+        let reports = prompt_files::drift_reports(root, &resolved, &self.bundle)?;
         let mut diff =
             prompt::unified_diff(&builtin.text, &effective.text, "builtin", effective.layer);
         for report in &reports {

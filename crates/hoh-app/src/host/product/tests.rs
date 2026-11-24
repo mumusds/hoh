@@ -1473,6 +1473,47 @@ fn test_047_03_packing_uses_the_attempt_pin_not_the_current_binary()
 }
 
 #[test]
+fn test_047_03_unpinned_pack_and_drift_use_the_host_bundle()
+-> Result<(), Box<dyn std::error::Error>> {
+    // M3G-54: with no pin, packing and drift follow the injected host bundle, not Bundle::current.
+    let dir = tempfile::Builder::new()
+        .prefix("m3t03-host-bundle-")
+        .tempdir()?;
+    let mut host = hoh_core::resource_bundle::Bundle::current();
+    host.files.insert(
+        "resources/prompts/developer.md".to_owned(),
+        "host developer\n".to_owned(),
+    );
+    hoh_core::prompt_files::save_override_based_on(
+        dir.path(),
+        ".hoh/prompts/developer.md",
+        "custom developer\n",
+        "developer",
+        &host,
+    )?;
+    let resolved = hoh_core::prompt_files::load(dir.path(), None, "R1", "developer", None)?;
+    let (_, record, _) = executor(dir.path())
+        .with_resources(host.clone())
+        .pack(&work(None), &resolved, None, false)
+        .map_err(|r| format!("{r:?}"))?;
+    let packing = record.packed.ok_or("no packing")?;
+    assert_eq!(packing.resource_bundle_version, host.version());
+    assert_ne!(
+        packing.resource_bundle_version,
+        hoh_core::resource_bundle::Bundle::current().version()
+    );
+    assert!(
+        packing.event["resource_drift"]
+            .as_array()
+            .ok_or("drift")?
+            .is_empty(),
+        "drift against the injected bundle: {}",
+        packing.event["resource_drift"]
+    );
+    Ok(())
+}
+
+#[test]
 fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::Builder::new().prefix("m3t03-drift-").tempdir()?;
     let mut old = hoh_core::resource_bundle::Bundle::current();

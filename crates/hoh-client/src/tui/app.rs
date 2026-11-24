@@ -222,6 +222,8 @@ pub struct App {
     requests: Vec<Request>,
     /// The commands of inputs sent whose acceptance event has not come yet.
     awaiting: Vec<String>,
+    /// Bundle the settings screen diffs against. Production uses the binary's bundle (M3G-54).
+    resources: hoh_core::resource_bundle::Bundle,
 }
 
 impl App {
@@ -248,7 +250,14 @@ impl App {
             slash: None,
             requests: Vec::new(),
             awaiting: Vec::new(),
+            resources: hoh_core::resource_bundle::Bundle::current(),
         }
+    }
+
+    /// Settings diffs against `bundle` instead of the binary's bundle (M3G-54).
+    #[cfg(test)]
+    pub fn set_resource_bundle(&mut self, bundle: hoh_core::resource_bundle::Bundle) {
+        self.resources = bundle;
     }
 
     /// The shell of `project`: its name, its input history and its configured mode (see [`mode_of`]).
@@ -851,6 +860,7 @@ impl App {
                     root,
                     self.run.as_ref().map_or("settings", |r| r.run_id.as_str()),
                     role,
+                    &self.resources,
                 ) {
                     Ok(settings) => self.settings = Some(settings),
                     Err(e) => self.messages.push(format!("设置无法打开：{e}")),
