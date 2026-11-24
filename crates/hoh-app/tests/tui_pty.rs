@@ -98,6 +98,21 @@ impl Session {
 }
 
 #[test]
+fn a_project_whose_host_socket_would_not_fit_is_refused_before_hoh_starts() -> R {
+    // M3C-01: with a long TMPDIR the project's `.hoh/host.sock` passes 107 bytes; the helper says so before `hoh` starts
+    // instead of a host that never connects.
+    let (home, base) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let project = base.path().join("p".repeat(100));
+    std::fs::create_dir_all(&project)?;
+    let pty = Pty::new(30, 100)?;
+    let Err(e) = spawn_in(&pty, &project, home.path(), &[], &[]) else {
+        return Err("hoh was started in a project whose socket path does not fit".into());
+    };
+    assert!(e.to_string().contains("longer than 107 bytes"), "{e}");
+    Ok(())
+}
+
+#[test]
 fn the_workspace_opens_connected_and_writes_nothing_until_enter() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
     // Bare `hoh` starts the project's host if none runs: stopped however the test ends.

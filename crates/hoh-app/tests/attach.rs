@@ -108,16 +108,24 @@ fn config(project: &Path) -> HostConfig {
 /// BLOCKED, AGENT_UNAVAILABLE, `<agent>:unsupported` (decisions 3 and 4).
 const FAKE_AGENT: &str = "#!/bin/sh\necho 'fake agent 0.0.0 (hoh attach tests)'\n";
 
-/// A project directory with a short path (a socket path has at most 107 bytes), a home of its own and the fake agents.
+/// A project directory with a short path (a socket path has at most 107 bytes, checked when it is made), a home of its
+/// own and the fake agents.
 struct Env {
     dir: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> R<Env> {
+        Env::new_in(&std::env::temp_dir())
+    }
+
+    fn new_in(base: &Path) -> R<Env> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = tempfile::Builder::new().prefix("hoh").tempdir()?;
+        let dir = tempfile::Builder::new().prefix("hoh").tempdir_in(base)?;
+        // M3C-01: the longest socket path of this file (the project host's) is refused at once when it does not fit,
+        // with the host's own words, rather than at a later bind (FakeHost's `h.sock` is shorter).
+        pty::socket_fits(&dir.path().join("p"))?;
         std::fs::create_dir_all(dir.path().join("p"))?;
         std::fs::create_dir_all(dir.path().join("home"))?;
         std::fs::create_dir_all(dir.path().join("agents"))?;
@@ -456,6 +464,20 @@ const ENDING: [(rustix::process::Signal, i32); 2] = [
     (rustix::process::Signal::TERM, 143),
     (rustix::process::Signal::INT, 130),
 ];
+
+#[test]
+fn an_env_whose_host_socket_would_not_fit_is_refused_at_once() -> R {
+    // M3C-01: a temporary directory base so long that `<dir>/p/.hoh/host.sock` passes 107 bytes is refused when the
+    // Env is made, with the host's own words, not at a later bind.
+    let base = tempfile::tempdir()?;
+    let long = base.path().join("b".repeat(100));
+    std::fs::create_dir_all(&long)?;
+    let Err(e) = Env::new_in(&long) else {
+        return Err("an Env was made whose socket path does not fit".into());
+    };
+    assert!(e.to_string().contains("longer than 107 bytes"), "{e}");
+    Ok(())
+}
 
 #[test]
 fn a_signal_while_p_waits_for_its_host_ends_it_at_once_with_its_code() -> R {
