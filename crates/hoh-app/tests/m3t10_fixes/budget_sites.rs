@@ -220,7 +220,7 @@ fn audit(sources: &[(String, String)]) -> R {
         if ![
             "budget_view.rs",
             "consult/children.rs",
-            "consult/bounds.rs",
+            "consult/bounds/mod.rs",
             "consult/listing.rs",
             "team.rs",
         ]
