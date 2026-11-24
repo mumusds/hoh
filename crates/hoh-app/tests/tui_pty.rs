@@ -153,6 +153,77 @@ fn the_workspace_opens_connected_and_writes_nothing_until_enter() -> R {
 }
 
 #[test]
+fn wide_glyphs_typed_into_the_editor_take_two_cells_and_are_erased_whole() -> R {
+    // M2QA-003: Chinese and an emoji typed into the editor are drawn whole, each in two cells, the cursor after them;
+    // Backspace erases the emoji as one glyph, both of its cells, and leaves the rest as it was.
+    let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let _daemons = Daemons(project.path().to_path_buf());
+    let mut s = open(project.path(), home.path(), &[])?;
+    s.pty.send("中文😀ab".as_bytes())?;
+    // The editor's row is the cursor's: "> " and then the glyphs, 中 文 😀 two cells each, a and b one each.
+    let editor = |screen: &vt100::Screen| {
+        let (row, _) = screen.cursor_position();
+        screen
+            .rows(0, 100)
+            .nth(usize::from(row))
+            .unwrap_or_default()
+    };
+    let typed = wide_screen(&s.pty, |screen| editor(screen).trim_end() == "> 中文😀ab")?;
+    let (row, col) = typed.cursor_position();
+    assert_eq!(col, 10, "the cursor after 2 + 2 + 2 + 2 + 1 + 1 cells");
+    for (at, glyph) in [(2, "中"), (4, "文"), (6, "😀")] {
+        let cell = typed.cell(row, at).ok_or("no cell")?;
+        let next = typed.cell(row, at + 1).ok_or("no cell")?;
+        assert_eq!(cell.contents(), glyph);
+        assert!(
+            cell.is_wide() && next.is_wide_continuation(),
+            "{glyph} at {at}"
+        );
+    }
+    assert_eq!(typed.cell(row, 8).ok_or("no cell")?.contents(), "a");
+    // Three Backspaces: b, a, then the emoji as one glyph, both of its cells.
+    s.pty.send(b"\x7f\x7f\x7f")?;
+    let erased = wide_screen(&s.pty, |screen| editor(screen).trim_end() == "> 中文")?;
+    assert_eq!(erased.cursor_position(), (row, 6));
+    for at in 6..10 {
+        let cell = erased.cell(row, at).ok_or("no cell")?;
+        assert!(
+            cell.contents().trim().is_empty() && !cell.is_wide() && !cell.is_wide_continuation(),
+            "cell {at}: {:?}",
+            cell.contents()
+        );
+    }
+    s.pty.send(b"\x03")?; // clears the editor
+    assert_eq!(s.detach()?, Some(0));
+    Ok(())
+}
+
+/// The 30x100 screen of `pty`'s output once `want` holds for it (within WAIT), after the snapshot helper's erase check.
+fn wide_screen(pty: &Pty, want: impl Fn(&vt100::Screen) -> bool) -> R<vt100::Screen> {
+    pty::erase_check(&pty::screen)?;
+    let (rows, cols) = (
+        std::num::NonZeroU16::new(30).ok_or("rows")?,
+        std::num::NonZeroU16::new(100).ok_or("columns")?,
+    );
+    let end = std::time::Instant::now() + WAIT;
+    loop {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(&pty.output());
+        if want(parser.screen()) {
+            return Ok(parser.screen().clone());
+        }
+        if std::time::Instant::now() > end {
+            return Err(format!(
+                "the screen was not as wanted within {WAIT:?}:\n{}",
+                parser.screen().contents()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn submitted_input_is_kept_and_found_again_in_the_next_session() -> R {
     let (home, project) = (tempfile::tempdir()?, tempfile::tempdir()?);
     // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
