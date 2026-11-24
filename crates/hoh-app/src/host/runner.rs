@@ -1659,7 +1659,7 @@ async fn attempt(
             outcome = &mut ended => break outcome,
             () = tokio::time::sleep(Duration::from_millis(200)), if serving.is_some() => {
                 if let Some(helpers) = serving {
-                    served += serve_request(common, &work, verifier.as_ref(), helpers, served + 1).await?;
+                    served += serve_request(common, &work, verifier.as_ref(), helpers, served + 1, &tracking).await?;
                 }
             }
             _ = looks.tick(), if look.is_none() && watch.is_some() => {
@@ -2045,6 +2045,7 @@ async fn serve_request(
     v: Option<&super::verifying::Verifier>,
     helpers: &super::requests::Helpers,
     n: u64,
+    tracking: &Tracking,
 ) -> Result<u64, PersistError> {
     let store = &common.shared.store;
     let held = helpers.clone();
@@ -2063,7 +2064,7 @@ async fn serve_request(
             Some("check") => {
                 let check_id = request["check_id"].as_str().unwrap_or_default().to_owned();
                 match v {
-                    Some(v) => run_check(common, work, v, n, &check_id).await?,
+                    Some(v) => run_check(common, work, v, n, &check_id, tracking).await?,
                     None => {
                         json!({"status":"refused","reasons":["checks require a frozen verification assignment"]})
                     }
@@ -2107,14 +2108,32 @@ async fn serve_request(
     Ok(1)
 }
 
+/// What joins a check's command to its attempt's cgroup (decision 7): the check follows its attempt's recorded
+/// tracking. One tracked by its cgroup: the command joins that cgroup, and one that cannot is refused (M3LD-01). One
+/// tracked by the /proc scan (no delegated cgroup, or its own could not be made or joined: CR-011 option A, degraded):
+/// none, the command is found by the attempt's marker in its environment, as the attempt's processes are (M3LD-L1).
+fn check_adopt(tracking: &Tracking) -> Option<crate::verify::check::Adopt> {
+    let Tracking::Cgroup { path, .. } = tracking else {
+        return None;
+    };
+    let path = path.clone();
+    Some(Box::new(move |pid: u32| {
+        AttemptGroup::adopt(&path, pid)
+            .map(drop)
+            .map_err(|e| format!("its attempt's cgroup could not be joined: {e}"))
+    }))
+}
+
 /// Run check `check_id` of the candidate's frozen plan for verifier `work` in its run directory, the attempt its
-/// producer, its command carrying the attempt's marker and joining its cgroup (decision 7): the answer to give.
+/// producer, its command carrying the attempt's marker and following the attempt's `tracking` (its cgroup when it has
+/// one; decision 7): the answer to give.
 async fn run_check(
     common: &Common,
     work: &Work,
     v: &super::verifying::Verifier,
     n: u64,
     check_id: &str,
+    tracking: &Tracking,
 ) -> Result<Value, PersistError> {
     use crate::verify::check::{CheckError, Launch, Request};
     let store = &common.shared.store;
@@ -2156,14 +2175,7 @@ async fn run_check(
         .await;
     };
     let marker = work.marker();
-    let adopt = common.shared.cgroups.clone().map(|delegated| {
-        let path = delegated.attempt(&marker);
-        Box::new(move |pid: u32| {
-            AttemptGroup::adopt(&path, pid)
-                .map(drop)
-                .map_err(|e| format!("its attempt's cgroup could not be joined: {e}"))
-        }) as crate::verify::check::Adopt
-    });
+    let adopt = check_adopt(tracking);
     let ran = crate::verify::check::run_with(
         store,
         &v.dir,
@@ -2539,6 +2551,31 @@ mod observed_tests {
         assert_eq!(detail["artifacts"], json!([row.json()]));
         assert_eq!(detail["artifacts_failed"][0]["name"], "stdout.jsonl");
         assert_eq!(detail["success"], true);
+    }
+}
+
+#[cfg(test)]
+mod check_adopt_tests {
+    use super::*;
+
+    #[test]
+    fn a_check_of_a_proc_tracked_attempt_is_not_adopted_into_a_cgroup() {
+        // M3LD-L1 (docs/adr/ADR-028.md decision 7, CR-011 option A): an attempt whose cgroup could not be made or
+        // joined on a host with delegated cgroups is tracked by the /proc scan; its check follows it (the attempt's
+        // marker in its environment), never into a cgroup the attempt does not have, which would refuse the check:
+        // what the check joins is its attempt's recorded tracking, not the host's delegated cgroups.
+        let proc =
+            Tracking::Proc("its cgroup could not be made or joined: Permission denied".to_owned());
+        assert!(check_adopt(&proc).is_none());
+        // One tracked by its cgroup: the check joins that cgroup, the one recorded, and a failure is the check's refusal.
+        // (Below /proc, where no directory can be made: the join fails without making anything.)
+        let path = std::path::PathBuf::from("/proc/hoh-m3ld-l1/attempt-0");
+        let group = Tracking::Cgroup {
+            path,
+            witness: None,
+        };
+        let joined = check_adopt(&group).map(|adopt| adopt(std::process::id()));
+        assert!(matches!(joined, Some(Err(_))), "{joined:?}");
     }
 }
 
