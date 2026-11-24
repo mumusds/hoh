@@ -189,21 +189,6 @@ pub(super) fn remedy(protocol: Protocol, auth_note: Option<String>) -> Option<St
     }
 }
 
-#[cfg(test)]
-mod install_hint {
-    use super::install;
-    use hoh_agents::compat::Agent;
-
-    #[test]
-    fn pi_install_hint_names_recorded_1_5_0_and_installed_1_6_0() {
-        // PI16-B2: the recorded suite is pi 1.5.0 and the installed CLI is 1.6.0 (ADR-040).
-        let hint = install(Agent::Pi);
-        assert!(hint.contains("@earendil-works/pi-coding-agent"), "{hint}");
-        assert!(hint.contains("1.5.0"), "{hint}");
-        assert!(hint.contains("1.6.0"), "{hint}");
-    }
-}
-
 /// The compat suite's note for an agent whose protocol is unknown.
 const SUITE_NOTE: &str = "host 在没有写租约时自动运行兼容套件；运行中的写任务结束后即登记该版本";
 
@@ -313,5 +298,20 @@ pub(super) fn read_only(
         },
         check: check.as_ref().map(probe::SandboxCheck::name),
         detail,
+    }
+}
+
+#[cfg(test)]
+mod install_hint {
+    use super::install;
+    use hoh_agents::compat::Agent;
+
+    #[test]
+    fn pi_install_hint_names_recorded_1_5_0_and_installed_1_6_0() {
+        // PI16-B2: the recorded suite is pi 1.5.0 and the installed CLI is 1.6.0 (ADR-040).
+        let hint = install(Agent::Pi);
+        assert!(hint.contains("@earendil-works/pi-coding-agent"), "{hint}");
+        assert!(hint.contains("1.5.0"), "{hint}");
+        assert!(hint.contains("1.6.0"), "{hint}");
     }
 }
