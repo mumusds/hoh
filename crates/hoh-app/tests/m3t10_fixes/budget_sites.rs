@@ -270,6 +270,7 @@ fn audit(sources: &[(String, String)]) -> R {
             ("commands.rs", 1),
             ("consult/returned.rs", 1),
             ("decide.rs", 1),
+            ("drafting.rs", 1), // Draft dispatch reads the same transactional view (M3-T04).
             ("retry.rs", 1),
             ("rounds.rs", 1),
             ("stall.rs", 1),
@@ -288,6 +289,7 @@ fn audit(sources: &[(String, String)]) -> R {
     assert_eq!(
         task_stops,
         expected(&[
+            ("admission.rs", 1), // The draft verdict consumes that view without a private rule.
             ("budget_view.rs", 1),
             ("consult/returned.rs", 1),
             ("decide.rs", 1),
