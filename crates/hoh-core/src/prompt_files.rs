@@ -61,6 +61,21 @@ pub fn load_with_bundle(
     configured: Option<&str>,
     bundle: &crate::resource_bundle::Bundle,
 ) -> Result<prompt::Resolved, Error> {
+    prompt::resolve(sources_with_bundle(
+        root, global, run, role, configured, bundle,
+    )?)
+}
+
+/// Read the ordered override chain before template resolution. Callers must still validate it
+/// with `prompt::resolve`; the executor first checks whether an effective old builtin is renderable.
+pub fn sources_with_bundle(
+    root: &Path,
+    global: Option<&Path>,
+    run: &str,
+    role: &str,
+    configured: Option<&str>,
+    bundle: &crate::resource_bundle::Bundle,
+) -> Result<Vec<crate::config::Contract>, Error> {
     use crate::config::{self, Contract};
     let builtin = configured
         .and_then(|p| p.strip_prefix(config::BUILTIN_PROMPT))
@@ -102,7 +117,7 @@ pub fn load_with_bundle(
             sources.push(source);
         }
     }
-    prompt::resolve(sources)
+    Ok(sources)
 }
 
 /// Shared directory chain for role contracts, skills and templates (ADR-034, ADR-040).

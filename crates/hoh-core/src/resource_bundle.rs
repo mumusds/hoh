@@ -133,19 +133,21 @@ impl Bundle {
         computed
     }
 
-    /// Whether this binary can render `role` from these bytes (M3G-52): the context format matches,
-    /// the role's output schemas resolve, and its contract template parses when the bundle has one.
-    /// A prompt with no placeholders is compatible. This does not reject an old prompt's wording.
-    pub fn renderer_compatible(&self, role: &str) -> Result<(), String> {
+    /// Check the output schemas and the actual builtin selected by the override chain.
+    /// A user override is validated separately and never becomes a transient bundle error.
+    pub fn renderer_compatible(
+        &self,
+        role: &str,
+        builtin_path: Option<&str>,
+    ) -> Result<(), String> {
         if self.format != context::FORMAT {
             return Err("pinned context format cannot be rendered by this binary".to_owned());
         }
         context::output_schemas_with(role, |path| {
             serde_json::from_str(self.text(path)?).map_err(|error| error.to_string())
         })?;
-        let prompt = format!("resources/prompts/{role}.md");
-        if let Ok(text) = self.text(&prompt) {
-            context::contract_template_ok(text)?;
+        if let Some(path) = builtin_path {
+            context::contract_template_ok(self.text(path)?)?;
         }
         Ok(())
     }
@@ -172,15 +174,33 @@ impl Bundle {
     }
 }
 
-impl Pin {
-    pub fn load(&self, project: &Path) -> Result<Bundle, String> {
-        let bundle: Bundle = serde_json::from_slice(&objects::get(project, &self.bundle_sha256)?)
-            .map_err(|e| e.to_string())?;
-        if bundle.version() != self.resource_bundle_version {
-            return Err("resource bundle identity mismatch".to_owned());
+/// Loading failures describe immutable input integrity, not renderer compatibility.
+#[derive(Debug)]
+pub enum LoadError {
+    Object(String),
+    Decode(serde_json::Error),
+    IdentityMismatch,
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Object(why) => f.write_str(why),
+            Self::Decode(error) => error.fmt(f),
+            Self::IdentityMismatch => f.write_str("resource bundle identity mismatch"),
         }
-        if bundle.format != context::FORMAT {
-            return Err("pinned context format cannot be rendered by this binary".to_owned());
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl Pin {
+    /// Load and verify identity; the executor checks compatibility only after this succeeds.
+    pub fn load(&self, project: &Path) -> Result<Bundle, LoadError> {
+        let bytes = objects::get(project, &self.bundle_sha256).map_err(LoadError::Object)?;
+        let bundle: Bundle = serde_json::from_slice(&bytes).map_err(LoadError::Decode)?;
+        if bundle.version() != self.resource_bundle_version {
+            return Err(LoadError::IdentityMismatch);
         }
         Ok(bundle)
     }

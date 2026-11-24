@@ -44,6 +44,8 @@ pub struct ProductExecutor {
     watchers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The host's installed bundle. Absent means [`hoh_core::resource_bundle::Bundle::current`] (M3G-54).
     resources: Option<hoh_core::resource_bundle::Bundle>,
+    /// Explicit global-layer injection; outer None uses the normal product environment.
+    global_root: Option<Option<PathBuf>>,
 }
 
 /// How long the host's stop waits for a turn's raw logs being kept as objects when it stops (a blocking copy).
@@ -116,7 +118,20 @@ impl ProductExecutor {
             stopping: tokio::sync::watch::Sender::new(false),
             watchers: Mutex::default(),
             resources: None,
+            global_root: None,
         }
+    }
+
+    /// Isolate an embedded executor or test from user configuration. None disables the global layer.
+    pub fn with_global_root(mut self, root: Option<PathBuf>) -> Self {
+        self.global_root = Some(root);
+        self
+    }
+
+    fn global_root(&self) -> Option<PathBuf> {
+        self.global_root
+            .clone()
+            .unwrap_or_else(hoh_core::prompt_files::global_root)
     }
 
     /// Pack and drift against `bundle` when the attempt has no pin. The product host passes the
@@ -490,14 +505,14 @@ impl ProductExecutor {
     }
 
     /// An old pin this binary cannot render is transient, so its checkpoint can still move.
-    /// The host bundle's own failure, and an identity mismatch, stay a decision (M3G-52).
-    fn bundle_refusal(&self, work: &Work, why: String) -> Refusal {
+    /// Call only after successful loading: immutable input errors are always decisions.
+    fn renderer_refusal(&self, work: &Work, why: String) -> Refusal {
         let old_pin = work
             .assignment
             .resource_bundle
             .as_ref()
             .is_some_and(|pin| pin.resource_bundle_version != self.host_bundle().version());
-        let class = if old_pin && why != "resource bundle identity mismatch" {
+        let class = if old_pin {
             FailureClass::Transient { retry_after: None }
         } else {
             FailureClass::Decision
@@ -509,8 +524,13 @@ impl ProductExecutor {
         work.assignment.resource_bundle.as_ref().map_or_else(
             || Ok(self.host_bundle()),
             |pin| {
-                pin.load(&self.project)
-                    .map_err(|why| self.bundle_refusal(work, why))
+                pin.load(&self.project).map_err(|error| {
+                    refused(
+                        "PROMPT_UNAVAILABLE",
+                        FailureClass::Decision,
+                        error.to_string(),
+                    )
+                })
             },
         )
     }
@@ -518,7 +538,7 @@ impl ProductExecutor {
     fn load_skills(&self, work: &Work) -> Result<hoh_core::skills::Loaded, Refusal> {
         hoh_core::skills::load_with_diagnostics(
             &self.project,
-            hoh_core::prompt_files::product_global_root().as_deref(),
+            self.global_root().as_deref(),
             &work.run_id,
             &self.bundle(work)?,
         )
@@ -558,10 +578,11 @@ impl ProductExecutor {
     ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
         use hoh_core::context;
         let bundle = self.bundle(work)?;
-        if let Err(why) = bundle.renderer_compatible(&work.role) {
-            return Err(self.bundle_refusal(work, why));
-        }
         let contract = resolved.effective().map_err(prompt_refusal)?;
+        let builtin = (contract.layer == "builtin").then_some(contract.path.as_str());
+        if let Err(why) = bundle.renderer_compatible(&work.role, builtin) {
+            return Err(self.renderer_refusal(work, why));
+        }
         hoh_core::prompt::validate_variables(&resolved.template().map_err(prompt_refusal)?)
             .map_err(|error| Refusal {
                 reason: error.code.to_owned(),
@@ -997,15 +1018,23 @@ impl ProductExecutor {
             ..
         } = current;
         let bundle = self.bundle(work)?;
-        let contract = hoh_core::prompt_files::load_with_bundle(
+        let sources = hoh_core::prompt_files::sources_with_bundle(
             &self.project,
-            hoh_core::prompt_files::product_global_root().as_deref(),
+            self.global_root().as_deref(),
             &work.run_id,
             &work.role,
             a.prompt.as_deref(),
             &bundle,
         )
         .map_err(prompt_refusal)?;
+        // Validate the selected builtin before resolve can reject an old template's variables.
+        // User layers keep the normal prompt error and Decision classification.
+        if let Some(builtin) = sources.last().filter(|source| source.layer == "builtin") {
+            bundle
+                .renderer_compatible(&work.role, Some(&builtin.path))
+                .map_err(|why| self.renderer_refusal(work, why))?;
+        }
+        let contract = hoh_core::prompt::resolve(sources).map_err(prompt_refusal)?;
         // A new holder's first turn starts from its handover package (REQ-019 b4), as the store says which turn that
         // is (ADR-024 decision 4): one whose kept input is gone or unreadable is not started without it.
         let package = match (a.first_input, a.session_id.as_deref()) {
