@@ -391,11 +391,11 @@ async fn race(fail: bool) -> R {
     {
         let jobs = gate.jobs.lock().unwrap();
         assert!(
-            !jobs.iter().any(|j| *j == "Attempt"),
+            !jobs.contains(&"Attempt"),
             "the writer must not take Attempt while Checkpoint holds the transaction: {jobs:?}"
         );
         assert!(
-            jobs.iter().any(|j| *j == "Checkpoint"),
+            jobs.contains(&"Checkpoint"),
             "the checkpoint job was taken: {jobs:?}"
         );
     }
