@@ -116,7 +116,9 @@ pub(super) fn apply(
     let actual = index.sha256();
     let tracked_differs = matches!(input.action, SpecAction::Approve(_))
         && files.tracked_index.as_deref() != Some(index.bytes());
-    if expected != &actual || tracked_differs {
+    let rejecting =
+        matches!(&input.action, SpecAction::Approve(a) if a.decision == SpecDecision::Reject);
+    if !rejecting && (expected != &actual || tracked_differs) {
         let mut details = json!({"expected":expected,"actual":actual});
         if tracked_differs {
             details["tracked"] = json!(files.tracked_index.as_deref().map(specindex::digest));
@@ -125,7 +127,7 @@ pub(super) fn apply(
     }
     // Every decision cites a source the project holds (REQ-030 behaviour 5), checked before anything is written; a
     // REJECT decides on a CR and states nothing.
-    if !matches!(&input.action, SpecAction::Approve(a) if a.decision == SpecDecision::Reject) {
+    if !rejecting {
         super::spec_sources::check(tx, &project, index.decisions())?;
     }
     let question = super::draft_approval::pending(tx, &command.run_id)?;
@@ -380,7 +382,7 @@ fn approve(
     if let Some(base) = base {
         let proposed: Option<(String,String)> = tx.query_row(
             "SELECT c.cr_id,c.base_spec_id FROM change_requests c JOIN events e ON json_extract(e.payload_json,'$.cr_id')=c.cr_id WHERE c.project_id=?1 AND c.state='PROPOSED' AND e.kind='spec.proposed' AND json_extract(e.payload_json,'$.spec_sha256')=?2 ORDER BY e.seq DESC LIMIT 1",
-            params![command.event.project_id,index.sha256()], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
+            params![command.event.project_id,approval.spec_sha256], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
         if proposed.is_none()
             && approval.decision == SpecDecision::Reject
             && super::draft_approval::pending(tx, &command.run_id)?.is_some()
