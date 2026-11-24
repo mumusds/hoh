@@ -167,3 +167,31 @@ Evidence: `.hoh-dev/self-tests/m3flk/flk11-binary-heavy-before-{01..04}.log`,
 `flk11-green.patch` under the same directory. Self-tests, not acceptance. Similar single-sample helpers remain in
 `tests/world/mod.rs` (`Team::hold`), `tests/s5/mod.rs`, `tests/tui_pty.rs`, `tests/m3t10.rs` and recovery fixtures;
 these are unconfirmed out-of-scope risks, not failures reproduced here.
+
+## FLK-12 (fault injection bound to the failed turn)
+
+Developer diagnostics from `7dec042f`, REQ-020 / AC-020-05. The old `FailEnd` armed a one-shot fault at the auth latch,
+consumed it in `before_job("Runner")`, and failed the next `before_commit`. A read-only Runner request (such as
+`runner_waiting`) consumed the arm without committing; the following job reset `failing`, so the turn's end committed
+normally and the test failed at "no commit failed". No product failure was reproduced: the test failed to inject its
+intended fault.
+
+A 700 ms pause immediately after arming reproduced this **8/8** with 6 CPU burners. Replacing the pause by an explicit
+latch barrier, completing two real read-only Runner requests through the same store before releasing the end,
+reproduced it **3/3**. The regression keeps that barrier. A SQLite trigger in this temporary test database now aborts
+only the target attempt's update to FAILED; unrelated transactions and reads cannot consume it. The settle hook
+asserts the end rolled back (the attempt is still RUNNING with no failure_reason), removes the trigger, and preserves
+the original 700 ms hold before recovery. The existing exact `runner_error` count, `cause: "turn"`, auth fact, fallback
+epoch/session and no-pi-unblock assertions remain. The test now follows the TEST-020-05 naming convention:
+`test_020_05_flk12_turn_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block`.
+
+With the same 6 CPU burners and read-request barrier the rate is **3/3 before, 0/20 after**. The complete
+verification_dispatch binary also passed **33/33 twice** under 6 burners. A subsequent static check rejected `expect`
+in the new helper methods; explicit Result handling and diagnostic assertions replace those calls without allowing
+the lint or changing the fault/barrier. The final helper revision is rechecked before delivery.
+
+Evidence under `.hoh-dev/self-tests/m3flk/`: `flk12-pause-before-*`, `flk12-barrier-red-*`, `flk12-barrier-green-*`,
+`flk12-binary-regression-*`, `flk12-final-green-*`, `static-before-commits-*` and `static-fixed-*`; the patch files retain
+the red reproductions, and each `*-results.json` records argv, exit, duration and raw-log digest. The green output
+contains the actual injected SQLite error before recovery. These are scripted-agent product self-tests, not live
+agent evidence or independent acceptance. No production source, AC, requirement, check plan, baseline or gate changed.
