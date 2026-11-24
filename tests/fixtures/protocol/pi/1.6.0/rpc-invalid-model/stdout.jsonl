@@ -1,0 +1,7 @@
+{"type":"extension_ui_request","id":"fc3586d4-1d08-4ae3-af1c-a390c276b577","method":"setStatus","statusKey":"pi-lens-lsp","statusText":"\u001b[39m\u001b[2mLSP Inactive\u001b[22;39m"}
+{"type":"extension_ui_request","id":"429a4789-aa17-40e7-8850-bcc3e389a056","method":"setStatus","statusKey":"smart-context-navigation","statusText":"ctx 0%"}
+{"type":"extension_ui_request","id":"24d25bd5-b14f-4b9a-8b84-a6b61de6b0fa","method":"setStatus","statusKey":"smart-compact-policy"}
+{"type":"extension_ui_request","id":"af68eae3-5374-4824-84c8-dca31a58a4a1","method":"setStatus","statusKey":"smart-context-navigation","statusText":"ctx 0%"}
+{"id":"m1","type":"response","command":"set_model","success":false,"error":"Model not found: hoh-invalid-provider/hoh-invalid-model"}
+{"type":"extension_ui_request","id":"6d1f9bf3-f9ec-4691-aa58-e04e559b087d","method":"setStatus","statusKey":"fff"}
+{"type":"extension_ui_request","id":"61b74e5a-d603-4509-a9f7-6cd00291d50c","method":"setStatus","statusKey":"smart-context-navigation"}

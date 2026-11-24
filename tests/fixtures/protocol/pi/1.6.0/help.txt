@@ -1,0 +1,249 @@
+pi - AI coding assistant with read, bash, edit, write tools
+
+Usage:
+  pi [options] [--] [@files...] [messages...]
+
+Commands:
+  pi install <source> [-l]     Install extension source and add to settings
+  pi remove <source> [-l]      Remove extension source from settings
+  pi uninstall <source> [-l]   Alias for remove
+  pi update [source|self|pi]   Update pi, extensions, or model catalogs
+  pi list                      List installed extensions from settings
+  pi config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  pi auth <command>            Log in or out, print credentials, or check provider readiness
+  pi mcp <command>             Manage MCP servers
+  pi <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
+
+Options:
+  --provider <name>              Provider to search for --model (requires --model)
+  --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
+  --api-key <key>                API key (defaults to env vars)
+  --system-prompt <text>         System prompt (default: coding assistant prompt)
+  --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
+  --mode <mode>                  Output mode: text (default), json, or rpc
+  --print, -p                    Non-interactive mode: process prompt and exit
+  --continue, -c                 Continue the most recent session for the current directory
+  --resume, -r                   Pick a session to resume
+  --session <path|id>            Open a session by file path or full/partial ID
+  --session-id <id>              Use the current directory's existing session with the ID, creating it otherwise
+  --fork <path|id>               Fork a session by file path or full/partial ID into the current directory
+  --session-dir <dir>            Directory for session storage and lookup
+  --no-session                   Don't save session (ephemeral)
+  --name, -n <name>              Set session display name
+  --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
+                                 Supports globs (anthropic/*, *sonnet*) and fuzzy matching
+  --no-tools, -nt                Disable all tools by default (built-in and extension)
+  --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
+  --tools, -t <tools>            Comma-separated allowlist of tool names or patterns (*) to enable
+                                 Keeps MCP tools unless an entry starts with mcp__
+                                 Only +name/-name entries add to or remove from the defaults
+  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                                 Applies to all tools, MCP tools included
+  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
+  --extension, -e <path>         Load an extension file or builtin:<name> (can be used multiple times)
+  --no-extensions, -ne           Disable extension discovery and built-in extensions (explicit -e paths still work)
+  --no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools
+  --skill <path>                 Load a skill file or directory (can be used multiple times)
+  --no-skills, -ns               Disable skills discovery and loading
+  --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
+  --no-prompt-templates, -np     Disable prompt template discovery and loading
+  --theme <path>                 Load a theme file or directory (can be used multiple times)
+  --use-theme <name[/name]>      Set the initial interactive theme for this run
+  --no-themes                    Disable theme discovery and loading
+  --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
+  --export <file> [output]       Export session file to HTML and exit
+  --list-models [search]         List available models (with optional fuzzy search)
+  --verbose                      Force verbose startup (overrides quietStartup setting)
+  --tui-mode <mode>              TUI mode: fullscreen (default) or regular
+  --approve, -a                  Trust project-local files for this run
+  --no-approve, -na              Ignore project-local files for this run
+  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --                             End option parsing; treat remaining arguments as messages/files
+  --help, -h                     Show this help
+  --version, -v                  Show version number
+
+Extensions can register additional flags (e.g., --plan from plan-mode extension).
+Extension CLI Flags:
+  --subagent-max-depth <value>Maximum allowed subagent delegation depth (default: 3).
+  --subagent-prevent-cycles   Block delegating to agents already in the current delegation stack (default: true).
+  --no-subagent-prevent-cyclesDisable subagent delegation cycle prevention.
+  --fff-mode <value>          FFF mode: tools-and-ui | tools-only | override
+  --fff-frecency-db <value>   Path to the frecency database (overrides FFF_FRECENCY_DB env)
+  --fff-history-db <value>    Path to the query history database (overrides FFF_HISTORY_DB env)
+  --fff-enable-root-scan      Allow indexing when launched from the filesystem root (also: FFF_ENABLE_ROOT_SCAN env)
+  --fff-enable-home-scan      Index the home dir when launched from $HOME (default true; disable with --fff-enable-home-scan=false or FFF_ENABLE_HOME_SCAN=0)
+  --fff-follow-symlinks       Index through directory symlinks, e.g. a git worktree or stow layout (default true; disable with --fff-follow-symlinks=false or FFF_FOLLOW_SYMLINKS=0)
+  --fff-warn-home-scan        Warn when indexing $HOME (default true; silence with --fff-warn-home-scan=false or FFF_WARN_HOME_SCAN=0)
+  --no-lens                   Start pi-lens disabled for this session. Re-enable with /lens-toggle. Also via lens.enabled=false in ~/.pi-lens/config.json.
+  --no-lsp                    Disable unified LSP diagnostics and use language-specific fallbacks (for example pyright). Also via lsp.enabled=false in ~/.pi-lens/config.json.
+  --no-autoformat             Disable automatic formatting entirely (deferred format runs at agent_end by default). Also via format.enabled=false in config.
+  --immediate-format          Run automatic formatting immediately after each write/edit instead of deferring to agent_end. Also via format.mode="immediate" in config.
+  --no-autofix                Disable auto-fixing of lint issues (Biome, Ruff, ESLint). Also via autofix.enabled=false in config.
+  --no-tests                  Disable test runner on write. Also via tests.enabled=false in ~/.pi-lens/config.json.
+  --no-delta                  Disable delta mode (show all diagnostics, not just new ones). Also via delta.enabled=false in ~/.pi-lens/config.json.
+  --lens-guard                Experimental: block git commit/push when unresolved pi-lens blockers exist. Also via guard.enabled=true in ~/.pi-lens/config.json.
+  --lens-checkout-guard       Experimental: decline git commands that rewrite the working tree when another live pi-lens session shares this dirty checkout. Also via guard.sharedCheckout=true in ~/.pi-lens/config.json.
+  --no-opengrep               Disable the Opengrep security scanner (a default-on auxiliary LSP; auto-installs, uses repo rules if present, else the registry pack pi-lens refreshes into its cache, else the login-free 'auto' ruleset). Also via opengrep.enabled=false in ~/.pi-lens/config.json.
+  --no-ast-grep               Disable the ast-grep auxiliary LSP server (default-on; serves the bundled and repo ast-grep rules). Also via astGrep.enabled=false in ~/.pi-lens/config.json.
+  --no-zizmor                 Disable the zizmor auxiliary LSP server (default-on; audits GitHub Actions workflows). Also via zizmor.enabled=false in ~/.pi-lens/config.json.
+  --no-typos                  Disable the typos auxiliary LSP server (default-on; flags known misspellings in source and Markdown). Also via typos.enabled=false in ~/.pi-lens/config.json.
+  --lens-spotbugs             Opt-in: run SpotBugs on Java and Kotlin files when a Java build descriptor and a compiled .class directory exist (heavyweight: JVM cold start plus whole-tree analysis). Default off. Also via spotbugs.enabled=true in ~/.pi-lens/config.json.
+  --no-read-guard             Disable read-before-edit behavior monitor. Also via readGuard.enabled=false in ~/.pi-lens/config.json.
+  --no-read-expansion         Disable automatic read widening while keeping the read-before-edit monitor active. Also via readGuard.expandReads=false in ~/.pi-lens/config.json.
+  --no-lens-context           Disable automatic context injection (session-start guidance, turn-end & test findings) while keeping tools, LSP, read-guard, and formatting active. Toggle with /lens-context-toggle. Also via contextInjection.enabled=false in config or PI_LENS_NO_CONTEXT_INJECTION=1.
+  --lens-retain-injections    Opt-in (#4743): re-send each request's injected findings unchanged, at the same place, in every later request of the session, so an exact-prefix prompt cache (a local llama.cpp or Qwen server) keeps the whole conversation. Each retained block is labelled a snapshot; findings are still delivered once. Default off. Also via contextInjection.retain=true in ~/.pi-lens/config.json.
+  --lens-turn-summary         Opt-in: persist a per-turn transcript entry summarizing diagnostics found, autofixes applied, and autoformats applied this turn (#484). Collapsed one-line, expandable in place. Default off. Also via turnSummary.enabled=true in ~/.pi-lens/config.json.
+  --lens-actionable-warnings  Write turn-delta fixable warning reports and inject a short advisory. Also via actionableWarnings.enabled=true in ~/.pi-lens/config.json.
+  --lens-actionable-warning-actionsEnrich actionable-warning reports with LSP code-action titles (requires an active language server). Also via actionableWarnings.includeLspCodeActions=true in ~/.pi-lens/config.json.
+  --lens-actionable-warning-autofixExperimental: apply conservative LSP quickfixes for actionable warnings at agent_end. Also via actionableWarnings.autoFix.enabled=true in config.
+  --lens-actionable-warning-allReport every actionable warning, not just those introduced this turn. Also via actionableWarnings.deltaOnly=false in ~/.pi-lens/config.json.
+  --lens-compact-tool-line    Opt-in (#1327): collapse a pi-lens tool's call+result rows into ONE theme-aware line (status glyph + name + summary) instead of two. Preserves expand-to-view-full-output. Default off. Also via ui.compactToolLine=true in ~/.pi-lens/config.json.
+  --lens-compact-lsp-status   Opt-in (#3099): collapse the footer LSP status to one state glyph per group (LSP ✓ green, LSP ✗ red, dim LSP ✗ when nothing is warm) instead of listing the active server names. Default off. Also via ui.compactLspStatus=true in ~/.pi-lens/config.json.
+  --lens-hide-lsp-status      Opt-in (#3099): publish no pi-lens-lsp footer status at all, so a host that renders extension statuses stops showing the key. Outranks lens-compact-lsp-status when both are set. Default off. Also via ui.hideLspStatus=true in ~/.pi-lens/config.json.
+  --lens-compact-widget       Opt-in (#3959): render the pi-lens widget as ONE summary line (languages + error/warning totals) instead of also stacking file rows, the suppressed count and blocker details below it. Default off. Also via ui.compactWidget=true in ~/.pi-lens/config.json.
+  --lens-issues-status        Opt-in: publish a compact pi-lens-issues footer status (●<N>E, !<N>W, ⚠ <N> unchecked, ✓ clean) projected from the widget header. Default off. Also via ui.issuesStatus=true in ~/.pi-lens/config.json.
+  --no-lazy-tools             Keep every pi-lens tool active for the whole session. Same as tools.lazy=false in ~/.pi-lens/config.json; the default tools.lazy=true starts the situational tools inactive on every model, and tools.lazy="auto" only on models that support mid-conversation system messages.
+  --lens-turn-end-madge       Run the per-turn-end madge circular-dependency check on import-changed files. Off by default: the pass only writes debug output, and user-facing madge diagnostics come from the session-start scan cache + lens_diagnostics. Also via turnEnd.madge.enabled=true in ~/.pi-lens/config.json.
+  --lens-fallow               Opt-in (#4929): run fallow-lsp beside the TypeScript server on JS/TS files, an advisory auxiliary LSP for unused code, duplication and cycles (auto-installs the pinned release; never blocks; knip, jscpd and madge keep running). Default off. Also via fallow.enabled=true in ~/.pi-lens/config.json.
+  --no-knip                   Disable the knip session-start analyzer. Also via knip.enabled=false in config.
+  --no-jscpd                  Disable the jscpd session-start analyzer. Also via jscpd.enabled=false in config.
+  --no-madge                  Disable the madge session-start analyzer. Also via madge.enabled=false in config.
+  --no-gitleaks               Disable the gitleaks session-start analyzer. Also via gitleaks.enabled=false in config.
+  --no-govulncheck            Disable the govulncheck session-start analyzer. Also via govulncheck.enabled=false in config.
+  --no-dead-code              Disable the deadCode session-start analyzer. Also via deadCode.enabled=false in config.
+  --no-complexity             Disable the complexity session-start analyzer. Also via complexity.enabled=false in config.
+  --no-tool <value>           Disable a lens tool for this session (repeatable).
+
+
+Examples:
+  # Print a provider API key for an external client
+  pi auth print-api-key --provider openai
+
+  # Print an OAuth bearer token for an external client (refreshes if expired)
+  pi auth print-bearer-token --provider openai-codex
+
+  # Interactive mode
+  pi
+
+  # Interactive mode with initial prompt
+  pi "List all .ts files in src/"
+
+  # Include files in initial message
+  pi @prompt.md @image.png "What color is the sky?"
+
+  # Non-interactive mode (process and exit)
+  pi -p "List all .ts files in src/"
+
+  # Prompt beginning with a dash
+  pi -p -- "- Summarize these points"
+
+  # Multiple messages (interactive)
+  pi "Read package.json" "What dependencies do we have?"
+
+  # Continue previous session
+  pi --continue "What did we discuss?"
+
+  # Start a named session
+  pi --name "Refactor auth module"
+
+  # Use different model
+  pi --provider openai --model gpt-4o-mini "Help me refactor this code"
+
+  # Use model with provider prefix (no --provider needed)
+  pi --model openai/gpt-4o "Help me refactor this code"
+
+  # Use model with thinking level shorthand
+  pi --model sonnet:high "Solve this complex problem"
+
+  # Limit model cycling to specific models
+  pi --models claude-sonnet,claude-haiku,gpt-4o
+
+  # Limit to a specific provider with glob pattern
+  pi --models "github-copilot/*"
+
+  # Cycle models with fixed thinking levels
+  pi --models sonnet:high,haiku:low
+
+  # Start with a specific thinking level
+  pi --thinking high "Solve this complex problem"
+
+  # Read-only mode (no file modifications possible)
+  pi --tools read,grep,find,ls -p "Review the code in src/"
+
+  # Add codemode to the default tools
+  pi --tools +codemode
+
+  # Codemode with only the tools of one MCP server
+  pi --tools read,bash,codemode,'mcp__radius__*'
+
+  # Disable one tool while keeping the rest available
+  pi --exclude-tools ask_question
+
+  # Export a session file to HTML
+  pi --export ~/.pi/agent/sessions/--path--/session.jsonl
+  pi --export session.jsonl output.html
+
+Environment Variables:
+  ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token
+  ANTHROPIC_API_KEY                - Anthropic Claude API key
+  ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)
+  ANT_LING_API_KEY                 - Ant Ling API key
+  OPENAI_API_KEY                   - OpenAI GPT API key
+  AZURE_OPENAI_API_KEY             - Azure OpenAI API key
+  AZURE_OPENAI_BASE_URL            - Azure OpenAI/Cognitive Services base URL (e.g. https://{resource}.openai.azure.com)
+  AZURE_OPENAI_RESOURCE_NAME       - Azure OpenAI resource name (alternative to base URL)
+  AZURE_OPENAI_API_VERSION         - Azure OpenAI API version (default: v1)
+  AZURE_OPENAI_DEPLOYMENT_NAME_MAP - Azure OpenAI model=deployment map (comma-separated)
+  DEEPSEEK_API_KEY                 - DeepSeek API key
+  NVIDIA_API_KEY                   - NVIDIA NIM API key
+  GEMINI_API_KEY                   - Google Gemini API key
+  GROQ_API_KEY                     - Groq API key
+  CEREBRAS_API_KEY                 - Cerebras API key
+  XAI_API_KEY                      - xAI Grok API key
+  FIREWORKS_API_KEY                - Fireworks API key
+  TOGETHER_API_KEY                 - Together AI API key
+  BASETEN_API_KEY                  - Baseten API key
+  OPENROUTER_API_KEY               - OpenRouter API key
+  AI_GATEWAY_API_KEY               - Vercel AI Gateway API key
+  ZAI_API_KEY                      - ZAI Coding Plan API key (Global)
+  ZAI_CODING_CN_API_KEY            - ZAI Coding Plan API key (China)
+  MISTRAL_API_KEY                  - Mistral API key
+  MINIMAX_API_KEY                  - MiniMax API key
+  MOONSHOT_API_KEY                 - Moonshot AI API key
+  OPENCODE_API_KEY                 - OpenCode Zen/OpenCode Go API key
+  KIMI_API_KEY                     - Kimi For Coding API key
+  META_API_KEY                     - Meta Model API key
+  CLOUDFLARE_API_KEY               - Cloudflare API token (Workers AI and AI Gateway)
+  CLOUDFLARE_ACCOUNT_ID            - Cloudflare account id (required for both)
+  CLOUDFLARE_GATEWAY_ID            - Cloudflare AI Gateway slug (required for AI Gateway)
+  QWEN_TOKEN_PLAN_TEAM_API_KEY     - Qwen Token Plan Team API key (international region)
+  QWEN_TOKEN_PLAN_TEAM_CN_API_KEY  - Qwen Token Plan Team API key (China region)
+  QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY - Qwen Token Plan Individual API key (international region)
+  QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY - Qwen Token Plan Individual API key (China region)
+  XIAOMI_API_KEY                   - Xiaomi MiMo API key (api.xiaomimimo.com billing)
+  XIAOMI_TOKEN_PLAN_CN_API_KEY     - Xiaomi MiMo Token Plan API key (China region)
+  XIAOMI_TOKEN_PLAN_AMS_API_KEY    - Xiaomi MiMo Token Plan API key (Amsterdam region)
+  XIAOMI_TOKEN_PLAN_SGP_API_KEY    - Xiaomi MiMo Token Plan API key (Singapore region)
+  AWS_PROFILE                      - AWS profile for Amazon Bedrock
+  AWS_ACCESS_KEY_ID                - AWS access key for Amazon Bedrock
+  AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
+  AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
+  AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
+  PI_CODING_AGENT_DIR              - Config directory (default: ~/.pi/agent)
+  PI_CODING_AGENT_SESSION_DIR      - Session storage directory (overridden by --session-dir)
+  PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
+  PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
+  PI_SELF_UPDATE_COMMAND           - Command pi update runs to update pi itself ({packageName}, {version}, {installSpec})
+  PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
+  PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+
+Built-in Tool Names:
+  read       - Read file contents
+  bash       - Execute bash commands
+  powershell - Execute PowerShell commands on Windows
+  edit       - Edit files with find/replace
+  write      - Write files (creates/overwrites)
+  grep       - Search file contents (read-only, off by default)
+  find       - Find files by glob pattern (read-only, off by default)
+  ls         - List directory contents (read-only, off by default)
+

@@ -1,6 +1,6 @@
 {
   "schema_version": "1.3",
-  "recorded_at": "2026-11-04T15:12:33.745293+00:00",
+  "recorded_at": "2026-11-24T06:08:50.345368+00:00",
   "recorder": "tests/fixtures/protocol/record.py",
   "hash_algorithms": {
     "tree_sha256": "sha256 over the sorted lines '<relative path> <sha256 of file>\\n' of every file under root.",
@@ -290,6 +290,68 @@
               "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
               "stdin.txt": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208",
               "stdout.jsonl": "f90174d9a4d8f3cbd80fbbbce2e9e18350ecf5bb500bdb76be5bfb3d3704d175"
+            }
+          }
+        }
+      },
+      "1.6.0": {
+        "cli_version": "1.6.0",
+        "auth": "AUTHENTICATED (live turn recorded)",
+        "recording_started_at": "2026-11-24T06:08:14.680270+00:00",
+        "recorded_at": "2026-11-24T06:08:50.325540+00:00",
+        "help_argv": [
+          "pi",
+          "--help"
+        ],
+        "help_sha256": "47b6540cc4a044faf530ad87009cbc75b2160fd2546b6866e5162d0938968c26",
+        "entry_path": "/home/ai/.pi/agent/bin/pi",
+        "entry_sha256": "da0c6a49fe94aadc9765cc7afc6ba6b17e553eed0247d0385c160bc188f5cfbb",
+        "package_path": "/home/ai/.pi/agent/install/releases/1.6.0/node_modules/@earendil-works/pi-coding-agent",
+        "package_tree_sha256": "8d0c22d8a532fa88d23f1c7db2c8dbaa0ffd5495f6d1fe199904d893bc663093",
+        "cases": {
+          "rpc-abort": {
+            "valid": true,
+            "files": {
+              "meta.json": "3e229b1641f728ceaf26b4a9599f53a64ce25c6e85c2e1e98ef8509321cc379e",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "99c7a505677996869c7e80f94fd4ed338250cc63a7b03f00f3449de33029587c",
+              "stdout.jsonl": "f2920cf60e8e27ed91688475d976379c6fb41e72a395732cf5123c23e000ed0b"
+            }
+          },
+          "rpc-invalid-model": {
+            "valid": true,
+            "files": {
+              "meta.json": "efef293b26b192c8a0972050a2e2266032eba001a5a32fbe730a2940653d1823",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "77b54378e1f3a24beebb63b77a2e554caf074ea292bd3574e6c3b294323603f8",
+              "stdout.jsonl": "2f9b888c2b529530326b7751769f844672be3fa3f191b18c73a23ef9442053de"
+            }
+          },
+          "rpc-no-provider": {
+            "valid": true,
+            "files": {
+              "meta.json": "782a256f4d812ea79eadeec2dd17e6af14fc95607bf86d6e5633a4ec8dd75b70",
+              "stderr.log": "77801c41c929bf9199f40171d491eb3e8fd2c4bcd65ddc8be766b9c1096460e5",
+              "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
+              "stdout.jsonl": "f48bde06f5a3fd0dec35dd8ff4b865e636ba5a40c3b08e82888af0c401fef6ee"
+            }
+          },
+          "rpc-prompt": {
+            "valid": true,
+            "files": {
+              "meta.json": "afa0159cce0a7a267957e8fc9b27bf683dec0a913970c572ca4763a99c76b3fd",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "c10609ca526f2f0fb90a158f37860942b2a62f702030f7e4144680c7c55cae32",
+              "stdout.jsonl": "d1c2f6c375e0a80010b1060fe49b0547eaa2f3a3f45b283f77a1eae9b5d7b3d7"
+            }
+          },
+          "rpc-resume": {
+            "valid": true,
+            "files": {
+              "meta.json": "25e8f78f3302bce7ecfbd3516e9929ce18fe374dd1a174c11f4be1719cfce7e1",
+              "stderr.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdin.txt": "0d6bc083e013717442b2e8de57f30d3ccbd82b1893a49540fa915634ad8b7208",
+              "stdout.jsonl": "ec81b4130494f220eb78a6ce92f39e7783b50711c431722609ce1a668fa95f02"
             }
           }
         }
