@@ -3434,6 +3434,91 @@ async fn test_007_02_mode_change_waits_for_the_safe_point() -> R {
     Ok(())
 }
 
+/// The writer's `Mode` requests (each one a transaction of SetMode's safe point), counted before each begins, and the
+/// runner's ticks (after their staffing).
+#[derive(Debug, Default)]
+struct ModeJobs {
+    mode: std::sync::atomic::AtomicU64,
+    tick: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl hoh_core::persistence::FaultHooks for ModeJobs {
+    fn before_job(&self, job: &'static str) {
+        if job == "Mode" {
+            self.mode.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paced_run_with_no_pending_mode_change_takes_no_mode_step() -> R {
+    // M3F-03 (b): the runner's tick takes SetMode's safe-point step only for a run with a pending mode change
+    // (`waiting.mode_changes`), not for every paced run; a pending change is still applied once its writer ends.
+    let dir = tempfile::Builder::new().prefix("m3f03-mode-").tempdir()?;
+    let release = dir.path().join("release");
+    let script = format!(
+        "while [ ! -f '{}' ]; do sleep 0.02; done",
+        release.display()
+    );
+    let agents = Arc::new(Agents::new(&[("T1", &script)]));
+    let _leaders = Leaders(agents.leaders.clone());
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        &format!("{WORLD}UPDATE runs SET mode = 'BUILD' WHERE run_id = 'R';"),
+    )?;
+    let jobs = Arc::new(ModeJobs::default());
+    let mut config = config(&project);
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: agents.clone(),
+        context: context(),
+    });
+    config.store.faults = jobs.clone();
+    config.hooks = Arc::new(CountTicks(jobs.tick.clone()));
+    let host = start_when_free(config).await?;
+    until(
+        &project,
+        "SELECT state FROM attempts WHERE task_id = 'T1'",
+        "RUNNING",
+        Duration::from_secs(10),
+    )
+    .await?;
+    // Five whole ticks with R paced and no mode change pending.
+    let from = jobs.tick.load(Ordering::SeqCst) + 1;
+    let end = Instant::now() + Duration::from_secs(30);
+    while jobs.tick.load(Ordering::SeqCst) < from + 5 {
+        if Instant::now() > end {
+            return Err("the runner did not tick five times".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        jobs.mode.load(Ordering::SeqCst),
+        0,
+        "a Mode request for a run with no pending mode change"
+    );
+    let revision = seq(&project, "SELECT revision FROM runs WHERE run_id = 'R'")?;
+    let request = json!({
+        "schema_version": "1.0", "command_id": "plan", "idempotency_key": "plan",
+        "expected_revision": revision, "kind": "SetMode", "run_id": "R", "payload": {"mode": "PLAN"}
+    });
+    let (status, accepted) = command(&host, &request).await?;
+    assert_eq!(status, 202, "SetMode must be accepted: {accepted}");
+    std::fs::write(&release, "go")?;
+    until(
+        &project,
+        "SELECT mode FROM runs WHERE run_id = 'R'",
+        "PLAN",
+        Duration::from_secs(15),
+    )
+    .await?;
+    assert!(jobs.mode.load(Ordering::SeqCst) > 0);
+    host.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_007_02_latest_pending_target_survives_host_restart() -> R {
     let dir = tempfile::Builder::new()
