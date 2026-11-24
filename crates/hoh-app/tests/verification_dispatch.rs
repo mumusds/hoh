@@ -3974,6 +3974,31 @@ async fn a_late_auth_failure_of_a_replaced_pi_does_not_block_qa() -> R {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turns_auth_failure_while_pi_says_logged_in_switches_qa_to_its_fallback() -> R {
+    turn_auth_failure_switches_qa(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turns_auth_failure_is_the_turns_block_even_when_ticks_pass_between_its_latch_and_its_commit()
+-> R {
+    // FLK-09: the end of qa's failed turn is held for 700 ms (over three runner ticks) after the registry latched its
+    // BLOCKED_AUTH and before the end is committed. No tick's staffing judges the latched fact before that commit, so
+    // pi's binding is blocked by the turn (`cause: "turn"`, with its attempt), not first by staffing.
+    turn_auth_failure_switches_qa(true).await
+}
+
+/// Holds an attempt's end for 700 ms where its turn's BLOCKED_AUTH was latched and its end is not committed yet.
+#[derive(Debug)]
+struct HoldLatch;
+
+impl hoh_app::host::HostHooks for HoldLatch {
+    fn turn_auth_latched(&self, _attempt_id: &str) {
+        std::thread::sleep(Duration::from_millis(700));
+    }
+}
+
+/// TEST-020-03's world with TEST-020-02's team: qa's turn as pi fails BLOCKED_AUTH while pi's status command says it is
+/// logged in; with `hold_latch`, its end is held between the latch and the commit ([`HoldLatch`]).
+async fn turn_auth_failure_switches_qa(hold_latch: bool) -> R {
     // AC-020-05's then-clause on the product path (docs/adr/ADR-030.md decisions 2 and 4 to 7, M2T15R-50):
     // TEST-020-03's world with TEST-020-02's team (qa pi falling back to claude), pi logged in and registered. qa's
     // turn runs as pi and fails BLOCKED_AUTH under pi's current identity while pi's status command keeps saying it is
@@ -3993,7 +4018,24 @@ async fn a_turns_auth_failure_while_pi_says_logged_in_switches_qa_to_its_fallbac
         *fails_as = Some("pi".to_owned());
     }
     let registry = hoh_app::host::Executor::registry(&*team).ok_or("no registry")?;
-    let host = host(&project, team.clone(), clock.clone()).await?;
+    let host = if hold_latch {
+        let mut config = config(&project);
+        config.clock = hoh_app::host::HostClock(clock.clone());
+        config.runner = Some(hoh_app::host::RunnerConfig {
+            executor: team.clone(),
+            context: Context {
+                required_capabilities: ["commander", "developer", "qa", "reviewer", "researcher"]
+                    .map(|r| (r.to_owned(), Default::default()))
+                    .into(),
+                commander_dir: project.parent().map(|d| d.join("state/hoh/commander")),
+                ..Context::default()
+            },
+        });
+        config.hooks = Arc::new(HoldLatch);
+        Host::start(config).await?
+    } else {
+        host(&project, team.clone(), clock.clone()).await?
+    };
     let outcome = async {
         let step = Duration::from_millis(100);
         let first = wait_for(
@@ -4173,7 +4215,11 @@ async fn a_turns_auth_failure_while_pi_says_logged_in_switches_qa_to_its_fallbac
             )))
         );
         keep(
-            "auth-latch-product-path",
+            if hold_latch {
+                "auth-latch-product-path-held"
+            } else {
+                "auth-latch-product-path"
+            },
             &json!({
                 "probe": probe,
                 "attempts": rows(&project, "SELECT a.attempt_id, t.role, a.state, a.agent, a.session_id, a.role_epoch, a.failure_reason FROM attempts a JOIN tasks t ON t.task_id = a.task_id ORDER BY a.rowid")?,

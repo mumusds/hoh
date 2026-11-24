@@ -302,6 +302,11 @@ struct Common {
     runs: std::path::PathBuf,
     /// The inactivity watchdog of its attempts (docs/adr/ADR-022.md decision 19).
     watchdog: super::Watchdog,
+    /// Held by a tick from its registry snapshot to the end of its staffing writes, and by an attempt's end from the
+    /// registry's latch of its turn's BLOCKED_AUTH to the commit of that end (FLK-09): staffing never judges a latched
+    /// fact whose turn's end is not committed yet, which would block the binding first (cause staffing) and leave the
+    /// end's `team.binding_blocked{cause: "turn"}` unwritten (docs/adr/ADR-030.md decision 6).
+    latching: tokio::sync::Mutex<()>,
 }
 
 impl Common {
@@ -360,6 +365,7 @@ pub(super) async fn run(
         unsupervised: std::sync::Mutex::default(),
         runs: crate::verify::rundir::root(config.context.commander_dir.as_deref()),
         watchdog,
+        latching: tokio::sync::Mutex::new(()),
     });
     let registry = config.executor.registry();
     // The project's compat manifest into the registry, the leftovers of a publication that crashed deleted, before the
@@ -853,6 +859,8 @@ async fn tick(
     let mut context = context.clone();
     let mut staffed = false;
     if let Some(registry) = &registry {
+        // No attempt's end between its latch and its commit (`Common::latching`).
+        let _latching = common.latching.lock().await;
         let snapshot = registry.snapshot(common.host_epoch);
         context.observations = Some(snapshot.observations.clone());
         context.staffing = Some(snapshot.clone());
@@ -1997,22 +2005,29 @@ async fn finished<T, F>(
 where
     F: std::future::Future<Output = Result<T, PersistError>>,
 {
-    if !ending.success
-        && ending.class == FailureClass::Auth
-        && let (Some(ran), Some(registry)) = (ran, common.executor.registry())
-        && let Some(said) = registry.turn_auth_failed(ran, id)
-    {
-        ending.observed.events.push((
-            "registry/turn-auth".to_owned(),
-            said.kind.to_owned(),
-            json!({"attempt_id": id, "agent": ran.agent.as_str(), "detail": said.detail}),
-        ));
-    }
     if !ending.success || ending.unknown_effect {
         ending.observed.draft_boundary =
             super::drafting::boundary(&common.shared.store, &common.shared.root, id).await;
     }
-    hand(ending).await
+    // From the latch to the end's commit no tick's staffing judges the registry (`Common::latching`, FLK-09).
+    let mut latching = None;
+    if !ending.success
+        && ending.class == FailureClass::Auth
+        && let (Some(ran), Some(registry)) = (ran, common.executor.registry())
+    {
+        latching = Some(common.latching.lock().await);
+        if let Some(said) = registry.turn_auth_failed(ran, id) {
+            ending.observed.events.push((
+                "registry/turn-auth".to_owned(),
+                said.kind.to_owned(),
+                json!({"attempt_id": id, "agent": ran.agent.as_str(), "detail": said.detail}),
+            ));
+        }
+        common.shared.hooks.turn_auth_latched(id);
+    }
+    let handed = hand(ending).await;
+    drop(latching);
+    handed
 }
 
 /// Serve request `n` of `work` through the existing bridge (ADR-028, ADR-037): 1 when it was
