@@ -52,6 +52,7 @@ fn executor(project: &Path) -> ProductExecutor {
         PathBuf::from("hoh"),
         (Duration::from_secs(10), Duration::from_secs(5)),
     )
+    .with_global_root(None)
 }
 
 fn contract(text: &str) -> hoh_core::prompt::Resolved {
@@ -1607,5 +1608,118 @@ fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::erro
             .iter()
             .any(|a| a.sha256 == sha && a.kind == "resource_drift")
     );
+    Ok(())
+}
+
+// M3LC-05/M3LC-50: corrupt or absent immutable input needs a decision, never a checkpoint retry.
+#[test]
+fn test_047_03_unreadable_old_pin_stays_decision() -> Result<(), Box<dyn std::error::Error>> {
+    for fault in ["missing", "digest", "decode", "identity"] {
+        let dir = tempfile::Builder::new().prefix("m3low-c-pin-").tempdir()?;
+        let mut old = hoh_core::resource_bundle::Bundle::current();
+        old.insert_file("resources/prompts/developer.md", "old developer\n");
+        let mut pin = old.store(dir.path())?;
+        let path = dir
+            .path()
+            .join(hoh_core::objects::relative_path(&pin.bundle_sha256));
+        match fault {
+            "missing" => std::fs::remove_file(path)?,
+            "digest" => std::fs::write(path, "corrupt bytes")?,
+            "decode" => pin.bundle_sha256 = hoh_core::objects::put(dir.path(), b"not json")?,
+            "identity" => pin.resource_bundle_version = "not-the-bytes".to_owned(),
+            _ => unreachable!(),
+        }
+        let mut w = work(None);
+        w.assignment.resource_bundle = Some(pin);
+        let err = executor(dir.path())
+            .pack(&w, &contract("contract"), None, false)
+            .err()
+            .ok_or("packed invalid pin")?;
+        assert_eq!(err.reason, "PROMPT_UNAVAILABLE", "{fault}: {err:?}");
+        assert_eq!(err.class, FailureClass::Decision, "{fault}: {err:?}");
+    }
+    Ok(())
+}
+
+// A real prepare path with a recorded-protocol fake registry, without starting a live agent.
+fn prepare_fixture(root: &Path) -> Result<(ProductExecutor, Work), Box<dyn std::error::Error>> {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    fake_codex(&bin, "m3low-c-prepare")?;
+    let registry = verified_codex(&bin, root)?;
+    let b = match registry.fact(Agent::Codex) {
+        Some(Fact::Usable(usable)) if usable.compat == Compat::Verified => *usable,
+        other => return Err(format!("not verified: {other:?}").into()),
+    };
+    let mut w = work(None);
+    w.assignment.agent = Some("codex".to_owned());
+    w.assignment.agent_version = Some(b.version);
+    w.assignment.session_capabilities = Some(b.session);
+    w.assignment.session_identity = Some(b.identity);
+    Ok((
+        ProductExecutor::new(
+            registry,
+            root.to_owned(),
+            PathBuf::from("hoh"),
+            (Duration::from_secs(10), Duration::from_secs(5)),
+        )
+        .with_global_root(Some(root.join("global"))),
+        w,
+    ))
+}
+
+#[tokio::test]
+async fn test_047_03_prepare_incompatible_builtin_is_transient()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (configured, builtin) in [(None, "developer"), (Some("builtin:qa"), "qa")] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3low-c-prepare-")
+            .tempdir()?;
+        let (exec, mut w) = prepare_fixture(dir.path())?;
+        let mut old = hoh_core::resource_bundle::Bundle::current();
+        old.insert_file(
+            format!("resources/prompts/{builtin}.md"),
+            "{{LEGACY_CONTEXT}}",
+        );
+        w.assignment.prompt = configured.map(str::to_owned);
+        w.assignment.resource_bundle = Some(old.store(dir.path())?);
+        let err = exec
+            .prepare(&w)
+            .err()
+            .ok_or("prepared incompatible builtin")?;
+        assert_eq!(
+            err.class,
+            FailureClass::Transient { retry_after: None },
+            "{configured:?}: {err:?}"
+        );
+        assert_eq!(err.reason, "PROMPT_UNAVAILABLE");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_045_03_prepare_user_override_error_stays_decision()
+-> Result<(), Box<dyn std::error::Error>> {
+    for layer in ["project", "global"] {
+        let dir = tempfile::Builder::new()
+            .prefix("m3low-c-override-")
+            .tempdir()?;
+        let (exec, mut w) = prepare_fixture(dir.path())?;
+        let mut old = hoh_core::resource_bundle::Bundle::current();
+        old.insert_file("resources/prompts/developer.md", "{{LEGACY_CONTEXT}}");
+        w.assignment.resource_bundle = Some(old.store(dir.path())?);
+        let path = if layer == "project" {
+            dir.path().join(".hoh/prompts/developer.md")
+        } else {
+            dir.path().join("global/prompts/developer.md")
+        };
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, "{{USER_UNKNOWN}}")?;
+        let err = exec.prepare(&w).err().ok_or("prepared bad user override")?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(err.class, FailureClass::Decision, "{layer}: {err:?}");
+        assert_eq!(err.reason, "PROMPT_VARIABLE_MISSING");
+        assert_eq!(err.details.unwrap()["variable"], "USER_UNKNOWN");
+    }
     Ok(())
 }
