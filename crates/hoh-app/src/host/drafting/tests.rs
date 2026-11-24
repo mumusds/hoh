@@ -18,6 +18,9 @@ fn repo() -> R<tempfile::TempDir> {
     Ok(dir)
 }
 fn docs(root: &Path) -> R {
+    docs_with_commit(root, &["commit", "-q", "-m", "draft"])
+}
+fn docs_with_commit(root: &Path, commit: &[&str]) -> R {
     std::fs::create_dir_all(root.join("docs/spec"))?;
     let source = hoh_core::specindex::Source {
         path: "docs/spec/main.md".into(),
@@ -33,7 +36,7 @@ fn docs(root: &Path) -> R {
     let index = hoh_core::specindex::generate_index(&[source])?;
     std::fs::write(root.join(hoh_core::specindex::PATH), index.bytes())?;
     git(root, &["add", "docs/spec"])?;
-    git(root, &["commit", "-q", "-m", "draft"])
+    git(root, commit)
 }
 #[test]
 fn test_008_02_draft_completion_requires_committed_canonical_index() -> R {
@@ -282,6 +285,188 @@ fn test_008_02_m3l250_unchanged_untracked_docs_need_no_commit() -> R {
         WriterOutcome::Correct { .. }
     ));
     Ok(())
+}
+
+fn predirty_doc(staged: bool) -> R<tempfile::TempDir> {
+    let dir = repo()?;
+    std::fs::create_dir_all(dir.path().join("docs"))?;
+    std::fs::write(dir.path().join("docs/notes.md"), "committed user notes")?;
+    git(dir.path(), &["add", "docs/notes.md"])?;
+    git(dir.path(), &["commit", "-qm", "user baseline"])?;
+    std::fs::write(dir.path().join("docs/notes.md"), "uncommitted user notes")?;
+    if staged {
+        git(dir.path(), &["add", "docs/notes.md"])?;
+    }
+    Ok(dir)
+}
+
+fn unchanged_predirty_doc(staged: bool) -> R {
+    let dir = predirty_doc(staged)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    // Commit only the draft, preserving the user's staged delta as well as its working bytes.
+    docs_with_commit(
+        root,
+        &["commit", "-q", "-m", "draft", "--only", "--", "docs/spec"],
+    )?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/notes.md"))?,
+        "uncommitted user notes"
+    );
+    assert_eq!(
+        observe_git(root, &["show", "HEAD:docs/notes.md"], OBSERVATION_LIMIT)?,
+        b"committed user notes"
+    );
+    let changed = git_paths(root, &["diff", "--cached", "--name-only", "-z", "HEAD"])?;
+    assert_eq!(changed.contains(b"docs/notes.md".as_slice()), staged);
+    assert!(dirty(root, true)?.contains(b"docs/notes.md".as_slice()));
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l502_unchanged_unstaged_tracked_docs_need_no_commit() -> R {
+    unchanged_predirty_doc(false)
+}
+
+#[test]
+fn test_008_02_m3l502_unchanged_staged_tracked_docs_need_no_commit() -> R {
+    unchanged_predirty_doc(true)
+}
+
+#[test]
+fn test_008_02_m3l502_preexisting_tracked_deletion_needs_no_commit() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    std::fs::remove_file(root.join("docs/notes.md"))?;
+    let start = snapshot(root);
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    assert!(!root.join("docs/notes.md").exists());
+    assert_eq!(
+        observe_git(root, &["show", "HEAD:docs/notes.md"], OBSERVATION_LIMIT)?,
+        b"committed user notes"
+    );
+    Ok(())
+}
+
+fn assert_predirty_ownership_uncertain(root: &Path, start: &Value) -> R {
+    let error = checked(root, start).unwrap_err();
+    assert!(
+        error.contains("ownership uncertain") && error.contains("docs/notes.md"),
+        "{error}"
+    );
+    // The completion adapter must classify it as observation_failed (empty paths), not a
+    // correctable must-commit refusal. It runs the write boundary before validating a result.
+    let identity = hoh_core::bridge::Identity {
+        run_id: "R".into(),
+        task_id: "D".into(),
+        attempt_id: "A".into(),
+        role: "cto".into(),
+        role_epoch: 1,
+    };
+    let mut ending = Ending {
+        success: true,
+        detail: "scripted draft".into(),
+        class: hoh_core::retry::FailureClass::Decision,
+        at: std::time::SystemTime::now(),
+        draw: 0,
+        observed: Default::default(),
+        unknown_effect: false,
+    };
+    assert!(
+        matches!(outcome(root, &identity, &mut ending, start), WriterOutcome::DraftBlocked { paths, .. } if paths.is_empty())
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l502_changed_predirty_tracked_doc_has_uncertain_owner() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    docs(root)?;
+    std::fs::write(root.join("docs/notes.md"), "changed during draft")?;
+    assert_predirty_ownership_uncertain(root, &start)?;
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/notes.md"))?,
+        "changed during draft"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l502_committed_change_of_predirty_doc_has_uncertain_owner() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    docs(root)?;
+    std::fs::write(
+        root.join("docs/notes.md"),
+        "changed and committed during draft",
+    )?;
+    git(root, &["add", "docs/notes.md"])?;
+    git(root, &["commit", "-qm", "changed user notes"])?;
+    let end = head(root)?;
+    assert_predirty_ownership_uncertain(root, &start)?;
+    assert_eq!(head(root)?, end, "the user's commit is retained");
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l502_committing_unchanged_user_delta_has_uncertain_owner() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    docs(root)?;
+    git(root, &["add", "docs/notes.md"])?;
+    git(root, &["commit", "-qm", "user delta included in draft"])?;
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
+fn test_008_04_m3l502_deleted_predirty_tracked_doc_has_uncertain_owner() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    docs(root)?;
+    std::fs::remove_file(root.join("docs/notes.md"))?;
+    assert_predirty_ownership_uncertain(root, &start)?;
+    assert!(!root.join("docs/notes.md").exists());
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l502_mode_changed_predirty_tracked_doc_has_uncertain_owner() -> R {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let start = snapshot(root);
+    docs(root)?;
+    let path = root.join("docs/notes.md");
+    let mut permissions = std::fs::metadata(&path)?.permissions();
+    permissions.set_mode(permissions.mode() ^ 0o100);
+    std::fs::set_permissions(&path, permissions)?;
+    assert_predirty_ownership_uncertain(root, &start)
+}
+
+#[test]
+fn test_008_04_m3l502_old_predirty_start_without_digests_is_uncertain() -> R {
+    let dir = predirty_doc(false)?;
+    let root = dir.path();
+    let mut start = snapshot(root);
+    start
+        .as_object_mut()
+        .ok_or("snapshot object")?
+        .remove("draft_tracked");
+    docs(root)?;
+    assert_predirty_ownership_uncertain(root, &start)
 }
 
 #[test]
