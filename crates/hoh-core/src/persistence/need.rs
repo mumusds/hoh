@@ -245,6 +245,14 @@ pub enum RunReason {
     /// The project's detected test commands, to run once into the baseline only when the user confirms (REQ-028
     /// behaviour 3, O3; docs/adr/ADR-039.md decision 8).
     BaselineTests,
+    /// The committed draft awaits the user’s specification decision.
+    SpecApproval,
+    /// The drafter needs user input before another attempt.
+    DraftQuestion,
+    /// BUILD cannot repair content gaps without the user choosing another mode.
+    BuildReadiness,
+    /// A deterministic draft dispatch refusal, retryable after user repair.
+    DraftUnavailable,
 }
 
 impl RunReason {
@@ -253,6 +261,10 @@ impl RunReason {
         RunReason::NoSpec,
         RunReason::Stalled,
         RunReason::BaselineTests,
+        RunReason::SpecApproval,
+        RunReason::DraftQuestion,
+        RunReason::BuildReadiness,
+        RunReason::DraftUnavailable,
     ];
 
     /// Its name: the `reason` of its `need_decision` and of its question.
@@ -261,6 +273,10 @@ impl RunReason {
             RunReason::NoSpec => "no_spec",
             RunReason::Stalled => "stalled",
             RunReason::BaselineTests => "baseline_tests",
+            RunReason::SpecApproval => "spec_approval",
+            RunReason::DraftQuestion => "draft_question",
+            RunReason::BuildReadiness => "build_readiness",
+            RunReason::DraftUnavailable => "draft_unavailable",
         }
     }
 
@@ -270,6 +286,10 @@ impl RunReason {
             RunReason::NoSpec => 0,
             RunReason::Stalled => 1,
             RunReason::BaselineTests => 2,
+            RunReason::SpecApproval => 3,
+            RunReason::DraftQuestion => 4,
+            RunReason::BuildReadiness => 5,
+            RunReason::DraftUnavailable => 6,
         }
     }
 

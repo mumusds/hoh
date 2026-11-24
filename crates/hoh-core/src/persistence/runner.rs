@@ -178,6 +178,9 @@ pub(super) enum RunnerJob {
     },
     /// A run's readiness step (docs/adr/ADR-035.md decisions 4 and 8).
     Readiness(String),
+    DraftStep(String, bool),
+    DraftDispatch(String, Box<crate::decision::Context>),
+    DraftInit(String),
     /// One look at a run as a whole (ADR-020 decisions 4, 5 and 7).
     Pace {
         run_id: String,
@@ -252,6 +255,8 @@ pub struct Ending {
 /// so a full writer queue cannot lose it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Observed {
+    /// The host's Task-level draft boundary observation, applied atomically with the ending.
+    pub draft_boundary: Option<(String, Vec<String>)>,
     /// The model the agent ran (REQ-018: recorded after the attempt).
     pub resolved_model: Option<String>,
     pub usage: Option<serde_json::Value>,
@@ -488,6 +493,15 @@ pub(super) fn run(
             super::team::checkpoint(conn, &run_id, &availability, ctx).map(RunnerDone::Applied)
         }
         RunnerJob::Mode(run) => super::modes::step(conn, &run, ctx).map(RunnerDone::Applied),
+        RunnerJob::DraftStep(run, discovered) => {
+            super::drafting::step(conn, &run, discovered, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::DraftDispatch(run, context) => {
+            super::drafting::dispatch(conn, &run, &context, ctx).map(RunnerDone::Applied)
+        }
+        RunnerJob::DraftInit(attempt) => {
+            super::drafting::prepare_init(conn, &attempt, ctx).map(RunnerDone::Applied)
+        }
         RunnerJob::Readiness(run_id) => {
             super::readiness::settle(conn, &run_id, ctx).map(RunnerDone::Applied)
         }
@@ -564,7 +578,7 @@ fn waiting(
              AND json_extract(o.payload_json, '$.kind') IS 'dispatch' AND a.state = 'PREPARED' \
              AND (r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
                   OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
-                      AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) \
+                      AND json_extract(o.payload_json, '$.origin') NOT IN ('spec_review','spec_draft'))) \
              ORDER BY o.event_seq",
         )
         .map_err(sqlite_error)?;
@@ -788,14 +802,62 @@ fn received(
             "SELECT r.state IN ('CREATED', 'DISCOVERING', 'SPECIFYING', 'READY', 'RUNNING', 'VERIFYING') \
              OR (r.state IN ('BLOCKED', 'WAITING_EXTERNAL') AND EXISTS (SELECT 1 FROM outbox o WHERE o.message_id = ?2 \
                  AND json_extract(o.payload_json, '$.origin') IS NOT NULL \
-                 AND json_extract(o.payload_json, '$.origin') IS NOT 'spec_review')) FROM runs r WHERE r.run_id = ?1",
+                 AND json_extract(o.payload_json, '$.origin') NOT IN ('spec_review','spec_draft'))) FROM runs r WHERE r.run_id = ?1",
             params![notice.run_id, notice.message_id],
             |r| r.get(0),
         )
         .optional()
         .map_err(sqlite_error)?
         .unwrap_or(false);
-    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) || !working {
+    if taken != 1 || prepared.as_deref() != Some(AttemptState::Prepared.as_str()) {
+        return Ok(false);
+    }
+    if super::drafting::is_draft(&tx, &notice.task_id)?
+        && let Err(refusal) = super::admission::admit_one(
+            &tx,
+            &notice.run_id,
+            &notice.task_id,
+            super::admission::By::Draft,
+        )?
+    {
+        // PREPARED is proof that no process gate opened. End the leased attempt here, atomically with its receipt,
+        // instead of retaining a notice that the pending mode and writer safe point would wait on forever.
+        tx.execute(
+            "INSERT INTO receipts(consumer,message_id,applied_at,result_json) VALUES(?1,?2,?3,?4)",
+            params![
+                RUNNER,
+                notice.message_id,
+                crate::time::rfc3339_utc(at),
+                json!({"refused":notice.attempt_id}).to_string()
+            ],
+        )
+        .map_err(sqlite_error)?;
+        finish_in(
+            &tx,
+            &notice.attempt_id,
+            &Ending {
+                success: false,
+                detail: format!("draft start admission refused: {refusal:?}"),
+                class: crate::retry::FailureClass::Transient { retry_after: None },
+                at,
+                draw: 0,
+                observed: Observed {
+                    events: vec![(
+                        "draft/start-refused".into(),
+                        "spec.draft_start_refused".into(),
+                        json!({"attempt_id":notice.attempt_id,"proof":"not_started","refusal":format!("{refusal:?}")}),
+                    )],
+                    ..Observed::default()
+                },
+                unknown_effect: false,
+            },
+            true,
+            ctx,
+        )?;
+        writer::commit(tx, ctx)?;
+        return Ok(false);
+    }
+    if !working {
         return Ok(false);
     }
     let now = crate::time::rfc3339_utc(at);
@@ -1159,17 +1221,51 @@ fn running(
             |r| r.get(0),
         )
         .map_err(sqlite_error)?;
-    if !can_start || task_state == TaskState::Cancelled {
-        return Ok(false);
-    }
+    let draft = super::drafting::is_draft(&tx, &task_id)?;
+    let refused = !can_start
+        || task_state == TaskState::Cancelled
+        || (draft
+            && super::admission::admit_one(&tx, &run_id, &task_id, super::admission::By::Draft)?
+                .is_err());
     let key = crate::reconcile::work_key(attempt_id);
-    let started = tx
-        .execute(
+    let started = if refused {
+        0
+    } else {
+        tx.execute(
             "UPDATE effects SET state = 'STARTED' WHERE effect_key = ?1 AND attempt_id = ?2 AND state = 'PREPARED'",
             params![key, attempt_id],
-        )
-        .map_err(sqlite_error)?;
+        ).map_err(sqlite_error)?
+    };
     if started != 1 {
+        // A closed gate still has a process, including when the work effect changed (M3L-303).
+        // Preserve its identity before any termination attempt (M3L-252),
+        // without marking work STARTED or changing the Attempt state. Reconcile must never infer NoPid here.
+        if draft
+            && let (Some(pid), Some(boot), Some(start)) =
+                (facts.pid, &facts.boot_id, &facts.process_start_id)
+        {
+            let changed = tx.execute(
+                "UPDATE attempts SET pid=?2,boot_id=?3,process_start_id=?4 WHERE attempt_id=?1 AND state='STARTING' \
+                 AND (pid IS NULL OR (pid=?2 AND boot_id=?3 AND process_start_id=?4))",
+                params![attempt_id,pid,boot,start]).map_err(sqlite_error)?;
+            if changed == 1 {
+                writer::write(
+                    &tx,
+                    &Commit {
+                        events: vec![event(
+                            &project_id,
+                            &run_id,
+                            child_id(attempt_id, "tracking"),
+                            "attempt.tracking",
+                            tracking,
+                        )],
+                        ..Commit::default()
+                    },
+                    ctx,
+                )?;
+                writer::commit(tx, ctx)?;
+            }
+        }
         return Ok(false);
     }
     let at = facts
@@ -1455,7 +1551,17 @@ pub(super) fn finished_in(
     ending: &Ending,
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
-    let (task_id, task_state, revision, run_id, project_id) = task_of(tx, attempt_id)?;
+    finish_in(tx, attempt_id, ending, false, ctx)
+}
+
+fn finish_in(
+    tx: &Transaction<'_>,
+    attempt_id: &str,
+    ending: &Ending,
+    refused_draft_gate: bool,
+    ctx: &Ctx<'_>,
+) -> Result<bool, PersistError> {
+    let (task_id, mut task_state, mut revision, run_id, project_id) = task_of(tx, attempt_id)?;
     let (from, cancelled): (String, bool) = tx
         .query_row(
             "SELECT state, cancel_requested FROM attempts WHERE attempt_id = ?1",
@@ -1464,18 +1570,43 @@ pub(super) fn finished_in(
         )
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
+    // Every normal ending has a termination proof. STARTING failures still carry a class:
+    // only an explicit admission refusal without a failure gets a free retry (M3L-500).
+    let draft_end = super::drafting::is_draft(tx, &task_id)?.then(|| {
+        crate::reconcile::draft_end(
+            from == AttemptState::Running,
+            &crate::reconcile::Process::Gone {
+                basis: "runner termination proof".into(),
+            },
+        )
+    });
+    let retry_draft = refused_draft_gate && draft_end == Some(crate::reconcile::DraftEnd::Retry);
+    if !cancelled
+        && task_state == TaskState::Running
+        && let Some((detail, paths)) = &ending.observed.draft_boundary
+        && draft_end == Some(crate::reconcile::DraftEnd::CheckWrites)
+    {
+        super::drafting::blocked(tx, attempt_id, detail, Some(paths), ctx)?;
+        (_, task_state, revision, _, _) = task_of(tx, attempt_id)?;
+    }
     // A process that never started leaves its attempt STARTING: it can only fail. A cancel takes precedence over how
     // the work ended: CANCELLED, not counted, no retry; the run's cancel moves its task (ADR-021 decision 8e).
     // Its effects still STARTED: none was observed (the runner observes and commits the work it saw end first).
     let started = super::attempts::started_effects(tx, attempt_id)?;
     // A turn that started an effect it never reported, or an effect left STARTED at all: what it did is unknown, so
     // nothing runs it again and its task stays, by the rule a reconcile applies too (ADR-019 decision 5; ADR-022
-    // decision 12 v3, M2T07R-200, -451). Only a RUNNING attempt can have started one.
-    let unknown = (ending.unknown_effect || !started.is_empty())
-        && from == AttemptState::Running
-        && !cancelled;
+    // decision 12 v3, M2T07R-200, -451). Draft preparation can start non-work effects
+    // before the process gate opens (M3L-600); a classified failure cannot retry those.
+    let unknown = !cancelled
+        && ((from == AttemptState::Running && (ending.unknown_effect || !started.is_empty()))
+            || (from == AttemptState::Starting
+                && draft_end.is_some()
+                && started
+                    .iter()
+                    .any(|key| key != &crate::reconcile::work_key(attempt_id))));
+    let retry_draft = retry_draft && !unknown;
     let success = ending.success && from == AttemptState::Running && !cancelled && !unknown;
-    let to = if cancelled {
+    let to = if cancelled || retry_draft {
         AttemptState::Cancelled
     } else if unknown {
         AttemptState::UnknownEffect
@@ -1629,6 +1760,12 @@ pub(super) fn finished_in(
                 change: Change::Task(TaskState::Implemented),
             });
         }
+    } else if retry_draft && !cancelled {
+        commit.cas.push(StateCas {
+            id: task_id,
+            expected_revision: revision,
+            change: Change::Task(TaskState::Ready),
+        });
     } else if !unknown && !cancelled {
         // Its task by the retry policy, in this transaction (ADR-020 decision 3).
         let failed = super::retry::fail_task(

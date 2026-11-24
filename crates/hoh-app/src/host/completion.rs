@@ -175,7 +175,7 @@ fn admissible(project: &Path, dir: &str, path: &str) -> Result<(), String> {
 /// The TaskResult a work attempt's bridge gives (docs/adr/ADR-028.md decision 2), its refused lines added to `ending`'s
 /// events as `bridge.rejected`; or why its output is to be corrected (cut at its limit, missing, or its last TaskResult
 /// refused).
-fn result_of(
+pub(super) fn result_of(
     identity: &Identity,
     ending: &mut Ending,
 ) -> Result<hoh_core::protocol::TaskResult, String> {
@@ -507,10 +507,22 @@ pub(super) async fn complete(
 ) -> Result<WriterCompleted, PersistError> {
     let held = project.to_path_buf();
     let attempt_id = identity.attempt_id.clone();
+    let draft = store
+        .reader()
+        .and_then(|reader| reader.draft_start(&attempt_id));
     let (outcome, ending) = super::begun::spawn_blocking(move || {
         hooks.completing(&identity.attempt_id);
         let mut ending = ending;
-        let outcome = outcome(&held, &identity, &mut ending);
+        let outcome = match draft {
+            Ok(Some(start)) => super::drafting::outcome(&held, &identity, &mut ending, &start),
+            Ok(None) => outcome(&held, &identity, &mut ending),
+            // Hand the ending to its transaction even if the start could not be read (M3L-302).
+            // The draft blocker rechecks task kind there; a read error cannot authorize a freeze.
+            Err(error) => WriterOutcome::DraftBlocked {
+                detail: format!("draft start observation failed: {error}"),
+                paths: vec![],
+            },
+        };
         (outcome, ending)
     })
     .await

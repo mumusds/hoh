@@ -370,13 +370,11 @@ pub(super) fn settle(
     ctx: &Ctx<'_>,
 ) -> Result<bool, PersistError> {
     // Judged first outside a write: a step with nothing to change begins no write at all.
-    if judged(conn, run_id)?.is_none() {
+    if judged(conn, run_id)?.is_none() && build_content_gaps(conn, run_id)?.is_empty() {
         return Ok(false);
     }
     let tx = writer::begin(conn, ctx)?;
-    let Some((commit, reasons)) = judged(&tx, run_id)? else {
-        return Ok(false);
-    };
+    let (commit, reasons) = judged(&tx, run_id)?.unwrap_or_default();
     for (task_id, reason) in reasons {
         tx.execute(
             "UPDATE tasks SET blocked_reason = ?1, next_retry_at = CASE WHEN ?1 IS NULL THEN next_retry_at END \
@@ -386,8 +384,78 @@ pub(super) fn settle(
         .map_err(sqlite_error)?;
     }
     writer::write(&tx, &commit, ctx)?;
+    let gaps = build_content_gaps(&tx, run_id)?;
+    if !gaps.is_empty() {
+        let project: String = tx
+            .query_row(
+                "SELECT project_id FROM runs WHERE run_id=?1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let revision: i64 = tx
+            .query_row("SELECT revision FROM runs WHERE run_id=?1", [run_id], |r| {
+                r.get(0)
+            })
+            .map_err(sqlite_error)?;
+        let question = super::need::run_question(
+            &tx,
+            super::need::RunQuestion {
+                project_id: &project,
+                run_id,
+                reason: super::need::RunReason::BuildReadiness,
+                question_id: child_id(run_id, &format!("build-readiness/{revision}")),
+                fields: json!({"text":"BUILD 的任务因必需规格缺项而 BLOCKED(READINESS_NOT_MET)。可切到 AUTO 或 PLAN 补充规格，批准前不实施。","reasons":gaps}),
+                at: &crate::time::rfc3339_utc(ctx.now()),
+                detail: "BUILD content readiness requires user choice",
+            },
+            ctx,
+        )?;
+        writer::write(&tx, &question, ctx)?;
+    }
+
     writer::commit(tx, ctx)?;
     Ok(true)
+}
+
+/// BUILD asks only when its affected work cannot progress. Recheck already-blocked tasks too: the last unrelated
+/// ready task may have completed since the previous tick, without another readiness state change.
+fn build_content_gaps(conn: &Connection, run: &str) -> Result<Vec<Value>, PersistError> {
+    let build: bool = conn.query_row(
+        "SELECT mode='BUILD' AND state IN ('SPECIFYING','READY','RUNNING','VERIFYING') FROM runs WHERE run_id=?1",
+        [run], |r|r.get(0)).optional().map_err(sqlite_error)?.unwrap_or(false);
+    if !build || super::admission::product_work_progressing(conn, run)? {
+        return Ok(vec![]);
+    }
+    let mut query = conn.prepare(
+        "SELECT t.task_id FROM tasks t WHERE t.run_id=?1 AND t.kind='work' \
+         AND (t.state IN ('READY','PENDING') OR (t.state='BLOCKED' AND t.blocked_reason='READINESS_NOT_MET')) \
+         AND EXISTS(SELECT 1 FROM task_requirements q WHERE q.task_id=t.task_id)"
+    ).map_err(sqlite_error)?;
+    let tasks = query
+        .query_map([run], |r| r.get::<_, String>(0))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    let ids = tasks.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut gaps = vec![];
+    for (task, verdict) in
+        super::admission::admit(conn, run, &ids, super::admission::By::Round, None)?
+    {
+        if let Err(super::admission::Refusal::NotReady { reasons, .. }) = verdict
+            && reasons.iter().any(|r| {
+                matches!(
+                    r.code,
+                    crate::readiness::Code::MissingAc
+                        | crate::readiness::Code::Unobservable
+                        | crate::readiness::Code::Undecided
+                )
+            })
+        {
+            gaps.push(json!({"task_id":task,"reasons":reasons.iter().map(crate::readiness::Reason::json).collect::<Vec<_>>()}));
+        }
+    }
+    Ok(gaps)
 }
 
 /// What run `run_id`'s readiness step would write, read from `conn`: its commit and each task's `blocked_reason` to

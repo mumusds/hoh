@@ -18,6 +18,13 @@ use serde_json::json;
 /// What the host decided from a successful writer attempt's bridge (docs/adr/ADR-028.md decision 3).
 #[derive(Debug, Clone)]
 pub enum WriterOutcome {
+    /// A committed, bounded specification draft; no candidate and no AC acceptance.
+    Draft {
+        git_commit: String,
+        files: Box<super::SpecFiles>,
+    },
+    /// An uncertain or out-of-scope draft write set, preserved for the user.
+    DraftBlocked { detail: String, paths: Vec<String> },
     /// Its TaskResult is COMPLETED and the workspace was prepared for a freeze: freeze, accept, settle.
     Freeze {
         job: Box<Freeze>,
@@ -55,6 +62,8 @@ pub struct WriterCompletion {
 /// What the completion did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterCompleted {
+    /// The draft is IMPLEMENTED and awaits the user’s approval.
+    Drafted,
     /// Frozen and accepted: the candidate under verification and its handoff messages.
     Verifying {
         candidate_id: String,
@@ -123,6 +132,26 @@ pub(super) fn complete(
         refusal_holds(&tx, job, &task, ctx)?
     } else {
         match &job.outcome {
+            WriterOutcome::Draft { git_commit, files } => {
+                super::drafting::completed(&tx, &job.attempt_id, git_commit, files, ctx)?;
+                WriterCompleted::Drafted
+            }
+            WriterOutcome::DraftBlocked { detail, paths } => {
+                super::drafting::blocked(&tx, &job.attempt_id, detail, Some(paths), ctx)?;
+                WriterCompleted::Blocked {
+                    reason: if paths.is_empty() {
+                        "draft_write_uncertain"
+                    } else {
+                        "plan.write_violation"
+                    }
+                    .into(),
+                }
+            }
+            WriterOutcome::Freeze { .. } if super::drafting::is_draft(&tx, &task.task_id)? => {
+                return Err(PersistError::IntegrityViolation(
+                    "a specification draft cannot freeze a product candidate".into(),
+                ));
+            }
             WriterOutcome::Freeze {
                 job: freeze,
                 result,
@@ -130,7 +159,14 @@ pub(super) fn complete(
             } => freeze_and_accept(&tx, job, &task, freeze, result, ctx)?,
             WriterOutcome::Correct { reasons } => correct(&tx, job, &task, reasons, ctx)?,
             WriterOutcome::Decide { reason, detail } => {
-                decide(&tx, job, &task, *reason, detail, ctx)?
+                if super::drafting::is_draft(&tx, &task.task_id)? {
+                    super::drafting::blocked(&tx, &job.attempt_id, detail, None, ctx)?;
+                    WriterCompleted::Blocked {
+                        reason: reason.as_str().into(),
+                    }
+                } else {
+                    decide(&tx, job, &task, *reason, detail, ctx)?
+                }
             }
         }
     };

@@ -118,10 +118,16 @@ fn test_031_04_every_attempt_creating_path_goes_through_the_admission() -> R {
         listed(&[
             (DECIDE, 2),
             ("hoh-core/src/persistence/rounds.rs", 1),
+            ("hoh-core/src/persistence/drafting.rs", 1),
             ("hoh-core/src/persistence/wakes.rs", 1),
         ])
     );
     assert!(body(text(DECIDE)?, "decide_in")?.contains("admission::admit_one("));
+    let draft = body(text("hoh-core/src/persistence/drafting.rs")?, "dispatch")?;
+    assert!(
+        draft.find("admission::admit(").ok_or("draft admission")?
+            < draft.find("decide::lease_task(").ok_or("draft lease")?
+    );
     assert!(
         body(text("hoh-core/src/persistence/rounds.rs")?, "round")?.contains("admission::admit(")
     );
@@ -254,7 +260,7 @@ async fn test_028_03_the_admission_holds_a_write_task_on_dirty_files_on_every_di
     let held = json!({"paths": ["src/lib.rs"]});
     // The admission itself, for the round and the Commander alike.
     for by in [super::By::Round, super::By::Commander, super::By::Direct] {
-        let verdicts = super::admit(&conn, "R", &["W", "Rd", "W2"], by)?;
+        let verdicts = super::admit(&conn, "R", &["W", "Rd", "W2"], by, None)?;
         let refusal = verdicts["W"]
             .as_ref()
             .err()
@@ -591,5 +597,61 @@ async fn a_direct_creation_of_a_blocked_task_is_refused() -> R {
         "{created:?}"
     );
     assert_eq!(attempts_of(&conn, "W2")?, 0);
+    Ok(())
+}
+
+#[test]
+fn test_008_04_plan_blocks_every_ordinary_writer_dispatch_path() -> R {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+      INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+      INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','PLAN','now');
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES('w','r','s','READY','developer',1,1),('q','r','s','READY','qa',0,2);")?;
+    for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+        assert!(
+            super::admit_one(&conn, "r", "w", by)?.is_err(),
+            "PLAN writer admitted by {by:?}"
+        );
+        assert!(
+            super::admit_one(&conn, "r", "q", by)?.is_ok(),
+            "read-only work blocked by PLAN"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_009_02_m3l103_only_own_active_draft_holds_product_writes() -> R {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    super::super::migrate(&conn, super::super::MIGRATIONS)?;
+    conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+      INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+      INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES
+      ('r','p','s','RUNNING','BUILD','now'),('other','p','s','RUNNING','PLAN','now');
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) VALUES('w','r','s','READY','developer',1,1);
+      INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,kind,created_seq) VALUES('d','other','s','IMPLEMENTED','cto',1,'spec_draft',1);")?;
+    for state in ["RUNNING", "INCOMPLETE", "FAILED", "COMPLETED", "CANCELLED"] {
+        conn.execute("UPDATE runs SET state=?1 WHERE run_id='other'", [state])?;
+        for by in [super::By::Round, super::By::Commander, super::By::Direct] {
+            assert!(
+                super::admit_one(&conn, "r", "w", by)?.is_ok(),
+                "unrelated {state} run held {by:?}"
+            );
+        }
+    }
+    conn.execute("UPDATE tasks SET run_id='r' WHERE task_id='d'", [])?;
+    assert!(matches!(
+        super::admit_one(&conn, "r", "w", super::By::Round)?,
+        Err(super::Refusal::Mode(
+            crate::mode::WriteRefusal::PendingDraft
+        ))
+    ));
+    conn.execute("UPDATE tasks SET state='ACCEPTED' WHERE task_id='d'", [])?;
+    conn.execute("INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES('cr','p','s','PROPOSED','change','{}','now')", [])?;
+    assert!(
+        super::admit_one(&conn, "r", "w", super::By::Round)?.is_ok(),
+        "a proposed CR leaves work on the approved revision unchanged"
+    );
     Ok(())
 }

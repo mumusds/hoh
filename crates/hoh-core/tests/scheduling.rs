@@ -863,3 +863,172 @@ async fn test_007_02_pending_mode_blocks_both_writer_dispatch_paths_but_not_read
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_009_01_build_plan_unknown_req_is_durably_rejected_then_valid_plan_imports() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    seed(
+        &db,
+        "UPDATE runs SET mode='BUILD'; INSERT INTO requirements(requirement_id,spec_id,title,required_release) VALUES('REQ-A','s2','A',1);",
+    )?;
+    let task = |id: &str, req: &str, writer: bool| json!({"task_id":id,"title":id,"role":"developer","writer":writer,"depends_on":[],"requirement_ids":[req]});
+    let bad=store.decide(proposal("bad-plan",7,json!({"kind":"create_tasks","plan":{"tasks":[task("A","REQ-A",true),task("Z","REQ-Z",true)]}}))?,context()).await?;
+    assert!(matches!(
+        bad,
+        Decided::Rejected {
+            reason: RejectionReason::IllegalTransition,
+            ..
+        }
+    ));
+    assert_eq!(count(&db, "tasks")?, 3);
+    assert_eq!(count(&db, "task_requirements")?, 0);
+    let details = rows(
+        &db,
+        "SELECT json_extract(payload_json,'$.details') FROM events WHERE kind='decision.rejected'",
+    )?;
+    assert!(format!("{details:?}").contains("BUILD 不改规格，用 /plan 或 CR"));
+    assert!(format!("{details:?}").contains("REQ-Z"));
+    let good = store
+        .decide(
+            proposal(
+                "good-plan",
+                7,
+                json!({"kind":"create_tasks","plan":{"tasks":[task("A","REQ-A",true)]}}),
+            )?,
+            context(),
+        )
+        .await?;
+    assert!(matches!(good, Decided::Applied { .. }));
+    assert_eq!(
+        rows(&db, "SELECT task_id,requirement_id FROM task_requirements")?,
+        vec![vec![json!("A"), json!("REQ-A")]]
+    );
+    keep(
+        "test-009-01-mode-plan.json",
+        &json!({"decisions":rows(&db,"SELECT decision_id,state,reason_code FROM decisions")?,"requirements":rows(&db,"SELECT * FROM task_requirements")?}),
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_04_plan_refuses_product_tasks_but_keeps_read_only_planning() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, db) = open(&dir)?;
+    seed(&db, WORLD)?;
+    // Read-only planning still references the approved scope (ADR-039 decision 6).
+    seed(
+        &db,
+        "UPDATE runs SET mode='PLAN';
+         INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-008', 's2', 'Plan', 1);",
+    )?;
+    let payload = |writer| json!({"kind":"create_tasks","plan":{"tasks":[{"task_id":"planned","title":"planned","role":"developer","writer":writer,"depends_on":[],"requirement_ids":["REQ-008"]}]}});
+    let no = store
+        .decide(proposal("plan-writer", 7, payload(true))?, context())
+        .await?;
+    assert!(
+        matches!(no,Decided::Rejected{reason:RejectionReason::IllegalTransition,ref detail,..} if detail.contains("PLAN 不实施"))
+    );
+    assert_eq!(count(&db, "tasks")?, 3);
+    assert_eq!(count(&db, "task_requirements")?, 0);
+    assert!(matches!(
+        store
+            .decide(proposal("plan-read", 7, payload(false))?, context())
+            .await?,
+        Decided::Applied { .. }
+    ));
+    assert_eq!(
+        rows(&db, "SELECT writer FROM tasks WHERE task_id='planned'")?,
+        vec![vec![json!(0)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT task_id,requirement_id FROM task_requirements")?,
+        vec![vec![json!("planned"), json!("REQ-008")]]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_04_all_dispatch_paths_obey_plan_pending_mode_and_unapproved_draft() -> R {
+    for case in [
+        "PLAN",
+        "BUILD",
+        "AUTO",
+        "mode_pending",
+        "draft_pending",
+        "cr_pending",
+    ] {
+        for route in ["round", "commander", "direct"] {
+            let dir = tempfile::tempdir()?;
+            let (store, db) = open(&dir)?;
+            seed(&db, WORLD)?;
+            let mode = if ["PLAN", "BUILD", "AUTO"].contains(&case) {
+                case
+            } else {
+                "BUILD"
+            };
+            seed(&db, &format!("UPDATE runs SET mode='{mode}';"))?;
+            match case {
+                "mode_pending" => seed(
+                    &db,
+                    "INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES('p1','pending','R','run.mode_change_pending','{\"to\":\"PLAN\",\"command_id\":\"m\"}','now');",
+                )?,
+                "draft_pending" => seed(
+                    &db,
+                    "INSERT INTO tasks(task_id,run_id,spec_id,kind,state,role,writer,created_seq) VALUES('draft','R','s2','spec_draft','IMPLEMENTED','cto',1,4);",
+                )?,
+                "cr_pending" => seed(
+                    &db,
+                    "INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at) VALUES('cr','p1','s2','PROPOSED','draft','{}','now');",
+                )?,
+                _ => {}
+            }
+            // M3L-103: a proposed CR alone keeps the approved work dispatchable; only its own pending draft holds it.
+            let permitted = matches!(case, "BUILD" | "AUTO" | "cr_pending");
+            match route {
+                "round" => assert_eq!(
+                    store
+                        .schedule_round("R", context())
+                        .await?
+                        .dispatched
+                        .is_some(),
+                    permitted,
+                    "{case}/{route}"
+                ),
+                "commander" => assert_eq!(
+                    matches!(
+                        store
+                            .decide(proposal("dispatch", 7, dispatch("T1"))?, context())
+                            .await?,
+                        Decided::Applied { .. }
+                    ),
+                    permitted,
+                    "{case}/{route}"
+                ),
+                _ => assert_eq!(
+                    store
+                        .create_attempt(hoh_core::persistence::NewAttempt {
+                            attempt_id: "A".into(),
+                            task_id: "T1".into(),
+                            session_id: Some("sd".into()),
+                            role_epoch: 2,
+                            host_epoch: 1,
+                            config_revision: 1,
+                            agent: Some("claude".into())
+                        })
+                        .await
+                        .is_ok(),
+                    permitted,
+                    "{case}/{route}"
+                ),
+            }
+            assert_eq!(
+                count(&db, "attempts")?,
+                i64::from(permitted),
+                "{case}/{route}"
+            );
+        }
+    }
+    Ok(())
+}

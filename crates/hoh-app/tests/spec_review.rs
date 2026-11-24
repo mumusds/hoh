@@ -63,10 +63,16 @@ fn commit_spec(world: &World, text: &str) -> R<String> {
 
 /// A command of run `run` at its current revision: its status and body.
 async fn submit(host: &Host, run: &str, key: &str, kind: &str, payload: Value) -> R<(u16, Value)> {
-    let (_, got) = world::exchange(host, "GET", &format!("/v1/runs/{run}"), None).await?;
-    let body = json!({"schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
-        "expected_revision": got["revision"], "run_id": run, "kind": kind, "payload": payload});
-    world::exchange(host, "POST", "/v1/commands", Some(&body)).await
+    for _ in 0..10 {
+        let (_, got) = world::exchange(host, "GET", &format!("/v1/runs/{run}"), None).await?;
+        let body = json!({"schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
+            "expected_revision": got["revision"], "run_id": run, "kind": kind, "payload": payload});
+        let reply = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+        if reply.0 != 409 || reply.1["code"] != "STALE_REVISION" {
+            return Ok(reply);
+        }
+    }
+    Err("the command remained stale during runtime progress".into())
 }
 
 /// Revision `sha256` proposed (a CR on an approved base) and approved on run `run`.
@@ -233,6 +239,9 @@ async fn test_031_04_spec_review_gates_ready() -> R {
     let outcome = async {
         approve_first(&world, &host, &first_sha).await?;
         let run = world::start_run(&host, "r", "做一个记账工具").await?;
+        // This fixture supplies the CR itself and tests independent review, not AUTO's new drafting workflow.
+        let (status, body) = submit(&host, &run, "manual-cr", "SetMode", json!({"mode":"BUILD"})).await?;
+        assert_eq!(status, 202, "{body}");
         world.staff(&run)?;
         // The Commander's transition_run to READY: REJECTED (ILLEGAL_TRANSITION, details missing_ac); R in SPECIFYING.
         let refused_sql = format!(

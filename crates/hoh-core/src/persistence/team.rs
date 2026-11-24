@@ -880,6 +880,8 @@ pub struct Assignment {
     /// Its task holds the write lease: a successful attempt ends through its completion commit (docs/adr/ADR-028.md
     /// decision 4).
     pub writer: bool,
+    /// Runtime specification drafting, never a candidate-producing writer.
+    pub spec_draft: bool,
 }
 
 /// The assignment of attempt `attempt_id` of task `task_id` in run `run_id` (project `project_id`), `role`.
@@ -910,13 +912,15 @@ pub(super) fn assignment(
              (SELECT json_extract(j.value, '$.title') FROM events e, json_each(json_extract(e.payload_json, '$.tasks')) j \
               WHERE e.run_id = ?2 AND e.kind = 'plan.imported' AND json_extract(j.value, '$.task_id') = ?3 \
               ORDER BY e.seq DESC LIMIT 1), \
-             (SELECT t.writer FROM tasks t WHERE t.task_id = ?3), s.capabilities_json \
+             (SELECT t.writer FROM tasks t WHERE t.task_id = ?3), s.capabilities_json, \
+             (SELECT t.kind='spec_draft' FROM tasks t WHERE t.task_id=?3) \
              FROM attempts a LEFT JOIN sessions s ON s.session_id = a.session_id \
              LEFT JOIN role_bindings b ON b.run_id = ?2 AND b.role = ?4 WHERE a.attempt_id = ?1",
             params![attempt_id, run_id, task_id, role],
             |r| {
                 Ok(Assignment {
                     inputs: Vec::new(),
+                    spec_draft: r.get(11)?,
                     context_seq,
                     resource_bundle: None,
                     agent: r.get(0)?,

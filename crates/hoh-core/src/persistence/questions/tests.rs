@@ -46,7 +46,7 @@ fn every_typed_reason_has_its_decision_8_exit_and_choices() {
     assert_eq!(route_run(RunReason::Stalled), Route::Stalled);
     assert_eq!(ids(Route::Stalled), ["retry", "cancel"]);
     assert_eq!(route_run(RunReason::NoSpec), Route::Adopt);
-    assert_eq!(ids(Route::Adopt), ["adopt"]);
+    assert_eq!(ids(Route::Adopt), ["adopt", "draft"]);
     // No source exit offers a cancel, nor goes back to VERIFYING under the same join number (E6).
     for reason in SourceReason::ALL {
         for verifying in [true, false] {

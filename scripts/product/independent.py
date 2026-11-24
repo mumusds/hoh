@@ -87,9 +87,11 @@ def context(role: str, profile: str, candidate: dict, judged: dict, judgement_pa
         'TASK_CONTEXT': (f'Role {role}, check {CHECK[role]}. Do not modify, add or delete any tracked file, and create '
                          f'no file in the checkout except under {observations} (ignored by git), where your notes, '
                          'logs and experiment outputs go; a planned check you run goes through tools/run_check.py with '
-                         f'its --out under {observations}; an experiment that needs a writable tree runs in a copy under '
-                         '/tmp that you delete. Never touch the user\'s .hoh/ or agent credentials; start no agent '
-                         'session. A fixture or mock result is never live. End with the ```hoh-report block of the '
+                         f'its --out under {observations}; an experiment that needs a writable tree runs in a git clone '
+                         f'of the candidate commit under {observations} that you delete afterwards (not under /tmp, '
+                         'whose small per-user quota other sessions share). Never touch the user\'s .hoh/ or agent '
+                         'credentials; start no agent session. A fixture or mock result is never live. End with the '
+                         '```hoh-report block of the '
                          'output contract: status PASS only when the scope was fully examined and no critical or high '
                          'defect was found.'),
     }

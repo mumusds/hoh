@@ -91,6 +91,56 @@ pub enum Process {
     Uncertain { basis: String },
 }
 
+/// DC-T04b's one draft-ending table. RUNNING is the durable gate boundary; an unproven
+/// process always keeps its identity and lease, regardless of what its work effect says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftEnd {
+    Unreaped,
+    Retry,
+    CheckWrites,
+}
+
+pub fn draft_end(gate_opened: bool, process: &Process) -> DraftEnd {
+    match process {
+        Process::Uncertain { .. } | Process::Stopped { reaped: false, .. } => DraftEnd::Unreaped,
+        _ if !gate_opened => DraftEnd::Retry,
+        _ => DraftEnd::CheckWrites,
+    }
+}
+
+impl DraftEnd {
+    pub fn disposition(self, normal: Disposition, attempt: &str) -> Disposition {
+        match self {
+            Self::Unreaped => Disposition::Unreaped,
+            // No agent work ran. Preserve preparation observations (e.g. git init), but never
+            // turn an unopened work effect's OBSERVED into COMMITTED. No counted retry.
+            Self::Retry => {
+                let (effects, unknown) = match normal {
+                    Disposition::Ended { effects, .. }
+                    | Disposition::Complete { effects }
+                    | Disposition::Completed { effects, .. } => (effects, vec![]),
+                    Disposition::UnknownEffect { effects, unknown } => (effects, unknown),
+                    Disposition::Redeliver | Disposition::Unreaped => (vec![], vec![]),
+                };
+                let work = work_key(attempt);
+                let effects = effects.into_iter().filter(|m| m.key != work).collect();
+                let unknown: Vec<_> = unknown.into_iter().filter(|key| key != &work).collect();
+                if unknown.is_empty() {
+                    Disposition::Ended {
+                        to: AttemptState::Cancelled,
+                        task_to: TaskState::Ready,
+                        effects,
+                    }
+                } else {
+                    // An unopened agent gate proves nothing about Runtime preparation effects.
+                    Disposition::UnknownEffect { effects, unknown }
+                }
+            }
+            Self::CheckWrites => normal,
+        }
+    }
+}
+
 /// One unfinished attempt (PREPARED, STARTING or RUNNING) with its task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unfinished {
@@ -258,6 +308,159 @@ pub fn dispose(u: &Unfinished) -> Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_008_02_m3l450_draft_ending_table_keeps_unproven_processes() {
+        let unknown = Disposition::UnknownEffect {
+            effects: vec![],
+            unknown: vec![work_key("A")],
+        };
+        for opened in [false, true] {
+            for process in [
+                Process::Uncertain {
+                    basis: "unavailable".into(),
+                },
+                Process::Stopped {
+                    steps: vec![],
+                    reaped: false,
+                },
+            ] {
+                assert_eq!(
+                    draft_end(opened, &process).disposition(unknown.clone(), "A"),
+                    Disposition::Unreaped
+                );
+            }
+            for process in [
+                Process::NotStarted,
+                Process::Gone {
+                    basis: "gone".into(),
+                },
+                Process::Stopped {
+                    steps: vec![],
+                    reaped: true,
+                },
+            ] {
+                let actual = draft_end(opened, &process).disposition(unknown.clone(), "A");
+                if opened {
+                    assert_eq!(actual, unknown);
+                } else {
+                    assert_eq!(
+                        actual,
+                        Disposition::Ended {
+                            to: AttemptState::Cancelled,
+                            task_to: TaskState::Ready,
+                            effects: vec![]
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_008_02_m3l450_retry_preserves_observed_preparation_effects() {
+        let init = EffectMove {
+            key: crate::ids::child_id("A", "git-init"),
+            from: EffectState::Started,
+            to: EffectState::Committed,
+            external_ref: Some(".git".into()),
+        };
+        let work = EffectMove {
+            key: work_key("A"),
+            from: EffectState::Observed,
+            to: EffectState::Committed,
+            external_ref: None,
+        };
+        let normal = Disposition::UnknownEffect {
+            effects: vec![init.clone(), work],
+            unknown: vec![work_key("A")],
+        };
+        assert_eq!(
+            DraftEnd::Retry.disposition(normal, "A"),
+            Disposition::Ended {
+                to: AttemptState::Cancelled,
+                task_to: TaskState::Ready,
+                effects: vec![init],
+            }
+        );
+    }
+
+    #[test]
+    fn test_008_02_m3l501_unknown_git_init_keeps_draft_unknown() {
+        let init = crate::ids::child_id("A", "git-init");
+        let u = unfinished(
+            AttemptState::Starting,
+            gone(),
+            vec![effect(
+                &init,
+                EffectState::Started,
+                Some(Observation::Unavailable {
+                    detail: "incomplete .git".into(),
+                }),
+            )],
+        );
+        assert_eq!(
+            draft_end(false, &u.process).disposition(dispose(&u), "A"),
+            Disposition::UnknownEffect {
+                effects: vec![EffectMove {
+                    key: init.clone(),
+                    from: EffectState::Started,
+                    to: EffectState::Unknown,
+                    external_ref: None
+                }],
+                unknown: vec![init],
+            }
+        );
+    }
+
+    #[test]
+    fn test_008_02_m3l501_mixed_unknown_keys_clear_only_this_attempts_work() {
+        let init = crate::ids::child_id("A", "git-init");
+        let u = unfinished(
+            AttemptState::Starting,
+            gone(),
+            vec![
+                effect(&work_key("A"), EffectState::Started, None),
+                effect(&init, EffectState::Unknown, None),
+            ],
+        );
+        assert_eq!(
+            draft_end(false, &u.process).disposition(dispose(&u), "A"),
+            Disposition::UnknownEffect {
+                effects: vec![],
+                unknown: vec![init]
+            }
+        );
+    }
+
+    #[test]
+    fn test_008_02_m3l501_other_unknown_keys_and_observed_preparation_survive_retry() {
+        let observed = crate::ids::child_id("A", "git-init");
+        // Only the exact work key belongs to A's unopened gate. Neither a lookalike nor another
+        // attempt's work key can be cleared on its behalf.
+        for key in ["work".to_owned(), work_key("B")] {
+            let u = unfinished(
+                AttemptState::Starting,
+                gone(),
+                vec![
+                    effect(&key, EffectState::Unknown, None),
+                    effect(&observed, EffectState::Observed, None),
+                ],
+            );
+            assert_eq!(
+                draft_end(false, &u.process).disposition(dispose(&u), "A"),
+                Disposition::UnknownEffect {
+                    effects: vec![EffectMove {
+                        key: observed.clone(),
+                        from: EffectState::Observed,
+                        to: EffectState::Committed,
+                        external_ref: None
+                    }],
+                    unknown: vec![key],
+                }
+            );
+        }
+    }
 
     fn unfinished(state: AttemptState, process: Process, effects: Vec<Effect>) -> Unfinished {
         Unfinished {

@@ -5,6 +5,177 @@ use crate::protocol::SpecDecision;
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
+// Product persistence with a synthetic STARTING attempt: no native agent is launched.
+async fn starting_draft_failure(class: crate::retry::FailureClass, reason: Option<&str>) -> R {
+    use crate::persistence::Ending;
+    use std::time::Duration;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("DELETE FROM events;
+        UPDATE runs SET state='SPECIFYING',resume_state=NULL,blocked_reason=NULL,blocked_reasons_json='[]';
+        UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO role_bindings(run_id,role,agent,session_id,role_epoch,config_revision,bound_at) VALUES('R','cto','claude','SD',1,1,'2026-11-22T00:00:00Z');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    let work = crate::reconcile::work_key("A");
+    db.execute(
+        "INSERT INTO effects(effect_key,attempt_id,state) VALUES(?1,'A','PREPARED')",
+        [&work],
+    )?;
+    let at = crate::time::parse_rfc3339("2026-11-22T00:00:00Z").ok_or("time")?;
+    assert!(
+        store
+            .runner_finished(
+                "A",
+                Ending {
+                    success: false,
+                    detail: "scripted executor start refusal".into(),
+                    class,
+                    at,
+                    draw: u32::MAX,
+                    observed: Default::default(),
+                    unknown_effect: false,
+                }
+            )
+            .await?
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM attempts WHERE attempt_id='A'", [], |r| r
+            .get::<_, String>(0))?,
+        "FAILED"
+    );
+    let (state, count, blocked, next): (String, i64, Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT state,attempt_count,blocked_reason,next_retry_at FROM tasks WHERE task_id='D'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    assert_eq!(count, 1);
+    assert_eq!(blocked.as_deref(), reason);
+    if reason.is_some() {
+        assert_eq!(state, "BLOCKED");
+        assert_eq!(next, None);
+        let payload: String = db.query_row(
+            "SELECT payload_json FROM events WHERE kind='task.blocked'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload)?["failure"],
+            class.to_json()
+        );
+        if class == crate::retry::FailureClass::Decision {
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM events WHERE kind='need_decision'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+        }
+    } else {
+        assert_eq!(state, "READY");
+        let wait = match class {
+            crate::retry::FailureClass::Transient {
+                retry_after: Some(wait),
+            } => wait,
+            _ => Duration::from_secs(2),
+        };
+        assert_eq!(next, Some(crate::time::rfc3339_utc(at + wait)));
+        let payload: String = db.query_row(
+            "SELECT payload_json FROM events WHERE kind='task.retry_scheduled'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload)?["failure"],
+            class.to_json()
+        );
+    }
+    assert!(
+        !store
+            .dispatch_draft(
+                "R",
+                crate::decision::Context {
+                    now: Some(at),
+                    ..Default::default()
+                }
+            )
+            .await?,
+        "no immediate redispatch"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM effects WHERE effect_key=?1",
+            [&work],
+            |r| r.get::<_, String>(0)
+        )?,
+        "PREPARED"
+    );
+    assert_eq!(db.query_row("SELECT count(*) FROM leases l JOIN attempts a USING(attempt_id) WHERE l.expires_at<=a.ended_at", [], |r| r.get::<_,i64>(0))?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_m3l500_starting_auth_blocks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Auth, Some("BLOCKED_AUTH")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_capability_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Capability,
+        Some("BLOCKED_CAPABILITY"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_model_blocks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Model, Some("MODEL_UNAVAILABLE")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_unavailable_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Unavailable,
+        Some("AGENT_UNAVAILABLE"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_compat_blocks() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Compat,
+        Some("COMPAT_UNVERIFIED"),
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_decision_asks() -> R {
+    starting_draft_failure(crate::retry::FailureClass::Decision, Some("NEED_DECISION")).await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_transient_waits_retry_after() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Transient {
+            retry_after: Some(std::time::Duration::from_secs(3600)),
+        },
+        None,
+    )
+    .await
+}
+#[tokio::test]
+async fn test_008_02_m3l500_starting_transient_waits_jitter() -> R {
+    starting_draft_failure(
+        crate::retry::FailureClass::Transient { retry_after: None },
+        None,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn test_008_05_store_origin_guard_precedes_replay_conflict_and_parse() -> R {
     let dir = tempfile::Builder::new().prefix("m3t04-").tempdir()?;
@@ -90,5 +261,758 @@ async fn test_008_05_store_origin_guard_precedes_replay_conflict_and_parse() -> 
         before
     );
     drop(store);
+    Ok(())
+}
+
+async fn approval_world() -> Result<
+    (
+        tempfile::TempDir,
+        Store,
+        rusqlite::Connection,
+        SubmitCommand,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let dir = tempfile::Builder::new().prefix("m3t04-").tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    store
+        .ensure_project("P", dir.path().to_str().ok_or("path")?)
+        .await?;
+    let sources = vec![Source {path:"docs/spec/main.md".into(),bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec()}];
+    let index = specindex::generate_index(&sources)?;
+    let db = rusqlite::Connection::open(&path)?;
+    db.execute_batch("INSERT INTO runs(run_id,project_id,state,resume_state,blocked_reason,blocked_reasons_json,mode,revision,created_at) VALUES('R','P','BLOCKED','SPECIFYING','NEED_DECISION','[\"NEED_DECISION\"]','PLAN',5,'2026-11-22T00:00:00Z');
+        INSERT INTO tasks(task_id,run_id,spec_id,kind,role,writer,state,created_seq) VALUES('D','R',NULL,'spec_draft','cto',1,'IMPLEMENTED',1);
+        INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES('P','R','claim','run.blocker_claimed','{\"source\":\"runtime:spec_approval\",\"reason\":\"NEED_DECISION\"}','2026-11-22T00:00:00Z');")?;
+    db.execute("INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES('P','R','Q','question.asked',?1,'2026-11-22T00:00:00Z')",[json!({"reason":"spec_approval","question_id":"Q","task_id":"D","attempt_id":"A","spec_sha256":index.sha256(),"git_commit":"a".repeat(40),"base_spec_id":null,"text":"请批准"}).to_string()])?;
+    let command = SubmitCommand {
+        command_id: "approve".into(),
+        idempotency_key: "approve".into(),
+        kind: "ApproveSpec".into(),
+        run_id: "R".into(),
+        expected_revision: 5,
+        payload: json!({}),
+        payload_sha256: "1".repeat(64),
+        target: RunTarget::Specification(Box::new(SpecRequest {
+            origin: Origin::User,
+            action: SpecAction::Approve(ApproveSpec {
+                spec_sha256: index.sha256(),
+                decision: SpecDecision::ApproveOnly,
+                note: None,
+            }),
+            files: Ok(SpecFiles {
+                sources,
+                existing_index: Some(index.bytes().into()),
+                tracked_index: Some(index.bytes().into()),
+            }),
+        })),
+        event: NewEvent {
+            intent: crate::persistence::Intent::Progress,
+            project_id: "P".into(),
+            run_id: Some("R".into()),
+            event_id: "approved-event".into(),
+            kind: "spec.changed".into(),
+            payload: json!({}),
+        },
+        outbox: None,
+    };
+    Ok((dir, store, db, command))
+}
+
+#[tokio::test]
+async fn test_008_02_direct_approval_finishes_draft_without_candidate() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    store.submit_command(command).await?;
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "ACCEPTED"
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM runs WHERE run_id='R'", [], |r| r
+            .get::<_, String>(0))?,
+        "SPECIFYING"
+    );
+    assert_eq!(
+        db.query_row("SELECT revision FROM runs WHERE run_id='R'", [], |r| r
+            .get::<_, i64>(0))?,
+        6
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM candidates", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert!(
+        db.query_row("SELECT spec_id FROM tasks WHERE task_id='D'", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })?
+        .is_none()
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM specs WHERE revision=1", [], |r| r
+            .get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}
+
+fn input_approval(
+    mut command: SubmitCommand,
+    answer: bool,
+    origin: Origin,
+    text: &str,
+) -> SubmitCommand {
+    let RunTarget::Specification(request) = command.target else {
+        panic!("fixture")
+    };
+    command.kind = if answer {
+        "AnswerQuestion"
+    } else {
+        "SendInput"
+    }
+    .into();
+    command.target = RunTarget::ObservedInput {
+        input: if answer {
+            super::super::Input::Answer {
+                question_id: "Q".into(),
+                choice_id: None,
+                answer: text.into(),
+            }
+        } else {
+            super::super::Input::Send {
+                text: text.into(),
+                target_role: None,
+                input_kind: "REPLY".into(),
+            }
+        },
+        origin,
+        files: Box::new(request.files),
+    };
+    command
+}
+#[tokio::test]
+async fn test_008_05_all_answer_entrances_guard_before_replay_and_rollback_conflict() -> R {
+    for answer in [true, false] {
+        let (_dir, store, db, command) = approval_world().await?;
+        let before = db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?;
+        for origin in [
+            Origin::Unknown,
+            Origin::Marker,
+            Origin::AncestorMarker,
+            Origin::AttemptCgroup,
+        ] {
+            let rejected = store
+                .submit_command(input_approval(command.clone(), answer, origin, "approve"))
+                .await;
+            assert!(
+                matches!(rejected, Err(PersistError::SpecApprovalNotUser(_))),
+                "{rejected:?}"
+            );
+            assert_eq!(
+                db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?,
+                before
+            );
+        }
+        let mut wrong = input_approval(command.clone(), answer, Origin::User, "approve");
+        if let RunTarget::ObservedInput { files, .. } = &mut wrong.target {
+            files.as_mut().as_mut().expect("files").sources[0]
+                .bytes
+                .push(b'\n');
+        }
+        assert!(matches!(
+            store.submit_command(wrong).await,
+            Err(PersistError::SpecConflict(_))
+        ));
+        assert_eq!(
+            db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?,
+            before,
+            "conflict writes neither a receipt nor a T09 rejection"
+        );
+        let input = input_approval(command.clone(), answer, Origin::User, "approve");
+        let accepted = store.submit_command(input.clone()).await?;
+        assert!(matches!(
+            accepted,
+            CommandOutcome::Accepted { revision: 6, .. }
+        ));
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM commands WHERE kind='ApproveSpec'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert!(matches!(
+            store.submit_command(input).await?,
+            CommandOutcome::Replayed { .. }
+        ));
+        let before = db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?;
+        assert!(matches!(
+            store
+                .submit_command(input_approval(command, answer, Origin::Marker, "approve"))
+                .await,
+            Err(PersistError::SpecApprovalNotUser(_))
+        ));
+        assert_eq!(
+            db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))?,
+            before
+        );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn test_008_02_reject_reuses_task_with_note_and_approve_and_build_sets_mode() -> R {
+    for decision in [SpecDecision::Reject, SpecDecision::ApproveAndBuild] {
+        let (_dir, store, db, mut command) = approval_world().await?;
+        if let RunTarget::Specification(request) = &mut command.target
+            && let SpecAction::Approve(a) = &mut request.action
+        {
+            a.decision = decision;
+            a.note = Some("请完善边界".into());
+        }
+        store.submit_command(command).await?;
+        assert_eq!(
+            db.query_row("SELECT revision FROM runs", [], |r| r.get::<_, i64>(0))?,
+            6,
+            "one revision for approval including BUILD intent"
+        );
+        let reject = decision == SpecDecision::Reject;
+        assert_eq!(
+            db.query_row("SELECT state FROM tasks", [], |r| r.get::<_, String>(0))?,
+            if reject { "READY" } else { "ACCEPTED" }
+        );
+        assert_eq!(
+            db.query_row("SELECT mode FROM runs", [], |r| r.get::<_, String>(0))?,
+            if reject { "PLAN" } else { "BUILD" }
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            if reject { 0 } else { 1 }
+        );
+        assert_eq!(db.query_row("SELECT json_extract(payload_json,'$.answer') FROM events WHERE kind='question.answered'",[],|r|r.get::<_,String>(0))?,"请完善边界");
+    }
+    for text in ["", "please approve", "reject", "请修改"] {
+        let (_dir, store, db, command) = approval_world().await?;
+        store
+            .submit_command(input_approval(command, true, Origin::User, text))
+            .await?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            0,
+            "only explicit approve approves"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_competing_first_approval_requires_reconfirmation_on_new_base() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    db.execute_batch("INSERT INTO runs(run_id,project_id,state,mode,revision,created_at) VALUES('R2','P','SPECIFYING','PLAN',0,'2026-11-22T00:00:00Z');")?;
+    let mut other = command.clone();
+    other.command_id = "other".into();
+    other.idempotency_key = "other".into();
+    other.event.event_id = "other-event".into();
+    other.event.run_id = Some("R2".into());
+    other.run_id = "R2".into();
+    other.expected_revision = 0;
+    if let RunTarget::Specification(request) = &mut other.target {
+        let files = request.files.as_mut().expect("files");
+        files.sources[0].bytes.extend_from_slice(b"\n");
+        let index = specindex::generate_index(&files.sources)?;
+        files.existing_index = Some(index.bytes().into());
+        files.tracked_index = Some(index.bytes().into());
+        if let SpecAction::Approve(a) = &mut request.action {
+            a.spec_sha256 = index.sha256();
+        }
+    }
+    store.submit_command(other).await?;
+    store.submit_command(command.clone()).await?;
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+        1,
+        "old approve never crosses a base"
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "IMPLEMENTED"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM change_requests WHERE state='PROPOSED'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    let q = super::super::draft_approval::pending(&db, "R")?.ok_or("reconfirmation")?;
+    assert_ne!(q.question_id, "Q");
+    assert!(q.anchor["base_spec_id"].is_string());
+    let mut fresh = command;
+    fresh.command_id = "fresh".into();
+    fresh.idempotency_key = "fresh".into();
+    fresh.event.event_id = "fresh-event".into();
+    fresh.expected_revision =
+        db.query_row("SELECT revision FROM runs WHERE run_id='R'", [], |r| {
+            r.get(0)
+        })?;
+    store.submit_command(fresh).await?;
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+        2
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "ACCEPTED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_completion_and_blocked_draft_are_idempotent_user_questions() -> R {
+    use super::super::{WriterCompleted, WriterCompletion, WriterOutcome};
+    for blocked in [false, true] {
+        let (_dir, store, db, command) = approval_world().await?;
+        db.execute_batch("DELETE FROM events; UPDATE runs SET state='SPECIFYING',resume_state=NULL,blocked_reason=NULL,blocked_reasons_json='[]'; UPDATE tasks SET state='RUNNING';
+    INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+    INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision,started_at) VALUES('A','D','SD','RUNNING',1,1,1,'2026-11-22T00:00:00Z');
+    INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+        let RunTarget::Specification(request) = command.target.clone() else {
+            panic!("fixture")
+        };
+        let files = request.files?;
+        let sha = specindex::generate_index(&files.sources)?.sha256();
+        let outcome = if blocked {
+            WriterOutcome::Decide {
+                reason: super::super::need::WorkReason::AgentBlocked,
+                detail: "目标用户是谁？".into(),
+            }
+        } else {
+            WriterOutcome::Draft {
+                git_commit: "a".repeat(40),
+                files: Box::new(files.clone()),
+            }
+        };
+        let job = WriterCompletion {
+            attempt_id: "A".into(),
+            ending: super::super::completion::tests::ending(),
+            outcome,
+        };
+        let done = store.complete_writer_attempt(job.clone()).await?;
+        assert!(if blocked {
+            matches!(done, WriterCompleted::Blocked { .. })
+        } else {
+            matches!(done, WriterCompleted::Drafted)
+        });
+        assert!(matches!(
+            store.complete_writer_attempt(job).await?,
+            WriterCompleted::AlreadyEnded
+        ));
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM candidates", [], |r| r
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT state||'/'||resume_state FROM runs", [], |r| r
+                .get::<_, String>(0))?,
+            "BLOCKED/SPECIFYING"
+        );
+        let qs = super::super::questions::open(&db, "R")?;
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].default, None);
+        if blocked {
+            assert_eq!(qs[0].text, "目标用户是谁？");
+            let mut note = command;
+            note.kind = "AnswerQuestion".into();
+            note.expected_revision = db.query_row("SELECT revision FROM runs", [], |r| r.get(0))?;
+            note.target = RunTarget::Input(super::super::Input::Answer {
+                question_id: qs[0].question_id.clone(),
+                answer: "给管理员使用".into(),
+                choice_id: None,
+            });
+            store.submit_command(note).await?;
+            assert_eq!(
+                db.query_row("SELECT state FROM tasks", [], |r| r.get::<_, String>(0))?,
+                "READY"
+            );
+            assert_eq!(db.query_row("SELECT json_extract(payload_json,'$.note') FROM events WHERE kind='spec.draft_note'",[],|r|r.get::<_,String>(0))?,"给管理员使用");
+        } else {
+            assert_eq!(qs[0].anchor["spec_sha256"], sha);
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM events WHERE kind='spec.draft_completed'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert!(super::super::spec_review::authors(&db, "R", "P", &sha)?.contains("SD"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_04_m3l200_each_attempt_owns_its_start() -> R {
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+      INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES
+      ('A1','D','SD','FAILED',1,1,1),('A2','D','SD','RUNNING',1,1,1);")?;
+    for (attempt, head) in [("A1", "original"), ("A2", "after-other-run")] {
+        db.execute("INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES(?1,'P','R','attempt.workspace_start',?2,'now')",
+            params![child_id(attempt,"workspace_start"),json!({"attempt_id":attempt,"head":head}).to_string()])?;
+    }
+    assert_eq!(
+        store.reader()?.draft_start("A2")?.ok_or("start")?["head"],
+        "after-other-run"
+    );
+    assert_eq!(
+        store.reader()?.draft_start("A1")?.ok_or("start")?["head"],
+        "original"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_01_s7_plan_entry_generates_one_draft_without_rewinding_run() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    store.submit_command(command).await?;
+    db.execute_batch("UPDATE runs SET state='RUNNING',mode='PLAN';
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('plan-entry','P','R','run.mode_changed','{\"to\":\"PLAN\",\"command_id\":\"plan-entry\"}','now');")?;
+    assert!(store.draft_step("R", false).await?);
+    assert!(!store.draft_step("R", false).await?);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM tasks WHERE kind='spec_draft' AND spec_id IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM runs", [], |r| r.get::<_, String>(0))?,
+        "RUNNING"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_009_02_s7_auto_only_drafts_content_gaps_once_per_base() -> R {
+    for mode in ["AUTO", "BUILD"] {
+        let (_dir, store, db, command) = approval_world().await?;
+        store.submit_command(command).await?;
+        db.execute("UPDATE runs SET state='RUNNING',mode=?1", [mode])?;
+        // Only the independent review is missing: no draft is appropriate.
+        assert!(!store.draft_step("R", false).await?);
+        db.execute("DELETE FROM acceptance_criteria", [])?;
+        assert_eq!(store.draft_step("R", false).await?, mode == "AUTO");
+        assert!(!store.draft_step("R", false).await?);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
+        if mode == "AUTO" {
+            db.execute(
+                "UPDATE tasks SET state='CANCELLED' WHERE spec_id IS NOT NULL",
+                [],
+            )?;
+            assert!(
+                !store.draft_step("R", false).await?,
+                "same base and cause must not spin"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_01_s8_applied_change_does_not_open_another_draft() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    store.submit_command(command).await?;
+    db.execute("UPDATE runs SET state='RUNNING',mode='AUTO'", [])?;
+    db.execute_batch("INSERT INTO input_queue VALUES('I','R','CHANGE',NULL,'APPLIED','{\"text\":\"更新说明\"}');
+        INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES('queued-I','P','R','input.queued','{\"input_id\":\"I\"}','now');
+        INSERT INTO change_requests(cr_id,project_id,base_spec_id,state,reason,impact_json,created_at)
+        SELECT 'CR','P',spec_id,'PROPOSED','用户变更','{}','now' FROM runs WHERE run_id='R';")?;
+    assert!(
+        !store.draft_step("R", false).await?,
+        "CHANGE already proposes its CR; it must not introduce a pending-draft hold"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT state FROM change_requests WHERE cr_id='CR'",
+            [],
+            |r| r.get::<_, String>(0)
+        )?,
+        "PROPOSED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_s8_identical_competing_draft_can_be_explicitly_accepted() -> R {
+    let (_dir, store, db, command) = approval_world().await?;
+    db.execute_batch("INSERT INTO runs(run_id,project_id,state,mode,revision,created_at) VALUES('R2','P','SPECIFYING','PLAN',0,'2026-11-22T00:00:00Z');")?;
+    let mut other = command.clone();
+    other.command_id = "other".into();
+    other.idempotency_key = "other".into();
+    other.event.event_id = "other-event".into();
+    other.event.run_id = Some("R2".into());
+    other.run_id = "R2".into();
+    other.expected_revision = 0;
+    store.submit_command(other).await?;
+    store.submit_command(command.clone()).await?;
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "IMPLEMENTED",
+        "old approval must not cross a base"
+    );
+    let mut fresh = command;
+    fresh.command_id = "fresh".into();
+    fresh.idempotency_key = "fresh".into();
+    fresh.event.event_id = "fresh-event".into();
+    fresh.expected_revision =
+        db.query_row("SELECT revision FROM runs WHERE run_id='R'", [], |r| {
+            r.get(0)
+        })?;
+    store.submit_command(fresh).await?;
+    assert_eq!(
+        db.query_row("SELECT state FROM tasks WHERE task_id='D'", [], |r| r
+            .get::<_, String>(0))?,
+        "ACCEPTED"
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM specs", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM change_requests", [], |r| r
+            .get::<_, i64>(0))?,
+        0
+    );
+    assert!(super::super::draft_approval::pending(&db, "R")?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_s8_refused_draft_dispatch_has_a_run_question() -> R {
+    for mode in ["PLAN", "BUILD"] {
+        let (_dir, store, db, _) = approval_world().await?;
+        db.execute_batch(&format!("DELETE FROM events; UPDATE runs SET state='SPECIFYING',mode='{mode}',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL; UPDATE tasks SET state='READY';"))?;
+        assert!(
+            store
+                .dispatch_draft("R", crate::decision::Context::default())
+                .await?,
+            "a deterministic refusal must make durable progress"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "BLOCKED/NEED_DECISION/SPECIFYING"
+        );
+        let questions = super::super::questions::open(&db, "R")?;
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].reason.as_deref(), Some("draft_unavailable"));
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_008_02_m3l251_failed_observation_is_local_to_attempt() -> R {
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+      INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES
+      ('A1','D','SD','FAILED',1,1,1),('A2','D','SD','RUNNING',1,1,1);")?;
+    for (attempt, payload) in [
+        ("A1", json!({"draft_error":"unreadable"})),
+        ("A2", json!({"head":"recovered","draft_dirty":[]})),
+    ] {
+        let mut payload = payload;
+        payload["attempt_id"] = json!(attempt);
+        db.execute("INSERT INTO events(event_id,project_id,run_id,kind,payload_json,created_at) VALUES(?1,'P','R','attempt.workspace_start',?2,'now')",
+            params![child_id(attempt,"workspace_start"),payload.to_string()])?;
+    }
+    assert_eq!(
+        store.reader()?.draft_start("A1")?.ok_or("start")?["draft_error"],
+        "unreadable"
+    );
+    assert_eq!(
+        store.reader()?.draft_start("A2")?.ok_or("start")?["head"],
+        "recovered"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_009_03_m3l252_refused_gate_retains_process_identity_when_unreaped() -> R {
+    use crate::persistence::AttemptFacts;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("UPDATE runs SET state='SPECIFYING',mode='BUILD'; UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO effects(effect_key,attempt_id,state) VALUES('work/A','A','PREPARED');
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    let tracking = json!({"attempt_id":"A","mode":"proc"});
+    assert!(
+        !store
+            .runner_running(
+                "A",
+                AttemptFacts {
+                    pid: Some(123),
+                    boot_id: Some("boot".into()),
+                    process_start_id: Some("start".into()),
+                    ..Default::default()
+                },
+                tracking.clone()
+            )
+            .await?
+    );
+    assert_eq!(db.query_row("SELECT coalesce(pid,0)||'/'||coalesce(boot_id,'')||'/'||coalesce(process_start_id,'')||'/'||state FROM attempts WHERE attempt_id='A'",[],|r|r.get::<_,String>(0))?, "123/boot/start/STARTING");
+    let row = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("attempt")?;
+    assert_eq!(row.pid, Some(123), "a later reconcile must not infer NoPid");
+    store
+        .reconcile_apply(
+            row,
+            crate::reconcile::Disposition::Unreaped,
+            crate::reconcile::Process::Uncertain {
+                basis: "injected proof unavailable".into(),
+            },
+            "draft_gate_refused",
+            std::time::SystemTime::now(),
+            0,
+        )
+        .await?;
+    let later = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("still unfinished")?;
+    assert_eq!(later.pid, Some(123));
+    assert_eq!(later.state, crate::lifecycle::AttemptState::Starting);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM leases WHERE attempt_id='A'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        store.reader()?.attempt_event("attempt.tracking", "A")?,
+        Some(tracking)
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM effects WHERE attempt_id='A'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "PREPARED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_009_03_m3l303_changed_work_effect_keeps_refused_process_identity() -> R {
+    use crate::persistence::AttemptFacts;
+    let (_dir, store, db, _) = approval_world().await?;
+    db.execute_batch("UPDATE runs SET state='SPECIFYING',mode='PLAN'; UPDATE tasks SET state='LEASED';
+        INSERT INTO sessions(session_id,agent,role,agent_version,capabilities_json) VALUES('SD','claude','cto','test','{}');
+        INSERT INTO attempts(attempt_id,task_id,session_id,state,role_epoch,host_epoch,config_revision) VALUES('A','D','SD','STARTING',1,1,1);
+        INSERT INTO leases(project_id,kind,attempt_id,epoch,expires_at) VALUES('P','writer','A',1,'2100-01-01T00:00:00Z');")?;
+    db.execute(
+        "INSERT INTO effects(effect_key,attempt_id,state) VALUES(?1,'A','OBSERVED')",
+        [crate::reconcile::work_key("A")],
+    )?;
+    assert!(
+        super::super::admission::admit_one(&db, "R", "D", super::super::admission::By::Draft)?
+            .is_ok()
+    );
+    let tracking = json!({"attempt_id":"A","mode":"proc"});
+    assert!(
+        !store
+            .runner_running(
+                "A",
+                AttemptFacts {
+                    pid: Some(123),
+                    boot_id: Some("boot".into()),
+                    process_start_id: Some("start".into()),
+                    ..Default::default()
+                },
+                tracking.clone()
+            )
+            .await?
+    );
+    assert_eq!(db.query_row("SELECT coalesce(pid,0)||'/'||coalesce(boot_id,'')||'/'||coalesce(process_start_id,'')||'/'||state FROM attempts WHERE attempt_id='A'",[],|r|r.get::<_,String>(0))?, "123/boot/start/STARTING");
+    assert_eq!(
+        store.reader()?.attempt_event("attempt.tracking", "A")?,
+        Some(tracking)
+    );
+    let row = store
+        .reconcile_scan("P", std::time::SystemTime::now())
+        .await?
+        .into_iter()
+        .find(|r| r.attempt_id == "A")
+        .ok_or("attempt")?;
+    assert_eq!(row.pid, Some(123));
+    store
+        .reconcile_apply(
+            row,
+            crate::reconcile::Disposition::Unreaped,
+            crate::reconcile::Process::Uncertain {
+                basis: "injected proof unavailable".into(),
+            },
+            "draft_gate_refused",
+            std::time::SystemTime::now(),
+            0,
+        )
+        .await?;
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM leases WHERE attempt_id='A'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(db.query_row("SELECT t.state||'/'||l.expires_at FROM tasks t JOIN attempts a ON a.task_id=t.task_id JOIN leases l ON l.attempt_id=a.attempt_id WHERE a.attempt_id='A'", [], |r| r.get::<_, String>(0))?, "LEASED/2100-01-01T00:00:00Z");
+    assert_eq!(
+        db.query_row("SELECT state FROM attempts WHERE attempt_id='A'", [], |r| r
+            .get::<_, String>(0))?,
+        "STARTING"
+    );
+    assert_eq!(
+        db.query_row("SELECT state FROM effects WHERE attempt_id='A'", [], |r| {
+            r.get::<_, String>(0)
+        })?,
+        "OBSERVED"
+    );
     Ok(())
 }

@@ -47,6 +47,8 @@ fn ending(lines: &[String], truncated: bool) -> Ending {
 
 fn reasons(outcome: &WriterOutcome) -> String {
     match outcome {
+        WriterOutcome::Draft { .. } => "draft".into(),
+        WriterOutcome::DraftBlocked { detail, .. } => format!("draft blocked: {detail}"),
         WriterOutcome::Correct { reasons } => format!("correct: {}", reasons.join("; ")),
         WriterOutcome::Decide { reason, detail } => {
             format!("decide {}: {detail}", reason.as_str())

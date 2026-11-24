@@ -128,7 +128,80 @@ pub(super) fn apply(
     if !matches!(&input.action, SpecAction::Approve(a) if a.decision == SpecDecision::Reject) {
         super::spec_sources::check(tx, &project, index.decisions())?;
     }
+    let question = super::draft_approval::pending(tx, &command.run_id)?;
+    if let (Some(q), SpecAction::Approve(approval)) = (&question, &input.action)
+        && q.anchor["spec_sha256"].as_str() != Some(approval.spec_sha256.as_str())
+    {
+        return Err(PersistError::SpecConflict(Box::new(
+            json!({"expected":q.anchor["spec_sha256"],"actual":approval.spec_sha256}),
+        )));
+    }
     let base = latest(tx, &project)?;
+    if let (Some(q), SpecAction::Approve(approval)) = (&question, &input.action)
+        && approval.decision != SpecDecision::Reject
+        && q.anchor["base_spec_id"].as_str() != base.as_ref().map(|b| b.id.as_str())
+    {
+        let (new_base, mut events) = draft_proposal(
+            tx,
+            &project,
+            &command.run_id,
+            &command.command_id,
+            files,
+            ctx,
+        )?;
+        let mut event = command.event.clone();
+        event.event_id = child_id(&command.command_id, "draft/reconfirm");
+        event.kind = "question.asked".into();
+        event.payload = q.anchor.clone();
+        event.payload["question_id"] = json!(event.event_id);
+        event.payload["base_spec_id"] = json!(new_base);
+        event.payload["text"] = json!(
+            "项目已批准了另一修订，草稿已按当前 base 重新提出。请重新确认；旧批准未生效。若内容相同，可明确批准并结束草稿，无需新修订。"
+        );
+        events.push(event);
+        let done = writer::write(
+            tx,
+            &Commit {
+                cas: vec![StateCas {
+                    id: command.run_id.clone(),
+                    expected_revision: revision,
+                    change: Change::Touch(Entity::Run),
+                }],
+                events,
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+        return Ok((done.revisions[0], done.event_seqs[0]));
+    }
+    // Reconfirmation has already fenced the digest and base above. Explicit acceptance of unchanged content
+    // closes only this draft; ADR-033 forbids an empty CR or another identical revision.
+    if let (Some(q), SpecAction::Approve(approval), Some(base)) = (&question, &input.action, &base)
+        && approval.decision != SpecDecision::Reject
+        && base.sha256 == actual
+    {
+        let mut follow = super::draft_approval::answered(tx, command, q, approval, ctx)?;
+        if !follow.cas.iter().any(|c| c.id == command.run_id) {
+            follow.cas.push(StateCas {
+                id: command.run_id.clone(),
+                expected_revision: revision,
+                change: Change::Touch(Entity::Run),
+            });
+        }
+        let mut event = command.event.clone();
+        event.kind = "spec.draft_unchanged".into();
+        event.payload = json!({"command_id":command.command_id,"spec_id":base.id,"spec_sha256":actual,"task_id":q.anchor["task_id"]});
+        follow.events.push(event);
+        let done = writer::write(tx, &follow, ctx)?;
+        let revision = tx
+            .query_row(
+                "SELECT revision FROM runs WHERE run_id=?1",
+                [&command.run_id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_error)?;
+        return Ok((revision, done.event_seqs[0]));
+    }
     let mut events = match &input.action {
         SpecAction::Propose(proposal) => {
             let base = base.as_ref().ok_or_else(|| {
@@ -139,6 +212,16 @@ pub(super) fn apply(
             propose(tx, command, proposal, files, &index, base)?
         }
         SpecAction::Approve(approval) => approve(tx, command, approval, &index, base.as_ref())?,
+    };
+    // Accept the completed draft before migrating non-terminal tasks. Otherwise migrate's saved Task revision
+    // would be stale after IMPLEMENTED -> VERIFYING -> ACCEPTED, and every CR approval would roll back.
+    let draft_follow = if let (Some(q), SpecAction::Approve(approval)) = (&question, &input.action)
+    {
+        Some(super::draft_approval::answered(
+            tx, command, q, approval, ctx,
+        )?)
+    } else {
+        None
     };
     // Approvals may update other non-terminal runs (Q3). Their touches fence decisions against the old revision.
     let mut cas = vec![StateCas {
@@ -186,6 +269,22 @@ pub(super) fn apply(
             }
         }
     }
+    if let Some(follow) = draft_follow {
+        if follow.cas.iter().any(|c| c.id == command.run_id) {
+            cas.retain(|c| c.id != command.run_id);
+        }
+        cas.extend(follow.cas);
+        events.extend(follow.events);
+    } else if matches!(&input.action, SpecAction::Approve(a) if a.decision == SpecDecision::ApproveAndBuild)
+    {
+        super::modes::intent(
+            tx,
+            &command.run_id,
+            &command.command_id,
+            crate::protocol::Mode::Build,
+            ctx,
+        )?;
+    }
     let done = writer::write(
         tx,
         &Commit {
@@ -195,7 +294,14 @@ pub(super) fn apply(
         },
         ctx,
     )?;
-    Ok((done.revisions[0], done.event_seqs[0]))
+    let revision = tx
+        .query_row(
+            "SELECT revision FROM runs WHERE run_id=?1",
+            [&command.run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    Ok((revision, done.event_seqs[0]))
 }
 
 fn propose(
@@ -275,6 +381,15 @@ fn approve(
         let proposed: Option<(String,String)> = tx.query_row(
             "SELECT c.cr_id,c.base_spec_id FROM change_requests c JOIN events e ON json_extract(e.payload_json,'$.cr_id')=c.cr_id WHERE c.project_id=?1 AND c.state='PROPOSED' AND e.kind='spec.proposed' AND json_extract(e.payload_json,'$.spec_sha256')=?2 ORDER BY e.seq DESC LIMIT 1",
             params![command.event.project_id,index.sha256()], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
+        if proposed.is_none()
+            && approval.decision == SpecDecision::Reject
+            && super::draft_approval::pending(tx, &command.run_id)?.is_some()
+        {
+            let mut event = command.event.clone();
+            event.kind = "spec.draft_rejected".into();
+            event.payload = json!({"command_id":command.command_id,"note":approval.note});
+            return Ok(vec![event]);
+        }
         let Some((id, from)) = proposed else {
             return Err(PersistError::SpecConflict(Box::new(
                 json!({"expected":approval.spec_sha256,"actual":index.sha256(),"reason":"no proposed change for this digest"}),
@@ -295,9 +410,11 @@ fn approve(
     }
     let mut event = command.event.clone();
     if approval.decision == SpecDecision::Reject {
-        let cr = cr.ok_or_else(|| {
-            PersistError::BadRequest("there is no proposed change to reject".into())
-        })?;
+        if cr.is_none() && super::draft_approval::pending(tx, &command.run_id)?.is_none() {
+            return Err(PersistError::BadRequest(
+                "there is no proposed change to reject".into(),
+            ));
+        }
         tx.execute("UPDATE change_requests SET state='REJECTED',decided_by=?1 WHERE cr_id=?2 AND state='PROPOSED'",params![command.command_id,cr]).map_err(sqlite_error)?;
         event.kind = "spec.rejected".into();
         event.payload = json!({"command_id":command.command_id,"cr_id":cr,"spec_revision":base.map_or(0,|b| b.revision)});
@@ -414,3 +531,74 @@ fn insert(
 
 #[cfg(test)]
 mod tests;
+
+/// A completed draft based on the latest approved revision becomes a CR through the same proposal writer.
+pub(super) fn draft_proposal(
+    tx: &Transaction<'_>,
+    project: &str,
+    run: &str,
+    id: &str,
+    files: &SpecFiles,
+    ctx: &Ctx<'_>,
+) -> Result<(Option<String>, Vec<NewEvent>), PersistError> {
+    let Some(base) = latest(tx, project)? else {
+        return Ok((None, Vec::new()));
+    };
+    let current: Option<String> = tx
+        .query_row("SELECT spec_id FROM runs WHERE run_id=?1", [run], |r| {
+            r.get(0)
+        })
+        .map_err(sqlite_error)?;
+    if current.as_deref() != Some(&base.id) {
+        tx.execute(
+            "UPDATE runs SET spec_id=?1 WHERE run_id=?2",
+            params![base.id, run],
+        )
+        .map_err(sqlite_error)?;
+        writer::write(
+            tx,
+            &Commit {
+                events: vec![NewEvent {
+                    intent: super::writer::Intent::Progress,
+                    project_id: project.into(),
+                    run_id: Some(run.into()),
+                    event_id: child_id(id, "draft/adopted"),
+                    kind: "spec.changed".into(),
+                    payload: json!({"cause":"adopted","run_id":run,"spec_id":base.id,"spec_revision":base.revision,"spec_sha256":base.sha256}),
+                }],
+                ..Commit::default()
+            },
+            ctx,
+        )?;
+    }
+    let index = specindex::generate_index(&files.sources).map_err(PersistError::SpecInvalid)?;
+    let proposal = ProposeSpecChange {
+        reason: "Plan 起草，请用户确认当前 base".into(),
+        spec_sha256: index.sha256(),
+    };
+    let command = SubmitCommand {
+        command_id: id.into(),
+        idempotency_key: id.into(),
+        kind: "ProposeSpecChange".into(),
+        run_id: run.into(),
+        expected_revision: 0,
+        payload: json!(proposal),
+        payload_sha256: index.sha256(),
+        target: super::RunTarget::Specification(Box::new(SpecRequest {
+            origin: crate::origin::Origin::Unknown,
+            action: SpecAction::Propose(proposal.clone()),
+            files: Ok(files.clone()),
+        })),
+        event: NewEvent {
+            intent: super::writer::Intent::Progress,
+            project_id: project.into(),
+            run_id: Some(run.into()),
+            event_id: child_id(id, "cr"),
+            kind: "spec.proposed".into(),
+            payload: json!({}),
+        },
+        outbox: None,
+    };
+    let events = propose(tx, &command, &proposal, files, &index, &base)?;
+    Ok((Some(base.id), events))
+}

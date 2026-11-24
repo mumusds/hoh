@@ -837,9 +837,41 @@ pub(crate) fn git_run(
     project: &Path,
     args: &[&str],
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    git_run_limited(project, args, None)
+}
+
+/// Bounded Git output for draft path observations. Never accept a truncated path set.
+pub(super) fn git_bounded<S: AsRef<std::ffi::OsStr>>(
+    project: &Path,
+    args: &[S],
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let (status, out) = git_run_limited(project, args, Some(limit))?;
+    if !status.success() {
+        return Err(format!(
+            "git {}: {status}",
+            args.iter()
+                .map(|a| a.as_ref().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    Ok(out)
+}
+
+fn git_run_limited<S: AsRef<std::ffi::OsStr>>(
+    project: &Path,
+    args: &[S],
+    limit: Option<usize>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     use rustix::process::{WaitId, WaitIdOptions};
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
+    let label = args
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut command = std::process::Command::new("git");
     if let Some(marker) = ATTEMPT.with(|a| a.borrow().clone()) {
         command.env(super::processes::ATTEMPT_ENV, marker);
@@ -854,15 +886,19 @@ pub(crate) fn git_run(
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("git {}: {e}", label))?;
     let git = rustix::process::Pid::from_child(&child);
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
+        let stdout = stdout.ok_or_else(|| std::io::Error::other("no stdout"))?;
         stdout
-            .ok_or_else(|| std::io::Error::other("no stdout"))?
-            .read_to_end(&mut out)
-            .map(|_| out)
+            .take(limit.map_or(u64::MAX, |n| n as u64 + 1))
+            .read_to_end(&mut out)?;
+        if limit.is_some_and(|n| out.len() > n) {
+            return Err(std::io::Error::other("draft path output limit exceeded"));
+        }
+        Ok(out)
     });
     let end = Instant::now() + GIT_LIMIT;
     // Its end is seen without reaping it: its pid, which names its group, stays its own until the wait below.
@@ -873,8 +909,12 @@ pub(crate) fn git_run(
         ) {
             Ok(Some(_)) => break Ok(()),
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => break Err(format!("git {}: over {GIT_LIMIT:?}", args.join(" "))),
-            Err(e) => break Err(format!("git {}: {e}", args.join(" "))),
+            Ok(None) => {
+                break Err(format!("git {}: over {GIT_LIMIT:?}", label));
+            }
+            Err(e) => {
+                break Err(format!("git {}: {e}", label));
+            }
         }
     };
     // What git started and left in its group ends with it (and git, past the limit); then git is reaped, then the
@@ -886,10 +926,10 @@ pub(crate) fn git_run(
     let status = child.wait();
     let read = reader.join();
     ended?;
-    let status = status.map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    let status = status.map_err(|e| format!("git {}: {e}", label))?;
     let out = read
         .map_err(|_| "git: its output was lost".to_owned())?
-        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        .map_err(|e| format!("git {}: {e}", label))?;
     Ok((status, out))
 }
 

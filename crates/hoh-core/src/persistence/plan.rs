@@ -344,3 +344,61 @@ pub(super) fn task_paths(conn: &Connection, task_id: &str) -> Result<Vec<String>
         }),
     }
 }
+
+/// Mode-level rejection precedes import, and Commander decisions persist it as ILLEGAL_TRANSITION.
+pub(super) fn mode_refusal(
+    conn: &Connection,
+    run: &str,
+    raw: &Value,
+) -> Result<Option<crate::decision::Rejection>, PersistError> {
+    let (mode, spec): (String, Option<String>) = conn
+        .query_row(
+            "SELECT mode,spec_id FROM runs WHERE run_id=?1",
+            [run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .ok_or_else(|| PersistError::RunNotFound(run.into()))?;
+    let tasks: Vec<&Value> = raw["tasks"].as_array().into_iter().flatten().collect();
+    let blocked: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t["writer"] == true)
+        .filter_map(|t| t["task_id"].as_str())
+        .collect();
+    let (detail, details) = if mode == "PLAN" && !blocked.is_empty() {
+        (
+            "PLAN 不实施",
+            json!({"message":"PLAN 不实施","task_ids":blocked}),
+        )
+    } else if mode == "BUILD" {
+        let mut missing = BTreeSet::new();
+        for requirement in tasks
+            .iter()
+            .flat_map(|t| t["requirement_ids"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+        {
+            let known: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM requirements WHERE spec_id=?1 AND requirement_id=?2)",
+                params![spec, requirement], |r| r.get(0),
+            ).map_err(sqlite_error)?;
+            if !known {
+                missing.insert(requirement.to_owned());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        (
+            "BUILD 不改规格，用 /plan 或 CR",
+            json!({"message":"BUILD 不改规格，用 /plan 或 CR","requirement_ids":missing}),
+        )
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(crate::decision::Rejection {
+        reason: crate::protocol::RejectionReason::IllegalTransition,
+        detail: detail.into(),
+        details: Some(details),
+    }))
+}

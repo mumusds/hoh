@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 pub(super) enum By {
     /// The scheduling round (its retries, verifier and review tasks included).
     Round,
+    /// Runtime specification drafting (outside the scheduler).
+    Draft,
     /// A Commander's dispatch decision.
     Commander,
     /// [`super::attempts::create`]: `Store::create_attempt` and a consumer's effect.
@@ -32,6 +34,7 @@ pub(super) enum By {
 #[derive(Debug)]
 pub(super) struct Admission {
     task_id: String,
+    pub(super) draft_role_epoch: Option<u64>,
 }
 
 impl Admission {
@@ -50,6 +53,12 @@ pub(super) enum Refusal {
     },
     /// A review task, which only the scheduling round dispatches (after its independence pre-check).
     RuntimeOwned,
+    /// Drafts only start in the four working states with a settled Plan/Auto intent.
+    DraftStopped,
+    /// A deterministic drafting refusal that needs a user decision.
+    DraftUnavailable(String),
+    /// Ordinary product writes obey mode intent and pending approval.
+    Mode(crate::mode::WriteRefusal),
     /// A planned task whose readiness under the run's current revision does not pass.
     NotReady { revision: i64, reasons: Vec<Reason> },
     /// A write task whose path scope holds `paths`, files the run's baseline lists as uncommitted, and whose user has
@@ -67,6 +76,19 @@ impl Refusal {
             } => format!(
                 "{task_id} belongs to specification {task_spec:?} but the run's is {run_spec:?}"
             ),
+            Refusal::Mode(reason) => format!(
+                "{task_id}: {} — {}",
+                reason.code(),
+                if *reason == crate::mode::WriteRefusal::Plan {
+                    "PLAN 不实施"
+                } else {
+                    "产品写入等待模式、批准与 readiness"
+                }
+            ),
+            Refusal::DraftUnavailable(detail) => format!("{task_id}: {detail}"),
+            Refusal::DraftStopped => {
+                format!("{task_id}: specification drafting waits for a working PLAN/AUTO run")
+            }
             Refusal::RuntimeOwned => format!(
                 "{task_id} is a specification review's task: the Runtime dispatches it in a session independent of \
                  its revision's drafters and the Commander"
@@ -91,6 +113,7 @@ impl Refusal {
 
     fn details(&self) -> Option<serde_json::Value> {
         match self {
+            Refusal::Mode(reason) => Some(json!({"reason":reason.code()})),
             Refusal::NotReady { reasons, .. } => Some(json!({
                 "reasons": reasons.iter().map(Reason::json).collect::<Vec<_>>()
             })),
@@ -106,6 +129,9 @@ impl Refusal {
             reason: match self {
                 Refusal::SpecMismatch { .. } => RejectionReason::SpecMismatch,
                 Refusal::RuntimeOwned
+                | Refusal::DraftStopped
+                | Refusal::DraftUnavailable(_)
+                | Refusal::Mode(_)
                 | Refusal::NotReady { .. }
                 | Refusal::DirtyWorkspace { .. } => RejectionReason::IllegalTransition,
             },
@@ -127,26 +153,90 @@ impl Refusal {
     }
 }
 
+/// Whether an already-running run can continue its planned product work. Automatic specification repair must not
+/// stop an unrelated ready task (REQ-031). Use the same admission verdicts as dispatch, not another readiness gate.
+pub(super) fn product_work_progressing(
+    tx: &Connection,
+    run_id: &str,
+) -> Result<bool, PersistError> {
+    let working: bool = tx
+        .query_row(
+            "SELECT state IN ('RUNNING','VERIFYING') FROM runs WHERE run_id=?1",
+            [run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if !working {
+        return Ok(false);
+    }
+    let mut query = tx.prepare(
+        "SELECT t.task_id,t.state FROM tasks t WHERE t.run_id=?1 AND t.kind='work' \
+         AND EXISTS(SELECT 1 FROM task_requirements q WHERE q.task_id=t.task_id) \
+         AND (t.state IN ('LEASED','RUNNING','IMPLEMENTED','VERIFYING') OR \
+          (t.state IN ('READY','PENDING') AND NOT EXISTS(SELECT 1 FROM task_dependencies d \
+           JOIN tasks parent ON parent.task_id=d.depends_on WHERE d.task_id=t.task_id AND parent.state<>'ACCEPTED')))"
+    ).map_err(sqlite_error)?;
+    let tasks = query
+        .query_map([run_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if tasks.iter().any(|(_, state)| {
+        matches!(
+            state.as_str(),
+            "LEASED" | "RUNNING" | "IMPLEMENTED" | "VERIFYING"
+        )
+    }) {
+        return Ok(true);
+    }
+    let ids = tasks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+    Ok(admit(tx, run_id, &ids, By::Round, None)?
+        .values()
+        .any(Result::is_ok))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DraftContext<'a> {
+    pub context: &'a crate::decision::Context,
+    pub version: &'a str,
+    pub budget: &'a super::budget_view::View,
+}
+
 /// The verdict on each of `tasks` of run `run_id`, created by `by`, read in the caller's transaction `tx`.
 pub(super) fn admit(
     tx: &Connection,
     run_id: &str,
     tasks: &[&str],
     by: By,
+    draft_context: Option<DraftContext<'_>>,
 ) -> Result<BTreeMap<String, Result<Admission, Refusal>>, PersistError> {
     let mut verdicts = BTreeMap::new();
     if tasks.is_empty() {
         return Ok(verdicts);
     }
-    let run_spec: Option<String> = tx
+    let (run_spec, run_state, run_mode): (Option<String>, String, String) = tx
         .query_row(
-            "SELECT spec_id FROM runs WHERE run_id = ?1",
+            "SELECT spec_id,state,mode FROM runs WHERE run_id = ?1",
             params![run_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(sqlite_error)?
         .ok_or_else(|| PersistError::RunNotFound(run_id.to_owned()))?;
+    let mode: crate::protocol::Mode = serde_json::from_value(json!(run_mode))
+        .map_err(|e| PersistError::IntegrityViolation(e.to_string()))?;
+    let mode_pending = super::modes::pending(tx, run_id)?.is_some();
+    let draft_pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks t JOIN runs r ON r.run_id=t.run_id \
+         WHERE r.run_id=?1 AND r.state NOT IN ('INCOMPLETE','FAILED','COMPLETED','CANCELLED','CANCEL_REQUESTED') \
+         AND t.kind='spec_draft' AND t.state NOT IN ('ACCEPTED','CANCELLED'))",
+            [run_id],
+            |r| r.get(0),
+        )
+        .map_err(sqlite_error)?;
     let reviews = super::spec_review::review_tasks(tx, run_id)?;
     // The run's revision, plan and review, read once for every task (none without a specification).
     let judged = match &run_spec {
@@ -185,15 +275,32 @@ pub(super) fn admit(
                 "no task {task_id}"
             )));
         };
+        let draft = super::drafting::is_draft(tx, task_id)?;
         // 1. Its revision: of this run, and of its current specification when it has adopted one.
-        let verdict = if task_run != run_id || (run_spec.is_some() && task_spec != run_spec) {
+        let verdict = if task_run != run_id
+            || (run_spec.is_some() && task_spec != run_spec && !(draft && task_spec.is_none()))
+        {
             Err(Refusal::SpecMismatch {
                 task_spec,
                 run_spec: run_spec.clone(),
             })
         // 2. Who may dispatch it: a review task is the round's (its independence pre-check runs there).
-        } else if by != By::Round && reviews.contains(task_id) {
+        } else if (draft && by != By::Draft)
+            || (!draft && by == By::Draft)
+            || (by != By::Round && reviews.contains(task_id))
+        {
             Err(Refusal::RuntimeOwned)
+        } else if draft
+            && (!matches!(
+                run_state.as_str(),
+                "SPECIFYING" | "READY" | "RUNNING" | "VERIFYING"
+            ) || mode_pending)
+        {
+            Err(Refusal::DraftStopped)
+        } else if draft && run_mode == "BUILD" {
+            Err(Refusal::DraftUnavailable(
+                "BUILD 不起草规格；请选择 PLAN 或 AUTO".into(),
+            ))
         } else {
             // 3. Its readiness under the run's current revision, when it is a planned task of that revision.
             let readiness = judged.as_ref().and_then(|(revision, plan, review)| {
@@ -204,20 +311,86 @@ pub(super) fn admit(
                     )
                 })
             });
-            match readiness {
-                Some((revision, Readiness::NotReady(reasons))) => {
+            let mode_refusal = if writer && !draft {
+                crate::mode::product_write(
+                    mode,
+                    crate::mode::WriteFacts {
+                        approved: run_spec.is_some(),
+                        ready: !matches!(&readiness, Some((_, Readiness::NotReady(_)))),
+                        mode_pending,
+                        draft_pending,
+                    },
+                )
+                .err()
+            } else {
+                None
+            };
+            match (mode_refusal, readiness) {
+                (Some(reason), _) if reason != crate::mode::WriteRefusal::NotReady => {
+                    Err(Refusal::Mode(reason))
+                }
+                (_, Some((revision, Readiness::NotReady(reasons)))) => {
                     Err(Refusal::NotReady { revision, reasons })
                 }
                 // 4. Its files: a write task whose path scope holds files uncommitted at the run's baseline waits for
                 // the user's answer, asked once (REQ-028 behaviour 4, O3).
                 _ => match dirty(tx, task_id, writer, &uncommitted, &verifiers)? {
                     Some(paths) => Err(Refusal::DirtyWorkspace { paths }),
-                    // 5. M3-T04: the run mode's admission (PLAN/BUILD/AUTO) joins here, as one more refusal.
                     None => Ok(Admission {
                         task_id: task_id.to_owned(),
+                        draft_role_epoch: None,
                     }),
                 },
             }
+        };
+        let verdict = match (verdict, draft, draft_context) {
+            (
+                Ok(mut admitted),
+                true,
+                Some(DraftContext {
+                    context,
+                    version,
+                    budget,
+                }),
+            ) => {
+                let cost: i64 = tx
+                    .query_row(
+                        "SELECT cost_estimate FROM tasks WHERE task_id=?1",
+                        [task_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(sqlite_error)?;
+                if budget.task_stop(task_id).is_some()
+                    || context.budget_headroom.is_some_and(|h| i64::from(h) < cost)
+                {
+                    Err(Refusal::DraftUnavailable(
+                        "起草预算不足；调整预算后重试".into(),
+                    ))
+                } else if let Some(binding) =
+                    super::decide::load_binding(tx, run_id, "cto", version)?
+                {
+                    if !binding.active && !binding.blocked {
+                        Err(Refusal::DraftStopped) // Pending staffing/handover is a bounded wait, not a user decision.
+                    } else if !binding.active
+                        || !context
+                            .required_capabilities
+                            .get("cto")
+                            .is_some_and(|required| required.is_subset(&binding.capabilities))
+                    {
+                        Err(Refusal::DraftUnavailable(
+                            "cto 绑定不可用或缺少起草能力；请修复团队配置后重试".into(),
+                        ))
+                    } else {
+                        admitted.draft_role_epoch = Some(binding.role_epoch);
+                        Ok(admitted)
+                    }
+                } else {
+                    Err(Refusal::DraftUnavailable(
+                        "缺少 cto 绑定；请配置起草角色后重试".into(),
+                    ))
+                }
+            }
+            (verdict, _, _) => verdict,
         };
         verdicts.insert(task_id.to_owned(), verdict);
     }
@@ -252,7 +425,7 @@ pub(super) fn admit_one(
     task_id: &str,
     by: By,
 ) -> Result<Result<Admission, Refusal>, PersistError> {
-    admit(tx, run_id, &[task_id], by)?
+    admit(tx, run_id, &[task_id], by, None)?
         .remove(task_id)
         .ok_or_else(|| PersistError::Storage(format!("{task_id} left its admission")))
 }
@@ -275,6 +448,7 @@ pub(super) fn supervision(tx: &Connection, task_id: &str) -> Result<Admission, P
     }
     Ok(Admission {
         task_id: task_id.to_owned(),
+        draft_role_epoch: None,
     })
 }
 

@@ -18,7 +18,7 @@
 
 `hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
-没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id，Run 同样 BLOCKED）。项目有了已批准的规格之后，以 `adopt` 答复它（`hoh -p adopt --resume <run_id>`，或在 TUI 中回答），Run 采用该规格、回到 CREATED，由 Commander 继续推进；仍没有规格时答复不改变什么，Run 保持 BLOCKED。项目有已批准的规格时，新 Run 在启动时采用 revision 最高的那一版。产品已有 `ProposeSpecChange` 与直接 `ApproveSpec` API；批准会核对当前 Markdown 生成且被 Git 跟踪的索引，内容冲突返回 409 SPEC_CONFLICT。首次起草与批准问题的交互接线仍在 M3-T04 后续切片中。
+没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id）。用 `hoh -p draft --resume <run_id>` 或在 TUI 中选择 draft，HoH 先只读地了解项目，再由 Plan 起草规格并请你批准；起草只能写文档和 `.hoh/`，不能实施产品代码。起草完成后，`-p` 在 `spec_approval` 问题处以 3 退出，不会自行批准。可在 TUI 明确选择 approve，或用 `hoh -p approve --resume <run_id> --detach` 提交批准并取回 run_id（去掉 `--detach` 会继续跟随 Run）。其他答复退回起草，正文作为修改意见。只有用户能批准；从 Agent 进程或其可识别后代发出的批准被拒为 SPEC_APPROVAL_NOT_USER。批准前 specs 没有修订，批准时核对当前 Markdown 生成的摘要与问题中的摘要，内容冲突返回 409 SPEC_CONFLICT。项目已经有已批准修订时，no_spec 问题的 draft 与 adopt 都采用当前最高修订，不再建首次起草 Task；仍没有规格时 adopt 保持阻塞。当前自动起草入口支持首次规格；已有修订的修改仍可通过 ProposeSpecChange API 提出 CR 后批准。
 
 直接 `ApproveSpec` 只允许用户来源。host 从 TCP/Unix socket 的真实对端确认进程，检查
 Attempt 标记、同 uid 祖先标记和 Attempt cgroup；Agent 工具中的 shell 也在此范围内。
@@ -61,7 +61,7 @@ HoH 的 Slash 不转给底座。要定向发送底座命令，使用 `/agent dev
 
 ## 异常解释
 
-NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --resume <run_id>` 或在 TUI 中回答（原因 `no_spec`：项目还没有已批准的规格，见“常用操作”）；BLOCKED_AUTH：需要原生登录（恢复见下）；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；AGENT_UNAVAILABLE / MODEL_UNAVAILABLE：Agent 未安装或无法探测 / 配置的模型不可用（见下“职位缺员”）；COMMANDER_UNAVAILABLE：Commander 无法启动，已派发的 QA/Review 照常进行；BUDGET_UNENFORCEABLE：设置了费用上限但模型价格未知，不会继续花费；COMPAT_UNVERIFIED：原生 CLI 变了，host 在没有写任务时自动跑兼容套件（恢复见下）；DB_WAL_UNSUPPORTED / DB_ON_NETWORK_FS：项目所在文件系统不支持可靠的 SQLite WAL；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足；FAILED：不可恢复的运行失败或数据完整性异常。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
+NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --resume <run_id>` 或在 TUI 中回答（原因 `no_spec`：项目还没有已批准的规格；`spec_approval`：规格待你批准，只有你能批准，Agent 进程的批准被拒为 SPEC_APPROVAL_NOT_USER；见“常用操作”）；BLOCKED_AUTH：需要原生登录（恢复见下）；BLOCKED_CAPABILITY：当前版本不支持所需接口（对应错误码 CAPABILITY_UNSUPPORTED，API 返回 422）；AGENT_UNAVAILABLE / MODEL_UNAVAILABLE：Agent 未安装或无法探测 / 配置的模型不可用（见下“职位缺员”）；COMMANDER_UNAVAILABLE：Commander 无法启动，已派发的 QA/Review 照常进行；BUDGET_UNENFORCEABLE：设置了费用上限但模型价格未知，不会继续花费；COMPAT_UNVERIFIED：原生 CLI 变了，host 在没有写任务时自动跑兼容套件（恢复见下）；DB_WAL_UNSUPPORTED / DB_ON_NETWORK_FS：项目所在文件系统不支持可靠的 SQLite WAL；WAITING_EXTERNAL：已保存next_retry；INVALID_EVIDENCE：版本或文件已变；INCOMPLETE：剩余需求/预算不满足；FAILED：不可恢复的运行失败或数据完整性异常。状态不是“AI坏了”的泛化报错；每项提供诊断和恢复动作。
 
 **职位缺员**（ADR-030 决定 3–7、11）：职位的 Agent 未安装、不受支持、未登录、配置的模型不可用、缺该职位所需的能力（所有职位要 structured_events，commander、reviewer 另要 resume，developer、qa 另要 command_execution，commander 另要 read_only_workspace），或新版本的兼容套件 FAIL 或判不了时，HoH 按 `[team.<role>]` 的 `fallback` 顺序换到第一个可用的 Agent，commander 也一样；不在列表里的 Agent 不会被启用，默认没有 fallback。换绑等该职位正在运行的 turn 结束后生效（role_epoch+1，新会话从交接包开始；qa、reviewer 总在新会话里，不用开发者的会话），首选恢复后不自动换回。探测暂时失败、兼容待验证与 429/503 只等待，不触发 fallback。没有可用候选时该职位 BLOCKED，团队视图列出每个候选的缺项，如 `pi:not_installed`、`claude:BLOCKED_AUTH`、`codex:CAPABILITY_UNSUPPORTED:resume`（`<agent>:CAPABILITY_UNSUPPORTED:read_only_workspace` 表示该 Agent 不能以只读工作区档当 Commander：被测 help/schema 不提供只读档、兼容清单的 read_only 用例未通过、codex 只有 exec，或这台主机上 codex 的沙箱检查为 unconfined、unavailable，或它的 App Server 在本 host 运行中降级为 exec；它在其他职位照常可用，主机的问题修好后至多 60 秒内恢复，见下“Commander 的只读档与余项”）；该职位到期的 Task 以同一原因 BLOCKED，不建 Attempt、不排重试，别的职位照常推进，没有别的事可做时 Run 才 BLOCKED；qa 或 reviewer 缺员时候选停在 VERIFYING，不会 ACCEPTED；commander 连 fallback 都不可用时才持续 COMMANDER_UNAVAILABLE。Agent 恢复可用（重新登录、升级后能力回来、兼容套件通过）后，HoH 自己给该职位新会话并把这些 Task 放回 READY，不需要重新提交。
 
@@ -74,6 +74,12 @@ NEED_DECISION：缺少只能由你给出的决定，用 `hoh -p '<答复>' --res
 **已接受的余项 R1、R2、R3**（ADR-030 决定 9；批准人：所有者，R1、R2 于 2026-11-13，R3 于 2026-11-14）：HoH 在启动 Agent 之前核对它的文件，并直接执行核对过的那个文件；下列情形不在这一保证之内。R1：核对完到开始执行之间，有程序就地改写同一个已安装文件（正常升级写新文件或新目录，不会这样）。R2：脚本实现的 Agent（pi、npm 安装的 claude）在解释器读到主脚本之前路径被换成别的文件；脚本之后再加载的包内文件与解释器本身不在核对范围内。R3：Agent 启动之后按路径再启动的自身或包内辅助程序（如 codex 的 `apply_patch` 与沙箱辅助程序，claude 在旧版本文件被删除后经启动器执行的搜索），在 turn 进行中有新版本装入时运行的是新版本，主进程仍是核对过的版本。另有两次再核对收窄它们：pi（RPC）与 codex App Server 在发出第一个工作输入之前再看一次启动器与实现文件，变了即不发输入、结束这个 Attempt（COMPAT_UNVERIFIED），提示词没有交付，Task 等新版本通过套件后再派发（只是权限之类的元数据变了、内容没变时按普通失败退避重试）；每个 turn 进行中每 200 ms 再看一次，变了只在该 Attempt 上记一条诊断 `IMPLEMENTATION_CHANGED_IN_TURN`，turn 照常结束（运行中的 Attempt 不受影响，AC-027-04），之后的新 Attempt 照样等套件通过。
 
 `hoh` 与 `hoh -p` 的退出码（REQ-004）：0 COMPLETED；1 FAILED；3 BLOCKED；4 INCOMPLETE；5 CANCELLED；6 PAUSED；64 用法错误；69 host 不可用；78 配置错误；130 被 SIGINT 中断（后台任务继续）；143 被 SIGTERM 中断。
+
+### 已有规格时继续规划
+
+运行中输入 `/plan`，模式会在当前写入安全结束后生效。HoH 保持 Run 的工作阶段，以当前已批准规格起草变更；暂停期间不开始新草稿，恢复后继续。起草完成会提出 CR 并等待你批准；切换到 BUILD 不会替你批准，也不会跳过新修订的独立规格审查。
+
+已经运行的 Run 中，不受规格缺项影响的就绪任务和在途工作继续推进；这些工作结束后，再处理尚未解决的缺项。AUTO 遇到缺少验收条件、无法观察的条件或待定内容时会请求补充规格，并停在批准问题前；无人值守的 `-p` 此时以 3 退出。BUILD 遇到这些缺项会保留 readiness 阻塞，提示切到 PLAN/AUTO 或修复后重试。TUI 选择退回草稿时，先输入非空修改意见再按 Enter；Esc 返回选择。取消草稿会保留已写入的文件和提交。
 
 ## 最终报告
 
