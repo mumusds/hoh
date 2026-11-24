@@ -521,7 +521,7 @@ impl ProductExecutor {
         package: Option<&serde_json::Value>,
         skills: &hoh_core::skills::Loaded,
         native_skills: bool,
-        fallbacks: &std::collections::BTreeMap<String, String>,
+        fallbacks: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(String, PromptRecord, Vec<PathBuf>), Refusal> {
         use hoh_core::context;
         let bundle = self.bundle(work)?;
@@ -666,7 +666,14 @@ impl ProductExecutor {
                         match hoh_core::skills::native_path(&self.project, session, skill) {
                             Ok(path) => path,
                             Err(error) => {
-                                fallback_reasons.insert(skill.skill.id.clone(), error.to_string());
+                                fallback_reasons.insert(
+                                    skill.skill.id.clone(),
+                                    serde_json::json!({
+                                        "path": format!(".hoh/sessions/{}/skills/{}/SKILL.md",
+                                            hoh_core::layout::component(session), skill.skill.id),
+                                        "kind": error.code,
+                                    }),
+                                );
                                 None
                             }
                         }
@@ -879,7 +886,13 @@ impl ProductExecutor {
                     Path::new(field("native_path")?),
                     field("sha256")?,
                 ) {
-                    fallbacks.insert(field("id")?.to_owned(), error.to_string());
+                    fallbacks.insert(
+                        field("id")?.to_owned(),
+                        serde_json::json!({
+                            "path": Path::new(field("native_path")?).join("SKILL.md"),
+                            "kind": error.code,
+                        }),
+                    );
                     changed = true;
                 }
             }

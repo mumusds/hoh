@@ -83,7 +83,7 @@ fn bundle_includes_all_skills_templates_and_catalogs() -> R {
 }
 
 #[test]
-fn test_046_03_four_layers_validate_before_becoming_effective() -> R {
+fn four_layers_validate_before_becoming_effective() -> R {
     let dir = tempfile::Builder::new().prefix("m3t08-skills-").tempdir()?;
     let project = dir.path().join("project");
     let global = dir.path().join("global");
@@ -197,7 +197,7 @@ fn old_pin_without_registry_has_no_builtin_skills() -> R {
 }
 
 #[test]
-fn test_046_03_unknown_extra_fields_are_rejected() -> R {
+fn unknown_extra_fields_are_rejected() -> R {
     for (key, value) in [
         ("capabilities", json!(["scheduler"])),
         ("registers", json!("scheduler")),

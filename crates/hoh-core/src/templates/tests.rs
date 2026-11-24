@@ -2,7 +2,7 @@ use super::*;
 type R = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn test_029_01_user_braces_are_literal_values_not_template_residue() -> R {
+fn user_braces_are_literal_values_not_template_residue() -> R {
     let dir = tempfile::Builder::new().prefix("m3t08-braces-").tempdir()?;
     let templates = load(
         dir.path(),
@@ -47,7 +47,7 @@ fn test_029_01_user_braces_are_literal_values_not_template_residue() -> R {
 }
 
 #[test]
-fn test_029_01_indented_goal_headings_are_quoted() -> R {
+fn indented_goal_headings_are_quoted() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-headings-")
         .tempdir()?;
@@ -133,7 +133,7 @@ fn test_029_01_profiles_instantiate_all_templates_without_placeholders() -> R {
 }
 
 #[test]
-fn test_029_01_global_and_run_overrides_validate_every_layer() -> R {
+fn global_and_run_overrides_validate_every_layer() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-template-layers-")
         .tempdir()?;
@@ -176,7 +176,7 @@ fn test_029_01_global_and_run_overrides_validate_every_layer() -> R {
 }
 
 #[test]
-fn test_029_01_render_rejects_unclosed_placeholders_and_empty_metadata_with_positions() -> R {
+fn render_rejects_unclosed_placeholders_and_empty_metadata_with_positions() -> R {
     for (text, expected) in [("{{BROKEN", "placeholder"), ("标题：\n", "标题")] {
         let error = validate("docs/feature.md", text).unwrap_err().to_string();
         assert!(
@@ -188,7 +188,7 @@ fn test_029_01_render_rejects_unclosed_placeholders_and_empty_metadata_with_posi
 }
 
 #[test]
-fn test_029_01_invalid_profiles_and_spec_are_rejected_before_publication() -> R {
+fn invalid_profiles_and_spec_are_rejected_before_publication() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-profiles-")
         .tempdir()?;

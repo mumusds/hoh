@@ -385,7 +385,7 @@ async fn test_045_01_replay_records_layers_and_revision() -> R {
 }
 
 #[tokio::test]
-async fn test_029_02_run_snapshot_pins_profile_and_source() -> R {
+async fn run_snapshot_pins_profile_and_source() -> R {
     for explicit in [false, true] {
         let world = World::new()?;
         let project = world.project();
@@ -837,7 +837,12 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(loaded))
             assert_eq!(tdd["native"],if native {"pi_skill"} else {"injected"});
             assert_eq!(tdd["layer"],"project");
             if case.starts_with("native-read-") || case.starts_with("native-changed-") {
-                assert!(tdd["native_fallback"].as_str().is_some_and(|s| !s.is_empty()), "missing fallback reason: {tdd}");
+                let session = query(&project, &format!("SELECT session_id FROM attempts WHERE attempt_id = '{attempt}'"))?;
+                assert_eq!(tdd["native_fallback"], json!({
+                    "path": format!(".hoh/sessions/{}/skills/tdd/SKILL.md", hoh_core::layout::component(&session)),
+                    "kind": "PROMPT_UNAVAILABLE",
+                }), "fallback must identify the relative file and error kind: {case}");
+                assert!(!tdd["native_fallback"].to_string().contains(&project.display().to_string()));
             }
 
             let input = event["inputs"].as_array().ok_or("no inputs")?.iter().find(|s|s["path"] == ".hoh/skills/tdd/SKILL.md" && s["kind"] == "entry");
@@ -882,8 +887,8 @@ fn isolated_xdg_rejects_a_test_name_that_matches_nothing() {
 }
 
 #[tokio::test]
-async fn test_046_03_invalid_registration_keeps_the_attempts_valid_skill_set() -> R {
-    if isolated_xdg("test_046_03_invalid_registration_keeps_the_attempts_valid_skill_set")? {
+async fn invalid_registration_keeps_the_attempts_valid_skill_set() -> R {
+    if isolated_xdg("invalid_registration_keeps_the_attempts_valid_skill_set")? {
         return Ok(());
     }
     let world = World::new()?;
