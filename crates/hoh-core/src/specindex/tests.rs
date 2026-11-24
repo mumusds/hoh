@@ -52,6 +52,73 @@ fn test_034_04_generator_canonical_bytes_and_source_digest() -> R {
     );
     let bytes = format!("{}\n", serde_json::to_string_pretty(&expected)?).into_bytes();
     assert_eq!(index.bytes(), bytes);
+    // M3B-09: pinned bytes. A serde_json encoding of the same value would
+    // follow a map-order change and hide it.
+    const CANONICAL: &str = r#"{
+  "files": [
+    {
+      "path": "docs/spec/a.md",
+      "sha256": "e3352f139a1305b88a3bdcbe3b9e9e9d4ce53e929d7e8888cf011f1e9c9ed1b9"
+    },
+    {
+      "path": "docs/spec/b.md",
+      "sha256": "4d1e8ed3f5f7839ef3d3155045a1ac5edf32a9d6b9b3174d29fde77e022b9c0a"
+    }
+  ],
+  "generated": "生成，勿改",
+  "requirements": [
+    {
+      "acceptance": [
+        {
+          "given": "前提",
+          "id": "AC-A-01",
+          "test_id": "TEST-A-01",
+          "then": "结果",
+          "when": "操作"
+        }
+      ],
+      "id": "REQ-A",
+      "release_class": "required",
+      "release_targets": [
+        "project"
+      ],
+      "title": "标题"
+    },
+    {
+      "acceptance": [
+        {
+          "given": "前提",
+          "id": "AC-B-01",
+          "test_id": "TEST-B-01",
+          "then": "结果",
+          "when": "操作"
+        }
+      ],
+      "id": "REQ-B",
+      "release_class": "degradable",
+      "release_targets": [
+        "project"
+      ],
+      "title": "标题"
+    }
+  ],
+  "scenarios": [
+    {
+      "acceptance_id": "AC-A-01",
+      "check_id": "check-A",
+      "id": "TEST-A-01",
+      "requirement_id": "REQ-A"
+    },
+    {
+      "acceptance_id": "AC-B-01",
+      "check_id": "check-B",
+      "id": "TEST-B-01",
+      "requirement_id": "REQ-B"
+    }
+  ]
+}
+"#;
+    assert_eq!(index.bytes(), CANONICAL.as_bytes(), "canonical index bytes");
     assert_eq!(
         index.bytes(),
         generate_index(&[a.clone(), b.clone()])?.bytes()
