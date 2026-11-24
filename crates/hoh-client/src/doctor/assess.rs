@@ -16,7 +16,10 @@ fn install(agent: Agent) -> &'static str {
         Agent::Claude => {
             "安装 Claude Code 后重试：下载 https://claude.ai/install.sh 并运行 bash install.sh stable"
         }
-        Agent::Pi => "安装 pi 后重试：npm install -g @earendil-works/pi-coding-agent@1.5.0",
+        // Recorded suite traffic is 1.5.0; the installed CLI recorded in ADR-040 is 1.6.0 (PI16-B2).
+        Agent::Pi => {
+            "安装 pi 后重试：npm install -g @earendil-works/pi-coding-agent@1.6.0（兼容套件录制为 1.5.0）"
+        }
     }
 }
 
@@ -183,6 +186,21 @@ pub(super) fn remedy(protocol: Protocol, auth_note: Option<String>) -> Option<St
         (_, Some(note)) => Some(note),
         (Protocol::Unknown, None) => Some(SUITE_NOTE.to_owned()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod install_hint {
+    use super::install;
+    use hoh_agents::compat::Agent;
+
+    #[test]
+    fn pi_install_hint_names_recorded_1_5_0_and_installed_1_6_0() {
+        // PI16-B2: the recorded suite is pi 1.5.0 and the installed CLI is 1.6.0 (ADR-040).
+        let hint = install(Agent::Pi);
+        assert!(hint.contains("@earendil-works/pi-coding-agent"), "{hint}");
+        assert!(hint.contains("1.5.0"), "{hint}");
+        assert!(hint.contains("1.6.0"), "{hint}");
     }
 }
 
