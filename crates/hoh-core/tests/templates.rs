@@ -68,7 +68,7 @@ fn test_029_02_default_profile_source_and_reprofile_preserves_edited_files() -> 
 }
 
 #[test]
-fn test_029_02_invalid_render_or_link_cannot_overwrite_or_escape() -> R {
+fn invalid_render_or_link_cannot_overwrite_or_escape() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-doc-errors-")
         .tempdir()?;
@@ -99,7 +99,7 @@ fn test_029_02_invalid_render_or_link_cannot_overwrite_or_escape() -> R {
 }
 
 #[test]
-fn test_029_02_retry_after_publication_error_keeps_completed_files() -> R {
+fn retry_after_publication_error_keeps_completed_files() -> R {
     let dir = tempfile::Builder::new()
         .prefix("m3t08-doc-retry-")
         .tempdir()?;
@@ -143,7 +143,7 @@ fn no_staged_files(root: &std::path::Path) -> R {
 }
 
 #[test]
-fn test_029_02_publication_rejects_links_fifo_and_unwritable_directory() -> R {
+fn publication_rejects_links_fifo_and_unwritable_directory() -> R {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     for case in [
         "leaf",
@@ -220,7 +220,7 @@ fn test_029_02_publication_rejects_links_fifo_and_unwritable_directory() -> R {
 
 // A real write is interrupted at a deterministic byte offset. No product fault hook or live agent.
 #[test]
-fn test_029_02_killed_mid_write_leaves_no_named_staging_file() -> R {
+fn killed_mid_write_leaves_no_named_staging_file() -> R {
     use std::os::unix::process::ExitStatusExt;
     const CHILD: &str = "HOH_M3T08_WRITE_CHILD";
     if let Some(root) = std::env::var_os(CHILD) {
@@ -282,7 +282,7 @@ ssize_t write(int fd, const void *buf, size_t n) {
         .env("LD_PRELOAD", &library)
         .args([
             "--exact",
-            "test_029_02_killed_mid_write_leaves_no_named_staging_file",
+            "killed_mid_write_leaves_no_named_staging_file",
             "--nocapture",
         ])
         .output()?;
