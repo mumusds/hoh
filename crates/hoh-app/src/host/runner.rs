@@ -2159,8 +2159,10 @@ async fn run_check(
     let adopt = common.shared.cgroups.clone().map(|delegated| {
         let path = delegated.attempt(&marker);
         Box::new(move |pid: u32| {
-            let _ = AttemptGroup::adopt(&path, pid);
-        }) as Box<dyn FnOnce(u32) + Send>
+            AttemptGroup::adopt(&path, pid)
+                .map(drop)
+                .map_err(|e| format!("its attempt's cgroup could not be joined: {e}"))
+        }) as crate::verify::check::Adopt
     });
     let ran = crate::verify::check::run_with(
         store,
