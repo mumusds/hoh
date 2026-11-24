@@ -255,40 +255,71 @@ fn test_047_03_read_between_base_and_override_rename_never_trusts_mixed_bytes() 
     Ok(())
 }
 
-/// A cargo test process must not fall back to `$HOME/.config/hoh` (M3E-02). Paths come from the
-/// caller; this test does not read or write the process environment.
+/// Isolation is explicit: tests supply an XDG root or omit HOME, never infer it from cargo.
 #[test]
-fn global_root_for_skips_home_when_cargo_manifest_is_set() {
+fn global_root_for_uses_explicit_inputs_for_test_isolation() {
     let dir = tempfile::Builder::new()
-        .prefix("m3e02-global-")
+        .prefix("m3low-c-global-")
         .tempdir()
         .unwrap();
     let xdg = dir.path().join("xdg");
     let home = dir.path().join("home");
-    let cargo = std::ffi::OsStr::new("crate");
     assert!(
-        global_root_for(Some(cargo), None, Some(home.as_os_str())).is_none(),
-        "cargo without XDG must not use HOME"
+        global_root_for(None, None).is_none(),
+        "no injected roots means no global layer"
     );
     assert!(
-        global_root_for(
-            Some(cargo),
-            Some(std::ffi::OsStr::new("")),
-            Some(home.as_os_str())
-        )
-        .is_none(),
+        global_root_for(Some(std::ffi::OsStr::new("")), None).is_none(),
         "an empty XDG is unset"
     );
     assert_eq!(
-        global_root_for(Some(cargo), Some(xdg.as_os_str()), Some(home.as_os_str())).as_deref(),
+        global_root_for(Some(xdg.as_os_str()), Some(home.as_os_str())).as_deref(),
         Some(xdg.join("hoh").as_path())
     );
     assert_eq!(
-        global_root_for(None, None, Some(home.as_os_str())).as_deref(),
-        Some(home.join(".config").join("hoh").as_path())
+        global_root_for(None, Some(home.as_os_str())).as_deref(),
+        Some(home.join(".config/hoh").as_path())
     );
     assert_eq!(
-        global_root_for(None, Some(xdg.as_os_str()), Some(home.as_os_str())).as_deref(),
+        global_root_for(Some(xdg.as_os_str()), None).as_deref(),
         Some(xdg.join("hoh").as_path())
+    );
+    assert_eq!(
+        global_root_for(Some(std::ffi::OsStr::new("")), Some(home.as_os_str())).as_deref(),
+        Some(home.join(".config/hoh").as_path())
+    );
+}
+
+#[test]
+fn test_047_01_cargo_launch_keeps_home_fallback() {
+    const CHILD: &str = "HOH_M3LC_GLOBAL_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let expected =
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".config/hoh");
+        assert_eq!(product_global_root(), Some(expected.clone()));
+        assert_eq!(global_root(), Some(expected));
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("m3low-c-home-")
+        .tempdir()
+        .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "prompt_files::tests::test_047_01_cargo_launch_keeps_home_fallback",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("CARGO_MANIFEST_DIR", "cargo-parent")
+        .env("HOME", dir.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

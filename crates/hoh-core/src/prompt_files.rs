@@ -10,43 +10,29 @@ static SAVES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests;
 
-/// The global HoH configuration root. Reading this does not create or modify a user directory.
-/// Installed binaries and the TUI use this. A cargo test process that must not read `$HOME`
-/// uses [`product_global_root`] (M3E-02).
+/// The global HoH configuration root, shared by the executor and clients.
+/// Test harnesses isolate it by injecting XDG_CONFIG_HOME; cargo is also a product launch path.
 pub fn global_root() -> Option<PathBuf> {
     global_root_for(
-        None,
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
 
-/// Resolve the global root from explicit inputs. A non-empty `xdg` wins. When `cargo_manifest`
-/// is set and `xdg` is absent, the result is `None`: `$HOME/.config` is not a fallback.
-/// When `cargo_manifest` is absent, the fallback is `$HOME/.config/hoh`, as [`global_root`].
+/// Resolve the XDG -> HOME rule from explicit inputs without reading the process environment.
 pub fn global_root_for(
-    cargo_manifest: Option<&std::ffi::OsStr>,
     xdg: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let xdg = xdg.filter(|value| !value.is_empty());
-    if cargo_manifest.is_some() {
-        return xdg.map(|root| PathBuf::from(root).join("hoh"));
-    }
-    xdg.map(PathBuf::from)
+    xdg.filter(|value| !value.is_empty())
+        .map(PathBuf::from)
         .or_else(|| home.map(|path| PathBuf::from(path).join(".config")))
         .map(|root| root.join("hoh"))
 }
 
-/// The product host's global root. `cargo test` and `cargo run` set `CARGO_MANIFEST_DIR`; those
-/// processes read `$XDG_CONFIG_HOME/hoh` only, and do not fall back to `$HOME/.config/hoh`.
-/// An installed binary has no `CARGO_MANIFEST_DIR` and keeps [`global_root`]'s rule.
+/// The product host follows the same rule even under cargo or a cargo-spawned parent.
 pub fn product_global_root() -> Option<PathBuf> {
-    global_root_for(
-        std::env::var_os("CARGO_MANIFEST_DIR").as_deref(),
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
+    global_root()
 }
 
 /// Read each Attempt's directory chain afresh. A configured project file replaces the conventional project file.
