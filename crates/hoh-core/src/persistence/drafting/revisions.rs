@@ -24,10 +24,10 @@ fn requested(conn: &Connection, run: &str) -> Result<Option<Request>, PersistErr
         "SELECT i.input_id,i.payload_json FROM input_queue i JOIN events e ON json_extract(e.payload_json,'$.input_id')=i.input_id \
          WHERE i.run_id=?1 AND ?3='PLAN' AND i.kind='STEER' AND i.state<>'REJECTED' AND i.target_role IS NULL \
          AND e.kind='input.queued' AND e.seq>?2 AND e.seq>(SELECT coalesce(max(seq),0) FROM events WHERE run_id=?1 AND kind='question.answered') \
-         AND e.seq>(SELECT coalesce(max(seq),0) FROM events WHERE run_id=?1 AND kind='run.mode_changed' AND json_extract(payload_json,'$.to')='PLAN') \
+         AND e.seq>(SELECT coalesce(max(seq),0) FROM events WHERE run_id=?1 AND kind='run.mode_changed' AND json_extract(payload_json,'$.to')='PLAN' AND json_extract(payload_json,'$.from')<>'PLAN') \
          ORDER BY e.seq DESC LIMIT 1",params![run,last,mode],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sqlite_error)?;
     let mode_entry: Option<String> = conn.query_row(
-        "SELECT event_id FROM events WHERE run_id=?1 AND kind='run.mode_changed' AND json_extract(payload_json,'$.to')='PLAN' AND seq>?2 ORDER BY seq DESC LIMIT 1",
+        "SELECT event_id FROM events WHERE run_id=?1 AND kind='run.mode_changed' AND json_extract(payload_json,'$.to')='PLAN' AND json_extract(payload_json,'$.from')<>'PLAN' AND seq>?2 ORDER BY seq DESC LIMIT 1",
         params![run,last],|r|r.get(0)).optional().map_err(sqlite_error)?;
     let (cause, note) = if let Some((id, payload)) = input {
         (

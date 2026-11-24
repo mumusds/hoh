@@ -1559,10 +1559,21 @@ pub(super) fn finished_in(
         )
         .map_err(sqlite_error)?;
     let from = writer::parse::<AttemptState>(&from)?;
+    // Every normal ending already has a termination proof. Use the same draft table as
+    // gate refusal and reconcile; never charge an unstarted draft to the retry budget.
+    let draft_end = super::drafting::is_draft(tx, &task_id)?.then(|| {
+        crate::reconcile::draft_end(
+            from == AttemptState::Running,
+            &crate::reconcile::Process::Gone {
+                basis: "runner termination proof".into(),
+            },
+        )
+    });
+    let retry_draft = draft_end == Some(crate::reconcile::DraftEnd::Retry);
     if !cancelled
         && task_state == TaskState::Running
         && let Some((detail, paths)) = &ending.observed.draft_boundary
-        && super::drafting::is_draft(tx, &task_id)?
+        && draft_end == Some(crate::reconcile::DraftEnd::CheckWrites)
     {
         super::drafting::blocked(tx, attempt_id, detail, Some(paths), ctx)?;
         (_, task_state, revision, _, _) = task_of(tx, attempt_id)?;
@@ -1578,7 +1589,7 @@ pub(super) fn finished_in(
         && from == AttemptState::Running
         && !cancelled;
     let success = ending.success && from == AttemptState::Running && !cancelled && !unknown;
-    let to = if cancelled {
+    let to = if cancelled || retry_draft {
         AttemptState::Cancelled
     } else if unknown {
         AttemptState::UnknownEffect
@@ -1732,6 +1743,12 @@ pub(super) fn finished_in(
                 change: Change::Task(TaskState::Implemented),
             });
         }
+    } else if retry_draft && !cancelled {
+        commit.cas.push(StateCas {
+            id: task_id,
+            expected_revision: revision,
+            change: Change::Task(TaskState::Ready),
+        });
     } else if !unknown && !cancelled {
         // Its task by the retry policy, in this transaction (ADR-020 decision 3).
         let failed = super::retry::fail_task(

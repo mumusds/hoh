@@ -25,9 +25,7 @@ use hoh_core::persistence::{
     AttemptFacts, Commit, DispatchNotice, Ending, Intent, NewEvent, PersistError, SessionStart,
     UnfinishedRow,
 };
-use hoh_core::reconcile::{
-    Disposition, Effect, EffectState, Process, Unfinished, dispose, work_key,
-};
+use hoh_core::reconcile::{Disposition, Effect, EffectState, Process, Unfinished, work_key};
 use hoh_core::retry::{FailureClass, SplitMix64};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -1915,25 +1913,29 @@ async fn refuse_draft_gate(
     })
     .await
     .map_err(|e| PersistError::Storage(e.to_string()))?;
-    let disposition = dispose(&Unfinished {
-        attempt_id: row.attempt_id.clone(),
-        state: row.state,
-        task_state: row.task_state,
-        process: process.clone(),
-        effects: row
-            .effects
-            .iter()
-            .map(|e| Effect {
-                key: e.key.clone(),
-                state: e.state,
-                observation: None,
-            })
-            .collect(),
-        lease_expired: row.lease_expired,
-        work_outcome: row.work_outcome,
-        writer: row.writer,
-        verifier: row.verifier,
-    });
+    let disposition = super::drafting::disposition(
+        store,
+        &Unfinished {
+            attempt_id: row.attempt_id.clone(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects: row
+                .effects
+                .iter()
+                .map(|e| Effect {
+                    key: e.key.clone(),
+                    state: e.state,
+                    observation: None,
+                })
+                .collect(),
+            lease_expired: row.lease_expired,
+            work_outcome: row.work_outcome,
+            writer: row.writer,
+            verifier: row.verifier,
+        },
+    )
+    .await?;
     store
         .commit(Commit {
             events: vec![NewEvent {
@@ -2379,17 +2381,21 @@ async fn settle(
             }),
         })
         .collect();
-    let disposition = dispose(&Unfinished {
-        attempt_id: id.to_owned(),
-        state: row.state,
-        task_state: row.task_state,
-        process: process.clone(),
-        effects,
-        lease_expired: cause == "lease_expired" || row.lease_expired,
-        work_outcome: row.work_outcome,
-        writer: row.writer,
-        verifier: row.verifier,
-    });
+    let disposition = super::drafting::disposition(
+        store,
+        &Unfinished {
+            attempt_id: id.to_owned(),
+            state: row.state,
+            task_state: row.task_state,
+            process: process.clone(),
+            effects,
+            lease_expired: cause == "lease_expired" || row.lease_expired,
+            work_outcome: row.work_outcome,
+            writer: row.writer,
+            verifier: row.verifier,
+        },
+    )
+    .await?;
     super::reconcile::apply(
         store,
         &common.shared.root,

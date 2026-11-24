@@ -516,3 +516,216 @@ fn test_008_02_m3l301_in_tree_ignored_build_products_do_not_consume_untracked_bu
     );
     Ok(())
 }
+
+#[test]
+fn test_008_02_m3l400_changed_initial_document_committed_or_deleted_is_complete() -> R {
+    for unborn in [false, true] {
+        for deleted in [false, true] {
+            let dir = repo()?;
+            let root = dir.path();
+            if !unborn {
+                docs(root)?;
+            }
+            std::fs::create_dir_all(root.join("docs"))?;
+            std::fs::write(root.join("docs/requirements.md"), "user draft")?;
+            let start = snapshot(root);
+            if deleted {
+                std::fs::remove_file(root.join("docs/requirements.md"))?;
+            } else {
+                std::fs::write(root.join("docs/requirements.md"), "finished draft")?;
+                git(root, &["add", "docs/requirements.md"])?;
+            }
+            if unborn {
+                docs(root)?;
+            } else if !deleted {
+                git(root, &["commit", "-q", "-m", "finish document"])?;
+            }
+            let result = checked(root, &start)?;
+            assert!(
+                matches!(result, WriterOutcome::Draft { .. }),
+                "unborn={unborn}, deleted={deleted}: {result:?}"
+            );
+            assert_eq!(root.join("docs/requirements.md").exists(), !deleted);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l401_signed_commits_have_only_raw_paths_under_user_config() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    let keys = tempfile::Builder::new()
+        .prefix("m3t04-signing-")
+        .tempdir()?;
+    let key = keys.path().join("key");
+    let made = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .output()?;
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let signers = keys.path().join("allowed");
+    std::fs::write(
+        &signers,
+        format!(
+            "t@example.invalid {}",
+            std::fs::read_to_string(key.with_extension("pub"))?
+        ),
+    )?;
+    for (name, value) in [
+        ("gpg.format", "ssh"),
+        ("commit.gpgsign", "true"),
+        ("log.showSignature", "true"),
+        ("color.ui", "always"),
+        ("log.diffMerges", "separate"),
+        ("diff.renames", "copies"),
+        ("core.pager", "false"),
+    ] {
+        git(root, &["config", name, value])?;
+    }
+    git(
+        root,
+        &["config", "user.signingkey", key.to_str().ok_or("key path")?],
+    )?;
+    git(
+        root,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            signers.to_str().ok_or("signers path")?,
+        ],
+    )?;
+    let start = snapshot(root);
+    docs(root)?;
+    let result = checked(root, &start)?;
+    assert!(matches!(result, WriterOutcome::Draft { .. }), "{result:?}");
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l402_large_ignored_inventory_has_bounded_snapshot() -> R {
+    let dir = repo()?;
+    let root = dir.path();
+    std::fs::write(root.join(".gitignore"), "*.o\n*.cmd\n")?;
+    for group in 0..20 {
+        let sub = root.join(format!("drivers/subsystem-{group:02}/component"));
+        std::fs::create_dir_all(&sub)?;
+        std::fs::write(sub.join("main.c"), "source")?;
+        for n in 0..800 {
+            std::fs::write(sub.join(format!("build-artifact-{n:04}.o")), "")?;
+        }
+    }
+    git(root, &["add", "."])?;
+    git(root, &["commit", "-q", "-m", "in-tree build"])?;
+    let start = snapshot(root);
+    assert!(start.get("draft_error").is_none(), "{start}");
+    assert!(
+        serde_json::to_vec(&start)?.len() < 16 * 1024,
+        "ignored artifacts expanded the persisted snapshot"
+    );
+    docs(root)?;
+    assert!(matches!(
+        checked(root, &start)?,
+        WriterOutcome::Draft { .. }
+    ));
+    std::fs::write(root.join("drivers/subsystem-00/component/new.o"), "new")?;
+    assert!(
+        checked(root, &start).is_err(),
+        "a changed large inventory must not be silently excluded"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_02_m3l403_old_git_is_rejected_before_observation() -> R {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(root) = std::env::var_os("HOH_M3L403_PROBE") {
+        let start = snapshot(Path::new(&root));
+        assert!(
+            start["draft_error"]
+                .as_str()
+                .is_some_and(|s| s.contains("Git 2.38")),
+            "{start}"
+        );
+        return Ok(());
+    }
+    let dir = repo()?;
+    let bin = tempfile::Builder::new()
+        .prefix("m3t04-git-version-")
+        .tempdir()?;
+    let real = Command::new("sh").args(["-c", "command -v git"]).output()?;
+    assert!(real.status.success());
+    let proxy = bin.path().join("git");
+    std::fs::write(
+        &proxy,
+        "#!/bin/sh\nfor arg in \"$@\"; do\n if [ \"$arg\" = --version ]; then echo 'git version 2.37.9'; exit 0; fi\ndone\nexec \"$HOH_M3L403_REAL_GIT\" \"$@\"\n",
+    )?;
+    std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700))?;
+    let out = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "host::drafting::tests::test_008_02_m3l403_old_git_is_rejected_before_observation",
+            "--nocapture",
+        ])
+        .env("HOH_M3L403_PROBE", dir.path())
+        .env(
+            "HOH_M3L403_REAL_GIT",
+            String::from_utf8(real.stdout)?.trim(),
+        )
+        .env("PATH", bin.path())
+        .output()?;
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_008_04_m3l451_merge_observes_first_parent_and_actual_product_changes() -> R {
+    for changes_product in [false, true] {
+        let dir = repo()?;
+        let root = dir.path();
+        docs(root)?;
+        std::fs::write(root.join("product.txt"), "base")?;
+        git(root, &["add", "product.txt"])?;
+        git(root, &["commit", "-q", "-m", "common base"])?;
+        git(root, &["branch", "side"])?;
+        git(root, &["checkout", "-q", "-b", "main-line"])?;
+        std::fs::write(root.join("main-only.txt"), "already present")?;
+        git(root, &["add", "main-only.txt"])?;
+        git(root, &["commit", "-q", "-m", "before draft"])?;
+        let start = snapshot(root);
+        git(root, &["checkout", "-q", "side"])?;
+        std::fs::write(root.join("docs/notes.md"), "planning notes")?;
+        if changes_product {
+            std::fs::write(root.join("product.txt"), "changed")?;
+        }
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-q", "-m", "side draft"])?;
+        git(root, &["checkout", "-q", "main-line"])?;
+        git(
+            root,
+            &["merge", "-q", "--no-ff", "-m", "merge draft", "side"],
+        )?;
+        let result = checked(root, &start)?;
+        if changes_product {
+            assert!(
+                matches!(result, WriterOutcome::DraftBlocked { paths, .. } if paths == ["product.txt"])
+            );
+        } else {
+            assert!(matches!(result, WriterOutcome::Draft { .. }), "{result:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("main-only.txt"))?,
+            "already present"
+        );
+    }
+    Ok(())
+}
