@@ -488,6 +488,23 @@ pub fn isolate(command: &mut Command, home: &Path) -> R {
     Ok(())
 }
 
+/// The longest Unix socket path (`sockaddr_un`), as the host checks it before it binds.
+const SOCKET_PATH_MAX: usize = 107;
+
+/// `project`'s host socket `.hoh/host.sock` fits [`SOCKET_PATH_MAX`]; else the host's own words for it, before anything
+/// starts (M3C-01: with a long TMPDIR the host refuses to start and the test sees only a Workspace that never connects).
+pub fn socket_fits(project: &Path) -> R {
+    let socket = project.join(".hoh/host.sock");
+    if socket.as_os_str().len() > SOCKET_PATH_MAX {
+        return Err(format!(
+            "the socket path {} is longer than {SOCKET_PATH_MAX} bytes (a shorter TMPDIR is needed)",
+            socket.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn spawn(
     pty: &Pty,
     ctty: bool,
@@ -496,6 +513,7 @@ fn spawn(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> R<Hoh> {
+    socket_fits(project)?;
     let mut cmd = Command::new("setsid");
     isolate(&mut cmd, home)?;
     if ctty {
