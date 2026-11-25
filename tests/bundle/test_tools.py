@@ -2,7 +2,7 @@ import contextlib,io,json,os,shutil,signal,subprocess,sys,tempfile,time,unittest
 from pathlib import Path
 from unittest.mock import patch
 from helpers import ROOT,init_repository,load_json,json_file
-from common import Terminated,execute,install_termination_handlers,ref_for,restore_handlers,safe_path,terminate_group
+from common import Terminated,execute,install_interrupt_handlers,ref_for,restore_handlers,safe_path,terminate_group
 from candidate import verify,freeze
 from agent_task import command_for,inspect_output
 from common import flag_supported
@@ -1280,7 +1280,7 @@ class Signals(unittest.TestCase):
     def test_sigterm_stops_child_and_surfaces(self):
         import threading
         with tempfile.TemporaryDirectory() as d:
-            r=Path(d);previous=install_termination_handlers()
+            r=Path(d);previous=install_interrupt_handlers()
             try:
                 threading.Timer(0.3,lambda:os.kill(os.getpid(),signal.SIGTERM)).start();start=time.monotonic()
                 with self.assertRaises(Terminated):execute([sys.executable,'-c','import time;time.sleep(30)'],r,r/'o',r/'e',30,grace=0.5)
@@ -1377,6 +1377,68 @@ class CandidateAndChecks(unittest.TestCase):
         self.assertEqual(rc,130)
         self.assertIs(r.get('started'),False)
         self.assertEqual(r['exit_code'],127)
+
+    def test_052_04_all_interrupt_windows_keep_every_signal_and_restore_handlers(self):
+        # DC-LS-B: actual signals, with deterministic seams around a real Popen. Both signals must be observed
+        # without handler exceptions, and the owned group must be reaped before run_check returns.
+        real_popen=subprocess.Popen;real_install=run_check.install_interrupt_handlers
+        for window in ('before','inside','after','wait','failed','failed_value'):
+            with self.subTest(window=window):
+                spawned=[];records=[];raised=[];swaps=[];sent=[]
+                previous=signal.signal(signal.SIGINT,signal.default_int_handler)
+                originals={s:signal.getsignal(s) for s in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP)}
+                def send():
+                    if sent:return
+                    for signum in (signal.SIGTERM,signal.SIGHUP):
+                        sent.append(signum)
+                        try:signal.raise_signal(signum)
+                        except BaseException as exc:raised.append(type(exc).__name__)
+                def installed():
+                    record=real_install();records.append(record);return record
+                class Interrupted(real_popen):
+                    def __init__(self,*args,**kwargs):
+                        if window in ('failed','failed_value'):send()
+                        if window=='failed_value':raise ValueError('injected invalid Popen argument')
+                        super().__init__(*args,**kwargs);spawned.append(self)
+                        if window=='inside':send()
+                    def communicate(self,*args,**kwargs):
+                        if window=='wait':send()
+                        return super().communicate(*args,**kwargs)
+                real_signal=signal.signal
+                def replaced(*args):
+                    swaps.append(args[0]);return real_signal(*args)
+                def injected(*args,**kwargs):
+                    if window=='before':send()
+                    if window=='after':
+                        on_spawn=kwargs['on_spawn']
+                        def notified():on_spawn();send()
+                        kwargs['on_spawn']=notified
+                    with patch('subprocess.Popen',Interrupted),patch('signal.signal',replaced):
+                        return execute(*args,**kwargs)
+                try:
+                    with patch.object(run_check,'install_interrupt_handlers',installed),patch.object(run_check,'execute',injected):
+                        rc,r,_=self.runcheck('spawn-missing' if window=='failed' else 'sleepy',
+                                             extra=['--timeout','0.2'],out='window-'+window)
+                    restored={s:signal.getsignal(s) for s in originals}
+                    self.assertEqual(raised,[],'signal handlers raised instead of recording')
+                    self.assertEqual(swaps,[],'execute swapped handlers')
+                    self.assertEqual(records[0].received,[signal.SIGTERM,signal.SIGHUP])
+                    self.assertEqual(restored,originals)
+                    self.assertEqual(rc,130)
+                    started=window not in ('before','failed','failed_value')
+                    self.assertIs(r['started'],started)
+                    self.assertEqual(r['exit_code'],130 if started else 127)
+                    self.assertFalse(r['timed_out'])
+                    self.assertEqual(len(spawned),int(started))
+                    for proc in spawned:
+                        self.assertIsNotNone(proc.returncode)
+                        with self.assertRaises(ChildProcessError):os.waitpid(proc.pid,os.WNOHANG)
+                        with self.assertRaises(ProcessLookupError):os.killpg(proc.pid,0)
+                    with self.assertRaises(KeyboardInterrupt):signal.raise_signal(signal.SIGINT)
+                finally:
+                    for proc in spawned:
+                        if proc.poll() is None:terminate_group(proc,grace=.1)
+                    restore_handlers(originals);signal.signal(signal.SIGINT,previous)
 
     def test_check_failing_exit(self):rc,r,_=self.runcheck('fail');self.assertEqual(rc,9);self.assertEqual(r['exit_code'],9)
     def test_check_mutating_source(self):
