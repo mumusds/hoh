@@ -2211,6 +2211,32 @@ fn test_008_03_plan_question_is_shown_and_explicit_answer_restores_specifying() 
     outcome
 }
 
+/// The project's files outside `.git/`, `docs/` and `.hoh/` (its product sources) and their sha256.
+fn product_digests(root: &Path) -> R<std::collections::BTreeMap<String, String>> {
+    let mut digests = std::collections::BTreeMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+            if [".git", "docs", ".hoh"].contains(&relative.as_str()) {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                digests.insert(relative, world::sha256_hex(&std::fs::read(&path)?));
+            }
+        }
+    }
+    Ok(digests)
+}
+
+/// The events that move a run's state (its state event sequence).
+const RUN_STATE_EVENTS: &str = "(kind IN ('run.pause_requested','run.paused','run.resumed','run.blocked',\
+    'run.cancel_requested','run.cancelled','run.transitioned','run.waiting','run.incomplete') \
+    OR (kind='decision.applied' AND json_extract(payload_json,'$.payload.kind')='transition_run'))";
+
 #[test]
 fn test_008_01_running_plan_pause_resume_approval_review() -> R {
     use serde_json::json;
@@ -2302,11 +2328,19 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
             "1",
             WAIT,
         )?;
+        // /plan waits for the safe point: BUILD while the write Attempt runs.
+        assert_eq!(world.query("SELECT json_extract(payload_json,'$.from')||'>'||json_extract(payload_json,'$.to') FROM events WHERE kind='run.mode_change_pending'")?, "BUILD>PLAN");
+        assert_eq!(world.query("SELECT mode FROM runs")?, "BUILD");
         assert_eq!(
             world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,
             "0"
         );
         request("pause", "PauseRun", json!({"reason":"规划暂停"}))?;
+        // PauseRun while the write Attempt runs: PAUSE_REQUESTED, not yet PAUSED.
+        assert_eq!(
+            world.query("SELECT state||'/'||(SELECT count(*) FROM attempts WHERE task_id='work' AND state='RUNNING') FROM runs")?,
+            "PAUSE_REQUESTED/1"
+        );
         std::fs::write(
             world.root().join("writer-release"),
             "release this fixture writer",
@@ -2316,6 +2350,46 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
             world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,
             "0"
         );
+        let seq = |sql: &str| -> R<i64> { Ok(world.query(sql)?.parse()?) };
+        let writer_end = seq(
+            "SELECT min(seq) FROM events WHERE kind='attempt.moved' AND json_extract(payload_json,'$.task_id')='work' AND json_extract(payload_json,'$.from')='RUNNING'",
+        )?;
+        let pause_requested = seq("SELECT min(seq) FROM events WHERE kind='run.pause_requested'")?;
+        let paused = seq("SELECT min(seq) FROM events WHERE kind='run.paused'")?;
+        let to_plan = seq(
+            "SELECT min(seq) FROM events WHERE kind='run.mode_changed' AND json_extract(payload_json,'$.from')='BUILD' AND json_extract(payload_json,'$.to')='PLAN'",
+        )?;
+        // PAUSE_REQUESTED, then PAUSED only after the write Attempt ended; the mode becomes PLAN at that safe point.
+        assert!(
+            pause_requested < writer_end && writer_end < paused,
+            "pause_requested={pause_requested} writer_end={writer_end} paused={paused}"
+        );
+        assert!(
+            writer_end < to_plan,
+            "writer_end={writer_end} to_plan={to_plan}"
+        );
+        assert_eq!(
+            world.query("SELECT mode||'/'||state FROM runs")?,
+            "PLAN/PAUSED"
+        );
+        // The write set and the product digests are taken from here: nothing but the draft writes after this point.
+        let status = || -> R<std::collections::BTreeSet<String>> {
+            Ok(world
+                .git(&[
+                    "status",
+                    "--porcelain=v1",
+                    "-uall",
+                    "--ignored",
+                    "--no-renames",
+                ])?
+                .lines()
+                .filter_map(|l| l.get(3..))
+                .map(str::to_owned)
+                .collect())
+        };
+        let base = world.git(&["rev-parse", "HEAD"])?.trim().to_owned();
+        let status_before = status()?;
+        let digests = product_digests(&world.project())?;
         request("resume", "ResumeRun", json!({"reason":"继续规划"}))?;
         world.wait(
             "SELECT count(*) FROM events WHERE kind='spec.draft_completed'",
@@ -2323,9 +2397,42 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
             Duration::from_secs(25),
         )?;
         assert_eq!(
-            world.query("SELECT state||'/'||resume_state FROM runs")?,
-            "BLOCKED/RUNNING"
+            world.query("SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs")?,
+            "BLOCKED/NEED_DECISION/RUNNING"
         );
+        // ResumeRun took R back to RUNNING and the draft was dispatched there: the draft's dispatch follows the
+        // ResumeRun, the last state event before it returns R to RUNNING, and the next one is the approval question's
+        // BLOCKED (whose resume_state is RUNNING).
+        let resumed = seq(
+            "SELECT min(seq) FROM events WHERE kind='run.resumed' AND json_extract(payload_json,'$.command_id')='resume'",
+        )?;
+        let dispatched = seq("SELECT min(seq) FROM events WHERE kind='spec.draft_dispatched'")?;
+        assert!(
+            paused < resumed && resumed < dispatched,
+            "paused={paused} resumed={resumed} dispatched={dispatched}"
+        );
+        let around = |order: &str, cmp: &str| -> R<String> {
+            world.query(&format!("SELECT kind||'>'||coalesce(json_extract(payload_json,'$.to'),'') FROM events WHERE run_id='{run}' AND {RUN_STATE_EVENTS} AND seq{cmp}{dispatched} ORDER BY seq {order} LIMIT 1"))
+        };
+        assert_eq!(around("DESC", "<")?, "run.resumed>RUNNING");
+        assert_eq!(around("ASC", ">")?, "run.blocked>");
+        // The draft's write set as Git records it (its commits, untracked files and deletions): docs/ and .hoh/ only.
+        let drafted = world.query("SELECT json_extract(payload_json,'$.git_commit') FROM events WHERE kind='spec.draft_completed'")?;
+        assert_eq!(drafted, world.git(&["rev-parse", "HEAD"])?.trim());
+        let mut writes: std::collections::BTreeSet<String> = world
+            .git(&["diff", "--name-only", "--no-renames", &base, &drafted])?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        writes.extend(status()?.difference(&status_before).cloned());
+        assert!(writes.contains("docs/spec/fixture.md"), "{writes:?}");
+        assert!(
+            writes
+                .iter()
+                .all(|p| p.starts_with("docs/") || p.starts_with(".hoh/")),
+            "{writes:?}"
+        );
+        assert_eq!(product_digests(&world.project())?, digests);
         assert_eq!(
             world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,
             "1"
@@ -2343,6 +2450,13 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Revision 2's spec_review.opened is written while R is RUNNING: the last state event before it returns R to
+        // RUNNING, and R is RUNNING while that review runs.
+        let opened = seq(
+            "SELECT min(seq) FROM events WHERE kind='spec_review.opened' AND json_extract(payload_json,'$.spec_revision')=2",
+        )?;
+        assert_eq!(world.query(&format!("SELECT kind||'>'||coalesce(json_extract(payload_json,'$.to'),'') FROM events WHERE run_id='{run}' AND {RUN_STATE_EVENTS} AND seq<{opened} ORDER BY seq DESC LIMIT 1"))?, "run.resumed>RUNNING");
+        assert_eq!(world.query("SELECT state FROM runs")?, "RUNNING");
         request("build", "SetMode", json!({"mode":"BUILD"}))?;
         let spec2 = world.query("SELECT spec_id FROM specs WHERE revision=2")?;
         world.exec(&format!("INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,cost_estimate) VALUES('new-work','{run}','{spec2}','READY','developer',1,0,1); INSERT INTO task_requirements(task_id,requirement_id,spec_id) VALUES('new-work','REQ-901','{spec2}'); INSERT INTO events(project_id,run_id,event_id,kind,payload_json,created_at) VALUES(:p,'{run}','s7-new-plan','plan.imported',json_object('run_id','{run}','tasks',json_array(json_object('task_id','new-work','paths',json_array('src/lib.rs')))),'2026-11-23T00:00:00Z');"))?;
@@ -2364,6 +2478,7 @@ fn test_008_01_running_plan_pause_resume_approval_review() -> R {
         )?;
         assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='run.transitioned' AND json_extract(payload_json,'$.to')='SPECIFYING'")?,"0");
         assert_eq!(std::fs::read(world.project().join("src/lib.rs"))?, product);
+        assert_eq!(product_digests(&world.project())?, digests);
         assert_eq!(
             world
                 .git(&["diff", "--name-only", "HEAD~1", "HEAD", "--", "src"])?
