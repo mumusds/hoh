@@ -508,3 +508,12 @@ split.
 |---|---|---|---|
 | M4L1-001 | high | `tests/bundle/test_trace_export.py:171`: the M3QA-003 change created the ProductStep temp dirs under the hard-coded `/home/ai/dev`; on the CI runner (and any other host) setUp raises FileNotFoundError and the bundle job fails. | Fixed: tempfile's default (TMPDIR) again. Same class as M3L-101 / PR #108 (a Rust test naming the developer's /home), so per docs/19 the design correction comes first: **DC-M4L1-001**, the static machine-path scan, which covered only `*.rs` under `crates/`, now covers Rust, Python and shell sources under `crates`, `tests`, `tools` and `scripts`. Red: the scan finds the old line (exit 0 → static fails); green: no match (`.hoh-dev/self-tests/m4low1/m4l1-001-scan.log`). |
 | M4L1-002 | low | `http.rs:984-997`: a JoinError still answers before the store, so Reject/replay/stale-revision/missing-run get 503 SPEC_SOURCE_UNAVAILABLE rather than their own answers (pre-existing shape; needs a blocking-thread panic; CR-036 holds). | Deferred to the M4 low package: map the JoinError to `files=Err(SpecReadError::unavailable(..))` and let the store decide, as inputs.rs does. |
+
+### M4 low package 1: fix re-review (fresh Claude session, read-only)
+
+- Scope: `0e8c66d6..904ba27e` (M4L1-001 fix, DC-M4L1-001 scan). Verdict: **PASS** (2 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| M4L1-100 | low | The scan misses unquoted shell paths, `/home/ai` without a trailing slash and other users' homes; `scripts/dev/pre-pr.sh:43` defaults the dev slot to `/home/ai/dev/.hoh-test-slot.lock` (dev-only, overridable by `HOH_TEST_SLOT`, not run in CI). | Deferred to the M4 low package: widen to `/home/<user>` with an explicit allowlist naming pre-pr.sh's slot default. |
+| M4L1-101 | low | `.toml`, `.yml`, `.json` sources are not scanned. | Deferred to the M4 low package. |
