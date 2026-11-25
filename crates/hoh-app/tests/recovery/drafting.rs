@@ -119,6 +119,68 @@ async fn command(
     }
     Err("command remained stale".into())
 }
+const NO_SPEC_TEXT: &str = "项目还没有已批准的规格。答复 draft：HoH 先只读地了解项目，再由 Plan 起草规格并请你批准，批准之前不改产品代码；项目有了已批准的规格之后，也可以答复 adopt 采用它。";
+
+async fn start_plan_run(host: &Host, key: &str, goal: &str) -> R<String> {
+    let body = json!({
+        "schema_version": "1.0", "command_id": format!("c-{key}"), "idempotency_key": key,
+        "expected_revision": 0, "kind": "StartRun", "run_id": null,
+        "payload": {"goal": goal, "mode": "PLAN", "interactive": true},
+    });
+    let (status, accepted) = world::exchange(host, "POST", "/v1/commands", Some(&body)).await?;
+    assert_eq!(status, 202, "{accepted}");
+    Ok(accepted["run_id"].as_str().ok_or("no run_id")?.to_owned())
+}
+
+fn given_plan(world: &World) -> R<(String, String)> {
+    world.configure(&[], "")?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let host = world.start_plain_host(None).await?;
+        let result = async {
+            let run = start_plan_run(&host, "r1", "起草新规格").await?;
+            let second = start_plan_run(&host, "r2", "等待已批准规格").await?;
+            // Phase 1 (AC-008-02): both runs blocked on runtime:no_spec with REQ-008 behaviour 2 text and choices.
+            for id in [&run, &second] {
+                assert_eq!(
+                    world.query(&format!(
+                        "SELECT state||'/'||coalesce(blocked_reason,'NULL')||'/'||coalesce(spec_id,'NULL') FROM runs WHERE run_id='{id}'"
+                    ))?,
+                    "BLOCKED/NEED_DECISION/NULL"
+                );
+                let q: Value = serde_json::from_str(&world.query(&format!(
+                    "SELECT payload_json FROM events WHERE run_id='{id}' AND kind='question.asked' AND json_extract(payload_json,'$.reason')='no_spec'"
+                ))?)?;
+                assert_eq!(q["text"], NO_SPEC_TEXT, "{q}");
+                assert_eq!(q["choices"], json!(["adopt", "draft"]), "{q}");
+                assert_eq!(
+                    world.query(&format!(
+                        "SELECT count(*) FROM events WHERE run_id='{id}' AND kind='run.blocker_claimed' AND json_extract(payload_json,'$.source')='runtime:no_spec'"
+                    ))?,
+                    "1"
+                );
+            }
+            assert_eq!(world.query("SELECT count(*) FROM tasks")?, "0");
+            assert_eq!(world.query("SELECT count(*) FROM attempts")?, "0");
+            world.staff(&run)?;
+            world.staff(&second)?;
+            command(
+                &host,
+                world,
+                &run,
+                "draft",
+                "SendInput",
+                json!({"text":"draft","target_role":null,"input_kind":"REPLY"}),
+            )
+            .await?;
+            Ok((run, second))
+        }
+        .await;
+        host.shutdown().await;
+        result
+    })
+}
+
 fn given(world: &World) -> R<(String, String)> {
     world.configure(&[], "")?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -218,7 +280,7 @@ fn test_008_02_first_draft_kill9_then_approve_and_late_adopt() -> R {
 }
 fn recovery(point: &str) -> R {
     let world = World::named("p")?;
-    let (run, second) = given(&world)?;
+    let (run, second) = given_plan(&world)?;
     killed(&world, point)?;
     let task = world.query("SELECT task_id FROM tasks WHERE kind='spec_draft'")?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -226,15 +288,127 @@ fn recovery(point: &str) -> R {
         let host=Host::start(team_config(world.root())).await?;
         let result:R=async {
             world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",WAIT).await?;
-            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"1");assert_eq!(world.query("SELECT task_id FROM tasks WHERE kind='spec_draft'")?,task);
-            assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.drafting'")?,"1");assert_eq!(world.query("SELECT count(*) FROM candidates")?,"0");assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");
-            assert_eq!(world.query("SELECT count(*) FROM effects WHERE effect_key IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='effect.started' AND json_extract(payload_json,'$.detail.operation')='git init') AND state='COMMITTED'")?,"1");
+            // Phase 2 (AC-008-02): CREATED (run.resumed) -> DISCOVERING -> SPECIFYING with no attempt/effect in DISCOVERING.
+            let resumed_seq: i64 = world
+                .query(&format!(
+                    "SELECT seq FROM events WHERE run_id='{run}' AND kind='run.resumed' AND json_extract(payload_json,'$.to')='CREATED' ORDER BY seq LIMIT 1"
+                ))?
+                .parse()?;
+            let transitions = world.rows(&format!(
+                "SELECT seq, json_extract(payload_json,'$.from') AS from_state, json_extract(payload_json,'$.to') AS to_state \
+                 FROM events WHERE run_id='{run}' AND kind='run.transitioned' ORDER BY seq"
+            ))?;
+            let states: Vec<(&str, &str)> = transitions
+                .iter()
+                .map(|r| {
+                    (
+                        r["from_state"].as_str().unwrap_or(""),
+                        r["to_state"].as_str().unwrap_or(""),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                states,
+                vec![("CREATED", "DISCOVERING"), ("DISCOVERING", "SPECIFYING")],
+                "expected CREATED -> DISCOVERING -> SPECIFYING: {transitions:?}"
+            );
+            let disc_seq = transitions[0]["seq"].as_i64().ok_or("disc_seq")?;
+            let spec_seq = transitions[1]["seq"].as_i64().ok_or("spec_seq")?;
+            assert!(
+                resumed_seq < disc_seq && disc_seq < spec_seq,
+                "state event order CREATED({resumed_seq}) < DISCOVERING({disc_seq}) < SPECIFYING({spec_seq})"
+            );
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT count(*) FROM events WHERE run_id='{run}' AND seq>{disc_seq} AND seq<{spec_seq} AND (kind GLOB 'attempt.*' OR kind GLOB 'effect.*')"
+                ))?,
+                "0",
+                "no Attempt or effect during DISCOVERING"
+            );
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT coalesce(spec_id,'NULL') FROM runs WHERE run_id='{run}'"
+                ))?,
+                "NULL",
+                "spec_id remains NULL in SPECIFYING before approval"
+            );
+            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"1");
+            assert_eq!(world.query("SELECT task_id FROM tasks WHERE kind='spec_draft'")?,task);
+            assert_eq!(
+                world.query("SELECT role||'/'||writer||'/'||coalesce(spec_id,'NULL')||'/'||state FROM tasks WHERE kind='spec_draft'")?,
+                "cto/1/NULL/IMPLEMENTED"
+            );
+            assert_eq!(world.query("SELECT count(*) FROM task_requirements")?,"0");
+            assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.drafting'")?,"1");
+            assert_eq!(world.query("SELECT count(*) FROM candidates")?,"0");
+            assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");
+            assert_eq!(
+                world.query("SELECT count(*) FROM effects e JOIN attempts a ON a.attempt_id=e.attempt_id JOIN tasks t ON t.task_id=a.task_id WHERE t.kind='spec_draft' AND e.state='COMMITTED' AND e.effect_key IN (SELECT json_extract(payload_json,'$.effect_key') FROM events WHERE kind='effect.started' AND json_extract(payload_json,'$.detail.operation')='git init')")?,
+                "1"
+            );
             assert!(!std::fs::read_to_string(world.project().join(".git/config"))?.contains("[remote"));
-            assert_eq!(world.query(&format!("SELECT state||'/'||resume_state FROM runs WHERE run_id='{run}'"))?,"BLOCKED/SPECIFYING");
-            command(&host,&world,&run,"approve","SendInput",json!({"text":"approve","target_role":null,"input_kind":"REPLY"})).await?;
-            assert_eq!(world.query("SELECT count(*) FROM specs WHERE revision=1")?,"1");assert_eq!(world.query("SELECT state||'/'||coalesce(spec_id,'NULL') FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED/NULL");
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT state||'/'||coalesce(blocked_reason,'NULL')||'/'||resume_state FROM runs WHERE run_id='{run}'"
+                ))?,
+                "BLOCKED/NEED_DECISION/SPECIFYING"
+            );
+            let spec_q: Value = serde_json::from_str(&world.query(&format!(
+                "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval' ORDER BY seq DESC LIMIT 1"
+            ))?)?;
+            let spec_sha = spec_q["spec_sha256"].as_str().ok_or("spec_approval missing spec_sha256")?;
+            assert_eq!(spec_sha.len(), 64, "{spec_q}");
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT state||'/'||coalesce(blocked_reason,'NULL')||'/'||coalesce(spec_id,'NULL') FROM runs WHERE run_id='{second}'"
+                ))?,
+                "BLOCKED/NEED_DECISION/NULL",
+                "R2 must remain blocked on no_spec until approval"
+            );
+            // Phase 3 (AC-008-02): ApproveSpec{APPROVE_ONLY}, spec.changed{cause:"approved"}, R1 back in SPECIFYING with trigger.
+            command(
+                &host,
+                &world,
+                &run,
+                "approve",
+                "ApproveSpec",
+                json!({"spec_sha256": spec_sha, "decision": "APPROVE_ONLY"}),
+            )
+            .await?;
+            assert_eq!(world.query("SELECT count(*) FROM specs WHERE revision=1")?,"1");
+            let rev1_spec = world.query("SELECT spec_id FROM specs WHERE revision=1")?;
+            assert_eq!(world.query("SELECT sha256 FROM specs WHERE revision=1")?, spec_sha);
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT count(*) FROM events WHERE run_id='{run}' AND kind='spec.changed' AND json_extract(payload_json,'$.cause')='approved' AND json_extract(payload_json,'$.spec_revision')=1"
+                ))?,
+                "1"
+            );
+            assert_eq!(
+                world.query(&format!("SELECT spec_id FROM runs WHERE run_id='{run}'"))?,
+                rev1_spec
+            );
+            assert_eq!(world.query("SELECT state||'/'||coalesce(spec_id,'NULL') FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED/NULL");
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT state||'/'||coalesce(blocked_reason,'NULL') FROM runs WHERE run_id='{run}'"
+                ))?,
+                "SPECIFYING/NULL"
+            );
+            world.until(
+                &format!("SELECT count(*)>0 FROM supervisor_triggers WHERE run_id='{run}'"),
+                "1",
+                WAIT,
+            ).await?;
+            // R2's draft answer acts as adopt: adopts revision 1 without creating another null-spec task.
             command(&host,&world,&second,"late-draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
-            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"1");assert_eq!(world.query(&format!("SELECT count(*) FROM runs WHERE run_id='{second}' AND spec_id IS NOT NULL"))?,"1");
+            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE kind='spec_draft'")?,"1");
+            assert_eq!(world.query("SELECT count(*) FROM tasks WHERE spec_id IS NULL")?,"1");
+            assert_eq!(world.query("SELECT task_id FROM tasks WHERE spec_id IS NULL")?, task);
+            assert_eq!(
+                world.query(&format!("SELECT spec_id FROM runs WHERE run_id='{second}'"))?,
+                rev1_spec
+            );
             Ok(())
         }.await;host.shutdown().await;result
     })
