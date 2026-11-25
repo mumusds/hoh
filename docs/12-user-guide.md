@@ -49,7 +49,7 @@ Workspace看统一进展与Commander决策；Team按需分屏；选中Agent进�
 
 普通输入默认交给 Commander。`@cto`、`@qa`、`@developer` 指定稳定职位，以 STEER 入队；使用品牌名时，例如 `@claude 先写测试`，客户端读取当前团队和正在运行任务的职位。只有一个匹配的当前职位时直接选择，否则弹出职位选择器；Esc 返回原草稿，不发送。消息栏显示实际目标，例如“→ developer”，队列保存该职位与受理时的 epoch，换绑后的旧输入拒绝为 STALE_ROLE_EPOCH。
 
-HoH 的 Slash 不转给底座。要定向发送底座命令，使用 `/agent developer /compact`；目标必须是当前已绑定的职位，缺目标、缺正文或未知目标均不提交。转发走同一 STEER 通道：支持时在当前 turn 内交付，否则等待该职位下一 Attempt。TUI 不新增 ASK/CHANGE/CONTROL 专门语法，输入种类通过共享 SendInput API 表达；CHANGE/CONTROL 的实现由后续切片交付。ASK 查询不会打断编码。暂停/取消通过控制面，不等模型同意。
+HoH 的 Slash 不转给底座。要定向发送底座命令，使用 `/agent developer /compact`；目标必须是当前已绑定的职位，缺目标、缺正文或未知目标均不提交。转发走同一 STEER 通道：支持时在当前 turn 内交付，否则等待该职位下一 Attempt。TUI 不新增 ASK/CHANGE/CONTROL 专门语法，输入种类通过共享 SendInput API 表达：CHANGE 新增一条待批准的变更提案（批准前规格与 Task 不变），CONTROL 转为暂停/恢复/取消命令，两者都不经过模型。ASK 查询不会打断编码。暂停/取消通过控制面，不等模型同意。
 
 ## 团队、模型、Prompt与Skill
 
