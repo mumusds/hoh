@@ -12,9 +12,11 @@ set -Eeuo pipefail
 cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 log="$(mktemp)"; trap 'rm -f "$log"' EXIT
 rc=0
-cargo test -p hoh-app --locked --test recovery 2>&1 | tee "$log" || rc=$?
+# The parsed log is cargo's stdout only: its stderr (build output, and diagnostics of the processes the tests start)
+# stays on this script's stderr, where it cannot break a libtest result line (M3QA-018, DC-QA018).
+cargo test -p hoh-app --locked --test recovery | tee "$log" || rc=$?
 systemd-run --user --scope -p Delegate=yes --quiet --collect -- \
-  cargo test -p hoh-app --locked --test recovery --test control 2>&1 | tee -a "$log" || rc=$?
+  cargo test -p hoh-app --locked --test recovery --test control | tee -a "$log" || rc=$?
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
   python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"
 fi

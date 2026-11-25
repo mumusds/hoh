@@ -507,6 +507,73 @@ class CargoTestsScript(unittest.TestCase):
         self.assertEqual(r.returncode,101,r.stderr)
         self.assertEqual(results,[('TEST-001-01','FAIL'),('TEST-002-01','PASS'),('TEST-003-01','PASS')])
 
+# A stand-in cargo whose test binary has host children writing to the inherited stderr while libtest writes its result
+# lines to stdout in pieces (`test X ... `, `ok`, newline: libtest's pretty formatter flushes each), as in M3QA-018: a
+# diagnostic before an unfinished line and one inside it. `HOH_FAKE_BUILD_ERROR` makes it a failed build instead.
+INTERLEAVING_CARGO=r"""#!/usr/bin/env bash
+if [[ -n "${HOH_FAKE_BUILD_ERROR:-}" ]]; then
+  printf '   Compiling hoh-app v0.0.0\nerror[E0425]: cannot find value `qa018` in this scope\n' >&2
+  printf 'error: could not compile `hoh-app` (test "a") due to 1 previous error\n' >&2; exit 101
+fi
+printf '     Running tests/a.rs (target/debug/deps/a-0)\n' >&2
+printf '\nrunning 2 tests\n'
+printf 'hoh host: origin lookup returned none: tcp_match missing' >&2
+printf 'test test_001_01_first ... '; printf 'ok'; printf '\n'
+printf '\n' >&2
+printf 'test x::test_002_01_second ... '
+printf 'hoh host: verification reconciled host_epoch=3' >&2; printf '\n' >&2
+printf 'ok'; printf '\n'
+printf '\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n'
+"""
+
+class TestLogStreams(unittest.TestCase):
+    """M3QA-018 / DC-QA018: a check that parses libtest's result lines parses its stdout only; diagnostics of processes the
+    tests start, on the inherited stderr, cannot break a result line. A failed build still fails the check, visibly."""
+    SCRIPTS=('cargo-tests.sh','recovery.sh','tui-pty.sh')
+    def run_script(self,script,*args,env_extra=None):
+        with tempfile.TemporaryDirectory(prefix='hoh-qa018-') as d:
+            d=Path(d);product=d/'repo/scripts/product';product.mkdir(parents=True)
+            for name in (script,'test_results.py'):shutil.copy(ROOT/'scripts/product'/name,product/name)
+            bin_=d/'bin';bin_.mkdir();cargo=bin_/'cargo';cargo.write_text(INTERLEAVING_CARGO);cargo.chmod(0o755)
+            # recovery.sh's second run: a stand-in systemd-run that runs the command after `--` as it is.
+            run=bin_/'systemd-run';run.write_text('#!/usr/bin/env bash\nwhile [[ "$1" != -- ]];do shift;done;shift;exec "$@"\n');run.chmod(0o755)
+            evidence=d/'evidence';evidence.mkdir()
+            env={**os.environ,'PATH':f'{bin_}:{os.environ["PATH"]}','HOH_EVIDENCE_DIR':str(evidence),**(env_extra or {})}
+            r=subprocess.run(['bash',str(product/script),*args],capture_output=True,text=True,env=env,timeout=60)
+            path=evidence/'test-results.jsonl'
+            results=[(x['test_id'],x['status']) for x in map(json.loads,path.read_text().splitlines())] if path.exists() else []
+            return r,results
+    def args(self,script):
+        return ('integration',) if script=='cargo-tests.sh' else ()
+    def test_qa018_child_stderr_cannot_break_a_result_line(self):
+        for script in self.SCRIPTS:
+            with self.subTest(script=script):
+                r,results=self.run_script(script,*self.args(script))
+                self.assertEqual(r.returncode,0,r.stderr)
+                runs=2 if script=='recovery.sh' else 1
+                self.assertEqual(results,[('TEST-001-01','PASS'),('TEST-002-01','PASS')]*runs)
+                # Both streams stay in the check's evidence: stdout.log and stderr.log under run_check.
+                self.assertIn('test test_001_01_first ... ok\n',r.stdout)
+                self.assertIn('hoh host: verification reconciled host_epoch=3\n',r.stderr)
+                self.assertNotIn('hoh host:',r.stdout)
+    def test_qa018_a_build_error_fails_the_check_and_stays_visible(self):
+        for script in self.SCRIPTS:
+            with self.subTest(script=script):
+                r,results=self.run_script(script,*self.args(script),env_extra={'HOH_FAKE_BUILD_ERROR':'1'})
+                self.assertEqual(r.returncode,101,r.stdout+r.stderr)
+                self.assertEqual(results,[])
+                self.assertIn('error[E0425]: cannot find value `qa018` in this scope',r.stderr)
+    def test_qa018_no_script_merges_stderr_into_a_parsed_log(self):
+        """deployment.sh builds two releases, too heavy to run here: every script that feeds test_results.py is held to
+        the same rule by its text. A `cargo test` line may not send stderr into the pipe whose log is parsed."""
+        feeding=sorted(p.name for p in (ROOT/'scripts/product').glob('*.sh') if 'test_results.py' in p.read_text())
+        self.assertEqual(feeding,['cargo-tests.sh','deployment.sh','recovery.sh','tui-pty.sh'])
+        for name in feeding:
+            for n,line in enumerate((ROOT/'scripts/product'/name).read_text().splitlines(),1):
+                if 'cargo test' in line and '| tee' in line:
+                    self.assertNotIn('2>&1',line,f'{name}:{n}')
+                    self.assertNotIn('|&',line,f'{name}:{n}')
+
 def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=(),target_dir=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
     workspace member to its directory under root (default crates/<name>); features lists rusqlite's features."""
