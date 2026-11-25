@@ -44,6 +44,7 @@ REQUIRED={
  'claude':['--output-format','--verbose','--dangerously-skip-permissions'],
  'pi':['--mode','--session-dir'],
  'grok':['--prompt-file','--output-format','--always-approve'],
+ 'agy':['--input-format','--output-format','--dangerously-skip-permissions','--print'],
 }
 def help_text(agent:str,cwd:Path)->str:
     cmd=[agent,'exec','--help'] if agent=='codex' else [agent,'--help']
@@ -71,14 +72,24 @@ def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=N
     elif agent=='grok':
         cmd=['grok','--prompt-file','/dev/stdin','--output-format','streaming-messages-json','--always-approve']
         if timeout is not None:cmd+=[GROK_BACKGROUND_WAIT,str(math.ceil(timeout))]
+    # agy (Antigravity CLI 1.5.17, a bootstrap helper like Grok): print mode with an empty -p= reads the prompt as one
+    # stream-json user message on stdin (stdin_for) and writes init/step_update/result events.
+    elif agent=='agy':
+        cmd=['agy','--dangerously-skip-permissions','--input-format','stream-json','--output-format','stream-json','-p=']
     else:
         cmd=['pi','--mode','json','--session-dir',str(session_dir)]
         if help_output and flag_supported(help_output,'--approve'):cmd+=['--approve']
     if model:
         # Keep stdin marker last for Codex; never shell-interpolate the model name.
-        if agent=='codex':cmd[-1:-1]=['--model',model]
+        if agent in ('codex','agy'):cmd[-1:-1]=['--model',model]
         else:cmd+=['--model',model]
     return cmd
+
+def stdin_for(agent:str,data:bytes)->bytes:
+    """What the native CLI reads on stdin: the prompt itself, or for agy one stream-json user message carrying it."""
+    if agent!='agy':return data
+    message={'event':'user','message':{'role':'user','content':data.decode('utf-8')}}
+    return (json.dumps(message,ensure_ascii=False)+'\n').encode('utf-8')
 
 REPORT_FENCE=re.compile(r'```hoh-report[ \t]*\n(.*?)\n```',re.S)
 FINAL_TEXT_LIMIT=1024*1024
@@ -105,12 +116,13 @@ def inspect_output(agent:str,path:Path)->dict:
             try:r=json.loads(line)
             except (ValueError,UnicodeError):malformed+=1;continue
             if not isinstance(r,dict):malformed+=1;continue
-            records+=1;t=r.get('type','')
+            records+=1;t=r.get('event','') if agent=='agy' else r.get('type','')
             text=None
             if agent=='codex' and t=='item.completed':
                 item=r.get('item',{})
                 if isinstance(item,dict) and item.get('type')=='agent_message':text=item.get('text')
             elif agent in ('claude','grok') and t=='result':text=r.get('result')
+            elif agent=='agy' and t=='result':text=(r.get('result') or {}).get('response')
             elif agent=='pi' and t=='message_end':
                 message=r.get('message',{})
                 if isinstance(message,dict) and message.get('role')=='assistant':
@@ -121,7 +133,12 @@ def inspect_output(agent:str,path:Path)->dict:
                 assistant_text.append(text[-4096:]);assistant_text=assistant_text[-16:]
                 if text.strip():final_text=text[-FINAL_TEXT_LIMIT:]
             # The terminal result alone carries the final answer: an earlier report must not outlive a last result without one.
-            if agent in ('claude','grok') and t=='result':final_text=text[-FINAL_TEXT_LIMIT:] if isinstance(text,str) else ''
+            if agent in ('claude','grok','agy') and t=='result':final_text=text[-FINAL_TEXT_LIMIT:] if isinstance(text,str) else ''
+            if agent=='agy':
+                body=r.get(t) if isinstance(r.get(t),dict) else {}
+                cid=r.get('conversation_id') or body.get('conversation_id')
+                if isinstance(cid,str):session_ids.add(cid)
+                if t=='init' and isinstance(body.get('model'),str):models.add(body['model'])
             for k in ['session_id','sessionId','thread_id']:
                 if isinstance(r.get(k),str):session_ids.add(r[k])
             if agent=='pi' and t=='session' and isinstance(r.get('id'),str):session_ids.add(r['id'])
@@ -132,6 +149,8 @@ def inspect_output(agent:str,path:Path)->dict:
                 transient+=t=='error'
             elif agent in ('claude','grok') and t=='result':
                 terminal=True;failed|=r.get('is_error',False) or r.get('subtype') not in [None,'success']
+            elif agent=='agy' and t=='result':
+                terminal=True;failed|=(r.get('result') or {}).get('status')!='SUCCESS'
             elif agent=='pi':
                 # JSON mode is a one-shot process: observed process exit is also
                 # required by main. Production RPC MUST use negotiated settled.
@@ -266,7 +285,7 @@ def main(argv=None)->int:
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)
     previous=install_interrupt_handlers()
     try:
-        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=env)
+        rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,stdin_for(a.agent,data),env=env)
         observed=inspect_output(a.agent,out/'stdout.jsonl');final_text=observed.pop('_final_text')
         ok=rc==0 and observed['terminal_observed'] and not observed['native_error_observed'] and observed['malformed_records']==0
         record.update(observed,exit_code=rc,timed_out=timed,duration_seconds=dur,finished_at=utcnow(),status='NATIVE_TURN_COMPLETED' if ok else 'NATIVE_FAILED',stdout_sha256=sha256(out/'stdout.jsonl'),stderr_sha256=sha256(out/'stderr.log'))
