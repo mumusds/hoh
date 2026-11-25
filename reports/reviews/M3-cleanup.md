@@ -227,7 +227,10 @@ newline-terminated and different, calling no hoh_core diff code. Fix 2 (Claude):
 three-way diffs with exact expected text", red through `deployment.sh` (exit 101) for empty, swapped, trailing '+' and signed-range
 sabotage. Deferred low: M3PD-L1 `host/product/tests.rs` `test_047_03_drift_persists_three_way_object` (product check) still
 computes its expectation with `three_way_diff` (the function has its own unit test). Final checks: `bash scripts/dev/pre-pr.sh`
-all ok on `5f38de52` (G4) and `pre-pr --no-deployment` all ok on `f49ed0d1` (G2+G5); after combining onto main see the PR.
+all ok on `5f38de52` (G4) and `pre-pr --no-deployment` all ok on `f49ed0d1` (G2+G5); combined onto main `7dec042f`, whose
+M3LC slice made `Bundle`'s fields private, the G4 test's `release_bundle` helper was adapted mechanically by the lead to
+`set_release`/`retain_files`/`release()` ("M3 pre-QA: G4 use Bundle accessors after main made its fields private"; same reads,
+same assertions); for the combined branch see the PR.
 
 ## FLK-11 and FLK-12 review
 
