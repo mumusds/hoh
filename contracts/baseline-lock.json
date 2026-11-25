@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 26,
+  "revision": 27,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "161cee8b4f4e01635b843f9b6dd76aa9189058ced654767a099655f3e1628161"
+    "lock_sha256": "029ddf74efc1b7e60db3ece4ff226375504331defde4673536cc9462ce6d8a7d"
   },
   "change_requests": [
     {
@@ -132,6 +132,11 @@
       "id": "CR-038",
       "path": "docs/cr/CR-038-execution-started.md",
       "sha256": "0cc0cd6e440fc0ca6eb2b51a98833c45738e74d4f0bc6fc347e40809094939c7"
+    },
+    {
+      "id": "CR-037",
+      "path": "docs/cr/CR-037-netlink-sock-diag-connect.md",
+      "sha256": "e89f26139aeb543a418f0bc4550e415e5cbf1dc2501d9cb1f83a7fcac3be8ddb"
     }
   ],
   "files": {
@@ -149,7 +154,7 @@
     "contracts/protocol.schema.json": "918b0bc5d3f94925110d25f1bd8ef4742c34089886b783c2f9cc40f06d7b75e4",
     "contracts/release-policy.json": "e54581614356ad310351994a6cdb94bfe5a170f8c9d06d852d92c3e9bbb03204",
     "contracts/release.schema.json": "c482028ebde16055ed00c4e3c2d1a86b27114fae447669c3dab17d1a5eb43ab7",
-    "contracts/requirements.json": "5ab1efedbe816ef5f8afb94db01313f3523c0d00124fae13c36eed3af42ed9a8",
+    "contracts/requirements.json": "d604f68ad6f106f1eb26402c66a9f9df73e8f66644437a209dcf7e3fdaa8c87a",
     "contracts/soak-event.schema.json": "87f1f9590bf2467308e38d9fe00d5a9395f06a887187e58ee4670ce586c25c6b",
     "contracts/spec-review-attempt.schema.json": "5fe268f583117e8fb8a45e15ba26f3ac947b693c737a3127c9f54721931d46de",
     "contracts/spec-review-report.schema.json": "c9945c39dffb13342748abdb31521b743ea4d045d2d2a024c117131e313ba352",

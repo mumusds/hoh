@@ -1830,7 +1830,7 @@
      "id": "AC-029-03",
      "given": "安装的发布包，测试环境不提供网络，HOME 与 XDG 目录为测试私有、没有运行中的 host；一个新的空项目，cto 职位绑定到随测试安装的假 Agent（它不改 docs/ 下的模板，只提交 docs/spec/ 后完成）",
      "when": "执行 hoh doctor；以 hoh -p 启动 Run（host 由此启动），以 strace -f -p 附着该 host 的全部线程（pid 取自 host 的运行记录），再在 strace -f 下以 hoh -p draft --resume <run_id> 选择起草",
-     "then": "doctor 输出列出模板包版本；起草 Attempt 开始时 docs/spec/ 有规格骨架，docs/ 下有 full 档 profiles.json 所列的全部模板文件，其中十类 product-definition、prd、feature、ux、architecture、development-plan、test-plan、acceptance、deployment、user-guide 各一份且没有残留占位语法；两个 strace 的全部记录（客户端、host 与 host 的子进程）中 connect 的目标只有本地地址（AF_UNIX 或回环）；第二个 hoh -p 停在批准问题并以 3 退出",
+     "then": "doctor 输出列出模板包版本；起草 Attempt 开始时 docs/spec/ 有规格骨架，docs/ 下有 full 档 profiles.json 所列的全部模板文件，其中十类 product-definition、prd、feature、ux、architecture、development-plan、test-plan、acceptance、deployment、user-guide 各一份且没有残留占位语法；两个 strace 的全部记录（客户端、host 与 host 的子进程）中 connect 的目标只有本地地址（AF_UNIX 或回环），或 sa_family=AF_NETLINK 且 nl_pid=0 的内核端点；后一种仅允许同一进程此前由 socket(AF_NETLINK, SOCK_RAW|..., NETLINK_SOCK_DIAG) 创建的描述符，两个 strace 同时记录 socket、close 与 connect，并按 pid 和 fd 关联到该 pid 中 connect 之前最近一次返回该 fd 的 socket，close 后旧关联失效；其他 netlink 协议、非零 nl_pid、无法关联的 fd 或无法解码的记录均失败；第二个 hoh -p 停在批准问题并以 3 退出",
      "test_id": "TEST-029-03"
     }
    ],
