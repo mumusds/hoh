@@ -972,17 +972,27 @@ async fn submit_command(
         ),
         CommandBody::ApproveSpec(_) | CommandBody::ProposeSpecChange(_) => {
             let root = shared.root.clone();
-            let files = super::begun::spawn_blocking(move || super::spec::files(&root)).await;
+            let hooks = Arc::clone(&shared.hooks);
+            let files = super::begun::spawn_blocking(move || {
+                // A test hook asks for a real JoinError (M3LE-02). The product hook returns false.
+                if hooks.fail_spec_source_read() {
+                    panic!("injected spec-source join failure");
+                }
+                super::spec::files(&root)
+            })
+            .await;
             let files = match files {
                 Ok(files) => files,
                 Err(e) => {
-                    return error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "UNPROCESSABLE",
-                        format!("specification read stopped: {e}"),
-                        true,
-                        None,
-                    );
+                    // CR-036: a join failure is an unavailable spec source, the same retryable 503 as a read error.
+                    return store_error(
+                        &shared,
+                        command.run_id.as_deref().unwrap_or(""),
+                        PersistError::SpecSourceUnavailable(format!(
+                            "specification read stopped: {e}"
+                        )),
+                    )
+                    .await;
                 }
             };
             let (name, action) = match &command.body {
