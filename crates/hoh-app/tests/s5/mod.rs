@@ -9,6 +9,9 @@ struct RecordingAgent {
     inputs: Mutex<Vec<(String, String)>>,
     leaders: Mutex<Vec<(u32, String)>>,
     releases: Arc<Mutex<Vec<std::process::ChildStdin>>>,
+    hold_next_steer: Arc<std::sync::atomic::AtomicBool>,
+    steer_entered: Arc<tokio::sync::Notify>,
+    steer_release: Arc<tokio::sync::Notify>,
 }
 
 impl Executor for RecordingAgent {
@@ -76,6 +79,20 @@ impl Executor for RecordingAgent {
         work: &hoh_app::host::Work,
         input: &hoh_core::persistence::InputRow,
     ) -> tokio::sync::oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .hold_next_steer
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let entered = self.steer_entered.clone();
+            let release = self.steer_release.clone();
+            tokio::spawn(async move {
+                entered.notify_one();
+                release.notified().await;
+                let _ = tx.send(hoh_agents::codex::SteerReceipt::NotNow);
+            });
+            return rx;
+        }
         let receipt = match (self.inputs.lock(), input.payload["text"].as_str()) {
             (Ok(mut inputs), Some(text)) => {
                 inputs.push((work.role.clone(), text.into()));
@@ -87,7 +104,6 @@ impl Executor for RecordingAgent {
                 reason: "fake could not record input".into(),
             },
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = tx.send(receipt);
         rx
     }
@@ -314,18 +330,43 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
     let receipt = world.query(&format!(
         "SELECT result_json FROM receipts WHERE message_id='{id}'"
     ))?;
-    let stored = world
-        .rows(&format!("SELECT * FROM outbox WHERE message_id='{id}'"))?
-        .remove(0);
-    let old = hoh_core::persistence::OutboxRow {
-        message_id: id.clone(),
-        run_id: Some("R".into()),
-        recipient_role: stored["recipient_role"].as_str().ok_or("role")?.into(),
-        role_epoch: stored["role_epoch"].as_i64().ok_or("epoch")?,
-        payload: serde_json::from_str(stored["payload_json"].as_str().ok_or("payload")?)?,
-        attempt_count: stored["attempt_count"].as_i64().ok_or("count")?,
-        next_retry_at: None,
-    };
+    // Hold the per-role delivery dispatcher in flight on one steer so a second epoch-1 input stays PENDING in outbox
+    // until after the host's runner applies the rebind checkpoint; then the host's own delivery loop rejects it.
+    agent
+        .hold_next_steer
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let revision: i64 = world
+        .query("SELECT revision FROM runs WHERE run_id='R'")?
+        .parse()?;
+    let hold_cmd = json!({"schema_version":"1.0","command_id":"hold-steer","idempotency_key":"hold-steer","kind":"SendInput","run_id":"R","expected_revision":revision,
+        "payload":{"text":"hold steer","input_kind":"STEER","target_role":"developer"}});
+    assert_eq!(
+        runtime
+            .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&hold_cmd)))?
+            .0,
+        202
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(WAIT, agent.steer_entered.notified()).await
+    })?;
+    let revision: i64 = world
+        .query("SELECT revision FROM runs WHERE run_id='R'")?
+        .parse()?;
+    let late_outbox = json!({"schema_version":"1.0","command_id":"late-outbox","idempotency_key":"late-outbox","kind":"SendInput","run_id":"R","expected_revision":revision,
+        "payload":{"text":"late outbox input","input_kind":"STEER","target_role":"developer"}});
+    assert_eq!(
+        runtime
+            .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&late_outbox)))?
+            .0,
+        202
+    );
+    let late_outbox_id = hoh_core::ids::child_id("late-outbox", "input");
+    assert_eq!(
+        world.query(&format!(
+            "SELECT state || ':' || role_epoch FROM outbox WHERE message_id='{late_outbox_id}'"
+        ))?,
+        "PENDING:1"
+    );
     let team_revision: i64 = world
         .query("SELECT max(revision) FROM team_revisions")?
         .parse()?;
@@ -338,7 +379,7 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         Some(&change),
     ))?;
     assert_eq!(status, 202, "{reply}");
-    // Release the fake turn through its pipe; the host settles it before the real checkpoint.
+    // Release the fake turn through its pipe; the host runner settles it and applies the rebind checkpoint itself.
     for mut stdin in agent.releases.lock().unwrap().drain(..) {
         use std::io::Write as _;
         stdin.write_all(b"done\n")?;
@@ -348,63 +389,66 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         "SETTLED",
         WAIT,
     )?;
-    runtime.block_on(
-        host.store()
-            .team_checkpoint("R", std::collections::BTreeSet::<String>::new()),
-    )?;
     world.wait(
         "SELECT agent || ':' || role_epoch FROM role_bindings WHERE role='developer'",
         "codex:2",
         WAIT,
     )?;
-    let reply = runtime.block_on(host.store().route_input(
-        hoh_core::persistence::InputRouting::Stage {
-            row: old,
-            attempt: None,
-            now: std::time::SystemTime::now(),
-        },
-    ))?;
-    assert!(reply.steer.is_none());
-    let project_id = world.query("SELECT project_id FROM projects")?;
-    for (id, kind) in [("current-ask", "ASK"), ("current-steer", "STEER")] {
-        runtime.block_on(host.store().enqueue_input(hoh_core::persistence::NewInput {
-            input_id: id.into(),
-            run_id: "R".into(),
-            kind: kind.into(),
-            target_role: Some("developer".into()),
-            payload: json!({"text":id}),
-        }))?;
+    // Unblock the held steer; the host's own input delivery loop delivers late-outbox (epoch 1) and sweeps late (ASK, epoch 1).
+    agent.steer_release.notify_one();
+    world.wait(
+        &format!("SELECT state FROM outbox WHERE message_id='{late_outbox_id}'"),
+        "ACKED",
+        WAIT,
+    )?;
+    for stale_id in [&late_outbox_id, &id] {
+        world.wait(
+            &format!("SELECT state FROM input_queue WHERE input_id='{stale_id}'"),
+            "REJECTED",
+            WAIT,
+        )?;
         assert_eq!(
-            host.store()
-                .reader()?
-                .input(id)?
-                .ok_or("current input")?
-                .payload["role_epoch"],
-            2
+            world.query(&format!(
+                "SELECT json_extract(payload_json,'$.reason') FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{stale_id}'"
+            ))?,
+            "STALE_ROLE_EPOCH",
+            "{stale_id}"
+        );
+        assert_eq!(
+            world.query(&format!(
+                "SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{stale_id}'"
+            ))?,
+            "1",
+            "{stale_id}"
         );
     }
-    runtime.block_on(host.store().settle_ended_inputs(&project_id))?;
-    assert_eq!(
-        world.query(&format!(
-            "SELECT state FROM input_queue WHERE input_id='{id}'"
-        ))?,
-        "REJECTED",
-        "a routed input must not wait forever for an attempt of its obsolete epoch"
-    );
-    assert_eq!(world.query(&format!("SELECT json_extract(payload_json,'$.reason') FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{id}'"))?, "STALE_ROLE_EPOCH");
-    runtime.block_on(host.store().settle_ended_inputs(&project_id))?;
-    for id in ["current-ask", "current-steer"] {
+    // Current-epoch inputs submitted through HTTP stay QUEUED across the host's sweep loop.
+    let mut current_ids = Vec::new();
+    for (cmd_id, kind) in [("current-ask", "ASK"), ("current-steer", "STEER")] {
+        let revision: i64 = world
+            .query("SELECT revision FROM runs WHERE run_id='R'")?
+            .parse()?;
+        let body = json!({"schema_version":"1.0","command_id":cmd_id,"idempotency_key":cmd_id,"kind":"SendInput","run_id":"R","expected_revision":revision,
+            "payload":{"text":cmd_id,"input_kind":kind,"target_role":"developer"}});
         assert_eq!(
-            host.store()
-                .reader()?
-                .input(id)?
-                .ok_or("current input")?
-                .state,
-            hoh_core::lifecycle::InputState::Queued,
-            "the sweep must keep current-epoch {id}"
+            runtime
+                .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&body)))?
+                .0,
+            202
+        );
+        current_ids.push(hoh_core::ids::child_id(cmd_id, "input"));
+    }
+    // Wait past at least two 200ms ticks of the host's input delivery/sweep loop.
+    std::thread::sleep(Duration::from_millis(500));
+    for current_id in current_ids {
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state || ':' || json_extract(payload_json,'$.role_epoch') FROM input_queue WHERE input_id='{current_id}'"
+            ))?,
+            "QUEUED:2",
+            "host sweep must keep current-epoch {current_id}"
         );
     }
-    assert_eq!(world.query(&format!("SELECT count(*) FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{id}'"))?, "1");
     assert_eq!(
         world.query(&format!(
             "SELECT result_json FROM receipts WHERE message_id='{id}'"
