@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 25,
+  "revision": 26,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "7e1a69dc425467f41a623ac197591d8a9ba8c87884a66fbc0538510fd727a0ea"
+    "lock_sha256": "161cee8b4f4e01635b843f9b6dd76aa9189058ced654767a099655f3e1628161"
   },
   "change_requests": [
     {
@@ -127,6 +127,11 @@
       "id": "CR-036",
       "path": "docs/cr/CR-036-spec-source-unavailable.md",
       "sha256": "c7e24c2f95feb6868b8c680c01821be228a691c530e070c53c0fd64f1f7e53db"
+    },
+    {
+      "id": "CR-038",
+      "path": "docs/cr/CR-038-execution-started.md",
+      "sha256": "0cc0cd6e440fc0ca6eb2b51a98833c45738e74d4f0bc6fc347e40809094939c7"
     }
   ],
   "files": {
@@ -136,7 +141,7 @@
     "contracts/candidate.schema.json": "5965712d9f1c16e8804f3e00dbc1e2faec0b878435ba868afd637b242bb439cb",
     "contracts/check-plan.schema.json": "d4dac3c7c3ebee4356d332541035ecf9c03d12e101acb5f7c717b1598359a86a",
     "contracts/compat-manifest.schema.json": "6b4a676fc8af07bef82c7fa2d3f911ef47791026459e88419026cad565ab8de4",
-    "contracts/execution.schema.json": "42f4dce4c68641f3eb07f8c699ba8e7a096d14a4514f4793c979cd4c3751128f",
+    "contracts/execution.schema.json": "f7fc577888c48f33c6369aaac8a6ceaa0a2bc92a3c04d80a122670a0ddf3d12e",
     "contracts/independent-report.schema.json": "5d241c3689e29d9512402f1606701e2c555888eefcec681fafd64a5a709b1615",
     "contracts/live-session.schema.json": "06ee125373701d6569477be0396e6e11e6b28b7f89903a020f0f241e3ce32793",
     "contracts/native-attempt.schema.json": "34fce4de57f4dcf79a9023d66f546ef75f96a0bbccd569c982e8a4c300a25220",
@@ -154,8 +159,8 @@
     "docs/10-acceptance.md": "ccd6309ba74af59c33401039f9a1d660a1fcf168cffaa029bf083732f989615d",
     "tools/baseline.py": "2a402141ba6e810eb85613947be508a1e066a27de2f736cd15ef5891bb9380c2",
     "tools/candidate.py": "83682c51735bcc84c1ac81217111f6eecd63ef660a57a9c4f182394d4001b98c",
-    "tools/common.py": "e0df9f5e3208342b72670dcbc458229cf898a57b02b79615d723707645e7e44a",
-    "tools/release_gate.py": "a022b9e596467d389b1f101f05f3dd2c68f5b7269cbc7fd967dee6f9870f69b5",
-    "tools/run_check.py": "d155bf2f31c87133a0a8be426c85f301147fc785d4da5b8d48bc59a2ee3d99bf"
+    "tools/common.py": "6f86c245776562b6dfd02dbbf5fafe3cc19e1d4c2b281f108cb76c5d8dc961c1",
+    "tools/release_gate.py": "2cc0f1faf7fb25ee398a0ec2d3ca87927c98b48d8f35ce343fff479327bab4a9",
+    "tools/run_check.py": "5cce57e531fe3cf70c840975f85dfd2fa9263dff786f697322437ef930afede2"
   }
 }
