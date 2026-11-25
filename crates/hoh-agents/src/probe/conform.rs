@@ -350,10 +350,11 @@ pub(super) fn schema(plan: &Plan, export: Export<'_>, work: &Work) -> Conformanc
                     Some(_) => ("ClientRequest.json", export.client_requests),
                     None => ("ClientNotification.json", export.client_notifications),
                 };
-                let truth = if method == crate::codex::RESUME_REQUEST
-                    && !declares_exclude_turns(schema, work)
-                {
-                    Truth::No
+                let truth = if method == crate::codex::RESUME_REQUEST {
+                    match declares_exclude_turns(schema, work) {
+                        Truth::Yes => judge(file, schema, message),
+                        other => other,
+                    }
                 } else {
                     judge(file, schema, message)
                 };
