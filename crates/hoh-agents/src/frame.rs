@@ -12,7 +12,7 @@
 //! [`Frame::Skipped`] and frames on after the LF. A known frame that the stream ends before its LF, or that grows past
 //! the rule's `max_length`, is refused like any other.
 //!
-//! CR-041 additionally reduces strings in known Codex items as they arrive: every field remains, large string values
+//! CR-041 additionally reduces strings in known over-limit Codex items: every field remains, large string values
 //! carry a typed prefix/length/hash marker, and invalid or over-budget records are refused. The reducer has its own
 //! 512 KiB output budget, keeping its input, output, head and string scratch within the unchanged reader bound.
 
@@ -235,10 +235,20 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 tokio::task::yield_now().await;
                 continue;
             }
-            // Start early, before a large frame fills the ordinary buffer: input + output stay within the same bound.
+            // CR-041 / M3CX-001: ordinary frames retain their exact Line/Partial semantics.
+            // Only a proven over-limit frame enters reduction (a CR before LF is not content).
             if let Some(rule) = self.reduce {
                 let pending = &self.buf[self.start..];
-                if let Some(kind) = (rule.known)(&pending[..pending.len().min(HEAD_BYTES)]) {
+                let end = pending[self.scanned..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(pending.len(), |i| self.scanned + i);
+                let content = pending[..end]
+                    .strip_suffix(b"\r")
+                    .unwrap_or(&pending[..end]);
+                if content.len() > self.limit
+                    && let Some(kind) = (rule.known)(&pending[..pending.len().min(HEAD_BYTES)])
+                {
                     self.buf.drain(..self.start);
                     self.buf.shrink_to(self.chunk.max(self.buf.len()));
                     self.start = 0;
@@ -322,7 +332,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             // Reads are capped so that at most limit + chunk bytes are ever held (at least one byte: chunk >= 2);
             // memory grows by at most one chunk per read, never to the whole limit up front.
             let room = self.limit + self.chunk - self.buf.len();
-            let want = room.min(self.chunk);
+            // Keep the transition input at most limit + 2 (including a possible CRLF).
+            let want = room.min(self.chunk).min(if self.reduce.is_some() {
+                (self.limit + 2).saturating_sub(self.buf.len())
+            } else {
+                room
+            });
             if self.buf.capacity() - self.buf.len() < want {
                 self.buf.reserve_exact(want);
             }
@@ -362,52 +377,63 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 tokio::task::yield_now().await;
             }
         }
-        let end = self.buf.iter().position(|&b| b == b'\n');
-        let bytes = &self.buf[..end.unwrap_or(self.buf.len())];
-        let Some((original, json)) = &mut self.reducing else {
-            return Ok(None);
-        };
-        if end.is_some() {
-            original.take_last(bytes);
-        } else {
-            original.take_open(bytes);
-        }
-        let valid = json.take(bytes).is_ok();
-        self.max_buffered = self
-            .max_buffered
-            .max(self.buf.capacity() + original.head.capacity() + json.buffered());
-        if !valid || eof || original.length > self.reduce.map_or(0, |r| r.max_length) {
-            return Ok(self.refuse_reduced());
-        }
-        if let Some(end) = end {
-            let Some((original, json)) = self.reducing.take() else {
+        loop {
+            // Consume the initial ordinary buffer in small pieces, releasing its allocation BEFORE
+            // growing reduced output. No second frame-sized buffer is kept during the transition.
+            let mut piece = [0u8; HEAD_BYTES];
+            let n = self.buf.len().min(piece.len());
+            piece[..n].copy_from_slice(&self.buf[..n]);
+            let end = piece[..n].iter().position(|&b| b == b'\n');
+            let used = end.map_or(n, |end| end + 1);
+            self.buf.drain(..used);
+            self.buf.shrink_to(self.chunk.max(self.buf.len()));
+            let bytes = &piece[..end.unwrap_or(n)];
+            let Some((original, json)) = &mut self.reducing else {
                 return Ok(None);
             };
-            let truncated = json.truncated;
-            self.start = end + 1;
-            self.scanned = 0;
-            let line = match json.finish() {
-                Ok(line) if valid_item(&line, original.kind) => line,
-                _ => {
-                    self.skipping = Some(original);
-                    return Ok(self.refuse_skipped());
-                }
-            };
-            if !truncated {
-                return Ok(Some(Frame::Line(line)));
+            if end.is_some() {
+                original.take_last(bytes);
+            } else {
+                original.take_open(bytes);
             }
-            return Ok(Some(Frame::Reduced {
-                line,
-                original: SkippedFrame {
-                    kind: original.kind,
-                    length: original.length,
-                    sha256: hex(&original.hasher.finalize()),
-                    head: original.head,
-                },
-            }));
+            let valid = json.take(bytes).is_ok();
+            self.max_buffered = self.max_buffered.max(
+                self.buf.capacity() + piece.len() + original.head.capacity() + json.buffered(),
+            );
+            if !valid || eof || original.length > self.reduce.map_or(0, |r| r.max_length) {
+                return Ok(self.refuse_reduced());
+            }
+            if end.is_some() {
+                let Some((original, json)) = self.reducing.take() else {
+                    return Ok(None);
+                };
+                let truncated = json.truncated;
+                self.start = 0;
+                self.scanned = 0;
+                let line = match json.finish() {
+                    Ok(line) if valid_item(&line, original.kind) => line,
+                    _ => {
+                        self.skipping = Some(original);
+                        return Ok(self.refuse_skipped());
+                    }
+                };
+                if !truncated {
+                    return Ok(Some(Frame::Line(line)));
+                }
+                return Ok(Some(Frame::Reduced {
+                    line,
+                    original: SkippedFrame {
+                        kind: original.kind,
+                        length: original.length,
+                        sha256: hex(&original.hasher.finalize()),
+                        head: original.head,
+                    },
+                }));
+            }
+            if self.buf.is_empty() {
+                return Ok(None);
+            }
         }
-        self.buf.clear();
-        Ok(None)
     }
 
     fn refuse_reduced(&mut self) -> Option<Frame> {
@@ -936,9 +962,73 @@ mod tests {
         format!(r#"{{"method":"item/completed","params":{{"item":{{"type":"commandExecution","id":"i","aggregatedOutput":"{text}","x_future":{{"n":7}}}},"threadId":"t","turnId":"u"}}}}"#).into_bytes()
     }
 
+    fn structured_item(length: usize) -> Vec<u8> {
+        let mut raw = large_item("");
+        raw.pop();
+        raw.extend_from_slice(b",\"padding\":[");
+        while raw.len() + 4004 < length {
+            raw.push(b'"');
+            raw.extend(std::iter::repeat_n(b'x', 4000));
+            raw.extend_from_slice(b"\",");
+        }
+        raw.push(b'"');
+        raw.extend(std::iter::repeat_n(b'x', length - raw.len() - 3));
+        raw.extend_from_slice(b"\"]}");
+        assert_eq!(raw.len(), length);
+        raw
+    }
+
+    #[tokio::test]
+    async fn test_027_06_m3cx001_under_limit_items_are_never_refused() -> R {
+        for length in [605_206, FRAME_LIMIT] {
+            let raw = structured_item(length);
+            let _: serde_json::Value = serde_json::from_slice(&raw)?;
+            for suffix in [b"\n".as_slice(), b"\r\n"] {
+                let input = [raw.as_slice(), suffix, b"after\n"].concat();
+                let mut reader = FrameReader::new(input.as_slice(), FRAME_LIMIT, READ_CHUNK)
+                    .reducing(Skip {
+                        known: item_head,
+                        max_length: SKIP_LIMIT,
+                    });
+                assert!(
+                    reader.next().await? == Some(Frame::Line(raw.clone())),
+                    "length={length} was changed or refused"
+                );
+                assert_eq!(reader.next().await?, Some(line("after")));
+                assert!(reader.max_buffered() <= FRAME_LIMIT + READ_CHUNK);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_027_06_m3cx001_limit_plus_one_still_enforces_reduction_budget() -> R {
+        for raw in [
+            structured_item(FRAME_LIMIT + 1),
+            large_item(&"x".repeat(FRAME_LIMIT + 1 - large_item("").len())),
+        ] {
+            assert_eq!(raw.len(), FRAME_LIMIT + 1);
+            let input = [raw.as_slice(), b"\nafter\n"].concat();
+            let mut reader =
+                FrameReader::new(input.as_slice(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+                    known: item_head,
+                    max_length: SKIP_LIMIT,
+                });
+            if raw.ends_with(b"\"]}") {
+                assert!(matches!(reader.next().await?, Some(Frame::TooLarge(_))));
+                assert_eq!(reader.next().await?, None);
+            } else {
+                assert!(matches!(reader.next().await?, Some(Frame::Reduced { .. })));
+                assert_eq!(reader.next().await?, Some(line("after")));
+            }
+            assert!(reader.max_buffered() <= FRAME_LIMIT + READ_CHUNK);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_027_06_reduced_frames_keep_fields_hash_and_crlf_across_reads() -> R {
-        let raw = large_item(&"é\\n".repeat(6000));
+        let raw = large_item(&"é\\n".repeat(FRAME_LIMIT / 4));
         let input = [b"before\n".to_vec(), raw.clone(), b"\r\nafter\n".to_vec()].concat();
         let original: serde_json::Value = serde_json::from_slice(&raw)?;
         for size in [1, 7, 4096, READ_CHUNK] {
