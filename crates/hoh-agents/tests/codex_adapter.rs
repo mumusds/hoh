@@ -2614,3 +2614,52 @@ async fn test_017_02_never_sent_buffered_steers_are_returned_at_gate_close() -> 
     assert!(received(&fake)?.is_empty());
     Ok(())
 }
+
+/// AC-027-05 (CR-040), codex App Server: a 1.5 MiB `turn/diff/updated` (the turn's whole diff, which the adapter does
+/// not read) before turn/completed is skipped with one diagnosis and the turn SETTLES; the same size in an
+/// `item/agentMessage/delta` still fails it (PROTOCOL_FRAME_TOO_LARGE).
+#[tokio::test]
+async fn test_027_05_codex_a_long_turn_diff_is_skipped_and_other_notifications_are_not() -> R {
+    let world = World::new()?;
+    let pad = "x".repeat(3 << 19);
+    let mut ends = Vec::new();
+    for (id, frame) in [
+        (
+            "A1",
+            json!({"method": "turn/diff/updated", "params": {"diff": pad, "threadId": "t", "turnId": "u"}}),
+        ),
+        (
+            "A2",
+            json!({"method": "item/agentMessage/delta", "params": {"delta": pad}}),
+        ),
+    ] {
+        let mut case = Case::load("app-server-turn")?;
+        let at = case.position("turn/completed")?;
+        case.frames.insert(at, frame);
+        let fake = world.fake(id, Some(&case), "exec", false)?;
+        let attempt = world.attempt(id).await?;
+        let outcome = run(&world, &attempt, &world.turn(&fake, &format!("logs/{id}"))?).await?;
+        ends.push((outcome.state, outcome.failure));
+    }
+    assert_eq!(
+        (ends[0].0, ends[0].1.as_deref()),
+        (AttemptState::Settled, None)
+    );
+    assert_eq!(
+        (ends[1].0, ends[1].1.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE"))
+    );
+    let skipped: Vec<Value> = events(&world, "adapter.diagnostic")?
+        .into_iter()
+        .filter(|d| d["reason"] == "known frame over the limit skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["type"], "turn/diff/updated");
+    assert!(skipped[0]["length"].as_u64().is_some_and(|n| n > 3 << 19));
+    assert!(
+        skipped[0]["head"].as_str().is_some_and(
+            |h| h.starts_with(r#"{"method":"turn/diff/updated","params":{"diff":"xxx"#)
+        )
+    );
+    Ok(())
+}

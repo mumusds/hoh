@@ -1486,3 +1486,68 @@ async fn claude_runner_mode_reports_when_a_recorded_usage_limit_lifts() -> R {
     }
     Ok(())
 }
+
+/// AC-027-05 (CR-040), claude: the recorded tool turn with its `user` record (a tool result) grown to 1.5 MiB ends
+/// as the recording does, SETTLED, with one skip diagnosis; the same growth in an `assistant` record, whose fields the
+/// adapter reads, still fails the turn (PROTOCOL_FRAME_TOO_LARGE).
+#[tokio::test]
+async fn test_027_05_claude_a_long_tool_result_is_skipped_and_an_assistant_record_is_not() -> R {
+    let recorded = String::from_utf8(fixture("tool-success")?)?;
+    let pad = "x".repeat(3 << 19);
+    let lines: Vec<&str> = recorded.lines().collect();
+    let user = lines
+        .iter()
+        .position(|l| l.starts_with(r#"{"type":"user","#))
+        .ok_or("no user record")?;
+    let assistant = lines
+        .iter()
+        .position(|l| l.starts_with(r#"{"type":"assistant","#))
+        .ok_or("no assistant record")?;
+    let grown = |at: usize| -> R<(String, String)> {
+        let mut lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+        // A string field near the start grows: the record keeps its type and key order.
+        let line = &lines[at];
+        let open = line.find(r#""session_id":""#).ok_or("no session_id")?;
+        let long = format!(r#"{}"x_pad":"{pad}",{}"#, &line[..open], &line[open..]);
+        lines[at] = long.clone();
+        Ok((lines.join("\n") + "\n", long))
+    };
+    let world = World::new()?;
+    let mut ends = Vec::new();
+    for (id, at) in [("A1", user), ("A2", assistant)] {
+        let (stdout, long) = grown(at)?;
+        let attempt = world.attempt(id).await?;
+        let fake = world.fake(id, stdout.as_bytes(), b"", 0)?;
+        let outcome = world
+            .run(&attempt, &world.turn(&fake, &format!("logs/{id}"))?)
+            .await?;
+        ends.push((outcome.state, outcome.failure, long));
+    }
+    assert_eq!(
+        (ends[0].0, ends[0].1.as_deref()),
+        (AttemptState::Settled, None),
+        "the user record is skipped"
+    );
+    assert_eq!(
+        (ends[1].0, ends[1].1.as_deref()),
+        (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE")),
+        "the assistant record is not"
+    );
+    let skipped: Vec<serde_json::Value> = world
+        .store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter(|(k, p)| {
+            k == "adapter.diagnostic" && p["reason"] == "known frame over the limit skipped"
+        })
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    let long = &ends[0].2;
+    assert_eq!(skipped[0]["type"], "user");
+    assert_eq!(skipped[0]["length"], serde_json::json!(long.len()));
+    assert_eq!(skipped[0]["sha256"], hex(long.as_bytes()));
+    assert_eq!(skipped[0]["head"], serde_json::json!(long[..4096]));
+    Ok(())
+}

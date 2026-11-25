@@ -881,6 +881,21 @@ pub struct Replayed {
     pub unknown_events: usize,
 }
 
+/// The `adapter.diagnostic` payload of a frame over the limit that the adapter's rule knew and the reader skipped
+/// (CR-040): its type, length, sha256 and first 4 KiB.
+pub(crate) fn skipped_frame(skipped: &crate::frame::SkippedFrame) -> serde_json::Value {
+    serde_json::json!({
+        "reason": SKIPPED_FRAME,
+        "type": skipped.kind,
+        "length": skipped.length,
+        "sha256": skipped.sha256,
+        "head": String::from_utf8_lossy(&skipped.head),
+    })
+}
+
+/// The reason of a skipped frame's diagnosis (CR-040).
+pub const SKIPPED_FRAME: &str = "known frame over the limit skipped";
+
 /// One step of a replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Replay {

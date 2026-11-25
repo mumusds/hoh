@@ -16,7 +16,7 @@
 //!
 //! The wall deadline here is the backstop: an inactivity watchdog is separate and does not kill (docs/13).
 
-use crate::frame::{FRAME_LIMIT, Frame, FrameReader, READ_CHUNK};
+use crate::frame::{FRAME_LIMIT, Frame, FrameReader, READ_CHUNK, Skip};
 use rustix::process::{Pid, Signal as RawSignal, test_kill_process_group};
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
@@ -92,6 +92,8 @@ impl Default for Escalation {
 pub struct Config {
     pub frame_limit: usize,
     pub read_chunk: usize,
+    /// Frames over the limit that are skipped rather than refused (CR-040); `None`: every one is refused.
+    pub skip: Option<Skip>,
     /// stderr bytes kept (the last ones).
     pub stderr_tail: usize,
     /// Frames waiting for the consumer before the reader stops.
@@ -115,6 +117,7 @@ impl Default for Config {
         Self {
             frame_limit: FRAME_LIMIT,
             read_chunk: READ_CHUNK,
+            skip: None,
             stderr_tail: 64 << 10,
             queue: 64,
             deadline: None,
@@ -309,15 +312,19 @@ impl Process {
         let (cancel_tx, cancel_rx) = watch::channel(None);
         let (leader_tx, leader_rx) = mpsc::unbounded_channel();
         let (abandon_tx, abandon) = watch::channel(false);
+        let reader = FrameReader::new(
+            Tee {
+                inner: stdout,
+                copy: stdout_copy,
+            },
+            config.frame_limit,
+            config.read_chunk,
+        );
         let out = tokio::spawn(read_stdout(
-            FrameReader::new(
-                Tee {
-                    inner: stdout,
-                    copy: stdout_copy,
-                },
-                config.frame_limit,
-                config.read_chunk,
-            ),
+            match config.skip {
+                Some(skip) => reader.skipping(skip),
+                None => reader,
+            },
             events_tx.clone(),
             abandon.clone(),
         ));
