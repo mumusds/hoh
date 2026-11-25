@@ -975,21 +975,26 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
     assert!(!diagnostics.readers.is_empty());
     assert!(diagnostics.readers_read_only, "a reader accepted a write");
     let to = To::Tcp(host.port);
-    for (hold, run, expect_busy) in [(2.0, "r1", false), (7.0, "r2", true)] {
+    // The outside connection holds the write lock until the test releases it (a line on its stdin, or its stdin closed
+    // when the test ends), never on a wall clock of its own: the 2 s hold ends 2 s after the command is sent, once the
+    // command is seen still waiting; the 7 s hold ends once the test has the command's reply and 7 s have passed
+    // (FLK-14: a hold timed from the lock let a command that reached SQLite over 2 s late find the lock gone).
+    for (hold, run, expect_busy) in [(2, "r1", false), (7, "r2", true)] {
         let before = call(&to, "GET", &format!("/v1/runs/{run}"), &host.token, b"")
             .await?
             .json()?;
         let mut locker = Command::new("python3")
             .args([
                 "-c",
-                "import sqlite3,sys,time; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
-                 c.execute('BEGIN IMMEDIATE'); print('locked', flush=True); time.sleep(float(sys.argv[2])); \
+                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
+                 c.execute('BEGIN IMMEDIATE'); print('locked', flush=True); sys.stdin.readline(); \
                  c.execute('COMMIT')",
             ])
             .arg(db(dir.path()))
-            .arg(hold.to_string())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()?;
+        let mut release = locker.stdin.take().ok_or("no stdin")?;
         let mut line = String::new();
         std::io::BufRead::read_line(
             &mut std::io::BufReader::new(locker.stdout.take().ok_or("no stdout")?),
@@ -997,7 +1002,8 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
         )?;
         assert_eq!(line.trim(), "locked");
         let started = Instant::now();
-        let command = tokio::spawn({
+        let held_until = tokio::time::Instant::from_std(started) + Duration::from_secs(hold);
+        let mut command = tokio::spawn({
             let to = to.clone();
             let token = host.token.clone();
             let body = pause(&format!("c-{run}"), &format!("k-{run}"), run, 0, "busy");
@@ -1012,10 +1018,28 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
             read_took <= Duration::from_millis(500),
             "GET took {read_took:?}"
         );
-        let reply = command.await??;
-        let took = started.elapsed();
+        let (reply, took) = if expect_busy {
+            let reply = (&mut command).await??;
+            let took = started.elapsed();
+            tokio::time::sleep_until(held_until).await;
+            std::io::Write::write_all(&mut release, b"release\n")?;
+            (reply, took)
+        } else {
+            tokio::time::sleep_until(held_until).await;
+            if command.is_finished() {
+                return Err(format!(
+                    "the command did not wait for the lock: {:?}",
+                    command.await?
+                )
+                .into());
+            }
+            std::io::Write::write_all(&mut release, b"release\n")?;
+            ((&mut command).await??, started.elapsed())
+        };
+        drop(release);
+        assert!(locker.wait()?.success(), "the outside connection failed");
         if expect_busy {
-            assert_eq!(reply.status, 503, "{reply:?}");
+            assert_eq!(reply.status, 503, "{reply:?} after {took:?}");
             let error = reply.json()?;
             assert_eq!(
                 (&error["code"], &error["retryable"]),
@@ -1036,7 +1060,6 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
             assert_eq!(reply.status, 202, "{reply:?}");
             assert!(took <= Duration::from_secs(5), "202 after {took:?}");
         }
-        locker.wait()?;
         // The host's pause step done (no work: PAUSED at once), nothing of it left to write. The host has no runner,
         // so no supervisor: nothing for a cursor to take in.
         if !expect_busy {
