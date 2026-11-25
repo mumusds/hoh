@@ -749,30 +749,20 @@ async fn finish(
     // nothing of it runs, nor forks, outside that cgroup (docs/adr/ADR-028.md decision 7, M3B-201); the gate execs it in
     // its own place (the same pid, process group and environment).
     let gated = launch.gate.clone().filter(|_| launch.adopt.is_some());
-    // A gated command's failed exec comes back on a socket whose other end only the gate holds: it takes that end over
-    // close-on-exec, so a command that started never holds it (CR-038 decision 2, M3LS-01). A socket, not a pipe: a
-    // pipe's end can be opened again through /proc, a socket's cannot. None (no gate, or no socket): never reported.
-    let exec_report = gated
+    let channel = gated
         .as_ref()
-        .map(|_| {
-            use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
-            socketpair(
-                AddressFamily::UNIX,
-                SocketType::SEQPACKET,
-                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-                None,
-            )
-        })
+        .map(|_| crate::gate::report::Channel::new())
         .transpose()
         .map_err(|e| io(format!("the check's exec report: {e}")))?;
-    let command = |exec_error_fd: Option<i32>| {
+    let (mut exec_report, stdin) = match channel {
+        Some((channel, stdin)) => (Some(channel), std::process::Stdio::from(stdin)),
+        None => (None, std::process::Stdio::piped()),
+    };
+    let command = || {
         let mut command = match &gated {
             Some(gate) => {
                 let mut command = std::process::Command::new(gate);
                 command.arg("__check-gate");
-                if let Some(fd) = exec_error_fd {
-                    command.arg("--exec-error-fd").arg(fd.to_string()).arg("--");
-                }
                 command.args(&ready.planned.argv);
                 command
             }
@@ -809,41 +799,22 @@ async fn finish(
         stdout: identity(&stdout),
         stderr: identity(&stderr),
     };
-    let spawn = |command| Process::spawn(command, config, &hoh_core::spawn::Direct::plain());
-    let spawned = match &exec_report {
-        Some((_, theirs)) => {
-            use std::os::fd::AsFd as _;
-            hoh_core::spawn::inheriting(theirs.as_fd(), |fd| spawn(command(Some(fd))))
-                .unwrap_or_else(Err)
-        }
-        None => spawn(command(None)),
-    };
-    // Only the gate holds the other end now: the report is what it wrote before it ended.
-    let ours = exec_report.map(|(ours, _)| ours);
+    let spawned =
+        Process::spawn_with_stdin(command(), config, &hoh_core::spawn::Direct::plain(), stdin);
     let (exit_code, timed_out, command_started) = match spawned {
         Ok(mut process) => {
             // An adoption that failed leaves the command outside the attempt's cgroup: it must not run (M3LD-01).
             let refused = launch.adopt.and_then(|adopt| adopt(process.pid()).err());
-            // Only now, and only once adopted, the gate opens. Its stdin is the command's after it, held open as
-            // the substrate held it. Not adopted: its stdin is closed, so the gate ends without running anything.
-            let _stdin = match (&gated, &refused) {
-                (Some(_), None) => {
-                    use tokio::io::AsyncWriteExt as _;
-                    let mut stdin = process.take_stdin();
-                    if let Some(pipe) = stdin.as_mut() {
-                        // A gate that cannot be written to has ended: its end is the command's, recorded below.
-                        let _ = pipe.write_all(b"go\n").await;
-                    }
-                    stdin
-                }
-                (Some(_), Some(_)) => {
-                    drop(process.take_stdin());
-                    None
-                }
-                (None, _) => None,
+            // SCM_RIGHTS is sent only after adoption. A failed delivery is a diagnostic failure, never evidence
+            // that the checked command did not start. Cancellation still owns and reaps the gate's process group.
+            let delivery_error = if refused.is_none() {
+                exec_report
+                    .as_mut()
+                    .and_then(|channel| channel.deliver().err())
+            } else {
+                None
             };
-            // Not adopted, its process group is ended (an ungated command has already started) and reaped below.
-            let mut cancelling = refused.is_some();
+            let mut cancelling = refused.is_some() || delivery_error.is_some();
             if cancelling {
                 process.cancel(Escalation::default());
             }
@@ -879,13 +850,22 @@ async fn finish(
                 }
                 None => {
                     let (exit, timed) = recorded_exit(report.status, report.cause);
-                    // Read once the gate has ended, without waiting: anything but its exact report (none, an
-                    // error) leaves the command recorded as started (CR-038 decision 2).
-                    let exec_failed = ours.as_ref().is_some_and(|ours| {
-                        let mut report = [0u8; 16];
-                        rustix::io::read(ours, &mut report)
-                            .is_ok_and(|n| report[..n] == *b"exec_failed\n")
-                    });
+                    if let Some(error) = delivery_error {
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&stderr)
+                            .and_then(|mut file| {
+                                writeln!(
+                                    file,
+                                    "hoh: cannot deliver gate report descriptor: {error}"
+                                )
+                            })
+                            .map_err(|e| io(e.to_string()))?;
+                    }
+                    let exec_failed = exec_report
+                        .as_ref()
+                        .is_some_and(|channel| channel.exec_failed());
                     // Preserve a timeout/cancellation even when the gate reported a failed exec: only a
                     // completed launch failure is safe to classify as NOT_STARTED.
                     (exit, timed, !(exit == 127 && !timed && exec_failed))

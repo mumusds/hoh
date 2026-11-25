@@ -14,13 +14,12 @@ use rustix::process::{
     Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, WaitIdStatus, kill_process_group, pidfd_open,
     pidfd_send_signal, waitid,
 };
-use std::cell::Cell;
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Where a helper's stderr goes: every start names it, and the spawner sets it before the spawn, so a helper never
@@ -83,42 +82,8 @@ impl Spawner for Direct {
     }
 
     fn host(&self, command: &mut Command) -> io::Result<WaitOnly> {
-        let _spawning = spawning();
         command.spawn().map(WaitOnly)
     }
-}
-
-/// Held for reading around every start of this module, and for writing while a descriptor is left inheritable for one
-/// start ([`inheriting`]), so no other child of this process inherits that descriptor (CR-038, M3LS-01).
-static SPAWNS: RwLock<()> = RwLock::new(());
-
-thread_local! {
-    /// This thread holds [`SPAWNS`] for writing: its own start, inside [`inheriting`], does not take it again.
-    static INHERITING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// [`SPAWNS`] held for reading for one start, unless this thread holds it for writing.
-fn spawning() -> Option<RwLockReadGuard<'static, ()>> {
-    (!INHERITING.get()).then(|| SPAWNS.read().unwrap_or_else(PoisonError::into_inner))
-}
-
-/// Run `spawn` with an inheritable copy of `fd` (its number, 3 or above, is what `spawn` is given): a child started
-/// through this module inside `spawn` inherits it; the copy is closed when `spawn` returns, and no other start of this
-/// module runs meanwhile, so no other child holds it (CR-038, M3LS-01). `fd` itself stays close-on-exec.
-pub fn inheriting<T>(fd: BorrowedFd<'_>, spawn: impl FnOnce(i32) -> T) -> io::Result<T> {
-    /// Clears [`INHERITING`] however `spawn` ends.
-    struct Clear;
-    impl Drop for Clear {
-        fn drop(&mut self) {
-            INHERITING.set(false);
-        }
-    }
-    let _all = SPAWNS.write().unwrap_or_else(PoisonError::into_inner);
-    let copy = rustix::io::fcntl_dupfd_cloexec(fd, 3)?;
-    rustix::io::fcntl_setfd(&copy, rustix::io::FdFlags::empty())?;
-    INHERITING.set(true);
-    let _clear = Clear;
-    Ok(spawn(copy.as_raw_fd()))
 }
 
 /// The spawner of code that starts nothing (a compat replay judges recorded output): it refuses every start.
@@ -173,11 +138,7 @@ impl Helper {
         open: &dyn Fn(Pid) -> io::Result<OwnedFd>,
         bound: Duration,
     ) -> io::Result<Helper> {
-        let spawned = {
-            let _spawning = spawning();
-            command.process_group(0).spawn()
-        };
-        let mut child = spawned?;
+        let mut child = command.process_group(0).spawn()?;
         let pid = Pid::from_child(&child);
         let pidfd = match open(pid) {
             Ok(fd) => fd,

@@ -2987,3 +2987,53 @@ async fn a_history_recovery_whose_run_stops_before_its_write_is_written_as_recor
     assert!(!f.store.reader()?.unrecovered_candidates()?.contains(&c));
     Ok(())
 }
+
+#[tokio::test]
+async fn test_052_04_a_gate_report_delivery_failure_is_still_recorded_started() -> R {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::with_qa("exit 127\n").await?;
+    // An owned gate fixture closes its control endpoint before adoption returns, deterministically failing sendmsg.
+    let gate = f.state().join("m3ls100-broken-gate");
+    std::fs::write(
+        &gate,
+        "#!/usr/bin/python3\nimport os,time\nos.close(0)\ntime.sleep(30)\n",
+    )?;
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o700))?;
+    let c = f.frozen().await?;
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c,
+            check_id: "qa".into(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".into(),
+        },
+        Launch {
+            gate: Some(gate),
+            adopt: Some(Box::new(|pid| {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::path::Path::new(&format!("/proc/{pid}/fd/0")).exists() {
+                    if std::time::Instant::now() > end {
+                        return Err("gate did not close stdin".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok(())
+            })),
+            ..Launch::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&ran)?;
+    assert_eq!(record["started"], true, "{record}");
+    assert_ne!(record["exit_code"], 0, "{record}");
+    assert_ne!(ran.outcome.reason, Some("NOT_STARTED"));
+    assert!(
+        std::fs::read_to_string(ran.record_dir.join("stderr.log"))?
+            .contains("cannot deliver gate report descriptor")
+    );
+    Ok(())
+}

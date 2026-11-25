@@ -214,24 +214,65 @@ fn output_within_names_the_bound_that_ended_its_wait() -> R {
 /// `hoh __check-gate <argv>` with `env` set, given `input` on stdin (then closed), in an isolated environment: its exit
 /// code and stdout, and its pid.
 fn check_gate(argv: &[&str], env: &[(&str, &str)], input: &[u8]) -> R<(Option<i32>, String, u32)> {
+    use rustix::net::{
+        AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags,
+        SocketType, sendmsg, socketpair,
+    };
+    use std::os::fd::AsFd as _;
     let dir = tempfile::tempdir()?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_hoh"));
     isolated(&mut command, dir.path())?;
-    let mut child = command
+    let pair = || {
+        socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+    };
+    let (control, stdin) = pair()?;
+    let (_reader, report) = pair()?;
+    let child = command
         .arg("__check-gate")
         .args(argv)
         .envs(env.iter().copied())
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    drop(command); // The host retains no extra copy of the gate's control endpoint.
     let pid = child.id();
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    match stdin.write_all(input) {
-        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
-        _ => {}
+    let held = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                Command::new("sh")
+                    .args(["-c", "for fd in /proc/$$/fd/*; do readlink \"$fd\"; done"])
+                    .output()
+            })
+            .join()
+            .map_err(|_| std::io::Error::other("spawn thread panicked"))
+            .and_then(|result| result)
+    })?;
+    assert!(
+        !String::from_utf8_lossy(&held.stdout).contains("socket:"),
+        "unrelated spawn inherited a check socket"
+    );
+    if !input.is_empty() {
+        let fds = [report.as_fd()];
+        let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+        match sendmsg(
+            &control,
+            &[std::io::IoSlice::new(input)],
+            &mut ancillary,
+            SendFlags::NOSIGNAL,
+        ) {
+            Ok(_) | Err(rustix::io::Errno::PIPE) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    drop(stdin);
+    drop(control);
     let out = common::output_within(child, std::time::Duration::from_secs(60))?;
     Ok((out.status.code(), String::from_utf8(out.stdout)?, pid))
 }
@@ -265,15 +306,5 @@ fn a_check_gate_execs_the_check_in_its_place_with_its_whole_environment_only_on_
     assert_eq!(code, Some(64));
     let (code, _, _) = check_gate(&["/nonexistent/check"], &env, b"go\n")?;
     assert_eq!(code, Some(127));
-    // CR-038 (M3LS-01): the exec report's descriptor is a number of 3 or above followed by `--`; nothing else runs.
-    for argv in [
-        &["--exec-error-fd", "1", "--", "sh", "-c", "echo ran"][..],
-        &["--exec-error-fd", "x", "--", "sh", "-c", "echo ran"],
-        &["--exec-error-fd", "5", "sh", "-c", "echo ran"],
-        &["--exec-error-fd"],
-    ] {
-        let (code, out, _) = check_gate(argv, &env, b"go\n")?;
-        assert_eq!((code, out.as_str()), (Some(64), ""), "{argv:?}");
-    }
     Ok(())
 }
