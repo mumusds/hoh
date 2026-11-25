@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib, json, os, re, signal, subprocess, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 # Generated/third-party trees that kit validators must never scan or hash.
 EXCLUDED_DIRS = frozenset({'.git','.hoh','.hoh-dev','.venv','venv','node_modules','target','dist','__pycache__'})
@@ -69,7 +69,7 @@ def install_termination_handlers() -> dict:
 def restore_handlers(previous: dict) -> None:
     for s,h in previous.items():signal.signal(s,h)
 
-def execute(argv: Sequence[str],cwd: Path,out: Path,err: Path,timeout: float,input_data: bytes|None=None,env: dict[str,str]|None=None,grace: float=2.0) -> tuple[int,bool,float]:
+def execute(argv: Sequence[str],cwd: Path,out: Path,err: Path,timeout: float,input_data: bytes|None=None,env: dict[str,str]|None=None,grace: float=2.0,on_spawn: Callable[[],None]|None=None) -> tuple[int,bool,float]:
     if not argv or timeout<=0: raise ValueError('command and positive timeout required')
     out.parent.mkdir(parents=True,exist_ok=True);err.parent.mkdir(parents=True,exist_ok=True)
     start=time.monotonic();timed=False
@@ -77,6 +77,7 @@ def execute(argv: Sequence[str],cwd: Path,out: Path,err: Path,timeout: float,inp
         p=subprocess.Popen(list(argv),cwd=str(cwd),stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
                            stdout=fo,stderr=fe,start_new_session=True,env=env)
         try:
+            if on_spawn is not None:on_spawn()
             p.communicate(input=input_data,timeout=timeout)
         except subprocess.TimeoutExpired:
             timed=True;terminate_group(p,grace)

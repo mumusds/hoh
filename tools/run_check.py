@@ -53,11 +53,14 @@ def main(argv=None):
     record_id=str(uuid.uuid4());artifact_dir=out/'artifacts';artifact_dir.mkdir(parents=True)
     env=os.environ|{'HOH_EVIDENCE_DIR':str(artifact_dir),'HOH_CHECK_ID':a.check_id,'HOH_CANDIDATE_ID':candidate['candidate_id'],'HOH_SPEC_SHA256':candidate['spec_sha256'],
          'HOH_CANDIDATE_FILE':str(candidate_file),'HOH_CHECK_RECORD_ID':record_id}
-    started=utcnow();interrupted=False;previous=install_termination_handlers()
-    try:rc,timed,duration=execute(entry['argv'],cwd,out/'stdout.log',out/'stderr.log',timeout,env=env,grace=CHILD_GRACE)
+    started=utcnow();command_started=False;interrupted=False;previous=install_termination_handlers()
+    def spawned():
+        nonlocal command_started
+        command_started=True
+    try:rc,timed,duration=execute(entry['argv'],cwd,out/'stdout.log',out/'stderr.log',timeout,env=env,grace=CHILD_GRACE,on_spawn=spawned)
     except OSError as exc:
         (out/'stdout.log').write_bytes(b'');(out/'stderr.log').write_text(str(exc));rc,timed,duration=127,False,0
-    except (KeyboardInterrupt,Terminated):rc,timed,duration=130,False,0;interrupted=True
+    except (KeyboardInterrupt,Terminated):rc,timed,duration=130 if command_started else 127,False,0;interrupted=True
     finally:restore_handlers(previous)
     for name in ('stdout.log','stderr.log'):
         if not (out/name).exists():(out/name).write_bytes(b'')
@@ -73,7 +76,7 @@ def main(argv=None):
             'check_id':a.check_id,'candidate_id':candidate['candidate_id'],'spec_sha256':candidate['spec_sha256'],'candidate_manifest':ref_for(candidate_file),
             'source_unchanged':unchanged,'environment_sha256':candidate['environment_sha256'],'test_plan_sha256':candidate['test_plan_sha256'],
             'mode':entry['mode'],'command':entry['argv'],'cwd':str(cwd.relative_to(ROOT.resolve())) or '.','started_at':started,'finished_at':finished,
-            'duration_seconds':duration,'exit_code':rc,'timed_out':timed,'stdout':ref_for(out/'stdout.log'),'stderr':ref_for(out/'stderr.log'),
+            'duration_seconds':duration,'started':command_started,'exit_code':rc,'timed_out':timed,'stdout':ref_for(out/'stdout.log'),'stderr':ref_for(out/'stderr.log'),
             'artifacts':artifacts,'missing_artifacts':missing,'runner':{'tool':'tools/run_check.py','euid':os.geteuid() if hasattr(os,'geteuid') else -1,'boot_id':boot_id()}}
     atomic_json(out/'execution.json',record);print(json.dumps(ref_for(out/'execution.json'),ensure_ascii=False))
     if missing:print('Declared artifacts missing: '+', '.join(missing),file=sys.stderr)

@@ -107,7 +107,7 @@ class ReleaseFixture:
                        'candidate_id':cid,'spec_sha256':c['spec_sha256'],'candidate_manifest':cr,'source_unchanged':True,
                        'environment_sha256':c['environment_sha256'],'test_plan_sha256':c['test_plan_sha256'],'mode':plan_checks[key]['mode'],
                        'command':plan_checks[key]['argv'],'cwd':'.','started_at':start.isoformat(),'finished_at':(start+timedelta(seconds=d)).isoformat(),
-                       'duration_seconds':d,'exit_code':0,'timed_out':False,'stdout':ref_for(out,r),'stderr':ref_for(err,r),
+                       'duration_seconds':d,'started':True,'exit_code':0,'timed_out':False,'stdout':ref_for(out,r),'stderr':ref_for(err,r),
                        'artifacts':artifacts,'missing_artifacts':[],'runner':{'tool':'tools/run_check.py','euid':1000}}
             execution_ref=json_file(r,p+'/execution.json',execution);self.records[key]=execution
             checks.append({'id':key,'status':'PASS','execution':execution_ref})

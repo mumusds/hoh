@@ -193,6 +193,10 @@
           "type": "string"
         }
       }
+    },
+    "started": {
+      "type": "boolean",
+      "description": "Whether the planned command started; independent of exit_code (CR-038). Missing is invalid, never inferred from 127."
     }
   },
   "required": [
@@ -208,6 +212,7 @@
     "started_at",
     "finished_at",
     "duration_seconds",
+    "started",
     "exit_code",
     "timed_out",
     "stdout",
@@ -222,5 +227,35 @@
     "runner"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:hoh:execution:1.1"
+  "$id": "urn:hoh:execution:1.1",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "started": {
+            "const": false
+          }
+        },
+        "required": [
+          "started"
+        ]
+      },
+      "then": {
+        "properties": {
+          "exit_code": {
+            "const": 127
+          },
+          "timed_out": {
+            "const": false
+          },
+          "artifacts": {
+            "maxItems": 0
+          },
+          "duration_seconds": {
+            "maximum": 5
+          }
+        }
+      }
+    }
+  ]
 }

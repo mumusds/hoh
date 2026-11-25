@@ -220,6 +220,19 @@ pub fn main(args: &[OsString]) -> i32 {
 /// runs; 64 without a program, 127 when the program cannot be executed. Unlike an agent's gate it keeps its whole
 /// environment: the check's six variables (docs/adr/ADR-027.md decision 6) are the command's own.
 pub fn check_main(args: &[OsString]) -> i32 {
+    // CR-038: an out-of-band exec failure marker distinguishes a failed exec from a command exiting 127.
+    // The path is private to this execution; a successful exec never writes it.
+    let (failure_path, args) = if args.first().is_some_and(|a| a == "--spawn-error-file") {
+        let Some(path) = args.get(1) else {
+            return USAGE;
+        };
+        if args.get(2).is_none_or(|a| a != "--") {
+            return USAGE;
+        }
+        (Some(Path::new(path)), &args[3..])
+    } else {
+        (None, args)
+    };
     let Some((program, rest)) = args.split_first() else {
         return USAGE;
     };
@@ -230,6 +243,17 @@ pub fn check_main(args: &[OsString]) -> i32 {
     defaults();
     let error = std::process::Command::new(program).args(rest).exec();
     say(&format!("{}: {error}", program.to_string_lossy()));
+    if let Some(path) = failure_path {
+        use std::io::Write as _;
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(b"exec_failed\n"))
+        {
+            say(&format!("cannot record exec failure: {e}"));
+        }
+    }
     EXEC_FAILED
 }
 

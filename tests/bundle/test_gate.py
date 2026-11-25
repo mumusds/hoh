@@ -2,10 +2,39 @@ import copy,json,shutil,unittest
 from pathlib import Path
 from datetime import timedelta
 from helpers import ReleaseFixture,load_json,json_file,ref_for,sha256
-from release_gate import validate_manifest,GateError
+from release_gate import validate_manifest,validate_schema,execution_start_consistent,GateError
 import baseline
 
 PLUGIN_AC='AC-048-01'
+
+class ExecutionStartedSchema(unittest.TestCase):
+    def setUp(self):
+        self.f=ReleaseFixture();self.addCleanup(self.f.close)
+        self.record=copy.deepcopy(self.f.records['unit'])
+    def test_052_04_missing_started_is_invalid(self):
+        self.record.pop('started',None)
+        with self.assertRaisesRegex(GateError,'started'):
+            validate_schema(self.f.root,'execution.schema.json',self.record)
+    def test_052_04_started_is_boolean_and_not_inferred_from_127(self):
+        self.record.update(started=True,exit_code=127)
+        validate_schema(self.f.root,'execution.schema.json',self.record)
+        for bad in (None,0,1,'true','false'):
+            with self.subTest(started=bad),self.assertRaises(GateError):
+                validate_schema(self.f.root,'execution.schema.json',self.record|{'started':bad})
+    def test_052_04_not_started_shape_is_strict(self):
+        self.record.update(started=False,exit_code=127,artifacts=[],missing_artifacts=['test-results.jsonl'],duration_seconds=5)
+        validate_schema(self.f.root,'execution.schema.json',self.record)
+        for fields in ({'exit_code':0},{'exit_code':1},{'exit_code':130},{'timed_out':True},
+                       {'duration_seconds':5.001},{'artifacts':self.f.records['unit']['artifacts']}):
+            with self.subTest(fields=fields),self.assertRaises(GateError):
+                validate_schema(self.f.root,'execution.schema.json',self.record|fields)
+    def test_052_04_not_started_interval_cannot_hide_behind_a_short_duration(self):
+        self.record.update(started=False,exit_code=127,artifacts=[],missing_artifacts=['test-results.jsonl'],duration_seconds=5)
+        self.record['finished_at']=(self.f.start+timedelta(seconds=5)).isoformat()
+        self.assertTrue(execution_start_consistent(self.record))
+        self.record['finished_at']=(self.f.start+timedelta(seconds=5.001)).isoformat()
+        validate_schema(self.f.root,'execution.schema.json',self.record)
+        self.assertFalse(execution_start_consistent(self.record))
 
 class ReleaseGate(unittest.TestCase):
     def setUp(self):self.f=ReleaseFixture();self.addCleanup(self.f.close);self.m=self.f.manifest

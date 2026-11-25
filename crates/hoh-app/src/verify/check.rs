@@ -511,8 +511,8 @@ pub type Adopt = Box<dyn FnOnce(u32) -> Result<(), String> + Send>;
 #[derive(Default)]
 pub struct Launch {
     pub env: Vec<(String, String)>,
-    /// Join the command's pid to the attempt's cgroup. One that fails never lets the command run: its gate stays closed,
-    /// its process group is ended, and the run is recorded as one whose command did not start (exit 127, M3LD-01).
+    /// Join the command's pid to the attempt's cgroup. With a start gate, failure keeps it closed and records
+    /// started=false/127. Without a gate the command already started: cancellation keeps started=true (CR-038).
     pub adopt: Option<Adopt>,
     /// The start gate program (`hoh`, run as `hoh __check-gate`) that holds the command until `adopt` has returned, so
     /// nothing of it runs, nor forks, outside the attempt's cgroup (docs/adr/ADR-028.md decision 7, M3B-201); none:
@@ -749,10 +749,16 @@ async fn finish(
     // nothing of it runs, nor forks, outside that cgroup (docs/adr/ADR-028.md decision 7, M3B-201); the gate execs it in
     // its own place (the same pid, process group and environment).
     let gated = launch.gate.clone().filter(|_| launch.adopt.is_some());
+    let spawn_error = record_dir.join("spawn-error");
     let mut command = match &gated {
         Some(gate) => {
             let mut command = std::process::Command::new(gate);
-            command.arg("__check-gate").args(&ready.planned.argv);
+            command
+                .arg("__check-gate")
+                .arg("--spawn-error-file")
+                .arg(&spawn_error)
+                .arg("--")
+                .args(&ready.planned.argv);
             command
         }
         None => {
@@ -786,7 +792,7 @@ async fn finish(
         stdout: identity(&stdout),
         stderr: identity(&stderr),
     };
-    let (exit_code, timed_out) =
+    let (exit_code, timed_out, command_started) =
         match Process::spawn(command, config, &hoh_core::spawn::Direct::plain()) {
             Ok(mut process) => {
                 // An adoption that failed leaves the command outside the attempt's cgroup: it must not run (M3LD-01).
@@ -831,28 +837,35 @@ async fn finish(
                 let report = report
                     .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
                 match refused {
-                    // As a command that cannot start (below): 127, recorded FAIL NOT_STARTED, a failure of HoH's
-                    // own start and not of the check; never the gate's clean exit (0) once it found no "go". The
-                    // adoption's error is added to its stderr.
+                    // CR-038: only a closed start gate proves that the command never ran. An ungated
+                    // command already started; preserve that fact even when adoption fails.
                     Some(error) => {
                         use std::io::Write as _;
                         std::fs::OpenOptions::new()
                             .append(true)
                             .open(&stderr)
                             .and_then(|mut file| {
-                                writeln!(file, "hoh: the check's command was not started: {error}")
+                                writeln!(file, "hoh: the check's cgroup adoption failed: {error}")
                             })
                             .map_err(|e| io(format!("{}: {e}", stderr.display())))?;
-                        (127, false)
+                        (127, false, gated.is_none())
                     }
-                    None => recorded_exit(report.status, report.cause),
+                    None => {
+                        let (exit, timed) = recorded_exit(report.status, report.cause);
+                        let exec_failed = gated.is_some()
+                            && hoh_core::objects::read_regular(&spawn_error)
+                                .is_ok_and(|bytes| bytes == b"exec_failed\n");
+                        // Preserve a timeout/cancellation even when the gate reported a failed exec: only a
+                        // completed launch failure is safe to classify as NOT_STARTED.
+                        (exit, timed, !(exit == 127 && !timed && exec_failed))
+                    }
                 }
             }
             Err(e) => {
                 // As run_check does when the command cannot start: 127, the error as its stderr.
                 std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
                 std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
-                (127, false)
+                (127, false, false)
             }
         };
     let elapsed = began.elapsed();
@@ -937,6 +950,7 @@ async fn finish(
                 started_at: instant(started),
                 finished_at: instant(finished),
                 duration_seconds: duration,
+                started: command_started,
                 exit_code,
                 timed_out,
                 stdout: file(&record_dir.join("stdout.log"))?,
@@ -1141,8 +1155,9 @@ pub async fn record_attempt_change(
             started_at: hoh_core::time::rfc3339_millis_utc(now),
             finished_at: hoh_core::time::rfc3339_millis_utc(now),
             duration_seconds: 0.0,
-            // Conventional: the record claims no success (decision 8).
-            exit_code: 1,
+            // No check command ran: this synthetic integrity veto is not a test failure (CR-038).
+            started: false,
+            exit_code: 127,
             timed_out: false,
             stdout: file(&stdout)?,
             stderr: file(&stderr)?,
