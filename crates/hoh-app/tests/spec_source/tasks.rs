@@ -874,3 +874,252 @@ async fn test_033_04_plan_import_pairs_replacements_per_run() -> R {
     host.shutdown().await;
     Ok(())
 }
+
+/// M3QA-019 (AC-033-04 / fault matrix G4): the product itself places a writer Task into SPEC_MISMATCH hold
+/// (`completion.rs:672-677` WorkReason::SpecMismatch) when the specification advances before its rev-1 freeze
+/// completes, and refuses dispatch of an old-spec Task (`admission.rs:283` Refusal::SpecMismatch); then the
+/// subsequent approval releases & migrates T1 (REQ-A) and cancels T2 (REQ-C, replaced by T3).
+#[tokio::test]
+async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_migrates_or_cancels() -> R {
+    fn revise_b(world: &World) -> R<Index> {
+        let mut files = sources();
+        files[0].bytes = String::from_utf8(files[0].bytes.clone())?
+            .replacen("then: result 3", "then: result B-rev2", 1)
+            .into_bytes();
+        std::fs::write(world.project().join(&files[0].path), &files[0].bytes)?;
+        Ok(specindex::generate_index(&files)?)
+    }
+
+    for (task_id, req_id, deleted) in [("T1", "REQ-A", false), ("T2", "REQ-C", true)] {
+        let world = World::new()?;
+        let (host, run, _) = approved(&world).await?;
+        world.exec(&format!(
+            "UPDATE runs SET state='RUNNING',blocked_reason=NULL,blocked_reasons_json='[]',resume_state=NULL WHERE run_id='{run}'"
+        ))?;
+        world.staff(&run)?;
+        let rev1_spec = world.query("SELECT spec_id FROM specs WHERE revision=1")?;
+        world.review_spec(&rev1_spec)?;
+        // Import a real planned writer task on revision 1 via Commander decision (no SQL-seeded SPEC_MISMATCH).
+        let planned = decide(
+            &world,
+            &host,
+            &run,
+            "plan-initial",
+            None,
+            json!({"kind":"create_tasks","plan":{"tasks":[
+                {"task_id":task_id,"title":task_id,"role":"developer","writer":true,"depends_on":[],"requirement_ids":[req_id]}
+            ]}}),
+        )
+        .await?;
+        assert!(matches!(planned, hoh_core::persistence::Decided::Applied { .. }), "{planned:?}");
+        // Schedule and start the writer attempt on revision 1.
+        let dispatched = host
+            .store()
+            .schedule_round(&run, context())
+            .await?
+            .dispatched
+            .ok_or("writer task must dispatch on rev 1")?;
+        assert_eq!(dispatched.task_id, task_id);
+        let attempt_id = dispatched.attempt_id.clone();
+        let project_id = world.query("SELECT project_id FROM projects")?;
+        let notice = host
+            .store()
+            .runner_waiting(&project_id)
+            .await?
+            .dispatches
+            .into_iter()
+            .find(|n| n.attempt_id == attempt_id)
+            .ok_or("dispatch notice for scheduled attempt")?;
+        assert!(
+            host.store()
+                .runner_received(notice, std::time::SystemTime::now())
+                .await?,
+            "attempt must enter STARTING with PREPARED work effect"
+        );
+        assert!(
+            host.store()
+                .runner_running(
+                    &attempt_id,
+                    hoh_core::persistence::AttemptFacts::default(),
+                    json!({}),
+                )
+                .await?,
+            "attempt and task must enter RUNNING"
+        );
+        // Prepare the real freeze job on revision 1 while the writer is completing.
+        let rev1_freeze = hoh_app::verify::freeze::prepare_job(
+            &world.project(),
+            &world.project().join(".hoh"),
+            &run,
+            &Inputs {
+                spec: specindex::PATH.into(),
+                environment: "environment.json".into(),
+                test_plan: "tests/check-plan.json".into(),
+            },
+        )?;
+        // Revision 2 is approved (modifying REQ-B) before the writer's completion commits.
+        let rev2 = revise_b(&world)?;
+        submit_spec(&host, &run, "rev2-propose", "ProposeSpecChange", &rev2).await?;
+        submit_spec(&host, &run, "rev2-approve", "ApproveSpec", &rev2).await?;
+        let rev2_spec = world.query("SELECT spec_id FROM specs WHERE revision=2")?;
+        // Complete the writer with its rev-1 freeze job: the product itself rejects with SpecMismatch and places the task in SPEC_MISMATCH hold.
+        let result: hoh_core::protocol::TaskResult = serde_json::from_value(json!({
+            "schema_version": "1.0",
+            "run_id": run,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "role": "developer",
+            "role_epoch": 1,
+            "status": "COMPLETED",
+            "summary": "completed against rev 1",
+            "candidate_id": null,
+            "evidence": [],
+            "issues": [],
+            "next_action": "verify"
+        }))?;
+        let completed = host
+            .store()
+            .complete_writer_attempt(hoh_core::persistence::WriterCompletion {
+                attempt_id: attempt_id.clone(),
+                ending: hoh_core::persistence::Ending {
+                    success: true,
+                    detail: "writer finished on rev 1".into(),
+                    class: hoh_core::retry::FailureClass::Transient { retry_after: None },
+                    at: std::time::SystemTime::now(),
+                    draw: 0,
+                    observed: hoh_core::persistence::Observed {
+                        workspace: Some(json!({
+                            "head": world.git(&["rev-parse", "HEAD"])?.trim(),
+                            "dirty": false
+                        })),
+                        ..Default::default()
+                    },
+                    unknown_effect: false,
+                },
+                outcome: hoh_core::persistence::WriterOutcome::Freeze {
+                    job: Box::new(rev1_freeze),
+                    result: Box::new(result),
+                    self_tests: Default::default(),
+                },
+            })
+            .await?;
+        assert!(
+            matches!(
+                completed,
+                hoh_core::persistence::WriterCompleted::Blocked { ref reason } if reason == "spec_mismatch"
+            ),
+            "expected product to hold writer on SpecMismatch: {completed:?}"
+        );
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state || '/' || coalesce(blocked_reason,'NULL') FROM tasks WHERE task_id='{task_id}'"
+            ))?,
+            "BLOCKED/NEED_DECISION",
+            "product must block {task_id} on SPEC_MISMATCH"
+        );
+        assert_eq!(
+            world.query(&format!(
+                "SELECT count(*) FROM events WHERE kind='need_decision' AND json_extract(payload_json,'$.task_id')='{task_id}' AND json_extract(payload_json,'$.reason')='spec_mismatch'"
+            ))?,
+            "1",
+            "product must write need_decision(spec_mismatch) for {task_id}"
+        );
+        assert!(
+            world.query(&format!(
+                "SELECT payload_json FROM events WHERE kind='need_decision' AND json_extract(payload_json,'$.task_id')='{task_id}' AND json_extract(payload_json,'$.reason')='spec_mismatch'"
+            ))?.contains("specification"),
+            "need_decision must record the spec mismatch detail"
+        );
+        // Exercise admission.rs:283 Refusal::SpecMismatch: a READY task still bound to revision 1 is refused by schedule_round on revision 2.
+        world.exec(&format!(
+            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq) \
+             VALUES('stale-rev1','{run}','{rev1_spec}','READY','developer',1,99);"
+        ))?;
+        let refused_round = host.store().schedule_round(&run, context()).await?;
+        assert!(
+            refused_round.dispatched.is_none(),
+            "admission must refuse stale-spec task: {refused_round:?}"
+        );
+        world.exec("DELETE FROM tasks WHERE task_id='stale-rev1';")?;
+        // Revision 3 rewrites REQ-A and deletes REQ-C: product releases T1 to READY (migrated) or cancels T2 (replaced by T3).
+        let rev3 = remove_c(&world)?;
+        submit_spec(&host, &run, "rev3-propose", "ProposeSpecChange", &rev3).await?;
+        submit_spec(&host, &run, "rev3-approve", "ApproveSpec", &rev3).await?;
+        let rev3_spec = world.query("SELECT spec_id FROM specs WHERE revision=3")?;
+        world.review_spec(&rev3_spec)?;
+        if !deleted {
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT state || '/' || spec_id || '/' || coalesce(blocked_reason,'NULL') FROM tasks WHERE task_id='{task_id}'"
+                ))?,
+                format!("READY/{rev3_spec}/NULL"),
+                "product must release and migrate {task_id} from its product-written SPEC_MISMATCH hold"
+            );
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT spec_id FROM task_requirements WHERE task_id='{task_id}' AND requirement_id='REQ-A'"
+                ))?,
+                rev3_spec
+            );
+            assert!(
+                event_payloads(&world, "task.migrated")?
+                    .iter()
+                    .any(|e| e["task_id"] == task_id && e["spec_revision"] == 3)
+            );
+            let next_dispatch = host
+                .store()
+                .schedule_round(&run, context())
+                .await?
+                .dispatched
+                .ok_or("migrated T1 must dispatch on rev 3")?;
+            assert_eq!(next_dispatch.task_id, task_id);
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT s.revision FROM attempts a JOIN tasks t ON t.task_id=a.task_id JOIN specs s ON s.spec_id=t.spec_id WHERE a.attempt_id='{}'",
+                    next_dispatch.attempt_id
+                ))?,
+                "3"
+            );
+        } else {
+            assert_eq!(
+                world.query(&format!("SELECT state FROM tasks WHERE task_id='{task_id}'"))?,
+                "CANCELLED"
+            );
+            let replanned = decide(
+                &world,
+                &host,
+                &run,
+                "plan-t3",
+                None,
+                json!({"kind":"create_tasks","plan":plan(&["T3"])}),
+            )
+            .await?;
+            assert!(matches!(replanned, hoh_core::persistence::Decided::Applied { .. }), "{replanned:?}");
+            let replaced = event_payloads(&world, "task.replaced")?;
+            assert_eq!(
+                replaced
+                    .iter()
+                    .map(|e| json!({"from": e["from"], "to": e["to"]}))
+                    .collect::<Vec<_>>(),
+                vec![json!({"from": "T2", "to": "T3"})]
+            );
+            let next_dispatch = host
+                .store()
+                .schedule_round(&run, context())
+                .await?
+                .dispatched
+                .ok_or("replacement T3 must dispatch on rev 3")?;
+            assert_eq!(next_dispatch.task_id, "T3");
+            assert_eq!(
+                world.query(&format!(
+                    "SELECT s.revision FROM attempts a JOIN tasks t ON t.task_id=a.task_id JOIN specs s ON s.spec_id=t.spec_id WHERE a.attempt_id='{}'",
+                    next_dispatch.attempt_id
+                ))?,
+                "3"
+            );
+            assert_ne!(rev2_spec, rev3_spec);
+        }
+        host.shutdown().await;
+    }
+    Ok(())
+}
