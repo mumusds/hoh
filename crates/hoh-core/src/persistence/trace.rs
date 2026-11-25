@@ -165,7 +165,8 @@ pub struct TaskItem {
     pub state: String,
     pub role: String,
     pub writer: bool,
-    pub spec_id: String,
+    /// The first drafting task permanently has no specification (migration 002 / REQ-008).
+    pub spec_id: Option<String>,
     pub requirement_ids: Vec<String>,
     pub depends_on: Vec<String>,
     /// `{kind, attempt_id}` of the lease one of its attempts holds.
