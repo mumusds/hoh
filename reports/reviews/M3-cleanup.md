@@ -552,3 +552,24 @@ Audit scope: all `select!`, `read_buf`, `read`, `read_line`, `read_until`, strea
 Synthetic cooperative readers reproduce both drain failures (512 total reads at the safety fuse), then assert abandon
 within one drain read and preserved counters/tail. Frame cancellation/restart tests cover ordinary, skip and reduction
 paths. Evidence: `.hoh-dev/self-tests/m3cxfrm/fix1-500-*.log`; all are self-tests, not acceptance.
+
+### CR-041 round-1 fix disposition (M3CX)
+
+Input: `.hoh-dev/self-tests/m3cxfrm/review1-findings.json`, candidate-3 / `62e8d689`.
+The branch stays DRAFT and unrelocked; the owning commander retains independent review and approval.
+
+| Finding | Disposition and diagnostic evidence under `.hoh-dev/self-tests/m3cxfrm/` |
+|---|---|
+| M3CX-500 medium | Fixed under DC-M3CX-500 above. `fix1-500-red.log`: both cooperative drains starved. `fix1-500-green.log`: 5 process tests pass; `fix1-500-frame-green-2.log`: all 8 cancellation/restart tests pass. |
+| M3CX-001 medium | Fixed: only frames proven over the normal limit enter reduction, with bounded allocation transfer. `fix1-001-002-red.log`: 605,206-byte frame refused. `fix1-001-002-green-2.log`: all 28 frame tests pass, including exact limit and limit+1. The existing reduction hash/escape test now uses an actually oversized input to retain its original purpose under the corrected threshold. |
+| M3CX-002 medium | Fixed by the same delayed-reduction boundary as M3CX-001; a separate commit records EOF/invalid-JSON/invalid-route regressions. The same red log shows small Partial/Line misclassified as TooLarge; the same green log verifies byte-exact legacy output. Codex verdict ranking is unchanged. |
+| M3CX-003 low | Fixed: declaration checks return Truth; budget/depth exhaustion is Unknown. `fix1-003-005-red-corrected.log` shows No on an exhausted budget; `fix1-003-regression.log` passes the declared/absent/exhausted schema cases. |
+| M3CX-004 low | CR-041 decision 5 documents full-raw replay versus online bounded items; documentation only, no behavioral red test. |
+| M3CX-005 low | Fixed: only command_execution items carry aggregated_output. `fix1-003-005-red-corrected.log` shows the spurious field on agent_message; `fix1-005-regression.log` passes Codex unit regressions. |
+
+All test results above are synthetic/product self-tests, not live sessions or independent acceptance. Failed diagnostics
+are retained: the initial M3CX-005 test had a Recorded-enum fixture compile error (not a red); the first frame-yield
+regression found a redundant yield and was corrected; the first threshold implementation exceeded the old interruption
+work bound and rescanned earlier bytes, so it was superseded by bounded buffered processing and incremental LF search.
+Its exact registered test process was stopped; `fix1-stopped-superseded-test.json` records identity. No gate, AC or check
+plan was changed. Final scratch-only approval/relock, full pre-pr and candidate-4 evidence accompany the handoff.
