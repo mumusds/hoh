@@ -851,6 +851,22 @@ async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
                 assert_eq!(world.query("SELECT count(*) FROM change_requests WHERE state='PROPOSED'")?,"1");
                 assert_eq!(world.query("SELECT state||'/'||blocked_reason||'/'||resume_state FROM runs")?,"BLOCKED/NEED_DECISION/RUNNING");
                 assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.kind='spec_draft'")?,"1");
+                if interactive {
+                    let q: serde_json::Value = serde_json::from_str(&world.query(&format!(
+                        "SELECT payload_json FROM events WHERE run_id='{run}' AND kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval' ORDER BY seq DESC LIMIT 1"
+                    ))?)?;
+                    let cr_sha = world.query("SELECT json_extract(payload_json,'$.spec_sha256') FROM events WHERE kind='spec.proposed' ORDER BY seq DESC LIMIT 1")?;
+                    assert_eq!(q["spec_sha256"], cr_sha, "{q}");
+                    assert!(q["text"].as_str().is_some_and(|t| t.contains("approve")), "{q}");
+                    let (status, projected) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
+                    assert_eq!(status, 200, "{projected}");
+                    assert!(
+                        projected["projection"]["questions"]
+                            .as_array()
+                            .is_some_and(|qs| qs.iter().any(|item| item["question_id"] == q["question_id"] && item["reason"] == "spec_approval")),
+                        "interactive AUTO must surface the open spec_approval question: {projected}"
+                    );
+                }
                 input(&host,&world,&run,"build","SetMode",json!({"mode":"BUILD"})).await?;
             } else {
                 world.until("SELECT state||'/'||blocked_reason FROM tasks WHERE task_id='work'","BLOCKED/READINESS_NOT_MET",Duration::from_secs(20)).await?;
@@ -860,6 +876,8 @@ async fn test_009_02_auto_drafts_pending_cr_while_build_blocks() -> R {
             }
             assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");assert_eq!(world.query("SELECT sha256 FROM specs")?,original);assert_eq!(world.query("SELECT spec_id FROM runs")?,spec);
             assert_eq!(world.query("SELECT count(*) FROM attempts WHERE task_id='work'")?,"0");
+            assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.writer=1 AND t.kind<>'spec_draft'")?,"0","no product-source writer attempt in any task");
+            assert_eq!(world.query("SELECT count(*) FROM events e JOIN tasks t ON t.task_id=json_extract(e.payload_json,'$.task_id') WHERE e.kind='schedule.round' AND t.writer=1 AND t.kind<>'spec_draft'")?,"0","no product-source writer dispatched by schedule.round");
             if let Some(cli)=cli {let output=cli.await??;assert_eq!(output.status.code(),Some(3),"{}",String::from_utf8_lossy(&output.stderr));}
             Ok(())
         }.await;
