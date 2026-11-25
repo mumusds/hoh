@@ -680,3 +680,56 @@ releases the 7 s hold only once it has the command's reply and at least 7 s have
 2 s hold 2 s after the command was sent, after checking that the command is still waiting. Both AC holds stay at least as
 long as the AC says, and no existing assertion changes. The same stdin-driven holder is already used by `db_faults.rs`, `tui_pty.rs`
 (`WriteLock`) and `delivery.rs`.
+
+DC-FLK14 revision (evidence after the first fix): the lag named above is not the only way, and on today's main not the
+likely way, for the command to reach SQLite late. The host's input loop (`crates/hoh-app/src/host/inputs.rs`, since
+"M3-T09 S3: deliver Commander inputs through the host outbox") calls `settle_ended_inputs` on every 200 ms poll; that is
+`OutboxJob::InputSweep` on the single writer, and `inputs::sweep` opens `BEGIN IMMEDIATE` (`writer::begin`) even when it
+finds nothing to settle (it then returns without a commit). While the outside connection holds the lock, the first sweep
+after the lock waits the whole 5 s busy timeout on the writer thread (stderr `hoh host: input delivery: DB_BUSY: database
+is locked`), and a command submitted after that sweep is queued behind it: it reaches SQLite about 5 s late. With the old
+fixed 7 s hold it then got the lock at 7 s and committed, 202 after about 6.7 s; with the test-driven hold it gets 503 after
+about 10 s. The command wins only if it reaches the writer before the next 200 ms poll, so a lag of a few to tens of
+milliseconds between the lock and the command already makes the failure likely in proportion. The M3-T02 occurrence predates
+the sweep (that branch did not contain the M3-T09 S3 commit), so there the lag itself is the candidate.
+
+Chain on today's main: outside `BEGIN IMMEDIATE` → within 200 ms the host's idle input sweep enters `BEGIN IMMEDIATE` on the
+writer and waits up to 5 s → the r2 PauseRun queued behind it → the sweep fails DB_BUSY at about 5 s → the command's own busy
+wait starts at about 5 s → the locker commits at 7 s → the command commits: 202 ACCEPTED where the test expected 503.
+
+Reproduction (diagnostic, not committed; each run under the test slot, `*-result.json` beside each log):
+- r2 command sent 2.5 s after the lock (`diag-before.patch`, `fix-plus-diag.patch`): before, 202 (`before-diag.log`, the CI
+  symptom, with the sweep's DB_BUSY line); after the test fix, `503 after 7.635978758s` (`after-diag.log`).
+- r2 command sent 250 ms after the lock, just over one sweep period (`diag250-before.patch`, `diag250-fix.patch`): before,
+  202 in 3/3 runs (`before-diag250-0{1,2,3}.log`), each with the sweep's DB_BUSY line; after the test fix, `503 after 9.83 s`,
+  `9.82 s`, `9.84 s` in 3/3 (`after-diag250-0{1,2,3}.log`). Deterministic.
+- No diagnostic, after the test fix: passed 3/3 (`after-0{1,2,3}.log`, 9.2 s each).
+
+Status: the test fix (commit "M3 cleanup: FLK-14 the busy-writer test releases the outside lock itself") removes the release
+race and reports the elapsed time, but it does not fix FLK-14 on today's main: the remaining cause is product behaviour,
+and the unchanged 5 to 6 s assertion (AC-062-01: 503 DB_BUSY within 5 to 6 s while the outside connection holds the lock)
+now reports it as `503 after ~10 s` instead of a 202. FLK-14 stays open, recorded as product issue FLK-14-P1 for the lead:
+an idle host's background sweep takes the write lock and so delays a command's DB_BUSY by up to one busy timeout.
+Recommendation (not implemented here: the brief scoped this task to the test, and the change is on the single-writer path):
+the idle sweep must not take the write lock, e.g. `settle_ended_inputs` first asks a read-only connection whether anything
+can be settled (an over-approximating `EXISTS` over the sweep's three selects; WAL reads take no write lock) and submits the
+`BEGIN IMMEDIATE` job only then; regression: this test with the 250 ms diagnostic made permanent (the r2 command sent after
+one sweep period) must give 503 within 5 to 6 s. More general, and a design question: any non-idle background job queued
+ahead of a command stretches the command's DB_BUSY to a multiple of the busy timeout (REQ-062 "SQLITE_BUSY超过busy_timeout时
+写命令返回503"); AC-062-01 covers only the idle host.
+
+Not weakened: every assertion stays (PRAGMAs, read-only readers, 202 within 5 s for the 2 s hold, 503 `DB_BUSY` retryable
+after 5 to 6 s with the Run unchanged for the 7 s hold, both GETs 200 within 500 ms, r1 PAUSED); added: the 2 s hold's
+command must still be waiting when the lock is released (not checked before), the outside connection must exit 0, and the
+503 message reports the elapsed time.
+
+Same pattern elsewhere (grep `BEGIN IMMEDIATE` in tests): `crates/hoh-agents/tests/claude_adapter.rs` `hold_store` (1.5 s
+from the lock) in `a_cancel_queued_with_the_exit_still_cancels` and in the cancel-after-result test near line 1028 relies on
+the cancel arriving before the hold ends (after up to 2 s of reap polling, or 400 ms after `go`); a lagging trigger would let
+the adapter's write through first. The same class, not seen in CI: low follow-up FLK-14-F1, not changed here (another crate,
+outside this task). `crates/hoh-core/tests/delivery.rs:1860` (0.4 s hold) does not depend on the hold's length: the tick's job
+is queued before the hold ends whatever the lag. `db_faults.rs`, `tui_pty.rs` and `delivery.rs:1623/2050` already release on
+stdin.
+
+Evidence under `.hoh-dev/self-tests/flk1415/flk14/` (patches, logs, `*-result.json` with argv, binary digest, exit, the run's
+duration without the slot wait, log digest). Self-tests, not acceptance.
