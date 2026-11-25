@@ -6,7 +6,9 @@ Run by tools/run_check.py as `bash scripts/product/traceability.sh <profile>`, i
    The tests under tests/bundle whose names hold `test_NNN_MM` for such a TEST run, and their results are written to
    $HOH_EVIDENCE_DIR/test-results.jsonl (none found: no line, and the TEST is NOT_RUN). Before them, a TEST with a
    product step (TEST-032-01, docs/adr/ADR-039.md DC-T07b) has the product run on the candidate's tree, writing the
-   exports its test reads into $HOH_EVIDENCE_DIR;
+   exports its test reads into $HOH_EVIDENCE_DIR. A relative HOH_EVIDENCE_DIR is made absolute against this process's
+   cwd once, before that step: the test binary's cwd is the package directory, and a relative path was NotFound there
+   (M3QA-003). An absolute value is kept as given, so a planned check records the same files;
 2. the members: every execution.json under .hoh-dev/ and .hoh/evidence/ that claims the candidate (or that cannot be
    read and holds its id) is judged by principle one: the rule table (veto), the outcome function, and the conclusion
    function per member and TEST. Each TEST's status follows from them over all members;
@@ -634,6 +636,19 @@ def self_test(root: Path, test_ids: list[str]) -> list[dict]:
              'status': result.status.get(case.id(), 'FAIL')} for case, ids in chosen for t in ids]
 
 
+def evidence_directory(raw: str) -> Path:
+    """`HOH_EVIDENCE_DIR` for every writer of this run, absolute against the cwd that read it.
+
+    A relative value is the invocation's directory. The product step's test binary runs with cargo's package
+    directory as its cwd, so leaving the value relative makes its export write fail with NotFound (M3QA-003). An
+    absolute value is returned unchanged: a planned check has already resolved it, and the files it records stay
+    the same."""
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('profile', help='The release profile whose TESTs are judged (contracts/release-policy.json).')
@@ -658,7 +673,9 @@ def main(argv=None) -> int:
     except (ValueError, KeyError, TypeError, OSError) as exc:
         print(f'traceability: {exc}', file=sys.stderr)
         return 1
-    out_dir = Path(out)
+    out_dir = evidence_directory(out)
+    if not Path(out).is_absolute():
+        os.environ['HOH_EVIDENCE_DIR'] = str(out_dir)
     step_failed = product_steps(ROOT, sorted(mine + extra), out_dir, world.candidate)
     # A product step that did not exit 0 fails its TEST's self-tests, whatever they found (M3N-200).
     own = [line | {'status': 'FAIL'} if line['test_id'] in step_failed else line
