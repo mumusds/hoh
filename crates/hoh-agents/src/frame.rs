@@ -1027,6 +1027,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_027_06_m3cx002_small_eof_preserves_partial_bytes() -> R {
+        let mut raw = large_item("unfinished");
+        raw.truncate(raw.len() - 10);
+        let mut reader = FrameReader::new(raw.as_slice(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+            known: item_head,
+            max_length: SKIP_LIMIT,
+        });
+        assert_eq!(reader.next().await?, Some(Frame::Partial(raw.clone())));
+        assert_eq!(reader.next().await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_027_06_m3cx002_small_invalid_json_and_route_preserve_line_bytes() -> R {
+        for raw in [
+            large_item("bad\\q"),
+            String::from_utf8(large_item("small"))?
+                .replace("\"threadId\":\"t\"", "\"threadId\":null")
+                .into_bytes(),
+        ] {
+            let input = [raw.as_slice(), b"\n"].concat();
+            let mut reader =
+                FrameReader::new(input.as_slice(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+                    known: item_head,
+                    max_length: SKIP_LIMIT,
+                });
+            assert_eq!(reader.next().await?, Some(Frame::Line(raw)));
+            assert_eq!(reader.next().await?, None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_027_06_reduced_frames_keep_fields_hash_and_crlf_across_reads() -> R {
         let raw = large_item(&"é\\n".repeat(FRAME_LIMIT / 4));
         let input = [b"before\n".to_vec(), raw.clone(), b"\r\nafter\n".to_vec()].concat();
