@@ -378,6 +378,7 @@ M4 · P1 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 **必须行为**
 
 - 顶部显示项目、已生效 mode、Run、基线身份；正文是统一的公开对话与工程活动，团队摘要可折叠；底部输入和 statusline。pending、输入四态与断线标记由 host 事实驱动，202 只说明接受。选择视图、展开和连接本身不调度任务。
+- C2（CTO 2026-11-25）：每项决策的依据取已公开 basis/reason/note、影响取已提交 effects，分别保留来源；任一缺失显示 unknown 且不计 PASS。M4-T02 对缺依据或影响生产者的决策类别经 refinement CR 加法增加可选协议字段及真实生产者，fixture 不得捏造；AC-010-01 意义不变。
 
 **失败与边界**
 
@@ -397,6 +398,7 @@ M4 · P1 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - （CR-028，CTO 2026-11-21 批准 D1–D12）D1/D4/D11；§1/2/2.2 的同水位读模型、输入四态与公开事实；§5.1 的性能与证据边界。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。
+- C3（CTO 2026-11-25）：输入历史加法扩展既有 H/limit/cursor 读模型；InputStatePageRef={run_id,watermark,limit,cursor}，watermark=H、limit=1–500/缺省100、首 cursor=null，续查 GET /v1/runs/{run_id}/inputs 的 Page.next_cursor。ui.task 取该 Run 中 RUNNING 且 started_at 最新者，同时间按 task_id 升序取首个；其它任务仍由既有 tasks 路由可查。
 
 ## REQ-011 · Team/Focus 布局
 
@@ -428,6 +430,7 @@ M4 · P1 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - （CR-028，CTO 2026-11-21 批准 D1–D12）D1/D9/D10/D11；§1/2/2.1/2.2/4 的身份、布局与公开流；REQ-013 的 H13 交接成员规则。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。
+- C3（CTO 2026-11-25）：AC-011-04 保持原判据及 M4-T02 属主；T02 交付小屏显示和其余自身 AC，未有 progress 时显示 unknown 不算该项 PASS。M4-T12 验证任务依赖 M4-T02 与提供共享 progress 聚合的 M4-T06，届时完整验证四组事实与 AC-011-04；M4-T04 依赖该验证任务。AC 集合与 check owner 不变。
 
 ## REQ-012 · 可展开内容块
 
@@ -488,6 +491,7 @@ M4 · P1 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - （CR-028，CTO 2026-11-21 批准 D1–D12）D1/D3/D4；§1/2/2.1 的水位/游标/迭代归属；本 CR 的完整 kind 分类、F13/H13 集合及应用核对的生产者闭包。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。
+- C3（CTO 2026-11-25）：M4-T06 交付 Timeline/状态栏共用 progress 聚合；依赖它的 M4-T12 才能验证 AC-011-04 的四组事实，不以 T02 的 unknown 占位代替证据，不新增或移动 AC。
 
 ## REQ-014 · 真实进度状态栏
 
@@ -2224,6 +2228,7 @@ M4 · P1 · 发布类 required · 目标 v1 · 成熟度 detailed，参考：`do
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
 - （CR-028，CTO 2026-11-21 批准 D1–D12）D1/D4/D5/D6；§1/2/5/5.1 的分页、异步回填、字节背压、对象引用/GC/pin、日志与空间保护、唯一串行 release 测量；应用核对的 GC 根闭包。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。
+- C1/C5（CTO 2026-11-25）：M4-T03 的 measurement runner/guardian 先独占 /home/ai/dev/.hoh-test-slot.lock，再取 D4 测量锁；每个被测 run_check/cargo/构建都经持有两锁的外部包装器，run_check 自身保持 BT-03 不取槽。两锁、原阈值、覆盖与清理要求共存。M3-T05 后绑定真实 pre-003 产品 commit 并先实测五阶段；3600s 内不能留600s余量则 CTO 以正式 CR 重规划 required check，任何降阈值/缩范围交所有者。本准备稿不预填耗时或分配数值。
 
 ## REQ-065 · Git集成与交付
 

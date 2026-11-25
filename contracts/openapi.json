@@ -960,6 +960,71 @@
           }
         }
       }
+    },
+    "/v1/runs/{run_id}/inputs": {
+      "get": {
+        "operationId": "listInputStates",
+        "summary": "Input history reconstructed at a fixed committed watermark",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "name": "watermark",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "H from InputStatePageRef; if omitted on the first page, choose the committed watermark. Continuation retains the same H."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Existing Page shape. Items are input facts at H with input_id, state, actual role/role_epoch/boundary and rejection reason, each retaining public source references; absent facts are null/unknown. Order by acceptance seq ascending, then input_id ascending. Empty items and null next_cursor mean no more history.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "description": "Run pagination convention: BAD_REQUEST for invalid/tampered/cross-query cursor or watermark beyond committed H; RUN_NOT_FOUND for missing Run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Index generation expired; resnapshot using top-level snapshot_watermark.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CursorExpiredError"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "CR-028 C3, delivered by M4-T03: additive extension of the existing read model, consumed by M4-T02. Limit defaults to 100 and is 1–500; cursor binds Run/query/H/generation. Repeated cursor yields the same page. Input transitions committed after H never change an old page; SSE/new snapshots deliver them. No input writes, resubmission or state-machine change; existing routes and error meanings remain unchanged."
+      }
     }
   },
   "components": {
@@ -1343,11 +1408,43 @@
           "task_id",
           "phase"
         ],
-        "description": "Current task/phase facts only; concurrent-task selection remains an application-review decision, not inferred from model prose."
+        "description": "CR-028 C3: among this Run's RUNNING tasks, select latest started_at, breaking ties by task_id ascending. No RUNNING task yields null ui.task. All other tasks remain queryable through the existing tasks route; no task is hidden from that list or inferred from model prose."
       },
       "InputStatePageRef": {
         "type": "object",
-        "description": "CR-028 §2: a page reference for persisted input states, not all input history. References carry query identity, H and continuation; the precise reference shape/continuation endpoint must be closed by the CTO before T02/T03 implementation (application re-check C3). No new command or delivery loop."
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "watermark": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "H from the same getRun snapshot. All pages reconstruct committed input state at this H, never the mutable current row at a later watermark."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 100
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Null for the first page; otherwise Page.next_cursor. Opaque continuation binds run_id/query, H and index generation. Omit the query parameter when null."
+          }
+        },
+        "required": [
+          "run_id",
+          "watermark",
+          "limit",
+          "cursor"
+        ],
+        "description": "CR-028 C3: exact read-only reference {run_id,watermark,limit,cursor} to GET /v1/runs/{run_id}/inputs. Reuse the existing H/limit/cursor read model additively. Fetch Page {items,next_cursor,watermark}; continue with the same run_id/H/limit and next_cursor until null. No embedded full history or new command/delivery loop."
       },
       "UiProjection": {
         "type": "object",
@@ -1395,7 +1492,7 @@
             "items": {
               "$ref": "#/components/schemas/InputStatePageRef"
             },
-            "description": "Paginated references to QUEUED/DELIVERED/APPLIED/REJECTED facts and their actual role/epoch/boundary; 202 is acceptance only."
+            "description": "References to persisted QUEUED/DELIVERED/APPLIED/REJECTED input history at the same getRun H; actual role/epoch/boundary and refusal sources come from committed facts. Empty history returns an empty Page, never fabricated states; 202 is acceptance only."
           },
           "team_revision": {
             "type": [
