@@ -734,6 +734,76 @@ stdin.
 Evidence under `.hoh-dev/self-tests/flk1415/flk14/` (patches, logs, `*-result.json` with argv, binary digest, exit, the run's
 duration without the slot wait, log digest). Self-tests, not acceptance.
 
+### FLK-14-P1 and DC-FLK14b (a write's wait for the lock is counted from its submission)
+
+FLK-14 is the second flake of AC-062-01's busy test, and FLK-14-P1 is a class: any writer job queued ahead of a command
+that is itself waiting for an outside lock stretches the command's DB_BUSY. Per docs/19 (审查收敛) a design correction
+comes before the fix.
+
+Chain (reproduced, `.hoh-dev/self-tests/flk14p1/red-host.log`): an outside `BEGIN IMMEDIATE` → within 200 ms the
+host's idle input sweep (`settle_ended_inputs` → `OutboxJob::InputSweep`) runs `writer::begin` on the single writer,
+and SQLite waits the connection's whole busy_timeout (5 s) for the lock → the PauseRun submitted 250 ms after the lock
+is queued behind it → the sweep fails DB_BUSY at about 5.2 s → the command's own `BEGIN IMMEDIATE` then waits a fresh
+5 s → 503 after 9.8 s, outside AC-062-01's 5 to 6 s.
+
+DC-FLK14b. Wrong assumption: a request's wait for the write lock is the busy_timeout SQLite gives its own `BEGIN
+IMMEDIATE`, so the writer's other work is cheap and never adds to a command's DB_BUSY time. It is not: the writer has one
+connection and takes its jobs in order, so every job ahead of a command that waits for the same outside lock adds up to
+one busy_timeout, and on an idle host the sweep (and, with a runner, Allocate and Stops) waits for the lock every
+200 ms. Rule adopted: **a request waits for the write lock at most until one busy_timeout after it was submitted**
+(submitted = before its caller waited for room in the queue), whatever was queued ahead of it. The writer records the
+instant with each queued request (both lanes); `writer::begin` sets the connection's busy_timeout to what is left of
+that (rounded up to whole ms; 0 once it is gone, so a free lock is still taken and a held one answers at once) for its
+`BEGIN IMMEDIATE` and sets the configured value back right after, so `PRAGMA busy_timeout` still reads 5000 between
+requests. It is one rule in one place and holds for every job, background or user, both lanes, without a per-job
+classification: a command's DB_BUSY comes busy_timeout after it was sent however many jobs are ahead of it, and a
+command whose lock frees in time still commits.
+
+Alternatives not taken: (a) the read-first gate for the sweep (ask a reader whether anything can be settled, take the
+writer only then) fixes the idle sweep only; Allocate, Stops and Renew still take the writer idle, and every per-run
+step (Pace, Round, Supervise, Stall, VerificationReconcile) takes it on a host with runs, so the class stays. (b) A
+short busy timeout for background jobs needs every job classified and makes one-shot background writes (an attempt's
+result, its end) fail on a brief outside lock they used to outlast. (c) Commands ahead of background work in the queue
+does not help: the job ahead is already inside SQLite's busy wait when the command arrives.
+
+Consequences, accepted: a request that waited in the queue behind lock waiters has less of its own wait left (none once
+busy_timeout has passed since it was submitted); it can then fail DB_BUSY although the outside lock goes a moment
+later. Before, it would have answered DB_BUSY even later or committed after more than busy_timeout. Every caller
+already handles a retryable `PersistError::Busy` (table below). With no outside lock nothing changes: the lock is free
+and a 0 wait takes it. `commands::begin_host` (host start, the first writer job) and the migration in `Store::open`
+(before the writer thread) do not go through `writer::begin` and keep the full busy_timeout: nothing is queued ahead
+of them. The idle BEGINs themselves stay (efficiency, and a `hoh host: input delivery: DB_BUSY` line every 5 s while an
+outside connection holds the lock): low follow-up FLK-14-L1, not needed by any AC.
+
+Audit of the writer's background jobs (code read with file:line evidence by an Explore subagent, spot-checked:
+inputs.rs:33-60, host/runner.rs:272/285/393-408/823; the rule above covers each without a per-job change):
+
+| # | Job (loop, file) | Period / trigger | Takes the writer on an idle host | Busy handling | Fix |
+|---|---|---|---|---|---|
+| 1 | InputSweep (`settle_ended_inputs`, host/inputs.rs:33-60) | 200 ms poll and each watermark move | yes: submitted unconditionally, `inputs::sweep` begins before its selects | logged, next poll | writer deadline |
+| 2 | Claim / Settle / Input / RouteInput / ChangeInput (delivery ticks, host/inputs.rs:61-91) | per poll, roles from a reader query | no (needs PENDING/DELIVERING inputs; a deferred row re-claims each poll, low FLK-14-L2) | tick ends, next poll | writer deadline |
+| 3 | Runner Allocate (host/runner.rs tick) | 200 ms or watermark | yes, with a runner | tick ends, logged, next tick | writer deadline |
+| 4 | Runner Stops | 200 ms or watermark | yes, with a runner | same | writer deadline |
+| 5 | Runner Renew | every 30 s | yes, with a runner | same, retried next tick | writer deadline |
+| 6 | Pace, Round, Mode, DraftStep/DraftDispatch/Readiness, spec review | per tick, per paced run | no runs: no; any waiting run: at least Pace + Round | tick ends | writer deadline |
+| 7 | VerificationReconcile | per tick, per verified run | no | tick ends | writer deadline |
+| 8 | Supervise / Dispose / StepFailed | per tick, per supervised run | no | Busy ends the tick | writer deadline |
+| 9 | Stall | per tick, per run with spec and commander | no | tick ends | writer deadline |
+| 10 | Checkpoint, Staff, SessionStart, Recovery, WithdrawTurn, Ack, lease-expiry settle | per tick, reader-gated | no | tick ends | writer deadline |
+| 11 | Attempt steps (Received, Running, Effect, Consult, Request, Finished, completion, candidate, evidence, Watched) | per attempt event (one-shot) | no | error ends the attempt, then `settle(runner_error)`; else the lease expiry (row 10) settles it | writer deadline |
+| 12 | Control PauseStep, Mode, Baseline (host/control.rs) | 200 ms tick | no (idle ticks only read) | tick ends, logged | writer deadline |
+| 13 | BaselineProcessEnded | control tick, reader-gated | no | logged, next tick | writer deadline |
+| 14 | BaselineProcess / BaselineTests (baseline task) | per confirmed run, one-shot | no | logged, task ends | writer deadline |
+| 15 | CancelPass / FinishCancel (urgent lane) | 1 s per cancelling run | no | logged, again in 1 s | writer deadline (urgent lane too) |
+| 16 | Suite Begin / Publish / End (host/suites.rs) | 200 ms after a registry refresh, when suites are pending | no | kept and retried each pass | writer deadline |
+| 17 | BeginHost, startup Reconcile, sync_config | host start, one-shot | n/a | host does not start / logged | BeginHost not via `begin` (first job); rest writer deadline |
+| 18 | Runner start: manifest, start recovery, verification start | one-shot | n/a | logged | writer deadline |
+| 19 | unclaim_all at writer close | once | only with claims left | ignored | full busy_timeout (nothing after it) |
+
+The writer also serves reads queued with the writes (`reconcile_scan`, `runner_waiting`, `session_starts`,
+`running_attempts`): no `BEGIN IMMEDIATE`, so no lock wait of their own. Outside hoh-core nothing opens SQLite but the
+clippy canary.
+
 ## FLK-15 (strace's `???` for a call it could not read)
 
 Developer diagnostics from `072f9fa6`, REQ-029 / AC-029-03 (CR-037), test
