@@ -23,7 +23,7 @@ ID：CR-028
 | `docs/04-architecture.md`、`docs/05-data-api.md`、`docs/14-resilience.md` | 客户端经 host 查询、事务水位、对象文件、背压、低空间保护、被引用证据不自动删除 |
 | `docs/09-testing.md`、`docs/10-acceptance.md`、`tests/check-plan.json` | 每 AC 一个 TEST 和指定 check；product/mock/live 分离；同候选的独立 QA/Review |
 | `docs/19-ai-development.md`、`docs/21-spec-governance.md`、CR-003 D1 | 委派边界、审查与预授权条件；草案不代表批准 |
-| CR-026，读取自 `/home/ai/dev/hoh-wt/m3-spec/docs/cr/CR-026-m3-detailed-spec.md`，该工作树 HEAD=`8cd7b715cc9b78c0178c7c1ce29540eb6f1dd3a5` | M3 已批准、尚未实施；下节逐项列出 M4 必须等待的契约 |
+| CR-026，读取自 `/home/ai/dev/hoh-wt/m3-spec/docs/cr/CR-026-m3-detailed-spec.md`，该工作树 HEAD=`8cd7b715cc9b78c0178c7c1ce29540eb6f1dd3a5` | M3 历史批准来源；截至 2026-11-25 的实施接线按末尾应用核对，不沿用旧工作树状态 |
 | CR-025，`docs/cr/CR-025-budget-risk-role-binding-pending-gate-date-time.md` | `budget.risk`、`ROLE_BINDING_PENDING` 的真实含义；沿用“背景→决定→AC/场景→影响→验证”的格式 |
 | CR-024，第4稿从 `/home/ai/dev/hoh` 的 main=`4a1f1c1236f04952f4d657e5db217d46446217b3` 读取 `docs/cr/CR-024-commander-read-only-profile.md`；原 cmdro 工作树已不存在 | Commander 只读档与公开最终消息决策；本工作树输入基线未含该文件，main 已有后续修订（含 supervisor.bridge_ignored）；正式应用时按最终 main 重核，不把 main 的实现状态借给本分支 |
 
@@ -31,8 +31,8 @@ ID：CR-028
 
 ### 当前实现与需要补齐的部分
 
-1. M1-T08 的 `crates/hoh-app/src/tui.rs`、`tui/app.rs`、`tui/input.rs`、`tui/terminal.rs` 已有 Ratatui/Crossterm 外壳、信号恢复、历史、括号粘贴解码。`tui/editor.rs` 明确是单行编辑器，当前将换行替换为空格；多行输入属于 M4。输入读取是可中断的自有解码器（ADR-014），不能为支持鼠标改回不可取消的阻塞读取。
-2. M2-T12 的 `host/http.rs::stream_events` 以 DB 水位和每批 500 行实现 SSE，`Last-Event-ID` 与 `after` 冲突为 409。当前路由有 runs、getRun、team、acceptance、issues、events；OpenAPI 已声明的 tasks、evidence、timeline、artifacts 并非都已有路由。M3-T07 承诺补 tasks 与追踪；其余缺口在本稿分派，不把“有 OpenAPI”当成已实现。
+1. M1-T08 的 `crates/hoh-client/src/tui.rs`、`tui/app.rs`、`tui/input.rs`、`tui/terminal.rs` 已有 Ratatui/Crossterm 外壳、信号恢复、历史、括号粘贴解码。`tui/editor.rs` 明确是单行编辑器，当前将换行替换为空格；多行输入属于 M4。输入读取是可中断的自有解码器（ADR-014），不能为支持鼠标改回不可取消的阻塞读取。
+2. M2-T12 的 `host/http.rs::stream_events` 以 DB 水位和每批 500 行实现 SSE，`Last-Event-ID` 与 `after` 冲突为 409。当前路由有 runs、getRun、team、acceptance、issues、events；OpenAPI 已声明的 tasks、evidence、timeline、artifacts 并非都已有路由。M3-T07 已在 fe27492f 交付 tasks 路由及 getRun.projection.trace（非独立 trace 路由）；其余缺口在本稿分派，不把“有 OpenAPI”当成已实现。
 3. M2-T18 的 `persistence/snapshot.rs::AcceptanceView` 与 `getRun.projection.acceptance` 中 accepted/total 是 **AC** 计数，且 accepted 只有当前候选被接受时才非零。状态栏需要需求计数，不能给这个旧字段换标签。Issue 状态来自 ADR-029 的状态函数，不能只读取可能过时的显示列。
 4. 当前 `tui.rs::Conn::link` 使用无界消息通道、首次从 seq=0 读；`App.messages` 为增长的向量。这些是 M4 容量改动的实际入口。新工作台须从水位快照和按需页面启动，不能先把百万历史事件全部读进客户端。
 5. 当前 `closing.rs` 只在 `iteration.completed` 时建 iterations 行，未写 tasks.iteration_id；adapter 的 Frame/Exit 与诊断输出不等于已持久的公开块。M4-T09 补齐归属、三适配器规范化、公开块与活动事实的生产者；M2-T07 不承担这项未实现工作。
@@ -237,7 +237,9 @@ Workspace 保持默认单主区，团队摘要可折叠；Team 显示全部配�
 
 普通诊断日志按 8 MiB 轮换、保留 5 段（D5 的缺省）；写入按字节拆段，每段不超过上限。证据、候选、发布、追踪节点、公开会话块和仍活动 Attempt 引用的对象全部保护，包括历史 STALE/INVALID/REJECTED 候选的引用；超过日志配额只标“证据占用”，不删除或改写它们。v1 的本提案不删除权威 events/验收历史，只清理没有任何引用、封口且年龄达到 48 h 的对象与未登记临时文件。创建、登记、引用与 GC 的最后一次可删判定使用同一 Persistence 写序列协调；对象读取持有短期 pin，正在读的对象不回收。清理在取可删集合后必须复查，不能用一次过时扫描删除刚被引用的对象。引用无法可靠解析时保留并诊断，不能假定无引用。
 
-引用的权威根明确为：`evidence.artifact_id`、`independent_reports.report_artifact_id/raw_session_artifact_id`、`handoffs.package_artifact_id`、活动 `attempts.raw_log_path` 及已登记输出、candidate manifest 的 FileRef/ArtifactRef、release manifest 的所有 ArtifactRef、追踪节点的 evidence refs、`public_segments.artifact_id` 和已提交事件载荷中 schema 标为 ArtifactRef 的 `artifact`、`artifacts[]`、`evidence[]`、`refs[]`。路径型引用解析到登记的 path+sha256，effects.artifact_sha256 保守保护同摘要对象；注册 artifacts 行自身不构成引用。未知载荷/解析失败保护可能涉及的对象并诊断，不把它当空引用。GC 保留登记行并原子写 tombstone，待删文件在读 pin 释放后删除；API 返回 404 ARTIFACT_NOT_FOUND/details.reason=collected，区分未知 ID 和丢文件。任何引用的历史对象都不能打 tombstone；崩溃后重复 GC 幂等，权威 events/evidence/acceptance 删除数为0。
+引用的权威根明确为：`evidence.artifact_id`、`independent_reports.report_artifact_id/raw_session_artifact_id`、`handoffs.package_artifact_id`、活动 `attempts.raw_log_path` 及已登记输出、candidate manifest 的 FileRef/ArtifactRef、release manifest 的所有 ArtifactRef、追踪节点的 evidence refs、`public_segments.artifact_id` 和已提交事件载荷中 schema 标为 ArtifactRef 的 `artifact`、`artifacts[]`、`evidence[]`、`refs[]`。路径型引用解析到登记的 path+sha256，effects.artifact_sha256 保守保护同摘要对象；注册 artifacts 行自身不构成引用。未知载荷/解析失败保护可能涉及的对象并诊断，不把它当空引用。2026-11-25 应用核对补齐 M3 根：`resource.pinned.bundle_sha256` 对应的资源包对象（包内文件字节随包保留）（`resource_bundle.rs::store/load`）；`prompt_revisions.content_sha256/path/parent_revision` 的完整历史链、`attempts.prompt_revision/prompt_sha256/resource_bundle_version`；`context.packed` 的 manifest/索引/逐层 source/skills/registry 摘要及其引用的全部全文对象，递归保留可逐字节重放所需对象（`context/record.rs`、`context/turn.rs`、`persistence/runner.rs::record_prompt`）。历史 Attempt 的重放根不因 Attempt 结束而释放；`spec_review.reported` 的 report/native_attempt/raw_session 等工件、`report.native_sessions` 的原生身份来源和 `run.baseline_tests`/`run.baseline_process`/ended 中的日志路径也沿生产字段解析并保护，不凭字段名猜 ArtifactRef。`resource.pinned` 的 hash 对象可能尚无 artifacts 行，不得归为未登记临时文件；未登记且无法证明无根的内容寻址对象一律保留诊断。已登记但没有任何根的对象仍按原 48h/复查/pin 规则回收。引用索引需同时表示 artifact_id 与无登记行的 object_sha256，不能强制后者先有 artifact 外键；按每个真实根生产者维护解析器与递归闭包，缺解析器或损坏引用保护涉及对象。这是本次委派明确要求的根清单纠正，AC-064-03 的“每一引用根各一对象”覆盖这些新增枚举，不删改 AC。
+
+GC 保留登记行并原子写 tombstone，待删文件在读 pin 释放后删除；API 返回 404 ARTIFACT_NOT_FOUND/details.reason=collected，区分未知 ID 和丢文件。任何引用的历史对象都不能打 tombstone；崩溃后重复 GC 幂等，权威 events/evidence/acceptance 删除数为0。
 
 大对象写入前需要 `available_bytes >= object_write_bytes + min_free_bytes`；流式未知长度按1 MiB segment 上限预留。低于门槛只拒绝新对象写入和新写 Attempt（包括新写重试），不打断已有执行/读取/控制。新增 `$defs.RejectionReason=STORAGE_LOW_SPACE`：Commander dispatch 的 decisions.reason_code 与自动调度 `schedule.round` 的 rejected 条目都记录该码及 available/required/min_free；不创建新的 Run BlockedReason，不伪称 DB 事务已失败。释放空间后原 READY Task 可按原调度重试，不制造新 Task。回归 REQ-035/036/037 的调度/租约、REQ-042预算/重试、REQ-043控制及 CR-025 ROLE_BINDING_PENDING 优先级。
 
@@ -380,6 +382,11 @@ doc_refs：`docs/03-ux.md`、`docs/05-data-api.md`、`docs/07-algorithms.md`、`
 | reconcile.attempt, reconcile.completed, reconcile.diagnostic, reconcile.run, reconcile.started, runner.diagnostic, runner.outside, runner.received, runner.refused, runner.unreaped, cancel.diagnostic, cancel.workspace, cancel.native_cancel, cancel.sigterm, cancel.sigkill, cancel.reaped, cancel.lost, cancel.unreaped, integrity_violation, bridge.rejected, registry.turn_auth_ignored | I | 恢复诊断；无Run的host诊断改入P |
 | lease.inspected, lease.native_cancel, lease.sigterm, lease.sigkill, lease.reaped, lease.lost_track, lease.cgroup_sigterm, lease.cgroup_sigterm_incomplete, lease.cgroup_kill, lease.cgroup_reaped, lease.cgroup_unreadable, lease.outside_sigterm, lease.outside_sigkill, lease.outside_reaped, lease.outside_unreadable | I | host/runner.rs::settle的lease_expired分支；同样为工程回收事实，不因Attempt身份进入A |
 | runner.inspected, runner.native_cancel, runner.sigterm, runner.sigkill, runner.reaped, runner.lost_track, runner.cgroup_sigterm, runner.cgroup_sigterm_incomplete, runner.cgroup_kill, runner.cgroup_reaped, runner.cgroup_unreadable, runner.outside_sigterm, runner.outside_sigkill, runner.outside_reaped, runner.outside_unreadable | I | 同一settle其余cause分支；后缀由reconcile.rs::step_names、cgroup.rs::stop、processes.rs::stop的有限返回集产生，不是接受任意runner前缀 |
+| spec.open_questions, spec_review.waiting, spec_review.ended, spec_review.dispatch_refused, spec.proposed, spec.regenerated, spec.rejected, spec.draft_requested, spec.draft_dispatched, spec.draft_start_refused, spec.draft_completed, spec.draft_note, spec.draft_rejected, spec.draft_unchanged, spec.task_replacements_opened, spec.task_replacements_consumed | P | 2026-11-25 应用核对：M3 规格/审查/起草生命周期；独立规格审查不计候选验收 |
+| run.transitioned, run.baseline_tests, run.baseline_process, run.baseline_process_ended | P | 已实现的 Run 阶段与基线命令生命周期；基线测试不是候选检查 |
+| resource.pinned, resource.drift, templates.instantiated | P | 资源/配置/模板来源事实；pin 的摘要还是 GC 根，不能当普通诊断丢弃 |
+| input.applied, input.rejected, input.reserved, input.released, outbox.rejected, request.routed | I | M3 输入结果、投递预留/释放及路由事实；不重复渲染 public.message |
+| consult.request, discussion.opinion, discussion.conclusion, task.consult, task.consult_finished, task.consult_recovered, progress.observed, progress.reset, report.native_sessions, commander.workdir, plan.write_observation_failed, need_decision | I | 已实现的咨询/净进展记账/审查身份/监督工作目录/写集观察失败与决定请求；no_progress 仍为上表 P,I。无 Run 的诊断只入 P；绝不把这些生产 kind 送入 Unknown |
 | 未列kind（包括未来扩展） | P；有Run另I；有明确Attempt另A | 恰一UI_UNKNOWN_EVENT块/seq，保留身份、经去敏的摘要和refs；不推导任务成功 |
 
 **交接成员 H13（D3）**：`handoff.prepared` 的职位取 `payload.role`；发送身份为 `(role, payload.from.role_epoch, payload.from.session_id)`，接收身份为 `(role, payload.to.role_epoch, payload.to.session_id)`，from/to=null 不构成成员，缺 session 只能匹配 role/epoch，不能匹配 session。顶层 role_epoch 是目标 epoch，不覆盖 from 的旧 epoch。`handoff.delivered/undelivered/superseded` 与 `session.start` 按各自 `payload.role/role_epoch` 匹配；session_id 仅在明确提供时匹配，缺 attempt_id 不按 session 推断某一 Attempt。session.start 当前只为 outbox notice：分类单元测试覆盖其字段，将来若新增持久事件亦遵守此规则，不在产品测试注入一个不存在的生产事件。
@@ -1003,3 +1010,120 @@ CR28D-350保留第4轮原high等级和历史回应；第5轮对其“已改好�
 提交前已执行 `bash scripts/check.sh --bundle`：退出0，504 tests，测试耗时409.885s、命令总耗时411.561s，1项既有skip（test_repository_packages_verified：Pi packages未安装），原始记录为bundle.log、bundle.exit、bundle-result.json。skip保留，未计为产品PASS。修订后ownership自检PASS：37 AC/9实现任务、归属与依赖闭包错误0，五轮125条处置的ID/原severity一致，本轮5项为1 high/2 medium/2 low；记录ownership-final.json、review-coverage-final.json。`python3 tools/validate_bundle.py` 与 `git diff --check` 通过，当前契约product_accepted=false；这不是本提案应用后的新AC验收。范围核对scope-check.json仅本文件变化、无未跟踪源码；AC表仅AC-015-01、任务JSON仅T07的done_when变化，其余AC/任务分工保留。临时根在bundle结束后清理，证据保留在忽略目录。
 
 本稿37条AC的产品红/绿、Unicode全量语料生成/逐项宽度测量器与压缩表、三native fixture/live、平台矩阵、性能/私有manager及噪声隔离和低空间场景均 **NOT_RUN**；第5轮独立设计审查为FAIL，第6稿的独立复审 **NOT_RUN**。新约定是待实现/审查的规格，不是本次产品测量结果。这是**自测，非验收**；不报告v1 COMPLETED，也不以本地commit代表CR已批准。Unicode锁定版本/文件摘要、旧schema生产commit与可执行阶段预算须在相应任务填实，不能在此编造。下一步由CTO审定D1–D12剩余提案并送第6稿修复复审；M4-T01正式应用仍等待M3-T05。
+
+## M4-T01 应用核对（2026-11-25）
+
+本节是已批准 CR 在当日主线上的**应用准备**，覆盖前文起草阶段的“当前”“尚未实施”和交付状态，历史审查表保持原记录。受托唯一写者仅写 `prep/M4-T01-apply`，起点 `fe27492f1e6657a960b31a2fd745321990c25a2b`、baseline revision 28；旧产品来源为 `067c241ed7dd1aaba0dd5ee1b0f6aa844414e5e2`。原件取自 `prep/M4-T01-spec` 的 `dde5109f43a2081b5d5e5c507b91a14b12c62143`，1005 行、sha256=`e442f111eb14227ba2fc5496dafe812e8eca1ee070b3ee7208f9c3ca560e1800`，已原字节独立提交 `44d41715`；本节及应用差异在其后的提交中审查。
+
+M3-T05 仍是 M4-T01 前置，未领取、未推进台账、未推送、未开 PR，本分支不 relock。没有 Runtime 身份头、TaskResult 输出路径或冻结 candidate，故不编造 run/attempt/epoch/candidate；本次证据按基线 commit 与源码/契约摘要绑定，保存 `.hoh-dev/self-tests/m4t01/`。这不是 M4-T01 正式完成、产品验收或 v1 交付。
+
+### 契约、来源与接线差异
+
+下表“应用”只指规格准备，不表示生产行为已交付。CR-030/031/032 在此主线 `docs/cr/` 与 baseline change_requests 中均不存在，不按连续编号假造这三份 CR；CR-025 已在旧来源，仍复核其约束。生产源的稳定函数/契约名为锚，旧清单行号不继续使用。
+
+| ID / 范围 | CR-028 的假定 | fe27492f 的事实与核对锚 | 处置 |
+|---|---|---|---|
+| A01 / CONTRACT、CR-024 | Commander 只读档、文件不能成为决策；后续 main 有 bridge_ignored | CONTRACT 第7条、ADR-032、host/product.rs 的 supervisor.bridge_ignored 均已合入；Codex Commander 只走 App Server，Pi Commander 禁扩展 | 保持已批准行为；公开流/大输入文件必须遵守该职位读取根，不能借 exec fixture 证明 Commander 能力；只更新来源 |
+| A02 / 客户端位置 | hoh-app/src/tui.rs 及子模块 | 客户端已在 hoh-client，ADR-036/spawn_scan 强制不依赖 hoh-app | 正文入口改 hoh-client；T02/05/06/07/08 在该边界实现，host 逻辑仍在 app/core |
+| A03 / CR-026、M3-T09 | SetMode、pending、SendInput 四态等待 M3 | persistence/modes.rs、inputs.rs、inputs/routing.rs 与 host/inputs.rs 已实现；ui.mode_cycle 已加载；QUEUED/DELIVERED/APPLIED/REJECTED 未变 | 已实现前提；保留同安全点/投递循环；Focus 同 Agent 多职位选择与 @agent 输入目标解析分开 |
+| A04 / 模式冲突与历史 | SetMode 的 expected_revision 409 不自动重发；/resume 只附着 | client::fresh 对 SendInput 的 STALE_REVISION 可重读后重试；ADR-041 早期方案给 SetMode 单次提交；/resume attach 与之后 INCOMPLETE 的显式恢复不同 | 保持 AC-010-02 与 ADR-031 的两种调用边界；不全局移除 fresh，不改变 /resume 交互 |
+| A05 / M3-T02、规格身份 | docs/spec/index.json 字节摘要、ApproveSpec、全旧验收失效 | specindex、persistence/spec.rs、spec/tasks.rs 已有修订/CR/替换任务与失效；源码读取故障另由 CR-036 分类 | 保留 Markdown 权威、当前批准修订、全部旧验收失效；未创建新的规格权威 |
+| A06 / M3-T04、起草 | spec_draft、spec_approval、用户批准、已运行 Run 不回 SPECIFYING | ADR-038，drafting.rs/draft_approval.rs、host/origin.rs 已归一三批准入口；002 已在 MIGRATIONS；新起草结束与拒绝事件见下表 | 已实现前提；保留 NULL spec 的历史起草 Task、独立批准来源与工作状态；只增事件分类 |
+| A07 / M3-T06、readiness | opened/reported、独立规格审查 PASS 不计 candidate acceptance | ADR-035，spec_review.rs、readiness.rs、admission.rs 已有 waiting/ended/dispatch_refused、CURRENT/reasons、路径/角色/修订闸 | 继续消费真实 readiness/open_questions；不把 Task ACCEPTED 当规格已就绪，新增种类归 P |
+| A08 / CR-029、会话独立 | 独立 QA/Review 与真实原生 session | 候选和规格审查都按 HoH id 或同 (agent,native_id) 判重；report.native_sessions、session.native 保存原生身份 | 不缩窄回 session_id 字符串；新增 report.native_sessions 为 I，并保护其来源报告；不改独立检查 |
+| A09 / M3-T07、tasks | 声明路由尚待实施 | host/http.rs::list_tasks 已有 GET /v1/runs/{run_id}/tasks，limit=100/1–500，cursor=created_seq:task_id，404 BAD_REQUEST/RUN_NOT_FOUND | 复用现有响应和游标，不把 M4 H+generation 游标强加到已实现 tasks 路由 |
+| A10 / M3-T07、trace | 依 M3 的 REQ→AC→TASK→candidate→TEST→EVIDENCE→acceptance | ADR-039；getRun.projection.trace，Reader::trace/hoh_core::trace；没有独立 HTTP trace 路由；projection.regression 另给基线对照 | 保留两个现有字段；T03/T06 用现有 trace 和新增 typed refs/Artifact API，不能写虚构 trace URL |
+| A11 / trace 标签、CR-035 | AC-013-03 UI 中 broken/orphan/stale/current 唯一，stale 优先 | 主线 trace 的 orphan 与 stale 数组可能同时含同一历史结果；无成员检查 TEST 为 MISSING，有成员无结论才 NOT_RUN | UI 按已批准 AC 做展示优先序，原始 trace 数组/历史不改；MISSING/NOT_RUN 均不入进度，不能改 CR-035 |
+| A12 / baseline | 顶栏 B 与当前 Run 的 B0 分离 | ADR-031 最近 COMPLETED Run 的 ACCEPTED commit；ADR-039 的 run.baseline、baseline_tests/process/ended 和 projection.regression 已交付 | 顶栏含义不变；详情保留 M3 原形与 baseline_complete/incomplete，不把执行失败当 HoH 新回归 |
+| A13 / M3-T10、净进展/咨询 | no_progress、budget.risk 和显式 activity | ADR-037，consult/*、progress.rs、budget_view.rs 已有咨询、progress.observed/reset；进程 alive 不是公开活动，原生 public.* 仍待 T09 | 补显式分类；当前预算视图/记账只读复用，不用 progress.observed 推算 Agent 思考或新验收 |
+| A14 / CR-025 | ROLE_BINDING_PENDING 与预算原因 | RejectionReason 与 staffing/admission 保留五种 pending、能力优先级；budget.risk 真实生产 | 不改优先级；新 STORAGE_LOW_SPACE 只追加派发/对象原因，不新增 BlockedReason |
+| A15 / CR-033 | 任务路径和假设来自计划/readiness | PlanProposal.tasks[].paths 已可选，ASSUMPTION_NOT_LISTED 已是拒绝码；admission 共用脏路径闸 | 保留字段与枚举顺序；M4 对 Task/决策只读显示，不能放宽准入或把环境层路径写进产品 |
+| A16 / CR-034 | 内置技能资源可引用/重放 | resource_bundle、prompt_revisions、context.packed 已形成摘要对象链；persistence-whitelist 的 embedded_markdown 精确列三条资源 | 原白名单三条与旧扫描规则原样保留，仅增加 003 SQL 的明确条目；GC 增加真实根，见下文 |
+| A17 / CR-036 | 503 DB_BUSY/DB_FULL 等既有 Error 语义不动 | SPEC_SOURCE_UNAVAILABLE 已是 503/retryable=true，无 command/CR/spec.index_failed 写入；真正坏规格仍 422 SPEC_INVALID | OpenAPI 的命令 503 描述保留 CR-036，再追加 STORAGE_LOW_SPACE 的明确不可自动重试分支，不覆盖旧分支 |
+| A18 / CR-037 | 用户批准仍依当前来源判定 | host/origin 的可关联 NETLINK_SOCK_DIAG 属本机来源识别；AC-029-03 已经所有者批准窄修订 | 原 AC/场景与来源验证保持原字节；TUI/Web 不以 token/interactive 字段自称用户，不改离线审计 |
+| A19 / CR-038 | 执行记录以退出码描述是否运行 | execution.schema.json 已必填 started；true/127 是真实 FAIL，false/127 仅满足严格无启动形状时无结论 | M4 未来 runner/测量/故障记录必须消费真实 started，不从退出码补默认；本次 shell 自测日志是诊断日志，不冒充 execution schema 记录 |
+| A20 / CR-039 | 长命令与中断按现有 runner | tools/common.py 保持继承 SIGINT=SIG_IGN，SIGTERM/SIGHUP 仍记录；docs/19 当前还规定本机测试槽 | 不改 common/run_check 信号语义；长检查前台由本会话收取；D4 测量锁与测试槽的冲突交 C1，不自行重写工具 |
+| A21 / 查询路由及错误 | timeline/evidence/artifacts 已声明未实现，新 /v1/timeline 与 search | routes() 只有 commands/runs/getRun/team/acceptance/tasks/issues/events/healthz；其余仍缺；SSE after/Last-Event-ID 真409、无 v1 真410 | 本次只落 OpenAPI 契约，T03 补路由；旧 Run 查询坏参数404，新 timeline/search 400，Range416、对象错误码保持 CR；SSE 原410顶层水位形状不变 |
+| A22 / schema/SQL | 预计下一迁移 003，M3 的 002 待实现 | 001/002 已入锁且 runner 实际支持2；还没有003 | 新增003空结构/索引/段/去重/引用/tombstone契约，旧SQL逐字节不变；生成版本列支持完整 generation 后原子切换，class 不持久化；运行器接线与回填仍属T09 |
+| A23 / 配置键 | standard/workspace 等旧值及 M4 新键 | config.rs 目前接受 workspace/team/focus、standard、mouse，另有 M3 mode_cycle/assumptions/max_discussion_rounds；无 M4 observability/icon/clipboard/keybindings | REQ-018 decisions 追加 CR 的值/范围/缺省/交付任务与 ui-only CAS 语义；旧键不删、不提前改 example 或加载器 |
+| A24 / 检查计划与工件 | 14检查，integration 3600s，三个性能产物等 T03 | 仍14项；traceability 已多四个本次产品导出工件，脚本会调用 cargo；checks owner 未变 | tests/check-plan.json 整文件保持主线字节；不删四份 trace 工件、不提前声明 M4 产物、不改 mode/argv/超时；T03 纳管负载时必须覆盖 traceability 内的 cargo |
+| A25 / 任务与逐 AC 闭包 | D12九 implement，verify无AC/check，M4-T01依赖M3-T05 | 当前图M3-T05依赖T02/T03/T04/T06/T07/T08/T09/T10；M4仍旧两大任务 | 精确应用D12 JSON：九implement共37唯一AC、每项≤2REQ/≤8AC；check owner不变；M6-T03/M7-T04仅追加既定平台义务，不移动AC；机械闭包证据逐AC列能力与祖先 |
+| A26 / 文档与 early 分支 | 旧输入文字 Esc+Enter；尚无 M4 代码 | docs/03旧句仍在；task/M4-T02-early 的 ADR-041 有统一布局/层叠/outcome 身份及迟到答复修正，未在此main | 应用已批准Ctrl+J/Esc文字到UX规范并在ADR-014记M4待实现；early方案只作来源/回归义务，不 cherry-pick 代码或声称已合入；涉及任务进度与小屏差异交C3 |
+| A27 / 性能、环境与前序提交 | pre-003 producer、阶段时限与Unicode摘要尚待实填 | fe27492f 实际运行002但M3-T05尚未通过；本次未运行性能/终端数据生成 | 不把此准备提交冒称“已完成M3”的 producer；T03在M3-T05后记录完整commit/tree/002/Cargo.lock并实测预算；T07提交真实Unicode来源/表，门槛原样 |
+
+### 生产 kind 分类闭包（本次委派明确授权的 M4-T03 Q5 纠正）
+
+从当前源检索所有 `NewEvent` 构造、`writer::insert_event/insert`、helper 参数、常量和传入 `Ending.observed.events` 的 adapter `Recorded::Event`；同时查 HTTP command 映射、有限动态分支和不带点的名字。原始检索保存 `event-construction-grep.log`、`event-producers-context.log`，逐 kind/来源/层的核对保存在 `event-kind-inventory.json`。字符串检索只供发现候选，路径名（例如 outbox.run_id）、只消费的 attempt.ended、notice session.start、effect key templates.instantiate 不冒充已生产事件；`public.*` 为本CR待T09新增，另行标记。正式T03仍须用封闭生产类型/共源ALL/无通配分类/唯一INSERT守卫和负例证明，不拿这次清单代替产品守卫。
+
+| 差异 | 旧假定 | 主线实际生产者 | 本次分类/处置 |
+|---|---|---|---|
+| 规格提案/起草/审查 | 只有较早的 changed/drafting/opened/reported | spec.rs、spec/tasks.rs、drafting.rs、draft_approval.rs、readiness.rs、spec_review.rs；正文新增行完整列16个名字 | P；保留真实状态与reasons，非candidate验收 |
+| Run基线/阶段 | run.baseline单一事件 | baseline.rs和drafting.rs另有baseline_tests、baseline_process、baseline_process_ended、transitioned | P；不改变顶栏baseline来源 |
+| 资源/模板 | 未枚举pin/drift/template成功 | resources.rs::pin、runner.rs::record_prompt/模板完成 | resource.pinned/resource.drift/templates.instantiated→P；对象摘要进入GC根 |
+| 输入/咨询 | input.accepted/queued/delivered等旧集合 | inputs.rs::transition/routing、outbox、consult子模块 | input.applied/rejected/reserved/released、outbox.rejected、request.routed→I；consult.request、discussion.opinion/conclusion、task.consult/finished/recovered→I |
+| 净进展/诊断 | 只列no_progress、need_decision.appended；遗漏无点kind | progress.rs、reports.rs、wakes.rs、drafting.rs、need.rs | progress.observed/reset、report.native_sessions、commander.workdir、plan.write_observation_failed、need_decision→I；无Run诊断仅P，不推断成功 |
+| 动态全集 | 文中列30种收尾但需重核最终生产调用 | control.rs Signal/PassEnd，host/runner.rs::settle与step_names/cgroup/processes；runner::effect，inputs::transition，product::outcome | cancel六种、lease/runner各15种、effect.started/observed/committed、input.delivered/applied/rejected逐项展开核对；adapter公开注册14种从真实Recorded生产链闭合；禁止任意前缀归类 |
+
+正文分类表已经补入上述41个遗漏名字（含实际动态分支的 input.applied，排除了 SQL 表达式 outbox.run_id）。当前逐项识别的 266 个生产 kind 均有显式 P/I/A 分类；7 个 public 新 kind 与 session.start notice 单列，不计入当前生产数。Unknown 仅保留历史/未来/损坏读数据的诊断行为。原 F13/H13、candidate_ready=I、终结尾部规则、37条 AC 的 Given/When/Then 未改。
+
+### GC 根闭包（本次委派明确授权的纠正）
+
+旧表只点名 ArtifactRef 常用字段，不足以覆盖已实现 M3。正文§5已补齐，引用索引同时容纳登记 ID 和无登记行的摘要。逐根的解析和保守行为如下；不是按字段名做任意 JSON 递归，也不是把登记行本身当根。
+
+| 根 | 当前权威位置 | 解析/保护 |
+|---|---|---|
+| 资源 pin | events resource.pinned.bundle_sha256；resource_bundle.rs::Pinned::load | 按摘要保护完整资源包，包内文件字节随包保留；resource_bundle_version 是身份而不是可自行当对象路径的摘要；没有artifacts行也不能当临时文件删 |
+| Prompt历史 | prompt_revisions(content_sha256,path,parent_revision)、attempts(prompt_revision,prompt_sha256,resource_bundle_version) | 沿已登记来源链保护实际对象与内容；prompt_sha256 是合成文本校验值，若无独立对象不得凭空认定文件存在；重放所需 manifest/inputs/source 对象仍受根保护 |
+| context/replay | context.packed.manifest/index/inputs[].sha256、source_chain/layers/skills；context/record.rs manifest.template.sha256、entries[].sha256/summary_sha256、source_chain | 依真实版本结构递归闭包；source/registry摘要对应对象都保护，历史Attempt终结不释放重放根；损坏或未知引用保守保留并诊断 |
+| 规格审查/原生身份 | spec_review.reported 的 report/raw_session/native_attempt（path+sha256）与raw_sha256；independent_reports、report.native_sessions关联来源 | 保留有效与拒绝/历史报告和原始会话，CR-029身份不能因GC丢证；不把native session id当文件路径 |
+| 基线命令记录 | run.baseline_process/ended、run.baseline_tests.commands[].log | 真实路径引用保留，未登记仍是持久事实引用；停止/失败命令日志不当普通诊断轮换 |
+| 既有根 | evidence、independent_reports、handoffs、候选/发布manifest、追踪、活动Attempt输出、effects摘要、public_segments和schema声明的ArtifactRef | 原§5全部保留；索引删除/重建不删除事实；读pin与最终可删复查同writer协调；未知解析/无归属文件绝不推断无引用 |
+
+AC-064-03 原文的“§5每一引用根各一对象”仍是判据，新增枚举逐根进入 fixture/observables，不换成更弱的抽样。仅无任何根且封口、达到宽限、复查无pin的对象可回收；events/evidence/acceptance删除数仍为0。
+
+### docs/24 逐条吸收（含 2026-11-21 之后的增补）
+
+已读全文，并对照11月23日 c8f14170、11月24日 d8ba1490/29d14ea9 的追加；不把经验库本身变成新AC。下表覆盖与M4相关的条目及邻近但留给后续里程碑的条目。
+
+| 条目/增补 | CR-028 已覆盖、吸收方式或不适用理由 |
+|---|---|
+| 1.1/1.2/1.3，4.2：长任务、真实恢复点与进度 | §3/AC-014不以Task或模型claim算完成，§2.1按持久停止/恢复事实显示；T02显示输入四态，T06消费M3 no_progress。恢复点正文内容仍属REQ-044/M5，不新增M4范围 |
+| 2.5/2.7：消息交叉、对象中途变更 | H13真实epoch/session过滤、公开块input_id、冻结候选/水位已有覆盖；STEER绑定代码提交的M3A-02仍留M5，不能在UI私加协议 |
+| 2.6，11月23日按mtime误删活会话副本 | §5.1按PID/start_time/pidfd/实际cgroup及登记清单清理已经覆盖；本任务scratch登记确切路径后才删除，不按年龄/模式清理他人资源。GC年龄只对已证明无根孤立对象，不能类推到会话目录 |
+| 2.8：同类场景复发、统一出口/钉住不变量 | 分类注册/唯一INSERT、对象生命周期/单writer、同水位投影已有对应；ADR-041的单布局/层叠/outcome作为T02实现与回归来源。审查循环/Commander策略归M5，不新增M4 AC或改轮数 |
+| 2.9：放宽已有断言 | 本次37条表格AC逐字节对照来源、旧范围与阈值核对；未来T03/T07负例/独立oracle已规定。Review断言diff的产品规则仍REQ-054/055/M5，不改其AC |
+| 2.10：开发机路径进入产品测试 | §5.1的参考盘/测试根属于外部测量设施，Rust产品/可移植测试不能硬编码本机/home路径；本次不新增Rust或runner；T03按现有static路径扫描验证 |
+| §5：tmpfs/EDQUOT低空间 | §5预留、真实ENOSPC与显式注入EDQUOT、日志/引用保护已覆盖；本机副本放项目盘，不把tmpfs失败误报产品故障 |
+| §5：退出中进程读不到环境导致终结证明停滞（FLK-07，11月23日） | §5.1要求复用真实Witness/归属/清理证明；沿当前processes/control实现，不复制一份过时扫描。REQ-043根因修复已在M3，本次不重写生命周期 |
+| §5：受锁schema只跑bundle，Rust镜像CI才红（11月21日，仍相关） | 同步发现protocol_roundtrip按schema枚举逐项相等；本次禁改产品代码，显式列C4并在scratch做完整pre-pr诊断，不能以bundle PASS替代Rust一致性 |
+| §5：多会话满套并跑过载/测试槽（11月24日） | 已批准D4的参考包络、独占/噪声/完整样本覆盖性能污染；docs/19 11月25日“run_check不取槽”与D4工具接入需C1协调，不降低时限或替别人杀进程 |
+| §5：旧main上CI、合并后未验证；字段变私有浪费长测 | 本次基于给定fe27492f核对所有契约；合入前若main再有产品变动，主会话须再次核差异/先静态再完整pre-pr。此为REQ-065后续交付过程，不改变M4阈值 |
+| §5：锁后再改CR、失败后继续提交 | 本分支不重锁；原件与应用分别提交，CR应用核对必须在主会话最终relock之前定稿；后续审查记录写reports/reviews，不改已锁CR；每个退出码独立记录 |
+| §5：Grok后台600秒与断电丢任务 | §5.1独立guardian/截止时间/崩溃证据已覆盖测量寿命；原生能力限制归REQ-027/M5或M7，不把600秒当HoH新阈值；本次长命令由工具会话持续收取并有恢复点 |
+| §5：判定用产品函数自证、宽松手写解析器 | AC-015-01以终端真实cursor为oracle、AC-013-04共源分类负例、F13/H13精确集合已有覆盖；本次不重写测试期望，独立来源逐字节比较应用产物；M3PD三方diff本身非M4改动 |
+| §5：未启动标记可被被测进程伪造（CR-038） | A19吸收当前started事实与外部通道；M4 guardian/测量证据必须来自独立观察，不能用被测命令可写标记抹去真实FAIL；不修改CR-038/039 |
+| §5：草案未重锁掩盖夹具缺依赖（M3LS-152） | 在登记的scratch副本实际relock并完整bundle，逐项看失败；原分支baseline失败单列，不能用它解释scratch或pre-pr的其它失败 |
+| 2.3/3.3/4.1以及环境中打包、跨Python版本等 | 评审收敛/Smart Compact/Hermes/交付真实性/跨版本矩阵仍在M5–M7；M4只消费已存在身份/来源、保留证据，不提前缩范围或宣称覆盖 |
+
+### 需 CTO 决定（未应用语义/门槛/任务AC集合变更）
+
+| ID | 差异/尚缺决定 | 推荐与保留边界 |
+|---|---|---|
+| C1（high） | D4要求修改run_check/cargo所有入口取得测量读写锁；docs/19的11月25日BT-03决定明确run_check不取本机测试槽，两种锁的集成/继承/等待语义尚未协调 | 推荐区分日常开发测试槽和正式计量排他锁，由CTO确认在外部统一包装器+guardian纳管所有负载而保持run_check本身不取槽是否足以满足D4；不足则正式修订工具接入。此分支保留D4全部阈值/清理/覆盖要求，不改run_check，不把已有flock冒充已实现D4 |
+| C2（medium） | AC-010-01的带rationale与impact决策；当前DecisionPayload没有通用这两个字段，只有部分basis/reason/note与实际效果；早期清单Q16建议展示缺失 | 推荐显示带来源的公开basis/reason/note及已提交效果；缺失标未知。若原AC要求所有决策都具备两项，则先确定正式公开字段/生产者，不能靠夹具捏造或把“缺失”当原AC PASS。本次不弱化原AC、不新增协议字段 |
+| C3（medium） | ui.input_states[]同时要求分页引用，未定义精确续查形状/入口；并发时ui.task单值选择未定；ADR-041在progress尚未交付时显示unknown，AC-011-04的“四组事实”正式判据需与T06前置核对 | 推荐input历史按H/limit/cursor使用既有读模型扩展、当前任务采用明确可重复排序并可查其它任务；T02只显示已有事实，若完整AC需要T06能力，CTO审定共享聚合的交付顺序/前置。OpenAPI只落已确定形状，InputStatePageRef保留object和待决描述，绝不凭准备任务添加新路由、改变任务AC集合或把unknown当验收通过 |
+| C4（high） | 七个ErrorCode与一个RejectionReason按apply list落盘后，现有Rust枚举仍旧值；protocol_roundtrip要求逐项相等。本次明确禁止产品代码变更 | 推荐主会话审核时授权一笔仅镜像枚举的实现提交（保留现有断言，先观察契约差异红灯，再同步），或明确把协议枚举落盘与T03同步并修订应用时序；不删除roundtrip、不放宽测试，不在本准备分支越权改Rust。该一致性必须在正式合入前闭合 |
+| C5（medium，D4既有决定点） | 001旧源已变真实002，但M3-T05未收口；五阶段/两release构建/百万库及guardian全机观测尚无时间证据 | 推荐M3-T05后绑定真实pre-003产品提交、T03先做可行性实测；装不进3600s且600s余量则CTO重规划required check，经正式CR；缩范围/降阈值必须交所有者，不能在本分支预填数字 |
+
+上述不是重新询问已批准D1–D12。除本次明确授权的事件清单与GC根补齐外，涉及AC意义、阈值、范围、任务AC集合或交互选择的新解决方案均未应用，原判据保留供主会话裁决。
+
+### 应用产物与验证边界
+
+- 八REQ从outline到detailed；37AC与同号TEST，旧8个ID保留、增加29个；metadata/summary/release_targets/release_class原样。REQ-018只追加已批准配置键/时序决定，旧AC不变。
+- D12九implement与T04精确应用；M4-T01仍依赖M3-T05；M6-T03/M7-T04追加批准的双平台收取义务。工具校验所有AC唯一归属、check唯一owner与祖先闭包。
+- 加法式OpenAPI、七ErrorCode/一RejectionReason、003 SQL空结构与扫描白名单已准备；SQL不启用到生产runner，不改001/002。`gen_spec_views.py`更新两生成视图。执行计划14项及其所有工件与脚本保持主线字节，未来产物按A24交付。
+- docs/03更新批准的键位规范；docs/05与ADR-014/027仅记录M4待实现契约及移交，docs/12实测版本说明、REQ-004的实现说明、config example、运行器/测量/CI/终端表均随对应实现任务，不能提前写为已可用。本次不修改产品代码、门禁、release-policy或主分支锁。
+- 原分支 `validate_bundle.py`/bundle的baseline不匹配是保留revision28的预期诊断；**必须另有scratch正式relock后的完整bundle成功**，不能把两个结果混称PASS。`baseline.py --cr`实际接受文件路径，因此scratch使用 `docs/cr/CR-028-m4-detailed-spec.md` 而非裸ID，新增003以`--add`登记。
+- 自测原始记录：`baseline-bundle-check.log`、`bundle-check.log`、`validate-bundle.log`、`application-audit.json`、`sql-contract-check.log`、`scratch-relock.log`、`scratch-bundle-check.log`、`pre-pr.log`；恢复点 `checkpoint.md`。scratch是 `mktemp -d -p /home/ai/dev m4t01-relock-XXXXXX` 后 `cp -a` 的本worktree副本，确切路径/归属与清理结果入记录；不触碰他人worktree、用户.hoh或凭证。
+
+所有验证均为**自测，非验收**。37项产品场景、live三Agent、性能/容量、Unicode测表、独立QA/Review和最终release gate在本次均NOT_RUN；生成规格和bundle成功也不代表M4或v1通过。最终执行退出码与提交由本次委派报告及上述日志提供，正式relock由主会话在审查及M3-T05之后完成。
