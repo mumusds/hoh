@@ -101,3 +101,31 @@ fn test_024_05_resume_excludes_turns_only_under_a_declared_schema() {
         }
     }
 }
+
+#[test]
+fn test_027_01_m3cx003_exhausted_resume_declaration_is_unknown() {
+    use crate::compat::suite::{Part, plan};
+    let schema = serde_json::json!({"oneOf":[{"properties":{"method":{"enum":["thread/resume"]},"params":{"properties":{"excludeTurns":{"type":"boolean"}}}}}]});
+    for budget in [0, 1] {
+        let conform = conform::schema(
+            &plan("codex"),
+            conform::Export {
+                client_requests: &schema,
+                client_notifications: &serde_json::json!({}),
+                server_notifications: &serde_json::json!({}),
+                responses: &BTreeMap::new(),
+            },
+            &Work::new(budget, None),
+        );
+        let resumed: Vec<_> = conform
+            .of("compaction")
+            .iter()
+            .filter(|f| f.part == Part::Requests && f.detail.starts_with("thread/resume "))
+            .collect();
+        assert!(!resumed.is_empty());
+        assert!(
+            resumed.iter().all(|f| f.truth == Truth::Unknown),
+            "budget={budget}: {resumed:?}"
+        );
+    }
+}

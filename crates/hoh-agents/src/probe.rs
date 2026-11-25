@@ -2917,28 +2917,31 @@ fn codex_sandbox_check_in(launcher: &Path, env: &ProbeEnv, base: &Path) -> Sandb
 
 /// CR-041: a permissive old schema does not prove that excludeTurns has any effect. Follow the tested
 /// thread/resume branch's params reference in the supported local-reference form and require the named property.
-fn declares_exclude_turns(file: &serde_json::Value, work: &Work) -> bool {
+fn declares_exclude_turns(file: &serde_json::Value, work: &Work) -> Truth {
     let branches = branches_by_method(file, work);
+    if work.ran_out() {
+        return Truth::Unknown;
+    }
     let Some(branch) = branches.get(crate::codex::RESUME_REQUEST) else {
-        return false;
+        return Truth::No;
     };
     let mut params = &branch["properties"]["params"];
     for _ in 0..64 {
         if !work.spend(1) {
-            return false;
+            return Truth::Unknown;
         }
         if params["properties"].get("excludeTurns").is_some() {
-            return true;
+            return Truth::Yes;
         }
         let Some(reference) = params["$ref"].as_str().and_then(|s| s.strip_prefix('#')) else {
-            return false;
+            return Truth::No;
         };
         let Some(next) = file.pointer(reference) else {
-            return false;
+            return Truth::No;
         };
         params = next;
     }
-    false
+    Truth::Unknown
 }
 
 /// Whether the App Server takes the read-only workspace profile (docs/adr/ADR-032.md decision 4): its thread/start and
