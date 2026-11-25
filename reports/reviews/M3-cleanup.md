@@ -289,3 +289,32 @@ the gate exec report over SCM_RIGHTS close-on-exec", "M3LS-150 M3LS-151 record i
 execute", "M3LS-152 copy release_gate.py into traceability fixtures". Round-1 lesson: a DRAFT CR's bundle suite was reported
 "red only on the unrelocked baseline" without checking; M3LS-152 hid behind it. Later rounds ran the bundle suite after a
 relock in a scratch copy. Deferred low: M3LS-200 (M3 low package). Final checks: see the PR.
+
+## FLK-13 (a concurrent spawn holds the gate's end of the control channel)
+
+Developer diagnostics from `116e3585`, REQ-052 / AC-052-04, test
+`test_052_04_delivery_receive_and_read_failures_do_not_prove_not_started`. Seen once in a parallel `cargo test --workspace`
+(`channel.deliver().is_err()` false). Chain: `Channel::new` creates the control socketpair close-on-exec, the test drops the
+gate's end and expects `deliver` to fail with the peer gone. Another test thread in the same binary that spawns a process
+inside that window gives its child a copy of the gate's end, held until the child's exec; the peer is still open, so the
+`go` packet is queued and `deliver` succeeds. No product defect: the test assumed that no other thread forks.
+
+Reproduction (temporary, not committed): an ignored test in the same module runs the real test function 20000 times while
+N threads spawn `true` in a loop, counting failures by panic location. **Before**: 1037, 1100 and 1067 failures in 20000
+with 8 spawners (all of the last two at `assert!(channel.deliver().is_err())`), 0/20000 with no spawners. **After**: 0/20000
+three times with 8 spawners, 0/20000 with 16 and 0/20000 with none. The test now waits, at most 10 s, until the control
+socket reports POLLHUP (the kernel sets it only when the peer socket is released, i.e. every copy is closed, as when the
+gate has exited) before calling `deliver`; on timeout the test fails. Its assertions are unchanged.
+
+Product: the same window exists when the host spawns other processes while a gated check starts, and it stays conservative.
+The workspace forbids `unsafe` and has no `pre_exec` or fork without exec, so a stray child holds copies of the control,
+reader and writer ends only until its exec (or `_exit`) and never reads or writes them. Effects: if the gate died before
+delivery, `deliver` may succeed instead of failing, so the "cannot deliver" stderr line and an already moot cancel are
+missed, and the record still says started=true; a stray copy of the writer can delay EOF but cannot produce the exact
+`exec_failed\n` report, and `exec_failed` treats EAGAIN like EOF; a stray copy of the control end delays the gate's EOF
+only when the host abandons a gate it is already cancelling. No path turns a started command into NOT_STARTED.
+
+Evidence under `.hoh-dev/self-tests/m3low2/`: `flk13-repro.patch` and `flk13-fix-plus-repro.patch` (harness on HEAD and
+on the fix), `flk13-{before-01,before-02,before-03,before-nospawn,after-01,after-02,after-03,after-nospawn,after-16spawners}.log`
+with their `*-result.json` (argv, binary digest, exit, duration, log digest); before-01 ran an earlier harness revision
+without the panic-location count. Self-tests, not acceptance.
