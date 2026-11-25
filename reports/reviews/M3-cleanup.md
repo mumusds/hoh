@@ -518,3 +518,37 @@ split.
 |---|---|---|---|
 | M4L1-100 | low | The scan misses unquoted shell paths, `/home/ai` without a trailing slash and other users' homes; `scripts/dev/pre-pr.sh:43` defaults the dev slot to `/home/ai/dev/.hoh-test-slot.lock` (dev-only, overridable by `HOH_TEST_SLOT`, not run in CI). | Deferred to the M4 low package: widen to `/home/<user>` with an explicit allowlist naming pre-pr.sh's slot default. |
 | M4L1-101 | low | `.toml`, `.yml`, `.json` sources are not scanned. | Deferred to the M4 low package. |
+
+## DC-M3CX-500: pipe reads must let control signals run
+
+M3R-503 and M3CX-500 repeat the same defect class: an always-readable pipe consumes Tokio's cooperative budget;
+a read-first biased select then polls its abandon watch only after that budget is exhausted. A supervisor that has
+killed its group can still wait forever for a pipe held by an escaped descendant.
+
+Design rule: **every loop that reads a pipe while racing an abandon, cancel or deadline signal yields after each
+successful read, inside the read side.** Save bytes, counters, raw-log writes and retained tails before yielding so
+that dropping the read future loses no consumed data. Drain loops check abandon first as well, including when the
+previous read spent the last cooperative operation. EOF and errors terminate without another read. This is a bound
+on reads/work between control polls, not a wall-clock bound on synchronous logging or scheduling.
+
+Audit scope: all `select!`, `read_buf`, `read`, `read_line`, `read_until`, stream-next and process-output loops in
+`crates/hoh-agents/src` and `crates/hoh-app/src`; the audit and deterministic cooperative-reader tests precede the fix.
+
+| Audited loop / call chain | Result |
+|---|---|
+| `frame.rs::next` ordinary reads | Already saves state and yields after each successful read. |
+| `frame.rs::skip_more` / `reduce_more` | Yield inside the read side also for the LF-bearing chunk; keep buffered input across dropped futures. |
+| `process.rs::read_stdout` framing | Calls cancel-safe `FrameReader::next`; bounded channel backpressure is intentional. |
+| `process.rs::read_stdout` refused-frame drain | Fixed: abandon first; count discarded bytes before read-side yield. |
+| `process.rs::drain_stderr` | Fixed: abandon first; raw copy, byte count and tail saved before read-side yield. |
+| `process.rs::supervise`, leader wait / drain grace | No pipe reads; signal, timer and stream joins. Stream joins rely on the fixed drains. |
+| Codex App Server / exec, Claude, Pi driver selects | Consume bounded `Process::next` events, not pipes; cancel and due-watch are before output. |
+| `hoh-app::verify::check` | Consumes `Process::next` events; its actual pipe readers are the fixed substrate. |
+| `hoh-agents::probe::capture` / `Output::drain` | Synchronous nonblocking reads, no Tokio coop/select; explicit output cap and outer deadline/cancel checks. No cooperative starvation. |
+| `hoh-app::host::control::git_run_limited` | Blocking reader thread joined after group termination; not a Tokio read/signal race. Escaped Git descendants holding stdout are a pre-existing separate lifetime risk, outside this CR. |
+| Remaining hoh-app selects (`runner`, `inputs`, `control`, `mod`, `product`, `http`) | Timers, channels, joins or HTTP sockets; no direct pipe read loop. |
+| Remaining read loops (probe/schema, adapter hashes; app gate, drafting, cgroup, product, untracked files) | Bounded regular-file/proc reads or test fixtures; not async pipe/control races. |
+
+Synthetic cooperative readers reproduce both drain failures (512 total reads at the safety fuse), then assert abandon
+within one drain read and preserved counters/tail. Frame cancellation/restart tests cover ordinary, skip and reduction
+paths. Evidence: `.hoh-dev/self-tests/m3cxfrm/fix1-500-*.log`; all are self-tests, not acceptance.

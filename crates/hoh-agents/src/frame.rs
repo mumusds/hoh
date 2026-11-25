@@ -259,10 +259,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if self.skipping.is_some() {
                 match self.skip_more().await? {
                     Some(frame) => return Ok(Some(frame)),
-                    None => {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
+                    None => continue,
                 }
             }
             let from = self.start + self.scanned;
@@ -361,6 +358,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 .await?;
             self.bytes += n as u64;
             eof = n == 0;
+            if n > 0 {
+                tokio::task::yield_now().await;
+            }
         }
         let end = self.buf.iter().position(|&b| b == b'\n');
         let bytes = &self.buf[..end.unwrap_or(self.buf.len())];
@@ -430,26 +430,31 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// One read of a frame being skipped: the frame once its LF came, a refusal once the stream ended or the frame
     /// passed the rule's length, else `None`. Nothing but the read is held between calls.
     async fn skip_more(&mut self) -> io::Result<Option<Frame>> {
-        if self.buf.capacity() < self.chunk {
-            self.buf.reserve_exact(self.chunk);
+        if self.buf.is_empty() {
+            if self.buf.capacity() < self.chunk {
+                self.buf.reserve_exact(self.chunk);
+            }
+            let n = (&mut self.inner)
+                .take(self.chunk as u64)
+                .read_buf(&mut self.buf)
+                .await?;
+            self.max_buffered = self.max_buffered.max(self.buf.len());
+            self.bytes += n as u64;
+            if n == 0 {
+                if let Some(skipping) = self.skipping.as_mut()
+                    && std::mem::take(&mut skipping.cr)
+                {
+                    skipping.take(b"\r");
+                }
+                return Ok(self.refuse_skipped());
+            }
+            // Save the read before yielding, including the chunk containing LF (DC-M3CX-500).
+            tokio::task::yield_now().await;
         }
-        let n = (&mut self.inner)
-            .take(self.chunk as u64)
-            .read_buf(&mut self.buf)
-            .await?;
-        self.max_buffered = self.max_buffered.max(self.buf.len());
-        self.bytes += n as u64;
         let max_length = self.skip.map_or(0, |s| s.max_length);
         let Some(skipping) = self.skipping.as_mut() else {
             return Ok(None);
         };
-        if n == 0 {
-            // Cut short: not a complete record. A held CR is content.
-            if std::mem::take(&mut skipping.cr) {
-                skipping.take(b"\r");
-            }
-            return Ok(self.refuse_skipped());
-        }
         match self.buf.iter().position(|&b| b == b'\n') {
             Some(i) => {
                 skipping.take_last(&self.buf[..i]);
