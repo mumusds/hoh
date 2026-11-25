@@ -1121,22 +1121,24 @@
    "done_when": "本里程碑全部需求spec_maturity=detailed；validate_bundle通过；CR已APPROVED并relock；按每个实现任务≤2项需求、≤8条AC拆分本里程碑实现任务（更新 development-tasks.json 的 requirements/acceptance/checks/depends_on，validate_bundle 的归属规则通过）；每条 AC 只分给依赖闭包已提供其所需能力（host、API、CLI 最终结果、QA/Review 循环、systemd、doctor、TUI 等）的任务（CR3R-02）。"
   },
   {
-   "id": "M4-T02",
+   "id": "M4-T09",
    "milestone": "M4",
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "Workspace/Team/Focus/Timeline与真实进度状态栏",
+   "title": "Iteration attribution and persisted native public streams",
    "depends_on": [
     "M4-T01"
    ],
    "requirements": [
-    "REQ-010",
     "REQ-011",
-    "REQ-013",
-    "REQ-014"
+    "REQ-013"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "acceptance": [
+    "AC-011-05",
+    "AC-013-05"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2.1/2.2生产接线、迁移003运行器/回填断点与public段登记；每个native模式的版本字段映射、真实runner fixture、重复/取消/恢复/旧epoch/去敏与有界队列；接入M3接受事务的用户原文块与input_id去重，背压不误报inactivity；索引不存class；不改M3投递或关轮算法。回归REQ-017/024/025/026/027/036/041/042/062和CR-026迁移002。生命周期与并发按docs/19双独立审查。 明确§2.1的COMPLETED/FAILED/CANCELLED、PAUSED与INCOMPLETE/ResumeRun快照边界；T09仅写身份，生产kind类型由后续T03统一接入。"
   },
   {
    "id": "M4-T03",
@@ -1144,17 +1146,173 @@
    "kind": "implement",
    "owner_role": "developer",
    "writer": true,
-   "title": "可展开块、输入与终端兼容、无障碍键位、可观测性与容量",
+   "title": "Typed UI queries, object lifecycle and bounded SSE",
    "depends_on": [
-    "M4-T01"
+    "M4-T09"
    ],
    "requirements": [
-    "REQ-012",
-    "REQ-015",
-    "REQ-016",
     "REQ-064"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "acceptance": [
+    "AC-064-03",
+    "AC-064-04",
+    "AC-064-05"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2错误与Range/search/evidence/timeline路由、查询时集中kind分类及完整性测试、引用/GC/tombstone/低空间原因；交付§5.1唯一release测量基础设施/runner与ENOSPC设施，三个工件声明只随可产出驱动同提交/relock生效；先实测阶段耗时并留600s总余量，否则提交D4重规划；PID/start_time/pidfd与实际unit/Attempt cgroup归属、正常/失败/超时/取消/SIGKILL无残留证据齐全；debug故障子例与release计量分开，SSE按字节限界。新配置与example同提交，回归TEST-018-01、REQ-005/035/036/037/042/043/058/062。对象与测量进程生命周期并发按docs/19双独立审查。 NewEvent.kind类型化与唯一INSERT守卫覆盖全部生产者/动态分支，不能用手写清单自证；503 STORAGE_LOW_SPACE受理错误/草稿与QUEUED投递诊断按§5，T07再接文件包装。冻结环境填齐五阶段正整数时限，runner/监护者强制执行；service/scope两真实启动路径、每Attempt身份/资源核对及SIGKILL外部收尾通过后才交付。 第5稿：同次构建绑定pre-003提交的release旧writer，真实造002百万库；首次open起计及回填中kill/reconcile两克隆共享backfill时限。私有manager位于项目盘测试根，测试HOME/XDG/hoh-host@模板与安装完全隔离；外层scope和真实manager guardian的RuntimeMaxSec=3600，SIGKILL整个run_check组后30s外层树空的证据。全机锁贯穿测量与清理，run_check/cargo各入口遵守，锁竞争/噪声SKIPPED/78且不能PASS。补503 STORAGE_LOW_SPACE的CLI69及明确提示/不自动重试；REQ-004旧AC不改。"
+  },
+  {
+   "id": "M4-T02",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Workspace, Team and Focus clients",
+   "depends_on": [
+    "M4-T03"
+   ],
+   "requirements": [
+    "REQ-010",
+    "REQ-011"
+   ],
+   "acceptance": [
+    "AC-010-01",
+    "AC-010-02",
+    "AC-010-03",
+    "AC-010-04",
+    "AC-011-01",
+    "AC-011-02",
+    "AC-011-03",
+    "AC-011-04"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付快照增量、断线/DB_BUSY、布局/身份/小屏、Ctrl+P动作注册表与Task/Issue/Evidence抽屉；自有poll SGR鼠标解码与ADR-014修订。保留M3模式/输入/批准/历史入口，不直接写host状态造测试。回归REQ-001/005/007/017/018。 未预选同Agent多职位必须选择，Focus区分role/epoch/session与Attempt级handoff可见范围；保留/resume选择后仅附着。"
+  },
+  {
+   "id": "M4-T05",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Eight public block actions and bounded rendering",
+   "depends_on": [
+    "M4-T02"
+   ],
+   "requirements": [
+    "REQ-012"
+   ],
+   "acceptance": [
+    "AC-012-01",
+    "AC-012-02",
+    "AC-012-03",
+    "AC-012-04"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。八类同一动作、Range装配/搜索边界、纯文本文件复制、引用错误和锚点；正文缓存与虚拟列表实现以小夹具回归，最终百万容量归T10；ui.clipboard/file加载与example同提交、exports守卫与占用诊断。不发OSC/DCS。TEST-012-01在既有integration的release阶段完整含PTY测量。 逐类断言鼠标单击选择/双击展开/滚轮滚动；新增场景后按§5.1重测全integration五阶段（含debug tui_pty），保存各段elapsed/limit和总余量，任何阶段超时FAIL。 第5稿：八类块逐项覆盖两处匹配的n到下一处/N回上一处、零命令。"
+  },
+  {
+   "id": "M4-T06",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Timeline navigation and factual statusline",
+   "depends_on": [
+    "M4-T05"
+   ],
+   "requirements": [
+    "REQ-013",
+    "REQ-014"
+   ],
+   "acceptance": [
+    "AC-013-01",
+    "AC-013-02",
+    "AC-013-03",
+    "AC-013-04",
+    "AC-014-01",
+    "AC-014-02",
+    "AC-014-03",
+    "AC-014-04"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。消费T09归属/公开活动与T03分类API，F13全过滤/引用，progress聚合、三档字段/水位探针；配置与example同提交；保留M3追踪标签、规格全量失效与旧acceptance的AC计数。回归TEST-018-01、REQ-032/033/053，不把adapter活动来源写成M2已提供。 013-04从受约束的生产类型穷举并证明旁路负例可检出；未知成本/上下文明确未知而非0。 第5稿：candidate_ready显式为I工程事实，分类为诊断的变异必失败；test_013_04 compile_fail doctest与生产定义共源。"
+  },
+  {
+   "id": "M4-T07",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Multiline input transport and terminal compatibility",
+   "depends_on": [
+    "M4-T06"
+   ],
+   "requirements": [
+    "REQ-015"
+   ],
+   "acceptance": [
+    "AC-015-01",
+    "AC-015-02",
+    "AC-015-03",
+    "AC-015-04"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付编辑器/有界paste、每adapter inline/frame预算与文件引用、启动复位/teardown/外层宽度四路径；只扩展M3投递的传输，不改变四态。§5.1收取TEST-015-03的debug功能与release RSS两个阶段；功能PTY的panic入口仍debug专用。准备CI的tmux/sshd/locale；回归REQ-004/017/024/025/026/043；生命周期双独立审查。同时交付§4终端版本/oracle与逐路径生成宽度表/唯一回退（Ambiguous原样）、会话内恢复和原屏往返；§5.1中test_015_03功能子例为debug libtest、RSS为release；REQ-015兼容矩阵的非默认测试注册/HOH_CHECK_ID门槛、无TEST id CI冒烟和平台manifest格式。 新增场景后按§5.1重测全integration五阶段（含debug tui_pty的busy/信号/布局/输入），记录elapsed/limit/总余量并强制阶段截止；CI编译/lint非默认tui-acceptance注册；015-02含Ctrl+C双Then、Esc零控制、粘贴/历史重新武装，015-03含3MiB非SendInput拒绝与已202输入低空间QUEUED。 第6稿CTO绑定：从锁定Unicode数据全量生成语料（全部已分配非控制单码点、emoji-test.txt全部RGI序列、VS15/VS16对及点名簇），提交生成器/测量器、逐码点/序列实测后按连续区段无损压缩的四路径表和manifest；渲染器嵌入所有已提交平台全部表，生产恒用完整交集、无路径识别；UI常量/边框非ASCII字形原样及非手选docs/03中文正文无码点串三项AC断言齐全。DSR由unhandled_csi按vt100当前cursor应答；Cargo只绑定vt100 lock记录和测量器摘要，不绑定整个Cargo.lock。全部显示跨度取实测值、禁手填及CellWidth覆盖；缺表/任一路径分歧（含跨平台）或不安全只用一个ASCII回退，完整语料每路径验证光标/cells/末列；现场重生成与提交表不符（含版本漂移）FAIL，不改源表续跑；M7交付两平台全表嵌入与交集回归。"
+  },
+  {
+   "id": "M4-T08",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Accessible actions and atomic keybinding settings",
+   "depends_on": [
+    "M4-T07"
+   ],
+   "requirements": [
+    "REQ-016"
+   ],
+   "acceptance": [
+    "AC-016-01",
+    "AC-016-02",
+    "AC-016-03",
+    "AC-016-04"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。键盘遍历所有动作、NO_COLOR/ASCII、scope冲突、项目ui配置CAS原子写保注释、ui-only重载、恢复默认；mode.cycle可重绑但不改ui.mode_cycle。配置/example同提交、回归TEST-018-01与输入teardown。 016-01明确Ctrl+R只召回、/resume未选零控制及选后仅附着，不用动作清单的一般断言代替。 第5稿：Tab唯一/he补/help但不提交，歧义/只移焦并保原文。"
+  },
+  {
+   "id": "M4-T10",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Final UI performance and million-event acceptance scenarios",
+   "depends_on": [
+    "M4-T08"
+   ],
+   "requirements": [
+    "REQ-015",
+    "REQ-064"
+   ],
+   "acceptance": [
+    "AC-015-05",
+    "AC-064-01",
+    "AC-064-02"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。完成最终UI+百万库组合、迁移/回填30s与600s上界、首中尾日志/虚拟列表/轮换/保护/慢读/磁盘失败、核心总RSS和1000样本交互测量；性能/规模经integration release串行阶段、故障子例经同检查debug阶段，参考环境不匹配不PASS；REQ-068/M7仍独立验收原门槛。AC-064-01必须同时收debug迁移故障和release规模证据；参考测量含writer忙时脱离≤1s，普通debug不以1s抖动判失败。 最终新增场景后重测全integration五阶段，含全部debug tui_pty成本；逐段elapsed/limit/总余量与强制截止证据齐全，超阶段/工作3000s或余量不足FAIL，不能复用T03/T05/T07时长。 第5稿：实填pre-003生产commit后同次旧/新release构建与002百万库，正常/回填中kill两克隆全部计入原五阶段；必须包含私有manager隔离/全机锁/噪声准入证据，不借旧候选测量。"
+  },
+  {
+   "id": "M4-T11",
+   "milestone": "M4",
+   "kind": "implement",
+   "owner_role": "developer",
+   "writer": true,
+   "title": "Live native stream persistence across three agents",
+   "depends_on": [
+    "M4-T06"
+   ],
+   "requirements": [
+    "REQ-014"
+   ],
+   "acceptance": [
+    "AC-014-05"
+   ],
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。扩展既有adapter-live到host→原生→公开持久事实的真实链，三家session/模型/公开工具/用量来源证据；复用T09生产者而非第二份解析器；未知能力如实记录，缺认证不PASS，不改live check owner或范围。"
   },
   {
    "id": "M4-T04",
@@ -1162,10 +1320,17 @@
    "kind": "verify",
    "owner_role": "qa",
    "writer": false,
-   "title": "M4独立QA（Pi）与独立Review（Codex），同一冻结候选",
+   "title": "M4 independent QA and review on one frozen candidate",
    "depends_on": [
+    "M4-T09",
+    "M4-T03",
     "M4-T02",
-    "M4-T03"
+    "M4-T05",
+    "M4-T06",
+    "M4-T07",
+    "M4-T08",
+    "M4-T10",
+    "M4-T11"
    ],
    "requirements": [
     "REQ-010",
@@ -1177,7 +1342,7 @@
     "REQ-016",
     "REQ-064"
    ],
-   "done_when": "同一冻结候选上由独立会话完成QA与Review（不同于开发会话），对本阶段每条AC给出PASS/FAIL/BLOCKED/NOT_RUN及原始证据；critical/high问题为零或已开修复任务。"
+   "done_when": "同一冻结候选由不同于开发者且彼此独立的QA/Reviewer验证全部37条AC；收取unit/integration/recovery/tui-pty/adapter-live与适用build/static、independent-qa/review的真实证据。critical/high必须为零；开修复任务不算通过。缺前提为BLOCKED/INCOMPLETE，修复后新候选重新验证；M4不签v1完成。"
   },
   {
    "id": "M5-T01",
@@ -1322,7 +1487,7 @@
     "REQ-065",
     "REQ-066"
    ],
-   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。"
+   "done_when": "所列需求的全部AC在冻结候选上有PASS证据（degradable需求可为带诊断与上游引用的DEGRADED）。 （CR-028 D10）准备隔离 Ubuntu 24.04 x86_64 实例与版本记录，为 M7-T04 最终同候选 tui-pty 的两平台四路径提供设施；不以 M4 的 26.04 证据替代。"
   },
   {
    "id": "M6-T04",
@@ -1484,7 +1649,7 @@
     "REQ-070"
    ],
    "profile": "v1",
-   "done_when": "release_gate --profile v1 PASS，release_status为COMPLETED或COMPLETED_DEGRADED；否则如实INCOMPLETE/BLOCKED。"
+   "done_when": "release_gate --profile v1 PASS，release_status为COMPLETED或COMPLETED_DEGRADED；否则如实INCOMPLETE/BLOCKED。 （CR-028 D10）最终候选的一次正式 tui-pty 检查收齐 Ubuntu 26.04/24.04 两平台各四路径；冻结 environment 预列两平台，分发同 commit/tree/spec/test-plan 并在前后核摘要；渲染器嵌入两平台全部表且两平台恒用完整交集。逐平台收取原始 PTY、会话内 stty、模式配对、光标、退出码与 manifest；逐项核对 AC-015-01 的 UI 字形/中文正文原样，缺任一路径或版本不符即非零，两平台子例全 PASS 才形成总 PASS。独立 QA/Reviewer 核对身份与来源，不拼接旧候选或另次检查，不改变 check/AC 归属。"
   }
  ]
 }
