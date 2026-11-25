@@ -549,6 +549,16 @@ struct StreamItems {
     problems: Vec<String>,
 }
 
+fn truncated(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("truncated") == Some(&Value::Bool(true)) || fields.values().any(truncated)
+        }
+        Value::Array(items) => items.iter().any(truncated),
+        _ => false,
+    }
+}
+
 /// Stage 2 on the adapter's items of the turn (row C): every started item completes, every completed one is classified.
 fn stream_items(c: &Case) -> StreamItems {
     let (mut runs, mut changes, mut problems) = (Vec::new(), Vec::new(), Vec::new());
@@ -569,6 +579,10 @@ fn stream_items(c: &Case) -> StreamItems {
     for item in completed {
         let kind = item["itemType"].as_str().unwrap_or_default();
         if hoh_agents::codex::is_text_item(kind) {
+            continue;
+        }
+        if truncated(item) {
+            problems.push("a completed item has truncated evidence".to_owned());
             continue;
         }
         if kind == "commandExecution" && item["command"] == driver_command(c).as_str() {

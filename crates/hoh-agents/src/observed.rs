@@ -19,6 +19,8 @@ pub use crate::pi::SessionFile;
 /// The launch a codex App Server turn starts from: its profile, the thread it resumes, its model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexLaunch {
+    /// Absent in historical observations before CR-041; new recordings explicitly carry true.
+    pub exclude_turns: bool,
     pub profile: Profile,
     pub resume: Option<String>,
     pub model: Option<String>,
@@ -192,7 +194,17 @@ pub fn parse(agent: Agent, observations: &Value) -> Result<Observed, String> {
         Agent::Claude => {}
         Agent::Codex => {
             if let Some(launch) = p.field(obs, "", "launch", |v| v.as_object().cloned()) {
-                p.closed(&launch, "launch", &["profile", "resume", "model"]);
+                p.closed(
+                    &launch,
+                    "launch",
+                    &["profile", "resume", "model", "exclude_turns"],
+                );
+                let exclude_turns = if launch.contains_key("exclude_turns") {
+                    p.field(&launch, "launch", "exclude_turns", Value::as_bool)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 let profile = p.field(&launch, "launch", "profile", |v| match v.as_str()? {
                     "read_only" => Some(Profile::ReadOnly),
                     "yolo" => Some(Profile::Yolo),
@@ -202,6 +214,7 @@ pub fn parse(agent: Agent, observations: &Value) -> Result<Observed, String> {
                 let model = p.field(&launch, "launch", "model", optional_text);
                 if let (Some(profile), Some(resume), Some(model)) = (profile, resume, model) {
                     codex = Some(CodexLaunch {
+                        exclude_turns,
                         profile,
                         resume,
                         model,

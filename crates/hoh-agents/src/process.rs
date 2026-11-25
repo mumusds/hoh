@@ -94,6 +94,8 @@ pub struct Config {
     pub read_chunk: usize,
     /// Frames over the limit that are skipped rather than refused (CR-040); `None`: every one is refused.
     pub skip: Option<Skip>,
+    /// Known Codex item frames whose strings are bounded (CR-041).
+    pub reduce: Option<Skip>,
     /// stderr bytes kept (the last ones).
     pub stderr_tail: usize,
     /// Frames waiting for the consumer before the reader stops.
@@ -118,6 +120,7 @@ impl Default for Config {
             frame_limit: FRAME_LIMIT,
             read_chunk: READ_CHUNK,
             skip: None,
+            reduce: None,
             stderr_tail: 64 << 10,
             queue: 64,
             deadline: None,
@@ -320,6 +323,10 @@ impl Process {
             config.frame_limit,
             config.read_chunk,
         );
+        let reader = match config.reduce {
+            Some(rule) => reader.reducing(rule),
+            None => reader,
+        };
         let out = tokio::spawn(read_stdout(
             match config.skip {
                 Some(skip) => reader.skipping(skip),

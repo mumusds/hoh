@@ -967,7 +967,9 @@ async fn drive(
             event = process.next() => event,
         };
         let line = match event {
-            Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
+            Some(Event::Frame(
+                Frame::Line(bytes) | Frame::Partial(bytes) | Frame::Reduced { line: bytes, .. },
+            )) => bytes,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 // Nothing more is framed: end the process rather than wait for it.
                 driven.too_large = true;

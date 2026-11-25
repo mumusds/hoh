@@ -161,6 +161,7 @@ struct State<'a> {
     changed: Option<Changed>,
     /// A cancel only interrupts the turn: the host's ladder ends the process (the runner's mode, decision 14).
     native_only: bool,
+    exclude_turns: bool,
     attempt: &'a AttemptRef,
     turn: &'a Turn,
     conn: Conn,
@@ -646,7 +647,7 @@ impl State<'_> {
                     let (profile, model) = (launch.profile, launch.model.as_deref());
                     match &launch.resume {
                         Some(thread) => self.conn.request(Pending::Thread, |id| {
-                            requests::thread_resume(id, profile, model, thread)
+                            requests::resume(id, profile, model, thread, self.exclude_turns)
                         }),
                         None => self.conn.request(Pending::Thread, |id| {
                             requests::thread_start(id, profile, model)
@@ -793,6 +794,7 @@ impl<'a> State<'a> {
             expect: None,
             changed: None,
             native_only,
+            exclude_turns: true,
             attempt,
             turn,
             conn: Conn {
@@ -1034,6 +1036,7 @@ pub(super) fn config(turn: &Turn) -> Config {
         stdout_copy: Some(stdout),
         stderr_copy: Some(stderr),
         skip: Some(SKIP),
+        reduce: Some(REDUCE),
         ..Config::default()
     }
 }
@@ -1053,6 +1056,32 @@ fn skippable(head: &[u8]) -> Option<&'static str> {
 /// The frames over the limit an App Server turn skips (CR-040); exec has none.
 pub const SKIP: Skip = Skip {
     known: skippable,
+    max_length: crate::frame::SKIP_LIMIT,
+};
+
+/// CR-041: native compact JSON prefix, including the item type before its potentially large content.
+fn reducible(head: &[u8]) -> Option<&'static str> {
+    crate::frame::by_prefix(
+        head,
+        &[
+            (
+                br#"{"method":"item/completed","params":{"item":{"type":"commandExecution","#,
+                "commandExecution",
+            ),
+            (
+                br#"{"method":"item/completed","params":{"item":{"type":"fileChange","#,
+                "fileChange",
+            ),
+            (
+                br#"{"method":"item/started","params":{"item":{"type":"fileChange","#,
+                "fileChange",
+            ),
+        ],
+    )
+}
+
+pub const REDUCE: Skip = Skip {
+    known: reducible,
     max_length: crate::frame::SKIP_LIMIT,
 };
 
@@ -1303,6 +1332,14 @@ pub(super) async fn drive(
         };
         let line = match event {
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
+            Some(Event::Frame(Frame::Reduced { line, original })) => {
+                let n = s.next("reduced");
+                let mut payload = crate::adapter::skipped_frame(&original);
+                payload["reason"] = json!("known item strings truncated");
+                s.event(&format!("frame-reduced-{n}"), "adapter.diagnostic", payload)
+                    .await?;
+                line
+            }
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 s.too_large = true;
                 s.hard_stop(Some(process));
@@ -1378,6 +1415,7 @@ pub(super) fn replay_facts(
     };
     let (lines, mut written) = mpsc::unbounded_channel::<Vec<u8>>();
     let mut s = State::new(None, &attempt, turn, lines, 0, true, false);
+    s.exclude_turns = observed.codex.as_ref().is_some_and(|c| c.exclude_turns);
     s.conn.request(Pending::Initialize, requests::initialize);
     let mut held = Vec::new();
     for step in crate::adapter::replay_steps(bytes) {

@@ -772,6 +772,7 @@ Codex 适配器以 `codex app-server`（stdio JSON-RPC）完成握手、thread�
 - mid-turn steer 必须用 turn/steer 并带 expectedTurnId=当前活动 turnId；原生拒绝时该输入记为 REJECTED，不显示为已应用。
 - 服务端请求（命令/文件审批、requestUserInput 等）必须按 headless 策略立即回应拒绝或取消并记录事件，不得悬挂，不伪造人类选择。
 - App Server 不可用时降级为 `codex exec --json`：capabilities.mid_turn_steer=false 并记录降级事件；YOLO flag 仅在当前 `codex exec --help` 含该 flag 时使用。
+- （CR-041）thread/resume 发送 excludeTurns=true 避免携带整个 Thread.turns；共享 builder 由 compat 校验，旧 schema 未声明字段不能通过符合性，不静默省略。
 
 **失败与边界**
 
@@ -792,6 +793,8 @@ Codex 适配器以 `codex app-server`（stdio JSON-RPC）完成握手、thread�
   - 判定：降级 argv[0..3]=[codex,exec,--json]，含已探测的 YOLO flag；sessions.capabilities_json.mid_turn_steer=false，adapter.degraded 事件1条；降级 steer 返回 CAPABILITY_UNSUPPORTED，input_queue 该行 state=QUEUED；过期 steer 对应 input_queue state=REJECTED；缺 flag 版本无子进程启动，原因=BLOCKED_CAPABILITY
 - **AC-024-04**（TEST-024-04 · 检查 `adapter-live`）Given VM 实装 codex（记录 version、binary sha256、help 与 schema hash），已原生登录，临时 Git 仓库；When live smoke：第1轮要求只回复 `HOH_NATIVE_SMOKE_OK` 且不用工具；第2轮要求执行 `sleep 120` 后立即 cancel；Then 第1轮 turn.status=completed、attempt=SETTLED、agent 消息含该 token；第2轮 turn.status=interrupted、attempt=CANCELLED，进程组在 grace 上限内无残留；未登录时检查结果为 BLOCKED 而非 PASS
   - 判定：第1轮 turn.status=completed，attempt=SETTLED，消息含 `HOH_NATIVE_SMOKE_OK`；第2轮 turn.status=interrupted，attempt=CANCELLED；cancel 后≤16 s 内进程组无存活进程与僵尸；evidence.mode=live 并记录实际版本、threadId、turnId 与 resolved model；鉴权失败时检查 outcome=BLOCKED，不得为 PASS
+- **AC-024-05**（TEST-024-05 · 检查 `integration`）Given codex 0.166 的录制 schema、实际请求 fake，与删除 ThreadResumeParams.excludeTurns 的旧 schema fixture；When 构建并执行 thread/resume，校验共享 builder 的请求符合性；Then resume 请求含 excludeTurns=true，threadId 保持原会话；thread/start 不含此字段；已声明且支持的 schema 通过，未声明字段的旧 schema 即使允许额外字段也不通过兼容校验
+  - 判定：resume 请求含 excludeTurns=true，threadId 保持原会话；thread/start 不含此字段；已声明且支持的 schema 通过，未声明字段的旧 schema 即使允许额外字段也不通过兼容校验
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
@@ -905,7 +908,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 实现 sha256、help 或 schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。
 - 未知事件类型与已知事件中的未知字段必须保存原始帧并产生 `adapter.unknown_event` 诊断，不 panic、不改变终态判定。
 - 请求不支持的能力必须返回 CAPABILITY_UNSUPPORTED（API 为422）或走文档化降级（如 steer 排到下一轮），不得静默伪装支持。
-- 协议帧超过1 MiB（初值）必须有界失败：缓冲不超过上限加一次读块，保存诊断并使该 attempt FAILED（PROTOCOL_FRAME_TOO_LARGE）。（CR-040）例外只有一种：适配器凭帧的前4 KiB 按确切字节前缀认出的已知记录、且适配器不需要其载荷（白名单：pi 的 agent_end、turn_end、tool_execution_end、toolResult 的 message_start/message_end，claude 的 user，codex App Server 的 turn/diff/updated），读到其 LF 时跳过：边读边丢弃，缓冲同样不超过上限加一次读块，记 adapter.diagnostic（类型、长度、整帧 sha256、前4 KiB），之后继续成帧；被认出但在 LF 前流结束或超过 256 MiB 的帧仍按上限失败。
+- 协议帧超过1 MiB（初值）必须有界失败：缓冲不超过上限加一次读块，保存诊断并使该 attempt FAILED（PROTOCOL_FRAME_TOO_LARGE）。（CR-040）跳过例外：适配器凭帧的前4 KiB 按确切字节前缀认出的已知记录、且适配器不需要其载荷（白名单：pi 的 agent_end、turn_end、tool_execution_end、toolResult 的 message_start/message_end，claude 的 user，codex App Server 的 turn/diff/updated），读到其 LF 时跳过：边读边丢弃，缓冲同样不超过上限加一次读块，记 adapter.diagnostic（类型、长度、整帧 sha256、前4 KiB），之后继续成帧；被认出但在 LF 前流结束或超过 256 MiB 的帧仍按上限失败。（CR-041）另对确切前缀识别的 Codex 完成 item（及携带相同 changes 的 fileChange item/started）做有界字符串归约（App Server commandExecution/fileChange、exec command_execution）：所有字段与元素保留，超过4 KiB 前缀预算的字符串值改为带 truncated/prefix/original_bytes/sha256 的对象；键不截断。归约结构≤512 KiB，原始≤256 MiB，读到 LF 且完整 JSON/UTF-8 验证才交付；路由标识必须完整。无 LF、格式损坏、超预算或未知帧仍失败。判定事实被截断时只读判定器不得 PASS。
 - 能力为 false 或数据缺失的指标（如 token_usage）必须显示 unknown/null，不显示0。
 - 每个适配器按 CLI 版本维护已知帧登记表 tests/fixtures/protocol/<agent>/<version>/known-frames.json（由录制样例与官方文档汇总，含已知但忽略的辅助帧，如 Claude 的 rate_limit_event、system/task_*，Codex 的 remoteControl/status/changed、deprecationNotice）；只有不在登记表中的帧才产生 adapter.unknown_event（CR-003）。
 
@@ -931,6 +934,8 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
   - 判定：替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动；原 attempt 最终 state=SETTLED，其进程仍为 A；doctor codex 项 protocol=unknown；租约活跃时套件请求被拒绝；套件 PASS 后 manifest 的 codex 项 implementation_sha256 等于 B 的 hash 且 suite.status=PASS，重试 attempt 成功启动
 - **AC-027-05**（TEST-027-05 · 检查 `integration`）Given pi fixture：正常帧之后1条 1.5 MiB 的 `agent_end`（键序同 pi：`{"type":"agent_end","messages":[…],"willRetry":false}`），其后 `agent_settled`；另备同长度但帧首不在白名单的一行、在 LF 之前流就结束的同一 `agent_end`；帧上限为默认1 MiB；When 分别运行 attempt 并通过测试探针记录 reader 最大缓冲字节；Then 白名单帧的 attempt=SETTLED，恰1条跳过诊断（含类型 agent_end、帧长度、整帧 sha256 与前4 KiB）；最大缓冲≤1 MiB+64 KiB；帧首不符与被截断的两份 attempt=FAILED、原因 PROTOCOL_FRAME_TOO_LARGE
   - 判定：白名单帧 attempt state=SETTLED；恰1条跳过诊断，含 type=agent_end、帧长度、整帧 sha256、前4096字节；最大缓冲字节≤1,114,112；帧首不符与被截断的 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE
+- **AC-027-06**（TEST-027-06 · 检查 `integration`）Given Codex App Server commandExecution/fileChange 与 exec command_execution 的 1.5 MiB item 完成帧（fileChange 另含相同 changes 的 started 帧）；未知超限帧、无 LF、无效尾部和超结构预算变体；只读判定 fixture；When 运行 adapter attempt 与 reader 探针，并把带截断标记的判定事实送入只读判定器；Then 已知合法 item 的 attempt=SETTLED；所有字段保留，大字符串值为含 truncated=true、prefix、original_bytes、sha256 的对象；诊断含原始整帧长度/hash/head，raw 日志完整；最大保留字节≤1 MiB+64 KiB；其他变体 FAILED/PROTOCOL_FRAME_TOO_LARGE；只读判定不得依据截断事实给出 PASS
+  - 判定：已知合法 item 的 attempt=SETTLED；所有字段保留，大字符串值为含 truncated=true、prefix、original_bytes、sha256 的对象；诊断含原始整帧长度/hash/head，raw 日志完整；最大保留字节≤1 MiB+64 KiB；其他变体 FAILED/PROTOCOL_FRAME_TOO_LARGE；只读判定不得依据截断事实给出 PASS
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 

@@ -832,7 +832,7 @@ async fn live_round(
             };
             observations.insert(
                 "launch".into(),
-                json!({"profile": name, "resume": session.native, "model": null}),
+                json!({"profile": name, "resume": session.native, "model": null, "exclude_turns": true}),
             );
             std::fs::write(dir.join(format!("{prefix}stdin.jsonl")), &sent)?;
             // The thread's rollout, as its thread/start or thread/resume answer names it (read only).
@@ -1125,5 +1125,27 @@ fn rejudge_a_recorded_segment() -> R {
             println!("{} red: {:?}", t.display(), round_verdict(c, Some(c)).0);
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_027_06_read_only_judge_refuses_truncated_item_facts() -> R {
+    // A token-read command's output is currently ignored by stream_items; a typed truncated value must not pass.
+    let mut case = Case::excerpt(&excerpts(), "codex", "app-ro-new")?;
+    let control = Case::excerpt(&excerpts(), "codex", "app-control")?;
+    let item = case
+        .stdout
+        .iter_mut()
+        .find(|f| {
+            f["method"] == "item/completed"
+                && f["params"]["item"]["type"] == "commandExecution"
+                && f["params"]["item"]["command"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("TOKEN.txt"))
+        })
+        .ok_or("token read item")?;
+    item["params"]["item"]["aggregatedOutput"] = json!({"truncated":true,"prefix":"refused", "original_bytes":1_500_000,"sha256":"a".repeat(64)});
+    let (verdict, why) = round_verdict(&case, Some(&control));
+    assert_ne!(verdict, Verdict::Pass, "{why:?}");
     Ok(())
 }
