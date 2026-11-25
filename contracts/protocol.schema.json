@@ -997,7 +997,7 @@
       ]
     },
     "RejectionReason": {
-      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003). RETRY_NOT_DUE (CR-009): the task waits for its persisted next_retry_at (REQ-042). ROLE_BINDING_PENDING (CR-025): the target role's binding is ACTIVE and cannot be dispatched now only because one of these holds: (1) a team change of the role waits for its checkpoint (REQ-018); (2) staffing holds a rebind of the role pending for the attempt in flight (REQ-020); (3) the binding has no session yet; (4) the session.start notice of the role's epoch, which carries the handover package, is not delivered yet (REQ-019); (5) the role's session owes its first input (the session.start of its epoch was delivered to it and none of its attempts is SETTLED) and has an attempt PREPARED, STARTING or RUNNING. These are exactly the cases in which an ACTIVE binding could not be dispatched before this code; it names them and adds none. A session that owes its first input with no attempt in flight is dispatched: that dispatch is the turn that delivers the package. ROLE_CAPABILITY_MISSING stays for: no binding of the role; a BLOCKED binding; no role contract stating the capabilities the task needs, which takes precedence over (1) to (5); and a session lacking a capability the task needs, which takes precedence over (4) and (5), where that session is the one that will serve, and is not judged under (1) to (3), where the serving session is not settled yet. The task is not reassigned: it stays READY, and the scheduling round dispatches it once the change has completed, with no new decision. ASSUMPTION_NOT_LISTED (CR-033): an unattended Run's record_assumption whose basis is not a key listed in the project's [assumptions] table (REQ-030 behaviour 4, AC-030-02); details name the basis key.",
+      "description": "decisions.reason_code and Message kind=rejected payload.reason_code (CR-003). RETRY_NOT_DUE (CR-009): the task waits for its persisted next_retry_at (REQ-042). ROLE_BINDING_PENDING (CR-025): the target role's binding is ACTIVE and cannot be dispatched now only because one of these holds: (1) a team change of the role waits for its checkpoint (REQ-018); (2) staffing holds a rebind of the role pending for the attempt in flight (REQ-020); (3) the binding has no session yet; (4) the session.start notice of the role's epoch, which carries the handover package, is not delivered yet (REQ-019); (5) the role's session owes its first input (the session.start of its epoch was delivered to it and none of its attempts is SETTLED) and has an attempt PREPARED, STARTING or RUNNING. These are exactly the cases in which an ACTIVE binding could not be dispatched before this code; it names them and adds none. A session that owes its first input with no attempt in flight is dispatched: that dispatch is the turn that delivers the package. ROLE_CAPABILITY_MISSING stays for: no binding of the role; a BLOCKED binding; no role contract stating the capabilities the task needs, which takes precedence over (1) to (5); and a session lacking a capability the task needs, which takes precedence over (4) and (5), where that session is the one that will serve, and is not judged under (1) to (3), where the serving session is not settled yet. The task is not reassigned: it stays READY, and the scheduling round dispatches it once the change has completed, with no new decision. ASSUMPTION_NOT_LISTED (CR-033): an unattended Run's record_assumption whose basis is not a key listed in the project's [assumptions] table (REQ-030 behaviour 4, AC-030-02); details name the basis key. STORAGE_LOW_SPACE (CR-028): a new write Attempt, including retries, cannot reserve its object-space floor; details include available_bytes, required_bytes and min_free_bytes. The Task stays eligible for the existing scheduler after space recovers; no new Run BlockedReason is introduced, and ROLE_BINDING_PENDING precedence is retained.",
       "enum": [
         "STALE_ROLE_EPOCH",
         "STALE_REVISION",
@@ -1016,11 +1016,12 @@
         "ROLE_BINDING_PENDING",
         "CONSULT_CYCLE",
         "DISCUSSION_LIMIT",
-        "ASSUMPTION_NOT_LISTED"
+        "ASSUMPTION_NOT_LISTED",
+        "STORAGE_LOW_SPACE"
       ]
     },
     "ErrorCode": {
-      "description": "API Error.code / CLI stderr code / attempt failure_reason (CR-003).",
+      "description": "API Error.code / CLI stderr code / attempt failure_reason (CR-003). CR-028: QUERY_INVALID is for the new timeline/search queries (400); ARTIFACT_NOT_FOUND (404, unknown_id/missing_file/collected), ARTIFACT_INVALID (409), ARTIFACT_NOT_TEXT (422, search only), ARTIFACT_RANGE_INVALID (416), ARTIFACT_UNREADABLE (503, permission/io). STORAGE_LOW_SPACE (503) is a pre-acceptance object-space refusal, not DB_FULL; its details carry reason, available_bytes, required_bytes (object_write_bytes + min_free_bytes), min_free_bytes. Existing route errors are unchanged.",
       "enum": [
         "CAPABILITY_UNSUPPORTED",
         "RUN_NOT_FOUND",
@@ -1043,7 +1044,14 @@
         "SPEC_APPROVAL_NOT_USER",
         "PROMPT_VARIABLE_MISSING",
         "PROMPT_TOO_LONG",
-        "SPEC_SOURCE_UNAVAILABLE"
+        "SPEC_SOURCE_UNAVAILABLE",
+        "QUERY_INVALID",
+        "ARTIFACT_NOT_FOUND",
+        "ARTIFACT_INVALID",
+        "ARTIFACT_NOT_TEXT",
+        "ARTIFACT_RANGE_INVALID",
+        "ARTIFACT_UNREADABLE",
+        "STORAGE_LOW_SPACE"
       ]
     },
     "SchedulerSettings": {

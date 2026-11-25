@@ -45,3 +45,13 @@ SQLite在线备份API或暂停writer一致性备份 [S22]。升级前backup+inte
 ## Runtime记录与自举证据导出
 
 protocol.schema.json的Candidate是运行时轻量引用（id+Git/spec/environment/test_plan身份）；candidate.schema.json是本开发工具的完整导出清单（candidate_id及source_files/原始ArtifactRef）。二者不是同一个序列化对象。导出器必须显式映射id→candidate_id并保留所有身份；不得把轻量引用当完整源代码校验证据。正式Rust实现可以采用同等或更强导出器，但门禁字段语义必须一致。
+
+## M4 已批准的查询契约（CR-028，待实现）
+
+2026-11-25 的 M4-T01 应用准备将命名读模型、timeline/Artifact Range/search、
+对象错误与空间预检写入 `contracts/openapi.json`，实现由 M4-T09/T03/T02/T06 接续。
+现有 tasks 路由和 getRun.projection.trace/regression 保留；SSE 的 seq 游标与
+新查询页的 H+generation 游标不同，旧路由错误与顶层 snapshot_watermark 不变。
+进度新增字段统计需求，原 acceptance 字段仍统计 AC。所有客户端只通过 host 查询。
+SQL 003 只建派生结构，迁移运行器、分批回填、引用闭包和 GC 尚待对应任务接线，
+本节不表示路由或回收已经可用。明确待决项见 CR-028 末尾应用核对。
