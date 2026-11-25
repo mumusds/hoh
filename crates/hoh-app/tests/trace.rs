@@ -453,6 +453,78 @@ async fn test_032_02_acceptance_and_tasks_match_db() -> R {
     Ok(())
 }
 
+/// M3R-001: the first drafting task has no specification, including after its draft is approved.
+async fn drafting_task_pages(after_approval: bool) -> R {
+    let world = World::new()?;
+    let index = project(&world)?;
+    let host = world.start_plain_host(None).await?;
+    let run = world::start_run(&host, "start", "trace first drafting task").await?;
+    world.exec(&format!(
+        "INSERT INTO tasks(task_id,run_id,state,role,writer,created_seq,kind)
+         VALUES('draft','{run}','IMPLEMENTED','cto',1,1,'spec_draft');"
+    ))?;
+    if after_approval {
+        let body = command(
+            &host,
+            &run,
+            "approve",
+            "ApproveSpec",
+            json!({"spec_sha256":index.sha256(),"decision":"APPROVE_ONLY"}),
+        )
+        .await?;
+        let (status, response) =
+            world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert_eq!(status, 202, "{response}");
+        world.exec(&format!(
+            "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq)
+             SELECT 'work-'||requirement_id,'{run}',s.spec_id,'READY','developer',1,2
+             FROM requirements q JOIN specs s USING(spec_id);"
+        ))?;
+    }
+    let expected = world.rows(&format!(
+        "SELECT task_id,spec_id FROM tasks WHERE run_id='{run}' ORDER BY created_seq,task_id"
+    ))?;
+    assert_eq!(expected.len(), if after_approval { 3 } else { 1 });
+    assert_eq!(expected[0], json!({"task_id":"draft","spec_id":null}));
+    assert!(expected.iter().skip(1).all(|t| t["spec_id"].is_string()));
+    let path = format!("/v1/runs/{run}/tasks");
+    let (status, page) = world::exchange(&host, "GET", &path, None).await?;
+    assert_eq!(status, 200, "{page}");
+    let paged = all_pages(&host, &path).await?;
+    assert_eq!(page["items"], json!(paged));
+    let projected: Vec<Value> = paged
+        .iter()
+        .map(|t| {
+            assert!(
+                t.get("spec_id").is_some(),
+                "spec_id must be explicit, including null"
+            );
+            json!({"task_id":t["task_id"],"spec_id":t["spec_id"]})
+        })
+        .collect();
+    assert_eq!(
+        projected, expected,
+        "HTTP pages preserve database identities"
+    );
+    assert_eq!(paged[0]["requirement_ids"], json!([]));
+    assert_eq!(
+        world.query("SELECT spec_id IS NULL FROM tasks WHERE task_id='draft'")?,
+        "1"
+    );
+    host.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_032_02_first_drafting_task_before_approval() -> R {
+    drafting_task_pages(false).await
+}
+
+#[tokio::test]
+async fn test_032_02_first_drafting_task_after_approval_across_pages() -> R {
+    drafting_task_pages(true).await
+}
+
 /// The product's trace exports for TEST-032-01 (docs/adr/ADR-039.md decision 3 and its round 1 corrections): what
 /// `tests/bundle/fixtures/trace-export.json` must be, `{whole, missing_evidence, stale_candidate, missing_candidate}`,
 /// its run and candidate ids replaced by fixed placeholders.
