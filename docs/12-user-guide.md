@@ -18,7 +18,7 @@
 
 `hoh -p "依据docs/PRD.md完成项目"`：前台非交互；`--output json`最终机器结果，`--output stream-json`实时事件。`--detach`先输出run_id和提交确认，任务后台继续。`hoh attach <id>`打开该运行。`hoh web`连接相同host。`hoh doctor`看环境能力：默认不调用模型，退出码0只表示没有缺失项，不代表已认证；`hoh doctor --live`才用一次小任务确认真能工作（可能产生费用）。
 
-没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id）。用 `hoh -p draft --resume <run_id>` 或在 TUI 中选择 draft，HoH 先只读地了解项目，再由 Plan 起草规格并请你批准；起草只能写文档和 `.hoh/`，不能实施产品代码。起草完成后，`-p` 在 `spec_approval` 问题处以 3 退出，不会自行批准。可在 TUI 明确选择 approve，或用 `hoh -p approve --resume <run_id> --detach` 提交批准并取回 run_id（去掉 `--detach` 会继续跟随 Run）。其他答复退回起草，正文作为修改意见。只有用户能批准；从 Agent 进程或其可识别后代发出的批准被拒为 SPEC_APPROVAL_NOT_USER。批准前 specs 没有修订，批准时核对当前 Markdown 生成的摘要与问题中的摘要，内容冲突返回 409 SPEC_CONFLICT。项目已经有已批准修订时，no_spec 问题的 draft 与 adopt 都采用当前最高修订，不再建首次起草 Task；仍没有规格时 adopt 保持阻塞。当前自动起草入口支持首次规格；已有修订的修改仍可通过 ProposeSpecChange API 提出 CR 后批准。
+没有已批准规格的项目：`hoh -p` 新建的 Run 在同一次提交里以 BLOCKED（NEED_DECISION，原因 `no_spec`）停下，`-p` 以 3 退出并列出这个问题（`--detach` 照常输出 run_id）。用 `hoh -p draft --resume <run_id>` 或在 TUI 中选择 draft，HoH 先只读地了解项目，再由 Plan 起草规格并请你批准；起草只能写文档和 `.hoh/`，不能实施产品代码。起草完成后，`-p` 在 `spec_approval` 问题处以 3 退出，不会自行批准。可在 TUI 明确选择 approve，或用 `hoh -p approve --resume <run_id> --detach` 提交批准并取回 run_id（去掉 `--detach` 会继续跟随 Run）。其他答复退回起草，正文作为修改意见。只有用户能批准；从 Agent 进程或其可识别后代发出的批准被拒为 SPEC_APPROVAL_NOT_USER。批准前 specs 没有修订，批准时核对当前 Markdown 生成的摘要与问题中的摘要，内容冲突返回 409 SPEC_CONFLICT。项目已经有已批准修订时，no_spec 问题的 draft 与 adopt 都采用当前最高修订，不再建首次起草 Task；仍没有规格时 adopt 保持阻塞。已有已批准规格后，PLAN/AUTO 也支持继续起草变更，完成后提出 CR 并请你批准（见“已有规格时继续规划”）；也可通过 ProposeSpecChange API 提出 CR 后批准。
 
 直接 `ApproveSpec` 只允许用户来源。host 从 TCP/Unix socket 的真实对端确认进程，检查
 Attempt 标记、同 uid 祖先标记和 Attempt cgroup；Agent 工具中的 shell 也在此范围内。
@@ -53,7 +53,7 @@ HoH 的 Slash 不转给底座。要定向发送底座命令，使用 `/agent dev
 
 ## 团队、模型、Prompt与Skill
 
-当前 `/team` 和 `/model` 显示附着 Run 的职位、Agent 与模型，并说明项目设置在 checkpoint 生效；它们不提供编辑入口，TUI 编辑属后续任务。设置页中的自定义职位、Prompt 覆盖、diff 和恢复默认属于后续界面范围；运行中的 attempt 使用锁定版本。项目内置 Skill 和文档模板不要求另装 Matt 工具；Pi 原生插件由 HoH 引导自动准备。
+当前 `/team` 和 `/model` 显示附着 Run 的职位、Agent 与模型，并说明项目设置在 checkpoint 生效；它们不提供编辑入口，TUI 编辑属后续任务。`/settings developer`（或 `/settings`）已提供职位契约的统一 diff 和恢复默认（见“职位契约设置”）；自定义职位和 Prompt 正文的界面编辑仍属后续范围。运行中的 attempt 使用锁定版本。项目内置 Skill 和文档模板不要求另装 Matt 工具；Pi 原生插件由 HoH 引导自动准备。
 
 ## 退出与恢复
 
