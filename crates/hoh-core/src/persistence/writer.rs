@@ -1,6 +1,7 @@
 //! The writer actor: the only read-write connection, owned by a dedicated thread (synchronous rusqlite never runs on
 //! a Tokio worker). Requests arrive through a bounded queue; a caller waits at most busy_timeout for room and then
-//! gets a retryable `DB_BUSY`, so nothing is dropped silently. Each [`Commit`] is one `BEGIN IMMEDIATE` transaction:
+//! gets a retryable `DB_BUSY`, so nothing is dropped silently. A request waits for the write lock only until one
+//! busy_timeout after it was submitted, however long what was queued ahead of it waited (DC-FLK14b). Each [`Commit`] is one `BEGIN IMMEDIATE` transaction:
 //! state compare-and-set, event appends and outbox inserts succeed together or not at all.
 
 use super::attempts::{self, AttemptJob, AttemptMove, CancelLatch};
@@ -281,6 +282,19 @@ pub(super) struct Ctx<'a> {
     commits: &'a std::cell::RefCell<super::supervise::CommitTimes>,
     /// The store's clock (the host's), the system clock when none.
     clock: Option<&'a super::StoreClock>,
+    /// How long its transactions may wait for the write lock: until the request's deadline, one busy_timeout after it
+    /// was submitted (DC-FLK14b); none outside the writer loop (SQLite's busy_timeout as set).
+    lock_wait: Option<LockWait>,
+}
+
+/// A request's wait for the write lock (DC-FLK14b, reports/reviews/M3-cleanup.md): its DB_BUSY comes one busy_timeout
+/// after it was submitted, however long what was queued ahead of it waited for the same lock.
+#[derive(Debug, Clone, Copy)]
+struct LockWait {
+    /// When it was submitted plus busy_timeout.
+    deadline: std::time::Instant,
+    /// The connection's busy_timeout, set again once the lock is taken or given up.
+    busy_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -300,6 +314,7 @@ impl Ctx<'_> {
             after_events: &nothing,
             commits: Box::leak(Box::default()),
             clock: None,
+            lock_wait: None,
         }
     }
 
@@ -360,9 +375,7 @@ pub(super) fn begin<'c>(
     conn: &'c mut Connection,
     ctx: &Ctx<'_>,
 ) -> Result<Transaction<'c>, PersistError> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(sqlite_error)?;
+    let tx = immediate(conn, ctx.lock_wait)?;
     // What a transaction registers is gone by its end, by its commit (`commit`) or its rollback: a row left here is a
     // commit that went around `commit` (docs/adr/ADR-031.md decision 3).
     temp_tables(&tx)?;
@@ -398,6 +411,30 @@ pub(super) fn begin<'c>(
         }
     }
     ctx.at(WritePoint::Begun);
+    Ok(tx)
+}
+
+/// `BEGIN IMMEDIATE`, waiting for the write lock at most until the request's deadline (DC-FLK14b): what is left of
+/// its busy_timeout since it was submitted, nothing once that is gone (the lock is still taken when free). The
+/// connection's busy_timeout is set back right after, so the PRAGMA reads the configured value between requests.
+fn immediate(conn: &Connection, wait: Option<LockWait>) -> Result<Transaction<'_>, PersistError> {
+    let Some(wait) = wait else {
+        return Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(sqlite_error);
+    };
+    let left = wait
+        .deadline
+        .saturating_duration_since(std::time::Instant::now());
+    // Whole milliseconds, rounded up: the DB_BUSY never comes before the deadline.
+    let left = std::time::Duration::from_millis(
+        u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX),
+    )
+    .min(wait.busy_timeout);
+    conn.busy_timeout(left).map_err(sqlite_error)?;
+    let began = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+    let reset = conn.busy_timeout(wait.busy_timeout);
+    let tx = began.map_err(sqlite_error)?;
+    reset.map_err(sqlite_error)?;
     Ok(tx)
 }
 
@@ -442,11 +479,15 @@ pub(super) enum Fault {
 /// The priority lane's capacity.
 const URGENT: usize = 16;
 
+/// A request and when it was submitted (before its caller waited for room in the queue): its lock wait ends one
+/// busy_timeout after that (DC-FLK14b).
+type Queued = (std::time::Instant, Job);
+
 #[derive(Debug, Clone)]
 pub(super) struct Writer {
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::Sender<Queued>,
     /// The priority lane: what is queued here is taken before anything of `jobs` (a cancel, REQ-043 behaviour 3).
-    urgent: mpsc::Sender<Job>,
+    urgent: mpsc::Sender<Queued>,
     busy_timeout: std::time::Duration,
     /// Becomes true when the writer thread has ended normally: every request done, its connection closed, what it
     /// kept dropped. Its sender also goes when the thread unwinds from a panic, and then what it kept is leaked
@@ -573,8 +614,9 @@ impl Writer {
         before: impl Fn() + Send + 'static,
         after_events: impl Fn() + Send + 'static,
     ) -> Result<Writer, PersistError> {
-        let (jobs, mut rx) = mpsc::channel::<Job>(options.queue.max(1));
-        let (urgent, mut urgent_rx) = mpsc::channel::<Job>(URGENT);
+        let (jobs, mut rx) = mpsc::channel::<Queued>(options.queue.max(1));
+        let (urgent, mut urgent_rx) = mpsc::channel::<Queued>(URGENT);
+        let busy_timeout = options.busy_timeout;
         // The claims handed out and not yet handed to a transport (ADR-018 decision 4).
         let writer_claims = Registry::default();
         let faults = options.faults.clone();
@@ -595,7 +637,7 @@ impl Writer {
                 loop {
                     // The priority lane first; a queued request after it (ADR-021 decision 8a). When every handle is
                     // gone, what is left of the lane is still done.
-                    let job = match urgent_rx.try_recv() {
+                    let (submitted, job) = match urgent_rx.try_recv() {
                         Ok(job) => job,
                         Err(_) => match rx.blocking_recv() {
                             Some(job) => job,
@@ -618,6 +660,10 @@ impl Writer {
                         after_events: &after_events,
                         commits: &commits,
                         clock: clock.as_ref(),
+                        lock_wait: Some(LockWait {
+                            deadline: submitted + busy_timeout,
+                            busy_timeout,
+                        }),
                     };
                     let mut deferred: Option<Reply> = None;
                     match job {
@@ -849,6 +895,7 @@ impl Writer {
                     after_events: &after_events,
                     commits: &commits,
                     clock: clock.as_ref(),
+                    lock_wait: None,
                 };
                 let _ = super::outbox::unclaim_all(&mut conn, &left, &close);
                 drop(conn);
@@ -869,7 +916,12 @@ impl Writer {
         job: impl FnOnce(oneshot::Sender<Result<T, PersistError>>) -> Job,
     ) -> Result<T, PersistError> {
         let (tx, rx) = oneshot::channel();
-        match self.jobs.send_timeout(job(tx), self.busy_timeout).await {
+        let submitted = std::time::Instant::now();
+        match self
+            .jobs
+            .send_timeout((submitted, job(tx)), self.busy_timeout)
+            .await
+        {
             Ok(()) => {}
             Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
                 return Err(PersistError::Busy(format!(
@@ -892,7 +944,12 @@ impl Writer {
         job: impl FnOnce(oneshot::Sender<Result<T, PersistError>>) -> Job,
     ) -> Result<T, PersistError> {
         let (tx, rx) = oneshot::channel();
-        match self.urgent.send_timeout(job(tx), self.busy_timeout).await {
+        let submitted = std::time::Instant::now();
+        match self
+            .urgent
+            .send_timeout((submitted, job(tx)), self.busy_timeout)
+            .await
+        {
             Ok(()) => {}
             Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
                 return Err(PersistError::Busy(format!(
@@ -904,7 +961,7 @@ impl Writer {
                 return Err(PersistError::WriterStopped);
             }
         }
-        let _ = self.jobs.try_send(Job::Wake);
+        let _ = self.jobs.try_send((std::time::Instant::now(), Job::Wake));
         rx.await.map_err(|_| PersistError::WriterStopped)?
     }
 

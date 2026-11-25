@@ -976,6 +976,69 @@ async fn a_locked_database_is_busy_and_changes_nothing() -> R {
     Ok(())
 }
 
+/// DC-FLK14b (AC-062-01): a write queued behind another that is waiting for an outside lock answers DB_BUSY one busy
+/// timeout after it was submitted, not one busy timeout after the write ahead of it gave up; nothing changes and the
+/// writer's busy_timeout PRAGMA stays the configured one.
+#[tokio::test]
+async fn test_062_01_a_queued_write_is_busy_one_timeout_after_its_submission() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let busy = Duration::from_millis(2000);
+    let store = std::sync::Arc::new(Store::open(
+        &path,
+        Options {
+            busy_timeout: busy,
+            ..test_options()
+        },
+    )?);
+    seed(&path)?;
+    let before = snapshot(&path)?;
+    let external = Connection::open(&path)?;
+    external.execute_batch("BEGIN IMMEDIATE")?;
+    let ahead = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .commit(Commit {
+                    cas: vec![],
+                    events: vec![event("ahead")],
+                    outbox: vec![],
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1000)).await; // the writer took `ahead`, which waits for the lock
+    let started = Instant::now();
+    let queued = store
+        .commit(Commit {
+            cas: vec![cas(0, RunState::Discovering)],
+            events: vec![event("e1")],
+            outbox: vec![],
+        })
+        .await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(&queued, Err(e @ PersistError::Busy(_)) if e.retryable()),
+        "{queued:?}"
+    );
+    assert!(
+        waited >= busy && waited < busy + Duration::from_millis(500),
+        "DB_BUSY {waited:?} after it was submitted"
+    );
+    assert!(matches!(ahead.await?, Err(PersistError::Busy(_))));
+    external.execute_batch("ROLLBACK")?;
+    assert_eq!(snapshot(&path)?, before);
+    assert_eq!(store.writer_pragmas().await?.busy_timeout_ms, 2000);
+    store
+        .commit(Commit {
+            cas: vec![cas(0, RunState::Discovering)],
+            events: vec![event("e1")],
+            outbox: vec![],
+        })
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_full_queue_holds_callers_back_and_loses_nothing() -> R {
     let dir = tempfile::tempdir()?;
