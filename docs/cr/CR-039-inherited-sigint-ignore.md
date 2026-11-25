@@ -1,8 +1,8 @@
 # CR-039 · run_check 保留继承的 SIGINT 忽略
 
 ID：CR-039
-状态：DRAFT
-批准人：待主会话依 CR-003 D1 审查批准
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权（独立 Review 会话见审查记录）
 日期：2026-11-25
 关联：M3LS-200（CR-038 第 3 轮审查的 low，M3 low 包 2），REQ-052（AC-052-04），ADR-027 2026-11-25 更正，CR-038 决定 2
 
@@ -33,3 +33,11 @@ CR-038 决定 2 让 `tools/common.py` 的 `install_interrupt_handlers` 在入口
 ## 验证方式
 
 `python3 -m unittest test_tools.Signals`（在 `tests/bundle`，修复前红、修复后绿）；批准后 `python3 tools/baseline.py relock --cr docs/cr/CR-039-inherited-sigint-ignore.md`，`bash scripts/check.sh --bundle`；`bash scripts/dev/pre-pr.sh --no-deployment`。
+
+## 审查记录
+
+| 轮 | 冻结提交 | 审查者 | 结论 |
+|---|---|---|---|
+| 1 | `116e3585` | Grok grok 1.0.92，会话 `01a21161-52c7-7013-8895-be194d0fc0ac`（attempt `3fe8814f-a341-4b32-9b2d-e0e29144accf`） | PASS，无发现（同轮审查 M3 low 包 2 的 M3PD-L1、M3FK-L1） |
+
+全部记录见 `reports/reviews/M3-cleanup.md` 的“M3 low package 2”一节。
