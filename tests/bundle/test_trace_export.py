@@ -147,7 +147,7 @@ class ProductStep(unittest.TestCase):
     frozen in a fixture ROOT of its own, whose spec has TEST-032-01 on the traceability check and whose plan has the
     real plan's traceability entry; `cargo` on PATH is a stub. With the product step disabled, failing, or giving
     another tree's or another run's exports, TEST-032-01 is not PASS; with exports of this run and tree it is."""
-    FILES=['tools/run_check.py','tools/candidate.py','tools/common.py','scripts/product/traceability.sh',
+    FILES=['tools/run_check.py','tools/candidate.py','tools/release_gate.py','tools/common.py','scripts/product/traceability.sh',
            'scripts/product/traceability.py','tests/bundle/helpers.py','tests/bundle/test_trace_export.py',
            'tests/bundle/fixtures/trace-export.json']+[f'contracts/{n}.schema.json' for n in
                                                      ('execution','test-result','live-session','soak-event','candidate','check-plan')]
