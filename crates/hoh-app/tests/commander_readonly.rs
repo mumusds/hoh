@@ -274,7 +274,7 @@ async fn read_only_launches(agent: &str) -> R {
         }
         if agent == "codex" {
             // Each Commander turn's App Server: thread/start for the first, thread/resume of the session's thread for
-            // the others, with exactly the read-only parameters.
+            // the others, with exactly the read-only parameters and no hydrated history (CR-041).
             let requests = world.log("codex-requests.jsonl")?;
             for (i, attempt) in attempts.iter().enumerate() {
                 let thread: Vec<&Value> = requests
@@ -292,7 +292,7 @@ async fn read_only_launches(agent: &str) -> R {
                 } else {
                     (
                         "thread/resume",
-                        json!({"approvalPolicy": "never", "sandbox": "read-only", "threadId": native}),
+                        json!({"approvalPolicy": "never", "sandbox": "read-only", "threadId": native, "excludeTurns": true}),
                     )
                 };
                 assert_eq!(
