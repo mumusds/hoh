@@ -223,8 +223,108 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
         "the World read the candidate's spec file: {opened:?}"
     );
 
-    // The product's export of the same candidate: TEST→check item for item the same as the World's.
-    let trace = export(&host, &run).await?;
+    // The product's export of the same candidate, served by a real `hoh __host` child traced with strace so every
+    // file-open/stat syscall made by the product during export is audited for `<project>/contracts/` (M3QA-015).
+    host.shutdown().await;
+    let strace_log = world.root().join("product-export.strace");
+    let strace_err = world.root().join("product-export.strace.stderr");
+    let strace_bin = std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("strace"))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/strace"));
+    let mut tracer = {
+        use std::os::unix::process::CommandExt as _;
+        pty::Hoh(
+            std::process::Command::new(strace_bin)
+                .args([
+                    "-f",
+                    "-e",
+                    "trace=open,openat,openat2,stat,newfstatat,statx,access,faccessat,faccessat2",
+                    "-s",
+                    "4096",
+                    "-o",
+                ])
+                .arg(&strace_log)
+                .arg(world::HOH)
+                .arg("__host")
+                .arg(world.project())
+                .envs(world.env())
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::fs::File::create(&strace_err)?)
+                .spawn()?,
+        )
+    };
+    let host_json_path = world.project().join(".hoh/host.json");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (port, token, host_pid): (u16, String, i32) = loop {
+        if let Ok(bytes) = std::fs::read(&host_json_path)
+            && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
+            && let (Some(port), Some(token), Some(pid)) = (
+                v["port"].as_u64(),
+                v["token"].as_str(),
+                v["pid"].as_u64(),
+            )
+            && std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
+        {
+            break (port as u16, token.to_owned(), i32::try_from(pid)?);
+        }
+        if std::time::Instant::now() >= end {
+            return Err(format!(
+                "traced hoh __host did not become ready: {}",
+                std::fs::read_to_string(&strace_err).unwrap_or_default()
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let trace: Value = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        use std::io::{Read as _, Write as _};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .map_err(|e| e.to_string())?;
+        let req = format!(
+            "GET /v1/runs/{run} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-HoH-Token: {token}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+        let resp = String::from_utf8(raw).map_err(|e| e.to_string())?;
+        let (head, body) = resp.split_once("\r\n\r\n").ok_or("no HTTP body")?;
+        if !head.starts_with("HTTP/1.1 200") {
+            return Err(format!("{head}: {body}"));
+        }
+        let parsed: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        Ok(parsed["projection"]["trace"].clone())
+    })
+    .await?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(host_pid).ok_or("host pid")?,
+        rustix::process::Signal::TERM,
+    );
+    let _ = tracer.0.wait();
+    let traced_calls = std::fs::read_to_string(&strace_log)?;
+    assert!(
+        traced_calls.contains(&index.sha256()),
+        "strace must observe the product reading the frozen candidate spec object {}: {}",
+        index.sha256(),
+        &traced_calls[..traced_calls.len().min(2000)]
+    );
+    let contracts_hits: Vec<&str> = traced_calls
+        .lines()
+        .filter(|line| line.contains(&prefix) || line.contains("\"contracts/"))
+        .collect();
+    assert!(
+        contracts_hits.is_empty(),
+        "product host opened a path under project contracts/: {contracts_hits:?}"
+    );
     assert_eq!(trace["candidate_id"], json!(candidate), "{trace}");
     assert_eq!(trace["spec_source"], "candidate", "{trace}");
     let product: Vec<(String, String)> = trace["tests"]
@@ -240,7 +340,6 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
         .collect();
     assert_eq!(product, tests, "the product export and the World agree");
     assert!(!contracts.exists(), "nothing made the project's contracts/");
-    host.shutdown().await;
     Ok(())
 }
 
