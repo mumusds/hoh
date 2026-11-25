@@ -17,7 +17,7 @@ name=os.path.basename(sys.argv[0]);args=sys.argv[1:]
 if name=='grok' and os.getenv('FAKE_MODE')=='old-grok' and '--background-wait-timeout' in args:
  print("error: unexpected argument '--background-wait-timeout' found",file=sys.stderr);sys.exit(2)
 if '--help' in args:
- print('--json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-format --verbose --dangerously-skip-permissions --mode --session-dir --approve --model --prompt-file --always-approve');sys.exit(0)
+ print('--json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --output-format --verbose --dangerously-skip-permissions --mode --session-dir --approve --model --prompt-file --always-approve --input-format --print');sys.exit(0)
 if '--version' in args:print('MOCK_AGENT_VERSION');sys.exit(0)
 # Grok takes its prompt from the file --prompt-file names (the bridge passes /dev/stdin).
 data=open(args[args.index('--prompt-file')+1],'rb').read() if name=='grok' else sys.stdin.buffer.read()
@@ -33,6 +33,14 @@ if name=='codex':
  print(json.dumps({'type':'thread.started','thread_id':'mock-thread'}))
  print(json.dumps({'type':'turn.failed' if mode=='semantic-error' else 'turn.completed','usage':{}}))
 elif name=='claude':print(json.dumps({'type':'result','subtype':'success','is_error':mode=='semantic-error','session_id':'mock-claude','result':os.getenv('FAKE_RESULT','')}))
+elif name=='agy':
+ # agy 1.5.17 print mode: --input-format stream-json reads {"event":"user","message":{"role":"user","content":...}} lines.
+ m=json.loads(data.decode().splitlines()[0])
+ assert m['event']=='user' and m['message']['role']=='user' and isinstance(m['message']['content'],str),m
+ cid='mock-agy'
+ print(json.dumps({'event':'init','conversation_id':cid,'init':{'model':'agy-mock','cwd':os.getcwd(),'tools':[]}}))
+ print(json.dumps({'event':'step_update','step_update':{'conversation_id':cid,'step_index':1,'state':'DONE','step_type':'agent_response','text_delta':'done'}}))
+ print(json.dumps({'event':'result','result':{'conversation_id':cid,'status':'ERROR' if mode=='semantic-error' else 'SUCCESS','response':os.getenv('FAKE_RESULT','done'),'num_turns':1}}))
 elif name=='grok':
  print(json.dumps({'type':'system','subtype':'init','session_id':'mock-grok','model':'grok-mock'}))
  print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'done'}]},'session_id':'mock-grok'}))
@@ -84,7 +92,7 @@ class NativeBridge(unittest.TestCase):
     def setUp(self):
         self.t=tempfile.TemporaryDirectory(prefix='hoh mock 中文 ');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name)
         self.bin=self.root/'bin';self.bin.mkdir()
-        for name in ['codex','claude','pi','grok']:
+        for name in ['codex','claude','pi','grok','agy']:
             p=self.bin/name;p.write_text(FAKE);p.chmod(0o755)
         self.prompt=self.root/'prompt with spaces.md';self.prompt.write_text('真实Unicode input，不是产品验收。')
         # Outside any check: run_check's variables would send the mock sessions into that check's evidence.
@@ -198,6 +206,26 @@ class NativeBridge(unittest.TestCase):
         p,out,pointer=self.review(REPORT_BLOCK,role='developer');self.assertEqual(p.returncode,0,p.stderr)
         self.assertIsNone(pointer['hoh_report']);self.assertFalse((out/'hoh-report.json').exists())
         self.assertNotIn('hoh_report_error',load_json(out/'attempt.json'))
+    def test_agy_print_mode_stream(self):
+        # agy (Antigravity CLI, bootstrap helper like Grok) takes the prompt as one stream-json user message on stdin.
+        p,out=self.bridge(agent='agy');self.assertEqual(p.returncode,0,p.stderr);r=load_json(out/'attempt.json')
+        self.assertEqual(r['status'],'NATIVE_TURN_COMPLETED');self.assertEqual(r['session_ids'],['mock-agy']);self.assertEqual(r['resolved_models'],['agy-mock'])
+        t=load_json(self.root/'trace.json');lines=t['stdin'].splitlines();self.assertEqual(len(lines),1)
+        m=json.loads(lines[0]);self.assertEqual((m['event'],m['message']['role']),('user','user'))
+        self.assertTrue(m['message']['content'].startswith('[HOH_DELEGATED_TASK]'));self.assertTrue(m['message']['content'].endswith(self.prompt.read_text()))
+        self.assertEqual(r['argv'][-1],'-p=');self.assertIn('--dangerously-skip-permissions',r['argv'])
+    def test_agy_error_result_fails_the_turn_despite_a_zero_exit(self):
+        p,out=self.bridge(agent='agy',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
+        self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
+    def test_agy_final_text_is_the_result_response(self):
+        p=self.raw({'event':'step_update','step_update':{'conversation_id':'c','state':'DONE','text_delta':REPORT_BLOCK}},{'event':'result','result':{'conversation_id':'c','status':'SUCCESS','response':'last'}})
+        o=inspect_output('agy',p);self.assertEqual(o['_final_text'],'last');self.assertEqual(o['session_ids'],['c']);self.assertTrue(o['terminal_observed'])
+        p=self.raw({'event':'result','result':{'conversation_id':'c','status':'SUCCESS','response':REPORT_BLOCK}},{'event':'result','result':{'conversation_id':'c','status':'SUCCESS'}})
+        self.assertEqual(inspect_output('agy',p)['_final_text'],'')
+    def test_agy_command(self):
+        c=command_for('agy',self.root,'gemini-x');self.assertEqual(c[0],'agy');self.assertEqual(c[-1],'-p=');self.assertEqual(c[-3:-1],['--model','gemini-x'])
+        for flag in ['--input-format','--output-format','--dangerously-skip-permissions']:self.assertIn(flag,c)
+        with self.assertRaisesRegex(ValueError,'--input-format'):command_for('agy',self.root,None,'--output-format --dangerously-skip-permissions --print')
     def test_grok_error_result_fails_the_turn_despite_a_zero_exit(self):
         p,out=self.bridge(agent='grok',mode='semantic-error');self.assertEqual(p.returncode,1,p.stderr);r=load_json(out/'attempt.json')
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
