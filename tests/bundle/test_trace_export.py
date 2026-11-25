@@ -141,6 +141,19 @@ if mode == 'written-then-killed':
     os.kill(os.getpid(), signal.SIGKILL)
 '''
 
+# M3QA-003: cargo's test binary does not keep the script's cwd. This stand-in changes to a package directory, then
+# writes a marker the way trace.rs write_exports writes (the path as given, relative to its own cwd).
+REL_STUB = r'''import os, sys
+from pathlib import Path
+os.chdir(os.environ['STUB_PACKAGE'])
+target = Path(os.environ['HOH_TRACE_EXPORT_DIR']) / 'marker'
+try:
+    target.write_text('ok', encoding='utf-8')
+except OSError as exc:
+    print(f'marker write: {type(exc).__name__}: {exc}', file=sys.stderr)
+    sys.exit(1)
+'''
+
 
 class ProductStep(unittest.TestCase):
     """M3N-100 (docs/adr/ADR-039.md DC-T07b (4)): the real traceability.sh through tools/run_check.py on a candidate
@@ -155,7 +168,8 @@ class ProductStep(unittest.TestCase):
            'test_032_01_product_export_over_fault_variants_matches_the_mirror']
 
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='hoh-m3t07-product-step-');self.addCleanup(self.temp.cleanup)
+        self.temp=tempfile.TemporaryDirectory(prefix='hoh-m4low1-product-step-', dir='/home/ai/dev')
+        self.addCleanup(self.temp.cleanup)
         r=self.root=Path(self.temp.name)/'root';r.mkdir()
         self.bin=Path(self.temp.name)/'bin';self.bin.mkdir()
         for rel in self.FILES:(r/rel).parent.mkdir(parents=True,exist_ok=True);shutil.copy2(ROOT/rel,r/rel)
@@ -240,6 +254,32 @@ class ProductStep(unittest.TestCase):
                 self.assertIsNotNone(seen,'the check never ran the product step')
                 self.assertEqual(statuses,['FAIL'],err);self.assertNotEqual(rc,0)
                 self.assertEqual(record['missing_artifacts'],[])
+
+    def test_a_relative_evidence_directory_is_written_from_the_invocation(self):
+        """M3QA-003: a relative HOH_EVIDENCE_DIR is the cwd of the process that read it. The product step's
+        binary runs with cargo's package directory as its cwd, so the same relative path was NotFound there."""
+        invocation, package = self.root / 'invoke', self.root / 'pkg'
+        invocation.mkdir(); package.mkdir(); (invocation / 'rel-evidence').mkdir()
+        out = '.hoh-dev/candidates/relative.json'
+        frozen = self.tool('tools/candidate.py', 'freeze', '--spec', 'contracts/requirements.json',
+                           '--environment', '.hoh-dev/environment.json', '--test-plan', 'plan.json', '--out', out)
+        self.assertEqual(frozen.returncode, 0, frozen.stderr)
+        stub = self.bin / 'rel_stub.py'
+        stub.write_text(REL_STUB)
+        cargo = self.bin / 'cargo'
+        cargo.write_text(f'#!/bin/sh\nexec {sys.executable} {stub} "$@"\n')
+        cargo.chmod(0o755)
+        ran = subprocess.run(
+            [sys.executable, str(self.root / 'scripts/product/traceability.py'), 'v1'],
+            cwd=invocation, capture_output=True, text=True, timeout=120,
+            env=clean_env() | {'PATH': self.path, 'PYTHONDONTWRITEBYTECODE': '1',
+                               'HOH_EVIDENCE_DIR': 'rel-evidence',
+                               'HOH_CANDIDATE_FILE': str(self.root / out),
+                               'STUB_PACKAGE': str(package)})
+        marker = invocation / 'rel-evidence' / 'marker'
+        self.assertTrue(marker.is_file() and marker.read_text() == 'ok', ran.stderr)
+        self.assertNotIn('product step', ran.stderr, ran.stderr)
+        self.assertFalse((package / 'rel-evidence').exists(), 'the export followed the package cwd')
 
 
 if __name__=='__main__':unittest.main()
