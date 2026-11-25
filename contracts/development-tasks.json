@@ -1158,7 +1158,7 @@
     "AC-064-04",
     "AC-064-05"
    ],
-   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2错误与Range/search/evidence/timeline路由、查询时集中kind分类及完整性测试、引用/GC/tombstone/低空间原因；交付§5.1唯一release测量基础设施/runner与ENOSPC设施，三个工件声明只随可产出驱动同提交/relock生效；先实测阶段耗时并留600s总余量，否则提交D4重规划；PID/start_time/pidfd与实际unit/Attempt cgroup归属、正常/失败/超时/取消/SIGKILL无残留证据齐全；debug故障子例与release计量分开，SSE按字节限界。新配置与example同提交，回归TEST-018-01、REQ-005/035/036/037/042/043/058/062。对象与测量进程生命周期并发按docs/19双独立审查。 NewEvent.kind类型化与唯一INSERT守卫覆盖全部生产者/动态分支，不能用手写清单自证；503 STORAGE_LOW_SPACE受理错误/草稿与QUEUED投递诊断按§5，T07再接文件包装。冻结环境填齐五阶段正整数时限，runner/监护者强制执行；service/scope两真实启动路径、每Attempt身份/资源核对及SIGKILL外部收尾通过后才交付。 第5稿：同次构建绑定pre-003提交的release旧writer，真实造002百万库；首次open起计及回填中kill/reconcile两克隆共享backfill时限。私有manager位于项目盘测试根，测试HOME/XDG/hoh-host@模板与安装完全隔离；外层scope和真实manager guardian的RuntimeMaxSec=3600，SIGKILL整个run_check组后30s外层树空的证据。全机锁贯穿测量与清理，run_check/cargo各入口遵守，锁竞争/噪声SKIPPED/78且不能PASS。补503 STORAGE_LOW_SPACE的CLI69及明确提示/不自动重试；REQ-004旧AC不改。"
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付§2错误与Range/search/evidence/timeline路由、查询时集中kind分类及完整性测试、引用/GC/tombstone/低空间原因；交付§5.1唯一release测量基础设施/runner与ENOSPC设施，三个工件声明只随可产出驱动同提交/relock生效；先实测阶段耗时并留600s总余量，否则提交D4重规划；PID/start_time/pidfd与实际unit/Attempt cgroup归属、正常/失败/超时/取消/SIGKILL无残留证据齐全；debug故障子例与release计量分开，SSE按字节限界。新配置与example同提交，回归TEST-018-01、REQ-005/035/036/037/042/043/058/062。对象与测量进程生命周期并发按docs/19双独立审查。 NewEvent.kind类型化与唯一INSERT守卫覆盖全部生产者/动态分支，不能用手写清单自证；503 STORAGE_LOW_SPACE受理错误/草稿与QUEUED投递诊断按§5，T07再接文件包装。冻结环境填齐五阶段正整数时限，runner/监护者强制执行；service/scope两真实启动路径、每Attempt身份/资源核对及SIGKILL外部收尾通过后才交付。 第5稿：同次构建绑定pre-003提交的release旧writer，真实造002百万库；首次open起计及回填中kill/reconcile两克隆共享backfill时限。私有manager位于项目盘测试根，测试HOME/XDG/hoh-host@模板与安装完全隔离；外层scope和真实manager guardian的RuntimeMaxSec=3600，SIGKILL整个run_check组后30s外层树空的证据。C1：外部measurement runner/guardian先独占开发测试槽，再取D4测量锁，两锁贯穿测量与清理；全部被测run_check/cargo/构建经该包装器，run_check本身保持BT-03不取槽；普通负载外部包装器的共享测量锁、锁顺序/继承与噪声准入按§5.1，锁竞争/噪声SKIPPED/78且不能PASS。补503 STORAGE_LOW_SPACE的CLI69及明确提示/不自动重试；REQ-004旧AC不改。 C3：加法交付InputStatePageRef={run_id,watermark,limit,cursor}与GET /v1/runs/{run_id}/inputs，复用既有H/limit/cursor和Page；同H翻页/续查/过期/空页及四态来源不猜测，旧路由保持。C5：M3-T05完成后绑定真实pre-003产品commit，先做五阶段可行性实测；装不进3600s且600s余量时，CTO以正式CR重规划required check，降阈值或缩范围交所有者；不得预填数值。"
   },
   {
    "id": "M4-T02",
@@ -1184,7 +1184,7 @@
     "AC-011-03",
     "AC-011-04"
    ],
-   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付快照增量、断线/DB_BUSY、布局/身份/小屏、Ctrl+P动作注册表与Task/Issue/Evidence抽屉；自有poll SGR鼠标解码与ADR-014修订。保留M3模式/输入/批准/历史入口，不直接写host状态造测试。回归REQ-001/005/007/017/018。 未预选同Agent多职位必须选择，Focus区分role/epoch/session与Attempt级handoff可见范围；保留/resume选择后仅附着。"
+   "done_when": "除完整AC-011-04依C3在M4-T12验证外，其余指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。交付快照增量、断线/DB_BUSY、布局/身份/小屏、Ctrl+P动作注册表与Task/Issue/Evidence抽屉；自有poll SGR鼠标解码与ADR-014修订。保留M3模式/输入/批准/历史入口，不直接写host状态造测试。回归REQ-001/005/007/017/018。 未预选同Agent多职位必须选择，Focus区分role/epoch/session与Attempt级handoff可见范围；保留/resume选择后仅附着。 C2：逐决策类别核对依据（公开basis/reason/note）与影响（已提交effects），各带来源；缺任一项显示unknown且不计PASS，fixture不捏造。缺生产者的类别在本任务经refinement CR以加法可选协议字段补齐真实生产者，保留旧记录兼容。C3：消费T03的H/limit/cursor输入历史页；ui.task取RUNNING中started_at最新者，同时间task_id升序，其余任务仍可查询。交付小屏显示与自身其余AC，保留AC-011-04属主；四组事实完整验证由依赖T06共享progress聚合的M4-T12收取，unknown不算该AC通过。"
   },
   {
    "id": "M4-T05",
@@ -1231,7 +1231,7 @@
     "AC-014-03",
     "AC-014-04"
    ],
-   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。消费T09归属/公开活动与T03分类API，F13全过滤/引用，progress聚合、三档字段/水位探针；配置与example同提交；保留M3追踪标签、规格全量失效与旧acceptance的AC计数。回归TEST-018-01、REQ-032/033/053，不把adapter活动来源写成M2已提供。 013-04从受约束的生产类型穷举并证明旁路负例可检出；未知成本/上下文明确未知而非0。 第5稿：candidate_ready显式为I工程事实，分类为诊断的变异必失败；test_013_04 compile_fail doctest与生产定义共源。"
+   "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。消费T09归属/公开活动与T03分类API，F13全过滤/引用，progress聚合、三档字段/水位探针；配置与example同提交；保留M3追踪标签、规格全量失效与旧acceptance的AC计数。回归TEST-018-01、REQ-032/033/053，不把adapter活动来源写成M2已提供。 013-04从受约束的生产类型穷举并证明旁路负例可检出；未知成本/上下文明确未知而非0。 第5稿：candidate_ready显式为I工程事实，分类为诊断的变异必失败；test_013_04 compile_fail doctest与生产定义共源。 C3：交付供T02状态页及Timeline/状态栏共用的progress聚合，为M4-T12完整验证AC-011-04四组事实提供前置；不复用unknown占位为PASS。"
   },
   {
    "id": "M4-T07",
@@ -1315,6 +1315,22 @@
    "done_when": "指定AC在冻结候选的指定检查中有逐测试证据；独立审查无未解决critical/high；自测不等于验收。扩展既有adapter-live到host→原生→公开持久事实的真实链，三家session/模型/公开工具/用量来源证据；复用T09生产者而非第二份解析器；未知能力如实记录，缺认证不PASS，不改live check owner或范围。"
   },
   {
+   "id": "M4-T12",
+   "milestone": "M4",
+   "kind": "verify",
+   "owner_role": "qa",
+   "writer": false,
+   "title": "Verify small-screen facts after shared progress delivery",
+   "depends_on": [
+    "M4-T02",
+    "M4-T06"
+   ],
+   "requirements": [
+    "REQ-011"
+   ],
+   "done_when": "C3（CTO 2026-11-25）：在T02显示与T06共享progress聚合均交付后的同一冻结候选，用既有tui-pty检查完整验证AC-011-04/TEST-011-04（含四组事实、小尺寸交互与恢复）；unknown不计PASS。只收取验证证据，不认领acceptance或checks、不移动AC-011-04的T02属主；缺前置或失败不得标验证通过。结果由M4-T04纳入全部37条AC的独立QA/Review。"
+  },
+  {
    "id": "M4-T04",
    "milestone": "M4",
    "kind": "verify",
@@ -1330,7 +1346,8 @@
     "M4-T07",
     "M4-T08",
     "M4-T10",
-    "M4-T11"
+    "M4-T11",
+    "M4-T12"
    ],
    "requirements": [
     "REQ-010",
@@ -1342,7 +1359,7 @@
     "REQ-016",
     "REQ-064"
    ],
-   "done_when": "同一冻结候选由不同于开发者且彼此独立的QA/Reviewer验证全部37条AC；收取unit/integration/recovery/tui-pty/adapter-live与适用build/static、independent-qa/review的真实证据。critical/high必须为零；开修复任务不算通过。缺前提为BLOCKED/INCOMPLETE，修复后新候选重新验证；M4不签v1完成。"
+   "done_when": "同一冻结候选由不同于开发者且彼此独立的QA/Reviewer验证全部37条AC；收取unit/integration/recovery/tui-pty/adapter-live与适用build/static、independent-qa/review的真实证据。critical/high必须为零；开修复任务不算通过。缺前提为BLOCKED/INCOMPLETE，修复后新候选重新验证；M4不签v1完成。 C3：收取M4-T12在T06交付共享聚合后验证AC-011-04的完整证据，T02早期unknown显示不算通过。"
   },
   {
    "id": "M5-T01",

@@ -54,4 +54,18 @@ protocol.schema.json的Candidate是运行时轻量引用（id+Git/spec/environme
 新查询页的 H+generation 游标不同，旧路由错误与顶层 snapshot_watermark 不变。
 进度新增字段统计需求，原 acceptance 字段仍统计 AC。所有客户端只通过 host 查询。
 SQL 003 只建派生结构，迁移运行器、分批回填、引用闭包和 GC 尚待对应任务接线，
-本节不表示路由或回收已经可用。明确待决项见 CR-028 末尾应用核对。
+本节不表示路由或回收已经可用。CTO 2026-11-25 的 C1–C5 应用决定见 CR-028 末尾；本应用分支保持 DRAFT、未 relock。
+
+输入历史按既有 H/limit/cursor 读模型加法扩展：`InputStatePageRef` 精确为
+`{run_id,watermark,limit,cursor}`，watermark 取 getRun 的 H，limit 为1–500、缺省100，
+首 cursor 为 null。由新增只读 `GET /v1/runs/{run_id}/inputs` 返回既有 Page
+（items/next_cursor/watermark）；续页保持同 Run/H/limit，cursor 绑定查询和 generation。
+按 H 的已提交事实重建四态、实际角色/epoch/boundary和拒绝原因，后续事实不漂移旧页，
+不新增输入命令或投递循环。该扩展由 T03 交付，T02 消费，旧路由与错误语义保持。
+
+`ui.task` 取当前 Run 的 RUNNING Task 中 started_at 最新者，同时间按 task_id 升序取首个；
+没有 RUNNING 时为 null，其它 Task 仍经 tasks 路由查询。决策依据取公开 basis/reason/note，
+影响取已提交 effects，分别带来源；缺失显示 unknown 且不计 PASS。T02 经 refinement CR
+以加法可选协议字段补齐缺失类别的真实生产者，fixture 不捏造依据或影响。
+T02 先交付小屏显示与自身其余 AC；四组事实由依赖 T02/T06 的 T12 在共享 progress
+交付后完整验证 AC-011-04。其 T02 属主与37条 AC 集合不变，T04 收取 T12 证据。
