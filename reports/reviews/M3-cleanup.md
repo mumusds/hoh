@@ -383,3 +383,13 @@ piped now and its answer asserted, like the first's. Evidence under `.hoh-dev/se
 Self-tests, not acceptance. Other merged streams: adapter-live.sh writes each live test's output with `2>&1` to its own
 log, but its results come from the verdict files the tests write, never from that log; static.sh's `clippy.log` is not
 parsed for test results. Both stay as they are.
+
+### M3QA-018: fix review (fresh Pi session, attempt 3a30276d-ad69-40c1-8ce2-f1b3f5e7ce09)
+
+- Scope: `ab3e92ce..7b5d1ff4` on the frozen worktree; bundle tests and shellcheck in a copy. Verdict: **PASS** (3 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| M3R-1001 | low | No durable guard against the same root cause returning (a test child inheriting fd 1); the stdout classifier of the fd-1 audit lives only in `.hoh-dev`. A future offender gives a fail-closed NOT_RUN again, never a false PASS. | Deferred to the M4 low package: a test-Command helper with piped/null stdout by default, or the classifier as a bundle check. |
+| M3R-1002 | low | The fd-1 audit's list of direct `io::stdout()` writers misses hoh-client's CLI output (`lib.rs:68`, `follow.rs:159`, `doctor.rs:468`); the conclusion holds since tests run the CLI via `.output()` or a PTY. | Noted here: CLI output belongs to the "parent pipes it" class. |
+| M3R-1003 | low | recovery.sh's second run takes its pipe status from `systemd-run --user --scope`, not cargo (pre-existing, unchanged by this diff); whether systemd-run propagates cargo's non-zero exit is not evidenced. | Deferred to the M4 low package: show a failing cargo under the scope fails the check. |
