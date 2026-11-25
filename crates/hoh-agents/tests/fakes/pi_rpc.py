@@ -11,7 +11,8 @@ close. With `--session-dir D --session-id I` in PI-ARGV it finds or makes the se
 session id and file.
 
 Pseudo-records (not sent as such): {"hoh_wait": {"command": T, "count": N}} waits until N commands of type T came;
-{"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_stderr": BYTES}
+{"hoh_batch": [R, ...]} sends records in one write; {"hoh_split": [R, N]} sends R in N writes; {"hoh_raw": [TEXT, N]}
+sends TEXT as it is (no LF added, key order kept) in N writes; {"hoh_stderr": BYTES}
 writes that many bytes to stderr; {"hoh_hold": PATH} waits until PATH exists; {"hoh_exit": CODE} exits at once; a {"hoh_keep_session": true} anywhere keeps the recorded session id; a {"hoh_new_file": true} anywhere makes
 a new session file even if one is found; a {"hoh_lose_session": true} anywhere deletes the found file and reports a new
 path it never writes; a {"hoh_lazy_session": true} anywhere writes a new session file only once the first prompt comes
@@ -146,6 +147,12 @@ def main() -> int:
                 if not all(answer(x) for x in batch if x.get('type') == 'response'):
                     return None
                 write(b''.join(line(x) for x in batch))
+            elif 'hoh_raw' in r:
+                text, n = r['hoh_raw']
+                data = text.encode('utf-8')
+                step = max(1, -(-len(data) // n))
+                for i in range(0, len(data), step):
+                    write(data[i:i + step])
             elif 'hoh_split' in r:
                 record, n = r['hoh_split']
                 if record.get('type') == 'response' and not answer(record):

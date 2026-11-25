@@ -1752,3 +1752,166 @@ async fn pi_runner_mode_cancel_is_an_abort_only() -> R {
     assert!(alive, "the adapter ended the turn itself");
     Ok(())
 }
+
+/// CR-040: pi's `agent_end` as pi writes it (`JSON.stringify`, its key order), its one message's text `pad` bytes long.
+fn long_agent_end(pad: usize) -> String {
+    format!(
+        r#"{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{}"}}]}}],"willRetry":false}}"#,
+        "x".repeat(pad)
+    )
+}
+
+/// rpc-prompt with its `agent_end` replaced by `raw` written as it is in `writes` writes.
+fn with_raw_end(raw: &str, writes: usize) -> R<Case> {
+    let mut case = Case::load("rpc-prompt")?;
+    let end = case.position("agent_end")?;
+    case.frames[end] = json!({"hoh_raw": [raw, writes]});
+    Ok(case)
+}
+
+const SKIP_REASON: &str = "known frame over the limit skipped";
+const BOUND: usize = 1_048_576 + 65_536;
+
+/// AC-027-05 (CR-040): a 1.5 MiB `agent_end` followed by `agent_settled` ends the turn SETTLED, written whole or in
+/// seven writes ending CR LF: one skip diagnosis (type, length, sha256 of the whole frame, its first 4 KiB), the reply
+/// noted, and the reader never held more than the limit and one read.
+#[tokio::test]
+async fn test_027_05_pi_a_1_5_mib_agent_end_is_skipped_and_the_turn_settles() -> R {
+    let frame = long_agent_end(3 << 19);
+    assert!(frame.len() > 3 << 19);
+    for (writes, ending) in [(1, "\n"), (7, "\r\n")] {
+        let world = World::new()?;
+        let fake = world.fake("long", &with_raw_end(&format!("{frame}{ending}"), writes)?)?;
+        let attempt = world.attempt("A1").await?;
+        let outcome = run(&world, &attempt, &world.turn(&fake, "logs/A1")?).await?;
+        assert_eq!(
+            (
+                outcome.state,
+                outcome.failure.as_deref(),
+                outcome.settled_by
+            ),
+            (AttemptState::Settled, None, Some(SettledBy::AgentSettled)),
+            "{writes} writes"
+        );
+        assert_eq!(outcome.reply.as_deref(), Some("HOH_SAMPLE_OK"));
+        assert!(
+            outcome.max_buffered.is_some_and(|n| n <= BOUND),
+            "{:?}",
+            outcome.max_buffered
+        );
+        let skipped: Vec<Value> = events(&world, "adapter.diagnostic")?
+            .into_iter()
+            .filter(|d| d["reason"] == SKIP_REASON)
+            .collect();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        let d = &skipped[0];
+        assert_eq!(d["type"], json!("agent_end"));
+        assert_eq!(d["length"], json!(frame.len()));
+        assert_eq!(d["sha256"], json!(hex(frame.as_bytes())));
+        assert_eq!(d["head"], json!(frame[..4096]));
+        assert_eq!(d["attempt_id"], json!("A1"));
+        // The raw log keeps every byte.
+        let raw = std::fs::read(&outcome.stdout)?;
+        assert!(raw.windows(frame.len()).any(|w| w == frame.as_bytes()));
+    }
+    Ok(())
+}
+
+/// AC-027-05 (CR-040): a version without `agent_settled` checks for idle after a skipped `agent_end` as after any.
+#[tokio::test]
+async fn test_027_05_pi_a_skipped_agent_end_checks_for_idle_without_agent_settled() -> R {
+    let world = World::new()?;
+    let mut case = with_raw_end(&format!("{}\n", long_agent_end(3 << 19)), 3)?;
+    case.frames.retain(|f| f["type"] != "agent_settled");
+    let mut idle = case.frames[case.response("s1")?].clone();
+    idle["id"] = json!("s2");
+    case.frames.push(idle);
+    case.commands
+        .push(("s2".to_owned(), "get_state".to_owned()));
+    let fake = world.fake("long-idle", &case)?;
+    let attempt = world.attempt("A1").await?;
+    let mut turn = world.turn(&fake, "logs/A1")?;
+    turn.launch.settled_event = false;
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(30), run(&world, &attempt, &turn)).await??;
+    assert_eq!(
+        (outcome.state, outcome.settled_by, outcome.state_queries),
+        (AttemptState::Settled, Some(SettledBy::State), 1)
+    );
+    Ok(())
+}
+
+/// AC-027-05 (CR-040): a line over the limit whose head is not one of the known records fails as AC-027-03 says
+/// (another type, a type only starting like agent_end, another key order), and so does a known one the stream ends
+/// before its LF.
+#[tokio::test]
+async fn test_027_05_pi_an_unknown_head_or_a_cut_short_line_still_fails() -> R {
+    let pad = "x".repeat(3 << 19);
+    let cases = [
+        (
+            "other-type",
+            format!(r#"{{"type":"agent_endx","messages":["{pad}"]}}"#) + "\n",
+            false,
+        ),
+        (
+            "key-order",
+            format!(r#"{{"messages":["{pad}"],"type":"agent_end"}}"#) + "\n",
+            false,
+        ),
+        ("cut-short", long_agent_end(3 << 19), true),
+    ];
+    for (name, raw, cut) in cases {
+        let world = World::new()?;
+        let mut case = with_raw_end(&raw, 3)?;
+        if cut {
+            // pi exits right after the line, before its LF.
+            let at = case
+                .frames
+                .iter()
+                .position(|f| f.get("hoh_raw").is_some())
+                .ok_or("no raw line")?;
+            case.frames.insert(at + 1, json!({"hoh_exit": 0}));
+        }
+        let fake = world.fake(name, &case)?;
+        let attempt = world.attempt("A1").await?;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            run(&world, &attempt, &world.turn(&fake, "logs/A1")?),
+        )
+        .await??;
+        assert_eq!(
+            (outcome.state, outcome.failure.as_deref()),
+            (AttemptState::Failed, Some("PROTOCOL_FRAME_TOO_LARGE")),
+            "{name}"
+        );
+        assert!(
+            outcome.max_buffered.is_some_and(|n| n <= BOUND),
+            "{name}: {:?}",
+            outcome.max_buffered
+        );
+        let diagnosis = events(&world, "adapter.diagnostic")?
+            .into_iter()
+            .find(|d| d["reason"] == "PROTOCOL_FRAME_TOO_LARGE")
+            .ok_or("no diagnosis")?;
+        let length = usize::try_from(diagnosis["length"].as_u64().ok_or("no length")?)?;
+        if cut {
+            // Every byte of the cut line was read and counted, none kept.
+            assert_eq!(length, raw.len(), "{name}");
+            assert_eq!(
+                diagnosis["prefix_sha256"],
+                json!(hex(raw.as_bytes())),
+                "{name}"
+            );
+        } else {
+            assert!(length > 1 << 20 && length <= BOUND, "{name}: {length}");
+        }
+        assert_eq!(diagnosis["head"], json!(raw[..4096]), "{name}");
+        assert!(
+            !events(&world, "adapter.diagnostic")?
+                .iter()
+                .any(|d| d["reason"] == SKIP_REASON),
+            "{name}"
+        );
+    }
+    Ok(())
+}

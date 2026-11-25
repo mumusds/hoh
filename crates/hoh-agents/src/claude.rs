@@ -24,7 +24,7 @@ pub use crate::adapter::{
 use crate::adapter::{
     Observer, Recorder, Replay, Replayed, Stop, Watch, finish, now, offers, sha256_file, step,
 };
-use crate::frame::Frame;
+use crate::frame::{Frame, Skip};
 use crate::known;
 use crate::process::{Cause, Config, Escalation, Event, Process, Signal, Step, Termination};
 use hoh_core::lifecycle::AttemptState;
@@ -542,16 +542,29 @@ fn usage_with_estimate(usage: Option<Value>, cost: Option<f64>) -> Option<Value>
     }
 }
 
-/// The process settings of `turn`: its escalation, its deadline and its raw logs.
+/// The process settings of `turn`: its escalation, its deadline, its raw logs and the frames over the limit it skips.
 fn config(turn: &Turn, stdout: &std::path::Path, stderr: &std::path::Path) -> Config {
     Config {
         escalation: turn.escalation,
         deadline: turn.deadline,
         stdout_copy: Some(stdout.to_path_buf()),
         stderr_copy: Some(stderr.to_path_buf()),
+        skip: Some(SKIP),
         ..Config::default()
     }
 }
+
+/// The records this adapter reads nothing of and that a long session can grow past the frame limit (CR-040): `user`,
+/// which carries tool results twice (`message.content` and `tool_use_result`: whole files, images in base64).
+fn skippable(head: &[u8]) -> Option<&'static str> {
+    crate::frame::by_prefix(head, &[(br#"{"type":"user","#, "user")])
+}
+
+/// The frames over the limit a claude turn skips (CR-040).
+pub const SKIP: Skip = Skip {
+    known: skippable,
+    max_length: crate::frame::SKIP_LIMIT,
+};
 
 /// Start one turn in the runner's mode (docs/adr/ADR-022.md decisions 12 to 14): through `gate`, held there until
 /// [`Held::open`] is sent, then the prompt on stdin; no attempt state moves and nothing is written to the store, the
@@ -677,6 +690,8 @@ struct Driven {
     cost: Option<f64>,
     diagnostics: usize,
     too_large: bool,
+    /// Frames over the limit the reader skipped ([`SKIP`]), numbering their events.
+    skipped: usize,
     auth_failed: bool,
     cancelled: bool,
     fed: Option<std::io::Result<()>>,
@@ -795,6 +810,7 @@ impl Driven {
             cost: None,
             diagnostics: 0,
             too_large: false,
+            skipped: 0,
             auth_failed: false,
             cancelled,
             fed: None,
@@ -966,6 +982,17 @@ async fn drive(
                             "prefix_sha256": refused.prefix_sha256,
                             "head": String::from_utf8_lossy(&refused.head),
                         }),
+                    )
+                    .await?;
+                continue;
+            }
+            Some(Event::Frame(Frame::Skipped(skipped))) => {
+                driven.skipped += 1;
+                recorder
+                    .event(
+                        &format!("frame-skipped-{}", driven.skipped),
+                        "adapter.diagnostic",
+                        crate::adapter::skipped_frame(&skipped),
                     )
                     .await?;
                 continue;

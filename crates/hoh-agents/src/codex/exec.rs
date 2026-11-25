@@ -413,6 +413,16 @@ pub(super) async fn drive(
                     .await?;
                 continue;
             }
+            // exec sets no Skip rule (CR-040), so the reader refuses every frame over the limit; were one skipped, it
+            // would still be diagnosed.
+            Some(Event::Frame(Frame::Skipped(skipped))) => {
+                let mut payload = crate::adapter::skipped_frame(&skipped);
+                payload["attempt_id"] = json!(id);
+                recorder
+                    .event("exec-frame-skipped", "adapter.diagnostic", payload)
+                    .await?;
+                continue;
+            }
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
         };

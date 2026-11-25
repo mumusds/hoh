@@ -9,7 +9,8 @@
 //! one not written yet means it did not resume the session (SESSION_MISMATCH, no prompt sent; M1T05R-03/06/10/11). A
 //! `*.jsonl` entry that is not a regular file would block pi's own lookup, so nothing starts in such a directory
 //! (SESSION_DIR_UNSAFE; M1T05R-08/12). stdout is framed by the process substrate on LF bytes only (one CR before it
-//! dropped, U+2028/U+2029 kept inside frames, 1 MiB per frame) and read from the start, stderr is drained alongside;
+//! dropped, U+2028/U+2029 kept inside frames, 1 MiB per frame, a known record over it that the adapter does not
+//! need skipped: [`SKIP`], CR-040) and read from the start, stderr is drained alongside;
 //! every record goes to the turn's subscriber, if any.
 //!
 //! The turn: `get_state` (to check the session), then `prompt` with its own id. Its response only says the prompt was
@@ -30,7 +31,7 @@ use crate::adapter::{
 };
 pub use crate::adapter::{Facts, GateCommand, Held, Observe, Recorded, Refused};
 use crate::clock::{Clock, Timer};
-use crate::frame::Frame;
+use crate::frame::{Frame, Skip, SkippedFrame};
 use crate::known;
 use crate::process::{Config, Escalation, Event, Process, Step, Termination};
 use hoh_core::lifecycle::{AttemptState, InputState};
@@ -189,6 +190,34 @@ pub fn args(launch: &Launch) -> Result<Vec<String>, Blocked> {
     }
     Ok(args)
 }
+
+/// The records this adapter does not need the payload of and that a long run can grow past the frame limit, by the
+/// exact start pi writes them with (`JSON.stringify`, its key order; CR-040): `agent_end` carries every message of the
+/// run, and a tool result (an image read is up to 4.5 MB of base64) is in `tool_execution_end`, the toolResult
+/// message's `message_start`/`message_end` and `turn_end`. Only their type is judged ([`Rpc::on_skipped`]).
+const SKIPPABLE: &[(&[u8], &str)] = &[
+    (br#"{"type":"agent_end","#, "agent_end"),
+    (br#"{"type":"turn_end","#, "turn_end"),
+    (br#"{"type":"tool_execution_end","#, "tool_execution_end"),
+    (
+        br#"{"type":"message_start","message":{"role":"toolResult","#,
+        "message_start",
+    ),
+    (
+        br#"{"type":"message_end","message":{"role":"toolResult","#,
+        "message_end",
+    ),
+];
+
+fn skippable(head: &[u8]) -> Option<&'static str> {
+    crate::frame::by_prefix(head, SKIPPABLE)
+}
+
+/// The frames over the limit a pi turn skips (CR-040).
+pub const SKIP: Skip = Skip {
+    known: skippable,
+    max_length: crate::frame::SKIP_LIMIT,
+};
 
 /// Dialog UI methods: they wait for an answer, which headless HoH gives as `cancelled`.
 pub const DIALOGS: &[&str] = &["select", "confirm", "input", "editor"];
@@ -510,6 +539,7 @@ pub async fn run(
         deadline: None,
         stdout_copy: Some(stdout.clone()),
         stderr_copy: Some(stderr.clone()),
+        skip: Some(SKIP),
         ..Config::default()
     };
     // The substrate reads stdout and stderr from the start: nothing Pi writes can be missed or block it.
@@ -676,6 +706,7 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
         deadline: None,
         stdout_copy: Some(stdout),
         stderr_copy: Some(stderr),
+        skip: Some(SKIP),
         ..Config::default()
     };
     let mut process = Process::spawn(command, config, &*turn.spawner)
@@ -802,6 +833,7 @@ struct Rpc<'a> {
     reply: Option<String>,
     unknown_records: usize,
     parse_errors: usize,
+    skipped: usize,
     state_queries: usize,
     agent_starts: usize,
     dialogs: usize,
@@ -875,6 +907,7 @@ impl<'a> Rpc<'a> {
             reply: None,
             unknown_records: 0,
             parse_errors: 0,
+            skipped: 0,
             state_queries: 0,
             agent_starts: 0,
             dialogs: 0,
@@ -995,7 +1028,6 @@ impl<'a> Rpc<'a> {
     /// Judge one stdout line and record what it shows.
     async fn on_record(&mut self, sink: &mut Sink<'_>, bytes: &[u8]) -> Result<(), PersistError> {
         let (id, turn) = (self.id, self.turn);
-        let launch = &turn.launch;
         let Some(record) = serde_json::from_slice::<Value>(bytes)
             .ok()
             .filter(Value::is_object)
@@ -1025,6 +1057,40 @@ impl<'a> Rpc<'a> {
             )
             .await?;
         }
+        self.judge(sink, &record).await
+    }
+
+    /// A frame over the limit the reader skipped ([`SKIP`]): its diagnosis, then its type judged as a record of only
+    /// that type (a toolResult message's `role` too), for it is the payload that went unread (CR-040).
+    async fn on_skipped(
+        &mut self,
+        sink: &mut Sink<'_>,
+        skipped: &SkippedFrame,
+    ) -> Result<(), PersistError> {
+        let id = self.id;
+        self.skipped += 1;
+        let mut payload = crate::adapter::skipped_frame(skipped);
+        payload["attempt_id"] = json!(id);
+        sink.attempt_event(
+            id,
+            &format!("frame-skipped-{}", self.skipped),
+            "adapter.diagnostic",
+            payload,
+        )
+        .await?;
+        let record = match skipped.kind {
+            kind @ ("message_start" | "message_end") => {
+                json!({"type": kind, "message": {"role": "toolResult"}})
+            }
+            kind => json!({"type": kind}),
+        };
+        self.judge(sink, &record).await
+    }
+
+    /// Judge one record by its type.
+    async fn judge(&mut self, sink: &mut Sink<'_>, record: &Value) -> Result<(), PersistError> {
+        let (id, turn) = (self.id, self.turn);
+        let launch = &turn.launch;
         match record["type"].as_str().unwrap_or_default() {
             "response" => {
                 let what = record["id"].as_str().and_then(|i| self.pending.remove(i));
@@ -1405,8 +1471,11 @@ async fn drive(
             }
             event = process.next() => event,
         };
-        let bytes = match event {
-            Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
+        match event {
+            Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => {
+                r.on_record(sink, &bytes).await?;
+            }
+            Some(Event::Frame(Frame::Skipped(skipped))) => r.on_skipped(sink, &skipped).await?,
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 r.too_large = true;
                 r.lines = None;
@@ -1426,8 +1495,7 @@ async fn drive(
             }
             Some(Event::Exit(report)) => break Some(*report),
             None => break None,
-        };
-        r.on_record(sink, &bytes).await?;
+        }
         // stdin was closed: Pi has the term grace to exit by itself.
         if std::mem::take(&mut r.closed) && exit_timer.is_none() {
             exit_timer = Some(Box::pin(tokio::time::sleep(turn.escalation.term_grace)));

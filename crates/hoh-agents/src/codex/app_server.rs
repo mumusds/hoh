@@ -19,7 +19,7 @@ use crate::adapter::{
     AdapterError, AttemptRef, Changed, Expect, Observer, Recorded, Replay, Replayed, Stop, Watch,
     finish, now, soft_move, step,
 };
-use crate::frame::Frame;
+use crate::frame::{Frame, Skip};
 use crate::known;
 use crate::process::{Config, Event, Process};
 use hoh_core::lifecycle::{AttemptState, InputState};
@@ -180,6 +180,8 @@ struct State<'a> {
     cancelled: bool,
     deadline: bool,
     too_large: bool,
+    /// Frames over the limit the reader skipped ([`SKIP`]), numbering their events.
+    skipped: usize,
     tool_started: bool,
     failure: Option<String>,
     degrade: Option<String>,
@@ -812,6 +814,7 @@ impl<'a> State<'a> {
             cancelled,
             deadline: false,
             too_large: false,
+            skipped: 0,
             tool_started: false,
             failure: None,
             degrade: None,
@@ -1030,9 +1033,28 @@ pub(super) fn config(turn: &Turn) -> Config {
         deadline: None,
         stdout_copy: Some(stdout),
         stderr_copy: Some(stderr),
+        skip: Some(SKIP),
         ..Config::default()
     }
 }
+
+/// The notifications this adapter reads nothing of and that a long turn can grow past the frame limit (CR-040):
+/// `turn/diff/updated`, the turn's whole diff so far.
+fn skippable(head: &[u8]) -> Option<&'static str> {
+    crate::frame::by_prefix(
+        head,
+        &[(
+            br#"{"method":"turn/diff/updated","params":"#,
+            "turn/diff/updated",
+        )],
+    )
+}
+
+/// The frames over the limit an App Server turn skips (CR-040); exec has none.
+pub const SKIP: Skip = Skip {
+    known: skippable,
+    max_length: crate::frame::SKIP_LIMIT,
+};
 
 pub(super) async fn run(
     store: &Store,
@@ -1290,6 +1312,17 @@ pub(super) async fn drive(
                     json!({"reason": "PROTOCOL_FRAME_TOO_LARGE",
                            "length": refused.length, "prefix_sha256": refused.prefix_sha256,
                            "head": String::from_utf8_lossy(&refused.head)}),
+                )
+                .await?;
+                continue;
+            }
+            Some(Event::Frame(Frame::Skipped(skipped))) => {
+                s.skipped += 1;
+                let key = format!("frame-skipped-{}", s.skipped);
+                s.event(
+                    &key,
+                    "adapter.diagnostic",
+                    crate::adapter::skipped_frame(&skipped),
                 )
                 .await?;
                 continue;
