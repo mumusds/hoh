@@ -1267,6 +1267,7 @@ PY=sys.executable
 PLAN={'spawn-missing':{'mode':'mock','argv':['/nonexistent-m3ld100-command']},
       'ran-127':{'mode':'mock','argv':['bash','-c','exec /nonexistent-m3ld100-command']},
       'ok':{'mode':'mock','argv':[PY,'-c','print("MOCK UNIT CHECK ONLY")']},
+      'sleepy':{'mode':'mock','argv':[PY,'-c','import time;time.sleep(30)']},
       'fail':{'mode':'mock','argv':[PY,'-c','import sys;sys.exit(9)']},
       'mutate':{'mode':'mock','argv':[PY,'-c','open("source.txt","w").write("modified")']},
       'live':{'mode':'live','argv':[PY,'-c','pass']},
@@ -1332,6 +1333,49 @@ class CandidateAndChecks(unittest.TestCase):
             rc,r,_=self.runcheck('ok')
         self.assertNotEqual(rc,0)
         self.assertIs(r.get('started'),True)
+        self.assertEqual(r['exit_code'],127)
+
+    def test_052_04_interrupt_as_spawn_returns_reaps_the_group_and_records_started(self):
+        # M3LS-50: a SIGTERM or SIGINT arriving as Popen returns (here: raised at the end of its __init__) still ends
+        # the child's process group and is recorded as an interrupted run of a started command (130, started=true).
+        real=subprocess.Popen
+        for signum in (signal.SIGTERM,signal.SIGINT):
+            with self.subTest(signal=signum.name):
+                spawned=[]
+                class Interrupted(real):
+                    def __init__(self,*args,**kwargs):
+                        super().__init__(*args,**kwargs);spawned.append(self.pid);signal.raise_signal(signum)
+                execute=run_check.execute
+                def injected(*args,**kwargs):
+                    with patch('subprocess.Popen',Interrupted):return execute(*args,**kwargs)
+                previous=signal.signal(signal.SIGINT,signal.default_int_handler)
+                try:
+                    with patch.object(run_check,'execute',injected):rc,r,_=self.runcheck('sleepy',out='interrupted-'+signum.name)
+                finally:
+                    signal.signal(signal.SIGINT,previous);alive=[]
+                    for pid in spawned:
+                        try:os.killpg(pid,signal.SIGKILL);alive.append(pid)
+                        except ProcessLookupError:continue
+                        try:os.waitpid(pid,0)
+                        except ChildProcessError:pass
+                self.assertEqual(len(spawned),1)
+                self.assertEqual(alive,[],"the check's process group lived on")
+                self.assertEqual(rc,130)
+                self.assertIs(r.get('started'),True)
+                self.assertEqual(r['exit_code'],130)
+
+    def test_052_04_interrupt_before_a_failed_spawn_records_not_started(self):
+        # M3LS-50: an interrupt that arrives before the command could be started is recorded 127, started=false.
+        real=subprocess.Popen
+        class Interrupted(real):
+            def __init__(self,*args,**kwargs):
+                signal.raise_signal(signal.SIGTERM);super().__init__(*args,**kwargs)
+        execute=run_check.execute
+        def injected(*args,**kwargs):
+            with patch('subprocess.Popen',Interrupted):return execute(*args,**kwargs)
+        with patch.object(run_check,'execute',injected):rc,r,_=self.runcheck('spawn-missing')
+        self.assertEqual(rc,130)
+        self.assertIs(r.get('started'),False)
         self.assertEqual(r['exit_code'],127)
 
     def test_check_failing_exit(self):rc,r,_=self.runcheck('fail');self.assertEqual(rc,9);self.assertEqual(r['exit_code'],9)
