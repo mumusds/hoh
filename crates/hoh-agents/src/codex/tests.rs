@@ -535,7 +535,7 @@ fn the_read_only_thread_requests_are_decision_3s() {
     assert_eq!(
         thread_resume(1, ro, Some("gpt-x"), "t-1"),
         json!({"method": "thread/resume", "id": 1,
-               "params": {"approvalPolicy": "never", "sandbox": "read-only", "model": "gpt-x", "threadId": "t-1"}})
+               "params": {"approvalPolicy": "never", "sandbox": "read-only", "model": "gpt-x", "threadId": "t-1", "excludeTurns": true}})
     );
     // Yolo and Plain are today's.
     assert_eq!(
@@ -722,4 +722,33 @@ fn the_replay_of_a_recorded_turn_builds_the_product_messages_from_the_launch() {
             .as_deref()
             .is_some_and(|f| f.starts_with(crate::observed::NOT_OBSERVED))
     );
+}
+
+#[test]
+fn test_024_05_replay_uses_the_recorded_exclude_turns_fact() {
+    let (stdout, _, mut observations) = excerpt("app-ro-resumed");
+    let historical = replay_facts(&stdout, &observations);
+    assert!(
+        historical
+            .sent
+            .expect("historical messages")
+            .iter()
+            .find(|m| m["method"] == "thread/resume")
+            .expect("resume")["params"]
+            .get("excludeTurns")
+            .is_none()
+    );
+    observations["launch"]["exclude_turns"] = json!(true);
+    let current = replay_facts(&stdout, &observations);
+    assert_eq!(
+        current
+            .sent
+            .expect("current messages")
+            .iter()
+            .find(|m| m["method"] == "thread/resume")
+            .expect("resume")["params"]["excludeTurns"],
+        true
+    );
+    observations["launch"]["exclude_turns"] = json!("true");
+    assert!(replay_facts(&stdout, &observations).sent.is_none());
 }

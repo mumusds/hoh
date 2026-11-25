@@ -47,7 +47,21 @@ pub fn thread_start(id: i64, profile: Profile, model: Option<&str>) -> Value {
 
 /// `thread/resume` of the session's thread `thread`.
 pub fn thread_resume(id: i64, profile: Profile, model: Option<&str>, thread: &str) -> Value {
+    resume(id, profile, model, thread, true)
+}
+
+/// Historical replay explicitly records whether the old launch excluded turns; current live requests always do.
+pub(super) fn resume(
+    id: i64,
+    profile: Profile,
+    model: Option<&str>,
+    thread: &str,
+    exclude_turns: bool,
+) -> Value {
     let mut params = thread_params(profile, model);
+    if exclude_turns {
+        params["excludeTurns"] = json!(true);
+    }
     params["threadId"] = json!(thread);
     request(id, super::super::RESUME_REQUEST, params)
 }

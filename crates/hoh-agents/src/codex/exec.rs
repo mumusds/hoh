@@ -18,6 +18,29 @@ use std::process::Command;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// CR-041: exec serializes id before type. Only the native compact prefix with a complete id in the head qualifies.
+fn reducible(head: &[u8]) -> Option<&'static str> {
+    let rest = head.strip_prefix(br#"{"type":"item.completed","item":{"id":""#)?;
+    let mut escaped = false;
+    for (i, &b) in rest.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return rest[i + 1..]
+                .starts_with(br#","type":"command_execution","#)
+                .then_some("command_execution");
+        }
+    }
+    None
+}
+
+pub const REDUCE: crate::frame::Skip = crate::frame::Skip {
+    known: reducible,
+    max_length: crate::frame::SKIP_LIMIT,
+};
+
 /// The raw log files of an exec turn.
 pub(super) fn logs(turn: &Turn) -> (std::path::PathBuf, std::path::PathBuf) {
     (
@@ -33,6 +56,7 @@ pub(super) fn config(turn: &Turn) -> Config {
         escalation: interrupt_first(turn.escalation),
         deadline: turn.deadline,
         stdout_copy: Some(stdout),
+        reduce: Some(REDUCE),
         stderr_copy: Some(stderr),
         ..Config::default()
     }
@@ -212,7 +236,7 @@ impl Seen {
                         &format!("exec-item-{}", self.items),
                         "adapter.item",
                         json!({"attempt_id": id, "method": kind, "threadId": self.thread_id, "turnId": null,
-                               "itemId": item["id"], "itemType": item_type}),
+                               "itemId": item["id"], "itemType": item_type, "aggregated_output": item["aggregated_output"]}),
                     )
                     .await?;
                 if kind == "item.completed" && item_type == "agent_message" {
@@ -399,6 +423,19 @@ pub(super) async fn drive(
         };
         let line = match event {
             Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => bytes,
+            Some(Event::Frame(Frame::Reduced { line, original })) => {
+                let mut payload = crate::adapter::skipped_frame(&original);
+                payload["reason"] = json!("known item strings truncated");
+                payload["attempt_id"] = json!(id);
+                recorder
+                    .event(
+                        &format!("exec-frame-reduced-{}", seen.items),
+                        "adapter.diagnostic",
+                        payload,
+                    )
+                    .await?;
+                line
+            }
             Some(Event::Frame(Frame::TooLarge(refused))) => {
                 seen.too_large = true;
                 process.cancel(hard_stop(turn.escalation));

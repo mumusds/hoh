@@ -2663,3 +2663,136 @@ async fn test_027_05_codex_a_long_turn_diff_is_skipped_and_other_notifications_a
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_024_05_resume_requests_exclude_history() -> R {
+    let world = World::new()?;
+    let case = Case::load("app-server-resume")?;
+    let thread = case.thread_id()?;
+    let fake = world.fake("resume-bounded", Some(&case), "exec", false)?;
+    let mut turn = world.turn(&fake, "logs/resume")?;
+    turn.launch.resume = Some(thread.clone());
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(outcome.state, AttemptState::Settled);
+    let got = received(&fake)?;
+    let resume = got
+        .iter()
+        .find(|m| m["method"] == "thread/resume")
+        .ok_or("resume")?;
+    assert_eq!(resume["params"]["threadId"], thread);
+    assert_eq!(resume["params"]["excludeTurns"], true);
+    Ok(())
+}
+
+async fn large_codex_item(kind: &str) -> R {
+    let world = World::new()?;
+    let pad = "z".repeat(3 << 19);
+    let (fake, raw) = if kind == "command_execution" {
+        let fake = world.fake("big-exec", None, "no-such-fixture", false)?;
+        let raw = format!(
+            r#"{{"type":"item.completed","item":{{"id":"big-item","type":"command_execution","command":"cat big","aggregated_output":"{pad}","exit_code":0,"status":"completed"}}}}"#
+        );
+        std::fs::write(
+            fake.parent().ok_or("parent")?.join("exec.0000"),
+            format!(
+                "{{\"type\":\"thread.started\",\"thread_id\":\"t\"}}\n{raw}\n{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n"
+            ),
+        )?;
+        (fake, raw)
+    } else {
+        let mut case = Case::load("app-server-turn")?;
+        let at = case.position("turn/completed")?;
+        let p = &case.frames[at]["params"];
+        let raw = format!(
+            r#"{{"method":"item/completed","params":{{"item":{{"type":"{kind}","id":"big-item",{content},"status":"completed","x_future":17}},"threadId":{thread},"turnId":{turn}}}}}"#,
+            content = if kind == "fileChange" {
+                format!(
+                    r#""changes":[{{"path":"big.txt","kind":{{"type":"update"}},"diff":"{pad}"}}]"#
+                )
+            } else {
+                format!(r#""command":"cat big","aggregatedOutput":"{pad}","exitCode":0"#)
+            },
+            thread = p["threadId"],
+            turn = p["turn"]["id"]
+        );
+        case.frames.insert(at, json!({"hoh_marker":"big-item"}));
+        let fake = world.fake("big-app", Some(&case), "exec", false)?;
+        let file = fake.parent().ok_or("parent")?.join("frames.jsonl");
+        std::fs::write(
+            &file,
+            read(&file)?.replace(
+                r#"{"hoh_marker":"big-item"}"#,
+                &if kind == "fileChange" {
+                    format!("{}\n{raw}", raw.replace("item/completed", "item/started"))
+                } else {
+                    raw.clone()
+                },
+            ),
+        )?;
+        (fake, raw)
+    };
+    let mut turn = world.turn(&fake, "logs/big")?;
+    if kind == "command_execution" {
+        turn.launch.app_server_help = None;
+    }
+    let attempt = world.attempt("A1").await?;
+    let outcome = run(&world, &attempt, &turn).await?;
+    assert_eq!(
+        outcome.state,
+        AttemptState::Settled,
+        "{kind}: {:?}",
+        outcome.failure
+    );
+    assert!(
+        outcome
+            .max_buffered
+            .is_some_and(|n| n <= (1 << 20) + (64 << 10))
+    );
+    let items = events(&world, "adapter.item")?;
+    let item = items
+        .iter()
+        .find(|i| i["itemId"] == "big-item" && i["method"] != "item/started")
+        .ok_or("big item missing")?;
+    assert_eq!(item["itemType"], kind);
+    let value = match kind {
+        "fileChange" => {
+            assert_eq!(item["changes"][0]["path"], "big.txt");
+            &item["changes"][0]["diff"]
+        }
+        "command_execution" => &item["aggregated_output"],
+        _ => &item["aggregatedOutput"],
+    };
+    assert_eq!(value["truncated"], true);
+    assert_eq!(value["original_bytes"], pad.len());
+    assert_eq!(value["sha256"], hex(pad.as_bytes()));
+    assert!(
+        value["prefix"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= 4096 && pad.starts_with(s))
+    );
+    assert!(read(&outcome.stdout)?.contains(&raw), "raw content changed");
+    let diagnostics = events(&world, "adapter.diagnostic")?;
+    let d = diagnostics
+        .iter()
+        .find(|d| {
+            d["reason"] == "known item strings truncated" && d["sha256"] == hex(raw.as_bytes())
+        })
+        .ok_or("truncation diagnosis")?;
+    assert_eq!(d["length"], raw.len());
+    assert_eq!(d["sha256"], hex(raw.as_bytes()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_027_06_app_command_output_keeps_bounded_content_and_settles() -> R {
+    large_codex_item("commandExecution").await
+}
+#[tokio::test]
+async fn test_027_06_app_file_changes_keep_bounded_content_and_settle() -> R {
+    large_codex_item("fileChange").await
+}
+#[tokio::test]
+async fn test_027_06_exec_command_output_keeps_bounded_content_and_settles() -> R {
+    large_codex_item("command_execution").await
+}

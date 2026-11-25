@@ -45,3 +45,59 @@ fn the_embedded_codex_notifications_are_accepted_by_the_recorded_schema() {
     let work = Work::new(VALIDATION_BUDGET, None);
     assert_eq!(frame_valid(Some(&schema), &unlisted, &work), Truth::No);
 }
+
+#[test]
+fn test_024_05_resume_excludes_turns_only_under_a_declared_schema() {
+    use crate::compat::suite::{Part, plan};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/protocol/codex/0.166.0/app-server-schema/ClientRequest.json"
+    );
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("schema")).expect("JSON");
+    let plan = plan("codex");
+    for declared in [true, false] {
+        let mut schema = original.clone();
+        if !declared {
+            schema["definitions"]["ThreadResumeParams"]["properties"]
+                .as_object_mut()
+                .expect("properties")
+                .remove("excludeTurns");
+        }
+        let conform = conform::schema(
+            &plan,
+            conform::Export {
+                client_requests: &schema,
+                client_notifications: &serde_json::json!({}),
+                server_notifications: &serde_json::json!({}),
+                responses: &BTreeMap::new(),
+            },
+            &Work::new(VALIDATION_BUDGET, None),
+        );
+        let resumed: Vec<_> = conform
+            .of("compaction")
+            .iter()
+            .filter(|f| f.part == Part::Requests && f.detail.starts_with("thread/resume "))
+            .collect();
+        assert!(!resumed.is_empty());
+        assert!(
+            resumed
+                .iter()
+                .all(|f| f.truth == if declared { Truth::Yes } else { Truth::No }),
+            "declared={declared}: {resumed:?}"
+        );
+    }
+    for case in &plan.cases {
+        for launch in &case.launches {
+            for request in launch.built["messages"].as_array().expect("messages") {
+                match request["method"].as_str() {
+                    Some("thread/resume") => assert_eq!(request["params"]["excludeTurns"], true),
+                    Some("thread/start") => {
+                        assert!(request["params"].get("excludeTurns").is_none())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}

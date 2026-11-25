@@ -97,6 +97,8 @@ def codex_thread(rid: int, launch: dict) -> dict:
         params['model'] = launch['model']
     if launch['resume'] is not None:
         params['threadId'] = launch['resume']
+        if launch.get('exclude_turns', False):
+            params['excludeTurns'] = True
         return {'method': 'thread/resume', 'id': rid, 'params': params}
     return {'method': 'thread/start', 'id': rid, 'params': params}
 
@@ -292,7 +294,7 @@ def _file_identity(v) -> bool:
     return isinstance(v, list) and len(v) == 3 and _text(v[0]) and _int(v[1]) and _int(v[2])
 
 
-LAUNCH_FIELDS = {'codex': {'profile', 'resume', 'model'}, 'pi': {'session_id', 'resume'}}
+LAUNCH_FIELDS = {'codex': {'profile', 'resume', 'model', 'exclude_turns'}, 'pi': {'session_id', 'resume'}}
 EXIT_FIELDS = {'returncode', 'how'}  # closed (M2T20D-1001): `how` is the named recorder-only description
 # Recorded but read by no adapter, so not compared (named): the recorder's description of how the process ended (the
 # exit status is `exit.returncode`), and pi's `prompt_sent` (what the adapter itself decides from the get_state
@@ -320,6 +322,8 @@ def required_observations(c: Case) -> list[tuple[tuple, object, list]]:
                 (('launch', 'profile'), lambda v: isinstance(v, str) and v in CODEX_PROFILES, ['readonly', 1]),
                 (('launch', 'resume'), lambda v: v is None or _text(v), [True, '']),
                 (('launch', 'model'), lambda v: v is None or _text(v), [5])]
+        if _at(c.observations, ('launch', 'exclude_turns')) is not UNOBSERVED:
+            req.append((('launch', 'exclude_turns'), lambda v: isinstance(v, bool), ['true']))
     elif c.agent == 'pi':
         req += [(('launch',), lambda v: isinstance(v, dict), ['new']),
                 (('launch', 'session_id'), _text, ['', 5]),
@@ -684,6 +688,13 @@ def untaken(c: Case) -> list[str]:
             and id(f) not in taken and (f.get('params') or {}).get('threadId') == r.thread and _turn_of(f) == r.turn]
 
 
+def truncated(value) -> bool:
+    """CR-041: a prefix is never complete evidence, including fields this judge previously ignored."""
+    if isinstance(value, dict):
+        return value.get('truncated') is True or any(truncated(v) for v in value.values())
+    return isinstance(value, list) and any(truncated(v) for v in value)
+
+
 def stream_items(c: Case) -> tuple[list[list[tuple]], list[tuple[str, str]], list[str]]:
     """Stage 2 on the adapter's items of the turn (codex; M2-T20 reads them from the `adapter.item` records that carry
     the item). Every item/started must have an item/completed. Every completed item is classified, else it is a
@@ -702,6 +713,9 @@ def stream_items(c: Case) -> tuple[list[list[tuple]], list[tuple[str, str]], lis
     for item in completed:
         kind, iid = item.get('type'), item.get('id')
         if kind in TEXT_ITEMS:
+            continue
+        if truncated(item):
+            problems.append('a completed item has truncated evidence')
             continue
         if kind == 'commandExecution' and item.get('command') == driver_command(c):
             lines = cell_lines([item['aggregatedOutput']] if isinstance(item.get('aggregatedOutput'), str) else [])

@@ -6,11 +6,17 @@
 //! holds at most `limit + chunk` bytes (`chunk` is at least 2), reports the length it saw, the sha256 of those bytes and their first 4 KiB,
 //! and yields no further frames.
 //!
-//! The one exception (CR-040): a reader given a [`Skip`] rule skips a frame over the limit whose head the rule knows
+//! The skip exception (CR-040): a reader given a [`Skip`] rule skips a frame over the limit whose head the rule knows
 //! (a record its adapter does not need): it drops what it held and then reads one chunk at a time up to the frame's
 //! LF, hashing and counting the bytes without keeping them, still within `limit + chunk`, yields
 //! [`Frame::Skipped`] and frames on after the LF. A known frame that the stream ends before its LF, or that grows past
 //! the rule's `max_length`, is refused like any other.
+//!
+//! CR-041 additionally reduces strings in known Codex items as they arrive: every field remains, large string values
+//! carry a typed prefix/length/hash marker, and invalid or over-budget records are refused. The reducer has its own
+//! 512 KiB output budget, keeping its input, output, head and string scratch within the unchanged reader bound.
+
+mod reduce;
 
 use sha2::{Digest, Sha256};
 use std::io;
@@ -35,10 +41,15 @@ pub enum Frame {
     /// A frame longer than the limit that the reader's [`Skip`] rule knew by its head, read to its LF without being
     /// kept (CR-040); framing goes on after it.
     Skipped(SkippedFrame),
+    /// A known item with typed, bounded string values (CR-041); original bytes remain in the raw log.
+    Reduced {
+        line: Vec<u8>,
+        original: SkippedFrame,
+    },
 }
 
-/// Knows, from the head of a frame longer than the limit (its first [`HEAD_BYTES`] bytes), a record whose payload its
-/// adapter does not use: the record's name, or `None` to refuse the frame (CR-040).
+/// Identifies a record by its first [`HEAD_BYTES`] bytes. Skip rules name records whose payload is unused (CR-040);
+/// reduction rules name Codex items that can preserve their fields with bounded string values (CR-041).
 pub type Known = fn(&[u8]) -> Option<&'static str>;
 
 /// Which frames over the limit are skipped rather than refused (CR-040).
@@ -101,6 +112,8 @@ pub struct FrameReader<R> {
     done: bool,
     skip: Option<Skip>,
     skipping: Option<Skipping>,
+    reduce: Option<Skip>,
+    reducing: Option<(Skipping, reduce::Json)>,
 }
 
 /// A known frame over the limit being read to its LF without being kept (CR-040).
@@ -171,12 +184,22 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             done: false,
             skip: None,
             skipping: None,
+            reduce: None,
+            reducing: None,
         }
     }
 
     /// The reader skipping the frames over the limit that `skip` knows (CR-040).
     pub fn skipping(mut self, skip: Skip) -> Self {
         self.skip = Some(skip);
+        self
+    }
+
+    /// Stream known item strings into a bounded representation (CR-041). Only used with the default frame budget.
+    pub fn reducing(mut self, rule: Skip) -> Self {
+        if self.limit >= FRAME_LIMIT && self.chunk <= READ_CHUNK {
+            self.reduce = Some(rule);
+        }
         self
     }
 
@@ -201,6 +224,33 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         loop {
             if self.done {
                 return Ok(None);
+            }
+            if self.reducing.is_some() {
+                if let Some(frame) = self.reduce_more().await? {
+                    return Ok(Some(frame));
+                }
+                continue;
+            }
+            // Start early, before a large frame fills the ordinary buffer: input + output stay within the same bound.
+            if let Some(rule) = self.reduce {
+                let pending = &self.buf[self.start..];
+                if let Some(kind) = (rule.known)(&pending[..pending.len().min(HEAD_BYTES)]) {
+                    self.buf.drain(..self.start);
+                    self.buf.shrink_to(self.chunk.max(self.buf.len()));
+                    self.start = 0;
+                    self.scanned = 0;
+                    self.reducing = Some((
+                        Skipping {
+                            kind,
+                            hasher: Sha256::new(),
+                            length: 0,
+                            head: Vec::new(),
+                            cr: false,
+                        },
+                        reduce::Json::default(),
+                    ));
+                    continue;
+                }
             }
             if self.skipping.is_some() {
                 match self.skip_more().await? {
@@ -273,7 +323,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 self.buf.reserve_exact(want);
             }
             let n = (&mut self.inner)
-                .take(room as u64)
+                .take(if self.reduce.is_some() { want } else { room } as u64)
                 .read_buf(&mut self.buf)
                 .await?;
             self.max_buffered = self.max_buffered.max(self.buf.len());
@@ -288,6 +338,75 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 return Ok((!rest.is_empty()).then_some(Frame::Partial(rest)));
             }
         }
+    }
+
+    /// Consume at most one read of a known item. CR is handled by the frame digest, and remains JSON whitespace.
+    async fn reduce_more(&mut self) -> io::Result<Option<Frame>> {
+        let mut eof = false;
+        if self.buf.is_empty() {
+            self.buf.reserve_exact(self.chunk);
+            let n = (&mut self.inner)
+                .take(self.chunk as u64)
+                .read_buf(&mut self.buf)
+                .await?;
+            self.bytes += n as u64;
+            eof = n == 0;
+        }
+        let end = self.buf.iter().position(|&b| b == b'\n');
+        let bytes = &self.buf[..end.unwrap_or(self.buf.len())];
+        let Some((original, json)) = &mut self.reducing else {
+            return Ok(None);
+        };
+        if end.is_some() {
+            original.take_last(bytes);
+        } else {
+            original.take_open(bytes);
+        }
+        let valid = json.take(bytes).is_ok();
+        self.max_buffered = self
+            .max_buffered
+            .max(self.buf.capacity() + original.head.capacity() + json.buffered());
+        if !valid || eof || original.length > self.reduce.map_or(0, |r| r.max_length) {
+            return Ok(self.refuse_reduced());
+        }
+        if let Some(end) = end {
+            let Some((original, json)) = self.reducing.take() else {
+                return Ok(None);
+            };
+            let truncated = json.truncated;
+            self.start = end + 1;
+            self.scanned = 0;
+            let line = match json.finish() {
+                Ok(line) if valid_item(&line, original.kind) => line,
+                _ => {
+                    self.skipping = Some(original);
+                    return Ok(self.refuse_skipped());
+                }
+            };
+            if !truncated {
+                return Ok(Some(Frame::Line(line)));
+            }
+            return Ok(Some(Frame::Reduced {
+                line,
+                original: SkippedFrame {
+                    kind: original.kind,
+                    length: original.length,
+                    sha256: hex(&original.hasher.finalize()),
+                    head: original.head,
+                },
+            }));
+        }
+        self.buf.clear();
+        Ok(None)
+    }
+
+    fn refuse_reduced(&mut self) -> Option<Frame> {
+        let (mut original, _) = self.reducing.take()?;
+        if std::mem::take(&mut original.cr) {
+            original.take(b"\r");
+        }
+        self.skipping = Some(original);
+        self.refuse_skipped()
     }
 
     /// The name and the rule's length of the frame in `buf[from..to]` over the limit, when the [`Skip`] rule knows its
@@ -375,6 +494,61 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         self.done = true;
         self.buf = Vec::new();
         Frame::TooLarge(refused)
+    }
+}
+
+/// Recheck the exact kind and routing after JSON validation; a reduced identifier must never be used for correlation.
+fn valid_item(line: &[u8], kind: &str) -> bool {
+    fn present<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        <serde::de::IgnoredAny as serde::Deserialize>::deserialize(de).map(|_| true)
+    }
+
+    // Borrow routing strings; ignore all other fields without building a second JSON tree.
+    #[derive(serde::Deserialize)]
+    struct Item<'a> {
+        #[serde(rename = "type", borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        id: std::borrow::Cow<'a, str>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Params<'a> {
+        #[serde(borrow)]
+        item: Item<'a>,
+        #[serde(rename = "threadId", borrow)]
+        thread: std::borrow::Cow<'a, str>,
+        #[serde(rename = "turnId", borrow)]
+        turn: std::borrow::Cow<'a, str>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Route<'a> {
+        #[serde(borrow)]
+        method: Option<std::borrow::Cow<'a, str>>,
+        #[serde(rename = "type", borrow)]
+        kind: Option<std::borrow::Cow<'a, str>>,
+        #[serde(default, deserialize_with = "present")]
+        id: bool,
+        #[serde(borrow)]
+        params: Option<Params<'a>>,
+        #[serde(borrow)]
+        item: Option<Item<'a>>,
+    }
+    let Ok(v) = serde_json::from_slice::<Route<'_>>(line) else {
+        return false;
+    };
+    if kind == "command_execution" {
+        v.kind.as_deref() == Some("item.completed")
+            && v.item.is_some_and(|i| i.kind == kind && !i.id.is_empty())
+    } else {
+        (v.method.as_deref() == Some("item/completed")
+            || (kind == "fileChange" && v.method.as_deref() == Some("item/started")))
+            && !v.id
+            && v.params.is_some_and(|p| {
+                p.item.kind == kind
+                    && !p.item.id.is_empty()
+                    && !p.thread.is_empty()
+                    && !p.turn.is_empty()
+            })
     }
 }
 
@@ -730,6 +904,120 @@ mod tests {
         );
         assert_eq!(refused.head, vec![b'z'; HEAD_BYTES]);
         assert!(max <= limit + chunk, "buffered {max} bytes");
+        Ok(())
+    }
+    fn item_head(head: &[u8]) -> Option<&'static str> {
+        by_prefix(
+            head,
+            &[(
+                br#"{"method":"item/completed","params":{"item":{"type":"commandExecution","#,
+                "commandExecution",
+            )],
+        )
+    }
+
+    fn large_item(text: &str) -> Vec<u8> {
+        format!(r#"{{"method":"item/completed","params":{{"item":{{"type":"commandExecution","id":"i","aggregatedOutput":"{text}","x_future":{{"n":7}}}},"threadId":"t","turnId":"u"}}}}"#).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_027_06_reduced_frames_keep_fields_hash_and_crlf_across_reads() -> R {
+        let raw = large_item(&"é\\n".repeat(6000));
+        let input = [b"before\n".to_vec(), raw.clone(), b"\r\nafter\n".to_vec()].concat();
+        let original: serde_json::Value = serde_json::from_slice(&raw)?;
+        for size in [1, 7, 4096, READ_CHUNK] {
+            let mut reader =
+                FrameReader::new(Parts(reads(&input, size).into()), FRAME_LIMIT, READ_CHUNK)
+                    .reducing(Skip {
+                        known: item_head,
+                        max_length: SKIP_LIMIT,
+                    });
+            assert_eq!(reader.next().await?, Some(line("before")));
+            let Some(Frame::Reduced {
+                line: reduced,
+                original: record,
+            }) = reader.next().await?
+            else {
+                return Err("not reduced".into());
+            };
+            let value: serde_json::Value = serde_json::from_slice(&reduced)?;
+            let output = &value["params"]["item"]["aggregatedOutput"];
+            let text = original["params"]["item"]["aggregatedOutput"]
+                .as_str()
+                .ok_or("string")?;
+            assert_eq!(output["truncated"], true);
+            assert_eq!(output["original_bytes"], text.len());
+            assert_eq!(output["sha256"], hex(&Sha256::digest(text.as_bytes())));
+            assert_eq!(
+                value["params"]["item"]["x_future"],
+                serde_json::json!({"n":7})
+            );
+            assert_eq!(value["params"]["threadId"], "t");
+            assert_eq!(record.length, raw.len() as u64);
+            assert_eq!(record.sha256, hex(&Sha256::digest(&raw)));
+            assert_eq!(record.head, raw[..HEAD_BYTES]);
+            assert_eq!(reader.next().await?, Some(line("after")));
+            assert_eq!(reader.next().await?, None);
+            assert!(
+                reader.max_buffered() <= FRAME_LIMIT + READ_CHUNK,
+                "{}",
+                reader.max_buffered()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_027_06_unknown_unterminated_malformed_and_over_budget_items_fail() -> R {
+        let raw = large_item(&"x".repeat(3 << 19));
+        let malformed = large_item(&("x".repeat(3 << 19) + "\\q"));
+        let unknown = String::from_utf8(raw.clone())?
+            .replace("commandExecution", "commandExecutionFuture")
+            .into_bytes();
+        let long_id = String::from_utf8(raw.clone())?
+            .replace("\"id\":\"i\"", &format!("\"id\":\"{}\"", "i".repeat(5000)))
+            .into_bytes();
+        for (frame, lf, max_length) in [
+            (raw.clone(), false, SKIP_LIMIT),
+            (malformed, true, SKIP_LIMIT),
+            (unknown, true, SKIP_LIMIT),
+            (long_id, true, SKIP_LIMIT),
+            (raw.clone(), true, 1 << 20),
+        ] {
+            let mut input = frame;
+            if lf {
+                input.extend_from_slice(b"\nafter\n");
+            }
+            let mut reader =
+                FrameReader::new(input.as_slice(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+                    known: item_head,
+                    max_length,
+                });
+            assert!(matches!(reader.next().await?, Some(Frame::TooLarge(_))));
+            assert_eq!(reader.next().await?, None);
+            assert!(reader.max_buffered() <= FRAME_LIMIT + READ_CHUNK);
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_027_06_route_strings_may_be_escaped_but_a_request_id_is_not_a_notification() -> R
+    {
+        let raw = String::from_utf8(large_item("small"))?
+            .replace("\"threadId\":\"t\"", r#""threadId":"t\u0031""#);
+        let input = format!("{raw}\n");
+        let mut reader =
+            FrameReader::new(input.as_bytes(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+                known: item_head,
+                max_length: SKIP_LIMIT,
+            });
+        assert_eq!(reader.next().await?, Some(line(&raw)));
+        let raw = String::from_utf8(large_item(&"x".repeat(3 << 19)))?;
+        let raw = format!("{},\"id\":null}}\n", raw.strip_suffix('}').ok_or("object")?);
+        let mut reader = FrameReader::new(raw.as_bytes(), FRAME_LIMIT, READ_CHUNK).reducing(Skip {
+            known: item_head,
+            max_length: SKIP_LIMIT,
+        });
+        assert!(matches!(reader.next().await?, Some(Frame::TooLarge(_))));
         Ok(())
     }
 }

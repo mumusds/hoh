@@ -1472,7 +1472,9 @@ async fn drive(
             event = process.next() => event,
         };
         match event {
-            Some(Event::Frame(Frame::Line(bytes) | Frame::Partial(bytes))) => {
+            Some(Event::Frame(
+                Frame::Line(bytes) | Frame::Partial(bytes) | Frame::Reduced { line: bytes, .. },
+            )) => {
                 r.on_record(sink, &bytes).await?;
             }
             Some(Event::Frame(Frame::Skipped(skipped))) => r.on_skipped(sink, &skipped).await?,

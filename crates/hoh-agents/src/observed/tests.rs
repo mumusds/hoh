@@ -52,6 +52,7 @@ fn the_recorded_observations_are_the_contracts() {
     assert_eq!(
         o.codex,
         Some(CodexLaunch {
+            exclude_turns: false,
             profile: Profile::ReadOnly,
             resume: None,
             model: None

@@ -4908,6 +4908,46 @@
     "实际版本",
     "判定结果"
    ]
+  },
+  {
+   "id": "TEST-024-05",
+   "requirement_id": "REQ-024",
+   "acceptance_id": "AC-024-05",
+   "check_id": "integration",
+   "fixture": "codex 0.166 的录制 schema、实际请求 fake，与删除 ThreadResumeParams.excludeTurns 的旧 schema fixture",
+   "steps": [
+    "构建并执行 thread/resume，校验共享 builder 的请求符合性"
+   ],
+   "pass_criteria": [
+    "resume 请求含 excludeTurns=true，threadId 保持原会话；thread/start 不含此字段；已声明且支持的 schema 通过，未声明字段的旧 schema 即使允许额外字段也不通过兼容校验"
+   ],
+   "observables": [
+    "请求日志",
+    "adapter 事件",
+    "reader 峰值",
+    "只读判定结果",
+    "原始 stdout"
+   ]
+  },
+  {
+   "id": "TEST-027-06",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-06",
+   "check_id": "integration",
+   "fixture": "Codex App Server commandExecution/fileChange 与 exec command_execution 的 1.5 MiB item 完成帧（fileChange 另含相同 changes 的 started 帧）；未知超限帧、无 LF、无效尾部和超结构预算变体；只读判定 fixture",
+   "steps": [
+    "运行 adapter attempt 与 reader 探针，并把带截断标记的判定事实送入只读判定器"
+   ],
+   "pass_criteria": [
+    "已知合法 item 的 attempt=SETTLED；所有字段保留，大字符串值为含 truncated=true、prefix、original_bytes、sha256 的对象；诊断含原始整帧长度/hash/head，raw 日志完整；最大保留字节≤1 MiB+64 KiB；其他变体 FAILED/PROTOCOL_FRAME_TOO_LARGE；只读判定不得依据截断事实给出 PASS"
+   ],
+   "observables": [
+    "请求日志",
+    "adapter 事件",
+    "reader 峰值",
+    "只读判定结果",
+    "原始 stdout"
+   ]
   }
  ]
 }
