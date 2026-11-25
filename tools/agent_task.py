@@ -91,6 +91,10 @@ def stdin_for(agent:str,data:bytes)->bytes:
     message={'event':'user','message':{'role':'user','content':data.decode('utf-8')}}
     return (json.dumps(message,ensure_ascii=False)+'\n').encode('utf-8')
 
+def agy_result(r:dict)->dict:
+    """The body of an agy result event; anything but an object counts as empty, so the turn fails rather than the bridge."""
+    body=r.get('result');return body if isinstance(body,dict) else {}
+
 REPORT_FENCE=re.compile(r'```hoh-report[ \t]*\n(.*?)\n```',re.S)
 FINAL_TEXT_LIMIT=1024*1024
 # The longest JSONL record parsed: pi 1.6.0's terminal agent_end carries the whole message history (1.4 MB in the M3-T05
@@ -122,7 +126,7 @@ def inspect_output(agent:str,path:Path)->dict:
                 item=r.get('item',{})
                 if isinstance(item,dict) and item.get('type')=='agent_message':text=item.get('text')
             elif agent in ('claude','grok') and t=='result':text=r.get('result')
-            elif agent=='agy' and t=='result':text=(r.get('result') or {}).get('response')
+            elif agent=='agy' and t=='result':text=agy_result(r).get('response')
             elif agent=='pi' and t=='message_end':
                 message=r.get('message',{})
                 if isinstance(message,dict) and message.get('role')=='assistant':
@@ -150,7 +154,7 @@ def inspect_output(agent:str,path:Path)->dict:
             elif agent in ('claude','grok') and t=='result':
                 terminal=True;failed|=r.get('is_error',False) or r.get('subtype') not in [None,'success']
             elif agent=='agy' and t=='result':
-                terminal=True;failed|=(r.get('result') or {}).get('status')!='SUCCESS'
+                terminal=True;failed|=agy_result(r).get('status')!='SUCCESS'
             elif agent=='pi':
                 # JSON mode is a one-shot process: observed process exit is also
                 # required by main. Production RPC MUST use negotiated settled.
@@ -230,6 +234,10 @@ def main(argv=None)->int:
     a=p.parse_args(argv)
     if a.timeout<=0 or not a.prompt_file.is_file() or not a.cwd.is_dir():p.error('positive timeout, existing prompt and cwd required')
     original=a.prompt_file.read_bytes()
+    if a.agent=='agy':
+        # agy reads the prompt inside a JSON message, so it must be text: refuse before any attempt is written.
+        try:original.decode('utf-8')
+        except UnicodeDecodeError:p.error('agy needs a UTF-8 prompt file')
     if not original.strip():p.error('prompt must not be empty')
     if a.top_level and a.role not in TOP_LEVEL_ROLES:p.error('--top-level requires role commander or developer')
     if not a.role.strip():p.error('--role must name a role')
