@@ -341,3 +341,31 @@ the lead's recommendation"): tools/run_check.py stays unchanged (the slot is a d
 environments do not have); callers hold the slot (`flock /home/ai/dev/.hoh-test-slot.lock python3 tools/run_check.py …`), so
 waiting for it is not part of a check's recorded duration; docs/19 records the rule. Deferred low: none new. Final checks: see
 the PR.
+
+## M3QA-018 (per-test result lines lost from check logs)
+
+M3-T05 QA round 2, high, REQ-053: traceability reported TEST-062-01 NOT_RUN although it passed, and the v0.1 gate failed
+nondeterministically. QA evidence: integration `stdout.log:9287` `hoh host: origin lookup returned none: stage=capture tcp
+port=53426: tcp_match missingtest test_062_01_settings_busy_writer_responsive_reads ... ok`; the rerun lost another test the
+same way (`integration-rerun1/stdout.log:7304`); deployment `stdout.log:7-8` `test
+resource_deployment::test_047_03_bundle_pinned_until_checkpoint ... hoh host: verification reconciled host_epoch=3`, then `ok`
+on the next line.
+
+Chain: scripts/product/cargo-tests.sh, recovery.sh, tui-pty.sh and deployment.sh ran `cargo test … 2>&1 | tee "$log"` and
+parsed `$log` with test_results.py. libtest's pretty formatter writes a result line in several flushed writes to stdout
+(`test X ... `, then `ok`, then the newline); host processes the tests start inherit the test binary's stderr and write
+their diagnostics with Rust's unbuffered stderr, the message and its newline in separate write(2) calls. With `2>&1` both
+reach one pipe, so a diagnostic can land inside or just before a result line, which then no longer starts with `test ` or
+ends in ` ... ok`; test_results.py (correctly) does not recognise it and the TEST stays NOT_RUN.
+
+DC-QA018 (design correction). Wrong assumption: one log stream can carry both libtest's result lines and arbitrary
+diagnostics of the processes under test. It cannot: line integrity holds only for a stream with one writer that writes whole
+lines. Correction: the parsed log is libtest's stdout only. The scripts pipe only cargo's stdout into `tee "$log"` and leave
+cargo's stderr (compiler output and errors, `Running …` headers, `error: test failed`, and every inherited child diagnostic)
+on the script's own stderr, which tools/run_check.py records as the check's `stderr.log` beside `stdout.log`; nothing a
+parser or the scripts' `test result:` / `^test … ok$` greps need is on stderr (libtest writes result lines, failure
+sections `---- X stdout ----` and `test result:` summaries to stdout). Exit codes are unchanged: `set -o pipefail` with
+`|| rc=$?` still yields cargo's status, so a build failure fails the check and its errors stay visible on stderr. A child
+that inherits the test binary's *stdout* would still interleave, so the fix includes an audit for test-spawned processes
+writing to an inherited fd 1 (recorded below). test_results.py does not guess at damaged lines: a lost line stays NOT_RUN.
+static.sh merges clippy's stderr into `clippy.log`, which no parser reads for test results, so it stays as it is.
