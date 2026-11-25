@@ -93,19 +93,21 @@ INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALU
 }
 #[tokio::test]
 async fn test_040_01_third_round_writes_one_no_progress() -> R {
-    let dir = tempfile::Builder::new()
-        .prefix("m3t10-progress-")
-        .tempdir()?;
-    let host = Host::start(config(dir.path())).await?;
-    sql(dir.path(), WORLD, false)?;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    let world = world::World::named("m3t10-progress")?;
+    world.configure(&[], "")?;
+    let root = world.project();
+    let host = Host::start(config(&root)).await?;
+    sql(&root, WORLD, false)?;
+    sql(&root, CURRENT_SPEC_REVIEW, false)?;
     for n in 1..=4 {
-        round(dir.path(), n)?;
+        round(&root, n)?;
         let closed = host
             .store()
             .reconcile_verification("R", Default::default())
             .await?;
         assert_eq!(closed.closed.len(), 1);
-        let found = events(dir.path(), "no_progress")?;
+        let found = events(&root, "no_progress")?;
         assert_eq!(
             found.len(),
             usize::from(n >= 3),
@@ -115,7 +117,18 @@ async fn test_040_01_third_round_writes_one_no_progress() -> R {
             assert_eq!(found[0]["window"], 3);
             assert_eq!(found[0]["fingerprints"], json!(["F"]));
             assert_eq!(found[0]["last_progress_seq"], 0);
-            assert!(found[0]["vector"].is_object());
+            assert_eq!(
+                found[0]["vector"],
+                json!({
+                    "accepted": 0,
+                    "closed_issues": 0,
+                    "reopened_issues": 0,
+                    "new_critical_high": 1,
+                    "decision_risks": 0
+                }),
+                "exact net-progress vector components: {}",
+                found[0]["vector"]
+            );
         }
     }
     let now = SystemTime::now() + Duration::from_secs(20);
@@ -140,29 +153,129 @@ async fn test_040_01_third_round_writes_one_no_progress() -> R {
         )
         .await?;
     let diagnosis_seq = sql(
-        dir.path(),
+        &root,
         "SELECT seq FROM events WHERE kind='no_progress'",
         true,
     )?[0]["seq"]
         .as_i64()
         .ok_or("diagnosis seq")?;
-    assert!(
+    assert_eq!(
         first
             .fired
             .iter()
             .chain(&second.fired)
-            .any(|f| f.event_seqs.contains(&diagnosis_seq)
-                && f.severity == hoh_core::supervise::Severity::High),
-        "the actual diagnosis event must fire at High priority"
+            .filter(|f| f.event_seqs.contains(&diagnosis_seq)
+                && f.severity == hoh_core::supervise::Severity::High)
+            .count(),
+        1,
+        "the diagnosis event must fire at High priority exactly once"
+    );
+    let woken = sql(
+        &root,
+        &format!(
+            "SELECT json_extract(payload_json,'$.severity') AS severity FROM events \
+             WHERE kind='supervisor.woken' AND run_id='R' \
+             AND EXISTS (SELECT 1 FROM json_each(payload_json,'$.event_seqs') WHERE value={diagnosis_seq})"
+        ),
+        true,
+    )?;
+    assert_eq!(
+        woken,
+        json!([{"severity": "high"}]),
+        "persisted supervisor.woken must record exactly one High wake"
+    );
+    let triggers = sql(
+        &root,
+        &format!(
+            "SELECT state, severity FROM supervisor_triggers \
+             WHERE run_id='R' AND EXISTS (SELECT 1 FROM json_each(event_seqs_json) WHERE value={diagnosis_seq})"
+        ),
+        true,
+    )?;
+    assert_eq!(
+        triggers,
+        json!([{"state": "HANDLED", "severity": "high"}]),
+        "persisted supervisor_triggers must record one HANDLED High trigger"
     );
     host.shutdown().await;
-    let host = Host::start(config(dir.path())).await?;
-    round(dir.path(), 5)?;
-    host.store()
-        .reconcile_verification("R", Default::default())
-        .await?;
-    assert_eq!(events(dir.path(), "no_progress")?.len(), 1);
-    host.shutdown().await;
+
+    // Real host process SIGKILL and restart: the restarted host process itself reconciles round 5.
+    let spawn_host = || -> R<pty::Hoh> {
+        Ok(pty::Hoh(
+            std::process::Command::new(world::HOH)
+                .args(["__host"])
+                .arg(&root)
+                .envs(world.env())
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?,
+        ))
+    };
+    let wait_host_pid = |expected: u32| -> R {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let path = root.join(".hoh/host.json");
+        loop {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
+                && v["pid"].as_u64() == Some(u64::from(expected))
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= end {
+                return Err(format!("host.json did not record pid {expected}").into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let mut first_proc = spawn_host()?;
+    let first_pid = first_proc.0.id();
+    wait_host_pid(first_pid)?;
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(first_pid)?).ok_or("pid")?,
+        rustix::process::Signal::KILL,
+    )?;
+    let killed = first_proc.0.wait()?;
+    assert_eq!(killed.signal(), Some(9), "first host process must end by SIGKILL");
+
+    let mut restarted = spawn_host()?;
+    let restarted_pid = restarted.0.id();
+    wait_host_pid(restarted_pid)?;
+    round(&root, 5)?;
+    let wait_end = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let closed = sql(
+            &root,
+            "SELECT count(*) AS n FROM events WHERE kind='verification.round_closed'",
+            true,
+        )?[0]["n"]
+            .as_i64()
+            .unwrap_or(0);
+        if closed >= 5 {
+            break;
+        }
+        if std::time::Instant::now() >= wait_end {
+            return Err(format!("restarted host did not close round 5 (closed={closed})").into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(events(&root, "no_progress")?.len(), 1);
+    let woken_after = sql(
+        &root,
+        &format!(
+            "SELECT json_extract(payload_json,'$.severity') AS severity FROM events \
+             WHERE kind='supervisor.woken' AND run_id='R' \
+             AND EXISTS (SELECT 1 FROM json_each(payload_json,'$.event_seqs') WHERE value={diagnosis_seq})"
+        ),
+        true,
+    )?;
+    assert_eq!(woken_after, json!([{"severity": "high"}]));
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(restarted_pid)?).ok_or("pid")?,
+        rustix::process::Signal::TERM,
+    );
+    let _ = restarted.0.wait();
     Ok(())
 }
 
