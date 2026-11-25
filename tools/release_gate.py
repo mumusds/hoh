@@ -87,6 +87,13 @@ def when(value: str) -> datetime:
     need(d.tzinfo is not None,'timestamp must include timezone')
     return d
 
+def execution_start_consistent(record: dict) -> bool:
+    """CR-038: only a short, artifact-free launch failure can be NOT_STARTED; schema checks types first."""
+    if record['started']:return True
+    elapsed=(when(record['finished_at'])-when(record['started_at'])).total_seconds()
+    return (record['exit_code']==127 and not record['timed_out'] and not record['artifacts']
+            and 0<=record['duration_seconds']<=5 and 0<=elapsed<=5)
+
 def unique_index(items: list, key: str, label: str) -> dict:
     index={v[key]:v for v in items}
     need(len(index)==len(items),f'duplicate {label}')
@@ -147,6 +154,8 @@ def validate_manifest(root: Path, manifest: dict) -> dict:
         execution_path=verify_ref(root,check['execution'],True)
         execution=load_json(execution_path)
         validate_schema(root,'execution.schema.json',execution)
+        need(execution_start_consistent(execution),f'{check_id}: inconsistent not-started execution')
+        need(execution['started'],f'{check_id}: command not started')
         need(check_id in plan['checks'],f'{check_id}: not declared in the frozen check plan')
         planned=plan['checks'][check_id]
         need(planned['mode']==rule['mode'],f'{check_id}: check plan mode {planned["mode"]} but policy needs {rule["mode"]}')

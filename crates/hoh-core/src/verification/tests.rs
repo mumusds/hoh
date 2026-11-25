@@ -177,12 +177,124 @@ impl Lookup for World {
 
 const DIR: &str = ".hoh/evidence/C/unit/r1";
 
+#[test]
+fn test_053_02_started_exit_127_is_a_failure_and_a_passing_rerun_is_flaky() -> R {
+    use super::acceptance::{CheckRun, Label, check_label};
+    let c = manifest().seal();
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    let pass = CheckRun {
+        check_id: "unit".into(),
+        outcome: "PASS".into(),
+        reason: None,
+        fail_lines: false,
+    };
+    e.record.exit_code = 127;
+    let verdict = valid(&e, &c, &c.manifest.spec.sha256, &w);
+    assert!(verdict.is_ok(), "{verdict:?}");
+    let o = outcome(&e, &verdict, &w);
+    assert_eq!((o.status.code(), o.reason), ("FAIL", None));
+    let fail = CheckRun {
+        check_id: "unit".into(),
+        outcome: o.status.code().into(),
+        reason: o.reason.map(str::to_owned),
+        fail_lines: false,
+    };
+    assert_eq!(check_label(&[&fail]), Label::Fail);
+    assert_eq!(check_label(&[&fail, &pass]), Label::Flaky);
+    assert_eq!(check_label(&[&pass, &fail]), Label::Flaky);
+    Ok(())
+}
+
+#[test]
+fn test_053_02_not_started_127_is_inconclusive_and_a_passing_rerun_passes() -> R {
+    use super::acceptance::{CheckRun, Label, check_label};
+    let c = manifest().seal();
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    let mut value = serde_json::to_value(&e.record)?;
+    value["started"] = json!(false);
+    value["exit_code"] = json!(127);
+    value["artifacts"] = json!([]);
+    value["missing_artifacts"] = json!(["test-results.jsonl"]);
+    e.record = Record::from_value(&value)?;
+    e.observations.clear();
+    let verdict = valid(&e, &c, &c.manifest.spec.sha256, &w);
+    assert!(verdict.is_ok(), "{verdict:?}");
+    let o = outcome(&e, &verdict, &w);
+    assert_eq!((o.status.code(), o.reason), ("FAIL", Some("NOT_STARTED")));
+    let failed = CheckRun {
+        check_id: "unit".into(),
+        outcome: o.status.code().into(),
+        reason: o.reason.map(str::to_owned),
+        fail_lines: false,
+    };
+    let pass = CheckRun {
+        check_id: "unit".into(),
+        outcome: "PASS".into(),
+        reason: None,
+        fail_lines: false,
+    };
+    assert_eq!(check_label(&[&failed]), Label::Unknown);
+    assert_eq!(check_label(&[&failed, &pass]), Label::Pass);
+    Ok(())
+}
+
+#[test]
+fn test_052_04_missing_or_inconsistent_started_is_invalid() -> R {
+    let c = manifest().seal();
+    let base = serde_json::to_value(e0(&c).record)?;
+    let mut missing = base.clone();
+    missing
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("started");
+    assert!(
+        Record::from_value(&missing).is_err(),
+        "missing started accepted"
+    );
+    let mut unstarted = base.clone();
+    unstarted["started"] = json!(false);
+    unstarted["exit_code"] = json!(127);
+    unstarted["artifacts"] = json!([]);
+    assert!(
+        Record::from_value(&unstarted).is_ok(),
+        "boundary 5 seconds accepted"
+    );
+    for (key, bad) in [
+        ("exit_code", json!(0)),
+        ("exit_code", json!(1)),
+        ("exit_code", json!(130)),
+        ("started", json!("false")),
+        ("timed_out", json!(true)),
+        ("duration_seconds", json!(5.001)),
+        ("artifacts", base["artifacts"].clone()),
+    ] {
+        let mut value = unstarted.clone();
+        value[key] = bad;
+        assert!(
+            Record::from_value(&value).is_err(),
+            "accepted inconsistent {key}"
+        );
+    }
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    e.record = Record::from_value(&unstarted)?;
+    e.record.finished_at = "2026-11-11T10:00:06Z".into();
+    assert!(
+        valid(&e, &c, &c.manifest.spec.sha256, &w).is_err(),
+        "long interval is not trusted"
+    );
+    Ok(())
+}
+
 fn e0(c: &Sealed) -> Evidence {
     let m = &c.manifest;
     Evidence {
         record: Record {
             schema_version: "1.1".to_owned(),
             record_type: "command_execution".to_owned(),
+            started: true,
             record_id: "r1".to_owned(),
             check_id: "unit".to_owned(),
             candidate_id: c.candidate_id.clone(),
@@ -839,7 +951,7 @@ fn the_outcome_is_the_first_of_the_ordered_rules_that_holds() -> R {
         (3, "BLOCKED", None),
         (1, "FAIL", None),
         (101, "FAIL", None),
-        (127, "FAIL", Some("NOT_STARTED")),
+        (127, "FAIL", None),
         (130, "FAIL", Some("INTERRUPTED")),
         (-15, "FAIL", Some("INTERRUPTED")),
     ] {

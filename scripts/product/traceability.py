@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from jsonschema import Draft202012Validator, FormatChecker  # noqa: E402
 from common import atomic_json, load_json, safe_path, sha256  # noqa: E402
 from candidate import identity  # noqa: E402
+from release_gate import execution_start_consistent  # noqa: E402
 
 TOOLS = {'tools/run_check.py', 'hoh'}
 SEARCH = ('.hoh-dev', '.hoh/evidence')
@@ -308,6 +309,7 @@ def judge(world: World, m: Member, members: list[Member]) -> None:
     need(r['test_plan_sha256'] == c['test_plan_sha256'], 'TEST_PLAN_MISMATCH')
     # Rule 9: an interval that runs backwards vetoes; a duration that disagrees only leaves the record incomplete.
     need(interval(r) is not None, 'INTERVAL_INVALID')
+    need(execution_start_consistent(r), 'RECORD_INVALID')
     # Rule 6.
     need(r['source_unchanged'] is True, 'SOURCE_CHANGED')
     # Rule 7.
@@ -396,7 +398,7 @@ def outcome(world: World, m: Member) -> tuple[str, str | None]:
     code = r['exit_code']
     if code == 3:
         return 'BLOCKED', None
-    if code == 127:
+    if code == 127 and not r['started']:
         return 'FAIL', 'NOT_STARTED'
     if code == 130 or code < 0:
         return 'FAIL', 'INTERRUPTED'

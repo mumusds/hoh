@@ -162,6 +162,7 @@ fn a_product_execution_record_is_valid_under_the_locked_schema_and_its_shape_che
     let record = Record {
         schema_version: "1.1".to_owned(),
         record_type: "command_execution".to_owned(),
+        started: true,
         record_id: "r1".to_owned(),
         check_id: "unit".to_owned(),
         candidate_id: format!("CAND-{}", "a".repeat(64)),

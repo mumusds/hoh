@@ -50,6 +50,30 @@ class Envelope(unittest.TestCase):
 def own(*test_ids,status='PASS'):
     return [{'schema_version':'1.0','test_id':t,'name':'self_'+t,'status':status} for t in test_ids]
 
+class StartedRecords(Envelope):
+    def test_053_02_started_exit_127_is_an_ordinary_failure(self):
+        # The schema fixture gains started with the implementation; no FAIL result line masks the exit-code bug.
+        self.f.edit_execution('unit',exit_code=127)
+        _,found=self.judged();m=self.member(found,'unit')
+        self.assertEqual((m.reasons,m.outcome),([],('FAIL',None)))
+    def test_053_02_not_started_exit_127_is_inconclusive(self):
+        self.f.edit_execution('unit',started=False,exit_code=127,artifacts=[],missing_artifacts=['test-results.jsonl'])
+        _,found=self.judged();m=self.member(found,'unit')
+        self.assertEqual((m.reasons,m.outcome),([],('FAIL','NOT_STARTED')))
+    def test_052_04_missing_started_is_invalid(self):
+        record=copy.deepcopy(self.f.records['unit']);record.pop('started',None)
+        json_file(self.f.root,self.f.dirs['unit']+'/execution.json',record)
+        _,found=self.judged();m=self.member(found,'unit')
+        self.assertEqual(m.outcome[0],'INVALID')
+    def test_052_04_not_started_artifacts_or_long_duration_are_invalid(self):
+        base=copy.deepcopy(self.f.records['unit'])
+        valid=base|dict(started=False,exit_code=127,artifacts=[],missing_artifacts=['test-results.jsonl'])
+        for fields in ({'exit_code':0},{'artifacts':base['artifacts']},{'duration_seconds':5.001},
+                       {'finished_at':'2020-01-01T00:00:06+00:00'}):
+            with self.subTest(fields=fields):
+                json_file(self.f.root,self.f.dirs['unit']+'/execution.json',valid|fields)
+                _,found=self.judged();self.assertEqual(self.member(found,'unit').outcome[0],'INVALID')
+
 class GateComparison(Envelope):
     """Each case starts from the complete envelope both pass, then replaces one record by a variant: the gate rejects
     it with its rule's first error, and the replica vetoes it or concludes as the differences table lists
@@ -299,13 +323,13 @@ SHAPES=[('run_check timeout',124,True,True,()),('run_check timeout, artifacts mi
         ('command not started',127,False,True,('live-sessions.json','test-results.jsonl')),
         ('run_check interrupted',130,False,False,()),('run_check interrupted, artifacts missing',130,False,False,('live-sessions.json',)),
         ('not implemented',3,False,True,('live-sessions.json','test-results.jsonl')),('adapter-live blocked',3,False,True,('live-sessions.json',)),
-        ('tests failed',101,False,True,()),('killed by a signal',-15,False,True,()),('killed, artifacts missing',-15,False,True,('live-sessions.json',)),
+        ('tests failed',101,False,True,()),('command exited 127',127,False,True,()),('killed by a signal',-15,False,True,()),('killed, artifacts missing',-15,False,True,('live-sessions.json',)),
         ('product cancelled',130,False,True,()),('product deadline, child exit 0',0,True,True,()),('product unreaped',-9,False,True,()),
         ('exit 0',0,False,True,()),('exit 0, duration disagrees',0,False,False,()),('exit 0, artifacts missing',0,False,True,('live-sessions.json',)),
         ('exit 3, complete',3,False,True,())]
 LINES={'none':None,'pass':'PASS','skipped':'SKIPPED','fail':'FAIL','degraded':'DEGRADED','bare':'DEGRADED'}
 
-def derived(exit_code,timed_out,agrees,missing,kind):
+def derived(exit_code,timed_out,agrees,missing,kind,started=True):
     """The derived table of principle one, row by row: (outcome, conclusion on the scenario check's TEST)."""
     if exit_code==0 and not timed_out and (missing or kind=='fail'):return ('INVALID',None),'INVALID'
     complete=not missing and agrees
@@ -313,7 +337,7 @@ def derived(exit_code,timed_out,agrees,missing,kind):
     elif kind=='degraded' and complete:out=('DEGRADED',None)
     elif exit_code==0:out=('PASS',None) if complete else ('FAIL','INCOMPLETE')
     elif exit_code==3:out=('BLOCKED',None)
-    elif exit_code==127:out=('FAIL','NOT_STARTED')
+    elif exit_code==127 and not started:out=('FAIL','NOT_STARTED')
     elif exit_code==130 or exit_code<0:out=('FAIL','INTERRUPTED')
     else:out=('FAIL',None)
     if kind in ('fail','bare'):return out,'FAIL'
@@ -337,12 +361,12 @@ class Shapes(Envelope):
                     record=copy.deepcopy(base);art={a['name']:a for a in record['artifacts']}
                     p=self.f.root/art['test-results.jsonl']['path'];p.write_text(''.join(json.dumps(l)+'\n' for l in lines))
                     art['test-results.jsonl']['sha256']=sha256(p)
-                    record.update(exit_code=exit_code,timed_out=timed_out,started_at=start,
+                    record.update(exit_code=exit_code,started=label!='command not started',timed_out=timed_out,started_at=start,
                                   finished_at=start if exit_code==127 else finish,duration_seconds=(30 if agrees else 0) if exit_code!=127 else 0,
                                   artifacts=[a for a in record['artifacts'] if a['name'] not in missing],missing_artifacts=list(missing))
                     json_file(self.f.root,self.f.dirs[key]+'/execution.json',record)
                     w,found=self.judged();m=self.member(found,key);test=w.tests()[t]
-                    out,conclusion=derived(exit_code,timed_out,agrees,missing,kind)
+                    out,conclusion=derived(exit_code,timed_out,agrees,missing,kind,record['started'])
                     self.assertEqual(m.outcome if out[0]!='INVALID' else (m.outcome[0],None),out)
                     self.assertEqual(tr.conclude(w,m,t,test),conclusion)
                     # The same lines on a check that is not the TEST's scenario conclude only INVALID or FAIL: any

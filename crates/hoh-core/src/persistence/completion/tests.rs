@@ -3832,6 +3832,7 @@ pub(in crate::persistence) fn pass_recording(
         record: Record {
             schema_version: "1.1".to_owned(),
             record_type: "command_execution".to_owned(),
+            started: true,
             record_id: record_id.to_owned(),
             check_id: "unit".to_owned(),
             candidate_id: candidate.to_owned(),

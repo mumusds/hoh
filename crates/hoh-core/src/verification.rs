@@ -229,6 +229,7 @@ pub struct Record {
     pub started_at: String,
     pub finished_at: String,
     pub duration_seconds: f64,
+    pub started: bool,
     pub exit_code: i64,
     pub timed_out: bool,
     pub stdout: FileRef,
@@ -256,7 +257,7 @@ impl Record {
         };
         let relative = |p: &str| !p.is_empty() && !p.starts_with('/');
         let bounded = |s: &str| (1..=160).contains(&s.len());
-        let checks: [(bool, &str); 17] = [
+        let checks: [(bool, &str); 18] = [
             (record.schema_version == "1.1", "schema_version is not 1.1"),
             (
                 record.record_type == "command_execution",
@@ -292,6 +293,14 @@ impl Record {
             (
                 record.duration_seconds.is_finite() && record.duration_seconds >= 0.0,
                 "duration_seconds is negative",
+            ),
+            (
+                record.started
+                    || (record.exit_code == 127
+                        && !record.timed_out
+                        && record.artifacts.is_empty()
+                        && record.duration_seconds <= 5.0),
+                "not-started record has an inconsistent exit, timeout, artifacts or duration",
             ),
             (
                 [&record.stdout, &record.stderr, &record.candidate_manifest]
@@ -690,6 +699,11 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
             .is_some_and(|v| Record::from_value(&v).is_ok()),
         Reason::RecordInvalid,
     );
+    // CR-038: a long interval cannot masquerade as an inconclusive launch failure.
+    need(
+        r.started || interval(r).is_some_and(|seconds| seconds <= 5.0),
+        Reason::RecordInvalid,
+    );
     need(e.git_tree == m.git_tree, Reason::TreeMismatch);
     need(
         r.spec_sha256 == s && s == m.spec.sha256,
@@ -938,7 +952,7 @@ pub fn outcome(e: &Evidence, verdict: &Result<(), Invalid>, world: &dyn Lookup) 
     match r.exit_code {
         3 => of(Status::Blocked, None),
         // Not a test failure (M2T10D-753): the command did not start, or the run was interrupted or killed.
-        127 => of(Status::Fail, Some("NOT_STARTED")),
+        127 if !r.started => of(Status::Fail, Some("NOT_STARTED")),
         130 => of(Status::Fail, Some("INTERRUPTED")),
         code if code < 0 => of(Status::Fail, Some("INTERRUPTED")),
         // Exit 0 reaches here only claiming success with a duration that disagrees with its interval (missing

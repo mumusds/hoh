@@ -1351,7 +1351,8 @@ async fn a_gated_check_runs_nothing_before_its_adoption_has_returned() -> R {
 }
 
 #[tokio::test]
-async fn a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_started() -> R {
+async fn test_052_04_a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_started()
+-> R {
     // M3LD-01 (docs/adr/ADR-028.md decision 7): when joining the attempt's cgroup fails (its cgroup.procs write refused,
     // say), the gate is never opened: the command does not run outside the attempt's cgroup, its process group is ended
     // and reaped, and the run is recorded as a command that did not start (exit 127, FAIL NOT_STARTED, the adoption's
@@ -1385,6 +1386,7 @@ async fn a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_star
     assert!(!ran_marker.exists(), "the check's command ran");
     let record = f.record(&ran)?;
     assert_eq!(record["exit_code"], 127, "{record}");
+    assert_eq!(record["started"], false, "{record}");
     assert_eq!(record["timed_out"], false, "{record}");
     let stderr = std::fs::read_to_string(ran.record_dir.join("stderr.log"))?;
     assert!(
@@ -1402,10 +1404,82 @@ async fn a_gated_check_whose_adoption_failed_never_runs_and_is_recorded_not_star
 }
 
 #[tokio::test]
-async fn an_ungated_check_whose_adoption_failed_is_cancelled_and_recorded_not_started() -> R {
+async fn test_052_04_a_missing_command_is_not_started_with_or_without_a_gate() -> R {
+    for gated in [false, true] {
+        let plan = PLAN.replace(
+            "[\"bash\", \"qa.sh\"]",
+            "[\"/nonexistent-m3ld100-command\"]",
+        );
+        let f = Fixture::with(&plan, QA_PASSES, Arc::new(NoFaults)).await?;
+        let c = f.frozen().await?;
+        let ran = run_with(
+            &f.store,
+            &f.root(),
+            &f.state(),
+            &Request {
+                candidate_id: c,
+                check_id: "qa".into(),
+                argv: vec!["/nonexistent-m3ld100-command".into()],
+                producer_attempt_id: "Q/attempt-1".into(),
+            },
+            if gated {
+                Launch {
+                    adopt: Some(Box::new(|_| Ok(()))),
+                    gate: Some(env!("CARGO_BIN_EXE_hoh").into()),
+                    ..Launch::default()
+                }
+            } else {
+                Launch::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        let record = f.record(&ran)?;
+        assert_eq!(record["started"], false, "gated={gated}: {record}");
+        assert_eq!(record["exit_code"], 127);
+        assert_eq!(
+            (ran.outcome.status.code(), ran.outcome.reason),
+            ("FAIL", Some("NOT_STARTED"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_053_02_a_real_started_127_and_a_passing_rerun_are_flaky() -> R {
+    use hoh_core::verification::acceptance::{CheckRun, Label, check_label};
+    // Both executions use the same frozen candidate; only the ignored runtime marker changes.
+    let f = Fixture::with_qa(&format!(
+        "[ -f .hoh/second-run ] || exec /nonexistent-m3ld100-command\n{QA_PASSES}"
+    ))
+    .await?;
+    let c = f.frozen().await?;
+    let first = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&first)?;
+    assert_eq!(record["started"], true);
+    assert_eq!(record["exit_code"], 127);
+    assert_eq!(
+        (first.outcome.status.code(), first.outcome.reason),
+        ("FAIL", None)
+    );
+    std::fs::write(f.root().join(".hoh/second-run"), b"")?;
+    let second = f.run(&c, "qa", QA).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(second.outcome.status.code(), "PASS");
+    let run = |r: &Ran| CheckRun {
+        check_id: "qa".into(),
+        outcome: r.outcome.status.code().into(),
+        reason: r.outcome.reason.map(str::to_owned),
+        fail_lines: false,
+    };
+    assert_eq!(check_label(&[&run(&first), &run(&second)]), Label::Flaky);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_052_04_an_ungated_check_whose_adoption_failed_is_still_recorded_started() -> R {
     // M3LD-01 without a start gate (a test executor's direct start: adopt follows the command's start): the command,
     // already running, is cancelled (its process group ended and reaped, long before its own 30 s end) and the run is
-    // recorded as a command that did not start (exit 127, FAIL NOT_STARTED, the adoption's error as its stderr).
+    // recorded as started (exit 127, ordinary FAIL, the adoption's error as its stderr; CR-038).
     let f = Fixture::with_qa(&format!("sleep 30\n{QA_PASSES}")).await?;
     let c = f.frozen().await?;
     let began = std::time::Instant::now();
@@ -1436,6 +1510,7 @@ async fn an_ungated_check_whose_adoption_failed_is_cancelled_and_recorded_not_st
     );
     let record = f.record(&ran)?;
     assert_eq!(record["exit_code"], 127, "{record}");
+    assert_eq!(record["started"], true, "{record}");
     assert_eq!(record["timed_out"], false, "{record}");
     let stderr = std::fs::read_to_string(ran.record_dir.join("stderr.log"))?;
     assert!(
@@ -1444,7 +1519,7 @@ async fn an_ungated_check_whose_adoption_failed_is_cancelled_and_recorded_not_st
     );
     assert_eq!(
         (ran.outcome.status.code(), ran.outcome.reason),
-        ("FAIL", Some("NOT_STARTED")),
+        ("FAIL", None),
         "{:?}",
         ran.reasons
     );
@@ -2622,6 +2697,7 @@ async fn a_verifier_attempt_whose_run_directory_changed_is_recorded_invalid_by_i
             record["command"],
             serde_json::json!(["hoh-runtime:verification-attempt", "Q/attempt-1"])
         );
+        assert_eq!(record["started"], false);
         assert_eq!(
             (
                 record["exit_code"].as_i64(),
@@ -2629,7 +2705,7 @@ async fn a_verifier_attempt_whose_run_directory_changed_is_recorded_invalid_by_i
                 record["artifacts"].as_array().map(Vec::len),
                 record["producer_attempt_id"].as_str()
             ),
-            (Some(1), Some(false), Some(0), Some("Q/attempt-1"))
+            (Some(127), Some(false), Some(0), Some("Q/attempt-1"))
         );
         for log in ["stdout.log", "stderr.log"] {
             assert_eq!(std::fs::read(ran.record_dir.join(log))?.len(), 0, "{log}");

@@ -1264,7 +1264,9 @@ class ProcessLifecycle(unittest.TestCase):
             with self.assertRaises(ValueError):safe_path(Path(d),'../outside')
 
 PY=sys.executable
-PLAN={'ok':{'mode':'mock','argv':[PY,'-c','print("MOCK UNIT CHECK ONLY")']},
+PLAN={'spawn-missing':{'mode':'mock','argv':['/nonexistent-m3ld100-command']},
+      'ran-127':{'mode':'mock','argv':['bash','-c','exec /nonexistent-m3ld100-command']},
+      'ok':{'mode':'mock','argv':[PY,'-c','print("MOCK UNIT CHECK ONLY")']},
       'fail':{'mode':'mock','argv':[PY,'-c','import sys;sys.exit(9)']},
       'mutate':{'mode':'mock','argv':[PY,'-c','open("source.txt","w").write("modified")']},
       'live':{'mode':'live','argv':[PY,'-c','pass']},
@@ -1312,6 +1314,26 @@ class CandidateAndChecks(unittest.TestCase):
     def test_real_check_record(self):
         rc,r,_=self.runcheck('ok');self.assertEqual(rc,0);self.assertTrue(r['source_unchanged']);self.assertEqual((r['mode'],r['cwd']),('mock','.'))
         self.assertEqual(r['command'],PLAN['ok']['argv']);self.assertEqual(r['producer_attempt_id'],r['record_id'])
+    def test_052_04_started_records_the_actual_spawn(self):
+        for check,expected,code in [('ok',True,0),('spawn-missing',False,127),('ran-127',True,127)]:
+            with self.subTest(check=check):
+                rc,r,_=self.runcheck(check,out='started-'+check)
+                self.assertIs(r.get('started'),expected)
+                self.assertEqual(r['exit_code'],code)
+                self.assertEqual(bool(rc),bool(code))
+
+    def test_052_04_io_failure_after_spawn_does_not_claim_not_started(self):
+        # Verify calls git too: inject only in execute's process, after candidate verification.
+        execute=run_check.execute
+        def faulted(*args,**kwargs):
+            with patch('subprocess.Popen.communicate',side_effect=OSError('read failed after spawn')):
+                return execute(*args,**kwargs)
+        with patch.object(run_check,'execute',faulted):
+            rc,r,_=self.runcheck('ok')
+        self.assertNotEqual(rc,0)
+        self.assertIs(r.get('started'),True)
+        self.assertEqual(r['exit_code'],127)
+
     def test_check_failing_exit(self):rc,r,_=self.runcheck('fail');self.assertEqual(rc,9);self.assertEqual(r['exit_code'],9)
     def test_check_mutating_source(self):
         rc,r,_=self.runcheck('mutate');self.assertNotEqual(rc,0);self.assertFalse(r['source_unchanged'])
