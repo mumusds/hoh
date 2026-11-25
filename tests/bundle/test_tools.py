@@ -331,7 +331,21 @@ class NativeBridge(unittest.TestCase):
         o=inspect_output('claude',self.raw({'type':'result','subtype':'success','result':long,'session_id':'s'}))
         self.assertEqual(o['_final_text'],long)
     def test_oversized_json_frame(self):
-        p=self.root/'raw';p.write_bytes(b'{"text":"'+b'x'*(1024*1024)+b'"}\n');self.assertEqual(inspect_output('pi',p)['malformed_records'],1)
+        # A frame over the bound counts malformed without being parsed (the bound shrunk to 1 MiB here, as it was).
+        with patch('agent_task.LINE_LIMIT',1024*1024):
+            p=self.root/'raw';p.write_bytes(b'{"text":"'+b'x'*(1024*1024)+b'"}\n');self.assertEqual(inspect_output('pi',p)['malformed_records'],1)
+    def test_long_pi_agent_end_record_is_parsed(self):
+        # BT-04: pi 1.6.0's terminal agent_end carries the whole message history (1.4 MB in the M3-T05 QA); a valid
+        # JSON line over 1 MiB is a record, not a malformed one, so a long pi session still completes.
+        history=[{'role':'user','content':[{'type':'text','text':'y'*1024}]}]*1500
+        o=inspect_output('pi',self.raw({'type':'session','id':'pi-long'},
+                                       {'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'done'}],'stopReason':'stop'}},
+                                       {'type':'agent_end','messages':history}))
+        self.assertGreater((self.root/'raw').stat().st_size,1024*1024+1)
+        self.assertEqual((o['malformed_records'],o['records'],o['terminal_observed'],o['native_error_observed']),(0,3,True,False))
+    def test_long_invalid_line_is_still_malformed(self):
+        p=self.root/'raw';p.write_bytes(b'{"type":"agent_end","messages":"'+b'x'*(2*1024*1024)+b'\n{"type":"agent_end"}\n')
+        o=inspect_output('pi',p);self.assertEqual((o['malformed_records'],o['records']),(1,1))
     def test_dry_run_no_attempt_dir(self):
         p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','codex','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--output-dir',str(self.root/'unused'),'--dry-run'],capture_output=True,text=True,env=self.env)
         self.assertEqual(p.returncode,0,p.stderr);self.assertFalse((self.root/'unused').exists())
