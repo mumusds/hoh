@@ -1814,6 +1814,28 @@ async fn a_pending_record_is_judged_on_its_files_as_they_are_when_it_is_recorded
 }
 
 #[tokio::test]
+async fn test_052_04_a_pending_record_written_without_started_is_recorded_invalid() -> R {
+    // M3LS-02 (CR-038 decision 1): pending facts an older writer left have no `started`. Their recovery is not a
+    // permanent failure that holds the candidate back: the record is judged as it was written, RECORD_INVALID, and
+    // recorded, so the candidate's history goes on.
+    let (f, _faults, c, dir) = pending_qa(&[]).await?;
+    let pending = pending_of(&f, &dir);
+    let mut facts: serde_json::Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+    facts["record"]
+        .as_object_mut()
+        .ok_or("pending facts without a record")?
+        .remove("started")
+        .ok_or("pending record without started")?;
+    std::fs::write(&pending, serde_json::to_vec(&facts)?)?;
+    assert_eq!(super_reconcile(&f, &c).await?, 1);
+    assert_eq!(f.query("SELECT outcome FROM evidence")?, ["INVALID"]);
+    let payload = f.query("SELECT payload_json FROM events WHERE kind = 'evidence.recorded'")?;
+    assert!(payload[0].contains("RECORD_INVALID"), "{payload:?}");
+    assert_eq!(pending_files(&f)?, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_committed_records_pending_file_is_never_read_again() -> R {
     // M2T10R-151: once its evidence is recorded, a record's pending file plays no part: damaged later, it stops nothing.
     let f = Fixture::new().await?;
