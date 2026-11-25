@@ -318,3 +318,26 @@ Evidence under `.hoh-dev/self-tests/m3low2/`: `flk13-repro.patch` and `flk13-fix
 on the fix), `flk13-{before-01,before-02,before-03,before-nospawn,after-01,after-02,after-03,after-nospawn,after-16spawners}.log`
 with their `*-result.json` (argv, binary digest, exit, duration, log digest); before-01 ran an earlier harness revision
 without the panic-location count. Self-tests, not acceptance.
+
+## M3 low package 2 (M3PD-L1, M3FK-L1, M3LS-200 with CR-039) and FLK-13 review
+
+Developer: Claude (package and FLK-13, separate sessions). M3PD-L1: the packing test's drift diff is compared with an exact
+expected text the test spells out ("M3 cleanup: M3PD-L1 spell out the expected three-way drift diff in the packing test", red
+with an empty-diff sabotage). M3FK-L1: one shared bounded group-exit wait (`world::group_exit`, Team::review's 5 s bound)
+replaces single `group_empty()` samples where a single false sample could make a fixture report a live group (Team::hold, s5,
+tui_pty, m3t10, recovery start_cancel, drafting); sites asserting a product guarantee or a live group keep their single sample
+("M3 cleanup: M3FK-L1 report scripted groups only after the shared group-exit barrier", "M3 cleanup: M3FK-L1 reach the
+group-exit barrier from m3t10 through the world module"). M3LS-200: an inherited SIGINT ignore is kept by run_check ("M3
+cleanup: M3LS-200 keep an inherited SIGINT ignore in install_interrupt_handlers"; tools/common.py is locked, so CR-039, approved
+by the CTO under CR-003 D1 after review: "M3 cleanup: approve CR-039 and relock baseline rev 28").
+
+| Slice | Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|---|
+| package 2 + CR-039 | 1 | `116e3585` | Grok grok 1.0.92 (b06756fd6256), `01a21161-52c7-7013-8895-be194d0fc0ac` (`3fe8814f-a341-4b32-9b2d-e0e29144accf`) | PASS, no findings |
+| FLK-13 | 1 | `1dc8b789` | Grok grok 1.0.92 (b06756fd6256), `01a211b9-ca15-7ab0-8843-95567c0c505c` (`7c927095-ecd1-4fba-990d-528f188ffc51`) | PASS, no findings |
+
+BT-03 (run_check.py and the machine test slot), decided 2026-11-25 under the owner's delegation ("pending owner decisions take
+the lead's recommendation"): tools/run_check.py stays unchanged (the slot is a development-machine convention that product
+environments do not have); callers hold the slot (`flock /home/ai/dev/.hoh-test-slot.lock python3 tools/run_check.py …`), so
+waiting for it is not part of a check's recorded duration; docs/19 records the rule. Deferred low: none new. Final checks: see
+the PR.
