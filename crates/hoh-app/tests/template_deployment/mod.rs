@@ -3,6 +3,7 @@ use crate::{installed, record, text, world};
 use installed::R;
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -120,17 +121,132 @@ fn wait_trace(mut child: Child) -> R {
 
 fn audit(trace: &str) -> R<usize> {
     let mut count = 0;
-    for line in trace.lines().filter(|line| line.contains("connect(")) {
-        count += 1;
-        let local = line.contains("sa_family=AF_UNIX")
-            || (line.contains("sa_family=AF_INET,") && line.contains("inet_addr(\"127."))
-            || (line.contains("sa_family=AF_INET6,")
-                && line.contains("inet_pton(AF_INET6, \"::1\""));
-        if !local {
-            return Err(format!("non-local or undecodable connect: {line}").into());
+    let mut sockets = BTreeSet::new();
+    let mut pending = BTreeMap::new();
+    for line in trace.lines() {
+        let (pid, body) = trace_line(line)?;
+        if body.starts_with("+++ ") {
+            sockets.retain(|(owner, _)| Some(*owner) != pid);
+            continue;
+        }
+        if body.is_empty() || body.starts_with("--- ") || body.starts_with("execve(") {
+            continue;
+        }
+        let call = if let Some(rest) = body.strip_prefix("<... ") {
+            let (name, rest) = rest.split_once(" resumed>").ok_or("undecodable resume")?;
+            if name == "execve" {
+                continue;
+            }
+            let start: String = pending.remove(&pid).ok_or("resume without syscall start")?;
+            if !start.starts_with(&format!("{name}(")) {
+                return Err(format!("mismatched syscall resume: {line}").into());
+            }
+            format!("{start}{rest}")
+        } else {
+            if !["socket(", "close(", "connect("]
+                .iter()
+                .any(|name| body.starts_with(name))
+            {
+                return Err(format!("undecodable trace line: {line}").into());
+            }
+            if let Some(start) = body.strip_suffix("<unfinished ...>") {
+                if pending.insert(pid, start.to_owned()).is_some() {
+                    return Err(format!("overlapping syscalls: {line}").into());
+                }
+                continue;
+            }
+            if pending.contains_key(&pid) {
+                return Err(format!("syscall before pending resume: {line}").into());
+            }
+            body.to_owned()
+        };
+        let invalid = || format!("non-local or undecodable syscall: {line}");
+        let (name, rest) = call.split_once('(').ok_or_else(invalid)?;
+        let (args, result) = rest.rsplit_once("= ").ok_or_else(invalid)?;
+        let args = args
+            .trim_end()
+            .strip_suffix(')')
+            .ok_or_else(invalid)?
+            .trim_end();
+        let result = result
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<i32>().ok())
+            .ok_or_else(invalid)?;
+        match name {
+            "socket" => {
+                let pid = pid.ok_or_else(invalid)?;
+                let fields = args.split(", ").collect::<Vec<_>>();
+                let [family, kind, protocol] = fields.as_slice() else {
+                    return Err(invalid().into());
+                };
+                if result >= 0 {
+                    // Every successful socket replaces the previous identity of this fd.
+                    sockets.remove(&(pid, result));
+                    let mut flags = kind.split('|');
+                    if *family == "AF_NETLINK"
+                        && flags.next() == Some("SOCK_RAW")
+                        && flags.all(|v| matches!(v, "SOCK_CLOEXEC" | "SOCK_NONBLOCK"))
+                        && *protocol == "NETLINK_SOCK_DIAG"
+                    {
+                        sockets.insert((pid, result));
+                    }
+                }
+            }
+            "close" => {
+                let pid = pid.ok_or_else(invalid)?;
+                let fd = args.parse::<i32>().map_err(|_| invalid())?;
+                // Do not retain permission even on a failed/ambiguous close.
+                sockets.remove(&(pid, fd));
+            }
+            "connect" => {
+                count += 1;
+                let (fd, address) = args.split_once(", ").ok_or_else(invalid)?;
+                let fd = fd.parse::<i32>().map_err(|_| invalid())?;
+                let (address, length) = address.rsplit_once(", ").ok_or_else(invalid)?;
+                let _ = length.parse::<u32>().map_err(|_| invalid())?;
+                let address = address
+                    .strip_prefix('{')
+                    .and_then(|v| v.strip_suffix('}'))
+                    .ok_or_else(invalid)?;
+                let local = address.starts_with("sa_family=AF_UNIX,")
+                    || (address.starts_with("sa_family=AF_INET,")
+                        && address.contains("inet_addr(\"127."))
+                    || (address.starts_with("sa_family=AF_INET6,")
+                        && address.contains("inet_pton(AF_INET6, \"::1\""));
+                let kernel = address
+                    .strip_prefix("sa_family=AF_NETLINK, nl_pid=0, nl_groups=")
+                    .is_some_and(|groups| {
+                        groups.len() == 8 && groups.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                    && pid.is_some_and(|pid| sockets.contains(&(pid, fd)));
+                if !local && !kernel {
+                    return Err(invalid().into());
+                }
+            }
+            _ => unreachable!(),
         }
     }
+    if !pending.is_empty() {
+        return Err("trace ended with an unfinished syscall".into());
+    }
     Ok(count)
+}
+
+fn trace_line(line: &str) -> R<(Option<u32>, &str)> {
+    let line = line.trim();
+    if let Some(rest) = line.strip_prefix("[pid ") {
+        let (pid, body) = rest.split_once(']').ok_or("undecodable trace pid")?;
+        return Ok((Some(pid.trim().parse()?), body.trim_start()));
+    }
+    if line.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        let (pid, body) = line
+            .split_once(char::is_whitespace)
+            .ok_or("trace pid without syscall")?;
+        return Ok((Some(pid.parse()?), body.trim_start()));
+    }
+    // Unprefixed local connects remain readable, but cannot authorize a netlink fd.
+    Ok((None, line))
 }
 
 pub fn offline_instantiation() -> R {
@@ -244,7 +360,7 @@ def template_drafter(ident):
             "strace",
             "-f",
             "-e",
-            "trace=connect,execve",
+            "trace=socket,close,connect,execve",
             "-s",
             "4096",
             "-o",
@@ -284,7 +400,7 @@ def template_drafter(ident):
             std::thread::sleep(Duration::from_millis(20));
         }
         let child = command(&world, "strace")
-            .args(["-f", "-e", "trace=connect", "-s", "4096", "-o"])
+            .args(["-f", "-e", "trace=socket,close,connect", "-s", "4096", "-o"])
             .arg(&client_trace)
             .arg(&hoh)
             .args(["-p", "draft", "--resume", run, "--output", "json"])
@@ -357,6 +473,129 @@ def template_drafter(ident):
     }
     result?;
     Ok(())
+}
+
+#[test]
+fn connect_audit_accepts_correlated_kernel_sock_diag() -> R {
+    let trace = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG) = 7\n\
+                 101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    assert_eq!(audit(trace)?, 1);
+    Ok(())
+}
+
+#[test]
+fn connect_audit_accepts_aligned_returns_and_errno_descriptions() -> R {
+    // strace's default return-column alignment, observed in the installed-release trace.
+    let trace = "101 close(28)                       = 0\n\
+                 101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG) = 28\n\
+                 101 connect(28, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n\
+                 101 close(28)                       = -1 EINTR (Interrupted system call)\n";
+    assert_eq!(audit(trace)?, 1);
+    Ok(())
+}
+
+#[test]
+fn connect_audit_uses_the_latest_socket_for_a_reused_fd() -> R {
+    for history in [
+        "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) = 7\n101 close(7) = 0\n",
+        "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) = 7\n101 close(7) = 0\n",
+        "102 socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) = 7\n102 close(7) = 0\n",
+    ] {
+        for flags in ["SOCK_RAW", "SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC"] {
+            let trace = format!(
+                "{history}101 socket(AF_NETLINK, {flags}, NETLINK_SOCK_DIAG) = 7\n\
+                 101 connect(7, {{sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}}, 12) = 0\n"
+            );
+            assert_eq!(audit(&trace)?, 1, "{trace}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn connect_audit_rejects_unqualified_netlink_sockets_and_targets() {
+    let socket = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG) = 7\n";
+    let connect = "101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    for trace in [
+        connect.to_owned(),
+        format!("{connect}{socket}"),
+        format!(
+            "{}{connect}",
+            socket.replace("NETLINK_SOCK_DIAG", "NETLINK_ROUTE")
+        ),
+        format!(
+            "{}{connect}",
+            socket.replace("NETLINK_SOCK_DIAG", "NETLINK_USERSOCK")
+        ),
+        format!("{}{connect}", socket.replace("SOCK_RAW", "SOCK_DGRAM")),
+        format!("{}{connect}", socket.replace("SOCK_RAW", "SOCK_STREAM")),
+        format!("{}{connect}", socket.replace("AF_NETLINK", "AF_UNIX")),
+        format!("{}{connect}", socket.replace("SOCK_CLOEXEC", "0x40000000")),
+        format!(
+            "{}{connect}",
+            socket.replace("= 7", "= -1 EMFILE (Too many open files)")
+        ),
+        format!("{}{connect}", socket.replace("= 7", "= 8")),
+        format!("{}{connect}", socket.replace("101 ", "102 ")),
+        format!("{socket}{}", connect.replace("nl_pid=0,", "nl_pid=10,")),
+        format!("{socket}{}", connect.replace("nl_pid=0,", "nl_pid=-1,")),
+        format!("{socket}{}", connect.replace("101 ", "102 ")),
+        format!("{socket}{}", connect.replace("101 ", "")),
+        format!(
+            "{socket}{}",
+            connect.replace("nl_groups=00000000", "nl_groups=???")
+        ),
+        format!(
+            "{socket}{}",
+            connect.replace(
+                "{sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}",
+                "0x1234"
+            )
+        ),
+        format!("{socket}{}", connect.replace("= 0", "= ?")),
+        format!("{socket}101 close(7) = 0\n{connect}"),
+        format!("{socket}101 close(7) = -1 EINTR (Interrupted system call)\n{connect}"),
+        format!(
+            "{socket}101 close(7) = 0\n{}{connect}",
+            socket.replace("NETLINK_SOCK_DIAG", "NETLINK_ROUTE")
+        ),
+        // A newer socket result supersedes the old fd even if close was not observed.
+        format!(
+            "{socket}{}{connect}",
+            socket.replace("NETLINK_SOCK_DIAG", "NETLINK_ROUTE")
+        ),
+    ] {
+        assert!(audit(&trace).is_err(), "unexpectedly allowed: {trace}");
+    }
+}
+
+#[test]
+fn connect_audit_correlates_interleaved_unfinished_syscalls() -> R {
+    let trace = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG <unfinished ...>\n\
+                 102 socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) = 7\n\
+                 101 <... socket resumed>) = 7\n\
+                 101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12 <unfinished ...>\n\
+                 102 close(7) = 0\n\
+                 101 <... connect resumed>) = 0\n\
+                 101 close(7 <unfinished ...>\n\
+                 101 <... close resumed>) = 0\n";
+    assert_eq!(audit(trace)?, 1);
+    assert_eq!(audit(&trace.replace("101 ", "[pid 101] "))?, 1);
+    for invalid in [
+        "101 connect(7,  <unfinished ...>",
+        "101 <... connect resumed>) = 0",
+        "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG <unfinished ...>\n101 <... close resumed>) = 7",
+        "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG <unfinished ...>\n102 <... socket resumed>) = 7",
+        "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG <unfinished ...>\n101 close(7) = 0",
+    ] {
+        assert!(audit(invalid).is_err(), "{invalid}");
+    }
+    Ok(())
+}
+
+#[test]
+fn connect_audit_rejects_an_undecodable_syscall_line() {
+    assert!(audit("unreadable connect(7, 0x1234, 12) = -1").is_err());
 }
 
 #[test]
