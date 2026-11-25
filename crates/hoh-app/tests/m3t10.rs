@@ -237,7 +237,11 @@ async fn test_040_01_third_round_writes_one_no_progress() -> R {
         rustix::process::Signal::KILL,
     )?;
     let killed = first_proc.0.wait()?;
-    assert_eq!(killed.signal(), Some(9), "first host process must end by SIGKILL");
+    assert_eq!(
+        killed.signal(),
+        Some(9),
+        "first host process must end by SIGKILL"
+    );
 
     let mut restarted = spawn_host()?;
     let restarted_pid = restarted.0.id();
@@ -877,10 +881,15 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
                 .contains(opinion["event_id"].as_str().ok_or("id")?)
         );
     }
-    let decision = sql(dir.path(), "SELECT state, payload_json FROM decisions", true)?;
+    let decision = sql(
+        dir.path(),
+        "SELECT state, payload_json FROM decisions",
+        true,
+    )?;
     assert_eq!(decision.as_array().map(Vec::len), Some(1), "{decision}");
     assert_eq!(decision[0]["state"], "APPLIED", "{decision}");
-    let payload: Value = serde_json::from_str(decision[0]["payload_json"].as_str().ok_or("decision")?)?;
+    let payload: Value =
+        serde_json::from_str(decision[0]["payload_json"].as_str().ok_or("decision")?)?;
     assert_eq!(payload["kind"], "record_assumption", "{payload}");
     assert!(
         payload["statement"]
@@ -1009,7 +1018,8 @@ async fn test_023_04_major_decision_escalates_before_dispatch() -> R {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_023_04_consultation_conclusion_escalates_and_schedules_nothing_before_commander() -> R {
+async fn test_023_04_consultation_conclusion_escalates_and_schedules_nothing_before_commander() -> R
+{
     let dir = tempfile::Builder::new()
         .prefix("m3t10-major-host-")
         .tempdir()?;

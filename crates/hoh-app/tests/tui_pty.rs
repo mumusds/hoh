@@ -1981,13 +1981,18 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
         let mut child = world.hoh_pty(&pty, &[])?;
         pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("host 已连接"))?;
         let builtin_text = std::fs::read_to_string(resources.join("developer.md"))?;
-        let first_builtin_line = builtin_text.lines().next().ok_or("empty builtin developer.md")?;
+        let first_builtin_line = builtin_text
+            .lines()
+            .next()
+            .ok_or("empty builtin developer.md")?;
         pty.send(b"/settings developer\r")?;
         let shown = pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("--- builtin"))?;
         assert!(shown.contains("+++ project"), "{shown}");
         assert!(shown.contains("@@ -1,"), "{shown}");
         assert!(
-            shown.lines().any(|line| line.contains(&format!("-{first_builtin_line}"))),
+            shown
+                .lines()
+                .any(|line| line.contains(&format!("-{first_builtin_line}"))),
             "diff must show deleted builtin line '-{first_builtin_line}': {shown}"
         );
         // Scroll down through the deleted builtin contract lines to observe the added project override line.
@@ -2003,7 +2008,9 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
                 break screen;
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("added override line not shown after scrolling:\n{screen}").into());
+                return Err(
+                    format!("added override line not shown after scrolling:\n{screen}").into(),
+                );
             }
         };
         assert!(
