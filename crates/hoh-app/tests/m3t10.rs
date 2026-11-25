@@ -877,8 +877,231 @@ async fn test_023_04_major_decision_escalates_before_dispatch() -> R {
         host.store().consult_request(plain).await?.is_none(),
         "free text is not a major-decision classifier"
     );
+    let scheduled = host
+        .store()
+        .schedule_round(
+            "R",
+            Context {
+                required_capabilities: [("developer".into(), Default::default())].into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(
+        scheduled.dispatched.is_none(),
+        "no task may be dispatched before escalation is handled: {scheduled:?}"
+    );
     host.shutdown().await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_023_04_consultation_conclusion_escalates_and_schedules_nothing_before_commander() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("m3t10-major-host-")
+        .tempdir()?;
+    Host::start(config(dir.path())).await?.shutdown().await;
+    sql(dir.path(), WORLD, false)?;
+    sql(dir.path(), CURRENT_SPEC_REVIEW, false)?;
+    sql(
+        dir.path(),
+        PARTICIPANTS
+            .replace(
+                "'D','R','s1','RUNNING','developer',1,1",
+                "'D','R','s1','READY','developer',0,1",
+            )
+            .split("INSERT INTO attempts")
+            .next()
+            .ok_or("seed")?,
+        false,
+    )?;
+    sql(
+        dir.path(),
+        "UPDATE sessions SET capabilities_json='{\"mid_turn_steer\":true}'; UPDATE runs SET deadline_at='2099-01-01T00:00:00Z' WHERE run_id='R'; INSERT INTO budgets(scope_kind,scope_id,kind,limit_value) VALUES ('run','R','wall_seconds',600);",
+        false,
+    )?;
+    let (stx, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let (itx, mut inputs) = tokio::sync::mpsc::unbounded_channel();
+    let fake = std::sync::Arc::new(FakeConsult {
+        started: stx,
+        steers: itx,
+        research: Default::default(),
+        summary: Some("改公开接口的签名"),
+    });
+    let clock = std::sync::Arc::new(Clock::default());
+    let mut c = config(dir.path());
+    c.clock = hoh_app::host::HostClock(clock.clone());
+    c.runner = Some(hoh_app::host::RunnerConfig {
+        executor: fake.clone(),
+        context: Context {
+            required_capabilities: [
+                ("developer".into(), Default::default()),
+                ("researcher".into(), Default::default()),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    });
+    let host = Host::start(c).await?;
+    let outcome: R = async {
+        let (work, mut release) = tokio::time::timeout(Duration::from_secs(20), starts.recv())
+            .await?
+            .ok_or("developer started")?;
+        let helpers = work
+            .helpers
+            .as_ref()
+            .ok_or("running developer must have request bridge")?;
+        let revision = sql(
+            dir.path(),
+            "SELECT revision FROM tasks WHERE task_id='D'",
+            true,
+        )?[0]["revision"]
+            .as_u64()
+            .ok_or("revision")?;
+        // 1. Real developer -> researcher consultation through the host request bridge and delivery loop.
+        let mut consult = message(
+            "consult-api",
+            json!({"intent":"consult","question":"是否需要改公开接口的签名？","budget":{"wall_seconds":30},"deadline":"2098-01-01T00:00:00Z"}),
+        )?;
+        consult.attempt_id = work.attempt_id.clone();
+        consult.role_epoch = work.assignment.role_epoch as u64;
+        consult.expected_revision = revision;
+        let consult_file = dir.path().join("consult-api.json");
+        std::fs::write(&consult_file, serde_json::to_vec(&consult)?)?;
+        let ask = helpers.ask.clone();
+        let asked = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(ask).arg(consult_file).output()
+        })
+        .await??;
+        assert!(asked.status.success(), "{}", String::from_utf8_lossy(&asked.stderr));
+        let consult_reply: Value = serde_json::from_slice(&asked.stdout)?;
+        assert_eq!(consult_reply["status"], "queued", "{consult_reply}");
+        let child_task = consult_reply["task_id"].as_str().ok_or("child task_id")?.to_owned();
+        let delivered = tokio::time::timeout(Duration::from_secs(20), inputs.recv())
+            .await?
+            .ok_or("consultation conclusion delivered")?;
+        assert_eq!(delivered.target_role.as_deref(), Some("developer"));
+        assert!(
+            delivered.payload.to_string().contains("改公开接口的签名"),
+            "researcher conclusion must reach developer: {:?}",
+            delivered.payload
+        );
+        // 2. Developer attempts to apply that consultation conclusion directly through the request bridge.
+        let mut apply = message(
+            "apply-public-api",
+            json!({"intent":"apply","decision_class":"public_api","statement":"改公开接口的签名"}),
+        )?;
+        apply.attempt_id = work.attempt_id.clone();
+        apply.role_epoch = work.assignment.role_epoch as u64;
+        apply.expected_revision = revision;
+        let apply_file = dir.path().join("apply-api.json");
+        std::fs::write(&apply_file, serde_json::to_vec(&apply)?)?;
+        let ask = helpers.ask.clone();
+        let applied = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(ask).arg(apply_file).output()
+        })
+        .await??;
+        assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+        let apply_reply: Value = serde_json::from_slice(&applied.stdout)?;
+        assert_eq!(apply_reply["status"], "rejected", "{apply_reply}");
+        assert_eq!(apply_reply["reason_code"], "ILLEGAL_TRANSITION", "{apply_reply}");
+        assert_eq!(apply_reply["details"]["decision_class"], "public_api", "{apply_reply}");
+        assert_eq!(
+            apply_reply["details"]["cause"],
+            "commander_decision_required",
+            "{apply_reply}"
+        );
+        // 3. Escalated as Commander's need_decision; High wake recorded; nothing dispatched before handling.
+        let escalated = events(dir.path(), "need_decision")?;
+        assert_eq!(escalated.len(), 1, "{escalated:?}");
+        assert_eq!(escalated[0]["decision_class"], "public_api");
+        assert_eq!(escalated[0]["statement"], "改公开接口的签名");
+        let need_seq = sql(
+            dir.path(),
+            "SELECT seq FROM events WHERE kind='need_decision' AND run_id='R'",
+            true,
+        )?[0]["seq"]
+            .as_i64()
+            .ok_or("need_decision seq")?;
+        let now = SystemTime::now() + Duration::from_secs(20);
+        let supervised = host
+            .store()
+            .supervise(
+                "R",
+                Context {
+                    now: Some(now),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            supervised
+                .fired
+                .iter()
+                .any(|f| f.event_seqs.contains(&need_seq) && f.severity == hoh_core::supervise::Severity::High),
+            "need_decision must fire at High priority: {:?}",
+            supervised.fired
+        );
+        let woken = sql(
+            dir.path(),
+            &format!(
+                "SELECT json_extract(payload_json,'$.severity') AS severity FROM events \
+                 WHERE kind='supervisor.woken' AND run_id='R' \
+                 AND EXISTS (SELECT 1 FROM json_each(payload_json,'$.event_seqs') WHERE value={need_seq})"
+            ),
+            true,
+        )?;
+        assert_eq!(woken, json!([{"severity": "high"}]), "{woken}");
+        // Run an explicit scheduling round before Commander handles the escalation: nothing is dispatched.
+        let scheduled = host
+            .store()
+            .schedule_round(
+                "R",
+                Context {
+                    required_capabilities: [
+                        ("developer".into(), Default::default()),
+                        ("researcher".into(), Default::default()),
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            scheduled.dispatched.is_none(),
+            "no task may be dispatched for the unapproved conclusion: {scheduled:?}"
+        );
+        assert_eq!(
+            sql(
+                dir.path(),
+                &format!("SELECT count(*) n FROM events WHERE kind='schedule.round' AND seq>{need_seq}"),
+                true,
+            )?[0]["n"],
+            0
+        );
+        let task_ids = sql(
+            dir.path(),
+            "SELECT task_id FROM tasks WHERE role<>'commander' ORDER BY task_id",
+            true,
+        )?;
+        let mut expected_tasks = vec!["D".to_owned(), child_task];
+        expected_tasks.sort();
+        let actual_tasks: Vec<String> = task_ids
+            .as_array()
+            .ok_or("tasks")?
+            .iter()
+            .filter_map(|r| r["task_id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(actual_tasks, expected_tasks);
+        assert_eq!(sql(dir.path(), "SELECT count(*) n FROM decisions", true)?[0]["n"], 0);
+        use std::io::Write as _;
+        release.write_all(b"done\n")?;
+        drop(release);
+        Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    outcome
 }
 
 #[tokio::test]
@@ -1161,6 +1384,7 @@ struct FakeConsult {
     started: tokio::sync::mpsc::UnboundedSender<(hoh_app::host::Work, std::process::ChildStdin)>,
     steers: tokio::sync::mpsc::UnboundedSender<hoh_core::persistence::InputRow>,
     research: std::sync::Mutex<Vec<hoh_app::host::Work>>,
+    summary: Option<&'static str>,
 }
 impl hoh_app::host::Executor for FakeConsult {
     fn deliver(
@@ -1201,7 +1425,7 @@ impl hoh_app::host::Executor for FakeConsult {
         let mut stdin = child.stdin.take().ok_or_else(|| "stdin".to_owned())?;
         let held = work.clone();
         let started = self.started.clone();
-        let result = json!({"schema_version":"1.0","run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"role":work.role,"role_epoch":work.assignment.role_epoch,"status":"COMPLETED","summary":"Use the existing durable input delivery loop","candidate_id":null,"evidence":[],"issues":[],"next_action":"Return to parent"});
+        let result = json!({"schema_version":"1.0","run_id":work.run_id,"task_id":work.task_id,"attempt_id":work.attempt_id,"role":work.role,"role_epoch":work.assignment.role_epoch,"status":"COMPLETED","summary":self.summary.unwrap_or("Use the existing durable input delivery loop"),"candidate_id":null,"evidence":[],"issues":[],"next_action":"Return to parent"});
         let (tx, ended) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let status = child.wait();
@@ -1285,6 +1509,7 @@ async fn consult_delivery(runtime_stop: bool) -> R {
         started: stx,
         steers: itx,
         research: Default::default(),
+        summary: None,
     });
     let clock = std::sync::Arc::new(Clock::default());
     let mut c = config(dir.path());

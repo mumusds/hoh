@@ -67,6 +67,7 @@ async fn test_023_01_m3k600_runner_records_rejection_and_still_settles() -> R {
             started: stx,
             steers: itx,
             research: Default::default(),
+            summary: None,
         },
         messages: messages.clone(),
     });
