@@ -1286,6 +1286,25 @@ class Signals(unittest.TestCase):
                 with self.assertRaises(Terminated):execute([sys.executable,'-c','import time;time.sleep(30)'],r,r/'o',r/'e',30,grace=0.5)
                 self.assertLess(time.monotonic()-start,10)
             finally:restore_handlers(previous)
+    def test_inherited_sigint_ignore_is_kept(self):
+        # M3LS-200: a background run_check without job control starts with SIGINT ignored; a terminal Ctrl-C must not
+        # end its check, while SIGTERM still does, and the ignore survives restore_handlers.
+        child=('import json,os,signal,sys;from pathlib import Path;sys.path.insert(0,sys.argv[2])\n'
+               'from common import Terminated,execute,install_interrupt_handlers,restore_handlers\n'
+               'r=Path(sys.argv[1]);state={"inherited":signal.getsignal(signal.SIGINT)==signal.SIG_IGN}\n'
+               'record=install_interrupt_handlers()\n'
+               'state.update(recorded=signal.SIGINT in record,ignored=signal.getsignal(signal.SIGINT)==signal.SIG_IGN)\n'
+               'for signum in (signal.SIGINT,signal.SIGTERM):\n'
+               '    os.kill(os.getpid(),signum)\n'
+               '    try:state[signum.name]=execute([sys.executable,"-c","pass"],r,r/"o",r/"e",30)[0]\n'
+               '    except Terminated as e:state[signum.name]=str(e)\n'
+               'restore_handlers(record);state["after"]=signal.getsignal(signal.SIGINT)==signal.SIG_IGN\n'
+               'print(json.dumps(state))\n')
+        with tempfile.TemporaryDirectory(prefix='m3ls200-') as d:
+            p=subprocess.run(['sh','-c','trap "" INT; exec "$@"','sh',sys.executable,'-c',child,d,str(ROOT/'tools')],
+                             capture_output=True,text=True,timeout=60)
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(json.loads(p.stdout),{'inherited':True,'recorded':False,'ignored':True,'SIGINT':0,'SIGTERM':'SIGTERM','after':True})
 
 class CandidateAndChecks(unittest.TestCase):
     def setUp(self):

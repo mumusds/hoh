@@ -87,7 +87,10 @@ def install_interrupt_handlers() -> SignalRecord:
     record=SignalRecord();record.parent=_signal_record;_signal_record=record
     try:
         for signum in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
-            record[signum]=signal.getsignal(signum)
+            previous=signal.getsignal(signum)
+            # M3LS-200: a background job without job control inherits SIGINT ignored; keep it so (unrecorded).
+            if signum==signal.SIGINT and previous==signal.SIG_IGN:continue
+            record[signum]=previous
             signal.signal(signum,record.handler)
     except BaseException:
         restore_handlers(record)
