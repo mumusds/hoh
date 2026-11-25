@@ -6,7 +6,7 @@ Audit only: a native turn completing never means the product passed acceptance.
 from __future__ import annotations
 import argparse, fcntl, json, math, os, re, shutil, subprocess, sys, uuid
 from pathlib import Path
-from common import ROOT, Terminated, atomic_json, execute, flag_supported, install_termination_handlers, load_json, restore_handlers, running_as_root, sha256, utcnow
+from common import ROOT, Terminated, atomic_json, execute, flag_supported, install_interrupt_handlers, load_json, restore_handlers, running_as_root, sha256, utcnow
 from install_pi_plugins import verify_installed
 
 # Set in every native child. A nested bridge call with --top-level is refused,
@@ -260,7 +260,7 @@ def main(argv=None)->int:
     if pi_packages is not None:record.update(env_set={'PI_OFFLINE':'1'},pi_packages=pi_packages)
     atomic_json(out/'attempt.json',record)
     print(f'Native {a.agent} invocation; logs: {out}',file=sys.stderr,flush=True)
-    previous=install_termination_handlers()
+    previous=install_interrupt_handlers()
     try:
         rc,timed,dur=execute(cmd,a.cwd.resolve(),out/'stdout.jsonl',out/'stderr.log',a.timeout,data,env=env)
         observed=inspect_output(a.agent,out/'stdout.jsonl');final_text=observed.pop('_final_text')

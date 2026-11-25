@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse,json,os,sys,uuid
 from pathlib import Path
 from jsonschema import Draft202012Validator
-from common import ROOT,Terminated,atomic_json,execute,install_termination_handlers,load_json,ref_for,restore_handlers,running_as_root,safe_path,utcnow
+from common import ROOT,Terminated,atomic_json,execute,install_interrupt_handlers,load_json,ref_for,restore_handlers,running_as_root,safe_path,utcnow
 # Longer than agent_task's own 2 s child grace, so a nested bridge can stop its agent and write its record first.
 CHILD_GRACE=15.0
 from candidate import verify
@@ -29,6 +29,12 @@ def boot_id()->str:
     except OSError:return 'unknown'
 
 def main(argv=None):
+    # Install once, before parsing/verifying; handlers only append. Every return restores them, including refusals.
+    previous=install_interrupt_handlers()
+    try:return run(argv)
+    finally:restore_handlers(previous)
+
+def run(argv=None):
     p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--check-id',required=True);p.add_argument('--candidate-file',type=Path,required=True)
     p.add_argument('--out',type=Path,required=True);p.add_argument('--timeout',type=float,help='Overrides the plan timeout_seconds.')
@@ -53,7 +59,7 @@ def main(argv=None):
     record_id=str(uuid.uuid4());artifact_dir=out/'artifacts';artifact_dir.mkdir(parents=True)
     env=os.environ|{'HOH_EVIDENCE_DIR':str(artifact_dir),'HOH_CHECK_ID':a.check_id,'HOH_CANDIDATE_ID':candidate['candidate_id'],'HOH_SPEC_SHA256':candidate['spec_sha256'],
          'HOH_CANDIDATE_FILE':str(candidate_file),'HOH_CHECK_RECORD_ID':record_id}
-    started=utcnow();command_started=False;interrupted=False;previous=install_termination_handlers()
+    started=utcnow();command_started=False;interrupted=False
     def spawned():
         nonlocal command_started
         command_started=True
@@ -61,7 +67,6 @@ def main(argv=None):
     except OSError as exc:
         (out/'stdout.log').write_bytes(b'');(out/'stderr.log').write_text(str(exc));rc,timed,duration=127,False,0
     except (KeyboardInterrupt,Terminated):rc,timed,duration=130 if command_started else 127,False,0;interrupted=True
-    finally:restore_handlers(previous)
     for name in ('stdout.log','stderr.log'):
         if not (out/name).exists():(out/name).write_bytes(b'')
     finished=utcnow();unchanged=True
