@@ -172,9 +172,13 @@ fn publish_with(
     let source = format!("/proc/self/fd/{}", file.as_raw_fd());
     let created = match link(fs::CWD, &source, dir.as_fd(), name, AtFlags::SYMLINK_FOLLOW) {
         Ok(()) => true,
+        // Skipped only if a regular file is still there. A name that vanished after EEXIST
+        // means a concurrent change; fail so the effect stays UNKNOWN (ADR-040: no replay).
+        Err(rustix::io::Errno::EXIST) if present(&dir, name)? => false,
         Err(rustix::io::Errno::EXIST) => {
-            present(&dir, name)?;
-            false
+            return Err(std::io::Error::other(
+                "document name vanished after linkat reported EEXIST; publication outcome unknown",
+            ));
         }
         Err(e) => {
             return Err(std::io::Error::new(
@@ -252,6 +256,44 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("/proc/self/fd"), "{error}");
         assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        Ok(())
+    }
+
+    /// M3R-500: EEXIST from linkat is "skipped" only if a regular file is still there.
+    #[test]
+    fn test_029_01_eexist_with_vanished_name_is_an_error_not_skipped() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = fs::open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        // The name existed when linkat ran and vanished before the recheck.
+        let error = publish_with(&root, "doc.md", "complete document", |_, _, _, _, _| {
+            Err(rustix::io::Errno::EXIST)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("vanished"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_029_01_eexist_with_existing_regular_file_is_skipped() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = fs::open(
+            temp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )?;
+        let user = temp.path().join("doc.md");
+        let created = publish_with(&root, "doc.md", "complete document", |_, _, _, _, _| {
+            // A user file appeared between the precheck and linkat.
+            std::fs::write(&user, "user text").unwrap();
+            Err(rustix::io::Errno::EXIST)
+        })?;
+        assert!(!created);
+        assert_eq!(std::fs::read_to_string(&user)?, "user text");
         Ok(())
     }
 }
