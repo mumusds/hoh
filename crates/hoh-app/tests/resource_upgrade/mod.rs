@@ -175,15 +175,21 @@ fn semver(hoh: &Path) -> R<String> {
 /// build's: deployment.sh's v2 changes only the developer contract and the version.
 fn release_bundle(hoh: &Path) -> R<Bundle> {
     let mut bundle = Bundle::current();
-    bundle.release = semver(hoh)?;
-    for (path, text) in &mut bundle.files {
+    bundle.set_release(semver(hoh)?);
+    let mut read: R<()> = Ok(());
+    bundle.retain_files(|path, text| {
         if path.starts_with("resources/") {
-            *text = std::fs::read_to_string(hoh.join(path))?;
+            match std::fs::read_to_string(hoh.join(path)) {
+                Ok(t) => *text = t,
+                Err(e) if read.is_ok() => read = Err(e.into()),
+                Err(_) => {}
+            }
         } else {
             assert!(path.starts_with("contracts/"), "{path}");
         }
-    }
-    Ok(bundle)
+        true
+    });
+    read.map(|()| bundle)
 }
 
 /// The digest of the executable process `pid` runs (its `/proc/<pid>/exe`).
@@ -272,15 +278,15 @@ fn test_047_03_an_installed_v1_upgraded_to_v2_under_a_running_run_pins_until_its
             .text("resources/prompts/developer.md")?
             .to_owned();
         // v2 is another release whose developer builtin contract changed.
-        assert_ne!(old_bundle.release, new_bundle.release);
+        assert_ne!(old_bundle.release(), new_bundle.release());
         assert_ne!(old_builtin, new_builtin);
         assert_ne!(old_version, new_version);
         // v1 is this candidate's release: the bundle this test was built with.
         assert_eq!(old_version, Bundle::current().version());
         seen.insert(
             "bundles".into(),
-            json!({"v1": {"release": old_bundle.release, "resource_bundle_version": old_version},
-                   "v2": {"release": new_bundle.release, "resource_bundle_version": new_version}}),
+            json!({"v1": {"release": old_bundle.release(), "resource_bundle_version": old_version},
+                   "v2": {"release": new_bundle.release(), "resource_bundle_version": new_version}}),
         );
 
         // A Git project, v1 installed with its host unit enabled, and the fake agent the unit's host finds.
