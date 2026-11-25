@@ -499,3 +499,12 @@ changes what clients retry and touches the locked protocol schema, OpenAPI, ADR-
 CR and a baseline relock if an `ErrorCode` is added. It is not a CR-003 D1 "add a missing code" change: the code
 exists and the approved text already classifies these failures as retryable. This package does not implement the
 split.
+
+### M4 low package 1: review (fresh Claude session, attempt daf3a4f4-3ad0-4dfb-b20f-ddfb6abdd663)
+
+- Scope: `072f9fa6..0e8c66d6` (M3QA-003, M3LE-02, M3LE-01 analysis). Verdict: **FAIL** (1 high, 1 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| M4L1-001 | high | `tests/bundle/test_trace_export.py:171`: the M3QA-003 change created the ProductStep temp dirs under the hard-coded `/home/ai/dev`; on the CI runner (and any other host) setUp raises FileNotFoundError and the bundle job fails. | Fixed: tempfile's default (TMPDIR) again. Same class as M3L-101 / PR #108 (a Rust test naming the developer's /home), so per docs/19 the design correction comes first: **DC-M4L1-001**, the static machine-path scan, which covered only `*.rs` under `crates/`, now covers Rust, Python and shell sources under `crates`, `tests`, `tools` and `scripts`. Red: the scan finds the old line (exit 0 → static fails); green: no match (`.hoh-dev/self-tests/m4low1/m4l1-001-scan.log`). |
+| M4L1-002 | low | `http.rs:984-997`: a JoinError still answers before the store, so Reject/replay/stale-revision/missing-run get 503 SPEC_SOURCE_UNAVAILABLE rather than their own answers (pre-existing shape; needs a blocking-thread panic; CR-036 holds). | Deferred to the M4 low package: map the JoinError to `files=Err(SpecReadError::unavailable(..))` and let the store decide, as inputs.rs does. |
