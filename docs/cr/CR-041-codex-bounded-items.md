@@ -23,6 +23,8 @@ M3L-101：App Server 的 commandExecution.aggregatedOutput / fileChange.changes[
 5. **只读判定 fail closed。** 完成的非文本 item 的判定事实只要含截断标记，就记录证据不全、不得 PASS，不尝试用前缀推断后缀。即使当前判定器不读 diff 或 token-read 输出，也保守拒绝。完整原始日志仍可供后续独立判定读取；本次不引入无界读回作为在线自动放行路径。
 6. AC-027-03 与 AC-027-05 不变，CR-040 的跳过名单、256 MiB、LF 与诊断保证不变。未知超限帧仍使 attempt FAILED/PROTOCOL_FRAME_TOO_LARGE。不提高 1 MiB、没有 mock 替代 live、没有更改检查计划/门禁。
 
+**M3R-503：块间让出。** 普通成帧、CR-040 跳过和本 CR 的归约在保存非终结读块的状态后显式 `yield_now()`，不依赖 reader 的协作预算。一次 `next()` 的 poll 最多新增一次读取后返回 Pending 或结果；skip/reduce 每次读≤64 KiB，普通路径保留容量复用，单次读≤1 MiB+64 KiB。转入 skip 还可处理此前缓冲的≤1 MiB+64 KiB，归约终结校验仍限于512 KiB。丢弃 future 后保留字节、哈希、待定 CR 及 UTF-8/转义状态，续读不改变帧结果、哈希或预算。当前生产管道与 ChildStdout 都经 PollEvented 消耗 Tokio 的128次预算（原有纯 skip/reduce 单次 poll 最多读8 MiB），但耗尽预算也会延后协作式 abandon/watch，不能代替显式让出。测试覆盖无协作 reader 的前置/块中取消、仅剩1次预算时至多2次读即观察到 abandon，以及三条路径的丢弃后续读。这是工作量界，不是毫秒承诺；同步 raw-log 写入和调度仍影响时间。调查与红绿记录见 `.hoh-dev/self-tests/m3cxfrm/m3r503-*`。
+
 ## AC 与测试
 
 - AC-024-05 / TEST-024-05（integration）：resume 实际发送 excludeTurns=true；0.166 schema 请求符合；旧 schema 删除字段后不能通过；新建请求不加此字段；恢复仍正确关联原 thread。

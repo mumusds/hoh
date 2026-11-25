@@ -43,6 +43,8 @@ RPC ctx.hasUI=true只表示部分协议UI能力。confirm/select/input/editor需
 
 独立进程组；命令超时/取消先native cancel，等待短grace后SIGTERM整组，再有界SIGKILL并wait/reap。读stdout/stderr并行；协议frame上限1MiB初值，超限保存诊断并fail，不无限buffer。（CR-040）跳过例外：适配器凭帧的前4 KiB 按确切字节前缀认出、且不需要其载荷的已知记录（pi 的 agent_end、turn_end、tool_execution_end 与 toolResult 的 message_start/message_end，claude 的 user，codex App Server 的 turn/diff/updated），reader 读到其 LF 为止边读边丢弃（缓冲仍不超过上限加一个读块），记跳过诊断后继续成帧；在 LF 前流结束或超过 256 MiB 的仍按上限 fail。（CR-041，待批准）Codex 的 commandExecution/fileChange 完成 item、fileChange started item 与 exec command_execution 完成 item 还可按确切前缀做有界字符串归约：所有字段/数组元素保留，大字符串改为带 truncated、prefix、original_bytes（解码后 UTF-8 字节数）、sha256 的对象；字符串前缀≤4 KiB、归约 JSON≤512 KiB、原始帧≤256 MiB，输入块/首部/归约缓冲总量仍≤1 MiB+64 KiB。完整字符串尾部仍校验 JSON/UTF-8，缺 LF、格式错误、路由被截断或超预算仍失败；raw 日志不变。只读判定遇到截断事实不得 PASS。thread/resume 的共享请求带 excludeTurns=true，compat 另要求被测 schema 声明此字段，旧 schema 不得因允许额外字段而通过。wall deadline与inactivity watchdog分开，长测试无输出不直接当死机。
 
+（M3R-503）普通读帧、跳过和归约均在保存非终结读块状态后显式让出，使调用方有机会检查 abandon/cancel/deadline/grace。一次 `FrameReader::next()` 的 poll 最多新增一次底层读取：skip/reduce≤64 KiB，普通路径因复用已有容量可达1 MiB+64 KiB；此前缓冲的处理和归约终结的≤512 KiB校验仍有界。丢弃 future 后可无损续读。此界不依赖 reader 是否消耗 Tokio 协作预算，也不等于硬实时延迟保证：同步原始日志写入、解析和运行时调度仍影响耗时。适配器经独立 reader 任务的事件队列收帧；它们的取消/期限分支不需要等整条长帧结束。
+
 对象销毁不意味着子进程树已结束，Tokio句柄生命周期需显式设计 [S23]。启动新attempt前确保同写租约旧进程不再写；否则block。
 
 ## 版本锁和协议样例
