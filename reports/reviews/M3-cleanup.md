@@ -733,3 +733,66 @@ stdin.
 
 Evidence under `.hoh-dev/self-tests/flk1415/flk14/` (patches, logs, `*-result.json` with argv, binary digest, exit, the run's
 duration without the slot wait, log digest). Self-tests, not acceptance.
+
+## FLK-15 (strace's `???` for a call it could not read)
+
+Developer diagnostics from `072f9fa6`, REQ-029 / AC-029-03 (CR-037), test
+`test_029_03_offline_instantiation_in_installed_release`. Seen once on PR #128's pull_request run 45659710217, deployment
+job: `Error: "undecodable trace line: 8388  ???( <unfinished ...>"`.
+
+What strace prints (source of strace 6.8, the Ubuntu 24.04 runner's package, and 6.19, this VM; the paths below are the
+same in both): `syscall_entering_decode` prints `<name>(` with `tcp_sysent(tcp)->sys_name`, which is `stub_sysent`'s `"???"`
+when `get_scno` returned an error. On x86_64 with PTRACE_GET_SYSCALL_INFO (Linux ≥ 5.3) the only such error is
+`strace_get_syscall_info` failing, i.e. `ptrace(PTRACE_GET_SYSCALL_INFO)` failing at a syscall-entry stop. An unknown call
+is qualified `QUAL_RAW | DEFAULT_QUAL_FLAGS` (traced), which is why it shows despite `-e trace=socket,close,connect`. The
+call's end is printed by `print_event_exit` at the thread's PTRACE_EVENT_EXIT stop: `<... ??? resumed>) = ?` (or `???() = ?`
+when no other line came between), `?` being strace's pseudo result for a call that did not return, and then
+`+++ exited … +++`. Without that stop strace prints the thread's exit right after the call's `<unfinished ...>` entry.
+
+Why such a call never ran (kernel v6.8 and master): every ptrace request but PTRACE_KILL/INTERRUPT goes through
+`ptrace_check_attach`, which fails with ESRCH unless `ptrace_freeze_traced` succeeds, and that requires
+`!__fatal_signal_pending(task)`. A tracee in a syscall-entry stop leaves the stop only when its tracer resumes it (strace had
+not) or a fatal signal wakes it. So the request failed because a fatal signal (SIGKILL from `exit_group`, `execve`'s
+de_thread or a kill) was pending. `ptrace_report_syscall` then returns `fatal_signal_pending(current)` (master: its negation
+through `ptrace_report_syscall_permit_entry`), on which `syscall_trace_enter` aborts the call: "That must prevent normal
+entry so no system call is made" (`ptrace_report_syscall_entry`). A `???` call therefore cannot be a connect that happened,
+and it has no arguments to check.
+
+Chain: the host stops (SIGTERM, `exit_group`) while another of its threads is at the entry stop of some call; the kill lands
+before strace reads the stop; strace prints `???(`; the audit, which allowed only `socket(`, `close(` and `connect(` lines,
+failed closed. The same exit also leaves named calls ending `= ?` or `= ? <unavailable>`, or `<unfinished ...>` followed
+directly by the thread's exit, which the audit also rejected: the same flake, not seen in CI yet.
+
+Reproduction: `spin.c` (8 threads looping `socket`/`close`, the main thread `_exit`s after 20 ms) under
+`strace -f -e trace=socket,close,connect,execve -s 4096 -o <trace> ./spin`. First batch, 60 runs, the 46 traces with `???(`
+kept (`flk15/traces/`, `repro-summary.txt`): 64 `???( <unfinished ...>`, each later `<... ??? resumed>) = ?`, one
+`???() = ?`, 125 named calls ending `= ?` or `= ? <unavailable>`, every `= ?` line followed for its thread directly by `+++`;
+32 of the 46 have a named call left `<unfinished ...>` at its thread's exit. Second batch, 60 runs, all kept
+(`flk15/traces2/`): 46 with `???(`, 36 with an unfinished call at an exit, 60 with `= ?`. The CI line is the first form.
+
+Fix (fails closed on everything else), in two steps:
+1. "M3 cleanup: FLK-15 the connect audit accepts a call strace could not read only when its thread exits": `???(` is
+   accepted only with no arguments and the pseudo result `?`; a call with the pseudo result `?` (named or `???`) puts its
+   thread in "exiting", after which any line of that thread other than its `+++` exit fails the audit, as does a trace ending
+   first; a line without a thread id cannot carry `?`; a named call with `?` is checked on its decoded arguments as before.
+2. "M3 cleanup: FLK-15 a call left unfinished by its thread's exit is checked as one with result ?": the harness below found
+   the third form (first-step audit: `t.48: trace ended with an unfinished syscall`; on the second batch `u.55`). At a thread's
+   exit its pending call is checked as `<start>) = ?` would be: a connect still needs a local target or an owned SOCK_DIAG
+   socket (strace prints all of connect's arguments at entry; a partial entry does not parse and fails), a socket authorizes
+   nothing, a close drops the fd. Without a thread id an exit closes nothing. The per-call check moved into `check_call`.
+
+How strace is attached is unchanged: an undecodable call is not a blind spot to close, because it never ran.
+
+Runs (prebuilt test binaries under the test slot, `*-result.json` beside each log): red, the new tests on the old audit:
+`connect_audit_accepts_a_syscall_cut_off_by_its_threads_exit` failed with the CI error, 8 others passed (`red.log`, exit
+101); first step: 9 passed (`green.log`); final: 9 passed (`green2.log`), the audit accepts all 46 + 60 reproduction traces
+with 0 connects (`repro-traces-green2.log`, `repro-traces2-green2.log`; uncommitted ignored harness
+`repro-audit-harness.rs`), where the first step failed both batches (`repro-traces-v1.log`, `repro-traces2-v1.log`).
+
+Not weakened: all existing audit tests pass unchanged, including the rejection of a netlink connect with result `?` and no
+exit. Added tests reject `???` with arguments or a numeric result; `?` or an unfinished call without a thread id; `?` followed
+by another call of its thread or by the trace end; an external connect with `?`, or unfinished at its thread's exit (also with
+another thread's line between); a netlink connect, unfinished at exit, on no SOCK_DIAG socket; a netlink connect on an fd
+only a `?` socket returned.
+
+Evidence under `.hoh-dev/self-tests/flk1415/flk15/`. Self-tests, not acceptance.
