@@ -42,7 +42,7 @@ else:
  print(json.dumps({'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':text}],'stopReason':'stop'}}));print(json.dumps({'type':'agent_end'}))
 """
 
-FILES=['tools/agent_task.py','tools/common.py','tools/run_check.py','tools/candidate.py','tools/install_pi_plugins.py','tools/render_prompt.py',
+FILES=['tools/agent_task.py','tools/common.py','tools/run_check.py','tools/candidate.py','tools/release_gate.py','tools/install_pi_plugins.py','tools/render_prompt.py',
        'scripts/product/independent.sh','scripts/product/independent.py','scripts/product/traceability.py',
        'resources/prompts/qa.md','resources/prompts/reviewer.md']+[f'contracts/{n}.schema.json' for n in
        ('independent-report','live-session','execution','test-result','soak-event','candidate','check-plan','native-attempt')]

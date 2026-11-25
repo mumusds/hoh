@@ -446,7 +446,7 @@ class EndToEnd(unittest.TestCase):
     """TEST-052-05: the real traceability.sh through run_check in a fixture ROOT of its own: a git repository, a
     fixture spec whose TESTs map to a `unit` check and to `traceability` itself, and fixture tests. The fixture's own
     self-test is its tests/bundle test, not this one, so nothing recurses."""
-    FILES=['tools/run_check.py','tools/candidate.py','tools/common.py','scripts/product/traceability.sh','scripts/product/traceability.py',
+    FILES=['tools/run_check.py','tools/candidate.py','tools/release_gate.py','tools/common.py','scripts/product/traceability.sh','scripts/product/traceability.py',
            'scripts/product/test_results.py']+[f'contracts/{n}.schema.json' for n in ('execution','test-result','live-session','soak-event','candidate','check-plan')]
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='hoh-traceability-');self.addCleanup(self.temp.cleanup);r=self.root=Path(self.temp.name)
