@@ -1262,7 +1262,7 @@ async fn evidence_whose_source_changed_wakes_the_commander_in_the_step_that_sees
         "schema_version": "1.1", "record_type": "command_execution", "record_id": "r1", "check_id": "unit",
         "candidate_id": "C1", "spec_sha256": format!("{:064}", 3), "mode": "product", "command": ["true"], "cwd": ".",
         "started_at": "2026-11-11T10:00:00Z", "finished_at": "2026-11-11T10:00:01Z", "duration_seconds": 1.0,
-        "exit_code": 0, "timed_out": false, "stdout": file("o"), "stderr": file("e"), "candidate_manifest": file("c"),
+        "started": true, "exit_code": 0, "timed_out": false, "stdout": file("o"), "stderr": file("e"), "candidate_manifest": file("c"),
         "source_unchanged": false, "environment_sha256": format!("{:064}", 5),
         "test_plan_sha256": format!("{:064}", 6), "artifacts": [], "missing_artifacts": [],
         "producer_attempt_id": "Q/attempt-1", "runner": {"tool": "hoh", "euid": 1000}
