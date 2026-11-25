@@ -1650,13 +1650,33 @@ fn test_047_03_drift_persists_three_way_object() -> Result<(), Box<dyn std::erro
     let sha = reports[0]["sha256"].as_str().ok_or("drift sha")?;
     let report: serde_json::Value =
         serde_json::from_slice(&hoh_core::objects::get(dir.path(), sha)?)?;
+    // M3PD-L1: the oracle spells out the unified-diff text itself (as the resource_upgrade
+    // suite's assert_three_way_diff does); it never calls the product diff code under test.
+    // Single-line old and override texts share no line with the builtin: one whole-file hunk each.
+    let builtin = hoh_core::config::builtin_contract("developer").ok_or("builtin")?;
+    assert!(
+        builtin.ends_with('\n')
+            && !builtin
+                .split_inclusive('\n')
+                .any(|l| l == "old developer\n")
+    );
+    let expected = |to: &str, text: &str| {
+        let mut diff = format!(
+            "--- old-builtin\n+++ {to}\n@@ -1,1 +1,{} @@\n-old developer\n",
+            text.split_inclusive('\n').count()
+        );
+        for line in text.split_inclusive('\n') {
+            diff.push('+');
+            diff.push_str(line);
+        }
+        diff
+    };
     assert_eq!(
         report["diff"],
-        hoh_core::prompt::three_way_diff(
-            "old developer\n",
-            hoh_core::config::builtin_contract("developer").unwrap(),
-            "custom developer\n"
-        )
+        serde_json::json!({
+            "builtin": expected("new-builtin", builtin),
+            "override": "--- old-builtin\n+++ override\n@@ -1,1 +1,1 @@\n-old developer\n+custom developer\n",
+        })
     );
     assert!(
         packing
