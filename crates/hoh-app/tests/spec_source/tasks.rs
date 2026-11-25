@@ -880,7 +880,8 @@ async fn test_033_04_plan_import_pairs_replacements_per_run() -> R {
 /// completes, and refuses dispatch of an old-spec Task (`admission.rs:283` Refusal::SpecMismatch); then the
 /// subsequent approval releases & migrates T1 (REQ-A) and cancels T2 (REQ-C, replaced by T3).
 #[tokio::test]
-async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_migrates_or_cancels() -> R {
+async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_migrates_or_cancels()
+-> R {
     fn revise_b(world: &World) -> R<Index> {
         let mut files = sources();
         files[0].bytes = String::from_utf8(files[0].bytes.clone())?
@@ -911,7 +912,10 @@ async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_m
             ]}}),
         )
         .await?;
-        assert!(matches!(planned, hoh_core::persistence::Decided::Applied { .. }), "{planned:?}");
+        assert!(
+            matches!(planned, hoh_core::persistence::Decided::Applied { .. }),
+            "{planned:?}"
+        );
         // Schedule and start the writer attempt on revision 1.
         let dispatched = host
             .store()
@@ -1082,7 +1086,9 @@ async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_m
             );
         } else {
             assert_eq!(
-                world.query(&format!("SELECT state FROM tasks WHERE task_id='{task_id}'"))?,
+                world.query(&format!(
+                    "SELECT state FROM tasks WHERE task_id='{task_id}'"
+                ))?,
                 "CANCELLED"
             );
             let replanned = decide(
@@ -1094,7 +1100,10 @@ async fn test_033_04_product_places_writer_in_spec_mismatch_hold_then_approval_m
                 json!({"kind":"create_tasks","plan":plan(&["T3"])}),
             )
             .await?;
-            assert!(matches!(replanned, hoh_core::persistence::Decided::Applied { .. }), "{replanned:?}");
+            assert!(
+                matches!(replanned, hoh_core::persistence::Decided::Applied { .. }),
+                "{replanned:?}"
+            );
             let replaced = event_payloads(&world, "task.replaced")?;
             assert_eq!(
                 replaced

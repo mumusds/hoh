@@ -342,13 +342,16 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         "payload":{"text":"hold steer","input_kind":"STEER","target_role":"developer"}});
     assert_eq!(
         runtime
-            .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&hold_cmd)))?
+            .block_on(world::exchange(
+                &host,
+                "POST",
+                "/v1/commands",
+                Some(&hold_cmd)
+            ))?
             .0,
         202
     );
-    runtime.block_on(async {
-        tokio::time::timeout(WAIT, agent.steer_entered.notified()).await
-    })?;
+    runtime.block_on(async { tokio::time::timeout(WAIT, agent.steer_entered.notified()).await })?;
     let revision: i64 = world
         .query("SELECT revision FROM runs WHERE run_id='R'")?
         .parse()?;
@@ -356,7 +359,12 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         "payload":{"text":"late outbox input","input_kind":"STEER","target_role":"developer"}});
     assert_eq!(
         runtime
-            .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&late_outbox)))?
+            .block_on(world::exchange(
+                &host,
+                "POST",
+                "/v1/commands",
+                Some(&late_outbox)
+            ))?
             .0,
         202
     );

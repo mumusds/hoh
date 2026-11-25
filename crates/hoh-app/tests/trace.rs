@@ -264,11 +264,8 @@ async fn test_032_04_scenarios_from_spec_not_contracts() -> R {
     let (port, token, host_pid): (u16, String, i32) = loop {
         if let Ok(bytes) = std::fs::read(&host_json_path)
             && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
-            && let (Some(port), Some(token), Some(pid)) = (
-                v["port"].as_u64(),
-                v["token"].as_str(),
-                v["pid"].as_u64(),
-            )
+            && let (Some(port), Some(token), Some(pid)) =
+                (v["port"].as_u64(), v["token"].as_str(), v["pid"].as_u64())
             && std::net::TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
         {
             break (port as u16, token.to_owned(), i32::try_from(pid)?);
