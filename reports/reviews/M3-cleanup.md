@@ -369,3 +369,17 @@ sections `---- X stdout ----` and `test result:` summaries to stdout). Exit code
 that inherits the test binary's *stdout* would still interleave, so the fix includes an audit for test-spawned processes
 writing to an inherited fd 1 (recorded below). test_results.py does not guess at damaged lines: a lost line stays NOT_RUN.
 static.sh merges clippy's stderr into `clippy.log`, which no parser reads for test results, so it stays as it is.
+
+fd 1 audit. Static: no product `println!` on a host path (the direct `io::stdout()` writers are `hoh __wal-probe` and `hoh
+__unit`, protocol outputs their parents pipe); the inherited-stdout spawns in crates/hoh-app/tests that were read start
+quiet children (`sleep`, `sh -c 'read …'`, `tar -x`, `true`) or set stdout through a helper, and the deployment suite's
+children are piped, nulled or write to a log. Dynamic: the whole `cargo test --workspace --locked --no-fail-fast` with stdout
+and stderr in separate files (exit 0): its stdout held 2932 result lines, equal to the `test result:` totals, while 13829
+`hoh host:` diagnostics went to stderr; every stdout line but one is libtest's or rustdoc's own. The exception was
+`{"reasons":["worktree dirty: x"],"status":"refused"}` from `run_check_asks_for_its_check_and_ends_with_its_exit_code`
+(crates/hoh-app/src/host/requests/tests.rs), whose second `run-check` helper inherited the test binary's stdout: it is
+piped now and its answer asserted, like the first's. Evidence under `.hoh-dev/self-tests/qa018/` (`audit-workspace.*`,
+`green-requests.*`, `qa018-classify.py`, `qa018-scan.py`, `red-bundle.log`, `green-bundle.log`, `pre-pr.log`).
+Self-tests, not acceptance. Other merged streams: adapter-live.sh writes each live test's output with `2>&1` to its own
+log, but its results come from the verdict files the tests write, never from that log; static.sh's `clippy.log` is not
+parsed for test results. Both stay as they are.
