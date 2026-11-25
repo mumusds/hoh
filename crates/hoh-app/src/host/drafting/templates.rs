@@ -33,10 +33,15 @@ pub(super) async fn prepare(
     let root = project.to_path_buf();
     let held = work.clone();
     let prepared = crate::host::begun::spawn_blocking(move || {
-        let bundle = held.assignment.resource_bundle.as_ref().map_or_else(
-            || Ok(hoh_core::resource_bundle::Bundle::current()),
-            |pin| pin.load(&root),
-        )?;
+        let bundle = held
+            .assignment
+            .resource_bundle
+            .as_ref()
+            .map_or_else(
+                || Ok(hoh_core::resource_bundle::Bundle::current()),
+                |pin| pin.load(&root),
+            )
+            .map_err(|e| e.to_string())?;
         let templates = hoh_core::templates::load(
             &root,
             hoh_core::prompt_files::global_root().as_deref(),

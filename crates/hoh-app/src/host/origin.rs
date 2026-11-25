@@ -542,7 +542,7 @@ fn unix_peer_inode(inode: u64) -> Option<u64> {
     let inode = u32::try_from(inode).ok()?;
     let socket = net::socket_with(
         AddressFamily::NETLINK,
-        SocketType::DGRAM,
+        SocketType::RAW,
         SocketFlags::CLOEXEC,
         Some(net::netlink::SOCK_DIAG),
     )
