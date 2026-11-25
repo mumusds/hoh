@@ -1930,6 +1930,9 @@ pub struct Team {
     /// A scripted specification drafter, restricted to this test project.
     drafter: Option<PathBuf>,
     draft_source: Option<hoh_core::specindex::Source>,
+    /// Shell commands the scripted drafter runs in the project before it commits `docs/spec` (none: it writes
+    /// nothing else).
+    draft_writes: Option<String>,
     turns: std::sync::Mutex<Vec<(Turn, Vec<Value>)>>,
     refused: std::sync::Mutex<Vec<String>>,
     /// Each turn's process group (its leader's pid) and its leader's start time.
@@ -1966,6 +1969,7 @@ impl Team {
             reviewer: None,
             drafter: None,
             draft_source: None,
+            draft_writes: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -1986,6 +1990,7 @@ impl Team {
             reviewer: None,
             drafter: None,
             draft_source: None,
+            draft_writes: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -2007,6 +2012,7 @@ impl Team {
             reviewer: Some((project, Box::new(verdict))),
             drafter: None,
             draft_source: None,
+            draft_writes: None,
             turns: std::sync::Mutex::default(),
             refused: std::sync::Mutex::default(),
             agents: std::sync::Mutex::default(),
@@ -2023,6 +2029,7 @@ impl Team {
             reviewer: None,
             drafter: Some(project),
             draft_source: None,
+            draft_writes: None,
             turns: Default::default(),
             refused: Default::default(),
             agents: Default::default(),
@@ -2056,6 +2063,30 @@ impl Team {
             reviewer: Some((project.clone(), Box::new(verdict))),
             drafter: Some(project),
             draft_source: Some(source),
+            draft_writes: None,
+            turns: Default::default(),
+            refused: Default::default(),
+            agents: Default::default(),
+        })
+    }
+
+    /// As [`Team::planning`] without held work, its drafter also running `writes` (shell commands in the project)
+    /// before it commits `docs/spec`: a drafter that writes outside the draft boundary.
+    pub fn planning_with_draft_writes(
+        project: PathBuf,
+        source: hoh_core::specindex::Source,
+        script: impl Fn(&Turn) -> Vec<Value> + Send + Sync + 'static,
+        writes: &str,
+    ) -> std::sync::Arc<Team> {
+        std::sync::Arc::new(Team {
+            script: Box::new(script),
+            answer: Box::new(|_| None),
+            work: None,
+            work_gate: None,
+            reviewer: Some((project.clone(), Box::new(|_| Verdict::Pass))),
+            drafter: Some(project),
+            draft_source: Some(source),
+            draft_writes: Some(writes.to_owned()),
             turns: Default::default(),
             refused: Default::default(),
             agents: Default::default(),
@@ -2153,13 +2184,17 @@ impl Team {
             std::fs::write(prepared.join("main.md"), source.bytes).map_err(|e| e.to_string())?;
             std::fs::write(prepared.join("index.json"), index.bytes())
                 .map_err(|e| e.to_string())?;
-            "read -r go || exit 1; set -e; mkdir -p docs/spec; cp -- \"$DRAFT_INPUT/main.md\" \"$DRAFT_PATH\"; cp -- \"$DRAFT_INPUT/index.json\" docs/spec/index.json; git add docs/spec; git -c user.name=test -c user.email=test@example.invalid commit --allow-empty -qm draft"
+            "read -r go || exit 1; set -e; mkdir -p docs/spec; cp -- \"$DRAFT_INPUT/main.md\" \"$DRAFT_PATH\"; cp -- \"$DRAFT_INPUT/index.json\" docs/spec/index.json; eval \"$DRAFT_WRITES\"; git add docs/spec; git -c user.name=test -c user.email=test@example.invalid commit --allow-empty -qm draft"
         } else {
             "read -r go; exit 0"
         };
         let mut child = Command::new("sh")
             .current_dir(project)
             .env("DRAFT_INPUT", prepared)
+            .env(
+                "DRAFT_WRITES",
+                self.draft_writes.as_deref().unwrap_or_default(),
+            )
             .env(
                 "DRAFT_PATH",
                 self.draft_source

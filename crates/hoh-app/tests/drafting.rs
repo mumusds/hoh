@@ -464,6 +464,120 @@ async fn test_008_04_m3l102_failed_draft_checks_committed_product_writes() -> R 
     result
 }
 
+/// AC-008-04 end to end: in a PLAN Run on revision 1 the Commander's plan with a developer write Task is rejected and
+/// imports nothing, and the cto drafter's tracked modification, untracked file and deletion of product sources block
+/// its draft Task with exactly those paths, without a CR or a new revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_008_04_plan_rejects_writer_plan_and_draft_product_writes_block_with_their_paths() -> R
+{
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let world = world::World::named("m3qa006-plan-writes")?;
+    world.configure(&[], "")?;
+    world.commit_project(&[world::Requirement {
+        id: "REQ-A".into(),
+        title: "标题".into(),
+        criteria: vec![],
+    }])?;
+    // A second tracked product source, the one the drafter deletes.
+    std::fs::write(world.project().join("src/old.rs"), "pub fn old() {}\n")?;
+    world.git(&["add", "src/old.rs"])?;
+    world.git(&["commit", "-q", "-m", "fixture old source"])?;
+    world.init_store().await?;
+    let spec = world.seed_spec()?;
+    let setup = world.start_plain_host(None).await?;
+    let run = world::start_run(&setup, "start", "规划越界写").await?;
+    world.staff(&run)?;
+    world.exec(&format!(
+        "UPDATE runs SET state='RUNNING',mode='PLAN' WHERE run_id='{run}';"
+    ))?;
+    setup.shutdown().await;
+    assert_eq!(
+        world.query("SELECT mode||'/'||spec_id FROM runs")?,
+        format!("PLAN/{spec}")
+    );
+    let source=hoh_core::specindex::Source{path:"docs/spec/fixture.md".into(),bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec()};
+    let planned = std::sync::Arc::new(AtomicBool::new(false));
+    let once = planned.clone();
+    let release = world.root().join("draft-release");
+    let team = world::Team::planning_with_draft_writes(
+        world.project(),
+        source,
+        move |_| {
+            if once.swap(true, SeqCst) {
+                return Vec::new();
+            }
+            vec![world::rejected(
+                json!({"kind":"create_tasks","plan":{"tasks":[
+                {"task_id":"planned-write","title":"实现","role":"developer","writer":true,
+                 "depends_on":[],"requirement_ids":["REQ-A"]}]}}),
+            )]
+        },
+        // The drafter holds its writes until the plan was judged in the RUNNING Run (its question would block it).
+        &format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; printf 'pub fn changed() {{}}\\n' > src/lib.rs; \
+             printf 'pub fn new() {{}}\\n' > src/new.rs; rm src/old.rs",
+            release.display()
+        ),
+    );
+    let host = world.team_host(team, None).await?;
+    let result: R = async {
+        input(&host, &world, &run, "ask-plan", "SendInput",
+            json!({"text":"请给出实施计划","target_role":"commander","input_kind":"STEER"})).await?;
+        let decisions = "SELECT state||'/'||reason_code FROM decisions WHERE json_extract(payload_json,'$.kind')='create_tasks'";
+        if let Err(e) = world.until(&format!("SELECT count(*) FROM ({decisions})"), "1", Duration::from_secs(30)).await {
+            return Err(format!("{e}; runs={:?}; events={:?}", world.rows("SELECT state,mode,blocked_reasons_json FROM runs")?,
+                world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 20")?).into());
+        }
+        // The plan is rejected, with its reason, and imports nothing.
+        assert_eq!(world.query(decisions)?, "REJECTED/ILLEGAL_TRANSITION");
+        let rejected = world.rows("SELECT payload_json FROM events WHERE kind='decision.rejected'")?;
+        assert_eq!(rejected.len(), 1, "{rejected:?}; decisions={:?}", world.rows("SELECT * FROM decisions")?);
+        let rejected: serde_json::Value = serde_json::from_str(rejected[0]["payload_json"].as_str().ok_or("payload")?)?;
+        assert!(rejected["details"].to_string().contains("PLAN 不实施"), "{rejected}");
+        assert_eq!(world.query("SELECT count(*) FROM tasks WHERE task_id='planned-write'")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM tasks WHERE role='developer'")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM task_requirements")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='plan.imported'")?, "0");
+        assert_eq!(world.query("SELECT state FROM runs")?, "RUNNING");
+        std::fs::write(&release, "release the drafter")?;
+        // The drafter's three product writes: exactly those paths, in the violation and in the question.
+        if let Err(e) = world.until("SELECT count(*) FROM events WHERE kind='plan.write_violation'", "1", Duration::from_secs(30)).await {
+            return Err(format!("{e}; tasks={:?}; events={:?}", world.rows("SELECT task_id,kind,state,blocked_reason FROM tasks")?,
+                world.rows("SELECT kind,payload_json FROM events ORDER BY seq DESC LIMIT 20")?).into());
+        }
+        let three = json!(["src/lib.rs", "src/new.rs", "src/old.rs"]);
+        let sorted = |sql: &str| -> R<serde_json::Value> {
+            let mut paths: Vec<String> = serde_json::from_str(&world.query(sql)?)?;
+            paths.sort();
+            Ok(json!(paths))
+        };
+        let draft = world.query("SELECT task_id FROM tasks WHERE kind='spec_draft'")?;
+        assert_eq!(world.query("SELECT json_extract(payload_json,'$.task_id') FROM events WHERE kind='plan.write_violation'")?, draft);
+        assert_eq!(sorted("SELECT json_extract(payload_json,'$.paths') FROM events WHERE kind='plan.write_violation'")?, three);
+        let question = format!("SELECT json_extract(payload_json,'$.paths') FROM events WHERE kind='question.asked' \
+            AND run_id='{run}' AND json_extract(payload_json,'$.reason')='draft_question' AND json_extract(payload_json,'$.task_id')='{draft}'");
+        assert_eq!(world.rows(&question)?.len(), 1);
+        assert_eq!(sorted(&question)?, three);
+        assert_eq!(world.query(&format!("SELECT state||'/'||blocked_reason FROM tasks WHERE task_id='{draft}'"))?, "BLOCKED/NEED_DECISION");
+        // No CR, no completed draft and no new approved revision.
+        assert_eq!(world.query("SELECT count(*) FROM change_requests")?, "0");
+        assert_eq!(world.query("SELECT count(*) FROM events WHERE kind='spec.draft_completed'")?, "0");
+        assert_eq!(world.query("SELECT count(*)||'/'||max(spec_id) FROM specs")?, format!("1/{spec}"));
+        assert_eq!(world.query("SELECT spec_id FROM runs")?, spec);
+        // The files stay as the drafter left them (Git's view of the same three paths).
+        let status = world.git(&["status", "--porcelain=v1", "-uall", "--", "src"])?;
+        let mut changed: Vec<&str> = status.lines().collect();
+        changed.sort_unstable();
+        assert_eq!(changed, vec![" D src/old.rs", " M src/lib.rs", "?? src/new.rs"]);
+        Ok(())
+    }
+    .await;
+    // A failure before the release must not leave the drafter waiting.
+    std::fs::write(&release, "release the drafter")?;
+    host.shutdown().await;
+    result
+}
+
 #[derive(Debug)]
 struct DraftBarrier {
     point: hoh_app::host::RunnerPoint,
