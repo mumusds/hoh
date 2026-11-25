@@ -63,9 +63,11 @@ executable2="$(cd "$v2" && CARGO_TARGET_DIR="$target" HOH_BUILD_COMMIT="${HOH_BU
 (cd "$v2" && HOH_BUILD_COMMIT="${HOH_BUILD_COMMIT%-dirty}-dirty" bash scripts/product/bundle.sh "$work/hoh-release-v2.tar.gz" "$executable2")
 echo "deployment: release bundle v2 $(sha256sum "$work/hoh-release-v2.tar.gz" | cut -c1-16)… ($("$executable2" --version | head -n 1))" >&2
 rc=0
+# The parsed log is cargo's stdout only: its stderr (build output, and diagnostics of the processes the tests start)
+# stays on this script's stderr, where it cannot break a libtest result line (M3QA-018, DC-QA018).
 HOH_RELEASE_BUNDLE="$work/hoh-release.tar.gz" HOH_RELEASE_BUNDLE_V2="$work/hoh-release-v2.tar.gz" \
   HOH_EXPECTED_COMMIT="$HOH_BUILD_COMMIT" \
-  cargo test -p hoh-app --locked --test deployment -- --include-ignored --test-threads=1 2>&1 | tee "$log" || rc=$?
+  cargo test -p hoh-app --locked --test deployment -- --include-ignored --test-threads=1 | tee "$log" || rc=$?
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
   python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"
 fi
