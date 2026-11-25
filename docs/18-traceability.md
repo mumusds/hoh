@@ -13,13 +13,13 @@
 |REQ-007|Slash 与统一操作|M3|required|v1|detailed|AC-007-01（TEST-007-01·tui-pty·M3-T09）<br>AC-007-02（TEST-007-02·integration·M3-T09）<br>AC-007-03（TEST-007-03·tui-pty·M3-T09）|M3-T01, M3-T09, M3-T05, M7-T04|
 |REQ-008|Plan 互动与文档|M3|required|v1|detailed|AC-008-01（TEST-008-01·tui-pty·M3-T04）<br>AC-008-02（TEST-008-02·recovery·M3-T04）<br>AC-008-03（TEST-008-03·tui-pty·M3-T04）<br>AC-008-04（TEST-008-04·integration·M3-T04）<br>AC-008-05（TEST-008-05·integration·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
 |REQ-009|Build 与 Auto|M3|required|v1|detailed|AC-009-01（TEST-009-01·integration·M3-T04）<br>AC-009-02（TEST-009-02·integration·M3-T04）<br>AC-009-03（TEST-009-03·unit·M3-T04）|M3-T01, M3-T04, M3-T05, M7-T04|
-|REQ-010|Workspace 工作台|M4|required|v1|outline|AC-010-01（TEST-010-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
-|REQ-011|Team/Focus 布局|M4|required|v1|outline|AC-011-01（TEST-011-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
-|REQ-012|可展开内容块|M4|required|v1|outline|AC-012-01（TEST-012-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
-|REQ-013|三级时间线|M4|required|v1|outline|AC-013-01（TEST-013-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
-|REQ-014|真实进度状态栏|M4|required|v1|outline|AC-014-01（TEST-014-01·tui-pty·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
-|REQ-015|输入与终端兼容|M4|required|v1|outline|AC-015-01（TEST-015-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
-|REQ-016|无障碍与键位|M4|required|v1|outline|AC-016-01（TEST-016-01·tui-pty·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
+|REQ-010|Workspace 工作台|M4|required|v1|detailed|AC-010-01（TEST-010-01·tui-pty·M4-T02）<br>AC-010-02（TEST-010-02·tui-pty·M4-T02）<br>AC-010-03（TEST-010-03·tui-pty·M4-T02）<br>AC-010-04（TEST-010-04·unit·M4-T02）|M4-T01, M4-T02, M4-T04, M7-T04|
+|REQ-011|Team/Focus 布局|M4|required|v1|detailed|AC-011-01（TEST-011-01·tui-pty·M4-T02）<br>AC-011-02（TEST-011-02·tui-pty·M4-T02）<br>AC-011-03（TEST-011-03·integration·M4-T02）<br>AC-011-04（TEST-011-04·tui-pty·M4-T02）<br>AC-011-05（TEST-011-05·integration·M4-T09）|M4-T01, M4-T09, M4-T02, M4-T04, M7-T04|
+|REQ-012|可展开内容块|M4|required|v1|detailed|AC-012-01（TEST-012-01·integration·M4-T05）<br>AC-012-02（TEST-012-02·integration·M4-T05）<br>AC-012-03（TEST-012-03·tui-pty·M4-T05）<br>AC-012-04（TEST-012-04·unit·M4-T05）|M4-T01, M4-T05, M4-T04, M7-T04|
+|REQ-013|三级时间线|M4|required|v1|detailed|AC-013-01（TEST-013-01·tui-pty·M4-T06）<br>AC-013-02（TEST-013-02·integration·M4-T06）<br>AC-013-03（TEST-013-03·integration·M4-T06）<br>AC-013-04（TEST-013-04·unit·M4-T06）<br>AC-013-05（TEST-013-05·integration·M4-T09）|M4-T01, M4-T09, M4-T06, M4-T04, M7-T04|
+|REQ-014|真实进度状态栏|M4|required|v1|detailed|AC-014-01（TEST-014-01·tui-pty·M4-T06）<br>AC-014-02（TEST-014-02·unit·M4-T06）<br>AC-014-03（TEST-014-03·tui-pty·M4-T06）<br>AC-014-04（TEST-014-04·integration·M4-T06）<br>AC-014-05（TEST-014-05·adapter-live·M4-T11）|M4-T01, M4-T06, M4-T11, M4-T04, M7-T04|
+|REQ-015|输入与终端兼容|M4|required|v1|detailed|AC-015-01（TEST-015-01·tui-pty·M4-T07）<br>AC-015-02（TEST-015-02·tui-pty·M4-T07）<br>AC-015-03（TEST-015-03·integration·M4-T07）<br>AC-015-04（TEST-015-04·tui-pty·M4-T07）<br>AC-015-05（TEST-015-05·integration·M4-T10）|M4-T01, M4-T07, M4-T10, M4-T04, M7-T04|
+|REQ-016|无障碍与键位|M4|required|v1|detailed|AC-016-01（TEST-016-01·tui-pty·M4-T08）<br>AC-016-02（TEST-016-02·unit·M4-T08）<br>AC-016-03（TEST-016-03·tui-pty·M4-T08）<br>AC-016-04（TEST-016-04·unit·M4-T08）|M4-T01, M4-T08, M4-T04, M7-T04|
 |REQ-017|运行中对话|M3|required|v1|detailed|AC-017-01（TEST-017-01·integration·M3-T09）<br>AC-017-02（TEST-017-02·adapter-live·M3-T09）<br>AC-017-03（TEST-017-03·integration·M3-T09）<br>AC-017-04（TEST-017-04·tui-pty·M3-T09）<br>AC-017-05（TEST-017-05·recovery·M3-T09）|M3-T01, M3-T09, M3-T05, M7-T04|
 |REQ-018|默认与自定义团队|M2|required|v1|detailed|AC-018-01（TEST-018-01·unit·M2-T07）<br>AC-018-02（TEST-018-02·integration·M2-T07）<br>AC-018-03（TEST-018-03·integration·M2-T07）<br>AC-018-04（TEST-018-04·integration·M2-T07）<br>AC-018-05（TEST-018-05·integration·M2-T07）|M2-T07, M2-T11, M7-T04|
 |REQ-019|角色交接|M2|required|v1|detailed|AC-019-01（TEST-019-01·integration·M2-T17）<br>AC-019-02（TEST-019-02·integration·M2-T17）<br>AC-019-03（TEST-019-03·integration·M2-T17）<br>AC-019-04（TEST-019-04·integration·M2-T17）<br>AC-019-05（TEST-019-05·recovery·M2-T17）|M2-T17, M2-T11, M7-T04|
@@ -67,7 +67,7 @@
 |REQ-061|无障碍和远程体验|M6|required|v1|outline|AC-061-01（TEST-061-01·web-e2e·M6-T02）|M6-T01, M6-T02, M6-T04, M7-T04|
 |REQ-062|持久化一致性|M2|required|v1, v0.1|detailed|AC-062-01（TEST-062-01·integration·M2-T12）<br>AC-062-02（TEST-062-02·integration·M2-T12）<br>AC-062-03（TEST-062-03·integration·M2-T04）<br>AC-062-04（TEST-062-04·integration·M2-T12）<br>AC-062-05（TEST-062-05·static·M2-T01）<br>AC-062-06（TEST-062-06·integration·M2-T12）|M2-T01, M2-T12, M2-T04, M2-T11, V01-T01, V01-T02, M7-T04|
 |REQ-063|备份与迁移|M5|required|v1|outline|AC-063-01（TEST-063-01·recovery·M5-T02）|M5-T01, M5-T02, M5-T04, M7-T04|
-|REQ-064|可观测性与容量|M4|required|v1|outline|AC-064-01（TEST-064-01·integration·M4-T03）|M4-T01, M4-T03, M4-T04, M7-T04|
+|REQ-064|可观测性与容量|M4|required|v1|detailed|AC-064-01（TEST-064-01·integration·M4-T10）<br>AC-064-02（TEST-064-02·integration·M4-T10）<br>AC-064-03（TEST-064-03·integration·M4-T03）<br>AC-064-04（TEST-064-04·recovery·M4-T03）<br>AC-064-05（TEST-064-05·integration·M4-T03）|M4-T01, M4-T03, M4-T10, M4-T04, M7-T04|
 |REQ-065|Git集成与交付|M6|required|v1|outline|AC-065-01（TEST-065-01·integration·M6-T03）|M6-T01, M6-T03, M6-T04, M7-T04|
 |REQ-066|安装使用文档|M6|required|v1|outline|AC-066-01（TEST-066-01·deployment·M6-T03）|M6-T01, M6-T03, M6-T04, M7-T04|
 |REQ-067|跨天稳定性|M7|required|v1|outline|AC-067-01（TEST-067-01·soak·M7-T03）|M7-T01, M7-T03, M7-T04|
@@ -75,4 +75,4 @@
 |REQ-069|交付真实性|M7|required|v1|outline|AC-069-01（TEST-069-01·traceability·M7-T02）|M7-T01, M7-T02, M7-T04|
 |REQ-070|长期维护与升级|M7|required|v1|outline|AC-070-01（TEST-070-01·deployment·M7-T02）|M7-T01, M7-T02, M7-T04|
 
-合计：70 项需求（43 项 detailed），217 条验收。v0.1 范围：18 项需求。
+合计：70 项需求（51 项 detailed），246 条验收。v0.1 范围：18 项需求。
