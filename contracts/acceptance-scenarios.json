@@ -2178,6 +2178,29 @@
    ]
   },
   {
+   "id": "TEST-027-05",
+   "requirement_id": "REQ-027",
+   "acceptance_id": "AC-027-05",
+   "check_id": "integration",
+   "fixture": "pi 录制样例改写：1.5 MiB agent_end（pi 键序）后接 agent_settled；帧首不符白名单的同长度行；在 LF 前结束的 agent_end；缓冲探针",
+   "steps": [
+    "分别运行三份 fixture 的 attempt",
+    "等待终态并读取探针与诊断"
+   ],
+   "pass_criteria": [
+    "白名单帧 attempt state=SETTLED",
+    "恰1条跳过诊断，含 type=agent_end、帧长度、整帧 sha256、前4096字节",
+    "最大缓冲字节≤1,114,112",
+    "帧首不符与被截断的 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE"
+   ],
+   "observables": [
+    "缓冲探针数据",
+    "诊断事件",
+    "attempts 行",
+    "原始 stdout 日志"
+   ]
+  },
+  {
    "id": "TEST-028-01",
    "requirement_id": "REQ-028",
    "acceptance_id": "AC-028-01",

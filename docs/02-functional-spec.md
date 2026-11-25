@@ -905,7 +905,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 实现 sha256、help 或 schema hash 与 manifest 不符时，新 attempt 不得使用该版本（COMPAT_UNVERIFIED），直到在无写租约时重跑兼容套件通过；运行中的 attempt 不受影响。
 - 未知事件类型与已知事件中的未知字段必须保存原始帧并产生 `adapter.unknown_event` 诊断，不 panic、不改变终态判定。
 - 请求不支持的能力必须返回 CAPABILITY_UNSUPPORTED（API 为422）或走文档化降级（如 steer 排到下一轮），不得静默伪装支持。
-- 协议帧超过1 MiB（初值）必须有界失败：缓冲不超过上限加一次读块，保存诊断并使该 attempt FAILED（PROTOCOL_FRAME_TOO_LARGE）。
+- 协议帧超过1 MiB（初值）必须有界失败：缓冲不超过上限加一次读块，保存诊断并使该 attempt FAILED（PROTOCOL_FRAME_TOO_LARGE）。（CR-040）例外只有一种：适配器凭帧的前4 KiB 按确切字节前缀认出的已知记录、且适配器不需要其载荷（白名单：pi 的 agent_end、turn_end、tool_execution_end、toolResult 的 message_start/message_end，claude 的 user，codex App Server 的 turn/diff/updated），读到其 LF 时跳过：边读边丢弃，缓冲同样不超过上限加一次读块，记 adapter.diagnostic（类型、长度、整帧 sha256、前4 KiB），之后继续成帧；被认出但在 LF 前流结束或超过 256 MiB 的帧仍按上限失败。
 - 能力为 false 或数据缺失的指标（如 token_usage）必须显示 unknown/null，不显示0。
 - 每个适配器按 CLI 版本维护已知帧登记表 tests/fixtures/protocol/<agent>/<version>/known-frames.json（由录制样例与官方文档汇总，含已知但忽略的辅助帧，如 Claude 的 rate_limit_event、system/task_*，Codex 的 remoteControl/status/changed、deprecationNotice）；只有不在登记表中的帧才产生 adapter.unknown_event（CR-003）。
 
@@ -917,6 +917,7 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
 - 当收到8 MiB 无 LF 的单行时，最大缓冲≤1 MiB+64 KiB，attempt FAILED，host 与其它 attempt 继续运行。
 - 当有写租约活跃时请求运行兼容套件，被拒绝并提示维护窗口，不中途替换正在使用的版本。
 - 当 Claude 不支持中途 steer 时，steer 输入保持 QUEUED 至下一轮 resume 投递，不标 APPLIED。
+- （CR-040）当长会话的 pi 发出超过1 MiB 的 agent_end 等白名单记录并以 agent_settled 结束时，attempt SETTLED，不因帧长失败；帧首不符白名单的超限帧照旧 FAILED。
 
 **验收**
 
@@ -928,6 +929,8 @@ M1 · P0 · 发布类 required · 目标 v1, v0.1 · 成熟度 detailed，参考
   - 判定：三个适配器最大缓冲字节均≤1,114,112；超大帧 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE；诊断记录含长度、前缀 sha256、前4096字节；并行正常 attempt state=SETTLED，host 进程未退出
 - **AC-027-04**（TEST-027-04 · 检查 `integration`）Given compat manifest 已登记 fake codex A 的 hash 且兼容套件 PASS；一个使用 A 的 RUNNING attempt 持有写租约；When 将 PATH 中 codex 替换为 hash 不同的 B 后请求新 attempt；请求运行兼容套件；待写租约释放后运行套件并重试；Then 新 attempt 被拒（COMPAT_UNVERIFIED）而原 attempt 继续至 SETTLED；写租约活跃时套件请求被拒；套件 PASS 后 manifest 的 codex 项更新为 B（implementation_sha256=B 的 hash、suite.status=PASS）且新 attempt 成功启动；PASS 前 doctor 显示 protocol=unknown
   - 判定：替换后首个新 attempt 被拒，错误码=COMPAT_UNVERIFIED，无子进程启动；原 attempt 最终 state=SETTLED，其进程仍为 A；doctor codex 项 protocol=unknown；租约活跃时套件请求被拒绝；套件 PASS 后 manifest 的 codex 项 implementation_sha256 等于 B 的 hash 且 suite.status=PASS，重试 attempt 成功启动
+- **AC-027-05**（TEST-027-05 · 检查 `integration`）Given pi fixture：正常帧之后1条 1.5 MiB 的 `agent_end`（键序同 pi：`{"type":"agent_end","messages":[…],"willRetry":false}`），其后 `agent_settled`；另备同长度但帧首不在白名单的一行、在 LF 之前流就结束的同一 `agent_end`；帧上限为默认1 MiB；When 分别运行 attempt 并通过测试探针记录 reader 最大缓冲字节；Then 白名单帧的 attempt=SETTLED，恰1条跳过诊断（含类型 agent_end、帧长度、整帧 sha256 与前4 KiB）；最大缓冲≤1 MiB+64 KiB；帧首不符与被截断的两份 attempt=FAILED、原因 PROTOCOL_FRAME_TOO_LARGE
+  - 判定：白名单帧 attempt state=SETTLED；恰1条跳过诊断，含 type=agent_end、帧长度、整帧 sha256、前4096字节；最大缓冲字节≤1,114,112；帧首不符与被截断的 attempt state=FAILED，原因=PROTOCOL_FRAME_TOO_LARGE
 
 **已确认的设计选择**（项目所有者 2026-11-03 确认，CR-002；“初值”指可经 CR 调整的基线值）
 
