@@ -231,12 +231,16 @@ impl Seen {
                 self.items += 1;
                 let item = &frame["item"];
                 let item_type = item["type"].as_str().unwrap_or_default();
+                let mut payload = json!({"attempt_id": id, "method": kind, "threadId": self.thread_id, "turnId": null,
+                    "itemId": item["id"], "itemType": item_type});
+                if item_type == "command_execution" {
+                    payload["aggregated_output"] = item["aggregated_output"].clone();
+                }
                 recorder
                     .event(
                         &format!("exec-item-{}", self.items),
                         "adapter.item",
-                        json!({"attempt_id": id, "method": kind, "threadId": self.thread_id, "turnId": null,
-                               "itemId": item["id"], "itemType": item_type, "aggregated_output": item["aggregated_output"]}),
+                        payload,
                     )
                     .await?;
                 if kind == "item.completed" && item_type == "agent_message" {
@@ -510,5 +514,47 @@ pub(super) fn replay(bytes: &[u8]) -> Replayed {
         state: driven.state,
         failure: driven.failure,
         unknown_events: crate::adapter::unknown_events(&recorded),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_027_06_m3cx005_only_command_items_carry_aggregated_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in [
+            "command_execution",
+            "agent_message",
+            "file_change",
+            "mcp_tool_call",
+        ] {
+            let mut recorder = Recorder::Collect(Vec::new(), Observer::default());
+            let mut seen = Seen::default();
+            let frame = json!({"type":"item.completed","item":{"type":kind,"id":"i","aggregated_output":"output"}});
+            seen.on_line(&mut recorder, "test", frame.to_string().as_bytes())
+                .await?;
+            let Recorder::Collect(events, _) = recorder else {
+                unreachable!()
+            };
+            let payload = events
+                .iter()
+                .find_map(|event| match event {
+                    crate::adapter::Recorded::Event { kind, payload, .. }
+                        if kind == "adapter.item" =>
+                    {
+                        Some(payload)
+                    }
+                    _ => None,
+                })
+                .ok_or("item event")?;
+            assert_eq!(
+                payload.get("aggregated_output"),
+                (kind == "command_execution").then(|| &frame["item"]["aggregated_output"]),
+                "{kind}"
+            );
+        }
+        Ok(())
     }
 }
