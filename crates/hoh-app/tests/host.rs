@@ -946,10 +946,25 @@ async fn test_041_04_retry_after_disconnect_returns_first_result() -> R {
 /// does not) while reads answer within 500 ms. The host has nothing else to write (AC-062-01's given: a host just
 /// started, the outside connection, two PauseRuns): its runs have no work, so a pause completes at once, and the
 /// second hold begins only once the first run is PAUSED. A run pausing with work keeps the host's pause step taking
-/// the write lock at each tick (docs/adr/ADR-021.md decision 7), and a command queued behind such a step waits for it
-/// first: the single writer takes its jobs in order.
+/// the write lock at each tick (docs/adr/ADR-021.md decision 7); the single writer takes its jobs in order, and a
+/// command queued behind such a step, or behind the idle input sweep, still waits for the lock only until one busy
+/// timeout after it was submitted (DC-FLK14b).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
+    busy_writer(Duration::ZERO).await
+}
+
+/// AC-062-01 with each command sent 250 ms after the outside connection took the lock, over one period of the host's
+/// idle input sweep (200 ms), which then waits for the lock on the single writer ahead of the command (FLK-14-P1):
+/// the command's DB_BUSY still comes 5 to 6 s after it was sent, its 202 within 5 s (DC-FLK14b: a write waits for
+/// the lock at most busy_timeout from its submission, whatever is queued ahead of it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_062_01_busy_answer_not_delayed_by_background_sweep() -> R {
+    busy_writer(Duration::from_millis(250)).await
+}
+
+/// The body of the AC-062-01 tests: each PauseRun is sent `delay` after the outside connection took the lock.
+async fn busy_writer(delay: Duration) -> R {
     let dir = tempfile::tempdir()?;
     let host = Host::start(config(dir.path())).await?;
     python(
@@ -1001,6 +1016,7 @@ async fn test_062_01_settings_busy_writer_responsive_reads() -> R {
             &mut line,
         )?;
         assert_eq!(line.trim(), "locked");
+        tokio::time::sleep(delay).await;
         let started = Instant::now();
         let held_until = tokio::time::Instant::from_std(started) + Duration::from_secs(hold);
         let mut command = tokio::spawn({
