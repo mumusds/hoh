@@ -11,6 +11,7 @@
   "contracts/requirements.json": "requirements describing the store",
   "contracts/sql/001_initial.sql": "the schema; embedded and run only by the Persistence module (MIGRATIONS)",
   "contracts/sql/002_spec_drafting.sql": "the schema's migration 2 (CR-026, C22 (a)); embedded and run only by the Persistence module (MIGRATIONS, from M3-T04)",
+  "contracts/sql/003_ui_observability.sql": "The schema contract for migration 3 (CR-028): empty UI identity/segment/reference/tombstone structures; wired into Persistence by M4-T09, queried and GC-coordinated by M4-T03.",
   "crates/hoh-app/tests/support/io_fault.c": "test artefact of crates/hoh-app/tests/db_faults.rs (fault7 review round 2): an LD_PRELOAD shim the test builds with cc into its temporary directory, failing file I/O on the WAL self-test's files; its comments name SQLite, it opens no database and holds no SQL",
   "crates/hoh-core/Cargo.toml": "hoh-core's rusqlite dependency (check 1)",
   "reports/history/kit-1.0.0/round1-interrupted.txt": "archived kit review log",

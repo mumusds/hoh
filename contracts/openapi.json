@@ -23,7 +23,8 @@
                 "$ref": "./protocol.schema.json#/$defs/Command"
               }
             }
-          }
+          },
+          "description": "CR-028: SendInput JSON request at most 8388608 raw bytes; decoded normalized UTF-8 body at most 1048576 bytes. Non-SendInput remains at most 2097152 raw bytes, checked after decoding the command kind but before any write; padding counts. Excess/broken body remains 400 BAD_REQUEST, never 202/413. Adapter inline/file encoding is specified in CR-028 §4; this does not change the M3 input state machine."
         },
         "responses": {
           "202": {
@@ -87,7 +88,7 @@
           },
           "503": {
             "$ref": "#/components/responses/Error",
-            "description": "Service unavailable. SPEC_SOURCE_UNAVAILABLE means Git enumeration or filesystem reads needed to index the specification failed; retryable=true, current_revision is preserved, and no command, CR, revision or spec.index_failed is written. Uses the same Error body and no Retry-After header as DB_BUSY (CR-036)."
+            "description": "Service unavailable. SPEC_SOURCE_UNAVAILABLE means Git enumeration or filesystem reads needed to index the specification failed; retryable=true, current_revision is preserved, and no command, CR, revision or spec.index_failed is written. Uses the same Error body and no Retry-After header as DB_BUSY (CR-036). CR-028: object preflight for SendInput may return STORAGE_LOW_SPACE, retryable=false, details={reason:STORAGE_LOW_SPACE,available_bytes,required_bytes,min_free_bytes}, required_bytes=object_write_bytes+min_free_bytes. No command/input/public-message acceptance is written; client preserves draft/target and reports not accepted (CLI exit 69), retries only on explicit user action. If already accepted (202), delivery-space failure keeps the same input QUEUED and records the diagnostic through the existing delivery chain. Low-space preflight alone does not block Pause/Cancel (202 if the state transaction commits); real ENOSPC/EDQUOT of that transaction is DB_FULL/503 with no 202."
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
@@ -116,34 +117,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "run_id": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 160
-                    },
-                    "state": {
-                      "type": "string"
-                    },
-                    "revision": {
-                      "type": "integer"
-                    },
-                    "watermark": {
-                      "type": "integer"
-                    },
-                    "projection": {
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "run_id",
-                    "state",
-                    "revision",
-                    "watermark",
-                    "projection"
-                  ]
+                  "$ref": "#/components/schemas/RunSnapshot"
                 }
               }
             }
@@ -256,6 +230,15 @@
               "minLength": 1,
               "maxLength": 160
             }
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "One byte range only (including suffix/open-ended single ranges); malformed, multiple or unsatisfiable ranges are 416."
           }
         ],
         "responses": {
@@ -268,15 +251,86 @@
                   "format": "binary"
                 }
               }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Quoted object sha256"
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "const": "bytes"
+                }
+              }
             }
           },
           "404": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_NOT_FOUND; details.reason is unknown_id, missing_file or collected."
           },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "206": {
+            "description": "Single byte range, streamed while pinned. UTF-8 UI assembly carries at most 3 unfinished bytes into the next page.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Quoted object sha256"
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "const": "bytes"
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "bytes <start>-<end>/<size>"
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_INVALID; size/hash mismatch, no body bytes returned."
+          },
+          "416": {
+            "description": "ARTIFACT_RANGE_INVALID; malformed, multiple or unsatisfiable range.",
+            "headers": {
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "bytes */<size>"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_UNREADABLE (details.reason=permission/io), or DB_BUSY/DB_FULL. EACCES is not authentication 403."
           }
-        }
+        },
+        "description": "CR-028: only registered object ids; verify registered size and sha256 before serving. Stream with a short read pin, never buffer the whole file. Path parameters never select arbitrary files. Tombstones retain registration; unknown_id, missing_file and collected are distinct."
       }
     },
     "/v1/capabilities": {
@@ -470,6 +524,20 @@
           },
           {
             "$ref": "#/components/parameters/RunId"
+          },
+          {
+            "name": "candidate_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "test_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -487,9 +555,15 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "404": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "Missing Run is RUN_NOT_FOUND; invalid query/cursor retains existing 404 BAD_REQUEST."
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "DB_BUSY or DB_FULL, with no partial success."
           }
-        }
+        },
+        "description": "CR-028: read-only candidate→TEST→ArtifactRef chain, with historical spec/candidate identity and broken/orphan/stale diagnostics. Never manufactures evidence or acceptance. Limit/cursor preserve the existing Page contract."
       }
     },
     "/v1/runs/{run_id}/team": {
@@ -551,6 +625,66 @@
                 "agent"
               ]
             }
+          },
+          {
+            "name": "iteration_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_epoch",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "attempt_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_seq",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before_seq",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "watermark",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -559,7 +693,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page"
+                  "$ref": "#/components/schemas/TimelinePage"
                 }
               }
             }
@@ -568,9 +702,25 @@
             "$ref": "#/components/responses/Forbidden"
           },
           "404": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "RUN_NOT_FOUND for a missing Run; invalid queries on this existing Run route retain 404 BAD_REQUEST."
+          },
+          "410": {
+            "description": "Expired page generation: 410 CURSOR_EXPIRED with top-level snapshot_watermark.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CursorExpiredError"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "DB_BUSY/DB_FULL; rebuilding returns DB_BUSY with details.reason=index_rebuilding. No partial page claims completeness."
           }
-        }
+        },
+        "description": "CR-028: all filters intersect. after_seq is exclusive, before_seq is exclusive, watermark inclusive. Cursor binds filters/H/generation; tampering or cross-Run iteration/attempt is rejected. Null project events never appear under a Run. I/A membership follows the closed producer classification and H-dependent iteration rules; absent identity is not guessed."
       }
     },
     "/v1/specs": {
@@ -601,6 +751,212 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/timeline": {
+      "get": {
+        "operationId": "listProjectTimeline",
+        "summary": "Timeline blocks (project/iteration/agent level)",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "schema": {
+              "enum": [
+                "project",
+                "iteration",
+                "agent"
+              ]
+            }
+          },
+          {
+            "name": "iteration_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role_epoch",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "attempt_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_seq",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "before_seq",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "watermark",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Timeline blocks (project/iteration/agent level)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TimelinePage"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error",
+            "description": "RUN_NOT_FOUND for an explicitly requested missing Run."
+          },
+          "410": {
+            "description": "Expired page generation: 410 CURSOR_EXPIRED with top-level snapshot_watermark.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CursorExpiredError"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "DB_BUSY/DB_FULL; rebuilding returns DB_BUSY with details.reason=index_rebuilding. No partial page claims completeness."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error",
+            "description": "QUERY_INVALID with parameter details; malformed/tampered cursor, future watermark and cross-Run filter combinations are rejected."
+          }
+        },
+        "description": "CR-028: all filters intersect. after_seq is exclusive, before_seq is exclusive, watermark inclusive. Cursor binds filters/H/generation; tampering or cross-Run iteration/attempt is rejected. Null project events never appear under a Run. I/A membership follows the closed producer classification and H-dependent iteration rules; absent identity is not guessed."
+      }
+    },
+    "/v1/artifacts/{artifact_id}/search": {
+      "get": {
+        "operationId": "searchArtifact",
+        "description": "CR-028: literal UTF-8 search, no regex. Only sealed objects classified text by full-file UTF-8 validation rejecting NUL; binary is 422, not an empty success. Full text and hashes are immutable; response is public content only.",
+        "parameters": [
+          {
+            "name": "artifact_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "1–256 UTF-8 encoded bytes."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 100
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded streaming search page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactSearchPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error",
+            "description": "QUERY_INVALID with the invalid parameter named, including cursor/query/hash mismatch."
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_NOT_FOUND; details.reason is unknown_id, missing_file or collected."
+          },
+          "409": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_INVALID; size/hash mismatch, no body bytes returned."
+          },
+          "422": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_NOT_TEXT: full-file text classification failed or the object is binary."
+          },
+          "503": {
+            "$ref": "#/components/responses/Error",
+            "description": "ARTIFACT_UNREADABLE (details.reason=permission/io), or DB_BUSY/DB_FULL. EACCES is not authentication 403."
           }
         }
       }
@@ -703,6 +1059,517 @@
             "description": "event seq the page is consistent with"
           }
         }
+      },
+      "BlockRef": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "enum": [
+              "requirement",
+              "issue",
+              "decision",
+              "commit",
+              "evidence",
+              "artifact"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "spec_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "candidate_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "attempt_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "type",
+          "id"
+        ],
+        "description": "Typed source identity; absent historical facts are null, never inferred from an Agent name. Trace labels come from the M3 trace export; UI precedence does not rewrite it."
+      },
+      "BlockDescriptor": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "block_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "event:<project_id>:<seq>:<part> or entity:<type>:<id>; historical entities also bind spec/candidate/attempt. A streamed public message keeps one id."
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "iteration_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "attempt_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "spec_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "candidate_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "role_epoch": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "summary": {
+            "type": "string"
+          },
+          "refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BlockRef"
+            }
+          }
+        },
+        "required": [
+          "block_id",
+          "seq",
+          "kind",
+          "run_id",
+          "iteration_id",
+          "role",
+          "attempt_id",
+          "session_id",
+          "spec_id",
+          "candidate_id",
+          "role_epoch",
+          "summary",
+          "refs"
+        ],
+        "description": "CR-028 §1/2 and REQ-013: public summaries only, bodies on demand via registered artifacts. Event seq is project ordered. Identity is resolved at H; no raw transcript, secrets, hidden reasoning or internal Prompt."
+      },
+      "TimelinePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/BlockDescriptor"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watermark": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "watermark"
+        ],
+        "description": "CR-028: fixed H and index generation; cursor binds every filter, seek position and H. Strict seq order, at most requested limit, at most 256 KiB body per page. Complete generation switch expires old page cursors; ordinary restart does not. Query while rebuilding is 503 DB_BUSY/details.reason=index_rebuilding. Truth is not deleted to expire cursors."
+      },
+      "CursorExpiredError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "snapshot_watermark"
+        ],
+        "properties": {
+          "code": {
+            "const": "CURSOR_EXPIRED"
+          },
+          "message": {
+            "type": "string"
+          },
+          "snapshot_watermark": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "description": "CR-028: query-page expiry uses the unchanged SSE 410 shape: code/message/top-level snapshot_watermark. Complete generation switches can expire page cursors; SSE expiry remains unreachable under v1 event retention."
+      },
+      "UiSpecIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "revision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "sha256"
+        ]
+      },
+      "UiBaseline": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          }
+        },
+        "required": [
+          "commit",
+          "source"
+        ],
+        "description": "ADR-031 project baseline: latest ACCEPTED candidate from a COMPLETED project Run, otherwise null. Never replaced by the current Run discovery baseline."
+      },
+      "UiTask": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "task_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          }
+        },
+        "required": [
+          "task_id",
+          "phase"
+        ],
+        "description": "Current task/phase facts only; concurrent-task selection remains an application-review decision, not inferred from model prose."
+      },
+      "InputStatePageRef": {
+        "type": "object",
+        "description": "CR-028 §2: a page reference for persisted input states, not all input history. References carry query identity, H and continuation; the precise reference shape/continuation endpoint must be closed by the CTO before T02/T03 implementation (application re-check C3). No new command or delivery loop."
+      },
+      "UiProjection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "spec": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UiSpecIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline": {
+            "$ref": "#/components/schemas/UiBaseline"
+          },
+          "run_baseline": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "M3 run.baseline plus recorded baseline-test facts (ADR-039); preserves source shape, unknowns and baseline_complete. Read-only discovery, distinct from project baseline."
+          },
+          "task": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UiTask"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_activity": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Explicit committed public activity/usage with role/epoch/attempt/session and observed time. Alive alone means activity unknown; model summary is labelled analysis."
+          },
+          "input_states": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InputStatePageRef"
+            },
+            "description": "Paginated references to QUEUED/DELIVERED/APPLIED/REJECTED facts and their actual role/epoch/boundary; 202 is acceptance only."
+          },
+          "team_revision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        },
+        "required": [
+          "spec",
+          "baseline",
+          "run_baseline",
+          "task",
+          "last_activity",
+          "input_states",
+          "team_revision"
+        ],
+        "description": "CR-028: all UI facts come from the same getRun transaction at H. No prior snapshot fragments or future bindings are mixed into it. Missing facts are null."
+      },
+      "ProgressProjection": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "spec_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "spec_revision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "candidate_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "requirements_total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "requirements_accepted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "requirements_degraded": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "issues_open": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "issues_reopened": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "scope_added": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "scope_removed": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "spec_id",
+          "spec_revision",
+          "candidate_id",
+          "requirements_total",
+          "requirements_accepted",
+          "requirements_degraded",
+          "issues_open",
+          "issues_reopened",
+          "scope_added",
+          "scope_removed"
+        ],
+        "description": "CR-028 §3: denominator is all requirements of the approved spec; numerator only all-AC PASS requirements of this Run's current ACCEPTED candidate. DEGRADED is separate and stays in denominator. New candidate/spec resets accepted; missing spec is 0/0, never complete. Issues use authoritative OPEN/REOPENED functions. Existing projection.acceptance retains AC counts."
+      },
+      "RunSnapshot": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "state": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "watermark": {
+            "type": "integer"
+          },
+          "projection": {
+            "type": "object",
+            "properties": {
+              "ui": {
+                "$ref": "#/components/schemas/UiProjection"
+              },
+              "progress": {
+                "$ref": "#/components/schemas/ProgressProjection"
+              }
+            },
+            "description": "Existing projection fields remain additive, including trace, regression, readiness, open_questions, team and AC-level acceptance; CR-028 adds ui/progress without replacing M3 shapes."
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "revision",
+          "watermark",
+          "projection"
+        ]
+      },
+      "ArtifactSearchMatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "byte_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "length": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          },
+          "context": {
+            "type": "string",
+            "description": "Valid UTF-8, clipped at grapheme boundaries, at most 256 encoded bytes."
+          }
+        },
+        "required": [
+          "byte_offset",
+          "length",
+          "context"
+        ]
+      },
+      "ArtifactSearchPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/ArtifactSearchMatch"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "description": "CR-028: increasing byte offsets, literal UTF-8 matches including overlaps. Cursor binds sha256/query/next unreported start/scanned offset. At most 8 MiB newly scanned per call, carrying at most query_bytes-1 tail bytes; limit resumes at last reported start+1, never skips remaining matches. No match is an empty page; continue until next_cursor is null."
       }
     },
     "parameters": {
