@@ -367,7 +367,7 @@ while True:
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_008_05_answer_and_reply_refuse_attempt_origin_before_application_and_replay() -> R {
-    for kind in ["AnswerQuestion", "SendInput"] {
+    for kind in ["AnswerQuestion", "SendInput", "Cli"] {
         let world = world::World::named("m3t04-draft-origin")?;
         world.configure(&[], "")?;
         let host = world
@@ -378,19 +378,40 @@ async fn test_008_05_answer_and_reply_refuse_attempt_origin_before_application_a
    input(&host,&world,&run,"draft","SendInput",json!({"text":"draft","target_role":null,"input_kind":"REPLY"})).await?;
    world.until("SELECT count(*) FROM events WHERE kind='spec.draft_completed'","1",Duration::from_secs(20)).await?;
    let q:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval'")?)?;
-   let payload=if kind=="AnswerQuestion"{json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"})}else{json!({"text":"approve","target_role":null,"input_kind":"REPLY"})};
+   let expected_sha = q["spec_sha256"].as_str().ok_or("spec_sha256")?;
    let revision:i64=world.query("SELECT revision FROM runs")?.parse()?;
-   let body=json!({"schema_version":"1.0","command_id":"approve","idempotency_key":"approve","run_id":run,"expected_revision":revision,"kind":kind,"payload":payload});
-   for _ in 0..2{
-    let (status,rejected)=marked_request(&host,&body).await?;
-    assert_eq!(status,403,"{rejected}");assert_eq!(rejected["code"],"SPEC_APPROVAL_NOT_USER");assert_eq!(rejected["details"]["reason"],"marker");
-    assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");assert_eq!(world.query("SELECT count(*) FROM commands WHERE command_id='approve'")?,"0");
+   if kind == "Cli" {
+    let mut marked_cli=world.command(&["-p","approve","--resume",&run,"--detach"]);
+    marked_cli.env(hoh_app::host::ATTEMPT_ENV,"another-project/attempt");
+    let output=tokio::task::spawn_blocking(move||marked_cli.output()).await??;
+    assert!(!output.status.success(),"marked hoh -p approve must fail");
+    let stderr=String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("SPEC_APPROVAL_NOT_USER"),"{stderr}");
+    assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");
+    assert_eq!(world.query("SELECT count(*) FROM commands WHERE kind='ApproveSpec'")?,"0");
     assert_eq!(world.query("SELECT revision FROM runs")?,revision.to_string());
+    let mut user_cli=world.command(&["-p","approve","--resume",&run,"--detach"]);
+    let output=tokio::task::spawn_blocking(move||user_cli.output()).await??;
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+   } else {
+    let payload=if kind=="AnswerQuestion"{json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"})}else{json!({"text":"approve","target_role":null,"input_kind":"REPLY"})};
+    let body=json!({"schema_version":"1.0","command_id":"approve","idempotency_key":"approve","run_id":run,"expected_revision":revision,"kind":kind,"payload":payload});
+    for _ in 0..2{
+     let (status,rejected)=marked_request(&host,&body).await?;
+     assert_eq!(status,403,"{rejected}");assert_eq!(rejected["code"],"SPEC_APPROVAL_NOT_USER");assert_eq!(rejected["details"]["reason"],"marker");
+     assert_eq!(world.query("SELECT count(*) FROM specs")?,"0");assert_eq!(world.query("SELECT count(*) FROM commands WHERE command_id='approve'")?,"0");
+     assert_eq!(world.query("SELECT revision FROM runs")?,revision.to_string());
+    }
+    assert_eq!(world::exchange(&host,"POST","/v1/commands",Some(&body)).await?.0,202);
+    assert_eq!(marked_request(&host,&body).await?.0,403,"origin guard precedes the user's accepted replay");
    }
-   assert_eq!(world::exchange(&host,"POST","/v1/commands",Some(&body)).await?.0,202);
-   assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");
-   assert_eq!(marked_request(&host,&body).await?.0,403,"origin guard precedes the user's accepted replay");
-   assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");Ok(())
+   assert_eq!(world.query("SELECT count(*) FROM specs WHERE revision=1")?,"1");
+   assert_eq!(world.query("SELECT count(*) FROM commands WHERE kind='ApproveSpec'")?,"1");
+   let derived:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM commands WHERE kind='ApproveSpec'")?)?;
+   assert_eq!(derived["decision"],"APPROVE_ONLY","{derived}");
+   assert_eq!(derived["spec_sha256"],expected_sha,"{derived}");
+   assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.writer=1 AND t.kind<>'spec_draft'")?,"0");
+   Ok(())
   }.await;
         host.shutdown().await;
         result?;
@@ -863,33 +884,54 @@ async fn test_008_05_s8_pending_cr_rejects_all_attempt_entries_then_user_cli_app
     let run = world::start_run(&setup, "start", "补规格").await?;
     world.staff(&run)?;
     world.exec(&format!(
-        "UPDATE runs SET state='RUNNING',mode='PLAN' WHERE run_id='{run}';"
+        "UPDATE runs SET state='RUNNING',mode='BUILD' WHERE run_id='{run}';"
     ))?;
     setup.shutdown().await;
     let source=hoh_core::specindex::Source{path:"docs/spec/fixture.md".into(),bytes:"# 用户\n用户\n# 范围\n范围\n# 非目标\n无\n# 决策\n无\n# 开放问题\n无\n# 需求\n## REQ-A 标题\n### AC-A-01\ngiven: 前提\nwhen: 操作\nthen: 结果\ncheck: unit\n".as_bytes().to_vec()};
-    let host = world
-        .team_host(
-            world::Team::planning(world.project(), source, |_| vec![], None),
-            None,
-        )
-        .await?;
+    // FakeCommander requests approval in its output; DecisionPayload has no approval decision, so it produces no revision.
+    let team = world::Team::planning(
+        world.project(),
+        source,
+        |_| {
+            vec![world::rejected(
+                json!({"kind":"approve_spec","decision":"APPROVE_ONLY"}),
+            )]
+        },
+        None,
+    );
+    let host = world.team_host(team.clone(), None).await?;
     let result:R=async {
+        world.until("SELECT count(*)>0 FROM events WHERE kind='supervisor.output_disposed'","1",Duration::from_secs(20)).await?;
+        assert!(!team.turns().is_empty(),"FakeCommander must have run a turn requesting approval");
+        assert_eq!(world.query("SELECT count(*) FROM specs")?,"1","FakeCommander output must not produce a revision");
+        input(&host,&world,&run,"enter-plan","SetMode",json!({"mode":"PLAN"})).await?;
         world.until("SELECT count(*) FROM change_requests WHERE state='PROPOSED'","1",Duration::from_secs(25)).await?;
         world.until("SELECT state FROM runs","BLOCKED",Duration::from_secs(10)).await?;
         let q:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM events WHERE kind='question.asked' AND json_extract(payload_json,'$.reason')='spec_approval' ORDER BY seq DESC LIMIT 1")?)?;
+        let expected_sha = q["spec_sha256"].as_str().ok_or("spec_sha256")?;
         let before=world.rows("SELECT kind,count(*) AS n FROM commands GROUP BY kind ORDER BY kind")?;
         for kind in ["ApproveSpec","AnswerQuestion","SendInput"] {
             let revision:i64=world.query("SELECT revision FROM runs")?.parse()?;
             let payload=match kind {"ApproveSpec"=>json!({"spec_sha256":q["spec_sha256"],"decision":"APPROVE_ONLY"}),"AnswerQuestion"=>json!({"question_id":q["question_id"],"choice_id":"approve","answer":"approve"}),_=>json!({"text":"approve","target_role":null,"input_kind":"REPLY"})};
             let body=json!({"schema_version":"1.0","command_id":kind,"idempotency_key":kind,"expected_revision":revision,"kind":kind,"run_id":run,"payload":payload});
-            let (status,reply)=marked_request(&host,&body).await?;assert_eq!(status,403,"{reply}");assert_eq!(reply["code"],"SPEC_APPROVAL_NOT_USER");
+            let (status,reply)=marked_request(&host,&body).await?;
+            assert_eq!(status,403,"{reply}");
+            assert_eq!(reply["code"],"SPEC_APPROVAL_NOT_USER");
+            assert_eq!(reply["details"]["reason"],"marker","{kind}: {reply}");
         }
         let mut cli=world.command(&["-p","approve","--resume",&run,"--detach"]);cli.env(hoh_app::host::ATTEMPT_ENV,"m3t04-scripted-attempt");
         let output=tokio::task::spawn_blocking(move||cli.output()).await??;assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("SPEC_APPROVAL_NOT_USER"),"{}",String::from_utf8_lossy(&output.stderr));
         assert_eq!(world.rows("SELECT kind,count(*) AS n FROM commands GROUP BY kind ORDER BY kind")?,before);
         assert_eq!(world.query("SELECT count(*) FROM specs")?,"1");assert_eq!(world.query("SELECT count(*) FROM input_queue")?,"0");assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"IMPLEMENTED");
+        assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.writer=1 AND t.kind<>'spec_draft'")?,"0");
         let mut cli=world.command(&["-p","approve","--resume",&run,"--detach"]);let output=tokio::task::spawn_blocking(move||cli.output()).await??;assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-        assert_eq!(world.query("SELECT count(*) FROM specs")?,"2");assert_eq!(world.query("SELECT state FROM change_requests")?,"APPLIED");assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED");Ok(())
+        assert_eq!(world.query("SELECT count(*) FROM specs")?,"2");assert_eq!(world.query("SELECT state FROM change_requests")?,"APPLIED");assert_eq!(world.query("SELECT state FROM tasks WHERE kind='spec_draft'")?,"ACCEPTED");
+        assert_eq!(world.query("SELECT count(*) FROM commands WHERE kind='ApproveSpec'")?,"1");
+        let derived:serde_json::Value=serde_json::from_str(&world.query("SELECT payload_json FROM commands WHERE kind='ApproveSpec'")?)?;
+        assert_eq!(derived["decision"],"APPROVE_ONLY","{derived}");
+        assert_eq!(derived["spec_sha256"],expected_sha,"{derived}");
+        assert_eq!(world.query("SELECT count(*) FROM attempts a JOIN tasks t ON t.task_id=a.task_id WHERE t.writer=1 AND t.kind<>'spec_draft'")?,"0");
+        Ok(())
     }.await;
     host.shutdown().await;
     result
