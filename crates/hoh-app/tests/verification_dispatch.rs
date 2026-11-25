@@ -3987,8 +3987,7 @@ async fn a_turns_auth_failure_is_the_turns_block_even_when_ticks_pass_between_it
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_020_05_flk12_turn_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block()
--> R {
+async fn a_turns_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block() -> R {
     // M3LD-50: the commit of qa's failed turn's end fails after the registry latched its BLOCKED_AUTH, so the latch's
     // lock is released before the end is committed; the end is committed by the runner_error settle, held 700 ms
     // (over three runner ticks) before it. A tick's staffing may block pi's binding first (cause staffing); the

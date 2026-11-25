@@ -182,8 +182,10 @@ reproduced it **3/3**. The regression keeps that barrier. A SQLite trigger in th
 only the target attempt's update to FAILED; unrelated transactions and reads cannot consume it. The settle hook
 asserts the end rolled back (the attempt is still RUNNING with no failure_reason), removes the trigger, and preserves
 the original 700 ms hold before recovery. The existing exact `runner_error` count, `cause: "turn"`, auth fact, fallback
-epoch/session and no-pi-unblock assertions remain. The test now follows the TEST-020-05 naming convention:
-`test_020_05_flk12_turn_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block`.
+epoch/session and no-pi-unblock assertions remain. The developer renamed the test to carry `test_020_05`; review
+M3FK-01 showed that would add a fault-injection fixture (different given, no `next_retry_at` assertion) to TEST-020-05's
+traceability, so the lead restored its original unmapped name
+`a_turns_auth_failure_whose_end_failed_to_commit_is_still_the_turns_block`.
 
 With the same 6 CPU burners and read-request barrier the rate is **3/3 before, 0/20 after**. The complete
 verification_dispatch binary also passed **33/33 twice** under 6 burners. A subsequent static check rejected `expect`
