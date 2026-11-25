@@ -219,7 +219,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 
     /// The next frame; `None` once the stream ended or a frame was refused. Cancel-safe: dropping the future loses
-    /// no bytes already read.
+    /// no bytes already read. Each incomplete read/skip/reduce step yields after saving its state (M3R-503), even
+    /// on readers without Tokio's cooperative budget. A poll performs at most one new read: skip/reduce cap it at
+    /// `chunk`, ordinary reads at `limit + chunk` (spare capacity may exceed `chunk`). Buffered data can also be
+    /// processed; this is a work bound, not a wall-clock guarantee for the reader or its synchronous raw-log writes.
     pub async fn next(&mut self) -> io::Result<Option<Frame>> {
         loop {
             if self.done {
@@ -229,6 +232,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if let Some(frame) = self.reduce_more().await? {
                     return Ok(Some(frame));
                 }
+                tokio::task::yield_now().await;
                 continue;
             }
             // Start early, before a large frame fills the ordinary buffer: input + output stay within the same bound.
@@ -255,7 +259,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if self.skipping.is_some() {
                 match self.skip_more().await? {
                     Some(frame) => return Ok(Some(frame)),
-                    None => continue,
+                    None => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                 }
             }
             let from = self.start + self.scanned;
@@ -337,6 +344,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 let rest = std::mem::take(&mut self.buf);
                 return Ok((!rest.is_empty()).then_some(Frame::Partial(rest)));
             }
+            // buf, bytes and max_buffered already own this read; dropping next() here loses nothing.
+            // An explicit yield also leaves budget for the caller's cooperative abandon/watch branch.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -558,6 +568,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod responsiveness;
     use super::*;
 
     type R = Result<(), Box<dyn std::error::Error>>;
