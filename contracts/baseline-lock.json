@@ -1,11 +1,11 @@
 {
   "schema_version": "1.1",
   "baseline_id": "HOH-BASELINE-1.1",
-  "revision": 27,
+  "revision": 28,
   "change_policy": "Formal CR + new baseline; never lower required gates to pass",
   "previous": {
     "baseline_id": "HOH-BASELINE-1.1",
-    "lock_sha256": "029ddf74efc1b7e60db3ece4ff226375504331defde4673536cc9462ce6d8a7d"
+    "lock_sha256": "438317976e230388c5d898b39ebd77b867111a1395160c23af9a5651d9614b69"
   },
   "change_requests": [
     {
@@ -137,6 +137,11 @@
       "id": "CR-037",
       "path": "docs/cr/CR-037-netlink-sock-diag-connect.md",
       "sha256": "e89f26139aeb543a418f0bc4550e415e5cbf1dc2501d9cb1f83a7fcac3be8ddb"
+    },
+    {
+      "id": "CR-039",
+      "path": "docs/cr/CR-039-inherited-sigint-ignore.md",
+      "sha256": "bb4294ce89726a0d045857d0a691bcb1cc06ba42c375e73f5478b70409b140c0"
     }
   ],
   "files": {
@@ -164,7 +169,7 @@
     "docs/10-acceptance.md": "ccd6309ba74af59c33401039f9a1d660a1fcf168cffaa029bf083732f989615d",
     "tools/baseline.py": "2a402141ba6e810eb85613947be508a1e066a27de2f736cd15ef5891bb9380c2",
     "tools/candidate.py": "83682c51735bcc84c1ac81217111f6eecd63ef660a57a9c4f182394d4001b98c",
-    "tools/common.py": "6f86c245776562b6dfd02dbbf5fafe3cc19e1d4c2b281f108cb76c5d8dc961c1",
+    "tools/common.py": "dc3ca744e8353305531f90e7c15435a1202877101b606fe248eeedf8ed4f2c39",
     "tools/release_gate.py": "2cc0f1faf7fb25ee398a0ec2d3ca87927c98b48d8f35ce343fff479327bab4a9",
     "tools/run_check.py": "5cce57e531fe3cf70c840975f85dfd2fa9263dff786f697322437ef930afede2"
   }
