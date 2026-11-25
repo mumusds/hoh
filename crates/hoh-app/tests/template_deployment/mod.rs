@@ -123,11 +123,26 @@ fn audit(trace: &str) -> R<usize> {
     let mut count = 0;
     let mut sockets = BTreeSet::new();
     let mut pending = BTreeMap::new();
+    // Threads whose last call strace saw cut off by the thread's exit (pseudo result `= ?`): only that exit may follow.
+    let mut exiting = BTreeSet::new();
     for line in trace.lines() {
         let (pid, body) = trace_line(line)?;
         if body.starts_with("+++ ") {
             sockets.retain(|(owner, _)| Some(*owner) != pid);
+            exiting.remove(&pid);
+            // A call strace could not read (`???`) never ran: its thread may exit without its pseudo result (FLK-15).
+            if pending
+                .get(&pid)
+                .is_some_and(|start: &String| start.starts_with("???("))
+            {
+                pending.remove(&pid);
+            }
             continue;
+        }
+        if exiting.contains(&pid) {
+            return Err(
+                format!("syscall after a call cut off by its thread's exit: {line}").into(),
+            );
         }
         if body.is_empty() || body.starts_with("--- ") || body.starts_with("execve(") {
             continue;
@@ -143,7 +158,7 @@ fn audit(trace: &str) -> R<usize> {
             }
             format!("{start}{rest}")
         } else {
-            if !["socket(", "close(", "connect("]
+            if !["socket(", "close(", "connect(", "???("]
                 .iter()
                 .any(|name| body.starts_with(name))
             {
@@ -168,11 +183,12 @@ fn audit(trace: &str) -> R<usize> {
             .strip_suffix(')')
             .ok_or_else(invalid)?
             .trim_end();
-        let result = result
-            .split_whitespace()
-            .next()
-            .and_then(|v| v.parse::<i32>().ok())
-            .ok_or_else(invalid)?;
+        // `?` is strace's pseudo result for a call whose thread exited before the call returned (the exit is checked
+        // below); anything else must be a number.
+        let result = match result.split_whitespace().next() {
+            Some("?") => None,
+            v => Some(v.and_then(|v| v.parse::<i32>().ok()).ok_or_else(invalid)?),
+        };
         match name {
             "socket" => {
                 let pid = pid.ok_or_else(invalid)?;
@@ -180,7 +196,8 @@ fn audit(trace: &str) -> R<usize> {
                 let [family, kind, protocol] = fields.as_slice() else {
                     return Err(invalid().into());
                 };
-                if result >= 0 {
+                // A socket whose result is unknown authorizes nothing.
+                if let Some(result) = result.filter(|v| *v >= 0) {
                     // Every successful socket replaces the previous identity of this fd.
                     sockets.remove(&(pid, result));
                     let mut flags = kind.split('|');
@@ -224,11 +241,22 @@ fn audit(trace: &str) -> R<usize> {
                     return Err(invalid().into());
                 }
             }
+            // strace prints `???(` when PTRACE_GET_SYSCALL_INFO fails at a syscall-entry stop. That fails only when the
+            // thread has a fatal signal pending (ptrace_freeze_traced), and with one pending the kernel aborts the call
+            // (ptrace_report_syscall_entry), so a `???` call never ran. It has no arguments and no result of its own.
+            "???" if args.is_empty() && result.is_none() => {}
+            "???" => return Err(invalid().into()),
             _ => unreachable!(),
+        }
+        if result.is_none() {
+            exiting.insert(Some(pid.ok_or_else(invalid)?));
         }
     }
     if !pending.is_empty() {
         return Err("trace ended with an unfinished syscall".into());
+    }
+    if !exiting.is_empty() {
+        return Err("trace ended before a thread with a cut-off call exited".into());
     }
     Ok(count)
 }
@@ -615,4 +643,80 @@ fn connect_audit_rejects_external_and_undecodable_targets() -> R {
         assert!(audit(line).is_err());
     }
     Ok(())
+}
+
+#[test]
+fn connect_audit_accepts_a_syscall_cut_off_by_its_threads_exit() -> R {
+    // FLK-15: strace prints `???(` when PTRACE_GET_SYSCALL_INFO fails at a syscall-entry stop, which happens only once
+    // a fatal signal is pending; the kernel then aborts that syscall. `= ?` is strace's pseudo result for a call whose
+    // thread exited before the call returned. The lines are verbatim from CI (8388) and from a local reproduction.
+    let ci = "8388  ???( <unfinished ...>\n\
+              8389  close(5)                    = 0\n\
+              8388  <... ??? resumed>)              = ?\n\
+              8388  +++ exited with 0 +++\n";
+    assert_eq!(audit(ci)?, 0);
+    assert_eq!(audit(&ci.replace("8388  ", "[pid  8388] "))?, 0);
+    let joined = "2588809 ???()                           = ?\n2588809 +++ exited with 0 +++\n";
+    assert_eq!(audit(joined)?, 0);
+    // A thread killed without an exit stop: strace prints no pseudo result.
+    assert_eq!(
+        audit("8388  ???( <unfinished ...>\n8388  +++ killed by SIGKILL +++\n")?,
+        0
+    );
+    let named = "2588810 socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>\n\
+                 2588807 close(4 <unfinished ...>\n\
+                 2588810 <... socket resumed>)           = ?\n\
+                 2588807 <... close resumed>)            = ? <unavailable>\n\
+                 2588810 +++ exited with 0 +++\n\
+                 2588807 +++ exited with 0 +++\n";
+    assert_eq!(audit(named)?, 0);
+    // A connect cut off by its thread's exit is still checked against its decoded target.
+    let local =
+        "101 connect(3, {sa_family=AF_UNIX, sun_path=\"/a\"}, 12) = ?\n101 +++ exited with 0 +++\n";
+    assert_eq!(audit(local)?, 1);
+    Ok(())
+}
+
+#[test]
+fn connect_audit_rejects_a_cut_off_syscall_whose_thread_did_not_exit() {
+    let killed = "101 +++ killed by SIGKILL +++\n";
+    let diag = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG) = 7\n";
+    let netlink = "101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    for trace in [
+        // The thread went on, so strace's view of the call was not cut off by its exit.
+        "101 ???( <unfinished ...>\n".to_owned(),
+        "101 ???( <unfinished ...>\n101 <... ??? resumed>) = ?\n".to_owned(),
+        "101 ???( <unfinished ...>\n101 <... ??? resumed>) = ?\n101 close(3) = 0\n".to_owned(),
+        "101 ???( <unfinished ...>\n101 close(3) = 0\n".to_owned(),
+        "101 ???()                           = ?\n101 close(3) = 0\n".to_owned(),
+        "101 socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = ?\n".to_owned(),
+        "101 socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = ?\n101 close(3) = 0\n".to_owned(),
+        // A call that returned a result was decodable, so `???` cannot stand for it.
+        format!("101 ???( <unfinished ...>\n101 <... ??? resumed>) = 0\n{killed}"),
+        format!("101 ???()                           = 3\n{killed}"),
+        format!("101 ???(7, 0x1234, 12)              = ?\n{killed}"),
+        format!("101 ???( <unfinished ...>\n101 <... ??? resumed>7, 0x1234, 12) = ?\n{killed}"),
+        // Without a thread id the exit cannot be tied to the call.
+        "???( <unfinished ...>\n<... ??? resumed>) = ?\n+++ exited with 0 +++\n".to_owned(),
+        "???()                           = ?\n+++ exited with 0 +++\n".to_owned(),
+        // A cut-off external connect is still refused, as is one whose fd only a cut-off socket opened, and a named
+        // call whose entry strace printed is checked whole, so it may not end with its thread.
+        format!(
+            "101 connect(3, {{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"1.1.1.1\")}}, 16 <unfinished ...>\n{killed}"
+        ),
+        format!(
+            "101 connect(3, {{sa_family=AF_UNIX, sun_path=\"/a\"}}, 12 <unfinished ...>\n{killed}"
+        ),
+        format!(
+            "101 connect(3, {{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"1.1.1.1\")}}, 16) = ?\n{killed}"
+        ),
+        format!("{}{killed}", netlink.replace("= 0", "= ?")),
+        format!(
+            "{}{}{killed}",
+            diag.replace("= 7", "= ?"),
+            netlink.replace("= 0", "= ?")
+        ),
+    ] {
+        assert!(audit(&trace).is_err(), "unexpectedly allowed: {trace}");
+    }
 }
