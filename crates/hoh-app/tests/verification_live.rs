@@ -8,8 +8,11 @@
 //! the product's executor, bound as AC-053-05 gives them: Developer claude, QA pi, Reviewer codex. A pi or codex not
 //! installed or not logged in is replaced by claude only under an explicit HOH_LIVE_PROFILE=v0.1 (v0.1 allows two
 //! Claude sessions); otherwise the run is BLOCKED. The Commander is a fake that proposes nothing (each of its turns
-//! records an assumption). The loop ends when the candidate's first verification round closes, within [`LOOP`]; the run
-//! is cancelled then, before it is judged, so no rework turn follows.
+//! records an assumption). The adopted revision comes with its independent specification review already reported
+//! (CURRENT, PASS), which readiness (REQ-031) requires before the developer task runs; the loop under test starts at
+//! the candidate, and a readiness hold, should one happen, is waited out, not taken for the loop's end. The loop ends
+//! when the candidate's first verification round closes, within [`LOOP`]; the run is cancelled then, before it is
+//! judged, so no rework turn follows.
 //!
 //! PASS iff the QA's and the Developer's HoH sessions differ and so do their native ids, both rows in `sessions`; the
 //! QA's report row is bound to the candidate C and its native_attempt's session_ids hold the report's session_id;
@@ -766,7 +769,11 @@ async fn started(host: &Host) -> R<String> {
 }
 
 /// The project's approved specification (`spec_sha`, the fixture's) with REQ-090 (AC-090-01 checked by feature-a,
-/// AC-090-02 by feature-b): written before the run starts, which adopts it.
+/// AC-090-02 by feature-b), and its revision's independent specification review CURRENT and PASS with no finding:
+/// written before the run starts, which adopts it. Readiness (REQ-031, docs/adr/ADR-035.md decision 8) holds a planned
+/// task BLOCKED(READINESS_NOT_MET) until its revision has such a review; the loop under test is candidate→QA, not the
+/// specification's review, so the fixture gives the review as already reported, as the other fixtures of an adopted
+/// revision do (ADR-035 S6, "夹具"). The reviewer's session is none of the run's, so it shares no identity with them.
 fn approve(project: &Path, spec_sha: &str) -> R {
     exec(
         project,
@@ -775,7 +782,12 @@ fn approve(project: &Path, spec_sha: &str) -> R {
              INSERT INTO requirements(requirement_id, spec_id, title, required_release) VALUES ('REQ-090', 'sv', 'lib.sh', 1);
              INSERT INTO acceptance_criteria(ac_id, requirement_id, spec_id, body, check_id) VALUES
                ('AC-090-01', 'REQ-090', 'sv', 'lib.sh 的 a() 输出 1（检查 feature-a，TEST-090-01）', 'feature-a'),
-               ('AC-090-02', 'REQ-090', 'sv', 'lib.sh 的 b() 输出 2（检查 feature-b，TEST-090-02）', 'feature-b');"
+               ('AC-090-02', 'REQ-090', 'sv', 'lib.sh 的 b() 输出 2（检查 feature-b，TEST-090-02）', 'feature-b');
+             INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at) SELECT project_id, \
+               'sv/review/fixture/reported', NULL, 'spec_review.reported', json_object('review_id', 'sv/review/fixture', \
+               'spec_id', 'sv', 'spec_revision', 1, 'status', 'PASS', 'state', 'CURRENT', 'reasons', json_array(), \
+               'session_id', 'live-fixture-spec-reviewer', 'findings', json_array()), \
+               strftime('%Y-%m-%dT%H:%M:%SZ', 'now') FROM projects;"
         ),
     )
 }
@@ -801,7 +813,7 @@ fn seed(project: &Path, run_id: &str) -> R {
 }
 
 /// Watch run `run_id` until its first verification round closes, a turn or binding is refused for its agent, the run
-/// or its developer task stops, or [`LOOP`] passes.
+/// or its developer task stops (a readiness hold is not a stop), or [`LOOP`] passes.
 async fn watch(project: &Path, run_id: &str) -> R<End> {
     let run = quoted(run_id);
     let sql = format!(
@@ -813,53 +825,64 @@ async fn watch(project: &Path, run_id: &str) -> R<End> {
          (SELECT group_concat(a.attempt_id || ': ' || a.failure_reason, '; ') FROM attempts a \
            JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = {run} AND a.failure_reason LIKE '%BLOCKED_AUTH%') AS auth, \
          (SELECT state FROM tasks WHERE task_id = '{TASK}') AS developer, \
+         (SELECT blocked_reason FROM tasks WHERE task_id = '{TASK}') AS developer_blocked, \
          (SELECT group_concat(t.role || ' ' || a.attempt_id || ' ' || a.state || coalesce(' ' || a.failure_reason, ''), '; ') \
            FROM attempts a JOIN tasks t ON t.task_id = a.task_id WHERE t.run_id = {run} AND t.role != 'commander') AS attempts"
     );
     let until = Instant::now() + LOOP;
     loop {
         let found = rows(project, &sql)?;
-        let now = &found[0];
-        let text = |key: &str| now[key].as_str().unwrap_or_default().to_owned();
-        if !text("auth").is_empty() {
-            return Ok(End::Blocked(format!(
-                "BLOCKED_AUTH: a turn was refused for its login: {}",
-                text("auth")
-            )));
-        }
-        if !text("bindings").is_empty() {
-            return Ok(End::Blocked(format!(
-                "a role's agent is unavailable: {}",
-                text("bindings")
-            )));
-        }
-        if now["closed"].as_i64().unwrap_or(0) > 0 {
-            return Ok(End::Closed);
-        }
-        let state = text("run");
-        if state == "BLOCKED" && text("run_blocked").contains("AUTH") {
-            return Ok(End::Blocked(format!(
-                "the run is BLOCKED: {}",
-                text("run_blocked")
-            )));
-        }
-        if matches!(
-            state.as_str(),
-            "BLOCKED" | "CANCELLED" | "FAILED" | "COMPLETED" | "INCOMPLETE"
-        ) || text("developer") == "BLOCKED"
-        {
-            return Ok(End::Stopped(format!(
-                "no round closed: the run {state} ({}), the developer task {}; attempts: {}",
-                text("run_blocked"),
-                text("developer"),
-                text("attempts")
-            )));
+        if let Some(end) = ended(&found[0]) {
+            return Ok(end);
         }
         if Instant::now() > until {
             return Ok(End::TimedOut(found));
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// How the loop ended, judged from one look at the store (`watch`'s row), or none while it goes on.
+fn ended(now: &Value) -> Option<End> {
+    let text = |key: &str| now[key].as_str().unwrap_or_default().to_owned();
+    if !text("auth").is_empty() {
+        return Some(End::Blocked(format!(
+            "BLOCKED_AUTH: a turn was refused for its login: {}",
+            text("auth")
+        )));
+    }
+    if !text("bindings").is_empty() {
+        return Some(End::Blocked(format!(
+            "a role's agent is unavailable: {}",
+            text("bindings")
+        )));
+    }
+    if now["closed"].as_i64().unwrap_or(0) > 0 {
+        return Some(End::Closed);
+    }
+    let state = text("run");
+    if state == "BLOCKED" && text("run_blocked").contains("AUTH") {
+        return Some(End::Blocked(format!(
+            "the run is BLOCKED: {}",
+            text("run_blocked")
+        )));
+    }
+    // A readiness hold (REQ-031: BLOCKED(READINESS_NOT_MET) while the revision's specification review runs) is
+    // released by the product when the review passes: not an end, the loop waits on within LOOP.
+    let held_for_readiness = text("developer_blocked") == "READINESS_NOT_MET";
+    if matches!(
+        state.as_str(),
+        "BLOCKED" | "CANCELLED" | "FAILED" | "COMPLETED" | "INCOMPLETE"
+    ) || (text("developer") == "BLOCKED" && !held_for_readiness)
+    {
+        return Some(End::Stopped(format!(
+            "no round closed: the run {state} ({}), the developer task {}; attempts: {}",
+            text("run_blocked"),
+            text("developer"),
+            text("attempts")
+        )));
+    }
+    None
 }
 
 /// What the closed loop showed, judged.
@@ -1235,4 +1258,124 @@ fn export(project: &Path, run_id: &str) -> R<Value> {
         all.insert(name.to_owned(), rows(project, &sql)?);
     }
     Ok(Value::Object(all))
+}
+
+/// Takes no work: every hand-over and start is refused (no agent runs).
+#[derive(Debug)]
+struct NoAgents;
+
+impl Executor for NoAgents {
+    fn deliver(&self, _work: &Work) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (answer, ack) = tokio::sync::oneshot::channel();
+        let _ = answer.send(Err("the scripted fixture takes no work".to_owned()));
+        ack
+    }
+
+    fn start(&self, _work: &Work) -> Result<Started, Refusal> {
+        Err(Refusal {
+            reason: "NO_AGENTS".to_owned(),
+            class: FailureClass::Capability,
+            detail: None,
+            details: None,
+        })
+    }
+}
+
+/// How long the scripted fixture's host runs after the seed: many of its ticks (200 ms each), each with its readiness
+/// step, which holds a planned task not ready within one tick.
+const SETTLED: Duration = Duration::from_secs(5);
+
+/// The live loop's fixture without agents (the team names claude, pi and codex; none runs): seeded as the live test
+/// seeds it, readiness (REQ-031) never holds the developer task and judges the run READY, so the live loop's Developer
+/// does not wait on a specification review the fixture never ran (M3QA-001).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_qa_loops_fixture_is_ready_for_its_developer_without_agents() -> R {
+    let dir = tempfile::Builder::new()
+        .prefix("hoh-qa-fixture-")
+        .tempdir()?;
+    let project = dir.path().join("project");
+    let stand_in = |agent: Agent| Cli {
+        agent,
+        launcher: PathBuf::from("/nonexistent"),
+        version: "none".to_owned(),
+        login: None,
+    };
+    let team = Team {
+        developer: stand_in(Agent::Claude),
+        qa: stand_in(Agent::Pi),
+        reviewer: stand_in(Agent::Codex),
+        profile: "default",
+        fallbacks: Vec::new(),
+    };
+    let spec_sha = fixture(&project, &team)?;
+    let mut config = HostConfig::new(&project);
+    config.port = 0;
+    config.store.wal_probe = Some(probe());
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: Arc::new(NoAgents),
+        context: hoh_core::decision::Context::default(),
+    });
+    let host = Host::start(config).await?;
+    let outcome = async {
+        approve(&project, &spec_sha)?;
+        let run_id = started(&host).await?;
+        seed(&project, &run_id)?;
+        let sql = format!(
+            "SELECT (SELECT group_concat(payload_json, '; ') FROM events WHERE kind IN ('task.blocked', \
+               'spec_review.opened') AND (json_extract(payload_json, '$.task_id') = '{TASK}' \
+               OR json_extract(payload_json, '$.run_id') = {})) AS held, \
+             (SELECT state FROM tasks WHERE task_id = '{TASK}') AS task",
+            quoted(&run_id)
+        );
+        let until = Instant::now() + SETTLED;
+        loop {
+            let now = rows(&project, &sql)?;
+            if let Some(held) = now[0]["held"].as_str() {
+                return Err::<String, Box<dyn std::error::Error>>(
+                    format!("{TASK} was held for readiness: {held}").into(),
+                );
+            }
+            if Instant::now() > until {
+                if now[0]["task"] != "READY" {
+                    return Err(format!("{TASK} is {}, not READY", now[0]["task"]).into());
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (status, shown) = exchange(&host, "GET", &format!("/v1/runs/{run_id}"), None).await?;
+        let readiness = &shown["projection"]["readiness"];
+        if status != 200 || readiness["state"] != "READY" {
+            return Err(format!("the run's readiness is not READY: {status} {readiness}").into());
+        }
+        Ok(run_id)
+    }
+    .await;
+    if let Ok(run_id) = &outcome {
+        cancel(&host, &project, run_id).await;
+    }
+    host.shutdown().await;
+    outcome.map(drop)
+}
+
+/// A developer task held by readiness (REQ-031: BLOCKED(READINESS_NOT_MET) while its revision's specification review
+/// runs, released when the review passes) does not end the loop; any other block of the task still does.
+#[test]
+fn a_readiness_hold_does_not_end_the_watch() {
+    let look = |blocked: &str| {
+        json!({"closed": 0, "run": "RUNNING", "run_blocked": null, "bindings": null, "auth": null,
+               "developer": "BLOCKED", "developer_blocked": blocked, "attempts": null})
+    };
+    assert!(
+        ended(&look("READINESS_NOT_MET")).is_none(),
+        "a readiness hold ended the watch: {:?}",
+        ended(&look("READINESS_NOT_MET"))
+    );
+    assert!(matches!(
+        ended(&look("NEED_DECISION")),
+        Some(End::Stopped(_))
+    ));
+    let mut released = look("READINESS_NOT_MET");
+    released["developer"] = json!("READY");
+    assert!(ended(&released).is_none());
 }
