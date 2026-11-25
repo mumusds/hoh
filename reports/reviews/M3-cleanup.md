@@ -804,6 +804,23 @@ The writer also serves reads queued with the writes (`reconcile_scan`, `runner_w
 `running_attempts`): no `BEGIN IMMEDIATE`, so no lock wait of their own. Outside hoh-core nothing opens SQLite but the
 clippy canary.
 
+Red first, on the code before the fix: `test_062_01_a_queued_write_is_busy_one_timeout_after_its_submission` (hoh-core,
+busy_timeout 2 s, a write queued 1 s after the one waiting for the lock): `DB_BUSY 3.006176727s after it was submitted`
+(`red-core.log`); `test_062_01_busy_answer_not_delayed_by_background_sweep` (hoh-app host, both PauseRuns sent 250 ms
+after the lock, one sweep period): `503 after 9.803797159s` with the sweep's `hoh host: input delivery: DB_BUSY` line
+(`red-host.log`). Green after the fix (`green-core.log`, `green-host.log`), then both host tests 10/10 in a row on the
+same binary under the test slot (`repeat-*.log`, `repeat-*-result.json`). The host test's body is shared with
+`test_062_01_settings_busy_writer_responsive_reads` (delay 0); no assertion or window changed (5 to 6 s, 202 within
+5 s, GETs within 500 ms, PRAGMAs 5000).
+
+FLK-14-F1 (`crates/hoh-agents/tests/claude_adapter.rs`, `hold_store`): the same fixed-hold pattern as DC-FLK14 (the
+outside lock lived 1.5 s on the child's clock while the test needs it held until its cancel is sent; the first test
+sends the cancel after up to 2 s of reap polling, so a slow reap already crossed the hold). Not seen failing, but the
+same class, so fixed like DC-FLK14: the holder releases on a line on its stdin (or its stdin closed), and both tests
+release it right after `cancel.request()` (`f1-claude-adapter.log`). No assertion changed.
+
+Evidence under `.hoh-dev/self-tests/flk14p1/`. Self-tests, not acceptance.
+
 ## FLK-15 (strace's `???` for a call it could not read)
 
 Developer diagnostics from `072f9fa6`, REQ-029 / AC-029-03 (CR-037), test
