@@ -286,6 +286,12 @@ pub trait HostHooks: Send + Sync + std::fmt::Debug {
     fn cgroups_allowed(&self) -> bool {
         true
     }
+
+    /// Before the blocking read of specification sources for `ApproveSpec` or `ProposeSpecChange` (M3LE-02). A test
+    /// returns true so that read panics and the join fails; the product returns false and the read runs.
+    fn fail_spec_source_read(&self) -> bool {
+        false
+    }
 }
 
 /// The product's host hooks: none.
