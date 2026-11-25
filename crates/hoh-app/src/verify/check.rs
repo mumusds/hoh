@@ -749,34 +749,51 @@ async fn finish(
     // nothing of it runs, nor forks, outside that cgroup (docs/adr/ADR-028.md decision 7, M3B-201); the gate execs it in
     // its own place (the same pid, process group and environment).
     let gated = launch.gate.clone().filter(|_| launch.adopt.is_some());
-    let spawn_error = record_dir.join("spawn-error");
-    let mut command = match &gated {
-        Some(gate) => {
-            let mut command = std::process::Command::new(gate);
-            command
-                .arg("__check-gate")
-                .arg("--spawn-error-file")
-                .arg(&spawn_error)
-                .arg("--")
-                .args(&ready.planned.argv);
-            command
-        }
-        None => {
-            let mut command = std::process::Command::new(&ready.planned.argv[0]);
-            command.args(&ready.planned.argv[1..]);
-            command
-        }
+    // A gated command's failed exec comes back on a socket whose other end only the gate holds: it takes that end over
+    // close-on-exec, so a command that started never holds it (CR-038 decision 2, M3LS-01). A socket, not a pipe: a
+    // pipe's end can be opened again through /proc, a socket's cannot. None (no gate, or no socket): never reported.
+    let exec_report = gated
+        .as_ref()
+        .map(|_| {
+            use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
+            socketpair(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+                None,
+            )
+        })
+        .transpose()
+        .map_err(|e| io(format!("the check's exec report: {e}")))?;
+    let command = |exec_error_fd: Option<i32>| {
+        let mut command = match &gated {
+            Some(gate) => {
+                let mut command = std::process::Command::new(gate);
+                command.arg("__check-gate");
+                if let Some(fd) = exec_error_fd {
+                    command.arg("--exec-error-fd").arg(fd.to_string()).arg("--");
+                }
+                command.args(&ready.planned.argv);
+                command
+            }
+            None => {
+                let mut command = std::process::Command::new(&ready.planned.argv[0]);
+                command.args(&ready.planned.argv[1..]);
+                command
+            }
+        };
+        command
+            .current_dir(checkout.join(&ready.planned.cwd))
+            .envs(check_env(
+                &artifacts_dir,
+                request,
+                &ready.sealed,
+                &export,
+                &record_id,
+            ))
+            .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        command
     };
-    command
-        .current_dir(checkout.join(&ready.planned.cwd))
-        .envs(check_env(
-            &artifacts_dir,
-            request,
-            &ready.sealed,
-            &export,
-            &record_id,
-        ))
-        .envs(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let config = Config {
         deadline: Some(std::time::Duration::from_secs_f64(timeout)),
         stdout_copy: Some(stdout.clone()),
@@ -792,82 +809,96 @@ async fn finish(
         stdout: identity(&stdout),
         stderr: identity(&stderr),
     };
-    let (exit_code, timed_out, command_started) =
-        match Process::spawn(command, config, &hoh_core::spawn::Direct::plain()) {
-            Ok(mut process) => {
-                // An adoption that failed leaves the command outside the attempt's cgroup: it must not run (M3LD-01).
-                let refused = launch.adopt.and_then(|adopt| adopt(process.pid()).err());
-                // Only now, and only once adopted, the gate opens. Its stdin is the command's after it, held open as
-                // the substrate held it. Not adopted: its stdin is closed, so the gate ends without running anything.
-                let _stdin = match (&gated, &refused) {
-                    (Some(_), None) => {
-                        use tokio::io::AsyncWriteExt as _;
-                        let mut stdin = process.take_stdin();
-                        if let Some(pipe) = stdin.as_mut() {
-                            // A gate that cannot be written to has ended: its end is the command's, recorded below.
-                            let _ = pipe.write_all(b"go\n").await;
-                        }
-                        stdin
+    let spawn = |command| Process::spawn(command, config, &hoh_core::spawn::Direct::plain());
+    let spawned = match &exec_report {
+        Some((_, theirs)) => {
+            use std::os::fd::AsFd as _;
+            hoh_core::spawn::inheriting(theirs.as_fd(), |fd| spawn(command(Some(fd))))
+                .unwrap_or_else(Err)
+        }
+        None => spawn(command(None)),
+    };
+    // Only the gate holds the other end now: the report is what it wrote before it ended.
+    let ours = exec_report.map(|(ours, _)| ours);
+    let (exit_code, timed_out, command_started) = match spawned {
+        Ok(mut process) => {
+            // An adoption that failed leaves the command outside the attempt's cgroup: it must not run (M3LD-01).
+            let refused = launch.adopt.and_then(|adopt| adopt(process.pid()).err());
+            // Only now, and only once adopted, the gate opens. Its stdin is the command's after it, held open as
+            // the substrate held it. Not adopted: its stdin is closed, so the gate ends without running anything.
+            let _stdin = match (&gated, &refused) {
+                (Some(_), None) => {
+                    use tokio::io::AsyncWriteExt as _;
+                    let mut stdin = process.take_stdin();
+                    if let Some(pipe) = stdin.as_mut() {
+                        // A gate that cannot be written to has ended: its end is the command's, recorded below.
+                        let _ = pipe.write_all(b"go\n").await;
                     }
-                    (Some(_), Some(_)) => {
-                        drop(process.take_stdin());
-                        None
-                    }
-                    (None, _) => None,
-                };
-                // Not adopted, its process group is ended (an ungated command has already started) and reaped below.
-                let mut cancelling = refused.is_some();
-                if cancelling {
-                    process.cancel(Escalation::default());
+                    stdin
                 }
-                let mut report = None;
-                loop {
-                    tokio::select! {
-                        event = process.next() => match event {
-                            Some(Event::Exit(r)) => report = Some(r),
-                            Some(_) => {}
-                            None => break,
-                        },
-                        _ = &mut cancelled, if !cancelling => {
-                            cancelling = true;
-                            process.cancel(Escalation::default());
-                        }
-                    }
+                (Some(_), Some(_)) => {
+                    drop(process.take_stdin());
+                    None
                 }
-                let report = report
-                    .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
-                match refused {
-                    // CR-038: only a closed start gate proves that the command never ran. An ungated
-                    // command already started; preserve that fact even when adoption fails.
-                    Some(error) => {
-                        use std::io::Write as _;
-                        std::fs::OpenOptions::new()
-                            .append(true)
-                            .open(&stderr)
-                            .and_then(|mut file| {
-                                writeln!(file, "hoh: the check's cgroup adoption failed: {error}")
-                            })
-                            .map_err(|e| io(format!("{}: {e}", stderr.display())))?;
-                        (127, false, gated.is_none())
-                    }
-                    None => {
-                        let (exit, timed) = recorded_exit(report.status, report.cause);
-                        let exec_failed = gated.is_some()
-                            && hoh_core::objects::read_regular(&spawn_error)
-                                .is_ok_and(|bytes| bytes == b"exec_failed\n");
-                        // Preserve a timeout/cancellation even when the gate reported a failed exec: only a
-                        // completed launch failure is safe to classify as NOT_STARTED.
-                        (exit, timed, !(exit == 127 && !timed && exec_failed))
+                (None, _) => None,
+            };
+            // Not adopted, its process group is ended (an ungated command has already started) and reaped below.
+            let mut cancelling = refused.is_some();
+            if cancelling {
+                process.cancel(Escalation::default());
+            }
+            let mut report = None;
+            loop {
+                tokio::select! {
+                    event = process.next() => match event {
+                        Some(Event::Exit(r)) => report = Some(r),
+                        Some(_) => {}
+                        None => break,
+                    },
+                    _ = &mut cancelled, if !cancelling => {
+                        cancelling = true;
+                        process.cancel(Escalation::default());
                     }
                 }
             }
-            Err(e) => {
-                // As run_check does when the command cannot start: 127, the error as its stderr.
-                std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
-                std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
-                (127, false, false)
+            let report = report
+                .ok_or_else(|| io("the check's process ended without its report".to_owned()))?;
+            match refused {
+                // CR-038: only a closed start gate proves that the command never ran. An ungated
+                // command already started; preserve that fact even when adoption fails.
+                Some(error) => {
+                    use std::io::Write as _;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&stderr)
+                        .and_then(|mut file| {
+                            writeln!(file, "hoh: the check's cgroup adoption failed: {error}")
+                        })
+                        .map_err(|e| io(format!("{}: {e}", stderr.display())))?;
+                    (127, false, gated.is_none())
+                }
+                None => {
+                    let (exit, timed) = recorded_exit(report.status, report.cause);
+                    // Read once the gate has ended, without waiting: anything but its exact report (none, an
+                    // error) leaves the command recorded as started (CR-038 decision 2).
+                    let exec_failed = ours.as_ref().is_some_and(|ours| {
+                        let mut report = [0u8; 16];
+                        rustix::io::read(ours, &mut report)
+                            .is_ok_and(|n| report[..n] == *b"exec_failed\n")
+                    });
+                    // Preserve a timeout/cancellation even when the gate reported a failed exec: only a
+                    // completed launch failure is safe to classify as NOT_STARTED.
+                    (exit, timed, !(exit == 127 && !timed && exec_failed))
+                }
             }
-        };
+        }
+        Err(e) => {
+            // As run_check does when the command cannot start: 127, the error as its stderr.
+            std::fs::write(&stdout, b"").map_err(|e| io(e.to_string()))?;
+            std::fs::write(&stderr, e.to_string()).map_err(|e| io(e.to_string()))?;
+            (127, false, false)
+        }
+    };
     let elapsed = began.elapsed();
     let wall_finished = std::time::SystemTime::now();
     // The record's finish is its start plus the monotonic time: interval and duration agree by construction and never
