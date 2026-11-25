@@ -262,9 +262,19 @@ impl Process {
     /// Start `command` with piped stdio in a new process group, through `spawner` (docs/adr/ADR-031.md, 设计修正 2:
     /// the host's direct spawner or a client's gate). Must be called within a Tokio runtime with IO and time enabled.
     pub fn spawn(
+        command: Command,
+        config: Config,
+        spawner: &dyn hoh_core::spawn::Spawner,
+    ) -> io::Result<Process> {
+        Self::spawn_with_stdin(command, config, spawner, Stdio::piped())
+    }
+
+    /// As `spawn`, with caller-owned stdin (e.g. a private gate socket). Only piped stdin is returned by `take_stdin`.
+    pub fn spawn_with_stdin(
         mut command: Command,
         config: Config,
         spawner: &dyn hoh_core::spawn::Spawner,
+        stdin: Stdio,
     ) -> io::Result<Process> {
         prepare_child_signals()?;
         // The copies exist before the child does, so a file that cannot be created starts nothing.
@@ -274,7 +284,7 @@ impl Process {
         // Without a pidfd the child cannot be supervised: the spawner ends it then (its group, its leader, a bounded
         // reap: M1T07R-103, CLT-700) rather than leave it running.
         let helper = spawner.helper(
-            command.stdin(Stdio::piped()).stdout(Stdio::piped()),
+            command.stdin(stdin).stdout(Stdio::piped()),
             hoh_core::spawn::HelperStderr::Piped,
         )?;
         // From here on the leader is ours to reap, through its handle (dropping `Leader` kills the group): until then
@@ -287,7 +297,11 @@ impl Process {
         let pid = leader.pid;
         let sigchld = signal(SignalKind::child())?;
         let piped = |fd: Option<OwnedFd>| fd.ok_or_else(|| io::Error::other("stdio was not piped"));
-        let stdin = pipe::Sender::from_owned_fd(piped(helper.stdin.map(OwnedFd::from))?)?;
+        let stdin = helper
+            .stdin
+            .map(OwnedFd::from)
+            .map(pipe::Sender::from_owned_fd)
+            .transpose()?;
         let stdout = pipe::Receiver::from_owned_fd(piped(helper.stdout.map(OwnedFd::from))?)?;
         let stderr = pipe::Receiver::from_owned_fd(piped(helper.stderr.map(OwnedFd::from))?)?;
 
@@ -327,7 +341,7 @@ impl Process {
         }));
         Ok(Process {
             pid: pid.as_raw_pid() as u32,
-            stdin: Some(stdin),
+            stdin,
             events: Events::Supervised(events),
             control: Control {
                 slot: std::sync::Arc::new(cancel_tx),

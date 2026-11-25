@@ -213,62 +213,33 @@ pub fn main(args: &[OsString]) -> i32 {
     }
 }
 
-/// `hoh __check-gate [--exec-error-fd <n> --] <program> <args…>`: the start gate a verifier attempt's check command is started through
-/// (docs/adr/ADR-028.md decision 7, M3B-201), so the host joins it to the attempt's cgroup before anything of the
-/// command runs. As the unchecked gate: one line on stdin, `go` execs the program in its own place (pid, process group,
-/// cgroup) with every signal at its default; at the end of its input or any other line it exits 0 and the command never
-/// runs; 64 without a program, 127 when the program cannot be executed. Unlike an agent's gate it keeps its whole
-/// environment: the check's six variables (docs/adr/ADR-027.md decision 6) are the command's own. A failed exec is
-/// reported as `exec_failed` on descriptor `n` (3 or above; 64 otherwise), which the command never inherits.
+pub(crate) mod report;
+
+/// `hoh __check-gate <program> <args…>`: private SEQPACKET stdin carries `go` plus one SCM_RIGHTS report fd.
+/// The host sends it only after adoption; recvmsg installs it CLOEXEC atomically. Exec closes it and replaces the
+/// control stdin with /dev/null, so the command can affect neither channel. Protocol errors never report exec failure.
 pub fn check_main(args: &[OsString]) -> i32 {
-    // CR-038 (M3LS-01, M3LS-51): `--exec-error-fd <n> --` names an inherited descriptor on which a failed exec is
-    // reported. It is taken over close-on-exec and its inherited number closed before anything else, so a command
-    // that does start never holds it: a successful exec closes it in the kernel, and only this gate can write it.
-    let (report, args) = match args.first() {
-        Some(first) if first == "--exec-error-fd" => {
-            let Some(fd) = args.get(1).and_then(|n| n.to_str()?.parse::<i32>().ok()) else {
-                return USAGE;
-            };
-            if fd < 3 || args.get(2).is_none_or(|a| a != "--") {
-                return USAGE;
-            }
-            (take_over(fd), &args[3..])
-        }
-        _ => (None, args),
-    };
     let Some((program, rest)) = args.split_first() else {
         return USAGE;
     };
-    match read_line() {
-        Line::Read(line) if line == b"go" => {}
-        _ => return 0,
-    }
+    let report = match report::receive(rustix::stdio::stdin()) {
+        Ok(Some(report)) => report,
+        Ok(None) => return 0,
+        Err(e) => {
+            say(&format!("cannot receive gate report descriptor: {e}"));
+            return EXEC_FAILED;
+        }
+    };
     defaults();
-    let error = std::process::Command::new(program).args(rest).exec();
+    let error = std::process::Command::new(program)
+        .args(rest)
+        .stdin(std::process::Stdio::null())
+        .exec();
     say(&format!("{}: {error}", program.to_string_lossy()));
-    if let Some(report) = report
-        && let Err(e) = rustix::io::write(&report, b"exec_failed\n")
-    {
+    if let Err(e) = rustix::io::write(&report, b"exec_failed\n") {
         say(&format!("cannot report the failed exec: {e}"));
     }
     EXEC_FAILED
-}
-
-/// A close-on-exec copy of this process's inherited descriptor `fd` (`pidfd_getfd` on itself), with `fd` itself closed
-/// whether or not the copy could be had: none means a failed exec goes unreported, which its runner records as a
-/// command that started (CR-038 decision 2).
-fn take_over(fd: i32) -> Option<std::os::fd::OwnedFd> {
-    use rustix::process::{PidfdFlags, PidfdGetfdFlags, getpid, pidfd_getfd, pidfd_open};
-    let copy = pidfd_open(getpid(), PidfdFlags::empty())
-        .and_then(|me| pidfd_getfd(&me, fd, PidfdGetfdFlags::empty()));
-    let _ = nix::unistd::close(fd);
-    match copy {
-        Ok(copy) => Some(copy),
-        Err(e) => {
-            say(&format!("cannot take over descriptor {fd}: {e}"));
-            None
-        }
-    }
 }
 
 /// One line on stderr, for a person.
