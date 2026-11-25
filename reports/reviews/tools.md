@@ -191,3 +191,20 @@ docs/22 records the main branch protection and branch auto-delete; bootstrap's P
 ### Round 1 (fresh Grok session)
 
 `grok` 1.0.70, model grok-4.7, session `01a1b1b6-2ca6-7c51-bd09-e8d2e0f7d3e0`, 838 s; attempt record sha256 `a03c0dcf69c8d5ef09f2e1395b91700958af960d8274d422043a4c77e657f400`, stdout sha256 `f460a23999bbb3475c6ea5ecaf850f7c27a008ca1c71aa6dac832538663a49fa`. Candidate 9b7767a. Scope: docs/22's new section against the live settings (`gh api …/branches/main/protection`, `delete_branch_on_merge`), the template with `scripts/dev/session-context.sh` on a temporary copy, the corrected records against their attempt records and evidence, D2R-06 against docs/22's 范围与限制; bundle on a git archive of the commit (395 OK). Verdict **PASS**, no findings.
+
+## agy (Antigravity CLI) as a bootstrap helper (branch `task/BT-agy`)
+
+Owner decision of 2026-11-25: agy (Antigravity CLI, model `gemini-4-neon-high`) is a fifth helper with ample quota and replaces Codex when Codex's quota runs out. Like Grok it runs outside checks only (`contracts/live-session.schema.json` accepts codex, claude and pi).
+
+### Round 1 (fresh Claude subagent session, read-only)
+
+- Scope: `ab3e92ce..84bcfabe` (tools/agent_task.py, tests/bundle/test_tools.py, docs/22, docs/19); bundle tool tests (160, one skip); direct probes of a missing result event and a non-object result.
+- Verdict: **PASS** (no critical, high or medium; 5 low).
+
+| ID | Severity | Summary | Disposition |
+|---|---|---|---|
+| BTA-001 | low | A prompt that is not UTF-8 failed late as BRIDGE_FAILED after the attempt directory was written. | Fixed: refused as a usage error (2) before any attempt is written; `test_agy_refuses_a_prompt_that_is_not_utf8` (red on the old code). |
+| BTA-002 | low | A `result` event whose body is not an object crashed the bridge (BRIDGE_FAILED, parsed output lost). | Fixed: a non-object body counts as empty, so the turn is NATIVE_FAILED; `test_agy_result_that_is_not_an_object_fails_the_turn` (red on the old code). |
+| BTA-003 | low | `ensure_ascii=False` leaves U+2028/U+2029 raw in the stdin line; agy's line reader and its line-size limit were not probed. | Deferred to the M4 low package: observed instead on the live M3-T05 round-2 agy review (a large Chinese prompt); if that turn fails on input, switch to `ensure_ascii=True`. |
+| BTA-004 | low | Only Grok was pinned as refused inside a check. | Fixed: the refusal test runs for grok and agy. |
+| BTA-005 | low | docs/22 `--agent` list, docs/19 refusal sentence and CLAUDE.md named four agents. | Fixed: agy added to the list and to the refusal sentences in docs/22, docs/19 and CLAUDE.md. |

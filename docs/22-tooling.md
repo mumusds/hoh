@@ -22,12 +22,12 @@ Pi 插件由 `tools/install_pi_plugins.py` 安装：只要 Pi 支持就带 `--ap
 source .hoh-dev/env.sh
 python3 tools/render_prompt.py --role reviewer --context .hoh-dev/review-context.json --output .hoh-dev/reviewer-prompt.md
 python3 tools/agent_task.py --agent codex --role reviewer --prompt-file .hoh-dev/reviewer-prompt.md --timeout 3600
-# --agent 可选 codex、claude、pi、grok；grok 以无头单轮方式运行（--prompt-file /dev/stdin --output-format streaming-messages-json --always-approve
+# --agent 可选 codex、claude、pi、grok、agy；grok 以无头单轮方式运行（--prompt-file /dev/stdin --output-format streaming-messages-json --always-approve
 # --background-wait-timeout <向上取整的 --timeout>），
 # 只能在检查之外使用：live-session schema 不接受 grok，在 run_check 内调用会以 64 拒绝
 # agy（Antigravity CLI，项目所有者 2026-11-25 提供，Gemini 4 Neon）同为自举助手：--dangerously-skip-permissions
 # --input-format stream-json --output-format stream-json -p=，提示词作为一条 stream-json 用户消息从 stdin 送入；
-# 用 --model gemini-4-neon-high 指定模型；同样只能在检查之外使用
+# 用 --model gemini-4-neon-high 指定模型；同样只能在检查之外使用（run_check 内以 64 拒绝），提示词文件须为 UTF-8
 ```
 
 真实任务必须引用当前 REQ 与候选，不能拿示例上下文验收。桥会探测实际 help（按整词匹配参数），记录 CLI 版本、会话 id 和解析出的模型，不把聊天中的“完成”当最终成功。Pi 的 JSON 单次进程退出，不能替代产品 Pi RPC 中对 `agent_settled` 的协商。

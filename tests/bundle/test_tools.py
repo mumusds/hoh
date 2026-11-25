@@ -222,6 +222,17 @@ class NativeBridge(unittest.TestCase):
         o=inspect_output('agy',p);self.assertEqual(o['_final_text'],'last');self.assertEqual(o['session_ids'],['c']);self.assertTrue(o['terminal_observed'])
         p=self.raw({'event':'result','result':{'conversation_id':'c','status':'SUCCESS','response':REPORT_BLOCK}},{'event':'result','result':{'conversation_id':'c','status':'SUCCESS'}})
         self.assertEqual(inspect_output('agy',p)['_final_text'],'')
+    def test_agy_result_that_is_not_an_object_fails_the_turn(self):
+        # BTA-002: a malformed result body is a failed turn, not a bridge crash.
+        o=inspect_output('agy',self.raw({'event':'result','result':'oops'}))
+        self.assertTrue(o['terminal_observed']);self.assertTrue(o['native_error_observed']);self.assertEqual(o['_final_text'],'')
+    def test_agy_refuses_a_prompt_that_is_not_utf8(self):
+        # BTA-001: refused as a usage error before any attempt directory exists.
+        bad=self.root/'bad.md';bad.write_bytes(b'\xff\xfe review')
+        out=self.root/'attempt-bad'
+        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','agy','--role','reviewer','--prompt-file',str(bad),'--cwd',str(self.root),'--timeout','10','--output-dir',str(out)],
+                         capture_output=True,text=True,env=self.env,timeout=20)
+        self.assertEqual(p.returncode,2,p.stderr);self.assertIn('UTF-8',p.stderr);self.assertFalse(out.exists())
     def test_agy_command(self):
         c=command_for('agy',self.root,'gemini-x');self.assertEqual(c[0],'agy');self.assertEqual(c[-1],'-p=');self.assertEqual(c[-3:-1],['--model','gemini-x'])
         for flag in ['--input-format','--output-format','--dangerously-skip-permissions']:self.assertIn(flag,c)
@@ -231,11 +242,14 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual((r['status'],r['exit_code'],r['terminal_observed'],r['native_error_observed']),('NATIVE_FAILED',0,True,True))
     def test_a_live_check_refuses_an_agent_its_session_schema_does_not_accept(self):
         # TG-01: live-sessions.json may only name agents contracts/live-session.schema.json accepts; Grok is not one.
-        ev=self.root/'evidence';ev.mkdir()
-        p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent','grok','--role','reviewer','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--timeout','10'],
-                         capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'independent-review','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
-        self.assertEqual(p.returncode,64,p.stderr);self.assertIn('live-session.schema.json',p.stderr)
-        self.assertEqual(list(ev.iterdir()),[]);self.assertFalse((self.root/'trace.json').exists())
+        # BTA-004: agy is a bootstrap helper too.
+        for agent in ['grok','agy']:
+            with self.subTest(agent=agent):
+                ev=self.root/f'evidence-{agent}';ev.mkdir()
+                p=subprocess.run([sys.executable,str(ROOT/'tools/agent_task.py'),'--agent',agent,'--role','reviewer','--prompt-file',str(self.prompt),'--cwd',str(self.root),'--timeout','10'],
+                                 capture_output=True,text=True,env=self.env|{'HOH_EVIDENCE_DIR':str(ev),'HOH_CHECK_ID':'independent-review','HOH_CANDIDATE_ID':'CAND-'+'a'*64},timeout=20)
+                self.assertEqual(p.returncode,64,p.stderr);self.assertIn('live-session.schema.json',p.stderr)
+                self.assertEqual(list(ev.iterdir()),[]);self.assertFalse((self.root/'trace.json').exists())
     def test_native_nonzero(self):
         p,out=self.bridge(mode='exit-error');self.assertEqual(p.returncode,7);self.assertEqual(load_json(out/'attempt.json')['status'],'NATIVE_FAILED')
     def test_semantic_failure_zero_exit(self):p,_=self.bridge(mode='semantic-error');self.assertNotEqual(p.returncode,0)
