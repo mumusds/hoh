@@ -82,6 +82,10 @@ def command_for(agent:str,session_dir:Path,model:str|None,help_output:str|None=N
 
 REPORT_FENCE=re.compile(r'```hoh-report[ \t]*\n(.*?)\n```',re.S)
 FINAL_TEXT_LIMIT=1024*1024
+# The longest JSONL record parsed: pi 1.6.0's terminal agent_end carries the whole message history (1.4 MB in the M3-T05
+# QA, BT-04), so a long session's record far exceeds 1 MiB. A line longer than this is skipped unread and counted
+# malformed; memory stays bounded by it.
+LINE_LIMIT=64*1024*1024
 
 def inspect_output(agent:str,path:Path)->dict:
     """Summarize a native JSONL stream. Failure is judged on terminal outcomes only: a transient error the
@@ -91,11 +95,11 @@ def inspect_output(agent:str,path:Path)->dict:
     final_text='';pi_last_stop=None;pi_retry_failed=False
     with path.open('rb') as f:
         while True:
-            line=f.readline(1024*1024+1)
+            line=f.readline(LINE_LIMIT+1)
             if not line:break
-            if len(line)>1024*1024:
+            if len(line)>LINE_LIMIT:
                 malformed+=1
-                while line and not line.endswith(b'\n'):line=f.readline(1024*1024+1)
+                while line and not line.endswith(b'\n'):line=f.readline(1024*1024)
                 continue
             if not line.strip():continue
             try:r=json.loads(line)
