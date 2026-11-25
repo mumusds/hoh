@@ -213,9 +213,17 @@ async fn test_031_04_spec_review_gates_ready() -> R {
         Tamper::Missing,
     ]))));
     // The reviewer's turns: revision 2's PASS, revision 3's six PASSes the test tampers with, a FAILED, a PASS.
+    // Revision 2 is drafted by a real spec_draft task (cto session) so the reviewer's independence from the
+    // drafting session is observed directly on the product path (M3QA-014).
+    let rev2_source = hoh_core::specindex::Source {
+        path: "docs/spec/spec.md".to_owned(),
+        bytes: markdown("REQ-1", 1, "记下").into_bytes(),
+    };
     let turns = Arc::new(AtomicUsize::new(0));
     let counted = turns.clone();
-    let team = world::Team::reviewing(
+    let team = world::Team::planning_with_review(
+        world.project(),
+        rev2_source,
         |turn| match turn.state.as_str() {
             "CREATED" => {
                 let mut decided = world::steps("CREATED", "SPECIFYING");
@@ -224,7 +232,8 @@ async fn test_031_04_spec_review_gates_ready() -> R {
             }
             _ => Vec::new(),
         },
-        world.project(),
+        None,
+        None,
         move |_| {
             if counted.fetch_add(1, Ordering::SeqCst) == 7 {
                 Verdict::Failed
@@ -268,15 +277,51 @@ async fn test_031_04_spec_review_gates_ready() -> R {
             world.query("SELECT count(*) FROM independent_reports")?,
             world.query("SELECT count(*) FROM candidates")?,
         );
-        // Revision 2 completes REQ-1's criterion; its review is opened, dispatched and PASSes; then R is READY.
-        let second_sha = commit_spec(&world, &markdown("REQ-1", 1, "记下"))?;
+        // Revision 2 is drafted by a real spec_draft task (cto session), approved by the user, reviewed and PASSes; then R is READY.
+        let (status, body) = submit(&host, &run, "auto-draft-rev2", "SetMode", json!({"mode":"AUTO"})).await?;
+        assert_eq!(status, 202, "{body}");
+        until("revision 2 drafted", || {
+            Ok(world.query("SELECT count(*) FROM events WHERE kind = 'spec.draft_completed'")? == "1")
+        })
+        .await?;
+        let drafter_rows = world.rows(
+            "SELECT a.attempt_id, a.session_id FROM attempts a JOIN tasks t ON t.task_id = a.task_id \
+             WHERE t.kind = 'spec_draft' ORDER BY a.rowid DESC LIMIT 1",
+        )?;
+        assert_eq!(drafter_rows.len(), 1, "{drafter_rows:?}");
+        let drafter_attempt = drafter_rows[0]["attempt_id"]
+            .as_str()
+            .ok_or("drafter attempt_id")?
+            .to_owned();
+        let drafter_session = drafter_rows[0]["session_id"]
+            .as_str()
+            .ok_or("drafter session_id")?
+            .to_owned();
+        let draft_q: Value = serde_json::from_str(&world.query(
+            "SELECT payload_json FROM events WHERE kind = 'question.asked' \
+             AND json_extract(payload_json, '$.reason') = 'spec_approval' ORDER BY seq DESC LIMIT 1",
+        )?)?;
+        let second_sha = draft_q["spec_sha256"]
+            .as_str()
+            .ok_or("spec_approval missing spec_sha256")?
+            .to_owned();
         let second_commit = world.git(&["rev-parse", "HEAD"])?.trim().to_owned();
-        approve_change(&host, &run, "rev2", &second_sha).await?;
+        let (status, body) = submit(
+            &host,
+            &run,
+            "rev2-approve",
+            "ApproveSpec",
+            json!({"spec_sha256": second_sha, "decision": "APPROVE_ONLY"}),
+        )
+        .await?;
+        assert_eq!(status, 202, "{body}");
         until("revision 2's report", || {
             Ok(reported(&world, 2)?.iter().any(|r| r["state"] == "CURRENT"))
         })
         .await?;
         until("R READY", || Ok(state()? == "READY")).await?;
+        let (status, body) = submit(&host, &run, "build-for-rev3", "SetMode", json!({"mode":"BUILD"})).await?;
+        assert_eq!(status, 202, "{body}");
         let opened = payloads(
             &world,
             "SELECT payload_json FROM events WHERE kind = 'spec_review.opened' \
@@ -293,6 +338,11 @@ async fn test_031_04_spec_review_gates_ready() -> R {
         ))?;
         assert_eq!(attempts.len(), 1, "{attempts:?}");
         assert_ne!(attempts[0]["session_id"], json!(commander));
+        assert_ne!(
+            attempts[0]["session_id"],
+            json!(drafter_session),
+            "reviewer session must differ from the session that drafted revision 2"
+        );
         let two = reported(&world, 2)?;
         assert_eq!(two.len(), 1, "{two:?}");
         let report = &two[0];
@@ -323,7 +373,10 @@ async fn test_031_04_spec_review_gates_ready() -> R {
         assert!(
             native["session_ids"]
                 .as_array()
-                .is_some_and(|ids| ids.contains(&report["session_id"])),
+                .is_some_and(|ids| ids.contains(&report["session_id"])
+                    && !ids.contains(&json!(commander))
+                    && !ids.contains(&json!(drafter_session))
+                    && !ids.contains(&json!(format!("N-{drafter_attempt}")))),
             "{native}"
         );
         assert_eq!(native["stdout_sha256"], report["raw_session"]["sha256"]);
@@ -415,6 +468,53 @@ async fn test_031_04_spec_review_gates_ready() -> R {
             ))?,
             "0"
         );
+        // Verify neither the object store nor artifacts table holds any native attempt or report object for `failed`.
+        let mut stack = vec![world.project().join(".hoh/objects")];
+        while let Some(dir) = stack.pop() {
+            if !dir.exists() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path)
+                    && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    assert_ne!(
+                        doc["attempt_id"].as_str(),
+                        Some(failed),
+                        "FAILED review attempt must export no native record or report object: {} -> {doc}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        let failed_artifacts = world.rows(
+            "SELECT path FROM artifacts WHERE path LIKE '.hoh/objects/%'",
+        )?;
+        for row in &failed_artifacts {
+            let rel = row["path"].as_str().unwrap_or("");
+            if let Ok(bytes) = std::fs::read(world.project().join(rel))
+                && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+            {
+                assert_ne!(
+                    doc["attempt_id"].as_str(),
+                    Some(failed),
+                    "FAILED review attempt must not register a native/report artifact: {row}"
+                );
+            }
+        }
+        assert_eq!(
+            world.query("SELECT count(*) FROM independent_reports")?,
+            reports,
+            "revision 3 reviews must add no independent_reports rows"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM candidates")?,
+            candidates,
+            "revision 3 reviews must add no candidates rows"
+        );
         let (_, got) = world::exchange(&host, "GET", &format!("/v1/runs/{run}"), None).await?;
         assert_eq!(got["projection"]["readiness"]["state"], "READY", "{got}");
         assert_eq!(turns.load(Ordering::SeqCst), 9);
@@ -480,6 +580,10 @@ async fn test_031_04_a_revision_approved_during_verification_is_reviewed_in_plac
                 json_object('tasks', json_array(json_object('task_id', 'TD'), json_object('task_id', 'TP'))),
                 '2026-11-22T00:00:00Z');"
         ))?;
+        let (reports_before, candidates_before) = (
+            world.query("SELECT count(*) FROM independent_reports")?,
+            world.query("SELECT count(*) FROM candidates")?,
+        );
         let second_sha = commit_spec(&world, &markdown("REQ-1", 2, "记下"))?;
         approve_change(&host, &run, "rev2", &second_sha).await?;
         // TP's dependency accepted: from here TP waits for revision 2's review alone.
@@ -544,6 +648,16 @@ async fn test_031_04_a_revision_approved_during_verification_is_reviewed_in_plac
             ))? != "0")
         })
         .await?;
+        assert_eq!(
+            world.query("SELECT count(*) FROM independent_reports")?,
+            reports_before,
+            "Project B revision 2 review must add no independent_reports rows"
+        );
+        assert_eq!(
+            world.query("SELECT count(*) FROM candidates")?,
+            candidates_before,
+            "Project B revision 2 review must add no candidates rows"
+        );
         Ok::<_, Box<dyn std::error::Error>>(())
     }
     .await;
