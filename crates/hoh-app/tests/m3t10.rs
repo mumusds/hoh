@@ -398,56 +398,81 @@ async fn test_023_03_discussion_limit_follows_max_rounds() -> R {
             sql(dir.path(), "SELECT state FROM runs WHERE run_id='R'", true)?[0]["state"],
             "RUNNING"
         );
-        if max == 3 {
-            // M3K-03: the discussion-limit event fires once. Other wakes may fire; count this seq.
-            let seq = sql(
-                dir.path(),
-                "SELECT seq FROM events WHERE kind='need_decision' AND run_id='R'",
-                true,
-            )?[0]["seq"]
-                .as_i64()
-                .ok_or("discussion seq")?;
-            // Quiet is 2s (supervise::QUIET). The step's clock must be past the trigger's due time.
-            let now = SystemTime::now() + Duration::from_secs(20);
-            let first = host
-                .store()
-                .supervise(
-                    "R",
-                    Context {
-                        now: Some(now),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            let second = host
-                .store()
-                .supervise(
-                    "R",
-                    Context {
-                        now: Some(now + Duration::from_secs(3)),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            assert_eq!(
-                first
-                    .fired
-                    .iter()
-                    .filter(|fired| fired.event_seqs.contains(&seq))
-                    .count(),
-                1,
-                "discussion limit fires once: {:?}",
-                first.fired
-            );
-            assert!(
-                !second
-                    .fired
-                    .iter()
-                    .any(|fired| fired.event_seqs.contains(&seq)),
-                "a second supervise must not re-fire it: {:?}",
-                second.fired
-            );
-        }
+        // M3K-03 / M3QA-011: both project A (max=2) and project B (max=3) wake Commander exactly once, observed in persisted records.
+        let seq = sql(
+            dir.path(),
+            "SELECT seq FROM events WHERE kind='need_decision' AND run_id='R'",
+            true,
+        )?[0]["seq"]
+            .as_i64()
+            .ok_or("discussion seq")?;
+        // Quiet is 2s (supervise::QUIET). The step's clock must be past the trigger's due time.
+        let now = SystemTime::now() + Duration::from_secs(20);
+        let first = host
+            .store()
+            .supervise(
+                "R",
+                Context {
+                    now: Some(now),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let second = host
+            .store()
+            .supervise(
+                "R",
+                Context {
+                    now: Some(now + Duration::from_secs(3)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            first
+                .fired
+                .iter()
+                .filter(|fired| fired.event_seqs.contains(&seq))
+                .count(),
+            1,
+            "discussion limit fires once (max={max}): {:?}",
+            first.fired
+        );
+        assert!(
+            !second
+                .fired
+                .iter()
+                .any(|fired| fired.event_seqs.contains(&seq)),
+            "a second supervise must not re-fire it (max={max}): {:?}",
+            second.fired
+        );
+        let woken = sql(
+            dir.path(),
+            &format!(
+                "SELECT json_extract(payload_json,'$.severity') AS severity FROM events \
+                 WHERE kind='supervisor.woken' AND run_id='R' \
+                 AND EXISTS (SELECT 1 FROM json_each(payload_json,'$.event_seqs') WHERE value={seq})"
+            ),
+            true,
+        )?;
+        assert_eq!(
+            woken,
+            json!([{"severity": "high"}]),
+            "persisted supervisor.woken must record exactly one High wake (max={max})"
+        );
+        let triggers = sql(
+            dir.path(),
+            &format!(
+                "SELECT state, severity FROM supervisor_triggers \
+                 WHERE run_id='R' AND EXISTS (SELECT 1 FROM json_each(event_seqs_json) WHERE value={seq})"
+            ),
+            true,
+        )?;
+        assert_eq!(
+            triggers,
+            json!([{"state": "HANDLED", "severity": "high"}]),
+            "persisted supervisor_triggers must record one HANDLED High trigger (max={max})"
+        );
         let conclude = message(
             "conclude",
             json!({"intent":"conclude","controversy_id":"architecture","adr":"docs/adr/ADR-037.md"}),
@@ -459,6 +484,14 @@ async fn test_023_03_discussion_limit_follows_max_rounds() -> R {
                 .ok_or("conclude")?["status"],
             "accepted"
         );
+        let conclusions = events(dir.path(), "discussion.conclusion")?;
+        assert_eq!(
+            conclusions.len(),
+            1,
+            "product must persist the discussion conclusion event (max={max})"
+        );
+        assert_eq!(conclusions[0]["controversy_id"], "architecture");
+        assert_eq!(conclusions[0]["conclusion"]["adr"], "docs/adr/ADR-037.md");
         assert_eq!(
             events(dir.path(), "discussion.opinion")?.len(),
             max as usize
@@ -731,14 +764,60 @@ async fn test_023_03_commander_records_conclusion_with_opinion_references() -> R
                 .contains(opinion["event_id"].as_str().ok_or("id")?)
         );
     }
-    let decision = sql(dir.path(), "SELECT payload_json FROM decisions", true)?;
+    let decision = sql(dir.path(), "SELECT state, payload_json FROM decisions", true)?;
+    assert_eq!(decision.as_array().map(Vec::len), Some(1), "{decision}");
+    assert_eq!(decision[0]["state"], "APPLIED", "{decision}");
+    let payload: Value = serde_json::from_str(decision[0]["payload_json"].as_str().ok_or("decision")?)?;
+    assert_eq!(payload["kind"], "record_assumption", "{payload}");
     assert!(
-        decision[0]["payload_json"]
+        payload["statement"]
             .as_str()
-            .ok_or("decision")?
-            .contains("ADR-037.md")
+            .is_some_and(|s| s.contains("docs/adr/ADR-037.md")),
+        "{payload}"
+    );
+    let applied_events = events(dir.path(), "decision.applied")?;
+    assert_eq!(applied_events.len(), 1, "{applied_events:?}");
+    assert!(
+        applied_events[0]["payload"]["statement"]
+            .as_str()
+            .is_some_and(|s| s.contains("docs/adr/ADR-037.md")),
+        "{applied_events:?}"
     );
     assert_eq!(events(dir.path(), "need_decision")?.len(), 1);
+    let seq = sql(
+        dir.path(),
+        "SELECT seq FROM events WHERE kind='need_decision' AND run_id='R'",
+        true,
+    )?[0]["seq"]
+        .as_i64()
+        .ok_or("need_decision seq")?;
+    let woken = sql(
+        dir.path(),
+        &format!(
+            "SELECT json_extract(payload_json,'$.severity') AS severity FROM events \
+             WHERE kind='supervisor.woken' AND run_id='R' \
+             AND EXISTS (SELECT 1 FROM json_each(payload_json,'$.event_seqs') WHERE value={seq})"
+        ),
+        true,
+    )?;
+    assert_eq!(
+        woken,
+        json!([{"severity": "high"}]),
+        "Commander must have exactly one persisted High wake for need_decision"
+    );
+    let triggers = sql(
+        dir.path(),
+        &format!(
+            "SELECT state, severity FROM supervisor_triggers \
+             WHERE run_id='R' AND EXISTS (SELECT 1 FROM json_each(event_seqs_json) WHERE value={seq})"
+        ),
+        true,
+    )?;
+    assert_eq!(
+        triggers,
+        json!([{"state": "HANDLED", "severity": "high"}]),
+        "persisted trigger for need_decision must be HANDLED once"
+    );
     host.shutdown().await;
     Ok(())
 }
