@@ -197,3 +197,61 @@ Evidence under `.hoh-dev/self-tests/m3flk/`: `flk12-pause-before-*`, `flk12-barr
 the red reproductions, and each `*-results.json` records argv, exit, duration and raw-log digest. The green output
 contains the actual injected SQLite error before recovery. These are scripted-agent product self-tests, not live
 agent evidence or independent acceptance. No production source, AC, requirement, check plan, baseline or gate changed.
+
+## M3-T05 pre-QA gaps G2, G4, G5
+
+Run book: `.hoh-dev/evidence/m3t05-prep/runbook.md` section 4. G2 (Codex): the optional ignored pre-002 old-binary
+diagnostic carried `test_008_02` in its name and wrote a TEST-008-02 SKIPPED line into the recovery check although
+AC-008-02's scenario is drafting recovery; renamed so it maps to no TEST id ("M3 pre-QA: G2 unmap optional old-binary
+diagnostic"); AC-008-02 stays covered by the two executed drafting-recovery tests, and refusing a newer schema by the
+executed migration and db_faults tests named in its comment. G5 (Codex): AC-009-01 was covered at store level only; a host
+test drives StartRun and a scripted Commander through the product host ("M3 pre-QA: G5 cover BUILD plan rejection through
+host"); no product change. G4 (Claude): TEST-047-03 used one binary and never upgraded; `deployment.sh` now builds a second
+release bundle v2 (developer contract and bundle version changed) and the new deployment test installs v1, upgrades to v2
+under a running Run through the documented unit restart and checks per-attempt pins, contract digests and the drift report
+("M3 pre-QA: G4 TEST-047-03 installs v1 and upgrades to a v2 release under a running Run"); ADR-034 carries a dated
+correction of decision 12's single-binary fixture.
+
+| Slice | Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|---|
+| G2+G5 | 1 | `f49ed0d1` | Grok grok 1.0.92 (b06756fd6256), `01a20faa-f301-7682-9ca0-83eba96f5121` (`d2c6e881-64c5-48d3-bbb8-0b66287c66cd`) | PASS, no findings |
+| G4 | 1 | `0b231a98` | Codex codex-cli 0.171.0, `01a20fab-8b8c-7840-8897-f3d9c0fb51f3` (`1f21d8f2-6cdf-4321-9b82-00c08caf5830`) | FAIL: M3PD-01 high (the three-way diff was checked against the product's own `three_way_diff`, so an empty-diff regression passed; the retained single-binary test likewise) |
+| G4 | 2 (fix diff) | `5566c274` | Codex codex-cli 0.171.0, `01a20fd4-c3cf-72b3-b3b0-3d19cd4b603d` (`5bd964b9-e6ed-44c5-8dbd-be40acc3e74d`) | FAIL: M3PD-50 high (the hand-written diff applier accepted a trailing bare '+'), M3PD-51 medium (hunk ranges accepted '+1') |
+| G4 | 3 (fix diff) | `5f38de52` | Codex codex-cli 0.171.0, `01a2101b-979c-7a12-9ab5-af874145111e` (`a08c2f53-5cb9-442e-9ba0-215670fab569`) | PASS, no findings |
+
+Round 1 fix (Claude, red with empty and swapped diffs): "M3 pre-QA: M3PD-01 assert TEST-047-03 three-way diffs against an
+independent oracle". Round 2 repeated the class (the diff oracle was not a strict independent expectation), so the lead wrote
+design correction DC-PD before fixing: no parser; exact equality with an expected text the test spells out from the output
+format (headers, one whole-file hunk, every old line '-', every new line '+'), after asserting the fixture inputs are non-empty,
+newline-terminated and different, calling no hoh_core diff code. Fix 2 (Claude): "M3 pre-QA: M3PD-50 M3PD-51 compare TEST-047-03
+three-way diffs with exact expected text", red through `deployment.sh` (exit 101) for empty, swapped, trailing '+' and signed-range
+sabotage. Deferred low: M3PD-L1 `host/product/tests.rs` `test_047_03_drift_persists_three_way_object` (product check) still
+computes its expectation with `three_way_diff` (the function has its own unit test). Final checks: `bash scripts/dev/pre-pr.sh`
+all ok on `5f38de52` (G4) and `pre-pr --no-deployment` all ok on `f49ed0d1` (G2+G5); after combining onto main see the PR.
+
+## FLK-11 and FLK-12 review
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `558ce2f5` | Claude 2.1.331 (Claude Code), `d7623a41-b544-4632-b5f0-851cf3725a0c` (`383736bf-dc16-4f54-8685-b24a0da82f03`) | PASS: M3FK-01 low (the rename to `test_020_05_…` added a fault-injection fixture to TEST-020-05's traceability) |
+
+M3FK-01 fixed by the lead ("M3 cleanup: M3FK-01 keep the FLK-12 test out of TEST-020-05"): the test's original unmapped name is
+restored; nothing else changed. Deferred low: M3FK-L1 other fixtures that sample `group_empty()` once (`Team::hold`, s5,
+tui_pty, m3t10, recovery fixtures), unreproduced risk, to the M3 low package.
+
+## L11 lead decisions (2026-11-24)
+
+- M3G-53: kept as the documented residual of ADR-034 d9 (no relaxation of the cross-version repack rule; AC-045-01 unchanged).
+- M3K-07: resolved in L5 (comment; never reaches a Message reason_code; no CR).
+- M3B-07: resolved by CR-036.
+- M2R-501: resolved by CR-036's correction section.
+- M2QF-02: accepted as documented (ADR-021 2026-11-21 note: SIGQUIT disposition depends on whether an agent turn started); no code.
+- M2R-500-fu: recorded residual within the owner's CR-011 option A (proc mode is declared best-effort); nothing beyond it is
+  proposed, so no owner question.
+- M2R-1003: recorded residual: report independence is judged at intake; a later resume into a verifier's session is not
+  re-judged. Recommended follow-up (not a gate change): re-judge at candidate acceptance in the next verification task (with
+  M3LD-100's CR). Owner question only if that re-judgement would change a release rule.
+- CLT-1260 (process-level memory measurement): moved to M4-T03 (observability and capacity), which owns resource measurement ACs.
+- BT-03 (run_check.py queueing on the machine test slot): stays open; it changes a locked gate tool's behaviour without being a
+  spec inconsistency, so it is not a CR-003 D1 refinement; asked of the owner in the next owner batch; meanwhile frozen checks
+  run with the slot taken by the caller.
