@@ -697,8 +697,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for Tee<R> {
     }
 }
 
-async fn read_stdout(
-    mut reader: FrameReader<Tee<pipe::Receiver>>,
+async fn read_stdout<R: AsyncRead + Unpin>(
+    mut reader: FrameReader<Tee<R>>,
     events: mpsc::Sender<Event>,
     mut abandon: watch::Receiver<bool>,
 ) -> StreamReport {
@@ -737,15 +737,23 @@ async fn read_stdout(
         loop {
             let n = tokio::select! {
                 biased;
-                n = inner.read(&mut sink) => n,
                 _ = abandoned(&mut abandon) => break,
+                n = async {
+                    let n = inner.read(&mut sink).await?;
+                    if n > 0 {
+                        report.discarded += n as u64;
+                        // DC-M3CX-500: keep consumed bytes before the control branch can drop us.
+                        tokio::task::yield_now().await;
+                    }
+                    Ok::<_, io::Error>(n)
+                } => n,
             };
             match n {
                 Ok(0) => {
                     report.eof = true;
                     break;
                 }
-                Ok(n) => report.discarded += n as u64,
+                Ok(_) => {}
                 Err(e) => {
                     report.error = Some(e.to_string());
                     break;
@@ -757,8 +765,8 @@ async fn read_stdout(
     report
 }
 
-async fn drain_stderr(
-    mut stderr: pipe::Receiver,
+async fn drain_stderr<R: AsyncRead + Unpin>(
+    mut stderr: R,
     keep: usize,
     mut copy: Option<std::fs::File>,
     mut abandon: watch::Receiver<bool>,
@@ -769,27 +777,33 @@ async fn drain_stderr(
     loop {
         let n = tokio::select! {
             biased;
-            n = stderr.read(&mut chunk) => n,
             _ = abandoned(&mut abandon) => break,
+            n = async {
+                let n = stderr.read(&mut chunk).await?;
+                if n > 0 {
+                    report.bytes += n as u64;
+                    if let Some(file) = copy.as_mut()
+                        && let Err(e) = file.write_all(&chunk[..n])
+                    {
+                        report.error = Some(format!("stderr copy: {e}"));
+                        copy = None;
+                    }
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > keep {
+                        tail.drain(..tail.len() - keep);
+                    }
+                    // DC-M3CX-500: the read side yields, with all read effects already recorded.
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, io::Error>(n)
+            } => n,
         };
         match n {
             Ok(0) => {
                 report.eof = true;
                 break;
             }
-            Ok(n) => {
-                report.bytes += n as u64;
-                if let Some(file) = copy.as_mut()
-                    && let Err(e) = file.write_all(&chunk[..n])
-                {
-                    report.error = Some(format!("stderr copy: {e}"));
-                    copy = None;
-                }
-                tail.extend_from_slice(&chunk[..n]);
-                if tail.len() > keep {
-                    tail.drain(..tail.len() - keep);
-                }
-            }
+            Ok(_) => {}
             Err(e) => {
                 report.error = Some(e.to_string());
                 break;
@@ -804,6 +818,102 @@ mod tests {
     use super::*;
     use rustix::process::{PidfdFlags, pidfd_open, pidfd_send_signal};
     use std::os::fd::AsFd as _;
+
+    // An always-ready synthetic pipe with the same cooperative debit as Tokio pipes. The finite
+    // fuse makes the broken loop end with an assertion, never a timer-dependent test timeout.
+    struct CooperativePipe {
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: watch::Sender<bool>,
+        signal_at: usize,
+    }
+
+    impl AsyncRead for CooperativePipe {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            use std::sync::atomic::Ordering;
+            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+            let n = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 512 {
+                return Poll::Ready(Err(io::Error::other("test read fuse")));
+            }
+            buf.put_slice(b"xx");
+            if n == self.signal_at {
+                self.stop.send_replace(true);
+            }
+            coop.made_progress();
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_027_03_m3cx500_stderr_abandon_within_one_cooperative_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for initially_set in [false, true] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (stop, abandoned) = watch::channel(initially_set);
+            let pipe = CooperativePipe {
+                reads: reads.clone(),
+                stop,
+                signal_at: 1,
+            };
+            let (report, tail) = tokio::spawn(async move {
+                for _ in 0..127 {
+                    tokio::task::consume_budget().await;
+                }
+                drain_stderr(pipe, 4, None, abandoned).await
+            })
+            .await?;
+            let count = reads.load(Ordering::SeqCst);
+            assert!(count <= 1, "abandon starved for {count} reads");
+            assert!(!report.eof && report.error.is_none());
+            assert_eq!(report.bytes, (2 * count) as u64);
+            assert_eq!(tail, b"xx"[..2 * count]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_027_03_m3cx500_refused_stdout_abandon_within_one_cooperative_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (stop, abandoned) = watch::channel(false);
+        let pipe = CooperativePipe {
+            reads: reads.clone(),
+            stop,
+            signal_at: 2,
+        };
+        let reader = FrameReader::new(
+            Tee {
+                inner: pipe,
+                copy: None,
+            },
+            1,
+            2,
+        );
+        let (events, mut rx) = mpsc::channel(4);
+        let report = read_stdout(reader, events, abandoned).await;
+        let count = reads.load(Ordering::SeqCst);
+        assert!(count <= 2, "abandon starved for {} drain reads", count - 1);
+        assert!(matches!(
+            rx.recv().await,
+            Some(Event::Frame(Frame::TooLarge(_)))
+        ));
+        assert_eq!(report.discarded, 2);
+        assert_eq!(report.bytes, 4);
+        assert!(!report.eof && report.error.is_none());
+        Ok(())
+    }
 
     /// Set by a test: after a group signal to this leader, wait until this file exists (the leader's handler ran).
     static AFTER_GROUP_SIGNAL: std::sync::Mutex<Option<(Pid, PathBuf)>> =
