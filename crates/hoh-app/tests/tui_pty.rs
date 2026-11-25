@@ -824,7 +824,7 @@ impl hoh_app::host::Executor for Sixty {
             let _ = end.send(hoh_app::host::Outcome {
                 success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                 detail: format!("{status:?}"),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: world::group_exit::group_gone_after_reap(pid),
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: Default::default(),
                 unknown_effect: false,

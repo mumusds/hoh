@@ -91,7 +91,7 @@ impl Executor for Gated {
             let _ = send.send(Outcome {
                 success: status.is_ok_and(|s| s.success()),
                 detail: "fake gate ended".into(),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: crate::world::group_exit::group_gone_after_reap(pid),
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: Default::default(),
                 unknown_effect: false,

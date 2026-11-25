@@ -51,7 +51,7 @@ impl Executor for RecordingAgent {
             let _ = tx.send(hoh_app::host::Outcome {
                 success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                 detail: format!("{status:?}"),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: crate::world::group_exit::group_gone_after_reap(pid),
                 class: hoh_core::retry::FailureClass::Decision,
                 observed: Default::default(),
                 unknown_effect: false,

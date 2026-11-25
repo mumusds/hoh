@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 pub use pty::R;
 
 pub mod approval;
+pub mod group_exit;
 
 /// The product binary.
 pub const HOH: &str = env!("CARGO_BIN_EXE_hoh");
@@ -2189,12 +2190,7 @@ impl Team {
         let native = format!("N-{}", work.attempt_id);
         std::thread::spawn(move || {
             let status = child.wait();
-            let until = Instant::now() + Duration::from_secs(5);
-            let mut group_gone = hoh_agents::identity::group_empty(pid);
-            while !group_gone && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(10));
-                group_gone = hoh_agents::identity::group_empty(pid);
-            }
+            let group_gone = group_exit::group_gone_after_reap(pid);
             let _ = end.send(hoh_app::host::Outcome {
                 success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                 detail: "reviewed".to_owned(),
@@ -2269,7 +2265,7 @@ impl Team {
             let _ = end.send(hoh_app::host::Outcome {
                 success: false,
                 detail: "worked without a TaskResult".to_owned(),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: group_exit::group_gone_after_reap(pid),
                 class: hoh_core::retry::FailureClass::Transient { retry_after: None },
                 observed: hoh_core::persistence::Observed::default(),
                 unknown_effect: false,
@@ -2408,12 +2404,7 @@ impl hoh_app::host::Executor for Team {
         let (end, ended) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let status = child.wait();
-            let until = Instant::now() + Duration::from_secs(5);
-            let mut group_gone = hoh_agents::identity::group_empty(pid);
-            while !group_gone && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(10));
-                group_gone = hoh_agents::identity::group_empty(pid);
-            }
+            let group_gone = group_exit::group_gone_after_reap(pid);
             let _ = end.send(hoh_app::host::Outcome {
                 success: status.as_ref().is_ok_and(std::process::ExitStatus::success),
                 detail: "answered".to_owned(),

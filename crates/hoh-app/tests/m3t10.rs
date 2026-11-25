@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[path = "world/group_exit.rs"]
+mod group_exit;
 mod m3t10_fixes;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -639,7 +641,7 @@ impl hoh_app::host::Executor for FakeCommander {
             let _ = tx.send(hoh_app::host::Outcome {
                 success: status.is_ok_and(|s| s.success()),
                 detail: "scripted decision".into(),
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: group_exit::group_gone_after_reap(pid),
                 class: hoh_core::retry::FailureClass::Capability,
                 observed: hoh_core::persistence::Observed {
                     messages,
@@ -1128,7 +1130,7 @@ impl hoh_app::host::Executor for FakeConsult {
                 success: status.is_ok_and(|s| s.success()),
                 detail: "scripted consultation".into(),
                 class: hoh_core::retry::FailureClass::Capability,
-                group_gone: hoh_agents::identity::group_empty(pid),
+                group_gone: group_exit::group_gone_after_reap(pid),
                 observed: hoh_core::persistence::Observed {
                     messages: vec![result.to_string()],
                     ..Default::default()

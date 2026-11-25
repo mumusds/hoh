@@ -896,11 +896,7 @@ impl hoh_app::host::Executor for ProductBetweenDrafts {
             // FLK-11: reaping the leader can precede the kernel releasing its process group. As in Team::review,
             // report the outcome only after the group-exit barrier; false would leave the writer RUNNING/unreaped.
             let started = std::time::Instant::now();
-            let mut group_gone = hoh_agents::identity::group_empty(pid);
-            while !group_gone && started.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_millis(10));
-                group_gone = hoh_agents::identity::group_empty(pid);
-            }
+            let group_gone = world::group_exit::group_gone_after_reap(pid);
             eprintln!(
                 "FLK-11 group-exit barrier: {:?}, gone={group_gone}",
                 started.elapsed()
