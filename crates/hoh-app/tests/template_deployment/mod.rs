@@ -128,15 +128,16 @@ fn audit(trace: &str) -> R<usize> {
     for line in trace.lines() {
         let (pid, body) = trace_line(line)?;
         if body.starts_with("+++ ") {
+            // A call its thread did not return from, the exit printed without the call's pseudo result (FLK-15): checked
+            // as that result `?` would be, on what strace decoded at its entry. Only with a thread id.
+            if pid.is_some()
+                && let Some(start) = pending.remove(&pid)
+            {
+                count +=
+                    usize::from(check_call(&format!("{start}) = ?"), pid, line, &mut sockets)?.0);
+            }
             sockets.retain(|(owner, _)| Some(*owner) != pid);
             exiting.remove(&pid);
-            // A call strace could not read (`???`) never ran: its thread may exit without its pseudo result (FLK-15).
-            if pending
-                .get(&pid)
-                .is_some_and(|start: &String| start.starts_with("???("))
-            {
-                pending.remove(&pid);
-            }
             continue;
         }
         if exiting.contains(&pid) {
@@ -175,81 +176,11 @@ fn audit(trace: &str) -> R<usize> {
             }
             body.to_owned()
         };
-        let invalid = || format!("non-local or undecodable syscall: {line}");
-        let (name, rest) = call.split_once('(').ok_or_else(invalid)?;
-        let (args, result) = rest.rsplit_once("= ").ok_or_else(invalid)?;
-        let args = args
-            .trim_end()
-            .strip_suffix(')')
-            .ok_or_else(invalid)?
-            .trim_end();
-        // `?` is strace's pseudo result for a call whose thread exited before the call returned (the exit is checked
-        // below); anything else must be a number.
-        let result = match result.split_whitespace().next() {
-            Some("?") => None,
-            v => Some(v.and_then(|v| v.parse::<i32>().ok()).ok_or_else(invalid)?),
-        };
-        match name {
-            "socket" => {
-                let pid = pid.ok_or_else(invalid)?;
-                let fields = args.split(", ").collect::<Vec<_>>();
-                let [family, kind, protocol] = fields.as_slice() else {
-                    return Err(invalid().into());
-                };
-                // A socket whose result is unknown authorizes nothing.
-                if let Some(result) = result.filter(|v| *v >= 0) {
-                    // Every successful socket replaces the previous identity of this fd.
-                    sockets.remove(&(pid, result));
-                    let mut flags = kind.split('|');
-                    if *family == "AF_NETLINK"
-                        && flags.next() == Some("SOCK_RAW")
-                        && flags.all(|v| matches!(v, "SOCK_CLOEXEC" | "SOCK_NONBLOCK"))
-                        && *protocol == "NETLINK_SOCK_DIAG"
-                    {
-                        sockets.insert((pid, result));
-                    }
-                }
-            }
-            "close" => {
-                let pid = pid.ok_or_else(invalid)?;
-                let fd = args.parse::<i32>().map_err(|_| invalid())?;
-                // Do not retain permission even on a failed/ambiguous close.
-                sockets.remove(&(pid, fd));
-            }
-            "connect" => {
-                count += 1;
-                let (fd, address) = args.split_once(", ").ok_or_else(invalid)?;
-                let fd = fd.parse::<i32>().map_err(|_| invalid())?;
-                let (address, length) = address.rsplit_once(", ").ok_or_else(invalid)?;
-                let _ = length.parse::<u32>().map_err(|_| invalid())?;
-                let address = address
-                    .strip_prefix('{')
-                    .and_then(|v| v.strip_suffix('}'))
-                    .ok_or_else(invalid)?;
-                let local = address.starts_with("sa_family=AF_UNIX,")
-                    || (address.starts_with("sa_family=AF_INET,")
-                        && address.contains("inet_addr(\"127."))
-                    || (address.starts_with("sa_family=AF_INET6,")
-                        && address.contains("inet_pton(AF_INET6, \"::1\""));
-                let kernel = address
-                    .strip_prefix("sa_family=AF_NETLINK, nl_pid=0, nl_groups=")
-                    .is_some_and(|groups| {
-                        groups.len() == 8 && groups.bytes().all(|b| b.is_ascii_hexdigit())
-                    })
-                    && pid.is_some_and(|pid| sockets.contains(&(pid, fd)));
-                if !local && !kernel {
-                    return Err(invalid().into());
-                }
-            }
-            // strace prints `???(` when PTRACE_GET_SYSCALL_INFO fails at a syscall-entry stop. That fails only when the
-            // thread has a fatal signal pending (ptrace_freeze_traced), and with one pending the kernel aborts the call
-            // (ptrace_report_syscall_entry), so a `???` call never ran. It has no arguments and no result of its own.
-            "???" if args.is_empty() && result.is_none() => {}
-            "???" => return Err(invalid().into()),
-            _ => unreachable!(),
-        }
+        let (connect, result) = check_call(&call, pid, line, &mut sockets)?;
+        count += usize::from(connect);
         if result.is_none() {
-            exiting.insert(Some(pid.ok_or_else(invalid)?));
+            let pid = pid.ok_or_else(|| format!("pseudo result without a thread id: {line}"))?;
+            exiting.insert(Some(pid));
         }
     }
     if !pending.is_empty() {
@@ -259,6 +190,87 @@ fn audit(trace: &str) -> R<usize> {
         return Err("trace ended before a thread with a cut-off call exited".into());
     }
     Ok(count)
+}
+
+/// Checks one whole call and applies it to the thread's SOCK_DIAG sockets; gives whether it was a connect and its result
+/// (`None` for strace's pseudo result `?`, a call whose thread exited before it returned).
+fn check_call(
+    call: &str,
+    pid: Option<u32>,
+    line: &str,
+    sockets: &mut BTreeSet<(u32, i32)>,
+) -> R<(bool, Option<i32>)> {
+    let invalid = || format!("non-local or undecodable syscall: {line}");
+    let (name, rest) = call.split_once('(').ok_or_else(invalid)?;
+    let (args, result) = rest.rsplit_once("= ").ok_or_else(invalid)?;
+    let args = args
+        .trim_end()
+        .strip_suffix(')')
+        .ok_or_else(invalid)?
+        .trim_end();
+    let result = match result.split_whitespace().next() {
+        Some("?") => None,
+        v => Some(v.and_then(|v| v.parse::<i32>().ok()).ok_or_else(invalid)?),
+    };
+    match name {
+        "socket" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let fields = args.split(", ").collect::<Vec<_>>();
+            let [family, kind, protocol] = fields.as_slice() else {
+                return Err(invalid().into());
+            };
+            // A socket whose result is unknown authorizes nothing.
+            if let Some(result) = result.filter(|v| *v >= 0) {
+                // Every successful socket replaces the previous identity of this fd.
+                sockets.remove(&(pid, result));
+                let mut flags = kind.split('|');
+                if *family == "AF_NETLINK"
+                    && flags.next() == Some("SOCK_RAW")
+                    && flags.all(|v| matches!(v, "SOCK_CLOEXEC" | "SOCK_NONBLOCK"))
+                    && *protocol == "NETLINK_SOCK_DIAG"
+                {
+                    sockets.insert((pid, result));
+                }
+            }
+        }
+        "close" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let fd = args.parse::<i32>().map_err(|_| invalid())?;
+            // Do not retain permission even on a failed/ambiguous close.
+            sockets.remove(&(pid, fd));
+        }
+        "connect" => {
+            let (fd, address) = args.split_once(", ").ok_or_else(invalid)?;
+            let fd = fd.parse::<i32>().map_err(|_| invalid())?;
+            let (address, length) = address.rsplit_once(", ").ok_or_else(invalid)?;
+            let _ = length.parse::<u32>().map_err(|_| invalid())?;
+            let address = address
+                .strip_prefix('{')
+                .and_then(|v| v.strip_suffix('}'))
+                .ok_or_else(invalid)?;
+            let local = address.starts_with("sa_family=AF_UNIX,")
+                || (address.starts_with("sa_family=AF_INET,")
+                    && address.contains("inet_addr(\"127."))
+                || (address.starts_with("sa_family=AF_INET6,")
+                    && address.contains("inet_pton(AF_INET6, \"::1\""));
+            let kernel = address
+                .strip_prefix("sa_family=AF_NETLINK, nl_pid=0, nl_groups=")
+                .is_some_and(|groups| {
+                    groups.len() == 8 && groups.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+                && pid.is_some_and(|pid| sockets.contains(&(pid, fd)));
+            if !local && !kernel {
+                return Err(invalid().into());
+            }
+            return Ok((true, result));
+        }
+        // strace prints `???(` when PTRACE_GET_SYSCALL_INFO fails at a syscall-entry stop. That fails only when the
+        // thread has a fatal signal pending (ptrace_freeze_traced), and with one pending the kernel aborts the call
+        // (ptrace_report_syscall_entry), so a `???` call never ran. It has no arguments and no result of its own.
+        "???" if args.is_empty() && result.is_none() => {}
+        _ => return Err(invalid().into()),
+    }
+    Ok((false, result))
 }
 
 fn trace_line(line: &str) -> R<(Option<u32>, &str)> {
@@ -670,7 +682,19 @@ fn connect_audit_accepts_a_syscall_cut_off_by_its_threads_exit() -> R {
                  2588810 +++ exited with 0 +++\n\
                  2588807 +++ exited with 0 +++\n";
     assert_eq!(audit(named)?, 0);
-    // A connect cut off by its thread's exit is still checked against its decoded target.
+    // Calls whose thread exited, its exit printed without their pseudo result (local reproduction, t.48).
+    let unresumed = "2589424 socket(AF_INET, SOCK_STREAM, IPPROTO_IP <unfinished ...>\n\
+                     2589422 close(3 <unfinished ...>\n\
+                     2589424 +++ exited with 0 +++\n\
+                     2589422 +++ exited with 0 +++\n";
+    assert_eq!(audit(unresumed)?, 0);
+    // A connect cut off by its thread's exit is still checked against its decoded target, with or without `= ?`.
+    assert_eq!(
+        audit(
+            "101 connect(3, {sa_family=AF_UNIX, sun_path=\"/a\"}, 12 <unfinished ...>\n101 +++ exited with 0 +++\n"
+        )?,
+        1
+    );
     let local =
         "101 connect(3, {sa_family=AF_UNIX, sun_path=\"/a\"}, 12) = ?\n101 +++ exited with 0 +++\n";
     assert_eq!(audit(local)?, 1);
@@ -699,14 +723,20 @@ fn connect_audit_rejects_a_cut_off_syscall_whose_thread_did_not_exit() {
         // Without a thread id the exit cannot be tied to the call.
         "???( <unfinished ...>\n<... ??? resumed>) = ?\n+++ exited with 0 +++\n".to_owned(),
         "???()                           = ?\n+++ exited with 0 +++\n".to_owned(),
-        // A cut-off external connect is still refused, as is one whose fd only a cut-off socket opened, and a named
-        // call whose entry strace printed is checked whole, so it may not end with its thread.
+        // A cut-off external connect is still refused, unfinished at its thread's exit too, as is one whose fd only a
+        // cut-off socket opened.
         format!(
             "101 connect(3, {{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"1.1.1.1\")}}, 16 <unfinished ...>\n{killed}"
         ),
+        "101 connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"1.1.1.1\")}, 16 <unfinished ...>\n\
+         102 close(4) = 0\n101 +++ exited with 0 +++\n"
+            .to_owned(),
         format!(
-            "101 connect(3, {{sa_family=AF_UNIX, sun_path=\"/a\"}}, 12 <unfinished ...>\n{killed}"
+            "{}{killed}",
+            netlink.replace("= 0", "<unfinished ...>")
         ),
+        // An unfinished call without a thread id is not closed by an exit.
+        "connect(3, {sa_family=AF_UNIX, sun_path=\"/a\"}, 12 <unfinished ...>\n+++ exited with 0 +++\n".to_owned(),
         format!(
             "101 connect(3, {{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr(\"1.1.1.1\")}}, 16) = ?\n{killed}"
         ),
