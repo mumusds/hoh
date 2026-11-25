@@ -102,7 +102,8 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
     assert!(String::from_utf8(out.stdout)?.contains("\"outcome\":\"FAIL\""));
     let second = spawned(|| {
         let mut c = Command::new(&helpers.run_check);
-        c.arg("lint");
+        // Piped, never the test binary's stdout: libtest's result lines there are the checks' parsed log (M3QA-018).
+        c.arg("lint").stdout(Stdio::piped());
         c
     })?;
     serve(
@@ -110,7 +111,9 @@ fn run_check_asks_for_its_check_and_ends_with_its_exit_code() -> R {
         2,
         &json!({"status": "refused", "reasons": ["worktree dirty: x"]}),
     )?;
-    assert_eq!(second.wait_with_output()?.status.code(), Some(2));
+    let out = second.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stdout)?.contains("\"refused\""));
     let bad = spawned(|| {
         let mut c = Command::new(&helpers.run_check);
         c.arg("a b; rm -rf /").stdout(Stdio::piped());
