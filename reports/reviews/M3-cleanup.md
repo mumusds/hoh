@@ -660,3 +660,23 @@ Developer: agy (Antigravity CLI, gemini-4-neon-high), package `ab3e92ce..9711eeb
 | 2 (fix diff) | `b42503b7` | Grok 1.0.92, `01a215a5-4a8e-7383-bcd1-8650d07c5717` (`3a2c5e96-cf60-4415-ad87-0056e3e86699`), M4L2-200..299 | PASS, no findings: with the spec-inequality branch removed in a copy both the hoh-core unit test and the integration test exit 101, 0 on the unchanged tree; the integration assertion claims only the direct create_attempt refusal, not a round dispatch |
 
 M3QA-013 stays deferred (reason above). Deferred lows: none new.
+
+## FLK-14 (the busy-writer test's outside lock ran on its own wall clock)
+
+Developer diagnostics from `072f9fa6`, REQ-062 / AC-062-01, test `test_062_01_settings_busy_writer_responsive_reads`. Seen
+twice in a parallel `cargo test --workspace`: in the M3-T02 fix2 continuation ("expected HTTP 503, observed 202", isolated
+rerun passed, reports/reviews/M3.md) and on PR #128's pull_request run 45659710217 (`left: 202, right: 503`,
+`{"command_id":"c-r2","revision":1,"run_id":"r2","status":"ACCEPTED"}`). The second occurrence of the same class, so per
+docs/19 (审查收敛) a design correction came before the fix.
+
+DC-FLK14 (design correction). Invariant the test needs: while the test expects the product to see the database locked, the
+outside connection holds the lock, i.e. the release is ordered after the observation it is meant to precede. The old test did
+not have it: the python locker took `BEGIN IMMEDIATE`, printed `locked` and released after a fixed `time.sleep(7.0)` timed
+from the lock, while the test's busy window (5 s busy_timeout, 503 after 5 to 6 s) is timed from the command reaching SQLite.
+Their order held only while the command reached SQLite less than 2 s after the lock was taken (7 s − 5 s). Lifetime of the
+resource: the lock lived for a wall-clock interval chosen by the child, not for the test's observation. Correction: the
+child holds the lock until the test writes a line to its stdin (or its stdin closes, when the test ends or panics); the test
+releases the 7 s hold only once it has the command's reply and at least 7 s have passed since the command was sent, and the
+2 s hold 2 s after the command was sent, after checking that the command is still waiting. Both AC holds stay at least as
+long as the AC says, and no existing assertion changes. The same stdin-driven holder is already used by `db_faults.rs`, `tui_pty.rs`
+(`WriteLock`) and `delivery.rs`.
