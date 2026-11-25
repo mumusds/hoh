@@ -682,20 +682,29 @@ async fn running_pid(world: &World, id: &str) -> R<u32> {
     Err(format!("{id} never ran").into())
 }
 
-/// Another connection holding the store's write lock for `hold` (Python's sqlite3, test code); `ready` is created once
-/// the lock is held.
-fn hold_store(world: &World, ready: &Path, hold: Duration) -> R<std::process::Child> {
+/// Another connection holding the store's write lock (Python's sqlite3, test code); `ready` is created once the lock is
+/// held. It holds the lock until [`release`] (a line on its stdin, or its stdin closed when the test ends), never on a
+/// wall clock of its own (DC-FLK14, FLK-14-F1): the test releases it only after the cancel it must precede.
+fn hold_store(world: &World, ready: &Path) -> R<std::process::Child> {
     Ok(std::process::Command::new("python3")
         .args([
             "-c",
-            "import pathlib,sqlite3,sys,time; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
-             c.execute('BEGIN IMMEDIATE'); pathlib.Path(sys.argv[2]).touch(); time.sleep(float(sys.argv[3])); \
+            "import pathlib,sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
+             c.execute('BEGIN IMMEDIATE'); pathlib.Path(sys.argv[2]).touch(); sys.stdin.readline(); \
              c.execute('COMMIT')",
         ])
         .arg(world.dir.path().join(".hoh/state.db"))
         .arg(ready)
-        .arg(hold.as_secs_f64().to_string())
+        .stdin(std::process::Stdio::piped())
         .spawn()?)
+}
+
+/// Ends [`hold_store`]'s lock and waits for its connection: whether it held the lock and committed.
+fn release(mut holder: std::process::Child) -> R<bool> {
+    let mut stdin = holder.stdin.take().ok_or("no stdin")?;
+    std::io::Write::write_all(&mut stdin, b"release\n")?;
+    drop(stdin);
+    Ok(holder.wait()?.success())
 }
 
 /// A child that never reads its prompt neither holds up a cancel nor gets a success (M1T03R-02).
@@ -767,7 +776,7 @@ async fn a_cancel_queued_with_the_exit_still_cancels() -> R {
     let trigger = async {
         let pid = running_pid(&world, "A1").await?;
         // Hold the database while the fake speaks and exits; the adapter blocks on the init frame's write.
-        let mut holder = hold_store(&world, &go, Duration::from_millis(1500))?;
+        let holder = hold_store(&world, &go)?;
         for _ in 0..200 {
             if hoh_agents::identity::reaped(pid)? {
                 break;
@@ -775,8 +784,7 @@ async fn a_cancel_queued_with_the_exit_still_cancels() -> R {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(cancel.request(), CancelReceipt::Accepted);
-        let held = holder.wait()?;
-        Ok::<bool, Box<dyn std::error::Error>>(held.success())
+        release(holder)
     };
     let (outcome, held) = tokio::join!(running, trigger);
     assert!(held?, "the store was not held");
@@ -1025,14 +1033,13 @@ async fn a_cancel_while_the_end_is_committed_wins() -> R {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut holder = hold_store(&world, &go, Duration::from_millis(1500))?;
+        let holder = hold_store(&world, &go)?;
         while !go.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
         let receipt = cancel.request();
-        let held = holder.wait()?;
-        Ok::<(CancelReceipt, bool), Box<dyn std::error::Error>>((receipt, held.success()))
+        Ok::<(CancelReceipt, bool), Box<dyn std::error::Error>>((receipt, release(holder)?))
     };
     let (outcome, trigger) = tokio::join!(running, trigger);
     let (outcome, (receipt, held)) = (outcome?, trigger?);
