@@ -36,11 +36,13 @@ cargo deny --locked check licenses bans sources
 scan=(python3 scripts/product/persistence_scan.py --canary-log "$logs/canary.log")
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then scan+=(--out "$HOH_EVIDENCE_DIR/test-results.jsonl"); fi
 "${scan[@]}"
-# No Rust source names a machine-specific home directory: tests that created their temporary directories under one
-# developer's /home path passed on that machine and failed in CI (M3L-101, PR #108); use tempfile's defaults.
-found=0; grep -rnE 'tempdir_in\("/home|"/home/ai/' --include='*.rs' crates || found=$?
+# No source names a machine-specific home directory: tests that created their temporary directories under one
+# developer's /home path passed on that machine and failed in CI (M3L-101, PR #108 in Rust; M4L1-001 in a bundle test,
+# the same class again, so the scan covers Rust, Python and shell sources alike); use tempfile's defaults / TMPDIR.
+found=0; grep -rnE "tempdir_in\\(\"/home|[\"']/home/ai/" --include='*.rs' --include='*.py' --include='*.sh' \
+  crates tests tools scripts || found=$?
 if [[ "$found" == 0 ]]; then
-  echo 'static: a Rust source names a machine-specific /home path; use tempfile defaults' >&2
+  echo 'static: a source names a machine-specific /home path; use tempfile defaults' >&2
   exit 1
 elif [[ "$found" != 1 ]]; then
   echo "static: the machine-path scan failed (grep exit $found)" >&2

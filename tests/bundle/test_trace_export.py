@@ -168,7 +168,7 @@ class ProductStep(unittest.TestCase):
            'test_032_01_product_export_over_fault_variants_matches_the_mirror']
 
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='hoh-m4low1-product-step-', dir='/home/ai/dev')
+        self.temp=tempfile.TemporaryDirectory(prefix='hoh-m3t07-product-step-')
         self.addCleanup(self.temp.cleanup)
         r=self.root=Path(self.temp.name)/'root';r.mkdir()
         self.bin=Path(self.temp.name)/'bin';self.bin.mkdir()
