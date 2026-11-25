@@ -258,3 +258,34 @@ tui_pty, m3t10, recovery fixtures), unreproduced risk, to the M3 low package.
 - BT-03 (run_check.py queueing on the machine test slot): stays open; it changes a locked gate tool's behaviour without being a
   spec inconsistency, so it is not a CR-003 D1 refinement; asked of the owner in the next owner batch; meanwhile frozen checks
   run with the slot taken by the caller.
+
+## CR-038 / M3LD-100 (execution record `started`)
+
+Developer: Codex (CR draft and implementation), fix rounds by a fresh Claude session and a fresh Codex session. M3LD-100
+(medium, pre-existing): exit 127 meant both "never started" and "ran and exited 127", all FAIL/NOT_STARTED, so a real 127
+failure followed by a pass was PASS, not FLAKY. CR-038 adds a required `started` to the execution record: NOT_STARTED only
+for started=false (exit 127, not timed out, no artifacts, duration and interval within 5 s, else INVALID); started=true with
+127 is an ordinary FAIL; a record without the field is INVALID; pending facts written before the upgrade are recorded
+RECORD_INVALID. Approved by the CTO under CR-003 D1 after round 3 ("M3 cleanup: approve CR-038 and relock baseline rev 26").
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `6c9b89f2` | Claude 2.1.331 (Claude Code), `43d41e7d-38af-4cc9-965b-922e2fbabbfe` (`68f9d25a-2a3e-4b4b-9e53-3be4dd53dd31`) | PASS: M3LS-01 medium (the gate's exec-failure marker was a file the checked command could write, forging started=false), M3LS-02 low (pre-upgrade pending facts without `started` became Damaged), M3LS-03 low (docs) |
+| 1 | `6c9b89f2` | Grok grok 1.0.92 (b06756fd6256), `01a21057-72cf-7102-9436-5ab4cda170c9` (`0eda5ebb-8d1d-49d4-a733-23de78b081ec`) | PASS: M3LS-50 medium (a signal during or right after Popen escaped the cleanup; the child group kept running), M3LS-51 medium (= M3LS-01) |
+| 2 (fix diff) | `ca12180c` | Grok grok 1.0.92 (b06756fd6256), `01a2108d-b32c-7c21-b734-f8b638802e72` (`39c82cb7-5981-4bc7-ad95-8cf803c1a4f3`) | PASS: M3LS-100 medium (the inheritable report socket leaked into host spawns that bypassed the spawn lock) |
+| 2 (fix diff) | `ca12180c` | Codex codex-cli 0.171.0, `01a2108d-b665-79b0-9d5f-71533b027599` (`20f539e3-bbf6-4dfc-b9c3-2de4181990bd`) | PASS: M3LS-150 medium (a signal between the two handler swaps left SIGINT replaced), M3LS-151 medium (only the first held signal was replayed), M3LS-152 medium (traceability fixtures lacked the newly imported release_gate.py) |
+| 3 (fix diff) | `b2090e67` | Claude 2.1.331 (Claude Code), `4bf785f9-298f-4e4c-8f81-540256cf0b19` (`4a57525d-2770-4f69-997b-91df18335fb8`) | PASS: M3LS-200 low (an inherited SIG_IGN for SIGINT is replaced) |
+| 3 (fix diff) | `b2090e67` | Grok grok 1.0.92 (b06756fd6256), `01a210cd-1393-7963-80af-93de306105f7` (`fc0bc90a-e863-4073-b57b-9698bc829493`) | PASS, no findings |
+
+Round 1 fixes (Claude, red-first): "M3LS-01 M3LS-51 report gate exec failure through a close-on-exec descriptor", "M3LS-50 end
+a check interrupted as it is spawned and record it started", "M3LS-02 record pending facts written without started as
+RECORD_INVALID", "M3LS-03 document the interrupt and gate exec report corrections". Round 2 repeated both classes (a forgeable
+not-started report; a signal window), so the lead wrote design corrections before fixing: DC-LS-A, no inheritable report
+descriptor exists anywhere in the host at any time (the gate receives its report end with `go` over its private control
+channel by SCM_RIGHTS with MSG_CMSG_CLOEXEC; the spawn lock, `inheriting()` and `--exec-error-fd` removed; any delivery failure
+keeps started=true); DC-LS-B, handlers installed once by run_check only record signals, in order, and `execute` polls that
+record at fixed points (no handler swapping, nothing raised from a handler). Fix round 2 (Codex, red-first): "M3LS-100 deliver
+the gate exec report over SCM_RIGHTS close-on-exec", "M3LS-150 M3LS-151 record interrupts without swapping handlers in
+execute", "M3LS-152 copy release_gate.py into traceability fixtures". Round-1 lesson: a DRAFT CR's bundle suite was reported
+"red only on the unrelocked baseline" without checking; M3LS-152 hid behind it. Later rounds ran the bundle suite after a
+relock in a scratch copy. Deferred low: M3LS-200 (M3 low package). Final checks: see the PR.
