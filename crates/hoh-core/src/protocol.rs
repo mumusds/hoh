@@ -154,7 +154,7 @@ schema_enum!(
     RejectionReason, "SCREAMING_SNAKE_CASE",
     [StaleRoleEpoch, StaleRevision, StaleLeaseEpoch, SpecMismatch, CandidateMismatch, IllegalTransition, DependencyNotAccepted,
      BudgetNotReservable, RoleCapabilityMissing, EvidenceGateUnmet, SessionNotIndependent, KeyReuse, LeaseUnavailable,
-     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit, AssumptionNotListed]
+     RetryNotDue, RoleBindingPending, ConsultCycle, DiscussionLimit, AssumptionNotListed, StorageLowSpace]
 );
 schema_enum!(
     /// `ErrorCode`: API errors, CLI stderr codes and attempt failure reasons.
@@ -162,7 +162,8 @@ schema_enum!(
     [CapabilityUnsupported, RunNotFound, DbBusy, DbOnNetworkFs, DbWalUnsupported, DbFull, InvalidTeamConfig, ContextBudgetTooSmall,
      ProtocolFrameTooLarge, ProtocolIncomplete, DagCycle, DagMissingDependency, ScoreOutOfRange, CursorExpired,
      DagDuplicateTask, RunConfigFrozen, SpecConflict, SpecInvalid, SpecApprovalNotUser, PromptVariableMissing, PromptTooLong,
-     SpecSourceUnavailable]
+     SpecSourceUnavailable, QueryInvalid, ArtifactNotFound, ArtifactInvalid, ArtifactNotText, ArtifactRangeInvalid,
+     ArtifactUnreadable, StorageLowSpace]
 );
 schema_enum!(
     /// Task states (`transition_task.to_state`).
