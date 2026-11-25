@@ -1446,6 +1446,49 @@ async fn test_052_04_a_missing_command_is_not_started_with_or_without_a_gate() -
 }
 
 #[tokio::test]
+async fn test_052_04_a_gated_command_cannot_forge_its_gate_exec_failure() -> R {
+    // M3LS-01/M3LS-51 (CR-038 decision 2): the gate reports a failed exec through a descriptor the command never holds,
+    // not through any path the command can write. A started command that writes what the old file marker held, where
+    // it was ($HOH_EVIDENCE_DIR/../spawn-error), and exits 127 is still recorded started: an ordinary FAIL.
+    // It lists what it holds: never the gate's report socket.
+    let f = Fixture::with_qa(concat!(
+        "for fd in /proc/$$/fd/*; do readlink \"$fd\"; done\n",
+        "printf 'exec_failed\\n' > \"$HOH_EVIDENCE_DIR/../spawn-error\"\nexit 127\n",
+    ))
+    .await?;
+    let c = f.frozen().await?;
+    let ran = run_with(
+        &f.store,
+        &f.root(),
+        &f.state(),
+        &Request {
+            candidate_id: c,
+            check_id: "qa".into(),
+            argv: QA.iter().map(|a| (*a).to_owned()).collect(),
+            producer_attempt_id: "Q/attempt-1".into(),
+        },
+        Launch {
+            adopt: Some(Box::new(|_| Ok(()))),
+            gate: Some(env!("CARGO_BIN_EXE_hoh").into()),
+            ..Launch::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let record = f.record(&ran)?;
+    assert_eq!(record["exit_code"], 127, "{record}");
+    assert_eq!(record["started"], true, "{record}");
+    assert_ne!(ran.outcome.reason, Some("NOT_STARTED"), "{record}");
+    let held = std::fs::read_to_string(ran.record_dir.join("stdout.log"))?;
+    assert!(held.contains("pipe:"), "{held}");
+    assert!(
+        !held.contains("socket:"),
+        "the command holds a socket: {held}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_053_02_a_real_started_127_and_a_passing_rerun_are_flaky() -> R {
     use hoh_core::verification::acceptance::{CheckRun, Label, check_label};
     // Both executions use the same frozen candidate; only the ignored runtime marker changes.

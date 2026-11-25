@@ -265,5 +265,15 @@ fn a_check_gate_execs_the_check_in_its_place_with_its_whole_environment_only_on_
     assert_eq!(code, Some(64));
     let (code, _, _) = check_gate(&["/nonexistent/check"], &env, b"go\n")?;
     assert_eq!(code, Some(127));
+    // CR-038 (M3LS-01): the exec report's descriptor is a number of 3 or above followed by `--`; nothing else runs.
+    for argv in [
+        &["--exec-error-fd", "1", "--", "sh", "-c", "echo ran"][..],
+        &["--exec-error-fd", "x", "--", "sh", "-c", "echo ran"],
+        &["--exec-error-fd", "5", "sh", "-c", "echo ran"],
+        &["--exec-error-fd"],
+    ] {
+        let (code, out, _) = check_gate(argv, &env, b"go\n")?;
+        assert_eq!((code, out.as_str()), (Some(64), ""), "{argv:?}");
+    }
     Ok(())
 }
