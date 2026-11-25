@@ -399,3 +399,103 @@ parsed for test results. Both stay as they are.
 - Findings (M3-T05 QA round 2, medium): the scenario-check tests of AC-008-01 (`tui_pty.rs` `test_008_01_running_plan_pause_resume_approval_review`) and AC-008-04 did not observe every Then clause.
 - Fix (developer Claude session, attempt 3d0baeb6-b4d9-4f45-b899-c1b3fb78ce3c; test-only, no product change): `tui_pty.rs` now observes the PLAN safe point, PAUSE_REQUESTED before PAUSED, the return to RUNNING before drafting, `spec_review.opened` while RUNNING and the full Git write set; new `drafting.rs` `test_008_04_plan_rejects_writer_plan_and_draft_product_writes_block_with_their_paths` runs AC-008-04 end to end in the product host (Commander-bridge plan rejected, the drafting agent's own tracked/untracked/deleted writes, `plan.write_violation` with exactly those paths, the question listing them, no CR, no new revision). Eight reds shown by temporarily breaking the asserted product behaviour; equality assertions without a red are listed in the developer's per-clause table. pre-pr exit 0.
 - Review (fresh Grok session, attempt a603096d-0d2a-4c5a-9c47-59a00577b9ed, session 01a214c2-d1f7-7de3-bff0-9b517ba038d1): **PASS**, no findings; every Then clause of both ACs checked against the asserting lines; the diff is test-only.
+
+## M4 low package 1 (M3QA-003, M3LE-01, M3LE-02)
+
+Developer: Grok, branch `task/M4-lowpkg1` from `072f9fa6`. Three lows carried from M3. M3QA-003 and M3LE-02 are fixed
+red-first, each in its own commit. M3LE-01 is analysis only: contracts and behaviour are unchanged. The full
+`bash scripts/dev/pre-pr.sh` follows this record and is not claimed here. The logs below are self-tests, not acceptance.
+
+### M3QA-003
+
+`scripts/product/traceability.py` read a relative `HOH_EVIDENCE_DIR` and passed it to the TEST-032-01 product step.
+`crates/hoh-app/tests/trace.rs` `write_exports` writes those exports with the test binary's cwd, which cargo sets to
+`crates/hoh-app`, so a relative path was `NotFound` there (Os error 2). A planned check is unaffected:
+`tools/run_check.py` resolves the evidence directory to an absolute path before it starts the script.
+
+The script owns the value. `evidence_directory` resolves a relative path once against the cwd of the process that read
+it, and rewrites `HOH_EVIDENCE_DIR` only in that case, so the child sees the same directory. An absolute path is
+returned unchanged and the variable is not rewritten, so the files a planned check records stay the same. Commit
+`73083607` ("M3 cleanup: M3QA-003 resolve a relative HOH_EVIDENCE_DIR at the script"). ADR-039 DC-T07b notes the same
+rule.
+
+Red, before that change (`.hoh-dev/self-tests/m4low1/m3qa003-red.log`): 
+`test_a_relative_evidence_directory_is_written_from_the_invocation` failed because the product-step stub could not
+create `rel-evidence/marker` (`FileNotFoundError: [Errno 2] No such file or directory: 'rel-evidence/marker'`), and the
+script reported the product step failed (1), TEST-032-01 FAIL. Green, after
+(`.hoh-dev/self-tests/m4low1/m3qa003-green.log`): `python3 -m unittest discover -s tests/bundle -p test_trace_export.py`
+ran 9 tests, 1 skipped, OK in 8.137s. The marker landed under the invocation directory, and the absolute-path
+product-step test still passed.
+
+### M3LE-02
+
+`ApproveSpec` and `ProposeSpecChange` read the spec sources on `spawn_blocking`. A `JoinError` (the blocking thread
+panicked or was cancelled) answered HTTP 503 with code `UNPROCESSABLE`, `retryable=true`, and `current_revision` null.
+The approval-input path already maps the same join failure to `SpecReadError::unavailable`, and `store_error` already
+maps `PersistError::SpecSourceUnavailable` to 503 `SPEC_SOURCE_UNAVAILABLE`. CR-036 decision 1 is that an unavailable
+spec source is that retryable 503, with the DB_BUSY error shape (`code`, `message`, `retryable`, `current_revision`),
+and nothing is written. Post-commit index publication (`publish_spec`) stays the existing retryable 503
+`UNPROCESSABLE` (CR-036 decision 3) and was not changed.
+
+There was no seam that produces a `JoinError` without a panic. `HostHooks::fail_spec_source_read` defaults to false
+(`NoHostFaults` is unchanged). When a test returns true, the read panics inside that `spawn_blocking` closure; tokio
+turns the panic into a `JoinError`, and the arm now goes through
+`store_error(PersistError::SpecSourceUnavailable)`. Commit `39cd199f` ("M3 cleanup: M3LE-02 map a spec-source join
+failure to SPEC_SOURCE_UNAVAILABLE").
+
+The test name is `spec_source_join_failure_answers_spec_source_unavailable` and is not `test_NNN_MM`, so traceability
+does not record a new TEST id (M3FK-01). It arms the hook for one read of both `ApproveSpec` and `ProposeSpecChange`,
+and expects 503, `SPEC_SOURCE_UNAVAILABLE`, `retryable=true`, the CR-036 message prefix, `current_revision` equal to
+the command's `expected_revision`, the four-field error object, an unchanged snapshot, no `spec.index_failed`, then
+202 on the same command and a replay that does not write again.
+
+Red, mapping still `UNPROCESSABLE` (`.hoh-dev/self-tests/m4low1/m3le02-red.log`, exit 101): the join panicked with
+`injected spec-source join failure`, the body was `{"code":"UNPROCESSABLE","current_revision":null,"message":
+"specification read stopped: task 26 panicked with message \"injected spec-source join failure\"","retryable":true}`,
+and the assertion failed on the code. Green (`.hoh-dev/self-tests/m4low1/m3le02-green.log`, exit 0): that test passed
+in 1.74s. The six `unavailable` tests in the same binary, including the new one and the existing 422 invalid-index
+test, passed (`.hoh-dev/self-tests/m4low1/m3le02-unavailable-regression.log`, exit 0, 6 passed). Both runs were
+`flock /home/ai/dev/.hoh-test-slot.lock cargo test --locked -p hoh-app --test spec_source` with the test name, then
+with the filter `unavailable`.
+
+### M3LE-01
+
+No code or contract change. ENOENT on the spec root, and a workspace that is not a git repository, also answer the
+retryable 503 `SPEC_SOURCE_UNAVAILABLE`, and they are not transient. The current mapping matches the approved wording.
+Splitting the class needs its own CR.
+
+What the code does. `host/spec.rs` `sources` calls `symlink_metadata` on `docs` and `docs/spec` and maps every I/O
+error, including `NotFound`, to `SpecReadError::Unavailable`. If the path exists and is not a directory, that is an
+`IndexError` ("expected a directory, not a link") and stays 422 `SPEC_INVALID`. A missing `docs/spec/index.json` is
+not this case: `files` treats `NotFound` on the index as "no index yet". `files` then runs
+`git ls-files -z -- docs/spec/index.json`. `control::git` discards stderr and, on a non-zero status, returns
+`git <args>: <status>`. In a directory that is not a repository, `git ls-files` exits 128, so the client message is
+the status line (`exit status: 128`), not git's stderr phrase "not a git repository". A failure to spawn `git` is the
+same `Unavailable`. Both become `PersistError::SpecSourceUnavailable` and `store_error`'s retryable 503. Nothing is
+written and `spec.index_failed` is not recorded. No test in this tree drives ENOENT on `docs` or `docs/spec`, or a
+non-repository.
+
+Which wording covers them. CR-036 decision 1: a Git enumeration failure or a filesystem read failure, on
+`ApproveSpec`, `ProposeSpecChange`, or the read that answers a spec-approval question, is HTTP 503,
+`retryable=true`; the command is not accepted; no CR, revision, or `spec.index_failed` is written. Decision 3 keeps
+genuinely invalid specs on 422 `SPEC_INVALID`. ADR-033 §1 states the same split: enumeration or filesystem read
+failures are `SpecReadError::Unavailable` and 503 `SPEC_SOURCE_UNAVAILABLE`; illegal syntax, links, and non-regular
+files stay non-retryable 422. ENOENT on `docs` or `docs/spec`, exit 128 from `git ls-files`, and a missing `git`
+binary are read or enumeration failures under that wording. The code follows it.
+
+What a class split would be. Three classes, not one:
+
+1. Transient unavailability: permission denied on a file that exists, I/O errors, and the `JoinError` fixed as
+   M3LE-02. These stay retryable 503 `SPEC_SOURCE_UNAVAILABLE`.
+2. The spec root is absent (`docs` or `docs/spec` does not exist). That is a permanent shape, closer to the existing
+   "expected a directory" `IndexError` (422 `SPEC_INVALID`, non-retryable) than to a lock or a permissions blip.
+3. The workspace is not a git repository (exit 128), or `git` cannot be spawned. That stays permanent until the
+   repository or the binary exists. It is not invalid specification content, so 422 `SPEC_INVALID` would mis-label
+   it the way M3B-07 rejected for I/O errors.
+
+CR-036 ties `SPEC_SOURCE_UNAVAILABLE` to `retryable=true` (decision 1, and the client keeps exit 69 for 503). Setting
+`retryable=false` on the same code would contradict that decision. A new reason code, or moving class 2 or 3 to 422,
+changes what clients retry and touches the locked protocol schema, OpenAPI, ADR-033, and CR-036, so it needs its own
+CR and a baseline relock if an `ErrorCode` is added. It is not a CR-003 D1 "add a missing code" change: the code
+exists and the approved text already classifies these failures as retryable. This package does not implement the
+split.
