@@ -285,6 +285,21 @@ fn test_052_04_missing_or_inconsistent_started_is_invalid() -> R {
         valid(&e, &c, &c.manifest.spec.sha256, &w).is_err(),
         "long interval is not trusted"
     );
+    // M3LS-02: a record read with `started` filled in is judged as it was written, without it: RECORD_INVALID.
+    let mut e = e0(&c);
+    let w = world0(&c, &e);
+    let mut written = serde_json::to_value(&e.record)?;
+    assert!(valid(&e, &c, &c.manifest.spec.sha256, &w).is_ok());
+    written
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("started");
+    e.read_as = Some(written);
+    let codes = valid(&e, &c, &c.manifest.spec.sha256, &w)
+        .err()
+        .map(|i| i.codes())
+        .unwrap_or_default();
+    assert_eq!(codes, ["RECORD_INVALID"], "{codes:?}");
     Ok(())
 }
 
@@ -329,6 +344,7 @@ fn e0(c: &Sealed) -> Evidence {
         git_tree: m.git_tree.clone(),
         record_dir: DIR.to_owned(),
         observations: vec![line("TEST-052-04", "PASS")],
+        read_as: None,
     }
 }
 

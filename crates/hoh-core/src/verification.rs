@@ -346,6 +346,10 @@ pub struct Evidence {
     /// Relative to the checkout root; every file the record names is inside it.
     pub record_dir: String,
     pub observations: Vec<Value>,
+    /// The record as it was written, when that is not `record` itself: pending facts an older writer left without a
+    /// field the schema now requires, read with it filled in (CR-038 decision 1, M3LS-02). Rule 1 holds this, not
+    /// `record`, to the schema, so such a record is RECORD_INVALID.
+    pub read_as: Option<Value>,
 }
 
 /// The frozen check plan's entry for one check (contracts/check-plan.schema.json).
@@ -694,9 +698,12 @@ pub fn valid(e: &Evidence, c: &Sealed, s: &str, world: &dyn Lookup) -> Result<()
     need(r.candidate_id == c.candidate_id, Reason::CandidateMismatch);
     // Rule 1: the record is of the locked contracts/execution.schema.json's shape (M2T10R-01).
     need(
-        serde_json::to_value(r)
-            .ok()
-            .is_some_and(|v| Record::from_value(&v).is_ok()),
+        match &e.read_as {
+            Some(written) => Record::from_value(written).is_ok(),
+            None => serde_json::to_value(r)
+                .ok()
+                .is_some_and(|v| Record::from_value(&v).is_ok()),
+        },
         Reason::RecordInvalid,
     );
     // CR-038: a long interval cannot masquerade as an inconclusive launch failure.

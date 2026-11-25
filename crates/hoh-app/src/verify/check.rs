@@ -1073,6 +1073,7 @@ async fn finish(
                     run_id: &ready.run_id,
                     record_dir: &record_dir,
                     source: RecordingSource::Run,
+                    read_as: None,
                 },
                 &facts,
             )?;
@@ -1242,6 +1243,7 @@ pub async fn record_attempt_change(
                 run_id: &row.run_id,
                 record_dir: &record_dir,
                 source: RecordingSource::Run,
+                read_as: None,
             },
             &facts,
         )?;
@@ -1455,6 +1457,8 @@ struct Judged<'a> {
     record_dir: &'a Path,
     /// The check's own run, or a recovery of its pending record (docs/adr/ADR-031.md correction D's write intents).
     source: RecordingSource,
+    /// The record as its pending facts hold it, when they were read with a field filled in ([`Evidence::read_as`]).
+    read_as: Option<Value>,
 }
 
 /// The judgement of a run's facts on its files as they are now (principle one; decisions 8 and 9): its observations
@@ -1493,6 +1497,7 @@ fn judge(reader: &Reader, at: &Judged<'_>, facts: &Facts) -> Result<(Recording, 
             .to_owned(),
         record_dir: relative_to(project, at.record_dir),
         observations,
+        read_as: at.read_as.clone(),
     };
     let m = &sealed.manifest;
     let plan: Value = hoh_core::objects::get(project, &m.test_plan.sha256)
@@ -1801,8 +1806,20 @@ fn pending(
             }
             let text = hoh_core::objects::read_regular(&file).map_err(unreadable)?;
             let damaged = |e: String| CheckError::Damaged(format!("{}: {e}", file.display()));
-            let mut facts: Facts =
+            let mut facts: Value =
                 serde_json::from_slice(&text).map_err(|e| damaged(e.to_string()))?;
+            // Pending facts an older writer left have no `started` (CR-038 decision 1, M3LS-02): read as a command that
+            // started, never as one that did not, and judged as written, so RECORD_INVALID rather than never recorded.
+            let read_as = match facts.get_mut("record").and_then(Value::as_object_mut) {
+                Some(record) if !record.contains_key("started") => {
+                    let written = Value::Object(record.clone());
+                    record.insert("started".to_owned(), Value::Bool(true));
+                    Some(written)
+                }
+                _ => None,
+            };
+            let mut facts: Facts =
+                serde_json::from_value(facts).map_err(|e| damaged(e.to_string()))?;
             // Bound to its record directory by candidate and check as well as by record id (M2T10R-551).
             let check_id = check
                 .file_name()
@@ -1848,6 +1865,7 @@ fn pending(
                     run_id,
                     record_dir: &record_dir,
                     source: RecordingSource::Recovery,
+                    read_as,
                 },
                 &facts,
             )?;
