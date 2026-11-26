@@ -887,3 +887,59 @@ fn test_011_05_unmapped_frames_do_not_starve_the_coalescing_flush() {
         "an overdue coalesced text must flush on any later frame: {out:?}"
     );
 }
+
+#[tokio::test]
+async fn test_011_05_loss_ledger_counts_unsettled_closed_and_unqueued_parts() {
+    let (sender, mut receiver) = channel(Mode::CodexAppServer, "0.166.0");
+    let loss = receiver.loss.clone();
+    let mut part = gap(Mode::CodexAppServer, 3, "x");
+    part.text = "abcd".into();
+    let mut later = part.clone();
+    later.received_offset = 5;
+    publish(&sender, vec![part.clone(), later.clone()])
+        .await
+        .unwrap();
+    // The drain settles the first part and drops the second with its gap recorded.
+    let first = receiver.recv().await.unwrap();
+    loss.settled();
+    assert_eq!(
+        loss.summary().unrecorded,
+        1,
+        "an unsettled queued part counts lost"
+    );
+    assert_eq!(loss.summary().first_offset, Some(5));
+    let second = receiver.recv().await.unwrap();
+    loss.dropped(&second.part, true);
+    loss.settled();
+    let s = loss.summary();
+    assert_eq!((s.dropped, s.unrecorded, s.bytes), (1, 0, 4));
+    assert!(
+        !s.needs_gap(),
+        "a dropped part with its own gap needs no end gap"
+    );
+    drop((first, second));
+    // A closed queue: the part and the rest of its batch count lost.
+    drop(receiver);
+    let mut a = part.clone();
+    a.received_offset = 1;
+    assert!(publish(&sender, vec![a, part.clone()]).await.is_err());
+    let s = loss.summary();
+    assert_eq!(s.unrecorded, 2);
+    assert_eq!(s.first_offset, Some(1));
+    assert!(s.needs_gap());
+}
+
+#[tokio::test]
+async fn test_011_05_try_publish_never_waits_and_counts_what_does_not_fit() {
+    let (sender, mut receiver) = channel(Mode::CodexAppServer, "0.166.0");
+    let mut part = gap(Mode::CodexAppServer, 7, "x");
+    part.text = "y".repeat(600 << 10);
+    // Two 600 KiB bodies exceed the 1 MiB budget: the second is lost, not awaited.
+    try_publish(&sender, vec![part.clone(), part.clone()]);
+    assert!(receiver.recv().await.is_some());
+    let s = receiver.loss.summary();
+    assert_eq!(s.unrecorded, 2, "one lost, one queued and not yet settled");
+    receiver.loss.settled();
+    assert_eq!(receiver.loss.summary().unrecorded, 1);
+    assert_eq!(receiver.loss.summary().bytes, 600 << 10);
+}

@@ -713,6 +713,8 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     let mut normalizer = public
         .as_ref()
         .map(|p| crate::public_stream::Normalizer::new_coalescing(p.mode, &p.version));
+    // Kept after the queue closes, so what is no longer published is still counted (M4T09R-301).
+    let loss = public.as_ref().map(crate::public_stream::Publisher::loss);
     let mut receive_offset = 0u64;
     let mut settled = false;
     enum PublishState {
@@ -777,6 +779,11 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         match frame {
             Ok(Some(frame)) => {
                 refused = matches!(frame, Frame::TooLarge(_));
+                if public.is_none()
+                    && let Some(loss) = &loss
+                {
+                    loss.frame_after_close(receive_offset);
+                }
                 if let (Some(sender), Some(normalizer)) = (&public, normalizer.as_mut()) {
                     let mut parts = Vec::new();
                     if let Frame::Line(bytes) | Frame::Reduced { line: bytes, .. } = &frame {
@@ -850,12 +857,34 @@ async fn read_stdout<R: AsyncRead + Unpin>(
             public = None;
         }
     }
-    if let Some(sender) = &public
+    if was_abandoned && let (Some(sender), Some(normalizer)) = (&public, normalizer.as_mut()) {
+        // Abandoned: nothing may wait, but pending and held text (redacted per DC-M4T09b) and the unfinished gap are
+        // still offered to the queue; what does not fit is counted lost for the process-end gap (M4T09R-305).
+        let mut parts = normalizer.flush();
+        parts.push(crate::public_stream::gap(
+            sender.mode,
+            receive_offset,
+            "native_stream_unfinished",
+        ));
+        crate::public_stream::try_publish(sender, parts);
+    } else if let Some(sender) = &public
         && (!report.eof || !settled)
     {
         let gap =
             crate::public_stream::gap(sender.mode, receive_offset, "native_stream_unfinished");
-        tokio::select! { biased;_ = abandoned(&mut abandon)=>{}, _=sender.send(gap)=>{} }
+        // A send cut short by abandon counts its gap lost itself; one never started is offered without waiting.
+        let mut started = false;
+        tokio::select! {
+            biased;
+            _ = abandoned(&mut abandon) => {}
+            _ = async {
+                started = true;
+                sender.send(gap.clone()).await
+            } => {}
+        }
+        if !started {
+            crate::public_stream::try_publish(sender, vec![gap]);
+        }
     }
     report.bytes = reader.bytes_read();
     report.max_buffered = reader.max_buffered();
@@ -1355,6 +1384,57 @@ mod tests {
         .ok_or("no cancel exit report")?;
         assert_eq!(exit.cause, Cause::Cancelled);
         assert_eq!(exit.stdout.public_gap, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_011_05_abandon_flushes_pending_public_text_and_sends_the_unfinished_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncWriteExt as _;
+        let (publisher, mut receiver) =
+            crate::public_stream::channel(crate::public_stream::Mode::CodexAppServer, "0.166.0");
+        let (mut write, read) = tokio::io::duplex(4096);
+        let reader = FrameReader::new(
+            Tee {
+                inner: read,
+                copy: None,
+            },
+            1 << 20,
+            4096,
+        );
+        let (events, mut rx) = mpsc::channel(4);
+        let (stop, abandoned) = watch::channel(false);
+        let task = tokio::spawn(read_stdout(reader, events, abandoned, Some(publisher)));
+        write
+            .write_all(
+                b"{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"m\",\"delta\":\"line\\npassword tail\"}}\n",
+            )
+            .await?;
+        assert!(matches!(rx.recv().await, Some(Event::Frame(_))));
+        stop.send_replace(true);
+        let report = task.await?;
+        drop(write);
+        assert!(!report.eof);
+        let mut parts = Vec::new();
+        while let Some(pending) = receiver.recv().await {
+            parts.push(pending.part);
+        }
+        let text: String = parts
+            .iter()
+            .filter(|p| p.kind == hoh_core::public_output::PublicKind::Message)
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(
+            text, "line\n[redacted]",
+            "pending coalesced text and the held tail flush (redacted) on abandon: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|p| p.kind == hoh_core::public_output::PublicKind::Gap
+                    && p.activity.as_deref() == Some("native_stream_unfinished")),
+            "an abandoned stream still sends its unfinished gap: {parts:?}"
+        );
         Ok(())
     }
 
