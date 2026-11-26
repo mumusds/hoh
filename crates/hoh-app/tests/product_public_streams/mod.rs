@@ -533,6 +533,127 @@ async fn test_011_05_drain_survives_backpressure_diagnostic_busy_and_same_offset
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct PublicFullFault {
+    job: std::sync::Mutex<&'static str>,
+    public_count: std::sync::atomic::AtomicUsize,
+    gap_refusals_left: std::sync::atomic::AtomicUsize,
+    gap_attempts: std::sync::atomic::AtomicUsize,
+}
+impl hoh_core::persistence::FaultHooks for PublicFullFault {
+    fn before_job(&self, job: &'static str) {
+        if let Ok(mut current) = self.job.lock() {
+            *current = job;
+        }
+    }
+    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
+        use std::sync::atomic::Ordering;
+        let current = self.job.lock().map(|g| *g).unwrap_or("");
+        // Frame 0 (init) is public job 0; frame 1 (DROPPED_BODY) is job 1 and meets a full state DB.
+        if current == "Public" && self.public_count.fetch_add(1, Ordering::SeqCst) == 1 {
+            return Err(hoh_core::persistence::PersistError::Full(
+                "injected public DB_FULL".into(),
+            ));
+        }
+        if current == "PublicGap" {
+            self.gap_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .gap_refusals_left
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(hoh_core::persistence::PersistError::Full(
+                    "injected gap DB_FULL".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_011_05_db_full_drops_body_retries_its_gap_and_reports_unrecorded_loss_at_end() -> R {
+    use std::sync::{Arc, atomic::Ordering};
+    // (gap refusals, whether the inline gap is finally written)
+    for (refusals, recorded) in [(2usize, true), (usize::MAX, false)] {
+        let world = World::new()?;
+        let body = world.claude_body(None)?;
+        let frames = world.bin().join("claude.d/public-full.jsonl");
+        std::fs::write(
+            &frames,
+            [
+                json!({"type":"system","subtype":"init","session_id":"full","model":"fixture"}),
+                json!({"type":"assistant","uuid":"f1","session_id":"full","message":{"id":"m1","content":[{"type":"text","text":"DROPPED_BODY"}]}}),
+                json!({"type":"assistant","uuid":"f2","session_id":"full","message":{"id":"m2","content":[{"type":"text","text":"AFTER_FULL"}]}}),
+                json!({"type":"result","uuid":"f3","subtype":"success","is_error":false,"result":"AFTER_FULL","session_id":"full","usage":{"input_tokens":10,"output_tokens":5}}),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )?;
+        let body = body.replace("$f/success/stdout.jsonl", &frames.display().to_string());
+        world.script("claude", &body)?;
+        world.bind_installed()?;
+        let faults = Arc::new(PublicFullFault::default());
+        faults.gap_refusals_left.store(refusals, Ordering::SeqCst);
+        let mut config = world.config();
+        config.store.faults = faults.clone();
+        let host = start_when_free(config).await?;
+        let outcome = async {
+            let project = world.project();
+            let run = started(&host, &project, "db-full").await?;
+            ready(&project, &run, &[("FULL", "developer")])?;
+            until(
+                &project,
+                "SELECT state FROM attempts WHERE attempt_id='FULL/attempt-1'",
+                "SETTLED",
+                Duration::from_secs(30),
+            )
+            .await?;
+            let label = format!("refusals={refusals}");
+            assert_eq!(
+                faults.gap_attempts.load(Ordering::SeqCst),
+                3,
+                "{label}: the gap is tried a bounded number of times"
+            );
+            assert_eq!(
+                query(&project, "SELECT count(*) FROM events WHERE kind='public.message' AND json_extract(payload_json,'$.attempt_id')='FULL/attempt-1' AND json_extract(payload_json,'$.text')='AFTER_FULL'")?,
+                "1",
+                "{label}: the drain keeps going after DB_FULL"
+            );
+            assert_eq!(
+                query(&project, "SELECT count(*) FROM events WHERE json_extract(payload_json,'$.text')='DROPPED_BODY'")?,
+                "0",
+                "{label}: DB_FULL drops the body"
+            );
+            let inline = query(&project, "SELECT count(*) FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='FULL/attempt-1' AND json_extract(payload_json,'$.reason')='public_storage_error'")?;
+            let end = query(&project, "SELECT coalesce((SELECT payload_json FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='FULL/attempt-1' AND json_extract(payload_json,'$.reason')='public_output_lost'),'null')")?;
+            let end: Value = serde_json::from_str(&end)?;
+            if recorded {
+                assert_eq!(inline, "1", "{label}: the retried gap is written");
+                let gap: Value = serde_json::from_str(&query(&project, "SELECT payload_json FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='FULL/attempt-1' AND json_extract(payload_json,'$.reason')='public_storage_error'")?)?;
+                assert!(gap["error"].as_str().is_some_and(|e| e.contains("DB_FULL")), "{gap}");
+                assert_eq!(gap["dropped_bytes"], "DROPPED_BODY".len());
+                assert!(end.is_null(), "{label}: nothing unrecorded, no end gap: {end}");
+            } else {
+                assert_eq!(inline, "0", "{label}");
+                assert_eq!(end["first_dropped_offset"], 1, "{label}: {end}");
+                assert_eq!(end["unrecorded_parts"], 1, "{label}: {end}");
+                assert_eq!(end["dropped_bytes"], "DROPPED_BODY".len(), "{label}: {end}");
+                assert_eq!(end["complete"], false, "{label}: {end}");
+            }
+            R::Ok(())
+        }
+        .await;
+        host.shutdown().await;
+        world.stop_fakes()?;
+        outcome?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_011_05_low_space_body_writes_gap_without_stalling_attempt_or_inactivity() -> R {
     use std::sync::{Arc, atomic::AtomicU64};
@@ -592,6 +713,46 @@ signal.pause()
             "0",
             "low-space body must not write an object"
         );
+        // The gap carries the identity public::native binds and the dropped part's place (M4T09R-201).
+        let gap: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='LOWSPACE/attempt-1' AND json_extract(payload_json,'$.reason')='storage_low_space'",
+        )?)?;
+        let after: Value = serde_json::from_str(&query(
+            &project,
+            "SELECT payload_json FROM events WHERE kind='public.message' AND json_extract(payload_json,'$.attempt_id')='LOWSPACE/attempt-1' AND json_extract(payload_json,'$.text')='AFTER_LOW_SPACE'",
+        )?)?;
+        for key in ["run_id", "task_id", "role", "role_epoch", "session_id", "config_revision", "spec_id", "native_stream", "current"] {
+            assert_eq!(gap[key], after[key], "gap {key}: {gap} vs {after}");
+        }
+        assert!(gap["session_id"].is_string(), "{gap}");
+        assert_eq!(gap["task_id"], "LOWSPACE");
+        assert_eq!(gap["role"], "developer");
+        assert_eq!(gap["stream"], "text");
+        assert_eq!(gap["first_offset"], 0);
+        assert_eq!(gap["received_offset"], 1);
+        assert_eq!(gap["dropped_bytes"], 24576);
+        assert_eq!(gap["complete"], false);
+        assert!(gap.get("spec_id").is_some(), "{gap}");
+        assert_eq!(
+            query(
+                &project,
+                &format!(
+                    "SELECT count(*) FROM public_native_parts WHERE attempt_id='LOWSPACE/attempt-1' AND block_id='{}'",
+                    gap["block_id"].as_str().unwrap_or_default()
+                ),
+            )?,
+            "1",
+            "the gap takes the dropped part's place"
+        );
+        // A session-filtered Focus finds the gap beside the session's later message.
+        super::until(
+            &project,
+            "SELECT count(*)>0 FROM events e JOIN ui_event_index i ON i.seq=e.seq WHERE e.kind='public.gap' AND json_extract(e.payload_json,'$.reason')='storage_low_space' AND i.attempt_id='LOWSPACE/attempt-1' AND i.role='developer' AND i.session_id IS NOT NULL AND i.session_id IN (SELECT i2.session_id FROM events m JOIN ui_event_index i2 ON i2.seq=m.seq WHERE m.kind='public.message' AND json_extract(m.payload_json,'$.text')='AFTER_LOW_SPACE')",
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
         super::until(
             &project,
             &watchdog_events("LOWSPACE/attempt-1", "attempt.inactive"),

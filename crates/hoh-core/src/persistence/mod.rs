@@ -1226,6 +1226,19 @@ impl Store {
             .await
     }
 
+    /// Record the gap of a public part whose body was dropped, in the part's place and with its attempt's identity
+    /// (M4T09R-201); idempotent per native part.
+    pub async fn record_public_gap(
+        &self,
+        attempt: &str,
+        epoch: i64,
+        drop: crate::public_output::PublicDrop,
+    ) -> Result<Option<i64>, PersistError> {
+        self.writer
+            .record_public_gap(attempt.to_owned(), epoch, drop)
+            .await
+    }
+
     pub async fn ui_backfill(&self) -> Result<UiIndexStatus, PersistError> {
         self.writer.ui_backfill().await
     }

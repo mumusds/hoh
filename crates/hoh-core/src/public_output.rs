@@ -56,3 +56,12 @@ pub struct PublicPart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_id: Option<String>,
 }
+/// A public part whose body the drain could not store, recorded as a gap in its place (M4T09R-201). `part` names the
+/// dropped occurrence (its text is not carried); `details` are non-secret storage facts (bytes, an error code).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicDrop {
+    pub part: PublicPart,
+    pub dropped_bytes: u64,
+    pub reason: String,
+    pub details: serde_json::Map<String, serde_json::Value>,
+}

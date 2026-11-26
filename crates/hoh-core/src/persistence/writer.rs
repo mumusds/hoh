@@ -135,6 +135,12 @@ enum Job {
         Box<crate::public_output::PublicPart>,
         oneshot::Sender<Result<Option<i64>, PersistError>>,
     ),
+    PublicGap(
+        String,
+        i64,
+        Box<crate::public_output::PublicDrop>,
+        oneshot::Sender<Result<Option<i64>, PersistError>>,
+    ),
     UiBackfill(oneshot::Sender<Result<super::UiIndexStatus, PersistError>>),
     Commit(Commit, oneshot::Sender<Result<Committed, PersistError>>),
     EnsureProject(String, String, oneshot::Sender<Result<(), PersistError>>),
@@ -517,6 +523,7 @@ impl Job {
     fn name(&self) -> &'static str {
         match self {
             Job::Public(..) => "Public",
+            Job::PublicGap(..) => "PublicGap",
             Job::UiBackfill(..) => "UiBackfill",
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
@@ -685,6 +692,13 @@ impl Writer {
                                 &ctx,
                                 reply,
                                 super::public::native(&mut conn, &attempt, epoch, &part, &ctx),
+                            ));
+                        }
+                        Job::PublicGap(attempt, epoch, drop, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::public::dropped(&mut conn, &attempt, epoch, &drop, &ctx),
                             ));
                         }
                         Job::UiBackfill(reply) => {
@@ -996,6 +1010,16 @@ impl Writer {
         part: crate::public_output::PublicPart,
     ) -> Result<Option<i64>, PersistError> {
         self.submit(|reply| Job::Public(attempt, epoch, Box::new(part), reply))
+            .await
+    }
+
+    pub(super) async fn record_public_gap(
+        &self,
+        attempt: String,
+        epoch: i64,
+        drop: crate::public_output::PublicDrop,
+    ) -> Result<Option<i64>, PersistError> {
+        self.submit(|reply| Job::PublicGap(attempt, epoch, Box::new(drop), reply))
             .await
     }
 

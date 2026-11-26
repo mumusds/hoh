@@ -1725,8 +1725,12 @@ async fn attempt(
     // A failure whose provider said when its limit lifts waits for that as its Retry-After, counted by this clock from
     // the time it ended, so its task is due exactly then (REQ-042 behaviour 1, M2T07R-256).
     let mut outcome = outcome;
-    if let Some(reason) = public.finish().await {
-        outcome.observed.events.push(("public/gap".into(),"public.gap".into(),json!({"attempt_id":id,"role_epoch":work.assignment.role_epoch,"reason":reason,"complete":false})));
+    if let Some(gap) = public.finish().await {
+        outcome.observed.events.push((
+            "public/gap".into(),
+            "public.gap".into(),
+            gap.payload(&id, work.assignment.role_epoch),
+        ));
     }
     if !outcome.success {
         outcome.class = outcome.class.with_reset(outcome.retry_at, ended);
