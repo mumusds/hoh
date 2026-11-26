@@ -793,6 +793,10 @@ impl ProcessControl for Fixed {
 /// How long one git command of the workspace record may take.
 const GIT_LIMIT: Duration = Duration::from_secs(5);
 
+/// How long [`git_run_limited`] keeps draining stdout after git's process group has been killed and git reaped, so a
+/// hook or filter that left the group and holds stdout open cannot stall the caller (M3CX-700).
+const GIT_DRAIN_LIMIT: Duration = Duration::from_millis(500);
+
 /// git's empty tree, the base of a diff in a repository with no commit yet.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -829,10 +833,9 @@ pub(crate) fn as_attempt<T>(marker: &str, f: impl FnOnce() -> T) -> T {
 }
 
 /// [`git`] whatever its exit status: the status and the output (`git check-ignore` answers "not ignored" with 1). git
-/// runs in a process group of its own. On every path, its output's reader is joined before this returns, after the
-/// group is killed while git is not yet reaped (so its pid still names that group): the pipe's writers are gone then,
-/// and the join waits only for what is already in the pipe (M2T13R-450). Only a process git started that left the
-/// group and keeps the pipe open could hold it; git's read-only commands here start none that do.
+/// runs in a process group of its own. Stdout is drained nonblocking on the calling thread while waiting for git and
+/// for at most [`GIT_DRAIN_LIMIT`] after killing its process group and reaping git (M2T13R-450, M3CX-700): no reader
+/// thread can outlive the call if a child left the group and kept stdout open.
 pub(crate) fn git_run(
     project: &Path,
     args: &[&str],
@@ -859,13 +862,68 @@ pub(super) fn git_bounded<S: AsRef<std::ffi::OsStr>>(
     Ok(out)
 }
 
+enum PipeRead {
+    Open,
+    Eof,
+    LimitExceeded,
+    Error(std::io::Error),
+}
+
+fn drain_pipe(
+    pipe: &mut std::process::ChildStdout,
+    out: &mut Vec<u8>,
+    limit: Option<usize>,
+    discard: bool,
+    deadline: Instant,
+) -> PipeRead {
+    use std::io::Read as _;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => return PipeRead::Eof,
+            Ok(n) => {
+                if !discard {
+                    if let Some(max) = limit {
+                        let remaining = (max + 1).saturating_sub(out.len());
+                        let take = n.min(remaining);
+                        out.extend_from_slice(&buf[..take]);
+                        if out.len() > max {
+                            return PipeRead::LimitExceeded;
+                        }
+                    } else {
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return PipeRead::Open;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return PipeRead::Open,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= deadline {
+                    return PipeRead::Open;
+                }
+            }
+            Err(e) => return PipeRead::Error(e),
+        }
+    }
+}
+
+fn poll_pipe(pipe: &std::process::ChildStdout, wait: Duration) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(pipe, PollFlags::IN)];
+    let limit = Timespec::try_from(wait).ok();
+    let _ = poll(&mut fds, limit.as_ref());
+}
+
 fn git_run_limited<S: AsRef<std::ffi::OsStr>>(
     project: &Path,
     args: &[S],
     limit: Option<usize>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use rustix::process::{WaitId, WaitIdOptions};
-    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
     use std::os::unix::process::CommandExt as _;
     let label = args
         .iter()
@@ -888,27 +946,61 @@ fn git_run_limited<S: AsRef<std::ffi::OsStr>>(
         .spawn()
         .map_err(|e| format!("git {}: {e}", label))?;
     let git = rustix::process::Pid::from_child(&child);
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let stdout = stdout.ok_or_else(|| std::io::Error::other("no stdout"))?;
-        stdout
-            .take(limit.map_or(u64::MAX, |n| n as u64 + 1))
-            .read_to_end(&mut out)?;
-        if limit.is_some_and(|n| out.len() > n) {
-            return Err(std::io::Error::other("draft path output limit exceeded"));
+    let mut stdout = match child.stdout.take() {
+        Some(pipe) => match fcntl_getfl(pipe.as_fd())
+            .and_then(|flags| fcntl_setfl(pipe.as_fd(), flags | OFlags::NONBLOCK))
+        {
+            Ok(()) => Some(pipe),
+            Err(e) => {
+                let _ = rustix::process::kill_process_group(git, rustix::process::Signal::KILL);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {}: {e}", label));
+            }
+        },
+        None => {
+            let _ = rustix::process::kill_process_group(git, rustix::process::Signal::KILL);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("git {}: no stdout", label));
         }
-        Ok(out)
-    });
+    };
+    let mut out = Vec::new();
+    let mut read_error: Option<std::io::Error> = None;
+    let mut limit_exceeded = false;
     let end = Instant::now() + GIT_LIMIT;
     // Its end is seen without reaping it: its pid, which names its group, stays its own until the wait below.
     let ended = loop {
+        if let Some(pipe) = stdout.as_mut() {
+            match drain_pipe(pipe, &mut out, limit, false, end) {
+                PipeRead::Open => {}
+                PipeRead::Eof => stdout = None,
+                PipeRead::LimitExceeded => {
+                    limit_exceeded = true;
+                    stdout = None;
+                    break Ok(());
+                }
+                PipeRead::Error(e) => {
+                    read_error = Some(e);
+                    stdout = None;
+                }
+            }
+        }
         match rustix::process::waitid(
             WaitId::Pid(git),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ) {
             Ok(Some(_)) => break Ok(()),
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < end => {
+                let step = end
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10));
+                if let Some(pipe) = stdout.as_ref() {
+                    poll_pipe(pipe, step);
+                } else {
+                    std::thread::sleep(step);
+                }
+            }
             Ok(None) => {
                 break Err(format!("git {}: over {GIT_LIMIT:?}", label));
             }
@@ -917,19 +1009,61 @@ fn git_run_limited<S: AsRef<std::ffi::OsStr>>(
             }
         }
     };
-    // What git started and left in its group ends with it (and git, past the limit); then git is reaped, then the
-    // reader joined.
+    // What git started and left in its group ends with it (and git, past the limit); then git is reaped, then
+    // remaining buffered stdout is drained up to GIT_DRAIN_LIMIT (M3CX-700).
     let _ = rustix::process::kill_process_group(git, rustix::process::Signal::KILL);
-    if ended.is_err() {
+    if ended.is_err() || limit_exceeded {
         let _ = child.kill();
     }
     let status = child.wait();
-    let read = reader.join();
+    let mut stdout_held_open = false;
+    if stdout.is_some() {
+        let drain_end = Instant::now() + GIT_DRAIN_LIMIT;
+        let discard = ended.is_err();
+        while let Some(pipe) = stdout.as_mut() {
+            match drain_pipe(pipe, &mut out, limit, discard, drain_end) {
+                PipeRead::Open => {
+                    let left = drain_end.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        stdout_held_open = true;
+                        drop(stdout.take());
+                        break;
+                    }
+                    poll_pipe(pipe, left.min(Duration::from_millis(20)));
+                }
+                PipeRead::Eof => stdout = None,
+                PipeRead::LimitExceeded => {
+                    limit_exceeded = true;
+                    stdout = None;
+                }
+                PipeRead::Error(e) => {
+                    read_error = Some(e);
+                    stdout = None;
+                }
+            }
+        }
+    }
+    if stdout_held_open {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "hoh host: git {label}: stdout stayed open past {GIT_DRAIN_LIMIT:?} after process-group kill; stopped reading"
+        );
+    }
     ended?;
     let status = status.map_err(|e| format!("git {}: {e}", label))?;
-    let out = read
-        .map_err(|_| "git: its output was lost".to_owned())?
-        .map_err(|e| format!("git {}: {e}", label))?;
+    if limit_exceeded {
+        return Err(format!("git {}: draft path output limit exceeded", label));
+    }
+    if let Some(e) = read_error {
+        return Err(format!("git {}: {e}", label));
+    }
+    if stdout_held_open {
+        return Err(format!(
+            "git {}: stdout stayed open past {GIT_DRAIN_LIMIT:?}",
+            label
+        ));
+    }
     Ok((status, out))
 }
 
@@ -1180,6 +1314,128 @@ mod tests {
             "what git started still ran when git_run returned: {left:?}"
         );
         assert!(took < GIT_LIMIT + Duration::from_secs(3), "{took:?}");
+        Ok(())
+    }
+
+    /// Kill a daemonized test child recorded in `pidfile` only if its cmdline still matches `expected`.
+    struct KillRecordedSleep {
+        pidfile: PathBuf,
+        seconds: String,
+    }
+
+    impl KillRecordedSleep {
+        fn live_pid(&self) -> Option<i32> {
+            let pid = std::fs::read_to_string(&self.pidfile)
+                .ok()?
+                .trim()
+                .parse::<i32>()
+                .ok()?;
+            let expected = format!("sleep\0{}\0", self.seconds);
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .filter(|c| c == expected.as_bytes())
+                .map(|_| pid)
+        }
+    }
+
+    impl Drop for KillRecordedSleep {
+        fn drop(&mut self) {
+            if let Some(pid) = self.live_pid()
+                && let Some(pid) = rustix::process::Pid::from_raw(pid)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    #[test]
+    fn a_git_command_whose_daemonized_child_holds_stdout_returns_within_its_limit() -> R {
+        // M3CX-700: a hook/alias child that leaves git's process group (setsid) and keeps stdout open must not
+        // stall git_run indefinitely, both when git times out (keeping the timeout outcome) and when git exits.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir()?;
+        git_in(dir.path(), &["init", "-q"])?;
+
+        // Case 1: git itself times out while a daemonized child outside its process group holds stdout open.
+        let timeout_seconds = format!("10.{}", std::process::id());
+        let timeout_guard = KillRecordedSleep {
+            pidfile: dir.path().join("daemon-timeout.pid"),
+            seconds: timeout_seconds.clone(),
+        };
+        let timeout_script = dir.path().join("daemon-timeout.sh");
+        std::fs::write(
+            &timeout_script,
+            format!(
+                "#!/usr/bin/env sh\n\
+                 setsid -f -- sh -c 'echo $$ > \"$1\"; exec sleep \"$2\"' _ '{}' '{}' </dev/null 2>/dev/null\n\
+                 until [ -s '{}' ]; do sleep 0.01; done\n\
+                 exec sleep '{}'\n",
+                timeout_guard.pidfile.display(),
+                timeout_seconds,
+                timeout_guard.pidfile.display(),
+                timeout_seconds,
+            ),
+        )?;
+        std::fs::set_permissions(&timeout_script, std::fs::Permissions::from_mode(0o755))?;
+        let timeout_alias = format!("alias.m3cx700=!{}", timeout_script.display());
+        let began = Instant::now();
+        let ran = git_run(dir.path(), &["-c", &timeout_alias, "m3cx700"]);
+        let took = began.elapsed();
+        let still_live = timeout_guard.live_pid().is_some();
+        drop(timeout_guard);
+        let err = ran.expect_err("timed-out git with daemonized stdout holder must fail");
+        assert!(
+            err.contains(&format!("over {GIT_LIMIT:?}")),
+            "existing timeout outcome must be preserved: {err}"
+        );
+        assert!(
+            took < GIT_LIMIT + Duration::from_secs(3),
+            "git_run stalled waiting on stdout held by daemonized child: {took:?}"
+        );
+        assert!(
+            still_live,
+            "daemonized child should still have been holding stdout when git_run stopped waiting (took {took:?})"
+        );
+
+        // Case 2: git exits promptly while a daemonized child outside its process group keeps stdout open.
+        let exit_seconds = format!("8.{}", std::process::id());
+        let exit_guard = KillRecordedSleep {
+            pidfile: dir.path().join("daemon-exit.pid"),
+            seconds: exit_seconds.clone(),
+        };
+        let exit_script = dir.path().join("daemon-exit.sh");
+        std::fs::write(
+            &exit_script,
+            format!(
+                "#!/usr/bin/env sh\n\
+                 setsid -f -- sh -c 'echo $$ > \"$1\"; exec sleep \"$2\"' _ '{}' '{}' </dev/null 2>/dev/null\n\
+                 until [ -s '{}' ]; do sleep 0.01; done\n",
+                exit_guard.pidfile.display(),
+                exit_seconds,
+                exit_guard.pidfile.display(),
+            ),
+        )?;
+        std::fs::set_permissions(&exit_script, std::fs::Permissions::from_mode(0o755))?;
+        let exit_alias = format!("alias.m3cx700=!{}", exit_script.display());
+        let began = Instant::now();
+        let ran = git_run(dir.path(), &["-c", &exit_alias, "m3cx700"]);
+        let took = began.elapsed();
+        let still_live = exit_guard.live_pid().is_some();
+        drop(exit_guard);
+        let err =
+            ran.expect_err("exited git with daemonized stdout holder must fail at drain deadline");
+        assert!(
+            err.contains("stdout stayed open"),
+            "expected stdout-stayed-open error, got: {err}"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "git_run stalled waiting on stdout held by daemonized child after exit: {took:?}"
+        );
+        assert!(
+            still_live,
+            "daemonized child should still have been holding stdout when git_run stopped waiting (took {took:?})"
+        );
         Ok(())
     }
 
