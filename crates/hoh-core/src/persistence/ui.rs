@@ -66,8 +66,17 @@ pub(super) fn index_event(
         None
     };
     let attempt = payload["attempt_id"].as_str();
-    let facts: Option<(String, Option<i64>, Option<String>)> = if let Some(id) = attempt {
-        conn.query_row("SELECT t.role,a.role_epoch,a.session_id FROM attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=?1 AND (?2 IS NULL OR t.run_id=?2)",params![id,run],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sqlite_error)?
+    // Only immutable attempt-creation facts (task role, attempt role_epoch) are joined here;
+    // mutable attempts.session_id (updated via COALESCE in move_attempt) is never read so online
+    // indexing and forced rebuild produce identical rows field by field (M4T09R-002).
+    let facts: Option<(String, Option<i64>)> = if let Some(id) = attempt {
+        conn.query_row(
+            "SELECT t.role,a.role_epoch FROM attempts a JOIN tasks t USING(task_id) WHERE a.attempt_id=?1 AND (?2 IS NULL OR t.run_id=?2)",
+            params![id, run],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?
     } else {
         None
     };
@@ -79,9 +88,7 @@ pub(super) fn index_event(
         .as_i64()
         .or_else(|| facts.as_ref().and_then(|f| f.1))
         .filter(|n| *n > 0);
-    let named = payload["session_id"]
-        .as_str()
-        .or_else(|| facts.as_ref().and_then(|f| f.2.as_deref()));
+    let named = payload["session_id"].as_str();
     let session: Option<String> = if let Some(id) = named {
         conn.query_row(
             "SELECT session_id FROM sessions WHERE session_id=?1",
