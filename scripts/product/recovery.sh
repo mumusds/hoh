@@ -21,6 +21,7 @@ if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
   python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"
 fi
 [[ "$rc" -eq 0 ]] || exit "$rc"
+python3 scripts/product/test_results.py --log "$log" --check-stdout
 passed="$(grep -Eo 'test result: [a-z]+\. [0-9]+ passed' "$log" | awk '{s+=$4} END {print s+0}')"
 if [[ "$passed" -eq 0 ]]; then
   echo "NO_TESTS: the recovery check passed 0 executed tests; an empty or all-ignored suite is not evidence." >&2

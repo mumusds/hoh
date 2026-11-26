@@ -573,6 +573,42 @@ class TestLogStreams(unittest.TestCase):
                 if 'cargo test' in line and '| tee' in line:
                     self.assertNotIn('2>&1',line,f'{name}:{n}')
                     self.assertNotIn('|&',line,f'{name}:{n}')
+    def test_m3r1001_every_parsed_check_guards_fd1(self):
+        feeding=sorted(p.name for p in (ROOT/'scripts/product').glob('*.sh') if 'test_results.py' in p.read_text())
+        self.assertEqual(feeding,['cargo-tests.sh','deployment.sh','recovery.sh','tui-pty.sh'])
+        for name in feeding:
+            text=(ROOT/'scripts/product'/name).read_text()
+            self.assertIn('--check-stdout',text,f'{name} does not guard stdout against leaked child fd 1 output')
+    def test_m3r1001_child_writing_to_inherited_fd1_fails_the_check(self):
+        # M3R-1001: a test child inheriting fd 1 (like the stray JSON line found in the M3QA-018 audit, or an
+        # interleaved line that hides a test result) must fail the check instead of passing silently.
+        leak_cases=[
+            ('stray_json_line',
+             '#!/usr/bin/env bash\n'
+             'printf "\\nrunning 1 test\\n"\n'
+             'printf \'{"reasons":["worktree dirty: x"],"status":"refused"}\\n\'\n'
+             'printf "test test_001_01_ok ... ok\\n"\n'
+             'printf "\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n"\n'),
+            ('interleaved_result_line',
+             '#!/usr/bin/env bash\n'
+             'printf "\\nrunning 1 test\\n"\n'
+             'printf "child leak on fd1test test_001_01_ok ... ok\\n"\n'
+             'printf "\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n"\n'),
+        ]
+        for label,fake_cargo in leak_cases:
+            for script in self.SCRIPTS:
+                with self.subTest(case=label,script=script):
+                    with tempfile.TemporaryDirectory(prefix='hoh-m3r1001-') as d:
+                        d=Path(d);product=d/'repo/scripts/product';product.mkdir(parents=True)
+                        for name in (script,'test_results.py'):shutil.copy(ROOT/'scripts/product'/name,product/name)
+                        bin_=d/'bin';bin_.mkdir()
+                        cargo=bin_/'cargo';cargo.write_text(fake_cargo);cargo.chmod(0o755)
+                        run=bin_/'systemd-run';run.write_text('#!/usr/bin/env bash\nwhile [[ "$1" != -- ]];do shift;done;shift;exec "$@"\n');run.chmod(0o755)
+                        env={**os.environ,'PATH':f'{bin_}:{os.environ["PATH"]}'}
+                        env.pop('HOH_EVIDENCE_DIR',None)
+                        r=subprocess.run(['bash',str(product/script),*self.args(script)],capture_output=True,text=True,env=env,timeout=60)
+                        self.assertNotEqual(r.returncode,0,f'{script} ({label}) should fail on child fd-1 leak: {r.stdout}{r.stderr}')
+                        self.assertIn('fd 1',r.stderr.lower())
 
 def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=(),target_dir=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
