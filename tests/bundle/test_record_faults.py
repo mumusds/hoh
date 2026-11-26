@@ -125,6 +125,19 @@ class FakeProvider(unittest.TestCase):
         self.assertEqual(p.log[0]['model'],'m')
         self.assertNotIn('secret',json.dumps(p.log))
 
+    def test_flk17_an_answer_is_logged_before_the_client_can_read_it(self):
+        # FLK-17: the provider wrote the response before logging it, so a client that read the answer and closed
+        # the provider at once could find the last request missing from the log (seen once in pre-pr: [429, 503, 503]).
+        p=faults.FakeProvider({'routes':[],'default':{'status':404,'body':{'error':'no route'}}})
+        try:
+            for n in range(1,301):
+                req=urllib.request.Request(p.url+'/x',data=b'{}',method='POST')
+                try:urllib.request.urlopen(req,timeout=10).close()
+                except urllib.error.HTTPError as e:e.close()
+                self.assertEqual(len(p.log),n)
+        finally:
+            p.close()
+
 class Namespace(unittest.TestCase):
     def test_only_loopback_and_no_route_out_is_sealed(self):
         self.assertEqual(faults.sealed_problems(['lo'],[errno.ENETUNREACH,errno.ENETUNREACH]),[])

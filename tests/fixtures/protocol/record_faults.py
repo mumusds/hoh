@@ -94,12 +94,6 @@ class FakeProvider:
         data = QUOTED_NOW.sub(lambda m: str(int(at) + int(m.group(1))), json.dumps(resp.get('body', {}))).encode()
         headers = {'content-type': 'application/json'} | {k: NOW.sub(lambda m: str(int(at) + int(m.group(1))), str(v))
                                                           for k, v in resp.get('headers', {}).items()}
-        h.send_response(resp['status'])
-        for k, v in headers.items():
-            h.send_header(k, v)
-        h.send_header('content-length', str(len(data)))
-        h.end_headers()
-        h.wfile.write(data)
         try:
             model = json.loads(body).get('model') if body else None
         except (ValueError, AttributeError):
@@ -109,6 +103,13 @@ class FakeProvider:
                  'request_headers': sorted(k.lower() for k in h.headers.keys() if k.lower() not in SECRET_HEADERS)}
         with self.lock:
             self.log.append(entry)
+        # Logged before the answer is written (FLK-17): a client that has read it finds it in the log.
+        h.send_response(resp['status'])
+        for k, v in headers.items():
+            h.send_header(k, v)
+        h.send_header('content-length', str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
 
     def close(self) -> None:
         self.server.shutdown()
