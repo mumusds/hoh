@@ -424,8 +424,8 @@ fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offse
     assert_eq!(flushed[0].text, "hello world\n");
     assert_eq!(flushed[0].first_offset, 0);
 
-    // 16 KiB size cap flushes immediately without waiting for 50 ms.
-    let big = "a".repeat(COALESCE_BYTES);
+    // 16 KiB size cap flushes immediately without waiting for 50 ms (a whole line, so redaction withholds nothing).
+    let big = format!("{}\n", "a".repeat(COALESCE_BYTES - 1));
     let p2 = n.feed_at(
         &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":big}}),
         2,
@@ -629,9 +629,9 @@ fn random_split(text: &str, rng: &mut Rng) -> Vec<String> {
     out
 }
 
-/// Asserts DC-M4T09b on one block's published parts: concatenation equals the batch redaction of `full`, offsets are
-/// contiguous, and each part is marked redacted exactly when it carries a redaction.
-fn assert_block_invariant(parts: &[&PublicPart], full: &str, label: &str) {
+/// Offsets are contiguous and each part is flagged `redacted` exactly when redaction altered it, that is when it
+/// carries a `[redacted]` marker (the texts here never contain one themselves); returns the concatenation.
+fn assert_parts_contiguous_and_flagged(parts: &[&PublicPart], label: &str) -> String {
     let mut at = 0u64;
     for p in parts {
         assert_eq!(p.first_offset, at, "{label}: contiguous offsets {parts:?}");
@@ -639,11 +639,47 @@ fn assert_block_invariant(parts: &[&PublicPart], full: &str, label: &str) {
         assert_eq!(
             p.redacted,
             p.text.contains("[redacted]"),
-            "{label}: redacted flag iff the chunk carries a redaction: {p:?}"
+            "{label}: redacted flag iff redaction altered the part: {p:?}"
         );
     }
-    let combined: String = parts.iter().map(|p| p.text.as_str()).collect();
+    parts.iter().map(|p| p.text.as_str()).collect()
+}
+
+/// Asserts DC-M4T09b on one block's published parts: concatenation equals the batch redaction of `full`, offsets are
+/// contiguous, and each part is marked redacted exactly when redaction altered it.
+fn assert_block_invariant(parts: &[&PublicPart], full: &str, label: &str) {
+    let combined = assert_parts_contiguous_and_flagged(parts, label);
     assert_eq!(combined, redact(full).0, "{label}: streamed == batch");
+}
+
+/// The longest line of `full`, newline included.
+fn longest_line(full: &str) -> usize {
+    full.split_inclusive('\n').map(str::len).max().unwrap_or(0)
+}
+
+/// M4T09R-400: no byte of `secret` in `full` within [`WITHHELD_WINDOW`] bytes before the end of a keyword on its line
+/// may appear in `published`. Every test text places each secret once, before its keyword on the same line.
+fn assert_no_secret_within_window(published: &str, full: &str, secret: &str, label: &str) {
+    for line in full.split_inclusive('\n') {
+        let (Some(at), Some(end)) = (line.find(secret), keyword_end(line)) else {
+            continue;
+        };
+        if end <= at + secret.len() + WITHHELD_WINDOW {
+            assert!(
+                !published.contains(secret),
+                "{label}: a secret within the window of its keyword was published"
+            );
+        }
+    }
+}
+
+/// End (exclusive) of the first secret keyword in `line`: the shortest prefix [`line_contains_secret`] flags.
+fn keyword_end(line: &str) -> Option<usize> {
+    let low = line.to_ascii_lowercase();
+    SECRET_KEYWORDS
+        .iter()
+        .filter_map(|k| low.find(k).map(|at| at + k.len()))
+        .min()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -723,6 +759,37 @@ const PROPERTY_TEXTS: &[&str] = &[
     "short\nhunter2 then access_token later on the same line\nvisible\n",
 ];
 
+/// Lines near the 16 KiB cap and near the cap plus the withheld window (M4T09R-400, -401): a credential just before
+/// the boundary with its keyword one byte after it, multi-byte UTF-8 straddling it, clean long lines, and lines whose
+/// keyword lies far beyond the window.
+fn near_cap_texts() -> Vec<String> {
+    let mut texts = Vec::new();
+    for limit in [COALESCE_BYTES, COALESCE_BYTES + WITHHELD_WINDOW] {
+        for len in [limit - 1, limit, limit + 1] {
+            // A credential ending at `len` with its keyword starting one byte later.
+            texts.push(format!("{}hunter2 password\nafter\n", "a".repeat(len - 7)));
+            // A clean line of exactly `len` bytes, newline included.
+            texts.push(format!("{}\nnext\n", "b".repeat(len - 1)));
+            // Multi-byte characters across the boundary, then the credential and its keyword.
+            let wide = "中".repeat(len / 3 + 1);
+            texts.push(format!("{wide}hunter2 secret\n中文"));
+            // An unterminated tail of `len` bytes holding a credential and its keyword.
+            texts.push(format!("ok\n{}hunter2 token=v", "c".repeat(len - 15)));
+        }
+    }
+    // Keyword far beyond the window: only its own line's late bytes are redacted.
+    texts.push(format!(
+        "{}{}hunter2 api_key=K\nclean\n",
+        "d".repeat(COALESCE_BYTES + WITHHELD_WINDOW + 4000),
+        "e".repeat(100)
+    ));
+    texts.push(format!(
+        "head\n{}\ntail password\n",
+        "f".repeat(3 * (COALESCE_BYTES + WITHHELD_WINDOW))
+    ));
+    texts
+}
+
 #[test]
 fn test_011_05_streamed_redaction_equals_batch_for_any_split_and_flush_timing() {
     let long = format!(
@@ -730,10 +797,12 @@ fn test_011_05_streamed_redaction_equals_batch_for_any_split_and_flush_timing() 
         "x".repeat(3000),
         "y".repeat(5000)
     );
+    let near = near_cap_texts();
     let texts: Vec<&str> = PROPERTY_TEXTS
         .iter()
         .copied()
         .chain([long.as_str()])
+        .chain(near.iter().map(String::as_str))
         .collect();
     let mut runs = 0;
     for full in &texts {
@@ -749,11 +818,39 @@ fn test_011_05_streamed_redaction_equals_batch_for_any_split_and_flush_timing() 
                             .iter()
                             .filter(|p| p.kind == PublicKind::Message)
                             .collect();
-                        assert!(
-                            !block.iter().any(|p| p.text.contains("hunter2")),
-                            "{label}: secret published {block:?}"
-                        );
-                        assert_block_invariant(&block, full, &label);
+                        let label = format!("{label:.300} len={}", full.len());
+                        if longest_line(full) < COALESCE_BYTES + WITHHELD_WINDOW {
+                            // Every line fits the cap plus the window: nothing is published before its line ends.
+                            assert!(
+                                !block.iter().any(|p| p.text.contains("hunter2")),
+                                "{label}: secret published"
+                            );
+                            assert_block_invariant(&block, full, &label);
+                        } else {
+                            // A longer line: only bytes more than the window before a keyword may be published.
+                            let combined = assert_parts_contiguous_and_flagged(&block, &label);
+                            assert_no_secret_within_window(&combined, full, "hunter2", &label);
+                            if !full.split_inclusive('\n').any(line_contains_secret) {
+                                assert_eq!(
+                                    combined,
+                                    redact(full).0,
+                                    "{label}: clean text verbatim"
+                                );
+                            }
+                            let batch = redact(full).0;
+                            for ((raw, streamed), batch) in full
+                                .split_inclusive('\n')
+                                .zip(combined.split_inclusive('\n'))
+                                .zip(batch.split_inclusive('\n'))
+                            {
+                                if raw.len() < COALESCE_BYTES + WITHHELD_WINDOW {
+                                    assert_eq!(
+                                        streamed, batch,
+                                        "{label}: a short line equals batch"
+                                    );
+                                }
+                            }
+                        }
                         let complete = block.iter().filter(|p| p.complete).count();
                         match ending {
                             Ending::Completed => {
@@ -819,50 +916,162 @@ fn test_011_05_secret_before_keyword_never_flushes_ahead_of_its_keyword() {
     }
 }
 
-#[test]
-fn test_011_05_unterminated_tail_at_16kib_cap_is_redacted_as_one_unit() {
-    // Keyword inside the first capped unit: the rest of that line stays redacted, as in the batch path.
-    let line = format!("hunter2 password {}\n", "x".repeat(20_000));
-    let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
+fn stream(n: &mut Normalizer, deltas: &[&str]) -> Vec<PublicPart> {
     let mut out = Vec::new();
-    for (i, chunk) in line.as_bytes().chunks(1000).enumerate() {
-        out.extend(n.feed(
-            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":std::str::from_utf8(chunk).unwrap()}}),
-            i as u64,
-        ));
-    }
-    let combined: String = out.iter().map(|p| p.text.as_str()).collect();
-    assert_eq!(combined, redact(&line).0);
-    assert!(
-        out.iter().all(|p| p.redacted),
-        "every published unit of a redacted line is marked"
-    );
-
-    // A keyword straddling the cap boundary is still seen through the kept keyword context.
-    let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
-    let head = "a".repeat(COALESCE_BYTES - 4);
-    let mut out = Vec::new();
-    for (i, delta) in [head.as_str(), "pass", "word hunter2\n"]
-        .into_iter()
-        .enumerate()
-    {
+    for (i, delta) in deltas.iter().enumerate() {
         out.extend(n.feed(
             &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":delta}}),
             i as u64,
         ));
     }
-    let combined: String = out.iter().map(|p| p.text.as_str()).collect();
-    assert!(!combined.contains("hunter2"), "{combined:?}");
-    assert_eq!(combined, format!("{head}pass[redacted]\n"));
-    let last = out.last().unwrap();
-    assert!(last.redacted && last.text == "[redacted]\n");
-    // Nothing after the last newline was published before the cap.
-    assert_eq!(
-        out.len(),
-        2,
-        "{:?}",
-        out.iter().map(|p| p.text.len()).collect::<Vec<_>>()
-    );
+    out.extend(n.flush());
+    out
+}
+
+fn normalizers() -> [Normalizer; 2] {
+    [
+        Normalizer::new(Mode::CodexAppServer, "0.166.0"),
+        Normalizer::new_coalescing(Mode::CodexAppServer, "0.166.0"),
+    ]
+}
+
+#[test]
+fn test_011_05_credential_within_the_window_of_its_keyword_is_never_published() {
+    let cap = COALESCE_BYTES;
+    let window = WITHHELD_WINDOW;
+    // M4T09R-400 X1: a 7-byte credential ending 4 bytes before the cap, its keyword one byte after the next delta.
+    let head = format!("{}hunter2", "a".repeat(cap - 11));
+    for mut n in normalizers() {
+        let out = stream(&mut n, &[&head, " password\n"]);
+        let parts: Vec<&PublicPart> = out.iter().collect();
+        assert_block_invariant(&parts, &format!("{head} password\n"), "X1");
+    }
+    // The credential ends just before, at and just after the cap and the cap plus the window; multi-byte padding moves
+    // the boundary inside a character.
+    for limit in [cap, cap + window] {
+        for end in [limit - 1, limit, limit + 1] {
+            for pad in ["a", "é", "中"] {
+                let n_pad = (end - 7).div_ceil(pad.len());
+                let head = format!("{}hunter2", pad.repeat(n_pad));
+                let full = format!("{head} secret\nafter\n");
+                for mut n in normalizers() {
+                    let out = stream(&mut n, &[&head, " secret\n", "after\n"]);
+                    let parts: Vec<&PublicPart> = out.iter().collect();
+                    let label = format!("limit={limit} end={end} pad={pad}");
+                    let combined = assert_parts_contiguous_and_flagged(&parts, &label);
+                    assert!(
+                        !combined.contains("hunter2"),
+                        "{label}: credential published"
+                    );
+                    assert!(combined.ends_with("[redacted]\nafter\n"), "{label}");
+                    if full.len() < cap + window {
+                        assert_eq!(combined, redact(&full).0, "{label}");
+                    }
+                }
+            }
+        }
+    }
+    // The exact bound: a keyword ending within the window after the credential always redacts it, whatever the split.
+    for gap in [window - 8, window - 9, 1000] {
+        let full = format!("hunter2{}password\n", "b".repeat(gap));
+        let chunks: Vec<&str> = full
+            .as_bytes()
+            .chunks(997)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for mut n in normalizers() {
+            let out = stream(&mut n, &chunks);
+            let parts: Vec<&PublicPart> = out.iter().collect();
+            let combined = assert_parts_contiguous_and_flagged(&parts, &format!("gap={gap}"));
+            assert!(
+                !combined.contains("hunter2"),
+                "gap={gap}: credential published"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_011_05_long_line_publishes_only_bytes_older_than_the_window() {
+    let cap = COALESCE_BYTES;
+    let window = WITHHELD_WINDOW;
+    let line = "z".repeat(5 * (cap + window));
+    for mut n in normalizers() {
+        let mut published = 0usize;
+        let mut received = 0usize;
+        let mut first_early = None;
+        for (i, chunk) in line.as_bytes().chunks(1000).enumerate() {
+            received += chunk.len();
+            let out = n.feed(
+                &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":std::str::from_utf8(chunk).unwrap()}}),
+                i as u64,
+            );
+            published += out.iter().map(|p| p.text.len()).sum::<usize>();
+            if published > 0 && first_early.is_none() {
+                first_early = Some(received);
+            }
+            let held: usize = n.streams.values().map(|s| s.tail.len()).sum();
+            let pending = n.pending_text.as_ref().map_or(0, |p| p.raw_text.len());
+            assert!(
+                received - published >= window.min(received),
+                "the last {window} bytes of an open line are withheld: received={received} published={published}"
+            );
+            assert!(
+                held + pending < cap + window + cap + 1000,
+                "the withheld tail is bounded: held={held} pending={pending}"
+            );
+        }
+        assert!(
+            first_early.is_some_and(|r| r <= cap + window + cap + 1000),
+            "a long line is published before it ends: {first_early:?}"
+        );
+        let mut out = n.feed(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"\n"}}),
+            line.len() as u64,
+        );
+        out.extend(n.flush());
+        published += out.iter().map(|p| p.text.len()).sum::<usize>();
+        assert_eq!(
+            published,
+            line.len() + 1,
+            "the whole line is published at its newline"
+        );
+    }
+}
+
+#[test]
+fn test_011_05_redacted_flag_marks_parts_altered_by_redaction_and_not_a_bare_terminator() {
+    let cap = COALESCE_BYTES;
+    let window = WITHHELD_WINDOW;
+    // A keyword early in a line longer than the cap plus the window: the line is redacted as soon as it is published,
+    // its later bytes are suppressed, and its newline and the next line are published unaltered and unflagged.
+    let line = format!("hunter2 password {}", "x".repeat(2 * (cap + window)));
+    let chunks: Vec<&str> = line
+        .as_bytes()
+        .chunks(1000)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .chain(["\nnext\n"])
+        .collect();
+    for mut n in normalizers() {
+        let out = stream(&mut n, &chunks);
+        let parts: Vec<&PublicPart> = out.iter().collect();
+        let full = format!("{line}\nnext\n");
+        assert_block_invariant(&parts, &full, "early keyword");
+        let texts: Vec<(&str, bool)> = out.iter().map(|p| (p.text.as_str(), p.redacted)).collect();
+        assert_eq!(
+            texts,
+            [("[redacted]", true), ("\nnext\n", false)],
+            "the bare terminator after a redacted unit is not flagged"
+        );
+    }
+    // A keyword straddling where the first early publication cuts the line is still seen.
+    let head = format!("{}pass", "a".repeat(cap - 4));
+    let rest = format!("word{}", "b".repeat(window + 100));
+    for mut n in normalizers() {
+        let out = stream(&mut n, &[&head, &rest, "hunter2\n"]);
+        let parts: Vec<&PublicPart> = out.iter().collect();
+        assert_block_invariant(&parts, &format!("{head}{rest}hunter2\n"), "straddle");
+    }
 }
 
 #[test]

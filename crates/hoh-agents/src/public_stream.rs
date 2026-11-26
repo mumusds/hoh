@@ -34,21 +34,22 @@ impl Mode {
 /// Maximum time and raw byte size for coalescing consecutive streaming text deltas (CR-028 §2.2).
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 pub const COALESCE_BYTES: usize = 16 << 10;
+/// The trailing bytes of an unterminated line that are never published before the line ends (M4T09R-400): a byte is
+/// published early only once this many keyword-free bytes follow it on its line.
+pub const WITHHELD_WINDOW: usize = 16 << 10;
 
-/// Bytes of a line already published at the cap that are kept so a keyword straddling the cap is still seen: the
-/// longest keyword in [`line_contains_secret`] minus one.
-const KEYWORD_CONTEXT: usize = "authorization:".len() - 1;
-
-/// One streamed block (DC-M4T09b): nothing after the block's last newline is published until the newline arrives, the
-/// block ends, or that unterminated tail reaches [`COALESCE_BYTES`]; at the cap the tail is redacted as one unit. Only
-/// that tail and the received length and digest (for the final snapshot's prefix check) are kept, never the block's
-/// whole text (M4T09R-302).
+/// One streamed block (DC-M4T09b): nothing after the block's last newline is published until the newline arrives or
+/// the block ends, except that an unterminated line holding [`COALESCE_BYTES`] more than [`WITHHELD_WINDOW`] publishes
+/// its bytes older than the window (M4T09R-400). Every keyword check sees the whole withheld window, so a byte is
+/// published unredacted before its line ends only if no keyword ends within the window after it. Only the
+/// unterminated tail (under the cap plus the window plus one push) and the received length and digest (for the final
+/// snapshot's prefix check) are kept, never the block's whole text (M4T09R-302).
 #[derive(Default)]
 struct TextStreamState {
     tail: String,
-    /// The last bytes of the current line already published at the cap (keyword context only).
-    line_context: String,
-    /// The current line was redacted at the cap: its remaining bytes are suppressed up to its newline.
+    /// The current line's start was published before its end.
+    line_published: bool,
+    /// The current line was redacted before its end: its remaining bytes are suppressed up to its newline.
     line_redacted: bool,
     received_len: usize,
     received_digest: sha2::Sha256,
@@ -58,6 +59,7 @@ impl std::fmt::Debug for TextStreamState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextStreamState")
             .field("tail_len", &self.tail.len())
+            .field("line_published", &self.line_published)
             .field("line_redacted", &self.line_redacted)
             .field("received_len", &self.received_len)
             .field("pub_offset", &self.pub_offset)
@@ -80,8 +82,10 @@ impl TextStreamState {
                 == self.received_digest.clone().finalize())
         .then(|| &text[n..])
     }
-    /// Takes raw text of this block and returns what may be published now, redacted, and whether it was changed by
-    /// redaction. `end`: no more text follows, so the unterminated tail is published too.
+    /// Takes raw text of this block and returns what may be published now, redacted, and whether redaction altered it:
+    /// it carries a `[redacted]` marker. The bytes a marker stands for are suppressed, also when they arrive later; a
+    /// redacted line's newline is published unaltered. `end`: no more text follows, so the unterminated tail is
+    /// published too.
     fn push(&mut self, raw: &str, end: bool) -> (String, bool) {
         let mut out = String::new();
         let mut changed = false;
@@ -91,71 +95,70 @@ impl TextStreamState {
             let lines = std::mem::replace(&mut self.tail, rest);
             let first = lines.find('\n').map_or(lines.len(), |i| i + 1);
             let (head, others) = lines.split_at(first);
-            if self.line_redacted || !self.line_context.is_empty() {
-                // The rest of a line whose start was published at the cap.
-                if self.line_redacted {
-                    out.push('\n');
-                    changed = true;
-                } else if line_contains_secret(&format!("{}{head}", self.line_context)) {
+            if self.line_redacted {
+                out.push('\n');
+            } else if self.line_published {
+                // The rest of a line whose start was published early: what was published cannot be recalled.
+                if line_contains_secret(head) {
                     out.push_str("[redacted]\n");
                     changed = true;
                 } else {
                     out.push_str(head);
                 }
-                self.line_context.clear();
-                self.line_redacted = false;
-                let (clean, more) = redact(others);
-                out.push_str(&clean);
-                changed |= more;
             } else {
-                let (clean, more) = redact(&lines);
+                // The batch path's function on the whole line: identical output for an identical line.
+                let (clean, more) = redact(head);
                 out.push_str(&clean);
                 changed |= more;
             }
+            self.line_published = false;
+            self.line_redacted = false;
+            let (clean, more) = redact(others);
+            out.push_str(&clean);
+            changed |= more;
         }
-        if end || self.tail.len() >= COALESCE_BYTES {
+        if self.line_redacted {
+            self.tail.clear();
+        } else if end {
             let tail = std::mem::take(&mut self.tail);
-            if self.line_redacted {
-                changed |= !tail.is_empty();
-            } else if !self.line_context.is_empty() {
-                let seen = format!("{}{tail}", self.line_context);
-                if line_contains_secret(&seen) {
+            if self.line_published {
+                if line_contains_secret(&tail) {
                     out.push_str("[redacted]");
                     changed = true;
-                    self.line_redacted = true;
                 } else {
                     out.push_str(&tail);
-                    self.line_context = keyword_context(&seen);
                 }
             } else {
-                // The batch path's function on the unterminated line: identical output for an identical line.
                 let (clean, more) = redact(&tail);
                 out.push_str(&clean);
-                if more {
-                    changed = true;
-                    self.line_redacted = true;
-                } else {
-                    self.line_context = keyword_context(&tail);
+                changed |= more;
+            }
+        } else if self.tail.len() >= COALESCE_BYTES + WITHHELD_WINDOW {
+            if line_contains_secret(&self.tail) {
+                out.push_str("[redacted]");
+                changed = true;
+                self.line_redacted = true;
+                self.tail.clear();
+            } else {
+                let mut cut = self.tail.len() - WITHHELD_WINDOW;
+                while !self.tail.is_char_boundary(cut) {
+                    cut -= 1;
                 }
+                let window = self.tail.split_off(cut);
+                out.push_str(&std::mem::replace(&mut self.tail, window));
+                self.line_published = true;
             }
-            if end {
-                self.line_context = String::new();
-                self.line_redacted = false;
-                self.tail = String::new();
-            }
+        }
+        if end {
+            self.line_published = false;
+            self.line_redacted = false;
+            self.tail.clear();
         }
         (out, changed)
     }
     fn holds_text(&self) -> bool {
         !self.tail.is_empty()
     }
-}
-fn keyword_context(seen: &str) -> String {
-    let mut start = seen.len().saturating_sub(KEYWORD_CONTEXT);
-    while !seen.is_char_boundary(start) {
-        start += 1;
-    }
-    seen[start..].to_owned()
 }
 
 struct StreamMeta {
@@ -1145,22 +1148,22 @@ fn usage(v: &Value, camel: bool) -> PublicUsage {
         ..Default::default()
     }
 }
+/// A line holding any of these (ASCII case-insensitive) is redacted whole.
+const SECRET_KEYWORDS: [&str; 10] = [
+    "authorization:",
+    "bearer ",
+    "api_key",
+    "api-key",
+    "apikey",
+    "password",
+    "access_token",
+    "secret",
+    "private_key",
+    "token=",
+];
 fn line_contains_secret(line: &str) -> bool {
     let low = line.to_ascii_lowercase();
-    [
-        "authorization:",
-        "bearer ",
-        "api_key",
-        "api-key",
-        "apikey",
-        "password",
-        "access_token",
-        "secret",
-        "private_key",
-        "token=",
-    ]
-    .iter()
-    .any(|needle| low.contains(needle))
+    SECRET_KEYWORDS.iter().any(|needle| low.contains(needle))
 }
 /// The one redaction function of both the batch and the streaming path (DC-M4T09b): a line with a secret keyword is
 /// replaced whole.
