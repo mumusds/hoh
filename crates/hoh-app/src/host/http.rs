@@ -981,20 +981,14 @@ async fn submit_command(
                 super::spec::files(&root)
             })
             .await;
-            let files = match files {
-                Ok(files) => files,
-                Err(e) => {
-                    // CR-036: a join failure is an unavailable spec source, the same retryable 503 as a read error.
-                    return store_error(
-                        &shared,
-                        command.run_id.as_deref().unwrap_or(""),
-                        PersistError::SpecSourceUnavailable(format!(
-                            "specification read stopped: {e}"
-                        )),
-                    )
-                    .await;
-                }
-            };
+            let files = files.unwrap_or_else(|e| {
+                // CR-036 / M4L1-002: map a join failure into SpecReadError::Unavailable so the store still decides
+                // missing-run, stale-revision, replay and Reject before checking source files, as inputs.rs does.
+                Err(hoh_core::persistence::SpecReadError::unavailable(
+                    "specification read stopped",
+                    e,
+                ))
+            });
             let (name, action) = match &command.body {
                 CommandBody::ApproveSpec(approval) => (
                     "ApproveSpec",
