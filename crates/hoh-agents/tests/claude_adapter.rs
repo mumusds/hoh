@@ -685,26 +685,46 @@ async fn running_pid(world: &World, id: &str) -> R<u32> {
 /// Another connection holding the store's write lock (Python's sqlite3, test code); `ready` is created once the lock is
 /// held. It holds the lock until [`release`] (a line on its stdin, or its stdin closed when the test ends), never on a
 /// wall clock of its own (DC-FLK14, FLK-14-F1): the test releases it only after the cancel it must precede.
-fn hold_store(world: &World, ready: &Path) -> R<std::process::Child> {
-    Ok(std::process::Command::new("python3")
-        .args([
-            "-c",
-            "import pathlib,sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
-             c.execute('BEGIN IMMEDIATE'); pathlib.Path(sys.argv[2]).touch(); sys.stdin.readline(); \
-             c.execute('COMMIT')",
-        ])
-        .arg(world.dir.path().join(".hoh/state.db"))
-        .arg(ready)
-        .stdin(std::process::Stdio::piped())
-        .spawn()?)
+fn hold_store(world: &World, ready: &Path) -> R<Holder> {
+    Ok(Holder(
+        std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import pathlib,sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
+                 c.execute('BEGIN IMMEDIATE'); pathlib.Path(sys.argv[2]).touch(); sys.stdin.readline(); \
+                 c.execute('COMMIT')",
+            ])
+            .arg(world.dir.path().join(".hoh/state.db"))
+            .arg(ready)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?,
+    ))
+}
+
+/// [`hold_store`]'s connection, released and reaped when dropped on any path, a failed assertion's too (M3F-101).
+struct Holder(std::process::Child);
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        // Its own child: released (it commits and ends), else killed; reaped either way.
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, b"release\n");
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while matches!(self.0.try_wait(), Ok(None)) && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Ends [`hold_store`]'s lock and waits for its connection: whether it held the lock and committed.
-fn release(mut holder: std::process::Child) -> R<bool> {
-    let mut stdin = holder.stdin.take().ok_or("no stdin")?;
+fn release(mut holder: Holder) -> R<bool> {
+    let mut stdin = holder.0.stdin.take().ok_or("no stdin")?;
     std::io::Write::write_all(&mut stdin, b"release\n")?;
     drop(stdin);
-    Ok(holder.wait()?.success())
+    Ok(holder.0.wait()?.success())
 }
 
 /// A child that never reads its prompt neither holds up a cancel nor gets a success (M1T03R-02).

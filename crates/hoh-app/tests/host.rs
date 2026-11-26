@@ -963,6 +963,67 @@ async fn test_062_01_busy_answer_not_delayed_by_background_sweep() -> R {
     busy_writer(Duration::from_millis(250)).await
 }
 
+/// An outside connection's write lock (a `BEGIN IMMEDIATE` of a python3 of its own), held until [`OutsideLock::release`]
+/// (a line on its stdin) and never on a wall clock of its own (DC-FLK14); dropped on any path, a failed assertion's
+/// too, it is released and its child reaped (M3F-101, like `WriteLock` in tui_pty.rs).
+struct OutsideLock(std::process::Child);
+
+impl OutsideLock {
+    fn take(db: &Path) -> R<OutsideLock> {
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
+                 c.execute('BEGIN IMMEDIATE'); print('locked', flush=True); sys.stdin.readline(); \
+                 c.execute('COMMIT')",
+            ])
+            .arg(db)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        // Held before anything can fail, so its drop reaps the child on every path.
+        let stdout = child.stdout.take();
+        let lock = OutsideLock(child);
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(stdout.ok_or("no stdout")?),
+            &mut line,
+        )?;
+        if line.trim() != "locked" {
+            return Err(format!("the write lock was not taken: {line:?}").into());
+        }
+        Ok(lock)
+    }
+
+    /// Releases the lock: the connection commits and ends.
+    fn release(&mut self) -> R {
+        let stdin = self.0.stdin.as_mut().ok_or("released twice")?;
+        std::io::Write::write_all(stdin, b"release\n")?;
+        Ok(())
+    }
+
+    /// Waits for the connection's end (its stdin closed first): how it ended.
+    fn end(mut self) -> R<std::process::ExitStatus> {
+        drop(self.0.stdin.take());
+        Ok(self.0.wait()?)
+    }
+}
+
+impl Drop for OutsideLock {
+    fn drop(&mut self) {
+        // Its own child: released (it commits and ends), else killed; reaped either way.
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, b"release\n");
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The body of the AC-062-01 tests: each PauseRun is sent `delay` after the outside connection took the lock.
 async fn busy_writer(delay: Duration) -> R {
     let dir = tempfile::tempdir()?;
@@ -998,24 +1059,7 @@ async fn busy_writer(delay: Duration) -> R {
         let before = call(&to, "GET", &format!("/v1/runs/{run}"), &host.token, b"")
             .await?
             .json()?;
-        let mut locker = Command::new("python3")
-            .args([
-                "-c",
-                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
-                 c.execute('BEGIN IMMEDIATE'); print('locked', flush=True); sys.stdin.readline(); \
-                 c.execute('COMMIT')",
-            ])
-            .arg(db(dir.path()))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-        let mut release = locker.stdin.take().ok_or("no stdin")?;
-        let mut line = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(locker.stdout.take().ok_or("no stdout")?),
-            &mut line,
-        )?;
-        assert_eq!(line.trim(), "locked");
+        let mut locker = OutsideLock::take(&db(dir.path()))?;
         tokio::time::sleep(delay).await;
         let started = Instant::now();
         let held_until = tokio::time::Instant::from_std(started) + Duration::from_secs(hold);
@@ -1038,7 +1082,7 @@ async fn busy_writer(delay: Duration) -> R {
             let reply = (&mut command).await??;
             let took = started.elapsed();
             tokio::time::sleep_until(held_until).await;
-            std::io::Write::write_all(&mut release, b"release\n")?;
+            locker.release()?;
             (reply, took)
         } else {
             tokio::time::sleep_until(held_until).await;
@@ -1049,11 +1093,10 @@ async fn busy_writer(delay: Duration) -> R {
                 )
                 .into());
             }
-            std::io::Write::write_all(&mut release, b"release\n")?;
+            locker.release()?;
             ((&mut command).await??, started.elapsed())
         };
-        drop(release);
-        assert!(locker.wait()?.success(), "the outside connection failed");
+        assert!(locker.end()?.success(), "the outside connection failed");
         if expect_busy {
             assert_eq!(reply.status, 503, "{reply:?} after {took:?}");
             let error = reply.json()?;
