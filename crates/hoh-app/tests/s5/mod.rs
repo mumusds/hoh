@@ -9,9 +9,70 @@ struct RecordingAgent {
     inputs: Mutex<Vec<(String, String)>>,
     leaders: Mutex<Vec<(u32, String)>>,
     releases: Arc<Mutex<Vec<std::process::ChildStdin>>>,
-    hold_next_steer: Arc<std::sync::atomic::AtomicBool>,
-    steer_entered: Arc<tokio::sync::Notify>,
-    steer_release: Arc<tokio::sync::Notify>,
+}
+
+/// Pauses `HostHooks::input_delivered` for one target message_id so subsequent outbox rows for that role stay
+/// `PENDING` across a rebind checkpoint without depending on the product's 10 s `executor.steer` timeout (M4L2-100).
+#[derive(Debug, Default)]
+struct HoldDelivery {
+    target: Mutex<Option<String>>,
+    state: Mutex<(bool, bool)>,
+    cond: std::sync::Condvar,
+}
+
+impl HoldDelivery {
+    fn arm(&self, message_id: String) {
+        *self.target.lock().unwrap_or_else(|p| p.into_inner()) = Some(message_id);
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = (false, false);
+    }
+
+    fn wait_entered(&self, timeout: Duration) -> R {
+        let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (guard, result) = self
+            .cond
+            .wait_timeout_while(guard, timeout, |s| !s.0)
+            .unwrap_or_else(|p| p.into_inner());
+        if guard.0 {
+            Ok(())
+        } else {
+            Err(format!("delivery hook was not entered within {timeout:?} ({result:?})").into())
+        }
+    }
+
+    fn release(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.1 = true;
+        self.cond.notify_all();
+    }
+}
+
+impl hoh_app::host::HostHooks for HoldDelivery {
+    fn input_delivered(&self, message_id: &str) {
+        let matches = self
+            .target
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            == Some(message_id);
+        if !matches {
+            return;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.0 = true;
+        self.cond.notify_all();
+        drop(
+            self.cond
+                .wait_while(guard, |s| !s.1)
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+    }
+}
+
+struct ReleaseOnDrop(Arc<HoldDelivery>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl Executor for RecordingAgent {
@@ -80,19 +141,6 @@ impl Executor for RecordingAgent {
         input: &hoh_core::persistence::InputRow,
     ) -> tokio::sync::oneshot::Receiver<hoh_agents::codex::SteerReceipt> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .hold_next_steer
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let entered = self.steer_entered.clone();
-            let release = self.steer_release.clone();
-            tokio::spawn(async move {
-                entered.notify_one();
-                release.notified().await;
-                let _ = tx.send(hoh_agents::codex::SteerReceipt::NotNow);
-            });
-            return rx;
-        }
         let receipt = match (self.inputs.lock(), input.payload["text"].as_str()) {
             (Ok(mut inputs), Some(text)) => {
                 inputs.push((work.role.clone(), text.into()));
@@ -134,6 +182,7 @@ fn fixture(
     world: &world::World,
     active: bool,
     agent: Arc<RecordingAgent>,
+    hooks: Option<Arc<dyn hoh_app::host::HostHooks>>,
 ) -> R<Host> {
     world.configure(&[("cto", "claude"), ("developer", "claude")], "")?;
     let initial = runtime.block_on(world.start_plain_host(None))?;
@@ -146,6 +195,9 @@ fn fixture(
     let mut config = HostConfig::new(&world.project());
     config.port = 0;
     config.store.wal_probe = Some(world::probe());
+    if let Some(hooks) = hooks {
+        config.hooks = hooks;
+    }
     if active {
         config.runner = Some(RunnerConfig {
             executor: agent,
@@ -210,7 +262,7 @@ fn test_007_03_picker_commands_and_explicit_agent_forwarding() -> R {
     let world = world::World::named("s5-slash")?;
     let agent = Arc::new(RecordingAgent::default());
     let _cleanup = Cleanup(agent.clone());
-    let host = fixture(&runtime, &world, true, agent.clone())?;
+    let host = fixture(&runtime, &world, true, agent.clone(), None)?;
     let (mut pty, mut child) = attached(&world)?;
     // Enter on /help and the marker give an observable barrier even before the picker is implemented.
     pty.send(b"/")?;
@@ -294,7 +346,9 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
     let world = world::World::named("s5-role")?;
     let agent = Arc::new(RecordingAgent::default());
     let _cleanup = Cleanup(agent.clone());
-    let host = fixture(&runtime, &world, true, agent.clone())?;
+    let hold = Arc::new(HoldDelivery::default());
+    let _release = ReleaseOnDrop(hold.clone());
+    let host = fixture(&runtime, &world, true, agent.clone(), Some(hold.clone()))?;
     let (mut pty, mut child) = attached(&world)?;
     let screen = submit(&mut pty, "@claude 先写测试", "routed")?;
     assert_eq!(
@@ -309,7 +363,11 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         vec![("developer".into(), "先写测试".into())]
     );
     evidence("test-017-04-resolved.txt", &screen)?;
-    // ASK cannot interrupt this turn, so it remains queued for the next attempt.
+    // ASK cannot interrupt this turn, so it remains queued for the next attempt. Hold `developer`'s per-role
+    // dispatcher in `HostHooks::input_delivered` right after `late` is staged (no 10 s steer timeout) so
+    // `late-outbox` stays PENDING:1 in outbox until after the rebind checkpoint commits (M4L2-100).
+    let id = hoh_core::ids::child_id("late", "input");
+    hold.arm(id.clone());
     let revision: i64 = world
         .query("SELECT revision FROM runs WHERE run_id='R'")?
         .parse()?;
@@ -321,37 +379,10 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
             .0,
         202
     );
-    let id = hoh_core::ids::child_id("late", "input");
-    world.wait(
-        &format!("SELECT state FROM outbox WHERE message_id='{id}'"),
-        "ACKED",
-        WAIT,
-    )?;
+    hold.wait_entered(WAIT)?;
     let receipt = world.query(&format!(
         "SELECT result_json FROM receipts WHERE message_id='{id}'"
     ))?;
-    // Hold the per-role delivery dispatcher in flight on one steer so a second epoch-1 input stays PENDING in outbox
-    // until after the host's runner applies the rebind checkpoint; then the host's own delivery loop rejects it.
-    agent
-        .hold_next_steer
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let revision: i64 = world
-        .query("SELECT revision FROM runs WHERE run_id='R'")?
-        .parse()?;
-    let hold_cmd = json!({"schema_version":"1.0","command_id":"hold-steer","idempotency_key":"hold-steer","kind":"SendInput","run_id":"R","expected_revision":revision,
-        "payload":{"text":"hold steer","input_kind":"STEER","target_role":"developer"}});
-    assert_eq!(
-        runtime
-            .block_on(world::exchange(
-                &host,
-                "POST",
-                "/v1/commands",
-                Some(&hold_cmd)
-            ))?
-            .0,
-        202
-    );
-    runtime.block_on(async { tokio::time::timeout(WAIT, agent.steer_entered.notified()).await })?;
     let revision: i64 = world
         .query("SELECT revision FROM runs WHERE run_id='R'")?
         .parse()?;
@@ -402,13 +433,16 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
         "codex:2",
         WAIT,
     )?;
-    // Unblock the held steer; the host's own input delivery loop delivers late-outbox (epoch 1) and sweeps late (ASK, epoch 1).
-    agent.steer_release.notify_one();
-    world.wait(
-        &format!("SELECT state FROM outbox WHERE message_id='{late_outbox_id}'"),
-        "ACKED",
-        WAIT,
-    )?;
+    // Release the delivery hook; `late` ACKs and the host's own delivery loop processes `late-outbox` (epoch 1)
+    // against epoch 2 while the sweep rejects `late` (ASK, epoch 1).
+    hold.release();
+    for outbox_id in [&id, &late_outbox_id] {
+        world.wait(
+            &format!("SELECT state FROM outbox WHERE message_id='{outbox_id}'"),
+            "ACKED",
+            WAIT,
+        )?;
+    }
     for stale_id in [&late_outbox_id, &id] {
         world.wait(
             &format!("SELECT state FROM input_queue WHERE input_id='{stale_id}'"),
@@ -430,7 +464,9 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
             "{stale_id}"
         );
     }
-    // Current-epoch inputs submitted through HTTP stay QUEUED across the host's sweep loop.
+    // Current-epoch inputs submitted through HTTP stay QUEUED across a positive host sweep barrier (M4L2-101):
+    // queue both epoch-2 developer inputs into `input_queue` first, then queue an epoch-1 `cto` probe and rebind
+    // `cto` so the host's sweep rejects the probe before we check the epoch-2 developer inputs.
     let mut current_ids = Vec::new();
     for (cmd_id, kind) in [("current-ask", "ASK"), ("current-steer", "STEER")] {
         let revision: i64 = world
@@ -444,10 +480,64 @@ fn test_017_04_role_resolution_and_stale_epoch() -> R {
                 .0,
             202
         );
-        current_ids.push(hoh_core::ids::child_id(cmd_id, "input"));
+        let input_id = hoh_core::ids::child_id(cmd_id, "input");
+        assert_eq!(
+            world.query(&format!(
+                "SELECT state || ':' || json_extract(payload_json,'$.role_epoch') FROM input_queue WHERE input_id='{input_id}'"
+            ))?,
+            "QUEUED:2",
+            "SendInput must enqueue current-epoch {input_id} before the sweep barrier"
+        );
+        current_ids.push(input_id);
     }
-    // Wait past at least two 200ms ticks of the host's input delivery/sweep loop.
-    std::thread::sleep(Duration::from_millis(500));
+    let revision: i64 = world
+        .query("SELECT revision FROM runs WHERE run_id='R'")?
+        .parse()?;
+    let probe = json!({"schema_version":"1.0","command_id":"sweep-probe","idempotency_key":"sweep-probe","kind":"SendInput","run_id":"R","expected_revision":revision,
+        "payload":{"text":"sweep probe","input_kind":"ASK","target_role":"cto"}});
+    assert_eq!(
+        runtime
+            .block_on(world::exchange(&host, "POST", "/v1/commands", Some(&probe)))?
+            .0,
+        202
+    );
+    let probe_id = hoh_core::ids::child_id("sweep-probe", "input");
+    assert_eq!(
+        world.query(&format!(
+            "SELECT state || ':' || json_extract(payload_json,'$.role_epoch') FROM input_queue WHERE input_id='{probe_id}'"
+        ))?,
+        "QUEUED:1",
+        "SendInput must enqueue epoch-1 cto probe before rebinding cto"
+    );
+    let team_revision: i64 = world
+        .query("SELECT max(revision) FROM team_revisions")?
+        .parse()?;
+    let cto_rebind = json!({"schema_version":"1.0","command_id":"rebind-cto","idempotency_key":"rebind-cto","kind":"ConfigureTeam","run_id":"R","expected_revision":team_revision,
+        "payload":{"bindings":{"cto":{"agent":"codex"}},"apply_at":"checkpoint"}});
+    let (status, reply) = runtime.block_on(world::exchange(
+        &host,
+        "POST",
+        "/v1/commands",
+        Some(&cto_rebind),
+    ))?;
+    assert_eq!(status, 202, "{reply}");
+    world.wait(
+        "SELECT agent || ':' || role_epoch FROM role_bindings WHERE role='cto'",
+        "codex:2",
+        WAIT,
+    )?;
+    world.wait(
+        &format!("SELECT state FROM input_queue WHERE input_id='{probe_id}'"),
+        "REJECTED",
+        WAIT,
+    )?;
+    assert_eq!(
+        world.query(&format!(
+            "SELECT json_extract(payload_json,'$.reason') FROM events WHERE kind='input.rejected' AND json_extract(payload_json,'$.input_id')='{probe_id}'"
+        ))?,
+        "STALE_ROLE_EPOCH",
+        "sweep probe must prove host sweep ran after current-epoch inputs were queued"
+    );
     for current_id in current_ids {
         assert_eq!(
             world.query(&format!(
@@ -486,7 +576,7 @@ fn test_017_04_ambiguous_agent_picker_cancel_and_select() -> R {
     let runtime = runtime()?;
     let world = world::World::named("s5-picker")?;
     let agent = Arc::new(RecordingAgent::default());
-    let host = fixture(&runtime, &world, false, agent)?;
+    let host = fixture(&runtime, &world, false, agent, None)?;
     let (mut pty, mut child) = attached(&world)?;
     pty.send("@claude 先写测试\r".as_bytes())?;
     let screen = pty::screen_until(&pty, 34, 150, WAIT, |s| s.contains("选择目标职位"))?;
