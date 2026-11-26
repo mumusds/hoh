@@ -1282,6 +1282,11 @@ impl Loss {
         }
     }
     /// The drain settled the oldest queued part (persisted, or dropped and reported through [`Loss::dropped`]).
+    ///
+    /// Invariant (M4T09R-504): one task publishes into a channel (the stdout reader, through [`publish`] and
+    /// [`try_publish`]) and one drain receives from it, so parts enter `queued` in channel order and the oldest entry is
+    /// the part being settled. A second concurrent publisher could interleave enqueue and send, and would need settling
+    /// by ticket id.
     pub fn settled(&self) {
         self.state().queued.pop_front();
     }
@@ -1499,18 +1504,22 @@ impl Drop for Unsent<'_> {
         }
     }
 }
-pub(crate) async fn publish(
+/// Publishes in order, waiting for room. The parts are held by an [`Unsent`] from the call on, so a publish dropped
+/// before it is first polled (a biased select that finds abandon latched) counts them lost too (M4T09R-501).
+pub(crate) fn publish(
     sender: &Publisher,
     parts: Vec<PublicPart>,
-) -> Result<(), &'static str> {
+) -> impl Future<Output = Result<(), &'static str>> + '_ {
     let mut unsent = Unsent {
         loss: &sender.loss,
         parts: segments(parts).into_iter(),
     };
-    for part in unsent.parts.by_ref() {
-        sender.send(part).await?;
+    async move {
+        for part in unsent.parts.by_ref() {
+            sender.send(part).await?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 /// Publishes without waiting; what does not fit now is counted lost.
 pub(crate) fn try_publish(sender: &Publisher, parts: Vec<PublicPart>) {
