@@ -1,13 +1,13 @@
 # CR-028 · M4 的工作台、终端与容量规格细化
 
 ID：CR-028
-状态：DRAFT
-批准人：本应用准备稿待正式批准；2026-11-21 第 6 稿的历史批准与审查记录保留，2026-11-25 CTO 的 C1–C5 决定见末尾“需 CTO 决定”节。按本次委派，本分支保持 DRAFT、未 relock；M3-T05 完成并正式领取 M4-T01 后，按合入时 main 复核、批准及重锁
-日期：2026-11-21（第 6 稿批准；第 6 稿为最终轮的处置稿）
-输入基线：第 5 稿 `26f5c1b5f2df2cfc7a02e9662622f8980d18e199`，分支 `prep/M4-T01-spec`；产品来源基线仍为 `067c241ed7dd1aaba0dd5ee1b0f6aa844414e5e2`
-适用任务：M4-T01 的准备工作；正式应用仍须等 M3-T05 完成并领取 M4-T01
+状态：APPROVED
+批准人：CTO 依 CR-003 D1 预授权批准。第 6 稿 2026-11-21 批准（设计审查第 1–5 轮见下文）；应用稿 2026-11-26 在 M4-T01 领取时按当日 main 复核后批准并重锁（应用审查三轮：Codex、Pi 第 1 轮，Codex、Pi 第 2 轮，Pi 第 3 轮 PASS，见末节“M4-T01 应用审查第 3 轮与批准”）
+日期：2026-11-21（第 6 稿批准）；2026-11-26（应用稿批准，baseline revision 31）
+输入基线：第 5 稿 `26f5c1b5f2df2cfc7a02e9662622f8980d18e199`，分支 `prep/M4-T01-spec`；产品来源基线仍为 `067c241ed7dd1aaba0dd5ee1b0f6aa844414e5e2`；应用基于 main `d7cc5ff0245a74fb63ce4ab2fb98f468c1b43589`（baseline revision 30）
+适用任务：M4-T01
 
-本分支已准备 REQ-010、011、012、013、014、015、016、064 从 outline 到 detailed 的应用，保留全部旧 AC/TEST 标识并扩展为 37 条 AC。需求、场景、OpenAPI、SQL、配置键表、生成视图及任务图为待审的应用产物，不 relock、不领取任务、不推进全局台账。D1–D12 的历史批准保持，下文起草与审查记录按其日期阅读；2026-11-25 的 C1–C5 决定补齐应用约束，不改 AC 集合、意义或阈值，也不表示生产行为已实现。
+本分支已准备 REQ-010、011、012、013、014、015、016、064 从 outline 到 detailed 的应用，保留全部旧 AC/TEST 标识并扩展为 37 条 AC。需求、场景、OpenAPI、SQL、配置键表、生成视图及任务图为应用产物；准备阶段不 relock，正式批准与重锁见末节。D1–D12 的历史批准保持，下文起草与审查记录按其日期阅读；2026-11-25 的 C1–C5 决定补齐应用约束，不改 AC 集合、意义或阈值，也不表示生产行为已实现。
 
 ## 背景与依据
 
@@ -1201,3 +1201,20 @@ AC-064-03 原文的“§5每一引用根各一对象”仍是判据，新增枚�
 | M4A-1506 | LOW | 修复diff之外，登记M4低项清理包待办：普通重启不递增generation目前无AC断言；本轮不修改该规则、AC或测试 | 来源CR-028 §2及review2-findings.json；在M4 verify前按docs/19集中处置 |
 
 本轮scratch由任务命名的 `mktemp -d -p /home/ai/dev` 创建并登记确切路径/dev/inode/uid；仅副本临时APPROVED后执行relock、gen_spec_views、bundle和validate_bundle，原分支保持DRAFT及原锁。原分支bundle的baseline不匹配保留为预期诊断，scratch成功不得冒充正式批准。生成视图随源提交；逐命令退出码、源hash与清理结果见fix2记录。全部为**自测，非验收**；产品M4场景、live、性能、独立QA/Review及v1 release gate本轮NOT_RUN。
+
+
+## M4-T01 应用审查第 3 轮与批准（2026-11-26）
+
+第 3 轮为第 2 轮修复差异 `0c999e05..f4d9c5e5` 的 fix-diff 复审，全新 Pi 会话（attempt `fdb1433a-8d0f-4e02-b658-7662a3935900`，结果 `.hoh-dev/evidence/m4t01-rereview3-pi.out`）：PASS，无 critical/high/medium；M4A-1500..1505 全部闭合，M4A-1506 已登记待办；37 条 M4 AC 在 requirements、scenarios、docs/02 与本 CR 的表中逐字一致，属主/check、任务依赖与阈值未变。新 low 三项按 docs/19 审查收敛进入 M4 低项清理包，不在本次应用中修改：
+
+| Finding | 等级 | 处置 |
+|---|---|---|
+| M4A-2001 | LOW | 待办：AC-064-01 busy 子例在无测量包装器（CI、pre-pr）上下文中的行为，在 M4-T03 测量包装器设计中定（父未持锁时测试自持两锁，或仅 run_check 执行、其他上下文显式 SKIPPED 不记 PASS） |
+| M4A-2002 | LOW | 待办：DB_FULL ≤10 s 重试窗口内 TUI 绘制与脱离是否可用，与 §2 措辞对齐；在 M4-T02 实现前定 |
+| M4A-2003 | LOW | 待办：STORAGE_LOW_SPACE 503 的 `retryable` 取值在错误表/OpenAPI 点名；在 M4-T03 实现前定 |
+
+三轮应用审查的收敛：第 1 轮 Codex（attempt `7ab6c01a-1bbb-4478-8991-fa0a38f300c7`）M4A-001 high、M4A-002 medium，Pi（attempt `8c423fb5-e17c-4da9-b081-191acbc3d6f7`）M4A-500/501 high、M4A-502..506；第 2 轮 Codex（attempt `1f261c72-4544-438e-bcf7-cac41c496531`）无 finding，Pi（attempt `afda7138-f99d-46e7-9d4e-dd5b2fec079c`）M4A-1500..1506；第 3 轮如上。符合所有者 2026-11-21 的轮数上限：无 critical/high 且每个 medium 已处置即通过。
+
+应用时的 main 复核：准备分支基于 `f7269ab0`，以 rebase 移到 main `d7cc5ff0`（66 个提交）。其间 main 的契约改动为 CR-040、CR-041（REQ-024/027：AC-024-05、AC-027-06 等）与 M3 清理，均不触及本 CR 的 REQ-010..016、064、`003_ui_observability.sql` 或 `protocol.rs` 的 M4 枚举；rebase 仅 `docs/18-traceability.md` 生成视图冲突，重新生成解决，合计行由 244 变为 246 条验收（main 新增两条 M3 AC）。`git range-diff` 显示其余 7 个提交内容不变。
+
+批准：本 CR 是 CR-003 D1 细化（不缩范围、不降门槛、不改 CONTRACT 架构或交互决定），由 CTO 依预授权批准；随后 `python3 tools/gen_spec_views.py`、`python3 tools/baseline.py relock --cr docs/cr/CR-028-m4-detailed-spec.md --add contracts/sql/003_ui_observability.sql`，baseline revision 31。重锁与生成视图是规格应用，不是 M4 产品验收：37 条 M4 AC 的产品场景、live、性能与容量由 M4-T02..T12 实现与验证。
