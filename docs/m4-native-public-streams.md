@@ -35,6 +35,7 @@
 
 这些白名单已接到 adapter → runner → Persistence；四种模式均由 integration 中的产品 runner fixture 驱动。
 Claude stream_event、Pi auto_compaction_*、各版本缺失的 wait 活动和表外字段保持 unsupported/unmapped，按 `(attempt, frame_kind)` 聚合计数并记录 `frame_kind` 与 `count`。
+聚合诊断的 `count` 是累计最新值，不是增量：首条为 1，流结束时的汇总条给出该 `frame_kind` 的累计总数，两条不能相加。
 Pi auto_retry_start/end 采用版本化 known-frames.json 中的显式类型，只保留活动标记。
 其他所有版本（包括空版本）均为 unsupported_native_version（同样按 `(attempt, frame_kind)` 聚合计数），不推断兼容，不改变已有 compat 判定。
 Claude 同时识别实际版本输出 `2.1.317 (Claude Code)` / `2.1.318 (Claude Code)`，
@@ -55,19 +56,36 @@ thinking/signature、reasoning item、Pi sections/toolsAdded 等不进入公开�
 
 公开正文按 UTF-8 字节计数：≤16 KiB 可放入事件；较大正文以 ≤1 MiB 段封口，经过
 fsync → rename → 目录 fsync → artifact 登记，才写引用事件。流式文本增量按 CR-028 §2.2
-在 ≤50 ms 或 16 KiB（先到即提交）内合并，工具与块边界立即冲刷；跨增量按累积行/块去敏。
+在 ≤50 ms 或 16 KiB（先到即提交）内合并，工具与块边界立即冲刷；任何后续帧（含未映射帧）先冲刷已到期的合并文本。
+
+流式去敏（DC-M4T09b）：每个块中最后一个换行之后的字节不发布，直到换行到达、块结束（完成帧、进程结束、取消或放弃），
+或这段未结束的尾部达到 16 KiB。因此工具边界、不可合并帧和 50 ms 定时器只冲刷到最后一个换行为止。
+整行与结束时的尾部都经过批量路径同一个 `redact` 函数，所以无论增量如何切分、何时冲刷，
+同一块发布正文的拼接都等于对全文的批量去敏结果，跨模式输出一致；每个公开段的 `redacted`
+当且仅当该段含去敏内容时为 true。上限：单行超过 16 KiB 时尾部按一个单元去敏后发布，
+并保留其末尾 13 字节用于识别跨越上限的关键词；若关键词在同一行中比凭证晚出现超过 16 KiB，
+关键词之前已发布的部分无法收回。块只保留未结束的尾部、已接收长度与摘要，不保留全文。
 段的出现身份是 `(block_id, stream, first_offset)`，相同内容可复用一个 artifact。接收队列为 64 项，
 包括持久化中的正文总配额为 1 MiB；仅 `DB_BUSY` 触发背压重试与本地阻塞计时，
-`StorageLowSpace` 及不可重试写入错误写内联 `public.gap` 并丢弃该正文继续运行，诊断失败不终止排水，
-排水消失时原生 stdout 读取与取消继续可达。
+`StorageLowSpace`、`DB_FULL`（状态库已满）及其它写入错误都丢弃该正文并继续运行，不让存储拖住 agent。
+被丢弃的正文由一条内联 `public.gap` 占据它的位置：它与 `public.message` 绑定相同的 attempt、task、role、
+role_epoch、session、config_revision、spec 与 current，并带 `stream`、`first_offset`、`received_offset`、
+`dropped_bytes` 与原因，会话筛选的 Focus 能看到它。gap 本身最多尝试 3 次（间隔 50 ms、100 ms，合计远小于一个 quiet 周期），
+所以 gap 可能比后续正文晚一些出现；仍写不进时，这次丢失被计数，并写进进程结束时的 `public.gap`
+（`reason=public_output_lost`，带 `first_dropped_offset`、`unrecorded_parts`、`dropped_bytes`）。
+诊断失败不终止排水，排水消失时原生 stdout 读取与取消继续可达，此后未发布的帧数同样计入结束 gap。
 只有 inactivity 暂停 `DB_BUSY` 本地阻塞时间，已累计的 quiet 时间保留；进程结束、取消、期限和预算继续推进。
-进程结束后最多等待公开队列一秒，未完成则在原结束事务中写 gap；恢复也保留已提交正文并写 gap。
+进程结束后最多等待公开队列一秒，未完成则在原结束事务中写 gap，并附上排队未写的部分；恢复也保留已提交正文并写 gap。
+读取被放弃时不再等待：已合并和被保留的文本（按上述规则去敏）与 `native_stream_unfinished` gap 以不阻塞方式送入队列，
+放不下的部分计入结束 gap。
 适配器原有帧大小限制继续生效，超限、截断或缩减的帧明确写 gap，不能标为完整文本。
 
 SendInput 在原接受事务中按 input_id 保存 CR/LF 规范化的原文，文件投递提示不能替代它。
 角色取显式目标或已解析问题的目标，默认路径为 commander；无 Attempt 时不伪造 Attempt 身份。
 对象预检低空间返回唯一的 503 STORAGE_LOW_SPACE，接受事务不留下 commands/input/public 行。
 携带已接受 `input_id` 的原生 user 回显关联原块而不重复；无法核对的回显记明 `source=native_echo` 诊断，不冒充新用户提交。
+注意：已锁定的原生来源（录制、schema 与 compat 夹具）都不携带 `input_id`，所以目前没有可关联的原生回显，
+原生 user 回显一律保持私有；上述关联路径只由注入 `input_id` 的测试覆盖。
 原生同 ID/接收 offset 重放不重复；停止或旧 epoch 的历史输出保持原身份且 current=false。
 
 验证使用 `test_011_05_*` / `test_013_05_*`。故障夹具把唯一 marker 注入 auth/env/内部提示词/推理字段，
