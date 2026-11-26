@@ -53,4 +53,6 @@ pub struct PublicPart {
     pub frame_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<String>,
 }

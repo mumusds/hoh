@@ -25,6 +25,7 @@ fn message(id: &str, offset: u64, part: u64) -> PublicPart {
         complete: false,
         frame_kind: None,
         count: None,
+        input_id: None,
     }
 }
 #[tokio::test]
@@ -363,6 +364,16 @@ async fn test_013_05_writer_cas_and_control_snapshots_use_run_close_intervals() 
                     .finish_cancel("r", json!({}), BTreeSet::new(), SystemTime::now())
                     .await?;
             }
+        } else if state == RunState::Incomplete {
+            seed(
+                &path,
+                "UPDATE runs SET created_at='2026-11-07T00:00:00Z' WHERE run_id='r';
+                 INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,used_value) VALUES('run','r','iterations',1,1);",
+            )?;
+            let paced = store
+                .pace_run("r", hoh_core::decision::Context::default())
+                .await?;
+            assert_eq!(paced.incomplete, Some("max_iterations"));
         } else {
             move_run(&store, &path, "r", &[state]).await?;
         }
@@ -386,6 +397,16 @@ async fn test_013_05_writer_cas_and_control_snapshots_use_run_close_intervals() 
                 .any(|(k, p)| k == "run.result" && p["state"] == state.as_str())
         );
         if state == RunState::Incomplete {
+            assert!(
+                events
+                    .iter()
+                    .any(|(k, p)| k == "run.incomplete" && p["stop"] == "max_iterations"),
+                "INCOMPLETE must come from the real budget path writing run.incomplete"
+            );
+            seed(
+                &path,
+                "UPDATE budgets SET limit_value=2 WHERE scope_id='r' AND kind='iterations'",
+            )?;
             let rev = one(&path, "SELECT revision FROM runs WHERE run_id='r'")?
                 .as_i64()
                 .ok_or("rev")?;

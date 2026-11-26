@@ -433,3 +433,160 @@ fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offse
     assert_eq!(p2[0].first_offset, 11);
     assert_eq!(p2[0].text.len(), COALESCE_BYTES);
 }
+
+#[tokio::test]
+async fn test_011_05_publish_splits_over_one_mib_on_utf8_boundaries() {
+    let (sender, mut receiver) = channel(Mode::Claude, "2.1.318");
+    let mut part = Normalizer::new(Mode::Claude, "2.1.318")
+        .feed(
+            &json!({"type":"assistant","uuid":"big-1","message":{"id":"m","content":[{"type":"text","text":"x"}]}}),
+            0,
+        )
+        .remove(0);
+    // 1 MiB - 1 ASCII bytes + 3-byte UTF-8 '中' straddling the 1 MiB boundary + tail.
+    let prefix = "a".repeat((1 << 20) - 1);
+    let body = format!("{prefix}中{}", "b".repeat(1024));
+    part.first_offset = 10;
+    part.text = body.clone();
+    part.complete = true;
+    let drain = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Some(pending) = receiver.recv().await {
+            out.push(pending.part);
+        }
+        out
+    });
+    publish(&sender, vec![part]).await.unwrap();
+    drop(sender);
+    let got = drain.await.unwrap();
+    assert_eq!(got.len(), 2, "over-1MiB payload must split into 2 segments");
+    assert_eq!(got[0].text.len(), (1 << 20) - 1);
+    assert_eq!(got[0].first_offset, 10);
+    assert!(!got[0].complete);
+    assert!(got[0].native_item_id.ends_with("/segment/0"));
+    assert_eq!(got[1].first_offset, 10 + ((1 << 20) - 1) as u64);
+    assert!(got[1].text.starts_with('中'));
+    assert!(got[1].complete);
+    assert!(got[1].native_item_id.ends_with("/segment/1"));
+    assert_eq!(got[0].block_key, got[1].block_key);
+    assert_eq!(format!("{}{}", got[0].text, got[1].text), body);
+}
+
+#[test]
+fn test_011_05_cross_mode_equality_explicit_null_capabilities_and_native_echo_mapping() {
+    let mut signatures = Vec::new();
+    for (mode, version, fixture) in [
+        (
+            Mode::Claude,
+            "2.1.318",
+            include_str!("../compat/fixtures/claude/tool.jsonl"),
+        ),
+        (
+            Mode::CodexAppServer,
+            "0.166.0",
+            include_str!("../compat/fixtures/codex/tool.jsonl"),
+        ),
+        (
+            Mode::CodexExec,
+            "0.166.0",
+            include_str!("../compat/fixtures/codex-exec/tool.jsonl"),
+        ),
+        (
+            Mode::Pi,
+            "1.6.0",
+            include_str!("../compat/fixtures/pi/tool.jsonl"),
+        ),
+    ] {
+        let mut n = Normalizer::new(mode, version);
+        let parts: Vec<_> = fixture
+            .lines()
+            .enumerate()
+            .flat_map(|(offset, line)| n.feed(&serde_json::from_str(line).unwrap(), offset as u64))
+            .collect();
+        let tool_start = parts
+            .iter()
+            .position(|p| p.kind == PublicKind::ToolStart)
+            .expect("tool start");
+        let tool_end = parts
+            .iter()
+            .position(|p| p.kind == PublicKind::ToolEnd)
+            .expect("tool end");
+        let msg = parts
+            .iter()
+            .find(|p| p.kind == PublicKind::Message && p.text.contains("HOH_SUITE_OK"))
+            .expect("assistant message");
+        let usage_part = parts
+            .iter()
+            .find(|p| p.kind == PublicKind::Activity && p.activity.as_deref() == Some("usage"))
+            .expect("usage activity");
+        let usage = usage_part.usage.as_ref().expect("usage struct");
+        let usage_json = serde_json::to_value(usage).unwrap();
+        // Explicit null for unknown capability fields per mode.
+        if matches!(mode, Mode::Pi | Mode::CodexExec) {
+            assert_eq!(
+                usage_json.as_object().unwrap().get("context_limit"),
+                Some(&Value::Null),
+                "{mode:?}: unknown context_limit must be explicit null"
+            );
+        }
+        if matches!(mode, Mode::CodexAppServer | Mode::CodexExec) {
+            assert_eq!(
+                usage_json.as_object().unwrap().get("cost_usd"),
+                Some(&Value::Null),
+                "{mode:?}: unknown cost_usd must be explicit null"
+            );
+        }
+        signatures.push((
+            tool_start < tool_end,
+            parts[tool_start].block_key == parts[tool_end].block_key,
+            parts[tool_start].stream.clone(),
+            parts[tool_end].stream.clone(),
+            parts[tool_end].complete,
+            msg.speaker.clone(),
+            msg.text.trim().to_owned(),
+            msg.complete,
+            usage.input_tokens.is_some(),
+            usage.output_tokens.is_some(),
+        ));
+    }
+    for sig in &signatures[1..] {
+        assert_eq!(
+            &signatures[0], sig,
+            "all native modes must produce equal normalized public shape, order, and identity invariants"
+        );
+    }
+
+    // Native user echo carrying input_id maps with speaker=user and input_id across all modes; without input_id stays private.
+    for (mode, version, with_id, without_id) in [
+        (
+            Mode::Claude,
+            "2.1.318",
+            json!({"type":"user","uuid":"e1","input_id":"in-1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}),
+            json!({"type":"user","uuid":"e2","message":{"role":"user","content":[{"type":"text","text":"internal prompt"}]}}),
+        ),
+        (
+            Mode::CodexAppServer,
+            "0.166.0",
+            json!({"method":"item/completed","params":{"item":{"type":"userMessage","id":"u1","input_id":"in-1","content":[{"type":"text","text":"hello"}]}}}),
+            json!({"method":"item/completed","params":{"item":{"type":"userMessage","id":"u2","content":[{"type":"text","text":"internal prompt"}]}}}),
+        ),
+        (
+            Mode::Pi,
+            "1.6.0",
+            json!({"type":"message_end","message":{"role":"user","input_id":"in-1","content":[{"type":"text","text":"hello"}]}}),
+            json!({"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"internal prompt"}]}}),
+        ),
+    ] {
+        let mut n = Normalizer::new(mode, version);
+        let mapped = n.feed(&with_id, 0);
+        assert_eq!(mapped.len(), 1, "{mode:?} correlated echo");
+        assert_eq!(mapped[0].kind, PublicKind::Message);
+        assert_eq!(mapped[0].speaker.as_deref(), Some("user"));
+        assert_eq!(mapped[0].input_id.as_deref(), Some("in-1"));
+        let hidden = n.feed(&without_id, 1);
+        assert!(
+            hidden.iter().all(|p| p.kind != PublicKind::Message),
+            "{mode:?} uncorrelatable prompt echo must not emit public.message"
+        );
+    }
+}

@@ -190,3 +190,152 @@ fn test_013_05_damaged_backfill_retry_is_idempotent_without_duplicate_diagnostic
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn test_013_05_production_closing_iteration_and_budget_incomplete_paths() -> R {
+    use crate::persistence::{
+        CommandOutcome, Intent, NewEvent, Options, RunTarget, Store, SubmitCommand, selftest,
+    };
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let options = || Options {
+        wal_probe: Some(selftest::test_probe(None)),
+        ..Options::new(crate::spawn::Direct::shared())
+    };
+    let store = Store::open(&path, options())?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','2026-11-07T00:00:00Z');
+         INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+         INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','AUTO','2026-11-07T00:00:00Z');
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','READY','developer',1);
+         INSERT INTO candidates(candidate_id,run_id,git_commit,git_tree,spec_sha256,environment_sha256,test_plan_sha256,source_path,state,created_at) VALUES('c1','r',printf('%040d',1),printf('%040d',2),printf('%064d',1),printf('%064d',2),printf('%064d',3),'c1.json','VERIFYING','2026-11-07T00:00:00Z');
+         INSERT INTO budgets(scope_kind,scope_id,kind,limit_value,used_value) VALUES('run','r','iterations',1,0);",
+    )?;
+    store
+        .commit(crate::persistence::Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: "p".into(),
+                run_id: Some("r".into()),
+                event_id: "before-close".into(),
+                kind: "task.started".into(),
+                payload: json!({"task_id":"t"}),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    // Drive the iteration close through the production closing.rs path (writes iterations row,
+    // updates budgets.used_value to 1, and appends iteration.completed).
+    {
+        let mut conn = Connection::open(&path)?;
+        crate::persistence::hold::install(&conn)?;
+        let ctx = super::super::writer::Ctx::quiet();
+        let tx = super::super::writer::begin(&mut conn, &ctx)?;
+        crate::persistence::closing::iteration(&tx, ("p", "r"), "c1", "repair", &ctx)?;
+        super::super::writer::commit(tx, &ctx)?;
+    }
+    store
+        .commit(crate::persistence::Commit {
+            events: vec![NewEvent {
+                intent: Intent::Progress,
+                project_id: "p".into(),
+                run_id: Some("r".into()),
+                event_id: "tail-event".into(),
+                kind: "task.started".into(),
+                payload: json!({"task_id":"t"}),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    // Drive INCOMPLETE through the real budget pace path (writes run.incomplete + run.result).
+    let paced = store
+        .pace_run("r", crate::decision::Context::default())
+        .await?;
+    assert_eq!(paced.incomplete, Some("max_iterations"));
+    let h1 = store.reader()?.max_seq()?;
+    let events = store.reader()?.events("r")?;
+    assert!(
+        events.iter().any(|(k, p)| k == "iteration.completed"
+            && p["iteration"] == 1
+            && p["candidate_id"] == "c1"),
+        "closing.rs must produce real iteration.completed"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(k, p)| k == "run.incomplete" && p["stop"] == "max_iterations"),
+        "pace_run must produce real run.incomplete"
+    );
+    let at_h1 = store.reader()?.ui_identities("r", h1)?;
+    assert_eq!(at_h1[0].iteration_key, Some(child_id("r", "iteration/1")));
+    assert_eq!(at_h1[1].iteration_key, Some(child_id("r", "iteration/1")));
+    assert_eq!(
+        at_h1[2].iteration_key, None,
+        "tail event after close must be hidden in INCOMPLETE snapshot H1"
+    );
+
+    // Lift the iteration budget and resume through the real ResumeRun command path.
+    Connection::open(&path)?.execute(
+        "UPDATE budgets SET limit_value=2 WHERE scope_id='r' AND kind='iterations'",
+        [],
+    )?;
+    let rev: i64 = Connection::open(&path)?.query_row(
+        "SELECT revision FROM runs WHERE run_id='r'",
+        [],
+        |r| r.get(0),
+    )?;
+    let outcome = store
+        .submit_command(SubmitCommand {
+            command_id: "resume-real".into(),
+            idempotency_key: "resume-real".into(),
+            kind: "ResumeRun".into(),
+            run_id: "r".into(),
+            expected_revision: rev,
+            payload: json!({"reason":"budget increased"}),
+            payload_sha256: "b".repeat(64),
+            target: RunTarget::Resume,
+            event: NewEvent {
+                intent: Intent::Progress,
+                project_id: "p".into(),
+                run_id: Some("r".into()),
+                event_id: "resume-real".into(),
+                kind: "run.resumed".into(),
+                payload: json!({"command_id":"resume-real","reason":"budget increased"}),
+            },
+            outbox: None,
+        })
+        .await?;
+    assert!(matches!(outcome, CommandOutcome::Accepted { .. }));
+    let h2 = store.reader()?.max_seq()?;
+    let at_h2 = store.reader()?.ui_identities("r", h2)?;
+    assert_eq!(
+        at_h2[2].iteration_key,
+        Some(child_id("r", "iteration/2")),
+        "tail event must reopen into iteration/2 at H2"
+    );
+    assert_eq!(
+        store.reader()?.ui_identities("r", h1)?,
+        at_h1,
+        "H1 snapshot must remain unchanged after ResumeRun"
+    );
+    let end = store.writer_ended();
+    drop(store);
+    assert!(end.await);
+    // Forced rebuild matches online field by field at both H1 and H2.
+    Connection::open(&path)?.execute(
+        "DELETE FROM ui_event_index WHERE seq=(SELECT min(seq) FROM ui_event_index)",
+        [],
+    )?;
+    let store = Store::open(&path, options())?;
+    let mut ready = false;
+    for _ in 0..10 {
+        if store.ui_backfill().await?.index_ready {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready);
+    assert_eq!(store.reader()?.ui_identities("r", h1)?, at_h1);
+    assert_eq!(store.reader()?.ui_identities("r", h2)?, at_h2);
+    Ok(())
+}

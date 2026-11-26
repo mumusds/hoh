@@ -132,6 +132,7 @@ impl Normalizer {
             complete: false,
             frame_kind: None,
             count: None,
+            input_id: None,
         }
     }
     /// Complete non-delta text block (e.g. Claude assistant content block): never slices from another block's offset.
@@ -473,6 +474,23 @@ impl Normalizer {
                             p.stream = "input".into();
                             p
                         }
+                        ("user", "text") => {
+                            let Some(input_id) = safe_discriminant(&f["input_id"])
+                                .or_else(|| safe_discriminant(&m["input_id"]))
+                            else {
+                                continue;
+                            };
+                            self.flush_pending_text(&mut out);
+                            let mut p = self.complete_text(
+                                id.clone(),
+                                format!("input/{input_id}"),
+                                offset,
+                                c["text"].as_str().unwrap_or(""),
+                            );
+                            p.speaker = Some("user".into());
+                            p.input_id = Some(input_id);
+                            p
+                        }
                         ("user", "tool_result") => {
                             let Some(call) = c["tool_use_id"].as_str() else {
                                 continue;
@@ -567,6 +585,23 @@ impl Normalizer {
                         item["text"].as_str().unwrap_or(""),
                         &mut out,
                     );
+                }
+                "userMessage" | "user_message" if done => {
+                    if let Some(input_id) = safe_discriminant(&item["input_id"])
+                        .or_else(|| safe_discriminant(&params["input_id"]))
+                    {
+                        self.flush_pending_text(&mut out);
+                        let mut p = self.complete_text(
+                            key,
+                            format!("input/{input_id}"),
+                            offset,
+                            &public_text(&item["content"]),
+                        );
+                        p.speaker = Some("user".into());
+                        p.input_id = Some(input_id);
+                        *handled = true;
+                        out.push(p);
+                    }
                 }
                 "commandExecution" | "command_execution" => {
                     self.flush_pending_text(&mut out);
@@ -745,6 +780,22 @@ impl Normalizer {
                 now,
                 &mut out,
             );
+        } else if kind == "message_end" && m["role"] == "user" {
+            if let Some(input_id) =
+                safe_discriminant(&m["input_id"]).or_else(|| safe_discriminant(&f["input_id"]))
+            {
+                self.flush_pending_text(&mut out);
+                let mut p = self.complete_text(
+                    id,
+                    format!("input/{input_id}"),
+                    offset,
+                    &public_text(&m["content"]),
+                );
+                p.speaker = Some("user".into());
+                p.input_id = Some(input_id);
+                *handled = true;
+                out.push(p);
+            }
         } else if kind == "message_end" && m["role"] == "assistant" {
             let model = public_name(&m["model"]);
             if let Some(cs) = m["content"].as_array() {

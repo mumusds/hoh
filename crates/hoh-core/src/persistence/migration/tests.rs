@@ -516,6 +516,79 @@ fn test_013_05_migration_001_002_003_reopen_empty_indexes_and_foreign_keys() -> 
 }
 
 #[test]
+fn test_013_05_kill_during_migration_003_rolls_back_to_version_2() -> R {
+    use std::os::unix::process::ExitStatusExt as _;
+    if std::env::var_os("HOH_M4T09_CRASH_003").is_some() {
+        let path = std::env::var("HOH_M4T09_CRASH_003_DB")?;
+        let conn = Connection::open(path)?;
+        let outcome = migrate(&conn, MIGRATIONS);
+        eprintln!("migration 003 finished without a crash: {outcome:?}");
+        std::process::exit(2);
+    }
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("crash003.db");
+    let conn = Connection::open(&path)?;
+    migrate(&conn, &MIGRATIONS[..2])?;
+    conn.execute_batch(
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/project','now');
+         INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+         INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','AUTO','now');
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','READY','developer',1);
+         INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES('p','e1','r','task.started','{}','now');",
+    )?;
+    drop(conn);
+    let child = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "persistence::migration::tests::test_013_05_kill_during_migration_003_rolls_back_to_version_2",
+            "--nocapture",
+        ])
+        .env("HOH_M4T09_CRASH_003", "1")
+        .env("HOH_M4T09_CRASH_003_DB", &path)
+        .output()?;
+    assert_eq!(
+        child.status.signal(),
+        Some(9),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let conn = Connection::open(&path)?;
+    assert_eq!(user_version(&conn)?, 2);
+    for table in [
+        "ui_index_generations",
+        "ui_iteration_ranges",
+        "ui_event_index",
+        "public_segments",
+    ] {
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get(0),
+        )?;
+        assert_eq!(exists, 0, "migration 003 table {table} must roll back");
+    }
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?,
+        1
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?,
+        "ok"
+    );
+    assert_eq!(migrate(&conn, MIGRATIONS)?, 3);
+    fk_on(&conn)?;
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn test_011_05_segment_occurrences_reuse_artifacts_and_replay_after_upgrade() -> R {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("segments.db");

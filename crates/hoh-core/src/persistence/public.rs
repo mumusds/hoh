@@ -106,6 +106,92 @@ pub(super) fn native(
         return Ok(Some(seq));
     }
     let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM role_bindings b JOIN attempts a ON a.attempt_id=?1 WHERE b.run_id=?2 AND b.role=?3 AND b.role_epoch=?4 AND a.state='RUNNING')",params![attempt,run,role,epoch],|r|r.get(0)).map_err(sqlite_error)?;
+    // A native user echo with an accepted input_id links to the existing user block instead of duplicating it (CR-028 §2.2).
+    if let Some(input_id) = &part.input_id {
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT block_id, created_seq FROM public_input_blocks WHERE input_id=?1",
+                [input_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((block, seq)) = existing {
+            tx.execute(
+                "INSERT INTO public_native_parts(attempt_id,native_stream,native_item_id,part,block_id,received_offset,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    attempt,
+                    part.native_stream,
+                    part.native_item_id,
+                    sql_number(part.part)?,
+                    block,
+                    sql_number(part.received_offset)?,
+                    seq
+                ],
+            )
+            .map_err(sqlite_error)?;
+            writer::commit(tx, ctx)?;
+            return Ok(Some(seq));
+        }
+        // Unverifiable echo: never impersonate a new accepted user submission; record its native source explicitly.
+        let block = child_id(
+            attempt,
+            &format!("public/{}/echo/{}", part.native_stream, part.native_item_id),
+        );
+        let payload = json!({
+            "block_id": block,
+            "attempt_id": attempt,
+            "run_id": run,
+            "task_id": task,
+            "role": role,
+            "role_epoch": epoch,
+            "session_id": session,
+            "config_revision": revision,
+            "spec_id": spec,
+            "native_stream": part.native_stream,
+            "native_item_id": part.native_item_id,
+            "received_offset": part.received_offset,
+            "part": part.part,
+            "input_id": input_id,
+            "source": "native_echo",
+            "activity": "unverified_native_user_echo",
+            "current": current,
+            "complete": true,
+        });
+        let event_id = child_id(
+            attempt,
+            &format!(
+                "public-part/{}/{}/{}",
+                part.native_stream, part.native_item_id, part.part
+            ),
+        );
+        let seq = writer::insert_event(
+            &tx,
+            &writer::NewEvent {
+                intent: writer::Intent::Record,
+                project_id: project,
+                run_id: Some(run),
+                event_id,
+                kind: "public.diagnostic".into(),
+                payload,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO public_native_parts(attempt_id,native_stream,native_item_id,part,block_id,received_offset,created_seq) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                attempt,
+                part.native_stream,
+                part.native_item_id,
+                sql_number(part.part)?,
+                block,
+                sql_number(part.received_offset)?,
+                seq
+            ],
+        )
+        .map_err(sqlite_error)?;
+        writer::commit(tx, ctx)?;
+        return Ok(Some(seq));
+    }
     let block = child_id(
         attempt,
         &format!("public/{}/{}", part.native_stream, part.block_key),

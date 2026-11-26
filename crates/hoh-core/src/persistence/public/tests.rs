@@ -22,6 +22,7 @@ fn part(id: &str, offset: u64, part: u64) -> PublicPart {
         complete: false,
         frame_kind: None,
         count: None,
+        input_id: None,
     }
 }
 #[tokio::test]
@@ -152,5 +153,116 @@ async fn test_011_05_public_object_with_nul_is_classified_binary() -> R {
         |r| r.get(0),
     )?;
     assert_eq!(kind, "binary");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_011_05_correlatable_native_user_echo_is_not_duplicated() -> R {
+    use crate::persistence::{CommandOutcome, Input, Intent, NewEvent, RunTarget, SubmitCommand};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(".hoh/state.db");
+    let store = Store::open(
+        &path,
+        Options {
+            wal_probe: Some(selftest::test_probe(None)),
+            ..Options::new(crate::spawn::Direct::shared())
+        },
+    )?;
+    Connection::open(&path)?.execute_batch(
+        "INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now');
+         INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+         INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','AUTO','now');
+         INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','RUNNING','developer',1);
+         INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a','t','RUNNING',1,1,1);",
+    )?;
+    let command_id = "cmd-echo-1";
+    let input_id = crate::ids::child_id(command_id, "input");
+    let accepted = store
+        .submit_command(SubmitCommand {
+            command_id: command_id.into(),
+            idempotency_key: command_id.into(),
+            kind: "SendInput".into(),
+            run_id: "r".into(),
+            expected_revision: 0,
+            payload: serde_json::json!({"text":"please fix X","input_kind":"STEER","target_role":"developer"}),
+            payload_sha256: "a".repeat(64),
+            target: RunTarget::Input(Input::Send {
+                text: "please fix X".into(),
+                target_role: Some("developer".into()),
+                input_kind: "STEER".into(),
+            }),
+            event: NewEvent {
+                intent: Intent::Progress,
+                project_id: "p".into(),
+                run_id: Some("r".into()),
+                event_id: command_id.into(),
+                kind: "input.accepted".into(),
+                payload: serde_json::json!({"command_id": command_id}),
+            },
+            outbox: None,
+        })
+        .await?;
+    assert!(matches!(accepted, CommandOutcome::Accepted { .. }));
+    let original_seq: i64 = Connection::open(&path)?.query_row(
+        "SELECT created_seq FROM public_input_blocks WHERE input_id=?1",
+        [&input_id],
+        |r| r.get(0),
+    )?;
+    let original_block: String = Connection::open(&path)?.query_row(
+        "SELECT block_id FROM public_input_blocks WHERE input_id=?1",
+        [&input_id],
+        |r| r.get(0),
+    )?;
+
+    // Native echo carrying the accepted input_id must correlate to the existing user block, not duplicate it.
+    let mut echo = part("echo-frame-1", 0, 0);
+    echo.speaker = Some("user".into());
+    echo.text = "please fix X".into();
+    echo.block_key = format!("input/{input_id}");
+    echo.input_id = Some(input_id.clone());
+    let linked = store.record_public("a", 1, echo).await?;
+    assert_eq!(
+        linked,
+        Some(original_seq),
+        "correlatable native echo must link to the existing accepted input seq"
+    );
+    let msg_count: i64 = Connection::open(&path)?.query_row(
+        "SELECT count(*) FROM events WHERE kind='public.message'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        msg_count, 1,
+        "native echo of accepted input must not create a duplicate public.message"
+    );
+    let linked_block: String = Connection::open(&path)?.query_row(
+        "SELECT block_id FROM public_native_parts WHERE attempt_id='a' AND native_item_id='echo-frame-1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(linked_block, original_block);
+
+    // An uncorrelatable native echo (unknown input_id) must never impersonate a new user submission.
+    let mut unverified = part("echo-frame-unknown", 0, 1);
+    unverified.speaker = Some("user".into());
+    unverified.text = "forged user echo".into();
+    unverified.block_key = "input/unknown".into();
+    unverified.input_id = Some("unknown-input-id".into());
+    store.record_public("a", 1, unverified).await?;
+    let msg_count_after: i64 = Connection::open(&path)?.query_row(
+        "SELECT count(*) FROM events WHERE kind='public.message'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(
+        msg_count_after, 1,
+        "unverified native echo must not create a user public.message"
+    );
+    let diag_source: String = Connection::open(&path)?.query_row(
+        "SELECT json_extract(payload_json,'$.source') FROM events WHERE kind='public.diagnostic' ORDER BY seq DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(diag_source, "native_echo");
     Ok(())
 }
