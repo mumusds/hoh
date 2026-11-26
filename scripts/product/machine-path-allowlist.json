@@ -1,0 +1,47 @@
+{
+  "description": "Explicit allowlist for scripts/product/machine_path_scan.py (M4L1-100, M4L1-101). Every /home/<user> path in scanned sources (.rs, .py, .sh, .toml, .yml, .yaml, .json) must match an explicit entry here with a reason; stale entries fail the scan.",
+  "files": {
+    "scripts/dev/pre-pr.sh": {
+      "allowed_literals": [
+        "/home/ai/dev/.hoh-test-slot.lock"
+      ],
+      "reason": "dev-only machine test-slot default (overridable via HOH_TEST_SLOT; pre-pr.sh is not run in CI)"
+    },
+    "crates/hoh-agents/src/compat/tests.rs": {
+      "allowed_users": [
+        "x"
+      ],
+      "reason": "synthetic non-existent home path in fixture redaction unit test"
+    },
+    "crates/hoh-core/src/unit/tests.rs": {
+      "allowed_users": [
+        "u",
+        "a"
+      ],
+      "reason": "synthetic non-existent home paths in systemd unit template escaping unit tests"
+    },
+    "tests/bundle/test_commander_readonly.py": {
+      "allowed_users": [
+        "u"
+      ],
+      "reason": "synthetic non-existent path in commander read-only fixture unit test"
+    },
+    "tests/bundle/test_record.py": {
+      "allowed_users": [
+        "op"
+      ],
+      "reason": "synthetic non-existent home path in environment scrubbing unit test"
+    },
+    "tests/bundle/test_record_faults.py": {
+      "allowed_users": [
+        "x"
+      ],
+      "reason": "synthetic non-existent home path in fault-recorder environment unit test"
+    }
+  },
+  "directories": {
+    "tests/fixtures/protocol/": {
+      "reason": "recorded CLI provenance and protocol JSON fixtures from real agent captures; never opened as filesystem paths"
+    }
+  }
+}
