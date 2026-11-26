@@ -44,6 +44,14 @@ struct TextStreamState {
     any_redacted: bool,
 }
 
+struct StreamMeta {
+    id: String,
+    block: String,
+    offset: u64,
+    part: u64,
+    model: Option<String>,
+}
+
 #[derive(Debug)]
 struct CoalescedText {
     native_item_id: String,
@@ -144,23 +152,25 @@ impl Normalizer {
     }
     fn emit_stream_chunk(
         &mut self,
-        id: String,
-        block: String,
-        offset: u64,
-        part: u64,
-        model: Option<String>,
+        meta: StreamMeta,
         raw_chunk: &str,
         complete: bool,
     ) -> PublicPart {
-        let state = self.streams.entry(block.clone()).or_default();
+        let state = self.streams.entry(meta.block.clone()).or_default();
         let (clean, changed) = redact_streaming_chunk(state, raw_chunk);
         let first_offset = state.pub_offset;
         state.pub_offset += clean.len() as u64;
         let redacted = changed || (complete && state.any_redacted);
-        let mut p =
-            self.part_already_redacted(id, block, offset, PublicKind::Message, clean, redacted);
-        p.part = part;
-        p.model = model;
+        let mut p = self.part_already_redacted(
+            meta.id,
+            meta.block,
+            meta.offset,
+            PublicKind::Message,
+            clean,
+            redacted,
+        );
+        p.part = meta.part;
+        p.model = meta.model;
         p.first_offset = first_offset;
         p.complete = complete;
         p
@@ -168,11 +178,13 @@ impl Normalizer {
     fn flush_pending_text(&mut self, out: &mut Vec<PublicPart>) {
         if let Some(pending) = self.pending_text.take() {
             out.push(self.emit_stream_chunk(
-                pending.native_item_id,
-                pending.block_key,
-                pending.received_offset,
-                pending.part,
-                pending.model,
+                StreamMeta {
+                    id: pending.native_item_id,
+                    block: pending.block_key,
+                    offset: pending.received_offset,
+                    part: pending.part,
+                    model: pending.model,
+                },
                 &pending.raw_text,
                 false,
             ));
@@ -188,7 +200,17 @@ impl Normalizer {
         out: &mut Vec<PublicPart>,
     ) {
         if !self.coalescing {
-            out.push(self.emit_stream_chunk(id, block, offset, 0, None, delta, false));
+            out.push(self.emit_stream_chunk(
+                StreamMeta {
+                    id,
+                    block,
+                    offset,
+                    part: 0,
+                    model: None,
+                },
+                delta,
+                false,
+            ));
             return;
         }
         if self
@@ -216,25 +238,21 @@ impl Normalizer {
     }
     fn finish_stream_text(
         &mut self,
-        id: String,
-        block: String,
-        offset: u64,
-        part: u64,
-        model: Option<String>,
+        meta: StreamMeta,
         final_text: &str,
         out: &mut Vec<PublicPart>,
     ) {
         if self
             .pending_text
             .as_ref()
-            .is_some_and(|p| p.block_key != block)
+            .is_some_and(|p| p.block_key != meta.block)
         {
             self.flush_pending_text(out);
         }
         if let Some(mut pending) = self.pending_text.take() {
             let committed_len = self
                 .streams
-                .get(&block)
+                .get(&meta.block)
                 .map_or(0, |s| s.raw_accumulated.len());
             let prefix_len = committed_len + pending.raw_text.len();
             if final_text.len() > prefix_len
@@ -243,31 +261,33 @@ impl Normalizer {
                 && &final_text[..committed_len]
                     == self
                         .streams
-                        .get(&block)
+                        .get(&meta.block)
                         .map_or("", |s| s.raw_accumulated.as_str())
-                && &final_text[committed_len..prefix_len] == pending.raw_text
+                && final_text[committed_len..prefix_len] == pending.raw_text
             {
                 pending.raw_text.push_str(&final_text[prefix_len..]);
             }
-            let model = model.or(pending.model);
+            let model = meta.model.or(pending.model);
             out.push(self.emit_stream_chunk(
-                pending.native_item_id,
-                pending.block_key,
-                pending.received_offset,
-                part,
-                model,
+                StreamMeta {
+                    id: pending.native_item_id,
+                    block: pending.block_key,
+                    offset: pending.received_offset,
+                    part: meta.part,
+                    model,
+                },
                 &pending.raw_text,
                 true,
             ));
             return;
         }
-        let remaining = match self.streams.get(&block) {
+        let remaining = match self.streams.get(&meta.block) {
             Some(state) if !state.raw_accumulated.is_empty() => final_text
                 .strip_prefix(&state.raw_accumulated)
                 .unwrap_or(""),
             _ => final_text,
         };
-        out.push(self.emit_stream_chunk(id, block, offset, part, model, remaining, true));
+        out.push(self.emit_stream_chunk(meta, remaining, true));
     }
     pub fn next_flush_deadline(&self) -> Option<Instant> {
         self.pending_text
@@ -577,11 +597,13 @@ impl Normalizer {
                 "agentMessage" | "agent_message" if done => {
                     *handled = true;
                     self.finish_stream_text(
-                        key,
-                        format!("message/{id}"),
-                        offset,
-                        0,
-                        None,
+                        StreamMeta {
+                            id: key,
+                            block: format!("message/{id}"),
+                            offset,
+                            part: 0,
+                            model: None,
+                        },
                         item["text"].as_str().unwrap_or(""),
                         &mut out,
                     );
@@ -804,11 +826,13 @@ impl Normalizer {
                         let block =
                             format!("{}/text/{i}", self.pi_message.as_deref().unwrap_or(&id));
                         self.finish_stream_text(
-                            id.clone(),
-                            block,
-                            offset,
-                            i as u64,
-                            model.clone(),
+                            StreamMeta {
+                                id: id.clone(),
+                                block,
+                                offset,
+                                part: i as u64,
+                                model: model.clone(),
+                            },
                             c["text"].as_str().unwrap_or(""),
                             &mut out,
                         );
