@@ -22,6 +22,8 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod delivery_public;
+
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// The WAL self-test's second process: this binary, only this function.
