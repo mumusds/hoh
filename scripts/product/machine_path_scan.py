@@ -22,7 +22,7 @@ SKIP_DIRS = frozenset({".git", "target", ".hoh-dev", "node_modules", "__pycache_
 # Matches `/home/<user>` (with optional trailing subpath) regardless of quoting or trailing slash,
 # as well as `tempdir_in` targeting `/home` even without a username segment.
 HOME_PATH = re.compile(
-    r'(?<![A-Za-z0-9_./])/home/(?P<user>[A-Za-z0-9._-]+)(?P<rest>/[^\s"\'<>|;)\]},`\\]*)?'
+    r'(?<![A-Za-z0-9_])/home/(?P<user>[A-Za-z0-9._-]+)(?P<rest>/[^\s"\'<>|;)\]},`\\]*)?'
     r'|tempdir_in\(\s*"' + r'/home(?:/[^"]*)?"?'
 )
 

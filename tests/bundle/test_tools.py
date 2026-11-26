@@ -1920,6 +1920,8 @@ class MachinePathScan(unittest.TestCase):
             ('yml_source','.github/workflows/ci.yml',f'workdir: {h}runner/work\n'),
             ('yaml_source','scripts/cfg.yaml',f'root: {h}dave\n'),
             ('json_source','tests/cfg.json',f'{{"dir": "{h}eve"}}\n'),
+            ('double_slash_home','scripts/dev/example.sh',f'DIR=/{h}ai/dev\n'),
+            ('dotdot_slash_home','crates/a/src/lib.rs',f'const D: &str = "..{h}alice/work";\n'),
             ('tempdir_in_home','crates/a/src/lib.rs','let _ = tempdir_in("/ho'+'me");\n'),
         ]
         for label,rel,content in canaries:
