@@ -11,25 +11,19 @@ pub(super) struct Drain {
     executor: Arc<dyn Executor>,
     work: Work,
 }
-/// What the process-end gap says: why the public stream ended early, and what of it was lost (M4T09R-301).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct EndGap {
-    pub(super) reason: &'static str,
-    pub(super) loss: hoh_agents::public_stream::LossSummary,
-}
-impl EndGap {
-    pub(super) fn payload(&self, attempt: &str, epoch: i64) -> serde_json::Value {
-        serde_json::json!({
-            "attempt_id": attempt,
-            "role_epoch": epoch,
-            "reason": self.reason,
-            "first_dropped_offset": self.loss.first_offset,
-            "dropped_parts": self.loss.dropped,
-            "unrecorded_parts": self.loss.unrecorded,
-            "dropped_bytes": self.loss.bytes,
-            "frames_after_close": self.loss.frames_after_close,
-            "complete": false,
-        })
+/// What the process-end gap says: why the public stream ended early, and what of it was lost (M4T09R-301). The store
+/// builds its event with the attempt's identity in the attempt's end transaction (DC-M4T09c).
+fn end_gap(
+    reason: &str,
+    loss: &hoh_agents::public_stream::LossSummary,
+) -> hoh_core::public_output::PublicEndGap {
+    hoh_core::public_output::PublicEndGap {
+        reason: reason.to_owned(),
+        first_dropped_offset: loss.first_offset,
+        dropped_parts: loss.dropped,
+        unrecorded_parts: loss.unrecorded,
+        dropped_bytes: loss.bytes,
+        frames_after_close: loss.frames_after_close,
     }
 }
 /// Pauses before the second and third attempt at a dropped body's gap: all three take well under one quiet period
@@ -134,7 +128,7 @@ impl Drain {
         }
     }
     /// The process-end gap, if the stream ended early or lost output that no gap of its own records.
-    pub(super) async fn finish(mut self) -> Option<EndGap> {
+    pub(super) async fn finish(mut self) -> Option<hoh_core::public_output::PublicEndGap> {
         let reason = if let Some(task) = self.task.as_mut() {
             // Local storage cannot hold up process end, cancellation or the runner's budget accounting indefinitely.
             match tokio::time::timeout(Duration::from_secs(1), &mut *task).await {
@@ -152,11 +146,8 @@ impl Drain {
         };
         let loss = self.loss.summary();
         match reason {
-            Some(reason) => Some(EndGap { reason, loss }),
-            None if loss.needs_gap() => Some(EndGap {
-                reason: "public_output_lost",
-                loss,
-            }),
+            Some(reason) => Some(end_gap(reason, &loss)),
+            None if loss.needs_gap() => Some(end_gap("public_output_lost", &loss)),
             None => None,
         }
     }

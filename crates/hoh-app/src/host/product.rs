@@ -465,6 +465,7 @@ fn outcome(facts: Facts) -> Outcome {
             usage: facts.usage,
             native_session,
             events,
+            public_end_gap: None,
             prompt: None,
             raw_log_path: Some(facts.raw_log_path),
             workspace: None,

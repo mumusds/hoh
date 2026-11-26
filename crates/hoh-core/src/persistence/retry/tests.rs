@@ -734,6 +734,7 @@ async fn an_ending_records_what_the_agents_turn_showed() -> R {
                     resolved_model: Some("m-test".to_owned()),
                     usage: Some(json!({"input_tokens": 3})),
                     native_session: Some("native-1".to_owned()),
+                    public_end_gap: None,
                     prompt: Some(crate::persistence::PromptRecord {
         chain: Vec::new(),
                         layer: "project".to_owned(),

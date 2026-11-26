@@ -265,6 +265,8 @@ pub struct Observed {
     pub native_session: Option<String>,
     /// The attempt's events, in order: (key, kind, payload); each event's id is the attempt's id and its key.
     pub events: Vec<(String, String, serde_json::Value)>,
+    /// Its public stream's process-end gap, written with the attempt's identity in the commit of its end (DC-M4T09c).
+    pub public_end_gap: Option<crate::public_output::PublicEndGap>,
     /// The prompt it was sent (docs/adr/ADR-022.md decision 11).
     pub prompt: Option<PromptRecord>,
     /// The directory of its raw logs.
@@ -1735,6 +1737,11 @@ fn finish_in(
             kind: kind.clone(),
             payload: payload.clone(),
         });
+    }
+    if let Some(end) = &ending.observed.public_end_gap {
+        commit
+            .events
+            .push(super::public::ended(tx, attempt_id, end)?);
     }
     // The effects it left STARTED are UNKNOWN, in its ending's transaction, and named for whoever settles them, as the
     // cancel's own pass and a reconcile record them (ADR-021 decision 8e; ADR-022 decision 12 v3, M2T07R-301, -451).

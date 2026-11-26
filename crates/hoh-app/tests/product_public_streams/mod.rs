@@ -653,6 +653,21 @@ async fn test_011_05_db_full_drops_body_retries_its_gap_and_reports_unrecorded_l
                 assert_eq!(end["unrecorded_parts"], 1, "{label}: {end}");
                 assert_eq!(end["dropped_bytes"], "DROPPED_BODY".len(), "{label}: {end}");
                 assert_eq!(end["complete"], false, "{label}: {end}");
+                // The process-end gap carries the attempt's identity and is indexed in its session (DC-M4T09c,
+                // M4T09R-500/402).
+                let after: Value = serde_json::from_str(&query(&project, "SELECT payload_json FROM events WHERE kind='public.message' AND json_extract(payload_json,'$.attempt_id')='FULL/attempt-1' AND json_extract(payload_json,'$.text')='AFTER_FULL'")?)?;
+                for key in ["run_id", "task_id", "role", "role_epoch", "session_id", "config_revision", "spec_id"] {
+                    assert_eq!(end[key], after[key], "{label}: end gap {key}: {end} vs {after}");
+                }
+                assert!(end["session_id"].is_string(), "{label}: {end}");
+                assert_eq!(end["current"], false, "{label}: {end}");
+                super::until(
+                    &project,
+                    "SELECT count(*) FROM events e JOIN ui_event_index i ON i.seq=e.seq WHERE e.kind='public.gap' AND json_extract(e.payload_json,'$.reason')='public_output_lost' AND i.attempt_id='FULL/attempt-1' AND i.session_id IS NOT NULL AND i.session_id IN (SELECT i2.session_id FROM events m JOIN ui_event_index i2 ON i2.seq=m.seq WHERE m.kind='public.message' AND json_extract(m.payload_json,'$.text')='AFTER_FULL')",
+                    "1",
+                    Duration::from_secs(10),
+                )
+                .await?;
             }
             R::Ok(())
         }
