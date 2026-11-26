@@ -252,3 +252,226 @@ async fn test_011_05_http_input_original_objects_idempotency_and_single_low_spac
     world.stop_fakes()?;
     result
 }
+
+#[derive(Debug, Default)]
+struct PublicDiagnosticFault {
+    job: std::sync::Mutex<&'static str>,
+    public_count: std::sync::atomic::AtomicUsize,
+    arm_diag_refusal: std::sync::atomic::AtomicBool,
+    refuse_next_commit: std::sync::atomic::AtomicBool,
+    diagnostic_refusals: std::sync::atomic::AtomicUsize,
+    public_refusals: std::sync::atomic::AtomicUsize,
+}
+impl hoh_core::persistence::FaultHooks for PublicDiagnosticFault {
+    fn before_job(&self, job: &'static str) {
+        if let Ok(mut current) = self.job.lock() {
+            *current = job;
+        }
+    }
+    fn before_commit(&self) -> Result<(), hoh_core::persistence::PersistError> {
+        use std::sync::atomic::Ordering;
+        let current = self.job.lock().map(|g| *g).unwrap_or("");
+        if current == "Public" {
+            let n = self.public_count.fetch_add(1, Ordering::SeqCst);
+            // Frame 0 (init, offset 0): n=0 refused -> n=1 ok (optionally refuses its diagnostic Commit).
+            // Frame 1 (FIRST_BLOCK, offset 1): n=2 ok.
+            // Frame 2 part 0 (PART_ZERO, offset 2): n=3 refused -> n=4 ok.
+            // Frame 2 part 1 (tool_use, offset 2): n=5 refused -> n=6 ok.
+            if matches!(n, 0 | 3 | 5) {
+                self.public_refusals.fetch_add(1, Ordering::SeqCst);
+                if n == 0 && self.arm_diag_refusal.load(Ordering::SeqCst) {
+                    self.refuse_next_commit.store(true, Ordering::SeqCst);
+                }
+                return Err(hoh_core::persistence::PersistError::Busy(
+                    "injected public DB_BUSY".into(),
+                ));
+            }
+        } else if current == "Commit" && self.refuse_next_commit.swap(false, Ordering::SeqCst) {
+            self.diagnostic_refusals.fetch_add(1, Ordering::SeqCst);
+            return Err(hoh_core::persistence::PersistError::Busy(
+                "injected diagnostic commit DB_BUSY".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_011_05_drain_survives_backpressure_diagnostic_busy_and_same_offset_parts() -> R {
+    use std::sync::{Arc, atomic::Ordering};
+    for refuse_diag_commit in [true, false] {
+        let world = World::new()?;
+        let body = world.claude_body(None)?;
+        let frames = world.bin().join("claude.d/public-diag-fault.jsonl");
+        std::fs::write(
+            &frames,
+            [
+                json!({"type":"system","subtype":"init","session_id":"diag-fault","model":"fixture"}),
+                json!({"type":"assistant","uuid":"f1","session_id":"diag-fault","message":{"id":"m1","content":[{"type":"text","text":"FIRST_BLOCK"}]}}),
+                json!({"type":"assistant","uuid":"f2","session_id":"diag-fault","message":{"id":"m2","content":[{"type":"text","text":"PART_ZERO"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"echo ok"}}]}}),
+                json!({"type":"assistant","uuid":"f3","session_id":"diag-fault","message":{"id":"m3","content":[{"type":"text","text":"FINAL_BLOCK"}]}}),
+                json!({"type":"result","uuid":"f4","subtype":"success","is_error":false,"result":"FINAL_BLOCK","session_id":"diag-fault","usage":{"input_tokens":10,"output_tokens":5}}),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )?;
+        let body = body.replace("$f/success/stdout.jsonl", &frames.display().to_string());
+        world.script("claude", &body)?;
+        world.bind_installed()?;
+        let faults = Arc::new(PublicDiagnosticFault::default());
+        faults
+            .arm_diag_refusal
+            .store(refuse_diag_commit, Ordering::SeqCst);
+        let mut config = world.config();
+        config.store.faults = faults.clone();
+        let host = start_when_free(config).await?;
+        let outcome = async {
+            let project = world.project();
+            let run = started(&host, &project, "diag-fault").await?;
+            ready(&project, &run, &[("DIAG", "developer")])?;
+            until(
+                &project,
+                "SELECT state FROM attempts WHERE attempt_id='DIAG/attempt-1'",
+                "SETTLED",
+                Duration::from_secs(30),
+            )
+            .await?;
+            assert_eq!(faults.public_refusals.load(Ordering::SeqCst), 3, "refuse_diag_commit={refuse_diag_commit}");
+            assert_eq!(
+                faults.diagnostic_refusals.load(Ordering::SeqCst),
+                usize::from(refuse_diag_commit),
+                "refuse_diag_commit={refuse_diag_commit}"
+            );
+            let raw = query(
+                &project,
+                "SELECT json_group_array(json(payload_json)) FROM events WHERE kind LIKE 'public.%' AND json_extract(payload_json,'$.attempt_id')='DIAG/attempt-1'",
+            )?;
+            let messages: Vec<Value> = serde_json::from_str(&raw)?;
+            assert!(
+                messages.iter().any(|p| p["text"] == "FIRST_BLOCK"),
+                "refuse_diag_commit={refuse_diag_commit}: first block persisted: {raw}"
+            );
+            assert!(
+                messages.iter().any(|p| p["text"] == "PART_ZERO"),
+                "refuse_diag_commit={refuse_diag_commit}: same-offset part 0 persisted: {raw}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|p| p["name"] == "Bash" && p["stream"] == "input"),
+                "refuse_diag_commit={refuse_diag_commit}: same-offset part 1 persisted: {raw}"
+            );
+            assert!(
+                messages.iter().any(|p| p["text"] == "FINAL_BLOCK"),
+                "refuse_diag_commit={refuse_diag_commit}: drain must stay alive and persist final block: {raw}"
+            );
+            assert_eq!(
+                query(
+                    &project,
+                    "SELECT count(*) FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='DIAG/attempt-1'",
+                )?,
+                "0",
+                "refuse_diag_commit={refuse_diag_commit}: no drain death gap expected"
+            );
+            R::Ok(())
+        }
+        .await;
+        host.shutdown().await;
+        world.stop_fakes()?;
+        outcome?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_011_05_low_space_body_writes_gap_without_stalling_attempt_or_inactivity() -> R {
+    use std::sync::{Arc, atomic::AtomicU64};
+    let world = World::new()?;
+    let body = world.claude_body(None)?;
+    let script = world.bin().join("claude.d/public-lowspace.py");
+    let emitted = world.bin().join("claude.d/public-lowspace-emitted");
+    std::fs::write(
+        &script,
+        r#"import json,signal,sys
+signal.signal(signal.SIGINT,lambda *_:sys.exit(0))
+signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))
+print(json.dumps({'type':'system','subtype':'init','session_id':'lowspace','model':'fixture'}),flush=True)
+print(json.dumps({'type':'assistant','uuid':'big','session_id':'lowspace','message':{'id':'m1','content':[{'type':'text','text':'L'*24576}]}}),flush=True)
+print(json.dumps({'type':'assistant','uuid':'small','session_id':'lowspace','message':{'id':'m2','content':[{'type':'text','text':'AFTER_LOW_SPACE'}]}}),flush=True)
+open(sys.argv[1],'w').close()
+signal.pause()
+"#,
+    )?;
+    let body = body.replace(
+        "case \"$HOH_ATTEMPT_ID\" in",
+        &format!(
+            "case \"$HOH_ATTEMPT_ID\" in\n *LOWSPACE*) exec python3 '{}' '{}' ;;",
+            script.display(),
+            emitted.display()
+        ),
+    );
+    world.script("claude", &body)?;
+    world.bind_installed()?;
+    let capacity = Arc::new(PublicCapacity(AtomicU64::new(0)));
+    let mut config = watched(&world);
+    config.watchdog.quiet = Duration::from_millis(500);
+    config.watchdog.every = Duration::from_millis(25);
+    config.store.faults = capacity;
+    let host = start_when_free(config).await?;
+    let outcome = async {
+        let project = world.project();
+        let run = started(&host, &project, "lowspace").await?;
+        ready(&project, &run, &[("LOWSPACE", "developer")])?;
+        until_file(&emitted, Duration::from_secs(10)).await?;
+        super::until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind='public.gap' AND json_extract(payload_json,'$.attempt_id')='LOWSPACE/attempt-1' AND json_extract(payload_json,'$.reason')='storage_low_space'",
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
+        super::until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind='public.message' AND json_extract(payload_json,'$.attempt_id')='LOWSPACE/attempt-1' AND json_extract(payload_json,'$.text')='AFTER_LOW_SPACE'",
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
+        assert_eq!(
+            query(&project, "SELECT count(*) FROM public_segments")?,
+            "0",
+            "low-space body must not write an object"
+        );
+        super::until(
+            &project,
+            &watchdog_events("LOWSPACE/attempt-1", "attempt.inactive"),
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
+        let revision = query(&project, &format!("SELECT revision FROM runs WHERE run_id='{run}'"))?
+            .parse::<i64>()?;
+        let (status, answer) = common::fresh(json!(revision), |revision| {
+            let body = json!({"schema_version":"1.0","command_id":"cancel-lowspace","idempotency_key":"cancel-lowspace","expected_revision":revision,"kind":"CancelRun","run_id":run,"payload":{"reason":"stop lowspace"}});
+            let host = &host;
+            async move { exchange(host, "POST", "/v1/commands", Some(&body)).await }
+        })
+        .await?;
+        assert_eq!(status, 202, "{answer}");
+        super::until(
+            &project,
+            &format!("SELECT state FROM runs WHERE run_id='{run}'"),
+            "CANCELLED",
+            Duration::from_secs(15),
+        )
+        .await?;
+        R::Ok(())
+    }
+    .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}

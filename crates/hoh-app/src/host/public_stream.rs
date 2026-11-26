@@ -15,39 +15,148 @@ impl Drain {
         let task = executor.take_public_stream(&work).map(|mut receiver| {
             let attempt = work.attempt_id.clone();
             let epoch = work.assignment.role_epoch;
-            let project=work.project_id.clone();let run=work.run_id.clone();
+            let project = work.project_id.clone();
+            let run = work.run_id.clone();
             super::begun::spawn(async move {
                 while let Some(pending) = receiver.recv().await {
                     let mut blocked = None;
-                    let mut since=None;
+                    let mut since = None;
+                    let mut persisted = false;
                     loop {
                         match shared
                             .store
                             .record_public(&attempt, epoch, pending.part.clone())
                             .await
                         {
-                            Ok(_) => break,
-                            Err(
-                                PersistError::Busy(_)
-                                | PersistError::StorageLowSpace { .. }
-                                | PersistError::Full(_),
-                            ) => {
+                            Ok(_) => {
+                                persisted = true;
+                                break;
+                            }
+                            Err(PersistError::Busy(_)) => {
                                 if blocked.is_none() {
                                     blocked = Some(receiver.backpressure.blocked());
-                                    since=Some(std::time::Instant::now());
+                                    since = Some(std::time::Instant::now());
                                 }
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
-                            Err(_) => return Err("public_storage_failed"),
+                            Err(PersistError::StorageLowSpace {
+                                available_bytes,
+                                required_bytes,
+                                min_free_bytes,
+                            }) => {
+                                drop(blocked.take());
+                                let block = hoh_core::ids::child_id(
+                                    &attempt,
+                                    &format!(
+                                        "public/{}/{}",
+                                        pending.part.native_stream, pending.part.block_key
+                                    ),
+                                );
+                                let event = hoh_core::persistence::NewEvent {
+                                    intent: hoh_core::persistence::Intent::Record,
+                                    project_id: project.clone(),
+                                    run_id: Some(run.clone()),
+                                    event_id: hoh_core::ids::child_id(
+                                        &attempt,
+                                        &format!(
+                                            "public/gap/{}/{}/{}/{}",
+                                            pending.part.native_stream,
+                                            pending.part.received_offset,
+                                            pending.part.native_item_id,
+                                            pending.part.part
+                                        ),
+                                    ),
+                                    kind: "public.gap".into(),
+                                    payload: serde_json::json!({
+                                        "block_id": block,
+                                        "attempt_id": attempt,
+                                        "role_epoch": epoch,
+                                        "native_stream": pending.part.native_stream,
+                                        "native_item_id": pending.part.native_item_id,
+                                        "received_offset": pending.part.received_offset,
+                                        "part": pending.part.part,
+                                        "reason": "storage_low_space",
+                                        "available_bytes": available_bytes,
+                                        "required_bytes": required_bytes,
+                                        "min_free_bytes": min_free_bytes,
+                                        "dropped_bytes": pending.part.text.len(),
+                                        "complete": false,
+                                    }),
+                                };
+                                commit_best_effort(&shared.store, event, "storage_low_space_gap")
+                                    .await;
+                                break;
+                            }
+                            Err(err) => {
+                                drop(blocked.take());
+                                let block = hoh_core::ids::child_id(
+                                    &attempt,
+                                    &format!(
+                                        "public/{}/{}",
+                                        pending.part.native_stream, pending.part.block_key
+                                    ),
+                                );
+                                let event = hoh_core::persistence::NewEvent {
+                                    intent: hoh_core::persistence::Intent::Record,
+                                    project_id: project.clone(),
+                                    run_id: Some(run.clone()),
+                                    event_id: hoh_core::ids::child_id(
+                                        &attempt,
+                                        &format!(
+                                            "public/gap/{}/{}/{}/{}",
+                                            pending.part.native_stream,
+                                            pending.part.received_offset,
+                                            pending.part.native_item_id,
+                                            pending.part.part
+                                        ),
+                                    ),
+                                    kind: "public.gap".into(),
+                                    payload: serde_json::json!({
+                                        "block_id": block,
+                                        "attempt_id": attempt,
+                                        "role_epoch": epoch,
+                                        "native_stream": pending.part.native_stream,
+                                        "native_item_id": pending.part.native_item_id,
+                                        "received_offset": pending.part.received_offset,
+                                        "part": pending.part.part,
+                                        "reason": "public_storage_error",
+                                        "error": err.to_string(),
+                                        "dropped_bytes": pending.part.text.len(),
+                                        "complete": false,
+                                    }),
+                                };
+                                commit_best_effort(&shared.store, event, "public_storage_error_gap")
+                                    .await;
+                                break;
+                            }
                         }
                     }
                     drop(blocked);
-                    if let Some(since)=since {
-                        shared.store.commit(hoh_core::persistence::Commit {events:vec![hoh_core::persistence::NewEvent {
-                            intent:hoh_core::persistence::Intent::Record,project_id:project.clone(),run_id:Some(run.clone()),
-                            event_id:hoh_core::ids::child_id(&attempt,&format!("public/backpressure/{}/{}",pending.part.native_stream,pending.part.received_offset)),kind:"runner.diagnostic".into(),
-                            payload:serde_json::json!({"attempt_id":attempt,"role_epoch":epoch,"reason":"public_storage_backpressure","blocked_ms":u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)}),
-                        }],..Default::default()}).await.map_err(|_|"public_backpressure_diagnostic_failed")?;
+                    if persisted && let Some(since) = since {
+                        let event = hoh_core::persistence::NewEvent {
+                            intent: hoh_core::persistence::Intent::Record,
+                            project_id: project.clone(),
+                            run_id: Some(run.clone()),
+                            event_id: hoh_core::ids::child_id(
+                                &attempt,
+                                &format!(
+                                    "public/backpressure/{}/{}/{}/{}",
+                                    pending.part.native_stream,
+                                    pending.part.received_offset,
+                                    pending.part.native_item_id,
+                                    pending.part.part
+                                ),
+                            ),
+                            kind: "runner.diagnostic".into(),
+                            payload: serde_json::json!({
+                                "attempt_id": attempt,
+                                "role_epoch": epoch,
+                                "reason": "public_storage_backpressure",
+                                "blocked_ms": u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            }),
+                        };
+                        commit_best_effort(&shared.store, event, "public_storage_backpressure")
+                            .await;
                     }
                     drop(pending);
                 }
@@ -84,6 +193,23 @@ impl Drop for Drain {
             task.abort();
         }
         self.executor.release_public_stream(&self.work);
+    }
+}
+
+/// Best-effort diagnostics and inline gaps never end the drain task (DC-M4T09a).
+async fn commit_best_effort(
+    store: &hoh_core::persistence::Store,
+    event: hoh_core::persistence::NewEvent,
+    label: &str,
+) {
+    if let Err(err) = store
+        .commit(hoh_core::persistence::Commit {
+            events: vec![event],
+            ..Default::default()
+        })
+        .await
+    {
+        eprintln!("public stream {label} skipped: {err}");
     }
 }
 

@@ -491,6 +491,7 @@ impl Normalizer {
                 PublicKind::Activity,
                 String::new(),
             );
+            p.part = out.len() as u64;
             p.model = public_name(&m["model"]);
             p.activity = Some("usage".into());
             p.usage = Some(PublicUsage {
