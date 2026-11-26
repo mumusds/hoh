@@ -609,6 +609,45 @@ class TestLogStreams(unittest.TestCase):
                         r=subprocess.run(['bash',str(product/script),*self.args(script)],capture_output=True,text=True,env=env,timeout=60)
                         self.assertNotEqual(r.returncode,0,f'{script} ({label}) should fail on child fd-1 leak: {r.stdout}{r.stderr}')
                         self.assertIn('fd 1',r.stderr.lower())
+    def test_m3r1003_recovery_fails_when_cargo_fails_inside_real_systemd_scope(self):
+        # M3R-1003: recovery.sh's second run takes its pipe status from real `systemd-run --user --scope`; prove a
+        # failing cargo inside the real delegated scope fails the check with cargo's exit code and records FAIL.
+        probe=subprocess.run(
+            ['systemd-run','--user','--scope','-p','Delegate=yes','--quiet','--collect','--','true'],
+            capture_output=True,text=True,timeout=15,
+        )
+        if probe.returncode!=0:
+            if not os.environ.get('CI'):
+                self.skipTest(f'systemd user scopes unavailable: {probe.stderr.strip()}')
+            self.fail(f'systemd user scopes unavailable in CI: {probe.stderr.strip()}')
+        fake_cargo=(
+            '#!/usr/bin/env bash\n'
+            'if [[ "$*" == *"--test control"* ]]; then\n'
+            '  cat /proc/self/cgroup > "$SCOPE_CGROUP_FILE"\n'
+            '  printf "\\nrunning 1 test\\n"\n'
+            '  printf "test test_036_01_scoped_fail ... FAILED\\n"\n'
+            '  printf "\\nfailures:\\n\\nfailures:\\n    test_036_01_scoped_fail\\n"\n'
+            '  printf "\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n"\n'
+            '  exit 101\n'
+            'fi\n'
+            'printf "\\nrunning 1 test\\n"\n'
+            'printf "test test_036_01_proc_pass ... ok\\n"\n'
+            'printf "\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n"\n'
+        )
+        with tempfile.TemporaryDirectory(prefix='hoh-m3r1003-') as d:
+            d=Path(d);product=d/'repo/scripts/product';product.mkdir(parents=True)
+            for name in ('recovery.sh','test_results.py'):shutil.copy(ROOT/'scripts/product'/name,product/name)
+            bin_=d/'bin';bin_.mkdir()
+            cargo=bin_/'cargo';cargo.write_text(fake_cargo);cargo.chmod(0o755)
+            evidence=d/'evidence';evidence.mkdir()
+            cgroup_file=d/'scope.cgroup'
+            env={**os.environ,'PATH':f'{bin_}:{os.environ["PATH"]}','HOH_EVIDENCE_DIR':str(evidence),'SCOPE_CGROUP_FILE':str(cgroup_file)}
+            r=subprocess.run(['bash',str(product/'recovery.sh')],capture_output=True,text=True,env=env,timeout=60)
+            self.assertEqual(r.returncode,101,f'expected cargo exit 101 from scoped run: {r.stdout}{r.stderr}')
+            self.assertTrue(cgroup_file.exists(),'second run did not execute inside systemd-run scope')
+            self.assertIn('.scope',cgroup_file.read_text(),'second run did not run inside a systemd scope')
+            results=[(x['test_id'],x['status']) for x in map(json.loads,(evidence/'test-results.jsonl').read_text().splitlines())]
+            self.assertEqual(results,[('TEST-036-01','PASS'),('TEST-036-01','FAIL')])
 
 def scan_metadata(root,graph,dirs=None,features=None,targets=None,member_features=None,path_deps=(),target_dir=None):
     """cargo metadata JSON for persistence_scan.py: graph maps a package to [(extern name, package, kind)]; dirs maps a
