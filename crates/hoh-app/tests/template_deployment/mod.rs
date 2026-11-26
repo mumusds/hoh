@@ -733,7 +733,7 @@ fn connect_audit_rejects_a_cut_off_syscall_whose_thread_did_not_exit() {
             .to_owned(),
         format!(
             "{}{killed}",
-            netlink.replace("= 0", "<unfinished ...>")
+            netlink.replace(") = 0", " <unfinished ...>")
         ),
         // An unfinished call without a thread id is not closed by an exit.
         "connect(3, {sa_family=AF_UNIX, sun_path=\"/a\"}, 12 <unfinished ...>\n+++ exited with 0 +++\n".to_owned(),
@@ -749,4 +749,11 @@ fn connect_audit_rejects_a_cut_off_syscall_whose_thread_did_not_exit() {
     ] {
         assert!(audit(&trace).is_err(), "unexpectedly allowed: {trace}");
     }
+    // The same unfinished netlink connect on an owned SOCK_DIAG socket passes: the vector above fails on its
+    // authorization, not on its syntax (M3F-100).
+    let owned = format!(
+        "{diag}{}{killed}",
+        netlink.replace(") = 0", " <unfinished ...>")
+    );
+    assert_eq!(audit(&owned).ok(), Some(1), "refused: {owned}");
 }
