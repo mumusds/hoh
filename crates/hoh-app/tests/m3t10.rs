@@ -275,11 +275,23 @@ async fn test_040_01_third_round_writes_one_no_progress() -> R {
         true,
     )?;
     assert_eq!(woken_after, json!([{"severity": "high"}]));
-    let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(restarted_pid)?).ok_or("pid")?,
-        rustix::process::Signal::TERM,
-    );
-    let _ = restarted.0.wait();
+    let restarted_raw =
+        rustix::process::Pid::from_raw(i32::try_from(restarted_pid)?).ok_or("pid")?;
+    let _ = rustix::process::kill_process(restarted_raw, rustix::process::Signal::TERM);
+    let term_end = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if restarted.0.try_wait()?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= term_end {
+            let _ =
+                rustix::process::kill_process_group(restarted_raw, rustix::process::Signal::KILL);
+            let _ = rustix::process::kill_process(restarted_raw, rustix::process::Signal::KILL);
+            let _ = restarted.0.wait();
+            return Err("restarted hoh __host did not exit after SIGTERM within 15s".into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     Ok(())
 }
 
