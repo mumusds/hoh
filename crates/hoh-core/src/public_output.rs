@@ -49,4 +49,8 @@ pub struct PublicPart {
     pub usage: Option<PublicUsage>,
     pub redacted: bool,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
 }

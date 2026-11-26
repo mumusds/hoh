@@ -275,3 +275,161 @@ fn test_011_05_pi_message_update_deltas_with_shared_response_id_are_not_dropped(
             .any(|p| p.kind == PublicKind::Message && p.complete && p.text.is_empty())
     );
 }
+
+#[test]
+fn test_011_05_claude_two_text_blocks_same_message_including_non_ascii_boundary() {
+    let mut n = Normalizer::new(Mode::Claude, "2.1.318");
+    let a = n.feed(
+        &json!({"type":"assistant","uuid":"u1","session_id":"s","message":{"id":"msg_1","content":[{"type":"text","text":"First paragraph."}]}}),
+        0,
+    );
+    let b = n.feed(
+        &json!({"type":"assistant","uuid":"u2","session_id":"s","message":{"id":"msg_1","content":[{"type":"text","text":"Second paragraph is longer."}]}}),
+        1,
+    );
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert_ne!(
+        a[0].block_key, b[0].block_key,
+        "distinct Claude assistant frames of one message must have distinct block keys"
+    );
+    assert_eq!(b[0].first_offset, 0);
+    assert_eq!(
+        b[0].text, "Second paragraph is longer.",
+        "second text block must not be sliced by first block offset"
+    );
+
+    // Non-ASCII boundary: first block is 2 ASCII bytes; byte offset 2 falls inside the 3-byte UTF-8 '中'.
+    let c = n.feed(
+        &json!({"type":"assistant","uuid":"u3","session_id":"s","message":{"id":"msg_2","content":[{"type":"text","text":"ab"}]}}),
+        2,
+    );
+    let d = n.feed(
+        &json!({"type":"assistant","uuid":"u4","session_id":"s","message":{"id":"msg_2","content":[{"type":"text","text":"中文第二段"}]}}),
+        3,
+    );
+    assert_eq!(c.len(), 1);
+    assert_eq!(d.len(), 1);
+    assert_ne!(c[0].block_key, d[0].block_key);
+    assert_eq!(d[0].first_offset, 0);
+    assert_eq!(
+        d[0].text, "中文第二段",
+        "non-ASCII second block must not be emptied by char-boundary slice"
+    );
+}
+
+#[test]
+fn test_011_05_split_credential_across_deltas_is_redacted_without_misaligning_final() {
+    let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
+    let d1 = n.feed(
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"my pass"}}),
+        0,
+    );
+    let d2 = n.feed(
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"word is hunter2\n"}}),
+        1,
+    );
+    let done = n.feed(
+        &json!({"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"my password is hunter2\nvisible tail"}}}),
+        2,
+    );
+    let all: Vec<_> = d1.into_iter().chain(d2).chain(done).collect();
+    let combined: String = all.iter().map(|p| p.text.as_str()).collect();
+    assert!(
+        !combined.contains("hunter2"),
+        "split credential must never appear in plaintext: {combined:?}"
+    );
+    assert!(
+        all.iter().any(|p| p.redacted),
+        "split credential must be marked redacted: {all:?}"
+    );
+    assert!(
+        combined.contains("visible tail"),
+        "redaction length change must not misalign final snapshot tail: {combined:?}"
+    );
+}
+
+#[test]
+fn test_011_05_unmapped_and_unsupported_frames_are_aggregated_with_kind_and_count() {
+    let mut pi = Normalizer::new(Mode::Pi, "1.6.0");
+    let mut emitted = Vec::new();
+    for offset in 0..47u64 {
+        emitted.extend(pi.feed(
+            &json!({"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"secret thought"}}),
+            offset,
+        ));
+    }
+    assert!(
+        emitted.len() <= 2,
+        "47 unmapped thinking_delta frames must be aggregated, got {} diagnostics",
+        emitted.len()
+    );
+    assert_eq!(
+        emitted[0].frame_kind.as_deref(),
+        Some("message_update/thinking_delta"),
+        "diagnostic must record frame kind"
+    );
+    assert_eq!(emitted[0].count, Some(1));
+    let summary = pi.flush();
+    assert_eq!(summary.len(), 1);
+    assert_eq!(
+        summary[0].frame_kind.as_deref(),
+        Some("message_update/thinking_delta")
+    );
+    assert_eq!(summary[0].count, Some(47));
+    assert_eq!(summary[0].block_key, emitted[0].block_key);
+
+    let mut unsupported = Normalizer::new(Mode::Claude, "9.9.9-unknown");
+    let mut u_parts = Vec::new();
+    for offset in 0..10u64 {
+        u_parts.extend(unsupported.feed(
+            &json!({"type":"assistant","uuid":format!("u{offset}")}),
+            offset,
+        ));
+    }
+    assert!(
+        u_parts.len() <= 2,
+        "10 unsupported version frames must be aggregated, got {}",
+        u_parts.len()
+    );
+    assert_eq!(u_parts[0].frame_kind.as_deref(), Some("assistant"));
+    assert_eq!(u_parts[0].count, Some(1));
+    let u_summary = unsupported.flush();
+    assert_eq!(u_summary.len(), 1);
+    assert_eq!(u_summary[0].frame_kind.as_deref(), Some("assistant"));
+    assert_eq!(u_summary[0].count, Some(10));
+}
+
+#[test]
+fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offsets() {
+    let t0 = Instant::now();
+    let mut n = Normalizer::new_coalescing(Mode::CodexAppServer, "0.166.0");
+    let p0 = n.feed_at(
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"hello "}}),
+        0,
+        t0,
+    );
+    assert!(p0.is_empty(), "small delta buffers within 50 ms / 16 KiB");
+    let p1 = n.feed_at(
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"world"}}),
+        1,
+        t0 + Duration::from_millis(20),
+    );
+    assert!(p1.is_empty());
+    assert!(n.flush_due(t0 + Duration::from_millis(49)).is_empty());
+    let flushed = n.flush_due(t0 + Duration::from_millis(50));
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].text, "hello world");
+    assert_eq!(flushed[0].first_offset, 0);
+
+    // 16 KiB size cap flushes immediately without waiting for 50 ms.
+    let big = "a".repeat(COALESCE_BYTES);
+    let p2 = n.feed_at(
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":big}}),
+        2,
+        t0 + Duration::from_millis(51),
+    );
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].first_offset, 11);
+    assert_eq!(p2[0].text.len(), COALESCE_BYTES);
+}
