@@ -710,3 +710,170 @@ async fn the_runner_waits_for_a_retry_by_its_timers_and_not_the_wall_clock() -> 
     drop(executor);
     Ok(())
 }
+
+/// An outside connection's write lock (a `BEGIN IMMEDIATE` of a python3 of its own), held until dropped: then released
+/// (a line on its stdin) and its child reaped, never on a wall clock of its own (DC-FLK14).
+#[derive(Debug)]
+struct OutsideLock(std::process::Child);
+
+impl OutsideLock {
+    fn take(db: &Path) -> R<OutsideLock> {
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], isolation_level=None); \
+                 c.execute('BEGIN IMMEDIATE'); print('locked', flush=True); sys.stdin.readline(); \
+                 c.execute('COMMIT')",
+            ])
+            .arg(db)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        // Held before anything can fail, so its drop reaps the child on every path.
+        let stdout = child.stdout.take();
+        let lock = OutsideLock(child);
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(stdout.ok_or("no stdout")?),
+            &mut line,
+        )?;
+        if line.trim() != "locked" {
+            return Err(format!("the write lock was not taken: {line:?}").into());
+        }
+        Ok(lock)
+    }
+}
+
+impl Drop for OutsideLock {
+    fn drop(&mut self) {
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, b"release\n");
+        }
+        let end = Instant::now() + Duration::from_secs(5);
+        while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Takes the database's write lock from outside once the first attempt's process runs (`AfterEffectStarted`), so the
+/// writes that record its end wait for it; releases it when one of them met `DB_BUSY` and goes again
+/// (`RetryingBusy`) or, on code without that retry, when the attempt's error is settled (`Settling`).
+#[derive(Debug)]
+struct LockAtEnd {
+    db: PathBuf,
+    lock: std::sync::Mutex<Option<OutsideLock>>,
+    taken: std::sync::atomic::AtomicBool,
+    /// The attempt's points from the lock's take on, and what went wrong taking it.
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl hoh_app::host::HostHooks for LockAtEnd {
+    fn runner_of(&self, point: hoh_app::host::RunnerPoint, attempt_id: &str) {
+        use hoh_app::host::RunnerPoint;
+        let note = |what: String| {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(what);
+            }
+        };
+        match point {
+            RunnerPoint::AfterEffectStarted
+                if !self.taken.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+            {
+                match OutsideLock::take(&self.db) {
+                    Ok(lock) => {
+                        if let Ok(mut held) = self.lock.lock() {
+                            *held = Some(lock);
+                        }
+                        note(format!("{attempt_id}: locked"));
+                    }
+                    Err(e) => note(format!("{attempt_id}: the lock was not taken: {e}")),
+                }
+            }
+            RunnerPoint::RetryingBusy | RunnerPoint::Settling => {
+                let released = self.lock.lock().ok().and_then(|mut held| held.take());
+                note(format!(
+                    "{attempt_id}: {point:?}{}",
+                    if released.is_some() { ", released" } else { "" }
+                ));
+                drop(released);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// M3F-001 (DC-FLK14b addendum): an outside connection holds the write lock while an attempt's process ends, past one
+/// busy timeout from the submission of the write that records the end, and lets it go only once that write met
+/// `DB_BUSY`. The attempt's result is not lost: the write goes again, its effect COMMITTED, the attempt SETTLED and
+/// its task IMPLEMENTED with that one attempt, none disposed UNKNOWN_EFFECT or settled `runner_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_062_01_an_attempts_end_outlasts_an_outside_write_lock() -> R {
+    let dir = tempfile::tempdir()?;
+    let project = dir.path().join("p");
+    std::fs::create_dir_all(&project)?;
+    Host::start(config(&project)).await?.shutdown().await;
+    seed(
+        &project,
+        &format!(
+            "{COST_WORLD}
+             DELETE FROM budgets; DELETE FROM tasks WHERE task_id = 'Tc'; DELETE FROM role_bindings WHERE run_id = 'Rc';
+             DELETE FROM runs WHERE run_id = 'Rc';"
+        ),
+    )?;
+    let executor = Arc::new(Scripted {
+        script: [("Td".to_owned(), None)].into(),
+        started: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let hooks = Arc::new(LockAtEnd {
+        db: db(&project),
+        lock: std::sync::Mutex::new(None),
+        taken: std::sync::atomic::AtomicBool::new(false),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut config = config(&project);
+    // A short busy timeout keeps the test quick; the rule is the same at the product's 5 s.
+    config.store.busy_timeout = Duration::from_millis(1000);
+    config.hooks = hooks.clone();
+    config.runner = Some(hoh_app::host::RunnerConfig {
+        executor: executor.clone(),
+        context: context(),
+    });
+    let host = Host::start(config).await?;
+    let db = db(&project);
+    let end = Instant::now() + Duration::from_secs(60);
+    while query(&db, "SELECT state FROM tasks WHERE task_id = 'Td'")? != "IMPLEMENTED"
+        && query(
+            &db,
+            "SELECT count(*) FROM attempts WHERE task_id = 'Td' AND state IN ('UNKNOWN_EFFECT', 'FAILED')",
+        )? == "0"
+    {
+        if Instant::now() > end {
+            return Err(format!("Td did not end; hooks saw {:?}", hooks.seen.lock().map(|s| s.clone())).into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let attempts = rows(
+        &db,
+        "SELECT a.attempt_id, a.state, a.failure_reason, e.state AS effect FROM attempts a \
+         LEFT JOIN effects e USING(attempt_id) WHERE a.task_id = 'Td' ORDER BY a.rowid",
+    )?;
+    let seen = hooks.seen.lock().map(|s| s.clone()).unwrap_or_default();
+    host.shutdown().await;
+    drop(executor);
+    let attempts = attempts.as_array().ok_or("no attempts")?;
+    assert_eq!(attempts.len(), 1, "{attempts:?}; hooks saw {seen:?}");
+    assert_eq!(
+        (&attempts[0]["state"], &attempts[0]["effect"]),
+        (&json!("SETTLED"), &json!("COMMITTED")),
+        "{attempts:?}; hooks saw {seen:?}"
+    );
+    assert_eq!(query(&db, "SELECT state FROM tasks WHERE task_id = 'Td'")?, "IMPLEMENTED");
+    // The lock was held until the write met DB_BUSY and went again.
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[0].ends_with(": locked"), "{seen:?}");
+    assert!(seen[1].ends_with(": RetryingBusy, released"), "{seen:?}");
+    Ok(())
+}
