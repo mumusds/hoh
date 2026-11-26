@@ -130,12 +130,13 @@ fn test_011_05_recorded_compaction_retry_and_resolved_model_are_explicit() {
 #[test]
 fn test_011_05_replayed_native_delta_does_not_advance_later_offsets() {
     let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
-    let a = json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"one"}});
-    let b = json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"two"}});
+    // Newline-terminated: DC-M4T09b holds an unterminated line until its newline arrives.
+    let a = json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"one\n"}});
+    let b = json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"two\n"}});
     assert_eq!(n.feed(&a, 10)[0].first_offset, 0);
     n.feed(&a, 10);
     let second = n.feed(&b, 11);
-    assert_eq!(second[0].first_offset, 3, "replay must not invent a gap");
+    assert_eq!(second[0].first_offset, 4, "replay must not invent a gap");
 }
 #[test]
 fn test_011_05_schema_public_handoff_and_error_exclude_prompts_and_auth() {
@@ -249,21 +250,22 @@ fn test_011_05_failed_tools_are_not_presented_as_successful_boundaries() {
 fn test_011_05_pi_message_update_deltas_with_shared_response_id_are_not_dropped() {
     let mut n = Normalizer::new(Mode::Pi, "1.6.0");
     let start = json!({"type":"message_start","message":{"role":"assistant","responseId":"resp-1","content":[]}});
-    let d1 = json!({"type":"message_update","message":{"role":"assistant","responseId":"resp-1"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello "}});
-    let d2 = json!({"type":"message_update","message":{"role":"assistant","responseId":"resp-1"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"world"}});
-    let end = json!({"type":"message_end","message":{"role":"assistant","responseId":"resp-1","content":[{"type":"text","text":"hello world"}]}});
+    let d1 = json!({"type":"message_update","message":{"role":"assistant","responseId":"resp-1"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello\n"}});
+    let d2 = json!({"type":"message_update","message":{"role":"assistant","responseId":"resp-1"},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"world\n"}});
+    let end = json!({"type":"message_end","message":{"role":"assistant","responseId":"resp-1","content":[{"type":"text","text":"hello\nworld\n"}]}});
     let _ = n.feed(&start, 0);
     let p1 = n.feed(&d1, 1);
     let p2 = n.feed(&d2, 2);
     let p3 = n.feed(&end, 3);
     assert_eq!(p1.len(), 1);
-    assert_eq!(p1[0].text, "hello ");
+    // Newline-terminated deltas: DC-M4T09b publishes nothing after a block's last newline before it arrives.
+    assert_eq!(p1[0].text, "hello\n");
     assert_eq!(
         p2.len(),
         1,
         "second text_delta with same responseId must not be dropped"
     );
-    assert_eq!(p2[0].text, "world");
+    assert_eq!(p2[0].text, "world\n");
     assert_eq!(p2[0].first_offset, 6);
     assert_eq!(p1[0].block_key, p2[0].block_key);
     assert_ne!(
@@ -411,7 +413,7 @@ fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offse
     );
     assert!(p0.is_empty(), "small delta buffers within 50 ms / 16 KiB");
     let p1 = n.feed_at(
-        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"world"}}),
+        &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"world\n"}}),
         1,
         t0 + Duration::from_millis(20),
     );
@@ -419,7 +421,7 @@ fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offse
     assert!(n.flush_due(t0 + Duration::from_millis(49)).is_empty());
     let flushed = n.flush_due(t0 + Duration::from_millis(50));
     assert_eq!(flushed.len(), 1);
-    assert_eq!(flushed[0].text, "hello world");
+    assert_eq!(flushed[0].text, "hello world\n");
     assert_eq!(flushed[0].first_offset, 0);
 
     // 16 KiB size cap flushes immediately without waiting for 50 ms.
@@ -430,7 +432,7 @@ fn test_011_05_coalescer_flushes_on_50ms_window_or_16kib_cap_and_preserves_offse
         t0 + Duration::from_millis(51),
     );
     assert_eq!(p2.len(), 1);
-    assert_eq!(p2[0].first_offset, 11);
+    assert_eq!(p2[0].first_offset, 12);
     assert_eq!(p2[0].text.len(), COALESCE_BYTES);
 }
 
@@ -589,4 +591,299 @@ fn test_011_05_cross_mode_equality_explicit_null_capabilities_and_native_echo_ma
             "{mode:?} uncorrelatable prompt echo must not emit public.message"
         );
     }
+}
+
+/// Deterministic xorshift64 so every split and flush point is reproducible from its seed.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}
+
+fn random_split(text: &str, rng: &mut Rng) -> Vec<String> {
+    let bounds: Vec<usize> = (1..text.len())
+        .filter(|i| text.is_char_boundary(*i))
+        .collect();
+    let mut cuts: Vec<usize> = if bounds.is_empty() {
+        Vec::new()
+    } else {
+        (0..rng.below(12))
+            .map(|_| bounds[rng.below(bounds.len() as u64) as usize])
+            .collect()
+    };
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for cut in cuts.into_iter().chain([text.len()]) {
+        out.push(text[at..cut].to_owned());
+        at = cut;
+    }
+    out
+}
+
+/// Asserts DC-M4T09b on one block's published parts: concatenation equals the batch redaction of `full`, offsets are
+/// contiguous, and each part is marked redacted exactly when it carries a redaction.
+fn assert_block_invariant(parts: &[&PublicPart], full: &str, label: &str) {
+    let mut at = 0u64;
+    for p in parts {
+        assert_eq!(p.first_offset, at, "{label}: contiguous offsets {parts:?}");
+        at += p.text.len() as u64;
+        assert_eq!(
+            p.redacted,
+            p.text.contains("[redacted]"),
+            "{label}: redacted flag iff the chunk carries a redaction: {p:?}"
+        );
+    }
+    let combined: String = parts.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(combined, redact(full).0, "{label}: streamed == batch");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Ending {
+    Completed,
+    ProcessEnd,
+}
+
+fn drive(mode: Mode, coalescing: bool, full: &str, seed: u64, ending: Ending) -> Vec<PublicPart> {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let version = if mode == Mode::Pi { "1.6.0" } else { "0.166.0" };
+    let mut n = if coalescing {
+        Normalizer::new_coalescing(mode, version)
+    } else {
+        Normalizer::new(mode, version)
+    };
+    let t0 = Instant::now();
+    let mut now = t0;
+    let mut offset = 0u64;
+    let mut out = Vec::new();
+    let mut feed = |n: &mut Normalizer, frame: Value, now: Instant, out: &mut Vec<PublicPart>| {
+        out.extend(n.feed_at(&frame, offset, now));
+        offset += 1;
+    };
+    if mode == Mode::Pi {
+        feed(
+            &mut n,
+            json!({"type":"message_start","message":{"role":"assistant","responseId":"r","content":[]}}),
+            now,
+            &mut out,
+        );
+    }
+    for (k, delta) in random_split(full, &mut rng).into_iter().enumerate() {
+        now += Duration::from_millis(rng.below(80));
+        let frame = if mode == Mode::Pi {
+            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":delta}})
+        } else {
+            json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":delta}})
+        };
+        feed(&mut n, frame, now, &mut out);
+        match rng.below(6) {
+            0 | 1 => out.extend(n.flush_due(now + Duration::from_millis(rng.below(80)))),
+            2 => {
+                // A non-coalescible tool boundary in between.
+                let tool = if mode == Mode::Pi {
+                    json!({"type":"tool_execution_start","toolCallId":format!("c{k}"),"toolName":"bash","args":{"command":"ls"}})
+                } else {
+                    json!({"method":"item/started","params":{"item":{"type":"commandExecution","id":format!("c{k}"),"command":"ls"}}})
+                };
+                feed(&mut n, tool, now, &mut out);
+            }
+            3 => out.extend(n.flush_text()),
+            _ => {}
+        }
+    }
+    match ending {
+        Ending::Completed => {
+            let done = if mode == Mode::Pi {
+                json!({"type":"message_end","message":{"role":"assistant","responseId":"r","content":[{"type":"text","text":full}]}})
+            } else {
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":full}}})
+            };
+            feed(&mut n, done, now, &mut out);
+        }
+        Ending::ProcessEnd => out.extend(n.flush()),
+    }
+    out
+}
+
+const PROPERTY_TEXTS: &[&str] = &[
+    "hunter2 is my password\n",
+    "my password is hunter2\nvisible tail",
+    "line one\nsk-LIVE-hunter2 is my secret\nok line\napi_key=abc\n中文 token=xyz\nfin",
+    "no secrets here\njust text\n",
+    "Authorization: Bearer abc\n\n\nend hunter2 password",
+    "中文第一行\n第二行 hunter2 秘密 password\n尾",
+    "short\nhunter2 then access_token later on the same line\nvisible\n",
+];
+
+#[test]
+fn test_011_05_streamed_redaction_equals_batch_for_any_split_and_flush_timing() {
+    let long = format!(
+        "{}hunter2 private_key=K\n{}",
+        "x".repeat(3000),
+        "y".repeat(5000)
+    );
+    let texts: Vec<&str> = PROPERTY_TEXTS
+        .iter()
+        .copied()
+        .chain([long.as_str()])
+        .collect();
+    let mut runs = 0;
+    for full in &texts {
+        for mode in [Mode::CodexAppServer, Mode::Pi] {
+            for coalescing in [true, false] {
+                for ending in [Ending::Completed, Ending::ProcessEnd] {
+                    for seed in 1..=60u64 {
+                        let label = format!(
+                            "{mode:?} coalescing={coalescing} {ending:?} seed={seed} text={full:?}"
+                        );
+                        let parts = drive(mode, coalescing, full, seed, ending);
+                        let block: Vec<&PublicPart> = parts
+                            .iter()
+                            .filter(|p| p.kind == PublicKind::Message)
+                            .collect();
+                        assert!(
+                            !block.iter().any(|p| p.text.contains("hunter2")),
+                            "{label}: secret published {block:?}"
+                        );
+                        assert_block_invariant(&block, full, &label);
+                        let complete = block.iter().filter(|p| p.complete).count();
+                        match ending {
+                            Ending::Completed => {
+                                assert_eq!(complete, 1, "{label}: one completion");
+                                assert!(block.last().is_some_and(|p| p.complete), "{label}");
+                            }
+                            Ending::ProcessEnd => assert_eq!(complete, 0, "{label}"),
+                        }
+                        runs += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(runs >= 1000, "property runs: {runs}");
+    // Cross-mode: a complete (batch) block of the same text is identical.
+    for full in &texts {
+        let mut claude = Normalizer::new(Mode::Claude, "2.1.318");
+        let parts = claude.feed(
+            &json!({"type":"assistant","uuid":"u","message":{"id":"m","content":[{"type":"text","text":full}]}}),
+            0,
+        );
+        assert_eq!(parts[0].text, redact(full).0);
+    }
+}
+
+#[test]
+fn test_011_05_secret_before_keyword_never_flushes_ahead_of_its_keyword() {
+    for coalescing in [true, false] {
+        let t0 = Instant::now();
+        let mut n = if coalescing {
+            Normalizer::new_coalescing(Mode::CodexAppServer, "0.166.0")
+        } else {
+            Normalizer::new(Mode::CodexAppServer, "0.166.0")
+        };
+        let mut out = n.feed_at(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"hunter2 is my "}}),
+            0,
+            t0,
+        );
+        // The 50 ms window and a tool boundary both pass before the keyword arrives.
+        out.extend(n.flush_due(t0 + Duration::from_millis(60)));
+        out.extend(n.feed_at(
+            &json!({"method":"item/started","params":{"item":{"type":"commandExecution","id":"c","command":"ls"}}}),
+            1,
+            t0 + Duration::from_millis(61),
+        ));
+        out.extend(n.feed_at(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"password\n"}}),
+            2,
+            t0 + Duration::from_millis(200),
+        ));
+        out.extend(n.flush_due(t0 + Duration::from_millis(300)));
+        let msgs: Vec<&PublicPart> = out
+            .iter()
+            .filter(|p| p.kind == PublicKind::Message)
+            .collect();
+        assert!(
+            !msgs.iter().any(|p| p.text.contains("hunter2")),
+            "coalescing={coalescing}: {msgs:?}"
+        );
+        assert_block_invariant(&msgs, "hunter2 is my password\n", "secret-first");
+    }
+}
+
+#[test]
+fn test_011_05_unterminated_tail_at_16kib_cap_is_redacted_as_one_unit() {
+    // Keyword inside the first capped unit: the rest of that line stays redacted, as in the batch path.
+    let line = format!("hunter2 password {}\n", "x".repeat(20_000));
+    let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
+    let mut out = Vec::new();
+    for (i, chunk) in line.as_bytes().chunks(1000).enumerate() {
+        out.extend(n.feed(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":std::str::from_utf8(chunk).unwrap()}}),
+            i as u64,
+        ));
+    }
+    let combined: String = out.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(combined, redact(&line).0);
+    assert!(
+        out.iter().all(|p| p.redacted),
+        "every published unit of a redacted line is marked"
+    );
+
+    // A keyword straddling the cap boundary is still seen through the kept keyword context.
+    let mut n = Normalizer::new(Mode::CodexAppServer, "0.166.0");
+    let head = "a".repeat(COALESCE_BYTES - 4);
+    let mut out = Vec::new();
+    for (i, delta) in [head.as_str(), "pass", "word hunter2\n"]
+        .into_iter()
+        .enumerate()
+    {
+        out.extend(n.feed(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":delta}}),
+            i as u64,
+        ));
+    }
+    let combined: String = out.iter().map(|p| p.text.as_str()).collect();
+    assert!(!combined.contains("hunter2"), "{combined:?}");
+    assert_eq!(combined, format!("{head}pass[redacted]\n"));
+    let last = out.last().unwrap();
+    assert!(last.redacted && last.text == "[redacted]\n");
+    // Nothing after the last newline was published before the cap.
+    assert_eq!(
+        out.len(),
+        2,
+        "{:?}",
+        out.iter().map(|p| p.text.len()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_011_05_unmapped_frames_do_not_starve_the_coalescing_flush() {
+    let t0 = Instant::now();
+    let mut n = Normalizer::new_coalescing(Mode::CodexAppServer, "0.166.0");
+    let unmapped =
+        json!({"method":"item/reasoning/textDelta","params":{"itemId":"r","delta":"hidden"}});
+    let _ = n.feed_at(&unmapped, 0, t0);
+    assert!(
+        n.feed_at(
+            &json!({"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"visible\n"}}),
+            1,
+            t0 + Duration::from_millis(1),
+        )
+        .is_empty()
+    );
+    let out = n.feed_at(&unmapped, 2, t0 + Duration::from_millis(60));
+    assert!(
+        out.iter()
+            .any(|p| p.kind == PublicKind::Message && p.text == "visible\n"),
+        "an overdue coalesced text must flush on any later frame: {out:?}"
+    );
 }
