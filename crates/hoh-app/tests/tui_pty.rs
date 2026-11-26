@@ -25,7 +25,8 @@ mod s5;
 mod world;
 
 use pty::{
-    Hoh, Pty, R, exit_within, find, in_write, signal, spawn_in, spawn_without_ctty_in, tree,
+    Hoh, Pty, R, exit_within, find, in_poll, in_write, signal, spawn_in, spawn_without_ctty_in,
+    tree,
 };
 use rustix::process::Signal;
 use std::path::Path;
@@ -393,8 +394,7 @@ fn an_unfinished_escape_sequence_holds_up_neither_the_exit_nor_the_next_input() 
         home.path(),
         &[("HOH_DEBUG_TUI_RESTORE_GATE", gate_env)],
     )?;
-    s.pty.send(b"\x1b[")?;
-    std::thread::sleep(Duration::from_millis(200));
+    s.pty.send_and_wait_until_read(&s.child, b"\x1b[", WAIT)?;
     signal(&s.child, Signal::TERM)?;
     let (code, unread) = type_into_the_restore_window(s, &gate, b"echo NEXT\n")?;
     assert_eq!(code, Some(143));
@@ -414,12 +414,19 @@ fn a_signal_while_output_is_held_leaves_later_input_for_the_shell() -> R {
     // Bare `hoh` starts the project's host if none runs: stopped however the test ends.
     let _daemons = Daemons(project.path().to_path_buf());
     let mut s = open(project.path(), home.path(), &[])?;
+    // `open` returns once "host 已连接" appears from the first write(2) of the initial frame, before ratatui's
+    // follow-up cursor-placement write(2) has necessarily returned; wait until the loop is polling stdin so
+    // `hold_output(true)` cannot trap the initial frame's write (FLK-16).
+    in_poll(&s.child, WAIT)?;
     s.pty.hold_output(true)?;
-    // A key to draw, and the draw is held.
-    s.pty.send(b"a")?;
+    // A key to draw, and the draw is held: wait until hoh has read `a` before waiting for its write(2), so
+    // `in_write` observes the draw of `a` and SIGTERM cannot arrive while `a` is still queued.
+    s.pty.send_and_wait_until_read(&s.child, b"a", WAIT)?;
     in_write(&s.child, WAIT)?;
     signal(&s.child, Signal::TERM)?;
-    s.pty.send(b"echo NEXT\n")?;
+    let later = b"echo NEXT\n";
+    s.pty.send(later)?;
+    s.pty.wait_for_queued(u64::try_from(later.len())?, WAIT)?;
     s.pty.hold_output(false)?;
     let status = exit_within(&mut s.child, WAIT)?;
     assert_eq!(status.code(), Some(143));
