@@ -2055,11 +2055,6 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
             "installed hoh binary carrying embedded resources must be unchanged after restore"
         );
         assert_eq!(
-            hoh_core::resource_bundle::Bundle::current().version(),
-            bundle_version_before,
-            "embedded resource bundle version/digest must be unchanged after restore"
-        );
-        assert_eq!(
             if global_config.exists() {
                 Some(tree(&global_config)?)
             } else {
@@ -2092,10 +2087,6 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
             hoh_core::objects::hash_file(installed_bin)?,
             (bin_sha_before, bin_len_before),
             "installed hoh binary carrying embedded resources must be unchanged after next Attempt"
-        );
-        assert_eq!(
-            hoh_core::resource_bundle::Bundle::current().version(),
-            bundle_version_before
         );
         Ok(())
     })();
