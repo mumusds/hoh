@@ -589,7 +589,12 @@ async fn a_send_input_to_a_published_incomplete_run_is_the_commands_and_ends_wit
         .await?;
     assert_eq!(
         kinds_after(&path, before)?,
-        ["input.accepted", "input.queued", "run.result"]
+        [
+            "input.accepted",
+            "input.queued",
+            "public.message",
+            "run.result"
+        ]
     );
     assert_eq!(run_state(&path)?, json!("INCOMPLETE/7"));
     assert_eq!(last_of(&path, "run.result")?["state"], "INCOMPLETE");
@@ -717,7 +722,7 @@ async fn send_input_answers_the_only_question_and_otherwise_queues_a_steer() -> 
         .await?;
     assert_eq!(
         kinds_after(&path, before)?,
-        ["input.accepted", "input.queued"]
+        ["input.accepted", "input.queued", "public.message"]
     );
     assert_eq!(
         last_of(&path, "input.accepted")?["question_id"],
@@ -740,7 +745,12 @@ async fn send_input_answers_the_only_question_and_otherwise_queues_a_steer() -> 
         .await?;
     assert_eq!(
         kinds_after(&path, before)?,
-        ["input.accepted", "input.queued", "run.result"]
+        [
+            "input.accepted",
+            "input.queued",
+            "public.message",
+            "run.result"
+        ]
     );
     store
         .submit_command(send("c2", 6, "x", "ASK", Some("developer")))
@@ -1114,6 +1124,7 @@ mod real {
         let (store, path) = world(dir.path())?;
         refused_by_the_gate(&store, &path).await?;
         let q = open(&Connection::open(&path)?, "R")?.remove(0);
+        Connection::open(&path)?.execute("DELETE FROM ui_event_index WHERE seq IN (SELECT seq FROM events WHERE kind = 'verification.round_closed')", [])?;
         Connection::open(&path)?.execute(
             "DELETE FROM events WHERE kind = 'verification.round_closed'",
             [],
@@ -2696,5 +2707,157 @@ async fn test_023_01_dc4_every_persistence_commit_audits_anchors_and_consults() 
             "{broken}: {result:?}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_011_05_send_input_public_original_is_atomic_and_idempotent() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_store(&dir)?;
+    world(&path, "RUNNING", &[], "")?;
+    let command = send(
+        "public-original",
+        5,
+        "first\nsecond\nthird",
+        "ASK",
+        Some("developer"),
+    );
+    store.submit_command(command.clone()).await?;
+    store.submit_command(command).await?;
+    let messages: Vec<Value> = store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter_map(|(kind, payload)| (kind == "public.message").then_some(payload))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        1,
+        "one public user block per accepted input_id"
+    );
+    assert_eq!(messages[0]["text"], "first\nsecond\nthird");
+    assert_eq!(
+        messages[0]["input_id"],
+        crate::ids::child_id("public-original", "input")
+    );
+    assert_eq!(messages[0]["speaker"], "user");
+    assert_eq!(messages[0]["role"], "developer");
+    assert_eq!(messages[0]["attempt_id"], Value::Null);
+    assert_eq!(messages[0]["session_id"], Value::Null);
+    let before = max_seq(&path)?;
+    store
+        .submit_command(send(
+            "rejected-public",
+            5,
+            "unknown command",
+            "CONTROL",
+            None,
+        ))
+        .await?;
+    assert!(!kinds_after(&path, before)?.contains(&"public.message".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_011_05_large_input_is_sealed_and_reuses_body_without_merging_messages() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_store(&dir)?;
+    world(&path, "RUNNING", &[], "")?;
+    let text = "same body\r\n".repeat(3000);
+    let expected = text.replace("\r\n", "\n");
+    store
+        .submit_command(send("large-one", 5, &text, "ASK", Some("developer")))
+        .await?;
+    store
+        .submit_command(send("large-two", 5, &text, "ASK", Some("developer")))
+        .await?;
+    let messages: Vec<Value> = store
+        .reader()?
+        .events("R")?
+        .into_iter()
+        .filter_map(|(k, p)| (k == "public.message").then_some(p))
+        .collect();
+    assert_eq!(messages.len(), 2);
+    assert!(
+        messages
+            .iter()
+            .all(|p| p.get("text").is_none_or(Value::is_null)),
+        "large text must not be inline"
+    );
+    assert_ne!(messages[0]["block_id"], messages[1]["block_id"]);
+    assert_eq!(
+        messages[0]["refs"][0]["artifact_id"],
+        messages[1]["refs"][0]["artifact_id"]
+    );
+    let sha = messages[0]["refs"][0]["sha256"]
+        .as_str()
+        .ok_or("sealed reference missing")?;
+    assert_eq!(crate::objects::get(dir.path(), sha)?, expected.as_bytes());
+    assert_eq!(
+        value(&path, "SELECT count(*) FROM public_segments")?,
+        json!(2)
+    );
+    drop(store);
+    let (store, _) = open_store(&dir)?;
+    store
+        .submit_command(send("large-one", 5, &text, "ASK", Some("developer")))
+        .await?;
+    assert_eq!(
+        value(&path, "SELECT count(*) FROM public_segments")?,
+        json!(2)
+    );
+    assert_eq!(
+        value(&path, "SELECT count(*) FROM pragma_foreign_key_check")?,
+        json!(0)
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PublicLowSpace;
+impl FaultHooks for PublicLowSpace {
+    fn public_available_bytes(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+#[tokio::test]
+async fn test_011_05_input_low_space_rolls_back_command_acceptance_and_public_block() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_with(&dir, Arc::new(PublicLowSpace))?;
+    world(&path, "RUNNING", &[], "")?;
+    let before = max_seq(&path)?;
+    let outcome = store
+        .submit_command(send(
+            "low-space",
+            5,
+            &"body".repeat(5000),
+            "ASK",
+            Some("developer"),
+        ))
+        .await;
+    assert!(outcome.is_err(), "low space must refuse acceptance");
+    let error = outcome.unwrap_err();
+    assert_eq!(
+        error.error_code(),
+        Some(crate::protocol::ErrorCode::StorageLowSpace)
+    );
+    assert_eq!(max_seq(&path)?, before);
+    assert_eq!(value(&path, "SELECT count(*) FROM commands")?, json!(0));
+    assert_eq!(value(&path, "SELECT count(*) FROM input_queue")?, json!(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_011_05_reply_public_identity_uses_the_resolved_question_role() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open_store(&dir)?;
+    paced_world(&path, "retries_exhausted")?;
+    store
+        .submit_command(send("public-reply", 5, "continue", "REPLY", None))
+        .await?;
+    let public = last_of(&path, "public.message")?;
+    assert_eq!(public["role"], "developer");
+    assert_eq!(public["text"], "continue");
+    assert!(public["attempt_id"].is_null());
     Ok(())
 }

@@ -32,7 +32,7 @@ pub(super) fn in_g(conn: &Connection, run: &str) -> Result<bool, PersistError> {
 
 /// The kinds an event may be written as a Record (docs/adr/ADR-031.md correction D, rule 1): the history of evidence
 /// and integrity, the outbox's bookkeeping and the diagnostics. A Record of a stopped run is written project-scoped.
-pub(super) const RECORD_KINDS: [&str; 18] = [
+pub(super) const RECORD_KINDS: [&str; 24] = [
     "input.rejected",
     // (i) evidence and integrity history: a check's evidence, its Issues, a candidate's recovery.
     "evidence.recorded",
@@ -50,6 +50,12 @@ pub(super) const RECORD_KINDS: [&str; 18] = [
     // (iii) diagnostics.
     "reconcile.diagnostic",
     "runner.diagnostic",
+    "public.message",
+    "public.tool_started",
+    "public.tool_completed",
+    "public.activity",
+    "public.gap",
+    "public.diagnostic",
     "runner.outside",
     "runner.unreaped",
     "cancel.diagnostic",

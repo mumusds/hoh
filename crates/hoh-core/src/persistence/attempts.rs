@@ -498,6 +498,9 @@ pub(super) fn move_attempt(
     // ended still holds the slot.
     let interrupted = m.to == AttemptState::UnknownEffect
         || (m.from == AttemptState::Running && m.to.is_terminal() && m.to != AttemptState::Settled);
+    if interrupted {
+        super::public::interrupted(tx, &m.attempt_id, m.to.as_str())?;
+    }
     if interrupted && leases::names_writer(tx, &m.attempt_id)? {
         let Some(workspace) = &f.workspace else {
             return Err(PersistError::WorkspaceRecordRequired(m.attempt_id.clone()));

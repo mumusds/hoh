@@ -114,7 +114,7 @@ async fn opening_creates_a_migrated_database_with_verified_settings() -> R {
             )?,
         ))
     })?;
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert!(tables >= 30, "{tables} tables");
     // Readers cannot write.
     let refused = reader.with(|c| c.execute("INSERT INTO schema_migrations VALUES (9, 'x')", []));
@@ -140,13 +140,13 @@ async fn reopening_keeps_the_schema_and_a_newer_one_is_refused() -> R {
     let applied: i64 = store
         .reader()?
         .with(|c| c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r.get(0)))?;
-    assert_eq!(applied, 2, "each migration ran once");
+    assert_eq!(applied, 3, "each migration ran once");
     drop(store);
-    Connection::open(&path)?.pragma_update(None, "user_version", 3)?;
+    Connection::open(&path)?.pragma_update(None, "user_version", 4)?;
     match Store::open(&path, test_options()) {
         Err(PersistError::SchemaTooNew {
-            found: 3,
-            supported: 2,
+            found: 4,
+            supported: 3,
         }) => Ok(()),
         other => Err(format!("{other:?}").into()),
     }
@@ -616,6 +616,7 @@ async fn every_legal_run_edge_is_written_and_every_illegal_one_refused() -> R {
             )?;
             // Revision 0 again: the run.result of an earlier pair, named by its revision (docs/adr/ADR-031.md decision
             // 3), goes with the state it was placed in.
+            conn.execute("DELETE FROM ui_event_index WHERE seq IN (SELECT seq FROM events WHERE run_id = 'r1' AND kind = 'run.result')", [])?;
             conn.execute(
                 "DELETE FROM events WHERE run_id = 'r1' AND kind = 'run.result'",
                 [],
@@ -2070,5 +2071,112 @@ fn a_commit_that_failed_writing_is_db_full_only_when_the_stores_directory_has_no
 pub(super) fn seed_task_question(path: &Path, task: &str) -> R {
     let conn = Connection::open(path)?;
     conn.execute("INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) SELECT r.project_id,?1,t.run_id,'need_decision',json_object('task_id',t.task_id,'reason','retries_exhausted'),'2026-11-07T00:00:00Z' FROM tasks t JOIN runs r USING(run_id) WHERE t.task_id=?2", rusqlite::params![format!("fixture-question/{task}"),task])?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_013_05_writer_attributes_interleaved_runs_and_close_to_stable_round() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    {
+        let conn = Connection::open(&path)?;
+        // Prepare the adopted structures independently of the migration-runner test.
+        if user_version(&conn)? < 3 {
+            conn.execute_batch(include_str!(
+                "../../../../contracts/sql/003_ui_observability.sql"
+            ))?;
+        }
+        conn.execute_batch("INSERT INTO runs(run_id,project_id,state,mode,created_at) VALUES('r2','p1','CREATED','AUTO','now');")?;
+    }
+    let mut closed = event("close-1");
+    closed.kind = "iteration.completed".into();
+    closed.payload = json!({"iteration":1});
+    let mut other = event("other");
+    other.run_id = Some("r2".into());
+    let mut project = event("project");
+    project.run_id = None;
+    project.payload = json!({"run_id":"r1"});
+    let done = store
+        .commit(Commit {
+            events: vec![event("open"), other, closed, event("next"), project],
+            ..Default::default()
+        })
+        .await?;
+    let indexed: Vec<(i64, Option<String>, Option<String>)> = store.reader()?.with(|c| {
+        c.prepare("SELECT seq,run_id,iteration_key FROM ui_event_index ORDER BY seq")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect()
+    })?;
+    let i1 = crate::ids::child_id("r1", "iteration/1");
+    assert_eq!(
+        indexed,
+        vec![
+            (done.event_seqs[0], Some("r1".into()), Some(i1.clone())),
+            (
+                done.event_seqs[1],
+                Some("r2".into()),
+                Some(crate::ids::child_id("r2", "iteration/1"))
+            ),
+            (done.event_seqs[2], Some("r1".into()), Some(i1)),
+            (
+                done.event_seqs[3],
+                Some("r1".into()),
+                Some(crate::ids::child_id("r1", "iteration/2"))
+            ),
+            (done.event_seqs[4], None, None),
+        ]
+    );
+    assert_eq!(
+        store
+            .reader()?
+            .with(|c| c.query_row("SELECT count(*) FROM iterations", [], |r| r
+                .get::<_, i64>(0)))?,
+        0,
+        "UI attribution must not manufacture engineering closes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_013_05_invalid_close_preserves_authoritative_event_but_refuses_complete_index() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = db_in(&dir);
+    let store = Store::open(&path, test_options())?;
+    seed(&path)?;
+    store
+        .commit(Commit {
+            events: vec![event("first")],
+            ..Default::default()
+        })
+        .await?;
+    let mut bad = event("missing-close-one");
+    bad.kind = "iteration.completed".into();
+    bad.payload = json!({"iteration":2});
+    let result = store
+        .commit(Commit {
+            events: vec![bad],
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "a broken derived index must not roll back engineering facts: {result:?}"
+    );
+    assert!(!store.reader()?.ui_index_status()?.index_ready);
+    assert!(
+        store
+            .reader()?
+            .events("r1")?
+            .iter()
+            .any(|(k, p)| k == "iteration.completed" && p["iteration"] == 2)
+    );
+    assert!(matches!(
+        store
+            .reader()?
+            .ui_identities("r1", store.reader()?.max_seq()?),
+        Err(PersistError::Busy(_))
+    ));
     Ok(())
 }

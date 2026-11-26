@@ -1004,7 +1004,7 @@ async fn whether_a_run_is_stopped_is_read_without_its_history() -> R {
             // R's history before its stop: `history` events of a few kinds, then its result again last.
             conn.execute_batch(&format!(
                 "CREATE TEMP TABLE result AS SELECT * FROM events WHERE kind = 'run.result';
-                 DELETE FROM events WHERE kind = 'run.result';
+                 DELETE FROM ui_event_index WHERE seq IN (SELECT seq FROM events WHERE kind = 'run.result'); DELETE FROM events WHERE kind = 'run.result';
                  WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {history})
                  INSERT INTO events(project_id, event_id, run_id, kind, payload_json, created_at)
                    SELECT 'p1', 'h' || i, 'R', 'k' || (i % 7), '{{}}', '2026-11-15T00:00:00Z' FROM n;

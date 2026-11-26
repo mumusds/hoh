@@ -129,6 +129,13 @@ pub struct Committed {
 }
 
 enum Job {
+    Public(
+        String,
+        i64,
+        Box<crate::public_output::PublicPart>,
+        oneshot::Sender<Result<Option<i64>, PersistError>>,
+    ),
+    UiBackfill(oneshot::Sender<Result<super::UiIndexStatus, PersistError>>),
     Commit(Commit, oneshot::Sender<Result<Committed, PersistError>>),
     EnsureProject(String, String, oneshot::Sender<Result<(), PersistError>>),
     /// Project, run and task ids (and the repo path) for [`scratch_task`].
@@ -301,6 +308,10 @@ struct LockWait {
 fn nothing() {}
 
 impl Ctx<'_> {
+    pub(super) fn public_available_bytes(&self) -> Option<u64> {
+        self.hooks.public_available_bytes()
+    }
+
     /// A request outside the writer loop in a unit test: no hooks, no fence.
     #[cfg(test)]
     pub(super) fn quiet() -> Ctx<'static> {
@@ -505,6 +516,8 @@ impl Job {
     /// The request's name, as the fault hooks see it ([`FaultHooks::at`]).
     fn name(&self) -> &'static str {
         match self {
+            Job::Public(..) => "Public",
+            Job::UiBackfill(..) => "UiBackfill",
             Job::Commit(..) => "Commit",
             Job::EnsureProject(..) => "EnsureProject",
             Job::ScratchTask(..) => "ScratchTask",
@@ -667,6 +680,17 @@ impl Writer {
                     };
                     let mut deferred: Option<Reply> = None;
                     match job {
+                        Job::Public(attempt, epoch, part, reply) => {
+                            deferred = Some(answer(
+                                &ctx,
+                                reply,
+                                super::public::native(&mut conn, &attempt, epoch, &part, &ctx),
+                            ));
+                        }
+                        Job::UiBackfill(reply) => {
+                            deferred =
+                                Some(answer(&ctx, reply, super::ui::backfill(&mut conn, &ctx)));
+                        }
                         Job::Commit(commit, reply) => {
                             deferred = Some(answer(&ctx, reply, apply(&mut conn, &commit, &ctx)));
                         }
@@ -963,6 +987,20 @@ impl Writer {
         }
         let _ = self.jobs.try_send((std::time::Instant::now(), Job::Wake));
         rx.await.map_err(|_| PersistError::WriterStopped)?
+    }
+
+    pub(super) async fn record_public(
+        &self,
+        attempt: String,
+        epoch: i64,
+        part: crate::public_output::PublicPart,
+    ) -> Result<Option<i64>, PersistError> {
+        self.submit(|reply| Job::Public(attempt, epoch, Box::new(part), reply))
+            .await
+    }
+
+    pub(super) async fn ui_backfill(&self) -> Result<super::UiIndexStatus, PersistError> {
+        self.submit(Job::UiBackfill).await
     }
 
     pub(super) async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
@@ -1615,7 +1653,9 @@ fn insert(tx: &Connection, event: &NewEvent) -> Result<i64, PersistError> {
         ],
     )
     .map_err(sqlite_error)?;
-    Ok(tx.last_insert_rowid())
+    let seq = tx.last_insert_rowid();
+    super::ui::inserted(tx, seq, run_id, &event.kind, &payload)?;
+    Ok(seq)
 }
 
 /// The payload of Record `event` of stopped run `run`, written project-scoped: the run named in it (`run_id`).
