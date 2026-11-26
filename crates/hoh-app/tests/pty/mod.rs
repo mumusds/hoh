@@ -233,7 +233,7 @@ impl Pty {
     }
 
     /// Wait until the terminal's input queue holds `bytes` bytes typed and not yet read.
-    fn wait_for_queued(&self, bytes: u64, timeout: Duration) -> R {
+    pub fn wait_for_queued(&self, bytes: u64, timeout: Duration) -> R {
         let slave = self.slave.as_ref().ok_or("the PTY is closed")?;
         let end = Instant::now() + timeout;
         loop {
@@ -568,7 +568,7 @@ fn wait_for_state(Hoh(child): &Hoh, state: char, timeout: Duration) -> R {
     }
 }
 
-/// Wait until `hoh` (single-threaded) is inside write(2), as its `/proc/<pid>/syscall` says.
+/// Wait until `hoh` (its main thread) is inside write(2), as its `/proc/<pid>/syscall` says.
 pub fn in_write(Hoh(child): &Hoh, timeout: Duration) -> R {
     #[cfg(target_arch = "x86_64")]
     const WRITE: &str = "1";
@@ -583,6 +583,29 @@ pub fn in_write(Hoh(child): &Hoh, timeout: Duration) -> R {
         std::thread::sleep(Duration::from_millis(10));
     }
     Err(format!("hoh was not seen in write(2) within {timeout:?}").into())
+}
+
+/// Wait until `hoh`'s main thread is inside poll(2) or ppoll(2), as its `/proc/<pid>/syscall` says: once a drawn
+/// frame's text was seen, reaching poll shows every write(2) of that draw (including cursor placement) has returned
+/// and the event loop is idle waiting for input.
+pub fn in_poll(Hoh(child): &Hoh, timeout: Duration) -> R {
+    #[cfg(target_arch = "x86_64")]
+    const POLL: &[&str] = &["7", "271"];
+    #[cfg(target_arch = "aarch64")]
+    const POLL: &[&str] = &["73"];
+    let path = format!("/proc/{}/syscall", child.id());
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if std::fs::read_to_string(&path)?
+            .split(' ')
+            .next()
+            .is_some_and(|n| POLL.contains(&n))
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(format!("hoh was not seen in poll(2)/ppoll(2) within {timeout:?}").into())
 }
 
 /// Send `signal` to the process `child`.
