@@ -185,6 +185,25 @@ impl FdTables {
         }
     }
 
+    fn copy_table(&mut self, parent: u32, child: u32) {
+        let cloned = self
+            .by_pid
+            .get(&parent)
+            .and_then(|id| self.tables.get(id))
+            .cloned()
+            .unwrap_or_default();
+        let new_id = self.next_id;
+        self.next_id += 1;
+        self.tables.insert(new_id, cloned);
+        let old = self.by_pid.insert(child, new_id);
+        if let Some(old_id) = old
+            && old_id != new_id
+            && !self.by_pid.values().any(|&id| id == old_id)
+        {
+            self.tables.remove(&old_id);
+        }
+    }
+
     fn unshare(&mut self, pid: u32) {
         let old_id = self.table_id(pid);
         if self.by_pid.values().filter(|&&id| id == old_id).count() > 1 {
@@ -503,12 +522,24 @@ fn check_call(
                 result
                     .and_then(|v| u32::try_from(v).ok())
                     .filter(|&v| v > 0),
-            ) && has_ident(args, "CLONE_FILES")
-            {
-                sockets.share(parent, child);
+            ) {
+                if has_ident(args, "CLONE_FILES") {
+                    sockets.share(parent, child);
+                } else {
+                    sockets.copy_table(parent, child);
+                }
             }
         }
-        "fork" | "vfork" => {}
+        "fork" | "vfork" => {
+            if let (Some(parent), Some(child)) = (
+                pid,
+                result
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v > 0),
+            ) {
+                sockets.copy_table(parent, child);
+            }
+        }
         "unshare" => {
             if result == Some(0)
                 && let Some(pid) = pid
@@ -1058,6 +1089,13 @@ fn connect_audit_follows_fd_duplication_close_range_exec_and_clone_files() -> R 
     let exec_fail = "101 execve(\"/no/such\", [\"true\"], 0x7fff /* 1 vars */) = -1 ENOENT (No such file or directory)\n";
     let execat_ok = "101 execveat(AT_FDCWD, \"/bin/true\", [\"true\"], 0x7fff, 0) = 0\n";
     let clone_files = "101 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD, stack=0x0}, 88) = 102\n";
+    let fork_ok = "101 fork() = 102\n";
+    let vfork_ok = "101 vfork() = 102\n";
+    let clone_no_files = "101 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD) = 102\n";
+    let clone3_no_files = "101 clone3({flags=0, exit_signal=SIGCHLD}, 88) = 102\n";
+    let child_connect_7 =
+        "102 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    let child_exec_ok = "102 execve(\"/bin/true\", [\"true\"], 0x7fff /* 1 vars */) = 0\n";
 
     // Legitimate dups of a NETLINK_SOCK_DIAG socket remain admitted for nl_pid=0 only.
     for trace in [
@@ -1076,9 +1114,16 @@ fn connect_audit_follows_fd_duplication_close_range_exec_and_clone_files() -> R 
         // Benign fcntl metadata calls with hex returns are decoded cleanly.
         format!("{diag_cloexec}101 fcntl(7, F_GETFD) = 0x1 (flags FD_CLOEXEC)\n{connect_7}"),
         // Sibling thread sharing fd table via CLONE_FILES may connect on the process's SOCK_DIAG socket.
-        format!(
-            "{clone_files}{diag_cloexec}102 connect(7, {{sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}}, 12) = 0\n"
-        ),
+        format!("{clone_files}{diag_cloexec}{child_connect_7}"),
+        // M4L3-102: fork, vfork, and clone/clone3 without CLONE_FILES copy the parent's fd table, so a child's
+        // legal nl_pid=0 connect on an inherited SOCK_DIAG fd is admitted.
+        format!("{diag_cloexec}{fork_ok}{child_connect_7}"),
+        format!("{diag_cloexec}{vfork_ok}{child_connect_7}"),
+        format!("{diag_cloexec}{clone_no_files}{child_connect_7}"),
+        format!("{diag_cloexec}{clone3_no_files}{child_connect_7}"),
+        // Copied fd table is independent: child closing fd 7 leaves parent's fd 7 intact, and non-CLOEXEC survives child execve.
+        format!("{diag_cloexec}{fork_ok}102 close(7) = 0\n{connect_7}"),
+        format!("{diag_plain}{fork_ok}{child_exec_ok}{child_connect_7}"),
     ] {
         assert_eq!(audit(&trace)?, 1, "unexpectedly refused: {trace}");
     }
@@ -1110,6 +1155,11 @@ fn connect_audit_follows_fd_duplication_close_range_exec_and_clone_files() -> R 
         format!("{clone_files}{diag_cloexec}102 close(7) = 0\n{connect_7}"),
         format!("{clone_files}{diag_cloexec}{route}102 dup2(8, 7) = 7\n{connect_7}"),
         format!("{clone_files}{diag_cloexec}102 close_range(7, 7, 0) = 0\n{connect_7}"),
+        // M4L3-102: without CLONE_FILES, a socket opened AFTER fork is not visible to the child, and child execve
+        // closes inherited SOCK_CLOEXEC fds.
+        format!("{fork_ok}{diag_cloexec}{child_connect_7}"),
+        format!("{clone_no_files}{diag_cloexec}{child_connect_7}"),
+        format!("{diag_cloexec}{fork_ok}{child_exec_ok}{child_connect_7}"),
     ] {
         assert!(audit(&trace).is_err(), "unexpectedly allowed: {trace}");
     }
