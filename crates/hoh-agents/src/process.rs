@@ -164,6 +164,8 @@ pub struct StreamReport {
     /// The stream ended (EOF) rather than being abandoned or failing.
     pub eof: bool,
     pub error: Option<String>,
+    /// First receive offset where public frames were dropped because the public queue closed (DC-M4T09a).
+    pub public_gap: Option<u64>,
 }
 
 /// The last event of a process.
@@ -704,7 +706,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     mut reader: FrameReader<Tee<R>>,
     events: mpsc::Sender<Event>,
     mut abandon: watch::Receiver<bool>,
-    public: Option<crate::public_stream::Publisher>,
+    mut public: Option<crate::public_stream::Publisher>,
 ) -> StreamReport {
     let mut report = StreamReport::default();
     let mut refused = false;
@@ -752,11 +754,30 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                             "native_frame_reduced",
                         ));
                     }
-                    let sent = tokio::select! {biased;_ = abandoned(&mut abandon)=>false,result=crate::public_stream::publish(sender,parts)=>result.is_ok()};
-                    if !sent {
-                        break;
+                    enum PublishState {
+                        Abandoned,
+                        Sent,
+                        Closed,
                     }
-                    receive_offset += 1;
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = abandoned(&mut abandon) => PublishState::Abandoned,
+                        result = crate::public_stream::publish(sender, parts) => {
+                            if result.is_ok() { PublishState::Sent } else { PublishState::Closed }
+                        }
+                    };
+                    match outcome {
+                        PublishState::Abandoned => break,
+                        PublishState::Sent => {
+                            receive_offset += 1;
+                        }
+                        PublishState::Closed => {
+                            if report.public_gap.is_none() {
+                                report.public_gap = Some(receive_offset);
+                            }
+                            public = None;
+                        }
+                    }
                 }
                 // Waiting here for the consumer is the backpressure; it is never abandoned.
                 if events.send(Event::Frame(frame)).await.is_err() {
@@ -1184,6 +1205,100 @@ mod tests {
         assert_eq!(terms, 1, "SIGTERM delivered {terms} times");
         assert_eq!(report.status, Some(Termination::Signal(9)), "{report:?}");
         assert!(!left, "leader survived");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_011_05_reader_keeps_reading_stdout_and_stays_cancellable_when_public_drain_drops()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (publisher, receiver) =
+            crate::public_stream::channel(crate::public_stream::Mode::Claude, "2.1.318");
+        drop(receiver);
+        let mut command = std::process::Command::new("python3");
+        command.arg("-c").arg(
+            "import json\nfor i in range(3):\n    print(json.dumps({'type':'assistant','uuid':f'u{i}','message':{'id':'m','content':[{'type':'text','text':f'msg-{i}'}]}}), flush=True)\n",
+        );
+        let mut p = Process::spawn(
+            command,
+            Config {
+                public: Some(publisher.clone()),
+                ..Config::default()
+            },
+            &hoh_core::spawn::Direct::plain(),
+        )?;
+        let mut frames = Vec::new();
+        let mut exit = None;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
+            match event {
+                Event::Frame(f) => frames.push(f),
+                Event::Exit(r) => {
+                    exit = Some(*r);
+                    break;
+                }
+            }
+        }
+        let report = exit.ok_or("no exit report")?;
+        assert!(
+            report.stderr_tail.is_empty(),
+            "child stderr must be empty: {}",
+            String::from_utf8_lossy(&report.stderr_tail)
+        );
+        assert_eq!(
+            frames.len(),
+            3,
+            "native reader must keep reading stdout after public drain disappears"
+        );
+        assert!(
+            report.stdout.eof,
+            "stdout must reach EOF cleanly: {report:?}"
+        );
+        assert_eq!(
+            report.stdout.public_gap,
+            Some(0),
+            "dropped public frames must record one gap offset"
+        );
+
+        // Cancel stays reachable after the public drain is gone.
+        let mut slow = std::process::Command::new("python3");
+        slow.arg("-c").arg(
+            "import json, signal\n\
+             print(json.dumps({'type':'assistant','uuid':'s0','message':{'id':'m','content':[{'type':'text','text':'hi'}]}}), flush=True)\n\
+             signal.pause()\n",
+        );
+        let mut p = Process::spawn(
+            slow,
+            Config {
+                public: Some(publisher),
+                ..Config::default()
+            },
+            &hoh_core::spawn::Direct::plain(),
+        )?;
+        match tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
+            Some(Event::Frame(_)) => {}
+            other => {
+                return Err(
+                    format!("expected first frame after dropped drain, got {other:?}").into(),
+                );
+            }
+        }
+        p.cancel(Escalation {
+            native: None,
+            native_grace: Duration::ZERO,
+            term_grace: Duration::from_millis(200),
+            kill_grace: Duration::from_secs(2),
+        });
+        let exit = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = p.next().await {
+                if let Event::Exit(report) = event {
+                    return Some(*report);
+                }
+            }
+            None
+        })
+        .await?
+        .ok_or("no cancel exit report")?;
+        assert_eq!(exit.cause, Cause::Cancelled);
+        assert_eq!(exit.stdout.public_gap, Some(0));
         Ok(())
     }
 }
