@@ -1087,9 +1087,12 @@ async fn test_062_01_a_lasting_write_outlasts_an_outside_lock_for_two_more_busy_
     external.execute_batch("BEGIN IMMEDIATE")?;
     let started = Instant::now();
     let first = std::sync::Mutex::new(None);
+    let held_attempts = std::sync::atomic::AtomicU32::new(0);
+    let held_retries = std::sync::atomic::AtomicU32::new(0);
     let held = store
         .lasting(
             || {
+                held_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 store.commit(Commit {
                     cas: vec![],
                     events: vec![event("e2")],
@@ -1097,6 +1100,7 @@ async fn test_062_01_a_lasting_write_outlasts_an_outside_lock_for_two_more_busy_
                 })
             },
             || {
+                held_retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut first) = first.lock() {
                     first.get_or_insert_with(Instant::now);
                 }
@@ -1110,6 +1114,16 @@ async fn test_062_01_a_lasting_write_outlasts_an_outside_lock_for_two_more_busy_
     assert!(
         matches!(&held, Err(e @ PersistError::Busy(_)) if e.retryable()),
         "{held:?}"
+    );
+    assert_eq!(
+        held_retries.load(std::sync::atomic::Ordering::SeqCst),
+        LASTING_BUSY_TIMEOUTS,
+        "M3F-200: lasting must retry exactly LASTING_BUSY_TIMEOUTS times"
+    );
+    assert_eq!(
+        held_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        LASTING_BUSY_TIMEOUTS + 1,
+        "M3F-200: lasting must attempt initial write plus LASTING_BUSY_TIMEOUTS retries"
     );
     let lasted = first.duration_since(started);
     assert!(lasted >= busy, "first DB_BUSY after {lasted:?}");
