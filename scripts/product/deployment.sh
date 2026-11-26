@@ -72,6 +72,7 @@ if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then
   python3 scripts/product/test_results.py --log "$log" --out "$HOH_EVIDENCE_DIR/test-results.jsonl"
 fi
 [[ "$rc" -eq 0 ]] || exit "$rc"
+python3 scripts/product/test_results.py --log "$log" --check-stdout
 passed="$(grep -Eo 'test result: [a-z]+\. [0-9]+ passed' "$log" | awk '{s+=$4} END {print s+0}')"
 if [[ "$passed" -eq 0 ]] || ! grep -Eq '^test test_005_06_[a-z0-9_]+ \.\.\. ok$' "$log"; then
   echo "NO_TESTS: TEST-005-06 did not pass in the deployment check; an empty or all-ignored suite is not evidence." >&2
