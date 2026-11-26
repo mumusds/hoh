@@ -557,3 +557,80 @@ async fn test_011_05_input_acceptance_replay_and_shared_body_after_001_002_003()
     assert!(rows(&path, "PRAGMA foreign_key_check")?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn test_013_05_online_and_forced_rebuild_identities_match_field_by_field() -> R {
+    let dir = tempfile::tempdir()?;
+    let (store, path) = open(&dir)?;
+    seed(&path, WORLD)?;
+    seed(
+        &path,
+        "INSERT INTO sessions VALUES('sess','claude','developer',NULL,NULL,'2.1.318','{}')",
+    )?;
+    let ev = |id: &str| NewEvent {
+        intent: Intent::Progress,
+        project_id: "p".into(),
+        run_id: Some("r".into()),
+        event_id: id.into(),
+        kind: "task.started".into(),
+        payload: json!({"attempt_id":"a"}),
+    };
+    store
+        .commit(Commit {
+            events: vec![ev("x1")],
+            ..Default::default()
+        })
+        .await?;
+    // Simulate late session binding on attempts (as move_attempt's COALESCE does).
+    seed(
+        &path,
+        "UPDATE attempts SET session_id='sess' WHERE attempt_id='a'",
+    )?;
+    store
+        .commit(Commit {
+            events: vec![ev("x2")],
+            ..Default::default()
+        })
+        .await?;
+    let h = store
+        .record_public("a", 1, message("pub-with-sess", 0, 0))
+        .await?
+        .ok_or("public seq")?;
+    let online = store.reader()?.ui_identities("r", h)?;
+    assert_eq!(online.len(), 3);
+    assert_eq!(
+        online[2].session_id.as_deref(),
+        Some("sess"),
+        "public events carry immutable session_id in payload"
+    );
+    let end = store.writer_ended();
+    drop(store);
+    assert!(end.await);
+    // Force a new generation rebuild by deleting one index row.
+    seed(
+        &path,
+        "DELETE FROM ui_event_index WHERE seq=(SELECT min(seq) FROM ui_event_index)",
+    )?;
+    let (store, _) = open(&dir)?;
+    let mut ready = false;
+    let mut generation = 0;
+    for _ in 0..10 {
+        let s = store.ui_backfill().await?;
+        generation = s.generation;
+        if s.index_ready {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready);
+    assert!(
+        generation > 1,
+        "forced rebuild must advance generation, got {generation}"
+    );
+    let rebuilt = store.reader()?.ui_identities("r", h)?;
+    assert_eq!(
+        online, rebuilt,
+        "online and forced-rebuild identity sets must match field by field"
+    );
+    Ok(())
+}
