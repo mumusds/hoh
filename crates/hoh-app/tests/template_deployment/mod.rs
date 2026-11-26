@@ -119,9 +119,115 @@ fn wait_trace(mut child: Child) -> R {
     }
 }
 
+const TRACE_SYSCALLS: &str = "trace=socket,close,connect,dup,dup2,dup3,fcntl,close_range,clone,clone3,fork,vfork,unshare,execve,execveat";
+
+const CALL_PREFIXES: &[&str] = &[
+    "socket(",
+    "close(",
+    "connect(",
+    "dup(",
+    "dup2(",
+    "dup3(",
+    "fcntl(",
+    "close_range(",
+    "clone(",
+    "clone3(",
+    "fork(",
+    "vfork(",
+    "unshare(",
+    "execve(",
+    "execveat(",
+    "???(",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FdState {
+    cloexec: bool,
+}
+
+#[derive(Default)]
+struct FdTables {
+    next_id: usize,
+    by_pid: BTreeMap<u32, usize>,
+    tables: BTreeMap<usize, BTreeMap<i32, FdState>>,
+}
+
+impl FdTables {
+    fn table_id(&mut self, pid: u32) -> usize {
+        if let Some(&id) = self.by_pid.get(&pid) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.by_pid.insert(pid, id);
+        self.tables.insert(id, BTreeMap::new());
+        id
+    }
+
+    fn table_mut(&mut self, pid: u32) -> &mut BTreeMap<i32, FdState> {
+        let id = self.table_id(pid);
+        self.tables.entry(id).or_default()
+    }
+
+    fn get(&self, pid: u32, fd: i32) -> Option<FdState> {
+        let id = self.by_pid.get(&pid)?;
+        self.tables.get(id)?.get(&fd).copied()
+    }
+
+    fn share(&mut self, parent: u32, child: u32) {
+        let parent_id = self.table_id(parent);
+        let old = self.by_pid.insert(child, parent_id);
+        if let Some(old_id) = old
+            && old_id != parent_id
+            && !self.by_pid.values().any(|&id| id == old_id)
+        {
+            self.tables.remove(&old_id);
+        }
+    }
+
+    fn unshare(&mut self, pid: u32) {
+        let old_id = self.table_id(pid);
+        if self.by_pid.values().filter(|&&id| id == old_id).count() > 1 {
+            let cloned = self.tables.get(&old_id).cloned().unwrap_or_default();
+            let new_id = self.next_id;
+            self.next_id += 1;
+            self.tables.insert(new_id, cloned);
+            self.by_pid.insert(pid, new_id);
+        }
+    }
+
+    fn on_exec(&mut self, pid: u32) {
+        self.unshare(pid);
+        self.table_mut(pid).retain(|_, state| !state.cloexec);
+    }
+
+    fn on_exit(&mut self, pid: u32) {
+        if let Some(old_id) = self.by_pid.remove(&pid)
+            && !self.by_pid.values().any(|&id| id == old_id)
+        {
+            self.tables.remove(&old_id);
+        }
+    }
+}
+
+fn parse_u32_bound(token: &str) -> Option<u32> {
+    if matches!(token, "~0U" | "~0") {
+        return Some(u32::MAX);
+    }
+    if let Some(hex) = token.strip_prefix("0x") {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    token.parse::<u32>().ok()
+}
+
+fn has_ident(text: &str, ident: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| tok == ident)
+}
+
 fn audit(trace: &str) -> R<usize> {
     let mut count = 0;
-    let mut sockets = BTreeSet::new();
+    let mut sockets = FdTables::default();
     let mut pending = BTreeMap::new();
     // Threads whose last call strace saw cut off by the thread's exit (pseudo result `= ?`): only that exit may follow.
     let mut exiting = BTreeSet::new();
@@ -136,7 +242,9 @@ fn audit(trace: &str) -> R<usize> {
                 count +=
                     usize::from(check_call(&format!("{start}) = ?"), pid, line, &mut sockets)?.0);
             }
-            sockets.retain(|(owner, _)| Some(*owner) != pid);
+            if let Some(pid) = pid {
+                sockets.on_exit(pid);
+            }
             exiting.remove(&pid);
             continue;
         }
@@ -145,24 +253,18 @@ fn audit(trace: &str) -> R<usize> {
                 format!("syscall after a call cut off by its thread's exit: {line}").into(),
             );
         }
-        if body.is_empty() || body.starts_with("--- ") || body.starts_with("execve(") {
+        if body.is_empty() || body.starts_with("--- ") {
             continue;
         }
         let call = if let Some(rest) = body.strip_prefix("<... ") {
             let (name, rest) = rest.split_once(" resumed>").ok_or("undecodable resume")?;
-            if name == "execve" {
-                continue;
-            }
             let start: String = pending.remove(&pid).ok_or("resume without syscall start")?;
             if !start.starts_with(&format!("{name}(")) {
                 return Err(format!("mismatched syscall resume: {line}").into());
             }
             format!("{start}{rest}")
         } else {
-            if !["socket(", "close(", "connect(", "???("]
-                .iter()
-                .any(|name| body.starts_with(name))
-            {
+            if !CALL_PREFIXES.iter().any(|name| body.starts_with(name)) {
                 return Err(format!("undecodable trace line: {line}").into());
             }
             if let Some(start) = body.strip_suffix("<unfinished ...>") {
@@ -192,14 +294,14 @@ fn audit(trace: &str) -> R<usize> {
     Ok(count)
 }
 
-/// Checks one whole call and applies it to the thread's SOCK_DIAG sockets; gives whether it was a connect and its result
-/// (`None` for strace's pseudo result `?`, a call whose thread exited before it returned).
+/// Checks one whole call and applies it to the process's SOCK_DIAG fd table (M3O-800); gives whether it was a connect
+/// and its result (`None` for strace's pseudo result `?`, a call whose thread exited before it returned).
 fn check_call(
     call: &str,
     pid: Option<u32>,
     line: &str,
-    sockets: &mut BTreeSet<(u32, i32)>,
-) -> R<(bool, Option<i32>)> {
+    sockets: &mut FdTables,
+) -> R<(bool, Option<i64>)> {
     let invalid = || format!("non-local or undecodable syscall: {line}");
     let (name, rest) = call.split_once('(').ok_or_else(invalid)?;
     let (args, result) = rest.rsplit_once("= ").ok_or_else(invalid)?;
@@ -208,9 +310,13 @@ fn check_call(
         .strip_suffix(')')
         .ok_or_else(invalid)?
         .trim_end();
-    let result = match result.split_whitespace().next() {
-        Some("?") => None,
-        v => Some(v.and_then(|v| v.parse::<i32>().ok()).ok_or_else(invalid)?),
+    let token = result.split_whitespace().next().ok_or_else(invalid)?;
+    let result = if token == "?" {
+        None
+    } else if let Some(hex) = token.strip_prefix("0x") {
+        Some(i64::from_str_radix(hex, 16).map_err(|_| invalid())?)
+    } else {
+        Some(token.parse::<i64>().map_err(|_| invalid())?)
     };
     match name {
         "socket" => {
@@ -220,16 +326,25 @@ fn check_call(
                 return Err(invalid().into());
             };
             // A socket whose result is unknown authorizes nothing.
-            if let Some(result) = result.filter(|v| *v >= 0) {
+            if let Some(fd) = result
+                .and_then(|v| i32::try_from(v).ok())
+                .filter(|v| *v >= 0)
+            {
+                let table = sockets.table_mut(pid);
                 // Every successful socket replaces the previous identity of this fd.
-                sockets.remove(&(pid, result));
+                table.remove(&fd);
                 let mut flags = kind.split('|');
+                let primary = flags.next();
+                let extra: Vec<_> = flags.collect();
                 if *family == "AF_NETLINK"
-                    && flags.next() == Some("SOCK_RAW")
-                    && flags.all(|v| matches!(v, "SOCK_CLOEXEC" | "SOCK_NONBLOCK"))
+                    && primary == Some("SOCK_RAW")
+                    && extra
+                        .iter()
+                        .all(|v| matches!(*v, "SOCK_CLOEXEC" | "SOCK_NONBLOCK"))
                     && *protocol == "NETLINK_SOCK_DIAG"
                 {
-                    sockets.insert((pid, result));
+                    let cloexec = extra.contains(&"SOCK_CLOEXEC");
+                    table.insert(fd, FdState { cloexec });
                 }
             }
         }
@@ -237,7 +352,177 @@ fn check_call(
             let pid = pid.ok_or_else(invalid)?;
             let fd = args.parse::<i32>().map_err(|_| invalid())?;
             // Do not retain permission even on a failed/ambiguous close.
-            sockets.remove(&(pid, fd));
+            sockets.table_mut(pid).remove(&fd);
+        }
+        "dup" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let old = args.parse::<i32>().map_err(|_| invalid())?;
+            if let Some(new_fd) = result
+                .and_then(|v| i32::try_from(v).ok())
+                .filter(|v| *v >= 0)
+            {
+                let inherited = sockets.get(pid, old).is_some();
+                let table = sockets.table_mut(pid);
+                if inherited {
+                    table.insert(new_fd, FdState { cloexec: false });
+                } else {
+                    table.remove(&new_fd);
+                }
+            }
+        }
+        "dup2" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let fields = args.split(", ").collect::<Vec<_>>();
+            let [old, new] = fields.as_slice() else {
+                return Err(invalid().into());
+            };
+            let old = old.parse::<i32>().map_err(|_| invalid())?;
+            let new = new.parse::<i32>().map_err(|_| invalid())?;
+            if old != new {
+                if result.is_some_and(|v| v >= 0) {
+                    let inherited = sockets.get(pid, old).is_some();
+                    let table = sockets.table_mut(pid);
+                    if inherited {
+                        table.insert(new, FdState { cloexec: false });
+                    } else {
+                        table.remove(&new);
+                    }
+                } else {
+                    // Fail closed on interrupted/ambiguous dup2 targeting an existing fd.
+                    sockets.table_mut(pid).remove(&new);
+                }
+            }
+        }
+        "dup3" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let fields = args.split(", ").collect::<Vec<_>>();
+            let [old, new, flags] = fields.as_slice() else {
+                return Err(invalid().into());
+            };
+            let old = old.parse::<i32>().map_err(|_| invalid())?;
+            let new = new.parse::<i32>().map_err(|_| invalid())?;
+            let valid_flags = *flags == "0" || flags.split('|').all(|f| f == "O_CLOEXEC");
+            if !valid_flags {
+                return Err(invalid().into());
+            }
+            let cloexec = flags.split('|').any(|f| f == "O_CLOEXEC");
+            if result.is_some_and(|v| v >= 0) {
+                let inherited = sockets.get(pid, old).is_some();
+                let table = sockets.table_mut(pid);
+                if inherited {
+                    table.insert(new, FdState { cloexec });
+                } else {
+                    table.remove(&new);
+                }
+            } else if old != new {
+                sockets.table_mut(pid).remove(&new);
+            }
+        }
+        "fcntl" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let mut parts = args.splitn(3, ", ");
+            let fd = parts
+                .next()
+                .ok_or_else(invalid)?
+                .parse::<i32>()
+                .map_err(|_| invalid())?;
+            let cmd = parts.next().ok_or_else(invalid)?;
+            let arg = parts.next();
+            match cmd {
+                "F_DUPFD" | "F_DUPFD_CLOEXEC" => {
+                    let _ = arg.ok_or_else(invalid)?;
+                    let cloexec = cmd == "F_DUPFD_CLOEXEC";
+                    if let Some(new_fd) = result
+                        .and_then(|v| i32::try_from(v).ok())
+                        .filter(|v| *v >= 0)
+                    {
+                        let inherited = sockets.get(pid, fd).is_some();
+                        let table = sockets.table_mut(pid);
+                        if inherited {
+                            table.insert(new_fd, FdState { cloexec });
+                        } else {
+                            table.remove(&new_fd);
+                        }
+                    }
+                }
+                "F_SETFD" => {
+                    let arg = arg.ok_or_else(invalid)?;
+                    if sockets.get(pid, fd).is_some() {
+                        let cloexec = if result == Some(0) {
+                            arg != "0"
+                        } else {
+                            // Ambiguous or interrupted F_SETFD: fail safe toward closing on exec.
+                            true
+                        };
+                        sockets.table_mut(pid).insert(fd, FdState { cloexec });
+                    }
+                }
+                "F_GETFD" | "F_GETFL" | "F_SETFL" | "F_GETLK" | "F_SETLK" | "F_SETLKW"
+                | "F_OFD_GETLK" | "F_OFD_SETLK" | "F_OFD_SETLKW" | "F_GETOWN" | "F_SETOWN"
+                | "F_GETOWN_EX" | "F_SETOWN_EX" | "F_GETSIG" | "F_SETSIG" | "F_GETPIPE_SZ"
+                | "F_SETPIPE_SZ" | "F_ADD_SEALS" | "F_GET_SEALS" | "F_GETLEASE" | "F_SETLEASE"
+                | "F_NOTIFY" | "F_GET_RW_HINT" | "F_SET_RW_HINT" | "F_GET_FILE_RW_HINT"
+                | "F_SET_FILE_RW_HINT" => {}
+                _ => return Err(invalid().into()),
+            }
+        }
+        "close_range" => {
+            let pid = pid.ok_or_else(invalid)?;
+            let fields = args.split(", ").collect::<Vec<_>>();
+            let [first, last, flags] = fields.as_slice() else {
+                return Err(invalid().into());
+            };
+            let first = parse_u32_bound(first).ok_or_else(invalid)?;
+            let last = parse_u32_bound(last).ok_or_else(invalid)?;
+            let valid_flags = *flags == "0"
+                || flags
+                    .split('|')
+                    .all(|f| matches!(f, "CLOSE_RANGE_UNSHARE" | "CLOSE_RANGE_CLOEXEC"));
+            if !valid_flags {
+                return Err(invalid().into());
+            }
+            let unshare = flags.split('|').any(|f| f == "CLOSE_RANGE_UNSHARE");
+            let set_cloexec = flags.split('|').any(|f| f == "CLOSE_RANGE_CLOEXEC");
+            if unshare && result == Some(0) {
+                sockets.unshare(pid);
+            }
+            let in_range = |fd: i32| u32::try_from(fd).is_ok_and(|u| u >= first && u <= last);
+            if set_cloexec && result == Some(0) {
+                for (&fd, state) in sockets.table_mut(pid).iter_mut() {
+                    if in_range(fd) {
+                        state.cloexec = true;
+                    }
+                }
+            } else if !set_cloexec || result.is_none() {
+                sockets.table_mut(pid).retain(|&fd, _| !in_range(fd));
+            }
+        }
+        "clone" | "clone3" => {
+            if let (Some(parent), Some(child)) = (
+                pid,
+                result
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v > 0),
+            ) && has_ident(args, "CLONE_FILES")
+            {
+                sockets.share(parent, child);
+            }
+        }
+        "fork" | "vfork" => {}
+        "unshare" => {
+            if result == Some(0)
+                && let Some(pid) = pid
+                && has_ident(args, "CLONE_FILES")
+            {
+                sockets.unshare(pid);
+            }
+        }
+        "execve" | "execveat" => {
+            if result == Some(0)
+                && let Some(pid) = pid
+            {
+                sockets.on_exec(pid);
+            }
         }
         "connect" => {
             let (fd, address) = args.split_once(", ").ok_or_else(invalid)?;
@@ -258,7 +543,7 @@ fn check_call(
                 .is_some_and(|groups| {
                     groups.len() == 8 && groups.bytes().all(|b| b.is_ascii_hexdigit())
                 })
-                && pid.is_some_and(|pid| sockets.contains(&(pid, fd)));
+                && pid.is_some_and(|pid| sockets.get(pid, fd).is_some());
             if !local && !kernel {
                 return Err(invalid().into());
             }
@@ -400,7 +685,7 @@ def template_drafter(ident):
             "strace",
             "-f",
             "-e",
-            "trace=socket,close,connect,execve",
+            TRACE_SYSCALLS,
             "-s",
             "4096",
             "-o",
@@ -440,7 +725,7 @@ def template_drafter(ident):
             std::thread::sleep(Duration::from_millis(20));
         }
         let child = command(&world, "strace")
-            .args(["-f", "-e", "trace=socket,close,connect", "-s", "4096", "-o"])
+            .args(["-f", "-e", TRACE_SYSCALLS, "-s", "4096", "-o"])
             .arg(&client_trace)
             .arg(&hoh)
             .args(["-p", "draft", "--resume", run, "--output", "json"])
@@ -756,4 +1041,77 @@ fn connect_audit_rejects_a_cut_off_syscall_whose_thread_did_not_exit() {
         netlink.replace(") = 0", " <unfinished ...>")
     );
     assert_eq!(audit(&owned).ok(), Some(1), "refused: {owned}");
+}
+
+#[test]
+fn connect_audit_follows_fd_duplication_close_range_exec_and_clone_files() -> R {
+    let diag_cloexec = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_SOCK_DIAG) = 7\n";
+    let diag_plain = "101 socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) = 7\n";
+    let route = "101 socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE) = 8\n";
+    let connect_7 =
+        "101 connect(7, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    let connect_9 =
+        "101 connect(9, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0\n";
+    let connect_9_nonkernel =
+        "101 connect(9, {sa_family=AF_NETLINK, nl_pid=10, nl_groups=00000000}, 12) = 0\n";
+    let exec_ok = "101 execve(\"/bin/true\", [\"true\"], 0x7fff /* 1 vars */) = 0\n";
+    let exec_fail = "101 execve(\"/no/such\", [\"true\"], 0x7fff /* 1 vars */) = -1 ENOENT (No such file or directory)\n";
+    let execat_ok = "101 execveat(AT_FDCWD, \"/bin/true\", [\"true\"], 0x7fff, 0) = 0\n";
+    let clone_files = "101 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD, stack=0x0}, 88) = 102\n";
+
+    // Legitimate dups of a NETLINK_SOCK_DIAG socket remain admitted for nl_pid=0 only.
+    for trace in [
+        format!("{diag_cloexec}101 dup(7) = 9\n101 close(7) = 0\n{connect_9}"),
+        format!("{diag_cloexec}101 dup2(7, 9) = 9\n101 close(7) = 0\n{connect_9}"),
+        format!("{diag_cloexec}101 dup3(7, 9, O_CLOEXEC) = 9\n101 close(7) = 0\n{connect_9}"),
+        format!("{diag_cloexec}101 fcntl(7, F_DUPFD, 9) = 9\n101 close(7) = 0\n{connect_9}"),
+        format!(
+            "{diag_cloexec}101 fcntl(7, F_DUPFD_CLOEXEC, 9) = 9\n101 close(7) = 0\n{connect_9}"
+        ),
+        // Failed execve does not close CLOEXEC sockets; non-CLOEXEC sockets survive execve.
+        format!("{diag_cloexec}{exec_fail}{connect_7}"),
+        format!("{diag_plain}{exec_ok}{connect_7}"),
+        // dup2 clears FD_CLOEXEC on the new fd, so fd 9 survives execve while fd 7 closes.
+        format!("{diag_cloexec}101 dup2(7, 9) = 9\n{exec_ok}{connect_9}"),
+        // Benign fcntl metadata calls with hex returns are decoded cleanly.
+        format!("{diag_cloexec}101 fcntl(7, F_GETFD) = 0x1 (flags FD_CLOEXEC)\n{connect_7}"),
+        // Sibling thread sharing fd table via CLONE_FILES may connect on the process's SOCK_DIAG socket.
+        format!(
+            "{clone_files}{diag_cloexec}102 connect(7, {{sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}}, 12) = 0\n"
+        ),
+    ] {
+        assert_eq!(audit(&trace)?, 1, "unexpectedly refused: {trace}");
+    }
+
+    // Overwriting, closing, exec-closing, or non-kernel connects on dup'd fds MUST be rejected.
+    for trace in [
+        // dup2 / dup3 overwriting a SOCK_DIAG fd with a NETLINK_ROUTE socket must revoke SOCK_DIAG.
+        format!("{diag_cloexec}{route}101 dup2(8, 7) = 7\n{connect_7}"),
+        format!("{diag_cloexec}{route}101 dup3(8, 7, O_CLOEXEC) = 7\n{connect_7}"),
+        // Duplicating a non-SOCK_DIAG socket never authorizes connect.
+        format!("{route}101 dup(8) = 9\n{connect_9}"),
+        format!("{route}101 dup2(8, 9) = 9\n{connect_9}"),
+        format!("{route}101 dup3(8, 9, 0) = 9\n{connect_9}"),
+        format!("{route}101 fcntl(8, F_DUPFD, 9) = 9\n{connect_9}"),
+        format!("{route}101 fcntl(8, F_DUPFD_CLOEXEC, 9) = 9\n{connect_9}"),
+        // Non-kernel nl_pid on a dup'd SOCK_DIAG socket is still rejected.
+        format!("{diag_cloexec}101 dup(7) = 9\n{connect_9_nonkernel}"),
+        // close_range revokes SOCK_DIAG fds in range (both numeric and ~0U bounds).
+        format!("{diag_cloexec}101 close_range(3, 10, 0) = 0\n{connect_7}"),
+        format!("{diag_cloexec}101 close_range(3, ~0U, 0) = 0\n{connect_7}"),
+        // Exec-time closes: SOCK_CLOEXEC, dup3 O_CLOEXEC, F_DUPFD_CLOEXEC, F_SETFD FD_CLOEXEC, CLOSE_RANGE_CLOEXEC.
+        format!("{diag_cloexec}{exec_ok}{connect_7}"),
+        format!("{diag_cloexec}{execat_ok}{connect_7}"),
+        format!("{diag_plain}101 dup3(7, 9, O_CLOEXEC) = 9\n{exec_ok}{connect_9}"),
+        format!("{diag_plain}101 fcntl(7, F_DUPFD_CLOEXEC, 9) = 9\n{exec_ok}{connect_9}"),
+        format!("{diag_plain}101 fcntl(7, F_SETFD, FD_CLOEXEC) = 0\n{exec_ok}{connect_7}"),
+        format!("{diag_plain}101 close_range(7, 7, CLOSE_RANGE_CLOEXEC) = 0\n{exec_ok}{connect_7}"),
+        // CLONE_FILES sibling closing or overwriting fd 7 revokes it for the creator thread too.
+        format!("{clone_files}{diag_cloexec}102 close(7) = 0\n{connect_7}"),
+        format!("{clone_files}{diag_cloexec}{route}102 dup2(8, 7) = 7\n{connect_7}"),
+        format!("{clone_files}{diag_cloexec}102 close_range(7, 7, 0) = 0\n{connect_7}"),
+    ] {
+        assert!(audit(&trace).is_err(), "unexpectedly allowed: {trace}");
+    }
+    Ok(())
 }
