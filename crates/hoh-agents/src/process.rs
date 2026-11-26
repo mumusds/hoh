@@ -1438,6 +1438,130 @@ mod tests {
         Ok(())
     }
 
+    fn duplex_reader(read: tokio::io::DuplexStream) -> FrameReader<Tee<tokio::io::DuplexStream>> {
+        FrameReader::new(
+            Tee {
+                inner: read,
+                copy: None,
+            },
+            1 << 20,
+            4096,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_011_05_batch_dropped_by_a_latched_abandon_is_counted_lost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncWriteExt as _;
+        let (publisher, mut receiver) =
+            crate::public_stream::channel(crate::public_stream::Mode::CodexAppServer, "0.166.0");
+        let loss = publisher.loss();
+        let (mut write, read) = tokio::io::duplex(4096);
+        // Two frames in one read: the second is already buffered when abandon lands (M4T09R-501).
+        write
+            .write_all(
+                b"{\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"m1\",\"text\":\"first\\n\"}}}\n\
+                  {\"method\":\"item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"id\":\"m2\",\"text\":\"hello world\\n\"}}}\n",
+            )
+            .await?;
+        // The consumer is behind: the reader waits forwarding the first frame, which is never abandoned.
+        let (events, mut rx) = mpsc::channel(1);
+        events.send(Event::Frame(Frame::Line(Vec::new()))).await?;
+        let (stop, abandoned) = watch::channel(false);
+        let task = tokio::spawn(read_stdout(
+            duplex_reader(read),
+            events,
+            abandoned,
+            Some(publisher),
+        ));
+        let first = receiver.recv().await.ok_or("first part")?;
+        receiver.loss.settled();
+        assert_eq!(first.part.text, "first\n");
+        stop.send_replace(true);
+        assert!(rx.recv().await.is_some(), "the consumer catches up");
+        let report = tokio::time::timeout(Duration::from_secs(5), task).await??;
+        drop((write, stop, rx));
+        assert!(!report.eof);
+        let mut queued = Vec::new();
+        while let Some(pending) = receiver.recv().await {
+            receiver.loss.settled();
+            queued.push(pending.part);
+        }
+        assert!(
+            !queued
+                .iter()
+                .any(|p| p.kind == hoh_core::public_output::PublicKind::Message),
+            "the batch met the latched abandon before it was offered: {queued:?}"
+        );
+        let summary = loss.summary();
+        assert_eq!(
+            (
+                summary.unrecorded,
+                summary.bytes,
+                summary.first_offset,
+                summary.dropped
+            ),
+            (1, "hello world\n".len() as u64, Some(1), 0),
+            "the batch dropped by abandon is counted for the process-end gap: {summary:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_011_05_abandon_with_a_full_queue_ends_the_reader_at_once_and_counts_the_rest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncWriteExt as _;
+        let (publisher, receiver) =
+            crate::public_stream::channel(crate::public_stream::Mode::CodexAppServer, "0.166.0");
+        let loss = publisher.loss();
+        // Nobody drains: the queue is full before the reader starts (M4T09R-502).
+        let filler: Vec<_> = (0..64u64)
+            .map(|i| {
+                crate::public_stream::gap(
+                    crate::public_stream::Mode::CodexAppServer,
+                    1000 + i,
+                    "filler",
+                )
+            })
+            .collect();
+        crate::public_stream::try_publish(&publisher, filler);
+        assert_eq!(
+            loss.summary().unrecorded,
+            64,
+            "the fillers fill the queue, none settled"
+        );
+        let (mut write, read) = tokio::io::duplex(4096);
+        let (events, mut rx) = mpsc::channel(4);
+        let (stop, abandoned) = watch::channel(false);
+        let task = tokio::spawn(read_stdout(
+            duplex_reader(read),
+            events,
+            abandoned,
+            Some(publisher),
+        ));
+        write
+            .write_all(
+                b"{\"method\":\"item/agentMessage/delta\",\"params\":{\"itemId\":\"m\",\"delta\":\"line\\npassword tail\"}}\n",
+            )
+            .await?;
+        assert!(matches!(rx.recv().await, Some(Event::Frame(_))));
+        stop.send_replace(true);
+        let report = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .map_err(|_| "an abandoned reader waited on a full queue")??;
+        drop((write, receiver));
+        assert!(!report.eof);
+        let summary = loss.summary();
+        // "line\n", the held tail redacted, and the unfinished gap: none fits, all counted (the 64 queued fillers too,
+        // as nothing settled them).
+        assert_eq!(
+            (summary.unrecorded, summary.bytes),
+            (64 + 3, ("line\n".len() + "[redacted]".len()) as u64),
+            "{summary:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_011_05_text_deltas_coalesce_within_50ms_and_16kib_without_crossing_tools()
     -> Result<(), Box<dyn std::error::Error>> {
