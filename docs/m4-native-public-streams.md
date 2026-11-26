@@ -26,13 +26,17 @@
 | 同上，compat 合成夹具 | tool_execution_start、tool_execution_end | `/toolCallId`、`toolName`、`args` 白名单；`/result/content/*/text` 仅 type=text、`/isError` | 工具开始与结束，公开结果 |
 | Pi RPC 1.5.0、1.6.0，rpc-invalid-model / rpc-abort 录制 | response(success=false)、message_end | `/error`、`/message/errorMessage`，仅字符串，经去敏 | 公开错误或中断原因 |
 | 同上，compat 合成夹具 | compaction_start、compaction_end | `/type` | 活动；沿既有 agent_settled 结束判定 |
+| Claude stream-json 2.1.317、2.1.318 | wait 活动 | unsupported（已录制协议与 schema 无原生 wait 字段） | 明确 unsupported，不从进程存活或静默推断等待活动 |
+| Codex App Server 0.166.0 | wait 活动 | unsupported（已锁定 ServerNotification schema 无原生 wait 通知） | 明确 unsupported，不从进程存活或静默推断等待活动 |
+| Codex exec 0.166.0 | wait 活动 | unsupported（exec JSONL 录制无原生 wait 帧） | 明确 unsupported，不从进程存活或静默推断等待活动 |
+| Pi RPC 1.5.0、1.6.0 | wait 活动 | unsupported（known-frames 与录制无独立 wait 活动帧；`auto_retry_*` 仅记重试活动） | 明确 unsupported，不从进程存活或静默推断等待活动 |
 
 原生 session_id/threadId/turnId 由既有 adapter 校验；公开记录的 HoH session/role/epoch/config/spec 从持久 Attempt 取值，不直接把原生 session 字符串当 HoH 身份。
 
 这些白名单已接到 adapter → runner → Persistence；四种模式均由 integration 中的产品 runner fixture 驱动。
-Claude stream_event、Pi auto_compaction_* 和表外字段保持 unsupported/unmapped，发明确诊断。
+Claude stream_event、Pi auto_compaction_*、各版本缺失的 wait 活动和表外字段保持 unsupported/unmapped，按 `(attempt, frame_kind)` 聚合计数并记录 `frame_kind` 与 `count`。
 Pi auto_retry_start/end 采用版本化 known-frames.json 中的显式类型，只保留活动标记。
-其他所有版本（包括空版本）均为 unsupported_native_version，不推断兼容，不改变已有 compat 判定。
+其他所有版本（包括空版本）均为 unsupported_native_version（同样按 `(attempt, frame_kind)` 聚合计数），不推断兼容，不改变已有 compat 判定。
 Claude 同时识别实际版本输出 `2.1.317 (Claude Code)` / `2.1.318 (Claude Code)`，
 Codex 同时识别 `codex-cli 0.166.0`；除此之外不做模糊版本匹配。
 
@@ -50,16 +54,20 @@ thinking/signature、reasoning item、Pi sections/toolsAdded 等不进入公开�
 | pi | 1.5.0, 1.6.0 | `692491af0d6a4560f0c0fd67509f0fa0739ed5b23b8dd35256e0a13853d5de3e` |
 
 公开正文按 UTF-8 字节计数：≤16 KiB 可放入事件；较大正文以 ≤1 MiB 段封口，经过
-fsync → rename → 目录 fsync → artifact 登记，才写引用事件。段的出现身份是
-`(block_id, stream, first_offset)`，相同内容可复用一个 artifact。接收队列为 64 项，
-包括持久化中的正文总配额为 1 MiB；生产者等待和 DB_BUSY/空间等待共用实际阻塞计时。
-只有 inactivity 暂停这段本地时间，已累计的 quiet 时间保留；进程结束、取消、期限和预算继续推进。
+fsync → rename → 目录 fsync → artifact 登记，才写引用事件。流式文本增量按 CR-028 §2.2
+在 ≤50 ms 或 16 KiB（先到即提交）内合并，工具与块边界立即冲刷；跨增量按累积行/块去敏。
+段的出现身份是 `(block_id, stream, first_offset)`，相同内容可复用一个 artifact。接收队列为 64 项，
+包括持久化中的正文总配额为 1 MiB；仅 `DB_BUSY` 触发背压重试与本地阻塞计时，
+`StorageLowSpace` 及不可重试写入错误写内联 `public.gap` 并丢弃该正文继续运行，诊断失败不终止排水，
+排水消失时原生 stdout 读取与取消继续可达。
+只有 inactivity 暂停 `DB_BUSY` 本地阻塞时间，已累计的 quiet 时间保留；进程结束、取消、期限和预算继续推进。
 进程结束后最多等待公开队列一秒，未完成则在原结束事务中写 gap；恢复也保留已提交正文并写 gap。
 适配器原有帧大小限制继续生效，超限、截断或缩减的帧明确写 gap，不能标为完整文本。
 
 SendInput 在原接受事务中按 input_id 保存 CR/LF 规范化的原文，文件投递提示不能替代它。
 角色取显式目标或已解析问题的目标，默认路径为 commander；无 Attempt 时不伪造 Attempt 身份。
 对象预检低空间返回唯一的 503 STORAGE_LOW_SPACE，接受事务不留下 commands/input/public 行。
+携带已接受 `input_id` 的原生 user 回显关联原块而不重复；无法核对的回显记明 `source=native_echo` 诊断，不冒充新用户提交。
 原生同 ID/接收 offset 重放不重复；停止或旧 epoch 的历史输出保持原身份且 current=false。
 
 验证使用 `test_011_05_*` / `test_013_05_*`。故障夹具把唯一 marker 注入 auth/env/内部提示词/推理字段，

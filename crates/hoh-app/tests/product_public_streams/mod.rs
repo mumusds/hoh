@@ -69,6 +69,7 @@ fn install_public_fixtures(world: &World) -> R {
 }
 #[tokio::test]
 async fn test_011_05_native_recordings_reach_public_storage_through_product_runner() -> R {
+    let mut mode_summaries: Vec<(&str, Value)> = Vec::new();
     for mode in ["claude", "codex", "codex-exec", "pi"] {
         eprintln!("public native mode: {mode}");
         let world = World::new()?;
@@ -89,31 +90,176 @@ async fn test_011_05_native_recordings_reach_public_storage_through_product_runn
             None,
         ))
         .await?;
-        let outcome=async {
-            let project=world.project();
-            let role=match mode {"claude"=>"developer","codex"=>"reviewer","codex-exec"=>"developer",_=>"qa"};
-            if mode=="codex-exec"{configure(&host,"exec-binding",team_revision(&project)?,json!({"developer":{"agent":"codex"},"commander":{"agent":"claude"}})).await?;}
-            let run=started(&host,&project,"public").await?;
-            ready(&project,&run,&[("PUBLIC",role)])?;
-            if let Err(e)=until(&project,"SELECT state FROM attempts WHERE attempt_id='PUBLIC/attempt-1'","SETTLED",Duration::from_secs(30)).await {return Err(format!("{mode}: {e}; task={}; binding={}",query(&project,"SELECT state||'/'||coalesce(blocked_reason,'') FROM tasks WHERE task_id='PUBLIC'")?,query(&project,&format!("SELECT state||'/'||coalesce(blocked_reason,'') FROM role_bindings WHERE run_id='{run}' AND role='{role}'"))?).into());}
-            let raw=query(&project,"SELECT json_group_array(json(payload_json)) FROM events WHERE kind LIKE 'public.%' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1'")?;
-            let messages:Vec<Value>=serde_json::from_str(&raw)?;
-            assert!(!messages.is_empty(),"{mode}: real runner must persist native public messages");
-            assert!(!raw.contains(SECRET),"{mode}: forbidden native fields must not reach public storage");
-            assert!(messages.iter().any(|p|p["text"]=="HOH_SUITE_OK"),"{mode}: original assistant text");
-            for p in &messages {assert_eq!(p["role"],role);assert_eq!(p["role_epoch"],1);assert!(p["session_id"].is_string());assert_eq!(p["config_revision"],if mode=="codex-exec"{2}else{1});}
-            let start:Value=serde_json::from_str(&query(&project,"SELECT payload_json FROM events WHERE kind='public.tool_started' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1' ORDER BY seq LIMIT 1")?)?;
-            let end:Value=serde_json::from_str(&query(&project,"SELECT payload_json FROM events WHERE kind='public.tool_completed' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1' ORDER BY seq LIMIT 1")?)?;
-            assert_eq!(start["block_id"],end["block_id"]);assert!(end.get("text").is_none(),"large tool body is an object");assert_eq!(end["redacted"],true);
-            let refs=end["refs"].as_array().ok_or("public result references")?;let mut expanded=Vec::new();for reference in refs {expanded.extend(std::fs::read(project.join(reference["path"].as_str().ok_or("public object path")?))?);}
-            let expanded=String::from_utf8(expanded)?;assert!(expanded.contains("hoh"));assert!(!expanded.contains(SECRET),"{mode}: public objects exclude credentials");
-            assert!(messages.iter().any(|p|p["usage"]["input_tokens"].is_number()),"{mode}: explicit usage");
-            assert_ne!(query(&project,"SELECT count(*) FROM public_native_parts WHERE attempt_id='PUBLIC/attempt-1'")?,"0");
-            R::Ok(())
-        }.await;
+        let outcome = async {
+            let project = world.project();
+            let role = match mode {
+                "claude" => "developer",
+                "codex" => "reviewer",
+                "codex-exec" => "developer",
+                _ => "qa",
+            };
+            if mode == "codex-exec" {
+                configure(
+                    &host,
+                    "exec-binding",
+                    team_revision(&project)?,
+                    json!({"developer":{"agent":"codex"},"commander":{"agent":"claude"}}),
+                )
+                .await?;
+            }
+            let run = started(&host, &project, "public").await?;
+            ready(&project, &run, &[("PUBLIC", role)])?;
+            if let Err(e) = until(
+                &project,
+                "SELECT state FROM attempts WHERE attempt_id='PUBLIC/attempt-1'",
+                "SETTLED",
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                return Err(format!(
+                    "{mode}: {e}; task={}; binding={}",
+                    query(
+                        &project,
+                        "SELECT state||'/'||coalesce(blocked_reason,'') FROM tasks WHERE task_id='PUBLIC'"
+                    )?,
+                    query(
+                        &project,
+                        &format!(
+                            "SELECT state||'/'||coalesce(blocked_reason,'') FROM role_bindings WHERE run_id='{run}' AND role='{role}'"
+                        )
+                    )?
+                )
+                .into());
+            }
+            let raw = query(
+                &project,
+                "SELECT json_group_array(json_object('kind',kind,'seq',seq,'payload',json(payload_json))) FROM events WHERE kind LIKE 'public.%' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1' ORDER BY seq",
+            )?;
+            let rows: Vec<Value> = serde_json::from_str(&raw)?;
+            let messages: Vec<&Value> = rows.iter().map(|r| &r["payload"]).collect();
+            assert!(
+                !messages.is_empty(),
+                "{mode}: real runner must persist native public messages"
+            );
+            assert!(
+                !raw.contains(SECRET),
+                "{mode}: forbidden native fields must not reach public storage"
+            );
+            assert!(
+                messages.iter().any(|p| p["text"] == "HOH_SUITE_OK"),
+                "{mode}: original assistant text"
+            );
+            for p in &messages {
+                assert_eq!(p["role"], role);
+                assert_eq!(p["role_epoch"], 1);
+                assert!(p["session_id"].is_string());
+                assert_eq!(p["config_revision"], if mode == "codex-exec" { 2 } else { 1 });
+                assert_eq!(p["attempt_id"], "PUBLIC/attempt-1");
+                assert!(p["block_id"].is_string());
+                assert!(p["native_stream"].is_string());
+            }
+            let start_row = rows
+                .iter()
+                .find(|r| r["kind"] == "public.tool_started")
+                .ok_or("tool start")?;
+            let end_row = rows
+                .iter()
+                .find(|r| r["kind"] == "public.tool_completed")
+                .ok_or("tool end")?;
+            let msg_row = rows
+                .iter()
+                .find(|r| r["kind"] == "public.message" && r["payload"]["text"] == "HOH_SUITE_OK")
+                .ok_or("assistant message")?;
+            let usage_row = rows
+                .iter()
+                .find(|r| r["kind"] == "public.activity" && r["payload"]["activity"] == "usage")
+                .ok_or("usage activity")?;
+            assert!(
+                start_row["seq"].as_i64() < end_row["seq"].as_i64(),
+                "{mode}: tool_started must precede tool_completed"
+            );
+            assert!(
+                end_row["seq"].as_i64() < msg_row["seq"].as_i64(),
+                "{mode}: tool_completed must precede final answer"
+            );
+            let start = &start_row["payload"];
+            let end = &end_row["payload"];
+            assert_eq!(start["block_id"], end["block_id"]);
+            assert!(end.get("text").is_none(), "large tool body is an object");
+            assert_eq!(end["redacted"], true);
+            let refs = end["refs"].as_array().ok_or("public result references")?;
+            let mut expanded = Vec::new();
+            for reference in refs {
+                expanded.extend(std::fs::read(
+                    project.join(reference["path"].as_str().ok_or("public object path")?),
+                )?);
+            }
+            let expanded = String::from_utf8(expanded)?;
+            assert!(expanded.contains("hoh"));
+            assert!(
+                !expanded.contains(SECRET),
+                "{mode}: public objects exclude credentials"
+            );
+            let usage = usage_row["payload"]["usage"]
+                .as_object()
+                .ok_or("usage object")?;
+            assert!(usage["input_tokens"].is_number(), "{mode}: explicit usage");
+            // Explicit JSON null for unknown capability fields (AC-011-05).
+            if matches!(mode, "pi" | "codex-exec" | "claude") {
+                assert_eq!(
+                    usage.get("context_limit"),
+                    Some(&Value::Null),
+                    "{mode}: unknown context_limit must be explicit null"
+                );
+            }
+            if matches!(mode, "codex" | "codex-exec") {
+                assert_eq!(
+                    usage.get("cost_usd"),
+                    Some(&Value::Null),
+                    "{mode}: unknown cost_usd must be explicit null"
+                );
+            }
+            assert_ne!(
+                query(
+                    &project,
+                    "SELECT count(*) FROM public_native_parts WHERE attempt_id='PUBLIC/attempt-1'"
+                )?,
+                "0"
+            );
+            let summary = json!({
+                "ordered": [
+                    start_row["kind"],
+                    end_row["kind"],
+                    msg_row["kind"],
+                    usage_row["kind"],
+                ],
+                "tool_block_equal": start["block_id"] == end["block_id"],
+                "tool_streams": [start["stream"], end["stream"]],
+                "tool_end_complete": end["complete"],
+                "tool_end_redacted": end["redacted"],
+                "tool_end_has_hoh": expanded.contains("hoh"),
+                "msg_speaker": msg_row["payload"]["speaker"],
+                "msg_text": msg_row["payload"]["text"],
+                "msg_complete": msg_row["payload"]["complete"],
+                "msg_stream": msg_row["payload"]["stream"],
+                "usage_activity": usage_row["payload"]["activity"],
+                "usage_has_input": usage["input_tokens"].is_number(),
+                "usage_has_output": usage["output_tokens"].is_number(),
+            });
+            R::Ok(summary)
+        }
+        .await;
         host.shutdown().await;
         world.stop_fakes()?;
-        outcome?;
+        mode_summaries.push((mode, outcome?));
+    }
+    for (mode, summary) in &mode_summaries[1..] {
+        assert_eq!(
+            &mode_summaries[0].1, summary,
+            "cross-mode public normalized fields, order, and identity invariants must match ({} vs {mode})",
+            mode_summaries[0].0
+        );
     }
     Ok(())
 }
@@ -175,8 +321,9 @@ signal.pause()
         let faults = Arc::new(PublicBusy::default());
         faults.busy.store(true, Ordering::SeqCst);
         let mut config = watched(&world);
-        config.watchdog.quiet = Duration::from_millis(300);
-        config.watchdog.every = Duration::from_millis(25);
+        // M4T09R-105: keep quiet generous enough for fake startup under load while sleeping longer than quiet during DB_BUSY.
+        config.watchdog.quiet = Duration::from_millis(1000);
+        config.watchdog.every = Duration::from_millis(50);
         config.store.faults = faults.clone();
         let host = start_when_free(config).await?;
         let outcome=async {
@@ -184,7 +331,7 @@ signal.pause()
             ready(&project,&run,&[("PUBLIC-BUSY","developer")])?;
             let until=Instant::now()+Duration::from_secs(10);
             while faults.seen.load(Ordering::SeqCst)==0 {if Instant::now()>until{return Err("no real public persistence attempt".into());}tokio::time::sleep(Duration::from_millis(10)).await;}
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
             assert_eq!(query(&project,&watchdog_events("PUBLIC-BUSY/attempt-1","attempt.inactive"))?,"0","local storage blocking is not agent silence");
             if !cancel_while_busy {
                 faults.busy.store(false,Ordering::SeqCst);until_file(&emitted,Duration::from_secs(10)).await?;
@@ -471,6 +618,88 @@ signal.pause()
         R::Ok(())
     }
     .await;
+    host.shutdown().await;
+    world.stop_fakes()?;
+    outcome
+}
+
+#[tokio::test]
+async fn test_011_05_committed_public_blocks_are_readable_before_attempt_ends() -> R {
+    let world = World::new()?;
+    let body = world.claude_body(None)?;
+    let script = world.bin().join("claude.d/public-live-read.py");
+    let emitted = world.bin().join("claude.d/public-live-emitted");
+    let release = world.bin().join("claude.d/public-live-release");
+    std::fs::write(
+        &script,
+        r#"import json,os,sys,time
+print(json.dumps({'type':'system','subtype':'init','session_id':'live-read','model':'fixture'}),flush=True)
+print(json.dumps({'type':'assistant','uuid':'m1','session_id':'live-read','message':{'id':'msg1','content':[{'type':'text','text':'LIVE_BEFORE_END'},{'type':'tool_use','id':'call-live','name':'Bash','input':{'command':'echo live'}}]}}),flush=True)
+open(sys.argv[1],'w').close()
+while not os.path.exists(sys.argv[2]):
+    time.sleep(0.02)
+print(json.dumps({'type':'user','uuid':'m2','session_id':'live-read','message':{'role':'user','content':[{'type':'tool_result','tool_use_id':'call-live','content':'done','is_error':False}]}}),flush=True)
+print(json.dumps({'type':'result','uuid':'m3','subtype':'success','is_error':False,'result':'LIVE_BEFORE_END','session_id':'live-read','usage':{'input_tokens':5,'output_tokens':2}}),flush=True)
+"#,
+    )?;
+    let body = body.replace(
+        "case \"$HOH_ATTEMPT_ID\" in",
+        &format!(
+            "case \"$HOH_ATTEMPT_ID\" in\n *LIVE-READ*) exec python3 '{}' '{}' '{}' ;;",
+            script.display(),
+            emitted.display(),
+            release.display()
+        ),
+    );
+    world.script("claude", &body)?;
+    world.bind_installed()?;
+    let host = start_when_free(world.config()).await?;
+    let outcome = async {
+        let project = world.project();
+        let run = started(&host, &project, "live-read").await?;
+        ready(&project, &run, &[("LIVE-READ", "developer")])?;
+        until_file(&emitted, Duration::from_secs(10)).await?;
+        // Read committed message and tool_started while the attempt is STILL RUNNING.
+        super::until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind='public.message' AND json_extract(payload_json,'$.attempt_id')='LIVE-READ/attempt-1' AND json_extract(payload_json,'$.text')='LIVE_BEFORE_END'",
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
+        super::until(
+            &project,
+            "SELECT count(*) FROM events WHERE kind='public.tool_started' AND json_extract(payload_json,'$.attempt_id')='LIVE-READ/attempt-1'",
+            "1",
+            Duration::from_secs(10),
+        )
+        .await?;
+        assert_eq!(
+            query(&project, "SELECT state FROM attempts WHERE attempt_id='LIVE-READ/attempt-1'")?,
+            "RUNNING",
+            "committed public blocks must be readable before the attempt ends"
+        );
+        // Before result arrives, Claude usage is still unknown (no usage event yet).
+        assert_eq!(
+            query(
+                &project,
+                "SELECT count(*) FROM events WHERE kind='public.activity' AND json_extract(payload_json,'$.attempt_id')='LIVE-READ/attempt-1' AND json_extract(payload_json,'$.activity')='usage'"
+            )?,
+            "0",
+            "Claude usage must remain unknown until result arrives"
+        );
+        std::fs::write(&release, "go")?;
+        super::until(
+            &project,
+            "SELECT state FROM attempts WHERE attempt_id='LIVE-READ/attempt-1'",
+            "SETTLED",
+            Duration::from_secs(15),
+        )
+        .await?;
+        R::Ok(())
+    }
+    .await;
+    let _ = std::fs::write(&release, "go");
     host.shutdown().await;
     world.stop_fakes()?;
     outcome

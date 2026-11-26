@@ -963,6 +963,8 @@ fn run_script(conn: &Connection, sql: &str) -> Result<(), String> {
         // Workspace lint forbids unsafe, so the test cannot install sqlite3_update_hook (M3L-01).
         #[cfg(test)]
         crash_during_tasks_rebuild(&text);
+        #[cfg(test)]
+        crash_during_migration_003(&text);
         if conn.is_autocommit() {
             return Err(format!(
                 "the statement `{}` ended the transaction",
@@ -982,6 +984,26 @@ fn crash_during_tasks_rebuild(sql: &str) {
     }
     let lower = sql.to_ascii_lowercase();
     if leading_keyword(sql) != "INSERT" || !lower.contains("into tasks_new") {
+        return;
+    }
+    let Ok(raw) = i32::try_from(std::process::id()) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return;
+    };
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+}
+
+/// SIGKILL this process once migration 003 has created `ui_event_index` and not yet committed (M4T09R-104).
+/// Only the migration 003 crash test child sets `HOH_M4T09_CRASH_003`. Absent from the product binary (`cfg(test)`).
+#[cfg(test)]
+fn crash_during_migration_003(sql: &str) {
+    if std::env::var_os("HOH_M4T09_CRASH_003").is_none() {
+        return;
+    }
+    let lower = sql.to_ascii_lowercase();
+    if leading_keyword(sql) != "CREATE" || !lower.contains("table ui_event_index") {
         return;
     }
     let Ok(raw) = i32::try_from(std::process::id()) else {
