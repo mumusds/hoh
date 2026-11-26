@@ -12,14 +12,14 @@ from pathlib import Path
 
 LINE = re.compile(r'^test (?P<name>.+?) \.\.\. (?P<result>ok|FAILED|ignored)\b')
 STRICT_LINE = re.compile(r'^test (?P<name>.+?) \.\.\. (?P<result>ok|FAILED|ignored)(?P<tail>, .*)?$')
-RUNNING = re.compile(r'^running \d+ tests?$')
+RUNNING = re.compile(r'^running (?P<count>\d+) tests?$')
 RUNNING_LONG = re.compile(r'^test .+? has been running for over \d+ seconds$')
 DOCTEST_MERGED = re.compile(
     r'^all doctests ran in \d+(?:\.\d+)?s; merged doctests compilation took \d+(?:\.\d+)?s$'
 )
 SUMMARY = re.compile(
-    r'^test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; '
-    r'(?P<ignored>\d+) ignored; \d+ measured; \d+ filtered out(?:; finished in .*)?$'
+    r'^test result: (?P<status>ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed; '
+    r'(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; \d+ filtered out(?:; finished in .*)?$'
 )
 SECTION_HDR = re.compile(r'^---- .+ std(?:out|err) ----$')
 TEST_ID = re.compile(r'(?:^|[^0-9A-Za-z])test_(\d{3})_(\d{2})(?![0-9])')
@@ -27,47 +27,107 @@ STATUS = {'ok': 'PASS', 'FAILED': 'FAIL', 'ignored': 'SKIPPED'}
 
 
 def check_stdout(log: str) -> list[str]:
-    """M3R-1001: verify libtest stdout contains only recognized libtest lines and no leaked child fd 1 output."""
+    """M3R-1001 / M4L3-001 / M4L3-101: verify libtest stdout contains only recognized libtest lines and no leaked child fd 1 output."""
     problems: list[str] = []
     seen = {'ok': 0, 'FAILED': 0, 'ignored': 0}
     summarized = {'ok': 0, 'FAILED': 0, 'ignored': 0}
+    in_block = False
+    expected_count = 0
+    block_start_line = 0
+    block_seen = {'ok': 0, 'FAILED': 0, 'ignored': 0}
+    in_failures_phase = False
     in_captured = False
     in_failure_list = False
+    saw_any_summary = False
     for lineno, raw in enumerate(log.splitlines(), 1):
         line = raw.rstrip('\r')
-        if SUMMARY.match(line):
-            m = SUMMARY.match(line)
-            assert m is not None
-            summarized['ok'] += int(m['passed'])
-            summarized['FAILED'] += int(m['failed'])
-            summarized['ignored'] += int(m['ignored'])
-            in_captured = False
-            in_failure_list = False
+        m = SUMMARY.match(line)
+        if m:
+            passed = int(m['passed'])
+            failed = int(m['failed'])
+            ignored = int(m['ignored'])
+            measured = int(m['measured'])
+            summarized['ok'] += passed
+            summarized['FAILED'] += failed
+            summarized['ignored'] += ignored
+            if not in_block:
+                problems.append(
+                    f'line {lineno}: unexpected test result summary without preceding running header '
+                    f'(possible leaked child fd 1 output): {line[:200]!r}'
+                )
+            else:
+                status_ok = (m['status'] == 'ok' and failed == 0) or (m['status'] == 'FAILED' and failed > 0)
+                if (
+                    not status_ok
+                    or passed != block_seen['ok']
+                    or failed != block_seen['FAILED']
+                    or ignored != block_seen['ignored']
+                    or (passed + failed + ignored + measured) != expected_count
+                ):
+                    problems.append(
+                        f'line {lineno}: libtest block count mismatch (possible leaked child fd 1 output): '
+                        f'expected {expected_count} tests, saw {block_seen}, summary {line[:200]!r}'
+                    )
+                in_block = False
+                expected_count = 0
+                block_seen = {'ok': 0, 'FAILED': 0, 'ignored': 0}
+                in_failures_phase = False
+                in_captured = False
+                in_failure_list = False
+                saw_any_summary = True
             continue
-        if line == 'failures:':
+        if line == 'failures:' and in_block and block_seen['FAILED'] > 0:
+            in_failures_phase = True
             in_captured = False
             in_failure_list = True
             continue
-        if SECTION_HDR.match(line):
+        if SECTION_HDR.match(line) and in_block and block_seen['FAILED'] > 0 and in_failures_phase:
             in_captured = True
             in_failure_list = False
             continue
         if in_captured:
             continue
         if in_failure_list:
-            if line == '' or line.startswith('    '):
-                if line == '':
-                    in_failure_list = False
+            if line == '':
+                in_failure_list = False
+                continue
+            if line.startswith('    '):
                 continue
             in_failure_list = False
-        if line == '' or RUNNING.match(line) or RUNNING_LONG.match(line) or DOCTEST_MERGED.match(line):
+        if line == '':
+            continue
+        m = RUNNING.match(line)
+        if m:
+            if in_block:
+                problems.append(
+                    f'line {lineno}: unexpected running header inside open libtest block '
+                    f'(possible leaked child fd 1 output): {line[:200]!r}'
+                )
+            else:
+                in_block = True
+                expected_count = int(m['count'])
+                block_start_line = lineno
+                block_seen = {'ok': 0, 'FAILED': 0, 'ignored': 0}
+                in_failures_phase = False
+                in_captured = False
+                in_failure_list = False
+            continue
+        if DOCTEST_MERGED.match(line) and not in_block and saw_any_summary:
+            continue
+        if RUNNING_LONG.match(line) and in_block and not in_failures_phase:
             continue
         m = STRICT_LINE.match(line)
-        if m and (m['result'] == 'ignored' or not m['tail']):
+        if m and (m['result'] == 'ignored' or not m['tail']) and in_block and not in_failures_phase:
             seen[m['result']] += 1
+            block_seen[m['result']] += 1
             continue
         problems.append(
             f'line {lineno}: unexpected libtest stdout (possible leaked child fd 1 output): {line[:200]!r}'
+        )
+    if in_block:
+        problems.append(
+            f'line {block_start_line}: unclosed libtest running block (expected {expected_count} tests) '
+            f'without matching test result summary (possible leaked child fd 1 output)'
         )
     if seen != summarized:
         problems.append(
