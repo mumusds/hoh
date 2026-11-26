@@ -228,6 +228,8 @@ pub struct Turn {
     pub deadline: Option<Duration>,
     /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
     pub observe: Option<Observe>,
+    /// Bounded public output, separate from lifecycle/cancel control.
+    pub public: Option<crate::public_stream::Publisher>,
 }
 
 impl Turn {
@@ -547,6 +549,10 @@ fn config(turn: &Turn, stdout: &std::path::Path, stderr: &std::path::Path) -> Co
     Config {
         escalation: turn.escalation,
         deadline: turn.deadline,
+        public: turn
+            .public
+            .as_ref()
+            .map(|p| p.for_mode(crate::public_stream::Mode::Claude)),
         stdout_copy: Some(stdout.to_path_buf()),
         stderr_copy: Some(stderr.to_path_buf()),
         skip: Some(SKIP),

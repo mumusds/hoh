@@ -127,6 +127,14 @@ pub(crate) const FILES: &[(&str, &[u8])] = &[
         include_bytes!("../observed/tests.rs") as &[u8],
     ),
     (
+        "crates/hoh-agents/src/public_stream.rs",
+        include_bytes!("../public_stream.rs") as &[u8],
+    ),
+    (
+        "crates/hoh-agents/src/public_stream/tests.rs",
+        include_bytes!("../public_stream/tests.rs") as &[u8],
+    ),
+    (
         "crates/hoh-agents/src/pi.rs",
         include_bytes!("../pi.rs") as &[u8],
     ),

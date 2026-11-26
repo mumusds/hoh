@@ -116,6 +116,7 @@ async fn pi_live_turns_resume_and_cancel() -> R {
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
+            public: None,
             spawner: hoh_core::spawn::Direct::shared(),
         }
     };

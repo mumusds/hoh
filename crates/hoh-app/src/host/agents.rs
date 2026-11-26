@@ -1359,6 +1359,7 @@ impl Ready {
                     escalation: graced(hoh_agents::claude::Turn::default_escalation()),
                     deadline: None,
                     observe: None,
+                    public: None,
                     spawner: hoh_core::spawn::Direct::shared(),
                 })
             }
@@ -1393,6 +1394,7 @@ impl Ready {
                 handshake_timeout: Duration::from_secs(60),
                 deadline: None,
                 observe: None,
+                public: None,
                 spawner: hoh_core::spawn::Direct::shared(),
             }),
             (Agent::Pi, launch::Facts::Pi { help }) => Prepared::Pi(hoh_agents::pi::Turn {
@@ -1421,6 +1423,7 @@ impl Ready {
                 clock: Arc::new(hoh_agents::clock::SystemClock),
                 events: None,
                 observe: None,
+                public: None,
                 spawner: hoh_core::spawn::Direct::shared(),
             }),
             _ => {

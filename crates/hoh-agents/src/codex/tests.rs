@@ -301,6 +301,7 @@ fn a_sessions_capabilities_are_those_of_the_transport_a_turn_would_take() {
         handshake_timeout: Duration::from_secs(1),
         deadline: None,
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::Direct::shared(),
     };
     let exec_only = turn(launch());
@@ -376,6 +377,7 @@ fn a_yolo_session_runs_commands_on_either_transport_where_the_probe_found_it() {
                 handshake_timeout: Duration::from_secs(1),
                 deadline: None,
                 observe: None,
+                public: None,
                 spawner: hoh_core::spawn::Direct::shared(),
             };
             let caps = session_capabilities(&turn).expect("capabilities");
@@ -454,6 +456,7 @@ async fn the_driver_writes_what_the_request_builders_give() {
         handshake_timeout: Duration::from_secs(20),
         deadline: None,
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::Direct::shared(),
     };
     let attempt = AttemptRef {
@@ -577,6 +580,7 @@ fn a_read_only_turn_records_the_session_a_yolo_turn_records() {
         handshake_timeout: Duration::from_secs(1),
         deadline: None,
         observe: None,
+        public: None,
     };
     let yolo = session_capabilities(&turn(l.clone())).expect("capabilities");
     assert_eq!(yolo["read_only_workspace"], true, "{yolo}");

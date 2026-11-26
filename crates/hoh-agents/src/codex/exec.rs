@@ -55,6 +55,10 @@ pub(super) fn config(turn: &Turn) -> Config {
     Config {
         escalation: interrupt_first(turn.escalation),
         deadline: turn.deadline,
+        public: turn
+            .public
+            .as_ref()
+            .map(|p| p.for_mode(crate::public_stream::Mode::CodexExec)),
         stdout_copy: Some(stdout),
         reduce: Some(REDUCE),
         stderr_copy: Some(stderr),

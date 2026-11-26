@@ -1033,6 +1033,10 @@ pub(super) fn config(turn: &Turn) -> Config {
     Config {
         escalation: hard_stop(turn.escalation),
         deadline: None,
+        public: turn
+            .public
+            .as_ref()
+            .map(|p| p.for_mode(crate::public_stream::Mode::CodexAppServer)),
         stdout_copy: Some(stdout),
         stderr_copy: Some(stderr),
         skip: Some(SKIP),

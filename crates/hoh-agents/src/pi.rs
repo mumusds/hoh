@@ -271,6 +271,8 @@ pub struct Turn {
     pub events: Option<mpsc::UnboundedSender<Value>>,
     /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
     pub observe: Option<Observe>,
+    /// Bounded public output, separate from lifecycle/cancel control.
+    pub public: Option<crate::public_stream::Publisher>,
 }
 
 impl Turn {
@@ -537,6 +539,10 @@ pub async fn run(
             ..turn.escalation
         },
         deadline: None,
+        public: turn
+            .public
+            .as_ref()
+            .map(|p| p.for_mode(crate::public_stream::Mode::Pi)),
         stdout_copy: Some(stdout.clone()),
         stderr_copy: Some(stderr.clone()),
         skip: Some(SKIP),
@@ -704,6 +710,10 @@ pub fn start(attempt: &AttemptRef, turn: &Turn, gate: &GateCommand) -> Result<He
             ..turn.escalation
         },
         deadline: None,
+        public: turn
+            .public
+            .as_ref()
+            .map(|p| p.for_mode(crate::public_stream::Mode::Pi)),
         stdout_copy: Some(stdout),
         stderr_copy: Some(stderr),
         skip: Some(SKIP),
@@ -1571,6 +1581,7 @@ fn replay_turn(version: &str) -> Turn {
         clock: Arc::new(crate::clock::SystemClock),
         events: None,
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::NoStart::shared(),
     }
 }

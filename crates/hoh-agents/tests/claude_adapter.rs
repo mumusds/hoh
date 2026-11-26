@@ -106,6 +106,7 @@ impl Fakes for World {
             escalation: Turn::default_escalation(),
             deadline: Some(Duration::from_secs(60)),
             observe: None,
+            public: None,
             spawner: hoh_core::spawn::Direct::shared(),
         })
     }
