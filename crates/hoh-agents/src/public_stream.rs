@@ -35,13 +35,127 @@ impl Mode {
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 pub const COALESCE_BYTES: usize = 16 << 10;
 
-#[derive(Debug, Default)]
+/// Bytes of a line already published at the cap that are kept so a keyword straddling the cap is still seen: the
+/// longest keyword in [`line_contains_secret`] minus one.
+const KEYWORD_CONTEXT: usize = "authorization:".len() - 1;
+
+/// One streamed block (DC-M4T09b): nothing after the block's last newline is published until the newline arrives, the
+/// block ends, or that unterminated tail reaches [`COALESCE_BYTES`]; at the cap the tail is redacted as one unit. Only
+/// that tail and the received length and digest (for the final snapshot's prefix check) are kept, never the block's
+/// whole text (M4T09R-302).
+#[derive(Default)]
 struct TextStreamState {
-    raw_accumulated: String,
-    raw_line: String,
+    tail: String,
+    /// The last bytes of the current line already published at the cap (keyword context only).
+    line_context: String,
+    /// The current line was redacted at the cap: its remaining bytes are suppressed up to its newline.
     line_redacted: bool,
+    received_len: usize,
+    received_digest: sha2::Sha256,
     pub_offset: u64,
-    any_redacted: bool,
+}
+impl std::fmt::Debug for TextStreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextStreamState")
+            .field("tail_len", &self.tail.len())
+            .field("line_redacted", &self.line_redacted)
+            .field("received_len", &self.received_len)
+            .field("pub_offset", &self.pub_offset)
+            .finish()
+    }
+}
+impl TextStreamState {
+    fn received(&mut self, raw: &str) {
+        use sha2::Digest as _;
+        self.received_len += raw.len();
+        self.received_digest.update(raw.as_bytes());
+    }
+    /// The part of `text` after what this block already received, if `text` extends it; else `None`.
+    fn after_received<'a>(&self, text: &'a str) -> Option<&'a str> {
+        use sha2::Digest as _;
+        let n = self.received_len;
+        (text.len() >= n
+            && text.is_char_boundary(n)
+            && sha2::Sha256::digest(&text.as_bytes()[..n])
+                == self.received_digest.clone().finalize())
+        .then(|| &text[n..])
+    }
+    /// Takes raw text of this block and returns what may be published now, redacted, and whether it was changed by
+    /// redaction. `end`: no more text follows, so the unterminated tail is published too.
+    fn push(&mut self, raw: &str, end: bool) -> (String, bool) {
+        let mut out = String::new();
+        let mut changed = false;
+        self.tail.push_str(raw);
+        if let Some(last) = self.tail.rfind('\n') {
+            let rest = self.tail.split_off(last + 1);
+            let lines = std::mem::replace(&mut self.tail, rest);
+            let first = lines.find('\n').map_or(lines.len(), |i| i + 1);
+            let (head, others) = lines.split_at(first);
+            if self.line_redacted || !self.line_context.is_empty() {
+                // The rest of a line whose start was published at the cap.
+                if self.line_redacted {
+                    out.push('\n');
+                    changed = true;
+                } else if line_contains_secret(&format!("{}{head}", self.line_context)) {
+                    out.push_str("[redacted]\n");
+                    changed = true;
+                } else {
+                    out.push_str(head);
+                }
+                self.line_context.clear();
+                self.line_redacted = false;
+                let (clean, more) = redact(others);
+                out.push_str(&clean);
+                changed |= more;
+            } else {
+                let (clean, more) = redact(&lines);
+                out.push_str(&clean);
+                changed |= more;
+            }
+        }
+        if end || self.tail.len() >= COALESCE_BYTES {
+            let tail = std::mem::take(&mut self.tail);
+            if self.line_redacted {
+                changed |= !tail.is_empty();
+            } else if !self.line_context.is_empty() {
+                let seen = format!("{}{tail}", self.line_context);
+                if line_contains_secret(&seen) {
+                    out.push_str("[redacted]");
+                    changed = true;
+                    self.line_redacted = true;
+                } else {
+                    out.push_str(&tail);
+                    self.line_context = keyword_context(&seen);
+                }
+            } else {
+                // The batch path's function on the unterminated line: identical output for an identical line.
+                let (clean, more) = redact(&tail);
+                out.push_str(&clean);
+                if more {
+                    changed = true;
+                    self.line_redacted = true;
+                } else {
+                    self.line_context = keyword_context(&tail);
+                }
+            }
+            if end {
+                self.line_context = String::new();
+                self.line_redacted = false;
+                self.tail = String::new();
+            }
+        }
+        (out, changed)
+    }
+    fn holds_text(&self) -> bool {
+        !self.tail.is_empty()
+    }
+}
+fn keyword_context(seen: &str) -> String {
+    let mut start = seen.len().saturating_sub(KEYWORD_CONTEXT);
+    while !seen.is_char_boundary(start) {
+        start += 1;
+    }
+    seen[start..].to_owned()
 }
 
 struct StreamMeta {
@@ -150,17 +264,22 @@ impl Normalizer {
         p.complete = true;
         p
     }
+    /// Publishes what DC-M4T09b allows of `raw_chunk` (already counted as received); `end` also publishes the held
+    /// tail. A chunk with nothing to publish yields no part unless it completes the block.
     fn emit_stream_chunk(
         &mut self,
         meta: StreamMeta,
         raw_chunk: &str,
+        end: bool,
         complete: bool,
-    ) -> PublicPart {
+    ) -> Option<PublicPart> {
         let state = self.streams.entry(meta.block.clone()).or_default();
-        let (clean, changed) = redact_streaming_chunk(state, raw_chunk);
+        let (clean, redacted) = state.push(raw_chunk, end);
+        if clean.is_empty() && !complete {
+            return None;
+        }
         let first_offset = state.pub_offset;
         state.pub_offset += clean.len() as u64;
-        let redacted = changed || (complete && state.any_redacted);
         let mut p = self.part_already_redacted(
             meta.id,
             meta.block,
@@ -173,11 +292,11 @@ impl Normalizer {
         p.model = meta.model;
         p.first_offset = first_offset;
         p.complete = complete;
-        p
+        Some(p)
     }
     fn flush_pending_text(&mut self, out: &mut Vec<PublicPart>) {
         if let Some(pending) = self.pending_text.take() {
-            out.push(self.emit_stream_chunk(
+            out.extend(self.emit_stream_chunk(
                 StreamMeta {
                     id: pending.native_item_id,
                     block: pending.block_key,
@@ -186,6 +305,34 @@ impl Normalizer {
                     model: pending.model,
                 },
                 &pending.raw_text,
+                false,
+                false,
+            ));
+        }
+    }
+    /// The stream ends (process end, cancel or abandon) with blocks still open: their held tails are published,
+    /// redacted as the batch path would, never complete (DC-M4T09b, M4T09R-305).
+    fn flush_held_tails(&mut self, out: &mut Vec<PublicPart>) {
+        self.flush_pending_text(out);
+        let open: Vec<String> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.holds_text())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let offset = self.received.unwrap_or(0);
+        for block in open {
+            let first = self.streams.get(&block).map_or(0, |s| s.pub_offset);
+            out.extend(self.emit_stream_chunk(
+                StreamMeta {
+                    id: format!("tail/{block}/{first}"),
+                    block,
+                    offset,
+                    part: 0,
+                    model: None,
+                },
+                "",
+                true,
                 false,
             ));
         }
@@ -199,8 +346,12 @@ impl Normalizer {
         now: Instant,
         out: &mut Vec<PublicPart>,
     ) {
+        self.streams
+            .entry(block.clone())
+            .or_default()
+            .received(delta);
         if !self.coalescing {
-            out.push(self.emit_stream_chunk(
+            out.extend(self.emit_stream_chunk(
                 StreamMeta {
                     id,
                     block,
@@ -209,6 +360,7 @@ impl Normalizer {
                     model: None,
                 },
                 delta,
+                false,
                 false,
             ));
             return;
@@ -249,26 +401,14 @@ impl Normalizer {
         {
             self.flush_pending_text(out);
         }
+        // The final snapshot adds only what extends the received text; a snapshot that differs adds nothing.
+        let state = self.streams.entry(meta.block.clone()).or_default();
+        let remaining = state.after_received(final_text).unwrap_or("");
+        state.received(remaining);
         if let Some(mut pending) = self.pending_text.take() {
-            let committed_len = self
-                .streams
-                .get(&meta.block)
-                .map_or(0, |s| s.raw_accumulated.len());
-            let prefix_len = committed_len + pending.raw_text.len();
-            if final_text.len() > prefix_len
-                && final_text.is_char_boundary(committed_len)
-                && final_text.is_char_boundary(prefix_len)
-                && &final_text[..committed_len]
-                    == self
-                        .streams
-                        .get(&meta.block)
-                        .map_or("", |s| s.raw_accumulated.as_str())
-                && final_text[committed_len..prefix_len] == pending.raw_text
-            {
-                pending.raw_text.push_str(&final_text[prefix_len..]);
-            }
+            pending.raw_text.push_str(remaining);
             let model = meta.model.or(pending.model);
-            out.push(self.emit_stream_chunk(
+            out.extend(self.emit_stream_chunk(
                 StreamMeta {
                     id: pending.native_item_id,
                     block: pending.block_key,
@@ -278,16 +418,11 @@ impl Normalizer {
                 },
                 &pending.raw_text,
                 true,
+                true,
             ));
             return;
         }
-        let remaining = match self.streams.get(&meta.block) {
-            Some(state) if !state.raw_accumulated.is_empty() => final_text
-                .strip_prefix(&state.raw_accumulated)
-                .unwrap_or(""),
-            _ => final_text,
-        };
-        out.push(self.emit_stream_chunk(meta, remaining, true));
+        out.extend(self.emit_stream_chunk(meta, remaining, true, true));
     }
     pub fn next_flush_deadline(&self) -> Option<Instant> {
         self.pending_text
@@ -310,9 +445,10 @@ impl Normalizer {
         self.flush_pending_text(&mut out);
         out
     }
+    /// The stream ended: pending and held text (redacted per DC-M4T09b) and the aggregated diagnostics.
     pub fn flush(&mut self) -> Vec<PublicPart> {
         let mut out = Vec::new();
-        self.flush_pending_text(&mut out);
+        self.flush_held_tails(&mut out);
         let keys: Vec<(String, String)> = self
             .unmapped
             .iter()
@@ -373,7 +509,14 @@ impl Normalizer {
     pub fn feed(&mut self, frame: &Value, offset: u64) -> Vec<PublicPart> {
         self.feed_at(frame, offset, Instant::now())
     }
+    /// Any overdue coalesced text goes out first, so frames that publish nothing cannot starve the 50 ms flush
+    /// (M4T09R-202).
     pub fn feed_at(&mut self, frame: &Value, offset: u64, now: Instant) -> Vec<PublicPart> {
+        let mut out = self.flush_due(now);
+        out.extend(self.feed_frame(frame, offset, now));
+        out
+    }
+    fn feed_frame(&mut self, frame: &Value, offset: u64, now: Instant) -> Vec<PublicPart> {
         if self.received.is_some_and(|last| offset <= last) {
             return Vec::new();
         }
@@ -1019,41 +1162,8 @@ fn line_contains_secret(line: &str) -> bool {
     .iter()
     .any(|needle| low.contains(needle))
 }
-fn redact_streaming_chunk(state: &mut TextStreamState, raw: &str) -> (String, bool) {
-    let mut changed = false;
-    let mut out = String::with_capacity(raw.len());
-    for segment in raw.split_inclusive('\n') {
-        let ends_nl = segment.ends_with('\n');
-        state.raw_line.push_str(segment);
-        if state.line_redacted {
-            changed = true;
-            if ends_nl {
-                out.push('\n');
-                state.line_redacted = false;
-                state.raw_line.clear();
-            }
-        } else if line_contains_secret(&state.raw_line) {
-            changed = true;
-            if ends_nl {
-                out.push_str("[redacted]\n");
-                state.raw_line.clear();
-                state.line_redacted = false;
-            } else {
-                out.push_str("[redacted]");
-                state.line_redacted = true;
-            }
-        } else {
-            out.push_str(segment);
-            if ends_nl {
-                state.raw_line.clear();
-                state.line_redacted = false;
-            }
-        }
-    }
-    state.raw_accumulated.push_str(raw);
-    state.any_redacted |= changed;
-    (out, changed)
-}
+/// The one redaction function of both the batch and the streaming path (DC-M4T09b): a line with a secret keyword is
+/// replaced whole.
 fn redact(text: &str) -> (String, bool) {
     let mut changed = false;
     let clean = text

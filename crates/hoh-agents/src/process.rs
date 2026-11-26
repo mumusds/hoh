@@ -1365,10 +1365,12 @@ mod tests {
             crate::public_stream::channel(crate::public_stream::Mode::CodexAppServer, "0.166.0");
         let mut command = std::process::Command::new("python3");
         command.arg("-c").arg(
-            "import json\n\
+            "import json, time\n\
 for i in range(20):\n    print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m1','delta':f'tok{i} '}}), flush=True)\n\
+print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m1','delta':'\\n'}}), flush=True)\n\
 print(json.dumps({'method':'item/started','params':{'item':{'type':'commandExecution','id':'c1','command':'echo hi'}}}), flush=True)\n\
 print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m2','delta':'hunter2 is my '}}), flush=True)\n\
+time.sleep(0.15)\n\
 print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m2','delta':'password\\n'}}), flush=True)\n\
 print(json.dumps({'method':'item/completed','params':{'item':{'type':'agentMessage','id':'m2','text':'hunter2 is my password\\n'}}}), flush=True)\n\
 print(json.dumps({'method':'turn/completed','params':{}}), flush=True)\n",
@@ -1405,7 +1407,7 @@ print(json.dumps({'method':'turn/completed','params':{}}), flush=True)\n",
         );
         let m1_text: String = m1_parts.iter().map(|p| p.text.as_str()).collect();
         let expected: String = (0..20).map(|i| format!("tok{i} ")).collect();
-        assert_eq!(m1_text, expected);
+        assert_eq!(m1_text, expected + "\n");
         let tool_pos = parts
             .iter()
             .position(|p| p.kind == hoh_core::public_output::PublicKind::ToolStart)
@@ -1427,6 +1429,8 @@ print(json.dumps({'method':'turn/completed','params':{}}), flush=True)\n",
             !m2_text.contains("hunter2"),
             "coalesced raw deltas with secret before keyword must be redacted: {m2_text:?}"
         );
+        // The deltas are 150 ms apart, so they never share a 50 ms window: the result cannot depend on it.
+        assert_eq!(m2_text, "[redacted]\n");
         Ok(())
     }
 }
