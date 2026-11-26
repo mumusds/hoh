@@ -167,6 +167,10 @@ async fn spec_source_join_failure_answers_spec_source_unavailable() -> R {
         fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, response) =
             world::exchange(&host, "POST", "/v1/commands", Some(&body)).await?;
+        assert!(
+            !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+            "{kind}: injected JoinError hook did not fire"
+        );
         assert_eq!(status, 503, "{kind}, join failure: {response}");
         assert_eq!(
             response["code"], "SPEC_SOURCE_UNAVAILABLE",
@@ -254,6 +258,10 @@ async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_miss
         fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, response) =
             world::exchange(&host, "POST", "/v1/commands", Some(&missing_body)).await?;
+        assert!(
+            !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+            "{kind} missing run: injected JoinError hook did not fire"
+        );
         assert_eq!(status, 409, "{kind} missing run: {response}");
         assert_eq!(response["code"], "RUN_NOT_FOUND", "{kind}: {response}");
     }
@@ -274,6 +282,10 @@ async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_miss
         fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, response) =
             world::exchange(&host, "POST", "/v1/commands", Some(&stale_body)).await?;
+        assert!(
+            !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+            "{kind} stale revision: injected JoinError hook did not fire"
+        );
         assert_eq!(status, 409, "{kind} stale revision: {response}");
         assert_eq!(response["code"], "STALE_REVISION", "{kind}: {response}");
     }
@@ -294,6 +306,10 @@ async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_miss
     fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
     let (status, response) =
         world::exchange(&host, "POST", "/v1/commands", Some(&approve_body)).await?;
+    assert!(
+        !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+        "ApproveSpec replay: injected JoinError hook did not fire"
+    );
     assert_eq!(
         status, 202,
         "ApproveSpec replay under join error: {response}"
@@ -316,6 +332,10 @@ async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_miss
     fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
     let (status, response) =
         world::exchange(&host, "POST", "/v1/commands", Some(&propose_body)).await?;
+    assert!(
+        !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+        "ProposeSpecChange replay: injected JoinError hook did not fire"
+    );
     assert_eq!(
         status, 202,
         "ProposeSpecChange replay under join error: {response}"
@@ -334,6 +354,10 @@ async fn spec_source_join_failure_lets_store_decide_reject_replay_stale_and_miss
     fail.0.store(true, std::sync::atomic::Ordering::SeqCst);
     let (status, response) =
         world::exchange(&host, "POST", "/v1/commands", Some(&reject_body)).await?;
+    assert!(
+        !fail.0.load(std::sync::atomic::Ordering::SeqCst),
+        "Reject: injected JoinError hook did not fire"
+    );
     assert_eq!(status, 202, "Reject under join error: {response}");
     assert_eq!(
         world.query("SELECT state FROM change_requests")?,
