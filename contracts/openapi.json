@@ -1023,7 +1023,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "CR-028 C3, delivered by M4-T03: additive extension of the existing read model, consumed by M4-T02. Limit defaults to 100 and is 1–500; cursor binds Run/query/H/generation. Repeated cursor yields the same page. Input transitions committed after H never change an old page; SSE/new snapshots deliver them. No input writes, resubmission or state-machine change; existing routes and error meanings remain unchanged."
+        "description": "CR-028 C3, delivered by M4-T03: additive extension of the existing read model, consumed by M4-T02. Limit defaults to 100 and is 1–500; cursor binds Run/query/H/generation. Repeated cursor yields the same page. Input transitions committed after H never change an old page; SSE/new snapshots deliver them. No input writes, resubmission or state-machine change; existing routes and error meanings remain unchanged. AC-064-01: after rebuilding the index at the same H, fresh cursors reconstruct identical items; old-generation cursors return 410 CURSOR_EXPIRED with top-level snapshot_watermark. Cursor binding includes run_id/query (including limit), H and generation; changed query/H/limit or tampering returns 404 BAD_REQUEST. Empty history returns items=[], next_cursor=null and watermark=H; the final nonempty page also has next_cursor=null."
       }
     }
   },
@@ -1408,7 +1408,7 @@
           "task_id",
           "phase"
         ],
-        "description": "CR-028 C3: among this Run's RUNNING tasks, select latest started_at, breaking ties by task_id ascending. No RUNNING task yields null ui.task. All other tasks remain queryable through the existing tasks route; no task is hidden from that list or inferred from model prose."
+        "description": "CR-028 C3 / M4A-002: at snapshot H, consider this Run's RUNNING tasks. The ordering timestamp is attempts.started_at of that Task's unique current RUNNING Attempt at H: the persisted start fact recorded when the runner accepts dispatch and moves it to STARTING. A retry uses the new Attempt, never a finished historical Attempt, Task creation time, first-ever start or client time. Compare parsed UTC instants descending, then task_id ascending. Missing/unparseable started_at or no unique RUNNING Attempt yields unknown ordering time plus a diagnostic; unknowns sort after known times and among themselves by task_id ascending. With no RUNNING Task, ui.task is null. All other tasks remain queryable through the existing tasks route. Reconstruct facts at H, never substitute later mutable state."
       },
       "InputStatePageRef": {
         "type": "object",

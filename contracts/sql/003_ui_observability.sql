@@ -45,8 +45,10 @@ CREATE INDEX ui_events_attempt_seq ON ui_event_index(attempt_id,seq,generation);
 CREATE INDEX ui_events_role_seq ON ui_event_index(role,seq,generation);
 CREATE INDEX ui_events_session_seq ON ui_event_index(session_id,seq,generation);
 -- An accepted user's segment may precede an Attempt. input_id binds it to later delivery.
+-- Occurrence identity is (block_id,stream,first_offset), not the reusable content-addressed artifact.
+-- Replays retain the same occurrence/native identity; equal bytes at other identities remain distinct.
 CREATE TABLE public_segments(
-    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     attempt_id TEXT REFERENCES attempts(attempt_id),
     input_id TEXT REFERENCES input_queue(input_id),
     block_id TEXT NOT NULL,
@@ -57,7 +59,7 @@ CREATE TABLE public_segments(
     sealed INTEGER NOT NULL CHECK(sealed=1),
     created_seq INTEGER NOT NULL REFERENCES events(seq),
     CHECK(attempt_id IS NOT NULL OR input_id IS NOT NULL),
-    UNIQUE(block_id,stream,first_offset)
+    PRIMARY KEY(block_id,stream,first_offset)
 );
 CREATE TABLE public_native_parts(
     attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
