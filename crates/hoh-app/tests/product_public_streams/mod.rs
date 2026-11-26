@@ -134,7 +134,7 @@ async fn test_011_05_native_recordings_reach_public_storage_through_product_runn
             }
             let raw = query(
                 &project,
-                "SELECT json_group_array(json_object('kind',kind,'seq',seq,'payload',json(payload_json))) FROM events WHERE kind LIKE 'public.%' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1' ORDER BY seq",
+                "SELECT json_group_array(json_object('kind',kind,'seq',seq,'payload',json(payload_json))) FROM (SELECT kind,seq,payload_json FROM events WHERE kind LIKE 'public.%' AND json_extract(payload_json,'$.attempt_id')='PUBLIC/attempt-1' ORDER BY seq)",
             )?;
             let rows: Vec<Value> = serde_json::from_str(&raw)?;
             let messages: Vec<&Value> = rows.iter().map(|r| &r["payload"]).collect();
@@ -522,6 +522,16 @@ async fn test_011_05_drain_survives_backpressure_diagnostic_busy_and_same_offset
                 )?,
                 "0",
                 "refuse_diag_commit={refuse_diag_commit}: no drain death gap expected"
+            );
+            // One backpressure diagnostic per blocked part, including both parts of the same offset: frame 0's
+            // (unless its commit was refused) and frame 2's part 0 and part 1 (M4T09R-303).
+            assert_eq!(
+                query(
+                    &project,
+                    "SELECT count(*) FROM events WHERE kind='runner.diagnostic' AND json_extract(payload_json,'$.attempt_id')='DIAG/attempt-1' AND json_extract(payload_json,'$.reason')='public_storage_backpressure'",
+                )?,
+                if refuse_diag_commit { "2" } else { "3" },
+                "refuse_diag_commit={refuse_diag_commit}: per-part backpressure diagnostics"
             );
             R::Ok(())
         }
