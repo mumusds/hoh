@@ -664,9 +664,9 @@
    "acceptance": [
     {
      "id": "AC-010-01",
-     "given": "120×32 PTY；三Agent承接commander/developer/qa；水位H；既有COMPLETED Run最近ACCEPTED提交B，当前R的run.baseline=B0≠B、BUILD；公开U/A、task/candidate活动、带rationale与impact的decision",
-     "when": "打开Workspace，折叠团队，打开基线详情；Ctrl+P列动作，分别打开Task/Issue/Evidence抽屉；同快照TestBackend与PTY对照",
-     "then": "同屏项目/R/B、BUILD、U/A/活动、输入/statusline；decision显示依据和影响；详情B0不替换顶栏B；默认一个主区、三职位摘要一致；面板列全部已实现动作且三抽屉列host对应ID/状态/证据引用、可返回；打开/切换的POST与Task/Attempt新增为0",
+     "given": "120×32 PTY；三Agent承接commander/developer/qa；水位H；既有COMPLETED Run最近ACCEPTED提交B，当前R的run.baseline=B0≠B、BUILD；公开U/A、task/candidate活动、带rationale与impact的decision；多个RUNNING Task，含新重试及其已失败旧Attempt、同started_at的两个Task、缺失/不可解析started_at或无唯一RUNNING Attempt的Task；另有全unknown与无RUNNING子例；缺basis/reason/note的decision与缺已提交effects的decision各一（沿真实生产者保留来源）",
+     "when": "打开Workspace，折叠团队，打开基线详情；Ctrl+P列动作，分别打开Task/Issue/Evidence抽屉；同快照TestBackend与PTY对照；逐子例读取同H的ui.task并核对展示，再从tasks路由查询全部Task",
+     "then": "同屏项目/R/B、BUILD、U/A/活动、输入/statusline；decision显示依据和影响；详情B0不替换顶栏B；默认一个主区、三职位摘要一致；面板列全部已实现动作且三抽屉列host对应ID/状态/证据引用、可返回；打开/切换的POST与Task/Attempt新增为0；ui.task在同一H的RUNNING Task中，排序时间仅取该Task于H唯一RUNNING Attempt的attempts.started_at（runner接收派发、进入STARTING时持久化的启动事实）；重试使用当前新Attempt，忽略已结束历史Attempt，不用Task创建时间/首次启动/客户端时钟替代。按解析后的UTC时刻降序、同时间按task_id升序；无唯一RUNNING Attempt或started_at缺失/不可解析时排序值为unknown，排在已知时间之后，unknown之间仍按task_id升序并保留缺失诊断，不借旧Attempt补值。没有RUNNING Task时ui.task=null；其它Task仍由tasks路由可查；逐项断言新重试改变选择、历史Attempt不参与、同时间task_id决胜、缺失值后置/全unknown稳定排序和无RUNNING为null；缺依据或缺影响的decision对应项显示unknown且不计PASS，已有项仍保留真实来源，不捏造占位依据/影响",
      "test_id": "TEST-010-01"
     },
     {
@@ -678,9 +678,9 @@
     },
     {
      "id": "AC-010-03",
-     "given": "H=100、草稿“继续核对”，应用105后断线，host到110；可触发真实索引重建与writer busy锁",
-     "when": "恢复并重复105；debug钩子触发同一重建路径，以旧page cursor查询；静态核对SSE 410 OpenAPI并以明确stub响应测试客户端解析；writer持锁超过busy_timeout，等待请求已进入该锁后尝试脱离，再解除",
-     "then": "stale/105期间保留草稿，补齐110后去stale、块不重复；page真实过期410且顶层snapshot_watermark=110，重取快照保锚点；SSE矛盾真实409 CONFLICT，SSE 410仅静态/stub兼容覆盖，v1产品不可达；busy时控制503 DB_BUSY且未接受、旧快照可绘制；探针证明脱离在writer释放/超时前完成，不等满busy_timeout且无Cancel（绝对1s在§5.1参考测量另核）；恢复不自动重发、不乐观加进度",
+     "given": "H=100、草稿“继续核对”，应用105后断线，host到110；可触发真实索引重建与writer busy锁；32KiB未提交草稿与已选目标，真实host对象预检低空间以及状态事务DB_FULL",
+     "when": "恢复并重复105；debug钩子触发同一重建路径，以旧page cursor查询；静态核对SSE 410 OpenAPI并以明确stub响应测试客户端解析；writer持锁超过busy_timeout，等待请求已进入该锁后尝试脱离，再解除；从PTY提交该草稿分别收到受理前503 STORAGE_LOW_SPACE和503 DB_FULL，观察提示/草稿/目标并脱离；恢复空间后由用户显式以同幂等键重试",
+     "then": "stale/105期间保留草稿，补齐110后去stale、块不重复；page真实过期410且顶层snapshot_watermark=110，重取快照保锚点；SSE矛盾真实409 CONFLICT，SSE 410仅静态/stub兼容覆盖，v1产品不可达；busy时控制503 DB_BUSY且未接受、旧快照可绘制；探针证明脱离在writer释放/超时前完成，不等满busy_timeout且无Cancel（绝对1s在§5.1参考测量另核）；恢复不自动重发、不乐观加进度；两种受理前503均逐字保留原草稿与目标并显示“未接受”，不自动重试、不乐观清空或新增用户块/接受事实，仍可脱离；STORAGE_LOW_SPACE显示available/required/min_free，显式重试最多一次接受/用户块",
      "test_id": "TEST-010-03"
     },
     {
@@ -700,7 +700,7 @@
    ],
    "decisions": [
     "（CR-028，CTO 2026-11-21 批准 D1–D12）D1/D4/D11；§1/2/2.2 的同水位读模型、输入四态与公开事实；§5.1 的性能与证据边界。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。",
-    "C3（CTO 2026-11-25）：输入历史加法扩展既有 H/limit/cursor 读模型；InputStatePageRef={run_id,watermark,limit,cursor}，watermark=H、limit=1–500/缺省100、首 cursor=null，续查 GET /v1/runs/{run_id}/inputs 的 Page.next_cursor。ui.task 取该 Run 中 RUNNING 且 started_at 最新者，同时间按 task_id 升序取首个；其它任务仍由既有 tasks 路由可查。"
+    "C3（CTO 2026-11-25）：输入历史加法扩展既有 H/limit/cursor 读模型；InputStatePageRef={run_id,watermark,limit,cursor}，watermark=H、limit=1–500/缺省100、首 cursor=null，续查 GET /v1/runs/{run_id}/inputs 的 Page.next_cursor。ui.task在同一H的RUNNING Task中，排序时间仅取该Task于H唯一RUNNING Attempt的attempts.started_at（runner接收派发、进入STARTING时持久化的启动事实）；重试使用当前新Attempt，忽略已结束历史Attempt，不用Task创建时间/首次启动/客户端时钟替代。按解析后的UTC时刻降序、同时间按task_id升序；无唯一RUNNING Attempt或started_at缺失/不可解析时排序值为unknown，排在已知时间之后，unknown之间仍按task_id升序并保留缺失诊断，不借旧Attempt补值。没有RUNNING Task时ui.task=null；其它Task仍由tasks路由可查。"
    ],
    "doc_refs": [
     "docs/03-ux.md",
@@ -755,9 +755,9 @@
     },
     {
      "id": "AC-011-05",
-     "given": "每个codex App Server/受支持exec、claude、pi模式的版本绑定兼容fixture；含public message/tool开始结束、compact/wait/usage有与无、secret标记、两role/epoch；真实runner与Persistence，非直接注入UI事件",
-     "when": "经SendInput接受事务与native frame入口逐帧/重复/超大正文输入，队列背压；在提交前后kill/reopen、取消、EOF；从持久公开块读出",
-     "then": "三家按§2.2白名单输出逐字段/顺序/身份相同；另经SendInput受理普通/大正文后从Persistence读用户块，正文/hash等于规范化原文（非文件引用提示），重放input_id与可关联的native回显不重复；DB_BUSY背压超过quiet不产生attempt.inactive，解除后真正静默到余下quiet才产生，取消仍可达；启动和结束工具均可查、未知能力显式null，secret/隐藏字段不入供API消费的公开读模型或公开对象；未结束Attempt即可读到已提交消息/活动；队列≤256/1MiB、段≤1MiB；重复无重块、旧epoch不更新当前活动；已提交块重启不丢，未提交尾段有缺口而非完整成功；fixture标product+synthetic/recorded来源，不称live",
+     "given": "每个codex App Server/受支持exec、claude、pi模式的版本绑定兼容fixture；含public message/tool开始结束、compact/wait/usage有与无、secret标记、两role/epoch；真实runner与Persistence，非直接注入UI事件；两个不同input_id/block_id的相同正文，以及同block_id/stream两个不同first_offset的相同段",
+     "when": "经SendInput接受事务与native frame入口逐帧/重复/超大正文输入，队列背压；在提交前后kill/reopen、取消、EOF；从持久公开块读出；登记上述两类重复内容并在reopen后重放同input_id/native身份/offset",
+     "then": "三家按§2.2白名单输出逐字段/顺序/身份相同；另经SendInput受理普通/大正文后从Persistence读用户块，正文/hash等于规范化原文（非文件引用提示），重放input_id与可关联的native回显不重复；DB_BUSY背压超过quiet不产生attempt.inactive，解除后真正静默到余下quiet才产生，取消仍可达；启动和结束工具均可查、未知能力显式null，secret/隐藏字段不入供API消费的公开读模型或公开对象；未结束Attempt即可读到已提交消息/活动；队列≤256/1MiB、段≤1MiB；重复无重块、旧epoch不更新当前活动；已提交块重启不丢，未提交尾段有缺口而非完整成功；fixture标product+synthetic/recorded来源，不称live；public_segments以(block_id,stream,first_offset)标识每次出现，artifact_id为可复用外键：不同消息相同正文各有独立块/段，同块不同offset的相同段均保留且可共享同artifact_id；重放原input_id、(attempt_id,native_stream,native_item_id,part)及段offset不新增块/段；001→002→003迁移后逐项核对外键、两类重复内容与重启重放幂等",
      "test_id": "TEST-011-05"
     }
    ],
@@ -769,7 +769,7 @@
    ],
    "decisions": [
     "（CR-028，CTO 2026-11-21 批准 D1–D12）D1/D9/D10/D11；§1/2/2.1/2.2/4 的身份、布局与公开流；REQ-013 的 H13 交接成员规则。AC 中的章节号、F13/H13 与参考环境均指 docs/cr/CR-028-m4-detailed-spec.md；2026-11-25 应用核对仅更新来源/已实现前提及已授权的事件分类和 GC 根，不修改 AC 语义或阈值。",
-    "C3（CTO 2026-11-25）：AC-011-04 保持原判据及 M4-T02 属主；T02 交付小屏显示和其余自身 AC，未有 progress 时显示 unknown 不算该项 PASS。M4-T12 验证任务依赖 M4-T02 与提供共享 progress 聚合的 M4-T06，届时完整验证四组事实与 AC-011-04；M4-T04 依赖该验证任务。AC 集合与 check owner 不变。"
+    "C3（CTO 2026-11-25）：AC-011-04 保持原判据及 M4-T02 属主；T02 交付小屏显示和其余自身 AC，未有 progress 时显示 unknown 不算该项 PASS。M4-T06 写者在共享progress交付后补齐并执行test_011_04的四组事实、小尺寸交互与恢复断言；M4-T12 验证任务依赖 M4-T02 与提供共享 progress 聚合的 M4-T06，届时完整验证四组事实与 AC-011-04；M4-T04 依赖该验证任务。AC 集合与 check owner 不变。"
    ],
    "doc_refs": [
     "docs/03-ux.md",
@@ -798,7 +798,7 @@
      "id": "AC-012-01",
      "given": "§5.1参考环境/release串行阶段；八类块各一，首尾标记X，Tool20MiB；Evidence C1；父锚点K/200",
      "when": "每类先SGR单击选择、双击展开、滚轮滚动，再键盘展开→分页→全文搜索X（首尾两处不重叠，记录offset x1<x2）→n→N→全屏→Esc返回→复制文件，追加另一块；真实PTY采≥100次首屏",
-     "then": "单击只改选中项且保持折叠，双击恰一次展开，滚轮改变视窗锚点但不改所选块身份/不执行动作；八类键盘动作均可达且不执行工具/测试；搜索先定位x1，n准确到x2、N回x1，所选block_id/草稿不变，仅只读查询且零新增命令；返回K/200、首尾可达、导出字节/hash等于公开纯文本；首屏p95≤500ms且缓存有界；键鼠指向相同身份；环境不符SKIPPED诊断/退出78、AC不通过，禁止静默PASS",
+     "then": "单击只改选中项且保持折叠，双击恰一次展开，滚轮改变视窗锚点但不改所选块身份/不执行动作；八类键盘动作均可达且不执行工具/测试；搜索先定位x1，n准确到x2、N回x1，所选block_id/草稿不变，仅只读查询且零新增命令；返回K/200、首尾可达、导出字节/hash等于公开纯文本；首屏p95≤500ms且缓存有界（同AC-064-02：描述≤1000、正文≤4MiB、在途页≤2）；键鼠指向相同身份；环境不符SKIPPED诊断/退出78、AC不通过，禁止静默PASS",
      "test_id": "TEST-012-01"
     },
     {
@@ -1012,9 +1012,9 @@
     },
     {
      "id": "AC-015-03",
-     "given": "PTY按UTF-8/CRLF/起止标记边界分块（不声称内核保留单字节write）；草稿保留；合法最终1MiB与+1B；64MiB无结束paste；三家adapter编码/回显fixture",
-     "when": "合法/超限paste，结束后普通键；未结束时SIGTERM；从HTTP受理经真实投递链对每adapter测试§4的256KiB/1MiB/最坏转义与不可读文件，另测超8MiB请求，以及合法非SendInput命令用JSON空白补到3MiB；对已202的大正文在物化Attempt可读根文件前制造低空间、再释放重试",
-     "then": "完整paste不自动提交，超限原稿不变且UI_INPUT_TOO_LARGE；残缺保留≤1MiB+6B，丢尾到结束或信号，RSS增≤16MiB（RSS子例由本TEST在§5.1串行release阶段运行）；后续键正常、无斜杠执行；每adapter inline≤256KiB且编码≤768KiB、否则短文件引用≤16KiB，文件位于Attempt可读根且底座fixture可读取、字节/hash精确；Workspace/Focus展开的用户块等于已接受原文（不是短引用）、同input_id恰一块；每帧≤1MiB不触发PROTOCOL_FRAME_TOO_LARGE；超8MiB以及3MiB非SendInput均400 BAD_REQUEST、无202/commands或events写入、草稿保留；已202输入投递文件低空间时保持QUEUED并记STORAGE_LOW_SPACE及available/required/min_free，未DELIVERED/APPLIED；释放后原input_id仅投递/用户块各一次，不可读/摘要错明确REJECTED；fixture标product，非live；环境不符RSS子例SKIPPED/退出78、整AC不通过",
+     "given": "PTY按UTF-8/CRLF/起止标记边界分块（不声称内核保留单字节write）；草稿保留；合法最终1MiB与+1B；64MiB无结束paste；三家adapter编码/回显fixture；两个不同input_id/block_id的相同正文，以及同block_id/stream两个不同first_offset的相同段",
+     "when": "合法/超限paste，结束后普通键；未结束时SIGTERM；从HTTP受理经真实投递链对每adapter测试§4的256KiB/1MiB/最坏转义与不可读文件，另测超8MiB请求，以及合法非SendInput命令用JSON空白补到3MiB；对已202的大正文在物化Attempt可读根文件前制造低空间、再释放重试；登记上述两类重复内容并在reopen后重放同input_id/native身份/offset",
+     "then": "完整paste不自动提交，超限原稿不变且UI_INPUT_TOO_LARGE；残缺保留≤1MiB+6B，丢尾到结束或信号，RSS增≤16MiB（RSS子例由本TEST在§5.1串行release阶段运行）；后续键正常、无斜杠执行；每adapter inline≤256KiB且编码≤768KiB、否则短文件引用≤16KiB，文件位于Attempt可读根且底座fixture可读取、字节/hash精确；Workspace/Focus展开的用户块等于已接受原文（不是短引用）、同input_id恰一块；每帧≤1MiB不触发PROTOCOL_FRAME_TOO_LARGE；超8MiB以及3MiB非SendInput均400 BAD_REQUEST、无202/commands或events写入、草稿保留；已202输入投递文件低空间时保持QUEUED并记STORAGE_LOW_SPACE及available/required/min_free，未DELIVERED/APPLIED；释放后原input_id仅投递/用户块各一次，不可读/摘要错明确REJECTED；fixture标product，非live；环境不符RSS子例SKIPPED/退出78、整AC不通过；相同正文的两次独立输入在Workspace/Focus各保留一块，同块不同offset的相同段按offset完整展开/导出，可复用artifact_id而不丢字节；重放同input_id/native身份/offset仍恰一份对应块/段",
      "test_id": "TEST-015-03"
     },
     {
@@ -4128,9 +4128,9 @@
    "acceptance": [
     {
      "id": "AC-064-01",
-     "given": "§5.1参考环境、同次由已记录pre-003提交构建的旧release writer生成002百万事件/对象库、候选release与最终TUI、100Run×10轮、受限ENOSPC；另debug integration小旧库/迁移故障seam/旧binary",
-     "when": "先debug运行迁移失败回滚/旧binary拒读；再在同一backfill阶段以两克隆串行正常升级及回填中途kill/reopen、从每个候选首次open计时；按Run/iteration/attempt各查100页，limit100/500/非法0/501；Range首尾/缺文件/416；同夹具磁盘失败/慢客户端/轮换/引用保护/虚拟列表子例",
-     "then": "新/v1/timeline非法400 QUERY_INVALID、旧Run timeline非法404 BAD_REQUEST，416仅ARTIFACT_RANGE_INVALID与Content-Range组合；分页≤limit、seq完整、H固定，查询p95≤500ms；EXPLAIN用指定索引、每页描述反序列化≤500/正文≤256KiB，无全库加载；旧源码/tree/锁文件/产物hash与002 schema可核对，两release构建均计入release_build；造库≤600s、backfill阶段含两克隆/停机重启总计≤600s，各首次open单列；中断发生于0<indexed_through<H、断点续跑不重置计时，kill→reconcile和host-ready各≤30s、不等完整索引；期间Pause/Cancel仍202并持久、索引查询明示rebuilding。release升级原权威行/hash不变，新增控制/reconcile事件单列，两克隆同H最终索引相等；debug子例失败回滚/旧binary拒读；两阶段缺一不通过；子例包括日志≤8MiB×5、引用对象hash不变、描述≤1000/正文≤4MiB、磁盘无半登记、慢读不阻塞快读；环境不符SKIPPED/退出78，不PASS",
+     "given": "§5.1参考环境、同次由已记录pre-003提交构建的旧release writer生成002百万事件/对象库、候选release与最终TUI、100Run×10轮、受限ENOSPC；另debug integration小旧库/迁移故障seam/旧binary；/v1/runs/{run_id}/inputs有多页四态输入、H后新转换及空输入Run、可重建的索引generation；另有测量锁忙/噪声负例",
+     "when": "先debug运行迁移失败回滚/旧binary拒读；再在同一backfill阶段以两克隆串行正常升级及回填中途kill/reopen、从每个候选首次open计时；按Run/iteration/attempt各查100页，limit100/500/非法0/501；Range首尾/缺文件/416；同夹具磁盘失败/慢客户端/轮换/引用保护/虚拟列表子例；inputs按同Run/H/limit翻页和重放cursor，在H后提交转换再以同H重取首/续页；在同H重建索引并用旧generation cursor查询，以新快照重取全部页；交叉使用Run/query/H/limit及篡改cursor、非法0/501/未来watermark，查询空Run/末页；分别制造两锁竞争和无锁负载/观测缺口",
+     "then": "新/v1/timeline非法400 QUERY_INVALID、旧Run timeline非法404 BAD_REQUEST，416仅ARTIFACT_RANGE_INVALID与Content-Range组合；分页≤limit、seq完整、H固定，查询p95≤500ms；EXPLAIN用指定索引、每页描述反序列化≤500/正文≤256KiB，无全库加载；旧源码/tree/锁文件/产物hash与002 schema可核对，两release构建均计入release_build；造库≤600s、backfill阶段含两克隆/停机重启总计≤600s，各首次open单列；中断发生于0<indexed_through<H、断点续跑不重置计时，kill→reconcile和host-ready各≤30s、不等完整索引；期间Pause/Cancel仍202并持久、索引查询明示rebuilding。release升级原权威行/hash不变，新增控制/reconcile事件单列，两克隆同H最终索引相等；debug子例失败回滚/旧binary拒读；两阶段缺一不通过；子例包括日志≤8MiB×5、引用对象hash不变、描述≤1000/正文≤4MiB、磁盘无半登记、慢读不阻塞快读；环境不符SKIPPED/退出78，不PASS；inputs的Page逐页watermark=H、items≤limit、接受seq/input_id稳定排序且并集无重漏，四态及role/epoch/boundary/拒绝原因等于H内已提交事实；重放cursor及H后新增转换不改变旧页，同H索引重建后新cursor所得内容相等；cursor绑定Run/query（含limit）/H/generation，错配/篡改/非法参数为404 BAD_REQUEST，缺Run为404 RUN_NOT_FOUND，旧generation为410 CURSOR_EXPIRED且顶层snapshot_watermark可重取；空Run返回items=[]/next_cursor=null/watermark=H，末页next_cursor=null，无写入/重投递；test_064_01逐项记录测量锁忙/噪声负例：两锁等待合计≤30s，锁忙不得开测、detail.reason=MEASUREMENT_BUSY；无锁竞争负载、观测缺口>2s或锁覆盖不可核实为MEASUREMENT_NOISE；相关TEST=SKIPPED、整次退出78且AC不通过，保留已有FAIL；测量持锁时第二cargo/run_check不得启动，取消/杀runner后仍须等guardian完成清理释放两锁才可启动，产品自身负载超限仍FAIL",
      "test_id": "TEST-064-01"
     },
     {
@@ -4149,9 +4149,9 @@
     },
     {
      "id": "AC-064-04",
-     "given": "已有E/待写N、min_free32MiB、1MiB流段；32KiB SendInput需封口原文对象与未提交草稿；真实ENOSPC与注入EDQUOT；临时写/fsync/rename/登记故障",
+     "given": "已有E/待写N、min_free32MiB、1MiB流段；32KiB SendInput需封口原文对象；真实ENOSPC与注入EDQUOT；临时写/fsync/rename/登记故障",
      "when": "逐点失败或kill/reconcile；低空间但状态事务可提交时提交32KiB输入、分别Pause/Cancel；经hoh -p --resume以text/json/stream-json分别提交32KiB正文并观察低空间拒绝；状态事务本身满盘再试；释放后显式同幂等键重试",
-     "then": "E可读hash不变、N不留引用缺正文；新对象/新写Attempt为STORAGE_LOW_SPACE，含available/required/min_free；32KiB SendInput唯一HTTP503 code=STORAGE_LOW_SPACE、details.reason相同且字节数可核对，无202/接受行/input.accepted/public.message，UI保原草稿与目标、显示未接受；CLI三种输出均退出69，保留STORAGE_LOW_SPACE/details并明确输入未接受/存储空间不足，不自动重试、不新增run.result或改变Run状态；恢复后显式重试最多一次接受/用户块。低空间但状态事务可提交时Pause/Cancel仍202且持久；事务真失败503 DB_FULL无202，仍可脱离；原Task可重试、孤立48h策略不变；缺真实ENOSPC设施FAIL非零，EDQUOT明确注入；投递文件阶段子例由015-03覆盖",
+     "then": "E可读hash不变、N不留引用缺正文；新对象/新写Attempt为STORAGE_LOW_SPACE，含available/required/min_free；32KiB SendInput唯一HTTP503 code=STORAGE_LOW_SPACE、details.reason相同且字节数可核对，无202/接受行/input.accepted/public.message；CLI三种输出均退出69，保留STORAGE_LOW_SPACE/details并明确输入未接受/存储空间不足，不自动重试、不新增run.result或改变Run状态；恢复后显式重试最多一次接受/用户块。低空间但状态事务可提交时Pause/Cancel仍202且持久；事务真失败503 DB_FULL无202；原Task可重试、孤立48h策略不变；缺真实ENOSPC设施FAIL非零，EDQUOT明确注入；投递文件阶段子例由015-03覆盖；受理前503的UI草稿/目标/未接受提示及脱离由AC-010-03的tui-pty覆盖",
      "test_id": "TEST-064-04"
     },
     {

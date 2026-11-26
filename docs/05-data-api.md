@@ -61,11 +61,17 @@ SQL 003 只建派生结构，迁移运行器、分批回填、引用闭包和 GC
 首 cursor 为 null。由新增只读 `GET /v1/runs/{run_id}/inputs` 返回既有 Page
 （items/next_cursor/watermark）；续页保持同 Run/H/limit，cursor 绑定查询和 generation。
 按 H 的已提交事实重建四态、实际角色/epoch/boundary和拒绝原因，后续事实不漂移旧页，
+同H重建后新cursor所得内容相同，旧generation为410 CURSOR_EXPIRED并带顶层snapshot_watermark；
+cursor绑定Run/query（含limit）/H/generation，错配为404 BAD_REQUEST。空页items=[]、
+next_cursor=null、watermark=H，末页next_cursor=null。AC-064-01逐项核对。
 不新增输入命令或投递循环。该扩展由 T03 交付，T02 消费，旧路由与错误语义保持。
 
-`ui.task` 取当前 Run 的 RUNNING Task 中 started_at 最新者，同时间按 task_id 升序取首个；
-没有 RUNNING 时为 null，其它 Task 仍经 tasks 路由查询。决策依据取公开 basis/reason/note，
+ui.task在同一H的RUNNING Task中，排序时间仅取该Task于H唯一RUNNING Attempt的attempts.started_at（runner接收派发、进入STARTING时持久化的启动事实）；重试使用当前新Attempt，忽略已结束历史Attempt，不用Task创建时间/首次启动/客户端时钟替代。按解析后的UTC时刻降序、同时间按task_id升序；无唯一RUNNING Attempt或started_at缺失/不可解析时排序值为unknown，排在已知时间之后，unknown之间仍按task_id升序并保留缺失诊断，不借旧Attempt补值。没有RUNNING Task时ui.task=null；其它Task仍由tasks路由可查。决策依据取公开 basis/reason/note，
 影响取已提交 effects，分别带来源；缺失显示 unknown 且不计 PASS。T02 经 refinement CR
 以加法可选协议字段补齐缺失类别的真实生产者，fixture 不捏造依据或影响。
-T02 先交付小屏显示与自身其余 AC；四组事实由依赖 T02/T06 的 T12 在共享 progress
-交付后完整验证 AC-011-04。其 T02 属主与37条 AC 集合不变，T04 收取 T12 证据。
+T02 先交付小屏显示与自身其余 AC；T06 写者在共享 progress 交付后补齐并执行
+`test_011_04` 的四组事实、小尺寸交互和恢复断言，T12 依赖 T02/T06 收取完整验证证据。其 T02 属主与37条 AC 集合不变，T04 收取 T12 证据。
+
+公开段的出现身份为 `(block_id,stream,first_offset)`；`artifact_id` 是可复用的内容对象外键。
+相同正文的不同消息、同块不同offset的相同段均保留，重放按input/native身份/offset幂等；
+AC-011-05与AC-015-03分别核对持久化和UI展开/导出。
