@@ -970,3 +970,16 @@ another thread's line between); a netlink connect, unfinished at exit, on no SOC
 only a `?` socket returned.
 
 Evidence under `.hoh-dev/self-tests/flk1415/flk15/`. Self-tests, not acceptance.
+
+### FLK-14 / FLK-15 / FLK-14-P1: reviews
+
+Scope `072f9fa6..8dcea551` (round 1) and the fix diff `8dcea551..3b13ff12` (round 2). Complementary pairs (process-lifetime and concurrency change):
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `8dcea551` | Pi 1.6.1, `01a21567-2d57-76ab-b00f-97088b78ab83` (`49bcd666-b80b-430d-b6dd-2231bb78311c`), M3F-001..099: writer.rs and its call chain | PASS with M3F-001 medium (fixed under the DC-FLK14b addendum above), lows M3F-002..004 (deferred), M3F-005 (reviewer process note: it created and removed a file under the frozen copy's ignored `.hoh-dev/`; tracked content untouched) |
+| 1 | `8dcea551` | agy 1.5.17 (gemini-4-neon-high), `19171195-1b17-4d0b-bc9d-72139b70d066` (`14422f56-1167-4fb5-871b-61b34fad0d78`), M3F-100..199: test side, FLK-15 parser | PASS with lows M3F-100, M3F-101 (fixed) |
+| 2 (fix diff) | `3b13ff12` | Pi 1.6.1, `01a215de-e1af-76d7-b7fa-97574f613899` (`5ee3d293-8f2a-4e55-bf2f-f71be98881a7`), M3F-200..299: retry rule | PASS; lows M3F-200 (the lasting test's upper bound passes with 3 or 4 retries: count retries exactly), M3F-201 (an Auth-failed attempt's end holds the runner latch up to ~15 s while retrying), M3F-202 (`recover()` passes `NoHostFaults`, so its retries are invisible to test hooks): deferred to the M4 low package |
+| 2 (fix diff) | `3b13ff12` | Codex 0.171.0, `01a215de-e804-7932-b2db-4b41f5c41b4c` (`5b7120af-3818-43a2-9dd4-97531317c0c8`), M3F-300..399: audit completeness, hooks, tests | PASS, no findings: red on `0672061f` (UNKNOWN_EFFECT) and green 5/5 reproduced; caller audit complete; hooks no-op in production; guards reap on all nine paths |
+
+Out of scope, seen in the developer's first fix-round pre-pr: `tui_pty::a_signal_while_output_is_held_leaves_later_input_for_the_shell` failed once (`aecho NEXT`); tracked as FLK-16 on its own branch.
