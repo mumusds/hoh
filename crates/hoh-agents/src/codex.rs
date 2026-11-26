@@ -261,6 +261,8 @@ pub struct Turn {
     pub deadline: Option<Duration>,
     /// A test's look at the diagnostics a turn of the runner's mode collects; the product has none.
     pub observe: Option<Observe>,
+    /// Bounded public output, separate from lifecycle/cancel control.
+    pub public: Option<crate::public_stream::Publisher>,
 }
 
 impl Turn {
@@ -802,6 +804,7 @@ fn replay_turn() -> Turn {
         handshake_timeout: Duration::from_secs(60),
         deadline: None,
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::NoStart::shared(),
     }
 }

@@ -56,6 +56,7 @@ async fn a_raw_log_that_cannot_be_written_whole_fails_the_turn() -> R {
         escalation: Turn::default_escalation(),
         deadline: Some(Duration::from_secs(60)),
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::Direct::shared(),
     };
     // stderr.log stops at 4 MiB of the 8 MiB written; nothing else this process writes meanwhile comes near it.

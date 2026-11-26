@@ -68,6 +68,7 @@ pub(super) fn prepare(
             escalation: claude::Turn::default_escalation(),
             deadline: Some(DEADLINE),
             observe: None,
+            public: None,
             spawner: env.spawner.clone(),
         }),
         Agent::Codex => {
@@ -103,6 +104,7 @@ pub(super) fn prepare(
                 handshake_timeout: Duration::from_secs(60),
                 deadline: Some(DEADLINE),
                 observe: None,
+                public: None,
                 spawner: env.spawner.clone(),
             })
         }
@@ -131,6 +133,7 @@ pub(super) fn prepare(
             clock: Arc::new(SystemClock),
             events: None,
             observe: None,
+            public: None,
             spawner: env.spawner.clone(),
         }),
     })

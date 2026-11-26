@@ -149,6 +149,7 @@ async fn codex_live_turn_and_cancel() -> R {
         handshake_timeout: Duration::from_secs(60),
         deadline: Some(Duration::from_secs(600)),
         observe: None,
+        public: None,
         spawner: hoh_core::spawn::Direct::shared(),
     };
     let session_of = |o: &Outcome| {

@@ -35,3 +35,5 @@ pub enum Profile {
 
 /// Crate version, reported by the `hoh` binary for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub mod public_stream;

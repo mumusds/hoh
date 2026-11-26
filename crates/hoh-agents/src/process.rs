@@ -90,6 +90,7 @@ impl Default for Escalation {
 /// Limits and timings of one process.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub public: Option<crate::public_stream::Publisher>,
     pub frame_limit: usize,
     pub read_chunk: usize,
     /// Frames over the limit that are skipped rather than refused (CR-040); `None`: every one is refused.
@@ -117,6 +118,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            public: None,
             frame_limit: FRAME_LIMIT,
             read_chunk: READ_CHUNK,
             skip: None,
@@ -334,6 +336,7 @@ impl Process {
             },
             events_tx.clone(),
             abandon.clone(),
+            config.public.clone(),
         ));
         let err = tokio::spawn(drain_stderr(
             stderr,
@@ -701,9 +704,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     mut reader: FrameReader<Tee<R>>,
     events: mpsc::Sender<Event>,
     mut abandon: watch::Receiver<bool>,
+    public: Option<crate::public_stream::Publisher>,
 ) -> StreamReport {
     let mut report = StreamReport::default();
     let mut refused = false;
+    let mut normalizer = public
+        .as_ref()
+        .map(|p| crate::public_stream::Normalizer::new(p.mode, &p.version));
+    let mut receive_offset = 0u64;
+    let mut settled = false;
     loop {
         let frame = tokio::select! {
             biased;
@@ -713,6 +722,42 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         match frame {
             Ok(Some(frame)) => {
                 refused = matches!(frame, Frame::TooLarge(_));
+                if let (Some(sender), Some(normalizer)) = (&public, normalizer.as_mut()) {
+                    let mut parts = Vec::new();
+                    if let Frame::Line(bytes) | Frame::Reduced { line: bytes, .. } = &frame {
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                            settled |= value["type"] == "result"
+                                || value["type"] == "turn.completed"
+                                || value["method"] == "turn/completed"
+                                || value["type"] == "agent_settled";
+                            parts = normalizer.feed(&value, receive_offset);
+                        } else {
+                            parts.push(crate::public_stream::gap(
+                                sender.mode,
+                                receive_offset,
+                                "invalid_native_frame",
+                            ));
+                        }
+                    } else {
+                        parts.push(crate::public_stream::gap(
+                            sender.mode,
+                            receive_offset,
+                            "native_frame_incomplete_or_skipped",
+                        ));
+                    }
+                    if matches!(frame, Frame::Reduced { .. }) {
+                        parts.push(crate::public_stream::gap(
+                            sender.mode,
+                            receive_offset,
+                            "native_frame_reduced",
+                        ));
+                    }
+                    let sent = tokio::select! {biased;_ = abandoned(&mut abandon)=>false,result=crate::public_stream::publish(sender,parts)=>result.is_ok()};
+                    if !sent {
+                        break;
+                    }
+                    receive_offset += 1;
+                }
                 // Waiting here for the consumer is the backpressure; it is never abandoned.
                 if events.send(Event::Frame(frame)).await.is_err() {
                     break;
@@ -727,6 +772,13 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 break;
             }
         }
+    }
+    if let Some(sender) = &public
+        && (!report.eof || !settled)
+    {
+        let gap =
+            crate::public_stream::gap(sender.mode, receive_offset, "native_stream_unfinished");
+        tokio::select! { biased;_ = abandoned(&mut abandon)=>{}, _=sender.send(gap)=>{} }
     }
     report.bytes = reader.bytes_read();
     report.max_buffered = reader.max_buffered();
@@ -902,7 +954,7 @@ mod tests {
             2,
         );
         let (events, mut rx) = mpsc::channel(4);
-        let report = read_stdout(reader, events, abandoned).await;
+        let report = read_stdout(reader, events, abandoned, None).await;
         let count = reads.load(Ordering::SeqCst);
         assert!(count <= 2, "abandon starved for {} drain reads", count - 1);
         assert!(matches!(
