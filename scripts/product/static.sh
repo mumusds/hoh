@@ -36,18 +36,10 @@ cargo deny --locked check licenses bans sources
 scan=(python3 scripts/product/persistence_scan.py --canary-log "$logs/canary.log")
 if [[ -n "${HOH_EVIDENCE_DIR:-}" ]]; then scan+=(--out "$HOH_EVIDENCE_DIR/test-results.jsonl"); fi
 "${scan[@]}"
-# No source names a machine-specific home directory: tests that created their temporary directories under one
-# developer's /home path passed on that machine and failed in CI (M3L-101, PR #108 in Rust; M4L1-001 in a bundle test,
-# the same class again, so the scan covers Rust, Python and shell sources alike); use tempfile's defaults / TMPDIR.
-found=0; grep -rnE "tempdir_in\\(\"/home|[\"']/home/ai/" --include='*.rs' --include='*.py' --include='*.sh' \
-  crates tests tools scripts || found=$?
-if [[ "$found" == 0 ]]; then
-  echo 'static: a source names a machine-specific /home path; use tempfile defaults' >&2
-  exit 1
-elif [[ "$found" != 1 ]]; then
-  echo "static: the machine-path scan failed (grep exit $found)" >&2
-  exit 1
-fi
+# No source names a machine-specific home directory: tests or configs naming a developer's /home/<user> path pass on
+# one machine and fail in CI (M3L-101, M4L1-001, M4L1-100, M4L1-101); covers Rust, Python, shell, TOML, YAML and JSON
+# sources with an explicit allowlist in scripts/product/machine-path-allowlist.json.
+python3 scripts/product/machine_path_scan.py
 # docs/adr/ADR-031.md, 设计修正 2, E: the client crate does not depend on the host's, every place that starts a process
 # or makes the plain spawner is listed with its owner, and every direct stderr write outside the host is listed.
 python3 scripts/product/spawn_scan.py

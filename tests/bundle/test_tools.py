@@ -1676,3 +1676,69 @@ class PrePr(unittest.TestCase):
         calls=self.recorded();self.assertIn('scripts/check.sh --bundle CI=1',calls)
         self.assertIn('scripts/product/deployment.sh  CI=unset',calls)
         self.assertTrue(all(c.endswith('CI=unset') for c in calls if 'check.sh --bundle' not in c),calls)
+
+class MachinePathScan(unittest.TestCase):
+    """M4L1-100 / M4L1-101: scripts/product/machine_path_scan.py catches unquoted shell paths, /home/<user> without
+    a trailing slash, any username, and .toml/.yml/.yaml/.json sources, with an explicit allowlist."""
+    def run_scan(self,files,allowlist=None):
+        with tempfile.TemporaryDirectory(prefix='hoh-mpath-') as d:
+            root=Path(d)/'repo';root.mkdir()
+            for rel,text in files.items():
+                p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(text)
+            argv=[sys.executable,str(ROOT/'scripts/product/machine_path_scan.py'),'--root',str(root)]
+            if allowlist is None:
+                argv.append('--no-allowlist')
+            else:
+                allow_path=root/'scripts/product/machine-path-allowlist.json'
+                allow_path.parent.mkdir(parents=True,exist_ok=True)
+                allow_path.write_text(json.dumps(allowlist))
+                argv+=['--allowlist',str(allow_path)]
+            return subprocess.run(argv,capture_output=True,text=True,timeout=30)
+    def test_real_repository_is_clean_and_static_sh_runs_the_scan(self):
+        self.assertIn('python3 scripts/product/machine_path_scan.py',(ROOT/'scripts/product/static.sh').read_text())
+        r=subprocess.run([sys.executable,str(ROOT/'scripts/product/machine_path_scan.py')],capture_output=True,text=True,timeout=30)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+    def test_catches_every_new_machine_path_shape(self):
+        h='/'+'home/'
+        canaries=[
+            ('unquoted_shell','scripts/dev/example.sh',f'DIR={h}ai/dev\n'),
+            ('unquoted_shell_default','scripts/dev/example.sh',f'slot=${{SLOT:-{h}ai/dev/.lock}}\n'),
+            ('no_trailing_slash_shell','scripts/dev/example.sh',f'HOME="{h}ai"\n'),
+            ('no_trailing_slash_rust','crates/a/src/lib.rs',f'const D: &str = "{h}ai";\n'),
+            ('other_user_rust','crates/a/src/lib.rs',f'const D: &str = "{h}alice/work";\n'),
+            ('other_user_python','tests/bundle/x.py',f'P = "{h}bob"\n'),
+            ('toml_source','crates/a/Cargo.toml',f'path = "{h}carol/dep"\n'),
+            ('top_level_toml','Cargo.toml',f'dir = "{h}carol/cache"\n'),
+            ('yml_source','.github/workflows/ci.yml',f'workdir: {h}runner/work\n'),
+            ('yaml_source','scripts/cfg.yaml',f'root: {h}dave\n'),
+            ('json_source','tests/cfg.json',f'{{"dir": "{h}eve"}}\n'),
+            ('tempdir_in_home','crates/a/src/lib.rs','let _ = tempdir_in("/ho'+'me");\n'),
+        ]
+        for label,rel,content in canaries:
+            with self.subTest(case=label,file=rel):
+                r=self.run_scan({rel:content})
+                self.assertEqual(r.returncode,1,f'{label} was not caught: {r.stdout}{r.stderr}')
+                self.assertIn(rel,r.stderr)
+    def test_allowlist_admits_only_the_named_pre_pr_slot_and_rejects_other_or_stale_entries(self):
+        h='/'+'home/'
+        slot=f'{h}ai/dev/.hoh-test-slot.lock'
+        allow={
+            'files':{
+                'scripts/dev/pre-pr.sh':{
+                    'allowed_literals':[slot],
+                    'reason':'dev test-slot default',
+                }
+            },
+            'directories':{},
+        }
+        ok=self.run_scan({'scripts/dev/pre-pr.sh':f'slot=${{HOH_TEST_SLOT:-{slot}}}\n'},allowlist=allow)
+        self.assertEqual(ok.returncode,0,ok.stderr)
+        other_in_same_file=self.run_scan(
+            {'scripts/dev/pre-pr.sh':f'slot=${{HOH_TEST_SLOT:-{slot}}}\nother={h}ai/other\n'},
+            allowlist=allow,
+        )
+        self.assertEqual(other_in_same_file.returncode,1,other_in_same_file.stderr)
+        self.assertIn('scripts/dev/pre-pr.sh:2',other_in_same_file.stderr)
+        stale=self.run_scan({'scripts/dev/pre-pr.sh':'slot=/tmp/slot\n'},allowlist=allow)
+        self.assertEqual(stale.returncode,1,stale.stderr)
+        self.assertIn('stale allowlist',stale.stderr)
