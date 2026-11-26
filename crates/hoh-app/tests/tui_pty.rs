@@ -1980,14 +1980,36 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
     let file = project.join(".hoh/prompts/developer.md");
     std::fs::create_dir_all(file.parent().ok_or("parent")?)?;
     std::fs::write(&file, "CUSTOM SETTINGS CONTRACT\n")?;
-    let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/prompts");
-    let before = tree(&resources)?;
+    // M3QA-020: observe what the installed product actually uses (the installed `hoh` binary carrying the embedded
+    // builtin resources, its embedded resource bundle pin, and the user's global config directory), rather than the
+    // checkout's source `resources/prompts` tree that the embedded binary never touches.
+    let installed_bin = Path::new(world::HOH);
+    let (bin_sha_before, bin_len_before) = hoh_core::objects::hash_file(installed_bin)?;
+    let bundle_before = hoh_core::resource_bundle::Bundle::current();
+    let bundle_version_before = bundle_before.version();
+    let builtin_text = bundle_before
+        .files()
+        .get("resources/prompts/developer.md")
+        .ok_or("missing embedded builtin resources/prompts/developer.md")?
+        .clone();
+    let builtin_dev_sha: String = {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(builtin_text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    let global_config = world.home().join(".config");
+    let global_before = if global_config.exists() {
+        Some(tree(&global_config)?)
+    } else {
+        None
+    };
     let host = runtime.block_on(world.start_host())?;
     let outcome = (|| -> R {
         let mut pty = Pty::new(40, 120)?;
         let mut child = world.hoh_pty(&pty, &[])?;
         pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("host 已连接"))?;
-        let builtin_text = std::fs::read_to_string(resources.join("developer.md"))?;
         let first_builtin_line = builtin_text
             .lines()
             .next()
@@ -2028,9 +2050,23 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
         pty::screen_until(&pty, 40, 120, WAIT, |s| s.contains("已恢复默认"))?;
         assert!(!file.exists());
         assert_eq!(
-            tree(&resources)?,
-            before,
-            "installed-source resources are immutable"
+            hoh_core::objects::hash_file(installed_bin)?,
+            (bin_sha_before.clone(), bin_len_before),
+            "installed hoh binary carrying embedded resources must be unchanged after restore"
+        );
+        assert_eq!(
+            hoh_core::resource_bundle::Bundle::current().version(),
+            bundle_version_before,
+            "embedded resource bundle version/digest must be unchanged after restore"
+        );
+        assert_eq!(
+            if global_config.exists() {
+                Some(tree(&global_config)?)
+            } else {
+                None
+            },
+            global_before,
+            "global config directory must be unchanged after project restore"
         );
         signal(&child, Signal::TERM)?;
         assert_eq!(exit_within(&mut child, WAIT)?.code(), Some(143));
@@ -2040,7 +2076,27 @@ fn test_047_02_tui_diff_and_restore_default() -> R {
           INSERT INTO tasks(task_id, run_id, spec_id, state, revision, role, writer, created_seq, cost_estimate)
           VALUES ('T-settings', '{run}', '{spec}', 'READY', 1, 'developer', 0, 1, 1);"))?;
         world.wait("SELECT count(*) FROM attempts a JOIN prompt_revisions p ON p.revision_id = a.prompt_revision WHERE a.task_id = 'T-settings' AND p.layer = 'builtin'", "1", Duration::from_secs(45))?;
-        assert_eq!(tree(&resources)?, before);
+        assert_eq!(
+            world.query("SELECT p.content_sha256 FROM attempts a JOIN prompt_revisions p ON p.revision_id = a.prompt_revision WHERE a.task_id = 'T-settings' AND p.layer = 'builtin'")?,
+            builtin_dev_sha,
+            "next Attempt must use the exact unchanged embedded builtin developer contract"
+        );
+        assert_eq!(
+            world.query(
+                "SELECT resource_bundle_version FROM attempts WHERE task_id = 'T-settings'"
+            )?,
+            bundle_version_before,
+            "next Attempt must record the unchanged embedded resource bundle version"
+        );
+        assert_eq!(
+            hoh_core::objects::hash_file(installed_bin)?,
+            (bin_sha_before, bin_len_before),
+            "installed hoh binary carrying embedded resources must be unchanged after next Attempt"
+        );
+        assert_eq!(
+            hoh_core::resource_bundle::Bundle::current().version(),
+            bundle_version_before
+        );
         Ok(())
     })();
     runtime.block_on(host.shutdown());
