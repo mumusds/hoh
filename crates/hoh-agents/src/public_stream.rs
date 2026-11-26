@@ -1227,6 +1227,110 @@ impl Drop for Blocked {
         }
     }
 }
+/// Public output that was not persisted, shared by the reader's publisher and the host's drain and read at process end
+/// even if the drain was aborted (M4T09R-300, M4T09R-301).
+#[derive(Debug, Clone, Default)]
+pub struct Loss(Arc<std::sync::Mutex<LossState>>);
+#[derive(Debug, Default)]
+struct LossState {
+    summary: LossSummary,
+    /// Parts handed to the queue and not yet settled by the drain, in queue order: (ticket, offset, bytes).
+    queued: std::collections::VecDeque<(u64, u64, u64)>,
+    next: u64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LossSummary {
+    /// First receive offset of any public output that was dropped or lost.
+    pub first_offset: Option<u64>,
+    /// Parts the drain dropped with their own gap recorded.
+    pub dropped: u64,
+    /// Parts lost without a gap of their own: their gap could not be written, the drain never settled them, or they
+    /// could not be queued (closed queue, abandoned stream).
+    pub unrecorded: u64,
+    /// Body bytes of all dropped and lost parts.
+    pub bytes: u64,
+    /// Native frames not normalized because the public queue had closed.
+    pub frames_after_close: u64,
+}
+impl LossSummary {
+    /// Whether the loss is recorded nowhere but in a process-end gap.
+    pub fn needs_gap(&self) -> bool {
+        self.unrecorded > 0 || self.frames_after_close > 0
+    }
+    fn note(&mut self, offset: u64, bytes: u64) {
+        self.first_offset = Some(self.first_offset.map_or(offset, |o| o.min(offset)));
+        self.bytes += bytes;
+    }
+}
+impl Loss {
+    fn state(&self) -> std::sync::MutexGuard<'_, LossState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn enqueue(&self, part: &PublicPart) -> Ticket<'_> {
+        let mut s = self.state();
+        let id = s.next;
+        s.next += 1;
+        s.queued
+            .push_back((id, part.received_offset, part.text.len() as u64));
+        Ticket {
+            loss: self,
+            id,
+            armed: true,
+        }
+    }
+    /// The drain settled the oldest queued part (persisted, or dropped and reported through [`Loss::dropped`]).
+    pub fn settled(&self) {
+        self.state().queued.pop_front();
+    }
+    /// The drain dropped a part's body; `gap_recorded` says whether its own gap was written.
+    pub fn dropped(&self, part: &PublicPart, gap_recorded: bool) {
+        let mut s = self.state();
+        if gap_recorded {
+            s.summary.dropped += 1;
+        } else {
+            s.summary.unrecorded += 1;
+        }
+        s.summary.note(part.received_offset, part.text.len() as u64);
+    }
+    fn lost(&self, part: &PublicPart) {
+        let mut s = self.state();
+        s.summary.unrecorded += 1;
+        s.summary.note(part.received_offset, part.text.len() as u64);
+    }
+    pub(crate) fn frame_after_close(&self, offset: u64) {
+        let mut s = self.state();
+        s.summary.frames_after_close += 1;
+        s.summary.note(offset, 0);
+    }
+    /// Everything lost so far; parts still queued count as lost (the drain is gone when this is read).
+    pub fn summary(&self) -> LossSummary {
+        let s = self.state();
+        let mut summary = s.summary.clone();
+        for (_, offset, bytes) in &s.queued {
+            summary.unrecorded += 1;
+            summary.note(*offset, *bytes);
+        }
+        summary
+    }
+}
+/// A part entering the queue: dropped before it is in the channel, it is counted lost.
+struct Ticket<'a> {
+    loss: &'a Loss,
+    id: u64,
+    armed: bool,
+}
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut s = self.loss.state();
+            if let Some(at) = s.queued.iter().position(|(id, _, _)| *id == self.id) {
+                let (_, offset, bytes) = s.queued.remove(at).unwrap_or_default();
+                s.summary.unrecorded += 1;
+                s.summary.note(offset, bytes);
+            }
+        }
+    }
+}
 #[derive(Debug)]
 pub struct Pending {
     pub part: PublicPart,
@@ -1236,6 +1340,7 @@ pub struct Pending {
 pub struct Receiver {
     inner: mpsc::Receiver<Pending>,
     pub backpressure: Backpressure,
+    pub loss: Loss,
 }
 impl Receiver {
     pub async fn recv(&mut self) -> Option<Pending> {
@@ -1247,23 +1352,27 @@ pub struct Publisher {
     sender: mpsc::Sender<Pending>,
     bytes: Arc<Semaphore>,
     pressure: Backpressure,
+    loss: Loss,
     pub mode: Mode,
     pub version: String,
 }
 pub fn channel(mode: Mode, version: &str) -> (Publisher, Receiver) {
     let (sender, inner) = mpsc::channel(64);
     let pressure = Backpressure::default();
+    let loss = Loss::default();
     (
         Publisher {
             sender,
             bytes: Arc::new(Semaphore::new(1 << 20)),
             pressure: pressure.clone(),
+            loss: loss.clone(),
             mode,
             version: version.into(),
         },
         Receiver {
             inner,
             backpressure: pressure,
+            loss,
         },
     )
 }
@@ -1276,11 +1385,15 @@ impl Publisher {
     pub fn backpressure(&self) -> Backpressure {
         self.pressure.clone()
     }
+    pub fn loss(&self) -> Loss {
+        self.loss.clone()
+    }
     pub async fn send(&self, part: PublicPart) -> Result<(), &'static str> {
         let count = u32::try_from(part.text.len().max(1)).map_err(|_| "public body too large")?;
         if count > 1 << 20 {
             return Err("public body exceeds one segment");
         }
+        let mut ticket = self.loss.enqueue(&part);
         let bytes = match self.bytes.clone().try_acquire_many_owned(count) {
             Ok(p) => p,
             Err(_) => {
@@ -1296,14 +1409,37 @@ impl Publisher {
             part,
             _bytes: bytes,
         };
-        match self.sender.try_send(pending) {
+        let sent = match self.sender.try_send(pending) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err("public queue closed"),
             Err(mpsc::error::TrySendError::Full(p)) => {
                 let _blocked = self.pressure.blocked();
                 self.sender.send(p).await.map_err(|_| "public queue closed")
             }
-        }
+        };
+        ticket.armed = sent.is_err();
+        sent
+    }
+    /// Queues without waiting (an abandoned stream cannot wait); what does not fit is counted lost.
+    fn try_send(&self, part: PublicPart) -> bool {
+        let Ok(count) = u32::try_from(part.text.len().max(1)) else {
+            self.loss.lost(&part);
+            return false;
+        };
+        let Ok(bytes) = self.bytes.clone().try_acquire_many_owned(count) else {
+            self.loss.lost(&part);
+            return false;
+        };
+        let mut ticket = self.loss.enqueue(&part);
+        let sent = self
+            .sender
+            .try_send(Pending {
+                part,
+                _bytes: bytes,
+            })
+            .is_ok();
+        ticket.armed = !sent;
+        sent
     }
 }
 
@@ -1320,13 +1456,12 @@ pub(crate) fn gap(mode: Mode, offset: u64, reason: &str) -> PublicPart {
     p.activity = Some(reason.into());
     p
 }
-pub(crate) async fn publish(
-    sender: &Publisher,
-    parts: Vec<PublicPart>,
-) -> Result<(), &'static str> {
+/// Parts larger than one segment split on UTF-8 boundaries.
+fn segments(parts: Vec<PublicPart>) -> Vec<PublicPart> {
+    let mut out = Vec::new();
     for part in parts {
         if part.text.len() <= 1 << 20 {
-            sender.send(part).await?;
+            out.push(part);
             continue;
         }
         let mut offset = 0;
@@ -1341,10 +1476,48 @@ pub(crate) async fn publish(
             split.first_offset += offset as u64;
             split.text = part.text[offset..end].into();
             split.complete = part.complete && end == part.text.len();
-            sender.send(split).await?;
+            out.push(split);
             offset = end;
             segment += 1;
         }
     }
+    out
+}
+/// Parts not yet handed to the queue when a publish ends early (closed queue, or the publish dropped on abandon) are
+/// counted lost.
+struct Unsent<'a> {
+    loss: &'a Loss,
+    parts: std::vec::IntoIter<PublicPart>,
+}
+impl Drop for Unsent<'_> {
+    fn drop(&mut self) {
+        for part in self.parts.by_ref() {
+            self.loss.lost(&part);
+        }
+    }
+}
+pub(crate) async fn publish(
+    sender: &Publisher,
+    parts: Vec<PublicPart>,
+) -> Result<(), &'static str> {
+    let mut unsent = Unsent {
+        loss: &sender.loss,
+        parts: segments(parts).into_iter(),
+    };
+    for part in unsent.parts.by_ref() {
+        sender.send(part).await?;
+    }
     Ok(())
+}
+/// Publishes without waiting; what does not fit now is counted lost.
+pub(crate) fn try_publish(sender: &Publisher, parts: Vec<PublicPart>) {
+    let mut unsent = Unsent {
+        loss: &sender.loss,
+        parts: segments(parts).into_iter(),
+    };
+    for part in unsent.parts.by_ref() {
+        if !sender.try_send(part) {
+            break;
+        }
+    }
 }
