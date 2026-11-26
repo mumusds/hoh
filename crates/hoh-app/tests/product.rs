@@ -7,6 +7,7 @@
 
 mod common;
 mod product_prompts;
+mod product_public_streams;
 mod steer_live;
 
 use hoh_app::host::{Host, HostConfig};
