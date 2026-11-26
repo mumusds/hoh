@@ -17,6 +17,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
 
+type PublicPort = (
+    Option<hoh_agents::public_stream::Receiver>,
+    hoh_agents::public_stream::Backpressure,
+);
+
 /// The product's executor: the agents of the roles through the host's registry.
 #[derive(Debug)]
 pub struct ProductExecutor {
@@ -29,6 +34,7 @@ pub struct ProductExecutor {
     graces: (Duration, Duration),
     /// The native cancel of each attempt whose turn runs.
     cancels: Arc<Mutex<BTreeMap<String, Arc<Notify>>>>,
+    public_streams: Mutex<BTreeMap<String, PublicPort>>,
     steers: Arc<Mutex<BTreeMap<String, tokio::sync::mpsc::Sender<hoh_agents::codex::Steer>>>>,
     /// A test's look at each attempt's gate key as it is drawn; the product has none.
     keys: Option<KeyHook>,
@@ -111,6 +117,7 @@ impl ProductExecutor {
             graces,
             cancels: Arc::default(),
             steers: Arc::default(),
+            public_streams: Mutex::default(),
             keys: None,
             observe: None,
             keeping: None,
@@ -1353,6 +1360,18 @@ impl Executor for ProductExecutor {
         if let (Prepared::Pi(turn), Some(inputs)) = (&mut prepared, skill_repack) {
             self.recheck_skills(work, &inputs, turn, &mut record)?;
         }
+        let mode = match &prepared {
+            Prepared::Claude(_) => hoh_agents::public_stream::Mode::Claude,
+            Prepared::Codex(_) => hoh_agents::public_stream::Mode::CodexAppServer,
+            Prepared::Pi(_) => hoh_agents::public_stream::Mode::Pi,
+        };
+        let (public, receiver) = hoh_agents::public_stream::channel(mode, &attempt.agent_version);
+        let pressure = public.backpressure();
+        match &mut prepared {
+            Prepared::Claude(t) => t.public = Some(public),
+            Prepared::Codex(t) => t.public = Some(public),
+            Prepared::Pi(t) => t.public = Some(public),
+        }
         let held = match &prepared {
             Prepared::Claude(turn) => hoh_agents::claude::start(&attempt, turn, &gate),
             Prepared::Codex(turn) => hoh_agents::codex::start(&attempt, turn, &gate),
@@ -1362,6 +1381,10 @@ impl Executor for ProductExecutor {
             let class = class_of_code(Some(&r.code));
             refused(&r.code, class, r.detail)
         })?;
+        self.public_streams
+            .lock()
+            .map_err(|_| Refusal::from("public stream registry poisoned".to_owned()))?
+            .insert(work.attempt_id.clone(), (Some(receiver), pressure));
         let id = work.attempt_id.clone();
         if let Some(sender) = held.steers.clone() {
             self.steers
@@ -1474,6 +1497,9 @@ impl Executor for ProductExecutor {
     fn stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             self.stopping.send_replace(true);
+            if let Ok(mut streams) = self.public_streams.lock() {
+                streams.clear();
+            }
             if let Ok(mut senders) = self.steers.lock() {
                 senders.clear();
             }
@@ -1535,6 +1561,26 @@ impl Executor for ProductExecutor {
         held.is_some()
     }
 
+    fn take_public_stream(&self, work: &Work) -> Option<hoh_agents::public_stream::Receiver> {
+        self.public_streams
+            .lock()
+            .ok()?
+            .get_mut(&work.attempt_id)?
+            .0
+            .take()
+    }
+    fn local_backpressure(&self, work: &Work) -> (Duration, bool) {
+        self.public_streams
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(&work.attempt_id).map(|(_, p)| p.snapshot()))
+            .unwrap_or((Duration::ZERO, false))
+    }
+    fn release_public_stream(&self, work: &Work) {
+        if let Ok(mut streams) = self.public_streams.lock() {
+            streams.remove(&work.attempt_id);
+        }
+    }
     fn output_bytes(&self, work: &Work) -> Option<u64> {
         output_bytes(&attempt_logs(&self.project, &work.attempt_id))
     }

@@ -37,6 +37,7 @@ pub(super) enum Change {
 #[derive(Debug, Clone)]
 pub(super) struct Watch {
     quiet: Duration,
+    paused: Duration,
     /// Its output's size at the last look that could tell: nothing before its gate opened.
     bytes: u64,
     /// When a look last saw its output grow (its gate's opening before any).
@@ -54,6 +55,7 @@ impl Watch {
     pub(super) fn new(quiet: Duration, at: Instant) -> Watch {
         Watch {
             quiet,
+            paused: Duration::ZERO,
             bytes: 0,
             output: at,
             active: at,
@@ -91,6 +93,27 @@ impl Watch {
             episode: self.episode + 1,
             since: at.saturating_duration_since(self.output),
         })
+    }
+
+    /// The local public-queue delay is separate from agent output and wall deadlines.
+    pub(super) fn look_with_backpressure(
+        &mut self,
+        at: Instant,
+        bytes: Option<u64>,
+        blocked: (Duration, bool),
+        tools: impl FnOnce() -> Tools,
+    ) -> Option<Change> {
+        let added = blocked.0.saturating_sub(self.paused);
+        self.paused = blocked.0;
+        self.output += added;
+        self.active += added;
+        if let Some(open) = self.open.as_mut() {
+            *open += added;
+        }
+        if blocked.1 {
+            return None;
+        }
+        self.look(at, bytes, tools)
     }
 
     /// `change`, found by the look at `at`, was recorded.
@@ -310,5 +333,38 @@ mod tests {
         );
         assert_eq!(w.look(t0 + s(75), None, unasked), None);
         assert_eq!(w.look(t0 + s(90), Some(0), unasked), None);
+    }
+}
+
+#[cfg(test)]
+mod public_backpressure_tests {
+    use super::*;
+    #[test]
+    fn test_011_05_backpressure_pauses_only_local_time_and_preserves_elapsed_quiet() {
+        let t = Instant::now();
+        let mut w = Watch::new(Duration::from_secs(60), t);
+        let look = |w: &mut Watch, second, paused, blocked| {
+            w.look_with_backpressure(
+                t + Duration::from_secs(second),
+                Some(0),
+                (Duration::from_secs(paused), blocked),
+                || Tools::Absent,
+            )
+        };
+        assert_eq!(look(&mut w, 40, 0, false), None);
+        assert_eq!(
+            look(&mut w, 140, 100, true),
+            None,
+            "DB_BUSY exceeds quiet but is local delay"
+        );
+        assert_eq!(
+            look(&mut w, 240, 200, false),
+            None,
+            "release must retain 40 seconds of quiet"
+        );
+        assert_eq!(look(&mut w, 259, 200, false), None);
+        assert!(
+            matches!(look(&mut w,260,200,false),Some(Change::Inactive{since,..}) if since==Duration::from_secs(60))
+        );
     }
 }

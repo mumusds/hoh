@@ -224,6 +224,15 @@ pub trait Executor: Send + Sync + std::fmt::Debug {
     /// How many bytes `work`'s turn has output so far, its stdout and stderr as kept raw, read on a blocking thread
     /// for the inactivity watchdog (docs/adr/ADR-022.md decision 19 item 3). The default cannot tell (`None`): its
     /// attempts are never found inactive.
+    /// Cumulative local normalization-queue delay and whether it is blocked now.
+    fn take_public_stream(&self, _work: &Work) -> Option<hoh_agents::public_stream::Receiver> {
+        None
+    }
+    fn release_public_stream(&self, _work: &Work) {}
+    fn local_backpressure(&self, _work: &Work) -> (Duration, bool) {
+        (Duration::ZERO, false)
+    }
+
     fn output_bytes(&self, _work: &Work) -> Option<u64> {
         None
     }
@@ -1263,9 +1272,10 @@ async fn inactivity(
     let (mut watch, change, at) = super::begun::spawn_blocking(move || {
         let at = Instant::now();
         let bytes = executor.output_bytes(&held);
-        let change = watch.look(at, bytes, || {
-            super::processes::tools(&root, leader, &held.marker())
-        });
+        let change =
+            watch.look_with_backpressure(at, bytes, executor.local_backpressure(&held), || {
+                super::processes::tools(&root, leader, &held.marker())
+            });
         (watch, change, at)
     })
     .await
@@ -1544,6 +1554,11 @@ async fn attempt(
             return Ok(());
         }
     };
+    let public = super::public_stream::Drain::start(
+        common.shared.clone(),
+        common.executor.clone(),
+        work.clone(),
+    );
     // What its turn runs as, kept while it is in flight, for its end (docs/adr/ADR-030.md decision 2).
     let ran = started.ran.clone();
     // Its whole identity: without it the gate stays shut (dropped below) and the agent never runs (M2T05R-100). Its
@@ -1710,6 +1725,9 @@ async fn attempt(
     // A failure whose provider said when its limit lifts waits for that as its Retry-After, counted by this clock from
     // the time it ended, so its task is due exactly then (REQ-042 behaviour 1, M2T07R-256).
     let mut outcome = outcome;
+    if let Some(reason) = public.finish().await {
+        outcome.observed.events.push(("public/gap".into(),"public.gap".into(),json!({"attempt_id":id,"role_epoch":work.assignment.role_epoch,"reason":reason,"complete":false})));
+    }
     if !outcome.success {
         outcome.class = outcome.class.with_reset(outcome.retry_at, ended);
     }
