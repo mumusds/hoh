@@ -1011,3 +1011,48 @@ Evidence under `.hoh-dev/self-tests/flk16/`: `ci-like-failure.log`, `strace-sing
 ### FLK-16: review
 
 Developer: agy 1.5.17 (gemini-4-neon-high), attempt `1a4d19e9-7a0e-4454-b8c8-2b9182768f9f`; test and record changes only. Review: fresh Grok 1.0.92 session `01a21624-960d-7782-bf3f-4674e70b6024` (attempt `0f958b6d-5a3f-4975-bc4e-a7e262e188e7`), FLK16-001..099, on `09377776`: **PASS**, no findings. The reviewer re-read the three strace logs (the second initial-frame `write` trapped by `TCOOFF`, zero `read(0)` before exit), checked the poll syscall numbers (x86_64 7/271, aarch64 73; other architectures do not compile, as with `in_write`), re-ran the M1T08R-19 sabotage (exit 101, `left: ""`) and both tests 5/5.
+
+## M4 low package 3 (tests, scans and check-script guards)
+
+Branch `task/M4-low3-tests-scans`, developer agy (Antigravity CLI, gemini-4-neon-high); nine items, one commit each
+(subjects "M4 low 3: <item> ..."): M3CX-700 (medium, `git_run_limited` drains stdout without a blocking reader thread),
+M4L1-002, M4L1-100/101 (machine-path scan over Rust, Python and shell with a justified allowlist), M3R-1001
+(`test_results.py --check-stdout` run by `cargo-tests.sh`, `recovery.sh`, `deployment.sh`, `tui-pty.sh`), M3R-1003,
+M3O-800 (TEST-029-03 strace fd-table audit), M3F-200, M3QA-004, M3QA-020. Self-test logs under the worktree's
+`.hoh-dev/self-tests/m4low3/` (self-test, not acceptance).
+
+### Round 1 findings and fix round
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| M4L3-001 / M4L3-100 | high (same defect, found by both reviewers) | Fixed ("M4L3-001 accept rustdoc merged-doctest summary line"): `--check-stdout` rejected rustdoc's `all doctests ran in <x>s; merged doctests compilation took <y>s`, so the real `unit` check failed on a correct run; the developer had verified the guard only against fake cargo output. Fixture is a real merged-doctest log. |
+| M4L3-101 | medium | Fixed ("M4L3-101 gate libtest failure windows on FAILED lines"): the skip windows after `failures:` and after the summary let leaked child output pass in an all-green log; windows now open only after a FAILED result line, with block-structure checks and canaries. |
+| M4L3-102 | low | Fixed: the strace fd-table audit copies the parent table on fork, vfork and clone without CLONE_FILES. |
+| M4L3-103 | low | Fixed: `machine_path_scan.py` catches `//home/<user>` and `../home`. |
+| M4L3-002 | low | Fixed: tautological `Bundle::current().version()` assertions removed from `test_047_02`. |
+| M4L3-003 | low | Fixed: the JoinError fault hook is asserted consumed after each exchange. |
+| M4L3-004 | low | Deferred (watch item): the exact retry count in the `Store::lasting` test is timing-derived; recorded for the M4 low backlog if it ever flakes. |
+| (fix round) | — | The mandated real check-script runs exposed one more audit defect: strace prints a space before `<unfinished ...>` on resumed syscalls; fixed ("M3O-800 strip strace separator space"). |
+
+The fix round ran the five real check scripts (`cargo-tests.sh unit`, `cargo-tests.sh integration`, `recovery.sh`,
+`tui-pty.sh`, `deployment.sh`) under the test slot with `HOH_EVIDENCE_DIR` unset and set: all exit 0; `pre-pr.sh` exit 0.
+
+### M4 low package 3: reviews
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `b6fd512a` | Claude Code 2.1.331, `1881bb3a-3f0b-4f3f-ac6c-25bac4d47f0e` (`b21cc190-3a89-4b7c-808e-5666ef3d237b`), M4L3-001..099: drain correctness, M4L1-002, assertion strength | FAIL: M4L3-001 high; lows 002..004 |
+| 1 | `b6fd512a` | Grok 1.0.92, `01a21770-cf4b-7531-a921-b9dfb710f5fc` (`b32ad302-6e6b-4f08-abf9-4c2584f4c56a`), M4L3-100..199: process lifetime and audits | FAIL: M4L3-100 high (= 001), M4L3-101 medium; lows 102, 103 |
+| 2 (fix diff) | `c65c9f2e` | Pi 1.6.1, `01a217f6-8325-727f-938d-c142a25af536` (`8f20c28a-04e9-4190-9efc-f7004bbe7547`), M4L3-200..299 | PASS: real scripts unit/integration/deployment exit 0 in the reviewer's copy; 8 accept / 20 reject canaries without a misjudgement; the pre-fix audit rejects the `<unfinished ...>` shape (red before green). Medium M4L3-200 and lows 201..206 below |
+
+Round 2 dispositions (round 2 passes under the owner's round cap: no critical/high, the medium handled):
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| M4L3-200 | medium | Deferred to the M4 low backlog by AC-029-03's observable behaviour: strace 6.19 usually prints the child's first syscalls before the parent's fork/clone return line, so the audit copies the parent fd table after the child's own dup2/execve/close and can overwrite them. Reaching a wrong verdict needs an fd passed outside the trace; the product does not do that, the candidate's own trace is unaffected and no legal connect is rejected. Fix direction (backlog): snapshot the parent table when the child pid first appears and do not overwrite on the return line; add the real ordering as a test vector. |
+| M4L3-201 | low | Backlog question: the audit accepts an `nl_pid=0` netlink connect on an fd inherited across fork/clone, wider than AC-029-03's literal wording; the Commander decides whether a refinement CR records it. |
+| M4L3-202 | low | Backlog: allow the rustdoc footer once only. |
+| M4L3-203 | low | Backlog (outside the fix diff): `results()` reads captured output of a failing test as result lines, so a failing check's per-test evidence can contain a forged PASS; the check itself still fails. |
+| M4L3-204 | low | Backlog (outside the fix diff): `--check-stdout` on a failing log can report a false leak; the scripts run it only after a zero exit. |
+| M4L3-205 | low | Backlog: `/var/home/<user>` and `/Users/<user>` prefixes in the machine-path scan. |
+| M4L3-206 | low | Watch item: `test_sigint` in the bundle self-test timed out once at load ~7 and passed twice on rerun; not related to this package. |
