@@ -13,7 +13,7 @@ fn test_008_02_existing_transaction_refusal_does_not_claim_or_perform_rollback()
     conn.execute_batch(
         "BEGIN; CREATE TABLE caller_owned(value); INSERT INTO caller_owned VALUES(7);",
     )?;
-    let error = migrate(&conn, MIGRATIONS).unwrap_err();
+    let error = migrate(&conn, &MIGRATIONS[..2]).unwrap_err();
     assert!(
         !conn.is_autocommit(),
         "the caller still owns its transaction"
@@ -35,7 +35,7 @@ fn test_008_02_existing_transaction_refusal_does_not_claim_or_perform_rollback()
 #[test]
 fn test_008_02_post_commit_cleanup_failure_does_not_claim_rollback() -> R {
     let conn = Connection::open_in_memory()?;
-    let committed = migrate(&conn, MIGRATIONS);
+    let committed = migrate(&conn, &MIGRATIONS[..2]);
     // Deterministic fault at the cleanup-result seam: a successful COMMIT cannot be undone by a failed restore.
     let error = combine_migration(
         committed,
@@ -112,7 +112,7 @@ fn fk_on(conn: &Connection) -> R {
 fn test_008_02_v1_to_v2_preserves_every_original_column_and_row() -> R {
     let conn = populated()?;
     let before = snapshot(&conn)?;
-    assert_eq!(migrate(&conn, MIGRATIONS)?, 2);
+    assert_eq!(migrate(&conn, &MIGRATIONS[..2])?, 2);
     let after = snapshot(&conn)?;
     for (table, (columns, rows)) in &before {
         let (next_columns, next_rows) = &after[table];
@@ -217,7 +217,7 @@ fn test_008_02_mid_rebuild_and_fk_check_failures_roll_back_to_v1() -> R {
 #[test]
 fn test_008_02_sql_draft_constraints_keep_historical_null() -> R {
     let conn = Connection::open_in_memory()?;
-    assert_eq!(migrate(&conn, MIGRATIONS)?, 2);
+    assert_eq!(migrate(&conn, &MIGRATIONS[..2])?, 2);
     conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/repo','now'); INSERT INTO runs(run_id,project_id,state,mode,created_at) VALUES('r','p','SPECIFYING','PLAN','now');")?;
     let insert = "INSERT INTO tasks(task_id,run_id,spec_id,state,role,writer,created_seq,kind) VALUES(?1,'r',?2,'READY','cto',?3,1,?4)";
     for (kind, writer) in [("work", 1), ("spec_draft", 0)] {
@@ -303,10 +303,10 @@ fn test_008_02_commit_failure_and_busy_begin_restore_foreign_keys() -> R {
     fk_on(&writer)?;
     reader.execute_batch("ROLLBACK; BEGIN IMMEDIATE;")?;
     writer.pragma_update(None, "foreign_keys", false)?;
-    assert!(migrate(&writer, MIGRATIONS).is_err());
+    assert!(migrate(&writer, &MIGRATIONS[..2]).is_err());
     fk_on(&writer)?;
     reader.execute_batch("ROLLBACK")?;
-    assert_eq!(migrate(&writer, MIGRATIONS)?, 2);
+    assert_eq!(migrate(&writer, &MIGRATIONS[..2])?, 2);
     fk_on(&writer)
 }
 
@@ -394,7 +394,7 @@ fn test_008_02_kill_during_migration_002_rolls_back_to_version_1() -> R {
     if std::env::var_os("HOH_M3L01_CRASH").is_some() {
         let path = std::env::var("HOH_M3L01_CRASH_DB")?;
         let conn = Connection::open(path)?;
-        let outcome = migrate(&conn, MIGRATIONS);
+        let outcome = migrate(&conn, &MIGRATIONS[..2]);
         eprintln!("migration finished without a crash: {outcome:?}");
         std::process::exit(2);
     }
@@ -447,7 +447,7 @@ fn test_008_02_kill_during_migration_002_rolls_back_to_version_1() -> R {
         conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))?,
         "ok"
     );
-    assert_eq!(migrate(&conn, MIGRATIONS)?, 2);
+    assert_eq!(migrate(&conn, &MIGRATIONS[..2])?, 2);
     assert_eq!(
         conn.query_row("SELECT kind FROM tasks WHERE task_id='t'", [], |r| r
             .get::<_, String>(0))?,
@@ -459,6 +459,127 @@ fn test_008_02_kill_during_migration_002_rolls_back_to_version_1() -> R {
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
             r.get::<_, i64>(0)
         })?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn test_013_05_migration_001_002_003_reopen_empty_indexes_and_foreign_keys() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("observability.db");
+    {
+        let conn = Connection::open(&path)?;
+        migrate(&conn, &MIGRATIONS[..1])?;
+        assert_eq!(user_version(&conn)?, 1);
+        migrate(&conn, &MIGRATIONS[..2])?;
+        assert_eq!(user_version(&conn)?, 2);
+        assert_eq!(migrate(&conn, MIGRATIONS)?, 3);
+        for table in [
+            "ui_index_generations",
+            "ui_iteration_ranges",
+            "ui_event_index",
+            "public_segments",
+            "public_native_parts",
+            "public_input_blocks",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+        }
+        fk_on(&conn)?;
+    }
+    let conn = Connection::open(&path)?;
+    assert_eq!(migrate(&conn, MIGRATIONS)?, 3);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
+            .get::<_, i64>(0))?,
+        3
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))?,
+        0
+    );
+    assert!(matches!(
+        migrate(&conn, &MIGRATIONS[..2]),
+        Err(PersistError::SchemaTooNew {
+            found: 3,
+            supported: 2
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_011_05_segment_occurrences_reuse_artifacts_and_replay_after_upgrade() -> R {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("segments.db");
+    {
+        let conn = Connection::open(&path)?;
+        migrate(&conn, &MIGRATIONS[..1])?;
+        conn.execute_batch("INSERT INTO projects(project_id,repo_path,created_at) VALUES('p','/project','now');
+            INSERT INTO specs VALUES('s','p',printf('%064d',1),1);
+            INSERT INTO runs(run_id,project_id,spec_id,state,mode,created_at) VALUES('r','p','s','RUNNING','AUTO','now');
+            INSERT INTO tasks(task_id,run_id,spec_id,state,role,created_seq) VALUES('t','r','s','RUNNING','developer',1);
+            INSERT INTO attempts(attempt_id,task_id,state,role_epoch,host_epoch,config_revision) VALUES('a','t','RUNNING',1,1,1);
+            INSERT INTO input_queue VALUES('i1','r','STEER','developer','QUEUED','{}');
+            INSERT INTO input_queue VALUES('i2','r','STEER','developer','QUEUED','{}');
+            INSERT INTO events(project_id,event_id,run_id,kind,payload_json,created_at) VALUES('p','e','r','public.message','{}','now');
+            INSERT INTO artifacts VALUES('object',printf('%064d',2),'objects/body',4,'text/plain');")?;
+        assert_eq!(migrate(&conn, MIGRATIONS)?, 3);
+        for (block, input, offset) in [("b1", "i1", 0), ("b2", "i2", 0), ("b1", "i1", 4)] {
+            conn.execute("INSERT INTO public_segments VALUES('object','a',?1,?2,'text',?3,4,printf('%064d',2),1,1)",rusqlite::params![input,block,offset])?;
+        }
+        for (input, block) in [("i1", "b1"), ("i2", "b2")] {
+            conn.execute(
+                "INSERT INTO public_input_blocks VALUES(?1,?2,1)",
+                rusqlite::params![input, block],
+            )?;
+        }
+        conn.execute_batch(
+            "INSERT INTO public_native_parts VALUES('a','stdout','native',0,'b1',0,1)",
+        )?;
+    }
+    let conn = Connection::open(&path)?;
+    assert_eq!(migrate(&conn, MIGRATIONS)?, 3);
+    assert_eq!(conn.execute("INSERT OR IGNORE INTO public_segments VALUES('object','a','i1','b1','text',0,4,printf('%064d',2),1,1)",[])?,0);
+    assert_eq!(
+        conn.execute(
+            "INSERT OR IGNORE INTO public_native_parts VALUES('a','stdout','native',0,'b1',0,1)",
+            []
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.execute(
+            "INSERT OR IGNORE INTO public_input_blocks VALUES('i1','b1',1)",
+            []
+        )?,
+        0
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM public_segments", [], |r| r
+            .get::<_, i64>(0))?,
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(DISTINCT artifact_id) FROM public_segments",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))?,
         0
     );
     Ok(())

@@ -676,6 +676,25 @@ fn apply_input(
         ctx,
     )?;
     let seq = done.event_seqs[0];
+    // The public copy follows the already selected question without changing input routing.
+    let public_target = if let Some((question_id, _, _)) = &answer {
+        let question = super::questions::open(tx, &command.run_id)?
+            .into_iter()
+            .find(|q| q.question_id == *question_id);
+        question
+            .and_then(|q| q.task_id)
+            .map(|task| {
+                tx.query_row(
+                    "SELECT role FROM tasks WHERE task_id=?1 AND run_id=?2",
+                    params![task, command.run_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(sqlite_error)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if let Some((question_id, answer, choice_id)) = answer {
         super::questions::answer(
             tx,
@@ -710,6 +729,19 @@ fn apply_input(
                 ctx,
             )?;
         }
+    }
+    if let Input::Send {
+        text, target_role, ..
+    } = input
+    {
+        super::public::accepted(
+            tx,
+            &command.run_id,
+            &input_id,
+            text,
+            target_role.as_deref().or(public_target.as_deref()),
+            ctx,
+        )?;
     }
     // The stopped-state command's result has its new revision; working ASK emits none.
     if publish_result {

@@ -600,6 +600,12 @@ fn approval_refused(reason: &str) -> Response {
 /// database is 503 and retryable; the database's own text never reaches the client.
 async fn store_error(shared: &Arc<Shared>, run_id: &str, e: PersistError) -> Response {
     match e {
+        PersistError::StorageLowSpace{available_bytes,required_bytes,min_free_bytes} => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"code":"STORAGE_LOW_SPACE","message":"input not accepted: storage space is insufficient",
+                "retryable":false,"current_revision":current_revision(shared,run_id).await,
+                "details":{"reason":"STORAGE_LOW_SPACE","available_bytes":available_bytes,"required_bytes":required_bytes,"min_free_bytes":min_free_bytes}}))
+        ).into_response(),
         PersistError::SpecApprovalNotUser(reason) => approval_refused(reason),
         PersistError::SpecConflict(details) => (
             StatusCode::CONFLICT,

@@ -603,6 +603,7 @@ async fn the_lists_give_each_candidates_projection_newest_first_and_each_issues_
     // M2T18R-53: candidates without a `candidate.frozen` (imported or older data) share the freeze seq 0; the cursor
     // still names one item, so paging one by one gives every item once.
     drop(reader);
+    Connection::open(&path)?.execute("DELETE FROM ui_event_index WHERE seq IN (SELECT seq FROM events WHERE kind = 'candidate.frozen')", [])?;
     Connection::open(&path)?.execute("DELETE FROM events WHERE kind = 'candidate.frozen'", [])?;
     let reader = store.reader()?;
     let whole = reader.acceptance_page("R", 500, None)?.ok_or("no run R")?;

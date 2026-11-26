@@ -539,7 +539,7 @@ async fn a_grant_records_the_whole_identity_and_ends_a_vacancy_only() -> R {
         )?;
         exec(
             &path,
-            "DELETE FROM events WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.role') = 'reviewer';",
+            "DELETE FROM ui_event_index WHERE seq IN (SELECT seq FROM events WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.role') = 'reviewer'); DELETE FROM events WHERE kind = 'team.session_bound' AND json_extract(payload_json, '$.role') = 'reviewer';",
         )?;
         assert!(
             store

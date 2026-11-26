@@ -1219,7 +1219,7 @@ fn migration_a_database_of_a_newer_binary_is_refused_with_78_naming_both_version
         assert_eq!(out.status.code(), Some(78), "{}", text(&out));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("database schema version 7 is newer than this binary supports (2)"),
+            stderr.contains("database schema version 7 is newer than this binary supports (3)"),
             "{stderr}"
         );
         assert_eq!(project.dump()?, before);

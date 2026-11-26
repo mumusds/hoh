@@ -207,6 +207,45 @@ pub(crate) fn put_io(project: &Path, bytes: &[u8]) -> std::io::Result<String> {
     put_with(project, bytes, &|dir| std::fs::File::open(dir)?.sync_all())
 }
 
+/// Public segments are sealed before their ArtifactRef is committed (CR-028): fsync, rename, directory fsync.
+pub(crate) fn put_public_io(project: &Path, bytes: &[u8]) -> std::io::Result<String> {
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+    let sha256 = sha256_hex(bytes);
+    let path = object_path(project, &sha256).map_err(std::io::Error::other)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no object directory"))?;
+    state_dir(project)?;
+    std::fs::create_dir_all(dir)?;
+    if !holds(&path, &sha256).unwrap_or(false) {
+        let staged = dir.join(format!(
+            ".public-{}-{}-{}",
+            sha256,
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::File::create_new(&staged)?;
+        let sealed = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&staged, &path)
+        })();
+        // This exact path was created above. No other temporary object is removed.
+        if sealed.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        sealed?;
+    }
+    let top = project.join(".hoh");
+    let mut at = Some(dir);
+    while let Some(d) = at {
+        std::fs::File::open(d)?.sync_all()?;
+        at = if d == top { None } else { d.parent() };
+    }
+    Ok(sha256)
+}
+
 fn io_at(path: &Path, error: std::io::Error) -> std::io::Error {
     std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }

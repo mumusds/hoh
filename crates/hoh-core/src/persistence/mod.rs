@@ -44,9 +44,12 @@ pub mod need;
 mod outbox;
 mod outputs;
 mod plan;
+mod public;
 pub mod questions;
 mod readiness;
+mod ui;
 pub use readiness::SpecQuestion;
+pub use ui::{UiIdentity, UiIndexStatus};
 mod reconcile;
 mod recovery;
 mod reports;
@@ -187,6 +190,11 @@ impl Options {
 /// [`NoFaults`], does nothing; the implementations that make faults are test code, passed in process through
 /// [`Options::faults`]. No product entry point passes another, and no environment variable, argument or file does.
 pub trait FaultHooks: Send + Sync + std::fmt::Debug {
+    /// Override the public-object capacity probe in fault tests only.
+    fn public_available_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Before a write transaction commits: an error fails the commit with it, and the transaction rolls back.
     fn before_commit(&self) -> Result<(), PersistError> {
         Ok(())
@@ -334,6 +342,12 @@ pub enum PersistError {
     /// The database's file system is full or over quota, so the transaction could not commit (`DB_FULL`,
     /// retryable); nothing was written.
     Full(String),
+    /// A public object cannot leave the required free-space reserve; input was not accepted.
+    StorageLowSpace {
+        available_bytes: u64,
+        required_bytes: u64,
+        min_free_bytes: u64,
+    },
     /// The idempotency key was accepted before with another payload (`KEY_REUSE`); nothing was written.
     KeyReuse(String),
     /// A change or removal of a row of an append-only table (`acceptance_results`, `evidence`) was refused by the
@@ -388,6 +402,7 @@ impl PersistError {
             PersistError::WalUnsupported { .. } => Some(ErrorCode::DbWalUnsupported),
             PersistError::Busy(_) => Some(ErrorCode::DbBusy),
             PersistError::Full(_) => Some(ErrorCode::DbFull),
+            PersistError::StorageLowSpace { .. } => Some(ErrorCode::StorageLowSpace),
             PersistError::RunNotFound(_) => Some(ErrorCode::RunNotFound),
             PersistError::SpecApprovalNotUser(_) => Some(ErrorCode::SpecApprovalNotUser),
             PersistError::SpecConflict(_) => Some(ErrorCode::SpecConflict),
@@ -509,6 +524,14 @@ impl std::fmt::Display for PersistError {
             PersistError::Unsupported(kind) => write!(f, "{kind} decisions are not applied yet"),
             PersistError::Busy(detail) => write!(f, "DB_BUSY: {detail}"),
             PersistError::Full(detail) => write!(f, "DB_FULL: {detail}"),
+            PersistError::StorageLowSpace {
+                available_bytes,
+                required_bytes,
+                min_free_bytes,
+            } => write!(
+                f,
+                "STORAGE_LOW_SPACE: available={available_bytes}, required={required_bytes}, reserve={min_free_bytes}"
+            ),
             PersistError::KeyReuse(key) => write!(
                 f,
                 "KEY_REUSE: idempotency key {key} was accepted with another payload"
@@ -749,6 +772,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         2,
         include_str!("../../../../contracts/sql/002_spec_drafting.sql"),
+    ),
+    (
+        3,
+        include_str!("../../../../contracts/sql/003_ui_observability.sql"),
     ),
 ];
 
@@ -1166,6 +1193,21 @@ impl Store {
     }
 
     /// Commit `commit` in one IMMEDIATE transaction on the writer: all of it or nothing.
+    pub async fn record_public(
+        &self,
+        attempt: &str,
+        epoch: i64,
+        part: crate::public_output::PublicPart,
+    ) -> Result<Option<i64>, PersistError> {
+        self.writer
+            .record_public(attempt.to_owned(), epoch, part)
+            .await
+    }
+
+    pub async fn ui_backfill(&self) -> Result<UiIndexStatus, PersistError> {
+        self.writer.ui_backfill().await
+    }
+
     pub async fn commit(&self, commit: Commit) -> Result<Committed, PersistError> {
         self.writer.commit(commit).await
     }
@@ -2936,6 +2978,19 @@ impl Reader {
     /// At most `limit` events after seq `after`, in order.
     pub fn events_after(&self, after: i64, limit: usize) -> Result<Vec<EventRow>, PersistError> {
         commands::events_after(&self.conn, after, limit)
+    }
+
+    /// Event identities at the specified committed watermark (CR-028 section 2.1).
+    pub fn ui_index_status(&self) -> Result<UiIndexStatus, PersistError> {
+        ui::status(&self.conn)
+    }
+
+    pub fn ui_identities(
+        &self,
+        run: &str,
+        watermark: i64,
+    ) -> Result<Vec<UiIdentity>, PersistError> {
+        ui::at(&self.conn, run, watermark)
     }
 
     /// The highest event seq.
