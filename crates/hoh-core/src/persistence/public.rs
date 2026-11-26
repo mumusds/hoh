@@ -111,6 +111,12 @@ pub(super) fn native(
         &format!("public/{}/{}", part.native_stream, part.block_key),
     );
     let mut payload = json!({"block_id":block,"attempt_id":attempt,"run_id":run,"task_id":task,"role":role,"role_epoch":epoch,"session_id":session,"config_revision":revision,"spec_id":spec,"native_stream":part.native_stream,"native_item_id":part.native_item_id,"received_offset":part.received_offset,"part":part.part,"stream":part.stream,"first_offset":part.first_offset,"speaker":part.speaker,"name":part.name,"activity":part.activity,"model":part.model,"usage":part.usage,"redacted":part.redacted,"complete":part.complete,"current":current,"sha256":digest(&part.text)});
+    if let Some(frame_kind) = &part.frame_kind {
+        payload["frame_kind"] = json!(frame_kind);
+    }
+    if let Some(count) = part.count {
+        payload["count"] = json!(count);
+    }
     let segments = body(&tx, &part.text, &mut payload, ctx, true)?;
     let event_id = child_id(
         attempt,

@@ -23,6 +23,8 @@ fn message(id: &str, offset: u64, part: u64) -> PublicPart {
         usage: None,
         redacted: false,
         complete: false,
+        frame_kind: None,
+        count: None,
     }
 }
 #[tokio::test]

@@ -31,25 +31,67 @@ impl Mode {
         }
     }
 }
+/// Maximum time and raw byte size for coalescing consecutive streaming text deltas (CR-028 §2.2).
+pub const COALESCE_WINDOW: Duration = Duration::from_millis(50);
+pub const COALESCE_BYTES: usize = 16 << 10;
+
+#[derive(Debug, Default)]
+struct TextStreamState {
+    raw_accumulated: String,
+    raw_line: String,
+    line_redacted: bool,
+    pub_offset: u64,
+    any_redacted: bool,
+}
+
+#[derive(Debug)]
+struct CoalescedText {
+    native_item_id: String,
+    block_key: String,
+    received_offset: u64,
+    part: u64,
+    model: Option<String>,
+    raw_text: String,
+    started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct UnmappedSummary {
+    last_offset: u64,
+    count: u64,
+    emitted: u64,
+}
+
 #[derive(Debug)]
 pub struct Normalizer {
     mode: Mode,
     version: String,
-    offsets: BTreeMap<String, u64>,
+    streams: BTreeMap<String, TextStreamState>,
     pi_message: Option<String>,
     received: Option<u64>,
     native_seen: BTreeSet<String>,
+    coalescing: bool,
+    pending_text: Option<CoalescedText>,
+    unmapped: BTreeMap<(String, String), UnmappedSummary>,
 }
 impl Normalizer {
     pub fn new(mode: Mode, version: &str) -> Self {
         Self {
             mode,
             version: version.into(),
-            offsets: BTreeMap::new(),
+            streams: BTreeMap::new(),
             pi_message: None,
             received: None,
             native_seen: BTreeSet::new(),
+            coalescing: false,
+            pending_text: None,
+            unmapped: BTreeMap::new(),
         }
+    }
+    pub fn new_coalescing(mode: Mode, version: &str) -> Self {
+        let mut n = Self::new(mode, version);
+        n.coalescing = true;
+        n
     }
     fn part(
         &self,
@@ -60,6 +102,17 @@ impl Normalizer {
         text: String,
     ) -> PublicPart {
         let (text, redacted) = redact(&text);
+        self.part_already_redacted(id, block, offset, kind, text, redacted)
+    }
+    fn part_already_redacted(
+        &self,
+        id: String,
+        block: String,
+        offset: u64,
+        kind: PublicKind,
+        text: String,
+        redacted: bool,
+    ) -> PublicPart {
         PublicPart {
             native_stream: self.mode.name().into(),
             native_item_id: id,
@@ -77,33 +130,229 @@ impl Normalizer {
             usage: None,
             redacted,
             complete: false,
+            frame_kind: None,
+            count: None,
         }
     }
-    fn text(
+    /// Complete non-delta text block (e.g. Claude assistant content block): never slices from another block's offset.
+    fn complete_text(&self, id: String, block: String, offset: u64, text: &str) -> PublicPart {
+        let mut p = self.part(id, block, offset, PublicKind::Message, text.into());
+        p.first_offset = 0;
+        p.complete = true;
+        p
+    }
+    fn emit_stream_chunk(
         &mut self,
         id: String,
         block: String,
         offset: u64,
-        text: &str,
-        final_snapshot: bool,
+        part: u64,
+        model: Option<String>,
+        raw_chunk: &str,
+        complete: bool,
     ) -> PublicPart {
-        let (clean, redacted) = redact(text);
-        let text = clean.as_str();
-        let previous = *self.offsets.get(&block).unwrap_or(&0);
-        let body = if final_snapshot {
-            text.get(usize::try_from(previous).unwrap_or(usize::MAX)..)
-                .unwrap_or("")
-        } else {
-            text
-        };
-        let mut p = self.part(id, block.clone(), offset, PublicKind::Message, body.into());
-        p.redacted |= redacted;
-        p.first_offset = previous;
-        p.complete = final_snapshot;
-        self.offsets.insert(block, previous + p.text.len() as u64);
+        let state = self.streams.entry(block.clone()).or_default();
+        let (clean, changed) = redact_streaming_chunk(state, raw_chunk);
+        let first_offset = state.pub_offset;
+        state.pub_offset += clean.len() as u64;
+        let redacted = changed || (complete && state.any_redacted);
+        let mut p =
+            self.part_already_redacted(id, block, offset, PublicKind::Message, clean, redacted);
+        p.part = part;
+        p.model = model;
+        p.first_offset = first_offset;
+        p.complete = complete;
         p
     }
+    fn flush_pending_text(&mut self, out: &mut Vec<PublicPart>) {
+        if let Some(pending) = self.pending_text.take() {
+            out.push(self.emit_stream_chunk(
+                pending.native_item_id,
+                pending.block_key,
+                pending.received_offset,
+                pending.part,
+                pending.model,
+                &pending.raw_text,
+                false,
+            ));
+        }
+    }
+    fn push_delta(
+        &mut self,
+        id: String,
+        block: String,
+        offset: u64,
+        delta: &str,
+        now: Instant,
+        out: &mut Vec<PublicPart>,
+    ) {
+        if !self.coalescing {
+            out.push(self.emit_stream_chunk(id, block, offset, 0, None, delta, false));
+            return;
+        }
+        if self
+            .pending_text
+            .as_ref()
+            .is_some_and(|p| p.block_key != block)
+        {
+            self.flush_pending_text(out);
+        }
+        let pending = self.pending_text.get_or_insert_with(|| CoalescedText {
+            native_item_id: id,
+            block_key: block,
+            received_offset: offset,
+            part: 0,
+            model: None,
+            raw_text: String::new(),
+            started_at: now,
+        });
+        pending.raw_text.push_str(delta);
+        if pending.raw_text.len() >= COALESCE_BYTES
+            || now.saturating_duration_since(pending.started_at) >= COALESCE_WINDOW
+        {
+            self.flush_pending_text(out);
+        }
+    }
+    fn finish_stream_text(
+        &mut self,
+        id: String,
+        block: String,
+        offset: u64,
+        part: u64,
+        model: Option<String>,
+        final_text: &str,
+        out: &mut Vec<PublicPart>,
+    ) {
+        if self
+            .pending_text
+            .as_ref()
+            .is_some_and(|p| p.block_key != block)
+        {
+            self.flush_pending_text(out);
+        }
+        if let Some(mut pending) = self.pending_text.take() {
+            let committed_len = self
+                .streams
+                .get(&block)
+                .map_or(0, |s| s.raw_accumulated.len());
+            let prefix_len = committed_len + pending.raw_text.len();
+            if final_text.len() > prefix_len
+                && final_text.is_char_boundary(committed_len)
+                && final_text.is_char_boundary(prefix_len)
+                && &final_text[..committed_len]
+                    == self
+                        .streams
+                        .get(&block)
+                        .map_or("", |s| s.raw_accumulated.as_str())
+                && &final_text[committed_len..prefix_len] == pending.raw_text
+            {
+                pending.raw_text.push_str(&final_text[prefix_len..]);
+            }
+            let model = model.or(pending.model);
+            out.push(self.emit_stream_chunk(
+                pending.native_item_id,
+                pending.block_key,
+                pending.received_offset,
+                part,
+                model,
+                &pending.raw_text,
+                true,
+            ));
+            return;
+        }
+        let remaining = match self.streams.get(&block) {
+            Some(state) if !state.raw_accumulated.is_empty() => final_text
+                .strip_prefix(&state.raw_accumulated)
+                .unwrap_or(""),
+            _ => final_text,
+        };
+        out.push(self.emit_stream_chunk(id, block, offset, part, model, remaining, true));
+    }
+    pub fn next_flush_deadline(&self) -> Option<Instant> {
+        self.pending_text
+            .as_ref()
+            .map(|p| p.started_at + COALESCE_WINDOW)
+    }
+    pub fn flush_due(&mut self, now: Instant) -> Vec<PublicPart> {
+        let mut out = Vec::new();
+        if self
+            .pending_text
+            .as_ref()
+            .is_some_and(|p| now.saturating_duration_since(p.started_at) >= COALESCE_WINDOW)
+        {
+            self.flush_pending_text(&mut out);
+        }
+        out
+    }
+    pub fn flush_text(&mut self) -> Vec<PublicPart> {
+        let mut out = Vec::new();
+        self.flush_pending_text(&mut out);
+        out
+    }
+    pub fn flush(&mut self) -> Vec<PublicPart> {
+        let mut out = Vec::new();
+        self.flush_pending_text(&mut out);
+        let keys: Vec<(String, String)> = self
+            .unmapped
+            .iter()
+            .filter(|(_, s)| s.count > s.emitted)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for (activity, kind) in keys {
+            if let Some(summary) = self.unmapped.get_mut(&(activity.clone(), kind.clone())) {
+                let count = summary.count;
+                let offset = summary.last_offset;
+                summary.emitted = count;
+                let mut p = self.part_already_redacted(
+                    format!("diagnostic/{activity}/{kind}/summary/{count}"),
+                    format!("diagnostic/{activity}/{kind}"),
+                    offset,
+                    PublicKind::Diagnostic,
+                    String::new(),
+                    false,
+                );
+                p.activity = Some(activity);
+                p.frame_kind = Some(kind);
+                p.count = Some(count);
+                p.complete = true;
+                out.push(p);
+            }
+        }
+        out
+    }
+    fn record_unmapped(&mut self, activity: &str, frame: &Value, offset: u64) -> Vec<PublicPart> {
+        let kind = frame_kind(self.mode, frame);
+        let entry = self
+            .unmapped
+            .entry((activity.into(), kind.clone()))
+            .or_default();
+        entry.count += 1;
+        entry.last_offset = offset;
+        if entry.count == 1 {
+            entry.emitted = 1;
+            let mut out = Vec::new();
+            self.flush_pending_text(&mut out);
+            let mut p = self.part_already_redacted(
+                format!("diagnostic/{activity}/{kind}/first"),
+                format!("diagnostic/{activity}/{kind}"),
+                offset,
+                PublicKind::Diagnostic,
+                String::new(),
+                false,
+            );
+            p.activity = Some(activity.into());
+            p.frame_kind = Some(kind);
+            p.count = Some(1);
+            out.push(p);
+            out
+        } else {
+            Vec::new()
+        }
+    }
     pub fn feed(&mut self, frame: &Value, offset: u64) -> Vec<PublicPart> {
+        self.feed_at(frame, offset, Instant::now())
+    }
+    pub fn feed_at(&mut self, frame: &Value, offset: u64, now: Instant) -> Vec<PublicPart> {
         if self.received.is_some_and(|last| offset <= last) {
             return Vec::new();
         }
@@ -131,21 +380,14 @@ impl Normalizer {
             return Vec::new();
         }
         if !self.mode.supports(&self.version) {
-            let mut p = self.part(
-                format!("unsupported/{offset}"),
-                format!("unsupported/{offset}"),
-                offset,
-                PublicKind::Diagnostic,
-                String::new(),
-            );
-            p.activity = Some("unsupported_native_version".into());
-            return vec![p];
+            return self.record_unmapped("unsupported_native_version", frame, offset);
         }
+        let mut handled = false;
         let mut parts = match self.mode {
-            Mode::Claude => self.claude(frame, offset),
-            Mode::CodexAppServer => self.codex(frame, offset, true),
-            Mode::CodexExec => self.codex(frame, offset, false),
-            Mode::Pi => self.pi(frame, offset),
+            Mode::Claude => self.claude(frame, offset, &mut handled),
+            Mode::CodexAppServer => self.codex(frame, offset, true, now, &mut handled),
+            Mode::CodexExec => self.codex(frame, offset, false, now, &mut handled),
+            Mode::Pi => self.pi(frame, offset, now, &mut handled),
         };
         let error = match self.mode {
             Mode::Claude if frame["type"] == "result" && frame["is_error"] == true => {
@@ -172,6 +414,8 @@ impl Normalizer {
             _ => None,
         };
         if let Some(error) = error.filter(|text| !text.is_empty()) {
+            handled = true;
+            self.flush_pending_text(&mut parts);
             let mut part = self.part(
                 format!("error/{offset}"),
                 format!("error/{offset}"),
@@ -183,21 +427,13 @@ impl Normalizer {
             part.complete = true;
             parts.push(part);
         }
-        if parts.is_empty() {
-            let mut p = self.part(
-                format!("diagnostic/{offset}"),
-                format!("diagnostic/{offset}"),
-                offset,
-                PublicKind::Diagnostic,
-                String::new(),
-            );
-            p.activity = Some("private_or_unmapped_native_frame".into());
-            vec![p]
+        if !handled && parts.is_empty() {
+            self.record_unmapped("private_or_unmapped_native_frame", frame, offset)
         } else {
             parts
         }
     }
-    fn claude(&mut self, f: &Value, offset: u64) -> Vec<PublicPart> {
+    fn claude(&mut self, f: &Value, offset: u64, handled: &mut bool) -> Vec<PublicPart> {
         let kind = f["type"].as_str().unwrap_or("");
         let id = f["uuid"]
             .as_str()
@@ -209,17 +445,23 @@ impl Normalizer {
             if let Some(parts) = m["content"].as_array() {
                 for (i, c) in parts.iter().enumerate() {
                     let mut p = match (kind, c["type"].as_str().unwrap_or("")) {
-                        ("assistant", "text") => self.text(
-                            id.clone(),
-                            format!("message/{}/text/{i}", m["id"].as_str().unwrap_or(&id)),
-                            offset,
-                            c["text"].as_str().unwrap_or(""),
-                            true,
-                        ),
+                        ("assistant", "text") => {
+                            self.flush_pending_text(&mut out);
+                            self.complete_text(
+                                id.clone(),
+                                format!(
+                                    "message/{}/{id}/text/{i}",
+                                    m["id"].as_str().unwrap_or(&id)
+                                ),
+                                offset,
+                                c["text"].as_str().unwrap_or(""),
+                            )
+                        }
                         ("assistant", "tool_use") => {
                             let Some(call) = c["id"].as_str() else {
                                 continue;
                             };
+                            self.flush_pending_text(&mut out);
                             let mut p = self.part(
                                 id.clone(),
                                 format!("tool/{call}"),
@@ -235,6 +477,7 @@ impl Normalizer {
                             let Some(call) = c["tool_use_id"].as_str() else {
                                 continue;
                             };
+                            self.flush_pending_text(&mut out);
                             let mut p = self.part(
                                 id.clone(),
                                 format!("tool/{call}"),
@@ -253,10 +496,12 @@ impl Normalizer {
                     };
                     p.part = i as u64;
                     p.model = public_name(&m["model"]);
+                    *handled = true;
                     out.push(p);
                 }
             }
         } else if kind == "result" {
+            self.flush_pending_text(&mut out);
             let mut p = self.part(id.clone(), id, offset, PublicKind::Activity, String::new());
             p.activity = Some("usage".into());
             p.usage = Some(usage(&f["usage"], false));
@@ -276,15 +521,25 @@ impl Normalizer {
                 }
             }
             p.complete = true;
+            *handled = true;
             out.push(p);
         } else if kind == "system" && f["subtype"] == "compact_boundary" {
+            self.flush_pending_text(&mut out);
             let mut p = self.part(id.clone(), id, offset, PublicKind::Activity, String::new());
             p.activity = Some("compaction_completed".into());
+            *handled = true;
             out.push(p);
         }
         out
     }
-    fn codex(&mut self, f: &Value, offset: u64, app: bool) -> Vec<PublicPart> {
+    fn codex(
+        &mut self,
+        f: &Value,
+        offset: u64,
+        app: bool,
+        now: Instant,
+        handled: &mut bool,
+    ) -> Vec<PublicPart> {
         let method = f[if app { "method" } else { "type" }]
             .as_str()
             .unwrap_or("");
@@ -301,14 +556,20 @@ impl Normalizer {
             let done = matches!(method, "item/completed" | "item.completed");
             let key = format!("{method}/{id}");
             match item["type"].as_str().unwrap_or("") {
-                "agentMessage" | "agent_message" if done => out.push(self.text(
-                    key,
-                    format!("message/{id}"),
-                    offset,
-                    item["text"].as_str().unwrap_or(""),
-                    true,
-                )),
+                "agentMessage" | "agent_message" if done => {
+                    *handled = true;
+                    self.finish_stream_text(
+                        key,
+                        format!("message/{id}"),
+                        offset,
+                        0,
+                        None,
+                        item["text"].as_str().unwrap_or(""),
+                        &mut out,
+                    );
+                }
                 "commandExecution" | "command_execution" => {
+                    self.flush_pending_text(&mut out);
                     let text = if done {
                         item[if app {
                             "aggregatedOutput"
@@ -342,9 +603,11 @@ impl Normalizer {
                     {
                         p.activity = Some("tool_error".into());
                     }
+                    *handled = true;
                     out.push(p);
                 }
                 "collabAgentToolCall" | "mcpToolCall" | "dynamicToolCall" => {
+                    self.flush_pending_text(&mut out);
                     let body = if !done {
                         public_arguments(&item["arguments"])
                     } else if item["type"] == "mcpToolCall" {
@@ -381,9 +644,11 @@ impl Normalizer {
                     if item["type"] == "collabAgentToolCall" {
                         p.activity = Some("handoff".into());
                     }
+                    *handled = true;
                     out.push(p);
                 }
                 "contextCompaction" => {
+                    self.flush_pending_text(&mut out);
                     let mut p = self.part(
                         key,
                         format!("activity/{id}"),
@@ -399,11 +664,13 @@ impl Normalizer {
                         }
                         .into(),
                     );
+                    *handled = true;
                     out.push(p);
                 }
                 _ => {}
             }
         } else if app && method == "error" {
+            self.flush_pending_text(&mut out);
             let mut p = self.part(
                 format!("error/{offset}"),
                 format!("error/{offset}"),
@@ -412,18 +679,22 @@ impl Normalizer {
                 params["error"]["message"].as_str().unwrap_or("").into(),
             );
             p.activity = Some("error".into());
+            *handled = true;
             out.push(p);
         } else if app && method == "item/agentMessage/delta" {
             if let (Some(id), Some(delta)) = (params["itemId"].as_str(), params["delta"].as_str()) {
-                out.push(self.text(
+                *handled = true;
+                self.push_delta(
                     format!("delta/{id}/{offset}"),
                     format!("message/{id}"),
                     offset,
                     delta,
-                    false,
-                ));
+                    now,
+                    &mut out,
+                );
             }
         } else if method == "thread/tokenUsage/updated" || method == "turn.completed" {
+            self.flush_pending_text(&mut out);
             let v = if app {
                 &params["tokenUsage"]["total"]
             } else {
@@ -438,11 +709,12 @@ impl Normalizer {
             p.activity = Some("usage".into());
             p.usage = Some(u);
             p.complete = !app;
+            *handled = true;
             out.push(p);
         }
         out
     }
-    fn pi(&mut self, f: &Value, offset: u64) -> Vec<PublicPart> {
+    fn pi(&mut self, f: &Value, offset: u64, now: Instant, handled: &mut bool) -> Vec<PublicPart> {
         let kind = f["type"].as_str().unwrap_or("");
         let id = if kind == "message_update" {
             format!("receive/{offset}")
@@ -464,26 +736,35 @@ impl Normalizer {
                 self.pi_message.as_deref().unwrap_or(&id),
                 e["contentIndex"].as_u64().unwrap_or(0)
             );
-            out.push(self.text(id, block, offset, e["delta"].as_str().unwrap_or(""), false));
+            *handled = true;
+            self.push_delta(
+                id,
+                block,
+                offset,
+                e["delta"].as_str().unwrap_or(""),
+                now,
+                &mut out,
+            );
         } else if kind == "message_end" && m["role"] == "assistant" {
+            let model = public_name(&m["model"]);
             if let Some(cs) = m["content"].as_array() {
                 for (i, c) in cs.iter().enumerate() {
                     if c["type"] == "text" {
                         let block =
                             format!("{}/text/{i}", self.pi_message.as_deref().unwrap_or(&id));
-                        let mut p = self.text(
+                        self.finish_stream_text(
                             id.clone(),
                             block,
                             offset,
+                            i as u64,
+                            model.clone(),
                             c["text"].as_str().unwrap_or(""),
-                            true,
+                            &mut out,
                         );
-                        p.part = i as u64;
-                        p.model = public_name(&m["model"]);
-                        out.push(p);
                     }
                 }
             }
+            self.flush_pending_text(&mut out);
             let mut p = self.part(
                 format!("usage/{id}"),
                 format!("usage/{id}"),
@@ -492,7 +773,7 @@ impl Normalizer {
                 String::new(),
             );
             p.part = out.len() as u64;
-            p.model = public_name(&m["model"]);
+            p.model = model;
             p.activity = Some("usage".into());
             p.usage = Some(PublicUsage {
                 input_tokens: m["usage"]["input"].as_u64(),
@@ -503,9 +784,11 @@ impl Normalizer {
                     .filter(|v| v.is_finite() && *v >= 0.0),
                 context_limit: None,
             });
+            *handled = true;
             out.push(p);
         } else if matches!(kind, "tool_execution_start" | "tool_execution_end") {
             if let Some(call) = f["toolCallId"].as_str() {
+                self.flush_pending_text(&mut out);
                 let done = kind == "tool_execution_end";
                 let mut p = self.part(
                     format!("{kind}/{call}"),
@@ -528,17 +811,79 @@ impl Normalizer {
                 if done && f["isError"] == true {
                     p.activity = Some("tool_error".into());
                 }
+                *handled = true;
                 out.push(p);
             }
         } else if matches!(
             kind,
             "compaction_start" | "compaction_end" | "auto_retry_start" | "auto_retry_end"
         ) {
+            self.flush_pending_text(&mut out);
             let mut p = self.part(id.clone(), id, offset, PublicKind::Activity, String::new());
             p.activity = Some(kind.into());
+            *handled = true;
             out.push(p);
         }
         out
+    }
+}
+
+fn safe_discriminant(v: &Value) -> Option<String> {
+    v.as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
+        .map(str::to_owned)
+}
+
+fn frame_kind(mode: Mode, frame: &Value) -> String {
+    match mode {
+        Mode::Claude => {
+            let kind = safe_discriminant(&frame["type"]).unwrap_or_else(|| "unknown".into());
+            if kind == "system" {
+                if let Some(sub) = safe_discriminant(&frame["subtype"]) {
+                    return format!("system/{sub}");
+                }
+            } else if matches!(kind.as_str(), "assistant" | "user")
+                && let Some(first) = frame["message"]["content"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| safe_discriminant(&c["type"]))
+            {
+                return format!("{kind}/{first}");
+            }
+            kind
+        }
+        Mode::CodexAppServer => {
+            if let Some(method) = safe_discriminant(&frame["method"]) {
+                if matches!(method.as_str(), "item/started" | "item/completed")
+                    && let Some(item_type) = safe_discriminant(&frame["params"]["item"]["type"])
+                {
+                    return format!("{method}/{item_type}");
+                }
+                method
+            } else if !frame["id"].is_null() {
+                "jsonrpc_response".into()
+            } else {
+                "unknown".into()
+            }
+        }
+        Mode::CodexExec => {
+            let kind = safe_discriminant(&frame["type"]).unwrap_or_else(|| "unknown".into());
+            if matches!(kind.as_str(), "item.started" | "item.completed")
+                && let Some(item_type) = safe_discriminant(&frame["item"]["type"])
+            {
+                return format!("{kind}/{item_type}");
+            }
+            kind
+        }
+        Mode::Pi => {
+            let kind = safe_discriminant(&frame["type"]).unwrap_or_else(|| "unknown".into());
+            if kind == "message_update"
+                && let Some(ev) = safe_discriminant(&frame["assistantMessageEvent"]["type"])
+            {
+                return format!("message_update/{ev}");
+            }
+            kind
+        }
     }
 }
 fn public_name(v: &Value) -> Option<String> {
@@ -582,27 +927,64 @@ fn usage(v: &Value, camel: bool) -> PublicUsage {
         ..Default::default()
     }
 }
+fn line_contains_secret(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    [
+        "authorization:",
+        "bearer ",
+        "api_key",
+        "api-key",
+        "apikey",
+        "password",
+        "access_token",
+        "secret",
+        "private_key",
+        "token=",
+    ]
+    .iter()
+    .any(|needle| low.contains(needle))
+}
+fn redact_streaming_chunk(state: &mut TextStreamState, raw: &str) -> (String, bool) {
+    let mut changed = false;
+    let mut out = String::with_capacity(raw.len());
+    for segment in raw.split_inclusive('\n') {
+        let ends_nl = segment.ends_with('\n');
+        state.raw_line.push_str(segment);
+        if state.line_redacted {
+            changed = true;
+            if ends_nl {
+                out.push('\n');
+                state.line_redacted = false;
+                state.raw_line.clear();
+            }
+        } else if line_contains_secret(&state.raw_line) {
+            changed = true;
+            if ends_nl {
+                out.push_str("[redacted]\n");
+                state.raw_line.clear();
+                state.line_redacted = false;
+            } else {
+                out.push_str("[redacted]");
+                state.line_redacted = true;
+            }
+        } else {
+            out.push_str(segment);
+            if ends_nl {
+                state.raw_line.clear();
+                state.line_redacted = false;
+            }
+        }
+    }
+    state.raw_accumulated.push_str(raw);
+    state.any_redacted |= changed;
+    (out, changed)
+}
 fn redact(text: &str) -> (String, bool) {
     let mut changed = false;
     let clean = text
         .split_inclusive('\n')
         .map(|line| {
-            let low = line.to_ascii_lowercase();
-            if [
-                "authorization:",
-                "bearer ",
-                "api_key",
-                "api-key",
-                "apikey",
-                "password",
-                "access_token",
-                "secret",
-                "private_key",
-                "token=",
-            ]
-            .iter()
-            .any(|needle| low.contains(needle))
-            {
+            if line_contains_secret(line) {
                 changed = true;
                 if line.ends_with('\n') {
                     "[redacted]\n"

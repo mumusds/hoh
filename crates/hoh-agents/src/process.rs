@@ -712,14 +712,67 @@ async fn read_stdout<R: AsyncRead + Unpin>(
     let mut refused = false;
     let mut normalizer = public
         .as_ref()
-        .map(|p| crate::public_stream::Normalizer::new(p.mode, &p.version));
+        .map(|p| crate::public_stream::Normalizer::new_coalescing(p.mode, &p.version));
     let mut receive_offset = 0u64;
     let mut settled = false;
+    enum PublishState {
+        Abandoned,
+        Sent,
+        Closed,
+    }
+    let publish_batch = async |sender: &crate::public_stream::Publisher,
+                               parts: Vec<hoh_core::public_output::PublicPart>,
+                               abandon: &mut watch::Receiver<bool>| {
+        if parts.is_empty() {
+            return PublishState::Sent;
+        }
+        tokio::select! {
+            biased;
+            _ = abandoned(abandon) => PublishState::Abandoned,
+            result = crate::public_stream::publish(sender, parts) => {
+                if result.is_ok() { PublishState::Sent } else { PublishState::Closed }
+            }
+        }
+    };
+    let mut was_abandoned = false;
     loop {
+        let flush_deadline = match (&public, normalizer.as_ref()) {
+            (Some(_), Some(n)) => n.next_flush_deadline(),
+            _ => None,
+        };
         let frame = tokio::select! {
             biased;
-            frame = reader.next() => frame,
-            _ = abandoned(&mut abandon) => break,
+            frame = reader.next() => Some(frame),
+            _ = abandoned(&mut abandon) => {
+                was_abandoned = true;
+                break;
+            }
+            _ = async {
+                if let Some(deadline) = flush_deadline {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if flush_deadline.is_some() => None,
+        };
+        let Some(frame) = frame else {
+            if let (Some(sender), Some(normalizer)) = (&public, normalizer.as_mut()) {
+                let parts = normalizer.flush_due(Instant::now());
+                match publish_batch(sender, parts, &mut abandon).await {
+                    PublishState::Abandoned => {
+                        was_abandoned = true;
+                        break;
+                    }
+                    PublishState::Sent => {}
+                    PublishState::Closed => {
+                        if report.public_gap.is_none() {
+                            report.public_gap = Some(receive_offset);
+                        }
+                        public = None;
+                    }
+                }
+            }
+            continue;
         };
         match frame {
             Ok(Some(frame)) => {
@@ -734,6 +787,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                                 || value["type"] == "agent_settled";
                             parts = normalizer.feed(&value, receive_offset);
                         } else {
+                            parts.extend(normalizer.flush_text());
                             parts.push(crate::public_stream::gap(
                                 sender.mode,
                                 receive_offset,
@@ -741,6 +795,7 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                             ));
                         }
                     } else {
+                        parts.extend(normalizer.flush_text());
                         parts.push(crate::public_stream::gap(
                             sender.mode,
                             receive_offset,
@@ -748,26 +803,18 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                         ));
                     }
                     if matches!(frame, Frame::Reduced { .. }) {
+                        parts.extend(normalizer.flush_text());
                         parts.push(crate::public_stream::gap(
                             sender.mode,
                             receive_offset,
                             "native_frame_reduced",
                         ));
                     }
-                    enum PublishState {
-                        Abandoned,
-                        Sent,
-                        Closed,
-                    }
-                    let outcome = tokio::select! {
-                        biased;
-                        _ = abandoned(&mut abandon) => PublishState::Abandoned,
-                        result = crate::public_stream::publish(sender, parts) => {
-                            if result.is_ok() { PublishState::Sent } else { PublishState::Closed }
+                    match publish_batch(sender, parts, &mut abandon).await {
+                        PublishState::Abandoned => {
+                            was_abandoned = true;
+                            break;
                         }
-                    };
-                    match outcome {
-                        PublishState::Abandoned => break,
                         PublishState::Sent => {
                             receive_offset += 1;
                         }
@@ -792,6 +839,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 report.error = Some(e.to_string());
                 break;
             }
+        }
+    }
+    if !was_abandoned && let (Some(sender), Some(normalizer)) = (&public, normalizer.as_mut()) {
+        let flushed = normalizer.flush();
+        if let PublishState::Closed = publish_batch(sender, flushed, &mut abandon).await {
+            if report.public_gap.is_none() {
+                report.public_gap = Some(receive_offset);
+            }
+            public = None;
         }
     }
     if let Some(sender) = &public
@@ -1299,6 +1355,78 @@ mod tests {
         .ok_or("no cancel exit report")?;
         assert_eq!(exit.cause, Cause::Cancelled);
         assert_eq!(exit.stdout.public_gap, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_011_05_text_deltas_coalesce_within_50ms_and_16kib_without_crossing_tools()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (publisher, mut receiver) =
+            crate::public_stream::channel(crate::public_stream::Mode::CodexAppServer, "0.166.0");
+        let mut command = std::process::Command::new("python3");
+        command.arg("-c").arg(
+            "import json\n\
+for i in range(20):\n    print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m1','delta':f'tok{i} '}}), flush=True)\n\
+print(json.dumps({'method':'item/started','params':{'item':{'type':'commandExecution','id':'c1','command':'echo hi'}}}), flush=True)\n\
+print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m2','delta':'hunter2 is my '}}), flush=True)\n\
+print(json.dumps({'method':'item/agentMessage/delta','params':{'itemId':'m2','delta':'password\\n'}}), flush=True)\n\
+print(json.dumps({'method':'item/completed','params':{'item':{'type':'agentMessage','id':'m2','text':'hunter2 is my password\\n'}}}), flush=True)\n\
+print(json.dumps({'method':'turn/completed','params':{}}), flush=True)\n",
+        );
+        let mut p = Process::spawn(
+            command,
+            Config {
+                public: Some(publisher),
+                ..Config::default()
+            },
+            &hoh_core::spawn::Direct::plain(),
+        )?;
+        let drain = tokio::spawn(async move {
+            let mut parts = Vec::new();
+            while let Some(pending) = receiver.recv().await {
+                parts.push(pending.part);
+            }
+            parts
+        });
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(10), p.next()).await? {
+            if matches!(event, Event::Exit(_)) {
+                break;
+            }
+        }
+        let parts = drain.await?;
+        let m1_parts: Vec<_> = parts
+            .iter()
+            .filter(|p| p.block_key == "message/m1")
+            .collect();
+        assert!(
+            m1_parts.len() < 10,
+            "20 rapid text deltas must coalesce into far fewer parts (got {})",
+            m1_parts.len()
+        );
+        let m1_text: String = m1_parts.iter().map(|p| p.text.as_str()).collect();
+        let expected: String = (0..20).map(|i| format!("tok{i} ")).collect();
+        assert_eq!(m1_text, expected);
+        let tool_pos = parts
+            .iter()
+            .position(|p| p.kind == hoh_core::public_output::PublicKind::ToolStart)
+            .ok_or("tool start must not be merged away")?;
+        let m1_last = parts
+            .iter()
+            .rposition(|p| p.block_key == "message/m1")
+            .ok_or("m1 present")?;
+        assert!(
+            m1_last < tool_pos,
+            "coalesced deltas before tool must flush before ToolStart"
+        );
+        let m2_text: String = parts
+            .iter()
+            .filter(|p| p.block_key == "message/m2")
+            .map(|p| p.text.as_str())
+            .collect();
+        assert!(
+            !m2_text.contains("hunter2"),
+            "coalesced raw deltas with secret before keyword must be redacted: {m2_text:?}"
+        );
         Ok(())
     }
 }
