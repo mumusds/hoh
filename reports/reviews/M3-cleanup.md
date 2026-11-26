@@ -648,3 +648,15 @@ Review findings from `.hoh-dev/self-tests/m4low2/review1-findings.json` (no prod
 | M4L2-101 | low | Fixed | `crates/hoh-app/tests/s5/mod.rs:475-545`: replaced the fixed 500 ms sleep with a positive host-sweep barrier — enqueues epoch-2 `current-ask`/`current-steer` into `input_queue` (`QUEUED:2`), then enqueues epoch-1 `sweep-probe` (`ASK`, `cto`), rebinds `cto -> codex:2` via HTTP `ConfigureTeam`, waits for `sweep-probe` to reach `REJECTED` (`STALE_ROLE_EPOCH`) via `settle_ended_inputs`, and only then asserts `current-ask` and `current-steer` remain `QUEUED:2`. Red-first: widened `inputs.rs:709` sweep predicate to `>= 0` (`fix1-m4l2-101-red.log` exit 101; reverted; `fix1-m4l2-100-101-green.log` exit 0). Commit `67e0c9a5`. |
 | M4L2-102 | low | Fixed | `crates/hoh-app/tests/trace.rs:311-329` and `crates/hoh-app/tests/m3t10.rs:278-295`: replaced unbounded `wait()` after `SIGTERM` with bounded `try_wait()` polling (15 s deadline), falling back to `SIGKILL` (process group + child) and failing the test on timeout. Commit `9094ef68`. |
 | M4L2-103 | low | Fixed | `crates/hoh-app/tests/trace.rs:242-290, 338-348`: switched `strace` to `-e trace=%file`, added `tracer.0.try_wait()?` in the readiness loop, rejected `pid == own_pid` and asserted `host_pid != own_pid`, and matched relative `"contracts"` and `"/contracts\""` in addition to `prefix` and `"\"contracts/"`. Red-first: added `std::fs::read_link("contracts")` in `persistence/trace.rs:50` (`fix1-m4l2-103-red.log` exit 101 capturing `readlink("contracts", ...)`; reverted; `fix1-m4l2-102-103-green.log` exit 0). Commit `9094ef68`. |
+
+### M4 low package 2: reviews
+
+Developer: agy (Antigravity CLI, gemini-4-neon-high), package `ab3e92ce..9711eebe` and fix round `9711eebe..b42503b7`; test and record changes only.
+
+| Round | Frozen | Reviewer, session (attempt) | Verdict |
+|---|---|---|---|
+| 1 | `9711eebe` | Grok 1.0.92, `01a21563-08bf-7970-8d09-86ea156d3cd7` (`4a894da7-2786-4a1a-a2c2-a5eb874af728`), M4L2-001..099: AC coverage | FAIL: M4L2-001 high (the AC-033-04 "SpecMismatch" assertion on an SQL-seeded stale task passed with the branch deleted, because eligibility filters the task first) |
+| 1 | `9711eebe` | Claude Code 2.1.331, `a54d9334-45fa-4864-ade9-a2f03fcb0d67` (`f85eda8e-823f-4bc3-a8f2-838f936ed933`), M4L2-100..199: determinism, process lifetime | PASS: lows M4L2-100..103 (fixed in the fix round, table above) |
+| 2 (fix diff) | `b42503b7` | Grok 1.0.92, `01a215a5-4a8e-7383-bcd1-8650d07c5717` (`3a2c5e96-cf60-4415-ad87-0056e3e86699`), M4L2-200..299 | PASS, no findings: with the spec-inequality branch removed in a copy both the hoh-core unit test and the integration test exit 101, 0 on the unchanged tree; the integration assertion claims only the direct create_attempt refusal, not a round dispatch |
+
+M3QA-013 stays deferred (reason above). Deferred lows: none new.
